@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distribution, trust checked on every node, and grant-based networking.">
+<title>Zigcube</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+img{max-width:100%}[hidden]{display:none!important}
+/* Layout: a narrow reading column with a wide terminal band; the store's digest is the visual motif. */
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --fg:#151a24; --muted:#5d6676; --line:#dde2ea;
+  --accent:#2156b8; --accent-soft:#dde6f7; --term:#141925; --term-fg:#e3e8f2; --term-dim:#8790a3; --term-accent:#7fa8f5;
+  --ok:#2f7a4a; --wip:#2156b8; --plan:#8a8473;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --accent-soft:#1d2a45; --term:#0a0d13; --term-fg:#e3e8f2; --term-dim:#7d869a; --term-accent:#7fa8f5;
+  --ok:#6cc08a; --wip:#7fa8f5; --plan:#8a8473; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --accent-soft:#1d2a45; --term:#0a0d13; --term-fg:#e3e8f2; --term-dim:#7d869a; --term-accent:#7fa8f5;
+  --ok:#6cc08a; --wip:#7fa8f5; --plan:#8a8473; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;line-height:1.6;margin:0}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--bg)}
+.wrap{max-width:1040px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+a{color:var(--accent)} a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;line-height:1.15;margin:0}
+h2{font-size:1.75rem} h3{font-size:1.15rem}
+code{font-family:var(--mono);font-size:.9em}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+header.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:20px;padding-block:12px;flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;font-size:1.2rem;color:var(--fg);text-decoration:none;display:flex;gap:8px;align-items:center}
+.brand .mark{width:20px;height:20px;border:2px solid var(--accent);border-radius:3px;position:relative}
+.brand .mark{transform:rotate(45deg) scale(.85)}.brand .mark::after{content:"";position:absolute;inset:3px;border:2px solid var(--accent);border-radius:1px}
+nav{display:flex;gap:16px;flex-wrap:wrap;margin-left:auto;font-size:.9rem}
+nav a{color:var(--muted);text-decoration:none} nav a:hover{color:var(--fg)}
+.pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.72rem;padding:2px 8px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.s-done{color:var(--ok)} .s-wip{color:var(--wip)} .s-plan{color:var(--plan)}
+.hero{padding-block:56px 40px;display:grid;grid-template-columns:1.05fr 1fr;gap:40px;align-items:center}
+.hero>*{min-width:0}
+.hero h1{font-size:clamp(2.2rem,5vw,3.4rem);letter-spacing:-.01em}
+.hero p.lede{font-size:1.15rem;color:var(--muted);max-width:34ch;margin:16px 0 20px}
+.cta{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.btn{font:500 .95rem var(--body);padding:10px 16px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--fg);text-decoration:none;cursor:pointer}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.term{background:var(--term);color:var(--term-fg);border-radius:10px;font:14px/1.55 var(--mono);overflow-x:auto}
+.term .bar{display:flex;justify-content:space-between;gap:12px;padding:8px 14px;border-bottom:1px solid #ffffff14;color:var(--term-dim);font-size:.75rem}
+.term pre{margin:0;padding:14px 16px;white-space:pre;min-height:3em}
+.term .p{color:var(--term-accent)} .term .d{color:var(--term-dim)}
+.planned{font-size:.7rem;color:var(--term-dim);border:1px dashed var(--term-dim);border-radius:4px;padding:0 6px}
+section{padding-block:48px;border-top:1px solid var(--line)}
+.sec-head{display:flex;justify-content:space-between;align-items:end;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+.sec-head p{color:var(--muted);margin:6px 0 0;max-width:60ch}
+.principles{display:grid;grid-template-columns:repeat(3,1fr);gap:28px 32px}
+.principles div{min-width:0}
+.principles h3{margin-bottom:6px}
+.principles p{margin:0;color:var(--muted);font-size:.95rem}
+.progress{display:flex;gap:4px;margin-bottom:20px}
+.progress span{flex:1;height:6px;border-radius:2px;background:var(--line)}
+.progress span.done{background:var(--ok)} .progress span.wip{background:var(--wip)}
+.ms{display:grid;grid-template-columns:260px 1fr;gap:24px;border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:0;margin-bottom:14px;overflow:hidden}
+.ms>*{min-width:0}
+.ms .meta{padding:18px 20px;display:flex;flex-direction:column;gap:8px}
+.ms .code{font-family:var(--mono);color:var(--accent);font-size:.85rem}
+.ms .meta p{margin:0;color:var(--muted);font-size:.92rem}
+.ms .term{border-radius:0}
+.docs{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.doc{border:1px solid var(--line);border-radius:10px;padding:18px 20px;background:var(--surface);display:flex;flex-direction:column;gap:6px;min-width:0}
+.doc p{margin:0;color:var(--muted);font-size:.93rem}
+.doc .when{font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:24px}
+.facts div{min-width:0} .facts p{margin:4px 0 0;color:var(--muted);font-size:.93rem}
+footer{border-top:1px solid var(--line);padding-block:28px;color:var(--muted);font-size:.85rem}
+footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.digest{font-family:var(--mono);font-size:.75rem;color:var(--muted);word-break:break-all}
+@media (max-width:820px){.hero{grid-template-columns:1fr;padding-block:36px 28px}.principles,.facts{grid-template-columns:1fr 1fr}.ms{grid-template-columns:1fr;gap:0}.docs{grid-template-columns:1fr}}
+@media (max-width:520px){.principles,.facts{grid-template-columns:1fr} nav{margin-left:0;width:100%}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="#top"><span class="mark" aria-hidden="true"></span>Zigcube</a>
+  <span class="pill s-plan" id="hdr-status">Pre-alpha</span>
+  <nav aria-label="Sections"><a href="#why">Why</a><a href="#demos">Demos</a><a href="#docs">Docs</a><a href="#project">Project</a><a href="#" id="sister">← Zigbox</a></nav>
+</div></header>
+
+<main class="wrap" id="top">
+  <div class="hero">
+    <div>
+      <p class="eyebrow">Orchestration for Zigbox</p>
+      <h1>A cluster that only runs what it can verify.</h1>
+      <p class="lede">Zigcube schedules Zigbox workloads across a fleet. Images move as chunks between peers, every node checks signatures before it runs anything, and services talk only along declared grants.</p>
+      <div class="cta">
+        <a class="btn primary" href="#demos">See the demos</a>
+        <a class="btn" href="#docs">Read the docs</a>
+      </div>
+    </div>
+    <div class="term" aria-label="Example session">
+      <div class="bar"><span>zcube · example session</span><span class="planned">target for C2</span></div>
+      <pre id="hero-term"></pre>
+    </div>
+  </div>
+
+  <section id="why">
+    <div class="sec-head"><div><p class="eyebrow">Design principles</p><h2>Kubernetes' good idea, rebuilt around it</h2>
+    <p>Declared state reconciled by controllers stays. Most of the plumbing around it goes.</p></div></div>
+    <div class="principles">
+      <div><h3>One thin agent</h3><p>Each node runs a single rootless agent that links Zigbox directly. No CRI, no containerd, no shims.</p></div>
+      <div><h3>Store-aware scheduling</h3><p>The scheduler knows which chunks each node holds, and nodes fetch from peers before the registry.</p></div>
+      <div><h3>Trust checked twice</h3><p>Admission checks policy, then every node re-checks before exec. A compromised control plane cannot run unsigned code.</p></div>
+      <div><h3>Grants, not a flat network</h3><p><code>web → db:5432</code> is the whole rule. Identity-based, encrypted, default deny.</p></div>
+      <div><h3>Ask why</h3><p><code>zcube why</code> prints the causal chain behind any state, so "why isn't it running" takes one command.</p></div>
+      <div><h3>Boring storage</h3><p>Desired and observed state live in Postgres, with OrioleDB for the hot, update-heavy tables.</p></div>
+    </div>
+  </section>
+
+  <section id="demos">
+    <div class="sec-head">
+      <div><p class="eyebrow">Roadmap and demos</p><h2>Every milestone ends in a live demo</h2>
+      <p>Demos run on a small VM cluster built by a script in the repo. Work starts after Zigbox M8. Planned output is marked until the milestone ships.</p></div>
+      <span class="eyebrow" id="ms-count"></span>
+    </div>
+    <div class="progress" id="progress" aria-hidden="true"></div>
+    <div id="milestones"></div>
+  </section>
+
+  <section id="docs">
+    <div class="sec-head"><div><p class="eyebrow">Documentation</p><h2>Docs grow with the code</h2>
+    <p>Each page goes live with the milestone that makes it true.</p></div></div>
+    <div class="docs" id="docs-list"></div>
+  </section>
+
+  <section id="project">
+    <div class="sec-head"><div><p class="eyebrow">The project</p><h2>Open, neutral, staying that way</h2></div></div>
+    <div class="facts">
+      <div><h3>Apache 2.0, forever</h3><p>The same licence and no-relicensing pledge as Zigbox. DCO sign-off, no CLA.</p></div>
+      <div><h3>Headed for a foundation</h3><p>Conformance tests and a neutral home before anyone is asked to bet a company on it.</p></div>
+      <div><h3>Speaks Kubernetes at the edge</h3><p>A Kubernetes API facade is on the roadmap so existing tooling keeps working.</p></div>
+    </div>
+  </section>
+</main>
+
+<footer><div class="wrap">
+  <span>Zigcube · pre-alpha · updated <span id="updated"></span></span>
+  <span class="digest" id="digest"></span>
+</div></footer>
+
+<script>// ===== Site data: update the milestone entries as work lands. =====
+const SITE = {
+  updated: "2026-10-23",
+  sisterUrl: "../zigbox/", // Zigbox site
+  stage: "Pre-alpha · planning",
+};
+// status: "done" | "wip" | "plan"
+const MILESTONES = [
+  {id:"C0", name:"Loop", status:"plan", goal:"Declare a service, and a controller keeps reality matching it on one node.",
+   demo:[["$","zcube apply hello.zon"],["","service hello  replicas 3/3 running"],["$","zcube apply broken.zon && zcube why service broken"],["","pending ← agent vm1: image not found ← digest b3:00ff…e1"]]},
+  {id:"C1", name:"Fleet", status:"plan", goal:"Workloads spread across nodes and survive the loss of one.",
+   demo:[["$","zcube get replicas hello -o wide"],["","hello-1  vm1  running     hello-4  vm2  running"],["","hello-2  vm1  running     hello-5  vm3  running"],["","(vm3 powered off)"],["","hello-5  lost → rescheduled on vm2   (lease expired after 10s)"]]},
+  {id:"C2", name:"Swarm", status:"plan", goal:"Images reach nodes fast: peers share chunks, the scheduler prefers warm nodes.",
+   demo:[["$","zcube stats pull python-app:v2"],["","vm1  registry   0 B    peers  212 KB"],["","vm2  registry   0 B    peers  212 KB"],["","vm3  registry   0 B    peers  212 KB   (registry blocked)"]]},
+  {id:"C3", name:"Rollout", status:"plan", goal:"Image changes roll out gradually, gated by health, and undo themselves on failure.",
+   demo:[["$","zcube apply hello-v3-broken.zon"],["","rolling 1/6 … health check /ready failed (503)"],["","rolled back to b3:51aa…9c03   0 requests failed"]]},
+  {id:"C4", name:"Mesh", status:"plan", goal:"Services find each other by name and talk only along declared grants.",
+   demo:[["$","zcube exec batch -- nc -z db 5432"],["","refused: no grant batch → db:5432"],["$","zcube grant batch db:5432 && zcube exec batch -- nc -z db 5432"],["","db:5432 open"]]},
+  {id:"C5", name:"Edge", status:"plan", goal:"A service gets a public HTTPS address from one line of config.",
+   demo:[["$","curl -sI https://hello.demo.example | head -1"],["","HTTP/2 200"]]},
+  {id:"C6", name:"Trust", status:"plan", goal:"Only signed, policy-compliant images run, even with a compromised control plane.",
+   demo:[["$","zcube why service hello"],["","refused by node policy on vm1, vm2, vm3 (no trusted signature)"],["","still serving b3:51aa…9c03"]]},
+  {id:"C7", name:"State", status:"plan", goal:"A stateful service recovers on another node with a stated, bounded data loss.",
+   demo:[["$","zcube why service pg"],["","vm2 lost → restored snapshot 16:41:00 on vm3 → running (data loss ≤ 1m)"]]},
+  {id:"C8", name:"Jobs", status:"plan", goal:"Finite jobs, gang scheduling, and cluster-wide hermetic builds with one cache.",
+   demo:[["$","zcube build"],["","compile vm2 · test vm3 · docs vm1   parallel"],["","image b3:51aa…9c03   matches local zbx build"]]},
+];
+const DOCS = [
+  {t:"Build a demo cluster", m:"C0", d:"Boot the VM set from the repo script and install the server and agents."},
+  {t:"Services and controllers", m:"C0", d:"Declaring a service, reconciliation, and reading zcube why."},
+  {t:"Scheduling and failover", m:"C1", d:"Leases, resource fit, spread, and what happens when a node disappears."},
+  {t:"Chunk distribution", m:"C2", d:"Peer fetch, locality scoring and pull statistics."},
+  {t:"Rollouts", m:"C3", d:"Health checks, surge limits, history and rollback."},
+  {t:"Grants and identity", m:"C4", d:"The mesh, workload identity, and writing grants."},
+  {t:"Policy and trust", m:"C6", d:"Admission policy and node-local trust that the API cannot change."},
+  {t:"Stateful services and jobs", m:"C7", d:"Snapshots, recovery points, gang scheduling and cluster builds."},
+];
+// ===== Rendering =====
+const $ = s => document.querySelector(s);
+const label = {done:"Shipped", wip:"In progress", plan:"Planned"};
+function esc(s){return s.replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]))}
+function termHTML(lines){return lines.map(([k,t])=>k? `<span class="p">${k}</span> ${esc(t)}` : `<span class="d">${esc(t)}</span>`).join("\n")}
+$("#hero-term").innerHTML = termHTML([["$","zcube get nodes"],["","vm1  ready  4 cpu  8 GiB  warm: python-app"],["","vm2  ready  4 cpu  8 GiB  warm: python-app"],["","vm3  ready  4 cpu  8 GiB"],["$","zcube apply python-app.zon"],["","3/3 running   pulled 212 KB from peers, 0 B from registry"],["$","zcube why replica python-app-3"],["","placed on vm3 ← fit ok ← spread ← peers hold 99.6% of chunks"]]);
+const done = MILESTONES.filter(m=>m.status==="done").length;
+$("#ms-count").textContent = `${done} of ${MILESTONES.length} shipped`;
+$("#progress").innerHTML = MILESTONES.map(m=>`<span class="${m.status}"></span>`).join("");
+$("#milestones").innerHTML = MILESTONES.map(m=>`
+  <article class="ms" id="${m.id.toLowerCase()}">
+    <div class="meta"><span class="code">${m.id}</span><h3>${m.name}</h3><p>${m.goal}</p><span class="pill s-${m.status}">${label[m.status]}</span></div>
+    <div class="term"><div class="bar"><span>demo · ${m.id.toLowerCase()}</span>${m.status==="done"?"<span>recorded output</span>":'<span class="planned">planned output</span>'}</div><pre>${termHTML(m.demo)}</pre></div>
+  </article>`).join("");
+$("#docs-list").innerHTML = DOCS.map(d=>{const ms=MILESTONES.find(x=>x.id===d.m); const st=ms?ms.status:"plan";
+  return `<div class="doc"><h3>${d.t}</h3><p>${d.d}</p><span class="when">${st==="done"?"Available":"Arrives with "+d.m}</span></div>`}).join("");
+$("#updated").textContent = SITE.updated;
+$("#hdr-status").textContent = SITE.stage;
+$("#digest").textContent = "site tree b3:" + [...SITE.updated+MILESTONES.map(m=>m.status).join("")].reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))>>>0,7).toString(16).padStart(8,"0");
+const sis = $("#sister"); if(SITE.sisterUrl){sis.href=SITE.sisterUrl}else{sis.removeAttribute("href");sis.style.opacity=.5;sis.title="Link coming"}
+if(location.hash){const t=document.getElementById(location.hash.slice(1)); if(t) t.scrollIntoView();}
+</script>
+
+</body>
+</html>
