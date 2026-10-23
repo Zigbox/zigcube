@@ -124,14 +124,14 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       <div><h3>Trust checked twice</h3><p>Admission checks policy, then every node re-checks before exec. A compromised control plane cannot run unsigned code.</p></div>
       <div><h3>Grants, not a flat network</h3><p><code>web → db:5432</code> is the whole rule. Identity-based, encrypted, default deny.</p></div>
       <div><h3>Ask why</h3><p><code>zcube why</code> prints the causal chain behind any state, so "why isn't it running" takes one command.</p></div>
-      <div><h3>Boring storage</h3><p>Desired and observed state live in Postgres, with OrioleDB for the hot, update-heavy tables.</p></div>
+      <div><h3>Pluggable storage</h3><p>State lives behind a small versioned key-value interface. Postgres first, with OrioleDB for hot tables; SQLite for development.</p></div>
     </div>
   </section>
 
   <section id="demos">
     <div class="sec-head">
       <div><p class="eyebrow">Roadmap and demos</p><h2>Every milestone ends in a live demo</h2>
-      <p>Demos run on a small VM cluster built by a script in the repo. Work starts after Zigbox M8. Planned output is marked until the milestone ships.</p></div>
+      <p>Demos run on a small VM cluster built by a script in the repo. Control-plane work starts now against a stand-in runtime; real Zigbox plugs in from its M2. Planned output is marked until the milestone ships.</p></div>
       <span class="eyebrow" id="ms-count"></span>
     </div>
     <div class="progress" id="progress" aria-hidden="true"></div>
