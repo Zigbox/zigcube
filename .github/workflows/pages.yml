@@ -1,6 +1,5 @@
 name: Deploy site to GitHub Pages
-# Pages is intentionally not enabled yet (going public at Zigbox M1).
-# To go live: Settings -> Pages -> Source: GitHub Actions, then run this workflow.
+# Deploys site/ on every push to main that touches it. Requires Settings -> Pages -> Source: GitHub Actions.
 on:
   push:
     branches: [main]
