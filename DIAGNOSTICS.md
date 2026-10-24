@@ -49,6 +49,8 @@ bug[ZBX-B0001]: zbx hit an internal error while committing a container
   report https://github.com/Zigbox/zigbox/issues/new (attach the bundle after reviewing it)
 ```
 
+A bug's internal message (the panic text or the broken invariant) means nothing to the user, so the default output leaves it out. `--verbose` shows it as the bug's `cause` line, and JSON carries it in `causes`.
+
 ### Fields
 
 | Field | Required | Meaning |
@@ -58,16 +60,18 @@ bug[ZBX-B0001]: zbx hit an internal error while committing a container
 | `blame` | yes | `user`, `environment`, `external`, or `internal`. |
 | `summary` | yes | One line, present tense, no trailing period, under about 70 characters. |
 | `causes` | yes, at least one | The cause chain, innermost real cause last. |
+| `while` | no | What was being done when it failed (the `while` lines), outermost first. JSON always carries the array, empty if there are none. |
 | `context` | no | Key–value pairs (container, image, digest, node, pid, path). |
 | `fixes` | yes unless `internal` | Each fix is a sentence and optionally a command. |
 | `docs` | automatic | Generated from the code (see Codes). |
+| `omitted` | automatic | How many causes, `while` lines, context pairs and fixes were dropped because they exceeded the collector's fixed bounds. Verbose output says "(N more not shown)"; JSON always carries the counts, zero included. |
 | `trace` | bundle only | Zig error return trace and stack, never in default or verbose output. |
 
 ## Codes
 
 - Prefix by product: `ZBX-` for Zigbox, `ZC-` for Zigcube.
 - Letter by kind: `E` error, `W` warning, `B` internal bug.
-- Four digits, grouped by subsystem. Zigbox: `01xx` host and doctor, `02xx` runtime and isolation, `03xx` limits, `04xx` store, `05xx` registry and pull, `06xx` network, `07xx` state, `08xx` build, `09xx` trust and policy. Zigcube: `01xx` API and CLI, `02xx` store backends, `03xx` controllers, `04xx` scheduler, `05xx` agent, `06xx` distribution, `07xx` mesh, `08xx` trust.
+- Four digits, grouped by subsystem. Zigbox: `00xx` CLI and general, `01xx` host and doctor, `02xx` runtime and isolation, `03xx` limits, `04xx` store, `05xx` registry and pull, `06xx` network, `07xx` state, `08xx` build, `09xx` trust and policy. Zigcube: `01xx` API and CLI, `02xx` store backends, `03xx` controllers, `04xx` scheduler, `05xx` agent, `06xx` distribution, `07xx` mesh, `08xx` trust.
 - Every code is declared once in a registry (`src/diag/codes.zig`) with its summary template, blame, and a long explanation. The build fails if a code is used but not registered, registered twice, or registered without an explanation.
 - `zbx explain <code>` and `zcube explain <code>` print the long explanation offline. The same text is generated into `site/errors/<code>.html`, which is the `docs` link.
 
