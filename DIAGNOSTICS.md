@@ -94,7 +94,7 @@ A command that runs a container (`zbx run`, and later anything that waits on a w
 
 | Code | Meaning |
 | --- | --- |
-| `125` | zbx itself failed before the command started (any blame: a bad flag, a missing rootfs, a refused namespace, a bug) |
+| `125` | zbx itself failed: before the command started (any blame: a bad flag, a missing rootfs, a refused namespace, a bug), or it lost track of a command that had started |
 | `126` | the command was found but could not be run (not executable, wrong CPU) |
 | `127` | the command was not found |
 | `128`+*n* | the container's process was killed by signal *n* |
