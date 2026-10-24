@@ -25,6 +25,7 @@ error[ZBX-E0101]: can't create a user namespace
   fix    allow zbx only:   sudo zbx doctor --fix apparmor
          or system-wide:   sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
   more   zbx explain E0101 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigbox/errors/E0101.html
 ```
 
 With `--verbose`, the same diagnostic adds the cause chain (each layer that wrapped the failure, outermost first) and context fields:
@@ -79,10 +80,12 @@ A bug's internal message (the panic text or the broken invariant) means nothing 
 
 | Mode | Flag | Shows |
 | --- | --- | --- |
-| Default | none | summary, innermost cause, fixes, `more` line |
+| Default | none | summary, innermost cause, fixes, `more` and `docs` lines |
 | Verbose | `-v`, `--verbose` | plus the full cause chain and context fields |
 | JSON | `--output json` | the full diagnostic object on stderr, one JSON object per line, for scripts and CI |
 | Bundle | `zbx bundle`, `zcube bundle`, or automatic on `bug` | everything below |
+
+A command may report several diagnostics (`zbx doctor` reports one per failing check). They come in order: in text, blocks are separated by a blank line; in JSON, each is one object per line. The exit code is decided by the blame of the diagnostics.
 
 Exit codes: `1` user, `2` environment, `3` external, `70` internal (EX_SOFTWARE). A container's own exit code is passed through unchanged and is never confused with these.
 
