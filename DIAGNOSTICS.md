@@ -46,7 +46,7 @@ An internal bug (an invariant we broke, an unexpected error from our own code, a
 ```
 bug[ZBX-B0001]: zbx hit an internal error while committing a container
   this is a bug in zbx, not something you did
-  saved  diagnostic bundle: ~/.local/state/zbx/bundles/2026-10-23T22-41-07Z.tar.zst
+  saved  diagnostic bundle: ~/.local/state/zbx/bundles/2026-10-23T22-41-07Z.tar.gz
   report https://github.com/Zigbox/zigbox/issues/new (attach the bundle after reviewing it)
 ```
 
@@ -93,7 +93,7 @@ Colour only when stderr is a terminal and `NO_COLOR` is unset. Output must read 
 
 ## Bundles: the kitchen sink, only when needed
 
-A bundle is a single `.tar.zst` file with everything needed to diagnose a failure without a back-and-forth.
+A bundle is a single `.tar.gz` file with everything needed to diagnose a failure without a back-and-forth. (gzip, because the Zig standard library can write it; it decompresses zstd but cannot compress it.)
 
 - **Created** automatically for every `bug` diagnostic, and on request with `zbx bundle [--last | <container>]` or `zcube bundle [--last | <kind> <name>]`.
 - **Contents:** a `MANIFEST.txt` listing every file and why it is there; the diagnostic in JSON; the error return trace and stack; versions and build digests; `zbx doctor` output; kernel, distro and cgroup layout; the relevant config, redacted; recent events and logs for the subject; for Zigcube, the `zcube why` decision chain and the relevant store keys at the failing revision.
