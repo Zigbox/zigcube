@@ -59,6 +59,7 @@ nav a{color:var(--muted);text-decoration:none} nav a:hover{color:var(--fg)}
 .term .bar{display:flex;justify-content:space-between;gap:12px;padding:8px 14px;border-bottom:1px solid #ffffff14;color:var(--term-dim);font-size:.75rem}
 .term pre{margin:0;padding:14px 16px;white-space:pre;min-height:3em}
 .term .p{color:var(--term-accent)} .term .d{color:var(--term-dim)}
+.rec{font-size:.7rem;color:var(--ok);border:1px solid var(--ok);border-radius:4px;padding:0 6px;text-decoration:none;white-space:nowrap} .rec:hover,.rec:focus-visible{background:#ffffff14}
 .planned{font-size:.7rem;color:var(--term-dim);border:1px dashed var(--term-dim);border-radius:4px;padding:0 6px}
 section{padding-block:48px;border-top:1px solid var(--line)}
 .sec-head{display:flex;justify-content:space-between;align-items:end;gap:16px;flex-wrap:wrap;margin-bottom:24px}
@@ -75,6 +76,8 @@ section{padding-block:48px;border-top:1px solid var(--line)}
 .ms .meta{padding:18px 20px;display:flex;flex-direction:column;gap:8px}
 .ms .code{font-family:var(--mono);color:var(--accent);font-size:.85rem}
 .ms .meta p{margin:0;color:var(--muted);font-size:.92rem}
+.ms .meta .slices{font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+.ms .meta .slices b{color:var(--ok);font-weight:600}
 .ms .term{border-radius:0}
 .docs{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
 .doc{border:1px solid var(--line);border-radius:10px;padding:18px 20px;background:var(--surface);display:flex;flex-direction:column;gap:6px;min-width:0}
@@ -161,14 +164,16 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
 <script>// ===== Site data: update the milestone entries as work lands. =====
 const SITE = {
-  updated: "2026-10-23",
+  updated: "2026-10-25",
   sisterUrl: "../zigbox/", // Zigbox site
   stage: "Pre-alpha · planning",
 };
 // status: "done" | "wip" | "plan"
+// When a milestone ships: status "done", slices {green, total, note}, recorded {url, date} linking the
+// green demo-cN CI run, and demo lines copied from that run's output. Never show unrecorded output as recorded.
 const MILESTONES = [
   {id:"C0", name:"Loop", status:"plan", goal:"Declare a service, and a controller keeps reality matching it on one node.",
-   demo:[["$","zcube apply hello.zon"],["","service hello  replicas 3/3 running"],["$","zcube apply broken.zon && zcube why service broken"],["","pending ← agent vm1: image not found ← digest b3:00ff…e1"]]},
+   demo:[["$","zcube apply hello.zon"],["","service hello  replicas 3/3 running"],["$","zcube apply broken.zon && zcube why service broken"],["","service broken: 0/1 running"],["","  ← replica broken-1 pending on node1"],["","  ← error[ZBX-E0501]: image not found"],["","      cause  digest b3:00ff…e1 is not in this node's store"]]},
   {id:"C1", name:"Fleet", status:"plan", goal:"Workloads spread across nodes and survive the loss of one.",
    demo:[["$","zcube get replicas hello -o wide"],["","hello-1  vm1  running     hello-4  vm2  running"],["","hello-2  vm1  running     hello-5  vm3  running"],["","(vm3 powered off)"],["","hello-5  lost → rescheduled on vm2   (lease expired after 10s)"]]},
   {id:"C2", name:"Swarm", status:"plan", goal:"Images reach nodes fast: peers share chunks, the scheduler prefers warm nodes.",
@@ -207,8 +212,8 @@ $("#ms-count").textContent = `${done} of ${MILESTONES.length} shipped`;
 $("#progress").innerHTML = MILESTONES.map(m=>`<span class="${m.status}"></span>`).join("");
 $("#milestones").innerHTML = MILESTONES.map(m=>`
   <article class="ms" id="${m.id.toLowerCase()}">
-    <div class="meta"><span class="code">${m.id}</span><h3>${m.name}</h3><p>${m.goal}</p><span class="pill s-${m.status}">${label[m.status]}</span></div>
-    <div class="term"><div class="bar"><span>demo · ${m.id.toLowerCase()}</span>${m.status==="done"?"<span>recorded output</span>":'<span class="planned">planned output</span>'}</div><pre>${termHTML(m.demo)}</pre></div>
+    <div class="meta"><span class="code">${m.id}</span><h3>${m.name}</h3><p>${m.goal}</p><span class="pill s-${m.status}">${label[m.status]}</span>${m.slices?`<span class="slices"><b>${m.slices.green} of ${m.slices.total}</b> ${m.slices.note}</span>`:""}</div>
+    <div class="term"><div class="bar"><span>demo · ${m.id.toLowerCase()}</span>${m.recorded?`<a class="rec" href="${m.recorded.url}">✓ recorded in CI · ${m.recorded.date}</a>`:(m.status==="done"?"<span>recorded output</span>":'<span class="planned">planned output</span>')}</div><pre>${termHTML(m.demo)}</pre></div>
   </article>`).join("");
 $("#docs-list").innerHTML = DOCS.map(d=>{const ms=MILESTONES.find(x=>x.id===d.m); const st=ms?ms.status:"plan";
   return `<div class="doc"><h3>${d.t}</h3><p>${d.d}</p><span class="when">${st==="done"?"Available":"Arrives with "+d.m}</span></div>`}).join("");
