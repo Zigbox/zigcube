@@ -88,7 +88,19 @@ A bug's internal message (the panic text or the broken invariant) means nothing 
 
 A command may report several diagnostics (`zbx doctor` reports one per failing check). They come in order: in text, blocks are separated by a blank line; in JSON, each is one object per line. The exit code is decided by the blame of the diagnostics.
 
-Exit codes: `1` user, `2` environment, `3` external, `70` internal (EX_SOFTWARE). A container's own exit code is passed through unchanged and is never confused with these.
+Exit codes: `1` user, `2` environment, `3` external, `70` internal (EX_SOFTWARE).
+
+A command that runs a container (`zbx run`, and later anything that waits on a workload) passes the container's own exit code through unchanged, so it cannot also use those four: a container can exit with any code. Such a command uses the shell's reserved codes for its own failures instead, as Docker and Podman do:
+
+| Code | Meaning |
+| --- | --- |
+| `125` | zbx itself failed: before the command started (any blame: a bad flag, a missing rootfs, a refused namespace, a bug), or it lost track of a command that had started |
+| `126` | the command was found but could not be run (not executable, wrong CPU) |
+| `127` | the command was not found |
+| `128`+*n* | the container's process was killed by signal *n* |
+| anything else | the container's own exit code |
+
+A container that itself exits 125 to 127 is the one ambiguous case; the diagnostic on stderr, or the JSON on `--output json` (the run's last line carries `container_exit` only when the container ran), tells them apart.
 
 Colour only when stderr is a terminal and `NO_COLOR` is unset. Output must read correctly with no colour at all.
 
