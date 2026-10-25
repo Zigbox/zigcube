@@ -2,7 +2,7 @@
 
 You are starting Zigcube, the orchestrator for Zigbox. Zigbox (a rootless, content-addressed container runtime in Zig, repo `Zigbox/zigbox`) is being built in parallel and does not exist yet. Your job is the control plane and node agent, developed against a **fake runtime**, so that real Zigbox drops in later behind a fixed interface.
 
-Read this whole file before writing code. When something here is ambiguous, ask the human rather than guessing; the decisions marked **Ask first** below are not yours to make alone.
+Read this whole file and `DIAGNOSTICS.md` before writing code. When something here is ambiguous, ask the human rather than guessing; the decisions marked **Ask first** below are not yours to make alone.
 
 ## What Zigcube is
 
@@ -11,9 +11,10 @@ Zigcube runs Zigbox workloads across a fleet. It keeps Kubernetes' one good idea
 Principles:
 
 1. One thin node agent (`zcube-agent`) that links the runtime as a library. No CRI, no containerd, no shims.
-2. Explainable reconciliation: every controller decision is recorded with its cause, so `zcube why <thing>` answers "why is this not running" in one command.
-3. Pluggable control-plane storage behind a narrow versioned key-value interface (below). Postgres first, SQLite second.
-4. Later milestones add store-aware scheduling, peer chunk distribution, node-side signature checks and grant-based networking. Do not build those now, but do not design them out.
+2. Designed diagnostics from the first commit (see `DIAGNOSTICS.md`): every failure is a short, coded explanation with a cause and a fix, more detail on request, and a full bundle only when needed. Never a raw stack trace or bare Zig error name.
+3. Explainable reconciliation: every controller decision is recorded with its cause, so `zcube why <thing>` answers "why is this not running" in one command.
+4. Pluggable control-plane storage behind a narrow versioned key-value interface (below). Postgres first, SQLite second.
+5. Later milestones add store-aware scheduling, peer chunk distribution, node-side signature checks and grant-based networking. Do not build those now, but do not design them out.
 
 ## Scope of this handoff
 
@@ -30,11 +31,12 @@ Out of scope: real Zigbox integration, networking between workloads, images, sig
 | Service files | ZON (Zig Object Notation), e.g. `hello.zon`. |
 | Storage | Pluggable `Store` interface. Backend 1: Postgres 16+ (OrioleDB tables when the extension is present, plain heap otherwise; the schema must work on heap). Backend 2: SQLite, for dev, tests and single-node use. |
 | Agent ↔ server | HTTP/1.1 + JSON. Agents watch desired state and report observed state; the server never pushes to agents. |
+| Diagnostics | `DIAGNOSTICS.md` is binding: the `Diag` collector, the code registry (`ZC-` codes), output modes, bundles and golden tests are part of C0, not later polish. |
 | Licence | Apache 2.0. Every commit signed off (`git commit -s`, DCO). No CLA. |
 
 ## The two contracts
 
-These two interfaces are the most important things you will write. Get them reviewed by the human before building much on top of either.
+These two interfaces are the most important things you will write. Both report failure through the shared `Diag` type from `DIAGNOSTICS.md`, so a runtime failure on a node reaches `zcube why` intact. Get them reviewed by the human before building much on top of either.
 
 ### 1. `Store`: control-plane storage
 
@@ -78,7 +80,7 @@ pub const ExitReason = union(enum) {
     signaled: u8,        // signal number
     oom,                 // memory limit hit
     pid_limit,
-    start_failed: []const u8, // human-readable cause, e.g. "image not found: b3:00ff…"
+    start_failed: Diagnostic, // a full diagnostic, e.g. ZBX-E0501 image not found
     lost,                // process vanished without a known reason
 };
 
@@ -102,7 +104,7 @@ pub const Status = union(enum) { starting, running, stopped: ExitReason };
 
 - Runs the command as a plain host process (no isolation).
 - Persists handle and labels in a state directory so a restarted agent re-adopts running processes instead of starting duplicates.
-- Treats a digest as valid only if it appears in a fixtures file (`fixtures/images.zon`); anything else returns `start_failed` with a clear message.
+- Treats a digest as valid only if it appears in a fixtures file (`fixtures/images.zon`); anything else returns `start_failed` with a registered diagnostic (use a placeholder `ZBX-` code agreed with the Zigbox side, and note it in `docs/runtime-codes.md`).
 - Supports fault injection for tests: force `oom`, `pid_limit` or `lost` on a named replica.
 
 **Ask first** before changing the `Runtime` interface's semantics once the human has approved it: the Zigbox side will be building to it.
@@ -131,13 +133,23 @@ Example service file:
 1. `zcube apply hello.zon` with `replicas = 3`. `zcube get service hello` shows 3 running within seconds.
 2. `kill -9` one of the processes on the host. A replacement starts; `zcube get` shows 3 again.
 3. Change to `replicas = 5` and apply: two more start. Back to 2: three stop.
-4. Apply a service whose digest is not in the fixtures. `zcube why service broken` prints the causal chain, e.g. `pending ← agent node1: image not found ← digest b3:00ff…e1`.
+4. Apply a service whose digest is not in the fixtures. `zcube why service broken` prints the causal chain, each step rendered as a diagnostic:
+
+   ```
+   service broken: 0/1 running
+     ← replica broken-1 pending on node1
+     ← error[ZBX-E0501]: image not found
+         cause  digest b3:00ff…e1 is not in this node's store
+         fix    check the digest in broken.zon, or pull the image first
+   ```
+5. Stop Postgres mid-demo and run `zcube get service hello`. The CLI prints a `ZC-` diagnostic blaming the store backend, with a fix, not a connection-library error. Run `zcube bundle --last` and show the manifest.
 
 **Acceptance criteria:**
 
 - Restarting `zcube-server` mid-demo changes nothing; restarting the agent re-adopts running processes instead of duplicating them.
 - Every controller action is recorded with its cause and visible to `zcube why`.
 - The whole demo passes on both the Postgres and SQLite backends.
+- The diagnostics machinery from `DIAGNOSTICS.md` exists and is used everywhere: code registry with build-time checks, `zcube explain`, default/verbose/JSON output, bundles with redaction, golden tests, and the CI check that no user-facing output contains a stack trace.
 
 ## C1 · Fleet: placement and failover
 
@@ -163,7 +175,7 @@ With the fake runtime, "nodes" can be several agent processes on one machine wit
 
 - Demo-first: a milestone is done when its demo script passes start to finish on a clean machine, not when unit tests pass.
 - Never break an earlier demo. CI runs every `demo-*` and the store conformance suite on every change.
-- Error messages are part of the product: one line saying what was refused and why, never a raw errno.
+- Error messages are part of the product: follow `DIAGNOSTICS.md` for every failure path, and run its review checklist before each commit that touches one.
 - Small, reviewable commits with DCO sign-off.
 - Add a dependency only with a written reason in the commit message. Postgres and SQLite client libraries are expected; check maturity before choosing one.
 - When a milestone's demo passes, update `site/index.html`: set that milestone's `status` to `"done"` and replace its `demo` lines with real recorded output. Set `"wip"` when you start one.
