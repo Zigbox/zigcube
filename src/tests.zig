@@ -10,4 +10,5 @@ test {
     _ = @import("diagnostic.zig");
     _ = @import("store.zig");
     _ = @import("store_memory.zig");
+    _ = @import("runtime.zig");
 }
