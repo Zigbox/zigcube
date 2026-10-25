@@ -6,9 +6,11 @@
 //!
 //! It keeps the whole history in an append-only log, as the SQL backends do (docs/store-design.md),
 //! plus a table of live keys. Lookups are linear: the point is clarity, not speed. It is
-//! single-threaded: a threaded caller wraps it in a mutex. An allocation failure in the middle
-//! of a transaction is reported as `NoCapacity` but is not rolled back; the tests never inject
-//! one, and the SQL backends get atomicity from the database.
+//! single-threaded: a threaded caller wraps it in a mutex. **An allocation failure in the middle
+//! of a write (a transaction, a revoke) is not rolled back**: the call reports `NoCapacity` but
+//! the store may be half-updated, so treat it as fatal for this reference store. The tests never
+//! inject one; the SQL backends get atomicity from the database, and the conformance suite must
+//! not assert rollback on out-of-memory.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -394,6 +396,7 @@ pub const MemoryStore = struct {
         var events: std.ArrayList(store.Event) = .empty;
         var bookmark = slot.next_revision - 1;
         var index: usize = 0;
+        var caught_up = true; // False once a revision is held back for the next batch.
         while (index < self.log.items.len) {
             const revision = self.log.items[index].mod_revision;
             var end = index;
@@ -407,6 +410,7 @@ pub const MemoryStore = struct {
             const full = events.items.len + matching > constants.store_watch_batch_max;
             if (full) {
                 assert(events.items.len > 0); // A revision always fits (constants.zig).
+                caught_up = false;
                 break;
             }
             for (run) |entry| {
@@ -419,7 +423,7 @@ pub const MemoryStore = struct {
             }
             bookmark = revision;
         }
-        if (index == self.log.items.len) bookmark = self.revision;
+        if (caught_up) bookmark = self.revision;
         slot.next_revision = bookmark + 1;
         return .{ .events = events.items, .revision = bookmark };
     }
@@ -474,8 +478,7 @@ pub const MemoryStore = struct {
         for (self.leases.items, 0..) |lease, index| {
             if (lease.id == id) position = index;
         }
-        const index = position orelse return lease_not_found(id, diag);
-        _ = self.leases.swapRemove(index);
+        _ = position orelse return lease_not_found(id, diag);
         var keys: [constants.store_lease_keys_max][]const u8 = undefined;
         var count: u32 = 0;
         for (self.live.items) |entry| {
@@ -483,16 +486,33 @@ pub const MemoryStore = struct {
             keys[count] = entry.key; // Borrowed from `live`; stable until the deletes below.
             count += 1;
         }
-        if (count == 0) return self.revision;
+        if (count > 0) try self.delete_lease_keys(keys[0..count], diag);
+        // The lease goes last, so a failure above leaves it (and its remaining keys) in place.
+        for (self.leases.items, 0..) |lease, index| {
+            if (lease.id == id) {
+                _ = self.leases.swapRemove(index);
+                break;
+            }
+        }
+        return self.revision;
+    }
+
+    fn delete_lease_keys(
+        self: *MemoryStore,
+        found: [][]const u8,
+        diag: *Diag,
+    ) Error!void {
+        const count = found.len;
+        const keys = found;
         // Sorted, so that the events of one revoke come in a defined order.
-        std.mem.sort([]const u8, keys[0..count], {}, bytes_less);
+        std.mem.sort([]const u8, keys, {}, bytes_less);
         var owned: [constants.store_lease_keys_max][constants.store_key_bytes_max]u8 = undefined;
         self.revision += 1;
-        for (keys[0..count], 0..) |key, slot| {
+        for (keys, 0..) |key, slot| {
             @memcpy(owned[slot][0..key.len], key); // `apply_delete` frees the live copy.
             try self.apply_delete(owned[slot][0..key.len], diag);
         }
-        return self.revision;
+        assert(count == keys.len);
     }
 
     fn expire_leases_impl(context: *anyopaque, diag: *Diag) Error!u32 {
@@ -942,4 +962,34 @@ test "revoking a lease frees its keys; oversized requests are refused with a cod
     try fixture.expect_code(.E0206);
     try testing.expectError(error.TooLarge, s.lease_grant(1, &fixture.diag));
     try fixture.expect_code(.E0206);
+}
+
+test "a watch never skips a revision that did not fit the batch" {
+    // Goal: regression for "no gaps". Method: fill one batch exactly with single-put
+    // revisions, then commit a two-event transaction that cannot fit after it and is the last
+    // revision in the log. Reading until the bookmark reaches the head must deliver all
+    // events, and the bookmark must not jump past the revision that was held back.
+    var fixture: Fixture = .{};
+    fixture.start();
+    defer fixture.stop();
+    const s = fixture.memory.interface();
+    var name: [16]u8 = undefined;
+    for (0..constants.store_watch_batch_max) |index| {
+        const key = try std.fmt.bufPrint(&name, "/w/{d:0>4}", .{index});
+        _ = try fixture.put(key, "v");
+    }
+    const pair = [_]store.Op{
+        .{ .put = .{ .key = "/w/last-a", .value = "a" } },
+        .{ .put = .{ .key = "/w/last-b", .value = "b" } },
+    };
+    const head = (try s.txn(.{ .on_success = &pair }, &fixture.diag)).revision;
+
+    var watch = try s.watch(.{ .prefix = "/w/", .from_revision = 1 }, &fixture.diag);
+    defer watch.close();
+    const first = try watch.next(fixture.arena(), 0, &fixture.diag);
+    try testing.expectEqual(@as(usize, constants.store_watch_batch_max), first.events.len);
+    try testing.expectEqual(head - 1, first.revision);
+    const second = try watch.next(fixture.arena(), 0, &fixture.diag);
+    try testing.expectEqual(@as(usize, 2), second.events.len);
+    try testing.expectEqual(head, second.revision);
 }
