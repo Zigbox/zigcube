@@ -137,7 +137,7 @@ const sql_compact_batch =
     \\    WHERE l.revision <= ?1 AND (l.deleted = 1 OR EXISTS (
     \\        SELECT 1 FROM store_log n
     \\        WHERE n.key = l.key AND n.revision > l.revision AND n.revision <= ?1))
-    \\    LIMIT ?2)
+    \\    ORDER BY l.revision, l.idx LIMIT ?2)
 ;
 
 pub const Sync = enum { full, normal };
