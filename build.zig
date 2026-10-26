@@ -6,6 +6,8 @@ const executables = [_]struct { name: []const u8, root: []const u8 }{
     .{ .name = "zcube-agent", .root = "src/zcube_agent.zig" },
 };
 
+const Backend = enum { memory, sqlite, postgres };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -50,7 +52,44 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    add_store_step(b, .{ .target = target, .optimize = optimize, .sqlite = sqlite });
     add_tidy_step(b);
+}
+
+const StoreStepOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sqlite: *std.Build.Module,
+};
+
+/// `zig build test-store -Dbackend=memory|sqlite [-Dseed=N]`: the conformance suite, one test
+/// binary written against the `Store` interface, run against the chosen backend.
+fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
+    const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
+    const seed = b.option(u64, "seed", "Seed for the randomised store tests (default: random)");
+    const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
+    if (backend == .postgres) {
+        step.dependOn(&b.addFail("the postgres store backend arrives in C0 slice 3").step);
+        return;
+    }
+    const options = b.addOptions();
+    options.addOption(Backend, "backend", backend);
+    options.addOption(?u64, "seed", seed);
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/store_conformance.zig"),
+            .target = step_options.target,
+            .optimize = step_options.optimize,
+            .imports = &.{
+                .{ .name = "conformance_options", .module = options.createModule() },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(tests);
+    // A passing run is not cached: the seed is chosen when the tests start, so every run counts.
+    run.has_side_effects = true;
+    step.dependOn(&run.step);
 }
 
 fn add_tidy_step(b: *std.Build) void {

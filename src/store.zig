@@ -338,7 +338,9 @@ pub const Store = struct {
         assert(!has_duplicate_keys(request.on_success));
         assert(!has_duplicate_keys(request.on_failure));
         const result = try finish(diag, store.vtable.txn(store.context, request, diag));
-        if (result.revision == 0) assert(request.on_success.len + request.on_failure.len == 0);
+        // No assertion on `result.revision`: a transaction that changes nothing returns the
+        // current revision, which is 0 for an empty store, whatever operations it held.
+        if (!result.succeeded) assert(request.compares.len > 0); // Only a compare can fail.
         return result;
     }
 

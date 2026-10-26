@@ -257,20 +257,31 @@ pub const MemoryStore = struct {
             };
             if (put.lease == store.lease_none) continue;
             if (!self.lease_alive(put.lease)) return lease_not_found(put.lease, diag);
-            var count: u32 = 0;
-            for (self.live.items) |entry| {
-                if (entry.lease == put.lease) count += 1;
-            }
-            for (ops) |other| {
-                if (other != .put) continue;
-                if (other.put.lease != put.lease) continue;
-                const index = self.find(self.live.items, other.put.key);
-                if (index == null) count += 1;
-            }
+            const count = self.lease_key_count(put.lease, ops);
             if (count > constants.store_lease_keys_max) {
                 return failures.lease_keys_full(diag, put.lease, count);
             }
         }
+    }
+
+    /// How many keys the lease holds once `ops` is applied: those it holds now, less the ones
+    /// `ops` moves off it (to another lease, or by deleting them), plus the ones `ops` puts on it.
+    fn lease_key_count(self: *const MemoryStore, lease: LeaseId, ops: []const store.Op) u32 {
+        var count: u32 = 0;
+        for (self.live.items) |entry| {
+            if (entry.lease == lease) count += 1;
+        }
+        for (ops) |op| {
+            const index = self.find(self.live.items, store.op_key(op));
+            const was_on = if (index) |i| self.live.items[i].lease == lease else false;
+            const now_on = switch (op) {
+                .put => |put| put.lease == lease,
+                .delete => false,
+            };
+            if (was_on and !now_on) count -= 1;
+            if (!was_on and now_on) count += 1;
+        }
+        return count;
     }
 
     fn apply_put(self: *MemoryStore, put: store.Put, diag: *Diag) Error!void {
