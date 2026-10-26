@@ -1,5 +1,12 @@
 # Review pack: the `Store` and `Runtime` contracts
 
+**Status: both contracts are approved (2026-10-26).** The owner approved every choice below,
+including `lost: ?Diagnostic` (item 10, now in `src/runtime.zig`) and the extra `status()` and
+`expire_leases()` methods and OrioleDB on `store_live` only. Still open: the agent's threading
+and supervisor model (the question under item 12). Diagnostics: option D of
+`docs/diagnostics-plan.md` is accepted. The three HANDOFF open questions (section 5) are
+recorded in HANDOFF.md as provisional. Changing either contract is now an Ask first.
+
 For the owner. HANDOFF says both interfaces are reviewed before much is built on them, and that
 changing either afterwards is an **Ask first**. The code is `src/store.zig` (with the reference
 implementation `src/store_memory.zig`) and `src/runtime.zig`. Every choice below is one I made
@@ -22,7 +29,7 @@ Compared against `Zigbox/zigbox` `main` at `19984dc` (M0 and M1 shipped), readin
 | 7 | `stop(Handle, grace_ms)` | only `signal(*Handle, number)`; M2 adds `stop` as SIGTERM, timer, SIGKILL | Contract has `stop`. `signal` is **not** in the contract (the agent never needs one). |
 | 8 | `list() -> []Handle` with labels; must return containers of a previous agent process | none yet. M2: read the run-records directory; re-adoption by pid in a later record version | Contract has `list` returning `{handle, labels, status}`, including stopped containers (bounded retention, no `forget`). **Zigbox M2 dependency**, as `docs/SPEC.md` already says for C0. |
 | 9 | `ExitReason{exited, signaled, oom, pid_limit, start_failed: Diagnostic, lost}` | `{exited, signaled, start_failed: Diag, lost}`; `oom`, `pid_limit` arrive with M2 | Kept HANDOFF's. `start_failed` is Zigcube's plain-data `Diagnostic` (`src/diagnostic.zig`), because Zigbox's `Diag` is typed to the `ZBX-` registry. |
-| 10 | `lost` bare | `lost` bare, but the `Handle` keeps `lost_diag` explaining why | Kept bare. **Recommendation: `lost: ?Diagnostic`**, otherwise the explanation Zigbox computed is thrown away. Your call; it is a one-line change now and an Ask-first later. |
+| 10 | `lost` bare | `lost` bare, but the `Handle` keeps `lost_diag` explaining why | Kept bare. **Recommendation: `lost: ?Diagnostic`**, otherwise the explanation Zigbox computed is thrown away. Your call; it is a one-line change now and an Ask-first later. **Approved 2026-10-26 and made.** |
 | 11 | failure through `Diag` | `Diag` with a `ZBX-` code; `Error` is a Zig error set | A failed *start* is an outcome (`StartOutcome.failed`), so a `ZBX-` diagnostic is never forced into a `ZC-` `Diag`. Failures of the runtime itself use `ZC-E0501` and `ZC-E0502` with `*Diag`. |
 | 12 | (not mentioned) | **`start` asserts, in debug builds, that the process has exactly one thread** ("namespace setup must happen before any thread exists", Zigbox M1 acceptance). `host_real` keeps `errno_last` in a process-wide global. | **A real conflict with the agent**, which serves HTTP and reconciles. See below. |
 
@@ -56,7 +63,7 @@ unaffected, and nothing in C0's demo against the fake depends on it.
 7. `Error = {NotFound, RuntimeFailed}` with `ZC-E0501` and `ZC-E0502`.
 8. Memory: slices in results come from the caller's arena; the runtime copies what it keeps
    from the `Spec`.
-9. `signal` is omitted; `lost` stays bare (see item 10, my recommendation to change it).
+9. `signal` is omitted. `lost` is `?Diagnostic` (item 10, approved).
 
 ## 2. `Store`: choices to approve
 

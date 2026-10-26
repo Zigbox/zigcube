@@ -188,6 +188,11 @@ With the fake runtime, "nodes" can be several agent processes on one machine wit
 
 ## Open questions to raise, not decide
 
-- Node capacity: declared in agent config, or measured from the host?
-- Watch transport: long-poll HTTP is the default; propose alternatives only with evidence.
-- Retention for decision records (how long `zcube why` history lasts).
+Answered provisionally on 2026-10-26 ("good enough for now"): build to these, and raise a change
+only if the work shows one is wrong. The reasoning is in `docs/contracts-review.md`, section 5.
+
+- Node capacity: **provisional: declared in agent config.** An `auto` mode that reads
+  cgroup-aware host limits can come later.
+- Watch transport: **provisional: long-poll HTTP.** Propose alternatives only with evidence.
+- Retention for decision records: **provisional: newest 200 per subject and at most 7 days,
+  whichever is fewer; 24 hours after the subject is deleted.** Details in `docs/keys.md`.
