@@ -10,7 +10,7 @@ Zigcube runs Zigbox workloads across a fleet. It keeps Kubernetes' one good idea
 
 Principles:
 
-1. One thin node agent (`zcube-agent`) that links the runtime as a library. No CRI, no containerd, no shims.
+1. One thin node agent (`zcube-agent`) that links the runtime as a library. No CRI, no containerd, no shims. **Recorded exception (owner, 2026-10-26):** each container runs under a `zbx` supervisor process, because only a container's parent can collect its exit status across an agent restart and `start` needs a single-threaded caller. The supervisor is `zbx` itself, not a separate shim binary or daemon. See `docs/contracts-review.md`.
 2. Designed diagnostics from the first commit (see `DIAGNOSTICS.md`): every failure is a short, coded explanation with a cause and a fix, more detail on request, and a full bundle only when needed. Never a raw stack trace or bare Zig error name.
 3. Explainable reconciliation: every controller decision is recorded with its cause, so `zcube why <thing>` answers "why is this not running" in one command.
 4. Pluggable control-plane storage behind a narrow versioned key-value interface (below). Postgres first, SQLite second.

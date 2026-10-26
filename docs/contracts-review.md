@@ -2,8 +2,10 @@
 
 **Status: both contracts are approved (2026-10-26).** The owner approved every choice below,
 including `lost: ?Diagnostic` (item 10, now in `src/runtime.zig`) and the extra `status()` and
-`expire_leases()` methods and OrioleDB on `store_live` only. Still open: the agent's threading
-and supervisor model (the question under item 12). Diagnostics: option D of
+`expire_leases()` methods and OrioleDB on `store_live` only. The agent's
+threading question (item 12) is decided: **a `zbx` supervisor process per container** ("Answer is A -
+supervisor per container", relayed from the owner on 2026-10-26; Zigbox records the same decision in
+its `docs/DECISIONS.md`). See "Decision on item 12" below. Diagnostics: option D of
 `docs/diagnostics-plan.md` is accepted. The three HANDOFF open questions (section 5) are
 recorded in HANDOFF.md as provisional. Changing either contract is now an Ask first.
 
@@ -47,6 +49,23 @@ either that model or an in-process one, but **this is the question for the Zigbo
 M2 expose the detached/supervised run, `list`, and an event fd as a library API, and is
 "threads in the caller" meant to be unsupported? Until that is answered `FakeRuntime` is
 unaffected, and nothing in C0's demo against the fake depends on it.
+
+### Decision on item 12 (2026-10-26): a supervisor per container
+
+`zcube-agent` never calls `start` and `wait` in its own process. Each container is started as a
+detached run under a `zbx` supervisor: single-threaded, the container's parent, writing the exit
+reason to the run record. The agent uses the `zigbox` module for the rest (`list`, `inspect`,
+`stop`, the event stream). Zigbox M2 slice 4 delivers the library side. `FakeRuntime` will follow
+this model when it is built (not in slice 2).
+
+Proposals, not edits (the contract is approved, so changing it is an Ask first). None changes a
+signature:
+
+- `ExitReason.lost` should be documented as "the supervisor died or the process vanished"; the
+  `?Diagnostic` (already approved) is where Zigbox says which.
+- `stop`'s doc should not promise how it reaches the container (signal the supervisor, or the
+  container's PID 1 through a pidfd). Zigbox's slice 4 settles that.
+- `events` stays a hint; the run record is the truth for exit reasons, which suits `list`/`inspect`.
 
 ### `Runtime` choices to approve
 
