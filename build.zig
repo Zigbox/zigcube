@@ -27,6 +27,49 @@ pub fn build(b: *std.Build) void {
         .zigbox = zigbox_module,
     });
 
+    const c_modules = add_c_modules(b, target, optimize);
+    const sqlite = c_modules.sqlite;
+    const libpq_module = c_modules.libpq;
+
+    // The single-threaded half of the conformance suite runs in `zig build test` against the
+    // memory store; `test-store` runs the whole suite against the backend it is given.
+    const memory_suite = memory_suite_options(b);
+    const test_step = b.step("test", "Run unit and snapshot tests");
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "conformance_options", .module = memory_suite.createModule() },
+                .{ .name = "sqlite_c", .module = sqlite },
+                .{ .name = "libpq_c", .module = libpq_module },
+                .{ .name = "zigbox", .module = zigbox_module },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    add_store_step(b, .{
+        .target = target,
+        .optimize = optimize,
+        .sqlite = sqlite,
+        .libpq = libpq_module,
+        .zigbox = zigbox_module,
+    });
+    add_tidy_step(b);
+    add_pg_dev_steps(b);
+    add_wasm_steps(b, optimize);
+}
+
+const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
+
+fn add_c_modules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) CModules {
     // SQLite's C header, translated (`@cImport` is gone). Backends import it as `sqlite_c`.
     const sqlite = b.addTranslateC(.{
         .root_source_file = b.path("src/sqlite_c.h"),
@@ -47,33 +90,16 @@ pub fn build(b: *std.Build) void {
     libpq.addIncludePath(.{ .cwd_relative = pq_include });
     const libpq_module = libpq.createModule();
     libpq_module.linkSystemLibrary("pq", .{});
+    return .{ .sqlite = sqlite, .libpq = libpq_module };
+}
 
-    const test_step = b.step("test", "Run unit and snapshot tests");
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "build_options", .module = options.createModule() },
-                .{ .name = "sqlite_c", .module = sqlite },
-                .{ .name = "libpq_c", .module = libpq_module },
-                .{ .name = "zigbox", .module = zigbox_module },
-            },
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-
-    add_store_step(b, .{
-        .target = target,
-        .optimize = optimize,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
-        .zigbox = zigbox_module,
-    });
-    add_tidy_step(b);
-    add_pg_dev_steps(b);
-    add_wasm_steps(b, optimize);
+/// What `conformance_options` holds when the suite runs against the memory store with the
+/// per-run seed: the single-threaded tests in `zig build test` and `zig build wasm-test`.
+fn memory_suite_options(b: *std.Build) *std.Build.Step.Options {
+    const options = b.addOptions();
+    options.addOption(Backend, "backend", .memory);
+    options.addOption(?u64, "seed", null);
+    return options;
 }
 
 const ExecutablesOptions = struct {
@@ -238,6 +264,8 @@ fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
 /// address space and a single thread, with the testing allocator still checking for leaks. It is
 /// WASI and not freestanding because `std.testing` needs `std.Io`, which freestanding lacks.
 fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    // The single-threaded conformance tests run here against the memory store.
+    const memory_suite = memory_suite_options(b);
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const tests = b.addTest(.{
@@ -245,7 +273,10 @@ fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
             .root_source_file = b.path("src/core.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+            .imports = &.{
+                .{ .name = "zigbox", .module = zigbox.module("zigbox") },
+                .{ .name = "conformance_options", .module = memory_suite.createModule() },
+            },
         }),
     });
     const node = b.addSystemCommand(&.{ "node", "--no-warnings" });

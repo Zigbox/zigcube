@@ -66,3 +66,11 @@ test "every core module's tests are in this root" {
     // module, which brings its tests in.
     inline for (modules) |module| _ = module;
 }
+
+test "the single-threaded store conformance tests are in this root" {
+    // Goal: the memory store's semantics are checked in the environment the browser uses.
+    // Method: `store_conformance_single.zig` has no thread and runs against `MemoryStore`
+    // (`conformance_options` names the memory backend in this build); importing it brings its
+    // tests into this root, so `zig build wasm-test` runs them under WASI.
+    _ = @import("store_conformance_single.zig");
+}
