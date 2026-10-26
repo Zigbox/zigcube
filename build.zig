@@ -17,18 +17,15 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", manifest.version);
 
-    for (executables) |executable| {
-        const exe = b.addExecutable(.{
-            .name = executable.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(executable.root),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
-            }),
-        });
-        b.installArtifact(exe);
-    }
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+    const zigbox_module = zigbox.module("zigbox");
+
+    add_executables(b, .{
+        .target = target,
+        .optimize = optimize,
+        .options = options,
+        .zigbox = zigbox_module,
+    });
 
     // SQLite's C header, translated (`@cImport` is gone). Backends import it as `sqlite_c`.
     const sqlite = b.addTranslateC(.{
@@ -61,6 +58,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "build_options", .module = options.createModule() },
                 .{ .name = "sqlite_c", .module = sqlite },
                 .{ .name = "libpq_c", .module = libpq_module },
+                .{ .name = "zigbox", .module = zigbox_module },
             },
         }),
     });
@@ -71,9 +69,36 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sqlite = sqlite,
         .libpq = libpq_module,
+        .zigbox = zigbox_module,
     });
     add_tidy_step(b);
     add_pg_dev_steps(b);
+}
+
+const ExecutablesOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+    zigbox: *std.Build.Module,
+};
+
+fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) void {
+    const build_options = executables_options.options.createModule();
+    for (executables) |executable| {
+        const exe = b.addExecutable(.{
+            .name = executable.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(executable.root),
+                .target = executables_options.target,
+                .optimize = executables_options.optimize,
+                .imports = &.{
+                    .{ .name = "build_options", .module = build_options },
+                    .{ .name = "zigbox", .module = executables_options.zigbox },
+                },
+            }),
+        });
+        b.installArtifact(exe);
+    }
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it.
@@ -105,6 +130,7 @@ const StoreStepOptions = struct {
     optimize: std.builtin.OptimizeMode,
     sqlite: *std.Build.Module,
     libpq: *std.Build.Module,
+    zigbox: *std.Build.Module,
 };
 
 /// The database `-Dbackend=postgres` runs against: `-Dpostgres=<libpq settings>`, else the
@@ -136,6 +162,7 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
                 .{ .name = "conformance_options", .module = options.createModule() },
                 .{ .name = "sqlite_c", .module = step_options.sqlite },
                 .{ .name = "libpq_c", .module = step_options.libpq },
+                .{ .name = "zigbox", .module = step_options.zigbox },
             },
         }),
     });

@@ -3,6 +3,15 @@
     .version = "0.0.0",
     // Pinned, matching Zigbox and CI (.github/actions/setup-zig). Upgrade only between milestones.
     .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // The runtime as a library, and the diagnostics both products share (the `diagnostic`,
+        // `product`, `render` and `explain` modules). Pinned to Zigbox main at 90b6f1c, the merge
+        // of the PR that made a second product's diagnostics pluggable.
+        .zigbox = .{
+            .url = "https://github.com/Zigbox/zigbox/archive/90b6f1c9a973bc0e95ed50cbbd4db7ad27df2cdb.tar.gz",
+            .hash = "zigbox-0.0.0-RBMWEBtIGQC9CitEhpSgWCefmYYiC01NPxNFwcjjcROc",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

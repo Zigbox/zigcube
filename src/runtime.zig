@@ -26,8 +26,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
-const Diag = @import("diag.zig").Diag;
-const Diagnostic = @import("diagnostic.zig").Diagnostic;
+const diag_mod = @import("diag.zig");
+const Diag = diag_mod.Diag;
+const Diagnostic = diag_mod.Diagnostic;
 
 pub const Error = error{
     /// The runtime has no container of that name.
@@ -334,7 +335,7 @@ const Refusing = struct {
         diag.reset();
         diag.raise(.E0502);
         var failure: Diagnostic = undefined;
-        Diagnostic.from_diag(&failure, diag);
+        diag_mod.to_diagnostic(&failure, diag);
         diag.reset();
         return .{ .failed = failure };
     }

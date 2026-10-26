@@ -30,6 +30,9 @@ pub const diag_wrap_columns: u32 = 80;
 /// "ZC-" and a letter with four digits; Zigbox's "ZBX-E0501" is the longest code on the wire.
 pub const diag_code_bytes_max: u32 = 9;
 pub const state_path_bytes_max: u32 = 4096;
+/// The buffer one rendered diagnostic or `explain` text needs: Zigbox's `output_bytes_max`, which
+/// its renderer asserts and proves a maximal diagnostic fits.
+pub const diag_output_bytes_max: u32 = 16 * 1024;
 
 // ---- Store ---------------------------------------------------------------------------------
 

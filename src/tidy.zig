@@ -10,8 +10,8 @@
 //!
 //! Rules: 100-column lines; no tabs or trailing whitespace; functions and tests at most 70
 //! lines; no `usize`/`isize` in struct or union fields; `@import` only of `std`, `builtin`,
-//! `build_options`, the C-library modules named below, and files inside the repository; no
-//! `@cImport`; no `catch unreachable` without a comment; no `and`/`or` inside an `assert(...)`;
+//! `build_options`, `zigbox`, the C-library modules named below, and files inside the repository;
+//! no `@cImport`; no `catch unreachable` without a comment; no `and`/`or` inside an `assert(...)`;
 //! snake_case function names (except functions returning `type`) and `.zig` file names; no `.sh`
 //! files except those on an explicit allowlist.
 //!
@@ -41,7 +41,9 @@ const shell_allowlist = [_][]const u8{
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
-/// `conformance_options` carries the store suite's build options.
+/// `conformance_options` carries the store suite's build options. `zigbox` is the package of
+/// that name (the runtime library and the shared diagnostics), the one dependency besides SQLite
+/// and libpq (docs/STYLE.md, "Dependencies").
 const module_allowlist = [_][]const u8{
     "std",
     "builtin",
@@ -49,6 +51,7 @@ const module_allowlist = [_][]const u8{
     "sqlite_c",
     "libpq_c",
     "conformance_options",
+    "zigbox",
 };
 
 const skipped_directories = [_][]const u8{ ".git", ".zig-cache", "zig-out", "zig-pkg" };

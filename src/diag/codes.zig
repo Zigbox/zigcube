@@ -15,11 +15,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("../constants.zig");
 const text_util = @import("../text.zig");
+const zigbox = @import("zigbox");
 
-pub const Severity = enum { @"error", warning, note, bug };
+pub const Severity = zigbox.codes.Severity;
 
 /// Whose problem it is. This decides the exit code (see `exit_code`).
-pub const Blame = enum { user, environment, external, internal };
+pub const Blame = zigbox.codes.Blame;
 
 /// Every code, in registry order: `registry[i].code` is the i-th tag. The tag is the part of the
 /// code after "ZC-": a kind letter (E error, W warning, B bug) and four digits.
