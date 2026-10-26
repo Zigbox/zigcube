@@ -336,7 +336,7 @@ pub const Store = struct {
         assert(!has_duplicate_keys(request.on_success));
         assert(!has_duplicate_keys(request.on_failure));
         const result = try finish(diag, store.vtable.txn(store.context, request, diag));
-        assert(result.revision > 0 or request.on_success.len + request.on_failure.len == 0);
+        if (result.revision == 0) assert(request.on_success.len + request.on_failure.len == 0);
         return result;
     }
 

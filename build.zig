@@ -38,4 +38,25 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    add_tidy_step(b);
+}
+
+fn add_tidy_step(b: *std.Build) void {
+    // Tidy is a host tool: always built for the machine running the build.
+    const tidy = b.addExecutable(.{
+        .name = "tidy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tidy.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tidy);
+    run.setCwd(b.path("."));
+    // Formatting is checked alongside the mechanical rules: both must pass before review.
+    const format = b.addFmt(.{ .paths = &.{ b.path("src"), b.path("build.zig") }, .check = true });
+    const step = b.step("tidy", "Check formatting, line and function length, banned patterns");
+    step.dependOn(&format.step);
+    step.dependOn(&run.step);
 }

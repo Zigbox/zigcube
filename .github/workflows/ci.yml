@@ -27,6 +27,8 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - name: Formatting
         run: zig fmt --check .
+      - name: Tidy (style rules)
+        run: zig build tidy
       - name: Build the three executables
         run: zig build
       - name: Unit and snapshot tests
