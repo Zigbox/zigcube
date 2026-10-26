@@ -1,0 +1,22 @@
+name: Set up Zig
+description: >
+  Installs the Zig toolchain pinned in build.zig.zon (minimum_zig_version) from ziglang.org
+  and verifies the tarball against its published SHA-256 before using it.
+runs:
+  using: composite
+  steps:
+    - name: Install Zig 0.17.0
+      shell: bash
+      env:
+        ZIG_VERSION: 0.17.0
+        # From https://ziglang.org/download/index.json, field 0.17.0 / x86_64-linux / shasum.
+        ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      run: |
+        archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+        echo "${ZIG_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+        tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+        echo "${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}" >> "${GITHUB_PATH}"
+    - name: Show the toolchain
+      shell: bash
+      run: zig version

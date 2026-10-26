@@ -1,0 +1,14 @@
+.{
+    .name = .zigcube,
+    .version = "0.0.0",
+    // Pinned, matching Zigbox and CI (.github/actions/setup-zig). Upgrade only between milestones.
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "LICENSE",
+    },
+    .fingerprint = 0xc027cb705e8fff53,
+}

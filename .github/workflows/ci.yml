@@ -1,0 +1,33 @@
+# Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
+# installed from a verified tarball (.github/actions/setup-zig). No other shell.
+name: ci
+
+# CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
+# Actions time is spent once per change. Open a PR when a change needs CI. A newer push to the
+# same PR cancels the run it supersedes; runs on main are never cancelled.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: format, build, test
+    runs-on: ubuntu-24.04
+    steps:
+      # The SHA is the one Zigbox's CI pins for actions/checkout v7.0.1.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: Formatting
+        run: zig fmt --check .
+      - name: Build the three executables
+        run: zig build
+      - name: Unit and snapshot tests
+        run: zig build test --summary all
