@@ -6,6 +6,7 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 - **How the code is written and tested:** [docs/STYLE.md](docs/STYLE.md) (Zigbox's TigerStyle rules, with Zigcube's departures).
 - **Diagnostics standard, shared with Zigbox:** [DIAGNOSTICS.md](DIAGNOSTICS.md).
 - **Rules for contributors and agents:** [AGENTS.md](AGENTS.md).
+- **Web console (design and clickable prototype):** [docs/console.md](docs/console.md), with the HTTP API it needs proposed in [docs/api.md](docs/api.md).
 
 ## Status
 
@@ -45,7 +46,8 @@ The conformance suite draws a new random seed on every run. A failing test print
 ## Layout
 
 - `site/` — the project website (`index.html`), deployed to GitHub Pages by `.github/workflows/pages.yml`.
-- Code arrives with the first milestone.
+- `web/` — the web console: static files, no build step, no external requests. `python3 -m http.server -d web`, then open `/?mock=c0` (or `c1`) to click through it against the in-browser mock.
+- Server and agent code arrives with the first milestone.
 
 ## Updating the site
 
