@@ -6,6 +6,7 @@ Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding han
 
 - **Read [HANDOFF.md](HANDOFF.md) and [DIAGNOSTICS.md](DIAGNOSTICS.md) before writing code.** HANDOFF's **Ask first** list binds you. Every failure path follows DIAGNOSTICS.md, which is shared with Zigbox: change both copies together, and treat Zigbox's as canonical.
 - **Style and testing follow [docs/STYLE.md](docs/STYLE.md)** (Zigbox's TigerStyle rules, with Zigcube's departures at the top). Review rejects code that breaks it.
+- **The web console lives in `web/`; read [docs/console.md](docs/console.md) before changing it.** Plain HTML, CSS and ES modules: no build step, no npm, and no request to any host but the server's own (no CDN, no web fonts). It follows [docs/api.md](docs/api.md), which is a proposal until the server exists; `web/mock/` implements it in the browser (`?mock=c0`, `?mock=c1`). Anything it shows that is not in `docs/keys.md` is a gap to report, not to invent.
 - Work one milestone at a time. Do not start a later milestone or build anything HANDOFF puts out of scope.
 - A milestone is done only when its demo script passes start to finish on a clean machine. Unit tests passing, or code that compiles, is never reported as a passed demo. Say exactly what was and was not run.
 - Each demo script becomes an automated test, `zig build demo-cN`. Never break an earlier demo: all prior `demo-cN` tests and the store conformance suite run in CI.

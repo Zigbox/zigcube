@@ -79,7 +79,7 @@ export function createMockTransport(engine, faults) {
     if (from > engine.rev + 1) return fail(400, [diagFutureRevision(from, engine.rev)], requestId);
     const deadline = Date.now() + Math.min(WATCH_MAX_MS, Number(q.get("timeout") || WATCH_MAX_MS));
     for (;;) {
-      if (faults.apiDown) throw new TypeError("Failed to fetch");
+      if (faults.apiDown || engine.dead) throw new TypeError("Failed to fetch");
       if (!engine.storeUp) return fail(503, [engine.storeDiagnostic()], requestId);
       if (from <= engine.compacted) return fail(410, [diagCompacted(from, engine.compacted)], requestId);
       const r = engine.eventsFrom(prefixes.length ? prefixes : ["/"], from);

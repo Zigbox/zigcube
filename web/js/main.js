@@ -44,7 +44,7 @@ async function boot() {
   if (mockName) {
     const { startMock } = await import("../mock/index.js");
     mock = startMock({ scenario: mockName, at: Number(params.get("at") ?? meta("mock-at") ?? 0) || 0, speed: Number(params.get("speed") || 1) || 1, backend: params.get("backend") || "postgres" });
-    transport = mock.transport.request;
+    transport = mock.request;
     document.body.dataset.mock = mockName;
   }
   const client = createClient(transport);
@@ -99,16 +99,22 @@ async function boot() {
     setText($(".c-detail", pillEl), detail, { flash: false });
     if (s !== lastConn) { if (lastConn) announce(`Connection: ${LABEL[s]}`); lastConn = s; }
     const err = model.error;
-    const sig = err ? JSON.stringify([err.diagnostics, err.requestId, s]) : "";
+    const sig = err ? JSON.stringify([err.diagnostics, err.requestId]) : "";
+    const note = err ? (s === "stale" ? `The console is showing data from ${ago(model.lastOkAt)}. It keeps trying and will update itself.` : "Trying again. What you see is the last data received.") : "";
     if (banner._sig !== sig) {
       banner._sig = sig;
       banner.hidden = !err;
+      banner._collapsed = matchMedia("(max-width: 760px)").matches; // a phone starts with the one-line form
       clear(banner);
       if (err) {
-        const note = s === "stale" ? `The console is showing data from ${ago(model.lastOkAt)}. It keeps trying and will update itself.` : "Trying again. What you see is the last data received.";
-        banner.append(h("p", { class: "banner-t" }, note), ...err.diagnostics.map(d => diagnosticBlock(d, { origin: err.origin === "console" ? "raised by the console" : null, requestId: err.requestId })));
+        const toggle = h("button", { type: "button", class: "linklike", "aria-expanded": String(!banner._collapsed) }, banner._collapsed ? "Show diagnostic" : "Hide diagnostic");
+        const body = h("div", { class: "banner-body", hidden: banner._collapsed }, ...err.diagnostics.map(d => diagnosticBlock(d, { origin: err.origin === "console" ? "raised by the console" : null, requestId: err.requestId })));
+        toggle.addEventListener("click", () => { banner._collapsed = !banner._collapsed; body.hidden = banner._collapsed; toggle.setAttribute("aria-expanded", String(!banner._collapsed)); toggle.textContent = banner._collapsed ? "Show diagnostic" : "Hide diagnostic"; });
+        banner.append(h("p", { class: "banner-t" }, h("span", { class: "banner-note" }), " ", h("code", {}, err.diagnostics[0].code), " ", err.diagnostics[0].summary, " · ", toggle), body);
       }
     }
+    const noteEl = banner.querySelector(".banner-note");
+    if (noteEl) setText(noteEl, note, { flash: false });
     document.body.dataset.stale = s === "stale" || s === "reconnecting" ? "1" : "0";
   }
   $("#conn-btn").addEventListener("click", () => {
@@ -158,7 +164,7 @@ async function boot() {
 
   if (mock) {
     const { mountPanel } = await import("../mock/panel.js");
-    mountPanel(mock, ctx);
+    mountPanel(mock);
   }
   window.zc = { model, mock }; // handy in the console during development
   addEventListener("error", e => console.error(e.error || e.message));

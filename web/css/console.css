@@ -83,9 +83,9 @@ nav.side a:hover { color: var(--fg); background: var(--raised); }
 nav.side a[aria-current="page"] { color: var(--fg); background: var(--accent-soft); border-left-color: var(--accent); }
 .nav-hint { margin-top: auto; padding: 8px 10px; font-size: .75rem; color: var(--muted); }
 
-.banner { padding: 12px max(var(--gutter), env(safe-area-inset-right, 0px)) 0 var(--gutter); }
-.banner-t { margin-bottom: 8px; color: var(--muted); }
-main { padding: 20px max(24px, env(safe-area-inset-right, 0px)) 80px 24px; max-width: 84rem; width: 100%; min-width: 0; }
+.banner { padding: 12px max(24px, env(safe-area-inset-right, 0px)) 0 24px; min-width: 0; }
+.banner-t { margin-bottom: 8px; color: var(--muted); } .banner-t code { color: var(--fg); font-weight: 650; } .banner-body { display: grid; gap: 10px; }
+main { padding: 20px max(24px, env(safe-area-inset-right, 0px)) 80px max(24px, env(safe-area-inset-left, 0px)); max-width: 84rem; width: 100%; min-width: 0; }
 main:focus { outline: none; }
 .view { display: grid; gap: 16px; min-width: 0; align-content: start; }
 .pad { padding: 14px 16px; } .pad-h { padding: 12px 16px 6px; }
@@ -244,7 +244,7 @@ pre.cli { margin: 0; padding: 12px 14px; overflow-x: auto; white-space: pre; min
   nav.side a[aria-current="page"] { border-bottom-color: var(--accent); }
   .nav-hint, .env { display: none; }
   main { padding: 16px max(16px, env(safe-area-inset-right, 0px)) 120px max(16px, env(safe-area-inset-left, 0px)); }
-  .banner { padding-left: max(16px, env(safe-area-inset-left, 0px)); }
+  .banner { padding: 12px max(16px, env(safe-area-inset-right, 0px)) 0 max(16px, env(safe-area-inset-left, 0px)); }
   .hide-s { display: none; }
   .conn .c-detail { display: none; }
   .banner .diag > .drows > .drow:last-child { display: none; }
