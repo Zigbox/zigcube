@@ -38,6 +38,19 @@ pub fn build(b: *std.Build) void {
     }).createModule();
     sqlite.linkSystemLibrary("sqlite3", .{});
 
+    // libpq's C header, translated the same way. The header lives under /usr/include/postgresql on
+    // Debian and Ubuntu (libpq-dev); `-Dpq-include=` names another directory.
+    const pq_include = b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
+        "/usr/include/postgresql";
+    const libpq = b.addTranslateC(.{
+        .root_source_file = b.path("src/libpq_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    libpq.addIncludePath(.{ .cwd_relative = pq_include });
+    const libpq_module = libpq.createModule();
+    libpq_module.linkSystemLibrary("pq", .{});
+
     const test_step = b.step("test", "Run unit and snapshot tests");
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -47,31 +60,70 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "build_options", .module = options.createModule() },
                 .{ .name = "sqlite_c", .module = sqlite },
+                .{ .name = "libpq_c", .module = libpq_module },
             },
         }),
     });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
-    add_store_step(b, .{ .target = target, .optimize = optimize, .sqlite = sqlite });
+    add_store_step(b, .{
+        .target = target,
+        .optimize = optimize,
+        .sqlite = sqlite,
+        .libpq = libpq_module,
+    });
     add_tidy_step(b);
+    add_pg_dev_steps(b);
+}
+
+/// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it.
+fn add_pg_dev_steps(b: *std.Build) void {
+    const tool = b.addExecutable(.{
+        .name = "pg_dev",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pg_dev.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const commands = [_][]const u8{ "up", "down" };
+    const descriptions = [_][]const u8{
+        "Start a throwaway Postgres for test-store (prints its ZCUBE_TEST_POSTGRES)",
+        "Stop the throwaway Postgres and delete its files",
+    };
+    for (commands, descriptions) |command, description| {
+        const run = b.addRunArtifact(tool);
+        run.addArg(command);
+        run.has_side_effects = true;
+        const step_name = b.fmt("pg-{s}", .{command});
+        b.step(step_name, description).dependOn(&run.step);
+    }
 }
 
 const StoreStepOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sqlite: *std.Build.Module,
+    libpq: *std.Build.Module,
 };
 
-/// `zig build test-store -Dbackend=memory|sqlite [-Dseed=N]`: the conformance suite, one test
-/// binary written against the `Store` interface, run against the chosen backend.
+/// The database `-Dbackend=postgres` runs against: `-Dpostgres=<libpq settings>`, else the
+/// `ZCUBE_TEST_POSTGRES` environment variable, else the server `zig build pg-up` starts.
+fn postgres_conninfo(b: *std.Build) []const u8 {
+    const option = b.option([]const u8, "postgres", "libpq settings of the test database");
+    if (option) |settings| return settings;
+    if (b.graph.environ_map.get("ZCUBE_TEST_POSTGRES")) |settings| return settings;
+    return "host=127.0.0.1 port=55432 user=zcube dbname=postgres";
+}
+
+/// `zig build test-store -Dbackend=memory|sqlite|postgres [-Dseed=N]`: the conformance suite, one
+/// test binary written against the `Store` interface, run against the chosen backend. The
+/// backend's own tests come with it (they are in the same compilation), so for Postgres the
+/// binary needs the database even for those.
 fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
     const seed = b.option(u64, "seed", "Seed for the randomised store tests (default: random)");
     const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
-    if (backend == .postgres) {
-        step.dependOn(&b.addFail("the postgres store backend arrives in C0 slice 3").step);
-        return;
-    }
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
     options.addOption(?u64, "seed", seed);
@@ -83,6 +135,7 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
             .imports = &.{
                 .{ .name = "conformance_options", .module = options.createModule() },
                 .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
             },
         }),
     });
@@ -90,6 +143,11 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     // A passing run is not cached: the build runner draws a new seed per invocation (it is not
     // part of the cache key), so every run counts.
     run.has_side_effects = true;
+    if (backend == .postgres) {
+        const conninfo = postgres_conninfo(b);
+        run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", conninfo);
+        run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
+    }
     step.dependOn(&run.step);
 }
 

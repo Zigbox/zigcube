@@ -19,9 +19,12 @@
 //! ## Connections
 //!
 //! `Harness.connect` gives a test a `Store`. For SQLite each is a separate connection to one
-//! file, which is what the server's writers and the CLI's readers look like. The memory store is
-//! a single-threaded reference, so its connections share one instance behind a mutex
-//! (`Serialized`); that proves the contract, not the memory store's own locking.
+//! file, which is what the server's writers and the CLI's readers look like. For Postgres each
+//! is a `PostgresStore` (its own pool of connections) on one schema, created fresh for the test
+//! in the database named by `ZCUBE_TEST_POSTGRES` and dropped when it ends; lease time comes from
+//! the injected clock, so the same lease tests run, without sleeping, on every backend. The
+//! memory store is a single-threaded reference, so its connections share one instance behind a
+//! mutex (`Serialized`); that proves the contract, not the memory store's own locking.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -35,6 +38,8 @@ const store = @import("store.zig");
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 const SqliteStore = @import("store_sqlite.zig").SqliteStore;
 const OpenOptions = @import("store_sqlite.zig").OpenOptions;
+const postgres = @import("store_postgres.zig");
+const PostgresStore = postgres.PostgresStore;
 
 const Allocator = std.mem.Allocator;
 const Revision = store.Revision;
@@ -66,6 +71,9 @@ const Harness = struct {
     tmp: if (backend == .sqlite) testing.TmpDir else void,
     path_buffer: [160]u8,
     path_len: u32,
+    pg_conninfo: if (backend == .postgres) [:0]const u8 else void,
+    pg_schema: if (backend == .postgres) [32]u8 else void,
+    pg_schema_len: u32,
     connections: [connections_max]?*Connection,
 
     fn start() !*Harness {
@@ -79,6 +87,9 @@ const Harness = struct {
             .tmp = undefined,
             .path_buffer = undefined,
             .path_len = 0,
+            .pg_conninfo = undefined,
+            .pg_schema = undefined,
+            .pg_schema_len = 0,
             .connections = @splat(null),
         };
         switch (backend) {
@@ -91,7 +102,7 @@ const Harness = struct {
                 const text = try std.fmt.bufPrintSentinel(buffer, format, .{sub_path}, 0);
                 harness.path_len = @intCast(text.len);
             },
-            .postgres => @compileError("the postgres backend arrives in C0 slice 3"),
+            .postgres => try harness.start_postgres(),
         }
         return harness;
     }
@@ -106,7 +117,7 @@ const Harness = struct {
         switch (backend) {
             .memory => harness.memory.deinit(),
             .sqlite => harness.tmp.cleanup(),
-            .postgres => @compileError("the postgres backend arrives in C0 slice 3"),
+            .postgres => harness.drop_postgres_schema(),
         }
         testing.allocator.destroy(harness);
     }
@@ -127,6 +138,44 @@ const Harness = struct {
     /// A random generator for one test: the seed, mixed with a name so tests differ.
     fn prng(harness: *const Harness, comptime name: []const u8) std.Random.DefaultPrng {
         return .init(harness.seed ^ std.hash.Wyhash.hash(0, name));
+    }
+
+    /// Names the database from the environment and a schema no other run shares.
+    fn start_postgres(harness: *Harness) !void {
+        const conninfo = testing.environ.getPosix("ZCUBE_TEST_POSTGRES") orelse {
+            std.debug.print("ZCUBE_TEST_POSTGRES names no database (see AGENTS.md)\n", .{});
+            return error.PostgresNotConfigured;
+        };
+        harness.pg_conninfo = conninfo;
+        const now = std.Io.Clock.real.now(testing.io).toNanoseconds();
+        const unique = std.hash.Wyhash.hash(harness.seed, std.mem.asBytes(&now));
+        const text = try std.fmt.bufPrint(&harness.pg_schema, "zt_{x:0>16}", .{unique});
+        harness.pg_schema_len = @intCast(text.len);
+    }
+
+    fn schema_name(harness: *const Harness) []const u8 {
+        assert(backend == .postgres);
+        return harness.pg_schema[0..harness.pg_schema_len];
+    }
+
+    fn pg_options(harness: *Harness) postgres.OpenOptions {
+        return .{
+            .conninfo = harness.pg_conninfo,
+            .schema = harness.schema_name(),
+            .create = true,
+            .lease_time = .{ .clock = harness.manual.clock() },
+        };
+    }
+
+    /// Removes the test's schema, through a store of its own.
+    fn drop_postgres_schema(harness: *Harness) void {
+        var diag: Diag = undefined;
+        diag.reset();
+        const dropper = testing.allocator.create(PostgresStore) catch return;
+        defer testing.allocator.destroy(dropper);
+        dropper.open(testing.io, harness.pg_options(), &diag) catch return;
+        defer dropper.close();
+        dropper.drop_schema(&diag) catch {};
     }
 
     fn file_path(harness: *const Harness) []const u8 {
@@ -151,7 +200,7 @@ const Harness = struct {
                 const open_options: OpenOptions = .{ .create = true, .sync = .normal };
                 try conn.sqlite.open(testing.io, clock, harness.file_path(), open_options, &diag);
             },
-            .postgres => @compileError("the postgres backend arrives in C0 slice 3"),
+            .postgres => try conn.postgres.open(testing.io, harness.pg_options(), &diag),
         }
         for (&harness.connections) |*slot| {
             if (slot.* != null) continue;
@@ -165,17 +214,19 @@ const Harness = struct {
 const Connection = struct {
     sqlite: if (backend == .sqlite) SqliteStore else void,
     serialized: if (backend == .memory) Serialized else void,
+    postgres: if (backend == .postgres) PostgresStore else void,
 
     fn interface(conn: *Connection) Store {
         return switch (backend) {
             .memory => conn.serialized.interface(),
             .sqlite => conn.sqlite.interface(),
-            .postgres => @compileError("the postgres backend arrives in C0 slice 3"),
+            .postgres => conn.postgres.interface(),
         };
     }
 
     fn close(conn: *Connection, harness: *Harness) void {
         if (backend == .sqlite) conn.sqlite.close();
+        if (backend == .postgres) conn.postgres.close();
         harness.gpa.destroy(conn);
     }
 };

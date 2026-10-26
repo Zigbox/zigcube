@@ -58,6 +58,29 @@ pub const lease_ttl_ms_max: u32 = 60 * 60 * 1000;
 pub const store_sqlite_busy_ms: u32 = 5000;
 /// How often a SQLite watch re-reads the log while it waits for events (it has no NOTIFY).
 pub const store_watch_poll_ms: u32 = 10;
+/// Postgres: connections one store opens for operations. An operation holds one for its whole
+/// transaction, so this bounds the operations in flight; a further one waits for a free one.
+pub const store_postgres_connections_max: u32 = 8;
+/// Postgres: open watches per store. Each owns a connection of its own (it LISTENs on it), so this
+/// is lower than `store_watches_max`, which a backend with no such cost may provision.
+pub const store_postgres_watches_max: u32 = 64;
+pub const store_postgres_conninfo_bytes_max: u32 = 1024;
+pub const store_postgres_schema_bytes_max: u32 = 32;
+pub const store_postgres_connect_timeout_s: u32 = 5;
+/// How long a statement waits for a lock another transaction holds before ZC-E0208. Writers
+/// serialise on one row, each for milliseconds, so this is a stuck-peer limit (like SQLite's).
+pub const store_postgres_lock_timeout_ms: u32 = 5000;
+pub const store_postgres_statement_timeout_ms: u32 = 30 * 1000;
+/// A transaction left open this long by a client that has gone silent is ended by the server, so
+/// the writer lock it holds cannot block every other writer for as long as TCP takes to notice.
+pub const store_postgres_idle_txn_ms: u32 = 30 * 1000;
+/// How often a Postgres watch re-reads the log when no NOTIFY woke it: the bound on what a lost
+/// notification costs. A watch never depends on one arriving.
+pub const store_watch_notify_fallback_ms: u32 = 250;
+/// A watch that finds a hole in the revisions re-reads this many times, `store_watch_hole_wait_ms`
+/// apart, before it raises ZC-B0001 instead of skipping the missing revision.
+pub const store_watch_hole_retries_max: u32 = 3;
+pub const store_watch_hole_wait_ms: u32 = 5;
 /// Rows one compaction step deletes before it lets other writers in.
 pub const store_compact_batch_rows: u32 = 1000;
 /// The arena a server request or a reconcile pass gets; exceeding it is an operating error.
@@ -95,4 +118,11 @@ comptime {
     assert(store_watch_poll_ms < lease_ttl_ms_min);
     assert(store_sqlite_busy_ms > store_watch_poll_ms);
     assert(store_compact_batch_rows > 0);
+    assert(store_postgres_watches_max <= store_watches_max);
+    assert(store_postgres_connections_max > 0);
+    assert(store_watch_notify_fallback_ms >= store_watch_poll_ms);
+    assert(store_postgres_lock_timeout_ms < store_postgres_statement_timeout_ms);
+    assert(store_postgres_statement_timeout_ms <= store_postgres_idle_txn_ms);
+    assert(store_watch_hole_retries_max > 0);
+    assert(store_postgres_schema_bytes_max + "zcube_".len < 63); // A NOTIFY channel is a name.
 }

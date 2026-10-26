@@ -12,6 +12,8 @@ test {
     _ = @import("store_failures.zig");
     _ = @import("store_memory.zig");
     _ = @import("store_sqlite.zig");
+    _ = @import("pq.zig");
+    _ = @import("store_postgres.zig");
     _ = @import("runtime.zig");
     _ = @import("tidy.zig");
 }
