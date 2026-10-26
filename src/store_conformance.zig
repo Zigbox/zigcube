@@ -975,6 +975,37 @@ test "watch: after a reconnect, resuming from bookmark + 1 sees exactly what is 
     ), .E0204);
 }
 
+test "compaction: a delete pruned across batches never brings its key back" {
+    // Goal: compaction prunes oldest first, so a tombstone is never removed while an older put
+    // of its key survives; that put would no longer be superseded by anything at or below the
+    // point and would read as live for ever. Method: put /k, then enough puts of a filler key
+    // that pruning takes more than one batch, delete /k, compact past everything, and check
+    // that /k is absent from historical reads at the point and from a list there.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    _ = try put_one(s, &diag, "/k", "doomed");
+    const batch_rows = constants.store_compact_batch_rows;
+    const filler_count = batch_rows + @divFloor(batch_rows, 5); // More than one batch to prune.
+    for (0..filler_count) |_| _ = try put_one(s, &diag, "/filler", "x");
+    const deleted = try delete_one(s, &diag, "/k");
+    const head = try put_one(s, &diag, "/filler", "last");
+    try s.compact(head, &diag);
+    try expect_status(s, &diag, head, head);
+    try testing.expect((try s.get(arena, "/k", head, &diag)).kv == null);
+    try testing.expect((try s.get(arena, "/k", null, &diag)).kv == null);
+    const listed = try s.list(arena, .{ .prefix = "/", .at_revision = head, .limit = 10 }, &diag);
+    try testing.expectEqual(@as(usize, 1), listed.kvs.len);
+    try testing.expectEqualStrings("/filler", listed.kvs[0].key);
+    try testing.expect(deleted < head);
+}
+
 test "compaction: reads and watches below the point fail explicitly; at and above it work" {
     // Goal: "compacted" is an error, never silence, and compaction keeps every state a reader
     // at or after the point can ask for. Method: build history with a delete and a re-create,
