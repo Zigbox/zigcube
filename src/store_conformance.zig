@@ -55,8 +55,6 @@ const model_steps = 400;
 const model_events_max = model_steps * 3;
 const key_bytes = 32;
 
-var run_seed: ?u64 = null;
-
 // ---- Harness ---------------------------------------------------------------------------------
 
 const Harness = struct {
@@ -113,22 +111,17 @@ const Harness = struct {
         testing.allocator.destroy(harness);
     }
 
-    /// One seed per run, shared by every test and printed once, so a failure replays from one
-    /// number. The tests run one after another in one process, so a plain variable is enough.
+    /// One seed per run, shared by every test: `-Dseed=N` if given, else the seed Zig's build
+    /// runner draws for the run and passes to the test binary (`zig build --seed 0xN` replays
+    /// it). Nothing is printed while tests pass, because the build runner reports any stderr of
+    /// a passing step as a failure; a failing test prints it (`report_seed`).
     fn pick_seed() u64 {
-        if (run_seed) |chosen| return chosen;
-        var chosen: u64 = undefined;
-        if (suite.seed) |fixed| {
-            chosen = fixed;
-        } else {
-            var bytes: [8]u8 = undefined;
-            testing.io.random(&bytes);
-            chosen = std.mem.readInt(u64, &bytes, .little);
-        }
-        run_seed = chosen;
-        const banner = "store conformance: backend={s} seed={d}\n";
-        std.debug.print(banner, .{ @tagName(backend), chosen });
-        return chosen;
+        return suite.seed orelse testing.random_seed;
+    }
+
+    fn report_seed(harness: *const Harness) void {
+        const banner = "store conformance: backend={s} seed={d} (replay: -Dseed={d})\n";
+        std.debug.print(banner, .{ @tagName(backend), harness.seed, harness.seed });
     }
 
     /// A random generator for one test: the seed, mixed with a name so tests differ.
@@ -443,6 +436,7 @@ test "cas: of several writers racing to create a key, exactly one wins" {
     // value, and the writers' revisions are exactly 1..n: one per write, no gap, no repeat.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var gate = start_gate();
     var jobs: [writers_count]CreateRace = undefined;
     for (&jobs, 0..) |*job, id| {
@@ -528,6 +522,7 @@ test "cas: concurrent read-modify-write loses no update and takes one revision e
     // nothing, the revision must be exactly 1 + the increments (a failed attempt takes none).
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     const first = (try harness.connect()).interface();
@@ -741,6 +736,7 @@ test "watch: concurrent writers produce an ordered, gap-free stream, one batch p
     // in transaction order, with no revision split across batches.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var prng = harness.prng("watch-writers");
     var gate = start_gate();
     var finished: std.atomic.Value(u32) = .init(0);
@@ -800,6 +796,7 @@ test "watch: a revision that does not fit the batch is held back whole, never sk
     // deliver every event exactly once, in order.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -841,6 +838,7 @@ test "txn: a transaction that changes nothing takes no revision, even on an empt
     // then on a store with one key; the revision must not move and the key must be as it was.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     const s = (try harness.connect()).interface();
@@ -873,6 +871,7 @@ test "watch: after a reconnect, resuming from bookmark + 1 sees exactly what is 
     // is refused a start beyond head + 1.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -933,6 +932,7 @@ test "compaction: reads and watches below the point fail explicitly; at and abov
     // of `compact` itself.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -993,6 +993,7 @@ test "lease: expiry deletes its keys under one revision, visible to a watcher el
     // do nothing and take no revision.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1041,6 +1042,7 @@ test "lease: revoke frees its keys in one revision and reports it; unknown lease
     // revoke the first again (unknown) and an id never granted.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     const s = (try harness.connect()).interface();
@@ -1063,6 +1065,7 @@ test "lease: a put that names a dead lease changes nothing" {
     // named only by the branch not taken is no problem.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1096,6 +1099,7 @@ test "lease: one lease holds at most the limit of keys, and a refusal changes no
     // limit in transactions of at most the per-branch limit, then try one more key.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     const s = (try harness.connect()).interface();
@@ -1124,6 +1128,7 @@ test "lease: moving a key onto a full lease is refused; moving one off it makes 
     // lease and attach the key that was refused; that leaves the count unchanged, so it works.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     const s = (try harness.connect()).interface();
@@ -1157,6 +1162,7 @@ test "limits: oversized requests are refused with a code and write nothing" {
     // byte over the limit, a branch one operation over, and a ttl outside its range.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     const s = (try harness.connect()).interface();
@@ -1185,6 +1191,7 @@ test "list: pages are consistent at one revision, ordered bytewise, and join wit
     // must join up with no repeat and no gap.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     var diag: Diag = undefined;
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1504,6 +1511,7 @@ test "model: seeded random operations agree with a model of the store" {
     // `-Dseed=N` replays the run.
     const harness = try Harness.start();
     defer harness.stop();
+    errdefer harness.report_seed();
     const run = try testing.allocator.create(ModelRun);
     defer testing.allocator.destroy(run);
     run.* = .{

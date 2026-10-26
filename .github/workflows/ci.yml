@@ -36,7 +36,7 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends libsqlite3-dev
       - name: Unit and snapshot tests
         run: zig build test --summary all
-      # The suite picks a random seed per run and prints it; -Dseed=N replays a failure.
+      # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
       - name: Store conformance (memory)
         run: zig build test-store -Dbackend=memory --summary all
       - name: Store conformance (sqlite)

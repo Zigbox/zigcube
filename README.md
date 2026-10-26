@@ -40,7 +40,7 @@ zig build tidy                              # formatting and mechanical style ru
 zig build test-store -Dbackend=sqlite       # the store conformance suite (memory | sqlite)
 ```
 
-The conformance suite draws a random seed on every run and prints it; `-Dseed=N` replays a run.
+The conformance suite draws a new random seed on every run. A failing test prints it; `-Dseed=N` replays that run.
 
 ## Layout
 

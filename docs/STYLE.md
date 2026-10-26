@@ -16,8 +16,9 @@ Zigcube is a networked server, CLI and agent rather than a single-shot static bi
   (`std.Io.Mutex`, which needs an `std.Io`, so a backend's `open` takes one); a wait sleeps outside
   the mutex. No test spawns a thread it does not join.
 - **Randomised and racing tests (provisional, same slice).** All randomness in a test comes from
-  one seed, drawn once per run, printed once at the start, and replayed with `-Dseed=N` on the
-  build step. Where real threads race, the interleaving is the machine's, so those tests assert the
+  one seed, drawn once per run (Zig's per-run test seed), printed when a test fails, and replayed
+  with `-Dseed=N` on the build step. A passing run prints nothing, because the build runner reports
+  any stderr of a passing step as a failed command. Where real threads race, the interleaving is the machine's, so those tests assert the
   invariants that hold for every interleaving (no gap, no duplicate, revision order equals commit
   order, every event delivered once and in order) and never one particular order. A test step
   that draws its seed at run time is never cached: every CI run is a new draw.

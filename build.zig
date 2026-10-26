@@ -87,7 +87,8 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
         }),
     });
     const run = b.addRunArtifact(tests);
-    // A passing run is not cached: the seed is chosen when the tests start, so every run counts.
+    // A passing run is not cached: the build runner draws a new seed per invocation (it is not
+    // part of the cache key), so every run counts.
     run.has_side_effects = true;
     step.dependOn(&run.step);
 }
