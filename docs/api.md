@@ -1,12 +1,12 @@
 # HTTP API proposal for the web console
 
-**Status: proposal for the owner. The server does not exist yet.** This is the read-only API the
+**Status: Approved by the owner on 2026-10-26; the server implements it.** This is the read-only API the
 console ([console.md](console.md)) needs, written against HANDOFF's decisions and the approved
 `Store` and `Runtime` contracts. The browser mock in `web/mock/` implements exactly what is
 written here, so the console is already built against it. Nothing in this file changes `Store`
 or `Runtime` by itself; the places where it would need to are listed in
 [What the console needs from the contracts](#what-the-console-needs-from-the-contracts) and
-each is an **Ask first**.
+each is an **Ask first**. The owner approved this document as written (endpoints, conventions, the three `ZC-E01xx` codes and the 11 items below); the `Store`, key-layout and decision-schema changes land in a separate C0 slice, not here.
 
 ## Decisions taken from HANDOFF
 
@@ -180,45 +180,51 @@ looks for it in server logs.
 
 ## What the console needs from the contracts
 
-Each item is something the UI showed to be missing or awkward. None is built; all are
-**Ask first** under HANDOFF because they touch `Store`, the key layout, or the decision schema.
+Each item is something the UI showed to be missing or awkward. **All 11 are approved by the
+owner (2026-10-26)**, with the resolutions proposed here and the answers to items 10 and 11
+below. None is built: they touch `Store`, the key layout and the decision schema, so they go
+into a separate C0 slice after the Postgres backend lands.
 
-1. **Newest-first reads.** "Latest decisions" and every history list want the tail of a key
+1. **[Approved]** **Newest-first reads.** "Latest decisions" and every history list want the tail of a key
    range. `Store.list` is ascending only, so the server would read every decision to show eight.
    Proposed: `reverse: bool` on `ListOptions` (additive, both backends can do it with
    `ORDER BY key DESC`). Without it, the overview needs a separate ring key
    (`/decisions-latest/`), which is worse.
-2. **Lease inspection.** `Lease{id, ttl_ms}` comes only from `grant` and `keepalive`. Nothing
+2. **[Approved]** **Lease inspection.** `Lease{id, ttl_ms}` comes only from `grant` and `keepalive`. Nothing
    can read a lease's remaining time or its keys, so "lease state and TTL, last seen" (a stated
    requirement for the Nodes screen) has no source. Proposed: a read-only `lease_list()` on
    `Store`. The alternative, the server recording the time of each keepalive it forwarded, works
    for one server and breaks with two.
-3. **A cause for "the key was deleted by a lease".** A lost node leaves no observed record, so
+3. **[Approved]** **A cause for "the key was deleted by a lease".** A lost node leaves no observed record, so
    the `observed` cause kind cannot point at anything. Proposed: a fifth cause kind
    `lease_expired` with `{key, lease, ttl_ms, revision}`. The mock and `/v1/why` already use it.
-4. **Who applied, and from which file.** `zcube why` ends at `desired` ("an apply"); SPEC's
+4. **[Approved]** **Who applied, and from which file.** `zcube why` ends at `desired` ("an apply"); SPEC's
    audit log wants an actor and request ID, and "config in git" wants the file's commit.
    Proposed: `applied_by` and `request_id` on `/services/<name>` now, `source` (git commit, file
    digest) later. The mock writes the first two.
-5. **Spec history for diffs.** The previous generation's spec is gone after compaction, so
+5. **[Approved]** **Spec history for diffs.** The previous generation's spec is gone after compaction, so
    neither a "what changed" view nor `zcube apply`'s diff of an old apply can be shown. Cheap
    option: the `apply` decision records a one-line change summary ("replicas 3 → 5").
-6. **Resolved requests on the replica.** Node "used" capacity is the sum of replica `limits`,
+6. **[Approved]** **Resolved requests on the replica.** Node "used" capacity is the sum of replica `limits`,
    and a replica with no limits counts as 0 although the scheduler must assume something. Put
    the scheduler's resolved `requests` (`cpu_millis`, `memory_bytes`) on the replica record.
-7. **`started_at_ms` on observed state**, for a replica "age" column. `reported_at_ms` moves on
+7. **[Approved]** **`started_at_ms` on observed state**, for a replica "age" column. `reported_at_ms` moves on
    every status change, which is not the same thing.
-8. **Environment values are secrets in `/services/<name>`.** The API must not send them to a
+8. **[Approved]** **Environment values are secrets in `/services/<name>`.** The API must not send them to a
    read-only token; send names only. The console masks them anyway, but that is the second line
    of defence, not the first.
-9. **Service-level decisions.** `zcube why service x` needs decisions whose subject is the
+9. **[Approved]** **Service-level decisions.** `zcube why service x` needs decisions whose subject is the
    service ("scale_up", "replace_replica", "hold_failed_replica"), not only per-replica ones,
    or the chain for a service starts nowhere. The mock records both, linked by `cause`.
-10. **`generation` and replica counts.** keys.md says `generation` rises on every spec change
+10. **[Approved]** **`generation` and replica counts.** keys.md says `generation` rises on every spec change
     and the controller replaces replicas whose generation is behind. Read literally, scaling
     from 3 to 5 would replace the existing 3. The mock does not bump it for a count change.
     The owner should say which is intended.
-11. **What a failed start does.** HANDOFF says nothing about whether the controller replaces a
+11. **[Approved]** **What a failed start does.** HANDOFF says nothing about whether the controller replaces a
     replica whose `start_failed` is the user's fault (a bad digest). The mock holds it and says
     so (`hold_failed_replica`), because replacing it forever hides the cause in churn. This is a
     controller decision the UI depends on for a calm `why`.
+
+**Owner's answers.** Item 10: a change of the replica count alone does **not** bump
+`generation`. Item 11: a replica whose start failed through the user's fault (for example
+`ZBX-E0501`) is **held**, with a `hold_failed_replica` decision, and not retried or replaced.
