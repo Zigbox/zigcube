@@ -117,8 +117,9 @@ fn postgres_conninfo(b: *std.Build) []const u8 {
 }
 
 /// `zig build test-store -Dbackend=memory|sqlite|postgres [-Dseed=N]`: the conformance suite, one
-/// test binary written against the `Store` interface, run against the chosen backend. For
-/// Postgres it also runs the backend's own tests, which need the same database.
+/// test binary written against the `Store` interface, run against the chosen backend. The
+/// backend's own tests come with it (they are in the same compilation), so for Postgres the
+/// binary needs the database even for those.
 fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
     const seed = b.option(u64, "seed", "Seed for the randomised store tests (default: random)");
@@ -145,19 +146,7 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     if (backend == .postgres) {
         const conninfo = postgres_conninfo(b);
         run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", conninfo);
-        const own = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/store_postgres.zig"),
-                .target = step_options.target,
-                .optimize = step_options.optimize,
-                .imports = &.{.{ .name = "libpq_c", .module = step_options.libpq }},
-            }),
-        });
-        const own_run = b.addRunArtifact(own);
-        own_run.has_side_effects = true;
-        own_run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", conninfo);
-        own_run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
-        step.dependOn(&own_run.step);
+        run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
     }
     step.dependOn(&run.step);
 }

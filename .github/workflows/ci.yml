@@ -1,6 +1,6 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
 # installed from a verified tarball (.github/actions/setup-zig). The only other shell is the
-# one apt-get line that installs the SQLite development files the tests link.
+# apt-get line that installs the SQLite and libpq development files the tests link.
 name: ci
 
 # CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
@@ -32,8 +32,8 @@ jobs:
         run: zig build tidy
       - name: Build the three executables
         run: zig build
-      - name: SQLite development files
-        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
       - name: Unit and snapshot tests
         run: zig build test --summary all
       # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
@@ -41,3 +41,38 @@ jobs:
         run: zig build test-store -Dbackend=memory --summary all
       - name: Store conformance (sqlite)
         run: zig build test-store -Dbackend=sqlite --summary all
+
+  # The same conformance suite against a real Postgres 16, the server a deployment would run.
+  # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
+  # moving tag cannot change what CI tests. The suite makes its own schema per test in the
+  # database below and drops it, and it draws a new seed each run, so a few runs in a row are
+  # a few draws of the racing-writer tests.
+  store-postgres:
+    name: store conformance (postgres)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: Store conformance (postgres), three draws
+        run: |
+          for run in 1 2 3; do
+            zig build test-store -Dbackend=postgres --summary all
+          done

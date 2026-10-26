@@ -1365,17 +1365,26 @@ fn create_tables(session: *Session, diag: *Diag) Error!TableAccess {
     return access;
 }
 
-/// Tries `CREATE EXTENSION orioledb` inside a savepoint, so a refusal (the library is not
-/// preloaded, or the role may not) leaves the transaction usable and the store on heap tables.
 fn install_orioledb(session: *Session, diag: *Diag) Error!TableAccess {
-    try session.simple("SAVEPOINT zcube_orioledb", diag);
-    session.simple("CREATE EXTENSION orioledb", diag) catch {
+    if (try try_install_extension(session, "orioledb", diag)) return .orioledb;
+    return .heap;
+}
+
+/// Tries `CREATE EXTENSION` inside a savepoint, so a refusal (the library is not preloaded, or
+/// the role may not) leaves the transaction usable. False if it was refused.
+fn try_install_extension(
+    session: *Session,
+    comptime name: []const u8,
+    diag: *Diag,
+) Error!bool {
+    try session.simple("SAVEPOINT zcube_extension", diag);
+    session.simple("CREATE EXTENSION " ++ name, diag) catch {
         diag.reset();
-        try session.simple("ROLLBACK TO SAVEPOINT zcube_orioledb", diag);
-        return .heap;
+        try session.simple("ROLLBACK TO SAVEPOINT zcube_extension", diag);
+        return false;
     };
-    try session.simple("RELEASE SAVEPOINT zcube_orioledb", diag);
-    return .orioledb;
+    try session.simple("RELEASE SAVEPOINT zcube_extension", diag);
+    return true;
 }
 
 /// Which access method `store_live` actually has, whatever created it.
@@ -1615,4 +1624,671 @@ fn revisions_present(slot: *WatchSlot, from: Revision, to: Revision, diag: *Diag
 fn watch_close_impl(context: *anyopaque) void {
     const slot: *WatchSlot = @ptrCast(@alignCast(context));
     release_watch(slot);
+}
+
+// ---- Tests -------------------------------------------------------------------------------------
+// The behaviour every backend shares is checked by the conformance suite
+// (`zig build test-store -Dbackend=postgres`). These cover what only this backend has: the
+// schema, the failures, the connections, NOTIFY and the lease clock. Those that need a database
+// read it from `ZCUBE_TEST_POSTGRES` and are skipped when it is unset; `test-store` sets it, and
+// also sets `ZCUBE_TEST_POSTGRES_REQUIRED`, which turns a missing one into a failure.
+
+const testing = std.testing;
+const codes = @import("diag/codes.zig");
+const repeat = @import("test_util.zig").repeat;
+
+test "schema names are small, lowercase and start with a letter" {
+    // Goal: the name is safe in quotes and in a NOTIFY channel. Method: each rule once, and the
+    // longest name that is still accepted.
+    try testing.expect(schema_problem("zcube") == null);
+    try testing.expect(schema_problem("_x9") == null);
+    try testing.expect(schema_problem(repeat('a', 32)) == null);
+    try testing.expect(schema_problem(repeat('a', 33)) != null);
+    try testing.expect(schema_problem("") != null);
+    try testing.expect(schema_problem("9lives") != null);
+    try testing.expect(schema_problem("Zcube") != null);
+    try testing.expect(schema_problem("a\"b") != null);
+    try testing.expect(schema_problem("a-b") != null);
+}
+
+test "OrioleDB is chosen from the catalogue, and only store_live moves" {
+    // Goal: the OrioleDB path is decided correctly although it can't run here. Method: the three
+    // catalogue answers through `plan_access`, and the DDL it picks between.
+    const installed: Catalogue = .{ .installed = true, .available = true };
+    try testing.expectEqual(AccessPlan.orioledb, plan_access(installed));
+    const only_files: Catalogue = .{ .installed = false, .available = true };
+    try testing.expectEqual(AccessPlan.orioledb_after_create, plan_access(only_files));
+    const absent: Catalogue = .{ .installed = false, .available = false };
+    try testing.expectEqual(AccessPlan.heap, plan_access(absent));
+    const heap = schema_sql(.heap);
+    const oriole = schema_sql(.orioledb);
+    try testing.expect(std.mem.indexOf(u8, heap, "orioledb") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, oriole, "USING orioledb"));
+    const live = std.mem.indexOf(u8, oriole, "CREATE TABLE store_live").?;
+    const using = std.mem.indexOf(u8, oriole, "USING orioledb").?;
+    const lease_table = std.mem.indexOf(u8, oriole, "CREATE TABLE store_lease").?;
+    try testing.expect(live < using and using < lease_table);
+    // Everything but that one clause is the same, which is what "works on heap" means.
+    try testing.expectEqual(heap.len + " USING orioledb".len, oriole.len);
+}
+
+test "settings that cannot work are refused before any server is contacted" {
+    // Goal: a bad setting is ZC-E0201 with a fix, not a libpq error. Method: an empty
+    // connection string, an over-long one, and a schema with a bad name.
+    var diag: Diag = undefined;
+    diag.reset();
+    var db: PostgresStore = undefined;
+    const bad = [_]OpenOptions{
+        .{ .conninfo = "", .create = true },
+        .{
+            .conninfo = repeat('x', constants.store_postgres_conninfo_bytes_max + 1),
+            .create = true,
+        },
+        .{ .conninfo = "host=127.0.0.1", .schema = "No Good", .create = true },
+    };
+    for (bad) |options| {
+        try testing.expectError(error.BackendFailed, db.open(testing.io, options, &diag));
+        try testing.expectEqual(codes.Code.E0201, diag.code.?);
+        try testing.expect(diag.fixes.count >= 1);
+        try testing.expectEqualStrings("no Postgres server was contacted", diag.last_cause().?);
+        diag.reset();
+    }
+}
+
+test "opening a store whose server is down is ZC-E0201, as the demo shows it" {
+    // Goal: HANDOFF C0 demo step 5: a stopped Postgres reads as a store-backend problem with a
+    // fix, not as a connection-library error. Method: open against a port nobody listens on,
+    // and check the text a user would read, and that the store is left closed.
+    var diag: Diag = undefined;
+    diag.reset();
+    var db: PostgresStore = undefined;
+    const options: OpenOptions = .{
+        .conninfo = "host=127.0.0.1 port=1 user=zcube dbname=zcube",
+        .create = true,
+    };
+    try testing.expectError(error.BackendFailed, db.open(testing.io, options, &diag));
+    try testing.expectEqual(codes.Code.E0201, diag.code.?);
+    try testing.expectEqualStrings("can't reach the store backend", diag.entry().summary);
+    try testing.expectEqualStrings(
+        "the Postgres server at 127.0.0.1 port 1 did not accept a connection",
+        diag.last_cause().?,
+    );
+    try testing.expectEqual(@as(u8, constants.exit_external), diag.exit_code());
+    try testing.expect(diag.fixes.count >= 2);
+}
+
+/// The database the tests use, or a skip (or, under `test-store`, a failure) when none is set.
+fn test_conninfo() ![:0]const u8 {
+    if (testing.environ.getPosix("ZCUBE_TEST_POSTGRES")) |settings| return settings;
+    if (testing.environ.getPosix("ZCUBE_TEST_POSTGRES_REQUIRED") != null) {
+        return error.PostgresNotConfigured;
+    }
+    return error.SkipZigTest;
+}
+
+/// One schema of the test database, dropped when the test ends, and a clock for its leases.
+const Fixture = struct {
+    manual: ManualClock,
+    diag: Diag,
+    conninfo: [:0]const u8,
+    schema_buffer: [32]u8,
+    schema_len: u32,
+
+    fn create() !*Fixture {
+        const conninfo = try test_conninfo();
+        const fixture = try testing.allocator.create(Fixture);
+        fixture.manual = .{};
+        fixture.diag.reset();
+        fixture.conninfo = conninfo;
+        const now = std.Io.Clock.real.now(testing.io).toNanoseconds();
+        const unique = std.hash.Wyhash.hash(testing.random_seed, std.mem.asBytes(&now));
+        const text = try std.fmt.bufPrint(&fixture.schema_buffer, "zp_{x:0>16}", .{unique});
+        fixture.schema_len = @intCast(text.len);
+        return fixture;
+    }
+
+    fn destroy(fixture: *Fixture) void {
+        fixture.admin_sql("DROP SCHEMA IF EXISTS \"{s}\" CASCADE", .{fixture.schema()}) catch {};
+        testing.allocator.destroy(fixture);
+    }
+
+    fn schema(fixture: *const Fixture) []const u8 {
+        return fixture.schema_buffer[0..fixture.schema_len];
+    }
+
+    fn options(fixture: *Fixture, creating: bool) OpenOptions {
+        return .{
+            .conninfo = fixture.conninfo,
+            .schema = fixture.schema(),
+            .create = creating,
+            .lease_time = .{ .clock = fixture.manual.clock() },
+        };
+    }
+
+    /// A new, opened store; the caller closes and frees it with `release`.
+    fn open_new(fixture: *Fixture, open_options: OpenOptions) !*PostgresStore {
+        const db = try testing.allocator.create(PostgresStore);
+        errdefer testing.allocator.destroy(db);
+        try db.open(testing.io, open_options, &fixture.diag);
+        return db;
+    }
+
+    /// Runs SQL as an outside tool would, on a connection of its own, and returns the first
+    /// column of the first row if the statement is a SELECT of a bigint (else 0).
+    fn admin_sql(fixture: *Fixture, comptime format: []const u8, args: anytype) !void {
+        _ = try fixture.admin_value(format, args);
+    }
+
+    fn admin_value(fixture: *Fixture, comptime format: []const u8, args: anytype) !i64 {
+        var text: [512]u8 = undefined;
+        const sql = try std.fmt.bufPrintSentinel(&text, format, args, 0);
+        var diag: Diag = undefined; // Its own: the fixture's may hold the failure a test expects.
+        diag.reset();
+        const conn = try pq.connect(&diag, fixture.conninfo, "SELECT 1");
+        defer pq.close(conn);
+        var result = try pq.exec(&diag, conn, sql, &no_params, .{});
+        defer result.clear();
+        if (result.rows() == 0 or c.PQnfields(result.raw) == 0) return 0;
+        return result.int8(0, 0);
+    }
+};
+
+fn release(db: *PostgresStore) void {
+    db.close();
+    testing.allocator.destroy(db);
+}
+
+/// A failure is a designed diagnostic: the code, a fix, and a last cause that is the operator's.
+fn expect_designed(diag: *const Diag, code: codes.Code) !void {
+    try testing.expectEqual(code, diag.code.?);
+    try testing.expect(diag.fixes.count >= 1);
+    const last = diag.last_cause().?;
+    try testing.expect(std.mem.indexOf(u8, last, "libpq") == null);
+    try testing.expect(std.mem.indexOf(u8, last, "SQLSTATE") == null);
+}
+
+fn expect_open_fails(fixture: *Fixture, open_options: OpenOptions, code: codes.Code) !void {
+    const db = try testing.allocator.create(PostgresStore);
+    defer testing.allocator.destroy(db);
+    try testing.expectError(error.BackendFailed, db.open(testing.io, open_options, &fixture.diag));
+    try expect_designed(&fixture.diag, code);
+    fixture.diag.reset();
+}
+
+const put_a: store.Op = .{ .put = .{ .key = "/a", .value = "1" } };
+
+/// The server-side process id of the store's first pooled connection (it must have one).
+fn backend_pid(db: *PostgresStore) i64 {
+    const conn = db.pool[0].conn.?;
+    return c.PQbackendPID(conn);
+}
+
+/// Terminates a backend and waits until the server no longer lists it, so what the test does
+/// next meets a connection that is certainly gone.
+fn terminate(fixture: *Fixture, pid: i64) !void {
+    const kill = "SELECT pg_terminate_backend({d})::int::bigint";
+    const stopped = try fixture.admin_value(kill, .{pid});
+    try testing.expectEqual(@as(i64, 1), stopped);
+    for (0..1000) |_| {
+        const left = "SELECT count(*) FROM pg_stat_activity WHERE pid = {d}";
+        if (try fixture.admin_value(left, .{pid}) == 0) return;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.BackendDidNotExit;
+}
+
+test "open: a missing store is created only when asked, and a mistyped name is refused" {
+    // Goal: a mistyped schema does not quietly start an empty store. Method: open without
+    // `create` on a schema that is not there (ZC-E0209, and nothing is created), then with it.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    try expect_open_fails(fixture, fixture.options(false), .E0209);
+    const exists = "SELECT count(*) FROM pg_namespace WHERE nspname = '{s}'";
+    try testing.expectEqual(@as(i64, 0), try fixture.admin_value(exists, .{fixture.schema()}));
+    const db = try fixture.open_new(fixture.options(true));
+    try testing.expectEqual(TableAccess.heap, db.table_access); // No OrioleDB on this server.
+    release(db);
+    try testing.expectEqual(@as(i64, 1), try fixture.admin_value(exists, .{fixture.schema()}));
+    release(try fixture.open_new(fixture.options(false))); // Now it is there.
+}
+
+test "open: a schema that holds other tables is ZC-E0209 and is left as it was" {
+    // Goal: never initialise over something that is not ours. Method: a schema with a table of
+    // someone else's, opened with `create`; then the same table in the way of an empty store.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    try fixture.admin_sql("CREATE SCHEMA \"{s}\"", .{fixture.schema()});
+    try fixture.admin_sql("CREATE TABLE \"{s}\".somebody_elses (x int)", .{fixture.schema()});
+    try expect_open_fails(fixture, fixture.options(true), .E0209);
+    const tables = "SELECT count(*) FROM pg_tables WHERE schemaname = '{s}'";
+    try testing.expectEqual(@as(i64, 1), try fixture.admin_value(tables, .{fixture.schema()}));
+}
+
+test "open: a store_meta that says another application is ZC-E0209" {
+    // Goal: the identity row decides, not the table's name. Method: make a store, change the
+    // application it names, open it again.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    release(try fixture.open_new(fixture.options(true)));
+    const rename = "UPDATE \"{s}\".store_meta SET application = 'other'";
+    try fixture.admin_sql(rename, .{fixture.schema()});
+    try expect_open_fails(fixture, fixture.options(true), .E0209);
+}
+
+test "open: a schema from a newer zcube is ZC-E0210 and is not touched" {
+    // Goal: refuse rather than guess. Method: make a store, bump its schema version the way a
+    // newer zcube would, and open it again; the version must still be there afterwards.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    release(try fixture.open_new(fixture.options(true)));
+    try fixture.admin_sql("UPDATE \"{s}\".store_meta SET schema_version = 99", .{fixture.schema()});
+    try expect_open_fails(fixture, fixture.options(true), .E0210);
+    try expect_open_fails(fixture, fixture.options(false), .E0210);
+    const version = "SELECT schema_version::bigint FROM \"{s}\".store_meta";
+    try testing.expectEqual(@as(i64, 99), try fixture.admin_value(version, .{fixture.schema()}));
+}
+
+test "open: wrong credentials are ZC-E0211 and a missing database ZC-E0212" {
+    // Goal: the two failures an operator mistypes settings into are told apart, with fixes that
+    // name what to run. Method: a role that does not exist (on a server that checks passwords,
+    // a wrong password fails the same way), and a database that does not exist.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var text: [512]u8 = undefined;
+    const settings = "{s} user=zc_no_such_role password=wrong";
+    const user = try std.fmt.bufPrintSentinel(&text, settings, .{fixture.conninfo}, 0);
+    var denied = fixture.options(true);
+    denied.conninfo = user;
+    try expect_open_fails(fixture, denied, .E0211);
+    var other: [512]u8 = undefined;
+    const named = "{s} dbname=zc_no_such_database";
+    const database = try std.fmt.bufPrintSentinel(&other, named, .{fixture.conninfo}, 0);
+    var missing = fixture.options(true);
+    missing.conninfo = database;
+    const db = try testing.allocator.create(PostgresStore);
+    defer testing.allocator.destroy(db);
+    try testing.expectError(error.BackendFailed, db.open(testing.io, missing, &fixture.diag));
+    try expect_designed(&fixture.diag, .E0212);
+    try testing.expectEqualStrings(
+        "Postgres at 127.0.0.1 has no database named zc_no_such_database",
+        fixture.diag.last_cause().?,
+    );
+    const create = fixture.diag.fixes.slice()[1];
+    try testing.expect(std.mem.startsWith(u8, create.command.slice(), "createdb "));
+}
+
+test "open: two servers starting on an empty schema initialise it once" {
+    // Goal: the advisory lock makes concurrent openers take turns. Method: four threads open
+    // the same new schema at once; all must succeed and there must be one meta row.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const Job = struct {
+        fixture: *Fixture,
+        ok: bool = false,
+
+        fn run(job: *@This()) void {
+            var diag: Diag = undefined;
+            diag.reset();
+            const db = testing.allocator.create(PostgresStore) catch return;
+            defer testing.allocator.destroy(db);
+            db.open(testing.io, job.fixture.options(true), &diag) catch return;
+            db.close();
+            job.ok = true;
+        }
+    };
+    var jobs: [4]Job = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&jobs, &threads) |*job, *thread| {
+        job.* = .{ .fixture = fixture };
+        thread.* = try std.Thread.spawn(.{}, Job.run, .{job});
+    }
+    for (threads) |thread| thread.join();
+    for (jobs) |job| try testing.expect(job.ok);
+    const rows = "SELECT count(*) FROM \"{s}\".store_meta";
+    try testing.expectEqual(@as(i64, 1), try fixture.admin_value(rows, .{fixture.schema()}));
+}
+
+test "a connection that died while idle is replaced before the next operation" {
+    // Goal: a restart of Postgres between two requests costs nothing. Method: use the store,
+    // terminate its connection's backend, and write again; the write must succeed.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    const s = db.interface();
+    _ = try s.txn(.{ .on_success = &.{put_a} }, &fixture.diag);
+    try terminate(fixture, backend_pid(db));
+    const again = try s.txn(.{ .on_success = &.{put_a} }, &fixture.diag);
+    try testing.expectEqual(@as(Revision, 2), again.revision);
+}
+
+test "a connection lost inside a transaction is ZC-E0213, rolled back, and the store recovers" {
+    // Goal: a drop mid-operation is reported with what happened to the work, and does not
+    // poison the pool. Method: begin and take the writer lock on a session, terminate its
+    // backend, run the next statement (ZC-E0213: nothing was changed), release, and check that
+    // the store is still usable and has not moved.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    var session = try db.acquire(&fixture.diag);
+    try session.begin(&fixture.diag);
+    const writer: Writer = .{ .session = &session, .diag = &fixture.diag };
+    _ = try writer.bump();
+    try terminate(fixture, c.PQbackendPID(session.conn.?));
+    try testing.expectError(error.BackendFailed, writer.apply_op(put_a, 1, 0));
+    try expect_designed(&fixture.diag, .E0213);
+    try testing.expectEqualStrings(
+        "the connection to Postgres dropped; nothing was changed",
+        fixture.diag.last_cause().?,
+    );
+    fixture.diag.reset();
+    session.release();
+    const status = try db.interface().status(&fixture.diag);
+    try testing.expectEqual(@as(Revision, 0), status.revision);
+    _ = try db.interface().txn(.{ .on_success = &.{put_a} }, &fixture.diag);
+}
+
+test "a writer that waits too long for the lock is ZC-E0208, and nothing is left half done" {
+    // Goal: a stuck peer is an operating error with a name, not a hang. Method: one session holds
+    // the writer lock; a store with a short lock wait tries to write (ZC-E0208), reads still work
+    // (a reader takes no lock), and after the holder lets go the write succeeds as revision 1.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var options = fixture.options(true);
+    options.lock_timeout_ms = 100;
+    const waiter = try fixture.open_new(options);
+    defer release(waiter);
+    const holder = try fixture.open_new(fixture.options(false));
+    defer release(holder);
+    var session = try holder.acquire(&fixture.diag);
+    try session.begin(&fixture.diag);
+    const writer: Writer = .{ .session = &session, .diag = &fixture.diag };
+    _ = try writer.bump();
+    const s = waiter.interface();
+    const refused = s.txn(.{ .on_success = &.{put_a} }, &fixture.diag);
+    try testing.expectError(error.BackendFailed, refused);
+    try expect_designed(&fixture.diag, .E0208);
+    try testing.expectEqual(@as(u8, constants.exit_environment), fixture.diag.exit_code());
+    fixture.diag.reset();
+    try testing.expectEqual(@as(Revision, 0), (try s.status(&fixture.diag)).revision);
+    session.release(); // Rolls the holder's bump back.
+    const written = try s.txn(.{ .on_success = &.{put_a} }, &fixture.diag);
+    try testing.expectEqual(@as(Revision, 1), written.revision);
+}
+
+test "the pool is bounded: a further operation waits, then is ZC-E0207" {
+    // Goal: connections are a counted resource. Method: take every connection of a store, ask for
+    // one more with a short wait (ZC-E0207), give one back, and the same call succeeds.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var options = fixture.options(true);
+    options.pool_wait_ms = 20;
+    const db = try fixture.open_new(options);
+    defer release(db);
+    var held: [constants.store_postgres_connections_max]Session = undefined;
+    for (&held) |*session| session.* = try db.acquire(&fixture.diag);
+    try testing.expectError(error.NoCapacity, db.acquire(&fixture.diag));
+    try testing.expectEqual(codes.Code.E0207, fixture.diag.code.?);
+    fixture.diag.reset();
+    held[0].release();
+    var again = try db.acquire(&fixture.diag);
+    again.release();
+    for (held[1..]) |*session| session.release();
+}
+
+test "lease time is Postgres's own by default, so a stored deadline decides expiry" {
+    // Goal: with `.database` two servers agree and no clock of ours is consulted. Method: grant
+    // a lease and check its deadline is about now + ttl on Postgres's clock; then move the
+    // deadline into the past in the table: the lease can no longer be renewed or used, and
+    // `expire_leases` deletes its key, with no clock advanced by hand.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var options = fixture.options(true);
+    options.lease_time = .database;
+    const db = try fixture.open_new(options);
+    defer release(db);
+    const s = db.interface();
+    const lease = try s.lease_grant(60_000, &fixture.diag);
+    const remaining = "SELECT deadline_ms - " ++
+        "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint " ++
+        "FROM \"{s}\".store_lease WHERE id = {d}";
+    const left_ms = try fixture.admin_value(remaining, .{ fixture.schema(), lease.id });
+    try testing.expect(left_ms > 50_000 and left_ms <= 60_000);
+    const keyed: store.Op = .{ .put = .{ .key = "/n", .value = "node", .lease = lease.id } };
+    _ = try s.txn(.{ .on_success = &.{keyed} }, &fixture.diag);
+    try testing.expectEqual(lease.id, (try s.lease_keepalive(lease.id, &fixture.diag)).id);
+    try testing.expectEqual(@as(u32, 0), try s.expire_leases(&fixture.diag));
+    const past = "UPDATE \"{s}\".store_lease SET deadline_ms = 1 WHERE id = {d}";
+    try fixture.admin_sql(past, .{ fixture.schema(), lease.id });
+    try testing.expectError(error.LeaseNotFound, s.lease_keepalive(lease.id, &fixture.diag));
+    fixture.diag.reset();
+    const dead = s.txn(.{ .on_success = &.{keyed} }, &fixture.diag);
+    try testing.expectError(error.LeaseNotFound, dead);
+    fixture.diag.reset();
+    try testing.expectEqual(@as(u32, 1), try s.expire_leases(&fixture.diag));
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const got = try s.get(arena_state.allocator(), "/n", null, &fixture.diag);
+    try testing.expect(got.kv == null);
+}
+
+test "a lease clock is read once per call: the injected clock decides, not the database" {
+    // Goal: the test seam does what the conformance suite relies on. Method: a lease on the
+    // injected clock expires when that clock passes its deadline, though Postgres's time has
+    // barely moved.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    const s = db.interface();
+    const lease = try s.lease_grant(1000, &fixture.diag);
+    try testing.expectEqual(@as(u32, 0), try s.expire_leases(&fixture.diag));
+    fixture.manual.advance(1001);
+    try testing.expectEqual(@as(u32, 1), try s.expire_leases(&fixture.diag));
+    try testing.expectError(error.LeaseNotFound, s.lease_keepalive(lease.id, &fixture.diag));
+    fixture.diag.reset();
+}
+
+/// A watch's slot, for the tests that look at how it waits.
+fn slot_of(watch: *store.Watch) *WatchSlot {
+    return @ptrCast(@alignCast(watch.context));
+}
+
+const Waiter = struct {
+    watch: *store.Watch,
+    timeout_ms: u32,
+    arena: std.heap.ArenaAllocator,
+    events: u32 = 0,
+    failed: bool = false,
+
+    fn run(job: *Waiter) void {
+        var diag: Diag = undefined;
+        diag.reset();
+        const batch = job.watch.next(job.arena.allocator(), job.timeout_ms, &diag) catch {
+            job.failed = true;
+            return;
+        };
+        job.events = @intCast(batch.events.len);
+    }
+};
+
+/// Waits (bounded) until the watch is asleep on its socket or its wait, then writes.
+fn write_once_waiting(fixture: *Fixture, writer: store.Store, watch: *store.Watch) !void {
+    for (0..5000) |_| {
+        if (slot_of(watch).waiting.load(.acquire)) break;
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    } else return error.WatchNeverWaited;
+    const put_w: store.Op = .{ .put = .{ .key = "/w/a", .value = "1" } };
+    _ = try writer.txn(.{ .on_success = &.{put_w} }, &fixture.diag);
+}
+
+test "watch: a commit wakes a watch that would otherwise sleep a minute" {
+    // Goal: NOTIFY wakes a long-poll watch at once. Method: the fallback poll is set to a
+    // minute, so only a notification can end the wait in time; a thread waits in `next`, the test
+    // writes once it sees the watch asleep, and the thread must return the event and count one
+    // notification. (Without NOTIFY the thread would run out its 30 s and return nothing.)
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var options = fixture.options(true);
+    options.watch_fallback_ms = 60_000;
+    const watching = try fixture.open_new(options);
+    defer release(watching);
+    const writer = try fixture.open_new(fixture.options(false));
+    defer release(writer);
+    const from_one: store.WatchOptions = .{ .prefix = "/w/", .from_revision = 1 };
+    var watch = try watching.interface().watch(from_one, &fixture.diag);
+    defer watch.close();
+    var job: Waiter = .{ .watch = &watch, .timeout_ms = 30_000, .arena = .init(testing.allocator) };
+    defer job.arena.deinit();
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&job});
+    write_once_waiting(fixture, writer.interface(), &watch) catch |err| {
+        const put_x: store.Op = .{ .put = .{ .key = "/w/a", .value = "x" } };
+        _ = try writer.interface().txn(.{ .on_success = &.{put_x} }, &fixture.diag);
+        thread.join();
+        return err;
+    };
+    thread.join();
+    try testing.expect(!job.failed);
+    try testing.expectEqual(@as(u32, 1), job.events);
+    try testing.expect(slot_of(&watch).notified.load(.monotonic) >= 1);
+}
+
+test "watch: with no notifications at all, the fallback poll still delivers" {
+    // Goal: a watch never depends on a notification arriving. Method: LISTEN is off and the
+    // fallback is 10 ms; a thread waits, the test writes, and the thread must get the event
+    // having been woken by no notification.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var options = fixture.options(true);
+    options.listen = false;
+    options.watch_fallback_ms = 10;
+    const watching = try fixture.open_new(options);
+    defer release(watching);
+    const writer = try fixture.open_new(fixture.options(false));
+    defer release(writer);
+    const from_one: store.WatchOptions = .{ .prefix = "/w/", .from_revision = 1 };
+    var watch = try watching.interface().watch(from_one, &fixture.diag);
+    defer watch.close();
+    var job: Waiter = .{ .watch = &watch, .timeout_ms = 30_000, .arena = .init(testing.allocator) };
+    defer job.arena.deinit();
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&job});
+    try testing.io.sleep(.fromMilliseconds(30), .awake);
+    const put_w: store.Op = .{ .put = .{ .key = "/w/a", .value = "1" } };
+    _ = try writer.interface().txn(.{ .on_success = &.{put_w} }, &fixture.diag);
+    thread.join();
+    try testing.expect(!job.failed);
+    try testing.expectEqual(@as(u32, 1), job.events);
+    try testing.expectEqual(@as(u32, 0), slot_of(&watch).notified.load(.monotonic));
+}
+
+test "watch: a hole in the log is re-read, then ZC-B0001, and the revision is never skipped" {
+    // Goal: the defence in depth works. Method: three revisions; revision 2's rows are moved out
+    // of the log as a lost commit would leave it. A watch from 1 must fail with a bug diagnostic
+    // after re-reading, and must not deliver 3 past the hole. With the rows put back, the same
+    // watch delivers 1, 2 and 3 in order: its position did not move.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    const s = db.interface();
+    for ([_][]const u8{ "1", "2", "3" }) |value| {
+        const op: store.Op = .{ .put = .{ .key = "/h/k", .value = value } };
+        _ = try s.txn(.{ .on_success = &.{op} }, &fixture.diag);
+    }
+    const schema = fixture.schema();
+    const away = "UPDATE \"{s}\".store_log SET revision = 20 WHERE revision = 2";
+    try fixture.admin_sql(away, .{schema});
+    var watch = try s.watch(.{ .prefix = "/h/", .from_revision = 1 }, &fixture.diag);
+    defer watch.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.BackendFailed, watch.next(arena, 0, &fixture.diag));
+    try testing.expectEqual(codes.Code.B0001, fixture.diag.code.?);
+    try testing.expectEqual(@as(u8, constants.exit_internal), fixture.diag.exit_code());
+    fixture.diag.reset();
+    const back = "UPDATE \"{s}\".store_log SET revision = 2 WHERE revision = 20";
+    try fixture.admin_sql(back, .{schema});
+    const batch = try watch.next(arena, 0, &fixture.diag);
+    try testing.expectEqual(@as(usize, 3), batch.events.len);
+    for (batch.events, 1..) |event, revision| {
+        try testing.expectEqual(@as(Revision, revision), event.kv.mod_revision);
+    }
+}
+
+test "watch: every slot is its own connection, and one more than the limit is ZC-E0207" {
+    // Goal: watches are bounded by the connections they hold. Method: open the most the backend
+    // allows, check the next is refused with a code, close one, and the same call succeeds.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    const s = db.interface();
+    var watches: [constants.store_postgres_watches_max]store.Watch = undefined;
+    var opened: usize = 0;
+    defer for (watches[0..opened]) |*watch| watch.close();
+    for (&watches) |*watch| {
+        watch.* = try s.watch(.{ .prefix = "/", .from_revision = 1 }, &fixture.diag);
+        opened += 1;
+    }
+    const one_more = s.watch(.{ .prefix = "/", .from_revision = 1 }, &fixture.diag);
+    try testing.expectError(error.NoCapacity, one_more);
+    try testing.expectEqual(codes.Code.E0207, fixture.diag.code.?);
+    fixture.diag.reset();
+    watches[opened - 1].close();
+    opened -= 1;
+    var again = try s.watch(.{ .prefix = "/", .from_revision = 1 }, &fixture.diag);
+    again.close();
+}
+
+test "a store whose tables are removed under it is ZC-E0209, not a libpq error" {
+    // Goal: a schema damaged while the server runs is a designed diagnostic. Method: write, drop
+    // the live table from outside, read; the SQLSTATE for a missing table must become E0209.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    const s = db.interface();
+    _ = try s.txn(.{ .on_success = &.{put_a} }, &fixture.diag);
+    try fixture.admin_sql("DROP TABLE \"{s}\".store_live", .{fixture.schema()});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const read = s.get(arena_state.allocator(), "/a", null, &fixture.diag);
+    try testing.expectError(error.BackendFailed, read);
+    try expect_designed(&fixture.diag, .E0209);
+}
+
+test "an extension that cannot be installed leaves the transaction usable" {
+    // Goal: the OrioleDB fallback mechanism, which the real extension can't exercise here.
+    // Method: ask a savepoint to install an extension that does not exist; it must say no, and
+    // the schema must still be creatable in the same transaction afterwards.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    var session = try db.acquire(&fixture.diag);
+    defer session.release();
+    try session.begin(&fixture.diag);
+    const installed = try try_install_extension(&session, "zcube_no_such_extension", &fixture.diag);
+    try testing.expect(!installed);
+    try testing.expect(fixture.diag.code == null);
+    try session.simple("CREATE TEMP TABLE zcube_still_usable (x int)", &fixture.diag);
+}
+
+test "drop_schema removes the store and only the store" {
+    // Goal: the reset used by tests and tooling is exact. Method: a store and an unrelated schema;
+    // drop the store's; the other stays.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var other: [48]u8 = undefined;
+    const other_name = try std.fmt.bufPrint(&other, "{s}_keep", .{fixture.schema()});
+    try fixture.admin_sql("CREATE SCHEMA \"{s}\"", .{other_name});
+    defer fixture.admin_sql("DROP SCHEMA \"{s}\"", .{other_name}) catch {};
+    const db = try fixture.open_new(fixture.options(true));
+    defer release(db);
+    try db.drop_schema(&fixture.diag);
+    const count = "SELECT count(*) FROM pg_namespace WHERE nspname IN ('{s}', '{s}')";
+    const left = try fixture.admin_value(count, .{ fixture.schema(), other_name });
+    try testing.expectEqual(@as(i64, 1), left);
 }

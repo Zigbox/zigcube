@@ -193,6 +193,69 @@ decision for you (see `docs/contracts-review.md`).
   counter after `COMMIT` when it exists), a ring buffer shared by all watches, and any
   benchmark. All three are for C1.
 
+## Postgres as built (C0 slice 3)
+
+`src/store_postgres.zig` (the store) and `src/pq.zig` (libpq, parameters, results, failures)
+follow the design above, with these differences of detail. Each is also in the slice report.
+
+- **Revision.** As designed: `UPDATE store_meta SET revision = revision + 1 RETURNING revision`
+  opens every write, READ COMMITTED, compares under the lock. A transaction that wrote no event
+  rolls back. `lease_revoke` of a lease with no keys must still delete the lease row, so it
+  subtracts its bump before committing instead (the lock is still held, so nothing can see the
+  difference).
+- **Reads** (`get`, `list`, the watch read, `status`) are one statement each: the meta row, and
+  the data `LEFT JOIN`ed to it, so the revision and the rows share a snapshot without a
+  `REPEATABLE READ` transaction. A page also ends at `store_page_bytes_max`: the statement sends
+  a NULL value for rows past it, so libpq never holds more than a page of values.
+- **Watch.** Each watch has a connection of its own and `LISTEN`s on `zcube_<schema>` before its
+  first read. `next` reads, and if nothing is there waits on the socket for a notification, at
+  most `store_watch_notify_fallback_ms` (250 ms: the bound on what a lost notification costs;
+  SQLite's `store_watch_poll_ms` is 10 ms because it has nothing else). Postgres allows
+  `store_postgres_watches_max` (64) watches per store, not 256, because each holds a connection.
+  A notification is only a hint: the read happens after every wake-up whatever woke it.
+- **Contiguity check.** A watch filters by prefix, so the revisions it delivers are not
+  contiguous; the check therefore counts distinct revisions in the log over the range the batch
+  covers, whatever their keys, in a second statement. A mismatch is first compared with the
+  compaction point (a compaction that overtook the watch is `Compacted`, not a hole), then
+  re-read up to `store_watch_hole_retries_max` times, then ZC-B0001. A test makes a hole by
+  moving a revision's rows out of the log.
+- **Leases and time.** `OpenOptions.lease_time` is `.database` (Postgres's `clock_timestamp()`,
+  read inside the statement that stores or compares the deadline; two servers agree) or
+  `.clock` (an injected `Clock`, which the conformance suite uses so lease expiry needs no
+  sleeping). The contract's "the time is the backend's" holds in production; the seam is
+  explicit in the options and a deadline written under one means nothing under the other.
+  `lease_grant` takes an advisory lock so the lease-count limit cannot be overfilled by
+  concurrent grants.
+- **Schema identity** is a row, not a pragma: `store_meta` carries `application` and
+  `schema_version`. Opening takes an advisory lock, so servers starting together initialise an
+  empty schema once. A schema that holds other relations, or whose `store_meta` names another
+  application, is ZC-E0209; a higher `schema_version` is ZC-E0210; nothing is created without
+  `create`. The schema (`zcube` by default) is a setting, so several stores can share a database.
+- **OrioleDB.** On creation the catalogue is asked whether `orioledb` is installed or
+  available; `store_live` is `USING orioledb` if it is installed, or if `CREATE EXTENSION`
+  (in a savepoint, so a refusal costs nothing) succeeds. The decision (`plan_access`) and the
+  DDL (`schema_sql`) are tested; the extension itself has not been run, and the upsert
+  (`INSERT ... ON CONFLICT`) that `store_live` relies on is untested on OrioleDB tables.
+- **Connections.** At most `store_postgres_connections_max` (8) per store, one per operation in
+  flight, opened lazily. Each connection sets `search_path`, `lock_timeout`,
+  `statement_timeout` and `idle_in_transaction_session_timeout` (so a server that dies holding
+  the writer lock frees it in 30 s, not when TCP notices). A dead idle connection is replaced
+  before an operation begins; one lost inside a transaction is ZC-E0213, which says whether the
+  commit's outcome is unknown.
+- **Compaction** batches are ordered oldest first (`ORDER BY revision, idx`). Without the order a
+  batch could prune a tombstone while leaving the older puts of its key, which a historical read
+  would then return as live. The SQLite statement has no `ORDER BY` and relies on the scan order
+  of its primary key.
+- **Failures.** A connection that cannot be made is ZC-E0201 (refused, no route, bad settings),
+  ZC-E0211 (credentials) or ZC-E0212 (no such database). libpq reports no SQLSTATE for these, so
+  `classify_connect` matches Postgres's English text and falls back to ZC-E0201, whose first cause
+  is always the raw message. After connecting, SQLSTATEs decide: lock timeout, deadlock,
+  serialisation failure and statement timeout are ZC-E0208; a missing table or column is
+  ZC-E0209; a lost connection is ZC-E0213; everything else is ZC-E0202.
+- **Not done:** the ring buffer shared by all watches, group commit, and any benchmark
+  (all C1). A result is held whole by libpq, so a watch batch of 256 events can briefly hold
+  256 values; only list pages are bounded in bytes.
+
 ## k3s's kine: what I take and what I leave
 
 kine presents an etcd API on SQL. This section is from my knowledge of its design, not from
