@@ -9,6 +9,7 @@ test {
     _ = @import("diag.zig");
     _ = @import("diagnostic.zig");
     _ = @import("store.zig");
+    _ = @import("store_failures.zig");
     _ = @import("store_memory.zig");
     _ = @import("runtime.zig");
     _ = @import("tidy.zig");

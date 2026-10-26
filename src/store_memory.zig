@@ -19,6 +19,7 @@ const Diag = @import("diag.zig").Diag;
 const Clock = @import("clock.zig").Clock;
 const ManualClock = @import("clock.zig").ManualClock;
 const store = @import("store.zig");
+const failures = @import("store_failures.zig");
 
 const Allocator = std.mem.Allocator;
 const Revision = store.Revision;
@@ -122,24 +123,10 @@ pub const MemoryStore = struct {
 
     /// Fails unless `revision` can be read: not older than the compaction point, not future.
     fn check_readable(self: *const MemoryStore, revision: Revision, diag: *Diag) Error!void {
-        if (revision > self.revision) {
-            diag.raise(.E0204);
-            diag.cause("revision {d} was asked for; the store is at {d}", .{
-                revision, self.revision,
-            });
-            diag.fix(.{ .sentence = "use a revision this store returned" });
-            return error.FutureRevision;
+        if (revision > self.revision) return failures.future_read(diag, revision, self.revision);
+        if (revision < self.compacted_revision) {
+            return failures.compacted(diag, revision, self.compacted_revision);
         }
-        if (revision < self.compacted_revision) return compacted(revision, self, diag);
-    }
-
-    fn compacted(needed: Revision, self: *const MemoryStore, diag: *Diag) error{Compacted} {
-        diag.raise(.E0203);
-        diag.cause("history is needed from revision {d}; the store keeps it from {d}", .{
-            needed, self.compacted_revision,
-        });
-        diag.fix(.{ .sentence = "list the current state and watch again from its revision" });
-        return error.Compacted;
     }
 
     fn get_impl(
@@ -281,12 +268,7 @@ pub const MemoryStore = struct {
                 if (index == null) count += 1;
             }
             if (count > constants.store_lease_keys_max) {
-                diag.raise(.E0207);
-                diag.cause("lease {d} would hold {d} keys; the limit is {d}", .{
-                    put.lease, count, constants.store_lease_keys_max,
-                });
-                diag.fix(.{ .sentence = "attach fewer keys to one lease" });
-                return error.NoCapacity;
+                return failures.lease_keys_full(diag, put.lease, count);
             }
         }
     }
@@ -350,15 +332,10 @@ pub const MemoryStore = struct {
     ) Error!store.Watch {
         const self = from(context);
         if (options.from_revision <= self.compacted_revision) {
-            return compacted(options.from_revision, self, diag);
+            return failures.compacted(diag, options.from_revision, self.compacted_revision);
         }
         if (options.from_revision > self.revision + 1) {
-            diag.raise(.E0204);
-            diag.cause("a watch from revision {d} was asked for; the store is at {d}", .{
-                options.from_revision, self.revision,
-            });
-            diag.fix(.{ .sentence = "watch from a revision this store returned, plus one" });
-            return error.FutureRevision;
+            return failures.future_watch(diag, options.from_revision, self.revision);
         }
         for (&self.watches) |*slot| {
             if (slot.used) continue;
@@ -373,10 +350,7 @@ pub const MemoryStore = struct {
                 .delivered = options.from_revision - 1,
             };
         }
-        diag.raise(.E0207);
-        diag.cause("all {d} watch slots are in use", .{constants.store_watches_max});
-        diag.fix(.{ .sentence = "close watches that are no longer needed" });
-        return error.NoCapacity;
+        return failures.watch_slots_full(diag);
     }
 
     fn watch_next_impl(
@@ -390,7 +364,7 @@ pub const MemoryStore = struct {
         const self = slot.owner;
         assert(slot.used);
         if (slot.next_revision <= self.compacted_revision) {
-            return compacted(slot.next_revision, self, diag);
+            return failures.compacted(diag, slot.next_revision, self.compacted_revision);
         }
         const prefix = slot.prefix[0..slot.prefix_len];
         var events: std.ArrayList(store.Event) = .empty;
@@ -446,10 +420,7 @@ pub const MemoryStore = struct {
     fn lease_grant_impl(context: *anyopaque, ttl_ms: u32, diag: *Diag) Error!store.Lease {
         const self = from(context);
         if (self.leases.items.len >= constants.store_leases_max) {
-            diag.raise(.E0207);
-            diag.cause("all {d} lease slots are in use", .{constants.store_leases_max});
-            diag.fix(.{ .sentence = "revoke leases that are no longer needed" });
-            return error.NoCapacity;
+            return failures.lease_slots_full(diag);
         }
         const lease: LeaseState = .{
             .id = self.lease_next,
@@ -536,12 +507,7 @@ pub const MemoryStore = struct {
     fn compact_impl(context: *anyopaque, revision: Revision, diag: *Diag) Error!void {
         const self = from(context);
         if (revision > self.revision) {
-            diag.raise(.E0204);
-            diag.cause("compaction to revision {d} was asked for; the store is at {d}", .{
-                revision, self.revision,
-            });
-            diag.fix(.{ .sentence = "compact to a revision this store returned" });
-            return error.FutureRevision;
+            return failures.future_compact(diag, revision, self.revision);
         }
         if (revision <= self.compacted_revision) return;
         // Keep an event if it is newer than the point, or it is the latest put of its key at or
@@ -617,17 +583,11 @@ fn copy_kv(arena: Allocator, entry: Entry, diag: *Diag) Error!store.KeyValue {
 }
 
 fn no_memory(diag: *Diag) error{NoCapacity} {
-    diag.raise(.E0207);
-    diag.cause("the memory set aside for this request ran out", .{});
-    diag.fix(.{ .sentence = "ask for smaller pages, or raise the request arena limit" });
-    return error.NoCapacity;
+    return failures.no_memory(diag);
 }
 
 fn lease_not_found(id: LeaseId, diag: *Diag) error{LeaseNotFound} {
-    diag.raise(.E0205);
-    diag.cause("lease {d} is unknown, expired or revoked", .{id});
-    diag.fix(.{ .sentence = "grant a new lease and register again" });
-    return error.LeaseNotFound;
+    return failures.lease_not_found(diag, id);
 }
 
 // ---- Tests: these pin the semantics every backend must share ----------------------------------
