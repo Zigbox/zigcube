@@ -191,6 +191,12 @@ pub fn SqlBuffer(comptime capacity: u32) type {
             buffer.bytes[buffer.len] = 0;
             return buffer.bytes[0..buffer.len :0];
         }
+
+        /// For a buffer already finished with `terminated`.
+        pub fn terminated_const(buffer: *const Self) [:0]const u8 {
+            assert(buffer.bytes[buffer.len] == 0);
+            return buffer.bytes[0..buffer.len :0];
+        }
     };
 }
 
@@ -219,7 +225,7 @@ pub fn connect(diag: *Diag, conninfo: [:0]const u8, setup_sql: [:0]const u8) Err
         return failure;
     }
     _ = c.PQsetNoticeReceiver(raw, ignore_notice, null); // The previous receiver: none to restore.
-    var result = exec(diag, raw, setup_sql, null, .{}) catch |err| {
+    var result = exec_simple(diag, raw, setup_sql, .{}) catch |err| {
         c.PQfinish(raw);
         return err;
     };
@@ -269,29 +275,38 @@ pub const Context = struct {
     lock_timeout_ms: u32 = constants.store_postgres_lock_timeout_ms,
 };
 
-/// Runs one statement. With `params` it uses the extended protocol and the binary result format;
-/// without, the simple protocol (several statements may be given, the setup string does).
+/// Runs one statement on the extended protocol: typed parameters, and every result column in the
+/// binary format. A statement with no parameters passes an empty `Params`.
 pub fn exec(
     diag: *Diag,
     conn: *c.PGconn,
     sql: [:0]const u8,
-    params: ?*const Params,
+    params: *const Params,
     context: Context,
 ) Error!Result {
     assert(diag.code == null);
-    const raw = if (params) |p|
-        c.PQexecParams(
-            conn,
-            sql.ptr,
-            @intCast(p.count),
-            &p.types,
-            &p.values,
-            &p.lengths,
-            &p.formats,
-            1,
-        )
-    else
-        c.PQexec(conn, sql.ptr);
+    const raw = c.PQexecParams(
+        conn,
+        sql.ptr,
+        @intCast(params.count),
+        &params.types,
+        &params.values,
+        &params.lengths,
+        &params.formats,
+        1,
+    );
+    return finish(diag, conn, raw, context);
+}
+
+/// Runs text on the simple protocol, which allows several statements (the schema, the session
+/// settings) and BEGIN/COMMIT. Results come back as text, so it is for statements that return
+/// nothing the caller reads.
+pub fn exec_simple(diag: *Diag, conn: *c.PGconn, sql: [:0]const u8, context: Context) Error!Result {
+    assert(diag.code == null);
+    return finish(diag, conn, c.PQexec(conn, sql.ptr), context);
+}
+
+fn finish(diag: *Diag, conn: *c.PGconn, raw: ?*c.PGresult, context: Context) Error!Result {
     const status = if (raw) |present| c.PQresultStatus(present) else c.PGRES_FATAL_ERROR;
     switch (status) {
         c.PGRES_TUPLES_OK, c.PGRES_COMMAND_OK => return .{ .raw = raw.? },
@@ -301,6 +316,14 @@ pub fn exec(
             return failure;
         },
     }
+}
+
+/// Ends the open transaction, if any, discarding it. False if the connection could not be
+/// brought back to idle, in which case it must be closed.
+pub fn rollback(conn: *c.PGconn) bool {
+    if (c.PQtransactionStatus(conn) == c.PQTRANS_IDLE) return true;
+    if (c.PQexec(conn, "ROLLBACK")) |result| c.PQclear(result);
+    return c.PQtransactionStatus(conn) == c.PQTRANS_IDLE;
 }
 
 // ---- Failures ----------------------------------------------------------------------------------

@@ -66,26 +66,63 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
-    add_store_step(b, .{ .target = target, .optimize = optimize, .sqlite = sqlite });
+    add_store_step(b, .{
+        .target = target,
+        .optimize = optimize,
+        .sqlite = sqlite,
+        .libpq = libpq_module,
+    });
     add_tidy_step(b);
+    add_pg_dev_steps(b);
+}
+
+/// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it.
+fn add_pg_dev_steps(b: *std.Build) void {
+    const tool = b.addExecutable(.{
+        .name = "pg_dev",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pg_dev.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const commands = [_][]const u8{ "up", "down" };
+    const descriptions = [_][]const u8{
+        "Start a throwaway Postgres for test-store (prints its ZCUBE_TEST_POSTGRES)",
+        "Stop the throwaway Postgres and delete its files",
+    };
+    for (commands, descriptions) |command, description| {
+        const run = b.addRunArtifact(tool);
+        run.addArg(command);
+        run.has_side_effects = true;
+        const step_name = b.fmt("pg-{s}", .{command});
+        b.step(step_name, description).dependOn(&run.step);
+    }
 }
 
 const StoreStepOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sqlite: *std.Build.Module,
+    libpq: *std.Build.Module,
 };
 
-/// `zig build test-store -Dbackend=memory|sqlite [-Dseed=N]`: the conformance suite, one test
-/// binary written against the `Store` interface, run against the chosen backend.
+/// The database `-Dbackend=postgres` runs against: `-Dpostgres=<libpq settings>`, else the
+/// `ZCUBE_TEST_POSTGRES` environment variable, else the server `zig build pg-up` starts.
+fn postgres_conninfo(b: *std.Build) []const u8 {
+    const option = b.option([]const u8, "postgres", "libpq settings of the test database");
+    if (option) |settings| return settings;
+    if (b.graph.environ_map.get("ZCUBE_TEST_POSTGRES")) |settings| return settings;
+    return "host=127.0.0.1 port=55432 user=zcube dbname=postgres";
+}
+
+/// `zig build test-store -Dbackend=memory|sqlite|postgres [-Dseed=N]`: the conformance suite, one
+/// test binary written against the `Store` interface, run against the chosen backend. For
+/// Postgres it also runs the backend's own tests, which need the same database.
 fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
     const seed = b.option(u64, "seed", "Seed for the randomised store tests (default: random)");
     const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
-    if (backend == .postgres) {
-        step.dependOn(&b.addFail("the postgres store backend arrives in C0 slice 3").step);
-        return;
-    }
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
     options.addOption(?u64, "seed", seed);
@@ -97,6 +134,7 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
             .imports = &.{
                 .{ .name = "conformance_options", .module = options.createModule() },
                 .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
             },
         }),
     });
@@ -104,6 +142,23 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     // A passing run is not cached: the build runner draws a new seed per invocation (it is not
     // part of the cache key), so every run counts.
     run.has_side_effects = true;
+    if (backend == .postgres) {
+        const conninfo = postgres_conninfo(b);
+        run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", conninfo);
+        const own = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/store_postgres.zig"),
+                .target = step_options.target,
+                .optimize = step_options.optimize,
+                .imports = &.{.{ .name = "libpq_c", .module = step_options.libpq }},
+            }),
+        });
+        const own_run = b.addRunArtifact(own);
+        own_run.has_side_effects = true;
+        own_run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", conninfo);
+        own_run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
+        step.dependOn(&own_run.step);
+    }
     step.dependOn(&run.step);
 }
 
