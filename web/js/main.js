@@ -54,7 +54,7 @@ async function boot() {
 
   const ctx = { model, client, nav: hash => { location.hash = hash; }, mock };
   const main = $("#main");
-  let current = null, currentKey = null;
+  let current = null, currentKey = null, routed = false;
 
   function route() {
     const raw = location.hash.replace(/^#\/?/, "");
@@ -73,7 +73,8 @@ async function boot() {
       for (const a of $$("nav.side a")) setAttr(a, "aria-current", a.dataset.nav === nav ? "page" : null);
       document.title = `${TITLES[nav]}${m[1] && nav !== "overview" ? ` · ${decodeURIComponent(m[m.length - 1] || m[1])}` : ""} · Zigcube`;
       window.scrollTo(0, 0);
-      $("#page-title")?.focus({ preventScroll: true });
+      if (routed) $("#page-title")?.focus({ preventScroll: true }); // not on first load: the skip link stays the first Tab stop
+      routed = true;
       announce(`${TITLES[nav]}`);
       return;
     }

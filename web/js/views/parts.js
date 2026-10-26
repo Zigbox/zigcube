@@ -37,8 +37,8 @@ export function makeMeter(format, { lease = false } = {}) {
       const pct = cap ? Math.min(100, (used / cap) * 100) : 0;
       fill.style.width = pct + "%";
       setAttr(fill.parentElement, "data-high", (lease ? pct <= 50 : pct >= 85) ? "1" : null);
-      setText(text, cap == null ? "–" : lease ? `${format(used)} left of ${format(cap)}` : `${format(used)} / ${format(cap)}`);
-      setAttr(track, "aria-label", cap == null ? "no capacity declared" : `${Math.round(pct)}% used`);
+      setText(text, cap == null ? "–" : lease ? `${format(used)} left` : `${format(used)} / ${format(cap)}`);
+      setAttr(track, "aria-label", cap == null ? "no capacity declared" : lease ? `${format(used)} left of ${format(cap)}` : `${Math.round(pct)}% used`);
     },
   };
 }
