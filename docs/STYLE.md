@@ -8,6 +8,14 @@ Zigcube is a networked server, CLI and agent rather than a single-shot static bi
 
 - **libc is allowed** in `zcube-server` and `zcube` for the Postgres (libpq) and SQLite client libraries that HANDOFF.md expects. `zcube-agent` links the `zigbox` module, which is libc-free; keep libc out of the agent's runtime path unless a store backend needs it there.
 - **Allocation.** Startup allocation plus bounded per-request or per-reconcile arenas, freed whole when the request or pass ends. Every arena has a named size limit in `src/constants.zig`, and exceeding it is an operating error with a coded diagnostic. No unbounded growth: caches, watch buffers and queues all have named limits.
+- **Core and shell (C0 slice 4).** The control-plane core (the modules listed in `src/core.zig`:
+  controllers, scheduler, API handlers, `Store`, `Runtime`, `Clock`, the diagnostics) stays
+  `wasm32-freestanding`-clean: no threads, sockets, files, libc, `std.Io` value, real clock,
+  randomness source or blocking call, so that the console can one day run it in a browser. The
+  shell supplies those and may import the core; the core never imports the shell. CI enforces it
+  with `zig build wasm-check` and `zig build wasm-test` (`docs/wasm.md` has the rule and what the
+  check cannot see). Reason: a pure core is also what makes the deterministic simulation below
+  possible.
 - **Dependencies.** Beyond the Zig toolchain: libpq, SQLite and the `zigbox` package (for the runtime and the shared diagnostics). Any other dependency needs a written reason in its commit message and the owner's approval first.
 - **Simulation.** The seam for deterministic simulation is the `Store` and `Runtime` interfaces plus a clock and network seam, not Zigbox's `host.zig`. Controllers and the scheduler must not know which implementation they are using. The store conformance suite plays the part of Zigbox's store simulator.
 - **Threads (provisional, set in C0 slice 2; the owner has not set a rule yet).** `std.Thread` is

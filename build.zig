@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
     });
     add_tidy_step(b);
     add_pg_dev_steps(b);
+    add_wasm_steps(b, optimize);
 }
 
 const ExecutablesOptions = struct {
@@ -195,4 +196,62 @@ fn add_tidy_step(b: *std.Build) void {
     const step = b.step("tidy", "Check formatting, line and function length, banned patterns");
     step.dependOn(&format.step);
     step.dependOn(&run.step);
+}
+
+/// `zig build wasm` compiles the control-plane core for `wasm32-freestanding`: no libc, no OS, no
+/// threads, no `std.Io`. It is the check that the core stays free of the shell (docs/wasm.md).
+/// `zig build wasm-check` also runs the result in Node, as CI does.
+fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    // The same package, built for the wasm target: only its pure modules are reachable from the
+    // library, so nothing of its host code is compiled.
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+    const library = b.addExecutable(.{
+        .name = "zcube_core",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_core.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+        }),
+    });
+    // A library for a host to instantiate: no `_start`, and the exports stay whatever is `export`.
+    library.entry = .disabled;
+    library.rdynamic = true;
+    const install = b.addInstallArtifact(library, .{
+        .dest_dir = .{ .override = .{ .custom = "wasm" } },
+    });
+    const step = b.step("wasm", "Compile the control-plane core for wasm32-freestanding");
+    step.dependOn(&install.step);
+
+    // Node is the one runtime CI has for WebAssembly; the runner is a few lines of JavaScript
+    // (tools/wasm_check.mjs), whose reason is written at its top and in docs/wasm.md.
+    const node = b.addSystemCommand(&.{"node"});
+    node.addFileArg(b.path("tools/wasm_check.mjs"));
+    node.addFileArg(library.getEmittedBin());
+    const check = b.step("wasm-check", "Run the wasm core in Node and check its result");
+    check.dependOn(&node.step);
+    add_wasm_test_step(b, optimize);
+}
+
+/// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit
+/// address space and a single thread, with the testing allocator still checking for leaks. It is
+/// WASI and not freestanding because `std.testing` needs `std.Io`, which freestanding lacks.
+fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/core.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+        }),
+    });
+    const node = b.addSystemCommand(&.{ "node", "--no-warnings" });
+    node.addFileArg(b.path("tools/wasm_check.mjs"));
+    node.addArg("--wasi");
+    node.addFileArg(tests.getEmittedBin());
+    const step = b.step("wasm-test", "Run the core modules' unit tests under WASI in Node");
+    step.dependOn(&node.step);
 }

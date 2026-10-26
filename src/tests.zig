@@ -14,5 +14,6 @@ test {
     _ = @import("pq.zig");
     _ = @import("store_postgres.zig");
     _ = @import("runtime.zig");
+    _ = @import("core.zig");
     _ = @import("tidy.zig");
 }
