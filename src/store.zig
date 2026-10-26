@@ -23,7 +23,9 @@
 //!     error.LeaseNotFound   ZC-E0205   unknown, expired or revoked lease
 //!     error.TooLarge        ZC-E0206   key, value, transaction or ttl over its bound
 //!     error.NoCapacity      ZC-E0207   watch slots, lease slots or arena exhausted
-//!     error.BackendFailed   ZC-E0201 (unreachable) or ZC-E0202 (the backend refused or failed)
+//!     error.BackendFailed   ZC-E0201 (unreachable) or ZC-E0202 (the backend refused or failed);
+//!                           a SQLite file adds ZC-E0208 (busy), ZC-E0209 (damaged or not a
+//!                           store) and ZC-E0210 (schema from a newer zcube)
 //!
 //! ## Memory
 //!

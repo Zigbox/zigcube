@@ -28,13 +28,24 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
     }
 
+    // SQLite's C header, translated (`@cImport` is gone). Backends import it as `sqlite_c`.
+    const sqlite = b.addTranslateC(.{
+        .root_source_file = b.path("src/sqlite_c.h"),
+        .target = target,
+        .optimize = optimize,
+    }).createModule();
+    sqlite.linkSystemLibrary("sqlite3", .{});
+
     const test_step = b.step("test", "Run unit and snapshot tests");
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "build_options", .module = options.createModule() }},
+            .imports = &.{
+                .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "sqlite_c", .module = sqlite },
+            },
         }),
     });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);

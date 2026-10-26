@@ -40,9 +40,15 @@ const shell_allowlist = [_][]const u8{
     ".claude/hooks/session-start.sh",
 };
 
-/// `sqlite_c` is the translated SQLite header (`b.addTranslateC` in build.zig). Add the Postgres
-/// one when that backend lands.
-const module_allowlist = [_][]const u8{ "std", "builtin", "build_options", "sqlite_c" };
+/// `sqlite_c` is the translated SQLite header (`b.addTranslateC` in build.zig); add the Postgres
+/// one when that backend lands. `conformance_options` carries the store suite's build options.
+const module_allowlist = [_][]const u8{
+    "std",
+    "builtin",
+    "build_options",
+    "sqlite_c",
+    "conformance_options",
+};
 
 const skipped_directories = [_][]const u8{ ".git", ".zig-cache", "zig-out", "zig-pkg" };
 
