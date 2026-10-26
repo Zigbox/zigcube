@@ -53,6 +53,13 @@ pub const store_leases_max: u32 = 4096;
 pub const store_lease_keys_max: u32 = 64;
 pub const lease_ttl_ms_min: u32 = 100;
 pub const lease_ttl_ms_max: u32 = 60 * 60 * 1000;
+/// How long a SQLite connection waits for another one's write lock before the operation fails
+/// with ZC-E0208. A write holds the lock for milliseconds, so this is a stuck-peer limit.
+pub const store_sqlite_busy_ms: u32 = 5000;
+/// How often a SQLite watch re-reads the log while it waits for events (it has no NOTIFY).
+pub const store_watch_poll_ms: u32 = 10;
+/// Rows one compaction step deletes before it lets other writers in.
+pub const store_compact_batch_rows: u32 = 1000;
 /// The arena a server request or a reconcile pass gets; exceeding it is an operating error.
 pub const request_arena_bytes_max: u32 = 16 * 1024 * 1024;
 
@@ -84,4 +91,8 @@ comptime {
     assert(store_txn_ops_max <= store_watch_batch_max);
     assert(lease_ttl_ms_min < lease_ttl_ms_max);
     assert(runtime_events_batch_max <= runtime_handles_max);
+    assert(store_watch_poll_ms > 0);
+    assert(store_watch_poll_ms < lease_ttl_ms_min);
+    assert(store_sqlite_busy_ms > store_watch_poll_ms);
+    assert(store_compact_batch_rows > 0);
 }

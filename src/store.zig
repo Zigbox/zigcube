@@ -23,7 +23,9 @@
 //!     error.LeaseNotFound   ZC-E0205   unknown, expired or revoked lease
 //!     error.TooLarge        ZC-E0206   key, value, transaction or ttl over its bound
 //!     error.NoCapacity      ZC-E0207   watch slots, lease slots or arena exhausted
-//!     error.BackendFailed   ZC-E0201 (unreachable) or ZC-E0202 (the backend refused or failed)
+//!     error.BackendFailed   ZC-E0201 (unreachable) or ZC-E0202 (the backend refused or failed);
+//!                           a SQLite file adds ZC-E0208 (busy), ZC-E0209 (damaged or not a
+//!                           store) and ZC-E0210 (schema from a newer zcube)
 //!
 //! ## Memory
 //!
@@ -336,7 +338,9 @@ pub const Store = struct {
         assert(!has_duplicate_keys(request.on_success));
         assert(!has_duplicate_keys(request.on_failure));
         const result = try finish(diag, store.vtable.txn(store.context, request, diag));
-        assert(result.revision > 0 or request.on_success.len + request.on_failure.len == 0);
+        // No assertion on `result.revision`: a transaction that changes nothing returns the
+        // current revision, which is 0 for an empty store, whatever operations it held.
+        if (!result.succeeded) assert(request.compares.len > 0); // Only a compare can fail.
         return result;
     }
 

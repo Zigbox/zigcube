@@ -97,8 +97,9 @@ pub const ExitReason = union(enum) {
     pid_limit,
     /// It never started; the diagnostic says why, and may carry a `ZBX-` code.
     start_failed: Diagnostic,
-    /// The process vanished without a known reason.
-    lost,
+    /// The process vanished. The diagnostic, when the runtime has one, says why (Zigbox keeps the
+    /// explanation it computed in its handle); null means it truly does not know.
+    lost: ?Diagnostic,
 };
 
 pub const Status = union(enum) {

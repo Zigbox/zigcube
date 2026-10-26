@@ -26,8 +26,9 @@ Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding han
 These arrive with the scaffold; keep this list current as they land.
 
 - `zig build` builds `zig-out/bin/zcube`, `zcube-server` and `zcube-agent`.
-- `zig build test` runs unit and snapshot tests.
-- `zig build test-store -Dbackend=postgres|sqlite` runs the store conformance suite.
+- `zig build test` runs unit and snapshot tests (tidy's own tests included).
+- `zig build tidy` checks formatting and the mechanical style rules: 100 columns, 70-line functions, banned patterns, `catch unreachable` comments, no `and`/`or` inside `assert(...)`. Run it before every commit; CI does.
+- `zig build test-store -Dbackend=memory|sqlite [-Dseed=N]` runs the store conformance suite (`postgres` joins in C0 slice 3). It always re-runs with a fresh seed (Zig's per-run test seed), prints nothing when it passes, and a failing test prints `seed=N`; replay with `-Dseed=N`. SQLite needs `libsqlite3-dev`.
 - `zig build demo-cN` runs milestone N's demo.
 
 ## Working as the implementer

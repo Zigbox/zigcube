@@ -1,6 +1,9 @@
 # Diagnostics plan: how Zigcube gets the shared `Diag`
 
-Status: **proposal, waiting for the owner.** Until it is decided, the contracts are written
+Status: **option D accepted by the owner (2026-10-26).** Zigbox must change so a second
+registry (`ZC-` codes) plugs into its diagnostics and renderer; the precise change to ask for is
+in `docs/diagnostics-zigbox-proposal.md`. The `zigbox` dependency is not added until that lands
+and something uses it. Until then, the contracts are written
 against the local shim `src/diag.zig`, and only a `ZC-` registry stub exists
 (`src/diag/codes.zig`). Nothing here edits `DIAGNOSTICS.md`.
 

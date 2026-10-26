@@ -31,6 +31,9 @@ pub const Code = enum(u8) {
     E0205,
     E0206,
     E0207,
+    E0208,
+    E0209,
+    E0210,
     E0501,
     E0502,
     B0001,
@@ -148,6 +151,50 @@ pub const registry = [_]Entry{
         \\
         \\Close watches that are no longer needed, or ask for smaller pages. If the
         \\limit is too low for the fleet, raise it in the server's configuration.
+        ,
+    },
+    .{
+        .code = .E0208,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the store database is busy",
+        .explanation =
+        \\Another process or connection holds the store database's write lock and
+        \\did not let go within the time zcube waits. The operation did not take
+        \\effect.
+        \\
+        \\Only the zcube server should open a store file while it runs. Look for a
+        \\second server, a backup job or a manual sqlite3 session using the same
+        \\file, stop it, and retry.
+        ,
+    },
+    .{
+        .code = .E0209,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the store database is damaged or not a store",
+        .explanation =
+        \\The file zcube opened as its store is not a usable zcube store: it is
+        \\corrupt, truncated, or a different kind of file (or an empty file that
+        \\was not meant to be initialised).
+        \\
+        \\Restore the file from a backup, or point the server at a different path.
+        \\To start with an empty store, move the file aside and let the server
+        \\create a new one. Nothing was changed in the file.
+        ,
+    },
+    .{
+        .code = .E0210,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store database is from a newer zcube",
+        .explanation =
+        \\The store file was written by a newer version of zcube, whose schema this
+        \\version does not understand. It refuses to touch the file rather than
+        \\risk damaging it.
+        \\
+        \\Run the zcube version that created the file, or upgrade this one. The
+        \\cause line names both schema versions. Nothing was changed in the file.
         ,
     },
     .{

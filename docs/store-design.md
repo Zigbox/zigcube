@@ -162,6 +162,37 @@ ranges inside `store_live`, not tables, so my reading is to apply it to the one 
 holds them. If you want them physically separate, that is a key-routing layer and a layout
 decision for you (see `docs/contracts-review.md`).
 
+## SQLite as built (C0 slice 2)
+
+`src/store_sqlite.zig` follows the design above, with these differences of detail:
+
+- **Revision.** Inside `BEGIN IMMEDIATE` the revision is read, the ops are applied under
+  `revision + 1`, and `store_meta` is updated once, just before `COMMIT`. A transaction that wrote
+  nothing is rolled back instead, so it never takes a revision. This replaces the
+  `UPDATE ... RETURNING` of the Postgres sketch; the effect is the same.
+- **Reads.** `get`, `list` and the watch poll run in one deferred read transaction and read
+  `store_meta` first, so the revision they report and the rows they return share a snapshot. A
+  historical read therefore needs no re-check of the compaction point afterwards: compaction
+  lowers the floor in one write and prunes in later ones, and a snapshot sees either none of it or
+  the floor with the old rows still present.
+- **Watch.** `next` polls every `constants.store_watch_poll_ms` until events appear or its timeout
+  passes, and sleeps outside the connection mutex. It reads at most one batch plus one row; if the
+  extra row belongs to a revision whose events were cut, that revision is dropped from the batch
+  and the bookmark is the revision before it.
+- **Leases.** The deadline is stored in `store_lease` on the injected `Clock`. It outlives the
+  process, so the production clock for SQLite must be wall time in milliseconds; a monotonic clock
+  that restarts at boot would make every lease look expired or immortal after a restart.
+- **Compaction.** The first write sets `compacted_revision`; the rest deletes
+  `constants.store_compact_batch_rows` rows per write transaction until none are left.
+- **Failures.** `SQLITE_BUSY` after `store_sqlite_busy_ms` is ZC-E0208; `CORRUPT` or `NOTADB`, an
+  empty file opened without `create`, and a file of another application are ZC-E0209; a newer
+  `PRAGMA user_version` is ZC-E0210; `CANTOPEN` is ZC-E0201; anything else (I/O, full disk,
+  read-only) is ZC-E0202. The raw message and code are the first cause; the last cause is for the
+  operator.
+- **Not done:** `NOTIFY`-style wake-ups (SQLite has none; the server will signal an in-process
+  counter after `COMMIT` when it exists), a ring buffer shared by all watches, and any
+  benchmark. All three are for C1.
+
 ## k3s's kine: what I take and what I leave
 
 kine presents an etcd API on SQL. This section is from my knowledge of its design, not from
