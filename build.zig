@@ -38,6 +38,19 @@ pub fn build(b: *std.Build) void {
     }).createModule();
     sqlite.linkSystemLibrary("sqlite3", .{});
 
+    // libpq's C header, translated the same way. The header lives under /usr/include/postgresql on
+    // Debian and Ubuntu (libpq-dev); `-Dpq-include=` names another directory.
+    const pq_include = b.option([]const u8, "pq-include", "Directory of libpq-fe.h") orelse
+        "/usr/include/postgresql";
+    const libpq = b.addTranslateC(.{
+        .root_source_file = b.path("src/libpq_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    libpq.addIncludePath(.{ .cwd_relative = pq_include });
+    const libpq_module = libpq.createModule();
+    libpq_module.linkSystemLibrary("pq", .{});
+
     const test_step = b.step("test", "Run unit and snapshot tests");
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -47,6 +60,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "build_options", .module = options.createModule() },
                 .{ .name = "sqlite_c", .module = sqlite },
+                .{ .name = "libpq_c", .module = libpq_module },
             },
         }),
     });

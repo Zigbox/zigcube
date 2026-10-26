@@ -34,6 +34,9 @@ pub const Code = enum(u8) {
     E0208,
     E0209,
     E0210,
+    E0211,
+    E0212,
+    E0213,
     E0501,
     E0502,
     B0001,
@@ -159,13 +162,16 @@ pub const registry = [_]Entry{
         .blame = .environment,
         .summary = "the store database is busy",
         .explanation =
-        \\Another process or connection holds the store database's write lock and
-        \\did not let go within the time zcube waits. The operation did not take
-        \\effect.
+        \\Another process or connection held a lock the store needed and did not
+        \\let go within the time zcube waits, or Postgres ended the operation
+        \\because it conflicted with another (a deadlock or a serialisation
+        \\failure). The operation did not take effect.
         \\
-        \\Only the zcube server should open a store file while it runs. Look for a
-        \\second server, a backup job or a manual sqlite3 session using the same
-        \\file, stop it, and retry.
+        \\Only the zcube server should use a store while it runs. Look for a
+        \\second server, a backup job or a manual sqlite3 or psql session that
+        \\holds a transaction open on the same store, stop it, and retry. On
+        \\Postgres, a long-running transaction in pg_stat_activity is the usual
+        \\cause.
         ,
     },
     .{
@@ -174,13 +180,15 @@ pub const registry = [_]Entry{
         .blame = .external,
         .summary = "the store database is damaged or not a store",
         .explanation =
-        \\The file zcube opened as its store is not a usable zcube store: it is
-        \\corrupt, truncated, or a different kind of file (or an empty file that
-        \\was not meant to be initialised).
+        \\What zcube opened as its store is not a usable zcube store: a SQLite file
+        \\that is corrupt, truncated or of another kind (or empty and not meant to
+        \\be initialised), or a Postgres schema that holds other tables, lacks
+        \\zcube's own, or has lost one of them.
         \\
-        \\Restore the file from a backup, or point the server at a different path.
-        \\To start with an empty store, move the file aside and let the server
-        \\create a new one. Nothing was changed in the file.
+        \\Restore from a backup, or point the server at a different file or
+        \\schema. To start with an empty store, move the SQLite file aside, or
+        \\name a schema that does not exist yet, and let the server create it.
+        \\Nothing was changed.
         ,
     },
     .{
@@ -189,12 +197,60 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "the store database is from a newer zcube",
         .explanation =
-        \\The store file was written by a newer version of zcube, whose schema this
-        \\version does not understand. It refuses to touch the file rather than
+        \\The store was written by a newer version of zcube, whose schema this
+        \\version does not understand. It refuses to touch the store rather than
         \\risk damaging it.
         \\
         \\Run the zcube version that created the file, or upgrade this one. The
-        \\cause line names both schema versions. Nothing was changed in the file.
+        \\cause line names both schema versions. Nothing was changed.
+        ,
+    },
+    .{
+        .code = .E0211,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store backend refused the credentials",
+        .explanation =
+        \\Postgres was reachable but would not let zcube in: the password or the
+        \\role in the connection settings is wrong, or the server's pg_hba.conf
+        \\has no rule that admits this role from this host. Nothing can be read
+        \\or written until it does.
+        \\
+        \\Check the user and password in the server's store settings against
+        \\what Postgres has (psql with the same settings shows the same error),
+        \\or ask the database administrator for a pg_hba.conf rule. The first
+        \\cause line carries Postgres's own message.
+        ,
+    },
+    .{
+        .code = .E0212,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store database does not exist",
+        .explanation =
+        \\Postgres is up and accepted the connection, but the database named in
+        \\the store settings does not exist on that server (or this role may not
+        \\connect to it). zcube creates its tables, never the database itself.
+        \\
+        \\Create the database, or correct its name in the settings. The cause
+        \\line names it. Nothing was changed.
+        ,
+    },
+    .{
+        .code = .E0213,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the store connection dropped during an operation",
+        .explanation =
+        \\The connection to Postgres ended while an operation was in progress: the
+        \\server restarted or was stopped, a backend was terminated, or the
+        \\network between them failed. zcube reconnects before the next
+        \\operation, but cannot retry this one.
+        \\
+        \\If the cause line says nothing was changed, the operation was rolled
+        \\back. If it says the outcome is unknown, the connection dropped while
+        \\the commit was in flight and the write may or may not have been
+        \\applied: read the keys again before repeating it.
         ,
     },
     .{
