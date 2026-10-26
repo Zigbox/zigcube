@@ -147,6 +147,17 @@ pub fn check_path(report: *Report, path: []const u8) void {
     }
 }
 
+/// Names the standard library looks up by name, so they cannot be snake_case: `std.json` calls
+/// `jsonStringify` and `jsonParse` on a type that declares them.
+const std_protocol_names = [_][]const u8{ "jsonStringify", "jsonParse" };
+
+fn is_std_protocol_name(name: []const u8) bool {
+    for (std_protocol_names) |allowed| {
+        if (std.mem.eql(u8, name, allowed)) return true;
+    }
+    return false;
+}
+
 fn is_snake_case(stem: []const u8) bool {
     assert(std.mem.indexOfScalar(u8, stem, '/') == null); // A stem, never a path.
     if (stem.len == 0) return false;
@@ -280,7 +291,9 @@ const Scanner = struct {
             scanner.paren_depth = 0;
             scanner.pending_bad_name = false;
             scanner.pending_is_test = is_test_header(code);
-            if (function_name(code)) |name| scanner.pending_bad_name = !is_snake_case(name);
+            if (function_name(code)) |name| {
+                scanner.pending_bad_name = !is_snake_case(name) and !is_std_protocol_name(name);
+            }
         }
         if (scanner.depth > 0 and scanner.stack[scanner.depth - 1].kind == .container) {
             if (has_usize_field(code)) scanner.report.add(line, .usize_field);
@@ -851,6 +864,10 @@ test "function names must be snake_case, except type constructors" {
         \\const S = struct {
         \\    fn Method(self: S) void {
         \\        _ = self;
+        \\    }
+        \\    pub fn jsonStringify(self: S, jw: anytype) !void {
+        \\        _ = self;
+        \\        _ = jw;
         \\    }
         \\};
         \\

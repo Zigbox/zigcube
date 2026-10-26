@@ -25,6 +25,10 @@ pub const Blame = zigbox.codes.Blame;
 /// Every code, in registry order: `registry[i].code` is the i-th tag. The tag is the part of the
 /// code after "ZC-": a kind letter (E error, W warning, B bug) and four digits.
 pub const Code = enum(u8) {
+    E0101,
+    E0102,
+    E0103,
+    E0104,
     E0201,
     E0202,
     E0203,
@@ -38,6 +42,8 @@ pub const Code = enum(u8) {
     E0211,
     E0212,
     E0213,
+    E0301,
+    E0302,
     E0501,
     E0502,
     B0001,
@@ -54,6 +60,63 @@ pub const Entry = struct {
 };
 
 pub const registry = [_]Entry{
+    .{
+        .code = .E0101,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no such resource",
+        .explanation =
+        \\The API was asked for a service, replica or node that does not exist, or
+        \\for a path it does not serve. Nothing was changed.
+        \\
+        \\List what exists with zcube get service, or check the name for a typo.
+        \\A deleted service keeps its decision history for a day, so zcube why can
+        \\still explain a recent deletion.
+        ,
+    },
+    .{
+        .code = .E0102,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't reach zcube-server",
+        .explanation =
+        \\A client (the zcube command or the web console) could not complete a
+        \\request to zcube-server: it is down, unreachable from this machine, or a
+        \\proxy dropped the connection. This code is raised by the client, so it
+        \\never appears in the server's logs.
+        \\
+        \\Workloads keep running while the server is away. Check that the server is
+        \\up and that the address in the client's configuration is right.
+        ,
+    },
+    .{
+        .code = .E0103,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "zcube-server sent a reply the client can't read",
+        .explanation =
+        \\The reply was not JSON, or lacked the fields the API promises. This code
+        \\is raised by the client. The server and the client are probably
+        \\different versions.
+        \\
+        \\Use the client that came with the server, or upgrade whichever is older.
+        ,
+    },
+    .{
+        .code = .E0104,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the request can't be understood",
+        .explanation =
+        \\The request used a method the endpoint does not accept, or a query
+        \\parameter that is repeated, unknown, malformed or out of range, or a
+        \\request ID that is not 8 to 64 letters, digits and hyphens. The cause
+        \\line names the part at fault. Nothing was changed.
+        \\
+        \\The read-only API answers GET only. See docs/api.md for the parameters
+        \\of each endpoint.
+        ,
+    },
     .{
         .code = .E0201,
         .severity = .@"error",
@@ -252,6 +315,38 @@ pub const registry = [_]Entry{
         \\back. If it says the outcome is unknown, the connection dropped while
         \\the commit was in flight and the write may or may not have been
         \\applied: read the keys again before repeating it.
+        ,
+    },
+    .{
+        .code = .E0301,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a stored record can't be read",
+        .explanation =
+        \\A controller, the agent or the API read a value from the store that is
+        \\not a record of the kind its key says: not JSON, a field of the wrong
+        \\type, or a name that breaks the naming rules. The API validates what it
+        \\writes, so something else wrote this key, or the store was edited by hand.
+        \\
+        \\The cause line names the key. Fix or delete that key (zcube get shows
+        \\it); the controller skips nothing silently and tries again on its next
+        \\pass.
+        ,
+    },
+    .{
+        .code = .E0302,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "there is more to reconcile than one pass holds",
+        .explanation =
+        \\A controller pass reads every service and replica, and each kind has a
+        \\fixed upper bound so that a pass fits its memory. The store holds more
+        \\than that, so the pass stopped before changing anything it could not
+        \\see whole.
+        \\
+        \\The cause line names the bound. Delete services that are no longer
+        \\needed; if the fleet really is this large, the bound is a constant in
+        \\src/constants.zig and the next release raises it.
         ,
     },
     .{

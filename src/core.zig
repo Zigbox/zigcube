@@ -12,11 +12,16 @@
 const std = @import("std");
 
 pub const modules = .{
+    @import("apply.zig"),
     @import("clock.zig"),
+    @import("controller.zig"),
     @import("constants.zig"),
     @import("core_smoke.zig"),
     @import("diag.zig"),
     @import("diag/codes.zig"),
+    @import("records.zig"),
+    @import("replica_controller.zig"),
+    @import("retention.zig"),
     @import("runtime.zig"),
     @import("store.zig"),
     @import("store_failures.zig"),
@@ -73,4 +78,10 @@ test "the single-threaded store conformance tests are in this root" {
     // (`conformance_options` names the memory backend in this build); importing it brings its
     // tests into this root, so `zig build wasm-test` runs them under WASI.
     _ = @import("store_conformance_single.zig");
+}
+
+test "the controllers' tests are in this root" {
+    // Goal: the controllers' tests run under WASI too. Method: import them (they use only the
+    // memory store, a manual clock and the testing allocator).
+    _ = @import("replica_controller_test.zig");
 }

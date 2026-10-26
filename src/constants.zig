@@ -101,6 +101,59 @@ pub const label_value_bytes_max: u32 = 253;
 /// "b3:" and 64 hex digits; shorter forms are fixture names in the fake runtime.
 pub const image_digest_bytes_max: u32 = 67;
 
+// ---- Controllers, the agent step, the API (core) -------------------------------------------
+
+pub const service_name_bytes_max: u32 = 48;
+pub const node_name_bytes_max: u32 = 63;
+/// Replica ids are `<service>-<n>` with `n` under a billion, so an id is at most 58 bytes and fits
+/// the container-name rule of 63.
+pub const replica_number_max: u32 = 999_999_999;
+pub const services_max: u32 = 256;
+pub const replicas_max: u32 = runtime_handles_max;
+pub const nodes_max: u32 = 64;
+/// Records one reconcile pass reads: a service holds at most this many replicas.
+pub const replicas_per_service_max: u32 = 128;
+/// Writes one controller step makes at most (each is a transaction of at most
+/// `store_txn_ops_max` operations): the step stops, says so, and runs again for the rest.
+pub const controller_txns_per_step_max: u32 = 64;
+/// How many of a service's newest decisions the hold check reads to see whether a failure was
+/// already explained.
+pub const decisions_scan_max: u32 = 16;
+/// The agent's wait between looks at the runtime when nothing wakes it sooner.
+pub const agent_resync_ms: u32 = 1000;
+pub const node_lease_ttl_ms: u32 = 10 * 1000;
+/// A grace period for a stop, then a kill.
+pub const stop_grace_ms: u32 = 5000;
+/// Containers whose stop the agent has asked for and is waiting on.
+pub const agent_stops_max: u32 = runtime_handles_max;
+/// What the scheduler gives a replica whose service sets no limits (api.md item 6).
+pub const request_default_cpu_millis: u32 = 250;
+pub const request_default_memory_bytes: u64 = 128 * 1024 * 1024;
+/// Decision retention (docs/keys.md): the newest 200 per subject, at most 7 days; 24 hours after
+/// the subject is gone.
+pub const decisions_per_subject_max: u32 = 200;
+pub const decision_age_ms_max: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const decision_gone_age_ms_max: u64 = 24 * 60 * 60 * 1000;
+/// How often the controller looks for decisions to drop.
+pub const retention_interval_ms: u32 = 60 * 1000;
+pub const retention_batch_pairs: u32 = store_txn_ops_max / 2;
+pub const retention_batches_max: u32 = 32;
+/// Decisions that may be written by one step, so a decision id's counter cannot wrap inside one.
+pub const decision_counter_modulus: u32 = 10_000;
+/// The widest `at_ms` a decision id holds: 13 digits.
+pub const decision_time_ms_max: u64 = 9_999_999_999_999;
+pub const request_id_bytes_min: u32 = 8;
+pub const request_id_bytes_max: u32 = 64;
+pub const api_request_bytes_max: u32 = 64 * 1024;
+pub const api_query_params_max: u32 = 16;
+pub const api_watch_prefixes_max: u32 = 8;
+pub const api_watch_timeout_ms_max: u32 = 25_000;
+pub const api_list_limit_max: u32 = 500;
+pub const api_response_bytes_max: u32 = 8 * 1024 * 1024;
+/// Steps one `why` chain can have: decisions chain by cause, and each decision is read once.
+pub const why_steps_max: u32 = 64;
+pub const why_text_bytes_max: u32 = 480;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
@@ -128,4 +181,16 @@ comptime {
     assert(store_postgres_statement_timeout_ms <= store_postgres_idle_txn_ms);
     assert(store_watch_hole_retries_max > 0);
     assert(store_postgres_schema_bytes_max + "zcube_".len < 63); // A NOTIFY channel is a name.
+    assert(replicas_per_service_max <= replicas_max);
+    assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
+    assert(retention_batch_pairs * 2 <= store_txn_ops_max);
+    assert(decisions_scan_max <= store_list_limit_max);
+    assert(request_id_bytes_min < request_id_bytes_max);
+    assert(api_list_limit_max <= store_list_limit_max);
+    assert(node_lease_ttl_ms >= lease_ttl_ms_min);
+    assert(node_lease_ttl_ms <= lease_ttl_ms_max);
+    assert(agent_resync_ms < node_lease_ttl_ms);
+    assert(decision_counter_modulus == 10_000); // Four digits in the id.
+    assert(api_response_bytes_max <= request_arena_bytes_max);
+    assert(controller_txns_per_step_max > 0);
 }
