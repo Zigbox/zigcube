@@ -105,6 +105,22 @@ const sql_log_list =
     \\                    WHERE n.key = l.key AND n.revision <= ?5)
     \\ORDER BY l.key LIMIT ?4
 ;
+// The same two reads, newest key first. `?2` is NULL for the first page, else the last key
+// returned, and the page holds the keys below it.
+const sql_live_list_reverse =
+    \\SELECT key, value, create_revision, mod_revision, lease, 0 FROM store_live
+    \\WHERE key >= ?1 AND (?2 IS NULL OR key < ?2) AND (?3 IS NULL OR key < ?3)
+    \\ORDER BY key DESC LIMIT ?4
+;
+const sql_log_list_reverse =
+    \\SELECT l.key, l.value, l.create_revision, l.revision, l.lease, l.deleted
+    \\FROM store_log l
+    \\WHERE l.key >= ?1 AND (?2 IS NULL OR l.key < ?2) AND (?3 IS NULL OR l.key < ?3)
+    \\  AND l.deleted = 0
+    \\  AND l.revision = (SELECT MAX(n.revision) FROM store_log n
+    \\                    WHERE n.key = l.key AND n.revision <= ?5)
+    \\ORDER BY l.key DESC LIMIT ?4
+;
 const sql_watch =
     \\SELECT key, value, create_revision, revision, lease, deleted FROM store_log
     \\WHERE revision >= ?1 AND key >= ?2 AND (?3 IS NULL OR key < ?3)
@@ -130,6 +146,8 @@ const sql_lease_renew = "UPDATE store_lease SET deadline_ms = ?2 WHERE id = ?1";
 const sql_lease_delete = "DELETE FROM store_lease WHERE id = ?1";
 const sql_lease_keys = "SELECT key FROM store_live WHERE lease = ?1 ORDER BY key LIMIT ?2";
 const sql_lease_held = "SELECT COUNT(*) FROM store_live WHERE lease = ?1";
+const sql_lease_all = "SELECT id, ttl_ms, deadline_ms FROM store_lease ORDER BY id LIMIT ?1";
+const sql_lease_all_keys = "SELECT lease, key FROM store_live WHERE lease <> 0 ORDER BY lease, key";
 const sql_lease_due = "SELECT id FROM store_lease WHERE deadline_ms < ?1 ORDER BY id LIMIT 1";
 const sql_compact_batch =
     \\DELETE FROM store_log WHERE (revision, idx) IN (
@@ -219,6 +237,7 @@ pub const SqliteStore = struct {
         .lease_grant = lease_grant_impl,
         .lease_keepalive = lease_keepalive_impl,
         .lease_revoke = lease_revoke_impl,
+        .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
     };
@@ -515,19 +534,31 @@ pub const SqliteStore = struct {
         const meta = try self.read_meta(diag);
         const revision = options.at_revision orelse meta.revision;
         try check_readable(meta, revision, diag);
-        var stmt = if (options.at_revision == null)
-            try self.prepare(sql_live_list, diag)
-        else
-            try self.prepare(sql_log_list, diag);
+        var stmt = try self.prepare_list(options, diag);
         defer stmt.finalize();
         var end_buffer: [constants.store_key_bytes_max]u8 = undefined;
         stmt.bind_bytes(1, options.prefix);
-        stmt.bind_bytes(2, options.continue_after orelse "");
+        if (options.reverse) {
+            stmt.bind_optional(2, options.continue_after);
+        } else {
+            stmt.bind_bytes(2, options.continue_after orelse "");
+        }
         stmt.bind_optional(3, prefix_end(&end_buffer, options.prefix));
         stmt.bind_unsigned(4, @as(u64, options.limit) + 1); // One more tells if a page follows.
         if (options.at_revision != null) stmt.bind_unsigned(5, revision);
         const page = try collect_page(&stmt, arena, options.limit, diag);
         return .{ .kvs = page.kvs, .revision = revision, .continue_after = page.continue_after };
+    }
+
+    /// The list statement for the direction and the source (live state, or the log at a revision).
+    fn prepare_list(self: *SqliteStore, options: store.ListOptions, diag: *Diag) Error!Stmt {
+        const live = options.at_revision == null;
+        if (options.reverse) {
+            if (live) return self.prepare(sql_live_list_reverse, diag);
+            return self.prepare(sql_log_list_reverse, diag);
+        }
+        if (live) return self.prepare(sql_live_list, diag);
+        return self.prepare(sql_log_list, diag);
     }
 
     // ---- Transactions --------------------------------------------------------------------
@@ -945,6 +976,64 @@ pub const SqliteStore = struct {
             keys.lens[keys.count] = @intCast(key.len);
             keys.count += 1;
         }
+    }
+
+    fn lease_list_impl(
+        context: *anyopaque,
+        arena: Allocator,
+        diag: *Diag,
+    ) Error![]const store.LeaseInfo {
+        const self = from(context);
+        self.lock();
+        defer self.unlock();
+        try self.begin_read(diag);
+        defer self.rollback();
+        var leases: std.ArrayList(store.LeaseInfo) = .empty;
+        var stmt = try self.prepare(sql_lease_all, diag);
+        defer stmt.finalize();
+        stmt.bind_unsigned(1, constants.store_leases_max);
+        while (try stmt.step(diag)) {
+            const ttl_ms: u32 = @intCast(stmt.int(1));
+            const remaining = @max(stmt.int(2) - self.now_ms(), 0);
+            leases.append(arena, .{
+                .id = stmt.unsigned(0),
+                .ttl_ms = ttl_ms,
+                .remaining_ms = @intCast(@min(remaining, ttl_ms)),
+                .keys = &.{},
+            }) catch return failures.no_memory(diag);
+        }
+        try self.attach_lease_keys(arena, leases.items, diag);
+        return leases.items;
+    }
+
+    /// Fills in `keys` of each lease (ascending by id) from one scan of the leased keys.
+    fn attach_lease_keys(
+        self: *SqliteStore,
+        arena: Allocator,
+        leases: []store.LeaseInfo,
+        diag: *Diag,
+    ) Error!void {
+        var stmt = try self.prepare(sql_lease_all_keys, diag);
+        defer stmt.finalize();
+        var lists: std.ArrayList([]const u8) = .empty;
+        var current: usize = 0;
+        while (try stmt.step(diag)) {
+            const id = stmt.unsigned(0);
+            while (current < leases.len and leases[current].id < id) : (current += 1) {
+                leases[current].keys = lists.items;
+                lists = .empty;
+            }
+            // A key whose lease row is gone would be damage; the write path never leaves one.
+            if (current == leases.len or leases[current].id != id) {
+                return self.fail_damaged(diag, "has a key on a lease that does not exist");
+            }
+            const key = arena.dupe(u8, stmt.blob(1)) catch return failures.no_memory(diag);
+            lists.append(arena, key) catch return failures.no_memory(diag);
+            if (lists.items.len > constants.store_lease_keys_max) {
+                return self.fail_damaged(diag, "holds more keys on one lease than allowed");
+            }
+        }
+        if (current < leases.len) leases[current].keys = lists.items;
     }
 
     fn expire_leases_impl(context: *anyopaque, diag: *Diag) Error!u32 {
