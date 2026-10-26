@@ -26,6 +26,7 @@ pub const modules = .{
     @import("runtime_codes.zig"),
     @import("retention.zig"),
     @import("runtime.zig"),
+    @import("sim_c0.zig"),
     @import("sim_runtime.zig"),
     @import("sim_world.zig"),
     @import("store.zig"),

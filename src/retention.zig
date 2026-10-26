@@ -24,8 +24,8 @@ const Context = controller.Context;
 const Error = controller.Error;
 const Snapshot = controller.Snapshot;
 
-/// Subjects one pass looks at before it hands control back; the cursor carries on next time.
-const subjects_per_pass_max: u32 = 32;
+/// Pages of the index one pass reads before it hands control back; the cursor carries on.
+const pages_per_pass_max: u32 = 8;
 
 pub const Cursor = struct {
     /// When the next pass is due, on the `Clock`'s scale. 0: now.
@@ -33,10 +33,15 @@ pub const Cursor = struct {
     /// Resume after this key of the index. Meaningful only if `resuming`.
     after: records.Key = .{},
     resuming: bool = false,
+    /// Decisions this cursor has dropped (counted when the delete is attempted), for the
+    /// simulation to tell a link retention removed from one that was never written.
+    dropped: u64 = 0,
 };
 
-/// Looks at up to `subjects_per_pass_max` subjects from the cursor and drops what retention says.
-/// Returns when the next pass is due: now if the index was not finished, else a full interval on.
+/// Reads up to `pages_per_pass_max` pages of the index from the cursor and drops what retention
+/// says, a subject at a time. A page is a run of whole subjects: the last one in a full page may
+/// continue on the next, so it is left for the next page unless it is the only one. Returns when
+/// the next pass is due: now if the index was not finished, else a full interval on.
 pub fn prune(
     ctx: *const Context,
     cursor: *Cursor,
@@ -45,25 +50,27 @@ pub fn prune(
 ) Error!u64 {
     const revision = (try ctx.store.status(ctx.diag)).revision;
     var txns: u32 = 0;
-    for (0..subjects_per_pass_max) |_| {
+    for (0..pages_per_pass_max) |_| {
         if (revision == 0) break;
         const after: ?[]const u8 = if (cursor.resuming) cursor.after.slice() else null;
-        const first = try ctx.store.list(ctx.arena, .{
+        const page = try ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_index,
             .at_revision = revision,
-            .limit = 1,
+            .limit = constants.store_list_limit_max,
             .continue_after = after,
         }, ctx.diag);
-        if (first.kvs.len == 0) break;
-        const subject = parse_subject(first.kvs[0].key) orelse {
-            set_cursor(cursor, first.kvs[0].key);
-            continue;
-        };
-        const end = try prune_subject(ctx, subject, snapshot, now_ms, revision, &txns);
-        set_cursor(cursor, end.slice());
+        const last_page = page.continue_after == null;
+        const used = try prune_page(ctx, page.kvs, last_page, .{
+            .snapshot = snapshot,
+            .now_ms = now_ms,
+            .txns = &txns,
+            .dropped = &cursor.dropped,
+        });
+        if (used.len > 0) set_cursor(cursor, used.slice());
+        if (last_page) break;
         if (txns >= constants.retention_batches_max) return now_ms;
     }
-    const finished = !cursor.resuming or subjects_remaining(ctx, cursor, revision) == false;
+    const finished = !cursor.resuming or index_ended(ctx, cursor, revision);
     if (finished) {
         cursor.resuming = false;
         return now_ms + constants.retention_interval_ms;
@@ -71,7 +78,8 @@ pub fn prune(
     return now_ms;
 }
 
-fn subjects_remaining(ctx: *const Context, cursor: *const Cursor, revision: store.Revision) bool {
+/// Whether nothing follows the cursor in the index.
+fn index_ended(ctx: *const Context, cursor: *const Cursor, revision: store.Revision) bool {
     const page = ctx.store.list(ctx.arena, .{
         .prefix = records.prefix_index,
         .at_revision = revision,
@@ -79,9 +87,9 @@ fn subjects_remaining(ctx: *const Context, cursor: *const Cursor, revision: stor
         .continue_after = cursor.after.slice(),
     }, ctx.diag) catch {
         ctx.diag.reset();
-        return true;
+        return false;
     };
-    return page.kvs.len > 0;
+    return page.kvs.len == 0;
 }
 
 fn set_cursor(cursor: *Cursor, after: []const u8) void {
@@ -116,35 +124,68 @@ fn subject_end(prefix: []const u8) records.Key {
     return key;
 }
 
+const PageWork = struct {
+    snapshot: *const Snapshot,
+    now_ms: u64,
+    txns: *u32,
+    dropped: *u64,
+};
+
+/// Prunes the whole subjects in `kvs`, and returns the key to resume after (length 0 if the page
+/// held no subject). On a page that is not the last, the final subject is left for the next page
+/// unless it is the only one.
+fn prune_page(
+    ctx: *const Context,
+    kvs: []const store.KeyValue,
+    last_page: bool,
+    work: PageWork,
+) Error!records.Key {
+    var resume_after: records.Key = .{};
+    var start: usize = 0;
+    while (start < kvs.len) {
+        const subject = parse_subject(kvs[start].key) orelse {
+            resume_after = key_of(kvs[start].key);
+            start += 1;
+            continue;
+        };
+        var end = start + 1;
+        while (end < kvs.len and std.mem.startsWith(u8, kvs[end].key, subject.prefix)) end += 1;
+        const partial = end == kvs.len and !last_page;
+        if (partial and start > 0) return resume_after;
+        try prune_subject(ctx, subject, kvs[start..end], work);
+        resume_after = subject_end(subject.prefix);
+        start = end;
+    }
+    return resume_after;
+}
+
+fn key_of(text: []const u8) records.Key {
+    var key: records.Key = .{};
+    @memcpy(key.bytes[0..text.len], text);
+    key.len = @intCast(text.len);
+    return key;
+}
+
 fn prune_subject(
     ctx: *const Context,
     subject: Subject,
-    snapshot: *const Snapshot,
-    now_ms: u64,
-    revision: store.Revision,
-    txns: *u32,
-) Error!records.Key {
-    const page = try ctx.store.list(ctx.arena, .{
-        .prefix = subject.prefix,
-        .at_revision = revision,
-        .limit = constants.store_list_limit_max,
-    }, ctx.diag);
+    kvs: []const store.KeyValue,
+    work: PageWork,
+) Error!void {
     var drop: [constants.store_list_limit_max]bool = @splat(false);
-    mark_drops(page.kvs, subject, snapshot, now_ms, drop[0..page.kvs.len]);
+    mark_drops(kvs, subject, work.snapshot, work.now_ms, drop[0..kvs.len]);
     var batch: Batch = .{};
-    for (page.kvs, drop[0..page.kvs.len]) |kv, dropped| {
-        if (!dropped) continue;
-        if (!batch.has_room(2)) {
-            try flush(ctx, &batch, txns);
-        }
+    for (kvs, drop[0..kvs.len]) |kv, marked| {
+        if (!marked) continue;
+        if (!batch.has_room(2)) try flush(ctx, &batch, work.txns);
         const id = kv.key[subject.prefix.len..];
         if (id.len != records.decision_id_bytes) continue;
         const decision = records.decision_key(id);
+        work.dropped.* += 1;
         batch.delete(kv.key);
         batch.delete(try controller.key_copy(ctx, &decision));
     }
-    try flush(ctx, &batch, txns);
-    return subject_end(subject.prefix);
+    try flush(ctx, &batch, work.txns);
 }
 
 fn flush(ctx: *const Context, batch: *Batch, txns: *u32) Error!void {

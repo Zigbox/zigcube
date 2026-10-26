@@ -51,7 +51,11 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
+    const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
+    const seed = b.option(u64, "seed", seed_help);
     add_store_step(b, .{
+        .seed = seed,
         .target = target,
         .optimize = optimize,
         .sqlite = sqlite,
@@ -60,7 +64,14 @@ pub fn build(b: *std.Build) void {
     });
     add_tidy_step(b);
     add_pg_dev_steps(b);
-    add_wasm_steps(b, optimize);
+    const library = add_wasm_steps(b, optimize);
+    add_sim_step(b, .{
+        .seed = seed,
+        .target = target,
+        .optimize = optimize,
+        .zigbox = zigbox_module,
+        .library = library,
+    });
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
@@ -153,6 +164,7 @@ fn add_pg_dev_steps(b: *std.Build) void {
 }
 
 const StoreStepOptions = struct {
+    seed: ?u64,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sqlite: *std.Build.Module,
@@ -175,7 +187,7 @@ fn postgres_conninfo(b: *std.Build) []const u8 {
 /// binary needs the database even for those.
 fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
-    const seed = b.option(u64, "seed", "Seed for the randomised store tests (default: random)");
+    const seed = step_options.seed;
     const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
@@ -227,7 +239,7 @@ fn add_tidy_step(b: *std.Build) void {
 /// `zig build wasm` compiles the control-plane core for `wasm32-freestanding`: no libc, no OS, no
 /// threads, no `std.Io`. It is the check that the core stays free of the shell (docs/wasm.md).
 /// `zig build wasm-check` also runs the result in Node, as CI does.
-fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     // The same package, built for the wasm target: only its pure modules are reachable from the
     // library, so nothing of its host code is compiled.
@@ -258,6 +270,58 @@ fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
     const check = b.step("wasm-check", "Run the wasm core in Node and check its result");
     check.dependOn(&node.step);
     add_wasm_test_step(b, optimize);
+    return library;
+}
+
+const SimStepOptions = struct {
+    seed: ?u64,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zigbox: *std.Build.Module,
+    library: *std.Build.Step.Compile,
+};
+
+/// `zig build sim-c0 [-Dseed=N] [-Dops=N]`: the deterministic simulation of C0 (src/sim_c0.zig),
+/// run natively and as WebAssembly for the same seed, and the two reports compared byte for byte.
+/// It is a simulation, not `demo-c0`. The scenario and the fuzz variant both run; `-Dops` is the
+/// fuzz variant's number of operations. The default seed is 1, so a plain run is reproducible;
+/// CI passes its own and prints it.
+fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
+    const seed = sim.seed;
+    const ops_help = "Operations of the fuzz variant of sim-c0 (default 100)";
+    const operations = b.option(u32, "ops", ops_help) orelse 100;
+    const exe = b.addExecutable(.{
+        .name = "sim_c0",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c0_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    // The executable alone, for running many seeds by hand: `zig build sim-c0-exe`, then
+    // `zig-out/bin/sim_c0 <seed> [fuzz <operations>]` in a loop (build it with ReleaseSafe).
+    const install = b.addInstallArtifact(exe, .{});
+    const exe_help = "Install the native sim-c0 runner into zig-out/bin";
+    b.step("sim-c0-exe", exe_help).dependOn(&install.step);
+    const seed_text = b.fmt("{d}", .{seed orelse 1});
+    const operations_text = b.fmt("{d}", .{operations});
+    const scenario = b.addRunArtifact(exe);
+    scenario.addArg(seed_text);
+    const scenario_report = scenario.captureStdOut(.{});
+    const fuzz = b.addRunArtifact(exe);
+    fuzz.addArgs(&.{ seed_text, "fuzz", operations_text });
+    const fuzz_report = fuzz.captureStdOut(.{});
+    const node = b.addSystemCommand(&.{ "node", "--no-warnings" });
+    node.addFileArg(b.path("tools/wasm_check.mjs"));
+    node.addArg("--sim");
+    node.addFileArg(sim.library.getEmittedBin());
+    node.addArgs(&.{ seed_text, operations_text });
+    node.addFileArg(scenario_report);
+    node.addFileArg(fuzz_report);
+    const help = "Run the C0 simulation natively and as WASM, and compare (-Dseed=N)";
+    const step = b.step("sim-c0", help);
+    step.dependOn(&node.step);
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit

@@ -34,6 +34,8 @@ pub const epoch_ms: u64 = 1761350000000;
 /// How often the world looks at the clock: a step is made when its `Wakeup` is due or a watched
 /// prefix changed, and never more often than this.
 pub const tick_ms: u32 = 100;
+/// How often the world compacts the store, as the server's maintenance will.
+const compact_interval_ms: u64 = 60 * 1000;
 /// Steps of server and agent in turn until neither acts, at most this many in one tick.
 const rounds_max: u32 = 128;
 pub const node_name = "node1";
@@ -225,6 +227,10 @@ pub const World = struct {
     instance_next: u16,
     request_next: u32,
     stats: Stats,
+    /// When the store is compacted next: the server's maintenance, once a minute.
+    compact_due_ms: u64,
+    /// Decisions dropped by the controllers that have since restarted.
+    dropped_before_restart: u64,
     /// The last diagnostic that failed a step, kept for the caller to render.
     last_failure: ?codes.Code,
 
@@ -254,6 +260,8 @@ pub const World = struct {
         world.agent_seen_revision = 0;
         world.request_next = 1;
         world.stats = .{};
+        world.compact_due_ms = epoch_ms + compact_interval_ms;
+        world.dropped_before_restart = 0;
         world.last_failure = null;
         return world;
     }
@@ -401,8 +409,21 @@ pub const World = struct {
             left -= slice;
             world.diag.reset();
             _ = world.store_handle().expire_leases(&world.diag) catch world.diag.reset();
+            world.maintain();
             _ = world.settle();
         }
+    }
+
+    /// Compacts the store to its current revision when the minute is up (a store that is down
+    /// is tried again a tick later). The log would otherwise grow for ever, and the memory
+    /// store replays it on every read.
+    fn maintain(world: *World) void {
+        if (world.manual.ms < world.compact_due_ms) return;
+        const head = world.revision() orelse return;
+        world.compact_due_ms = world.manual.ms + compact_interval_ms;
+        if (head < 2) return;
+        world.diag.reset();
+        world.store_handle().compact(head, &world.diag) catch world.diag.reset();
     }
 
     // ---- What a person or a fault does ----
@@ -439,6 +460,7 @@ pub const World = struct {
 
     /// The server process restarts: a new controller instance with none of the old one's memory.
     pub fn restart_server(world: *World) void {
+        world.dropped_before_restart += world.server.retention.dropped;
         world.server = replica_controller.ReplicaController.init(world.take_instance());
         world.server_due_ms = 0;
     }
@@ -451,6 +473,21 @@ pub const World = struct {
     }
 
     // ---- Reading what the store holds ----
+
+    /// Decisions retention has dropped so far, over every controller instance.
+    pub fn decisions_dropped(world: *const World) u64 {
+        return world.dropped_before_restart + world.server.retention.dropped;
+    }
+
+    /// The store's current revision, or null if it cannot be read (it is down).
+    pub fn revision(world: *World) ?store.Revision {
+        world.diag.reset();
+        const status = world.store_handle().status(&world.diag) catch {
+            world.diag.reset();
+            return null;
+        };
+        return status.revision;
+    }
 
     /// How many replicas of `service` the agent has observed running.
     pub fn running_count(world: *World, service: []const u8) u32 {
