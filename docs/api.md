@@ -182,8 +182,9 @@ looks for it in server logs.
 
 Each item is something the UI showed to be missing or awkward. **All 11 are approved by the
 owner (2026-10-26)**, with the resolutions proposed here and the answers to items 10 and 11
-below. None is built: they touch `Store`, the key layout and the decision schema, so they go
-into a separate C0 slice after the Postgres backend lands.
+below. `Store.list` with `reverse` and `Store.lease_list` (items 1 and 2) are built in all three
+backends (C0 slice 4), and the record shapes of the other items are in `docs/keys.md`; no
+controller or API handler writes them yet.
 
 1. **[Approved]** **Newest-first reads.** "Latest decisions" and every history list want the tail of a key
    range. `Store.list` is ascending only, so the server would read every decision to show eight.
