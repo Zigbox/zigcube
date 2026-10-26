@@ -286,4 +286,14 @@ checkbox that opens the matching screen on each step, and faults: stop Postgres,
 and freeze time. It is the demo tool as well as the test rig. It is only loaded when the mock is
 on.
 
+### A case the real C1 tests must cover
+
+An agent that restarts **before its old lease expires** (power off and back on within the TTL).
+The new registration is a put under a new lease, so it replaces the key's lease association; when
+the old lease later expires it must not delete the new registration. Otherwise the node shows as
+lost for good although its agent is running. The mock found this: the store's `commit` now moves a
+key off its previous lease on a put. Also check that the restarted agent reports the replicas it
+can no longer find as `lost`, and that the controller replaces them. `node3` ends up registered
+and the service back at 6/6 for any restart gap, shorter or longer than the TTL.
+
 To regenerate the mock's explanation texts from the registry: `node web/mock/gen-codes.mjs`.

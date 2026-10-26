@@ -235,6 +235,8 @@ pre.cli { margin: 0; padding: 12px 14px; overflow-x: auto; white-space: pre; min
 .steps code { display: block; color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
 .dev .chk { font-size: .82rem; }
 
+body[data-mock] main { padding-bottom: 7rem; } /* the mock panel sits over the bottom right */
+
 /* ---- Narrow ---- */
 @media (max-width: 960px) { .cols { grid-template-columns: minmax(0, 1fr); } .sticky { position: static; } }
 @media (max-width: 760px) {

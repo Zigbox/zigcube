@@ -22,6 +22,8 @@ export function docsUrl(code) {
   const base = code.startsWith("ZBX-") ? "https://zigbox.github.io/zigbox" : "https://zigbox.github.io/zigcube";
   return `${base}/errors/${shortCode(code)}.html`;
 }
+/** Where to report a bug: the tracker of the product whose registry the code belongs to. */
+export function reportUrl(code) { return code.startsWith("ZBX-") ? "https://github.com/Zigbox/zigbox/issues/new" : "https://github.com/Zigbox/zigcube/issues/new"; }
 export function explainCommand(code) { return `${product(code)} explain ${shortCode(code)}`; }
 
 /** Fills the optional fields so renderers need no guards. */
@@ -41,9 +43,9 @@ export function cliDiagnostic(input, { verbose = false } = {}) {
   const kind = d.severity === "bug" ? "bug" : d.severity;
   const out = [`${kind}[${d.code}]: ${d.summary}`];
   if (d.severity === "bug") {
-    out.push("  this is a bug in zcube, not something you did");
+    out.push(`  this is a bug in ${product(d.code)}, not something you did`);
     if (d.saved) out.push(`  ${pad("saved")}diagnostic bundle: ${d.saved}`);
-    out.push(`  ${pad("report")}https://github.com/Zigbox/zigcube/issues/new (attach the bundle after reviewing it)`);
+    out.push(`  ${pad("report")}${reportUrl(d.code)} (attach the bundle after reviewing it)`);
     if (verbose) for (const c of d.causes) out.push(`  ${pad("cause")}${c}`);
     return out;
   }
@@ -88,9 +90,9 @@ export function diagnosticBlock(input, { compact = false, origin = null, request
   const row = (label, ...content) => h("div", { class: "drow" }, h("dt", {}, label), h("dd", {}, ...content));
   const rows = [];
   if (d.severity === "bug") {
-    rows.push(h("p", { class: "bug-note" }, "This is a bug in zcube, not something you did."));
+    rows.push(h("p", { class: "bug-note" }, `This is a bug in ${product(d.code)}, not something you did.`));
     if (d.saved) rows.push(row("saved", h("code", {}, d.saved)));
-    rows.push(row("report", h("a", { href: "https://github.com/Zigbox/zigcube/issues/new", target: "_blank", rel: "noopener" }, "Open an issue"), " and attach the bundle after reviewing it"));
+    rows.push(row("report", h("a", { href: reportUrl(d.code), target: "_blank", rel: "noopener" }, "Open an issue"), " and attach the bundle after reviewing it"));
   } else {
     const inner = d.causes[d.causes.length - 1];
     if (inner) rows.push(row("cause", inner));

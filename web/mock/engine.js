@@ -87,6 +87,7 @@ export class Engine {
       const prev = this.current(key, rev - 1);
       if (op.put) {
         list.push({ rev, value: op.put[1], create: prev ? prev.create : rev, lease: op.put[2] || 0 });
+        if (prev?.lease && prev.lease !== op.put[2]) this.leases.get(prev.lease)?.keys.delete(key); // a put replaces the lease association
         if (op.put[2]) this.leases.get(op.put[2])?.keys.add(key);
       } else {
         list.push({ rev, value: null });
@@ -239,8 +240,9 @@ export class Engine {
         cause: { kind: "observed", key: kv.key, revision: kv.mod_revision },
       });
       const ops = [...joined.ops];
-      const others = this.values("/replicas/").filter(r => r.node && r.node !== name).length;
-      if (rejoin && others > 0) {
+      const all = this.values("/replicas/");
+      const others = all.filter(r => r.node && r.node !== name).length;
+      if (rejoin && others > 0 && !all.some(r => r.node === name)) {
         ops.push(...this.decision({
           actor: "scheduler", action: "skip_rebalance", subject: { kind: "node", name },
           reason: `${name} rejoined with no replicas while ${others} run on other nodes; moving running replicas back would restart them, and rebalancing is off by default`,
@@ -327,6 +329,7 @@ export class Engine {
       const sd = this.decision({ actor: "replica-controller", action, subject: { kind: "service", name: svc.name }, reason, cause: baseCause });
       ops.push(...sd.ops);
       const placing = this.placementState();
+      placing.replicas = placing.replicas.filter(r => !removed.some(x => x.replica.id === r.id)); // what is being removed no longer counts
       for (let i = 0; i < n; i++) {
         const id = `${svc.name}-${next++}`;
         const create = this.decision({
@@ -410,7 +413,7 @@ export class Engine {
     return agent;
   }
 
-  powerOn(name) { const a = this.agents.get(name); a.up = true; a.lease = null; this.dirty = true; this.activeUntil = Math.max(this.activeUntil, this.t + 2000); }
+  powerOn(name) { const a = this.agents.get(name); a.up = true; a.lease = null; a.fresh = true; this.dirty = true; this.activeUntil = Math.max(this.activeUntil, this.t + 2000); }
   powerOff(name) {
     const a = this.agents.get(name);
     a.up = false;
@@ -425,6 +428,11 @@ export class Engine {
     } else a.lease.deadline = this.t + a.lease.ttl; // keepalive: not a revision
 
     const mine = this.list("/replicas/").kvs.map(kv => kv.value).filter(r => r.node === a.name);
+    if (a.fresh) { // a restarted agent finds no process for what it had been running: it reports them lost
+      a.fresh = false;
+      const lost = mine.filter(r => ["running", "starting"].includes(this.get(`/observed/${a.name}/${r.id}`)?.status));
+      if (lost.length) this.commit(lost.map(r => ({ put: [`/observed/${a.name}/${r.id}`, this.observed(a, r, "stopped", { kind: "lost" })] })));
+    }
     const ids = new Set(mine.map(r => r.id));
     for (const r of mine) {
       if (this.get(`/observed/${a.name}/${r.id}`) || a.starting.has(r.id)) continue;

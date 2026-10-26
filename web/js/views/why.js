@@ -110,7 +110,7 @@ export function why(ctx, params, query) {
     } else if (step.type === "observed") {
       body.append(
         h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "observed"), h("span", { class: "step-act" }, step.text)),
-        step.diagnostic ? diagnosticBlock(step.diagnostic) : h("p", { class: "step-t" }, step.text),
+        step.diagnostic ? diagnosticBlock(step.diagnostic) : null,
         h("p", { class: "step-m" }, h("code", {}, step.key), ` at revision ${step.revision}`));
     } else if (step.type === "desired") {
       body.append(
