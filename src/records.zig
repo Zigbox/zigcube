@@ -360,7 +360,11 @@ fn kind_name(comptime type_name: []const u8) []const u8 {
 /// A diagnostic as the compact JSON text a record embeds.
 pub fn diagnostic_raw(arena: Allocator, diagnostic: *const Diagnostic, diag: *Diag) Error!Raw {
     var out: std.Io.Writer.Allocating = .init(arena);
-    zigbox.diagnostic.write_json(&out.writer, diagnostic) catch return failures.no_memory(diag);
+    // The docs link is derived from the code by whoever renders it (docs/api.md), so it is not
+    // stored.
+    var bare = diagnostic.*;
+    bare.docs = .{};
+    zigbox.diagnostic.write_json(&out.writer, &bare) catch return failures.no_memory(diag);
     const bytes = out.toOwnedSlice() catch return failures.no_memory(diag);
     assert(bytes.len > 1);
     assert(bytes[bytes.len - 1] == '\n');

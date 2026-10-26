@@ -13,6 +13,7 @@ const std = @import("std");
 
 pub const modules = .{
     @import("agent.zig"),
+    @import("api.zig"),
     @import("apply.zig"),
     @import("clock.zig"),
     @import("controller.zig"),
@@ -22,6 +23,7 @@ pub const modules = .{
     @import("diag/codes.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
+    @import("runtime_codes.zig"),
     @import("retention.zig"),
     @import("runtime.zig"),
     @import("sim_runtime.zig"),
@@ -31,6 +33,7 @@ pub const modules = .{
     @import("store_memory.zig"),
     @import("test_util.zig"),
     @import("text.zig"),
+    @import("why.zig"),
 };
 
 /// References every public declaration of every core module, and of the types they declare, so
@@ -87,4 +90,5 @@ test "the controllers' tests are in this root" {
     // Goal: the controllers' tests run under WASI too. Method: import them (they use only the
     // memory store, a manual clock and the testing allocator).
     _ = @import("replica_controller_test.zig");
+    _ = @import("api_test.zig");
 }

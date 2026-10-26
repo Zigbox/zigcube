@@ -42,6 +42,7 @@ const constants = @import("constants.zig");
 const Clock = @import("clock.zig").Clock;
 const diag_mod = @import("diag.zig");
 const runtime = @import("runtime.zig");
+const runtime_codes = @import("runtime_codes.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -476,14 +477,15 @@ pub fn image_not_found(out: *Diagnostic, name: []const u8, image: []const u8) vo
     const safe_name = sanitise(&name_buffer, name);
     var json_buffer: [1024]u8 = undefined;
     const format = "{{\"code\":\"ZBX-E0501\",\"severity\":\"error\",\"blame\":\"user\"," ++
-        "\"summary\":\"image not found\"," ++
+        "\"summary\":\"{s}\"," ++
         "\"causes\":[\"digest {s} is not in this node's store\"]," ++
         "\"while\":[\"starting container {s}\"]," ++
         "\"context\":{{\"image\":\"{s}\"}}," ++
         "\"fixes\":[{{\"sentence\":\"check the digest in the service file, or pull the image " ++
         "first\",\"command\":null}}]," ++
         "\"omitted\":{{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}}}";
-    const json = std.fmt.bufPrint(&json_buffer, format, .{ short, safe_name, safe_image });
+    const summary = runtime_codes.image_not_found.summary;
+    const json = std.fmt.bufPrint(&json_buffer, format, .{ summary, short, safe_name, safe_image });
     // Cannot fail: the longest result is under 600 bytes, and the buffer holds 1024.
     // Cannot fail: `json` is the format above with sanitised text, which is well formed.
     zigbox.diagnostic.parse_json(out, json catch unreachable) catch unreachable;
