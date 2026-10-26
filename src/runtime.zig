@@ -26,8 +26,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
-const Diag = @import("diag.zig").Diag;
-const Diagnostic = @import("diagnostic.zig").Diagnostic;
+const diag_mod = @import("diag.zig");
+const Diag = diag_mod.Diag;
+const Diagnostic = diag_mod.Diagnostic;
 
 pub const Error = error{
     /// The runtime has no container of that name.
@@ -97,8 +98,9 @@ pub const ExitReason = union(enum) {
     pid_limit,
     /// It never started; the diagnostic says why, and may carry a `ZBX-` code.
     start_failed: Diagnostic,
-    /// The process vanished. The diagnostic, when the runtime has one, says why (Zigbox keeps the
-    /// explanation it computed in its handle); null means it truly does not know.
+    /// The container's supervisor died or its process vanished. The diagnostic, when the runtime
+    /// has one, says which of the two (Zigbox keeps the explanation it computed in its handle);
+    /// null means it truly does not know.
     lost: ?Diagnostic,
 };
 
@@ -164,8 +166,10 @@ pub const Runtime = struct {
         return outcome;
     }
 
-    /// Asks the container to stop (SIGTERM), waits up to `grace_ms`, then kills it. Returns once
-    /// it has stopped. Stopping a container that has already stopped does nothing.
+    /// Asks the container to stop, waits up to `grace_ms`, then kills it. Returns once it has
+    /// stopped. How the request reaches the container (a signal to its supervisor, or to its
+    /// PID 1 through a pidfd) is the runtime's business, and callers must not depend on it.
+    /// Stopping a container that has already stopped does nothing.
     pub fn stop(runtime: Runtime, handle: Handle, grace_ms: u32, diag: *Diag) Error!void {
         assert(diag.code == null);
         try finish(diag, runtime.vtable.stop(runtime.context, handle, grace_ms, diag));
@@ -188,7 +192,8 @@ pub const Runtime = struct {
 
     /// Status changes since the previous call, oldest first, waiting up to `timeout_ms` for the
     /// first one. Events are a hint to reconcile sooner: one may be lost (an agent restart),
-    /// and `list` and `inspect` are the truth.
+    /// and `list` and `inspect` are the truth. In particular the run record, which `list` and
+    /// `inspect` read, is the truth for why a container exited.
     pub fn events(
         runtime: Runtime,
         arena: std.mem.Allocator,
@@ -330,7 +335,7 @@ const Refusing = struct {
         diag.reset();
         diag.raise(.E0502);
         var failure: Diagnostic = undefined;
-        Diagnostic.from_diag(&failure, diag);
+        diag_mod.to_diagnostic(&failure, diag);
         diag.reset();
         return .{ .failed = failure };
     }

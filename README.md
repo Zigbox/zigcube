@@ -14,7 +14,7 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
-| C0 · Loop | One node keeps a promise: apply, get, why | **In progress**: slices 1 to 3 below |
+| C0 · Loop | One node keeps a promise: apply, get, why | **In progress**: slices 1 to 4 below |
 | C1 · Fleet | Placement across nodes, failover on lease expiry | Not started |
 | C2–C8 | Swarm, Rollout, Mesh, Edge, Trust, State, Jobs | Not started |
 
@@ -29,6 +29,7 @@ C0 is built in slices. Each is reviewed adversarially before it is merged. A sli
 | 1 · Scaffold and contracts | Zig 0.17.0 pinned; three stub executables; CI; limits in `src/constants.zig`; the `ZC-` diagnostics registry and `Diag` collector; the `Store` and `Runtime` contracts (both approved 2026-10-26); an in-memory reference store; the [review pack](docs/contracts-review.md) and [store design](docs/store-design.md) | **Built and reviewed**, in [PR #4](https://github.com/Zigbox/zigcube/pull/4) |
 | 2 · SQLite and conformance | `zig build tidy`; the SQLite `Store` backend (WAL, serialised writers, gap-free revisions, polling watch, leases on the injected clock, failures as `ZC-E02xx` diagnostics); the store conformance suite (`zig build test-store`), run for the memory and SQLite backends; the [proposal for Zigbox's diagnostics](docs/diagnostics-zigbox-proposal.md) | **In review.** Not yet run in CI. |
 | 3 · Postgres | The Postgres backend (revisions serialised on the meta row, `LISTEN`/`NOTIFY` wake-ups with a bounded poll, a watch that checks the log has no hole, leases on Postgres's clock or an injected one, `store_live` on OrioleDB when present), libpq through `b.addTranslateC`, failures as `ZC-E02xx` diagnostics (new: E0211 to E0213), run through the same suite; `zig build pg-up`/`pg-down` for a throwaway server; a CI job against a pinned Postgres 16 image | **In review.** Not yet run in CI; the OrioleDB path has not been run. |
+| 4 · Contracts and WASM | `Store.list` with `reverse` and a read-only `Store.lease_list`, in all three backends with conformance tests; the record shapes of the approved console items in [keys.md](docs/keys.md); Zigcube's diagnostics on Zigbox's `diagnostic`/`product`/`render`/`explain` (the `zigbox` package, pinned) with the stand-in retired; three comment-only `Runtime` doc tweaks; the control-plane core compiled to `wasm32-freestanding` and run in Node (`zig build wasm-check`, `wasm-test`) in a new CI job, and [what that found](docs/wasm.md) | **In review.** Not yet run in CI: the `zigbox` tarball URL, Node on the runner and the `wasm` job are first exercised there. |
 
 ## Building
 
@@ -39,6 +40,8 @@ zig build                                   # zig-out/bin/zcube, zcube-server, z
 zig build test                              # unit and snapshot tests
 zig build tidy                              # formatting and mechanical style rules
 zig build test-store -Dbackend=sqlite       # the store conformance suite (memory | sqlite | postgres)
+zig build wasm-check                        # the core as wasm32-freestanding, run in Node (needs node)
+zig build wasm-test                         # the core's unit tests under WASI in Node
 zig build pg-up                             # a throwaway Postgres for -Dbackend=postgres (pg-down removes it)
 ```
 

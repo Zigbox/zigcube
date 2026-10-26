@@ -58,14 +58,27 @@ reason to the run record. The agent uses the `zigbox` module for the rest (`list
 `stop`, the event stream). Zigbox M2 slice 4 delivers the library side. `FakeRuntime` will follow
 this model when it is built (not in slice 2).
 
-Proposals, not edits (the contract is approved, so changing it is an Ask first). None changes a
-signature:
+Three comment-only tweaks to `src/runtime.zig` were proposed here; **the owner approved all three
+on 2026-10-26 and they are made** (doc comments only, no signature changes):
 
 - `ExitReason.lost` should be documented as "the supervisor died or the process vanished"; the
   `?Diagnostic` (already approved) is where Zigbox says which.
 - `stop`'s doc should not promise how it reaches the container (signal the supervisor, or the
   container's PID 1 through a pidfd). Zigbox's slice 4 settles that.
 - `events` stays a hint; the run record is the truth for exit reasons, which suits `list`/`inspect`.
+
+### Decisions recorded on 2026-10-26 (C0 slice 4)
+
+The owner also decided, and slice 4 implements:
+
+- `docs/api.md` is approved as written, with all 11 items of "What the console needs from the
+  contracts". The `Store` part (`ListOptions.reverse`, `lease_list`) and the record shapes in
+  `docs/keys.md` land in slice 4; the server side comes later.
+- Zigcube depends on the `zigbox` package for diagnostics (`diagnostic`, `product`,
+  `render.render_diagnostic`, `explain.render_entry`), pinned to Zigbox `90b6f1c`. This retires the
+  stand-in of `docs/diagnostics-plan.md` and `src/diag.zig`'s copy of the collector's lists.
+- The control-plane core must compile to `wasm32-freestanding`, so the console can one day run the
+  real controllers, scheduler and store in the browser. `docs/wasm.md` is the spike's output.
 
 ### `Runtime` choices to approve
 

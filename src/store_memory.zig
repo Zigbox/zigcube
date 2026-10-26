@@ -70,6 +70,7 @@ pub const MemoryStore = struct {
         .lease_grant = lease_grant_impl,
         .lease_keepalive = lease_keepalive_impl,
         .lease_revoke = lease_revoke_impl,
+        .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
     };
@@ -166,10 +167,12 @@ pub const MemoryStore = struct {
         const revision = options.at_revision orelse self.revision;
         try self.check_readable(revision, diag);
         const entries = try self.snapshot(arena, revision, options.prefix, diag);
+        if (options.reverse) std.mem.reverse(store.KeyValue, entries);
         var start: usize = 0;
         if (options.continue_after) |after| {
+            const wanted: std.math.Order = if (options.reverse) .lt else .gt;
             while (start < entries.len) : (start += 1) {
-                if (std.mem.order(u8, entries[start].key, after) == .gt) break;
+                if (std.mem.order(u8, entries[start].key, after) == wanted) break;
             }
         }
         var end = start;
@@ -497,6 +500,45 @@ pub const MemoryStore = struct {
         assert(count == keys.len);
     }
 
+    fn lease_list_impl(
+        context: *anyopaque,
+        arena: Allocator,
+        diag: *Diag,
+    ) Error![]const store.LeaseInfo {
+        const self = from(context);
+        const now = self.clock.now_ms();
+        const infos = arena.alloc(store.LeaseInfo, self.leases.items.len) catch
+            return no_memory(diag);
+        for (self.leases.items, infos) |lease, *info| {
+            const remaining = if (lease.deadline_ms > now) lease.deadline_ms - now else 0;
+            info.* = .{
+                .id = lease.id,
+                .ttl_ms = lease.ttl_ms,
+                .remaining_ms = @intCast(@min(remaining, lease.ttl_ms)),
+                .keys = try lease_keys(self, arena, lease.id, diag),
+            };
+        }
+        std.mem.sort(store.LeaseInfo, infos, {}, lease_info_less);
+        return infos;
+    }
+
+    /// The keys attached to a lease, ascending, copied into `arena`.
+    fn lease_keys(
+        self: *const MemoryStore,
+        arena: Allocator,
+        id: LeaseId,
+        diag: *Diag,
+    ) Error![]const []const u8 {
+        var keys: std.ArrayList([]const u8) = .empty;
+        for (self.live.items) |entry| {
+            if (entry.lease != id) continue;
+            const copy = arena.dupe(u8, entry.key) catch return no_memory(diag);
+            keys.append(arena, copy) catch return no_memory(diag);
+        }
+        std.mem.sort([]const u8, keys.items, {}, bytes_less);
+        return keys.items;
+    }
+
     fn expire_leases_impl(context: *anyopaque, diag: *Diag) Error!u32 {
         const self = from(context);
         const now = self.clock.now_ms();
@@ -574,6 +616,11 @@ fn free_entry(gpa: Allocator, entry: Entry) void {
 fn entry_key_less(context: void, first: Entry, second: Entry) bool {
     _ = context;
     return std.mem.order(u8, first.key, second.key) == .lt;
+}
+
+fn lease_info_less(context: void, first: store.LeaseInfo, second: store.LeaseInfo) bool {
+    _ = context;
+    return first.id < second.id;
 }
 
 fn bytes_less(context: void, first: []const u8, second: []const u8) bool {

@@ -7,7 +7,6 @@ test {
     _ = @import("clock.zig");
     _ = @import("diag/codes.zig");
     _ = @import("diag.zig");
-    _ = @import("diagnostic.zig");
     _ = @import("store.zig");
     _ = @import("store_failures.zig");
     _ = @import("store_memory.zig");
@@ -15,5 +14,6 @@ test {
     _ = @import("pq.zig");
     _ = @import("store_postgres.zig");
     _ = @import("runtime.zig");
+    _ = @import("core.zig");
     _ = @import("tidy.zig");
 }

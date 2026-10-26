@@ -1,5 +1,14 @@
 # Proposal for Zigbox: let a second product's diagnostics plug into `src/diag/`
 
+**Status: adopted (2026-10-26).** Zigbox merged it as PR #7 (`90b6f1c`), and Zigcube depends on the
+`zigbox` package at that commit. What Zigcube does with it: its `Diag` collector and `ZC-`
+registry stay (`src/diag.zig`, `src/diag/codes.zig`) and use Zigbox's item types (`Text`, `Pair`,
+`Fix`); `diag.to_diagnostic` copies a finished collector into `zigbox.diagnostic.Diagnostic`;
+`diag.product` is Zigcube's `Product`; `diag.render` and `diag.explain` call
+`render.render_diagnostic` and `explain.render_entry`. Step 5 was only partly possible: Zigbox's
+`List` type stays private, so Zigcube keeps its own list wrapper over the shared item types.
+`src/diagnostic.zig` is gone. The text below is the proposal as sent.
+
 For the owner of `Zigbox/zigbox`. Self-contained: it needs no other Zigcube document. It is
 option D of `docs/diagnostics-plan.md`, which the Zigcube owner accepted on 2026-10-26 ("we will
 absolutely need a way to add Zigcube's errors to Zigbox's"). Read against Zigbox `main` at

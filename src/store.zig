@@ -96,11 +96,16 @@ pub const ListOptions = struct {
     /// early once its values total `constants.store_page_bytes_max` (it has at least one entry).
     limit: u32,
     /// Resume after this key, as returned in `ListResult.continue_after`. Null: from the start.
+    /// With `reverse`, "after" means below: the page holds keys less than this one.
     continue_after: ?[]const u8 = null,
+    /// Newest first: descending by key, so the tail of a key range (the latest decisions, whose
+    /// ids sort by time) costs one page and not the whole range. Paging works the same way, in
+    /// the other direction: `continue_after` is the last (smallest) key returned.
+    reverse: bool = false,
 };
 
 pub const ListResult = struct {
-    /// Ascending by key, bytewise.
+    /// Ascending by key, bytewise; descending if the request had `reverse`.
     kvs: []const KeyValue,
     /// The revision the page was read at (the current one, if `at_revision` was null).
     revision: Revision,
@@ -233,6 +238,19 @@ pub const Lease = struct {
     ttl_ms: u32,
 };
 
+/// A lease as `lease_list` reports it: what the Nodes screen shows (TTL, remaining time) and what
+/// a reader needs to say which keys a lease would take with it.
+pub const LeaseInfo = struct {
+    id: LeaseId,
+    ttl_ms: u32,
+    /// Milliseconds until the lease runs out, by the backend's clock, at most `ttl_ms`. 0 for a
+    /// lease whose time is up but which `expire_leases` has not yet revoked: it can no longer be
+    /// renewed, and its keys are still there.
+    remaining_ms: u32,
+    /// The keys attached to the lease, ascending, at most `constants.store_lease_keys_max`.
+    keys: []const []const u8,
+};
+
 // ---- The interface -------------------------------------------------------------------------
 
 pub const Store = struct {
@@ -262,6 +280,11 @@ pub const Store = struct {
         lease_grant: *const fn (context: *anyopaque, ttl_ms: u32, diag: *Diag) Error!Lease,
         lease_keepalive: *const fn (context: *anyopaque, id: LeaseId, diag: *Diag) Error!Lease,
         lease_revoke: *const fn (context: *anyopaque, id: LeaseId, diag: *Diag) Error!Revision,
+        lease_list: *const fn (
+            context: *anyopaque,
+            arena: std.mem.Allocator,
+            diag: *Diag,
+        ) Error![]const LeaseInfo,
         expire_leases: *const fn (context: *anyopaque, diag: *Diag) Error!u32,
         compact: *const fn (context: *anyopaque, revision: Revision, diag: *Diag) Error!void,
     };
@@ -321,7 +344,10 @@ pub const Store = struct {
         for (result.kvs) |kv| {
             assert(std.mem.startsWith(u8, kv.key, options.prefix));
             assert(kv.mod_revision <= result.revision);
-            if (previous) |before| assert(std.mem.order(u8, before, kv.key) == .lt);
+            if (previous) |before| {
+                const order = std.mem.order(u8, before, kv.key);
+                assert(order == if (options.reverse) std.math.Order.gt else std.math.Order.lt);
+            }
             previous = kv.key;
         }
         return result;
@@ -383,6 +409,23 @@ pub const Store = struct {
         assert(diag.code == null);
         assert(id != lease_none);
         return finish(diag, store.vtable.lease_revoke(store.context, id, diag));
+    }
+
+    /// Every lease the store holds, ascending by id: a read-only view, which changes nothing and
+    /// takes no revision. A lease past its time but not yet revoked is listed with
+    /// `remaining_ms == 0`.
+    pub fn lease_list(store: Store, arena: std.mem.Allocator, diag: *Diag) Error![]const LeaseInfo {
+        assert(diag.code == null);
+        const leases = try finish(diag, store.vtable.lease_list(store.context, arena, diag));
+        assert(leases.len <= constants.store_leases_max);
+        var previous: LeaseId = lease_none;
+        for (leases) |lease| {
+            assert(lease.id > previous);
+            assert(lease.remaining_ms <= lease.ttl_ms);
+            assert(lease.keys.len <= constants.store_lease_keys_max);
+            previous = lease.id;
+        }
+        return leases;
     }
 
     /// Revokes every lease whose time has run out, each as `lease_revoke` would. Returns how

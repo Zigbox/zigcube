@@ -1,45 +1,59 @@
-//! Shim for Zigbox's `Diag` (docs/diagnostics-plan.md). The surface is the same as Zigbox's
-//! `src/diag/diag.zig` (`raise`, `cause`, `while_`, `context`, `fix`, `fix_with`, `entry`,
-//! `exit_code`, `last_cause`), written against Zigcube's own `ZC-` registry, so replacing it
-//! with Zigbox's collector later changes an import and nothing else. The data model and the
-//! overflow policy are Zigbox's: see its header for the reasoning. Nothing here formats text
-//! for the user; rendering happens at the CLI and API boundary.
+//! Zigcube's diagnostic collector: the `Diag` a function fills while it fails, bound to the
+//! `ZC-` registry (`diag/codes.zig`). Its surface is Zigbox's `Diag` (`raise`, `cause`, `while_`,
+//! `context`, `fix`, `fix_with`, `entry`, `exit_code`, `last_cause`); the item types (`Text`,
+//! `Pair`, `Fix`) are Zigbox's own, so a finished collector becomes a
+//! `zigbox.diagnostic.Diagnostic` by copying arrays. That is the type that crosses every
+//! boundary (the store, the API, `zcube why`), for `ZC-` and `ZBX-` codes alike, and
+//! `zigbox.render.render_diagnostic` renders it.
+//!
+//! Zigbox's collector is typed to its own registry and keeps its list type private, so the
+//! collector stays here; docs/diagnostics-zigbox-proposal.md explains why. Nothing here formats
+//! text for the user: rendering happens at the CLI and API boundary (`render`, below).
 //!
 //! The collector is fixed-size and never allocates, and every byte stored is printable ASCII.
 //! It is several kilobytes: initialise it in place with `reset`, pass it as `*Diag`.
 
 const std = @import("std");
 const assert = std.debug.assert;
+const zigbox = @import("zigbox");
 const constants = @import("constants.zig");
 const codes = @import("diag/codes.zig");
 const text_util = @import("text.zig");
 
-pub const Text = text_util.Bounded(constants.diag_field_bytes_max);
-pub const Command = text_util.Bounded(constants.diag_command_bytes_max);
+pub const Diagnostic = zigbox.diagnostic.Diagnostic;
+pub const Product = zigbox.product.Product;
 
-pub const Pair = struct {
-    /// Lower-case ASCII letters, at most `diag_key_bytes_max`.
-    key: [constants.diag_key_bytes_max]u8,
-    key_len: u8,
-    value: Text,
+pub const Text = zigbox.diag.Text;
+pub const Command = zigbox.diag.Command;
+pub const Pair = zigbox.diag.Pair;
+pub const Fix = zigbox.diag.Fix;
+pub const FixOptions = zigbox.diag.FixOptions;
 
-    pub fn key_slice(pair: *const Pair) []const u8 {
-        assert(pair.key_len > 0);
-        assert(pair.key_len <= constants.diag_key_bytes_max);
-        return pair.key[0..pair.key_len];
-    }
+/// Zigcube's strings of a diagnostic. Zigbox's renderer picks a product by the prefix of the code
+/// it renders, so a `ZBX-` diagnostic that reaches `zcube why` still says `zbx explain`.
+pub const product: Product = .{
+    .prefix = "ZC-",
+    .command = "zcube",
+    .bundle_hint = "zcube bundle --last",
+    .report_url = "https://github.com/Zigbox/zigcube/issues/new",
+    .docs_url_base = "https://zigbox.github.io/zigcube/errors/",
 };
 
-pub const Fix = struct {
-    sentence: Text,
-    /// Empty when the fix is not a command.
-    command: Command,
-};
+/// Every product whose codes may appear in a diagnostic Zigcube shows.
+pub const products = [_]Product{ product, Product.zbx };
 
-pub const FixOptions = struct {
-    sentence: []const u8,
-    command: []const u8 = "",
-};
+comptime {
+    // The shared item types carry Zigbox's bounds; Zigcube's constants must say the same.
+    assert(@typeInfo(@FieldType(Text, "bytes")).array.len == constants.diag_field_bytes_max);
+    assert(@typeInfo(@FieldType(Command, "bytes")).array.len == constants.diag_command_bytes_max);
+    assert(@typeInfo(@FieldType(Pair, "key")).array.len == constants.diag_key_bytes_max);
+    const finished: Diagnostic = undefined;
+    const causes = @typeInfo(@TypeOf(finished.causes.items)).array.len;
+    assert(causes == constants.diag_causes_count_max);
+    assert(@typeInfo(@TypeOf(finished.whiles.items)).array.len == constants.diag_whiles_count_max);
+    assert(@typeInfo(@TypeOf(finished.pairs.items)).array.len == constants.diag_context_count_max);
+    assert(@typeInfo(@TypeOf(finished.fixes.items)).array.len == constants.diag_fixes_count_max);
+}
 
 /// Which end of a full list survives a new item.
 const Keep = enum { oldest, newest };
@@ -94,7 +108,7 @@ pub const Diag = struct {
     pairs: Pairs,
     fixes: Fixes,
     /// The path of the bundle written for this bug, empty for none. Only a bug has one.
-    saved: text_util.Bounded(constants.state_path_bytes_max + 128),
+    saved: zigbox.diag.Saved,
 
     /// Initialises in place: the struct is several kilobytes.
     pub fn reset(diag: *Diag) void {
@@ -219,6 +233,65 @@ pub const Diag = struct {
     }
 };
 
+/// Copies a finished collector. Initialises `out` in place (it is several kilobytes), and points
+/// its docs at Zigcube's page for the code.
+pub fn to_diagnostic(out: *Diagnostic, diag: *const Diag) void {
+    assert(diag.code != null);
+    const registered = diag.entry();
+    out.reset();
+    out.code.print("{s}", .{codes.full_name(registered.code)});
+    out.severity = registered.severity;
+    out.blame = registered.blame;
+    out.summary.print("{s}", .{registered.summary});
+    assert(!out.summary.truncated); // The registry's comptime check bounds every summary.
+    copy_list(&out.causes, &diag.causes);
+    copy_list(&out.whiles, &diag.whiles);
+    copy_list(&out.pairs, &diag.pairs);
+    copy_list(&out.fixes, &diag.fixes);
+    out.saved.print("{s}", .{diag.saved.slice()});
+    out.set_docs(&product);
+    assert(out.code.len > 0);
+}
+
+/// Copies the used items only, so no byte that was never written is read.
+fn copy_list(target: anytype, source: anytype) void {
+    assert(source.count <= source.items.len);
+    target.* = .{ .count = source.count, .omitted = source.omitted };
+    @memcpy(target.items[0..source.count], source.items[0..source.count]);
+    assert(target.slice().len == source.slice().len);
+}
+
+/// Renders a finished diagnostic of either product into `buffer` (`diag_output_bytes_max` bytes)
+/// and returns the used prefix.
+pub fn render(
+    diagnostic: *const Diagnostic,
+    mode: zigbox.render.Mode,
+    color: bool,
+    buffer: []u8,
+) []const u8 {
+    assert(buffer.len >= constants.diag_output_bytes_max);
+    assert(diagnostic.code.len > 0);
+    return zigbox.render.render_diagnostic(diagnostic, &products, mode, color, buffer);
+}
+
+/// The text of `zcube explain <code>`, built from Zigcube's registry and laid out by Zigbox's
+/// renderer, so the two products' `explain` cannot drift apart.
+pub fn explain(code: codes.Code, buffer: []u8) []const u8 {
+    assert(buffer.len >= constants.diag_output_bytes_max);
+    const registered = codes.entry(code);
+    var exit_buffer: [zigbox.codes.exit_text_bytes_max]u8 = undefined;
+    const exit_text = std.fmt.bufPrint(&exit_buffer, "{d}", .{codes.exit_code(registered.blame)});
+    return zigbox.explain.render_entry(.{
+        .full_name = codes.full_name(code),
+        .severity = registered.severity,
+        .blame = registered.blame,
+        .summary = registered.summary,
+        .explanation = registered.explanation,
+        // Cannot fail: an exit code is at most three digits, and the buffer holds forty bytes.
+        .exit_text = exit_text catch unreachable,
+    }, buffer);
+}
+
 fn check_key(comptime key: []const u8) void {
     comptime {
         assert(key.len > 0);
@@ -326,4 +399,120 @@ test "reset clears everything, including the code" {
     try testing.expectEqual(@as(u32, 0), diag.causes.count);
     diag.raise(.E0203); // Allowed again: reset starts a new diagnostic.
     try testing.expectEqual(@as(u8, constants.exit_user), diag.exit_code());
+}
+
+fn image_not_found(out: *Diagnostic) void {
+    // A diagnostic as it arrives from a node: the code is text of Zigbox's registry (ZBX-E0501 is
+    // the one HANDOFF's demo shows), which Zigcube's collector could never raise itself.
+    out.reset();
+    out.code.print("ZBX-E0501", .{});
+    out.severity = .@"error";
+    out.blame = .user;
+    out.summary.print("image not found", .{});
+    out.causes.count = 1;
+    out.causes.items[0] = .{};
+    out.causes.items[0].print("digest b3:00ff is not in this node's store", .{});
+    out.fixes.count = 1;
+    out.fixes.items[0] = .{ .sentence = .{}, .command = .{} };
+    out.fixes.items[0].sentence.print("check the digest in broken.zon", .{});
+    out.set_docs(&Product.zbx);
+}
+
+test "a diagnostic keeps the code, blame and causes of the collector it came from" {
+    // Goal: the copy loses nothing the renderer needs. Method: fill a collector, copy it,
+    // compare the text fields, the exit code and the docs page.
+    var diag: Diag = undefined;
+    diag.reset();
+    diag.raise(.E0201);
+    diag.cause("connection refused", .{});
+    diag.cause("postgres at 127.0.0.1:5432 is not accepting connections", .{});
+    diag.fix(.{ .sentence = "start it", .command = "pg_ctl start" });
+
+    var diagnostic: Diagnostic = undefined;
+    to_diagnostic(&diagnostic, &diag);
+    try testing.expectEqualStrings("ZC-E0201", diagnostic.code.slice());
+    try testing.expectEqualStrings("can't reach the store backend", diagnostic.summary.slice());
+    try testing.expectEqual(codes.Blame.external, diagnostic.blame);
+    try testing.expectEqual(@as(u32, 2), diagnostic.causes.count);
+    try testing.expectEqualStrings("pg_ctl start", diagnostic.fixes.slice()[0].command.slice());
+    try testing.expectEqual(diag.exit_code(), diagnostic.exit_code());
+    const docs = "https://zigbox.github.io/zigcube/errors/E0201.html";
+    try testing.expectEqualStrings(docs, diagnostic.docs.slice());
+}
+
+test "each product's diagnostic renders with its own commands and links" {
+    // Goal: the ZBX- diagnostic inside a ZC- failure keeps Zigbox's `zbx explain` and docs page,
+    // and the ZC- one gets Zigcube's. Method: render one of each through `render`, in text and
+    // verbose, and compare the `more` and `docs` lines.
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    var diag: Diag = undefined;
+    diag.reset();
+    diag.raise(.E0201);
+    diag.cause("connection refused", .{});
+    diag.fix(.{ .sentence = "start it", .command = "pg_ctl start" });
+    var own: Diagnostic = undefined;
+    to_diagnostic(&own, &diag);
+    try testing.expectEqualStrings(
+        "error[ZC-E0201]: can't reach the store backend\n" ++
+            "  cause  connection refused\n" ++
+            "  fix    start it   pg_ctl start\n" ++
+            "  more   zcube explain E0201 \u{b7} rerun with --verbose for the full cause chain\n" ++
+            "  docs   https://zigbox.github.io/zigcube/errors/E0201.html\n",
+        render(&own, .text, false, &buffer),
+    );
+
+    var foreign: Diagnostic = undefined;
+    image_not_found(&foreign);
+    try testing.expectEqualStrings(
+        "error[ZBX-E0501]: image not found\n" ++
+            "  cause  digest b3:00ff is not in this node's store\n" ++
+            "  fix    check the digest in broken.zon\n" ++
+            "  more   zbx explain E0501 \u{b7} rerun with --verbose for the full cause chain\n" ++
+            "  docs   https://zigbox.github.io/zigbox/errors/E0501.html\n",
+        render(&foreign, .text, false, &buffer),
+    );
+}
+
+test "a ZBX- diagnostic survives the wire and still renders with Zigbox's links" {
+    // Goal: the path a node's failure takes (runtime, store or API, `zcube why`). Method: write
+    // the JSON one-liner, parse it back, and compare both the value and its rendering. Then a
+    // code of an unknown product renders without `more` and `docs` lines.
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    var original: Diagnostic = undefined;
+    image_not_found(&original);
+    var writer = std.Io.Writer.fixed(&buffer);
+    try zigbox.diagnostic.write_json(&writer, &original);
+    const wire = writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, wire, "\"ZBX-E0501\"") != null);
+
+    var parsed: Diagnostic = undefined;
+    try zigbox.diagnostic.parse_json(&parsed, wire);
+    parsed.set_docs(&Product.zbx);
+    try testing.expect(parsed.equal(&original));
+
+    var text: [constants.diag_output_bytes_max]u8 = undefined;
+    const shown = render(&parsed, .verbose, false, &text);
+    try testing.expect(std.mem.indexOf(u8, shown, "zbx explain E0501") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "zigbox/errors/E0501.html") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "zcube explain") == null);
+
+    parsed.code = .{};
+    parsed.code.print("ZZ-E0001", .{});
+    const unknown = render(&parsed, .text, false, &text);
+    try testing.expect(std.mem.indexOf(u8, unknown, "error[ZZ-E0001]") != null);
+    try testing.expect(std.mem.indexOf(u8, unknown, "  more") == null);
+}
+
+test "zcube explain uses Zigbox's layout over Zigcube's registry" {
+    // Goal: the header, the blame line and the explanation of a ZC- code, as `zbx explain` would
+    // lay them out. Method: compare the first lines, and check every registered code renders.
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const shown = explain(.E0201, &buffer);
+    const header = "ZC-E0201: can't reach the store backend\nerror, blame: external, exit code 3\n";
+    try testing.expect(std.mem.startsWith(u8, shown, header));
+    try testing.expect(std.mem.indexOf(u8, shown, "The control-plane store") != null);
+    for (codes.registry) |item| {
+        const text = explain(item.code, &buffer);
+        try testing.expect(std.mem.startsWith(u8, text, codes.full_name(item.code)));
+    }
 }

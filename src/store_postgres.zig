@@ -209,6 +209,41 @@ const sql_list_log =
     \\          ORDER BY l.key LIMIT $4) w) t ON true
     \\WHERE m.id = 1 ORDER BY t.key
 ;
+// The same two reads, newest key first. `$2` is NULL for the first page, else the last key
+// returned, and the page holds the keys below it. The running byte total counts from the newest.
+const sql_list_live_reverse =
+    \\SELECT m.revision, m.compacted_revision, t.key, t.value, t.create_revision, t.mod_revision,
+    \\       t.lease, false
+    \\FROM store_meta m LEFT JOIN LATERAL (
+    \\    SELECT key, CASE WHEN n = 1 OR running <= $5 THEN value END AS value, create_revision,
+    \\           mod_revision, lease
+    \\    FROM (SELECT key, value, create_revision, mod_revision, lease,
+    \\                 SUM(octet_length(value)) OVER (ORDER BY key DESC) AS running,
+    \\                 ROW_NUMBER() OVER (ORDER BY key DESC) AS n
+    \\          FROM store_live
+    \\          WHERE key >= $1 AND ($2::text IS NULL OR key < $2)
+    \\            AND ($3::text IS NULL OR key < $3)
+    \\          ORDER BY key DESC LIMIT $4) w) t ON true
+    \\WHERE m.id = 1 ORDER BY t.key DESC
+;
+const sql_list_log_reverse =
+    \\SELECT m.revision, m.compacted_revision, t.key, t.value, t.create_revision, t.revision,
+    \\       t.lease, false
+    \\FROM store_meta m LEFT JOIN LATERAL (
+    \\    SELECT key, CASE WHEN n = 1 OR running <= $6 THEN value END AS value, create_revision,
+    \\           revision, lease
+    \\    FROM (SELECT l.key, l.value, l.create_revision, l.revision, l.lease,
+    \\                 SUM(octet_length(l.value)) OVER (ORDER BY l.key DESC) AS running,
+    \\                 ROW_NUMBER() OVER (ORDER BY l.key DESC) AS n
+    \\          FROM store_log l
+    \\          WHERE l.key >= $1 AND ($2::text IS NULL OR l.key < $2)
+    \\            AND ($3::text IS NULL OR l.key < $3)
+    \\            AND NOT l.deleted
+    \\            AND l.revision = (SELECT MAX(x.revision) FROM store_log x
+    \\                              WHERE x.key = l.key AND x.revision <= $5)
+    \\          ORDER BY l.key DESC LIMIT $4) w) t ON true
+    \\WHERE m.id = 1 ORDER BY t.key DESC
+;
 // Column 8 is the position inside the transaction, which orders a revision's events.
 const sql_watch =
     \\SELECT m.revision, m.compacted_revision, t.key, t.value, t.create_revision, t.revision,
@@ -256,6 +291,11 @@ const sql_lease_gate = "SELECT pg_advisory_xact_lock(hashtext($1))";
 const sql_lease_delete = "DELETE FROM store_lease WHERE id = $1";
 const sql_lease_keys = "SELECT key FROM store_live WHERE lease = $1 ORDER BY key LIMIT $2";
 const sql_lease_held = "SELECT count(*) FROM store_live WHERE lease = $1";
+// One statement, so the leases and their keys come from one snapshot. The inner query bounds the
+// leases; a lease holds at most `store_lease_keys_max` keys, so the rows are bounded too.
+const sql_lease_all = "SELECT s.id, s.ttl_ms, GREATEST(s.deadline_ms - " ++ lease_now ++
+    ", 0), l.key FROM store_lease s LEFT JOIN store_live l ON l.lease = s.id " ++
+    "WHERE s.id IN (SELECT id FROM store_lease ORDER BY id LIMIT $2) ORDER BY s.id, l.key";
 const sql_lease_due = "SELECT id FROM store_lease WHERE deadline_ms < " ++ lease_now ++
     " ORDER BY id LIMIT 1";
 // Oldest first, so a batch is a prefix in revision order: a tombstone is never pruned in an
@@ -366,6 +406,7 @@ pub const PostgresStore = struct {
         .lease_grant = lease_grant_impl,
         .lease_keepalive = lease_keepalive_impl,
         .lease_revoke = lease_revoke_impl,
+        .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
     };
@@ -896,12 +937,19 @@ fn list_impl(
     var end_buffer: [constants.store_key_bytes_max]u8 = undefined;
     var params: Params = .{};
     params.add_bytes(.text, options.prefix);
-    params.add_bytes(.text, options.continue_after orelse "");
+    if (options.reverse) {
+        params.add_optional_text(options.continue_after);
+    } else {
+        params.add_bytes(.text, options.continue_after orelse "");
+    }
     params.add_optional_text(prefix_end(&end_buffer, options.prefix));
     params.add_int8(@as(u64, options.limit) + 1); // One more tells if a page follows.
     if (options.at_revision) |revision| params.add_int8(revision);
     params.add_int8(constants.store_page_bytes_max);
-    const sql = if (options.at_revision == null) sql_list_live else sql_list_log;
+    const sql = switch (options.reverse) {
+        false => if (options.at_revision == null) sql_list_live else sql_list_log,
+        true => if (options.at_revision == null) sql_list_live_reverse else sql_list_log_reverse,
+    };
     var result = try session.query(sql, &params, diag);
     defer result.clear();
     const meta = try checked_meta(self, &result, diag);
@@ -1177,6 +1225,50 @@ fn collect_lease_keys(session: *Session, id: LeaseId, keys: *LeaseKeys, diag: *D
         @memcpy(keys.bytes[slot][0..key.len], key);
         keys.lens[slot] = @intCast(key.len);
     }
+}
+
+fn lease_list_impl(
+    context: *anyopaque,
+    arena: Allocator,
+    diag: *Diag,
+) Error![]const store.LeaseInfo {
+    const self = PostgresStore.from(context);
+    var session = try self.acquire(diag);
+    defer session.release();
+    var params: Params = .{};
+    params.add_optional_int8(self.lease_now_ms());
+    params.add_int8(constants.store_leases_max);
+    var result = try session.query(sql_lease_all, &params, diag);
+    defer result.clear();
+    var leases: std.ArrayList(store.LeaseInfo) = .empty;
+    var keys: std.ArrayList([]const u8) = .empty;
+    for (0..result.rows()) |index| {
+        const row: u32 = @intCast(index);
+        const id = result.unsigned(row, 0);
+        if (leases.items.len == 0 or leases.items[leases.items.len - 1].id != id) {
+            seal_lease_keys(leases.items, &keys);
+            const ttl_ms: u32 = @intCast(result.int4(row, 1));
+            const remaining: u64 = @intCast(result.int8(row, 2));
+            leases.append(arena, .{
+                .id = id,
+                .ttl_ms = ttl_ms,
+                .remaining_ms = @intCast(@min(remaining, ttl_ms)),
+                .keys = &.{},
+            }) catch return failures.no_memory(diag);
+        }
+        if (result.is_null(row, 3)) continue; // A lease that holds no key.
+        const key = arena.dupe(u8, result.bytes(row, 3)) catch return failures.no_memory(diag);
+        keys.append(arena, key) catch return failures.no_memory(diag);
+        assert(keys.items.len <= constants.store_lease_keys_max);
+    }
+    seal_lease_keys(leases.items, &keys);
+    return leases.items;
+}
+
+/// Hands the keys gathered so far to the newest lease and starts a fresh list.
+fn seal_lease_keys(leases: []store.LeaseInfo, keys: *std.ArrayList([]const u8)) void {
+    if (leases.len > 0) leases[leases.len - 1].keys = keys.items;
+    keys.* = .empty;
 }
 
 fn expire_leases_impl(context: *anyopaque, diag: *Diag) Error!u32 {

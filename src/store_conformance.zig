@@ -246,6 +246,7 @@ const Serialized = struct {
         .lease_grant = lease_grant,
         .lease_keepalive = lease_keepalive,
         .lease_revoke = lease_revoke,
+        .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
     };
@@ -371,6 +372,17 @@ const Serialized = struct {
         self.enter();
         defer self.leave();
         return self.inner.lease_revoke(id, diag);
+    }
+
+    fn lease_list(
+        context: *anyopaque,
+        arena: Allocator,
+        diag: *Diag,
+    ) store.Error![]const store.LeaseInfo {
+        const self = from(context);
+        self.enter();
+        defer self.leave();
+        return self.inner.lease_list(arena, diag);
     }
 
     fn expire_leases(context: *anyopaque, diag: *Diag) store.Error!u32 {
@@ -1305,6 +1317,207 @@ test "list: pages are consistent at one revision, ordered bytewise, and join wit
     try testing.expect(page2.continue_after == null);
     const now = try s.list(arena, .{ .prefix = "/r/", .limit = 10 }, &diag);
     try testing.expectEqual(@as(usize, 5), now.kvs.len); // a, b, bb, c, e.
+}
+
+test "list: reverse is the ascending list backwards, and its pages join with no gap" {
+    // Goal: `reverse` (newest key first) for the current state, a historical read and a prefix.
+    // Method: write keys out of order plus one outside the prefix; read all of them reversed and
+    // compare with the ascending read; page through two at a time with `continue_after`; then
+    // change the store and read the rest of the pages at the first page's revision, which must
+    // not show the change.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    const keys = [_][]const u8{ "/q/03", "/q/05", "/q/01", "/q/04", "/q/02", "/other/x" };
+    for (keys) |key| _ = try put_one(s, &diag, key, "v");
+
+    const ascending = try s.list(arena, .{ .prefix = "/q/", .limit = 10 }, &diag);
+    const descending = try s.list(arena, .{ .prefix = "/q/", .limit = 10, .reverse = true }, &diag);
+    try testing.expectEqual(@as(usize, 5), descending.kvs.len);
+    for (ascending.kvs, 0..) |kv, index| {
+        const mirror = descending.kvs[descending.kvs.len - 1 - index];
+        try testing.expectEqualStrings(kv.key, mirror.key);
+        try testing.expectEqual(kv.mod_revision, mirror.mod_revision);
+    }
+    try testing.expect(descending.continue_after == null);
+
+    const page1 = try s.list(arena, .{ .prefix = "/q/", .limit = 2, .reverse = true }, &diag);
+    try testing.expectEqual(@as(usize, 2), page1.kvs.len);
+    try testing.expectEqualStrings("/q/05", page1.kvs[0].key);
+    try testing.expectEqualStrings("/q/04", page1.kvs[1].key);
+    try testing.expectEqualStrings("/q/04", page1.continue_after.?);
+
+    _ = try put_one(s, &diag, "/q/035", "late");
+    _ = try delete_one(s, &diag, "/q/02");
+
+    const rest = try s.list(arena, .{
+        .prefix = "/q/",
+        .limit = 10,
+        .reverse = true,
+        .at_revision = page1.revision,
+        .continue_after = page1.continue_after,
+    }, &diag);
+    try testing.expectEqual(@as(usize, 3), rest.kvs.len);
+    try testing.expectEqualStrings("/q/03", rest.kvs[0].key);
+    try testing.expectEqualStrings("/q/02", rest.kvs[1].key);
+    try testing.expectEqualStrings("/q/01", rest.kvs[2].key);
+    try testing.expect(rest.continue_after == null);
+
+    const now = try s.list(arena, .{ .prefix = "/q/", .limit = 3, .reverse = true }, &diag);
+    try testing.expectEqualStrings("/q/05", now.kvs[0].key);
+    try testing.expectEqualStrings("/q/04", now.kvs[1].key);
+    try testing.expectEqualStrings("/q/035", now.kvs[2].key);
+    try testing.expectEqualStrings("/q/035", now.continue_after.?);
+}
+
+test "list: a reverse page ends at the byte limit, and the next one resumes below it" {
+    // Goal: the page byte bound holds for a reverse read, counted from the newest key. Method:
+    // write values that together exceed `store_page_bytes_max`, read reversed with a limit that
+    // would take them all, and join the pages: every key once, in descending order.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    const value = try arena.alloc(u8, constants.store_value_bytes_max);
+    @memset(value, 'v');
+    const count = constants.store_page_bytes_max / constants.store_value_bytes_max + 2;
+    var key_buffer: [16]u8 = undefined;
+    for (0..count) |index| {
+        const key = try std.fmt.bufPrint(&key_buffer, "/big/{d:0>3}", .{index});
+        _ = try put_one(s, &diag, key, value);
+    }
+    var seen: u32 = 0;
+    var after: ?[]const u8 = null;
+    var pinned: ?Revision = null;
+    var previous: []const u8 = "/big/~";
+    for (0..count) |_| {
+        const page = try s.list(arena, .{
+            .prefix = "/big/",
+            .limit = constants.store_list_limit_max,
+            .reverse = true,
+            .at_revision = pinned,
+            .continue_after = after,
+        }, &diag);
+        try testing.expect(page.kvs.len > 0);
+        try testing.expect(page.kvs.len < count); // The byte limit cut the first page short.
+        for (page.kvs) |kv| {
+            try testing.expectEqual(std.math.Order.gt, std.mem.order(u8, previous, kv.key));
+            previous = kv.key;
+            seen += 1;
+        }
+        after = page.continue_after;
+        pinned = page.revision;
+        if (after == null) break;
+    }
+    try testing.expectEqual(@as(u32, count), seen);
+}
+
+test "lease_list: id, ttl, remaining time and keys of every lease, read-only" {
+    // Goal: the view the Nodes screen needs. Method: grant three leases with different ttls,
+    // attach keys to two of them (in an order that is not key order), advance the manual clock,
+    // renew one, and read the list at each step; a lapsed but unreaped lease shows 0 remaining
+    // and its keys, and a reaped one is gone. Reading takes no revision.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    try testing.expectEqual(@as(usize, 0), (try s.lease_list(arena, &diag)).len);
+
+    const first = try s.lease_grant(1000, &diag);
+    const second = try s.lease_grant(5000, &diag);
+    const third = try s.lease_grant(2000, &diag);
+    const ops = [_]store.Op{
+        .{ .put = .{ .key = "/nodes/b", .value = "b", .lease = first.id } },
+        .{ .put = .{ .key = "/nodes/a", .value = "a", .lease = first.id } },
+        .{ .put = .{ .key = "/nodes/c", .value = "c", .lease = third.id } },
+        .{ .put = .{ .key = "/plain", .value = "p" } },
+    };
+    const written = try s.txn(.{ .on_success = &ops }, &diag);
+
+    harness.manual.advance(400);
+    const listed = try s.lease_list(arena, &diag);
+    try testing.expectEqual(@as(usize, 3), listed.len);
+    try testing.expectEqual(first.id, listed[0].id);
+    try testing.expectEqual(@as(u32, 1000), listed[0].ttl_ms);
+    try testing.expectEqual(@as(u32, 600), listed[0].remaining_ms);
+    try testing.expectEqual(@as(usize, 2), listed[0].keys.len);
+    try testing.expectEqualStrings("/nodes/a", listed[0].keys[0]);
+    try testing.expectEqualStrings("/nodes/b", listed[0].keys[1]);
+    try testing.expectEqual(second.id, listed[1].id);
+    try testing.expectEqual(@as(u32, 4600), listed[1].remaining_ms);
+    try testing.expectEqual(@as(usize, 0), listed[1].keys.len);
+    try testing.expectEqual(third.id, listed[2].id);
+    try testing.expectEqual(@as(usize, 1), listed[2].keys.len);
+    try testing.expectEqualStrings("/nodes/c", listed[2].keys[0]);
+    try expect_status(s, &diag, written.revision, 0);
+
+    // Past the first lease's time but not yet reaped: nothing remains, the keys are still there.
+    harness.manual.advance(700);
+    _ = try s.lease_keepalive(second.id, &diag);
+    const lapsed = try s.lease_list(arena, &diag);
+    try testing.expectEqual(@as(usize, 3), lapsed.len);
+    try testing.expectEqual(@as(u32, 0), lapsed[0].remaining_ms);
+    try testing.expectEqual(@as(usize, 2), lapsed[0].keys.len);
+    try testing.expectEqual(@as(u32, 5000), lapsed[1].remaining_ms);
+    try testing.expectEqual(@as(u32, 900), lapsed[2].remaining_ms);
+
+    try testing.expectEqual(@as(u32, 1), try s.expire_leases(&diag));
+    const reaped = try s.lease_list(arena, &diag);
+    try testing.expectEqual(@as(usize, 2), reaped.len);
+    try testing.expectEqual(second.id, reaped[0].id);
+    try testing.expectEqual(third.id, reaped[1].id);
+}
+
+test "lease_list: a lease at the key limit lists them all, in order" {
+    // Goal: the bound of the view. Method: attach `store_lease_keys_max` keys to one lease, in
+    // descending order of key, and read them back ascending.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    const lease = try s.lease_grant(5000, &diag);
+    var names: [constants.store_lease_keys_max][8]u8 = undefined;
+    var ops: [constants.store_lease_keys_max]store.Op = undefined;
+    comptime assert(constants.store_lease_keys_max % constants.store_txn_ops_max == 0);
+    for (&names, &ops, 0..) |*name, *op, index| {
+        const number: u32 = @intCast(constants.store_lease_keys_max - 1 - index);
+        const text = try std.fmt.bufPrint(name, "/l/{d:0>3}", .{number});
+        op.* = .{ .put = .{ .key = text, .value = "v", .lease = lease.id } };
+    }
+    const chunk = constants.store_txn_ops_max; // A transaction is small; the lease is not.
+    var done: usize = 0;
+    while (done < ops.len) : (done += chunk) {
+        _ = try s.txn(.{ .on_success = ops[done..][0..chunk] }, &diag);
+    }
+    const listed = try s.lease_list(arena, &diag);
+    try testing.expectEqual(@as(usize, 1), listed.len);
+    try testing.expectEqual(@as(usize, constants.store_lease_keys_max), listed[0].keys.len);
+    for (listed[0].keys, 0..) |key, index| {
+        var expected: [8]u8 = undefined;
+        const text = try std.fmt.bufPrint(&expected, "/l/{d:0>3}", .{index});
+        try testing.expectEqualStrings(text, key);
+    }
 }
 
 // ---- A model to compare against ----------------------------------------------------------------

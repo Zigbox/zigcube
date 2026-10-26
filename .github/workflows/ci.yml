@@ -1,6 +1,7 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
 # installed from a verified tarball (.github/actions/setup-zig). The only other shell is the
-# apt-get line that installs the SQLite and libpq development files the tests link.
+# apt-get line that installs the SQLite and libpq development files the tests link. The wasm job
+# uses the Node that the runner image carries.
 name: ci
 
 # CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
@@ -76,3 +77,22 @@ jobs:
           for run in 1 2 3; do
             zig build test-store -Dbackend=postgres --summary all
           done
+
+  # The control-plane core must compile for wasm32-freestanding (docs/wasm.md): no libc, no OS,
+  # no threads, no std.Io. Node is the one WebAssembly runtime on the runner (its version is
+  # printed below); tools/wasm_check.mjs says why a JavaScript runner is acceptable. The core is
+  # also built and run in ReleaseSafe, the mode Zigcube ships, where assertions stay on.
+  wasm:
+    name: core on wasm32
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: Node version
+        run: node --version
+      - name: Core library (wasm32-freestanding), run in Node
+        run: zig build wasm-check --summary all
+      - name: Core library, ReleaseSafe
+        run: zig build wasm-check -Doptimize=ReleaseSafe --summary all
+      - name: Core unit tests (wasm32-wasi), run in Node
+        run: zig build wasm-test --summary all
