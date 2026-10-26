@@ -173,7 +173,7 @@ const SITE = {
 // green demo-cN CI run, and demo lines copied from that run's output. Never show unrecorded output as recorded.
 const MILESTONES = [
   {id:"C0", name:"Loop", status:"plan", goal:"Declare a service, and a controller keeps reality matching it on one node.",
-   demo:[["$","zcube apply hello.zon"],["","service hello  replicas 3/3 running"],["$","zcube apply broken.zon && zcube why service broken"],["","service broken: 0/1 running"],["","  ← replica broken-1 pending on node1"],["","  ← error[ZBX-E0501]: image not found"],["","      cause  digest b3:00ff…e1 is not in this node's store"]]},
+   demo:[["$","zcube apply hello.zon"],["","service hello  replicas 3/3 running"],["$","zcube apply broken.zon && zcube why service broken"],["","service broken: 0/1 running"],["","  ← replica broken-1 pending on node1"],["","  ← error[ZBX-E0410]: no tree with that digest"],["","      cause  digest b3:00ff…e1 is not in this node's store"]]},
   {id:"C1", name:"Fleet", status:"plan", goal:"Workloads spread across nodes and survive the loss of one.",
    demo:[["$","zcube get replicas hello -o wide"],["","hello-1  vm1  running     hello-4  vm2  running"],["","hello-2  vm1  running     hello-5  vm3  running"],["","(vm3 powered off)"],["","hello-5  lost → rescheduled on vm2   (lease expired after 10s)"]]},
   {id:"C2", name:"Swarm", status:"plan", goal:"Images reach nodes fast: peers share chunks, the scheduler prefers warm nodes.",

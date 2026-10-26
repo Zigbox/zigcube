@@ -402,13 +402,13 @@ test "reset clears everything, including the code" {
 }
 
 fn image_not_found(out: *Diagnostic) void {
-    // A diagnostic as it arrives from a node: the code is text of Zigbox's registry (ZBX-E0501 is
+    // A diagnostic as it arrives from a node: the code is text of Zigbox's registry (ZBX-E0410 is
     // the one HANDOFF's demo shows), which Zigcube's collector could never raise itself.
     out.reset();
-    out.code.print("ZBX-E0501", .{});
+    out.code.print("ZBX-E0410", .{});
     out.severity = .@"error";
     out.blame = .user;
-    out.summary.print("image not found", .{});
+    out.summary.print("no tree with that digest", .{});
     out.causes.count = 1;
     out.causes.items[0] = .{};
     out.causes.items[0].print("digest b3:00ff is not in this node's store", .{});
@@ -464,11 +464,11 @@ test "each product's diagnostic renders with its own commands and links" {
     var foreign: Diagnostic = undefined;
     image_not_found(&foreign);
     try testing.expectEqualStrings(
-        "error[ZBX-E0501]: image not found\n" ++
+        "error[ZBX-E0410]: no tree with that digest\n" ++
             "  cause  digest b3:00ff is not in this node's store\n" ++
             "  fix    check the digest in broken.zon\n" ++
-            "  more   zbx explain E0501 \u{b7} rerun with --verbose for the full cause chain\n" ++
-            "  docs   https://zigbox.github.io/zigbox/errors/E0501.html\n",
+            "  more   zbx explain E0410 \u{b7} rerun with --verbose for the full cause chain\n" ++
+            "  docs   https://zigbox.github.io/zigbox/errors/E0410.html\n",
         render(&foreign, .text, false, &buffer),
     );
 }
@@ -483,7 +483,7 @@ test "a ZBX- diagnostic survives the wire and still renders with Zigbox's links"
     var writer = std.Io.Writer.fixed(&buffer);
     try zigbox.diagnostic.write_json(&writer, &original);
     const wire = writer.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "\"ZBX-E0501\"") != null);
+    try testing.expect(std.mem.indexOf(u8, wire, "\"ZBX-E0410\"") != null);
 
     var parsed: Diagnostic = undefined;
     try zigbox.diagnostic.parse_json(&parsed, wire);
@@ -492,8 +492,8 @@ test "a ZBX- diagnostic survives the wire and still renders with Zigbox's links"
 
     var text: [constants.diag_output_bytes_max]u8 = undefined;
     const shown = render(&parsed, .verbose, false, &text);
-    try testing.expect(std.mem.indexOf(u8, shown, "zbx explain E0501") != null);
-    try testing.expect(std.mem.indexOf(u8, shown, "zigbox/errors/E0501.html") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "zbx explain E0410") != null);
+    try testing.expect(std.mem.indexOf(u8, shown, "zigbox/errors/E0410.html") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "zcube explain") == null);
 
     parsed.code = .{};

@@ -93,12 +93,12 @@ service broken: 0/1 running                         ← headline, with a state p
 [replica-controller] hold_failed_replica            ← a decision: actor, action, reason, time
    because ↓
 [observed] broken-1 on node1: stopped               ← a terminal: the thing that happened
-   ┌ error ZBX-E0501  blame: your input             ← a diagnostic block, DIAGNOSTICS.md anatomy
-   │ image not found
+   ┌ error ZBX-E0410  blame: your input             ← a diagnostic block, DIAGNOSTICS.md anatomy
+   │ no tree with that digest
    │ cause  digest b3:00ff7be1 is not in this node's store
    │ fix    check the digest in broken.zon, or pull the image first
    │ or     then apply the corrected file   $ zcube apply broken.zon   [Copy]
-   └ more   zbx explain E0501 · docs …
+   └ more   zbx explain E0410 · docs …
 ```
 
 Rules:
@@ -277,7 +277,7 @@ controllers' behaviour.
 
 | Scenario | Steps |
 | --- | --- |
-| `c0` | apply `hello` with 3 replicas · `kill -9` one, a replacement starts · scale to 5 · back to 2 · apply `broken` (digest not in fixtures; the chain ends at `ZBX-E0501`) · Postgres goes down (`ZC-E0201`, the console goes stale) · Postgres comes back |
+| `c0` | apply `hello` with 3 replicas · `kill -9` one, a replacement starts · scale to 5 · back to 2 · apply `broken` (digest not in fixtures; the chain ends at `ZBX-E0410`) · Postgres goes down (`ZC-E0201`, the console goes stale) · Postgres comes back |
 | `c1` | three agents join · apply `hello` ×6, two per node · power off node3, its lease expires after 10 s, replicas are rescheduled · node3 rejoins empty · `why node node3` explains no rebalancing |
 
 The dev panel (bottom right, labelled "Mock") has Play, Step and Reset, a speed selector, a

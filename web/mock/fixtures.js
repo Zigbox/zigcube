@@ -1,6 +1,6 @@
 // Fixtures for the in-browser mock of the proposed Zigcube API (docs/api.md).
 // Everything here is illustrative. The diagnostics follow DIAGNOSTICS.md and docs/keys.md; the
-// ZBX-E0501 text is HANDOFF's example, since Zigbox's registry is not available to the mock.
+// ZBX-E0410 text is HANDOFF's example, since Zigbox's registry is not available to the mock.
 
 import { ZC_CODES } from "./codes.js";
 
@@ -34,7 +34,7 @@ export function digestShort(d) {
 
 export function diagImageNotFound(digest, node, replica) {
   return {
-    code: "ZBX-E0501", severity: "error", blame: "user", summary: "image not found",
+    code: "ZBX-E0410", severity: "error", blame: "user", summary: "no tree with that digest",
     causes: [`digest ${digestShort(digest)} is not in this node's store`],
     while: [`starting replica ${replica} on ${node}`],
     context: { node, replica, image: digest },
@@ -92,7 +92,7 @@ export function diagNotFound(what) {
 export const CODES = [
   ...ZC_CODES,
   {
-    code: "ZBX-E0501", severity: "error", blame: "user", summary: "image not found",
+    code: "ZBX-E0410", severity: "error", blame: "user", summary: "no tree with that digest",
     explanation: "The runtime on the node has no image with that digest in its store, so the\nreplica cannot start. The digest in the service file is wrong, or the image\nwas never pulled to this node.\n\n(Illustrative text. The real explanation comes from Zigbox's registry.)",
   },
   {

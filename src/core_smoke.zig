@@ -175,8 +175,9 @@ fn render_diagnostics(report: *Report, diag: *Diag) Failure!void {
     diag_mod.to_diagnostic(&own, diag);
     diag.reset();
     var foreign: Diagnostic = undefined;
-    const wire = "{\"code\":\"ZBX-E0501\",\"severity\":\"error\",\"blame\":\"user\"," ++
-        "\"summary\":\"image not found\",\"causes\":[\"digest b3:00ff is not in this store\"]," ++
+    const wire = "{\"code\":\"ZBX-E0410\",\"severity\":\"error\",\"blame\":\"user\"," ++
+        "\"summary\":\"no tree with that digest\"," ++
+        "\"causes\":[\"digest b3:00ff is not in this store\"]," ++
         "\"while\":[],\"context\":{},\"fixes\":[{\"sentence\":\"check the digest\"," ++
         "\"command\":null}],\"added_later\":{\"x\":[1,2]}," ++
         "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}";
@@ -184,7 +185,7 @@ fn render_diagnostics(report: *Report, diag: *Diag) Failure!void {
     foreign.set_docs(&zigbox.product.Product.zbx);
 
     const exit: runtime.ExitReason = .{ .start_failed = foreign };
-    try check(report, .runtime_types, exit.start_failed.code.len == "ZBX-E0501".len);
+    try check(report, .runtime_types, exit.start_failed.code.len == "ZBX-E0410".len);
 
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
     report.append(diag_mod.render(&own, .text, false, &buffer));
@@ -193,7 +194,7 @@ fn render_diagnostics(report: *Report, diag: *Diag) Failure!void {
     const mark = report.len;
     report.append(diag_mod.render(&exit.start_failed, .text, false, &buffer));
     const shown = report.text()[mark..];
-    try check(report, .render_zbx, std.mem.indexOf(u8, shown, "zbx explain E0501") != null);
+    try check(report, .render_zbx, std.mem.indexOf(u8, shown, "zbx explain E0410") != null);
 }
 
 const testing = std.testing;
@@ -210,8 +211,9 @@ test "the scenario passes natively, and what it renders names each product's own
     try testing.expect(std.mem.indexOf(u8, text, "zcube explain E0203") != null);
     const own_page = "zigbox.github.io/zigcube/errors/E0203.html";
     try testing.expect(std.mem.indexOf(u8, text, own_page) != null);
-    try testing.expect(std.mem.indexOf(u8, text, "error[ZBX-E0501]: image not found") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "zbx explain E0501") != null);
-    const foreign_page = "zigbox.github.io/zigbox/errors/E0501.html";
+    const foreign_head = "error[ZBX-E0410]: no tree with that digest";
+    try testing.expect(std.mem.indexOf(u8, text, foreign_head) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "zbx explain E0410") != null);
+    const foreign_page = "zigbox.github.io/zigbox/errors/E0410.html";
     try testing.expect(std.mem.indexOf(u8, text, foreign_page) != null);
 }

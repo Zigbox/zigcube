@@ -27,7 +27,7 @@ pub const diag_summary_bytes_max: u32 = 70;
 pub const diag_explanation_bytes_max: u32 = 2048;
 pub const diag_explanation_line_bytes_max: u32 = 76;
 pub const diag_wrap_columns: u32 = 80;
-/// "ZC-" and a letter with four digits; Zigbox's "ZBX-E0501" is the longest code on the wire.
+/// "ZC-" and a letter with four digits; Zigbox's "ZBX-E0410" is the longest code on the wire.
 pub const diag_code_bytes_max: u32 = 9;
 pub const state_path_bytes_max: u32 = 4096;
 /// The buffer one rendered diagnostic or `explain` text needs: Zigbox's `output_bytes_max`, which
@@ -107,7 +107,7 @@ comptime {
     assert(diag_command_bytes_max <= diag_field_bytes_max);
     assert(diag_summary_bytes_max < diag_wrap_columns);
     assert(diag_explanation_line_bytes_max < diag_wrap_columns);
-    assert(diag_code_bytes_max == "ZBX-E0501".len);
+    assert(diag_code_bytes_max == "ZBX-E0410".len);
     assert(store_value_bytes_max >= store_key_bytes_max);
     assert(store_page_bytes_max >= store_value_bytes_max);
     assert(store_page_bytes_max + store_value_bytes_max <= request_arena_bytes_max);

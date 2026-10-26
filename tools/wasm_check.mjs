@@ -70,9 +70,9 @@ const expected = [
   "error[ZC-E0203]:",
   "zcube explain E0203",
   "https://zigbox.github.io/zigcube/errors/E0203.html",
-  "error[ZBX-E0501]: image not found",
-  "zbx explain E0501",
-  "https://zigbox.github.io/zigbox/errors/E0501.html",
+  "error[ZBX-E0410]: no tree with that digest",
+  "zbx explain E0410",
+  "https://zigbox.github.io/zigbox/errors/E0410.html",
 ];
 const missing = expected.filter((line) => !report.includes(line));
 

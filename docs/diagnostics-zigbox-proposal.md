@@ -38,7 +38,7 @@ independent of Zigbox's M2.
 
 ```zig
 pub const Diagnostic = struct {
-    code: Bounded(constants.diag_code_bytes), // "ZBX-E0501", "ZC-E0201": text, not an enum
+    code: Bounded(constants.diag_code_bytes), // "ZBX-E0410", "ZC-E0201": text, not an enum
     severity: codes.Severity,
     blame: codes.Blame,
     summary: Bounded(constants.diag_summary_bytes),
@@ -64,7 +64,7 @@ pub fn parse_json(out: *Diagnostic, bytes: []const u8) error{Malformed}!void;
 `Diagnostic.exit_code` follows from `blame` alone (`codes.exit_code(blame)`; the container-run
 scope needs only `command_missing` and the code's `can_end_run`, which the owner of the product
 passes in). The bounds are the existing `constants.diag_*` values; the code width stays
-`diag_code_bytes = 9` ("ZBX-E0501" is the longest on the wire, "ZC-E0201" fits).
+`diag_code_bytes = 9` ("ZBX-E0410" is the longest on the wire, "ZC-E0201" fits).
 
 `write_json` is today's private `render.write_json`, rewritten to read a `Diagnostic` instead of
 a `Diag`; `render`'s `.json` mode then calls it through `from_diag`. A round-trip test
@@ -108,8 +108,8 @@ pub fn render_diagnostic(
 
 The text and verbose layouts are today's `write_text`, reading from the `Diagnostic` and the
 `Product` that `Product.find` picks **by the diagnostic's own code prefix**. That is deliberate:
-`zcube why` renders a `ZBX-E0501` that came off a node, and its `more` line should read
-`zbx explain E0501` (a command that exists, on the node), not a `zcube` command for a code
+`zcube why` renders a `ZBX-E0410` that came off a node, and its `more` line should read
+`zbx explain E0410` (a command that exists, on the node), not a `zcube` command for a code
 `zcube` did not define. A `ZC-` diagnostic gets `zcube explain ...` and its own docs and
 report URLs. If no product matches (a code from a newer version), the `more` and `docs` lines
 are omitted, and nothing else changes. The old entry point becomes

@@ -14,7 +14,7 @@
 //!     `list` give the truth at any time. The agent reconciles by level, so a lost event is
 //!     recovered by the next `list`.
 //!   - A start that fails is not an error of the call but an outcome: `StartOutcome.failed`
-//!     carries the `Diagnostic`, which may belong to Zigbox's registry (`ZBX-E0501`).
+//!     carries the `Diagnostic`, which may belong to Zigbox's registry (`ZBX-E0410`).
 //!
 //! ## Failure and memory
 //!

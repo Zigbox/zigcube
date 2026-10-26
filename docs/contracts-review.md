@@ -161,7 +161,7 @@ allowed, so I expect you to say yes, but HANDOFF reserves the decision.
 - **Zig 0.17 traps worth a line**: no `**` array repetition (added `test_util.repeat`), a function parameter may not shadow a method
   name, and `@cImport` is gone (already noted). Std's `ArrayList` is unmanaged by default.
 - **Bounded `Diag` text and the `ZBX-` code width.** `diag_code_bytes_max` is 9 so that a
-  `ZBX-E0501` fits a `Diagnostic`; any future registry prefix longer than four bytes needs it
+  `ZBX-E0410` fits a `Diagnostic`; any future registry prefix longer than four bytes needs it
   raised.
 - **Build tooling "in Zig, not shell"**: `.claude/hooks/session-start.sh` and the `setup-zig`
   action's `run:` blocks are shell. Both predate this slice, and Zigbox's action is the same.

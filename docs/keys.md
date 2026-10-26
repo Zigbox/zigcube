@@ -66,7 +66,7 @@ been scheduled; they are absent only while `node` is empty.
 
 **A replica whose start failed through the user's fault is held, not replaced** (owner,
 2026-10-26). When `/observed/<node>/<replica>` says `start_failed` with a diagnostic whose blame
-is `user` (a digest that is not in the store, `ZBX-E0501`), the replica controller leaves the
+is `user` (a digest that is not in the store, `ZBX-E0410`), the replica controller leaves the
 replica where it is and writes a `hold_failed_replica` decision on the *service* (below). It does
 not retry and does not create a replacement: a new replica would fail the same way, and replacing
 it for ever would bury the cause in churn. A change of the service (a new `generation`) is what
@@ -93,8 +93,8 @@ declared by the agent's configuration (see the open questions in `docs/contracts
 { "v": 1, "replica": "hello-9", "node": "node1", "generation": 4,
   "status": "stopped",
   "exit": {"kind": "start_failed"},
-  "diagnostic": { "code": "ZBX-E0501", "severity": "error", "blame": "user",
-                  "summary": "image not found", "causes": ["..."], "while": ["..."],
+  "diagnostic": { "code": "ZBX-E0410", "severity": "error", "blame": "user",
+                  "summary": "no tree with that digest", "causes": ["..."], "while": ["..."],
                   "context": {}, "fixes": [{"sentence": "...", "command": "..."}],
                   "omitted": {"causes": 0, "while": 0, "context": 0, "fixes": 0} },
   "started_at_ms": 1761349990000, "reported_at_ms": 1761350000000 }

@@ -144,14 +144,14 @@ terminal.
       "decision": { "id": "…-0025", "at_ms": 1761350000123, "actor": "replica-controller", "action": "hold_failed_replica",
                     "subject": {"kind": "service", "name": "broken"}, "reason": "…", "cause": {"kind": "observed", "key": "/observed/node1/broken-1", "revision": 28} } },
     { "type": "observed", "text": "broken-1 on node1: stopped (failed to start)",
-      "key": "/observed/node1/broken-1", "revision": 28, "diagnostic": { "code": "ZBX-E0501", "…": "…" } } ] }
+      "key": "/observed/node1/broken-1", "revision": 28, "diagnostic": { "code": "ZBX-E0410", "…": "…" } } ] }
 ```
 
 - `step.type` is `decision`, or a terminal: `observed`, `desired`, `resync`, `lease_expired`
   (new, below), or `gone` when a decision in the chain has been removed by retention.
 - **`state.text` and every `step.text` are the sentences the CLI prints.** The CLI renders
   `state.text`, then `← <text>` per step, and a step with a `diagnostic` as the full diagnostic
-  block instead (HANDOFF's `← error[ZBX-E0501]: image not found …` form). The console may add
+  block instead (HANDOFF's `← error[ZBX-E0410]: no tree with that digest …` form). The console may add
   structure around the text (who, when, links, the revision) but never different claims.
 - `state.health` is `healthy`, `degraded`, `failing` or `gone`.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
@@ -228,4 +228,4 @@ controller or API handler writes them yet.
 
 **Owner's answers.** Item 10: a change of the replica count alone does **not** bump
 `generation`. Item 11: a replica whose start failed through the user's fault (for example
-`ZBX-E0501`) is **held**, with a `hold_failed_replica` decision, and not retried or replaced.
+`ZBX-E0410`) is **held**, with a `hold_failed_replica` decision, and not retried or replaced.

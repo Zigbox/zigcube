@@ -80,7 +80,7 @@ pub const ExitReason = union(enum) {
     signaled: u8,        // signal number
     oom,                 // memory limit hit
     pid_limit,
-    start_failed: Diagnostic, // a full diagnostic, e.g. ZBX-E0501 image not found
+    start_failed: Diagnostic, // a full diagnostic, e.g. ZBX-E0410 no tree with that digest
     lost,                // process vanished without a known reason
 };
 
@@ -138,7 +138,7 @@ Example service file:
    ```
    service broken: 0/1 running
      ← replica broken-1 pending on node1
-     ← error[ZBX-E0501]: image not found
+     ← error[ZBX-E0410]: no tree with that digest
          cause  digest b3:00ff…e1 is not in this node's store
          fix    check the digest in broken.zon, or pull the image first
    ```
