@@ -9,15 +9,38 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 
 ## Status
 
-*As of 2026-10-25. Pre-alpha: C0 is about to start against a fake runtime. Nothing here runs yet.*
+*As of 2026-10-26. Pre-alpha: C0 is under way against a fake runtime. There is no server, agent or CLI command yet; what exists is the storage layer, below. Nothing is demonstrated.*
 
 | Milestone | What it adds | Status |
 | --- | --- | --- |
-| C0 · Loop | One node keeps a promise: apply, get, why | Not started |
+| C0 · Loop | One node keeps a promise: apply, get, why | **In progress**: slices 1 and 2 below |
 | C1 · Fleet | Placement across nodes, failover on lease expiry | Not started |
 | C2–C8 | Swarm, Rollout, Mesh, Edge, Trust, State, Jobs | Not started |
 
 A milestone is marked **demonstrated** only when its `demo-cN` job is green in CI, with a link to that run.
+
+### C0 in detail
+
+C0 is built in slices. Each is reviewed adversarially before it is merged. A slice is not a demo: `demo-c0` is not written yet.
+
+| Slice | Contents | Status |
+| --- | --- | --- |
+| 1 · Scaffold and contracts | Zig 0.17.0 pinned; three stub executables; CI; limits in `src/constants.zig`; the `ZC-` diagnostics registry and `Diag` collector; the `Store` and `Runtime` contracts (both approved 2026-10-26); an in-memory reference store; the [review pack](docs/contracts-review.md) and [store design](docs/store-design.md) | **Built and reviewed**, in [PR #4](https://github.com/Zigbox/zigcube/pull/4) |
+| 2 · SQLite and conformance | `zig build tidy`; the SQLite `Store` backend (WAL, serialised writers, gap-free revisions, polling watch, leases on the injected clock, failures as `ZC-E02xx` diagnostics); the store conformance suite (`zig build test-store`), run for the memory and SQLite backends; the [proposal for Zigbox's diagnostics](docs/diagnostics-zigbox-proposal.md) | **In review.** Not yet run in CI. |
+| 3 · Postgres | The Postgres backend (serialised revision assignment, `NOTIFY` wake-ups), run through the same suite | Not started |
+
+## Building
+
+Requires Zig 0.17.0 exactly ([download](https://ziglang.org/download/)), and the SQLite 3 development files (`libsqlite3-dev`) to run the tests.
+
+```sh
+zig build                                   # zig-out/bin/zcube, zcube-server, zcube-agent (stubs)
+zig build test                              # unit and snapshot tests
+zig build tidy                              # formatting and mechanical style rules
+zig build test-store -Dbackend=sqlite       # the store conformance suite (memory | sqlite)
+```
+
+The conformance suite draws a random seed on every run and prints it; `-Dseed=N` replays a run.
 
 ## Layout
 

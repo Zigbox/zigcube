@@ -1,5 +1,6 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
-# installed from a verified tarball (.github/actions/setup-zig). No other shell.
+# installed from a verified tarball (.github/actions/setup-zig). The only other shell is the
+# one apt-get line that installs the SQLite development files the tests link.
 name: ci
 
 # CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
@@ -31,5 +32,12 @@ jobs:
         run: zig build tidy
       - name: Build the three executables
         run: zig build
+      - name: SQLite development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev
       - name: Unit and snapshot tests
         run: zig build test --summary all
+      # The suite picks a random seed per run and prints it; -Dseed=N replays a failure.
+      - name: Store conformance (memory)
+        run: zig build test-store -Dbackend=memory --summary all
+      - name: Store conformance (sqlite)
+        run: zig build test-store -Dbackend=sqlite --summary all

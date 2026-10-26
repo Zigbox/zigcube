@@ -10,6 +10,24 @@ Zigcube is a networked server, CLI and agent rather than a single-shot static bi
 - **Allocation.** Startup allocation plus bounded per-request or per-reconcile arenas, freed whole when the request or pass ends. Every arena has a named size limit in `src/constants.zig`, and exceeding it is an operating error with a coded diagnostic. No unbounded growth: caches, watch buffers and queues all have named limits.
 - **Dependencies.** Beyond the Zig toolchain: libpq, SQLite and the `zigbox` package (for the runtime and the shared diagnostics). Any other dependency needs a written reason in its commit message and the owner's approval first.
 - **Simulation.** The seam for deterministic simulation is the `Store` and `Runtime` interfaces plus a clock and network seam, not Zigbox's `host.zig`. Controllers and the scheduler must not know which implementation they are using. The store conformance suite plays the part of Zigbox's store simulator.
+- **Threads (provisional, set in C0 slice 2; the owner has not set a rule yet).** `std.Thread` is
+  allowed in tests and inside a store backend, and nowhere else until the owner decides how the
+  server and the agent are structured. Shared state in a backend sits behind one mutex
+  (`std.Io.Mutex`, which needs an `std.Io`, so a backend's `open` takes one); a wait sleeps outside
+  the mutex. No test spawns a thread it does not join.
+- **Randomised and racing tests (provisional, same slice).** All randomness in a test comes from
+  one seed, drawn once per run, printed once at the start, and replayed with `-Dseed=N` on the
+  build step. Where real threads race, the interleaving is the machine's, so those tests assert the
+  invariants that hold for every interleaving (no gap, no duplicate, revision order equals commit
+  order, every event delivered once and in order) and never one particular order. A test step
+  that draws its seed at run time is never cached: every CI run is a new draw.
+- **Store backend allocation.** A backend's client library (SQLite, libpq) allocates inside the
+  library; that is outside "no allocation after startup". What the backend hands to its caller is
+  copied into the caller's arena, so `request_arena_bytes_max` bounds a request, and a result that
+  does not fit is `error.NoCapacity`.
+- **`zig build tidy`** is Zigbox's checker, ported. libc may be linked here, so its libc rule is
+  gone; the C libraries' translated headers are importable modules; and the average of two
+  assertions per function is checked by review, not yet by the tool.
 - **Demo tests.** `zig build demo-cN` runs against real Postgres and SQLite with `FakeRuntime` until real Zigbox drops in. From C1 on, nodes may be agent processes on one machine or VMs, as HANDOFF.md says.
 
 ## Zigbox's rules (copied)
