@@ -338,12 +338,17 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
 
 /// Raises ZC-E0301 for the key and returns the error.
 pub fn malformed(diag: *Diag, key: []const u8, comptime type_name: []const u8) error{Malformed} {
+    raise_malformed(diag, key, type_name);
+    return error.Malformed;
+}
+
+/// Fills `diag` as `malformed` does, for a caller that reports the diagnostic and does not fail.
+pub fn raise_malformed(diag: *Diag, key: []const u8, comptime type_name: []const u8) void {
     assert(diag.code == null);
     diag.raise(.E0301);
     const kind = comptime kind_name(type_name);
     diag.cause("the value at {s} is not a valid {s} record", .{ key, kind });
     diag.fix(.{ .sentence = "fix or delete that key; the next pass tries again" });
-    return error.Malformed;
 }
 
 fn kind_name(comptime type_name: []const u8) []const u8 {

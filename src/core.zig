@@ -12,6 +12,7 @@
 const std = @import("std");
 
 pub const modules = .{
+    @import("agent.zig"),
     @import("apply.zig"),
     @import("clock.zig"),
     @import("controller.zig"),
@@ -23,6 +24,8 @@ pub const modules = .{
     @import("replica_controller.zig"),
     @import("retention.zig"),
     @import("runtime.zig"),
+    @import("sim_runtime.zig"),
+    @import("sim_world.zig"),
     @import("store.zig"),
     @import("store_failures.zig"),
     @import("store_memory.zig"),
