@@ -214,7 +214,10 @@ This file describes the layout as C0 built it. For C1 the owner approved two cha
 
 - **Placement moves out of `/replicas`.** The scheduler writes `/assigned/<node>/<replica>`, which
   the agent watches, instead of the `node` field (this settles the fan-out observation that used to
-  stand here), and keeps `/allocations/<node>`, the authoritative sum of a node's assignments. A node controller writes `/node-status/<node>`, and observed records gain `tenure`
+  stand here), and keeps `/allocations/<node>`, the authoritative sum of a node's assignments.
+  An auditor checks that sum and records any mismatch under `/audit/allocations/<node>`.
+- **Decisions carry their evidence.** A decision whose cause is a key embeds, in
+  `cause_evidence`, the fields of that key's value it acted on, and `why` renders from them. A node controller writes `/node-status/<node>`, and observed records gain `tenure`
   and `assignment`.
 - **Retention follows reachability.** Decisions on a live subject's current chain are pinned;
   decisions stay immutable and repetition is counted in `/decision-summaries/`; `zcube why` says whether its chain is
