@@ -300,3 +300,149 @@ controller or API handler writes them yet.
 **Owner's answers.** Item 10: a change of the replica count alone does **not** bump
 `generation`. Item 11: a replica whose start failed through the user's fault (for example
 `ZBX-E0501`) is **held**, with a `hold_failed_replica` decision, and not retried or replaced.
+
+## Agent endpoints (slice 6a)
+
+**Status: proposed in slice 6a, for the supervisor and the owner to review in the PR.** Nothing
+above changes. HANDOFF says "agents watch desired state and report observed state over HTTP and
+JSON, and the server never pushes to agents"; these are the endpoints that make that so. They are
+implemented in the core (`src/agent_api.zig`, bytes in, bytes out, routed from `Api.route`) and
+used by `zcube-agent` through `src/agent_remote.zig`. [agent.md](agent.md) says how the agent
+uses them.
+
+**Unauthenticated, and they return secrets.** `GET .../replicas` carries `env` values (the agent
+must start the container with them), and the write endpoints change the store. Like `POST
+/v1/apply`, they are for a loopback or private address until auth exists. A token scope for
+agents is the natural first use of auth: a node's token would name the one `{node}` it may use.
+
+### Why dedicated endpoints and not `/v1/list` and `/v1/watch`
+
+The agent could read `/v1/list?prefix=/replicas/`, but that endpoint hides `env` values from a
+read-only token (item 8), which is right for the console and wrong for the agent. A node-scoped
+read also keeps the agent from having to read the whole fleet, and the node-scoped writes mean an
+agent cannot write a key that is not its own: the server builds each key from the `{node}` in the
+path and refuses a record that names another node.
+
+### The shape of a conversation
+
+The agent core (`agent.zig`) makes four kinds of store call. Each is one endpoint, so the core
+runs unchanged on the far side of HTTP:
+
+| Store call the core makes | Endpoint |
+| --- | --- |
+| `lease_grant(ttl)` | `POST /v1/agent/nodes/{node}/lease` |
+| `lease_keepalive(id)` | `POST /v1/agent/nodes/{node}/lease/{id}/keepalive` |
+| `txn` with one put of `/nodes/<node>` on a lease | `PUT /v1/agent/nodes/{node}` |
+| `list(/replicas/)`, filtered to the node | `GET /v1/agent/nodes/{node}/replicas` |
+| `list(/observed/<node>/)` | `GET /v1/agent/nodes/{node}/observed` |
+| `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
+| (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
+
+`{node}` is a node name (a hostname label, at most 63 bytes). Errors are the diagnostics of
+"Errors" above, with the same statuses; unknown fields in a body are `400` and `ZC-E0104`.
+
+### `POST /v1/agent/nodes/{node}/lease`
+
+Body `{"ttl_ms": 10000}`; answer `{"lease": {"id": 43, "ttl_ms": 10000}}`. A ttl outside the
+store's range is `400` and `ZC-E0206`. The lease is the store's: it expires by the store's clock.
+The server does not remember which node asked, so a lease is tied to the node only by the key
+registered on it.
+
+### `POST /v1/agent/nodes/{node}/lease/{id}/keepalive`
+
+No body; the same answer. **A lease that has ended is `503` and `ZC-E0205`**, and that code is how
+the agent learns it must grant a new lease and register again (`agent.zig` does exactly that). The
+HTTP status is the blame's (environment), not "not found", on purpose: the agent reads the code.
+
+### `PUT /v1/agent/nodes/{node}`
+
+Registers the node: the server writes `/nodes/<node>` on the lease, in the record of keys.md.
+
+```json
+{ "lease": 43,
+  "capacity": {"cpu_millis": 4000, "memory_bytes": 8589934592},
+  "agent_version": "0.0.0", "address": "10.0.0.5:7070", "labels": [] }
+```
+
+`lease` and `capacity` are required, and both capacity numbers must be above 0. Answer
+`{"revision": 431}`. A lease that is not the store's is `ZC-E0205`.
+
+### `GET /v1/agent/nodes/{node}/replicas`
+
+The node's desired replicas, and nothing else:
+
+```json
+{ "revision": 412,
+  "kvs": [ { "key": "/replicas/hello/hello-3", "value": {"v": 1, "id": "hello-3", "…": "…"},
+             "create_revision": 390, "mod_revision": 398, "lease": 0 } ] }
+```
+
+The shape is `/v1/list`'s, the `value` is the replica record of keys.md **with its `env` values**,
+and `revision` is the revision the list was read at. A node has at most `agent_node_replicas_max`
+(512); more is `ZC-E0302`. **C0 filters `/replicas/` by the record's `node` field on the server.**
+For C1 this is the place for the `/assigned/<node>/<replica>` index that keys.md proposes: the
+scheduler would write it with `node`, and this handler would read that prefix instead. The
+endpoint's shape does not change, which is why it is a list of replicas and not of keys.
+
+### `GET /v1/agent/nodes/{node}/observed` and `POST ...`
+
+`GET` answers `{"revision": R, "kvs": [...]}` for `/observed/<node>/`, the records of keys.md.
+`POST` is one transaction, without compares (the agent is the only writer, keys.md):
+
+```json
+{ "puts": [ { "key": "/observed/node1/hello-3", "value": {"v": 1, "replica": "hello-3", "…": "…"} } ],
+  "deletes": [ "/observed/node1/hello-2" ] }
+```
+
+Answer `{"revision": 431}`. The `value` is the observed record, **including `diagnostic`**: the
+runtime's own diagnostic (`ZBX-E0501` for an image that is not in the node's store) reaches the
+store as the agent built it, and `zcube why` renders it. The server refuses (`400`, `ZC-E0104`,
+nothing written) a put whose record is for another node, whose key is not the observed key of its
+record, a delete outside `/observed/<node>/`, a key named twice, and more than 16 operations.
+
+### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
+
+The long poll, the provisional transport of HANDOFF. `from` is a revision (at least 1) and
+`timeout` is up to 25000 milliseconds (the default). Answer:
+
+```json
+{ "revision": 415, "changed": true }
+```
+
+`changed` is true if any key under the watched prefix (C0: `/replicas/`; C1: the node's
+`/assigned/` prefix) was written or deleted at a revision `>= from`. If nothing has changed the
+server holds the reply up to `timeout`, as for `GET /v1/watch`, and answers with `changed: false`
+and the bookmark when the time is up. **The reply carries no events**, because the agent
+reconciles by level: it reads the list again and lets the core decide, so a lost or compacted
+event cannot matter. The agent lists, remembers the list's `revision`, and watches from
+`revision + 1`.
+
+`from` more than one past the store's revision is `400` and `ZC-E0204`; `from` below the
+compaction point is `410` and `ZC-E0203`, and the agent treats that as "changed" and lists again.
+
+### What the agent does with them
+
+1. Grant a lease, `PUT` its registration, and `POST` a keepalive every third of the ttl
+   (`agent.zig`'s heartbeat). A `ZC-E0205` from a keepalive means the lease is gone: grant,
+   register again, and **keep the workloads** (stopping them is C1's acceptance criterion).
+2. Each step: `GET replicas`, `GET observed`, drive the runtime, `POST observed` with what
+   changed.
+3. Between steps: `GET watch` for up to a quarter of a second, and look at the local runtime.
+   A server that cannot be reached is `ZC-E0503` on the agent; it waits, backs off and retries,
+   and the containers, which run under supervisors of their own, are untouched.
+
+### New diagnostic codes
+
+All in the agent's range, `05xx`. The first two are raised by the agent about the server; the
+rest are about the agent's own host.
+
+| Code | Blame | Summary | Raised by |
+| --- | --- | --- | --- |
+| `ZC-E0503` | environment | the agent can't reach zcube-server | the agent's HTTP client |
+| `ZC-E0504` | external | zcube-server refused the agent's request | the agent, for a reply it cannot use |
+| `ZC-E0505` | user | the agent's configuration can't be used | the agent at start-up |
+| `ZC-E0506` | environment | the agent's state directory can't be used | the agent at start-up, `FakeRuntime` |
+| `ZC-E0507` | environment | the agent can't start a container's supervisor | `FakeRuntime` |
+| `ZC-E0508` | user | the container's command can't be run | the supervisor, as `start_failed` |
+| `ZC-E0509` | environment | the container's supervisor is gone | `FakeRuntime`, as `lost` |
+| `ZC-W0501` | environment | the agent's lease ended and it registered again | the agent, a warning |

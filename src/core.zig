@@ -13,6 +13,7 @@ const std = @import("std");
 
 pub const modules = .{
     @import("agent.zig"),
+    @import("agent_api.zig"),
     @import("api.zig"),
     @import("apply.zig"),
     @import("clock.zig"),
@@ -95,4 +96,5 @@ test "the controllers' tests are in this root" {
     // memory store, a manual clock and the testing allocator).
     _ = @import("replica_controller_test.zig");
     _ = @import("api_test.zig");
+    _ = @import("agent_api_test.zig");
 }

@@ -206,6 +206,46 @@ pub const server_poll_ms: u32 = 10;
 /// How long a stopping server waits for its connections before it closes them.
 pub const server_stop_ms: u32 = 2000;
 
+// ---- Agent shell and FakeRuntime (zcube-agent) ---------------------------------------------
+
+/// The agent's long poll of the server in one wait: short, so that a container that ended on
+/// this node is noticed within about this long, which is the resolution of a purely local event.
+pub const agent_watch_slice_ms: u32 = 250;
+/// A reply from the server that the agent will read: the API's own bound.
+pub const agent_response_bytes_max: u32 = api_response_bytes_max;
+/// The agent's request: a transaction of observed records fits in it.
+pub const agent_request_bytes_max: u32 = api_request_bytes_max;
+/// Connecting to the server may take this long before the agent calls it unreachable.
+pub const agent_connect_timeout_ms: u32 = 3000;
+/// A request on an open connection may take this long beyond its long poll.
+pub const agent_io_timeout_ms: u32 = 10 * 1000;
+/// A replica list and an observed list each hold at most this many records, and so does a node's
+/// share of the fleet.
+pub const agent_node_replicas_max: u32 = replicas_max;
+/// Observed records one report carries: one transaction.
+pub const agent_report_ops_max: u32 = store_txn_ops_max;
+/// A flag value or a path given to the agent.
+pub const agent_arg_bytes_max: u32 = 4096;
+pub const agent_args_max: u32 = 64;
+/// Digests in `fixtures/images.zon`.
+pub const fixture_images_max: u32 = 64;
+pub const fixtures_bytes_max: u32 = 16 * 1024;
+/// `start` waits this long for the supervisor to report that the command runs.
+pub const fake_start_timeout_ms: u32 = 10 * 1000;
+/// The pause between looks while `start` waits and while `events` waits.
+pub const fake_poll_ms: u32 = 10;
+/// Containers kept in the state directory, running or not. A start past this drops the oldest
+/// stopped one first; with none to drop it is ZC-E0502.
+pub const fake_containers_max: u32 = runtime_handles_max;
+/// A container's spec file, run record and fault file.
+pub const fake_file_bytes_max: u32 = 64 * 1024;
+/// How long a stop waits, after the kill, for the supervisor to write the run record.
+pub const fake_reap_ms: u32 = 2000;
+/// Supervisors this agent process started and has not yet reaped.
+pub const fake_children_max: u32 = runtime_handles_max;
+/// The names a container directory may hold; anything else in the state directory is ignored.
+pub const fake_dir_entries_max: u32 = 4 * runtime_handles_max;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
@@ -254,4 +294,12 @@ comptime {
     assert(server_retry_ms_min <= server_retry_ms_max);
     assert(server_poll_ms >= store_watch_poll_ms);
     assert(store_spec_bytes_max > store_postgres_conninfo_bytes_max);
+    assert(agent_watch_slice_ms < agent_resync_ms);
+    assert(agent_watch_slice_ms < api_watch_timeout_ms_max);
+    assert(agent_report_ops_max <= store_txn_ops_max);
+    assert(agent_node_replicas_max <= replicas_max);
+    assert(fake_containers_max <= runtime_handles_max);
+    assert(fake_poll_ms < fake_start_timeout_ms);
+    assert(fake_file_bytes_max <= store_value_bytes_max);
+    assert(agent_io_timeout_ms > agent_watch_slice_ms);
 }
