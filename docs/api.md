@@ -379,7 +379,7 @@ The node's desired replicas, and nothing else:
 
 The shape is `/v1/list`'s, the `value` is the replica record of keys.md **with its `env` values**,
 and `revision` is the revision the list was read at. A node has at most `agent_node_replicas_max`
-(512); more is `ZC-E0302`. **C0 filters `/replicas/` by the record's `node` field on the server.**
+(500, one page of a store list); more is `ZC-E0302`. **C0 filters `/replicas/` by the record's `node` field on the server.**
 For C1 this is the place for the `/assigned/<node>/<replica>` index that keys.md proposes: the
 scheduler would write it with `node`, and this handler would read that prefix instead. The
 endpoint's shape does not change, which is why it is a list of replicas and not of keys.

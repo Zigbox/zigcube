@@ -215,13 +215,11 @@ pub const agent_watch_slice_ms: u32 = 250;
 pub const agent_response_bytes_max: u32 = api_response_bytes_max;
 /// The agent's request: a transaction of observed records fits in it.
 pub const agent_request_bytes_max: u32 = api_request_bytes_max;
-/// Connecting to the server may take this long before the agent calls it unreachable.
-pub const agent_connect_timeout_ms: u32 = 3000;
 /// A request on an open connection may take this long beyond its long poll.
 pub const agent_io_timeout_ms: u32 = 10 * 1000;
-/// A replica list and an observed list each hold at most this many records, and so does a node's
-/// share of the fleet.
-pub const agent_node_replicas_max: u32 = replicas_max;
+/// A replica list and an observed list each hold at most this many records: one page of a store
+/// list, because the agent endpoints do not page.
+pub const agent_node_replicas_max: u32 = store_list_limit_max;
 /// Observed records one report carries: one transaction.
 pub const agent_report_ops_max: u32 = store_txn_ops_max;
 /// A flag value or a path given to the agent.
@@ -298,6 +296,7 @@ comptime {
     assert(agent_watch_slice_ms < api_watch_timeout_ms_max);
     assert(agent_report_ops_max <= store_txn_ops_max);
     assert(agent_node_replicas_max <= replicas_max);
+    assert(agent_node_replicas_max <= store_list_limit_max); // One page: the reply is not paged.
     assert(fake_containers_max <= runtime_handles_max);
     assert(fake_poll_ms < fake_start_timeout_ms);
     assert(fake_file_bytes_max <= store_value_bytes_max);

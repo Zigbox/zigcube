@@ -16,6 +16,10 @@ test {
     _ = @import("runtime.zig");
     _ = @import("records.zig");
     _ = @import("agent_clock.zig");
+    _ = @import("agent_config.zig");
+    _ = @import("agent_http.zig");
+    _ = @import("agent_remote.zig");
+    _ = @import("agent_remote_test.zig");
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_runtime_test.zig");

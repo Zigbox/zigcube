@@ -300,7 +300,9 @@ pub const FakeRuntime = struct {
         }
         const full = found.len >= constants.fake_containers_max;
         const replaced = if (oldest) |item| std.mem.eql(u8, item.handle.name(), name) else false;
-        if (!full and !replaced) return;
+        if (!full) {
+            if (!replaced) return;
+        }
         const victim = oldest orelse
             return runtime_failed(diag, "hold another container");
         self.containers.deleteTree(self.io, victim.handle.name()) catch
@@ -550,7 +552,7 @@ pub const FakeRuntime = struct {
         for (found) |item| {
             const before = self.known_tag(item.handle);
             var tag = item.tag;
-            if (before == null or before.? != item.tag) {
+            if (before != item.tag) {
                 if (changes.items.len < constants.runtime_events_batch_max) {
                     const status = try inspect_impl(self, item.handle, diag);
                     changes.append(arena, .{ .handle = item.handle, .status = status }) catch
@@ -624,7 +626,7 @@ pub const FakeRuntime = struct {
         for (self.children[0..self.children_count]) |pid| {
             var status: i32 = 0;
             const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-            if (std.os.linux.errno(rc) == .SUCCESS and rc == 0) {
+            if (rc == 0) { // Still running; any other result is a reaped or unknown child.
                 self.children[kept] = pid;
                 kept += 1;
             }
@@ -655,7 +657,7 @@ pub const FakeRuntime = struct {
         if (files.exists(self.io, dir, files.file_run)) return true;
         const child = files.read_pid(self.io, dir, files.file_child) catch return false;
         _ = arena;
-        if (std.mem.eql(u8, word, "oom") or std.mem.eql(u8, word, "pid_limit")) {
+        if (is_limit_word(word)) {
             files.write_atomic(self.io, dir, files.file_forced, word) catch return false;
             signal(child, .KILL);
             return true;
@@ -671,6 +673,11 @@ pub const FakeRuntime = struct {
         return true;
     }
 };
+
+fn is_limit_word(word: []const u8) bool {
+    if (std.mem.eql(u8, word, "oom")) return true;
+    return std.mem.eql(u8, word, "pid_limit");
+}
 
 fn signal(pid: i32, sig: std.posix.SIG) void {
     assert(pid != 0);

@@ -35,6 +35,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const text_util = @import("text.zig");
 
 const Context = controller.Context;
 
@@ -203,6 +204,7 @@ const Call = struct {
             null,
             constants.replicas_max,
         ) catch return propagate(ctx);
+        if (all.items.len > constants.agent_node_replicas_max) return too_many(ctx, "records");
         const items = ctx.arena.alloc(Item(records.Observed), all.items.len) catch
             return no_memory(ctx);
         for (all.items, items) |entry, *slot| slot.* = item_of(records.Observed, entry);
@@ -384,7 +386,9 @@ fn check_text(
 ) Failure!void {
     if (text.len > bytes_max) return bad_request(ctx, what, "is too long");
     for (text) |byte| {
-        if (byte < 0x20 or byte >= 0x7f) return bad_request(ctx, what, "may hold printable ASCII");
+        if (!text_util.is_printable(byte)) {
+            return bad_request(ctx, what, "may hold printable ASCII");
+        }
     }
 }
 
