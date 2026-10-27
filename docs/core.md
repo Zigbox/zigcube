@@ -150,8 +150,9 @@ built with `-Doptimize=ReleaseSafe`).
 ## What the shell revealed about the step model (C0 slice 5b)
 
 `zcube-server` is the first shell that drives the core on real threads, a real clock and real
-stores (`src/server*.zig`). The model held: nothing in the core needed to change to be driven, and
-the same handlers answer HTTP and the browser. What it taught:
+stores (`src/server*.zig`). The model held: the controller, the agent's step and the handlers were
+driven as they were, and the same handlers answer HTTP and the browser. Two small changes came out
+of it (`Request.hold`, an atomic request counter), and the rest of what it taught is below:
 
 - **`Wakeup.prefixes` is several prefixes; `Store.watch` takes one.** The driver opens one watch on
   every key and filters locally against the prefixes. That also delivers every decision write, which
