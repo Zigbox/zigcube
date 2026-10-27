@@ -32,25 +32,54 @@ pub const Input = struct {
 };
 
 pub const Result = union(enum) {
-    /// Written at this revision; `created` says whether the service is new.
-    written: struct { revision: store.Revision, created: bool, generation: u64 },
+    /// Written at this revision; `created` says whether the service is new. `decision` is the id
+    /// of the `apply` decision and `change` its one-line summary, both in the context's arena.
+    written: struct {
+        revision: store.Revision,
+        created: bool,
+        generation: u64,
+        decision: []const u8,
+        change: []const u8,
+    },
     /// What was applied is what is already there: nothing was written.
     unchanged,
     /// The service changed while this apply was being made; nothing was written.
     conflict,
 };
 
-/// Applies a service. Invalid input is ZC-E0104 and nothing is read or written.
-pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
+/// What an apply would do, worked out without writing (`POST /v1/apply?dry_run=1`).
+pub const Plan = struct {
+    /// The service as stored now, if there is one.
+    existing: ?records.Service,
+    /// The stored service's `mod_revision`, or 0 for none: the compare that guards the write.
+    mod_revision: store.Revision,
+    generation: u64,
+    /// The one-line summary; `no_change` when `unchanged`.
+    change: []const u8,
+    unchanged: bool,
+};
+
+/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is read.
+pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     try validate(ctx, input);
     const key = records.service_key(input.name);
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
     var existing: ?records.Service = null;
     if (found.kv) |kv| existing = try records.read(records.Service, ctx.arena, kv, ctx.diag);
-
-    const generation = next_generation(existing, input);
     const change = try change_summary(ctx, existing, input);
-    if (existing != null and std.mem.eql(u8, change, no_change)) return .unchanged;
+    return .{
+        .existing = existing,
+        .mod_revision = if (found.kv) |kv| kv.mod_revision else 0,
+        .generation = next_generation(existing, input),
+        .change = change,
+        .unchanged = existing != null and std.mem.eql(u8, change, no_change),
+    };
+}
+
+/// Applies a service. Invalid input is ZC-E0104 and nothing is read or written.
+pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
+    const planned = try plan(ctx, input);
+    if (planned.unchanged) return .unchanged;
     const service: records.Service = .{
         .name = input.name,
         .image = input.image,
@@ -58,25 +87,25 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         .command = input.command,
         .env = input.env,
         .limits = input.limits,
-        .generation = generation,
-        .next_replica = if (existing) |old| old.next_replica else 1,
+        .generation = planned.generation,
+        .next_replica = if (planned.existing) |old| old.next_replica else 1,
         .applied_by = input.applied_by,
         .request_id = input.request_id,
     };
+    const key = records.service_key(input.name);
     var batch: controller.Batch = .{};
-    const mod_revision = if (found.kv) |kv| kv.mod_revision else 0;
-    batch.expect(key.slice(), mod_revision);
+    batch.expect(key.slice(), planned.mod_revision);
     const service_key_copy = try controller.key_copy(ctx, &key);
     batch.put(service_key_copy, try records.encode(ctx.arena, service, ctx.diag));
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{
         input.applied_by, input.name, input.request_id,
     });
-    _ = try controller.put_decision(ctx, source, .{
+    const id = try controller.put_decision(ctx, source, .{
         .actor = actor,
         .action = "apply",
         .subject = .{ .kind = .service, .name = input.name },
         .reason = reason,
-        .change = change,
+        .change = planned.change,
         // A transaction cannot know the revision it will take; a reader takes it from the
         // decision key's own `mod_revision` (docs/keys.md).
         .cause = .{ .kind = .desired, .key = service_key_copy },
@@ -84,8 +113,10 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
     return switch (try controller.commit(ctx, &batch)) {
         .applied => |revision| .{ .written = .{
             .revision = revision,
-            .created = existing == null,
-            .generation = generation,
+            .created = planned.existing == null,
+            .generation = planned.generation,
+            .decision = try controller.format(ctx, "{s}", .{id.slice()}),
+            .change = planned.change,
         } },
         .conflict => .conflict,
     };
@@ -111,7 +142,7 @@ pub fn delete_service(
     const reason = try controller.format(ctx, "{s} deleted {s} (request {s})", .{
         applied_by, name, request_id,
     });
-    _ = try controller.put_decision(ctx, source, .{
+    const id = try controller.put_decision(ctx, source, .{
         .actor = actor,
         .action = "delete_service",
         .subject = .{ .kind = .service, .name = name },
@@ -124,6 +155,8 @@ pub fn delete_service(
             .revision = revision,
             .created = false,
             .generation = 0,
+            .decision = try controller.format(ctx, "{s}", .{id.slice()}),
+            .change = "deleted",
         } },
         .conflict => .conflict,
     };

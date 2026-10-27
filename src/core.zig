@@ -42,6 +42,8 @@ pub const modules = .{
 /// only what is referenced, so a banned call inside a function nobody calls would otherwise go
 /// unseen. Two levels are followed: a module, then the types declared in it.
 pub fn reference_all() void {
+    // Walking every declaration of every module takes more comptime branches than the default.
+    @setEvalBranchQuota(1_000_000);
     inline for (modules) |module| reference_declarations(module);
 }
 

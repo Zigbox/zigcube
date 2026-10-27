@@ -22,7 +22,7 @@ each is an **Ask first**. The owner approved this document as written (endpoints
 | | |
 | --- | --- |
 | Base path | `/v1` |
-| Methods | The console uses `GET` only. Writes (`apply`) are CLI-only for now. |
+| Methods | The console uses `GET` only. Writes are for the CLI: see [Writes](#writes-proposed-in-slice-5b-owner-approval-pending), which is a proposal. |
 | Bodies | `application/json`, UTF-8. Values are the JSON records of [keys.md](keys.md), unchanged. |
 | Request ID | The server assigns one to every request and returns it in the `X-Request-Id` response header, on success and failure. A client may send its own `X-Request-Id` (`[A-Za-z0-9-]`, 8 to 64 bytes); the server then uses it. The CLI prints it with `--verbose`; bundles include it. |
 | Auth | Out of scope here. SPEC says tokens are scoped; the console needs a read-only scope. A missing or insufficient token must be a diagnostic like any other. |
@@ -163,6 +163,77 @@ The registry, for the console's code reader. `codes` is `[{code, severity, blame
 `explain` adds the long `explanation` text, byte for byte what `zcube explain` prints. Codes
 from Zigbox's registry (`ZBX-`) are served too, since a runtime diagnostic travels inside
 observed state; the server gets their text from the linked `zigbox` module.
+
+## Writes (proposed in slice 5b; owner approval pending)
+
+**Status: proposed, not approved.** Everything above is the approved read-only API and is
+unchanged. `zcube apply` needs two endpoints, and `src/apply.zig` (what is written, the
+generation rules, the change summary) was waiting for them. They are implemented in the core
+(`src/api.zig`, bytes to bytes like the rest) and routed by the server, so the owner can try them
+before approving the shape.
+
+**Writes are unauthenticated until auth exists.** Anyone who can reach the server's address can
+apply and delete services. `applied_by` is a name the caller chooses, recorded for the audit
+trail and the `zcube why` text; it proves nothing. The console never calls either endpoint.
+Run the server on a loopback or otherwise private address until auth is built.
+
+### `POST /v1/apply[?dry_run=1]`
+
+The body is one service as JSON; the CLI parses the `.zon` file and sends this. Unknown fields
+are refused (`ZC-E0104`), so a typo cannot be silently ignored.
+
+```json
+{ "name": "hello", "image": "b3:51aa9c03", "replicas": 3,
+  "command": ["sh", "-c", "while true; do sleep 1; done"],
+  "env": [["KEY", "value"]], "limits": {"cpu_millis": 500, "memory_bytes": 268435456},
+  "applied_by": "alex@laptop" }
+```
+
+`name`, `image`, `replicas` and `command` are required; `env`, `limits` and `applied_by` are
+optional (`applied_by` defaults to `anonymous`). The rules are `apply.zig`'s: a count change alone
+does not bump `generation`; a change to the image, command, env or limits does.
+
+The answer is the decision id and the one-line summary (api.md item 5), whether or not it wrote:
+
+```json
+{ "request_id": "r-0001a4f", "dry_run": false, "action": "update", "name": "hello",
+  "generation": 1, "change": "replicas 3 → 5", "revision": 431,
+  "decision": "0001761350123456-0001-0007" }
+```
+
+- `action` is `create`, `update`, `none` (what was sent is what is stored; nothing written, so no
+  `revision` or `decision`) or `delete`.
+- **`?dry_run=1`** computes the same answer and writes nothing: `dry_run` is `true`, and `revision`
+  and `decision` are absent. A dry run needs the store to read the current service.
+- A write whose compare fails (someone else changed the service during the request) is read and
+  planned again up to three times, then refused with `409` and the new **`ZC-E0105`**.
+- Invalid input (a bad name, no command, too many replicas, a body that is not a service) is
+  `400` and `ZC-E0104`. A store that is down is `503` and `ZC-E0201`, as everywhere.
+
+### `DELETE /v1/services/{name}[?applied_by=<name>]`
+
+Deletes the service key and records a `delete_service` decision in one transaction; the replica
+controller then stops its replicas. The answer has the shape above with `"action": "delete"`.
+No such service is `404` and `ZC-E0101`.
+
+### New diagnostic codes
+
+| Code | Blame | Summary | Raised by |
+| --- | --- | --- | --- |
+| `ZC-E0105` | user | the service changed while it was being applied | the write endpoints, `409` |
+| `ZC-E0106` | user | the server's configuration can't be used | `zcube-server` at start-up |
+| `ZC-E0107` | environment | can't listen on the server's address | `zcube-server` at start-up |
+| `ZC-E0108` | environment | the server is at one of its limits | the HTTP shell, `503` (or `413` for a request that is too large) |
+
+`ZC-E0106` to `ZC-E0108` belong to the server shell, not to the endpoints; they are listed here
+because they travel in the same diagnostic shape. A request the shell refuses before the API sees
+it (a body over the limit, too many connections) still answers with the error body above and an
+`X-Request-Id`.
+
+### What is not in this proposal
+
+The agent's endpoints (registration, its watch, observed-state reports) arrive with the agent in
+slice 6. Auth, scopes and the `--force`/plan-hash flow of SPEC do not exist yet.
 
 ## New diagnostic codes this needs
 
