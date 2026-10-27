@@ -1,4 +1,4 @@
-//! `pg_dev`: brings a throwaway Postgres up and down for the store conformance suite.
+//! `pg_dev`: brings a throwaway Postgres up and down for the store conformance suite and demo-c0.
 //! `zig build pg-up` starts one, `zig build pg-down` stops it and deletes its files. It is build
 //! tooling, so it is Zig (docs/STYLE.md), and it needs no database to exist before it runs.
 //!
@@ -39,11 +39,12 @@ pub fn main(init: std.process.Init) u8 {
     const command = args[1];
     if (std.mem.eql(u8, command, "up")) return up(init, config);
     if (std.mem.eql(u8, command, "down")) return down(init, config);
+    if (std.mem.eql(u8, command, "stop")) return stop(init, config);
     return usage(init.io);
 }
 
 fn usage(io: std.Io) u8 {
-    say(io, "usage: pg_dev up | down\n");
+    say(io, "usage: pg_dev up | stop | down\n");
     return constants.exit_user;
 }
 
@@ -114,6 +115,18 @@ fn up(init: std.process.Init, config: Config) u8 {
     const format = "ZCUBE_TEST_POSTGRES={s}\n";
     const line = std.fmt.allocPrint(arena, format, .{config.conninfo(&buffer)}) catch return 2;
     std.Io.File.stdout().writeStreamingAll(init.io, line) catch return 2;
+    return constants.exit_ok;
+}
+
+/// Stops the server and keeps its data, for a test that stops the database and starts it again
+/// with `up` (which starts a cluster that exists). Fails if the server was not running.
+fn stop(init: std.process.Init, config: Config) u8 {
+    const arena = init.arena.allocator();
+    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
+    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return 2;
+    if (!run(init, config, &.{ pg_ctl, "-D", data, "-m", "fast", "-w", "stop" })) {
+        return constants.exit_environment;
+    }
     return constants.exit_ok;
 }
 
