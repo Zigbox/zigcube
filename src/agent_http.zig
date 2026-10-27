@@ -1,7 +1,9 @@
-//! The agent's HTTP/1.1 client: one request per connection, `Connection: close`, the whole reply
-//! read into the caller's arena. Shell code: sockets. It is small on purpose. The agent talks to
+//! The agent's HTTP/1.1 client: one request per connection, the whole reply read into the
+//! caller's arena. Shell code: sockets. It is small on purpose. The agent talks to
 //! one server, a few times a second, and a connection per request costs nothing at that rate and
 //! cannot go stale; the server's keep-alive and its limits are for the console and the CLI.
+//!
+//! A connection serves one request and the agent closes it first (see `parse_head`).
 //!
 //! Everything is bounded: a reply is read for at most the request's own wait plus
 //! `agent_io_timeout_ms` (a socket timeout, so a server that accepts and then says nothing cannot
@@ -79,7 +81,7 @@ pub const Client = struct {
     fn send(client: *const Client, stream: *net.Stream, request: Request, diag: *Diag) Error!void {
         var buffer: [4096]u8 = undefined;
         var writer = stream.writer(client.io, &buffer);
-        const head = "{s} {s} HTTP/1.1\r\nHost: {f}\r\nConnection: close\r\n" ++
+        const head = "{s} {s} HTTP/1.1\r\nHost: {f}\r\n" ++
             "Accept: application/json\r\nContent-Type: application/json\r\n" ++
             "Content-Length: {d}\r\n\r\n";
         writer.interface.print(head, .{
@@ -99,35 +101,64 @@ pub const Client = struct {
     ) Error!Reply {
         var buffer: [4096]u8 = undefined;
         var reader = stream.reader(client.io, &buffer);
-        const limit: std.Io.Limit = .limited(constants.agent_response_bytes_max + head_bytes_max);
-        const raw = reader.interface.allocRemaining(arena, limit) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.StreamTooLong => return bad_reply(
-                diag,
-                "the reply is larger than the agent reads",
-            ),
-            error.ReadFailed => {
+        const head = try client.read_head(arena, &reader.interface, diag);
+        const parsed = try parse_head(head, diag);
+        const length = parsed.content_length orelse
+            return bad_reply(diag, "the reply has no Content-Length");
+        if (length > constants.agent_response_bytes_max) {
+            return bad_reply(diag, "the reply is larger than the agent reads");
+        }
+        const body = arena.alloc(u8, length) catch return error.OutOfMemory;
+        reader.interface.readSliceAll(body) catch
+            return unreachable_server(diag, client, "the connection was lost or timed out");
+        return .{ .status = parsed.status, .body = body };
+    }
+
+    /// The status line and headers, up to and including the blank line. Read a byte at a time
+    /// from the reader's buffer, so nothing of the body is consumed.
+    fn read_head(
+        client: *const Client,
+        arena: Allocator,
+        reader: *std.Io.Reader,
+        diag: *Diag,
+    ) Error![]const u8 {
+        var head: std.ArrayList(u8) = .empty;
+        for (0..head_bytes_max) |_| {
+            const byte = reader.takeByte() catch
                 return unreachable_server(diag, client, "the connection was lost or timed out");
-            },
-        };
-        return parse(raw, diag);
+            head.append(arena, byte) catch return error.OutOfMemory;
+            if (std.mem.endsWith(u8, head.items, "\r\n\r\n")) return head.items;
+        }
+        return bad_reply(diag, "the reply's headers are longer than the agent reads");
     }
 };
 
 /// The status line and headers of a reply fit in this many bytes, or the reply is not the server's.
 const head_bytes_max: u32 = 16 * 1024;
 
-/// Splits "HTTP/1.1 200 OK\r\n...\r\n\r\nbody". The body is whatever follows the blank line: the
-/// server sends `Content-Length` and closes, so the end of the stream is the end of the body.
-pub fn parse(raw: []const u8, diag: *Diag) Error!Reply {
+pub const Head = struct { status: u16, content_length: ?u32 };
+
+/// Reads "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n...\r\n\r\n": the status and, if it has one, the
+/// length of the body that follows. The agent closes the connection itself after the body, so
+/// that the server does not: a server that closes first keeps its port in TIME_WAIT, and could
+/// not be restarted on it (docs/core.md, "Known limit: reuse_address").
+pub fn parse_head(head: []const u8, diag: *Diag) Error!Head {
     const prefix = "HTTP/1.1 ";
-    if (raw.len < prefix.len + 3) return bad_reply(diag, "the reply is not HTTP");
-    if (!std.mem.startsWith(u8, raw, prefix)) return bad_reply(diag, "the reply is not HTTP/1.1");
-    const status = std.fmt.parseInt(u16, raw[prefix.len..][0..3], 10) catch
+    if (head.len < prefix.len + 3) return bad_reply(diag, "the reply is not HTTP");
+    if (!std.mem.startsWith(u8, head, prefix)) return bad_reply(diag, "the reply is not HTTP/1.1");
+    const status = std.fmt.parseInt(u16, head[prefix.len..][0..3], 10) catch
         return bad_reply(diag, "the reply has no status");
-    const split = std.mem.find(u8, raw, "\r\n\r\n") orelse
-        return bad_reply(diag, "the reply has no end of headers");
-    return .{ .status = status, .body = raw[split + 4 ..] };
+    var length: ?u32 = null;
+    var lines = std.mem.splitSequence(u8, head, "\r\n");
+    _ = lines.next(); // The status line.
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) continue;
+        const text = std.mem.trim(u8, line[colon + 1 ..], " ");
+        length = std.fmt.parseInt(u32, text, 10) catch
+            return bad_reply(diag, "the reply's Content-Length is not a number");
+    }
+    return .{ .status = status, .content_length = length };
 }
 
 /// A receive and send timeout on the socket, so that a blocked read ends with an error.
@@ -170,27 +201,27 @@ pub fn raise_bad_reply(diag: *Diag, problem: []const u8) void {
 
 const testing = std.testing;
 
-test "a reply is split into status and body, and anything else is ZC-E0504" {
-    // Goal: the one parser of the client. Method: a good reply with and without a body, and the
-    // malformed shapes: no HTTP, a short status, a head that never ends.
+test "a reply head gives the status and the length, and anything else is ZC-E0504" {
+    // Goal: the one parser of the client. Method: a good head with and without a length, and
+    // the malformed shapes: no HTTP, a short status, a length that is not a number.
     var diag: Diag = undefined;
     diag.reset();
-    const good = try parse("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}", &diag);
+    const good = try parse_head("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", &diag);
     try testing.expectEqual(@as(u16, 200), good.status);
-    try testing.expectEqualStrings("{}", good.body);
-    const empty = try parse("HTTP/1.1 503 Service Unavailable\r\n\r\n", &diag);
-    try testing.expectEqual(@as(u16, 503), empty.status);
-    try testing.expectEqualStrings("", empty.body);
+    try testing.expectEqual(@as(?u32, 2), good.content_length);
+    const bare = try parse_head("HTTP/1.1 503 Service Unavailable\r\n\r\n", &diag);
+    try testing.expectEqual(@as(u16, 503), bare.status);
+    try testing.expectEqual(@as(?u32, null), bare.content_length);
 
     const bad = [_][]const u8{
         "",
         "HTTP/1.0 200 OK\r\n\r\n",
         "HTTP/1.1 2x0 OK\r\n\r\n",
-        "HTTP/1.1 200 OK\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: many\r\n\r\n",
     };
     for (bad) |raw| {
         diag.reset();
-        try testing.expectError(error.BadReply, parse(raw, &diag));
+        try testing.expectError(error.BadReply, parse_head(raw, &diag));
         try testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0504), diag.code);
     }
 }

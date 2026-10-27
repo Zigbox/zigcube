@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
         .zigbox = zigbox_module,
     });
+    add_agent_smoke_step(b, built, zigbox_module);
     add_tidy_step(b);
     add_pg_dev_steps(b);
     const library = add_wasm_steps(b, optimize);
@@ -200,6 +201,28 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
         }
     }
     return built;
+}
+
+/// `zig build agent-smoke`: the server and the agent as real processes, with real containers
+/// (src/agent_smoke.zig). It runs the executables the build made, whatever `-Doptimize` says, and
+/// is not `demo-c0`. It never caches: it exists to be run.
+fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.Module) void {
+    const exe = b.addExecutable(.{
+        .name = "agent_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agent_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox_module }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArtifactArg(built.server);
+    run.addArtifactArg(built.agent);
+    run.addFileArg(b.path("fixtures/images.zon"));
+    run.has_side_effects = true;
+    const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
+    b.step("agent-smoke", help).dependOn(&run.step);
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it.
