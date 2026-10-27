@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
     add_tidy_step(b);
     add_pg_dev_steps(b);
     const library = add_wasm_steps(b, optimize);
+    add_console_steps(b);
     add_sim_step(b, .{
         .seed = seed,
         .target = target,
@@ -361,4 +362,47 @@ fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
         node.addFileArg(tests.getEmittedBin());
         step.dependOn(&node.step);
     }
+}
+
+/// `zig build console-wasm` builds the browser module of the console (src/console_wasm.zig: the
+/// real core over a memory store and the simulated runtime) in ReleaseSafe, whatever `-Doptimize`
+/// says, because `ReleaseSmall` removes the assertions the core relies on. It installs the module
+/// at `zig-out/console/sim/zcube_console.wasm` and runs `tools/console_check.mjs` on it under each
+/// V8 compiler: exactly one import, and it answers `GET /v1/status`. `zig build console-site`
+/// also copies `web/` beside it, so `zig-out/console` is the whole console as static files.
+fn add_console_steps(b: *std.Build) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = .ReleaseSafe });
+    const module = b.addExecutable(.{
+        .name = "zcube_console",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/console_wasm.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+        }),
+    });
+    module.entry = .disabled;
+    module.rdynamic = true;
+    const install = b.addInstallArtifact(module, .{
+        .dest_dir = .{ .override = .{ .custom = "console/sim" } },
+    });
+    const step = b.step("console-wasm", "Build the console's browser module and check it in Node");
+    step.dependOn(&install.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/console_check.mjs"));
+        node.addFileArg(module.getEmittedBin());
+        step.dependOn(&node.step);
+    }
+    const site_help = "Install the whole console (web/ and its WASM) to zig-out/console";
+    const site = b.step("console-site", site_help);
+    site.dependOn(step);
+    const web = b.addInstallDirectory(.{
+        .source_dir = b.path("web"),
+        .install_dir = .prefix,
+        .install_subdir = "console",
+    });
+    site.dependOn(&web.step);
 }

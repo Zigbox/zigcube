@@ -17,6 +17,7 @@ pub const modules = .{
     @import("apply.zig"),
     @import("clock.zig"),
     @import("controller.zig"),
+    @import("console_sim.zig"),
     @import("constants.zig"),
     @import("core_smoke.zig"),
     @import("diag.zig"),
