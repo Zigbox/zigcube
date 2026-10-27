@@ -15,6 +15,10 @@ This document answers four questions:
 
 It also replaces the shorthand "the store is the only state" with something precise.
 
+**Revision 2 (owner review, 2026-10-27):** a predicate over a set needs an authoritative aggregate
+(phantoms, §2), so `/allocations/<node>` is added; decisions are immutable and repetition is
+counted beside them (§5); I1 is split into ownership and execution; I6 is added.
+
 ## 1. Three classes of state
 
 | Class | Where it lives | Authoritative for | If it is lost |
@@ -48,7 +52,8 @@ byte for class 1 and with process ids for class 2.
 Every key prefix has exactly one writer role, so two controllers never contend for one key, and a
 failed compare always means the world changed, never that a peer controller got there first.
 **This is the owner's decision of 2026-10-27:** the scheduler no longer writes `node` into
-`/replicas`.
+`/replicas`, and it owns the node's allocation record (below), the one shared writable record in
+the layout.
 
 | Prefix | Sole writer | Holds | Lifetime |
 | --- | --- | --- | --- |
@@ -56,16 +61,23 @@ failed compare always means the world changed, never that a peer controller got 
 | `/replicas/<svc>/<id>` | replica controller | desired replica: spec and generation; **no placement** | until the replica is retired |
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |
+| `/allocations/<node>` | scheduler | authoritative accounting: the sum of the `requests` of every assignment on the node, their count, and the `/nodes/<node>` revision whose capacity it was checked against | while the node exists |
 | `/node-status/<node>` | node controller (new) | `ready`, `lost` or `fenced`, the tenure it judged (§3), when, and the decision that set it | until the node is removed |
 | `/observed/<node>/<id>` | that node's agent, through the agent endpoint | process facts (class 2, projected) | until the agent or the node controller removes it |
-| `/decisions/<id>`, `/decisions-by-subject/…` | whoever acts, in the same transaction as the action | one action and its cause | retention (§5) |
+| `/decisions/<id>`, `/decisions-by-subject/…` | whoever acts, in the same transaction as the action | one action and its cause; **immutable** | retention (§5) |
+| `/decision-summaries/<kind>/<name>/<action>/<cause-kind>` | the actor of the decisions it counts, in the same transaction | a projection over immutable decisions: count, first and last time, the newest decision's id | with its subject |
 
 - **`/assigned/<node>/` replaces the `node` field.** An agent's long-poll watches its own prefix,
   so fan-out is O(replicas on the node), not O(all replicas). The agent endpoint joins each
   assignment with its `/replicas` record, so the agent sees the same shape as today.
 - **The scheduler moves a replica in one transaction.** It deletes `/assigned/<old>/<id>`, puts
-  `/assigned/<new>/<id>` and writes the `place_replica` decision, with compares on the replica and
-  on both node records it read.
+  `/assigned/<new>/<id>`, updates both nodes' `/allocations` records and writes the
+  `place_replica` decision, with compares on the replica, on both node records and on both
+  allocation records.
+- **Only the scheduler removes an assignment**, and it releases the allocation in the same
+  transaction. A replica retired by the replica controller, or a node marked lost by the node
+  controller, is a fact the scheduler reacts to; neither of them touches `/assigned` or
+  `/allocations`.
 - **The replica controller never reads `/assigned` to decide anything about the desired set.** It
   reads only to report (`get replicas` shows where each replica runs).
 
@@ -79,6 +91,43 @@ next step plans again from the new state. This is optimistic serialisability. Th
 `store_txn_compares_max` (16) caps the read set. That is a design pressure, not a problem. An
 action that needs more than 16 facts to justify should be split into steps, each of which records
 what it decided.
+
+### Predicates over sets: phantoms
+
+**Comparing the keys that were read is not serialisability when the decision rests on a set.** A
+scheduler that sums a node's 12 assignments and compares all 12 revisions still commits on a stale
+sum if a 13th assignment was inserted meanwhile: none of the 12 keys moved. The store's `Compare`
+cannot see an insert into a range.
+
+So **a decision that rests on a predicate over a set must compare a single authoritative record
+that every change to that set also changes.** For capacity, that record is `/allocations/<node>`:
+
+- every transaction that adds or removes an assignment on a node updates that node's allocation
+  record, so a concurrent insert moves its `mod_revision` and the stale transaction fails;
+- the scheduler places only with a compare on the allocation record and on `/nodes/<node>`
+  (whose value holds the declared capacity), and only if the new total stays within it;
+- the record is **accounting, not a cache**: it is the authority for what is allocated, and
+  `sum(requests of /assigned/<node>/*) = /allocations/<node>.allocated` is an invariant (I6),
+  not a hope.
+
+The two alternatives were a range-generation token per prefix, maintained by the store, and a
+`txn` that validates range reads. Both change the approved `Store` interface (HANDOFF's **Ask
+first**) and push the problem into three backends. The allocation record keeps the invariant local
+to one key and needs nothing new from the store.
+
+The same rule applies to any later predicate over a set (C3's surge and unavailable limits, C8's
+gang admission): name the aggregate record, its sole writer, and the transactions that must update
+it.
+
+**Two edges, stated:**
+
+- **Capacity can shrink under allocations.** An agent may register again with less declared
+  capacity than is already allocated. That is not a placement, so it does not break I6. The node
+  is over-allocated: the scheduler places nothing more there and records a decision saying so. C1
+  does not evict.
+- **Accounting is released when the assignment is removed**, which is before the old process has
+  necessarily stopped. Physical use can therefore exceed the accounting for up to the stop grace
+  (`stop_grace_ms`). Allocation is a promise about placement, not a measurement.
 
 ## 3. Tenure, leases and fencing
 
@@ -196,16 +245,30 @@ same world with the following faults:
 - agents that die, freeze, or whose kill fails;
 - server restarts.
 
-It asserts these invariants after every event:
+It asserts these invariants after every event. I1 is split, because owning a replica and running
+it are different claims: the first can be guaranteed by epochs, the second cannot be guaranteed
+under a wedged-node fault without an external fence.
 
-- **I1.** No replica id has two running instances, except inside the stated window, and never when
-  the node is not wedged and skew is within bound.
+- **I1a. Authoritative ownership is exclusive, always.** At every revision, each replica id has at
+  most one assignment, and at most one tenure under which an observation of it is admissible. No
+  fault exempts this: it is enforced by the store's compares.
+- **I1b. Physical execution is exclusive outside the stated window.** A replaced replica's old
+  instance and its replacement do not run at the same time for longer than `lost_grace_ms` plus
+  kill latency, provided the node is not wedged and clock-rate skew is within bound. Under a wedged
+  node the simulation records the overlap and does not count it as a violation for stateless
+  replicas; for stateful ones (C7) only an external fence closes it.
 - **I2.** No transaction commits whose tenure or placement epoch was superseded.
 - **I3.** No decision cites an inadmissible observation as its cause.
 - **I4.** Every key changed by a transaction was written by its prefix's writer role (§2).
 - **I5.** Every `why` answer is `complete` or names its truncation (§5).
+- **I6. Resource allocation is conserved.** Every committed placement or release changes the
+  node's allocation record exactly once, by exactly the replica's `requests`; at every revision
+  `/allocations/<node>.allocated` equals the sum of the `requests` of `/assigned/<node>/*`; and no
+  committed placement leaves a node's allocation above its declared capacity.
 
-The negative test, with skew beyond the bound or a wedged node, must find I1 violated. That is how
+The negative test, with skew beyond the bound or a wedged node, must find I1b violated, and a
+scheduler variant that skips the allocation compare must find I6 violated. That is how we know
+the simulation can see the failures the rules exclude. That is how
 we know the simulation can see the failure the bound excludes.
 
 A TLA+ model of the tenure and fencing protocol alone is worth writing before C7, and not before C1.
@@ -237,7 +300,10 @@ That is the chain an operator most needs.
 
 C1 changes the rule:
 
-1. **Roots.** Each live subject's newest decision.
+1. **Roots.** For each live subject, its newest decision **of each action**. A service's latest
+   `apply` is therefore always a root, however many `replace_replica` decisions follow it; pinning
+   only the newest decision would not protect the `apply`, because a crash loop's chain ends at an
+   observation and never passes through it.
 2. **Pinned.** A retention pass walks each root's chain to its terminal (the same walk as `why`,
    bounded by `why`'s depth limit) and pins every decision on it.
 3. **Evictable.** A decision beyond the per-subject budget (newest 200, at most 7 days) **and not
@@ -247,34 +313,45 @@ C1 changes the rule:
 The cost is one chain walk per live subject per pass. Chains are short (the C0 demo's are 2 to 5
 steps), and a pass already works a page at a time.
 
-### Repetition collapses into one decision
+### Decisions are immutable; repetition is counted beside them
 
-When a controller takes the same action on the same subject for the same kind of cause repeatedly,
-it updates one **summary decision** instead of writing a new one each time. The summary holds
-`count`, `first_at_ms`, `last_at_ms`, the first cause and the latest cause. An example is
-`replace_replica` on a service whose replicas keep dying with `SIGKILL`.
+**A decision never changes after it is written.** A later decision that cites it must find what
+the controller saw when it acted. A decision updated in place to summarise later occurrences would
+change the ancestor of every decision that already cites it, and `why` would no longer reconstruct
+the justification at the time.
 
-- The update is in the same transaction as the action, so "every action is recorded" still holds.
-  The record is a counter, not a list.
-- This is the one exception to "decisions are written once". Only the writer role that created a
-  summary updates it.
-- The per-replica decisions of a loop (`create_replica` for each new id) belong to replicas that
-  are soon deleted, so they leave after their subject's 24 hours.
+Repetition is counted in a **summary record**, `/decision-summaries/<kind>/<name>/<action>/<cause-kind>`,
+for example `/decision-summaries/service/hello/replace_replica/observed`:
+
+- it holds `count`, `first_at_ms`, `last_at_ms` and the id of the newest decision it counts;
+- the actor updates it in the same transaction as each decision it counts, so it is exact;
+- it is a **projection over decisions, never a cause**: no decision cites it, and `why` shows it
+  next to a chain ("replaced 142 times since 14:02"), not as a step of one.
+
+The decisions themselves remain, and retention removes old ones as above. A crash loop evicts its
+own older `replace_replica` decisions, never the service's `apply` (a root). Any chain that needed
+an evicted decision reports `truncated` with reason `retention`, while the summary still says how
+many there were.
+
+The cost is one decision per action, as now, plus one summary record per (subject, action, kind of
+cause).
 
 ## 6. What C1 builds from this, and what it does not
 
 **Built in C1:**
 
-- the split of §2 (`/assigned/<node>/`, `/node-status/<node>`, the node controller);
+- the split of §2 (`/assigned/<node>/`, `/allocations/<node>`, `/node-status/<node>`, the node
+  controller);
 - the read-set rule;
 - tenure compares on the agent endpoint;
 - the `tenure` and `assignment` fields on observed records;
 - agent self-fencing with a persisted `CLOCK_BOOTTIME` deadline;
 - `lost_grace_ms`;
-- `sim-c1` with I1 to I5;
+- `sim-c1` with I1a, I1b and I2 to I6;
 - `completeness` in `why`;
-- reachability-based retention;
-- summary decisions.
+- reachability-based retention, with a root per subject and action;
+- `/allocations/<node>` and the placement and release transactions that maintain it;
+- `/decision-summaries/`, with decisions immutable.
 
 `demo-c1` shows the fencing window: the partition test of HANDOFF's acceptance criteria.
 

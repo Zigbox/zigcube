@@ -214,10 +214,10 @@ This file describes the layout as C0 built it. For C1 the owner approved two cha
 
 - **Placement moves out of `/replicas`.** The scheduler writes `/assigned/<node>/<replica>`, which
   the agent watches, instead of the `node` field (this settles the fan-out observation that used to
-  stand here). A node controller writes `/node-status/<node>`, and observed records gain `tenure`
+  stand here), and keeps `/allocations/<node>`, the authoritative sum of a node's assignments. A node controller writes `/node-status/<node>`, and observed records gain `tenure`
   and `assignment`.
 - **Retention follows reachability.** Decisions on a live subject's current chain are pinned;
-  repeated actions collapse into one summary decision; `zcube why` says whether its chain is
+  decisions stay immutable and repetition is counted in `/decision-summaries/`; `zcube why` says whether its chain is
   `complete` or `truncated`, and why.
 
 C1 updates the sections above when it lands.
