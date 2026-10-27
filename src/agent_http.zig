@@ -7,8 +7,8 @@
 //!
 //! Everything is bounded: a reply is read for at most the request's own wait plus
 //! `agent_io_timeout_ms` (a `poll` before each read, so a server that accepts and then says nothing
-//! cannot stop the agent), and a reply is at most `agent_response_bytes_max`. Connecting is bounded by
-//! the kernel only (see `connect`). A failure is ZC-E0503 (the server did not answer) or
+//! cannot stop the agent), and a reply is at most `agent_response_bytes_max`. Connecting is
+//! bounded by the kernel only (see `connect`). A failure is ZC-E0503 (the server did not answer) or
 //! ZC-E0504 (it answered something the agent cannot use), never a Zig error name.
 
 const std = @import("std");
@@ -113,7 +113,8 @@ pub const Client = struct {
         var head: ?Head = null;
         var head_len: usize = 0;
         while (true) {
-            var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const events = std.posix.POLL.IN;
+            var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
             const ready = std.posix.poll(&wait, @intCast(wait_ms)) catch
                 return unreachable_server(diag, client, lost);
             if (ready == 0) return unreachable_server(diag, client, "it did not answer in time");
