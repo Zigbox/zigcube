@@ -1,0 +1,6 @@
+error[ZC-E0111]: the command line can't be understood
+  while  reading the command line
+  cause  frobnicate is not a zcube command
+  fix    see the commands and flags:   zcube help
+  more   zcube explain E0111
+  docs   https://zigbox.github.io/zigcube/errors/E0111.html

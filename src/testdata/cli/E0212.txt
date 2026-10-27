@@ -1,0 +1,5 @@
+error[ZC-E0212]: the store database does not exist
+  cause  Postgres at 127.0.0.1 has no database named zcube
+  fix    create the database, or correct its name in the store settings
+  more   zcube explain E0212 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0212.html

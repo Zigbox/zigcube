@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0207]: the store has no free capacity for this
+  cause  all 256 watch slots are in use
+  reqid  r-0000001
+  fix    close watches that are no longer needed
+  more   zcube explain E0207
+  docs   https://zigbox.github.io/zigcube/errors/E0207.html

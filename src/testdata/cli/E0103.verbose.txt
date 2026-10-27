@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  200
+error[ZC-E0103]: zcube-server sent a reply the client can't read
+  while  reading the server's answer
+  cause  the reply is not JSON
+  reqid  r-0000001
+  fix    use the zcube that came with the server, or upgrade the older one
+  more   zcube explain E0103
+  docs   https://zigbox.github.io/zigcube/errors/E0103.html

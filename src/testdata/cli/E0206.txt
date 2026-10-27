@@ -1,0 +1,5 @@
+error[ZC-E0206]: the request exceeds a store limit
+  cause  a value is 300000 bytes; the limit is 262144
+  fix    store large data outside the control plane and keep a reference
+  more   zcube explain E0206 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0206.html

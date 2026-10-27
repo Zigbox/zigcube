@@ -1,0 +1,5 @@
+error[ZC-E0204]: that revision does not exist yet
+  cause  revision 9000 was asked for; the store is at 412
+  fix    use a revision this store returned
+  more   zcube explain E0204 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0204.html

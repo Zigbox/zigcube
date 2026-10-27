@@ -1,0 +1,5 @@
+error[ZC-E0205]: the lease has expired or was revoked
+  cause  lease 43 is unknown, expired or revoked
+  fix    grant a new lease and register again
+  more   zcube explain E0205 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0205.html

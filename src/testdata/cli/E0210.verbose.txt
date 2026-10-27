@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0210]: the store database is from a newer zcube
+  cause  the store file has schema version 3; this zcube understands up to 2
+  path   /var/lib/zcube/store.db
+  reqid  r-0000001
+  fix    run the zcube version that created the file, or upgrade zcube
+  more   zcube explain E0210
+  docs   https://zigbox.github.io/zigcube/errors/E0210.html

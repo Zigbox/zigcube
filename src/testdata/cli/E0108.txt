@@ -1,0 +1,5 @@
+error[ZC-E0108]: the server is at one of its limits
+  cause  the server could not start a thread for its work
+  fix    raise the process's thread limit (ulimit -u) and start it again
+  more   zcube explain E0108 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0108.html

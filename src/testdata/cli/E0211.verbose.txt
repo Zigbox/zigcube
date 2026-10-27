@@ -1,0 +1,9 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0211]: the store backend refused the credentials
+  cause  libpq reported: password authentication failed for user "zcube"
+  cause  Postgres at 127.0.0.1 did not let the role zcube in
+  user   zcube
+  reqid  r-0000001
+  fix    correct the user and password in the store settings
+  more   zcube explain E0211
+  docs   https://zigbox.github.io/zigcube/errors/E0211.html

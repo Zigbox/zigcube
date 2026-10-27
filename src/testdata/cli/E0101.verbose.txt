@@ -1,0 +1,9 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2Fnosuch&limit=500  200
+request  r-0000001  GET /v1/list?prefix=%2Freplicas%2F&limit=500  200
+request  r-0000001  GET /v1/list?prefix=%2Fobserved%2F&limit=500  200
+error[ZC-E0101]: no such resource
+  while  looking for service nosuch
+  cause  service nosuch does not exist
+  fix    list what exists:   zcube get service
+  more   zcube explain E0101
+  docs   https://zigbox.github.io/zigcube/errors/E0101.html

@@ -1,0 +1,5 @@
+error[ZC-E0210]: the store database is from a newer zcube
+  cause  the store file has schema version 3; this zcube understands up to 2
+  fix    run the zcube version that created the file, or upgrade zcube
+  more   zcube explain E0210 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0210.html

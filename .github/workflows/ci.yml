@@ -38,6 +38,10 @@ jobs:
         run: zig build
       - name: Unit and snapshot tests
         run: zig build test --summary all
+      # The golden files of every ZC- code are checked by the tests above (and embedded at compile
+      # time); the pages that the `docs` link of a diagnostic points at are checked here.
+      - name: Error pages are up to date
+        run: zig build errors-site-check
       # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
       - name: Store conformance (memory)
         run: zig build test-store -Dbackend=memory --summary all

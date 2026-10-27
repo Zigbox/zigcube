@@ -1,0 +1,5 @@
+error[ZC-E0115]: can't write the output
+  cause  the stream is closed or full
+  fix    write to something that has room, or check what the command did:   zcube get service
+  more   zcube explain E0115 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0115.html

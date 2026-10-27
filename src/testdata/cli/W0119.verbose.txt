@@ -1,0 +1,11 @@
+warning[ZC-W0119]: --no-redact keeps secrets in the bundle
+  cause  --no-redact keeps environment values and secrets in the bundle
+  fix    read every file in it before you share it, or leave --no-redact out
+  more   zcube explain W0119 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0119.html
+request  r-0000001  GET /v1/status  200
+request  r-0000001  GET /v1/why/service/hello  200
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2Fhello&limit=500  200
+request  r-0000001  GET /v1/list?prefix=%2Freplicas%2Fhello%2F&limit=500  200
+request  r-0000001  GET /v1/list?prefix=%2Fdecisions-by-subject%2Fservice%2Fhello%2F&limit=500  200
+request  r-0000001  GET /v1/list?prefix=%2Fobserved%2F&limit=500  200

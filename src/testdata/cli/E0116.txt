@@ -1,0 +1,5 @@
+error[ZC-E0116]: can't use the state directory
+  cause  neither XDG_STATE_HOME nor HOME names an absolute directory
+  fix    name one:   export XDG_STATE_HOME=$HOME/.local/state
+  more   zcube explain E0116 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0116.html

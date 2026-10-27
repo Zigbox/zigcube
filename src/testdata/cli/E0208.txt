@@ -1,0 +1,5 @@
+error[ZC-E0208]: the store database is busy
+  cause  another connection held the write lock for over 5000 ms
+  fix    stop whatever else uses the store file, then retry
+  more   zcube explain E0208 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0208.html

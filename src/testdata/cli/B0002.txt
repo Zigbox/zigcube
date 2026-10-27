@@ -1,0 +1,7 @@
+bug[ZC-B0002]: zcube failed in a way it should not
+  this is a bug in zcube, not something you did
+  saved  diagnostic bundle:
+         <state>/zcube/bundles/1970-01-01T00-00-00Z-last.tar.gz
+  report https://github.com/Zigbox/zigcube/issues/new
+  more   zcube explain B0002 · rerun with --verbose for the message
+  docs   https://zigbox.github.io/zigcube/errors/B0002.html

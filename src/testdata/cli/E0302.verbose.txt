@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0302]: there is more to reconcile than one pass holds
+  cause  more than 512 records under /replicas/
+  reqid  r-0000001
+  fix    delete what is no longer needed
+  more   zcube explain E0302
+  docs   https://zigbox.github.io/zigcube/errors/E0302.html

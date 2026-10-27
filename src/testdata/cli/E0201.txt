@@ -1,0 +1,6 @@
+error[ZC-E0201]: can't reach the store backend
+  cause  the Postgres server at 127.0.0.1 port 5432 did not accept a connection
+  fix    start Postgres, or correct the host and port in the store settings
+         check that it is accepting connections   pg_isready -h 127.0.0.1 -p 5432
+  more   zcube explain E0201 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0201.html

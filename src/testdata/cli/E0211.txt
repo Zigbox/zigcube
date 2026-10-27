@@ -1,0 +1,5 @@
+error[ZC-E0211]: the store backend refused the credentials
+  cause  Postgres at 127.0.0.1 did not let the role zcube in
+  fix    correct the user and password in the store settings
+  more   zcube explain E0211 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0211.html

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0205]: the lease has expired or was revoked
+  cause  lease 43 is unknown, expired or revoked
+  reqid  r-0000001
+  fix    grant a new lease and register again
+  more   zcube explain E0205
+  docs   https://zigbox.github.io/zigcube/errors/E0205.html

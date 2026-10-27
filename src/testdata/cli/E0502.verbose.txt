@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0502]: the runtime failed an operation
+  cause  the runtime refused to start the process
+  reqid  r-0000001
+  fix    check the node's runtime, then retry
+  more   zcube explain E0502
+  docs   https://zigbox.github.io/zigcube/errors/E0502.html

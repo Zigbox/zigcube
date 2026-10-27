@@ -1,0 +1,6 @@
+error[ZC-E0117]: there is no failure to bundle
+  while  looking for the last failure
+  cause  no failure has been recorded, or the record can't be read
+  fix    name what to bundle:   zcube bundle service <name>
+  more   zcube explain E0117
+  docs   https://zigbox.github.io/zigcube/errors/E0117.html

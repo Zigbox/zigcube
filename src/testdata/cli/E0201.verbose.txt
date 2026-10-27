@@ -1,0 +1,12 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0201]: can't reach the store backend
+  while  reading desired state for the request
+  cause  libpq reported: connection to server at "127.0.0.1", port 5432 failed:
+         Connection refused
+  cause  the Postgres server at 127.0.0.1 port 5432 did not accept a connection
+  store  postgres
+  reqid  r-0000001
+  fix    start Postgres, or correct the host and port in the store settings
+         check that it is accepting connections   pg_isready -h 127.0.0.1 -p 5432
+  more   zcube explain E0201
+  docs   https://zigbox.github.io/zigcube/errors/E0201.html

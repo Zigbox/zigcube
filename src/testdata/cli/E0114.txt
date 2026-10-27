@@ -1,0 +1,5 @@
+apply? [y/N] error[ZC-E0114]: the apply was declined
+  cause  the answer was not yes; nothing was changed
+  fix    do it without being asked:   zcube apply --yes src/testdata/cli/hello.zon
+  more   zcube explain E0114 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0114.html

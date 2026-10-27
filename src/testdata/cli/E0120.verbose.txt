@@ -1,0 +1,6 @@
+error[ZC-E0120]: zcube ran out of memory
+  while  running the command
+  cause  a request for memory was refused
+  fix    ask for less (one service by name), or free memory, then check the state:   zcube get service
+  more   zcube explain E0120
+  docs   https://zigbox.github.io/zigcube/errors/E0120.html

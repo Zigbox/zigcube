@@ -1,0 +1,5 @@
+error[ZC-E0105]: the service changed while it was being applied
+  cause  service hello was changed by someone else during the request
+  fix    look at it as it is now, then apply again   zcube get service hello
+  more   zcube explain E0105 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0105.html

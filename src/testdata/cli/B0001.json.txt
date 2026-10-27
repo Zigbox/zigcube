@@ -1,0 +1,1 @@
+{"code":"ZC-B0001","severity":"bug","blame":"internal","summary":"zcube hit an internal error","causes":["index out of bounds: index 5, len 3"],"while":[],"context":{},"fixes":[],"docs":"https://zigbox.github.io/zigcube/errors/B0001.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}
