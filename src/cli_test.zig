@@ -591,6 +591,9 @@ test "bundle --last without a record says so, and with a dead server still works
     try expect_contains(unpacked.find("/diagnostic.json").?, "ZC-E0102");
     try expect_contains(unpacked.find("/status.unavailable.txt").?, "ZC-E0102");
     try expect_contains(unpacked.find("/MANIFEST.txt").?, "status.unavailable.txt");
+    // The first request found the server gone; the others were not tried, and say so.
+    try expect_contains(unpacked.find("/why.unavailable.txt").?, "not asked");
+    try expect_contains(unpacked.find("/keys/observed.unavailable.txt").?, "not asked");
 }
 
 test "a server that accepts and says nothing is a timeout, not a hang and not a bug" {

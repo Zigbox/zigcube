@@ -201,10 +201,13 @@ const Gatherer = struct {
     files: *std.ArrayList(Supplied),
     /// The revision the failure was seen at, when it is known.
     revision: ?u64,
+    /// The server did not answer (or went silent): the rest is not asked, so a bundle of an
+    /// outage takes one wait, not one per file.
+    server_gone: bool = false,
 
     /// One GET, as a file, or a note saying why there is none. True if the reply came.
     fn fetch(
-        g: Gatherer,
+        g: *Gatherer,
         name: []const u8,
         why: []const u8,
         path: []const u8,
@@ -212,10 +215,17 @@ const Gatherer = struct {
     ) Error!bool {
         var scratch: Report = undefined;
         scratch.reset();
+        if (g.server_gone) {
+            raise_skipped(&scratch);
+            scratch.seal();
+            try g.note(name, why, &scratch);
+            return false;
+        }
         const reply = g.client.get(path, &scratch) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Failed => {
                 scratch.seal();
+                g.server_gone = is_unreachable(&scratch);
                 try g.note(name, why, &scratch);
                 return false;
             },
@@ -229,7 +239,12 @@ const Gatherer = struct {
         return true;
     }
 
-    fn note(g: Gatherer, name: []const u8, why: []const u8, report: *const Report) Error!void {
+    fn note(
+        g: *const Gatherer,
+        name: []const u8,
+        why: []const u8,
+        report: *const Report,
+    ) Error!void {
         const extension = ".json";
         const has_extension = std.mem.endsWith(u8, name, extension);
         const stem = if (has_extension) name[0 .. name.len - extension.len] else name;
@@ -241,7 +256,7 @@ const Gatherer = struct {
     }
 
     /// The store keys under a prefix, at the failing revision when that is still there, else now.
-    fn keys(g: Gatherer, name: []const u8, comptime format: []const u8, args: anytype) Error!void {
+    fn keys(g: *Gatherer, name: []const u8, comptime format: []const u8, args: anytype) Error!void {
         const prefix = try std.fmt.allocPrint(g.arena, format, args);
         const encoded = try cli_data.percent_encode(g.arena, prefix);
         const now_path = try std.fmt.allocPrint(g.arena, "/v1/list?prefix={s}&limit={d}", .{
@@ -259,6 +274,23 @@ const Gatherer = struct {
     }
 };
 
+/// The server could not be reached or did not answer: ZC-E0102, whoever raised it.
+fn is_unreachable(report: *const Report) bool {
+    for (report.shown()) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.code.slice(), "ZC-E0102")) return true;
+    }
+    return false;
+}
+
+/// What a skipped request says: ZC-E0102 again, with the reason that the first one failed.
+fn raise_skipped(report: *Report) void {
+    assert(report.diag.code == null);
+    report.diag.raise(.E0102);
+    report.diag.while_("asking zcube-server for evidence", .{});
+    report.diag.cause("not asked: the server did not answer the request before this one", .{});
+    report.diag.fix(.{ .sentence = "bundle again once the server is up, to include it" });
+}
+
 /// Everything the server can say about the subject.
 fn gather(
     arena: Allocator,
@@ -266,7 +298,7 @@ fn gather(
     evidence: Evidence,
     files: *std.ArrayList(Supplied),
 ) Error!void {
-    const g: Gatherer = .{
+    var g: Gatherer = .{
         .arena = arena,
         .client = client,
         .files = files,
