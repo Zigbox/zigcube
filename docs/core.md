@@ -196,3 +196,9 @@ of it (`Request.hold`, an atomic request counter), and the rest of what it taugh
   `wait_for_client`), so the client sends the first FIN, and the agent's client closes as soon as
   it has read its reply. A browser tab with a kept-alive connection still has the server close
   first, after `server_stop_ms`.
+  **Slice 6c found the same for the `zcube` command**, which sent `Connection: close` and read to
+  the end of the connection, so the server closed first after every command and a restart within
+  a minute of any `zcube get` was `ZC-E0107`. The command now sends no `Connection: close`, reads
+  the reply by its `Content-Length` and closes first (`cli_http.zig`, `read_reply`), with a test
+  (`cli_test.zig`, "a server can be restarted on its port right after zcube has used it").
+  A client that sends `Connection: close` still has the server close first.
