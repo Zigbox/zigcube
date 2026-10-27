@@ -106,7 +106,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 <header class="top"><div class="wrap">
   <a class="brand" href="./"><span class="mark" aria-hidden="true"></span>Zigcube</a>
   <span class="pill s-done">C0 shipped</span>
-  <nav aria-label="Sections"><a href="#shape">Shape</a><a href="#built">Built</a><a href="#next">Next</a><a href="#planned">Planned</a><a href="./">Home</a></nav>
+  <nav aria-label="Sections"><a href="#shape">Shape</a><a href="#authority">Authority</a><a href="#built">Built</a><a href="#next">Next</a><a href="#planned">Planned</a><a href="./">Home</a></nav>
 </div></header>
 
 <main class="wrap">
@@ -203,9 +203,23 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       </svg>
       <figcaption>
         <span class="legend" style="margin-bottom:8px"><span class="key"><i class="k-core"></i>core: pure, also compiled to wasm32</span><span class="key"><i class="k-shell"></i>shell: sockets, threads, files, clock</span><span class="key"><i class="k-plan"></i>planned</span></span>
-        The store is the only state. Stop and start the server or the agent over the same store, and nothing changes. The C0 demo asserts this byte for byte.
+        Intent lives in the store; process facts live in each node's state directory; everything else is a cache. Stop and start the server or the agent and nothing changes. The C0 demo asserts this byte for byte for the store and with process ids on the host.
       </figcaption>
     </figure>
+  </section>
+
+  <section id="authority">
+    <div class="sec-head read"><p class="eyebrow">State and authority</p><h2>Three kinds of state, each with one direction of authority</h2>
+    <p>"The store is the only state" is shorthand, and not quite true: only a process's parent can collect its exit status, so some facts can only come into being on the node. The precise model, the fencing protocol and the rules for believing an observation are in <a href="https://github.com/Zigbox/zigcube/blob/main/docs/authority.md"><code>docs/authority.md</code></a>.</p></div>
+    <div class="scroll"><table class="tbl">
+      <thead><tr><th>Class</th><th>Where</th><th>Authoritative for</th><th>If lost</th></tr></thead>
+      <tbody>
+        <tr><td>Intent and decisions</td><td>the store</td><td>what should run, and why each action was taken</td><td>the cluster is lost: restore the database</td></tr>
+        <tr><td>Process facts</td><td>each node's state directory (supervisor records)</td><td>what happened to that host's processes, and nothing else</td><td>that node's processes are treated as lost and killed: fail safe</td></tr>
+        <tr><td>Caches</td><td>server and agent memory; later Zigbox's chunk store</td><td>nothing</td><td>rebuilt from the other two</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note read">Intent flows from the store to the node, facts flow from the node to the store (as <code>/observed</code>), and a node never holds intent: from local files alone an agent may adopt or stop a container, never start one.</p>
   </section>
 
   <section id="built">
@@ -319,7 +333,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
     <div class="cols">
       <div><h3>Holds, and is tested</h3><ul>
         <li><b>Gap-free watch.</b> Revision order is commit order on every backend. The conformance suite checks it under concurrent writers.</li>
-        <li><b>Restart-safe.</b> Restarting the server or the agent changes no key and adds no decision. The demo compares byte for byte.</li>
+        <li><b>Restart-safe.</b> Restarting the server or the agent changes no key and adds no decision, and the same processes keep running. The demo compares the store byte for byte and the host by process id.</li>
         <li><b>Explainable.</b> Every action has a decision whose cause chain ends at a real key. The demo checks about 30 per run.</li>
         <li><b>Store outage.</b> Postgres down gives <code>ZC-E0201</code>, exit 3. Workloads keep running and recovery needs no restart.</li>
       </ul></div>
@@ -327,6 +341,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
         <li><b>One node, one server.</b> No scheduling, no failover, and no second server on the same store.</li>
         <li><b>No real runtime.</b> No isolation and no limits, and the <code>ZBX-</code> codes are placeholders until Zigbox's adapter lands.</li>
         <li><b>No authentication</b> on writes.</li>
+        <li><b>Explanations can be cut short.</b> Retention keeps the newest 200 decisions per subject, so a long crash loop can evict the cause of a chain. <code>why</code> then ends at a <code>gone</code> step; C1 makes this an explicit <code>truncated</code> verdict and stops evicting live chains.</li>
         <li><b>Write throughput</b> on Postgres is capped by the serialised writer: hundreds to low thousands of revisions a second. A benchmark is due at C1, and group commit is the fallback.</li>
         <li><b>OrioleDB</b> has not been run.</li>
       </ul></div>
@@ -335,21 +350,23 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
   <section id="next">
     <div class="sec-head read"><p class="eyebrow"><span class="pill s-wip">Next</span> C1 · Fleet</p><h2>Placement and failover</h2>
-    <p>Not started: the brief is the next piece of work. The goal is that workloads spread across nodes and survive the loss of one, still on <code>FakeRuntime</code>, with several agents and their own state directories on one machine or a few VMs.</p></div>
+    <p>Not started: the brief is the next piece of work, built to <a href="https://github.com/Zigbox/zigcube/blob/main/docs/authority.md"><code>docs/authority.md</code></a>. The goal is that workloads spread across nodes and survive the loss of one, still on <code>FakeRuntime</code>, with several agents and their own state directories on one machine or a few VMs.</p></div>
     <div class="cards">
       <div class="card"><h3>What gets built</h3><ul>
-        <li><b>Node registration on a lease.</b> <code>/nodes/&lt;node&gt;</code> is attached to the agent's lease and carries its declared CPU and memory. <code>zcube get nodes</code> lists the nodes.</li>
-        <li><b>A scheduler.</b> It filters on resource fit, then scores for spread. Its reasons go into the <code>place_replica</code> decision.</li>
-        <li><b>Lost-node handling.</b> When a lease expires, the node's replicas are marked lost, with the lease timeout in the decision. They are rescheduled on the survivors, and nothing moves back when the node returns.</li>
-        <li><b>Fencing.</b> An agent that loses its lease stops its own workloads, so a replica never runs twice for long. This is tested with a partition: the agent stays alive but cannot reach the server.</li>
-        <li><b><code>demo-c1</code>:</b> three agents join, six replicas spread two per node, one agent is killed, and <code>zcube why node node3</code> explains why nothing came back to it.</li>
+        <li><b>Node registration on a lease.</b> <code>/nodes/&lt;node&gt;</code> is bound to the agent's lease and carries its declared CPU and memory; while it exists, the agent holds <em>tenure</em>. <code>zcube get nodes</code> lists the nodes.</li>
+        <li><b>A scheduler</b> that filters on resource fit, then scores for spread, and writes the placement as <code>/assigned/&lt;node&gt;/&lt;replica&gt;</code> with its reasons in the decision. Agents watch only their own prefix.</li>
+        <li><b>A node controller.</b> On lease expiry it marks the node lost in <code>/node-status/&lt;node&gt;</code>, waits a short grace, and marks its replicas lost; the replica controller replaces them on the survivors, with new ids. Nothing moves back when the node returns.</li>
+        <li><b>Fencing, with a stated window.</b> Exclusive <em>ownership</em> of a replica is guaranteed by the store; exclusive <em>execution</em> only outside a stated window, and not on a wedged node. The agent stops its own workloads a margin before its lease can expire, timed from when it sent its last successful keepalive. Writes from an agent that lost tenure are refused by the store. <code>demo-c1</code> tests a partition: the agent stays alive but cannot reach the server.</li>
+        <li><b>Complete or truncated.</b> <code>zcube why</code> says whether its chain reached a terminal, retention never evicts a live subject's newest decision of each kind or its chain, and decisions stay immutable: repetition is counted in a separate summary that is never a cause.</li>
+        <li><b><code>demo-c1</code></b> (three agents, six replicas, one agent killed, <code>zcube why node node3</code>) and <b><code>sim-c1</code></b>, which checks the invariants under partitions, clock skew and kills that fail.</li>
       </ul></div>
-      <div class="card"><h3>Design points to settle in the brief</h3><ul>
-        <li>A per-node index of assigned replicas (proposed: <code>/assigned/&lt;node&gt;/</code>), so an agent's long-poll watches only its own work.</li>
-        <li>Who writes the <code>lease_expired</code> decision and the lost markers: the server driver's lease timer, or a node controller.</li>
-        <li>What happens to a replica that fits no node: held as pending, with a decision naming the shortfall.</li>
-        <li>Server-assigned request IDs gain a random part, so two servers that start in the same millisecond cannot collide.</li>
-        <li>The watch fan-out benchmark that SPEC.md's risk table asks for.</li>
+      <div class="card"><h3>Decided before the brief</h3><ul>
+        <li><b>One writer role per key prefix</b>: the API, the replica controller, the scheduler, the node controller, each node's agent. The scheduler no longer writes into <code>/replicas</code>.</li>
+        <li><b>The read-set rule</b>: a controller's transaction compares every key whose value justified the action, so a stale plan writes nothing.</li>
+        <li><b>No phantoms in capacity.</b> A decision over a set compares one authoritative aggregate that every change to the set updates. For capacity that is <code>/allocations/&lt;node&gt;</code>, owned by the scheduler and changed in the same transaction as every placement and release, so no placement overcommits a node.</li>
+        <li><b>Admissible observations</b>: a controller acts on an observation only under the node's current tenure, the replica's current placement, and a ready node. Older ones may explain, never justify.</li>
+        <li><b>A lease expiry is not proof of a stop.</b> Stateless replicas accept the stated window. A stateful replica (C7) moves only with a fencing proof: the node confirms, an external fence succeeds, or an operator asserts it, and durable writes check the placement epoch.</li>
+        <li>Still to fix in the brief: what happens to a replica that fits no node (held as pending, with a decision naming the shortfall), the fencing constants, a random part in server-assigned request IDs, and the watch fan-out benchmark.</li>
       </ul></div>
     </div>
   </section>
@@ -365,7 +382,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
         <tr><td>C4 · Mesh</td><td>WireGuard between nodes, cluster DNS, and a workload identity bound to service name and image digest. Grants such as <code>web → db:5432</code> compile into per-node rules, with default deny.</td><td>M5 network namespaces and grants</td></tr>
         <tr><td>C5 · Edge</td><td>An edge proxy role on chosen nodes, ACME certificates stored encrypted, and <code>public = "…"</code> on a service. Edge traffic enters the mesh through a grant.</td><td>C4</td></tr>
         <tr><td>C6 · Trust</td><td>A policy check at admission in the server, and again in every agent before exec, using node-local trusted keys that the API cannot change. A compromised control plane cannot run unsigned code.</td><td>M8 signatures</td></tr>
-        <tr><td>C7 · State</td><td>Named state volumes pinned by the scheduler, snapshots shipped to object storage, and restore on another node after node loss, with lease fencing. The recovery point is the snapshot interval.</td><td>M6 state volumes</td></tr>
+        <tr><td>C7 · State</td><td>Named state volumes pinned by the scheduler, snapshots shipped to object storage, and restore on another node after node loss. A move needs a fencing proof, not just an expired lease, and snapshot writes are conditional on the placement epoch. The recovery point is the snapshot interval.</td><td>M6 state volumes</td></tr>
         <tr><td>C8 · Jobs</td><td>A <code>job</code> object with retries and deadlines, gang scheduling, and Zigbox M7 build steps dispatched across nodes with one shared chunk-store cache.</td><td>M7 builds</td></tr>
       </tbody>
     </table></div>
