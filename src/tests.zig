@@ -22,5 +22,19 @@ test {
     _ = @import("server_static.zig");
     _ = @import("server.zig");
     _ = @import("server_test.zig");
+    _ = @import("bundle.zig");
+    _ = @import("bundle_collect.zig");
+    _ = @import("bundle_redact.zig");
+    _ = @import("cli.zig");
+    _ = @import("cli_args.zig");
+    _ = @import("cli_commands.zig");
+    _ = @import("cli_data.zig");
+    _ = @import("cli_env.zig");
+    _ = @import("cli_get.zig");
+    _ = @import("cli_http.zig");
+    _ = @import("cli_report.zig");
+    _ = @import("cli_service.zig");
+    _ = @import("cli_view.zig");
+    _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }

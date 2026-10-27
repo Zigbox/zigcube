@@ -206,6 +206,49 @@ pub const server_poll_ms: u32 = 10;
 /// How long a stopping server waits for its connections before it closes them.
 pub const server_stop_ms: u32 = 2000;
 
+// ---- The zcube command line and its bundles --------------------------------------------------
+
+/// Where the command line looks for zcube-server (docs/cli.md): the same default the server
+/// listens on.
+pub const cli_server_default = "127.0.0.1:7070";
+pub const cli_args_max: u32 = 64;
+pub const cli_arg_bytes_max: u32 = 1024;
+/// A service file: well under `api_request_bytes_max`, so the JSON made from it fits one request.
+pub const service_file_bytes_max: u32 = 32 * 1024;
+/// The longest the command line waits for a reply; a watch is never used by it.
+pub const cli_reply_timeout_ms: u32 = 30 * 1000;
+pub const cli_reply_bytes_max: u32 = api_response_bytes_max;
+/// Diagnostics one command reports at most (the server may send several in one reply).
+pub const cli_diagnostics_max: u32 = 8;
+/// Pages of 500 keys one listing reads at most: 8000 records, well over `replicas_max`.
+pub const cli_list_pages_max: u32 = 16;
+pub const cli_rows_max: u32 = 2048;
+/// The line `zcube apply` reads for its confirmation.
+pub const cli_answer_bytes_max: u32 = 64;
+pub const cli_user_bytes_max: u32 = 64;
+/// The file in the state directory that remembers the last failure (`zcube bundle --last`).
+pub const last_failure_bytes_max: u32 = 64 * 1024;
+pub const bundles_dir_name = "bundles";
+pub const state_dir_name = "zcube";
+pub const last_failure_file_name = "last-failure.json";
+
+/// A bundle (DIAGNOSTICS.md, "Bundles"): files are staged in one fixed workspace, cut at
+/// `bundle_file_bytes_max`, and written through the tar and gzip writers into a second buffer.
+pub const bundle_file_bytes_max: u32 = 128 * 1024;
+pub const bundle_files_max: u32 = 24;
+pub const bundle_manifest_bytes_max: u32 = 12 * 1024;
+pub const bundle_stage_bytes_max: u32 = 1024 * 1024;
+pub const bundle_gz_bytes_max: u32 = 1024 * 1024 + 64 * 1024;
+pub const bundle_secrets_max: u32 = 64;
+pub const secret_value_bytes_min: u32 = 4;
+pub const secret_value_bytes_max: u32 = 1024;
+pub const environment_entries_max: u32 = 1024;
+pub const timestamp_bytes: u32 = 20;
+/// Store keys read for a bundle: the subject's records, a page each.
+pub const bundle_keys_pages_max: u32 = 4;
+pub const bundle_name_bytes_max: u32 = timestamp_bytes + 1 + 3 + service_name_bytes_max + 20;
+pub const errors_page_bytes_max: u32 = 24 * 1024;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
@@ -254,4 +297,16 @@ comptime {
     assert(server_retry_ms_min <= server_retry_ms_max);
     assert(server_poll_ms >= store_watch_poll_ms);
     assert(store_spec_bytes_max > store_postgres_conninfo_bytes_max);
+    assert(service_file_bytes_max < api_request_bytes_max);
+    assert(cli_reply_bytes_max <= request_arena_bytes_max);
+    assert(cli_list_pages_max * api_list_limit_max >= replicas_max);
+    assert(bundle_file_bytes_max * 2 < bundle_stage_bytes_max);
+    assert(bundle_stage_bytes_max + 16 * 1024 <= bundle_gz_bytes_max);
+    assert(bundle_files_max * 1024 < bundle_stage_bytes_max); // The tar headers.
+    assert(bundle_manifest_bytes_max < bundle_stage_bytes_max);
+    assert(secret_value_bytes_min < secret_value_bytes_max);
+    assert(bundle_secrets_max * secret_value_bytes_max < bundle_stage_bytes_max);
+    assert(last_failure_bytes_max <= bundle_file_bytes_max);
+    assert(timestamp_bytes == "2026-10-23T22-41-07Z".len);
+    assert(6 * 1024 + 6 * diag_explanation_bytes_max + 2048 <= errors_page_bytes_max);
 }
