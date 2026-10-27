@@ -500,22 +500,52 @@ pub const FakeRuntime = struct {
     }
 
     /// The supervisor died without a record. Kill what it left, and write the verdict so it is
-    /// made once and a recycled pid is never signalled twice.
+    /// made once and a pid that has been recycled since is never signalled.
     fn declare_lost(self: *FakeRuntime, dir: Dir) void {
         self.kill_group(dir);
         const lost: files.RunFile = .{ .kind = .lost };
         files.write_json(self.io, dir, files.file_run, lost) catch {}; // Next look tries again.
     }
 
-    /// Kills the supervisor's process group (the supervisor, the command, what the command
-    /// started) and the command by its own pid in case it left the group.
+    /// Kills the supervisor's process group: the supervisor, the command, what the command
+    /// started. Only what is provably ours is signalled, because the pids come from files that may
+    /// be old (after a host restart a recycled pid belongs to someone else): the supervisor must
+    /// still be a `supervise` of this state directory, or the command must still be in the
+    /// session the supervisor led, which no new process can have as its id while a member lives.
     pub fn kill_group(self: *FakeRuntime, dir: Dir) void {
-        if (files.read_pid(self.io, dir, files.file_supervisor)) |supervisor| {
-            signal(-supervisor, .KILL);
-        } else |_| {}
-        if (files.read_pid(self.io, dir, files.file_child)) |child| {
-            signal(child, .KILL);
-        } else |_| {}
+        const supervisor = files.read_pid(self.io, dir, files.file_supervisor) catch return;
+        var ours = self.is_our_supervisor(supervisor);
+        if (!ours) {
+            const command = files.read_pid(self.io, dir, files.file_child) catch return;
+            ours = self.session_of(command) == supervisor;
+        }
+        if (ours) signal(-supervisor, .KILL);
+    }
+
+    /// True if `pid` is a `zcube-agent supervise` of a container under our state directory.
+    fn is_our_supervisor(self: *FakeRuntime, pid: i32) bool {
+        var path: [32]u8 = undefined;
+        // Cannot fail: "/proc/", a pid of at most ten digits and "/cmdline" fit 32 bytes.
+        const name = std.fmt.bufPrint(&path, "/proc/{d}/cmdline", .{pid}) catch unreachable;
+        var buffer: [constants.state_path_bytes_max + 256]u8 = undefined;
+        const line = Dir.cwd().readFile(self.io, name, &buffer) catch return false;
+        if (std.mem.find(u8, line, "supervise") == null) return false;
+        return std.mem.find(u8, line, self.options.state_dir) != null;
+    }
+
+    /// The session id of a process, from /proc; null if it is gone.
+    fn session_of(self: *FakeRuntime, pid: i32) ?i32 {
+        var path: [32]u8 = undefined;
+        // Cannot fail: "/proc/", a pid of at most ten digits and "/stat" fit 32 bytes.
+        const name = std.fmt.bufPrint(&path, "/proc/{d}/stat", .{pid}) catch unreachable;
+        var buffer: [1024]u8 = undefined;
+        const stat = Dir.cwd().readFile(self.io, name, &buffer) catch return null;
+        // "pid (comm) state ppid pgrp session ...": the fields after the last parenthesis.
+        const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+        var fields = std.mem.tokenizeScalar(u8, stat[close + 1 ..], ' ');
+        for (0..3) |_| _ = fields.next() orelse return null; // State, parent, group.
+        const text = fields.next() orelse return null;
+        return std.fmt.parseInt(i32, text, 10) catch null;
     }
 
     // ---- events ----
@@ -655,6 +685,8 @@ pub const FakeRuntime = struct {
         const dir = self.containers.openDir(self.io, name, .{}) catch return false;
         defer dir.close(self.io);
         if (files.exists(self.io, dir, files.file_run)) return true;
+        // Signal only what a live supervisor vouches for: a pid file can be old.
+        if (!self.supervisor_alive(dir)) return false;
         const child = files.read_pid(self.io, dir, files.file_child) catch return false;
         _ = arena;
         if (is_limit_word(word)) {

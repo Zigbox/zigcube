@@ -43,6 +43,10 @@ jobs:
         run: zig build test-store -Dbackend=memory --summary all
       - name: Store conformance (sqlite)
         run: zig build test-store -Dbackend=sqlite --summary all
+      # Not demo-c0: the server and one agent as real processes, with real containers (kill -9, an
+      # agent restart, a server restart, an unknown digest). It cleans up what it starts.
+      - name: Agent smoke (real processes)
+        run: zig build agent-smoke --summary all
 
   # The same conformance suite against a real Postgres 16, the server a deployment would run.
   # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
