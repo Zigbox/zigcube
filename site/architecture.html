@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="canonical" href="https://zigbox.github.io/zigcube/architecture.html">
+<meta name="description" content="How Zigcube is built: what exists after C0, what C1 adds next, and what is planned through C8.">
+<title>Zigcube architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{color-scheme:light}
+img,svg{max-width:100%}[hidden]{display:none!important}
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --fg:#151a24; --muted:#5d6676; --line:#dde2ea;
+  --accent:#2156b8; --accent-soft:#dde6f7; --term:#141925; --term-fg:#e3e8f2; --term-dim:#8790a3; --term-accent:#7fa8f5;
+  --ok:#2f7a4a; --wip:#2156b8; --plan:#8a8473; --ok-soft:#e1f0e6;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --accent-soft:#1d2a45; --term:#0a0d13; --term-fg:#e3e8f2; --term-dim:#7d869a; --term-accent:#7fa8f5;
+  --ok:#6cc08a; --wip:#7fa8f5; --plan:#a39d8a; --ok-soft:#173023; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --accent-soft:#1d2a45; --term:#0a0d13; --term-fg:#e3e8f2; --term-dim:#7d869a; --term-accent:#7fa8f5;
+  --ok:#6cc08a; --wip:#7fa8f5; --plan:#a39d8a; --ok-soft:#173023; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;line-height:1.6;margin:0}
+.wrap{max-width:1040px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.read{max-width:760px}
+a{color:var(--accent)} a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;line-height:1.15;margin:0}
+h1{font-size:clamp(2.2rem,5vw,3.2rem);letter-spacing:-.01em}
+h2{font-size:1.75rem} h3{font-size:1.1rem;margin-bottom:6px}
+p{margin:0 0 12px}
+code{font-family:var(--mono);font-size:.88em;overflow-wrap:anywhere}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+header.top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:20px;padding-block:12px;flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;font-size:1.2rem;color:var(--fg);text-decoration:none;display:flex;gap:8px;align-items:center}
+.brand .mark{width:20px;height:20px;border:2px solid var(--accent);border-radius:3px;position:relative;transform:rotate(45deg) scale(.85)}
+.brand .mark::after{content:"";position:absolute;inset:3px;border:2px solid var(--accent);border-radius:1px}
+nav{display:flex;gap:16px;flex-wrap:wrap;margin-left:auto;font-size:.9rem}
+nav a{color:var(--muted);text-decoration:none} nav a:hover{color:var(--fg)}
+.pill{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.72rem;padding:2px 8px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.s-done{color:var(--ok)} .s-wip{color:var(--wip)} .s-plan{color:var(--plan)}
+.hero{padding-block:48px 32px}
+.hero p.lede{font-size:1.15rem;color:var(--muted);max-width:62ch;margin:16px 0 18px}
+.legend{display:flex;gap:10px;flex-wrap:wrap}
+section{padding-block:44px;border-top:1px solid var(--line)}
+.sec-head{margin-bottom:22px}
+.sec-head p{color:var(--muted);margin:8px 0 0;max-width:66ch}
+.sec-head .eyebrow{display:flex;gap:10px;align-items:center;margin-bottom:6px}
+.diagram{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
+.diagram svg{display:block;min-width:720px;width:100%;height:auto}
+.diagram figcaption{color:var(--muted);font-size:.9rem;margin-top:10px}
+svg text{font-family:var(--mono);fill:var(--fg)}
+svg .t{font-family:var(--display);font-weight:700;font-size:15px}
+svg .s{font-size:11.5px;fill:var(--muted)}
+svg .l{font-size:11.5px;fill:var(--muted)}
+svg .box{fill:var(--surface);stroke:var(--line);stroke-width:1.5}
+svg .outer{fill:none;stroke:var(--muted);stroke-width:1.2;stroke-dasharray:2 4}
+svg .core{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.5}
+svg .shell{fill:var(--bg);stroke:var(--line);stroke-width:1.5}
+svg .planned{fill:none;stroke:var(--plan);stroke-width:1.5;stroke-dasharray:6 4}
+svg .arrow{stroke:var(--muted);stroke-width:1.5;fill:none}
+svg .arrow.dash{stroke-dasharray:5 4}
+svg .head{fill:var(--muted)}
+.key{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.75rem;color:var(--muted)}
+.key i{width:16px;height:12px;border-radius:2px;display:inline-block}
+.key .k-core{background:var(--accent-soft);border:1.5px solid var(--accent)}
+.key .k-shell{background:var(--bg);border:1.5px solid var(--line)}
+.key .k-plan{border:1.5px dashed var(--plan)}
+.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.card{border:1px solid var(--line);border-radius:10px;padding:18px 20px;background:var(--surface);min-width:0}
+.card p{color:var(--muted);font-size:.94rem}
+.card ul{margin:0;padding-left:18px;color:var(--muted);font-size:.93rem}
+.card li{margin-bottom:4px}
+.card .files{font-family:var(--mono);font-size:.72rem;color:var(--muted);margin-top:10px;overflow-wrap:anywhere}
+.flow{counter-reset:f;list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.flow li{counter-increment:f;display:grid;grid-template-columns:34px 1fr;gap:12px;align-items:start;min-width:0}
+.flow li::before{content:counter(f);font-family:var(--mono);font-size:.8rem;color:var(--accent);border:1.5px solid var(--accent);border-radius:50%;width:26px;height:26px;display:grid;place-items:center;margin-top:1px}
+.flow li>div{min-width:0}
+.tbl{width:100%;border-collapse:collapse;font-size:.93rem;background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.tbl th,.tbl td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl th{font-family:var(--mono);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500}
+.tbl tr:last-child td{border-bottom:0}
+.tbl td:first-child{white-space:nowrap}
+.scroll{overflow-x:auto;border-radius:10px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+.cols>div{min-width:0}
+.cols ul{padding-left:18px;margin:0;color:var(--muted)} .cols li{margin-bottom:6px}
+.cols li b{color:var(--fg);font-weight:600}
+.note{border-left:3px solid var(--plan);padding:2px 0 2px 14px;color:var(--muted);font-size:.93rem;margin-top:18px}
+footer{border-top:1px solid var(--line);padding-block:28px;color:var(--muted);font-size:.85rem}
+footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+@media (max-width:820px){.cards,.cols{grid-template-columns:1fr}}
+@media (max-width:520px){nav{margin-left:0;width:100%}.tbl td:first-child{white-space:normal}}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="./"><span class="mark" aria-hidden="true"></span>Zigcube</a>
+  <span class="pill s-done">C0 shipped</span>
+  <nav aria-label="Sections"><a href="#shape">Shape</a><a href="#built">Built</a><a href="#next">Next</a><a href="#planned">Planned</a><a href="./">Home</a></nav>
+</div></header>
+
+<main class="wrap">
+  <div class="hero read">
+    <p class="eyebrow">Architecture · as of 2026-10-27</p>
+    <h1>How Zigcube is built</h1>
+    <p class="lede">Desired state goes into a versioned store. Controllers turn it into replicas and record a decision for every action. A thin agent on each node pulls its replicas and runs them through a runtime interface. C0 builds all of that against a fake runtime on one node. This page says what exists, what C1 adds next, and what is planned after that.</p>
+    <div class="legend"><span class="pill s-done">Built: C0, demonstrated in CI</span><span class="pill s-wip">Next: C1, not started</span><span class="pill s-plan">Planned: C2 to C8</span></div>
+  </div>
+
+  <section id="shape">
+    <div class="sec-head read"><p class="eyebrow">The shape</p><h2>Three executables, one store, one contract with Zigbox</h2>
+    <p><code>zcube</code> (the command line), <code>zcube-server</code> (HTTP API plus controllers) and <code>zcube-agent</code> (one per node) come from one Zig 0.17 build, with no third-party Zig dependencies. The server talks to the store. Everyone else talks to the server over HTTP/1.1 and JSON, and the server never pushes to an agent.</p></div>
+    <figure class="diagram" style="margin:0">
+      <svg viewBox="0 0 960 520" role="img" aria-labelledby="dg-title dg-desc">
+        <title id="dg-title">Zigcube components after C0</title>
+        <desc id="dg-desc">The zcube CLI and the web console call the server's HTTP API. The server holds the API handlers and controllers, which form the WASM-clean core, plus a shell of threads, timers and the clock, and it reads and writes the Store, backed by Postgres, SQLite or memory. On a node, zcube-agent pulls its replicas from the server, reports observed state and keeps its lease. It drives the Runtime interface. FakeRuntime implements it today with one supervisor process per container; a Zigbox adapter is planned.</desc>
+        <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+
+        <rect class="box" x="40" y="70" width="200" height="56" rx="8"/>
+        <text class="t" x="56" y="94">zcube</text>
+        <text class="s" x="56" y="113">apply · get · why · bundle</text>
+        <rect class="box" x="40" y="150" width="200" height="56" rx="8"/>
+        <text class="t" x="56" y="174">web console</text>
+        <text class="s" x="56" y="193">served by zcube-server</text>
+        <path class="arrow" d="M240 98 H316" marker-end="url(#ah)"/>
+        <path class="arrow" d="M240 178 H270 V114 H316" marker-end="url(#ah)"/>
+        <text class="l" x="250" y="90">HTTP</text>
+
+        <rect class="box" x="300" y="40" width="360" height="230" rx="10"/>
+        <text class="t" x="316" y="64">zcube-server</text>
+        <rect class="core" x="316" y="78" width="328" height="52" rx="6"/>
+        <text x="330" y="99" style="font-size:13px">HTTP API · /v1</text>
+        <text class="s" x="330" y="118">handlers: request bytes → response bytes</text>
+        <rect class="core" x="316" y="140" width="328" height="52" rx="6"/>
+        <text x="330" y="161" style="font-size:13px">controllers</text>
+        <text class="s" x="330" y="180">reconcile → Wakeup · decision per action</text>
+        <rect class="shell" x="316" y="202" width="328" height="54" rx="6"/>
+        <text x="330" y="223" style="font-size:13px">shell</text>
+        <text class="s" x="330" y="242">connections · driver · leases · compaction</text>
+
+        <path class="arrow" d="M644 166 H720" marker-end="url(#ah)" marker-start="url(#ah)"/>
+        <text class="l" x="664" y="158">txn</text>
+        <text class="l" x="664" y="184">watch</text>
+
+        <rect class="box" x="720" y="78" width="200" height="178" rx="10"/>
+        <text class="t" x="736" y="102">Store</text>
+        <text class="s" x="736" y="122">revisions · CAS · watch</text>
+        <text class="s" x="736" y="139">leases · compaction</text>
+        <rect class="shell" x="736" y="152" width="168" height="26" rx="5"/>
+        <text x="748" y="170" style="font-size:12px">Postgres 16</text>
+        <rect class="shell" x="736" y="184" width="168" height="26" rx="5"/>
+        <text x="748" y="202" style="font-size:12px">SQLite, WAL</text>
+        <rect class="shell" x="736" y="216" width="168" height="26" rx="5"/>
+        <text x="748" y="234" style="font-size:12px">memory</text>
+
+        <rect class="outer" x="40" y="322" width="880" height="178" rx="12"/>
+        <text class="eyebrow" x="56" y="346" style="font-size:11px;fill:var(--muted);letter-spacing:.08em">ONE NODE</text>
+        <path class="arrow" d="M190 362 V296 H420 V270" marker-end="url(#ah)" marker-start="url(#ah)"/>
+        <text class="l" x="432" y="292">the agent pulls over HTTP: a long-poll for its</text>
+        <text class="l" x="432" y="308">replicas, observed-state reports, lease keepalive</text>
+
+        <rect class="box" x="60" y="362" width="260" height="118" rx="8"/>
+        <text class="t" x="76" y="386">zcube-agent</text>
+        <rect class="core" x="76" y="398" width="228" height="30" rx="5"/>
+        <text x="88" y="418" style="font-size:12px">reconcile step</text>
+        <rect class="shell" x="76" y="436" width="228" height="30" rx="5"/>
+        <text x="88" y="456" style="font-size:12px">store over HTTP · one thread</text>
+
+        <path class="arrow" d="M320 421 H360" marker-end="url(#ah)"/>
+        <rect class="box" x="360" y="362" width="180" height="118" rx="8"/>
+        <text class="t" x="376" y="386">Runtime</text>
+        <text class="s" x="376" y="408">start · stop · inspect</text>
+        <text class="s" x="376" y="426">list · events</text>
+        <text class="s" x="376" y="452">the contract with</text>
+        <text class="s" x="376" y="468">Zigbox</text>
+
+        <path class="arrow" d="M540 392 H580" marker-end="url(#ah)"/>
+        <path class="arrow dash" d="M540 452 H580" marker-end="url(#ah)"/>
+        <rect class="shell" x="580" y="362" width="160" height="56" rx="8"/>
+        <text x="594" y="385" style="font-size:13px">FakeRuntime</text>
+        <text class="s" x="594" y="404">host processes</text>
+        <rect class="planned" x="580" y="426" width="160" height="54" rx="8"/>
+        <text x="594" y="449" style="font-size:13px;fill:var(--muted)">zigbox adapter</text>
+        <text class="s" x="594" y="468">planned · Zigbox M2</text>
+
+        <path class="arrow" d="M740 390 H770" marker-end="url(#ah)"/>
+        <rect class="box" x="770" y="362" width="134" height="118" rx="8"/>
+        <text x="782" y="384" style="font-size:12.5px">supervisor</text>
+        <text x="782" y="401" style="font-size:12.5px">per container</text>
+        <text class="s" x="782" y="425">parent of the</text>
+        <text class="s" x="782" y="441">command; writes</text>
+        <text class="s" x="782" y="457">how it ended</text>
+      </svg>
+      <figcaption>
+        <span class="legend" style="margin-bottom:8px"><span class="key"><i class="k-core"></i>core: pure, also compiled to wasm32</span><span class="key"><i class="k-shell"></i>shell: sockets, threads, files, clock</span><span class="key"><i class="k-plan"></i>planned</span></span>
+        The store is the only state. Stop and start the server or the agent over the same store, and nothing changes. The C0 demo asserts this byte for byte.
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="built">
+    <div class="sec-head read"><p class="eyebrow"><span class="pill s-done">Built</span> C0 · Loop</p><h2>What exists today</h2>
+    <p>Everything here is merged on <code>main</code> and exercised by <code>demo-c0</code> on both Postgres and SQLite in CI. All of it runs against <code>FakeRuntime</code>, not real Zigbox, and on one node.</p></div>
+    <div class="cards">
+      <div class="card"><h3>Store: a versioned key-value interface</h3>
+        <p>The same semantics as etcd, on databases people already run. Every committed transaction gets one global revision, and the revision is assigned inside the transaction that writes the data.</p>
+        <ul>
+          <li><b>Operations:</b> <code>get</code>, <code>list</code> (at a revision, paged, reversible), <code>txn</code> (compare on <code>mod_revision</code>, then puts and deletes), <code>watch</code> (ordered, gap-free, an explicit error once compacted), leases (grant, keepalive, revoke, list), and <code>compact</code>.</li>
+          <li><b>Postgres:</b> each writer's first statement is <code>UPDATE store_meta SET revision = revision + 1 RETURNING revision</code>. That serialises writers, so revision order is commit order and a rollback never burns a number. <code>LISTEN</code>/<code>NOTIFY</code> wakes watchers, a bounded poll backs it up, and the reader checks the log has no hole. The schema is plain heap; OrioleDB is optional and has not been run.</li>
+          <li><b>SQLite:</b> WAL mode, with <code>BEGIN IMMEDIATE</code> as the single writer. For development and single-node use.</li>
+          <li><b>Memory:</b> the reference implementation, used by the tests and the console.</li>
+          <li>One conformance suite runs on all three backends with a fresh seed on every run.</li>
+        </ul>
+        <p class="files">store.zig · store_memory.zig · store_sqlite.zig · store_postgres.zig · store_conformance.zig · docs/store-design.md</p></div>
+
+      <div class="card"><h3>The core: controllers as steps</h3>
+        <p>A controller is <code>reconcile(ctx) → Wakeup</code>. It reads, does what is due, writes each action with its decision record in one transaction, and returns the time or key prefixes that should wake it next. It never blocks.</p>
+        <ul>
+          <li><b>Level-triggered and idempotent.</b> A converged system writes nothing, so a lost event costs nothing.</li>
+          <li><b>Partial progress is normal.</b> A transaction touches at most four replicas. A failed compare writes nothing, and the next step plans again.</li>
+          <li><b>No hidden state.</b> Whatever cannot finish now, such as a stop's grace period or a held replica, is written to the store.</li>
+          <li><b>WASM-clean.</b> No threads, sockets, files, libc, <code>std.Io</code>, real clock or randomness. CI compiles it to <code>wasm32-freestanding</code> and runs it in Node.</li>
+        </ul>
+        <p class="files">core.zig · controller.zig · replica_controller.zig · agent.zig · apply.zig · why.zig · retention.zig · docs/core.md</p></div>
+
+      <div class="card"><h3>zcube-server</h3>
+        <p>The shell around the core: an accept loop, one task per connection, a driver thread that runs the controllers when their <code>Wakeup</code> falls due, timers for lease expiry and compaction, and a watchdog over the connection table.</p>
+        <ul>
+          <li><b>API</b> (<code>docs/api.md</code>): reads under <code>/v1</code>; <code>POST /v1/apply</code>, with <code>?dry_run=1</code> to preview; <code>DELETE /v1/services/{name}</code>; agent endpoints under <code>/v1/agent/nodes/{node}/</code>.</li>
+          <li>Every request has an ID, returned in <code>X-Request-Id</code>: the client's own if it sends one (the CLI does, with a random part), otherwise <code>r-&lt;start&gt;-&lt;counter&gt;</code>, unique across restarts.</li>
+          <li>A failing store is reported once as a diagnostic, not once per step, with backoff.</li>
+          <li>Writes are <b>unauthenticated</b>: listen on a private address.</li>
+        </ul>
+        <p class="files">server.zig · server_drive.zig · server_http.zig · server_listen.zig · api.zig · agent_api.zig</p></div>
+
+      <div class="card"><h3>zcube-agent and FakeRuntime</h3>
+        <p>One single-threaded agent per node. It reconciles the node's desired replicas against what the runtime lists, and reports what it observes. The <code>Runtime</code> interface is the contract with Zigbox: a small serialisable <code>Handle</code>, <code>start</code>, <code>stop</code> with grace, <code>inspect</code>, <code>list</code>, and an event stream. There is no blocking <code>wait</code>.</p>
+        <ul>
+          <li><b>One supervisor per container</b> (the owner's recorded exception): <code>zcube-agent supervise</code> is the command's parent, runs in its own session, and records the exit, so the agent can restart without losing anything.</li>
+          <li><b>Re-adoption is <code>list</code>:</b> a restarted agent reads the state directory and never starts a duplicate.</li>
+          <li>A container whose supervisor vanished is <code>lost</code> (<code>ZC-E0509</code>). Its process group is killed once.</li>
+          <li>Images come from <code>fixtures/images.zon</code>. Any other digest fails with the placeholder <code>ZBX-E0501</code>. Limits are recorded but not enforced.</li>
+        </ul>
+        <p class="files">zcube_agent.zig · agent_run.zig · agent_remote.zig · runtime.zig · fake_runtime.zig · fake_supervisor.zig · docs/agent.md</p></div>
+
+      <div class="card"><h3>zcube, the command line</h3>
+        <ul>
+          <li><code>apply</code> shows a diff and asks first. <code>--yes</code> skips the question, and <code>--dry-run</code> only shows the diff.</li>
+          <li><code>get service|replicas</code>, <code>delete service</code>, and <code>explain &lt;code&gt;</code> (works offline).</li>
+          <li><code>why &lt;kind&gt; &lt;name&gt;</code> follows decision records back to an observed fact or a desired key.</li>
+          <li><code>bundle --last</code> writes a redacted <code>.tar.gz</code> of evidence that never leaves the machine.</li>
+          <li>Output is plain, <code>--verbose</code> or <code>--output json</code>. The exit code comes from the blame of the first diagnostic.</li>
+        </ul>
+        <p class="files">cli.zig · cli_*.zig · bundle*.zig · docs/cli.md</p></div>
+
+      <div class="card"><h3>Diagnostics, shared with Zigbox</h3>
+        <p>Every failure is a coded diagnostic with a blame, a cause and a fix, never a stack trace or a bare Zig error name. Zigcube's <code>ZC-</code> registry plugs into Zigbox's <code>diagnostic</code>, <code>render</code> and <code>explain</code> modules as a second product. Zigbox is a pinned package.</p>
+        <ul>
+          <li>Blame decides the exit code: 1 user, 2 environment, 3 external, 70 bug.</li>
+          <li>Golden tests cover every code in all three output modes. A no-stack-trace test covers every failure path, and the redactor is fuzzed.</li>
+          <li><a href="errors/">An error page per code</a> is generated from the registry and checked in CI.</li>
+        </ul>
+        <p class="files">diag.zig · src/diag/ · cli_golden.zig · errors_site.zig · DIAGNOSTICS.md</p></div>
+
+      <div class="card"><h3>Web console</h3>
+        <p>Plain HTML, CSS and ES modules, embedded in <code>zcube-server</code>. There is no build step and it makes no request to any other host. It lists once, then follows the store's watch, the same way an agent does, and shows the connection state at all times.</p>
+        <p>With <code>?sim=c0</code> it runs the real core, compiled to WASM, over a memory store and a simulated runtime in the browser. That module has exactly one import, <code>env.zc_panic</code>.</p>
+        <p class="files">web/ · console_wasm.zig · docs/console.md</p></div>
+
+      <div class="card"><h3>How it is checked</h3>
+        <ul>
+          <li><b><code>demo-c0</code></b> is the milestone demo. Real server, agent and CLI processes, on Postgres and on SQLite, assert every step and acceptance criterion: kill, scale, an unknown image, server and agent restarts, the store going down, and a bundle.</li>
+          <li><b><code>sim-c0</code></b> runs the same scenario natively and as WASM on virtual time and compares the reports. It is a simulation, not the demo.</li>
+          <li><b><code>agent-smoke</code></b> is a host check of the server and agent as real processes.</li>
+          <li>Also: <code>test</code>, <code>tidy</code>, <code>test-store</code> on each backend, <code>wasm-check</code>, <code>wasm-test</code> and <code>console-wasm</code>. The WASM jobs run under each V8 tier separately, because Node 22 crashes when tiers mix.</li>
+        </ul></div>
+    </div>
+  </section>
+
+  <section id="flow">
+    <div class="sec-head read"><p class="eyebrow">One request, end to end</p><h2>From <code>zcube apply</code> to a running process, and back through <code>why</code></h2></div>
+    <ol class="flow read">
+      <li><div><code>zcube apply hello.zon</code> parses the ZON file and asks the server for a dry run, which returns the diff. Once confirmed, <code>POST /v1/apply</code> writes <code>/services/hello</code> with a new generation and an <code>apply</code> decision, in one transaction.</div></li>
+      <li><div>The driver wakes on the change under <code>/services/</code>. The replica controller compares desired with actual and writes <code>scale_up</code>, then a <code>create_replica</code> and a <code>place_replica</code> for each new replica. Every one is a <code>/decisions/&lt;id&gt;</code> record with its cause, indexed under <code>/decisions-by-subject/</code>.</div></li>
+      <li><div>The agent's long-poll returns. It lists its replicas, compares them with <code>Runtime.list</code>, and calls <code>start</code>. FakeRuntime writes <code>spec.json</code> and launches a supervisor, which runs the command.</div></li>
+      <li><div>The agent reports what it sees under <code>/observed/&lt;node&gt;/&lt;replica&gt;</code>. If a start fails, the report carries the runtime's full diagnostic, for example <code>ZBX-E0501</code>. The controller then holds the replica rather than retrying a start that would fail the same way.</div></li>
+      <li><div><code>zcube why service broken</code> walks from the service through the decisions to that observed diagnostic and prints the chain: <code>service broken: 0/1 running ← replica broken-1 failed to start on node1 ← error[ZBX-E0501]: image not found</code>.</div></li>
+    </ol>
+  </section>
+
+  <section id="keys">
+    <div class="sec-head read"><p class="eyebrow">Data model</p><h2>The key layout</h2>
+    <p>Values are JSON. The full shapes are in <code>docs/keys.md</code>. Decision records are kept per subject: the newest 200 and at most 7 days, whichever is fewer, and 24 hours once the subject is deleted.</p></div>
+    <div class="scroll"><table class="tbl">
+      <thead><tr><th>Key</th><th>Written by</th><th>Holds</th></tr></thead>
+      <tbody>
+        <tr><td><code>/services/&lt;name&gt;</code></td><td>API (apply)</td><td>desired service: image digest, command, env, replicas, generation</td></tr>
+        <tr><td><code>/replicas/&lt;service&gt;/&lt;id&gt;</code></td><td>controller</td><td>desired replica and the node it is placed on</td></tr>
+        <tr><td><code>/nodes/&lt;node&gt;</code></td><td>agent</td><td>registration and declared capacity, attached to the node's lease</td></tr>
+        <tr><td><code>/observed/&lt;node&gt;/&lt;replica&gt;</code></td><td>agent</td><td>status, exit reason and, on failure, the full diagnostic</td></tr>
+        <tr><td><code>/decisions/&lt;id&gt;</code></td><td>controllers, API</td><td>one action: actor, action, reason, and a cause that names a key or another decision</td></tr>
+        <tr><td><code>/decisions-by-subject/&lt;kind&gt;/&lt;name&gt;/&lt;id&gt;</code></td><td>with each decision</td><td>the index <code>zcube why</code> reads</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section id="limits">
+    <div class="sec-head read"><p class="eyebrow">Guarantees and limits</p><h2>What holds, and what does not yet</h2></div>
+    <div class="cols">
+      <div><h3>Holds, and is tested</h3><ul>
+        <li><b>Gap-free watch.</b> Revision order is commit order on every backend. The conformance suite checks it under concurrent writers.</li>
+        <li><b>Restart-safe.</b> Restarting the server or the agent changes no key and adds no decision. The demo compares byte for byte.</li>
+        <li><b>Explainable.</b> Every action has a decision whose cause chain ends at a real key. The demo checks about 30 per run.</li>
+        <li><b>Store outage.</b> Postgres down gives <code>ZC-E0201</code>, exit 3. Workloads keep running and recovery needs no restart.</li>
+      </ul></div>
+      <div><h3>Not yet</h3><ul>
+        <li><b>One node, one server.</b> No scheduling, no failover, and no second server on the same store.</li>
+        <li><b>No real runtime.</b> No isolation and no limits, and the <code>ZBX-</code> codes are placeholders until Zigbox's adapter lands.</li>
+        <li><b>No authentication</b> on writes.</li>
+        <li><b>Write throughput</b> on Postgres is capped by the serialised writer: hundreds to low thousands of revisions a second. A benchmark is due at C1, and group commit is the fallback.</li>
+        <li><b>OrioleDB</b> has not been run.</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <section id="next">
+    <div class="sec-head read"><p class="eyebrow"><span class="pill s-wip">Next</span> C1 · Fleet</p><h2>Placement and failover</h2>
+    <p>Not started: the brief is the next piece of work. The goal is that workloads spread across nodes and survive the loss of one, still on <code>FakeRuntime</code>, with several agents and their own state directories on one machine or a few VMs.</p></div>
+    <div class="cards">
+      <div class="card"><h3>What gets built</h3><ul>
+        <li><b>Node registration on a lease.</b> <code>/nodes/&lt;node&gt;</code> is attached to the agent's lease and carries its declared CPU and memory. <code>zcube get nodes</code> lists the nodes.</li>
+        <li><b>A scheduler.</b> It filters on resource fit, then scores for spread. Its reasons go into the <code>place_replica</code> decision.</li>
+        <li><b>Lost-node handling.</b> When a lease expires, the node's replicas are marked lost, with the lease timeout in the decision. They are rescheduled on the survivors, and nothing moves back when the node returns.</li>
+        <li><b>Fencing.</b> An agent that loses its lease stops its own workloads, so a replica never runs twice for long. This is tested with a partition: the agent stays alive but cannot reach the server.</li>
+        <li><b><code>demo-c1</code>:</b> three agents join, six replicas spread two per node, one agent is killed, and <code>zcube why node node3</code> explains why nothing came back to it.</li>
+      </ul></div>
+      <div class="card"><h3>Design points to settle in the brief</h3><ul>
+        <li>A per-node index of assigned replicas (proposed: <code>/assigned/&lt;node&gt;/</code>), so an agent's long-poll watches only its own work.</li>
+        <li>Who writes the <code>lease_expired</code> decision and the lost markers: the server driver's lease timer, or a node controller.</li>
+        <li>What happens to a replica that fits no node: held as pending, with a decision naming the shortfall.</li>
+        <li>Server-assigned request IDs gain a random part, so two servers that start in the same millisecond cannot collide.</li>
+        <li>The watch fan-out benchmark that SPEC.md's risk table asks for.</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <section id="planned">
+    <div class="sec-head read"><p class="eyebrow"><span class="pill s-plan">Planned</span> C2 to C8</p><h2>Where the architecture goes after C1</h2>
+    <p>From the design doc, Part II. Each milestone waits on specific Zigbox milestones. The real runtime replaces <code>FakeRuntime</code> behind the same <code>Runtime</code> interface once Zigbox M2 ships its exit reasons and cgroup scopes.</p></div>
+    <div class="scroll"><table class="tbl">
+      <thead><tr><th>Milestone</th><th>What changes in the architecture</th><th>Needs from Zigbox</th></tr></thead>
+      <tbody>
+        <tr><td>C2 · Swarm</td><td>Agents advertise a compact summary of their chunk store, for example a Bloom filter per image tree. The scheduler adds a locality score, which never overrides fit or spread. Nodes fetch chunks from peers before the registry and verify each one by hash. <code>zcube stats pull</code>.</td><td>M3 chunk store, M4 for the demo</td></tr>
+        <tr><td>C3 · Rollout</td><td>Readiness and liveness checks, rolling updates within surge and unavailable limits, automatic rollback to the exact previous digest, and <code>zcube history</code> and <code>rollback</code>.</td><td>M4</td></tr>
+        <tr><td>C4 · Mesh</td><td>WireGuard between nodes, cluster DNS, and a workload identity bound to service name and image digest. Grants such as <code>web → db:5432</code> compile into per-node rules, with default deny.</td><td>M5 network namespaces and grants</td></tr>
+        <tr><td>C5 · Edge</td><td>An edge proxy role on chosen nodes, ACME certificates stored encrypted, and <code>public = "…"</code> on a service. Edge traffic enters the mesh through a grant.</td><td>C4</td></tr>
+        <tr><td>C6 · Trust</td><td>A policy check at admission in the server, and again in every agent before exec, using node-local trusted keys that the API cannot change. A compromised control plane cannot run unsigned code.</td><td>M8 signatures</td></tr>
+        <tr><td>C7 · State</td><td>Named state volumes pinned by the scheduler, snapshots shipped to object storage, and restore on another node after node loss, with lease fencing. The recovery point is the snapshot interval.</td><td>M6 state volumes</td></tr>
+        <tr><td>C8 · Jobs</td><td>A <code>job</code> object with retries and deadlines, gang scheduling, and Zigbox M7 build steps dispatched across nodes with one shared chunk-store cache.</td><td>M7 builds</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note read">Stretch goals, not scheduled: a Kubernetes API facade (CS1), cells (CS2), tenant isolation on microVMs (CS3) and accelerators (CS4). Out of scope through C8: clusters beyond a few hundred nodes, a custom consensus store, multi-region active-active control planes, and synchronous replication.</p>
+  </section>
+</main>
+
+<footer><div class="wrap">
+  <span>Zigcube · pre-alpha · architecture as of 2026-10-27</span>
+  <span><a href="./">Home</a> · <a href="errors/">Diagnostic codes</a> · <a href="https://github.com/Zigbox/zigcube">Source</a></span>
+</div></footer>
+</body>
+</html>
