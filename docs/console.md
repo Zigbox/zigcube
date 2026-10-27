@@ -1,12 +1,22 @@
 # The Zigcube web console
 
-Design of the console and its first clickable prototype. Status: **prototype against a mock**;
-the real API does not exist yet ([api.md](api.md) is the proposal it is built against).
+Design of the console. Status (C0 slice 5b): **it runs in three modes**, all through the same
+client and model, and the first two are the product:
+
+| Mode | How | What answers `/v1` |
+| --- | --- | --- |
+| **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) | the real server, on the same origin |
+| **Simulation** | `?sim=c0` | the **real control-plane core compiled to WebAssembly**, in the browser, over a memory store and the simulated runtime, on virtual time (`web/sim/`, `src/console_wasm.zig`) |
+| **Mock** | `?mock=c1` | a JavaScript model of the proposed API (`web/mock/`). It remains only for **C1** (several nodes, failover), because the core has no C1 yet; the UI says "mock" |
+
+The simulation is labelled **simulated** in the header and the panel. It is a simulation: nothing
+in it is recorded, no process starts, and it is never presented as a demo that passed (`demo-c0`
+is a different thing and is slice 6). `?mock=c0` links still work: they open `?sim=c0`.
 
 ## What it is, and what was decided
 
-- A **web console served by `zcube-server` itself**. Later it is embedded with `@embedFile`, so
-  one static binary still ships everything. Files live in `web/`.
+- A **web console served by `zcube-server` itself**, embedded with `@embedFile`, so one static
+  binary ships everything (the simulation's WebAssembly module included). Files live in `web/`.
 - **No build step.** Plain HTML, CSS and ES modules. No npm, no bundler, no framework.
 - **No external requests at runtime**, so it works on an air-gapped cluster: no CDN, no web
   fonts, no analytics. It uses the system font stack. The project site uses Familjen Grotesk and
@@ -15,8 +25,9 @@ the real API does not exist yet ([api.md](api.md) is the proposal it is built ag
   the brand fonts here, the files go under `web/fonts/` with a licence note.
 - **Read-only.** Changes go through `zcube apply` and git. Wherever a user would want to change
   something, the console shows the exact command (see [Interaction rules](#interaction-rules)).
-- **Design first, against a mock.** `web/mock/` implements the proposed API in the browser. Wiring
-  to the real server means changing one line (the transport in `web/js/main.js`).
+- **One client, three transports.** `web/js/api.js` talks through a transport with the shape of
+  `fetch`: the browser's (`fetchTransport`, the default), the simulation's (`web/sim/index.js`) or
+  the mock's. Nothing above the transport knows which one it has.
 
 The look continues `site/index.html`: the same palette, the same terminal blocks, the diamond
 mark. The landing page is generous and editorial; the console is dense and calm. Colour is
@@ -255,36 +266,80 @@ panel becomes a bottom sheet.
 web/
   index.html            shell: header, navigation, banner, main, live region
   css/console.css       tokens and every component
-  js/main.js            boot, router, header and connection pill, shortcuts, theme
+  js/main.js            boot, mode choice, router, header and connection pill, shortcuts, theme
   js/api.js             client over a transport; turns every failure into diagnostics
   js/model.js           the mirror: list, watch, poll, derived views, attention list
   js/diag.js            diagnostic blocks and the CLI text renderers
   js/ui.js              DOM helpers, keyed rows, pills, copy, formatting
   js/views/*.js         one module per screen
-  mock/                 the in-browser API: engine, fixtures, scenarios, dev panel
+  sim/index.js          the host of the WebAssembly core: frames, virtual time, held watches, traps
+  sim/panel.js          the simulation's dev panel
+  sim/scenario.js       the seven C0 steps as the panel shows them
+  mock/                 the JavaScript mock, for C1 only: engine, fixtures, scenarios, dev panel
 ```
 
-## The mock and its scenarios
+`sim/zcube_console.wasm` is not in the repository: `zig build console-wasm` builds it, and
+`zig build console-site` installs the whole console (`web/` plus the module) to
+`zig-out/console`. `zcube-server` embeds the same files.
 
-Turn it on with `?mock=c0` or `?mock=c1` (also `&at=N` to start after step N, `&speed=4` to run
-faster, `&backend=sqlite`). Without the parameter the console talks to `/v1/*` on its own origin.
+## Running it
 
-`web/mock/engine.js` is a small simulation of the store (revisions, versions, leases, watches,
-compaction), the controllers (they write decisions with causes, per keys.md), a scheduler
-(fit and spread) and node agents. It produces records of the shapes in keys.md, so the console's
-parsing is the same code that will read the real server. It is not a model of the real
-controllers' behaviour.
+- **Against a server:** start `zcube-server` and open its address. `GET /` and `/console/` both
+  serve the console, and `/v1/*` is on the same origin.
+- **The simulation:** `zig build console-site`, serve `zig-out/console` with any static file
+  server (the module needs the `application/wasm` type; `file://` does not work because the
+  browser will not fetch it), and open `/?sim=c0`. `zcube-server` also serves it at
+  `/?sim=c0`.
+- **The C1 mock:** the same, with `/?mock=c1`.
+- **Check it in a browser:** `node tools/browser_check.mjs <base-url> --mode sim|server`
+  (Playwright and the installed Chromium; a dev-time tool, not part of the build).
+
+## The simulation, and the mock for C1
+
+`?sim=c0` (also `&speed=4`) loads `sim/zcube_console.wasm`, which is `src/console_wasm.zig`: the
+API handlers, the replica controller, the agent's step and `why` of the server, over
+`MemoryStore` and `SimRuntime`, on a clock that only moves when the page moves it (real elapsed
+time times the speed; frozen means not moving it). The page frames each request, calls
+`zc_request`, and holds a long-poll watch itself when the core says `hold_ms`. The bodies are the
+core's own JSON, never rewritten.
+
+- **One import.** The module imports exactly `env.zc_panic(ptr, len)`, approved for this build
+  only; `tools/console_check.mjs` fails on any other. A panic hands its text to the page, and the
+  module traps.
+- **A trap discards the instance** (docs/wasm.md, row 9), and the in-browser store with it. The
+  page shows a `bug` diagnostic (`ZC-B0001`, with the panic text under "Show detail"), keeps the
+  last data on screen, stops time and offers **Reload**, which starts over from an empty cluster.
+- **The panel** (bottom right, "Simulated"): Play, Step and Reset; the seven scenario steps, keyed
+  to the core's step indexes; speed 1 to 8×; faults: stop the store (`ZC-E0201`, the console goes
+  stale), cut the API, "Sleep + compact" (the console is cut off while the core writes and
+  compacts its history, then returns to the core's own `410`, `ZC-E0203`), freeze time, restart the
+  server core and the agent core. Test hooks: `window.zc.sim` (`forcePanic()` forces a trap).
+
+| Step | What the core does |
+| --- | --- |
+| 1 | apply `hello` with 3 replicas; three start |
+| 2 | `kill -9` one; a replacement starts |
+| 3, 4 | scale to 5, then back to 2 |
+| 5 | apply `broken` (digest not in the node's store); the chain ends at `ZBX-E0501` |
+| 6, 7 | the store goes down (`ZC-E0201`); it comes back |
+
+**What the simulation is not:** real processes, Postgres or SQLite, real time, `zbx`. It shows
+what the controllers decide, with every fault under test control (docs/core.md says what the
+deterministic simulation proves and does not).
+
+**The mock** (`?mock=c1`) is `web/mock/engine.js`, a small JavaScript model of the store,
+controllers, a scheduler and node agents. The core has no C1 yet (no scheduler, no lost-node
+detection), so a three-node fleet can only be shown this way: the header says "mock", and the
+panel says the fleet is not built in the core. Its C0 scenario was retired when the simulation
+covered it. `web/mock/codes.js` (the mock's `explain` text, generated by
+`node web/mock/gen-codes.mjs`) is only needed for the mock now: the real core serves `/v1/codes`.
 
 | Scenario | Steps |
 | --- | --- |
-| `c0` | apply `hello` with 3 replicas · `kill -9` one, a replacement starts · scale to 5 · back to 2 · apply `broken` (digest not in fixtures; the chain ends at `ZBX-E0501`) · Postgres goes down (`ZC-E0201`, the console goes stale) · Postgres comes back |
-| `c1` | three agents join · apply `hello` ×6, two per node · power off node3, its lease expires after 10 s, replicas are rescheduled · node3 rejoins empty · `why node node3` explains no rebalancing |
+| `c1` (mock) | three agents join · apply `hello` ×6, two per node · power off node3, its lease expires after 10 s, replicas are rescheduled · node3 rejoins empty · `why node node3` explains no rebalancing |
 
-The dev panel (bottom right, labelled "Mock") has Play, Step and Reset, a speed selector, a
-checkbox that opens the matching screen on each step, and faults: stop Postgres, cut the API,
-"Sleep + compact" (the console is cut off while history is compacted, then returns to a `410`),
-and freeze time. It is the demo tool as well as the test rig. It is only loaded when the mock is
-on.
+The mock's panel has Play, Step and Reset, a speed selector, the "open the matching screen"
+checkbox and faults (stop Postgres, cut the API, "Sleep + compact", freeze time).
 
 ### A case the real C1 tests must cover
 

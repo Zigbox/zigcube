@@ -60,7 +60,7 @@ body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-a
 .mark { width: 16px; height: 16px; border: 2px solid var(--accent); border-radius: 3px; transform: rotate(45deg) scale(.85); position: relative; }
 .mark::after { content: ""; position: absolute; inset: 2px; border: 2px solid var(--accent); border-radius: 1px; }
 .env { font: .72rem var(--mono); color: var(--muted); border: 1px solid var(--line-strong); border-radius: 999px; padding: 1px 8px; }
-body[data-mock] .env { color: var(--warn); border-color: var(--warn); }
+body[data-mock] .env, body[data-sim] .env { color: var(--warn); border-color: var(--warn); }
 button { font: inherit; color: inherit; }
 .ghost, .conn-btn { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 4px 8px; cursor: pointer; color: var(--muted); }
 .ghost:hover, .conn-btn:hover { border-color: var(--line-strong); color: var(--fg); }
@@ -224,7 +224,7 @@ pre.cli { margin: 0; padding: 12px 14px; overflow-x: auto; white-space: pre; min
 .code-list { list-style: none; margin: 0; padding: 0; } .code-row { display: grid; grid-template-columns: 6.5rem 1fr auto; gap: 12px; padding: 8px 14px; border-top: 1px solid var(--line); text-decoration: none; color: var(--fg); } li:first-child > .code-row { border-top: 0; } .code-row:hover, .code-row[aria-current] { background: var(--raised); } .code-row code { font-weight: 650; color: var(--accent); }
 .code-detail { min-height: 12rem; } .explain { white-space: pre-wrap; font-size: .85rem; background: var(--raised); border-radius: 6px; padding: 10px 12px; margin: 10px 0; overflow-x: auto; } .summary { font-weight: 600; margin-top: 4px; }
 
-/* ---- Dev panel (mock only) ---- */
+/* ---- Dev panel (simulation and mock only) ---- */
 .dev { position: fixed; z-index: 24; bottom: 0; right: max(12px, env(safe-area-inset-right, 0px)); width: min(24rem, calc(100vw - 24px)); background: var(--surface); border: 1px solid var(--warn); border-bottom: 0; border-radius: 10px 10px 0 0; box-shadow: 0 -4px 22px #0003; padding-bottom: env(safe-area-inset-bottom, 0px); }
 .dev-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; width: 100%; background: none; border: 0; text-align: left; }
 .dev-bar .tag { font: 700 .68rem var(--mono); color: var(--warn); text-transform: uppercase; letter-spacing: .08em; }
@@ -235,7 +235,7 @@ pre.cli { margin: 0; padding: 12px 14px; overflow-x: auto; white-space: pre; min
 .steps code { display: block; color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
 .dev .chk { font-size: .82rem; }
 
-body[data-mock] main { padding-bottom: 7rem; } /* the mock panel sits over the bottom right */
+body[data-mock] main, body[data-sim] main { padding-bottom: 7rem; } /* the mock panel sits over the bottom right */
 
 /* ---- Narrow ---- */
 @media (max-width: 960px) { .cols { grid-template-columns: minmax(0, 1fr); } .sticky { position: static; } }

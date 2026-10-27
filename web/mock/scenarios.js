@@ -1,24 +1,12 @@
+// The mock now has the C1 scenario only: the core has no C1 yet (C0 runs the real core, web/sim/).
 // Scenarios replay HANDOFF's demos against the engine. A step has the CLI line it stands for, a
 // `run(engine, ctl)` that does what that line would do, and optionally a console view to open.
 
-import { HELLO, BROKEN } from "./fixtures.js";
+import { HELLO } from "./fixtures.js";
 
 const helloWith = replicas => ({ ...HELLO, replicas });
 
 export const SCENARIOS = {
-  c0: {
-    title: "C0 · Loop (one node)",
-    setup(engine) { engine.addAgent("node1"); },
-    steps: [
-      { title: "Apply hello with 3 replicas", cli: "zcube apply hello.zon", go: "#/services/hello", run: e => e.apply(helloWith(3)) },
-      { title: "kill -9 one replica", cli: "kill -9 $(pgrep -f hello-2)", go: "#/why/service/hello", run: e => e.kill("hello-2") },
-      { title: "Scale to 5", cli: "zcube apply hello.zon   # replicas = 5", go: "#/replicas", run: e => e.apply(helloWith(5)) },
-      { title: "Scale back to 2", cli: "zcube apply hello.zon   # replicas = 2", go: "#/services/hello", run: e => e.apply(helloWith(2)) },
-      { title: "Apply broken (digest not in fixtures)", cli: "zcube apply broken.zon && zcube why service broken", go: "#/why/service/broken", run: e => e.apply({ ...BROKEN, replicas: 1 }) },
-      { title: "Postgres goes down", cli: "pg_ctl stop && zcube get service hello", go: "#/", run: (e, c) => c.setStoreUp(false) },
-      { title: "Postgres comes back", cli: "pg_ctl start", go: "#/", run: (e, c) => c.setStoreUp(true) },
-    ],
-  },
   c1: {
     title: "C1 · Fleet (three nodes)",
     setup() {},

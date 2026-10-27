@@ -32,7 +32,7 @@ export function mountPanel(mock) {
     h("label", { class: "chk" }, followBox, " Open the matching screen on each step"),
     stepsEl,
     h("div", { class: "dev-row" }, storeBtn, apiBtn, sleepBtn, pauseBtn),
-    h("p", { class: "dim", style: "font-size:.75rem" }, "Mock data only: the API shape of docs/api.md, served from this page. Reset starts the scenario from an empty cluster."));
+    h("p", { class: "dim", style: "font-size:.75rem" }, "Mock data: the C1 fleet is not built in the core yet, so this is the API shape of docs/api.md served from this page by a JavaScript model. Reset starts the scenario from an empty cluster."));
   const el = h("aside", { class: "dev", "aria-label": "Scenario controls (mock only)" }, barBtn, body);
   document.body.append(el);
   $("#env-tag").textContent = "mock";
