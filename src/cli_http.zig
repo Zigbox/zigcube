@@ -149,12 +149,18 @@ pub const Client = struct {
             return unreachable_server(client, report, connect_reason(err));
         };
         defer stream.close(io);
-        var head: [2048]u8 = undefined;
-        const request = std.fmt.bufPrint(&head, "{s} {s} HTTP/1.1\r\nHost: {s}\r\n" ++
-            "User-Agent: zcube/{s}\r\nAccept: application/json\r\nX-Request-Id: {s}\r\n" ++
-            "Connection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{
-            method, path, client.server_text, client.env.version, id, body.len,
-        }) catch return bad_path(report, path);
+        // A service file is cut at `service_file_bytes_max`, so its JSON is far under the limit.
+        assert(body.len <= constants.api_request_bytes_max);
+        var head: [head_bytes_max]u8 = undefined;
+        const line: RequestLine = .{
+            .method = method,
+            .path = path,
+            .host = client.server_text,
+            .version = client.env.version,
+            .request_id = id,
+            .body_bytes = @intCast(body.len),
+        };
+        const request = request_head(&head, line) orelse return bad_path(report, path);
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(io, &write_buffer);
         writer.interface.writeAll(request) catch return lost(client, report, "sending the request");
@@ -220,6 +226,39 @@ fn silent(client: *const Client, report: *Report) Error {
     const sentence = "check that it is the server and that it is not stuck, then retry";
     report.diag.fix(.{ .sentence = sentence });
     return error.Failed;
+}
+
+const head_bytes_max = 2048;
+
+const RequestLine = struct {
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    version: []const u8,
+    request_id: []const u8,
+    body_bytes: u32,
+};
+
+/// The request line and headers. A request with no body has no `Content-Length` and no
+/// `Content-Type`: a `Content-Length: 0` on a GET crashes a release build of the server (it reads
+/// the empty body through the standard library's `ending` reader, which sits in read-only
+/// memory), and no header is the HTTP way to say "no body" anyway.
+fn request_head(buffer: *[head_bytes_max]u8, line: RequestLine) ?[]const u8 {
+    assert(line.path.len > 0);
+    var writer = std.Io.Writer.fixed(buffer);
+    const first = "{s} {s} HTTP/1.1\r\nHost: {s}\r\n";
+    writer.print(first, .{ line.method, line.path, line.host }) catch return null;
+    const second = "User-Agent: zcube/{s}\r\nAccept: application/json\r\n";
+    writer.print(second, .{line.version}) catch return null;
+    const third = "X-Request-Id: {s}\r\nConnection: close\r\n";
+    writer.print(third, .{line.request_id}) catch return null;
+    if (line.body_bytes > 0) {
+        writer.print("Content-Type: application/json\r\nContent-Length: {d}\r\n", .{
+            line.body_bytes,
+        }) catch return null;
+    }
+    writer.writeAll("\r\n") catch return null;
+    return writer.buffered();
 }
 
 const refused = "connection refused: nothing is listening there";
@@ -458,4 +497,32 @@ test "a reply is split into status, request id and exactly its promised body" {
         try testing.expectError(error.Failed, parse_reply(text, &report, "zc-1"));
         try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0103), report.diag.code);
     }
+}
+
+test "a request without a body has no Content-Length, and one with a body has" {
+    // Goal: the crash found with a release server (see request_head). Method: build the head of
+    // a GET and of a POST and look for the headers; a path too long for the buffer is null.
+    var buffer: [head_bytes_max]u8 = undefined;
+    var line: RequestLine = .{
+        .method = "GET",
+        .path = "/v1/status",
+        .host = "127.0.0.1:7070",
+        .version = "0.0.0",
+        .request_id = "zc-1",
+        .body_bytes = 0,
+    };
+    const get = request_head(&buffer, line).?;
+    try testing.expect(std.mem.indexOf(u8, get, "Content-Length") == null);
+    try testing.expect(std.mem.indexOf(u8, get, "Content-Type") == null);
+    const start = "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:7070\r\n";
+    try testing.expect(std.mem.startsWith(u8, get, start));
+    try testing.expect(std.mem.endsWith(u8, get, "\r\n\r\n"));
+    line.method = "POST";
+    line.body_bytes = 42;
+    const post = request_head(&buffer, line).?;
+    try testing.expect(std.mem.indexOf(u8, post, "Content-Length: 42\r\n") != null);
+    var long: [head_bytes_max]u8 = undefined;
+    @memset(&long, 'a');
+    line.path = &long;
+    try testing.expect(request_head(&buffer, line) == null);
 }
