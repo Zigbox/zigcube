@@ -7,6 +7,7 @@ test {
     _ = @import("clock.zig");
     _ = @import("diag/codes.zig");
     _ = @import("diag.zig");
+    _ = @import("errors_site.zig");
     _ = @import("store.zig");
     _ = @import("store_failures.zig");
     _ = @import("store_memory.zig");
@@ -25,6 +26,7 @@ test {
     _ = @import("bundle.zig");
     _ = @import("bundle_collect.zig");
     _ = @import("bundle_redact.zig");
+    _ = @import("bundle_redact_fuzz.zig");
     _ = @import("cli.zig");
     _ = @import("cli_args.zig");
     _ = @import("cli_commands.zig");

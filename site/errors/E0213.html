@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ZC-E0213 · Zigcube</title>
+<meta name="description" content="the store connection dropped during an operation">
+<link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0213.html">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+<style>
+:root{color-scheme:light}
+:root{
+  --bg:#f3f5f8; --surface:#ffffff; --fg:#151a24; --muted:#5d6676; --line:#dde2ea;
+  --accent:#2156b8; --term:#141925; --term-fg:#e3e8f2; --term-accent:#7fa8f5;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --term:#0a0d13; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f131b; --surface:#161b25; --fg:#e3e8f2; --muted:#98a1b3; --line:#262d3a;
+  --accent:#7fa8f5; --term:#0a0d13; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:16px;
+  line-height:1.6;margin:0}
+.wrap{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px))}
+a{color:var(--accent)} a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1,h2{font-family:var(--display);line-height:1.15;margin:0;text-wrap:balance}
+h1{font-size:clamp(2rem,6vw,2.8rem);font-family:var(--mono);font-weight:500;
+  letter-spacing:-.01em}
+h2{font-size:1.3rem;margin:32px 0 8px}
+code,pre{font-family:var(--mono);font-size:.9em}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--muted)}
+header.top{border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:20px;padding-block:12px;flex-wrap:wrap}
+.brand{font-family:var(--display);font-weight:700;font-size:1.2rem;color:var(--fg);
+  text-decoration:none;display:flex;gap:8px;align-items:center}
+.brand .mark{width:20px;height:20px;border:2px solid var(--accent);border-radius:3px;
+  position:relative}
+.brand .mark::after{content:"";position:absolute;inset:4px;background:var(--accent);
+  border-radius:1px}
+nav{margin-left:auto;font-size:.9rem}
+main{padding-block:40px 56px}
+.summary{font-size:1.25rem;margin:10px 0 24px}
+.facts{display:flex;gap:32px;flex-wrap:wrap;margin:0 0 8px;padding:16px 0;
+  border-block:1px solid var(--line)}
+.facts div{min-width:0} .facts dt{font-family:var(--mono);font-size:.72rem;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.facts dd{margin:2px 0 0;font-family:var(--mono)}
+p{margin:0 0 14px;max-width:68ch}
+.term{background:var(--term);color:var(--term-fg);border-radius:10px;margin:0;
+  padding:12px 16px;overflow-x:auto;white-space:pre}
+table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:8px 12px 8px 0;border-bottom:1px solid var(--line);
+  vertical-align:top}
+th{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);font-weight:500}
+td.code{font-family:var(--mono);white-space:nowrap}
+footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
+  font-size:.85rem}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="../"><span class="mark" aria-hidden="true"></span>Zigcube</a>
+  <nav aria-label="Diagnostics"><a href="./">All diagnostic codes</a></nav>
+</div></header>
+<main class="wrap">
+<p class="eyebrow">Diagnostic code</p>
+<h1>ZC-E0213</h1>
+<p class="summary">the store connection dropped during an operation</p>
+<dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
+<h2>What it means</h2>
+<p>The connection to Postgres ended while an operation was in progress: the server restarted or was stopped, a backend was terminated, or the network between them failed. zcube reconnects before the next operation, but cannot retry this one.</p>
+<p>If the cause line says nothing was changed, the operation was rolled back. If it says the outcome is unknown, the connection dropped while the commit was in flight and the write may or may not have been applied: read the keys again before repeating it.</p>
+<h2>Offline</h2>
+<p>The same text, without a network:</p>
+<pre class="term">zcube explain E0213</pre>
+</main>
+<footer><div class="wrap">
+Generated from the diagnostic registry by <code>zig build errors-site</code>.
+The same text is printed offline by <code>zcube explain</code>.
+</div></footer>
+</body>
+</html>
