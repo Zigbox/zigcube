@@ -98,7 +98,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 <header class="top"><div class="wrap">
   <a class="brand" href="#top"><span class="mark" aria-hidden="true"></span>Zigcube</a>
   <span class="pill s-plan" id="hdr-status">Pre-alpha</span>
-  <nav aria-label="Sections"><a href="#why">Why</a><a href="#demos">Demos</a><a href="#docs">Docs</a><a href="#project">Project</a><a href="#" id="sister">← Zigbox</a></nav>
+  <nav aria-label="Sections"><a href="#why">Why</a><a href="#demos">Demos</a><a href="#docs">Docs</a><a href="architecture.html">Architecture</a><a href="#project">Project</a><a href="#" id="sister">← Zigbox</a></nav>
 </div></header>
 
 <main class="wrap" id="top">
@@ -134,7 +134,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
   <section id="demos">
     <div class="sec-head">
       <div><p class="eyebrow">Roadmap and demos</p><h2>Every milestone ends in a live demo</h2>
-      <p>Demos run on a small VM cluster built by a script in the repo. Control-plane work starts now against a stand-in runtime; real Zigbox plugs in from its M2. Planned output is marked until the milestone ships.</p></div>
+      <p>Each demo is an automated test that runs in CI, and a shipped milestone shows the output recorded by that run, with a link to it. The control plane runs against a stand-in runtime until real Zigbox plugs in from its M2. Planned output is marked until the milestone ships. <a href="architecture.html">How it is built</a>.</p></div>
       <span class="eyebrow" id="ms-count"></span>
     </div>
     <div class="progress" id="progress" aria-hidden="true"></div>
@@ -164,16 +164,18 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
 <script>// ===== Site data: update the milestone entries as work lands. =====
 const SITE = {
-  updated: "2026-10-25",
+  updated: "2026-10-27",
   sisterUrl: "../zigbox/", // Zigbox site
-  stage: "Pre-alpha · planning",
+  stage: "Pre-alpha · C0 shipped",
 };
 // status: "done" | "wip" | "plan"
 // When a milestone ships: status "done", slices {green, total, note}, recorded {url, date} linking the
 // green demo-cN CI run, and demo lines copied from that run's output. Never show unrecorded output as recorded.
 const MILESTONES = [
-  {id:"C0", name:"Loop", status:"plan", goal:"Declare a service, and a controller keeps reality matching it on one node.",
-   demo:[["$","zcube apply hello.zon"],["","service hello  replicas 3/3 running"],["$","zcube apply broken.zon && zcube why service broken"],["","service broken: 0/1 running"],["","  ← replica broken-1 pending on node1"],["","  ← error[ZBX-E0501]: image not found"],["","      cause  digest b3:00ff…e1 is not in this node's store"]]},
+  {id:"C0", name:"Loop", status:"done", goal:"Declare a service, and a controller keeps reality matching it on one node.",
+   slices:{green:9, total:9, note:"slices reviewed and merged"},
+   recorded:{url:"https://github.com/Zigbox/zigcube/actions/runs/40556942364", date:"2026-10-27"},
+   demo:[["$","zcube get service hello"],["","NAME   READY  IMAGE"],["","hello  2/2    b3:51aa9c03"],["$","zcube why service broken"],["","service broken: 0/1 running"],["","  ← replica broken-1 failed to start on node1; it was not replaced because a new one would fail the same way"],["","  ← error[ZBX-E0501]: image not found"],["","      cause  digest b3:00ff7be1 is not in this node's store"],["","      fix    check the digest in the service file, or pull the image first"],["$","docker stop \"$PG_CONTAINER\""],["$","zcube get service hello"],["","error[ZC-E0201]: can't reach the store backend"],["","  cause  the Postgres server at 127.0.0.1 port 5432 did not accept a connection"],["","  fix    start Postgres, or correct the host and port in the store settings"],["","[exit 3]"],["","demo-c0 PASSED"]]},
   {id:"C1", name:"Fleet", status:"plan", goal:"Workloads spread across nodes and survive the loss of one.",
    demo:[["$","zcube get replicas hello -o wide"],["","hello-1  vm1  running     hello-4  vm2  running"],["","hello-2  vm1  running     hello-5  vm3  running"],["","(vm3 powered off)"],["","hello-5  lost → rescheduled on vm2   (lease expired after 10s)"]]},
   {id:"C2", name:"Swarm", status:"plan", goal:"Images reach nodes fast: peers share chunks, the scheduler prefers warm nodes.",
@@ -192,8 +194,9 @@ const MILESTONES = [
    demo:[["$","zcube build"],["","compile vm2 · test vm3 · docs vm1   parallel"],["","image b3:51aa…9c03   matches local zbx build"]]},
 ];
 const DOCS = [
-  {t:"Build a demo cluster", m:"C0", d:"Boot the VM set from the repo script and install the server and agents."},
-  {t:"Services and controllers", m:"C0", d:"Declaring a service, reconciliation, and reading zcube why."},
+  {t:"Build a demo cluster", m:"C1", d:"Boot the VM set from the repo script and install the server and agents."},
+  {t:"Architecture", m:"C0", href:"architecture.html", d:"What is built, what C1 adds next, and what is planned through C8."},
+  {t:"Services and controllers", m:"C0", href:"https://github.com/Zigbox/zigcube/blob/main/docs/cli.md", d:"Declaring a service, reconciliation, and reading zcube why."},
   {t:"Scheduling and failover", m:"C1", d:"Leases, resource fit, spread, and what happens when a node disappears."},
   {t:"Chunk distribution", m:"C2", d:"Peer fetch, locality scoring and pull statistics."},
   {t:"Rollouts", m:"C3", d:"Health checks, surge limits, history and rollback."},
@@ -216,7 +219,7 @@ $("#milestones").innerHTML = MILESTONES.map(m=>`
     <div class="term"><div class="bar"><span>demo · ${m.id.toLowerCase()}</span>${m.recorded?`<a class="rec" href="${m.recorded.url}">✓ recorded in CI · ${m.recorded.date}</a>`:(m.status==="done"?"<span>recorded output</span>":'<span class="planned">planned output</span>')}</div><pre>${termHTML(m.demo)}</pre></div>
   </article>`).join("");
 $("#docs-list").innerHTML = DOCS.map(d=>{const ms=MILESTONES.find(x=>x.id===d.m); const st=ms?ms.status:"plan";
-  return `<div class="doc"><h3>${d.t}</h3><p>${d.d}</p><span class="when">${st==="done"?"Available":"Arrives with "+d.m}</span></div>`}).join("");
+  return `<div class="doc"><h3>${d.href?`<a href="${d.href}">${d.t}</a>`:d.t}</h3><p>${d.d}</p><span class="when">${st==="done"?"Available":"Arrives with "+d.m}</span></div>`}).join("");
 $("#updated").textContent = SITE.updated;
 $("#hdr-status").textContent = SITE.stage;
 $("#digest").textContent = "site tree b3:" + [...SITE.updated+MILESTONES.map(m=>m.status).join("")].reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))>>>0,7).toString(16).padStart(8,"0");
