@@ -1,7 +1,7 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
 error[ZC-E0107]: can't listen on the server's address
-  cause  can't listen on 127.0.0.1:7070: another process is already listening on
-         it
+  cause  can't listen on 127.0.0.1:7070: the address is in use by another
+         process
   reqid  r-0000001
   fix    listen on another port
          or stop the other process   ss -ltnp | grep 7070

@@ -20,6 +20,7 @@ const Driver = @import("server_drive.zig").Driver;
 const http = @import("server_http.zig");
 const replica_controller = @import("replica_controller.zig");
 const Backend = @import("server_store.zig").Backend;
+const server_listen = @import("server_listen.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -125,15 +126,13 @@ pub const Server = struct {
     }
 
     fn listen(io: std.Io, where: net.IpAddress, diag: *Diag) Error!net.Server {
-        // Not `reuse_address`: the standard library ties it to SO_REUSEPORT, which would let a
-        // second server on the same port start without complaint. Strict is the safer failure.
-        return where.listen(io, .{ .reuse_address = false }) catch |err| {
+        return server_listen.listen(io, where) catch |err| {
             diag.raise(.E0107);
             const reason: []const u8 = switch (err) {
-                error.AddressInUse => "another process is already listening on it",
+                error.AddressInUse => "the address is in use by another process",
                 error.AddressUnavailable => "it is not an address of this machine",
                 error.AccessDenied => "this user may not listen on that port",
-                else => "the system refused",
+                error.Failed => "the system refused",
             };
             diag.cause("can't listen on {f}: {s}", .{ where, reason });
             diag.fix(.{

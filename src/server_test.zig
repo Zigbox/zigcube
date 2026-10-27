@@ -650,3 +650,38 @@ test "a server stopped while it answers a held watch leaves its port free to sta
     const second = try start_server(io, config);
     second.stop();
 }
+
+test "a server that closed a connection first can be restarted on its port at once" {
+    // Goal: "restarting zcube-server changes nothing". The side that closes a connection first
+    // keeps it in TIME_WAIT on its port; the server closes first for an idle client, for a reply
+    // that ends the connection, and for one still open when it stops. Without SO_REUSEADDR the
+    // next server could not listen there for a minute (ZC-E0107). Found by demo-c0, reproduced
+    // by review with an idle connection. Method: a request with `Connection: close` (the server
+    // closes first), stop, start another on the same port at once. A second server beside a
+    // running one must still fail loudly (SO_REUSEPORT would let it start).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const first = try start_server(io, config_for(.memory, false));
+    const address = first.address();
+    const reply = try get(io, address, "/v1/status");
+    reply.free();
+    first.stop();
+
+    var diag: Diag = undefined;
+    diag.reset();
+    var text: [32]u8 = undefined;
+    const listen = try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{address.getPort()});
+    var config = config_for(.memory, false);
+    config.listen = try config_mod.parse_listen(listen, &diag);
+    const second = try start_server(io, config);
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    status.free();
+
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test" };
+    const third = server_mod.Server.start(testing.allocator, io, config, options, &diag);
+    try testing.expectError(error.StartFailed, third);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0107), diag.code);
+}

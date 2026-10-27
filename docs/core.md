@@ -184,21 +184,16 @@ of it (`Request.hold`, an atomic request counter), and the rest of what it taugh
   `request_arena_bytes_max`; the core already reports a full arena as `ZC-E0207`. With 64
   connections that is a worst case of 1 GiB of address space, touched only if requests are that
   large.
-- **Known limit: `reuse_address`.** The standard library ties `SO_REUSEADDR` to `SO_REUSEPORT`
-  (`Io.net.IpAddress.ListenOptions`). With it, a second server on the same port starts without
-  complaint; without it, a restart can find the port in `TIME_WAIT` for a short while after a
-  server that closed connections first. The server does not set it: a second server fails loudly
-  with `ZC-E0107`.
-  **Slice 6a found this was not "a short while".** A connection the server closes first keeps the
-  port in `TIME_WAIT` for a minute, and the server closed first when it stopped while answering a
-  request: `zcube-agent` holds a long poll all the time, so every restart hit it. A stopping
-  server now waits for the client to close a connection it is done with (`server_http.zig`,
-  `wait_for_client`), so the client sends the first FIN, and the agent's client closes as soon as
-  it has read its reply. A browser tab with a kept-alive connection still has the server close
-  first, after `server_stop_ms`.
-  **Slice 6c found the same for the `zcube` command**, which sent `Connection: close` and read to
-  the end of the connection, so the server closed first after every command and a restart within
-  a minute of any `zcube get` was `ZC-E0107`. The command now sends no `Connection: close`, reads
-  the reply by its `Content-Length` and closes first (`cli_http.zig`, `read_reply`), with a test
-  (`cli_test.zig`, "a server can be restarted on its port right after zcube has used it").
-  A client that sends `Connection: close` still has the server close first.
+- **`SO_REUSEADDR`, without `SO_REUSEPORT`** (`server_listen.zig`). The standard library ties
+  `SO_REUSEADDR` to `SO_REUSEPORT` (`Io.net.IpAddress.ListenOptions`): with both, a second server on
+  the same port starts without complaint. Without `SO_REUSEADDR`, a server cannot listen on its port
+  for a minute after it closed a connection first (an idle client, a reply that ends the connection,
+  a connection open when it stops: the connection sits in `TIME_WAIT`), so a restart was `ZC-E0107`.
+  So on Linux the listening socket is made by hand with `SO_REUSEADDR` alone: a restart works at
+  once, and a second live server on the same port is still refused loudly (`SO_REUSEADDR` does not
+  allow a port with an active listener; `server_test.zig` checks both). Elsewhere the strict listen
+  of the standard library is used, with the old limit.
+  **Slices 6a and 6c found this from the client side first**: the agent, then the `zcube` command
+  (which sent `Connection: close` and read to the end), made the server close first. Both clients now
+  close first, which is still good manners, but the server no longer depends on it; review showed that
+  an idle connection, a browser or `curl` could still block a restart.

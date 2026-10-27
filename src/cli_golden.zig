@@ -124,7 +124,7 @@ fn bad_config(diag: *diag_mod.Diag) void { // server_config.zig
 }
 
 fn cannot_listen(diag: *diag_mod.Diag) void { // server.zig
-    const cause = "can't listen on 127.0.0.1:7070: another process is already listening on it";
+    const cause = "can't listen on 127.0.0.1:7070: the address is in use by another process";
     sample(diag, .E0107, &.{cause}, "listen on another port");
     diag.fix(.{ .sentence = "or stop the other process", .command = "ss -ltnp | grep 7070" });
 }

@@ -29,6 +29,7 @@ test {
     _ = @import("server_arena.zig");
     _ = @import("server_config.zig");
     _ = @import("server_http.zig");
+    _ = @import("server_listen.zig");
     _ = @import("server_static.zig");
     _ = @import("server.zig");
     _ = @import("server_test.zig");

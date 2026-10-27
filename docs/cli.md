@@ -259,6 +259,6 @@ that does not exist), `E0102`, `E0103` and relays the rest from the server.
   change, which may differ from the plan that was shown.
 - The reply is read by its `Content-Length`, and `zcube` closes the connection first (it sends no
   `Connection: close`): whoever closes first keeps the connection in `TIME_WAIT` on its port for a
-  minute, and a server on that port cannot be restarted meanwhile (docs/core.md). A reply with no
+  minute; the server no longer depends on this (docs/core.md, `SO_REUSEADDR`), but closing first is still good manners. A reply with no
   length is read to the end of the connection; a chunked reply is `ZC-E0103`. The server never
   sends either.
