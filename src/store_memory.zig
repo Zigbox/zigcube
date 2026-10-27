@@ -196,7 +196,14 @@ pub const MemoryStore = struct {
         diag: *Diag,
     ) Error![]store.KeyValue {
         var state: std.ArrayList(Entry) = .empty; // Borrowed entries; only the list is arena.
-        for (self.log.items) |entry| {
+        if (revision == self.revision) {
+            // The current state is the live table: no need to replay the log, which is linear in
+            // its length and, with the linear `find` below, quadratic in the keys it touched.
+            for (self.live.items) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) continue;
+                state.append(arena, entry) catch return no_memory(diag);
+            }
+        } else for (self.log.items) |entry| {
             if (entry.mod_revision > revision) break;
             if (!std.mem.startsWith(u8, entry.key, prefix)) continue;
             const slot = self.find(state.items, entry.key);

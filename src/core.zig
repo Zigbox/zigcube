@@ -12,17 +12,29 @@
 const std = @import("std");
 
 pub const modules = .{
+    @import("agent.zig"),
+    @import("api.zig"),
+    @import("apply.zig"),
     @import("clock.zig"),
+    @import("controller.zig"),
     @import("constants.zig"),
     @import("core_smoke.zig"),
     @import("diag.zig"),
     @import("diag/codes.zig"),
+    @import("records.zig"),
+    @import("replica_controller.zig"),
+    @import("runtime_codes.zig"),
+    @import("retention.zig"),
     @import("runtime.zig"),
+    @import("sim_c0.zig"),
+    @import("sim_runtime.zig"),
+    @import("sim_world.zig"),
     @import("store.zig"),
     @import("store_failures.zig"),
     @import("store_memory.zig"),
     @import("test_util.zig"),
     @import("text.zig"),
+    @import("why.zig"),
 };
 
 /// References every public declaration of every core module, and of the types they declare, so
@@ -65,4 +77,19 @@ test "every core module's tests are in this root" {
     // the core modules run on a 32-bit address space with a single thread. Method: import each
     // module, which brings its tests in.
     inline for (modules) |module| _ = module;
+}
+
+test "the single-threaded store conformance tests are in this root" {
+    // Goal: the memory store's semantics are checked in the environment the browser uses.
+    // Method: `store_conformance_single.zig` has no thread and runs against `MemoryStore`
+    // (`conformance_options` names the memory backend in this build); importing it brings its
+    // tests into this root, so `zig build wasm-test` runs them under WASI.
+    _ = @import("store_conformance_single.zig");
+}
+
+test "the controllers' tests are in this root" {
+    // Goal: the controllers' tests run under WASI too. Method: import them (they use only the
+    // memory store, a manual clock and the testing allocator).
+    _ = @import("replica_controller_test.zig");
+    _ = @import("api_test.zig");
 }

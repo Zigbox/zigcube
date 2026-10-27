@@ -2,6 +2,8 @@
 //
 //   node tools/wasm_check.mjs <zcube_core.wasm>          the freestanding library (zig build wasm-check)
 //   node tools/wasm_check.mjs --wasi <core_tests.wasm>   the core's unit tests under WASI (zig build wasm-test)
+//   node tools/wasm_check.mjs --sim <zcube_core.wasm> <seed> <operations> <native scenario> <native fuzz>
+//                                                        the C0 simulation, compared with the native run (zig build sim-c0)
 //
 // Why JavaScript, when docs/STYLE.md prefers Zig tooling: the check must execute a WebAssembly
 // module, and neither Zig's standard library nor the CI image has a WebAssembly runtime (no
@@ -15,10 +17,60 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const wasi = process.argv[2] === "--wasi";
-const path = process.argv[wasi ? 3 : 2];
+const sim = process.argv[2] === "--sim";
+const path = process.argv[wasi || sim ? 3 : 2];
 if (!path) {
-  console.error("usage: node tools/wasm_check.mjs [--wasi] <module.wasm>");
+  console.error("usage: node tools/wasm_check.mjs [--wasi | --sim ...] <module.wasm>");
   process.exit(2);
+}
+
+// A fresh instance per run: a trap poisons an instance (docs/wasm.md), so runs must not share one.
+async function instantiate(bytes) {
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  return instance.exports;
+}
+
+function simReport(exports) {
+  const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_sim_report_ptr(), exports.zcube_sim_report_len());
+  return new TextDecoder().decode(rendered);
+}
+
+function firstDifference(left, right) {
+  const a = left.split("\n");
+  const b = right.split("\n");
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return `line ${i + 1}:\n  native: ${a[i]}\n  wasm:   ${b[i]}`;
+  }
+  return "(no difference found)";
+}
+
+if (sim) {
+  // The simulation is deterministic: the same seed must give the same report, byte for byte, in
+  // WebAssembly and natively. The native reports arrive as files, written by the native run.
+  const [wasmPath, seedText, operationsText, nativeScenario, nativeFuzz] = process.argv.slice(3);
+  const bytes = readFileSync(wasmPath);
+  const seed = BigInt(seedText);
+  const operations = Number(operationsText);
+  const cases = [
+    ["scenario", (e) => e.zcube_sim_c0(seed), nativeScenario],
+    ["fuzz", (e) => e.zcube_sim_fuzz(seed, operations), nativeFuzz],
+  ];
+  const sizes = [];
+  for (const [name, run, nativePath] of cases) {
+    const exports = await instantiate(bytes);
+    const failed = run(exports);
+    const wasmText = simReport(exports);
+    const nativeText = readFileSync(nativePath, "utf8");
+    if (failed !== 0 || wasmText !== nativeText) {
+      console.error(`sim-c0 ${name} (seed ${seedText}): wasm stopped at step ${failed}; reports ${wasmText === nativeText ? "agree" : "differ"}`);
+      if (wasmText !== nativeText) console.error(firstDifference(nativeText, wasmText));
+      console.error(wasmText);
+      process.exit(1);
+    }
+    sizes.push(`${name} ${wasmText.length} bytes`);
+  }
+  console.log(`sim-c0: seed ${seedText}: native and wasm agree byte for byte (${sizes.join(", ")}; fuzz ${operations} operations)`);
+  process.exit(0);
 }
 
 if (wasi) {
@@ -81,4 +133,33 @@ if (failed !== 0 || missing.length > 0) {
   console.error(report);
   process.exit(1);
 }
-console.log(`wasm check: ok (${rendered.length} bytes of rendered diagnostics)`);
+
+// The C0 simulation, run in the module: the scenario for a few seeds, and the fuzz variant. Each
+// returns the step it stopped at (0: every step held) and a report to read.
+const simSeeds = [1n, 2n, 3n, 0xdeadbeefn];
+const fuzzSeeds = [1000n, 1001n];
+const fuzzOperations = 40;
+const simProblems = [];
+let simBytes = 0;
+for (const seed of simSeeds) {
+  const sim = await instantiate(bytes);
+  const stopped = sim.zcube_sim_c0(seed);
+  const text = simReport(sim);
+  simBytes += text.length;
+  const expectedText = ["sim-c0: every step held", "error[ZBX-E0501]: image not found", "service broken: 0/1 running"];
+  const absent = expectedText.filter((line) => !text.includes(line));
+  if (stopped !== 0 || absent.length > 0) simProblems.push(`scenario seed ${seed}: stopped at step ${stopped}, missing ${JSON.stringify(absent)}\n${text}`);
+}
+for (const seed of fuzzSeeds) {
+  const sim = await instantiate(bytes);
+  const stopped = sim.zcube_sim_fuzz(seed, fuzzOperations);
+  const text = simReport(sim);
+  simBytes += text.length;
+  if (stopped !== 0 || !text.includes("fuzz: every invariant held")) simProblems.push(`fuzz seed ${seed}: stopped at step ${stopped}\n${text}`);
+}
+if (simProblems.length > 0) {
+  console.error("wasm check failed: the C0 simulation did not hold in the module:");
+  for (const problem of simProblems) console.error(problem);
+  process.exit(1);
+}
+console.log(`wasm check: ok (${rendered.length} bytes of rendered diagnostics; the C0 simulation held for ${simSeeds.length} seeds and ${fuzzSeeds.length} fuzz runs, ${simBytes} bytes of report)`);

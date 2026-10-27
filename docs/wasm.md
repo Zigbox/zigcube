@@ -1,5 +1,9 @@
 # The control-plane core on WebAssembly: what the spike found
 
+> **Update, C0 slice 5a.** The core/shell rule below is adopted (AGENTS.md) and the controllers,
+> the agent's step, the API handlers, `why` and a simulated runtime are written to it: see
+> [core.md](core.md). What building them taught is in "What slice 5a taught", at the end.
+
 **Status: output of the C0 slice 4 spike (2026-10-26).** The owner wants the console demo to run the
 *real* controllers, scheduler and store in the browser, with a simulated runtime, instead of the
 JavaScript mock in `web/mock/engine.js`, and wants the attempt to teach us what our "pure" code
@@ -226,3 +230,78 @@ zig build wasm-test                             # the core's unit tests under WA
 ```
 
 Sizes on this machine: 1.3 MB Debug, 607 KB ReleaseSafe, 62 KB ReleaseSmall (not for shipping).
+
+## What slice 5a taught
+
+- **The core is bigger than the spike, and the rule held.** About a dozen modules (controllers,
+  agent step, API, `why`, the simulated runtime, the simulation) compile for `wasm32-freestanding`
+  with zero imports. The things that tried to pull the shell in were all in tests or debugging:
+  `std.debug.print` (it reaches `std.Io.Threaded`, row 2: a stray one in a core function fails the
+  build), and `std.testing`, which is why test files are listed only in `core.zig`'s `test` blocks
+  and not in `modules`.
+- **`usize` hides in random draws.** `random.uintLessThan(usize, n)` consumes different bits on
+  32 and 64 bits, so a seeded fuzz run diverged between native and WASM. The native-versus-WASM
+  comparison of `zig build sim-c0` (the report ends in a hash of the whole store) caught it at once;
+  draw with `u32`.
+- **Native and WASM agree byte for byte** for the scenario and for the fuzz variant, for the seeds
+  checked in CI. That includes the order of everything the core does: nothing in it depends on
+  pointer values, hash-map iteration order or the address space.
+- **The memory store is a reference, not a fast store.** `list` replays its log, and lookups are
+  linear, so a long simulation is dominated by it (hundreds of thousands of keys is slow even in
+  ReleaseSafe). The world compacts once a minute, as the server will, and retention reads the index
+  a page at a time; both exist because the profile showed the cost there and not in the controllers.
+- **A trap still poisons the instance.** `wasm_check.mjs` instantiates a fresh module per run
+  for that reason. `ReleaseSafe` remains the mode that ships.
+- **The conformance suite's single-threaded half runs under WASI** (`zig build wasm-test`), against
+  `MemoryStore`, the store the browser would use: the racing tests stay native.
+- **Still not done:** the one named host import for panics (slice 5b, with the browser demo), and a
+  real clock for the browser (`Date.now()` through a host import, or the host passing the time in).
+  The core's `Clock` must be Unix milliseconds for decision times to mean what keys.md says.
+
+## Running the simulation
+
+```
+zig build sim-c0                          # native and WASM, seed 1, compared byte for byte
+zig build sim-c0 -Dseed=7 -Dops=300       # another seed, a longer fuzz run
+zig build sim-c0-exe -Doptimize=ReleaseSafe && zig-out/bin/sim_c0 7 fuzz 300
+```
+
+## Node 22 crashes when V8 mixes its compiler tiers
+
+Found in review of slice 5a. `zig build wasm-test -Doptimize=ReleaseSafe` failed in 2 of 20 runs
+(Debug 0 of 10), and both failures were `node` dying with **SIGSEGV**, not a WebAssembly trap,
+on the same `test.wasm`. Running that binary directly, 30 times per V8 setting on Node v22.22.0:
+
+| V8 setting | SIGSEGV |
+| --- | --- |
+| default (Liftoff, then TurboFan tier-up) | 5 of 30 (3 of 30 in a second run) |
+| `--no-wasm-tier-up` | 6 of 30 |
+| `--liftoff-only` | 0 of 30 |
+| `--no-liftoff` (TurboFan only) | 0 of 30 |
+
+A valid module can at worst trap, so a crash of the host is an engine bug, in Node 22's V8, and
+not in our code; it happens only when the engine mixes its two compilers on one module. The
+freestanding core (`zcube_core.wasm`, ReleaseSafe) did not crash in 30 runs under Node 22 or in
+30 runs in Chromium 153 through Playwright.
+
+**What we do.** Every Node run of WebAssembly (`wasm-check`, `wasm-test`, and the WASM side of
+`sim-c0`) is made twice, once with `--liftoff-only` and once with `--no-liftoff` (`v8_modes` in
+`build.zig`), so each compiler runs every test and no run mixes them. After the change, 20 of 20
+runs of the test binary passed in each of those two modes, in Debug and in ReleaseSafe.
+
+**Browser demo.** A host segfault cannot be told from a bug in the core by looking at the
+result: if the demo ever dies without a trap message, run it on the other engines and the other
+tier settings before suspecting the core.
+
+**Not checked.** Whether Node 24 still crashes in default mode: the sandbox refused to run a
+downloaded Node binary, so it was skipped. It is worth one run when someone can.
+
+**Reproduce.** Build the test binary, then loop:
+
+```
+zig build wasm-test -Doptimize=ReleaseSafe
+W=$(ls -t .zig-cache/o/*/test.wasm | head -1)
+for i in $(seq 1 30); do node --no-warnings tools/wasm_check.mjs --wasi $W >/dev/null || echo crash; done
+```
+
+Add `--liftoff-only` or `--no-liftoff` after `--no-warnings` to see the pinned modes pass.

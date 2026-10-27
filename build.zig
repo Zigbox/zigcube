@@ -6,6 +6,12 @@ const executables = [_]struct { name: []const u8, root: []const u8 }{
     .{ .name = "zcube-agent", .root = "src/zcube_agent.zig" },
 };
 
+/// Every WebAssembly run goes through Node twice, once per V8 compiler. Node 22's V8 sometimes
+/// crashes the host process (SIGSEGV, not a trap) when it mixes its two tiers on one module, so a
+/// run pins one tier; both together run every test on both compilers. docs/wasm.md, "Node 22
+/// crashes when V8 mixes its compiler tiers".
+const v8_modes = [_][]const u8{ "--liftoff-only", "--no-liftoff" };
+
 const Backend = enum { memory, sqlite, postgres };
 
 pub fn build(b: *std.Build) void {
@@ -27,6 +33,60 @@ pub fn build(b: *std.Build) void {
         .zigbox = zigbox_module,
     });
 
+    const c_modules = add_c_modules(b, target, optimize);
+    const sqlite = c_modules.sqlite;
+    const libpq_module = c_modules.libpq;
+
+    // The single-threaded half of the conformance suite runs in `zig build test` against the
+    // memory store; `test-store` runs the whole suite against the backend it is given.
+    const memory_suite = memory_suite_options(b);
+    const test_step = b.step("test", "Run unit and snapshot tests");
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "conformance_options", .module = memory_suite.createModule() },
+                .{ .name = "sqlite_c", .module = sqlite },
+                .{ .name = "libpq_c", .module = libpq_module },
+                .{ .name = "zigbox", .module = zigbox_module },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
+    const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
+    const seed = b.option(u64, "seed", seed_help);
+    add_store_step(b, .{
+        .seed = seed,
+        .target = target,
+        .optimize = optimize,
+        .sqlite = sqlite,
+        .libpq = libpq_module,
+        .zigbox = zigbox_module,
+    });
+    add_tidy_step(b);
+    add_pg_dev_steps(b);
+    const library = add_wasm_steps(b, optimize);
+    add_sim_step(b, .{
+        .seed = seed,
+        .target = target,
+        .optimize = optimize,
+        .zigbox = zigbox_module,
+        .library = library,
+    });
+}
+
+const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
+
+fn add_c_modules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) CModules {
     // SQLite's C header, translated (`@cImport` is gone). Backends import it as `sqlite_c`.
     const sqlite = b.addTranslateC(.{
         .root_source_file = b.path("src/sqlite_c.h"),
@@ -47,33 +107,16 @@ pub fn build(b: *std.Build) void {
     libpq.addIncludePath(.{ .cwd_relative = pq_include });
     const libpq_module = libpq.createModule();
     libpq_module.linkSystemLibrary("pq", .{});
+    return .{ .sqlite = sqlite, .libpq = libpq_module };
+}
 
-    const test_step = b.step("test", "Run unit and snapshot tests");
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "build_options", .module = options.createModule() },
-                .{ .name = "sqlite_c", .module = sqlite },
-                .{ .name = "libpq_c", .module = libpq_module },
-                .{ .name = "zigbox", .module = zigbox_module },
-            },
-        }),
-    });
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-
-    add_store_step(b, .{
-        .target = target,
-        .optimize = optimize,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
-        .zigbox = zigbox_module,
-    });
-    add_tidy_step(b);
-    add_pg_dev_steps(b);
-    add_wasm_steps(b, optimize);
+/// What `conformance_options` holds when the suite runs against the memory store with the
+/// per-run seed: the single-threaded tests in `zig build test` and `zig build wasm-test`.
+fn memory_suite_options(b: *std.Build) *std.Build.Step.Options {
+    const options = b.addOptions();
+    options.addOption(Backend, "backend", .memory);
+    options.addOption(?u64, "seed", null);
+    return options;
 }
 
 const ExecutablesOptions = struct {
@@ -127,6 +170,7 @@ fn add_pg_dev_steps(b: *std.Build) void {
 }
 
 const StoreStepOptions = struct {
+    seed: ?u64,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     sqlite: *std.Build.Module,
@@ -149,7 +193,7 @@ fn postgres_conninfo(b: *std.Build) []const u8 {
 /// binary needs the database even for those.
 fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
-    const seed = b.option(u64, "seed", "Seed for the randomised store tests (default: random)");
+    const seed = step_options.seed;
     const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
@@ -201,7 +245,7 @@ fn add_tidy_step(b: *std.Build) void {
 /// `zig build wasm` compiles the control-plane core for `wasm32-freestanding`: no libc, no OS, no
 /// threads, no `std.Io`. It is the check that the core stays free of the shell (docs/wasm.md).
 /// `zig build wasm-check` also runs the result in Node, as CI does.
-fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     // The same package, built for the wasm target: only its pure modules are reachable from the
     // library, so nothing of its host code is compiled.
@@ -226,18 +270,76 @@ fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
 
     // Node is the one runtime CI has for WebAssembly; the runner is a few lines of JavaScript
     // (tools/wasm_check.mjs), whose reason is written at its top and in docs/wasm.md.
-    const node = b.addSystemCommand(&.{"node"});
-    node.addFileArg(b.path("tools/wasm_check.mjs"));
-    node.addFileArg(library.getEmittedBin());
     const check = b.step("wasm-check", "Run the wasm core in Node and check its result");
-    check.dependOn(&node.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addFileArg(library.getEmittedBin());
+        check.dependOn(&node.step);
+    }
     add_wasm_test_step(b, optimize);
+    return library;
+}
+
+const SimStepOptions = struct {
+    seed: ?u64,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zigbox: *std.Build.Module,
+    library: *std.Build.Step.Compile,
+};
+
+/// `zig build sim-c0 [-Dseed=N] [-Dops=N]`: the deterministic simulation of C0 (src/sim_c0.zig),
+/// run natively and as WebAssembly for the same seed, and the two reports compared byte for byte.
+/// It is a simulation, not `demo-c0`. The scenario and the fuzz variant both run; `-Dops` is the
+/// fuzz variant's number of operations. The default seed is 1, so a plain run is reproducible;
+/// CI passes its own and prints it.
+fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
+    const seed = sim.seed;
+    const ops_help = "Operations of the fuzz variant of sim-c0 (default 100)";
+    const operations = b.option(u32, "ops", ops_help) orelse 100;
+    const exe = b.addExecutable(.{
+        .name = "sim_c0",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c0_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    // The executable alone, for running many seeds by hand: `zig build sim-c0-exe`, then
+    // `zig-out/bin/sim_c0 <seed> [fuzz <operations>]` in a loop (build it with ReleaseSafe).
+    const install = b.addInstallArtifact(exe, .{});
+    const exe_help = "Install the native sim-c0 runner into zig-out/bin";
+    b.step("sim-c0-exe", exe_help).dependOn(&install.step);
+    const seed_text = b.fmt("{d}", .{seed orelse 1});
+    const operations_text = b.fmt("{d}", .{operations});
+    const scenario = b.addRunArtifact(exe);
+    scenario.addArg(seed_text);
+    const scenario_report = scenario.captureStdOut(.{});
+    const fuzz = b.addRunArtifact(exe);
+    fuzz.addArgs(&.{ seed_text, "fuzz", operations_text });
+    const fuzz_report = fuzz.captureStdOut(.{});
+    const help = "Run the C0 simulation natively and as WASM, and compare (-Dseed=N)";
+    const step = b.step("sim-c0", help);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, operations_text });
+        node.addFileArg(scenario_report);
+        node.addFileArg(fuzz_report);
+        step.dependOn(&node.step);
+    }
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit
 /// address space and a single thread, with the testing allocator still checking for leaks. It is
 /// WASI and not freestanding because `std.testing` needs `std.Io`, which freestanding lacks.
 fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+    // The single-threaded conformance tests run here against the memory store.
+    const memory_suite = memory_suite_options(b);
     const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const tests = b.addTest(.{
@@ -245,13 +347,18 @@ fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
             .root_source_file = b.path("src/core.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+            .imports = &.{
+                .{ .name = "zigbox", .module = zigbox.module("zigbox") },
+                .{ .name = "conformance_options", .module = memory_suite.createModule() },
+            },
         }),
     });
-    const node = b.addSystemCommand(&.{ "node", "--no-warnings" });
-    node.addFileArg(b.path("tools/wasm_check.mjs"));
-    node.addArg("--wasi");
-    node.addFileArg(tests.getEmittedBin());
     const step = b.step("wasm-test", "Run the core modules' unit tests under WASI in Node");
-    step.dependOn(&node.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--wasi");
+        node.addFileArg(tests.getEmittedBin());
+        step.dependOn(&node.step);
+    }
 }
