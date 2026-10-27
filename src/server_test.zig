@@ -588,3 +588,65 @@ test "request ids are not issued twice across server starts" {
     }
     try testing.expect(!std.mem.eql(u8, seen[0][0..lengths[0]], seen[1][0..lengths[1]]));
 }
+
+/// A client that does what the agent does: one request on a connection that stays open, the reply
+/// read by its `Content-Length`, and then the client closes the connection, first.
+fn keep_alive_client(io: std.Io, address: net.IpAddress, path: []const u8, done: *bool) void {
+    defer done.* = true;
+    var stream = address.connect(io, .{ .mode = .stream }) catch return;
+    defer stream.close(io);
+    var write_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    writer.interface.print("GET {s} HTTP/1.1\r\nHost: test\r\n\r\n", .{path}) catch return;
+    writer.interface.flush() catch return;
+    var read_buffer: [512]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var head: [2048]u8 = undefined;
+    var length: usize = 0;
+    while (length < head.len) {
+        head[length] = reader.interface.takeByte() catch return;
+        length += 1;
+        if (std.mem.endsWith(u8, head[0..length], "\r\n\r\n")) break;
+    }
+    const marker = "content-length: ";
+    const lowered = std.ascii.lowerString(&head, head[0..length]);
+    const at = std.mem.find(u8, lowered, marker) orelse return;
+    const end = std.mem.findPos(u8, lowered, at, "\r\n") orelse return;
+    const size = std.fmt.parseInt(usize, lowered[at + marker.len .. end], 10) catch return;
+    var body: [512]u8 = undefined;
+    if (size > body.len) return;
+    reader.interface.readSliceAll(body[0..size]) catch return;
+}
+
+test "a server stopped while it answers a held watch leaves its port free to start again" {
+    // Goal: the acceptance criterion "restarting zcube-server changes nothing" needs the port back.
+    // Whoever sends the first FIN keeps the connection in TIME_WAIT on its port, and the server
+    // does not set SO_REUSEADDR, so a server that closed first could not start on its port for a
+    // minute. Method: hold a watch from a client that closes its connection after the reply,
+    // stop the server (which ends the hold and answers), and start another on the same port.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const first = try start_server(io, config_for(.memory, false));
+    const address = first.address();
+    var done = false;
+    const path = "/v1/watch?from=1&timeout=5000&prefix=%2Fnothing%2F";
+    var client = try io.concurrent(keep_alive_client, .{ io, address, path, &done });
+    var tries: u32 = 0;
+    while (first.holds() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    first.stop();
+    client.await(io);
+    try testing.expect(done);
+
+    var diag: Diag = undefined;
+    diag.reset();
+    var text: [32]u8 = undefined;
+    const listen = try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{address.getPort()});
+    var config = config_for(.memory, false);
+    config.listen = try config_mod.parse_listen(listen, &diag);
+    const second = try start_server(io, config);
+    second.stop();
+}

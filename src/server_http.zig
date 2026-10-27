@@ -210,7 +210,7 @@ pub fn serve(shared: *Shared, slot: u32, stream: net.Stream) void {
     defer work.arena.deinit();
     for (0..constants.http_requests_per_connection_max) |_| {
         shared.set_state(slot, .waiting);
-        if (shared.stopping.load(.acquire)) return;
+        if (shared.stopping.load(.acquire)) return wait_for_client(shared, slot, &reader);
         var request = connection.receiveHead() catch |err| {
             refuse_head(&work, &writer, err);
             return linger(shared, slot, stream, &reader);
@@ -218,6 +218,17 @@ pub fn serve(shared: *Shared, slot: u32, stream: net.Stream) void {
         const keep_alive = answer(&work, &request) catch return;
         if (!keep_alive) return linger(shared, slot, stream, &reader);
     }
+}
+
+/// The server is stopping and this connection is done, but the client closes it first. Whoever
+/// sends the first FIN keeps the connection in TIME_WAIT on its port, and a server whose port is
+/// held cannot start again on it (the server does not set `SO_REUSEADDR`, docs/core.md, "Known
+/// limit: reuse_address"). A client that reads its reply and closes, as the agent does, closes
+/// at once; any other is ended by the watchdog (the idle timeout) or by the stop itself after
+/// `server_stop_ms`.
+fn wait_for_client(shared: *Shared, slot: u32, reader: *net.Stream.Reader) void {
+    shared.set_state(slot, .waiting);
+    _ = reader.interface.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
 }
 
 /// Closing a socket that still has unread data makes the kernel send a reset, which can destroy

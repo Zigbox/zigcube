@@ -189,3 +189,10 @@ of it (`Request.hold`, an atomic request counter), and the rest of what it taugh
   complaint; without it, a restart can find the port in `TIME_WAIT` for a short while after a
   server that closed connections first. The server does not set it: a second server fails loudly
   with `ZC-E0107`.
+  **Slice 6a found this was not "a short while".** A connection the server closes first keeps the
+  port in `TIME_WAIT` for a minute, and the server closed first when it stopped while answering a
+  request: `zcube-agent` holds a long poll all the time, so every restart hit it. A stopping
+  server now waits for the client to close a connection it is done with (`server_http.zig`,
+  `wait_for_client`), so the client sends the first FIN, and the agent's client closes as soon as
+  it has read its reply. A browser tab with a kept-alive connection still has the server close
+  first, after `server_stop_ms`.
