@@ -6,9 +6,9 @@
 //! A connection serves one request and the agent closes it first (see `parse_head`).
 //!
 //! Everything is bounded: a reply is read for at most the request's own wait plus
-//! `agent_io_timeout_ms` (a socket timeout, so a server that accepts and then says nothing cannot
-//! stop the agent), and a reply is at most `agent_response_bytes_max`. Connecting is bounded by
-//! the kernel only (see `connect`). A failure is ZC-E0503 (the server did not answer) or
+//! `agent_io_timeout_ms` (a `poll` before each read, so a server that accepts and then says nothing
+//! cannot stop the agent), and a reply is at most `agent_response_bytes_max`. Connecting is
+//! bounded by the kernel only (see `connect`). A failure is ZC-E0503 (the server did not answer) or
 //! ZC-E0504 (it answered something the agent cannot use), never a Zig error name.
 
 const std = @import("std");
@@ -39,6 +39,8 @@ pub const Reply = struct {
 pub const Client = struct {
     io: std.Io,
     address: net.IpAddress,
+    /// How long a read waits for the next piece of a reply, on top of the request's own hold.
+    io_timeout_ms: u32 = constants.agent_io_timeout_ms,
 
     /// Sends the request and returns the reply, whatever its status. `Unreachable` and `BadReply`
     /// leave a diagnostic in `diag`.
@@ -56,9 +58,8 @@ pub const Client = struct {
         }
         var stream = client.connect(diag) catch |err| return err;
         defer stream.close(client.io);
-        set_timeouts(&stream, request.hold_ms + constants.agent_io_timeout_ms);
         try client.send(&stream, request, diag);
-        return client.receive(arena, &stream, diag);
+        return client.receive(arena, &stream, request.hold_ms + client.io_timeout_ms, diag);
     }
 
     /// The standard library's threaded `Io` does not implement a connect timeout on POSIX (it
@@ -93,43 +94,54 @@ pub const Client = struct {
             return unreachable_server(diag, client, "the request could not be sent");
     }
 
+    /// The reply, head and body, read with `poll` so that a server that goes quiet ends the wait
+    /// with an error of ours. A receive timeout on the socket would end it inside the standard
+    /// library's reader, which panics when the timeout fires ("programmer bug caused syscall
+    /// error: AGAIN"): the agent then crashed with ZC-B0001 whenever the server held a request
+    /// for longer than the timeout, which a store outage does (found by demo-c0).
     fn receive(
         client: *const Client,
         arena: Allocator,
         stream: *net.Stream,
+        wait_ms: u32,
         diag: *Diag,
     ) Error!Reply {
-        var buffer: [4096]u8 = undefined;
-        var reader = stream.reader(client.io, &buffer);
-        const head = try client.read_head(arena, &reader.interface, diag);
-        const parsed = try parse_head(head, diag);
-        const length = parsed.content_length orelse
-            return bad_reply(diag, "the reply has no Content-Length");
-        if (length > constants.agent_response_bytes_max) {
-            return bad_reply(diag, "the reply is larger than the agent reads");
+        const fd = stream.socket.handle;
+        const lost = "the connection was lost";
+        var raw: std.ArrayList(u8) = .empty;
+        var chunk: [4096]u8 = undefined;
+        var head: ?Head = null;
+        var head_len: usize = 0;
+        while (true) {
+            const events = std.posix.POLL.IN;
+            var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+            const ready = std.posix.poll(&wait, @intCast(wait_ms)) catch
+                return unreachable_server(diag, client, lost);
+            if (ready == 0) return unreachable_server(diag, client, "it did not answer in time");
+            const length = std.posix.read(fd, &chunk) catch
+                return unreachable_server(diag, client, lost);
+            if (length == 0) return unreachable_server(diag, client, lost);
+            raw.appendSlice(arena, chunk[0..length]) catch return error.OutOfMemory;
+            if (head == null) {
+                const end = std.mem.find(u8, raw.items, "\r\n\r\n");
+                if (end == null and raw.items.len > head_bytes_max) {
+                    return bad_reply(diag, "the reply's headers are longer than the agent reads");
+                }
+                if (end) |at| {
+                    head_len = at + 4;
+                    head = try parse_head(raw.items[0..head_len], diag);
+                }
+            }
+            const parsed = head orelse continue;
+            const promised = parsed.content_length orelse
+                return bad_reply(diag, "the reply has no Content-Length");
+            if (promised > constants.agent_response_bytes_max) {
+                return bad_reply(diag, "the reply is larger than the agent reads");
+            }
+            if (raw.items.len - head_len >= promised) {
+                return .{ .status = parsed.status, .body = raw.items[head_len..][0..promised] };
+            }
         }
-        const body = arena.alloc(u8, length) catch return error.OutOfMemory;
-        reader.interface.readSliceAll(body) catch
-            return unreachable_server(diag, client, "the connection was lost or timed out");
-        return .{ .status = parsed.status, .body = body };
-    }
-
-    /// The status line and headers, up to and including the blank line. Read a byte at a time
-    /// from the reader's buffer, so nothing of the body is consumed.
-    fn read_head(
-        client: *const Client,
-        arena: Allocator,
-        reader: *std.Io.Reader,
-        diag: *Diag,
-    ) Error![]const u8 {
-        var head: std.ArrayList(u8) = .empty;
-        for (0..head_bytes_max) |_| {
-            const byte = reader.takeByte() catch
-                return unreachable_server(diag, client, "the connection was lost or timed out");
-            head.append(arena, byte) catch return error.OutOfMemory;
-            if (std.mem.endsWith(u8, head.items, "\r\n\r\n")) return head.items;
-        }
-        return bad_reply(diag, "the reply's headers are longer than the agent reads");
     }
 };
 
@@ -159,20 +171,6 @@ pub fn parse_head(head: []const u8, diag: *Diag) Error!Head {
             return bad_reply(diag, "the reply's Content-Length is not a number");
     }
     return .{ .status = status, .content_length = length };
-}
-
-/// A receive and send timeout on the socket, so that a blocked read ends with an error.
-fn set_timeouts(stream: *net.Stream, timeout_ms: u32) void {
-    const value: std.posix.timeval = .{
-        .sec = @intCast(timeout_ms / 1000),
-        .usec = @intCast((timeout_ms % 1000) * 1000),
-    };
-    const handle = stream.socket.handle;
-    const bytes = std.mem.asBytes(&value);
-    // A socket that cannot take a timeout keeps working; the watchdog of the server's idle
-    // timeout still bounds how long the other side waits.
-    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
-    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, bytes) catch {};
 }
 
 fn unreachable_server(diag: *Diag, client: *const Client, reason: []const u8) Error {
@@ -224,4 +222,30 @@ test "a reply head gives the status and the length, and anything else is ZC-E050
         try testing.expectError(error.BadReply, parse_head(raw, &diag));
         try testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0504), diag.code);
     }
+}
+
+test "a server that accepts and says nothing is ZC-E0503 after the wait, not a crash" {
+    // Goal: a server that holds a request longer than the agent waits (a store outage does) must
+    // end the wait with a coded diagnostic. With a receive timeout on the socket, the standard
+    // library's reader panicked when it fired ("syscall error: AGAIN"), and the agent died with
+    // ZC-B0001 (found by demo-c0). Method: a listener that never accepts (the kernel completes the
+    // connection) and a client that waits 100 ms.
+    const io = testing.io;
+    const any = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try any.listen(io, .{});
+    defer listener.deinit(io);
+    const client: Client = .{
+        .io = io,
+        .address = listener.socket.address,
+        .io_timeout_ms = 100,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const request: Request = .{ .method = "GET", .target = "/v1/status" };
+    const result = client.call(arena_state.allocator(), request, &diag);
+    try testing.expectError(error.Unreachable, result);
+    try testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0503), diag.code);
+    try testing.expect(std.mem.endsWith(u8, diag.last_cause().?, "it did not answer in time"));
 }

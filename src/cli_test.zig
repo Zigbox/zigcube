@@ -678,3 +678,35 @@ test "--verbose lists every request with the id the server answered under" {
     try expect_contains(world.err(), third);
     try testing.expectEqualStrings("no services\n", world.out());
 }
+
+test "a server can be restarted on its port right after zcube has used it" {
+    // Goal: the acceptance criterion "restarting zcube-server changes nothing", for a person who
+    // has just run `zcube`. Whoever closes a connection first keeps it in TIME_WAIT on its port,
+    // and a server cannot listen on a port that is held (it does not set SO_REUSEADDR, docs/
+    // core.md), so a command that waits for the server to close first made a restart within a
+    // minute fail with ZC-E0107. Found by demo-c0. Method: run commands, stop the server, start
+    // another on the same port at once, and run a command against it.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "get", "service" }));
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "why", "service", "nosuch" }));
+    const address = world.server.address();
+    world.node.stop();
+    world.server.stop();
+
+    var diag: Diag = undefined;
+    diag.reset();
+    const database = try std.fmt.allocPrint(world.arena_state.allocator(), "{s}/zcube.db", .{
+        world.dir,
+    });
+    world.server = try server_mod.Server.start(testing.allocator, world.io, .{
+        .listen = address,
+        .store = .{ .sqlite = database },
+        .create_store = false,
+        .verbose = false,
+        .quiet = true,
+    }, .{ .version = "0.0.0-test", .report_failures = false, .log_requests = false }, &diag);
+    world.node = try Node.start(world.io, world.server.backend.handle());
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "get", "service" }));
+}

@@ -1,7 +1,8 @@
-//! The command line's side of the API: one HTTP/1.1 request per connection (`Connection: close`),
-//! read to the end, bounded. Written over a bare socket and not `std.http.Client` because the
-//! command needs the `X-Request-Id` of every reply, a bounded read and a connect that fails fast,
-//! and the API is plain HTTP on a private address.
+//! The command line's side of the API: one HTTP/1.1 request per connection, the reply read by its
+//! `Content-Length`, bounded, and the connection closed by the command, first (see `read_reply`).
+//! Written over a bare socket and not `std.http.Client` because the command needs the
+//! `X-Request-Id` of every reply, a bounded read and a connect that fails fast, and the API is
+//! plain HTTP on a private address.
 //!
 //! Every way a request can fail below HTTP is `ZC-E0102` with the system's reason in words (never
 //! an error name), every reply the client can't read is `ZC-E0103`, and a non-2xx reply carries
@@ -166,7 +167,7 @@ pub const Client = struct {
         writer.interface.writeAll(request) catch return lost(client, report, "sending the request");
         writer.interface.writeAll(body) catch return lost(client, report, "sending the request");
         writer.interface.flush() catch return lost(client, report, "sending the request");
-        const raw = try read_all(client, &stream, report);
+        const raw = try read_reply(client, &stream, report);
         return parse_reply(raw, report, id);
     }
 };
@@ -189,11 +190,18 @@ pub fn parse_server(text: []const u8) ?net.IpAddress {
     return address;
 }
 
-/// Reads the reply to the end of the connection, waiting at most `cli_reply_timeout_ms` for each
-/// piece of it, and at most `cli_reply_bytes_max` bytes in all. It polls and reads the socket
-/// itself: a receive timeout on the socket makes the standard library's reader panic ("programmer
-/// bug caused syscall error: AGAIN"), which would turn a silent server into a bug report.
-fn read_all(client: *const Client, stream: *net.Stream, report: *Report) Error![]const u8 {
+/// Reads the reply, waiting at most `cli_reply_timeout_ms` for each piece of it, and at most
+/// `cli_reply_bytes_max` bytes in all, and returns as soon as the reply is whole: the head and as
+/// many body bytes as its `Content-Length` promises (the server always sends one). A reply with
+/// none is read to the end of the connection. The command then closes the connection, so *it*
+/// sends the first FIN: whoever does keeps the connection in TIME_WAIT on its port for a minute,
+/// and a `zcube-server` that closed first could not be restarted on its port in that time
+/// (docs/core.md, "Known limit: reuse_address"). So the request carries no `Connection: close`,
+/// which would make the server close first.
+/// It polls and reads the socket itself: a receive timeout on the socket makes the standard
+/// library's reader panic ("programmer bug caused syscall error: AGAIN"), which would turn a
+/// silent server into a bug report.
+fn read_reply(client: *const Client, stream: *net.Stream, report: *Report) Error![]const u8 {
     const fd = stream.socket.handle;
     var out: std.ArrayList(u8) = .empty;
     var chunk: [4096]u8 = undefined;
@@ -210,7 +218,23 @@ fn read_all(client: *const Client, stream: *net.Stream, report: *Report) Error![
         if (length == 0) return out.items;
         if (out.items.len + length > constants.cli_reply_bytes_max) return too_big(report);
         try out.appendSlice(client.env.arena, chunk[0..length]);
+        if (reply_is_whole(out.items)) return out.items;
     }
+}
+
+/// True once `raw` holds a head that promises a `Content-Length` and that many bytes after it.
+fn reply_is_whole(raw: []const u8) bool {
+    const split = std.mem.find(u8, raw, "\r\n\r\n") orelse return false;
+    var lines = std.mem.splitSequence(u8, raw[0..split], "\r\n");
+    _ = lines.next(); // The status line.
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const promised = std.fmt.parseInt(usize, value, 10) catch return false;
+        return raw.len - (split + 4) >= promised;
+    }
+    return false;
 }
 
 fn silent(client: *const Client, report: *Report) Error {
@@ -250,7 +274,7 @@ fn request_head(buffer: *[head_bytes_max]u8, line: RequestLine) ?[]const u8 {
     writer.print(first, .{ line.method, line.path, line.host }) catch return null;
     const second = "User-Agent: zcube/{s}\r\nAccept: application/json\r\n";
     writer.print(second, .{line.version}) catch return null;
-    const third = "X-Request-Id: {s}\r\nConnection: close\r\n";
+    const third = "X-Request-Id: {s}\r\n";
     writer.print(third, .{line.request_id}) catch return null;
     if (line.body_bytes > 0) {
         writer.print("Content-Type: application/json\r\nContent-Length: {d}\r\n", .{

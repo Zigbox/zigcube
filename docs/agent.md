@@ -134,7 +134,11 @@ real processes, for the owner and for the Zigbox adapter:
 - **Connecting has no timeout.** The standard library's threaded `Io` panics if `connect` is given
   one on POSIX, and a socket option can only be set after the socket exists. A server that is down
   refuses at once (the case on one network); a host that drops packets makes the agent wait as long
-  as the kernel does. Reads and writes are bounded by a socket timeout.
+  as the kernel does. A read waits at most `agent_io_timeout_ms` (plus a long poll's own hold) for
+  the next piece of a reply: the client `poll`s before each read. It does not use a receive timeout
+  on the socket, which makes the standard library's reader panic when it fires; the agent died
+  with `ZC-B0001` whenever a server held a request that long (a store outage does), which slice 6c
+  found. A request is small and is written at once, so a write has no timeout.
 - **The long poll is a quarter of a second.** The agent waits on the server for
   `agent_watch_slice_ms` at a time, so that it can look at the local runtime between polls, which
   makes about four requests a second per idle agent. A thread for each, or a runtime that can be

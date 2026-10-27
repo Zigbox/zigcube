@@ -287,6 +287,11 @@ pub const bundle_keys_pages_max: u32 = 4;
 pub const bundle_name_bytes_max: u32 = timestamp_bytes + 1 + 3 + service_name_bytes_max + 20;
 pub const errors_page_bytes_max: u32 = 24 * 1024;
 
+// ---- Test and demo tooling (agent-smoke, demo-c0) ---------------------------------------------
+
+/// A container's name as the host tooling reads it from the state directory (`hello-12`).
+pub const demo_name_bytes_max: u32 = 64;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);

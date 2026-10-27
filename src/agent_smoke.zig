@@ -22,6 +22,7 @@ const assert = std.debug.assert;
 const net = std.Io.net;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const host_procs = @import("host_procs.zig");
 const http = @import("agent_http.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,9 +36,7 @@ const processes_max: u32 = 64;
 
 const Failed = error{SmokeFailed};
 
-const Pids = struct { name: [64]u8, name_len: u8, supervisor: i32, command: i32 };
-
-const ProcInfo = struct { parent: i32, group: i32, session: i32, zombie: bool };
+const Pids = host_procs.Pids;
 
 const Smoke = struct {
     io: std.Io,
@@ -248,78 +247,20 @@ const Smoke = struct {
 
     // ---- The host ----
 
-    /// The containers the agent has made, from its state directory.
-    fn containers(smoke: *Smoke) ![]const Pids {
-        const arena = smoke.arena.allocator();
-        const root = try std.fmt.allocPrint(arena, "{s}/containers", .{smoke.state});
-        var dir = try std.Io.Dir.cwd().openDir(smoke.io, root, .{ .iterate = true });
-        defer dir.close(smoke.io);
-        var found: std.ArrayList(Pids) = .empty;
-        var iterator = dir.iterate();
-        while (try iterator.next(smoke.io)) |entry| {
-            if (entry.kind != .directory) continue;
-            var sub = dir.openDir(smoke.io, entry.name, .{}) catch continue;
-            defer sub.close(smoke.io);
-            const supervisor = read_pid(smoke.io, sub, "supervisor.pid") orelse continue;
-            const command = read_pid(smoke.io, sub, "child.pid") orelse continue;
-            var pids: Pids = .{ .name = undefined, .name_len = @intCast(
-                entry.name.len,
-            ), .supervisor = supervisor, .command = command };
-            @memcpy(pids.name[0..entry.name.len], entry.name);
-            try found.append(arena, pids);
-        }
-        std.mem.sort(Pids, found.items, {}, pids_less);
-        return found.items;
+    fn procs(smoke: *Smoke) host_procs.Procs {
+        return .{ .io = smoke.io, .arena = smoke.arena.allocator(), .state = smoke.state };
     }
 
-    fn pids_less(_: void, first: Pids, second: Pids) bool {
-        return std.mem.lessThan(u8, first.name[0..first.name_len], second.name[0..second.name_len]);
-    }
-
-    /// The live containers (the command runs), not the stopped ones whose directories remain.
     fn running_containers(smoke: *Smoke) ![]const Pids {
-        const arena = smoke.arena.allocator();
-        var alive: std.ArrayList(Pids) = .empty;
-        for (try smoke.containers()) |pids| {
-            const command = smoke.proc(pids.command) orelse continue;
-            if (command.zombie) continue;
-            try alive.append(arena, pids);
-        }
-        return alive.items;
+        return smoke.procs().running_containers();
     }
 
-    fn proc(smoke: *Smoke, pid: i32) ?ProcInfo {
-        var path: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&path, "/proc/{d}/stat", .{pid}) catch return null;
-        var buffer: [1024]u8 = undefined;
-        const bytes = std.Io.Dir.cwd().readFile(smoke.io, name, &buffer) catch return null;
-        return parse_stat(bytes);
+    fn proc(smoke: *Smoke, pid: i32) ?host_procs.ProcInfo {
+        return smoke.procs().proc(pid);
     }
 
-    /// The supervisors that run now: processes whose command line is `<agent> supervise` of a
-    /// container under our state directory. A scan of /proc, so a duplicate would be seen.
     fn supervisors(smoke: *Smoke) !u32 {
-        var proc_dir = try std.Io.Dir.cwd().openDir(smoke.io, "/proc", .{ .iterate = true });
-        defer proc_dir.close(smoke.io);
-        var count: u32 = 0;
-        var iterator = proc_dir.iterate();
-        while (try iterator.next(smoke.io)) |entry| {
-            const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
-            if (!smoke.is_supervisor(pid)) continue;
-            count += 1;
-        }
-        return count;
-    }
-
-    fn is_supervisor(smoke: *Smoke, pid: i32) bool {
-        const info = smoke.proc(pid) orelse return false;
-        if (info.zombie) return false;
-        var path: [32]u8 = undefined;
-        const name = std.fmt.bufPrint(&path, "/proc/{d}/cmdline", .{pid}) catch return false;
-        var buffer: [constants.state_path_bytes_max + 256]u8 = undefined;
-        const line = std.Io.Dir.cwd().readFile(smoke.io, name, &buffer) catch return false;
-        if (std.mem.find(u8, line, "supervise") == null) return false;
-        return std.mem.find(u8, line, smoke.state) != null;
+        return smoke.procs().supervisors();
     }
 
     // ---- The end, whatever happened ----
@@ -331,18 +272,7 @@ const Smoke = struct {
         smoke.agent = null;
         if (smoke.server) |*child| child.kill(smoke.io);
         smoke.server = null;
-        var proc_dir = std.Io.Dir.cwd().openDir(
-            smoke.io,
-            "/proc",
-            .{ .iterate = true },
-        ) catch return;
-        defer proc_dir.close(smoke.io);
-        var iterator = proc_dir.iterate();
-        while (iterator.next(smoke.io) catch null) |entry| {
-            const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
-            if (!smoke.is_supervisor(pid)) continue;
-            std.posix.kill(-pid, .KILL) catch {}; // The group may be gone already.
-        }
+        _ = smoke.procs().kill_supervisor_groups();
     }
 
     fn dump_logs(smoke: *Smoke) void {
@@ -367,23 +297,6 @@ const Smoke = struct {
         }
     }
 };
-
-fn read_pid(io: std.Io, dir: std.Io.Dir, name: []const u8) ?i32 {
-    var buffer: [32]u8 = undefined;
-    const bytes = dir.readFile(io, name, &buffer) catch return null;
-    return std.fmt.parseInt(i32, std.mem.trim(u8, bytes, "\n "), 10) catch null;
-}
-
-/// "pid (comm) S ppid pgrp session ...": the fields after the closing parenthesis.
-fn parse_stat(bytes: []const u8) ?ProcInfo {
-    const close = std.mem.lastIndexOfScalar(u8, bytes, ')') orelse return null;
-    var fields = std.mem.tokenizeScalar(u8, bytes[close + 1 ..], ' ');
-    const state = fields.next() orelse return null;
-    const parent = std.fmt.parseInt(i32, fields.next() orelse return null, 10) catch return null;
-    const group = std.fmt.parseInt(i32, fields.next() orelse return null, 10) catch return null;
-    const session = std.fmt.parseInt(i32, fields.next() orelse return null, 10) catch return null;
-    return .{ .parent = parent, .group = group, .session = session, .zombie = state[0] == 'Z' };
-}
 
 // ---- The script -------------------------------------------------------------------------------
 
@@ -424,7 +337,7 @@ fn step_apply_three(smoke: *Smoke) !void {
     for (alive) |pids| {
         const command = smoke.proc(pids.command).?;
         const supervisor = smoke.proc(pids.supervisor).?;
-        const name = pids.name[0..pids.name_len];
+        const name = pids.name();
         try smoke.expect(
             command.parent == pids.supervisor,
             "{s}: the command's parent is not its supervisor",
@@ -455,7 +368,7 @@ fn step_apply_three(smoke: *Smoke) !void {
 /// `kill -9` of one command: replaced, 3 again. Returns the containers that run then.
 fn step_kill_one(smoke: *Smoke) ![]const Pids {
     const first = (try smoke.running_containers())[0];
-    const killed = try smoke.arena.allocator().dupe(u8, first.name[0..first.name_len]);
+    const killed = try smoke.arena.allocator().dupe(u8, first.name());
     try std.posix.kill(first.command, .KILL);
     const replaced = struct {
         fn check(s: *Smoke) !bool {
@@ -467,7 +380,7 @@ fn step_kill_one(smoke: *Smoke) ![]const Pids {
     try smoke.wait_until("the killed replica to be replaced", replaced.check, wait_ms_default);
     const alive = try smoke.running_containers();
     for (alive) |pids| {
-        const same = std.mem.eql(u8, pids.name[0..pids.name_len], killed);
+        const same = std.mem.eql(u8, pids.name(), killed);
         try smoke.expect(
             !same,
             "{s} runs again after kill -9; a replacement was expected",
@@ -490,8 +403,8 @@ fn same_containers(smoke: *Smoke, before: []const Pids) !bool {
     for (before, now) |left, right| {
         const names_equal = std.mem.eql(
             u8,
-            left.name[0..left.name_len],
-            right.name[0..right.name_len],
+            left.name(),
+            right.name(),
         );
         if (!names_equal) return false;
         if (left.supervisor != right.supervisor) return false;
