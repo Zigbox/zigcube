@@ -24,6 +24,7 @@ test {
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_runtime_test.zig");
+    _ = @import("host_procs.zig");
     _ = @import("core.zig");
     _ = @import("server_arena.zig");
     _ = @import("server_config.zig");
