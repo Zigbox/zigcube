@@ -1,13 +1,16 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
-# installed from a verified tarball (.github/actions/setup-zig). The only other shell is the
-# apt-get line that installs the SQLite and libpq development files the tests link, and the
-# docker line of the Postgres demo job that names its service container. The wasm job uses the
-# Node that the runner image carries.
+# installed from a verified tarball (.github/actions/setup-zig). The other shell lines are the
+# changes job's classifier (git diff over the changed paths, see that job), the apt-get line that
+# installs the SQLite and libpq development files the tests link, and the docker line of the
+# Postgres demo job that names its service container. The wasm job uses the Node that the runner
+# image carries.
 name: ci
 
 # CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
 # Actions time is spent once per change. Open a PR when a change needs CI. A newer push to the
 # same PR cancels the run it supersedes; runs on main are never cancelled.
+# A change that touches only documentation (the changes job says what counts) skips every other
+# job: they report as skipped, which required checks count as passing. Anything else runs them all.
 on:
   push:
     branches: [main]
@@ -21,8 +24,76 @@ permissions:
   contents: read
 
 jobs:
+  # Decides whether the jobs below run. A change is documentation only when every changed path is
+  # a file ending in `.md` (except under web/ or src/), or lies under site/ (except site/errors/,
+  # which CI generates and checks). An empty diff, a path that is neither, or a diff that cannot be
+  # listed means code, so everything runs. Renames are listed as a delete and an add (--no-renames),
+  # so the old path is judged too. The jobs below run when `code` is true. If this job itself fails,
+  # they still run (the output defaults to true), so a broken classifier cannot skip the checks.
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Classify the change (documentation only or code)
+        id: classify
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          is_doc() {
+            case "$1" in
+              web/* | src/* | site/errors/*) return 1 ;;
+              site/*) return 0 ;;
+              *.md) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          files=""
+          listed=no
+          if [ "${EVENT}" = pull_request ]; then
+            if files="$(git diff --no-renames --name-only "${BASE}...${HEAD}")"; then listed=yes; fi
+          elif [ "${EVENT}" = push ] && [ "${BEFORE}" != 0000000000000000000000000000000000000000 ]; then
+            if files="$(git diff --no-renames --name-only "${BEFORE}" "${AFTER}")"; then listed=yes; fi
+          fi
+          code=true
+          why="the changed files could not be listed"
+          if [ "${listed}" = yes ] && [ -z "${files}" ]; then
+            why="the diff is empty"
+          elif [ "${listed}" = yes ]; then
+            code=false
+            why="every changed path is documentation"
+            while IFS= read -r f; do
+              if ! is_doc "${f}"; then
+                code=true
+                why="${f} is not documentation"
+                break
+              fi
+            done <<< "${files}"
+          fi
+          echo "Changed files:"
+          if [ -n "${files}" ]; then
+            while IFS= read -r f; do echo "  ${f}"; done <<< "${files}"
+          fi
+          if [ "${code}" = true ]; then
+            echo "Verdict: not documentation only (${why}); every job runs"
+          else
+            echo "Verdict: documentation only; the other jobs are skipped"
+          fi
+          echo "code=${code}" >> "${GITHUB_OUTPUT}"
+
   check:
     name: format, build, test
+    needs: changes
+    if: ${{ always() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       # The SHA is the one Zigbox's CI pins for actions/checkout v7.0.1.
@@ -60,6 +131,8 @@ jobs:
   # a few draws of the racing-writer tests.
   store-postgres:
     name: store conformance (postgres)
+    needs: changes
+    if: ${{ always() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -94,6 +167,8 @@ jobs:
   # everything it started. Two jobs, one per backend, so a failure names its backend.
   demo-c0-sqlite:
     name: demo-c0 (sqlite)
+    needs: changes
+    if: ${{ always() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,6 +190,8 @@ jobs:
   # data and its published port. The container is named once, before the demo runs.
   demo-c0-postgres:
     name: demo-c0 (postgres)
+    needs: changes
+    if: ${{ always() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -160,6 +237,8 @@ jobs:
   # also built and run in ReleaseSafe, the mode Zigcube ships, where assertions stay on.
   wasm:
     name: core on wasm32
+    needs: changes
+    if: ${{ always() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
