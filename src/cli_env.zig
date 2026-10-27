@@ -38,6 +38,8 @@ pub const Env = struct {
     /// Request ids that repeat from run to run (`zc-test-1`, ...), so a snapshot of the output
     /// can be compared byte for byte. Only the tests set it.
     deterministic_ids: bool = false,
+    /// How long to wait for the next piece of a reply; the tests shorten it.
+    reply_timeout_ms: u32 = constants.cli_reply_timeout_ms,
     /// A clock that stands still, for the same reason. Only the tests set it.
     fixed_now_ms: ?u64 = null,
     /// A network that is not one. Only the tests set it.

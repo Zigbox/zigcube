@@ -149,7 +149,6 @@ pub const Client = struct {
             return unreachable_server(client, report, connect_reason(err));
         };
         defer stream.close(io);
-        set_reply_timeout(&stream);
         var head: [2048]u8 = undefined;
         const request = std.fmt.bufPrint(&head, "{s} {s} HTTP/1.1\r\nHost: {s}\r\n" ++
             "User-Agent: zcube/{s}\r\nAccept: application/json\r\nX-Request-Id: {s}\r\n" ++
@@ -161,17 +160,7 @@ pub const Client = struct {
         writer.interface.writeAll(request) catch return lost(client, report, "sending the request");
         writer.interface.writeAll(body) catch return lost(client, report, "sending the request");
         writer.interface.flush() catch return lost(client, report, "sending the request");
-        var read_buffer: [4096]u8 = undefined;
-        var reader = stream.reader(io, &read_buffer);
-        const limit: std.Io.Limit = .limited(constants.cli_reply_bytes_max);
-        const raw = reader.interface.allocRemaining(
-            client.env.arena,
-            limit,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return too_big(report),
-            error.StreamTooLong => return too_big(report),
-            error.ReadFailed => return lost(client, report, "reading the reply"),
-        };
+        const raw = try read_all(client, &stream, report);
         return parse_reply(raw, report, id);
     }
 };
@@ -194,17 +183,43 @@ pub fn parse_server(text: []const u8) ?net.IpAddress {
     return address;
 }
 
-/// A reply that never comes must not hang the command: reads give up after the reply timeout.
-fn set_reply_timeout(stream: *net.Stream) void {
-    const seconds = constants.cli_reply_timeout_ms / 1000;
-    const timeout: std.posix.timeval = .{ .sec = seconds, .usec = 0 };
-    // Best effort: a platform without the option keeps the blocking read.
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&timeout),
-    ) catch {};
+/// Reads the reply to the end of the connection, waiting at most `cli_reply_timeout_ms` for each
+/// piece of it, and at most `cli_reply_bytes_max` bytes in all. It polls and reads the socket
+/// itself: a receive timeout on the socket makes the standard library's reader panic ("programmer
+/// bug caused syscall error: AGAIN"), which would turn a silent server into a bug report.
+fn read_all(client: *const Client, stream: *net.Stream, report: *Report) Error![]const u8 {
+    const fd = stream.socket.handle;
+    var out: std.ArrayList(u8) = .empty;
+    var chunk: [4096]u8 = undefined;
+    const timeout_ms: i32 = @intCast(client.env.reply_timeout_ms);
+    while (true) {
+        var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&wait, timeout_ms) catch {
+            return lost(client, report, "waiting for the reply");
+        };
+        if (ready == 0) return silent(client, report);
+        const length = std.posix.read(fd, &chunk) catch {
+            return lost(client, report, "reading the reply");
+        };
+        if (length == 0) return out.items;
+        if (out.items.len + length > constants.cli_reply_bytes_max) return too_big(report);
+        try out.appendSlice(client.env.arena, chunk[0..length]);
+    }
+}
+
+fn silent(client: *const Client, report: *Report) Error {
+    assert(report.diag.code == null);
+    report.diag.raise(.E0102);
+    report.diag.while_("waiting for the reply of zcube-server", .{});
+    report.diag.cause("zcube-server at {s} took the connection and sent nothing", .{
+        client.server_text,
+    });
+    report.diag.cause("no reply within {d} ms", .{client.env.reply_timeout_ms});
+    report.diag.context("server", "{s}", .{client.server_text});
+    report.diag.context("reqid", "{s}", .{report.request_id.slice()});
+    const sentence = "check that it is the server and that it is not stuck, then retry";
+    report.diag.fix(.{ .sentence = sentence });
+    return error.Failed;
 }
 
 const refused = "connection refused: nothing is listening there";

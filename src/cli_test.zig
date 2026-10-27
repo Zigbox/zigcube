@@ -103,8 +103,13 @@ const World = struct {
     dir: []const u8,
     stdin_text: []const u8 = "",
     stdin_terminal: bool = false,
+    reply_timeout_ms: u32 = constants.cli_reply_timeout_ms,
 
     fn start(world: *World) !void {
+        // `world` is `undefined` before this: the defaults of the fields are set here.
+        world.stdin_text = "";
+        world.stdin_terminal = false;
+        world.reply_timeout_ms = constants.cli_reply_timeout_ms;
         world.io = world.test_io.start();
         world.tmp = testing.tmpDir(.{});
         world.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -160,6 +165,7 @@ const World = struct {
             .stderr_is_terminal = false,
             .version = "0.0.0-test",
             .deterministic_ids = true,
+            .reply_timeout_ms = world.reply_timeout_ms,
         };
         return cli.run(&env, args);
     }
@@ -585,4 +591,87 @@ test "bundle --last without a record says so, and with a dead server still works
     try expect_contains(unpacked.find("/diagnostic.json").?, "ZC-E0102");
     try expect_contains(unpacked.find("/status.unavailable.txt").?, "ZC-E0102");
     try expect_contains(unpacked.find("/MANIFEST.txt").?, "status.unavailable.txt");
+}
+
+test "a server that accepts and says nothing is a timeout, not a hang and not a bug" {
+    // Goal: the command line never waits for ever on a reply. Method: a listener that never
+    // accepts (the connection sits in its backlog), a reply timeout of 200 ms; the answer is
+    // ZC-E0102 with the cause "no reply", exit 2, in well under a second.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    var diag: Diag = undefined;
+    diag.reset();
+    const where = try config_mod.parse_listen("127.0.0.1:0", &diag);
+    var listener = try where.listen(world.io, .{});
+    defer listener.deinit(world.io);
+    const arena = world.arena_state.allocator();
+    const address = try std.fmt.allocPrint(arena, "{f}", .{listener.socket.address});
+    try world.environ.put("ZCUBE_SERVER", address);
+    world.reply_timeout_ms = 200;
+    const started = std.Io.Clock.awake.now(world.io).toMilliseconds();
+    try testing.expectEqual(constants.exit_environment, world.run(&.{ "-v", "get", "service" }));
+    const elapsed = std.Io.Clock.awake.now(world.io).toMilliseconds() - started;
+    try testing.expect(elapsed < 5000);
+    try expect_contains(world.err(), "error[ZC-E0102]: can't reach zcube-server");
+    try expect_contains(world.err(), "cause  no reply within 200 ms");
+    try expect_contains(world.err(), "took the connection and sent");
+}
+
+/// Rewrites the record of the last failure so that it names a subject and a revision, as a
+/// failure partway through a command that had read the store would.
+fn record_revision(world: *World, revision: u64) !void {
+    const arena = world.arena_state.allocator();
+    const state = world.environ.get("XDG_STATE_HOME").?;
+    const name = constants.last_failure_file_name;
+    const path = try std.fmt.allocPrint(arena, "{s}/zcube/{s}", .{ state, name });
+    const old = try std.Io.Dir.cwd().readFileAlloc(world.io, path, arena, .limited(64 * 1024));
+    var record = try std.json.parseFromSliceLeaky(std.json.Value, arena, old, .{});
+    try record.object.put(arena, "kind", .{ .string = "service" });
+    try record.object.put(arena, "name", .{ .string = "hello" });
+    try record.object.put(arena, "revision", .{ .integer = @intCast(revision) });
+    const text = try std.json.Stringify.valueAlloc(arena, record, .{});
+    try std.Io.Dir.cwd().writeFile(world.io, .{ .sub_path = path, .data = text });
+}
+
+test "bundle --last reads the store keys at the failing revision, and says when it can't" {
+    // Goal: "the relevant store keys at the failing revision". Method: apply `hello`, fail a
+    // command, give its record the revision the apply made; the keys are read `at` it and the
+    // manifest says so. A record of a revision the store has not reached falls back to now, and
+    // says that instead.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    const text = try hello_zon(1);
+    defer testing.allocator.free(text);
+    const path = try world.file("hello.zon", text);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "apply", path, "--yes" }));
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "why", "service", "nosuch" }));
+
+    try record_revision(&world, 1);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "bundle", "--last" }));
+    const at = try unpack(&world, try bundle_path(&world));
+    const manifest = at.find("/MANIFEST.txt").?;
+    try expect_contains(manifest, "store keys under /services/hello at revision 1");
+    try expect_contains(at.find("/keys/service.json").?, "\"name\":\"hello\"");
+
+    try record_revision(&world, 999_999);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "bundle", "--last" }));
+    const now = try unpack(&world, try bundle_path(&world));
+    const fallback = "as they are now (the failing revision is not known or is gone)";
+    try expect_contains(now.find("/MANIFEST.txt").?, fallback);
+    try expect_contains(now.find("/keys/service.json").?, "\"name\":\"hello\"");
+}
+
+test "--verbose lists every request with the id the server answered under" {
+    // Goal: "request IDs shown in verbose output". Method: a verbose get; one line per request.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "-v", "get", "service" }));
+    const first = "request  zc-test-0001  GET /v1/list?prefix=%2Fservices%2F&limit=500  200\n";
+    const third = "request  zc-test-0003  GET /v1/list?prefix=%2Fobserved%2F&limit=500  200\n";
+    try expect_contains(world.err(), first);
+    try expect_contains(world.err(), third);
+    try testing.expectEqualStrings("no services\n", world.out());
 }
