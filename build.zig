@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
     });
     add_agent_smoke_step(b, built, zigbox_module);
     add_tidy_step(b);
+    add_errors_site_steps(b);
     add_pg_dev_steps(b);
     const library = add_wasm_steps(b, optimize);
     add_sim_step(b, .{
@@ -320,6 +321,35 @@ fn add_tidy_step(b: *std.Build) void {
     const step = b.step("tidy", "Check formatting, line and function length, banned patterns");
     step.dependOn(&format.step);
     step.dependOn(&run.step);
+}
+
+/// `zig build errors-site` writes site/errors/<code>.html from the diagnostic registry (the page
+/// every `ZC-` diagnostic's `docs` line points at); `zig build errors-site-check` (run by CI)
+/// fails if a checked-in page is missing or stale.
+fn add_errors_site_steps(b: *std.Build) void {
+    // A host tool: built for the machine running the build, like tidy. The registry it reads
+    // names Zigbox's severity and blame types, so it takes the package too (built for the host).
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .Debug });
+    const generator = b.addExecutable(.{
+        .name = "errors_site",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/errors_site.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+        }),
+    });
+    const write = b.addRunArtifact(generator);
+    write.setCwd(b.path("."));
+    write.addArg("site/errors");
+    const write_step = b.step("errors-site", "Write site/errors/<code>.html from the registry");
+    write_step.dependOn(&write.step);
+
+    const check = b.addRunArtifact(generator);
+    check.setCwd(b.path("."));
+    check.addArgs(&.{ "site/errors", "--check" });
+    const check_step = b.step("errors-site-check", "Fail if site/errors is stale");
+    check_step.dependOn(&check.step);
 }
 
 /// `zig build wasm` compiles the control-plane core for `wasm32-freestanding`: no libc, no OS, no

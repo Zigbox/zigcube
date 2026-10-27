@@ -1,0 +1,6 @@
+error[ZC-E0102]: can't reach zcube-server
+  cause  connection refused: nothing is listening there
+  fix    start it:                          zcube-server --store sqlite:zcube.db --create-store
+         or name the one that is running:   zcube --server HOST:PORT get service
+  more   zcube explain E0102 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0102.html

@@ -1,0 +1,5 @@
+error[ZC-E0507]: the agent can't start a container's supervisor
+  cause  the host refused to start a supervisor for hello-1
+  fix    free process slots on the node, or restart the agent
+  more   zcube explain E0507 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0507.html

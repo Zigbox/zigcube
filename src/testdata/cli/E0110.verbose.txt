@@ -1,0 +1,8 @@
+error[ZC-E0110]: the service file isn't valid
+  while  reading the service file src/testdata/cli/typo.zon
+  cause  src/testdata/cli/typo.zon:3:6: unexpected field 'imag'
+  at     src/testdata/cli/typo.zon:3:6
+  line   .imag = "b3:51aa9c03",
+  fix    a service has .name, .image, .replicas and .command; see the example:   zcube explain E0110
+  more   zcube explain E0110
+  docs   https://zigbox.github.io/zigcube/errors/E0110.html

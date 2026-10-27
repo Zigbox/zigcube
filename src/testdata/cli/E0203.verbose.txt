@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0203]: that revision was compacted away
+  cause  history is needed from revision 10; the store keeps it from 380
+  reqid  r-0000001
+  fix    list the current state and watch again from its revision
+  more   zcube explain E0203
+  docs   https://zigbox.github.io/zigcube/errors/E0203.html

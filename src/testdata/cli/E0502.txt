@@ -1,0 +1,5 @@
+error[ZC-E0502]: the runtime failed an operation
+  cause  the runtime refused to start the process
+  fix    check the node's runtime, then retry
+  more   zcube explain E0502 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0502.html

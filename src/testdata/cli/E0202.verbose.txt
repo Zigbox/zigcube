@@ -1,0 +1,9 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0202]: the store backend failed an operation
+  cause  SQLite reported: database or disk is full (result code 13)
+  cause  the disk holding the store file is full
+  path   /var/lib/zcube/store.db
+  reqid  r-0000001
+  fix    fix that condition, then retry; nothing was changed
+  more   zcube explain E0202
+  docs   https://zigbox.github.io/zigcube/errors/E0202.html

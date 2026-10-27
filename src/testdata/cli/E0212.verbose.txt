@@ -1,0 +1,9 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0212]: the store database does not exist
+  cause  libpq reported: database "zcube" does not exist
+  cause  Postgres at 127.0.0.1 has no database named zcube
+  db     zcube
+  reqid  r-0000001
+  fix    create the database, or correct its name in the store settings
+  more   zcube explain E0212
+  docs   https://zigbox.github.io/zigcube/errors/E0212.html

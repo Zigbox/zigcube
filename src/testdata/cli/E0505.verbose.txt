@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0505]: the agent's configuration can't be used
+  cause  the node has no name
+  reqid  r-0000001
+  fix    give --node, or .node in the file
+  more   zcube explain E0505
+  docs   https://zigbox.github.io/zigcube/errors/E0505.html

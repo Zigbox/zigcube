@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0108]: the server is at one of its limits
+  cause  the server could not start a thread for its work
+  reqid  r-0000001
+  fix    raise the process's thread limit (ulimit -u) and start it again
+  more   zcube explain E0108
+  docs   https://zigbox.github.io/zigcube/errors/E0108.html

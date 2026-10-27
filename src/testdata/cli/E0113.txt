@@ -1,0 +1,5 @@
+error[ZC-E0113]: apply needs an answer and there is no terminal
+  cause  standard input is not a terminal, so there is nobody to ask
+  fix    answer in advance:   zcube apply --yes src/testdata/cli/hello.zon
+  more   zcube explain E0113 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0113.html

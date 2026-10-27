@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0509]: the container's supervisor is gone
+  cause  the supervisor of hello-1 ended without writing how the command ended
+  reqid  r-0000001
+  fix    look for something killing zcube-agent processes on this node
+  more   zcube explain E0509
+  docs   https://zigbox.github.io/zigcube/errors/E0509.html

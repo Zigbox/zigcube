@@ -1,0 +1,5 @@
+warning[ZC-W0501]: the agent's lease ended and it registered again
+  cause  lease 4 ended; node node1 registered again on lease 5
+  fix    if this repeats, check the network between the agent and the server
+  more   zcube explain W0501 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0501.html

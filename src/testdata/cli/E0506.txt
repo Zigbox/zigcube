@@ -1,0 +1,5 @@
+error[ZC-E0506]: the agent's state directory can't be used
+  cause  another agent is using the state directory /var/lib/zcube-agent
+  fix    give each agent a state directory of its own
+  more   zcube explain E0506 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0506.html

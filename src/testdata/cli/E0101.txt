@@ -1,0 +1,5 @@
+error[ZC-E0101]: no such resource
+  cause  service nosuch does not exist
+  fix    list what exists:   zcube get service
+  more   zcube explain E0101 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0101.html

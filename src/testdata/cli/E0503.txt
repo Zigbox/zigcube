@@ -1,0 +1,6 @@
+error[ZC-E0503]: the agent can't reach zcube-server
+  cause  no answer from zcube-server at 127.0.0.1:7070: the connection was
+         refused
+  fix    start the server, or give the agent the address it listens on
+  more   zcube explain E0503 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0503.html

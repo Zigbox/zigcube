@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0503]: the agent can't reach zcube-server
+  cause  no answer from zcube-server at 127.0.0.1:7070: the connection was
+         refused
+  reqid  r-0000001
+  fix    start the server, or give the agent the address it listens on
+  more   zcube explain E0503
+  docs   https://zigbox.github.io/zigcube/errors/E0503.html

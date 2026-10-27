@@ -33,6 +33,18 @@ pub const Code = enum(u8) {
     E0106,
     E0107,
     E0108,
+    E0109,
+    E0110,
+    E0111,
+    E0112,
+    E0113,
+    E0114,
+    E0115,
+    E0116,
+    E0117,
+    E0118,
+    W0119,
+    E0120,
     E0201,
     E0202,
     E0203,
@@ -59,6 +71,7 @@ pub const Code = enum(u8) {
     E0509,
     W0501,
     B0001,
+    B0002,
 };
 
 pub const Entry = struct {
@@ -182,6 +195,179 @@ pub const registry = [_]Entry{
         \\changed.
         \\
         \\Try again shortly. A client that opens many watches should share one.
+        ,
+    },
+    .{
+        .code = .E0109,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the service file can't be read",
+        .explanation =
+        \\zcube apply could not read the file it was given: it does not exist, is
+        \\not a regular file, is larger than a service file may be (64 KiB), or you
+        \\may not read it. Nothing was sent to the server.
+        \\
+        \\The cause line names the path and the system's reason. Check the path, or
+        \\run zcube apply from the directory that holds the file.
+        ,
+    },
+    .{
+        .code = .E0110,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the service file isn't valid",
+        .explanation =
+        \\The file is not a service written in ZON, or it names a field zcube does
+        \\not know. The context line gives file:line:column of the first problem and
+        \\each cause line says what is wrong there. Nothing was sent to the server.
+        \\
+        \\A service has .name, .image, .replicas and .command; .env and .limits are
+        \\optional:
+        \\
+        \\    .{
+        \\        .name = "hello",
+        \\        .image = "b3:51aa9c03",
+        \\        .replicas = 3,
+        \\        .command = .{ "sh", "-c", "while true; do sleep 1; done" },
+        \\    }
+        ,
+    },
+    .{
+        .code = .E0111,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the command line can't be understood",
+        .explanation =
+        \\zcube was given a command it does not have, a flag it does not know, a
+        \\flag without its value, or too few or too many arguments. The cause line
+        \\names the part at fault. Nothing was sent to the server.
+        \\
+        \\zcube help lists the commands and flags.
+        ,
+    },
+    .{
+        .code = .E0112,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the server address can't be used",
+        .explanation =
+        \\The address given with --server, or in ZCUBE_SERVER, is not an IP address
+        \\(or localhost) and a port, written HOST:PORT. Nothing was sent.
+        \\
+        \\Without either, zcube talks to 127.0.0.1:7070, where zcube-server
+        \\listens by default.
+        ,
+    },
+    .{
+        .code = .E0113,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "apply needs an answer and there is no terminal",
+        .explanation =
+        \\zcube apply shows what it would change and asks before it changes
+        \\anything. Its input is not a terminal, so there is nobody to ask, and it
+        \\will not guess. Nothing was changed.
+        \\
+        \\Run it from a terminal, or give --yes to apply without being asked, as a
+        \\script does. The change is still shown first.
+        ,
+    },
+    .{
+        .code = .E0114,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the apply was declined",
+        .explanation =
+        \\zcube apply showed the change and the answer was not yes. Nothing was
+        \\changed on the server.
+        \\
+        \\Apply again and answer y, or give --yes to skip the question.
+        ,
+    },
+    .{
+        .code = .E0115,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't write the output",
+        .explanation =
+        \\zcube could not write its result to standard output or standard error:
+        \\the descriptor is closed, the pipe has no reader, or the disk is full
+        \\(for example when redirected to /dev/full). The command itself may have
+        \\succeeded: an apply is not undone by this failure.
+        \\
+        \\Run it again with output that can be written, or check with zcube get.
+        ,
+    },
+    .{
+        .code = .E0116,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't use the state directory",
+        .explanation =
+        \\zcube keeps the record of its last failure and the bundles it writes in
+        \\a state directory: $XDG_STATE_HOME/zcube, or $HOME/.local/state/zcube.
+        \\Neither variable names an absolute path, or the directory can't be
+        \\created or written. Bundles are only ever written there, never sent
+        \\anywhere.
+        \\
+        \\Name a directory you can write, for example
+        \\export XDG_STATE_HOME=$HOME/.local/state
+        ,
+    },
+    .{
+        .code = .E0117,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "there is no failure to bundle",
+        .explanation =
+        \\zcube bundle --last collects the evidence for the last command of yours
+        \\that failed. None is recorded in the state directory: nothing has failed
+        \\yet, or the record was deleted.
+        \\
+        \\Name what to bundle instead: zcube bundle service <name>, or
+        \\zcube bundle replica <id>.
+        ,
+    },
+    .{
+        .code = .E0118,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no such diagnostic code",
+        .explanation =
+        \\zcube explain was given a code that is not in the registry of Zigcube
+        \\(ZC-) or of Zigbox (ZBX-). A code is a letter and four digits, with or
+        \\without its prefix: E0201, ZC-E0201, ZBX-E0501.
+        \\
+        \\The index of every code is at https://zigbox.github.io/zigcube/errors/
+        ,
+    },
+    .{
+        .code = .W0119,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "--no-redact keeps secrets in the bundle",
+        .explanation =
+        \\Bundles replace environment values and anything that looks like a secret
+        \\with [redacted:<kind>]. --no-redact turns that off, so the bundle holds
+        \\them as they were. The command goes on.
+        \\
+        \\Read every file listed in MANIFEST.txt before you share the bundle, or
+        \\leave --no-redact out. zcube never uploads a bundle.
+        ,
+    },
+    .{
+        .code = .E0120,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "zcube ran out of memory",
+        .explanation =
+        \\zcube asked for memory for an answer or a file and the system, or the
+        \\limit zcube keeps on itself, said no. Nothing is lost: a command that was
+        \\sending a change may or may not have been applied, so check with
+        \\zcube get service before you repeat it.
+        \\
+        \\Ask for less (one service by name instead of all of them), or free
+        \\memory on this machine.
         ,
     },
     .{
@@ -571,6 +757,21 @@ pub const registry = [_]Entry{
         .explanation =
         \\An invariant that zcube relies on did not hold. This is a bug in zcube,
         \\not something you did.
+        \\
+        \\A diagnostic bundle is saved for every bug. Review its manifest, then
+        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        ,
+    },
+    .{
+        .code = .B0002,
+        .severity = .bug,
+        .blame = .internal,
+        .summary = "zcube failed in a way it should not",
+        .explanation =
+        \\A step of zcube stopped with an error that its own code is supposed to
+        \\handle before it reaches you. This is a bug in zcube, not something you
+        \\did, and the command may or may not have taken effect: check with
+        \\zcube get.
         \\
         \\A diagnostic bundle is saved for every bug. Review its manifest, then
         \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.

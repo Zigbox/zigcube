@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0508]: the container's command can't be run
+  cause  the command was not found on this node
+  reqid  r-0000001
+  fix    check the command in the service file, then apply it again
+  more   zcube explain E0508
+  docs   https://zigbox.github.io/zigcube/errors/E0508.html

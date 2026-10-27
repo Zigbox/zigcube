@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0507]: the agent can't start a container's supervisor
+  cause  the host refused to start a supervisor for hello-1
+  reqid  r-0000001
+  fix    free process slots on the node, or restart the agent
+  more   zcube explain E0507
+  docs   https://zigbox.github.io/zigcube/errors/E0507.html

@@ -22,7 +22,7 @@ each is an **Ask first**. The owner approved this document as written (endpoints
 | | |
 | --- | --- |
 | Base path | `/v1` |
-| Methods | The console uses `GET` only. Writes are for the CLI: see [Writes](#writes-proposed-in-slice-5b-owner-approval-pending), which is a proposal. |
+| Methods | The console uses `GET` only. Writes are for the CLI: see [Writes](#writes-approved-2026-10-27). |
 | Bodies | `application/json`, UTF-8. Values are the JSON records of [keys.md](keys.md), unchanged. |
 | Request ID | The server assigns one to every request and returns it in the `X-Request-Id` response header, on success and failure. A client may send its own `X-Request-Id` (`[A-Za-z0-9-]`, 8 to 64 bytes); the server then uses it. Otherwise the id is `r-<start>-<counter>`: the start part is the server's start time (so no two starts, or servers, repeat an id) and the counter is per start. The CLI prints it with `--verbose`; bundles include it. |
 | Auth | Out of scope here. SPEC says tokens are scoped; the console needs a read-only scope. A missing or insufficient token must be a diagnostic like any other. |
@@ -164,18 +164,20 @@ The registry, for the console's code reader. `codes` is `[{code, severity, blame
 from Zigbox's registry (`ZBX-`) are served too, since a runtime diagnostic travels inside
 observed state; the server gets their text from the linked `zigbox` module.
 
-## Writes (proposed in slice 5b; owner approval pending)
+## Writes (approved 2026-10-27)
 
-**Status: proposed, not approved.** Everything above is the approved read-only API and is
-unchanged. `zcube apply` needs two endpoints, and `src/apply.zig` (what is written, the
-generation rules, the change summary) was waiting for them. They are implemented in the core
-(`src/api.zig`, bytes to bytes like the rest) and routed by the server, so the owner can try them
-before approving the shape.
+**Status: approved by the owner on 2026-10-27**, as written below: `POST /v1/apply` with
+`?dry_run=1`, and `DELETE /v1/services/{name}`, unauthenticated until auth exists. Everything above
+is the read-only API, approved on 2026-10-26 and unchanged. `zcube apply` and `zcube delete`
+([cli.md](cli.md)) call these two endpoints; `src/apply.zig` decides what is written (the
+generation rules, the change summary) and they are implemented in the core (`src/api.zig`, bytes to
+bytes like the rest) and routed by the server.
 
 **Writes are unauthenticated until auth exists.** Anyone who can reach the server's address can
 apply and delete services. `applied_by` is a name the caller chooses, recorded for the audit
-trail and the `zcube why` text; it proves nothing. The console never calls either endpoint.
-Run the server on a loopback or otherwise private address until auth is built.
+trail and the `zcube why` text; it proves nothing (the command line sends `user@host`). The
+console never calls either endpoint. Run the server on a loopback or otherwise private address
+until auth is built.
 
 ### `POST /v1/apply[?dry_run=1]`
 

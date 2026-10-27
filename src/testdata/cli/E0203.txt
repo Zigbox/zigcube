@@ -1,0 +1,5 @@
+error[ZC-E0203]: that revision was compacted away
+  cause  history is needed from revision 10; the store keeps it from 380
+  fix    list the current state and watch again from its revision
+  more   zcube explain E0203 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0203.html

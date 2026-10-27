@@ -1,0 +1,1 @@
+{"code":"ZC-E0505","severity":"error","blame":"user","summary":"the agent's configuration can't be used","causes":["the node has no name"],"while":[],"context":{"reqid":"r-0000001"},"fixes":[{"sentence":"give --node, or .node in the file","command":null}],"docs":"https://zigbox.github.io/zigcube/errors/E0505.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}

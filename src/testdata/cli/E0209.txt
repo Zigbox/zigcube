@@ -1,0 +1,5 @@
+error[ZC-E0209]: the store database is damaged or not a store
+  cause  the store file is damaged or is not a zcube store
+  fix    restore the file from a backup, or use another path
+  more   zcube explain E0209 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0209.html
