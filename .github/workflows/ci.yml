@@ -1,7 +1,8 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
 # installed from a verified tarball (.github/actions/setup-zig). The only other shell is the
-# apt-get line that installs the SQLite and libpq development files the tests link. The wasm job
-# uses the Node that the runner image carries.
+# apt-get line that installs the SQLite and libpq development files the tests link, and the
+# docker line of the Postgres demo job that names its service container. The wasm job uses the
+# Node that the runner image carries.
 name: ci
 
 # CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
@@ -86,6 +87,72 @@ jobs:
           for run in 1 2 3; do
             zig build test-store -Dbackend=postgres --summary all
           done
+
+  # HANDOFF's C0 demo, run for real (docs/demos/c0.md): zcube-server, one zcube-agent with
+  # FakeRuntime and the zcube command as real processes, on each backend. Each prints a transcript
+  # (also kept as an artifact); the demo fails on the first assertion that does not hold, and kills
+  # everything it started. Two jobs, one per backend, so a failure names its backend.
+  demo-c0-sqlite:
+    name: demo-c0 (sqlite)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: demo-c0 on SQLite
+        run: zig build demo-c0 -Dbackend=sqlite -Dtranscript=demo-c0-sqlite.txt --summary all
+      - name: Keep the transcript
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c0-sqlite-transcript
+          path: demo-c0-sqlite.txt
+          if-no-files-found: warn
+
+  # The same image, by digest, as store-postgres. The demo stops the database mid-run: the service
+  # container is stopped with `docker stop` and started again with `docker start`, which keeps its
+  # data and its published port. The container is named once, before the demo runs.
+  demo-c0-postgres:
+    name: demo-c0 (postgres)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+      ZCUBE_DEMO_PG_STOP: docker stop "$PG_CONTAINER"
+      ZCUBE_DEMO_PG_START: docker start "$PG_CONTAINER"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: Name the Postgres container
+        run: |
+          container="$(docker ps --quiet --filter publish=5432)"
+          test -n "${container}"
+          echo "PG_CONTAINER=${container}" >> "${GITHUB_ENV}"
+      - name: demo-c0 on Postgres
+        run: zig build demo-c0 -Dbackend=postgres -Dtranscript=demo-c0-postgres.txt --summary all
+      - name: Keep the transcript
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c0-postgres-transcript
+          path: demo-c0-postgres.txt
+          if-no-files-found: warn
 
   # The control-plane core must compile for wasm32-freestanding (docs/wasm.md): no libc, no OS,
   # no threads, no std.Io. Node is the one WebAssembly runtime on the runner (its version is

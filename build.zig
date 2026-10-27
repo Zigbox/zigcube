@@ -58,18 +58,16 @@ pub fn build(b: *std.Build) void {
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
     const seed = b.option(u64, "seed", seed_help);
-    add_store_step(b, .{
-        .seed = seed,
+    add_store_and_demo_steps(b, built, seed, .{
         .target = target,
         .optimize = optimize,
+        .zigbox = zigbox_module,
         .sqlite = sqlite,
         .libpq = libpq_module,
-        .zigbox = zigbox_module,
     });
     add_agent_smoke_step(b, built, zigbox_module);
     add_tidy_step(b);
     add_errors_site_steps(b);
-    add_pg_dev_steps(b);
     const library = add_wasm_steps(b, optimize);
     add_sim_step(b, .{
         .seed = seed,
@@ -77,6 +75,42 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .zigbox = zigbox_module,
         .library = library,
+    });
+}
+
+const Shared = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zigbox: *std.Build.Module,
+    sqlite: *std.Build.Module,
+    libpq: *std.Build.Module,
+};
+
+/// The steps that run against a real store. `-Dbackend` and `-Dpostgres` are shared by two of
+/// them, so they are declared once, here: test-store (default memory) and demo-c0 (default sqlite).
+fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Shared) void {
+    const backend = b.option(Backend, "backend", "Store backend for test-store and demo-c0");
+    const postgres = postgres_conninfo(b);
+    add_store_step(b, .{
+        .backend = backend orelse .memory,
+        .postgres = postgres,
+        .seed = seed,
+        .target = shared.target,
+        .optimize = shared.optimize,
+        .sqlite = shared.sqlite,
+        .libpq = shared.libpq,
+        .zigbox = shared.zigbox,
+    });
+    const pg_dev = add_pg_dev_steps(b);
+    add_demo_step(b, .{
+        .built = built,
+        .backend = backend orelse .sqlite,
+        .postgres = postgres,
+        .target = shared.target,
+        .zigbox = shared.zigbox,
+        .sqlite = shared.sqlite,
+        .libpq = shared.libpq,
+        .pg_dev = pg_dev,
     });
 }
 
@@ -165,6 +199,7 @@ const ExecutablesOptions = struct {
 const Built = struct {
     server: *std.Build.Step.Compile,
     agent: *std.Build.Step.Compile,
+    cli: *std.Build.Step.Compile,
     server_install: *std.Build.Step.InstallArtifact,
     agent_install: *std.Build.Step.InstallArtifact,
 };
@@ -200,6 +235,7 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
             built.agent = exe;
             built.agent_install = install;
         }
+        if (std.mem.eql(u8, executable.name, "zcube")) built.cli = exe;
     }
     return built;
 }
@@ -226,8 +262,9 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     b.step("agent-smoke", help).dependOn(&run.step);
 }
 
-/// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it.
-fn add_pg_dev_steps(b: *std.Build) void {
+/// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it;
+/// `pg-stop` stops it and keeps its data (demo-c0 stops and starts it mid-run). Returns the tool.
+fn add_pg_dev_steps(b: *std.Build) *std.Build.Step.Compile {
     const tool = b.addExecutable(.{
         .name = "pg_dev",
         .root_module = b.createModule(.{
@@ -236,10 +273,11 @@ fn add_pg_dev_steps(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
-    const commands = [_][]const u8{ "up", "down" };
+    const commands = [_][]const u8{ "up", "down", "stop" };
     const descriptions = [_][]const u8{
         "Start a throwaway Postgres for test-store (prints its ZCUBE_TEST_POSTGRES)",
         "Stop the throwaway Postgres and delete its files",
+        "Stop the throwaway Postgres and keep its files",
     };
     for (commands, descriptions) |command, description| {
         const run = b.addRunArtifact(tool);
@@ -248,9 +286,88 @@ fn add_pg_dev_steps(b: *std.Build) void {
         const step_name = b.fmt("pg-{s}", .{command});
         b.step(step_name, description).dependOn(&run.step);
     }
+    return tool;
+}
+
+const DemoStepOptions = struct {
+    built: Built,
+    backend: Backend,
+    postgres: []const u8,
+    target: std.Build.ResolvedTarget,
+    zigbox: *std.Build.Module,
+    sqlite: *std.Build.Module,
+    libpq: *std.Build.Module,
+    pg_dev: *std.Build.Step.Compile,
+};
+
+/// `zig build demo-c0 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C0 demo, run for
+/// real (src/demo_c0.zig): the server, one agent and the `zcube` command as real processes. It
+/// never caches: it exists to be run. The Postgres run takes the database from `-Dpostgres` or
+/// `ZCUBE_TEST_POSTGRES` like test-store, and stops and starts it with `pg_dev stop` and
+/// `pg_dev up`, or with the shell commands in `ZCUBE_DEMO_PG_STOP` and `ZCUBE_DEMO_PG_START`
+/// (CI's service container is stopped with `docker stop`).
+fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
+    const transcript_help = "File that demo-c0 writes its transcript to";
+    const transcript = b.option([]const u8, "transcript", transcript_help);
+    const exe = b.addExecutable(.{
+        .name = "demo_c0",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_c0.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--backend");
+    switch (step_options.backend) {
+        .sqlite => run.addArg("sqlite"),
+        .postgres => run.addArg("postgres"),
+        .memory => std.debug.panic("demo-c0 needs a real store: -Dbackend=sqlite|postgres", .{}),
+    }
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addArtifactArg(built.agent);
+    run.addArg("--images");
+    run.addFileArg(b.path("fixtures/images.zon"));
+    if (step_options.backend == .postgres) {
+        add_postgres_control(b, run, step_options.pg_dev, step_options.postgres);
+    }
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
+    b.step("demo-c0", help).dependOn(&run.step);
+}
+
+/// The settings of the Postgres the demo runs against, and the commands that stop and start it.
+fn add_postgres_control(
+    b: *std.Build,
+    run: *std.Build.Step.Run,
+    pg_dev: *std.Build.Step.Compile,
+    conninfo: []const u8,
+) void {
+    run.addArgs(&.{ "--postgres", conninfo });
+    const stop = b.graph.environ_map.get("ZCUBE_DEMO_PG_STOP");
+    const start = b.graph.environ_map.get("ZCUBE_DEMO_PG_START");
+    if (stop) |command| run.addArgs(&.{ "--pg-stop", command });
+    if (start) |command| run.addArgs(&.{ "--pg-start", command });
+    if (stop != null and start != null) return;
+    // Local default: the throwaway server `zig build pg-up` made.
+    run.addArg("--pg-dev");
+    run.addArtifactArg(pg_dev);
 }
 
 const StoreStepOptions = struct {
+    backend: Backend,
+    postgres: []const u8,
     seed: ?u64,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -273,7 +390,7 @@ fn postgres_conninfo(b: *std.Build) []const u8 {
 /// backend's own tests come with it (they are in the same compilation), so for Postgres the
 /// binary needs the database even for those.
 fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
-    const backend = b.option(Backend, "backend", "Store backend for test-store") orelse .memory;
+    const backend = step_options.backend;
     const seed = step_options.seed;
     const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
     const options = b.addOptions();
@@ -297,8 +414,7 @@ fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
     // part of the cache key), so every run counts.
     run.has_side_effects = true;
     if (backend == .postgres) {
-        const conninfo = postgres_conninfo(b);
-        run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", conninfo);
+        run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", step_options.postgres);
         run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
     }
     step.dependOn(&run.step);
