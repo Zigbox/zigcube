@@ -265,3 +265,43 @@ zig build sim-c0                          # native and WASM, seed 1, compared by
 zig build sim-c0 -Dseed=7 -Dops=300       # another seed, a longer fuzz run
 zig build sim-c0-exe -Doptimize=ReleaseSafe && zig-out/bin/sim_c0 7 fuzz 300
 ```
+
+## Node 22 crashes when V8 mixes its compiler tiers
+
+Found in review of slice 5a. `zig build wasm-test -Doptimize=ReleaseSafe` failed in 2 of 20 runs
+(Debug 0 of 10), and both failures were `node` dying with **SIGSEGV**, not a WebAssembly trap,
+on the same `test.wasm`. Running that binary directly, 30 times per V8 setting on Node v22.22.0:
+
+| V8 setting | SIGSEGV |
+| --- | --- |
+| default (Liftoff, then TurboFan tier-up) | 5 of 30 (3 of 30 in a second run) |
+| `--no-wasm-tier-up` | 6 of 30 |
+| `--liftoff-only` | 0 of 30 |
+| `--no-liftoff` (TurboFan only) | 0 of 30 |
+
+A valid module can at worst trap, so a crash of the host is an engine bug, in Node 22's V8, and
+not in our code; it happens only when the engine mixes its two compilers on one module. The
+freestanding core (`zcube_core.wasm`, ReleaseSafe) did not crash in 30 runs under Node 22 or in
+30 runs in Chromium 153 through Playwright.
+
+**What we do.** Every Node run of WebAssembly (`wasm-check`, `wasm-test`, and the WASM side of
+`sim-c0`) is made twice, once with `--liftoff-only` and once with `--no-liftoff` (`v8_modes` in
+`build.zig`), so each compiler runs every test and no run mixes them. After the change, 20 of 20
+runs of the test binary passed in each of those two modes, in Debug and in ReleaseSafe.
+
+**Browser demo.** A host segfault cannot be told from a bug in the core by looking at the
+result: if the demo ever dies without a trap message, run it on the other engines and the other
+tier settings before suspecting the core.
+
+**Not checked.** Whether Node 24 still crashes in default mode: the sandbox refused to run a
+downloaded Node binary, so it was skipped. It is worth one run when someone can.
+
+**Reproduce.** Build the test binary, then loop:
+
+```
+zig build wasm-test -Doptimize=ReleaseSafe
+W=$(ls -t .zig-cache/o/*/test.wasm | head -1)
+for i in $(seq 1 30); do node --no-warnings tools/wasm_check.mjs --wasi $W >/dev/null || echo crash; done
+```
+
+Add `--liftoff-only` or `--no-liftoff` after `--no-warnings` to see the pinned modes pass.

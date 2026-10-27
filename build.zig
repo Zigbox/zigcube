@@ -6,6 +6,12 @@ const executables = [_]struct { name: []const u8, root: []const u8 }{
     .{ .name = "zcube-agent", .root = "src/zcube_agent.zig" },
 };
 
+/// Every WebAssembly run goes through Node twice, once per V8 compiler. Node 22's V8 sometimes
+/// crashes the host process (SIGSEGV, not a trap) when it mixes its two tiers on one module, so a
+/// run pins one tier; both together run every test on both compilers. docs/wasm.md, "Node 22
+/// crashes when V8 mixes its compiler tiers".
+const v8_modes = [_][]const u8{ "--liftoff-only", "--no-liftoff" };
+
 const Backend = enum { memory, sqlite, postgres };
 
 pub fn build(b: *std.Build) void {
@@ -264,11 +270,13 @@ fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.
 
     // Node is the one runtime CI has for WebAssembly; the runner is a few lines of JavaScript
     // (tools/wasm_check.mjs), whose reason is written at its top and in docs/wasm.md.
-    const node = b.addSystemCommand(&.{"node"});
-    node.addFileArg(b.path("tools/wasm_check.mjs"));
-    node.addFileArg(library.getEmittedBin());
     const check = b.step("wasm-check", "Run the wasm core in Node and check its result");
-    check.dependOn(&node.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addFileArg(library.getEmittedBin());
+        check.dependOn(&node.step);
+    }
     add_wasm_test_step(b, optimize);
     return library;
 }
@@ -312,16 +320,18 @@ fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
     const fuzz = b.addRunArtifact(exe);
     fuzz.addArgs(&.{ seed_text, "fuzz", operations_text });
     const fuzz_report = fuzz.captureStdOut(.{});
-    const node = b.addSystemCommand(&.{ "node", "--no-warnings" });
-    node.addFileArg(b.path("tools/wasm_check.mjs"));
-    node.addArg("--sim");
-    node.addFileArg(sim.library.getEmittedBin());
-    node.addArgs(&.{ seed_text, operations_text });
-    node.addFileArg(scenario_report);
-    node.addFileArg(fuzz_report);
     const help = "Run the C0 simulation natively and as WASM, and compare (-Dseed=N)";
     const step = b.step("sim-c0", help);
-    step.dependOn(&node.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, operations_text });
+        node.addFileArg(scenario_report);
+        node.addFileArg(fuzz_report);
+        step.dependOn(&node.step);
+    }
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit
@@ -343,10 +353,12 @@ fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
             },
         }),
     });
-    const node = b.addSystemCommand(&.{ "node", "--no-warnings" });
-    node.addFileArg(b.path("tools/wasm_check.mjs"));
-    node.addArg("--wasi");
-    node.addFileArg(tests.getEmittedBin());
     const step = b.step("wasm-test", "Run the core modules' unit tests under WASI in Node");
-    step.dependOn(&node.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--wasi");
+        node.addFileArg(tests.getEmittedBin());
+        step.dependOn(&node.step);
+    }
 }
