@@ -70,4 +70,5 @@ These arrive with the scaffold; keep this list current as they land.
 - Develop on the branch you were given and commit in small, meaningful steps, signed off (`git commit -s`, DCO). Licence is Apache 2.0; there is no CLA.
 - Never report an unpushed commit as pushed.
 - CI runs only on pull requests and on `main`, never on a plain branch push. When a change needs CI, open a PR (or push to an open one); don't push just to trigger CI, and batch small follow-ups into one push. Actions time is limited.
+- A change that touches only documentation (every changed path is a `.md` file outside `web/` and `src/`, or lies under `site/` outside `site/errors/`) skips CI's jobs, as the `changes` job in `ci.yml` decides. That does not change when a commit may carry `[skip ci]`.
 - A commit that only records status (README.md and `site/index.html` updated after a CI result) carries `[skip ci]` in its message, so it does not start a run of its own. Never use `[skip ci]` on a commit that changes code, tests, CI or generated files.
