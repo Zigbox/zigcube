@@ -102,9 +102,14 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
         .zigbox = shared.zigbox,
     });
     const pg_dev = add_pg_dev_steps(b);
+    // The demo needs a real store: `-Dbackend=memory` (which test-store takes) runs it on SQLite.
+    const demo_backend: Backend = switch (backend orelse .sqlite) {
+        .postgres => .postgres,
+        .sqlite, .memory => .sqlite,
+    };
     add_demo_step(b, .{
         .built = built,
-        .backend = backend orelse .sqlite,
+        .backend = demo_backend,
         .postgres = postgres,
         .target = shared.target,
         .zigbox = shared.zigbox,
@@ -329,7 +334,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     switch (step_options.backend) {
         .sqlite => run.addArg("sqlite"),
         .postgres => run.addArg("postgres"),
-        .memory => std.debug.panic("demo-c0 needs a real store: -Dbackend=sqlite|postgres", .{}),
+        .memory => unreachable, // `add_store_and_demo_steps` never passes it.
     }
     run.addArg("--zcube");
     run.addArtifactArg(built.cli);
