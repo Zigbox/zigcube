@@ -96,3 +96,11 @@ jobs:
         run: zig build wasm-check -Doptimize=ReleaseSafe --summary all
       - name: Core unit tests (wasm32-wasi), run in Node
         run: zig build wasm-test --summary all
+      # A simulation, not demo-c0 (docs/core.md). The same seed runs natively and in WASM and the
+      # reports must agree byte for byte. Seed 1 always, and one seed per CI run, printed here.
+      - name: C0 simulation, native and WASM, seed 1
+        run: zig build sim-c0 --summary all
+      - name: C0 simulation, native and WASM, seed of this run
+        run: |
+          echo "seed ${{ github.run_id }}"
+          zig build sim-c0 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all

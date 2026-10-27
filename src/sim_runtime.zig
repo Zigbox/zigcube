@@ -413,8 +413,7 @@ pub const SimRuntime = struct {
         const listings = arena.alloc(runtime.Listing, self.containers.items.len) catch
             return no_memory(diag);
         for (self.containers.items, listings) |*container, *listing| {
-            const labels = arena.dupe(runtime.Label, container.labels) catch
-                return no_memory(diag);
+            const labels = copy_labels(arena, container.labels) catch return no_memory(diag);
             listing.* = .{
                 .handle = runtime.Handle.init(container.name),
                 .labels = labels,
@@ -422,6 +421,20 @@ pub const SimRuntime = struct {
             };
         }
         return listings;
+    }
+
+    /// Labels with their strings, in the caller's arena: the container may be dropped by a later
+    /// call, and the caller's listing must outlive that (a start can evict a stopped container).
+    fn copy_labels(
+        arena: Allocator,
+        labels: []const runtime.Label,
+    ) Allocator.Error![]runtime.Label {
+        const copy = try arena.alloc(runtime.Label, labels.len);
+        for (labels, copy) |label, *slot| {
+            const key = try arena.dupe(u8, label.key);
+            slot.* = .{ .key = key, .value = try arena.dupe(u8, label.value) };
+        }
+        return copy;
     }
 
     fn events_impl(
@@ -654,4 +667,33 @@ test "the same seed gives the same faults, and time moves only with the clock" {
         try testing.expect(std.meta.eql(left.?.fault, right.?.fault));
         try testing.expect(left.?.handle.eql(&right.?.handle));
     }
+}
+
+test "a listing stays valid after a later start evicts the container it describes" {
+    // Goal: regression for a use-after-free found by the fuzz at about a thousand operations:
+    // `list` copied the label array but not its strings, so evicting a stopped container (the
+    // runtime holds at most 512) freed what the caller's listing still pointed at. Method: fill
+    // the runtime with stopped containers, list, start one more, and read the oldest listing.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 1, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    var name_buffer: [16]u8 = undefined;
+    for (0..constants.runtime_handles_max) |index| {
+        const name = try std.fmt.bufPrint(&name_buffer, "c-{d}", .{index});
+        const labels = labels_of.one(name);
+        _ = try rt.start(&spec_for(name, "b3:51aa9c03", &labels), &diag);
+        try sim.inject(name, .{ .exit = 0 });
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const listed = try rt.list(arena_state.allocator(), &diag);
+    try testing.expectEqual(@as(usize, constants.runtime_handles_max), listed.len);
+    const extra = labels_of.one("extra-1");
+    _ = try rt.start(&spec_for("extra-1", "b3:51aa9c03", &extra), &diag);
+    try testing.expectEqualStrings(runtime.label_replica, listed[0].labels[0].key);
+    try testing.expectEqualStrings("c-0", listed[0].labels[0].value);
 }
