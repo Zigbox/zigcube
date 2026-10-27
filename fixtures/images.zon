@@ -1,0 +1,11 @@
+// The image digests the fake runtime treats as present on the node. A start with any other digest
+// fails with the placeholder ZBX-E0501, "image not found" (docs/runtime-codes.md). A real runtime
+// has a store of images; this list stands in for it until Zigbox's M4.
+//
+// Read by `zcube-agent --images` (default: fixtures/images.zon, relative to where it runs).
+.{
+    .images = .{
+        "b3:51aa9c03", // HANDOFF's `hello`
+        "b3:9d20c4f1", // a second image, to change a running service to
+    },
+}
