@@ -137,6 +137,11 @@ pub const Client = struct {
         id: []const u8,
         report: *Report,
     ) Error!Reply {
+        if (client.env.transport) |transport| {
+            const raw = transport.exchange(transport.context, method, path, body);
+            const text = raw orelse return unreachable_server(client, report, refused);
+            return parse_reply(text, report, id);
+        }
         const io = client.env.io;
         // std's connect does not implement a timeout yet (it panics when given one), so a host
         // that drops packets keeps the connect until the kernel gives up. docs/cli.md says so.
@@ -202,9 +207,11 @@ fn set_reply_timeout(stream: *net.Stream) void {
     ) catch {};
 }
 
+const refused = "connection refused: nothing is listening there";
+
 fn connect_reason(err: net.IpAddress.ConnectError) []const u8 {
     return switch (err) {
-        error.ConnectionRefused => "connection refused: nothing is listening there",
+        error.ConnectionRefused => refused,
         error.Timeout => "no answer within the connect timeout",
         error.HostUnreachable => "no route to that host",
         error.NetworkUnreachable, error.NetworkDown => "the network is unreachable",

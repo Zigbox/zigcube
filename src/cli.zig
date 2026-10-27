@@ -153,11 +153,20 @@ fn raise_out_of_memory(report: *Report) void {
     });
 }
 
+/// A command failed and said nothing: that is a bug in the command, and it is shown as one.
+fn raise_no_reason(report: *Report, line: []const u8) void {
+    assert(report.diag.code == null);
+    report.diag.raise(.B0002);
+    report.diag.while_("running {s}", .{line});
+    report.diag.cause("a step failed and did not say why", .{});
+}
+
 /// Renders the failure, writes what a failure leaves behind and returns the exit code.
 fn finish(ending: *const Ending, report: *Report) u8 {
     const env = ending.env;
+    if (!report.failed()) raise_no_reason(report, ending.line);
     report.seal();
-    assert(report.count > 0); // A failure without a diagnostic is a bug in the command.
+    assert(report.count > 0);
     if (report.has_bug()) {
         bundle_collect.automatic(env, ending.client, report, ending.line, ending.server);
     }

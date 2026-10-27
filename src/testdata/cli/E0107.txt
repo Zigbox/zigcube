@@ -1,0 +1,7 @@
+error[ZC-E0107]: can't listen on the server's address
+  cause  can't listen on 127.0.0.1:7070: another process is already listening on
+         it
+  fix    listen on another port
+         or stop the other process   ss -ltnp | grep 7070
+  more   zcube explain E0107 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0107.html

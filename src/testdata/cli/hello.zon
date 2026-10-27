@@ -1,0 +1,6 @@
+.{
+    .name = "hello",
+    .image = "b3:51aa9c03",
+    .replicas = 5,
+    .command = .{ "sh", "-c", "while true; do sleep 1; done" },
+}

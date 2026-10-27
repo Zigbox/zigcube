@@ -1,0 +1,7 @@
+error[ZC-E0112]: the server address can't be used
+  while  reading the server address
+  cause  nonsense is not HOST:PORT with an IP address (or localhost) and a port
+  from   --server
+  fix    write it like this:   zcube --server 127.0.0.1:7070 get service
+  more   zcube explain E0112
+  docs   https://zigbox.github.io/zigcube/errors/E0112.html

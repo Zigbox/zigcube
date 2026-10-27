@@ -8,8 +8,8 @@ const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const cli_args = @import("cli_args.zig");
 const cli_env = @import("cli_env.zig");
+const cli_report = @import("cli_report.zig");
 const constants = @import("constants.zig");
-const diag_mod = @import("diag.zig");
 
 /// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`; a panic
 /// writes no bundle, because writing one from a panic handler could panic again.
@@ -20,14 +20,8 @@ var panic_mode: @import("zigbox").render.Mode = .text;
 
 fn panic_handler(message: []const u8, first_trace_address: ?usize) noreturn {
     _ = first_trace_address;
-    var diag: diag_mod.Diag = undefined;
-    diag.reset();
-    diag.raise(.B0001);
-    diag.cause("{s}", .{message});
-    var diagnostic: diag_mod.Diagnostic = undefined;
-    diag_mod.to_diagnostic(&diagnostic, &diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
-    const text = diag_mod.render(&diagnostic, panic_mode, false, &buffer);
+    const text = cli_report.panic_text(message, panic_mode, &buffer);
     var io_buffer: [64]u8 = undefined;
     var writer = std.Io.File.stderr().writerStreaming(std.Options.debug_io, &io_buffer);
     writer.interface.writeAll(text) catch {}; // A panic has nowhere else to report it.

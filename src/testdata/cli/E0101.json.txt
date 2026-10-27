@@ -1,0 +1,1 @@
+{"code":"ZC-E0101","severity":"error","blame":"user","summary":"no such resource","causes":["service nosuch does not exist"],"while":["looking for service nosuch"],"context":{},"fixes":[{"sentence":"list what exists:","command":"zcube get service"}],"docs":"https://zigbox.github.io/zigcube/errors/E0101.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}

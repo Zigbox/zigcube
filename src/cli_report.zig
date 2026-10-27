@@ -168,6 +168,18 @@ fn write_failure(
     try writer.writeAll("]}\n");
 }
 
+/// What the panic handler prints: a `bug` diagnostic, whose internal message only `--verbose` and
+/// JSON show. Pure, so a test can see the text without panicking.
+pub fn panic_text(message: []const u8, mode: Mode, buffer: []u8) []const u8 {
+    var diag: Diag = undefined;
+    diag.reset();
+    diag.raise(.B0001);
+    diag.cause("{s}", .{message});
+    var diagnostic: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&diagnostic, &diag);
+    return diag_mod.render(&diagnostic, mode, false, buffer);
+}
+
 const testing = std.testing;
 
 fn sample_report() Report {

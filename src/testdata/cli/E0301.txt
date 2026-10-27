@@ -1,0 +1,5 @@
+error[ZC-E0301]: a stored record can't be read
+  cause  the value at /services/old is not a valid service record
+  fix    fix or delete that key; the next pass tries again
+  more   zcube explain E0301 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0301.html

@@ -1,0 +1,7 @@
+error[ZC-E0109]: the service file can't be read
+  while  reading the service file
+  cause  src/testdata/cli/missing.zon: no such file
+  file   src/testdata/cli/missing.zon
+  fix    check the path; the file is a ZON service, for example:   zcube apply hello.zon
+  more   zcube explain E0109
+  docs   https://zigbox.github.io/zigcube/errors/E0109.html

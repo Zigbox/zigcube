@@ -47,7 +47,7 @@ pub fn run(
     command_line: []const u8,
     report: *Report,
 ) Error![]const u8 {
-    if (options.no_redact) warn_unredacted(env);
+    if (options.no_redact) warn_unredacted(env, options);
     var evidence: Evidence = switch (target) {
         .last => try last_failure(env, report),
         .subject => |subject| .{
@@ -102,14 +102,15 @@ pub fn automatic(
     }
 }
 
-fn warn_unredacted(env: *const Env) void {
+fn warn_unredacted(env: *const Env, options: cli_args.Options) void {
     var diag: diag_mod.Diag = undefined;
     diag.reset();
     bundle.unredacted_warning(&diag);
     var diagnostic: diag_mod.Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, &diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
-    const text = diag_mod.render(&diagnostic, .text, env.colour(), &buffer);
+    const mode: cli_report.Mode = if (options.output == .json) .json else .text;
+    const text = diag_mod.render(&diagnostic, mode, env.colour() and mode == .text, &buffer);
     env.stderr.writeAll(text) catch return; // A warning has nowhere else to go.
     env.stderr.flush() catch return;
 }

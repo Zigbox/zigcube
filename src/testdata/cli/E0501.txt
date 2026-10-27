@@ -1,0 +1,5 @@
+error[ZC-E0501]: the runtime does not know that container
+  cause  no container by that name
+  fix    list what the runtime knows, then retry
+  more   zcube explain E0501 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0501.html

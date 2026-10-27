@@ -11,6 +11,18 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const Reader = std.Io.Reader;
 
+/// Stands in for the network in tests: the raw HTTP reply to a request, or null for a connection
+/// that could not be made. Production code never sets it.
+pub const Transport = struct {
+    context: *anyopaque,
+    exchange: *const fn (
+        context: *anyopaque,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) ?[]const u8,
+};
+
 pub const Env = struct {
     io: std.Io,
     /// Startup storage for the whole run; the command line allocates from it and never frees.
@@ -26,6 +38,10 @@ pub const Env = struct {
     /// Request ids that repeat from run to run (`zc-test-1`, ...), so a snapshot of the output
     /// can be compared byte for byte. Only the tests set it.
     deterministic_ids: bool = false,
+    /// A clock that stands still, for the same reason. Only the tests set it.
+    fixed_now_ms: ?u64 = null,
+    /// A network that is not one. Only the tests set it.
+    transport: ?Transport = null,
 
     pub fn getenv(env: *const Env, name: []const u8) ?[]const u8 {
         assert(name.len > 0);
@@ -33,6 +49,7 @@ pub const Env = struct {
     }
 
     pub fn now_ms(env: *const Env) u64 {
+        if (env.fixed_now_ms) |ms| return ms;
         const ms = std.Io.Clock.real.now(env.io).toMilliseconds();
         assert(ms >= 0);
         return @intCast(ms);

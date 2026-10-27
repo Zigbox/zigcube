@@ -1,0 +1,5 @@
+error[ZC-E0202]: the store backend failed an operation
+  cause  the disk holding the store file is full
+  fix    fix that condition, then retry; nothing was changed
+  more   zcube explain E0202 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0202.html

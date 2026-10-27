@@ -1,0 +1,5 @@
+error[ZC-E0103]: zcube-server sent a reply the client can't read
+  cause  the reply is not JSON
+  fix    use the zcube that came with the server, or upgrade the older one
+  more   zcube explain E0103 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0103.html

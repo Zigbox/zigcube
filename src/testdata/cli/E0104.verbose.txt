@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0104]: the request can't be understood
+  while  reading the request
+  cause  applied_by must be 1 to 64 bytes
+  reqid  r-0000001
+  fix    see docs/api.md for the parameters of each endpoint
+  more   zcube explain E0104
+  docs   https://zigbox.github.io/zigcube/errors/E0104.html

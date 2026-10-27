@@ -1,0 +1,10 @@
+error[ZC-E0102]: can't reach zcube-server
+  while  sending a request to zcube-server
+  cause  no answer from zcube-server at 127.0.0.1:7070
+  cause  connection refused: nothing is listening there
+  server 127.0.0.1:7070
+  reqid  zc-test-0001
+  fix    start it:                          zcube-server --store sqlite:zcube.db --create-store
+         or name the one that is running:   zcube --server HOST:PORT get service
+  more   zcube explain E0102
+  docs   https://zigbox.github.io/zigcube/errors/E0102.html

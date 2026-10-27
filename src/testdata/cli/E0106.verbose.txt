@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0106]: the server's configuration can't be used
+  cause  the store is nosql:x; it must be memory, sqlite:<path> or
+         postgres:<settings>
+  reqid  r-0000001
+  fix    name a store zcube-server supports
+  more   zcube explain E0106
+  docs   https://zigbox.github.io/zigcube/errors/E0106.html

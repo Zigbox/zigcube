@@ -1,0 +1,11 @@
+request  r-0000001  GET /v1/status  200
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  200
+bug[ZC-B0002]: zcube failed in a way it should not
+  this is a bug in zcube, not something you did
+  saved  diagnostic bundle:
+         <state>/zcube/bundles/1970-01-01T00-00-00Z-last.tar.gz
+  while  running zcube get service -v
+  cause  a step failed and did not say why
+  report https://github.com/Zigbox/zigcube/issues/new
+  more   zcube explain B0002
+  docs   https://zigbox.github.io/zigcube/errors/B0002.html

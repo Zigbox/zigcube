@@ -1,0 +1,7 @@
+request  r-0000001  POST /v1/apply?dry_run=1  400
+error[ZC-E0105]: the service changed while it was being applied
+  cause  service hello was changed by someone else during the request
+  reqid  r-0000001
+  fix    look at it as it is now, then apply again   zcube get service hello
+  more   zcube explain E0105
+  docs   https://zigbox.github.io/zigcube/errors/E0105.html

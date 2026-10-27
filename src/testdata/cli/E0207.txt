@@ -1,0 +1,5 @@
+error[ZC-E0207]: the store has no free capacity for this
+  cause  all 256 watch slots are in use
+  fix    close watches that are no longer needed
+  more   zcube explain E0207 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0207.html

@@ -1,0 +1,6 @@
+bug[ZC-B0001]: zcube hit an internal error
+  this is a bug in zcube, not something you did
+  cause  index out of bounds: index 5, len 3
+  report https://github.com/Zigbox/zigcube/issues/new
+  more   zcube explain B0001
+  docs   https://zigbox.github.io/zigcube/errors/B0001.html

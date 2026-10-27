@@ -104,7 +104,8 @@ pub fn apply(
         );
         return;
     }
-    try confirm(env, options, "apply", report);
+    const again = try std.fmt.allocPrint(arena, "zcube apply --yes {s}", .{file});
+    try confirm(env, options, "apply", again, report);
     const reply = try client.send("POST", "/v1/apply", body, report);
     const reply_body = try cli_data.parse(arena, reply, report);
     const done = try cli_view.read_write_reply(reply_body, reply.request_id, report);
@@ -162,7 +163,8 @@ pub fn delete(
         );
         try emit(env, .stdout, line, report);
     }
-    try confirm(env, options, "delete", report);
+    const again = try std.fmt.allocPrint(arena, "zcube delete service {s} --yes", .{name});
+    try confirm(env, options, "delete", again, report);
     const encoded = try cli_data.percent_encode(arena, name);
     const path = try std.fmt.allocPrint(
         arena,
@@ -187,42 +189,43 @@ fn json_line(arena: Allocator, body: []const u8) Allocator.Error![]const u8 {
 
 /// Asks before a change unless `--yes`. Without a terminal there is nobody to ask: that is
 /// `ZC-E0113`, never a hang and never a guess.
-fn confirm(env: *const Env, options: Options, verb: []const u8, report: *Report) Error!void {
+fn confirm(
+    env: *const Env,
+    options: Options,
+    verb: []const u8,
+    again: []const u8,
+    report: *Report,
+) Error!void {
     if (options.yes) return;
-    if (!env.stdin_is_terminal) return no_terminal(report, verb);
-    const input = env.stdin orelse return no_terminal(report, verb);
+    if (!env.stdin_is_terminal) return no_terminal(report, verb, again);
+    const input = env.stdin orelse return no_terminal(report, verb, again);
     env.stderr.print("{s}? [y/N] ", .{verb}) catch return write_failed(report, "standard error");
     env.stderr.flush() catch return write_failed(report, "standard error");
-    const line = input.takeDelimiter('\n') catch return declined(
-        report,
-        verb,
-        "the answer could not be read",
-    );
+    const line = input.takeDelimiter('\n') catch {
+        return declined(report, verb, again, "the answer could not be read");
+    };
     const answer = std.mem.trim(u8, line orelse "", " \t\r");
-    if (answer.len > constants.cli_answer_bytes_max) return declined(
-        report,
-        verb,
-        "the answer was not yes",
-    );
-    if (std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes")) return;
-    return declined(report, verb, "the answer was not yes");
+    if (answer.len <= constants.cli_answer_bytes_max) {
+        if (std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes")) return;
+    }
+    return declined(report, verb, again, "the answer was not yes");
 }
 
-fn no_terminal(report: *Report, verb: []const u8) Error {
+fn no_terminal(report: *Report, verb: []const u8, again: []const u8) Error {
     assert(report.diag.code == null);
     report.diag.raise(.E0113);
     report.diag.while_("asking whether to {s}", .{verb});
     report.diag.cause("standard input is not a terminal, so there is nobody to ask", .{});
-    report.diag.fix_with("answer in advance:", "zcube {s} --yes ...", .{verb});
+    report.diag.fix_with("answer in advance:", "{s}", .{again});
     return error.Failed;
 }
 
-fn declined(report: *Report, verb: []const u8, why_text: []const u8) Error {
+fn declined(report: *Report, verb: []const u8, again: []const u8, why_text: []const u8) Error {
     assert(report.diag.code == null);
     report.diag.raise(.E0114);
     report.diag.while_("asking whether to {s}", .{verb});
     report.diag.cause("{s}; nothing was changed", .{why_text});
-    report.diag.fix_with("do it without being asked:", "zcube {s} --yes ...", .{verb});
+    report.diag.fix_with("do it without being asked:", "{s}", .{again});
     return error.Failed;
 }
 

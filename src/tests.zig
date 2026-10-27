@@ -35,6 +35,7 @@ test {
     _ = @import("cli_report.zig");
     _ = @import("cli_service.zig");
     _ = @import("cli_view.zig");
+    _ = @import("cli_golden.zig");
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }

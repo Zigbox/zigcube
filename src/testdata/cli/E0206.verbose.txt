@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0206]: the request exceeds a store limit
+  cause  a value is 300000 bytes; the limit is 262144
+  reqid  r-0000001
+  fix    store large data outside the control plane and keep a reference
+  more   zcube explain E0206
+  docs   https://zigbox.github.io/zigcube/errors/E0206.html

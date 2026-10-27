@@ -1,0 +1,5 @@
+error[ZC-E0118]: no such diagnostic code
+  cause  nope is not a code in Zigcube's registry or Zigbox's
+  fix    codes look like E0201, ZC-E0201 or ZBX-E0501; every ZC- code is at https://zigbox.github.io/zigcube/errors/
+  more   zcube explain E0118 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0118.html

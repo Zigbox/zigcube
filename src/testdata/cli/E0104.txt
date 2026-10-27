@@ -1,0 +1,5 @@
+error[ZC-E0104]: the request can't be understood
+  cause  applied_by must be 1 to 64 bytes
+  fix    see docs/api.md for the parameters of each endpoint
+  more   zcube explain E0104 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0104.html
