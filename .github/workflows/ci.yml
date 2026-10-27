@@ -28,8 +28,11 @@ jobs:
   # a file ending in `.md` (except under web/ or src/), or lies under site/ (except site/errors/,
   # which CI generates and checks). An empty diff, a path that is neither, or a diff that cannot be
   # listed means code, so everything runs. Renames are listed as a delete and an add (--no-renames),
-  # so the old path is judged too. The jobs below run when `code` is true. If this job itself fails,
-  # they still run (the output defaults to true), so a broken classifier cannot skip the checks.
+  # so the old path is judged too. A `.zig`, `.zon` or `.sh` file is code wherever it is, because
+  # `zig fmt --check .` and tidy read every one in the tree. The jobs below run when `code` is
+  # true. If this job itself fails, they still run (the output defaults to true), so a broken
+  # classifier cannot skip the checks; `!cancelled()` rather than `always()`, so a run superseded
+  # by a newer push is still cancelled.
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -52,6 +55,7 @@ jobs:
           is_doc() {
             case "$1" in
               web/* | src/* | site/errors/*) return 1 ;;
+              *.zig | *.zon | *.sh) return 1 ;;
               site/*) return 0 ;;
               *.md) return 0 ;;
               *) return 1 ;;
@@ -93,7 +97,7 @@ jobs:
   check:
     name: format, build, test
     needs: changes
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       # The SHA is the one Zigbox's CI pins for actions/checkout v7.0.1.
@@ -132,7 +136,7 @@ jobs:
   store-postgres:
     name: store conformance (postgres)
     needs: changes
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -168,7 +172,7 @@ jobs:
   demo-c0-sqlite:
     name: demo-c0 (sqlite)
     needs: changes
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -191,7 +195,7 @@ jobs:
   demo-c0-postgres:
     name: demo-c0 (postgres)
     needs: changes
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -238,7 +242,7 @@ jobs:
   wasm:
     name: core on wasm32
     needs: changes
-    if: ${{ always() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
