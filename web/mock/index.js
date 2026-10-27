@@ -9,7 +9,7 @@ import { createMockTransport } from "./transport.js";
 
 const TICK_MS = 50;
 
-export function startMock({ scenario = "c0", at = 0, speed = 1, backend = "postgres" } = {}) {
+export function startMock({ scenario = "c1", at = 0, speed = 1, backend = "postgres" } = {}) {
   const mock = {
     scenarios: Object.fromEntries(Object.entries(SCENARIOS).map(([k, v]) => [k, v.title])),
     paused: false,

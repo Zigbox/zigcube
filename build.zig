@@ -22,40 +22,38 @@ pub fn build(b: *std.Build) void {
     const manifest = @import("build.zig.zon");
     const options = b.addOptions();
     options.addOption([]const u8, "version", manifest.version);
+    // Zigbox's package has a `build_options` module of its own; if the two files were byte for
+    // byte the same, the compiler would see one file in two modules. This line keeps them apart.
+    options.addOption([]const u8, "product", "zigcube");
 
     const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = optimize });
     const zigbox_module = zigbox.module("zigbox");
+
+    const c_modules = add_c_modules(b, target, optimize);
+    const sqlite = c_modules.sqlite;
+    const libpq_module = c_modules.libpq;
+    const console = add_console_steps(b);
+    const web_files = add_web_files(b, console);
 
     add_executables(b, .{
         .target = target,
         .optimize = optimize,
         .options = options,
         .zigbox = zigbox_module,
+        .sqlite = sqlite,
+        .libpq = libpq_module,
+        .web_files = web_files,
     });
 
-    const c_modules = add_c_modules(b, target, optimize);
-    const sqlite = c_modules.sqlite;
-    const libpq_module = c_modules.libpq;
-
-    // The single-threaded half of the conformance suite runs in `zig build test` against the
-    // memory store; `test-store` runs the whole suite against the backend it is given.
-    const memory_suite = memory_suite_options(b);
-    const test_step = b.step("test", "Run unit and snapshot tests");
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "build_options", .module = options.createModule() },
-                .{ .name = "conformance_options", .module = memory_suite.createModule() },
-                .{ .name = "sqlite_c", .module = sqlite },
-                .{ .name = "libpq_c", .module = libpq_module },
-                .{ .name = "zigbox", .module = zigbox_module },
-            },
-        }),
+    add_unit_tests(b, .{
+        .target = target,
+        .optimize = optimize,
+        .options = options,
+        .zigbox = zigbox_module,
+        .sqlite = sqlite,
+        .libpq = libpq_module,
+        .web_files = web_files,
     });
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
@@ -78,6 +76,29 @@ pub fn build(b: *std.Build) void {
         .zigbox = zigbox_module,
         .library = library,
     });
+}
+
+/// `zig build test`. The single-threaded half of the conformance suite runs here against the
+/// memory store; `test-store` runs the whole suite against the backend it is given.
+fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions) void {
+    const memory_suite = memory_suite_options(b);
+    const test_step = b.step("test", "Run unit and snapshot tests");
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = unit.target,
+            .optimize = unit.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = unit.options.createModule() },
+                .{ .name = "conformance_options", .module = memory_suite.createModule() },
+                .{ .name = "sqlite_c", .module = unit.sqlite },
+                .{ .name = "libpq_c", .module = unit.libpq },
+                .{ .name = "zigbox", .module = unit.zigbox },
+                .{ .name = "web_files", .module = unit.web_files },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
@@ -124,23 +145,31 @@ const ExecutablesOptions = struct {
     optimize: std.builtin.OptimizeMode,
     options: *std.Build.Step.Options,
     zigbox: *std.Build.Module,
+    sqlite: *std.Build.Module,
+    libpq: *std.Build.Module,
+    web_files: *std.Build.Module,
 };
 
 fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) void {
     const build_options = executables_options.options.createModule();
     for (executables) |executable| {
-        const exe = b.addExecutable(.{
-            .name = executable.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(executable.root),
-                .target = executables_options.target,
-                .optimize = executables_options.optimize,
-                .imports = &.{
-                    .{ .name = "build_options", .module = build_options },
-                    .{ .name = "zigbox", .module = executables_options.zigbox },
-                },
-            }),
+        const module = b.createModule(.{
+            .root_source_file = b.path(executable.root),
+            .target = executables_options.target,
+            .optimize = executables_options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options },
+                .{ .name = "zigbox", .module = executables_options.zigbox },
+            },
         });
+        // The server is the one executable that opens a store and serves the console; the CLI
+        // and the agent reach it over HTTP.
+        if (std.mem.eql(u8, executable.name, "zcube-server")) {
+            module.addImport("sqlite_c", executables_options.sqlite);
+            module.addImport("libpq_c", executables_options.libpq);
+            module.addImport("web_files", executables_options.web_files);
+        }
+        const exe = b.addExecutable(.{ .name = executable.name, .root_module = module });
         b.installArtifact(exe);
     }
 }
@@ -361,4 +390,66 @@ fn add_wasm_test_step(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
         node.addFileArg(tests.getEmittedBin());
         step.dependOn(&node.step);
     }
+}
+
+/// `zig build console-wasm` builds the browser module of the console (src/console_wasm.zig: the
+/// real core over a memory store and the simulated runtime) in ReleaseSafe, whatever `-Doptimize`
+/// says, because `ReleaseSmall` removes the assertions the core relies on. It installs the module
+/// at `zig-out/console/sim/zcube_console.wasm` and runs `tools/console_check.mjs` on it under each
+/// V8 compiler: exactly one import, and it answers `GET /v1/status`. `zig build console-site`
+/// also copies `web/` beside it, so `zig-out/console` is the whole console as static files.
+fn add_console_steps(b: *std.Build) *std.Build.Step.Compile {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const zigbox = b.dependency("zigbox", .{ .target = target, .optimize = .ReleaseSafe });
+    const module = b.addExecutable(.{
+        .name = "zcube_console",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/console_wasm.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox.module("zigbox") }},
+        }),
+    });
+    module.entry = .disabled;
+    module.rdynamic = true;
+    const install = b.addInstallArtifact(module, .{
+        .dest_dir = .{ .override = .{ .custom = "console/sim" } },
+    });
+    const step = b.step("console-wasm", "Build the console's browser module and check it in Node");
+    step.dependOn(&install.step);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/console_check.mjs"));
+        node.addFileArg(module.getEmittedBin());
+        step.dependOn(&node.step);
+    }
+    const site_help = "Install the whole console (web/ and its WASM) to zig-out/console";
+    const site = b.step("console-site", site_help);
+    site.dependOn(step);
+    const web = b.addInstallDirectory(.{
+        .source_dir = b.path("web"),
+        .install_dir = .prefix,
+        .install_subdir = "console",
+    });
+    site.dependOn(&web.step);
+    return module;
+}
+
+/// The console's files as a Zig module for `zcube-server` to embed: `src/web_embed.zig` copies
+/// `web/` and the browser WASM module beside a generated table of `@embedFile`s.
+fn add_web_files(b: *std.Build, console: *std.Build.Step.Compile) *std.Build.Module {
+    const tool = b.addExecutable(.{
+        .name = "web_embed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/web_embed.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    const out = run.addOutputDirectoryArg("web_embed");
+    run.addDirectoryArg(b.path("web"));
+    run.addFileArg(console.getEmittedBin());
+    return b.createModule(.{ .root_source_file = out.path(b, "web_files.zig") });
 }

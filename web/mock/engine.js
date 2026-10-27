@@ -456,15 +456,6 @@ export class Engine {
     return value;
   }
 
-  /** Simulates `kill -9` of a replica's process on its node. */
-  kill(replicaId) {
-    const r = this.values("/replicas/").find(x => x.id === replicaId);
-    if (!r) return false;
-    const a = this.agents.get(r.node);
-    this.commit([{ put: [`/observed/${r.node}/${r.id}`, this.observed(a, r, "stopped", { kind: "signaled", signal: 9 })] }]);
-    return true;
-  }
-
   runningReplicas(service) {
     return this.values(`/replicas/${service}/`).filter(r => this.observedOf(r)?.status === "running").map(r => r.id);
   }

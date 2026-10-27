@@ -17,6 +17,7 @@ pub const modules = .{
     @import("apply.zig"),
     @import("clock.zig"),
     @import("controller.zig"),
+    @import("console_sim.zig"),
     @import("constants.zig"),
     @import("core_smoke.zig"),
     @import("diag.zig"),
@@ -42,6 +43,8 @@ pub const modules = .{
 /// only what is referenced, so a banned call inside a function nobody calls would otherwise go
 /// unseen. Two levels are followed: a module, then the types declared in it.
 pub fn reference_all() void {
+    // Walking every declaration of every module takes more comptime branches than the default.
+    @setEvalBranchQuota(1_000_000);
     inline for (modules) |module| reference_declarations(module);
 }
 

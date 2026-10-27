@@ -10,7 +10,8 @@
 //!
 //! Rules: 100-column lines; no tabs or trailing whitespace; functions and tests at most 70
 //! lines; no `usize`/`isize` in struct or union fields; `@import` only of `std`, `builtin`,
-//! `build_options`, `zigbox`, the C-library modules named below, and files inside the repository;
+//! `build_options`, `zigbox`, `web_files` (the embedded console), the C-library modules named
+//! below, and files inside the repository;
 //! no `@cImport`; no `catch unreachable` without a comment; no `and`/`or` inside an `assert(...)`;
 //! snake_case function names (except functions returning `type`) and `.zig` file names; no `.sh`
 //! files except those on an explicit allowlist.
@@ -52,6 +53,7 @@ const module_allowlist = [_][]const u8{
     "libpq_c",
     "conformance_options",
     "zigbox",
+    "web_files",
 };
 
 const skipped_directories = [_][]const u8{ ".git", ".zig-cache", "zig-out", "zig-pkg" };

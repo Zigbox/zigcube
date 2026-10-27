@@ -38,15 +38,34 @@ function applyTheme(t) {
 async function boot() {
   const params = new URLSearchParams(location.search);
   const meta = (n) => document.querySelector(`meta[name="zcube-${n}"]`)?.content || "";
-  const mockName = params.get("mock") ?? (meta("mock") || null);
+  // Three ways to run (docs/console.md): against the server it came from (default), against the
+  // real core in WebAssembly (?sim=c0), or against the JavaScript mock, now for C1 only (?mock=c1).
+  let simName = params.get("sim") ?? (meta("sim") || null);
+  let mockName = params.get("mock") ?? (meta("mock") || null);
+  if (mockName === "c0") { // the old C0 mock is retired: its links open the simulation
+    mockName = null; simName = "c0";
+    params.delete("mock"); params.set("sim", "c0");
+    history.replaceState(null, "", `${location.pathname}?${params}${location.hash}`);
+  }
+  if (simName && simName !== "c0") simName = null; // only C0 exists in the core
   let transport = fetchTransport();
-  let mock = null;
-  if (mockName) {
+  let mock = null, sim = null;
+  const envTag = $("#env-tag");
+  if (simName) {
+    const { startSim } = await import("../sim/index.js");
+    try { sim = await startSim({ speed: Number(params.get("speed") || 1) || 1 }); } catch (e) {
+      transport = async () => { throw new TypeError(`the simulation could not start: ${e.message}`); };
+    }
+    if (sim) transport = sim.request;
+    document.body.dataset.sim = simName;
+    envTag.textContent = "simulated";
+  } else if (mockName) {
     const { startMock } = await import("../mock/index.js");
     mock = startMock({ scenario: mockName, at: Number(params.get("at") ?? meta("mock-at") ?? 0) || 0, speed: Number(params.get("speed") || 1) || 1, backend: params.get("backend") || "postgres" });
     transport = mock.request;
     document.body.dataset.mock = mockName;
-  }
+    envTag.textContent = "mock";
+  } else envTag.textContent = "server";
   const client = createClient(transport);
   const model = new Model(client);
   let theme = loadTheme();
@@ -100,7 +119,7 @@ async function boot() {
     if (s !== lastConn) { if (lastConn) announce(`Connection: ${LABEL[s]}`); lastConn = s; }
     const err = model.error;
     const sig = err ? JSON.stringify([err.diagnostics, err.requestId]) : "";
-    const note = err ? (s === "stale" ? `The console is showing data from ${ago(model.lastOkAt)}. It keeps trying and will update itself.` : "Trying again. What you see is the last data received.") : "";
+    const note = err?.diagnostics[0].severity === "bug" && sim ? "The simulation stopped and its in-browser store is lost. What you see is the last data received; reload to start again." : err ? (s === "stale" ? `The console is showing data from ${ago(model.lastOkAt)}. It keeps trying and will update itself.` : "Trying again. What you see is the last data received.") : "";
     if (banner._sig !== sig) {
       banner._sig = sig;
       banner.hidden = !err;
@@ -110,7 +129,9 @@ async function boot() {
         const toggle = h("button", { type: "button", class: "linklike", "aria-expanded": String(!banner._collapsed) }, banner._collapsed ? "Show diagnostic" : "Hide diagnostic");
         const body = h("div", { class: "banner-body", hidden: banner._collapsed }, ...err.diagnostics.map(d => diagnosticBlock(d, { origin: err.origin === "console" ? "raised by the console" : null, requestId: err.requestId })));
         toggle.addEventListener("click", () => { banner._collapsed = !banner._collapsed; body.hidden = banner._collapsed; toggle.setAttribute("aria-expanded", String(!banner._collapsed)); toggle.textContent = banner._collapsed ? "Show diagnostic" : "Hide diagnostic"; });
-        banner.append(h("p", { class: "banner-t" }, h("span", { class: "banner-note" }), " ", h("code", {}, err.diagnostics[0].code), " ", err.diagnostics[0].summary, " · ", toggle), body);
+        const bug = err.diagnostics[0].severity === "bug" && sim;
+        const reload = bug && h("button", { type: "button", class: "sm", id: "reload", onclick: () => location.reload() }, "Reload");
+        banner.append(h("p", { class: "banner-t" }, h("span", { class: "banner-note" }), " ", h("code", {}, err.diagnostics[0].code), " ", err.diagnostics[0].summary, " · ", toggle, bug && " · ", reload), body);
       }
     }
     const noteEl = banner.querySelector(".banner-note");
@@ -162,11 +183,15 @@ async function boot() {
   route();
   renderConn();
 
+  if (sim) {
+    const { mountSimPanel } = await import("../sim/panel.js");
+    mountSimPanel(sim);
+  }
   if (mock) {
     const { mountPanel } = await import("../mock/panel.js");
     mountPanel(mock);
   }
-  window.zc = { model, mock }; // handy in the console during development
+  window.zc = { model, mock, sim }; // `sim` also holds the test hooks (forcePanic, control, step) // handy in the console during development
   addEventListener("error", e => console.error(e.error || e.message));
 }
 

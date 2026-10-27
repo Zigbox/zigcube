@@ -14,6 +14,11 @@
 //! `hold_prefixes` which keys' changes end the hold; the shell then calls `handle` again with the
 //! same request. A handler that waited would hang a browser.
 //!
+//! **Writes** (proposed in docs/api.md, owner approval pending): `POST /v1/apply` takes a service
+//! as JSON (`?dry_run=1` answers what would change and writes nothing), `DELETE
+//! /v1/services/{name}` deletes one. Both are `apply.zig`'s functions behind a route, and both
+//! are unauthenticated until the API has auth.
+//!
 //! **Secrets.** `env` values in `/services/` and `/replicas/` records are never sent to a
 //! read-only token: the names stay and each value is `null` (docs/api.md item 8; the replica
 //! carries a copy, docs/keys.md).
@@ -22,12 +27,14 @@ const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const codes = @import("diag/codes.zig");
+const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const runtime_codes = @import("runtime_codes.zig");
 const store = @import("store.zig");
+const text_util = @import("text.zig");
 const why_mod = @import("why.zig");
 
 const Allocator = std.mem.Allocator;
@@ -42,6 +49,11 @@ pub const Request = struct {
     query: []const u8 = "",
     /// The client's `X-Request-Id` header, if it sent one.
     request_id: ?[]const u8 = null,
+    /// The request body, for `POST /v1/apply` (the only endpoint that reads one).
+    body: []const u8 = "",
+    /// False asks a watch not to say "hold me": the shell sets it when it asks again after a hold
+    /// ended, so the same request is answered with what is ready and nothing more.
+    hold: bool = true,
 };
 
 pub const Response = struct {
@@ -63,13 +75,21 @@ pub const Api = struct {
     started_at_ms: u64,
     /// False for a token that may write: it sees `env` values.
     read_only: bool = true,
-    counter: u32 = 0,
+    /// Atomic so that several reads can run at once; the writes (`POST`, `DELETE`) also change
+    /// `source`, and the shell runs those one at a time.
+    counter: std.atomic.Value(u32) = .init(0),
+    /// Names this start of the server in the ids it issues (`r-<instance>-<counter>`), so that two
+    /// starts, or two servers, never issue the same id. The shell supplies it (it may read the
+    /// clock; the core may not). 0 means "none": ids are then `r-<counter>`, as in the simulation.
+    instance: u32 = 0,
+    /// Names the decisions the write endpoints record. Its instance number is the shell's.
+    source: controller.DecisionSource = .{ .instance = 0 },
 
     /// Answers one request. `ctx.arena` holds the answer: it stays valid until the arena is reset.
     pub fn handle(api: *Api, ctx: *const Context, request: Request) Response {
         assert(ctx.diag.code == null);
         const id = api.assign_id(ctx, request);
-        if (api.route(ctx, request)) |reply| {
+        if (api.route(ctx, request, id)) |reply| {
             return .{
                 .status = 200,
                 .request_id = id,
@@ -84,27 +104,41 @@ pub const Api = struct {
 
     /// The client's id if it sent a valid one, else a new one (an invalid one is refused by
     /// `route`, and the refusal is reported under the new id).
-    fn assign_id(api: *Api, ctx: *const Context, request: Request) []const u8 {
+    pub fn assign_id(api: *Api, ctx: *const Context, request: Request) []const u8 {
         if (request.request_id) |sent| {
             if (id_problem(sent) == null) return sent;
         }
-        api.counter +%= 1;
-        return std.fmt.allocPrint(ctx.arena, "r-{x:0>7}", .{api.counter}) catch "r-0000000";
+        const number = api.counter.fetchAdd(1, .monotonic) +% 1;
+        if (api.instance == 0) {
+            return std.fmt.allocPrint(ctx.arena, "r-{x:0>7}", .{number}) catch "r-0000000";
+        }
+        const format = "r-{x:0>8}-{x:0>7}";
+        return std.fmt.allocPrint(ctx.arena, format, .{ api.instance, number }) catch "r-00000000";
     }
 
-    fn route(api: *const Api, ctx: *const Context, request: Request) Failure!Reply {
+    fn route(api: *Api, ctx: *const Context, request: Request, id: []const u8) Failure!Reply {
         if (request.request_id) |sent| {
             if (id_problem(sent)) |problem| return bad_request(ctx, "X-Request-Id", problem);
-        }
-        if (!std.mem.eql(u8, request.method, "GET")) {
-            return bad_request(ctx, "method", "this API answers GET only");
         }
         const prefix = "/v1/";
         if (!std.mem.startsWith(u8, request.path, prefix)) return no_such(ctx, request.path);
         var parts = std.mem.splitScalar(u8, request.path[prefix.len..], '/');
         const first = parts.next().?; // A split always has a first part.
         const query = try Query.parse(ctx, request.query);
-        const call: Call = .{ .api = api, .ctx = ctx, .query = &query, .parts = &parts };
+        const call: Call = .{
+            .api = api,
+            .ctx = ctx,
+            .query = &query,
+            .parts = &parts,
+            .hold = request.hold,
+        };
+        if (std.mem.eql(u8, request.method, "POST")) {
+            return call.write_post(first, request.body, id);
+        }
+        if (std.mem.eql(u8, request.method, "DELETE")) return call.write_delete(first, id);
+        if (!std.mem.eql(u8, request.method, "GET")) {
+            return bad_request(ctx, "method", "this API answers GET, POST and DELETE only");
+        }
         if (std.mem.eql(u8, first, "status")) return call.status();
         if (std.mem.eql(u8, first, "list")) return call.list();
         if (std.mem.eql(u8, first, "watch")) return call.watch();
@@ -127,6 +161,95 @@ const Reply = struct {
 const Failure = error{Failed};
 
 const Parts = std.mem.SplitIterator(u8, .scalar);
+
+// ---- Writes ------------------------------------------------------------------------------------
+
+/// A conflicting write is read and planned again this many times before it is reported.
+const apply_attempts_max: u32 = 3;
+/// Who a write is attributed to while the API has no auth.
+const anonymous = "anonymous";
+const applied_by_bytes_max: u32 = 64;
+
+/// The body of `POST /v1/apply`: the fields of a service the user writes (docs/keys.md), as JSON.
+const ApplyBody = struct {
+    name: []const u8,
+    image: []const u8,
+    replicas: u32,
+    command: []const []const u8,
+    env: []const records.Pair = &.{},
+    limits: records.Limits = .{},
+    applied_by: []const u8 = anonymous,
+};
+
+const WriteReply = struct {
+    request_id: []const u8,
+    dry_run: bool,
+    action: []const u8,
+    name: []const u8,
+    generation: ?u64 = null,
+    change: []const u8,
+    revision: ?store.Revision = null,
+    decision: ?[]const u8 = null,
+};
+
+fn apply_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!apply_mod.Input {
+    if (body.len == 0) return bad_request(ctx, "body", "is required: the service as JSON");
+    if (body.len > constants.api_request_bytes_max) {
+        return bad_request(ctx, "body", "is larger than 65536 bytes");
+    }
+    const parsed = std.json.parseFromSliceLeaky(ApplyBody, ctx.arena, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return no_memory(ctx);
+        const problem = "is not a service: it needs name, image, replicas and command";
+        return bad_request(ctx, "body", problem);
+    };
+    try check_applied_by(ctx, parsed.applied_by);
+    return .{
+        .name = parsed.name,
+        .image = parsed.image,
+        .replicas = parsed.replicas,
+        .command = parsed.command,
+        .env = parsed.env,
+        .limits = parsed.limits,
+        .applied_by = parsed.applied_by,
+        .request_id = id,
+    };
+}
+
+/// `applied_by` goes into a decision's reason, which people read: a short printable name.
+fn check_applied_by(ctx: *const Context, text: []const u8) Failure!void {
+    if (text.len == 0 or text.len > applied_by_bytes_max) {
+        return bad_request(ctx, "applied_by", "must be 1 to 64 bytes");
+    }
+    for (text) |byte| {
+        if (!text_util.is_printable(byte)) {
+            return bad_request(ctx, "applied_by", "may hold printable ASCII only");
+        }
+    }
+}
+
+fn write_reply(ctx: *const Context, reply: WriteReply) Failure!Reply {
+    const out = Out.create(ctx) catch return no_memory(ctx);
+    out.json.options.emit_null_optional_fields = false;
+    try out.value(reply);
+    return out.finish();
+}
+
+fn conflict(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0105);
+    ctx.diag.cause("service {s} was changed by someone else during the request", .{name});
+    const sentence = "look at it as it is now, then apply again";
+    ctx.diag.fix_with(sentence, "zcube get service {s}", .{name});
+    return error.Failed;
+}
+
+/// A reply for a request the shell refuses before it reaches `handle` (too large, too many
+/// connections): the failure already raised on `ctx.diag`, with the shell's own status.
+pub fn refusal(ctx: *const Context, request_id: []const u8, status: u16) Response {
+    var response = error_response(ctx, request_id);
+    response.status = status;
+    return response;
+}
 
 // ---- Request ids and errors --------------------------------------------------------------------
 
@@ -203,6 +326,7 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
         .user => {
             if (code == .E0101) return 404;
             if (code == .E0203) return 410;
+            if (code == .E0105) return 409;
             return 400;
         },
         .environment => return 503,
@@ -356,8 +480,10 @@ const Query = struct {
     fn flag(query: *const Query, ctx: *const Context, name: []const u8) Failure!bool {
         const text = try query.one(ctx, name) orelse return false;
         if (std.mem.eql(u8, text, "true")) return true;
+        if (std.mem.eql(u8, text, "1")) return true;
         if (std.mem.eql(u8, text, "false")) return false;
-        return bad_request(ctx, name, "must be true or false");
+        if (std.mem.eql(u8, text, "0")) return false;
+        return bad_request(ctx, name, "must be true, false, 1 or 0");
     }
 };
 
@@ -430,7 +556,8 @@ const watch_batches_max: u32 = 64;
 const list_limit_default: u64 = 100;
 
 const Call = struct {
-    api: *const Api,
+    api: *Api,
+    hold: bool,
     ctx: *const Context,
     query: *const Query,
     parts: *Parts,
@@ -597,9 +724,13 @@ const Call = struct {
         try out.end_array();
         try out.end_object();
         var reply = try out.finish();
-        if (events.items.len == 0 and timeout_ms > 0) {
-            reply.hold_ms = timeout_ms;
-            reply.hold_prefixes = prefixes;
+        if (events.items.len == 0) {
+            if (call.hold) {
+                if (timeout_ms > 0) {
+                    reply.hold_ms = timeout_ms;
+                    reply.hold_prefixes = prefixes;
+                }
+            }
         }
         return reply;
     }
@@ -654,6 +785,88 @@ const Call = struct {
         out.json.options.emit_null_optional_fields = false;
         try out.value(result);
         return out.finish();
+    }
+
+    // ---- Writes: POST /v1/apply and DELETE /v1/services/{name} ----
+
+    fn write_post(call: Call, first: []const u8, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        if (!std.mem.eql(u8, first, "apply")) {
+            return bad_request(ctx, "method", "POST is accepted at /v1/apply only");
+        }
+        try call.query.allow(ctx, &.{"dry_run"});
+        try call.no_more();
+        const dry_run = try call.query.flag(ctx, "dry_run");
+        const input = try apply_input(ctx, body, id);
+        if (dry_run) {
+            const planned = apply_mod.plan(ctx, input) catch return propagate(ctx);
+            const action = if (planned.existing == null)
+                "create"
+            else if (planned.unchanged) "none" else "update";
+            return write_reply(ctx, .{
+                .request_id = id,
+                .dry_run = true,
+                .action = action,
+                .name = input.name,
+                .generation = planned.generation,
+                .change = planned.change,
+            });
+        }
+        for (0..apply_attempts_max) |_| {
+            const result = apply_mod.apply(ctx, &call.api.source, input) catch
+                return propagate(ctx);
+            switch (result) {
+                .written => |done| return write_reply(ctx, .{
+                    .request_id = id,
+                    .dry_run = false,
+                    .action = if (done.created) "create" else "update",
+                    .name = input.name,
+                    .generation = done.generation,
+                    .change = done.change,
+                    .revision = done.revision,
+                    .decision = done.decision,
+                }),
+                .unchanged => return write_reply(ctx, .{
+                    .request_id = id,
+                    .dry_run = false,
+                    .action = "none",
+                    .name = input.name,
+                    .change = "no change",
+                }),
+                .conflict => {},
+            }
+        }
+        return conflict(ctx, input.name);
+    }
+
+    fn write_delete(call: Call, first: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        if (!std.mem.eql(u8, first, "services")) {
+            return bad_request(ctx, "method", "DELETE is accepted at /v1/services/{name} only");
+        }
+        try call.query.allow(ctx, &.{"applied_by"});
+        const name = call.parts.next() orelse return no_such(ctx, "/v1/services");
+        try call.no_more();
+        const by = try call.query.one(ctx, "applied_by") orelse anonymous;
+        try check_applied_by(ctx, by);
+        for (0..apply_attempts_max) |_| {
+            const result = apply_mod.delete_service(ctx, &call.api.source, name, by, id) catch
+                return propagate(ctx);
+            switch (result) {
+                .written => |done| return write_reply(ctx, .{
+                    .request_id = id,
+                    .dry_run = false,
+                    .action = "delete",
+                    .name = name,
+                    .change = done.change,
+                    .revision = done.revision,
+                    .decision = done.decision,
+                }),
+                .unchanged => unreachable, // `delete_service` never reports "unchanged".
+                .conflict => {},
+            }
+        }
+        return conflict(ctx, name);
     }
 
     // ---- /v1/codes and /v1/explain/{code} ----

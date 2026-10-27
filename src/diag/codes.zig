@@ -29,6 +29,10 @@ pub const Code = enum(u8) {
     E0102,
     E0103,
     E0104,
+    E0105,
+    E0106,
+    E0107,
+    E0108,
     E0201,
     E0202,
     E0203,
@@ -115,6 +119,61 @@ pub const registry = [_]Entry{
         \\
         \\The read-only API answers GET only. See docs/api.md for the parameters
         \\of each endpoint.
+        ,
+    },
+    .{
+        .code = .E0105,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the service changed while it was being applied",
+        .explanation =
+        \\Someone else applied or deleted the same service between the moment this
+        \\request read it and the moment it tried to write. The store refused the
+        \\write rather than overwrite their change. Nothing was changed.
+        \\
+        \\Look at the service as it is now (zcube get service), then apply again.
+        ,
+    },
+    .{
+        .code = .E0106,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the server's configuration can't be used",
+        .explanation =
+        \\zcube-server read its configuration file and flags and found a setting
+        \\it cannot use: a file that is not valid ZON, an unknown setting, a store
+        \\that is not memory, sqlite:<path> or postgres:<settings>, or a listen
+        \\address that is not host:port. The cause line names the setting.
+        \\
+        \\Nothing was started. Correct the setting and start the server again.
+        ,
+    },
+    .{
+        .code = .E0107,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "can't listen on the server's address",
+        .explanation =
+        \\zcube-server could not bind its listen address: another process already
+        \\holds the port, the address is not one of this machine's, or the user
+        \\may not bind it (ports below 1024 need privileges).
+        \\
+        \\Choose another port with --listen, or stop the process that holds this
+        \\one. The cause line names the address and the system's reason.
+        ,
+    },
+    .{
+        .code = .E0108,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the server is at one of its limits",
+        .explanation =
+        \\zcube-server refused a request because it is already serving as many
+        \\connections or waiting watches as it is configured to, or the request
+        \\was larger than it accepts. The cause line names the limit. Nothing was
+        \\changed.
+        \\
+        \\Try again shortly. A client that opens many watches should share one.
         ,
     },
     .{

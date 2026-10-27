@@ -202,6 +202,14 @@ test "watch answers what is ready with a bookmark and leaves the waiting to the 
     const waiting_query = try std.fmt.bufPrint(&query_buffer, waiting_format, .{bookmark + 1});
     const waiting = rig.get("/v1/watch", waiting_query);
     try testing.expectEqual(@as(u32, 5000), waiting.hold_ms);
+    const again = rig.call(.{
+        .method = "GET",
+        .path = "/v1/watch",
+        .query = waiting_query,
+        .hold = false,
+    });
+    try testing.expectEqual(@as(u32, 0), again.hold_ms);
+    try testing.expectEqual(@as(u16, 200), again.status);
 
     _ = try rig.world.delete_service("hello");
     const deleted_format = "from={d}&timeout=0&prefix=/services/";
@@ -318,6 +326,7 @@ test "the store failing during a request is its own diagnostic with the status i
 test "the status follows the blame of the first diagnostic" {
     // Goal: the table of api.md, "Errors", for each blame and the codes that single one out.
     try testing.expectEqual(@as(u16, 404), api_mod.status_for(.E0101, .user));
+    try testing.expectEqual(@as(u16, 409), api_mod.status_for(.E0105, .user));
     try testing.expectEqual(@as(u16, 410), api_mod.status_for(.E0203, .user));
     try testing.expectEqual(@as(u16, 400), api_mod.status_for(.E0204, .user));
     try testing.expectEqual(@as(u16, 503), api_mod.status_for(.E0207, .environment));
@@ -354,4 +363,99 @@ test "codes lists both registries and the placeholders; explain prints what the 
     try testing.expect(std.mem.indexOf(u8, placeholder, "image") != null);
     try rig.refused(rig.get("/v1/explain/ZC-E9999", ""), 404, "ZC-E0101");
     try rig.refused(rig.get("/v1/explain/ZBX-E9999", ""), 404, "ZC-E0101");
+}
+
+const hello_json =
+    \\{"name":"hello","image":"b3:51aa9c03","replicas":2,
+    \\ "command":["sh","-c","sleep 1"],"env":[["API_TOKEN","s3cr3t"]],"applied_by":"alex@laptop"}
+;
+
+fn post(rig: *Rig, query: []const u8, body: []const u8) api_mod.Response {
+    return rig.call(.{ .method = "POST", .path = "/v1/apply", .query = query, .body = body });
+}
+
+test "POST /v1/apply creates, scales, answers a dry run without writing, and reports no change" {
+    // Goal: the proposed write endpoint of docs/api.md. Method: apply, read back through the
+    // read endpoints, scale, dry-run a change, repeat an apply; check the revision each time.
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    const created = try rig.json(post(&rig, "", hello_json));
+    try testing.expectEqualStrings("create", field(created, "action").string);
+    try testing.expectEqual(@as(i64, 1), field(created, "generation").integer);
+    try testing.expectEqualStrings("created", field(created, "change").string);
+    const decision = field(created, "decision").string;
+    try testing.expect(field(created, "revision").integer > 0);
+    try testing.expect(!field(created, "dry_run").bool);
+
+    rig.world.advance(2000);
+    const listed = try rig.ok("/v1/list", "prefix=%2Fservices%2F");
+    try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
+    const why = try rig.ok("/v1/why/service/hello", "");
+    const state_text = field(field(why, "state"), "text").string;
+    try testing.expectEqualStrings("service hello: 2/2 running", state_text);
+    const index = try rig.ok("/v1/list", "prefix=%2Fdecisions%2F");
+    var found = false;
+    for (field(index, "kvs").array.items) |kv| {
+        if (std.mem.endsWith(u8, field(kv, "key").string, decision)) found = true;
+    }
+    try testing.expect(found);
+
+    const before = rig.world.revision().?;
+    const two = "\"replicas\":2";
+    const four = "\"replicas\":4";
+    const scaled_json = try std.mem.replaceOwned(u8, testing.allocator, hello_json, two, four);
+    defer testing.allocator.free(scaled_json);
+    const dry = try rig.json(post(&rig, "dry_run=1", scaled_json));
+    try testing.expectEqualStrings("update", field(dry, "action").string);
+    try testing.expectEqualStrings("replicas 2 → 4", field(dry, "change").string);
+    try testing.expect(field(dry, "dry_run").bool);
+    try testing.expect(dry.object.get("decision") == null);
+    try testing.expectEqual(before, rig.world.revision().?);
+
+    const real = try rig.json(post(&rig, "", scaled_json));
+    try testing.expectEqual(@as(i64, 1), field(real, "generation").integer);
+    const same = try rig.json(post(&rig, "", scaled_json));
+    try testing.expectEqualStrings("none", field(same, "action").string);
+    try testing.expectEqualStrings("no change", field(same, "change").string);
+}
+
+test "a body that is not a service is ZC-E0104 and writes nothing" {
+    // Goal: every way a write can be refused before it touches the store. Method: no body, JSON
+    // that is not a service, an unknown field, a bad name, an applied_by with a newline.
+    var rig = try Rig.start(11);
+    defer rig.stop();
+    try rig.refused(post(&rig, "", ""), 400, "ZC-E0104");
+    try rig.refused(post(&rig, "", "{"), 400, "ZC-E0104");
+    try rig.refused(post(&rig, "", "{\"name\":\"x\"}"), 400, "ZC-E0104");
+    try rig.refused(post(&rig, "dry_run=maybe", hello_json), 400, "ZC-E0104");
+    try rig.refused(post(&rig, "x=1", hello_json), 400, "ZC-E0104");
+    const small = "{\"name\":\"a\",\"image\":\"b\",\"replicas\":1,\"command\":[\"c\"]";
+    const typo = small ++ ",\"replica\":3}";
+    try rig.refused(post(&rig, "", typo), 400, "ZC-E0104");
+    const upper = "{\"name\":\"Hello\",\"image\":\"b\",\"replicas\":1,\"command\":[\"c\"]}";
+    try rig.refused(post(&rig, "", upper), 400, "ZC-E0104");
+    const newline = small ++ ",\"applied_by\":\"x\\ny\"}";
+    try rig.refused(post(&rig, "", newline), 400, "ZC-E0104");
+    try testing.expectEqual(@as(store.Revision, 0), rig.world.revision().?);
+}
+
+test "DELETE /v1/services/{name} deletes, and a missing service is ZC-E0101" {
+    // Goal: the second proposed write endpoint. Method: apply, delete, delete again; the replicas
+    // are stopped by the controller afterwards, and a wrong path or method is a refusal.
+    var rig = try Rig.start(12);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    rig.world.advance(2000);
+    const deleted = rig.call(.{ .method = "DELETE", .path = "/v1/services/hello" });
+    const body = try rig.json(deleted);
+    try testing.expectEqual(@as(u16, 200), deleted.status);
+    try testing.expectEqualStrings("delete", field(body, "action").string);
+    try testing.expect(field(body, "decision").string.len > 0);
+    rig.world.advance(5000);
+    try testing.expectEqual(@as(u32, 0), rig.world.replica_count("hello"));
+    const again = rig.call(.{ .method = "DELETE", .path = "/v1/services/hello" });
+    try rig.refused(again, 404, "ZC-E0101");
+    try rig.refused(rig.call(.{ .method = "DELETE", .path = "/v1/list" }), 400, "ZC-E0104");
+    const odd = rig.call(.{ .method = "PUT", .path = "/v1/apply", .body = hello_json });
+    try rig.refused(odd, 400, "ZC-E0104");
 }

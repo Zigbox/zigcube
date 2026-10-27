@@ -31,10 +31,11 @@ jobs:
         run: zig fmt --check .
       - name: Tidy (style rules)
         run: zig build tidy
-      - name: Build the three executables
-        run: zig build
+      # Before the build: zcube-server links both client libraries.
       - name: SQLite and libpq development files
         run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: Build the three executables
+        run: zig build
       - name: Unit and snapshot tests
         run: zig build test --summary all
       # The suite picks a random seed per run; a failure prints it, and -Dseed=N replays it.
@@ -96,6 +97,10 @@ jobs:
         run: zig build wasm-check -Doptimize=ReleaseSafe --summary all
       - name: Core unit tests (wasm32-wasi), run in Node
         run: zig build wasm-test --summary all
+      # The console's browser module (ReleaseSafe, whatever -Doptimize says): it must build, import
+      # exactly env.zc_panic, answer GET /v1/status and run the scenario, under each V8 compiler.
+      - name: Console module (browser), checked in Node
+        run: zig build console-wasm --summary all
       # A simulation, not demo-c0 (docs/core.md). The same seed runs natively and in WASM and the
       # reports must agree byte for byte. Seed 1 always, and one seed per CI run, printed here.
       - name: C0 simulation, native and WASM, seed 1

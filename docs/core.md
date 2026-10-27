@@ -143,4 +143,49 @@ built with `-Doptimize=ReleaseSafe`).
   (so a replica never runs twice) is C1's acceptance criterion.
 - **Retention runs in the controller's step, a few pages at a time, not in the transaction that
   writes a decision** as keys.md words it: a count needs a list.
-- **The API's write endpoints are not here.** `apply.zig` is what they will call.
+- **The API's write endpoints** arrived in slice 5b as a proposal (api.md, "Writes"): `POST
+  /v1/apply` and `DELETE /v1/services/{name}`, `apply.zig` behind a route. `apply` now returns the
+  decision id and the change summary, and `plan` is a dry run.
+
+## What the shell revealed about the step model (C0 slice 5b)
+
+`zcube-server` is the first shell that drives the core on real threads, a real clock and real
+stores (`src/server*.zig`). The model held: the controller, the agent's step and the handlers were
+driven as they were, and the same handlers answer HTTP and the browser. Two small changes came out
+of it (`Request.hold`, an atomic request counter), and the rest of what it taught is below:
+
+- **`Wakeup.prefixes` is several prefixes; `Store.watch` takes one.** The driver opens one watch on
+  every key and filters locally against the prefixes. That also delivers every decision write, which
+  the controller ignores; on Postgres it keeps the cost to one connection, where a watch per prefix
+  would be four.
+- **A step that acted always wakes itself.** Its own writes are under the prefixes it named, so the
+  next wait ends at once and the following step finds `acted == 0`. It costs one extra snapshot read
+  per acting step. It is harmless and honest; if snapshots grow, `Wakeup` could carry "ignore up to
+  revision R" for the step's own writes.
+- **"Call `handle` again with the same request" was not enough for a held watch.** The same request
+  would ask to be held again. `Request.hold` (default true) is the shell's way to say "answer with
+  what is ready and nothing more"; the first, empty answer is what a timed-out hold sends. The
+  shell opens its store watch from the revision it read *before* calling `handle`, so a change
+  between the handler's look and the shell's wait cannot be missed.
+- **`Api.handle` needed `*Api`, which made it serial.** Only the request counter and the decision
+  source are mutable: the counter is atomic now, so reads run side by side, and writes (which move
+  the source) take a mutex in the shell.
+- **The memory store does not wait.** `Watch.next(timeout)` returns at once on it, so every loop that
+  waits on a watch (the driver, a held request) naps `server_poll_ms` when an empty batch comes back
+  early. On SQLite and Postgres the call itself waits. The memory store also needs a mutex in a
+  threaded shell (`server_store.zig`, `Locked`).
+- **Identity is the shell's.** The controller's instance number is derived from the start time so a
+  restarted server takes a new one; the API's source keeps instance 0, so the two never share a
+  decision id.
+- **Failure shows once.** A store that goes down fails every step; the driver prints the diagnostic
+  when the code changes or every 30 s, backs off 250 ms doubling to 5 s, drops and reopens its
+  watch, and prints one line when it recovers. Nothing in the core had to know.
+- **The arena limit is real.** Each request and each step has a `BoundedArena` of
+  `request_arena_bytes_max`; the core already reports a full arena as `ZC-E0207`. With 64
+  connections that is a worst case of 1 GiB of address space, touched only if requests are that
+  large.
+- **Known limit: `reuse_address`.** The standard library ties `SO_REUSEADDR` to `SO_REUSEPORT`
+  (`Io.net.IpAddress.ListenOptions`). With it, a second server on the same port starts without
+  complaint; without it, a restart can find the port in `TIME_WAIT` for a short while after a
+  server that closed connections first. The server does not set it: a second server fails loudly
+  with `ZC-E0107`.

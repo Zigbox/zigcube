@@ -15,14 +15,6 @@ export const HELLO = {
   limits: { cpu_millis: 500, memory_bytes: 134217728 },
 };
 
-export const BROKEN = {
-  name: "broken",
-  image: "b3:00ff7be1",
-  command: ["sh", "-c", "echo never runs"],
-  env: [],
-  limits: { cpu_millis: 250, memory_bytes: 67108864 },
-};
-
 export const NODE_CAPACITY = { cpu_millis: 4000, memory_bytes: 8589934592 };
 export const LEASE_TTL_MS = 10000;
 

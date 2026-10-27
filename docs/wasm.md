@@ -254,9 +254,26 @@ Sizes on this machine: 1.3 MB Debug, 607 KB ReleaseSafe, 62 KB ReleaseSmall (not
   for that reason. `ReleaseSafe` remains the mode that ships.
 - **The conformance suite's single-threaded half runs under WASI** (`zig build wasm-test`), against
   `MemoryStore`, the store the browser would use: the racing tests stay native.
-- **Still not done:** the one named host import for panics (slice 5b, with the browser demo), and a
-  real clock for the browser (`Date.now()` through a host import, or the host passing the time in).
-  The core's `Clock` must be Unix milliseconds for decision times to mean what keys.md says.
+- **Still not done:** a real clock for the browser. The simulation runs on virtual time that starts
+  at a fixed Unix epoch (`sim_world.epoch_ms`) and moves when the page moves it, so no import is
+  needed. The core's `Clock` must be Unix milliseconds for decision times to mean what keys.md says.
+
+## What slice 5b did with it (the browser module)
+
+- **The one import, approved and enforced.** `src/console_wasm.zig` imports exactly
+  `env.zc_panic(ptr, len)` and declares `pub const panic` over it: the text goes to the page, then
+  `@trap()`. `tools/console_check.mjs` fails on any other import and forces a panic (a length past
+  the request buffer) to see the message arrive and the instance trap. The smoke module of
+  `wasm-check` still has zero imports; that rule is unchanged.
+- **The logic is a core module.** `console_sim.zig` (request frame in, API answer out, virtual time,
+  the seven scenario steps) is in `core.zig`, so `wasm-check` compiles it, `wasm-test` runs its
+  tests under WASI and `zig build test` runs them natively. The wasm root is only exports.
+- **Size.** `zig build console-wasm` (ReleaseSafe, stripped): 522 KB, 205 KB gzipped, with the
+  whole core, the agent's step, the simulated runtime and the API. Unstripped it is 2.3 MB: the
+  name and debug sections are most of it.
+- **Atomics.** `Api.counter` became `std.atomic.Value(u32)` so the server can run reads side by
+  side; 32-bit atomics compile for `wasm32-freestanding` (row 5 is about 64-bit ones).
+- **Two V8 tiers.** `console-wasm` runs its Node check once per tier like every other WASM check.
 
 ## Running the simulation
 
