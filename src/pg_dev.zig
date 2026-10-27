@@ -97,9 +97,14 @@ fn up(init: std.process.Init, config: Config) u8 {
         .{ config.port, config.dir },
     ) catch return constants.exit_environment;
     if (!run(init, config, &.{ "mkdir", "-p", config.dir })) return constants.exit_environment;
-    const made = run(init, config, &.{ initdb, "-D", data, "-A", "trust", "-U", "zcube" });
-    const present = made or run(init, config, &.{ pg_ctl, "-D", data, "status" });
-    if (!present) return constants.exit_environment;
+    // A cluster that exists but is stopped is started, not made again (`initdb` refuses a
+    // directory that is not empty, and `pg_ctl status` says "no" for a stopped one).
+    const marker = std.fmt.allocPrint(arena, "{s}/PG_VERSION", .{data}) catch return 2;
+    const present = run(init, config, &.{ "test", "-f", marker });
+    if (!present) {
+        const made = run(init, config, &.{ initdb, "-D", data, "-A", "trust", "-U", "zcube" });
+        if (!made) return constants.exit_environment;
+    }
     const start = [_][]const u8{ pg_ctl, "-D", data, "-o", options, "-l", log, "-w", "start" };
     const started = run(init, config, &start);
     if (!started and !run(init, config, &.{ pg_ctl, "-D", data, "status" })) {

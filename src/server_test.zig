@@ -566,3 +566,25 @@ fn run_until_running(io: std.Io, server: *server_mod.Server, node: *Node, count:
     }
     return error.NeverConverged;
 }
+
+test "request ids are not issued twice across server starts" {
+    // Goal: DIAGNOSTICS, "every API request gets a request ID" so a client's error can be matched
+    // to a log: a restart must not repeat the ids of the start before it. Method: start, ask, stop,
+    // start again, ask; the first ids differ, and so do the counters' first values.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var seen: [2][64]u8 = undefined;
+    var lengths: [2]usize = undefined;
+    for (&seen, &lengths) |*buffer, *length| {
+        const server = try start_server(io, config_for(.memory, false));
+        defer server.stop();
+        const reply = try get(io, server.address(), "/v1/status");
+        defer reply.free();
+        const id = reply.header("x-request-id").?;
+        @memcpy(buffer[0..id.len], id);
+        length.* = id.len;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try testing.expect(!std.mem.eql(u8, seen[0][0..lengths[0]], seen[1][0..lengths[1]]));
+}

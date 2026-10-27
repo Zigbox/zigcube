@@ -78,6 +78,10 @@ pub const Api = struct {
     /// Atomic so that several reads can run at once; the writes (`POST`, `DELETE`) also change
     /// `source`, and the shell runs those one at a time.
     counter: std.atomic.Value(u32) = .init(0),
+    /// Names this start of the server in the ids it issues (`r-<instance>-<counter>`), so that two
+    /// starts, or two servers, never issue the same id. The shell supplies it (it may read the
+    /// clock; the core may not). 0 means "none": ids are then `r-<counter>`, as in the simulation.
+    instance: u32 = 0,
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
 
@@ -105,7 +109,11 @@ pub const Api = struct {
             if (id_problem(sent) == null) return sent;
         }
         const number = api.counter.fetchAdd(1, .monotonic) +% 1;
-        return std.fmt.allocPrint(ctx.arena, "r-{x:0>7}", .{number}) catch "r-0000000";
+        if (api.instance == 0) {
+            return std.fmt.allocPrint(ctx.arena, "r-{x:0>7}", .{number}) catch "r-0000000";
+        }
+        const format = "r-{x:0>8}-{x:0>7}";
+        return std.fmt.allocPrint(ctx.arena, format, .{ api.instance, number }) catch "r-00000000";
     }
 
     fn route(api: *Api, ctx: *const Context, request: Request, id: []const u8) Failure!Reply {

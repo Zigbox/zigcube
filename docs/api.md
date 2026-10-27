@@ -24,7 +24,7 @@ each is an **Ask first**. The owner approved this document as written (endpoints
 | Base path | `/v1` |
 | Methods | The console uses `GET` only. Writes are for the CLI: see [Writes](#writes-proposed-in-slice-5b-owner-approval-pending), which is a proposal. |
 | Bodies | `application/json`, UTF-8. Values are the JSON records of [keys.md](keys.md), unchanged. |
-| Request ID | The server assigns one to every request and returns it in the `X-Request-Id` response header, on success and failure. A client may send its own `X-Request-Id` (`[A-Za-z0-9-]`, 8 to 64 bytes); the server then uses it. The CLI prints it with `--verbose`; bundles include it. |
+| Request ID | The server assigns one to every request and returns it in the `X-Request-Id` response header, on success and failure. A client may send its own `X-Request-Id` (`[A-Za-z0-9-]`, 8 to 64 bytes); the server then uses it. Otherwise the id is `r-<start>-<counter>`: the start part is the server's start time (so no two starts, or servers, repeat an id) and the counter is per start. The CLI prints it with `--verbose`; bundles include it. |
 | Auth | Out of scope here. SPEC says tokens are scoped; the console needs a read-only scope. A missing or insufficient token must be a diagnostic like any other. |
 | Versioning | The path carries the major version. Additive fields are not a new version, so clients ignore unknown fields. |
 
@@ -34,7 +34,7 @@ A failed request has a non-2xx status and this body:
 
 ```json
 {
-  "request_id": "r-0001a4f",
+  "request_id": "r-5f3a91c2-0001a4f",
   "diagnostics": [
     { "code": "ZC-E0201", "severity": "error", "blame": "external",
       "summary": "can't reach the store backend",
@@ -196,7 +196,7 @@ does not bump `generation`; a change to the image, command, env or limits does.
 The answer is the decision id and the one-line summary (api.md item 5), whether or not it wrote:
 
 ```json
-{ "request_id": "r-0001a4f", "dry_run": false, "action": "update", "name": "hello",
+{ "request_id": "r-5f3a91c2-0001a4f", "dry_run": false, "action": "update", "name": "hello",
   "generation": 1, "change": "replicas 3 → 5", "revision": 431,
   "decision": "0001761350123456-0001-0007" }
 ```

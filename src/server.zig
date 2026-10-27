@@ -94,6 +94,9 @@ pub const Server = struct {
                     .version = options.version,
                     .backend = config.store.backend(),
                     .started_at_ms = now,
+                    // The low 32 bits of the start time in milliseconds, never 0: a restart
+                    // is later, so its ids differ from the last start's.
+                    .instance = @max(1, @as(u32, @truncate(now))),
                     // Distinct from the controller's instance, so two writers in one
                     // millisecond never share a decision id.
                     .source = .{ .instance = 0 },
