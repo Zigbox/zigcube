@@ -154,6 +154,58 @@ pub const api_response_bytes_max: u32 = 8 * 1024 * 1024;
 pub const why_steps_max: u32 = 64;
 pub const why_text_bytes_max: u32 = 480;
 
+// ---- Server shell (zcube-server) -----------------------------------------------------------
+
+/// Connections the HTTP server serves at once; the next one is answered 503 and closed.
+pub const http_connections_max: u32 = 64;
+/// Long-poll watches held open at once. Each holds one store watch (and, on Postgres, one
+/// connection), so this stays well under `store_postgres_watches_max`.
+pub const http_holds_max: u32 = 24;
+/// Refusals being delivered at once to connections the server will not serve. Each has a task
+/// and a slot of its own, so a flood of refused clients cannot starve the served ones; one past
+/// this is closed without a reply.
+pub const http_refusals_max: u32 = 4;
+/// The request line and headers together; a larger head is 431.
+pub const http_head_bytes_max: u32 = 16 * 1024;
+/// A request body; a larger one is 413 and the connection is closed.
+pub const http_body_bytes_max: u32 = api_request_bytes_max;
+/// A connection that sends nothing for this long while the server waits for a request (or the
+/// rest of one) is closed. It does not apply while a long poll is held.
+pub const http_idle_timeout_ms: u32 = 10 * 1000;
+/// How often the idle watchdog of a connection looks.
+pub const http_watchdog_ms: u32 = 500;
+/// Requests served on one connection before the server closes it.
+pub const http_requests_per_connection_max: u32 = 1000;
+pub const http_write_buffer_bytes: u32 = 16 * 1024;
+/// What the server reads and discards from a client whose connection it is closing, so that the
+/// close is not a reset that eats the reply.
+pub const http_linger_bytes_max: u32 = 1024 * 1024;
+/// The longest a held long poll sleeps in one wait on the store, so it notices a stop request.
+pub const http_hold_slice_ms: u32 = 1000;
+pub const server_header_name_bytes_max: u32 = 64;
+/// The server's own threads beyond one per connection: the accept loop, the controller loop.
+pub const server_threads_extra: u32 = 4;
+/// How often the controller loop expires leases, and compacts the store.
+pub const server_maintenance_ms: u32 = 1000;
+pub const server_compact_ms: u32 = 60 * 1000;
+/// Revisions of history the compaction keeps, so a console that was away for a minute can still
+/// resume its watch and a paged list can finish.
+pub const server_compact_keep_revisions: u32 = 1000;
+/// After a failed step the controller waits this long, doubling up to the maximum.
+pub const server_retry_ms_min: u32 = 250;
+pub const server_retry_ms_max: u32 = 5000;
+/// A repeated failure is shown again only after this long (a new code is shown at once).
+pub const server_report_ms: u32 = 30 * 1000;
+pub const config_bytes_max: u32 = 16 * 1024;
+pub const config_path_bytes_max: u32 = 1024;
+pub const listen_bytes_max: u32 = 128;
+pub const store_spec_bytes_max: u32 = 1100;
+/// The controller loop and the accept loop may not wait on a clock-less store longer than this
+/// between looks (the memory store never blocks in `Watch.next`).
+pub const server_poll_ms: u32 = 10;
+/// How long a stopping server waits for its connections before it closes them.
+pub const server_stop_ms: u32 = 2000;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
@@ -193,4 +245,13 @@ comptime {
     assert(decision_counter_modulus == 10_000); // Four digits in the id.
     assert(api_response_bytes_max <= request_arena_bytes_max);
     assert(controller_txns_per_step_max > 0);
+    // The controller's watch, and one spare, besides the held watches.
+    assert(http_holds_max + 2 < store_postgres_watches_max);
+    assert(http_holds_max <= http_connections_max);
+    assert(http_head_bytes_max < http_body_bytes_max);
+    assert(http_watchdog_ms < http_idle_timeout_ms);
+    assert(http_hold_slice_ms <= api_watch_timeout_ms_max);
+    assert(server_retry_ms_min <= server_retry_ms_max);
+    assert(server_poll_ms >= store_watch_poll_ms);
+    assert(store_spec_bytes_max > store_postgres_conninfo_bytes_max);
 }

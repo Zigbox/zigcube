@@ -95,7 +95,7 @@ pub const Api = struct {
 
     /// The client's id if it sent a valid one, else a new one (an invalid one is refused by
     /// `route`, and the refusal is reported under the new id).
-    fn assign_id(api: *Api, ctx: *const Context, request: Request) []const u8 {
+    pub fn assign_id(api: *Api, ctx: *const Context, request: Request) []const u8 {
         if (request.request_id) |sent| {
             if (id_problem(sent) == null) return sent;
         }
