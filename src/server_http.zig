@@ -68,6 +68,7 @@ pub const Shared = struct {
     store: store.Store,
     clock: Clock,
     api: api_mod.Api,
+    /// Taken by writes only (they move the API's decision source).
     api_mutex: std.Io.Mutex = .init,
     options: Options,
     holds: std.atomic.Value(u32) = .init(0),
@@ -150,21 +151,22 @@ pub const Shared = struct {
         }
     }
 
-    // ---- The API, one request at a time ----
+    // ---- The API ----
 
+    /// Reads run side by side (the request counter is atomic); a write also moves the decision
+    /// source, so writes take turns.
     fn handle(
         shared: *Shared,
         ctx: *const controller.Context,
         request: api_mod.Request,
     ) api_mod.Response {
+        if (is_read(request.method)) return shared.api.handle(ctx, request);
         shared.api_mutex.lockUncancelable(shared.io);
         defer shared.api_mutex.unlock(shared.io);
         return shared.api.handle(ctx, request);
     }
 
     fn new_id(shared: *Shared, ctx: *const controller.Context) []const u8 {
-        shared.api_mutex.lockUncancelable(shared.io);
-        defer shared.api_mutex.unlock(shared.io);
         return shared.api.assign_id(ctx, .{ .method = "", .path = "" });
     }
 };
@@ -348,7 +350,7 @@ fn serve_api(
     defer _ = shared.holds.fetchSub(1, .acq_rel);
     if (!wait_for_change(shared, first, from)) return first;
     var again = request;
-    again.query = without_timeout(ctx.arena, parsed.query) catch return first;
+    again.hold = false;
     return shared.handle(ctx, again);
 }
 
@@ -397,20 +399,6 @@ fn matches(prefixes: []const []const u8, key: []const u8) bool {
         if (std.mem.startsWith(u8, key, prefix)) return true;
     }
     return false;
-}
-
-/// The query with its `timeout` parameter replaced by `timeout=0`: "do not wait".
-fn without_timeout(arena: Allocator, query: []const u8) Allocator.Error![]const u8 {
-    var text: std.ArrayList(u8) = .empty;
-    var pairs = std.mem.splitScalar(u8, query, '&');
-    while (pairs.next()) |pair| {
-        if (pair.len == 0) continue;
-        if (std.mem.startsWith(u8, pair, "timeout=")) continue;
-        try text.appendSlice(arena, pair);
-        try text.append(arena, '&');
-    }
-    try text.appendSlice(arena, "timeout=0");
-    return text.items;
 }
 
 const json_headers = [_]http.Header{
@@ -627,23 +615,6 @@ fn log_request(
 }
 
 const testing = std.testing;
-
-test "the timeout parameter is replaced by timeout=0, the rest kept in order" {
-    // Goal: the second ask of a held watch is the first one with waiting turned off. Method:
-    // queries with the parameter first, last, in the middle and absent.
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const first = try without_timeout(arena, "from=5&timeout=25000");
-    try testing.expectEqualStrings("from=5&timeout=0", first);
-    const second = try without_timeout(arena, "timeout=1&from=5");
-    try testing.expectEqualStrings("from=5&timeout=0", second);
-    try testing.expectEqualStrings(
-        "prefix=%2Fa&from=5&prefix=%2Fb&timeout=0",
-        try without_timeout(arena, "prefix=%2Fa&timeout=9&from=5&prefix=%2Fb"),
-    );
-    try testing.expectEqualStrings("timeout=0", try without_timeout(arena, ""));
-}
 
 test "a key matches a hold when it is under one of its prefixes, or when there are none" {
     // Goal: which changes end a hold. Method: no prefixes, one, two.

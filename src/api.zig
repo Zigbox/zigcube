@@ -51,6 +51,9 @@ pub const Request = struct {
     request_id: ?[]const u8 = null,
     /// The request body, for `POST /v1/apply` (the only endpoint that reads one).
     body: []const u8 = "",
+    /// False asks a watch not to say "hold me": the shell sets it when it asks again after a hold
+    /// ended, so the same request is answered with what is ready and nothing more.
+    hold: bool = true,
 };
 
 pub const Response = struct {
@@ -72,7 +75,9 @@ pub const Api = struct {
     started_at_ms: u64,
     /// False for a token that may write: it sees `env` values.
     read_only: bool = true,
-    counter: u32 = 0,
+    /// Atomic so that several reads can run at once; the writes (`POST`, `DELETE`) also change
+    /// `source`, and the shell runs those one at a time.
+    counter: std.atomic.Value(u32) = .init(0),
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
 
@@ -99,8 +104,8 @@ pub const Api = struct {
         if (request.request_id) |sent| {
             if (id_problem(sent) == null) return sent;
         }
-        api.counter +%= 1;
-        return std.fmt.allocPrint(ctx.arena, "r-{x:0>7}", .{api.counter}) catch "r-0000000";
+        const number = api.counter.fetchAdd(1, .monotonic) +% 1;
+        return std.fmt.allocPrint(ctx.arena, "r-{x:0>7}", .{number}) catch "r-0000000";
     }
 
     fn route(api: *Api, ctx: *const Context, request: Request, id: []const u8) Failure!Reply {
@@ -112,7 +117,13 @@ pub const Api = struct {
         var parts = std.mem.splitScalar(u8, request.path[prefix.len..], '/');
         const first = parts.next().?; // A split always has a first part.
         const query = try Query.parse(ctx, request.query);
-        const call: Call = .{ .api = api, .ctx = ctx, .query = &query, .parts = &parts };
+        const call: Call = .{
+            .api = api,
+            .ctx = ctx,
+            .query = &query,
+            .parts = &parts,
+            .hold = request.hold,
+        };
         if (std.mem.eql(u8, request.method, "POST")) {
             return call.write_post(first, request.body, id);
         }
@@ -538,6 +549,7 @@ const list_limit_default: u64 = 100;
 
 const Call = struct {
     api: *Api,
+    hold: bool,
     ctx: *const Context,
     query: *const Query,
     parts: *Parts,
@@ -704,9 +716,13 @@ const Call = struct {
         try out.end_array();
         try out.end_object();
         var reply = try out.finish();
-        if (events.items.len == 0 and timeout_ms > 0) {
-            reply.hold_ms = timeout_ms;
-            reply.hold_prefixes = prefixes;
+        if (events.items.len == 0) {
+            if (call.hold) {
+                if (timeout_ms > 0) {
+                    reply.hold_ms = timeout_ms;
+                    reply.hold_prefixes = prefixes;
+                }
+            }
         }
         return reply;
     }

@@ -202,6 +202,14 @@ test "watch answers what is ready with a bookmark and leaves the waiting to the 
     const waiting_query = try std.fmt.bufPrint(&query_buffer, waiting_format, .{bookmark + 1});
     const waiting = rig.get("/v1/watch", waiting_query);
     try testing.expectEqual(@as(u32, 5000), waiting.hold_ms);
+    const again = rig.call(.{
+        .method = "GET",
+        .path = "/v1/watch",
+        .query = waiting_query,
+        .hold = false,
+    });
+    try testing.expectEqual(@as(u32, 0), again.hold_ms);
+    try testing.expectEqual(@as(u16, 200), again.status);
 
     _ = try rig.world.delete_service("hello");
     const deleted_format = "from={d}&timeout=0&prefix=/services/";

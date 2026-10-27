@@ -28,13 +28,22 @@ Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding han
 
 These arrive with the scaffold; keep this list current as they land.
 
-- `zig build` builds `zig-out/bin/zcube`, `zcube-server` and `zcube-agent`.
+- `zig build` builds `zig-out/bin/zcube`, `zcube-server` and `zcube-agent`. `zcube-server` needs
+  the SQLite and libpq development files, embeds `web/` and the console's WASM module, and runs
+  as `zcube-server [--config FILE] [--listen HOST:PORT] [--store memory|sqlite:<path>|postgres:<settings>]
+  [--create-store]`; `--help` says the rest. Its writes are unauthenticated: listen on a private address.
 - `zig build test` runs unit and snapshot tests (tidy's own tests included).
 - `zig build tidy` checks formatting and the mechanical style rules: 100 columns, 70-line functions, banned patterns, `catch unreachable` comments, no `and`/`or` inside `assert(...)`. Run it before every commit; CI does.
 - `zig build test-store -Dbackend=memory|sqlite|postgres [-Dseed=N]` runs the store conformance suite. It always re-runs with a fresh seed (Zig's per-run test seed), prints nothing when it passes, and a failing test prints `seed=N`; replay with `-Dseed=N`. SQLite needs `libsqlite3-dev`, Postgres `libpq-dev` (the session-start hook installs it).
 - **The Postgres test database.** `-Dbackend=postgres` takes the connection from `-Dpostgres=<libpq settings>`, else the `ZCUBE_TEST_POSTGRES` environment variable, else the server `zig build pg-up` starts (`host=127.0.0.1 port=55432 user=zcube dbname=postgres`). `zig build pg-up` runs a throwaway Postgres 16 as the `postgres` user in `/tmp/zcube-pg` (override with `ZCUBE_PG_DIR`, `ZCUBE_PG_PORT`; `ZCUBE_PG_BIN` if the Postgres programs are not on PATH) and prints the variable; `zig build pg-down` stops it and deletes the directory. The suite creates a schema of its own per test in that database and drops it, so any database it may create schemas in will do. `zig build test` also runs the Postgres-specific tests, and skips those that need a database when `ZCUBE_TEST_POSTGRES` is unset; `test-store -Dbackend=postgres` fails instead of skipping.
 - `zig build wasm` compiles the control-plane core for `wasm32-freestanding` (`zig-out/wasm/zcube_core.wasm`); `zig build wasm-check [-Doptimize=ReleaseSafe]` runs it in Node (installed here at `/opt/node22`) and checks its result; `zig build wasm-test` runs the core's unit tests under WASI in Node. See `docs/wasm.md`.
 - `zig build sim-c0 [-Dseed=N] [-Dops=N]` runs the deterministic C0 simulation natively and as WASM and compares the reports (a simulation, never reported as `demo-c0`); `zig build sim-c0-exe` installs its native runner for loops over many seeds. See `docs/core.md`.
+- `zig build console-wasm` builds the console's browser module (`src/console_wasm.zig`, the real
+  core over a memory store and the simulated runtime, ReleaseSafe) and checks it in Node under both
+  V8 compilers: exactly one import (`env.zc_panic`), `GET /v1/status`, the C0 scenario, a reported
+  panic. `zig build console-site` also installs the whole console to `zig-out/console` for any
+  static file server. `node tools/browser_check.mjs <url> --mode sim|server` is the dev-time
+  Playwright check. See `docs/console.md`.
 - `zig build demo-cN` runs milestone N's demo.
 
 ## Working as the implementer
