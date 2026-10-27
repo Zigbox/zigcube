@@ -62,6 +62,14 @@ pub const Code = enum(u8) {
     E0302,
     E0501,
     E0502,
+    E0503,
+    E0504,
+    E0505,
+    E0506,
+    E0507,
+    E0508,
+    E0509,
+    W0501,
     B0001,
     B0002,
 };
@@ -622,6 +630,123 @@ pub const registry = [_]Entry{
         \\The cause line names the operation and what the host reported. A failure
         \\to start one workload is not this code: it is reported on that workload,
         \\with the runtime's own diagnostic.
+        ,
+    },
+    .{
+        .code = .E0503,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the agent can't reach zcube-server",
+        .explanation =
+        \\The agent asked zcube-server for its replicas or told it what it saw, and
+        \\the connection failed: the server is down, the address in the agent's
+        \\configuration is wrong, or the network between them is broken.
+        \\
+        \\Workloads keep running while the server is away: each runs under a
+        \\supervisor of its own. The agent retries with a growing pause and reports
+        \\once when the server is back. Check that the server is up and that
+        \\--server names its address.
+        ,
+    },
+    .{
+        .code = .E0504,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "zcube-server refused the agent's request",
+        .explanation =
+        \\zcube-server answered the agent with an error it does not expect, or with
+        \\a reply the agent cannot read. The cause line carries the server's own
+        \\diagnostic. The server and the agent are probably different versions,
+        \\or something between them is answering in the server's place.
+        \\
+        \\Use the agent that came with the server. The agent retries; nothing it
+        \\runs is stopped meanwhile.
+        ,
+    },
+    .{
+        .code = .E0505,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the agent's configuration can't be used",
+        .explanation =
+        \\A flag or a setting in the agent's ZON file is missing, unknown or out of
+        \\range, or the image fixtures file it names cannot be read. The cause
+        \\line names the setting. The agent did not start and changed nothing.
+        \\
+        \\Run zcube-agent --help for the flags and the file's fields.
+        ,
+    },
+    .{
+        .code = .E0506,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the agent's state directory can't be used",
+        .explanation =
+        \\The agent keeps one directory per container, holding the container's
+        \\spec, the run record its supervisor writes and the lock that shows the
+        \\supervisor is alive. The directory could not be created or read, or
+        \\another agent is using it.
+        \\
+        \\Check the path and its permissions, and that only one agent uses it. The
+        \\cause line names the path and what the host reported.
+        ,
+    },
+    .{
+        .code = .E0507,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the agent can't start a container's supervisor",
+        .explanation =
+        \\Each container runs under a supervisor, the agent's own executable started
+        \\again. The host refused to start it: no process slots, no memory, or the
+        \\executable is gone. The container was not started.
+        \\
+        \\The cause line says what the host reported. Free process slots or restart
+        \\the agent from its installed executable; the controller retries.
+        ,
+    },
+    .{
+        .code = .E0508,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the container's command can't be run",
+        .explanation =
+        \\The supervisor could not execute the replica's command: the program was
+        \\not found on the node, is not executable, or is not a program. Nothing
+        \\of the workload ran.
+        \\
+        \\Check the command in the service file. The replica is held, not retried:
+        \\a new one would fail the same way. Apply the corrected file to replace it.
+        ,
+    },
+    .{
+        .code = .E0509,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the container's supervisor is gone",
+        .explanation =
+        \\The container's supervisor process ended without writing a run record,
+        \\so nobody knows how the command ended: it was killed, or the host
+        \\restarted. The agent stops any process of the container that is left,
+        \\and the controller starts a replacement.
+        \\
+        \\If this repeats, look for something killing zcube-agent processes (an
+        \\out-of-memory killer, a cleanup job) on the node.
+        ,
+    },
+    .{
+        .code = .W0501,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the agent's lease ended and it registered again",
+        .explanation =
+        \\The agent could not renew its lease in time, so the store deleted the
+        \\node's registration. The agent granted a new lease and registered again.
+        \\Its workloads keep running: stopping them when a node is cut off is
+        \\planned for a later milestone.
+        \\
+        \\This happens when the agent was paused or cut off from the server for
+        \\longer than the lease time to live.
         ,
     },
     .{

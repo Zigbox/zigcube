@@ -1,0 +1,5 @@
+error[ZC-E0504]: zcube-server refused the agent's request
+  cause  body: is not what this endpoint takes: see docs/api.md
+  fix    look at the server's log for this request, or restart the server
+  more   zcube explain E0504 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0504.html

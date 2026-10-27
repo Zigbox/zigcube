@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     const console = add_console_steps(b);
     const web_files = add_web_files(b, console);
 
-    add_executables(b, .{
+    const built = add_executables(b, .{
         .target = target,
         .optimize = optimize,
         .options = options,
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
         .sqlite = sqlite,
         .libpq = libpq_module,
         .web_files = web_files,
-    });
+    }, built);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
         .zigbox = zigbox_module,
     });
+    add_agent_smoke_step(b, built, zigbox_module);
     add_tidy_step(b);
     add_errors_site_steps(b);
     add_pg_dev_steps(b);
@@ -81,7 +82,7 @@ pub fn build(b: *std.Build) void {
 
 /// `zig build test`. The single-threaded half of the conformance suite runs here against the
 /// memory store; `test-store` runs the whole suite against the backend it is given.
-fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions) void {
+fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     const memory_suite = memory_suite_options(b);
     const test_step = b.step("test", "Run unit and snapshot tests");
     const unit_tests = b.addTest(.{
@@ -99,7 +100,15 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions) void {
             },
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    const run = b.addRunArtifact(unit_tests);
+    // The tests of the fake runtime run real processes, and the supervisor of each is the agent's
+    // own executable (`zcube-agent supervise`). The build system of 0.17 knows the install prefix
+    // only while it runs, so the tests look for `zig-out/bin/zcube-agent` (or the path in
+    // `ZCUBE_AGENT_EXE`) and skip if it is not there; the step installs the agent first and
+    // reruns when the agent changes.
+    run.step.dependOn(&built.agent_install.step);
+    run.addFileInput(built.agent.getEmittedBin());
+    test_step.dependOn(&run.step);
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
@@ -151,8 +160,18 @@ const ExecutablesOptions = struct {
     web_files: *std.Build.Module,
 };
 
-fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) void {
+/// What `add_executables` made that other steps use: the server and the agent, and the steps that
+/// install them (the agent-smoke test runs the installed files, as a deployment would).
+const Built = struct {
+    server: *std.Build.Step.Compile,
+    agent: *std.Build.Step.Compile,
+    server_install: *std.Build.Step.InstallArtifact,
+    agent_install: *std.Build.Step.InstallArtifact,
+};
+
+fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built {
     const build_options = executables_options.options.createModule();
+    var built: Built = undefined;
     for (executables) |executable| {
         const module = b.createModule(.{
             .root_source_file = b.path(executable.root),
@@ -171,8 +190,40 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) void 
             module.addImport("web_files", executables_options.web_files);
         }
         const exe = b.addExecutable(.{ .name = executable.name, .root_module = module });
-        b.installArtifact(exe);
+        const install = b.addInstallArtifact(exe, .{});
+        b.getInstallStep().dependOn(&install.step);
+        if (std.mem.eql(u8, executable.name, "zcube-server")) {
+            built.server = exe;
+            built.server_install = install;
+        }
+        if (std.mem.eql(u8, executable.name, "zcube-agent")) {
+            built.agent = exe;
+            built.agent_install = install;
+        }
     }
+    return built;
+}
+
+/// `zig build agent-smoke`: the server and the agent as real processes, with real containers
+/// (src/agent_smoke.zig). It runs the executables the build made, whatever `-Doptimize` says, and
+/// is not `demo-c0`. It never caches: it exists to be run.
+fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.Module) void {
+    const exe = b.addExecutable(.{
+        .name = "agent_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agent_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox_module }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArtifactArg(built.server);
+    run.addArtifactArg(built.agent);
+    run.addFileArg(b.path("fixtures/images.zon"));
+    run.has_side_effects = true;
+    const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
+    b.step("agent-smoke", help).dependOn(&run.step);
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it.

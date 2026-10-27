@@ -243,6 +243,71 @@ fn runtime_failed(diag: *diag_mod.Diag) void { // runtime.zig
     sample(diag, .E0502, &.{cause}, "check the node's runtime, then retry");
 }
 
+fn agent_unreachable(diag: *diag_mod.Diag) void { // agent_http.zig
+    sample(
+        diag,
+        .E0503,
+        &.{"no answer from zcube-server at 127.0.0.1:7070: the connection was refused"},
+        "start the server, or give the agent the address it listens on",
+    );
+}
+
+fn agent_refused(diag: *diag_mod.Diag) void { // agent_remote.zig
+    sample(diag, .E0504, &.{
+        "zcube-server answered 400: the request can't be understood (ZC-E0104)",
+        "body: is not what this endpoint takes: see docs/api.md",
+    }, "look at the server's log for this request, or restart the server");
+}
+
+fn agent_config(diag: *diag_mod.Diag) void { // agent_config.zig
+    sample(diag, .E0505, &.{"the node has no name"}, "give --node, or .node in the file");
+}
+
+fn agent_state_dir(diag: *diag_mod.Diag) void { // fake_runtime.zig
+    sample(
+        diag,
+        .E0506,
+        &.{"another agent is using the state directory /var/lib/zcube-agent"},
+        "give each agent a state directory of its own",
+    );
+}
+
+fn agent_supervisor(diag: *diag_mod.Diag) void { // fake_runtime.zig
+    sample(
+        diag,
+        .E0507,
+        &.{"the host refused to start a supervisor for hello-1"},
+        "free process slots on the node, or restart the agent",
+    );
+}
+
+fn agent_command(diag: *diag_mod.Diag) void { // fake_supervisor.zig
+    sample(
+        diag,
+        .E0508,
+        &.{"the command was not found on this node"},
+        "check the command in the service file, then apply it again",
+    );
+}
+
+fn agent_lost(diag: *diag_mod.Diag) void { // fake_runtime.zig
+    sample(
+        diag,
+        .E0509,
+        &.{"the supervisor of hello-1 ended without writing how the command ended"},
+        "look for something killing zcube-agent processes on this node",
+    );
+}
+
+fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
+    sample(
+        diag,
+        .W0501,
+        &.{"lease 4 ended; node node1 registered again on lease 5"},
+        "if this repeats, check the network between the agent and the server",
+    );
+}
+
 /// A bug the server reports (it has written its own bundle, on its own machine).
 fn server_bug(diag: *diag_mod.Diag) void { // store_postgres.zig
     diag.raise(.B0001);
@@ -310,6 +375,14 @@ const cases = [_]Case{
     relayed(.E0302, too_many),
     relayed(.E0501, unknown_container),
     relayed(.E0502, runtime_failed),
+    relayed(.E0503, agent_unreachable),
+    relayed(.E0504, agent_refused),
+    relayed(.E0505, agent_config),
+    relayed(.E0506, agent_state_dir),
+    relayed(.E0507, agent_supervisor),
+    relayed(.E0508, agent_command),
+    relayed(.E0509, agent_lost),
+    relayed(.W0501, agent_lease),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
 };
 

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0506]: the agent's state directory can't be used
+  cause  another agent is using the state directory /var/lib/zcube-agent
+  reqid  r-0000001
+  fix    give each agent a state directory of its own
+  more   zcube explain E0506
+  docs   https://zigbox.github.io/zigcube/errors/E0506.html

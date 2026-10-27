@@ -1,0 +1,5 @@
+error[ZC-E0509]: the container's supervisor is gone
+  cause  the supervisor of hello-1 ended without writing how the command ended
+  fix    look for something killing zcube-agent processes on this node
+  more   zcube explain E0509 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0509.html

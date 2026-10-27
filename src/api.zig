@@ -27,6 +27,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const codes = @import("diag/codes.zig");
+const agent_api = @import("agent_api.zig");
 const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
@@ -124,6 +125,22 @@ pub const Api = struct {
         if (!std.mem.startsWith(u8, request.path, prefix)) return no_such(ctx, request.path);
         var parts = std.mem.splitScalar(u8, request.path[prefix.len..], '/');
         const first = parts.next().?; // A split always has a first part.
+        if (std.mem.eql(u8, first, "agent")) {
+            // The agent's endpoints (agent_api.zig) parse their own few parameters.
+            const agent = try agent_api.route(
+                ctx,
+                request.method,
+                &parts,
+                request.query,
+                request.body,
+                request.hold,
+            );
+            return .{
+                .body = agent.body,
+                .hold_ms = agent.hold_ms,
+                .hold_prefixes = agent.hold_prefixes,
+            };
+        }
         const query = try Query.parse(ctx, request.query);
         const call: Call = .{
             .api = api,
