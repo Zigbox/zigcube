@@ -204,13 +204,20 @@ the transaction that writes a new one for that subject. When a subject is delete
 decisions stay for 24 hours so `zcube why` can still say why a replica went away. The numbers
 are constants in `src/constants.zig`, not user configuration, until someone needs them to be.
 
-## One layout observation for the owner
+C1 changes this rule: decisions on a live subject's current chain are never evicted
+([authority.md](authority.md), section 5).
 
-An agent needs only its own node's replicas, but `/replicas/<service>/<id>` is keyed by
-service, so a prefix watch cannot select one node: every agent would watch all replicas and
-filter, which is O(agents × replicas) of wasted fan-out. For C0 (one node) this does not
-matter. For C1 I would propose an index key **`/assigned/<node>/<replica>`**, written by the
-scheduler in the same transaction that sets `node`, that the agent watches. It is an addition
-to HANDOFF's suggested layout, so it needs your approval; the alternative is server-side
-filtering of the watch by the `node` field, which keeps the layout but makes the API server
-inspect values.
+## C1 changes this layout (decided 2026-10-27)
+
+This file describes the layout as C0 built it. For C1 the owner approved two changes, specified in
+[authority.md](authority.md):
+
+- **Placement moves out of `/replicas`.** The scheduler writes `/assigned/<node>/<replica>`, which
+  the agent watches, instead of the `node` field (this settles the fan-out observation that used to
+  stand here). A node controller writes `/node-status/<node>`, and observed records gain `tenure`
+  and `assignment`.
+- **Retention follows reachability.** Decisions on a live subject's current chain are pinned;
+  repeated actions collapse into one summary decision; `zcube why` says whether its chain is
+  `complete` or `truncated`, and why.
+
+C1 updates the sections above when it lands.
