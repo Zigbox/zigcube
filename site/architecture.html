@@ -111,7 +111,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
 <main class="wrap">
   <div class="hero read">
-    <p class="eyebrow">Architecture · as of 2026-10-27 · authority model revision 2</p>
+    <p class="eyebrow">Architecture · as of 2026-10-27 · authority model revision 3</p>
     <h1>How Zigcube is built</h1>
     <p class="lede">Desired state goes into a versioned store. Controllers turn it into replicas and record a decision for every action. A thin agent on each node pulls its replicas and runs them through a runtime interface. C0 builds all of that against a fake runtime on one node. This page says what exists, what C1 adds next, and what is planned after that.</p>
     <div class="legend"><span class="pill s-done">Built: C0, demonstrated in CI</span><span class="pill s-wip">Next: C1, not started</span><span class="pill s-plan">Planned: C2 to C8</span></div>
@@ -335,14 +335,15 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
         <tr><td><code>/replicas/&lt;service&gt;/&lt;id&gt;</code></td><td>replica controller</td><td>desired replica: spec and generation, <b>no placement</b></td></tr>
         <tr><td><code>/assigned/&lt;node&gt;/&lt;id&gt;</code></td><td>scheduler</td><td>the placement: replica, service, resolved requests. Its revision is the <b>placement epoch</b>. The agent watches only its own node's prefix</td></tr>
         <tr><td><code>/allocations/&lt;node&gt;</code></td><td>scheduler</td><td>authoritative accounting: the sum of the node's assigned requests, updated in every placement and release transaction</td></tr>
+        <tr><td><code>/audit/allocations/&lt;node&gt;</code></td><td>allocation auditor</td><td>an open finding: the recorded and reconstructed totals, and the revision both were read at. While it is open, nothing new is placed on the node</td></tr>
         <tr><td><code>/nodes/&lt;node&gt;</code></td><td>that node's agent</td><td>registration and declared capacity, bound to the lease. Its revision is the agent's <b>tenure</b></td></tr>
         <tr><td><code>/node-status/&lt;node&gt;</code></td><td>node controller</td><td><code>ready</code>, <code>lost</code> or <code>fenced</code>, the tenure judged, and the deciding decision</td></tr>
         <tr><td><code>/observed/&lt;node&gt;/&lt;id&gt;</code></td><td>that node's agent</td><td>as in C0, plus the <code>tenure</code> and <code>assignment</code> it was observed under. A write is refused unless the tenure is current</td></tr>
-        <tr><td><code>/decisions/&lt;id&gt;</code></td><td>whoever acts</td><td>one action and its cause, <b>immutable</b> once written</td></tr>
+        <tr><td><code>/decisions/&lt;id&gt;</code></td><td>whoever acts</td><td>one action and its cause, <b>immutable</b> once written, with the <b>evidence</b> it acted on: the fields of the cited key's value at the cited revision</td></tr>
         <tr><td><code>/decision-summaries/&lt;kind&gt;/&lt;name&gt;/&lt;action&gt;/&lt;cause-kind&gt;</code></td><td>the actor it counts</td><td>count, first and last time, and the newest decision for repeated actions. A projection, never a cause</td></tr>
       </tbody>
     </table></div>
-    <p class="note read">C1 retention keeps, for each live subject, its newest decision of every action and the chain behind each one. Only decisions outside those chains age out under the C0 limits. <code>zcube why</code> returns <code>complete</code>, or <code>truncated</code> with the reason (retention, a deleted subject, or a compacted key).</p>
+    <p class="note read">C1 retention keeps, for each live subject, its newest decision of every action and the chain behind each one. Only decisions outside those chains age out under the C0 limits. <code>zcube why</code> returns <code>complete</code>, or <code>truncated</code> with the reason (retention, a deleted subject, or a compacted key). A terminal is rendered from the evidence the decision carries, never from the key's current value.</p>
   </section>
 
   <section id="limits">
@@ -381,9 +382,11 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
         <li><b>One writer role per key prefix</b>: the API, the replica controller, the scheduler, the node controller, each node's agent. The scheduler no longer writes into <code>/replicas</code>.</li>
         <li><b>The read-set rule</b>: a controller's transaction compares every key whose value justified the action, so a stale plan writes nothing.</li>
         <li><b>Only the scheduler assigns and releases</b>, and it updates the allocation record in the same transaction. A retired replica or a lost node is a fact the scheduler reacts to.</li>
+        <li><b>The full placement compare set.</b> A placement compares the replica, the absence of another assignment, the node's tenure and capacity, its <b>readiness</b>, its allocation record, and the absence of an open audit finding. A node lost between planning and commit gets nothing.</li>
         <li><b>No phantoms in capacity.</b> A decision over a set compares one authoritative aggregate that every change to the set updates. For capacity that is <code>/allocations/&lt;node&gt;</code>, owned by the scheduler and changed in the same transaction as every placement and release, so no placement overcommits a node.</li>
+        <li><b>Audited, never silently repaired.</b> An auditor rebuilds each node's allocation from its assignments at one revision. A mismatch is recorded as a finding and reported as a bug, and the node gets no new placements. Repair is an operator's request, carried out by the scheduler as a decision of its own.</li>
         <li><b>Admissible observations</b>: a controller acts on an observation only under the node's current tenure, the replica's current placement, and a ready node. Older ones may explain, never justify.</li>
-        <li><b>Decisions are immutable.</b> A decision another decision cites never changes afterwards. Repeated actions are counted in a separate summary.</li>
+        <li><b>Decisions are immutable and carry their evidence.</b> A decision another decision cites never changes afterwards. Each one embeds what it read from the key it cites, so an explanation survives that key changing or being compacted. Repeated actions are counted in a separate summary.</li>
         <li><b>A lease expiry is not proof of a stop.</b> Stateless replicas accept the stated window. A stateful replica (C7) moves only with a fencing proof: the node confirms, an external fence succeeds, or an operator asserts it, and durable writes check the placement epoch.</li>
         <li>Still to fix in the brief: what happens to a replica that fits no node (held as pending, with a decision naming the shortfall), the final fencing constants, a random part in server-assigned request IDs, and the watch fan-out benchmark.</li>
       </ul></div>
@@ -404,7 +407,9 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
         <li><b>I4.</b> Every key is written only by its prefix's writer role.</li>
         <li><b>I5.</b> Every <code>why</code> answer is complete, or names its truncation.</li>
         <li><b>I6.</b> Allocation is conserved, and no placement overcommits a node.</li>
-        <li>Negative tests must <em>find</em> I1b broken under excess skew or a wedged node, and I6 broken when a scheduler skips the allocation compare.</li>
+        <li><b>I7.</b> No placement commits onto a node that is not ready.</li>
+        <li><b>Evidence test.</b> Every decision's explanation is captured, then every cited key is changed and compacted. Each answer must render the same evidence, or say it is truncated and why.</li>
+        <li>Negative tests must <em>find</em> the failures: I1b under excess skew or a wedged node, I6 when a scheduler skips the allocation compare, and I7 when it skips the readiness compare.</li>
       </ul></div>
     </div>
   </section>
@@ -417,10 +422,10 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       <tbody>
         <tr><td>C2 · Swarm</td><td>Agents advertise a compact summary of their chunk store, for example a Bloom filter per image tree. The scheduler adds a locality score, which never overrides fit or spread. Nodes fetch chunks from peers before the registry and verify each one by hash. <code>zcube stats pull</code>.</td><td>M3 chunk store, M4 for the demo</td></tr>
         <tr><td>C3 · Rollout</td><td>Readiness and liveness checks, rolling updates within surge and unavailable limits, automatic rollback to the exact previous digest, and <code>zcube history</code> and <code>rollback</code>. The surge and unavailable limits are predicates over a set, so they get an aggregate record with one writer, like capacity.</td><td>M4</td></tr>
-        <tr><td>C4 · Mesh</td><td>WireGuard between nodes, cluster DNS, and a workload identity bound to service name and image digest. Grants such as <code>web → db:5432</code> compile into per-node rules, with default deny.</td><td>M5 network namespaces and grants</td></tr>
+        <tr><td>C4 · Mesh</td><td>WireGuard between nodes, cluster DNS, and a workload identity bound to service name, image digest and <b>placement epoch</b>. The epoch is carried from C4 so C7 can enforce it without changing the protocol. Grants such as <code>web → db:5432</code> compile into per-node rules, with default deny.</td><td>M5 network namespaces and grants</td></tr>
         <tr><td>C5 · Edge</td><td>An edge proxy role on chosen nodes, ACME certificates stored encrypted, and <code>public = "…"</code> on a service. Edge traffic enters the mesh through a grant.</td><td>C4</td></tr>
         <tr><td>C6 · Trust</td><td>A policy check at admission in the server, and again in every agent before exec, using node-local trusted keys that the API cannot change. A compromised control plane cannot run unsigned code.</td><td>M8 signatures</td></tr>
-        <tr><td>C7 · State</td><td>Named state volumes pinned by the scheduler, snapshots shipped to object storage, and restore on another node after node loss. A move needs a fencing proof, not just an expired lease, and snapshot writes are conditional on the placement epoch. The recovery point is the snapshot interval. A TLA+ model of the tenure and fencing protocol comes before C7.</td><td>M6 state volumes</td></tr>
+        <tr><td>C7 · State</td><td>Named state volumes pinned by the scheduler, snapshots shipped to object storage, and restore on another node after node loss. A move needs a fencing proof, not just an expired lease, snapshot writes are conditional on the placement epoch, and peers accept only the current epoch's identity. The recovery point is the snapshot interval. A TLA+ model of the tenure and fencing protocol comes before C7.</td><td>M6 state volumes</td></tr>
         <tr><td>C8 · Jobs</td><td>A <code>job</code> object with retries and deadlines, gang scheduling, and Zigbox M7 build steps dispatched across nodes with one shared chunk-store cache. Gang admission is all or nothing against the allocation records, in one transaction.</td><td>M7 builds</td></tr>
       </tbody>
     </table></div>

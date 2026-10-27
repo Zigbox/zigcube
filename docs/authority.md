@@ -19,6 +19,11 @@ It also replaces the shorthand "the store is the only state" with something prec
 (phantoms, §2), so `/allocations/<node>` is added; decisions are immutable and repetition is
 counted beside them (§5); I1 is split into ownership and execution; I6 is added.
 
+**Revision 3 (owner review, 2026-10-27):** allocations are audited, never silently repaired (§2);
+the placement compare set is listed in full and includes node readiness (§2, I7); a decision
+carries the evidence it acted on, and an acceptance test holds `why` to it (§5); workload identity
+is bound to the placement epoch from C4 (§3).
+
 ## 1. Three classes of state
 
 | Class | Where it lives | Authoritative for | If it is lost |
@@ -62,6 +67,7 @@ the layout.
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |
 | `/allocations/<node>` | scheduler | authoritative accounting: the sum of the `requests` of every assignment on the node, their count, and the `/nodes/<node>` revision whose capacity it was checked against | while the node exists |
+| `/audit/allocations/<node>` | allocation auditor | an open finding: the recorded and the reconstructed totals, and the revision they were read at | until a later audit finds the node consistent |
 | `/node-status/<node>` | node controller (new) | `ready`, `lost` or `fenced`, the tenure it judged (§3), when, and the decision that set it | until the node is removed |
 | `/observed/<node>/<id>` | that node's agent, through the agent endpoint | process facts (class 2, projected) | until the agent or the node controller removes it |
 | `/decisions/<id>`, `/decisions-by-subject/…` | whoever acts, in the same transaction as the action | one action and its cause; **immutable** | retention (§5) |
@@ -72,8 +78,7 @@ the layout.
   assignment with its `/replicas` record, so the agent sees the same shape as today.
 - **The scheduler moves a replica in one transaction.** It deletes `/assigned/<old>/<id>`, puts
   `/assigned/<new>/<id>`, updates both nodes' `/allocations` records and writes the
-  `place_replica` decision, with compares on the replica, on both node records and on both
-  allocation records.
+  `place_replica` decision, with the compare set below for each node it touches.
 - **Only the scheduler removes an assignment**, and it releases the allocation in the same
   transaction. A replica retired by the replica controller, or a node marked lost by the node
   controller, is a fact the scheduler reacts to; neither of them touches `/assigned` or
@@ -91,6 +96,25 @@ next step plans again from the new state. This is optimistic serialisability. Th
 `store_txn_compares_max` (16) caps the read set. That is a design pressure, not a problem. An
 action that needs more than 16 facts to justify should be split into steps, each of which records
 what it decided.
+
+### The placement compare set
+
+Every fact a placement rests on is in its transaction's compares. For a placement of replica `r`
+of service `s` on node `n`, all of these must hold at commit, or nothing is written:
+
+| Compare | Why |
+| --- | --- |
+| `/replicas/<s>/<r>` at the revision read | the replica still wants placing, with the same requests |
+| `/assigned/<n>/<r>` absent (and, for a move, `/assigned/<old>/<r>` at the revision read) | no other placement of `r` was committed meanwhile (I1a) |
+| `/nodes/<n>` at the revision read | the same tenure, and the same declared capacity |
+| `/node-status/<n>` at the revision read, whose value was `ready` | the node did not become `lost` or `fenced` between planning and commit |
+| `/allocations/<n>` at the revision read | no other placement or release on `n` (phantoms, below) |
+| `/audit/allocations/<n>` absent | the node's accounting is not under an open finding (below) |
+
+A move touches two nodes, so it compares both sets: at most 10 compares, within
+`store_txn_compares_max` (16). A release compares `/assigned/<n>/<r>` and `/allocations/<n>`.
+**Readiness is part of every placement's read set**: a scheduler that planned against a ready node
+cannot commit onto one that became lost before the commit (I7).
 
 ### Predicates over sets: phantoms
 
@@ -118,6 +142,31 @@ to one key and needs nothing new from the store.
 The same rule applies to any later predicate over a set (C3's surge and unavailable limits, C8's
 gang admission): name the aggregate record, its sole writer, and the transactions that must update
 it.
+
+### Auditing the accounting
+
+An authoritative aggregate creates an invariant that every transaction must preserve, and a bug in
+any of them would corrupt it silently. So an **allocation auditor** (a controller in the server,
+and `zcube check allocations` on demand) reconstructs each node's allocation independently:
+
+1. it lists `/assigned/<n>/` and reads `/allocations/<n>` **at one revision**, so both come from
+   the same snapshot;
+2. it sums the `requests` of the assignments and compares the sum and the count with the record;
+3. on a mismatch it writes `/audit/allocations/<n>`, a finding with both totals and the revision,
+   and an `allocation_mismatch` decision whose cause is that revision. The diagnostic is a `bug`
+   (`ZC-B` code): a mismatch can only come from a defect, never from the environment. It shows in
+   `GET /v1/status`, the console and `zcube get nodes`.
+
+**The auditor never repairs.** A repair is an authoritative mutation, so it needs an actor and a
+cause like any other. While a finding is open the scheduler places nothing on that node (the
+finding's absence is in the compare set above), but it still releases. Repair is an operator's
+request, `zcube repair allocations <node> --confirm`. The scheduler carries it out as a
+`repair_allocation` decision, citing the finding and the operator. It writes the reconstructed
+total under the same compares as a placement. The auditor's next pass, finding the node consistent,
+removes the finding.
+
+`sim-c1` runs the same reconstruction after every event (I6), so a defect is found in simulation
+before an auditor ever has to find it in a cluster.
 
 **Two edges, stated:**
 
@@ -224,6 +273,23 @@ revision) is carried by anything that writes durable state:
 - the C4 mesh identity of a stateful replica is bound to its epoch, so peers refuse the old
   instance.
 
+### Workload identity carries the placement epoch from C4
+
+SPEC.md binds C4's workload identity to service name and image digest. C7 needs the placement
+epoch in it too, and changing an identity format after C4 ships would change the mesh protocol
+under every running workload. So **from C4, a workload identity names the service, the image
+digest and the placement epoch** (the `/assigned` revision of the replica it was issued to).
+
+- C4 issues and carries the epoch in every identity, for every replica.
+- C4's grants match on service, and on digest where a grant is scoped to signed versions. They
+  ignore the epoch, so stateless traffic is unaffected.
+- C7 adds enforcement: for a stateful service, a peer accepts only the epoch that is current in
+  the store, and identities are short-lived, so a fenced instance's identity stops being honoured
+  within one lifetime.
+
+This amends the C4 entry of the design doc (SPEC.md Part II). The live doc needs the same change,
+and the owner makes it there.
+
 This is how C7's acceptance criterion "never runs on two nodes at once" becomes true rather than
 probable.
 
@@ -265,11 +331,17 @@ under a wedged-node fault without an external fence.
   node's allocation record exactly once, by exactly the replica's `requests`; at every revision
   `/allocations/<node>.allocated` equals the sum of the `requests` of `/assigned/<node>/*`; and no
   committed placement leaves a node's allocation above its declared capacity.
+- **I7. No placement onto a node that is not ready.** At the revision a placement commits,
+  `/node-status/<node>` is `ready` under the tenure the placement compared.
 
-The negative test, with skew beyond the bound or a wedged node, must find I1b violated, and a
-scheduler variant that skips the allocation compare must find I6 violated. That is how we know
-the simulation can see the failures the rules exclude. That is how
-we know the simulation can see the failure the bound excludes.
+The negative tests must find violations:
+
+- skew beyond the bound, or a wedged node, must break I1b;
+- a scheduler variant that skips the allocation compare must break I6;
+- one that skips the readiness compare, with a node lost between planning and commit, must break
+  I7.
+
+That is how we know the simulation can see the failures the rules exclude.
 
 A TLA+ model of the tenure and fencing protocol alone is worth writing before C7, and not before C1.
 
@@ -291,6 +363,41 @@ A TLA+ model of the tenure and fencing protocol alone is worth writing before C7
 
 The text output ends a truncated chain with one line saying so. Today that is a `gone` step, which
 is already in `src/why.zig`; C1 gives it a reason and puts the verdict in the JSON and the console.
+
+### A decision carries its evidence
+
+A chain usually ends at a mutable key: a desired service, an observed record. That key can change
+or vanish after the decision, and once the store compacts, its value at the cited revision is gone.
+An explanation that rendered the key's **current** value would show something that did not justify
+the action. So:
+
+- **every decision whose cause is a key embeds the evidence it acted on**, in `cause_evidence`: the
+  fields of that key's value at the cited revision that the decision used. For example, `replicas`
+  and `generation` for a `scale_up`; `status`, `exit` and the diagnostic for a `replace_replica`.
+  It is bounded (`decision_evidence_bytes_max`, about 1 KiB, plus the diagnostic copy the cause
+  already carries), and it is written in the same transaction as the decision, so it is exactly
+  what the controller read;
+- **`why` renders a terminal from the embedded evidence**, labelled with the revision it was read at.
+  If the key has changed since, it may add the current value, labelled as current. It never
+  presents the current value as the justification;
+- **a decision without evidence** (one written before C1) whose key has moved past the compaction
+  point ends `truncated` with reason `compacted`.
+
+### The acceptance test
+
+`sim-c1`, and a test over the real core, hold `why` to this for **every** decision a run writes:
+
+1. Record each decision's terminal evidence as `why` renders it right after the decision commits.
+2. Then change or delete every key any decision cites, and compact the store past all of them.
+3. Ask `why` again for every decision. Each answer must either:
+   - be `complete` and render **the same evidence as in step 1**, read from the decision; or
+   - be `truncated`, naming the reason, and render nothing it cannot back.
+
+   A chain that renders a changed value as its justification fails the test. So does one that
+   claims `complete` without evidence.
+
+The C0 demo's existing check, that every decision's chain ends at a real key, becomes this test in
+`demo-c1`.
 
 ### Retention follows reachability (owner's decision, 2026-10-27)
 
@@ -347,17 +454,23 @@ cause).
 - the `tenure` and `assignment` fields on observed records;
 - agent self-fencing with a persisted `CLOCK_BOOTTIME` deadline;
 - `lost_grace_ms`;
-- `sim-c1` with I1a, I1b and I2 to I6;
+- `sim-c1` with I1a, I1b and I2 to I7, and the evidence acceptance test;
 - `completeness` in `why`;
 - reachability-based retention, with a root per subject and action;
 - `/allocations/<node>` and the placement and release transactions that maintain it;
-- `/decision-summaries/`, with decisions immutable.
+- `/decision-summaries/`, with decisions immutable;
+- the full placement compare set, including `/node-status/<node>`;
+- the allocation auditor, `/audit/allocations/<node>`, `zcube check allocations` and
+  `zcube repair allocations`;
+- `cause_evidence` on every decision whose cause is a key.
 
 `demo-c1` shows the fencing window: the partition test of HANDOFF's acceptance criteria.
 
 **Recorded, not built:**
 
 - the C7 fencing proofs and epoch-checked durable writes;
+- the placement epoch in C4's workload identity (C4), and its enforcement for stateful services
+  (C7);
 - controller leadership for a second server;
 - the TLA+ model.
 
