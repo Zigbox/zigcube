@@ -17,6 +17,11 @@ Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding han
 - `zig build` fetches the `zigbox` package pinned in `build.zig.zon` (a tarball of a Zigbox commit); Zig 0.17 unpacks it into `zig-pkg/`, which is ignored. Its diagnostics (`diagnostic`, `product`, `render`, `explain`) are Zigcube's too: `src/diag.zig` keeps the `ZC-` collector and registry and declares Zigcube's `Product`.
 - The agent links Zigbox's `zigbox` module. Zigcube's `Runtime` interface follows what that module actually exposes. Report any gap between it and HANDOFF to the owner; don't paper over it.
 
+## Disk
+
+- The session's disk allowance is fixed and cannot be raised. Give each parallel worktree its own `ZIG_GLOBAL_CACHE_DIR`, and when `.zig-cache/o` grows large, empty it outside a build (`rm -rf .zig-cache`). Never delete another worktree's cache. `zig build pg-down` removes the throwaway Postgres.
+- A build that was killed can leave `.zig-cache` half written, which then fails with `FileNotFound`; `rm -rf .zig-cache` fixes it.
+
 ## Environment facts (checked 2026-10-25 in the Claude Code cloud container)
 
 - `.claude/hooks/session-start.sh` installs Zig 0.17.0 (checksum-verified) and libpq-dev, and puts `zig` and the Postgres 16 binaries on PATH.
@@ -56,9 +61,23 @@ These arrive with the scaffold; keep this list current as they land.
 
 ## Working as the implementer
 
-- Work in slices. At the end of each slice, commit and stop with a report. The supervisor reviews each slice adversarially, and you fix what the review finds before the next slice.
-- In a cloud session the container is ephemeral, so push each reviewed slice to your own branch. Never push to `main`.
-- Report what you ran and its output, what you did not run and why, every deviation from HANDOFF, and anything in HANDOFF, DIAGNOSTICS or the Zigbox code that seemed wrong.
+- Work in slices as the brief defines them (`docs/briefs/`). At the end of each slice, commit and stop with a report. The supervisor reviews each slice adversarially; what the review finds is fixed before the next slice, by a fresh session (see below).
+- In a cloud session the container is ephemeral, so push each slice to your own session branch. Never push to `main`, and never to another session's branch.
+- **Before you report, run [REVIEW.md](REVIEW.md) on your own diff**, and say which of its items your slice touched and what you checked.
+- **Gates, on the commit you report:** `zig build check` once it exists (it is C1's first slice); until then `zig build`, `zig build test`, `zig build tidy`, `zig build errors-site-check`, `zig build wasm-check` and `zig build test-store -Dbackend=sqlite`, plus `-Dbackend=postgres` when the store changed. Name the commit they ran on. A report without them, or with another commit's, is not a report.
+- Report what you ran and its output (the last lines, not the log), what you did not run and why, every deviation from HANDOFF or the brief, and anything in HANDOFF, DIAGNOSTICS or the Zigbox code that seemed wrong. End the report with the handoff note described below.
+
+## Agent context discipline
+
+An agent re-reads its whole context on every turn, so cost grows with context size, not with the work done. Keep implementer context small. (Adopted from Zigbox, 2026-10-30.)
+
+- **One session per slice.** The supervisor starts a fresh implementer session for each slice of a milestone. Do not resume a finished implementer for the next slice or for follow-up fixes.
+- **Hand off through the repo.** Before stopping, the implementer commits its work and ends its report with a handoff note: decisions made, traps found, what's next. Lasting decisions go in [docs/DECISIONS.md](docs/DECISIONS.md). The next implementer starts from the brief, the branch and that note.
+- **Context ceiling.** Stop at about 250K tokens of context or 60 turns, whichever comes first. At that point, reach the next safe stopping place, commit, write the handoff note and report. The supervisor enforces this and starts a new implementer rather than extending the current one.
+- **Small fixes get new sessions.** For a bug or review finding, start a fresh session with the symptom and the relevant commit. Do not send it back to the session that wrote the code.
+- **Keep noisy output out of context.** Redirect `zig build` and test output to a file and read only the failing lines. Do not paste full logs.
+- **Delegate lookups.** Send broad reads, such as searching the Zig std source or the pinned Zigbox package, to a cheap read-only agent and keep only the answer.
+- The supervisor follows the same rules; its own handoff is [docs/supervisor-handoff.md](docs/supervisor-handoff.md).
 
 ## README and site status
 
