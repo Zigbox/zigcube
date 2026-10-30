@@ -13,6 +13,8 @@ const codes = @import("diag/codes.zig");
 const Diag = @import("diag.zig").Diag;
 const store = @import("store.zig");
 const harness_mod = @import("store_harness.zig");
+const compare_sets = @import("compare_sets.zig");
+const writers = @import("writers.zig");
 
 const Allocator = std.mem.Allocator;
 const Revision = store.Revision;
@@ -1007,4 +1009,128 @@ test "model: seeded random operations agree with a model of the store" {
         try run.check_status();
     }
     try run.check_replay();
+}
+
+// ---- Compare sets (docs/authority.md §2) -------------------------------------------------------
+
+/// The facts a scheduler reads before it places `hello-1` and `hello-2` on node `n1`.
+const Facts = struct {
+    replica_1: Revision,
+    replica_2: Revision,
+    node: Revision,
+    status: Revision,
+    allocation: Revision,
+
+    fn node_read(facts: Facts) compare_sets.NodeRead {
+        return .{
+            .node = "n1",
+            .node_revision = facts.node,
+            .status_revision = facts.status,
+            .allocation_revision = facts.allocation,
+        };
+    }
+};
+
+fn seed_facts(s: Store, diag: *Diag) !Facts {
+    return .{
+        .replica_1 = try put_one(s, diag, "/replicas/hello/hello-1", "{}"),
+        .replica_2 = try put_one(s, diag, "/replicas/hello/hello-2", "{}"),
+        .node = try put_one(s, diag, "/nodes/n1", "{}"),
+        .status = try put_one(s, diag, "/node-status/n1", "{}"),
+        .allocation = try put_one(s, diag, "/allocations/n1", "{\"count\":0}"),
+    };
+}
+
+/// Commits the placement of `replica` as the scheduler would: the assignment and the new
+/// allocation, under the compare set built from `facts`.
+fn place(s: Store, diag: *Diag, facts: Facts, replica: []const u8) !store.TxnResult {
+    var set: compare_sets.Set = .{};
+    const first = std.mem.eql(u8, replica, "hello-1");
+    compare_sets.placement(&set, .{
+        .service = "hello",
+        .replica = replica,
+        .replica_revision = if (first) facts.replica_1 else facts.replica_2,
+    }, facts.node_read());
+    var key_buffer: [64]u8 = undefined;
+    const assigned = try std.fmt.bufPrint(&key_buffer, "/assigned/n1/{s}", .{replica});
+    const ops = [_]store.Op{
+        .{ .put = .{ .key = assigned, .value = "{}" } },
+        .{ .put = .{ .key = "/allocations/n1", .value = "{\"count\":1}" } },
+    };
+    return writers.txn(s, .scheduler, .{ .compares = set.compares(), .on_success = &ops }, diag);
+}
+
+test "compare set: a placement commits when nothing it read has moved" {
+    // Goal: the six compares of a placement hold on the facts as read. Method: seed the facts,
+    // place with the revisions the puts returned; both keys are written in one revision.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    const s = (try harness.connect()).interface();
+    const facts = try seed_facts(s, &diag);
+    const result = try place(s, &diag, facts, "hello-1");
+    try testing.expect(result.succeeded);
+    try testing.expectEqual(facts.allocation + 1, result.revision);
+}
+
+test "compare set: each of the six compared keys, moved, refuses the placement and writes nothing" {
+    // Goal: every compare matters. Method: for each of the six keys, change it after the
+    // facts were read (the replica, the node, its status and its allocation are rewritten, the
+    // assignment and the audit finding appear), then place on the stale revisions. The
+    // transaction fails and the revision does not move.
+    const moved = [_][]const u8{
+        "/replicas/hello/hello-1",
+        "/assigned/n1/hello-1",
+        "/nodes/n1",
+        "/node-status/n1",
+        "/allocations/n1",
+        "/audit/allocations/n1",
+    };
+    for (moved) |key| {
+        const harness = try Harness.start();
+        defer harness.stop();
+        errdefer harness.report_seed();
+        var diag: Diag = undefined;
+        diag.reset();
+        const s = (try harness.connect()).interface();
+        const facts = try seed_facts(s, &diag);
+        const changed = try put_one(s, &diag, key, "{\"other\":true}");
+        const result = try place(s, &diag, facts, "hello-1");
+        try testing.expect(!result.succeeded);
+        try testing.expectEqual(changed, result.revision);
+        try expect_status(s, &diag, changed, 0);
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const allocation = (try s.get(arena, "/allocations/n1", null, &diag)).kv.?;
+        const rewritten = std.mem.eql(u8, key, "/allocations/n1");
+        const want = if (rewritten) changed else facts.allocation;
+        try testing.expectEqual(want, allocation.mod_revision);
+        const assigned = (try s.get(arena, "/assigned/n1/hello-1", null, &diag)).kv;
+        try testing.expectEqual(std.mem.eql(u8, key, "/assigned/n1/hello-1"), assigned != null);
+    }
+}
+
+test "compare set: two placements planned on one allocation revision cannot both commit" {
+    // Goal: the phantom case. Two replicas are placed on the same node from the same read of
+    // `/allocations/n1`; their assignments are different keys, so only the allocation compare
+    // can tell. The first commits and the second, on the stale revision, must fail.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    const s = (try harness.connect()).interface();
+    const facts = try seed_facts(s, &diag);
+    const first = try place(s, &diag, facts, "hello-1");
+    try testing.expect(first.succeeded);
+    const second = try place(s, &diag, facts, "hello-2");
+    try testing.expect(!second.succeeded);
+    try testing.expectEqual(first.revision, second.revision);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const missing = try s.get(arena_state.allocator(), "/assigned/n1/hello-2", null, &diag);
+    try testing.expect(missing.kv == null);
 }

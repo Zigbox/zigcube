@@ -35,6 +35,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const writers = @import("writers.zig");
 const text_util = @import("text.zig");
 
 const Context = controller.Context;
@@ -134,7 +135,9 @@ const Call = struct {
         const value = records.encode(ctx.arena, node, ctx.diag) catch return propagate(ctx);
         const put: store.Put = .{ .key = key.slice(), .value = value, .lease = input.lease };
         const op: store.Op = .{ .put = put };
-        const result = ctx.store.txn(.{ .on_success = &.{op} }, ctx.diag) catch
+        const request: store.TxnRequest = .{ .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = call.node };
+        const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
         return reply(ctx, .{ .revision = result.revision });
     }
@@ -236,7 +239,9 @@ const Call = struct {
         }
         try no_duplicates(ctx, ops[0..count]);
         assert(count == total);
-        const result = ctx.store.txn(.{ .on_success = ops[0..count] }, ctx.diag) catch
+        const request: store.TxnRequest = .{ .on_success = ops[0..count] };
+        const role: writers.Role = .{ .agent = call.node };
+        const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
         return reply(ctx, .{ .revision = result.revision });
     }

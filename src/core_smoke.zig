@@ -15,6 +15,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 const store = @import("store.zig");
+const writers = @import("writers.zig");
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 const runtime = @import("runtime.zig");
 
@@ -103,7 +104,8 @@ fn fail(report: *Report, step: Step) Failure {
 
 fn put_and_watch(report: *Report, s: store.Store, arena: Allocator, diag: *Diag) Failure!void {
     const put: store.Op = .{ .put = .{ .key = "/services/hello", .value = "{\"v\":1}" } };
-    const written = s.txn(.{ .on_success = &.{put} }, diag) catch return fail(report, .put);
+    const written = writers.txn(s, .api, .{ .on_success = &.{put} }, diag) catch
+        return fail(report, .put);
     try check(report, .put, written.succeeded);
     try check(report, .put, written.revision == 1);
 
@@ -127,7 +129,7 @@ fn lease_lapses(
 ) Failure!void {
     const lease = s.lease_grant(1000, diag) catch return fail(report, .lease_attached);
     const node: store.Op = .{ .put = .{ .key = "/nodes/n1", .value = "{}", .lease = lease.id } };
-    const written = s.txn(.{ .on_success = &.{node} }, diag) catch
+    const written = writers.txn(s, .{ .agent = "n1" }, .{ .on_success = &.{node} }, diag) catch
         return fail(report, .lease_attached);
     var watch = s.watch(.{ .prefix = "/nodes/", .from_revision = written.revision + 1 }, diag) catch
         return fail(report, .lease_attached);

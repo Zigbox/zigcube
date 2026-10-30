@@ -233,6 +233,12 @@ fn too_many(diag: *diag_mod.Diag) void { // controller.zig
     sample(diag, .E0302, &.{cause}, "delete what is no longer needed");
 }
 
+fn record_too_new(diag: *diag_mod.Diag) void { // records.zig
+    const cause = "the value at /observed/node1/hello-1 is version 3; this release reads up to " ++
+        "version 2";
+    sample(diag, .E0303, &.{cause}, "run the zcube release that wrote it, or upgrade this one");
+}
+
 fn unknown_container(diag: *diag_mod.Diag) void { // runtime.zig
     const sentence = "list what the runtime knows, then retry";
     sample(diag, .E0501, &.{"no container by that name"}, sentence);
@@ -373,6 +379,7 @@ const cases = [_]Case{
     relayed(.E0213, store_dropped),
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
+    relayed(.E0303, record_too_new),
     relayed(.E0501, unknown_container),
     relayed(.E0502, runtime_failed),
     relayed(.E0503, agent_unreachable),

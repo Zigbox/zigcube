@@ -190,7 +190,7 @@ fn prune_subject(
 
 fn flush(ctx: *const Context, batch: *Batch, txns: *u32) Error!void {
     if (batch.ops_count == 0) return;
-    _ = try controller.commit(ctx, batch);
+    _ = try controller.commit(ctx, .retention, batch);
     txns.* += 1;
     batch.* = .{};
 }
@@ -296,7 +296,7 @@ const Fixture = struct {
         const decision = records.decision_key(id.slice());
         batch.put(try controller.key_copy(&ctx, &index), "{\"v\":1}");
         batch.put(try controller.key_copy(&ctx, &decision), "{\"v\":1}");
-        _ = try controller.commit(&ctx, &batch);
+        _ = try controller.commit(&ctx, .retention, &batch);
     }
 
     fn count(self: *Fixture, prefix: []const u8) !usize {

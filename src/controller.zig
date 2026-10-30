@@ -19,6 +19,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const writers = @import("writers.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -96,13 +97,14 @@ pub const Commit = union(enum) {
     conflict,
 };
 
-pub fn commit(ctx: *const Context, batch: *const Batch) Error!Commit {
+/// Commits `batch` as `role`; a batch that writes a key that is not the role's asserts (I4).
+pub fn commit(ctx: *const Context, role: writers.Role, batch: *const Batch) Error!Commit {
     assert(batch.ops_count > 0);
     const request: store.TxnRequest = .{
         .compares = batch.compares[0..batch.compares_count],
         .on_success = batch.ops[0..batch.ops_count],
     };
-    const result = try ctx.store.txn(request, ctx.diag);
+    const result = try writers.txn(ctx.store, role, request, ctx.diag);
     if (!result.succeeded) return .conflict;
     return .{ .applied = result.revision };
 }
@@ -342,7 +344,7 @@ test "a decision and its index entry are written together, with a unique sortabl
     try testing.expectEqual(@as(u32, 4), batch.ops_count);
     try testing.expect(std.mem.order(u8, first.slice(), second.slice()) == .lt);
     try testing.expectEqualStrings("1761350000123-0001-0000", first.slice());
-    const done = try commit(&ctx, &batch);
+    const done = try commit(&ctx, .replica_controller, &batch);
     try testing.expectEqual(@as(Revision, 1), done.applied);
 
     const key = records.decision_key(first.slice());
@@ -372,7 +374,7 @@ test "a commit whose compare fails reports a conflict and writes nothing" {
     var batch: Batch = .{};
     batch.expect("/services/x", 7);
     batch.put("/services/x", "{}");
-    try testing.expect((try commit(&ctx, &batch)) == .conflict);
+    try testing.expect((try commit(&ctx, .api, &batch)) == .conflict);
     const status = try ctx.store.status(&diag);
     try testing.expectEqual(@as(Revision, 0), status.revision);
 }

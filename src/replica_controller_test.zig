@@ -14,6 +14,7 @@ const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const replica_controller = @import("replica_controller.zig");
 const store = @import("store.zig");
+const writers = @import("writers.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 
@@ -69,11 +70,12 @@ const Fixture = struct {
         try testing.expect(result == .written);
     }
 
-    fn put(self: *Fixture, key: []const u8, value: anytype) !void {
+    /// Writes a fixture record as `role`, the one that stands in for whoever wrote it in a cluster.
+    fn put(self: *Fixture, role: writers.Role, key: []const u8, value: anytype) !void {
         const ctx = self.context();
         const bytes = try records.encode(ctx.arena, value, &self.diag);
         const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
-        const done = try ctx.store.txn(.{ .on_success = &.{op} }, &self.diag);
+        const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &self.diag);
         try testing.expect(done.succeeded);
     }
 
@@ -82,7 +84,7 @@ const Fixture = struct {
             .name = name,
             .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
         };
-        try self.put(records.node_key(name).slice(), node);
+        try self.put(.{ .agent = name }, records.node_key(name).slice(), node);
     }
 
     fn observe(
@@ -102,7 +104,7 @@ const Fixture = struct {
             .diagnostic = raw,
             .reported_at_ms = self.manual.ms,
         };
-        try self.put(records.observed_key(node, replica).slice(), observed);
+        try self.put(.{ .agent = node }, records.observed_key(node, replica).slice(), observed);
     }
 
     /// One pass; returns what it said.
@@ -399,7 +401,7 @@ test "a malformed record is ZC-E0301 naming its key" {
     try fixture.start();
     defer fixture.stop();
     const op: store.Op = .{ .put = .{ .key = "/services/bad", .value = "[1,2" } };
-    _ = try fixture.memory.interface().txn(.{ .on_success = &.{op} }, &fixture.diag);
+    _ = try writers.txn(fixture.memory.interface(), .api, .{ .on_success = &.{op} }, &fixture.diag);
     try testing.expectError(error.Malformed, fixture.step());
     try testing.expectEqual(codes.Code.E0301, fixture.diag.code.?);
 }

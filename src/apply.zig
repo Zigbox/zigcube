@@ -110,7 +110,7 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         // decision key's own `mod_revision` (docs/keys.md).
         .cause = .{ .kind = .desired, .key = service_key_copy },
     }, &batch);
-    return switch (try controller.commit(ctx, &batch)) {
+    return switch (try controller.commit(ctx, .api, &batch)) {
         .applied => |revision| .{ .written = .{
             .revision = revision,
             .created = planned.existing == null,
@@ -150,7 +150,7 @@ pub fn delete_service(
         .change = "deleted",
         .cause = .{ .kind = .desired, .key = kv.key },
     }, &batch);
-    return switch (try controller.commit(ctx, &batch)) {
+    return switch (try controller.commit(ctx, .api, &batch)) {
         .applied => |revision| .{ .written = .{
             .revision = revision,
             .created = false,

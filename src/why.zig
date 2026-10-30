@@ -19,6 +19,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const writers = @import("writers.zig");
 
 const Allocator = std.mem.Allocator;
 const Context = controller.Context;
@@ -568,7 +569,7 @@ test "why ends at the desired spec for a scale-up, and a missing link is a gone 
     const create_id = replica.steps[1].decision.?.id;
     const key = records.decision_key(create_id);
     const op: store.Op = .{ .delete = key.slice() };
-    _ = try ctx.store.txn(.{ .on_success = &.{op} }, ctx.diag);
+    _ = try writers.txn(ctx.store, .retention, .{ .on_success = &.{op} }, ctx.diag);
     const after = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
     try testing.expectEqual(StepType.gone, after.steps[after.steps.len - 1].type);
     try testing.expectEqual(@as(usize, 2), after.steps.len);
@@ -595,7 +596,7 @@ test "why renders a lease that ran out, and refuses an unknown subject" {
             .revision = 5,
         },
     }, &batch);
-    _ = try controller.commit(&ctx, &batch);
+    _ = try controller.commit(&ctx, .replica_controller, &batch);
     ctx = world.controller_context();
     const result = try why(&ctx, .{ .kind = .node, .name = "node3" }, null);
     try testing.expectEqual(Health.gone, result.state.health);
