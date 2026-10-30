@@ -17,6 +17,7 @@ pub const modules = .{
     @import("api.zig"),
     @import("apply.zig"),
     @import("clock.zig"),
+    @import("compare_sets.zig"),
     @import("controller.zig"),
     @import("console_sim.zig"),
     @import("constants.zig"),
@@ -37,6 +38,7 @@ pub const modules = .{
     @import("test_util.zig"),
     @import("text.zig"),
     @import("why.zig"),
+    @import("writers.zig"),
 };
 
 /// References every public declaration of every core module, and of the types they declare, so

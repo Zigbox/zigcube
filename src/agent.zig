@@ -34,6 +34,7 @@ const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
 const store = @import("store.zig");
+const writers = @import("writers.zig");
 const Clock = @import("clock.zig").Clock;
 
 const Allocator = std.mem.Allocator;
@@ -142,7 +143,8 @@ pub const Agent = struct {
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);
         const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = lease.id } };
-        _ = try ctx.store.txn(.{ .on_success = &.{op} }, ctx.diag);
+        const request: store.TxnRequest = .{ .on_success = &.{op} };
+        _ = try writers.txn(ctx.store, .{ .agent = agent.config.node }, request, ctx.diag);
         agent.lease = lease.id;
         agent.renew_at_ms = now + @divFloor(agent.config.lease_ttl_ms, 3);
         return true;
@@ -421,14 +423,14 @@ const Pass = struct {
         const ctx = pass.ctx.as_controller();
         for (pass.writes.items) |write| {
             if (!batch.has_room(1)) {
-                _ = try controller.commit(&ctx, &batch);
+                _ = try controller.commit(&ctx, .{ .agent = pass.agent.config.node }, &batch);
                 commits += 1;
                 batch = .{};
             }
             if (write.value) |value| batch.put(write.key, value) else batch.delete(write.key);
         }
         if (batch.ops_count > 0) {
-            _ = try controller.commit(&ctx, &batch);
+            _ = try controller.commit(&ctx, .{ .agent = pass.agent.config.node }, &batch);
             commits += 1;
         }
         return commits;

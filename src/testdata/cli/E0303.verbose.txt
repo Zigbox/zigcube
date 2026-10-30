@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0303]: a stored record is from a newer release
+  cause  the value at /observed/node1/hello-1 is version 3; this release reads
+         up to version 2
+  reqid  r-0000001
+  fix    run the zcube release that wrote it, or upgrade this one
+  more   zcube explain E0303
+  docs   https://zigbox.github.io/zigcube/errors/E0303.html

@@ -153,7 +153,7 @@ const Run = struct {
     /// Commits; a conflict is not an error: the plan was made on state that has changed, so the
     /// next step plans again.
     fn finish(run: *Run, batch: *const Batch) Error!bool {
-        const done = try controller.commit(run.ctx, batch);
+        const done = try controller.commit(run.ctx, .replica_controller, batch);
         switch (done) {
             .applied => {
                 run.acted += 1;

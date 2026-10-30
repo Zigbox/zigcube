@@ -1,0 +1,6 @@
+error[ZC-E0303]: a stored record is from a newer release
+  cause  the value at /observed/node1/hello-1 is version 3; this release reads
+         up to version 2
+  fix    run the zcube release that wrote it, or upgrade this one
+  more   zcube explain E0303 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0303.html

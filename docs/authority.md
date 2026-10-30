@@ -73,6 +73,9 @@ the layout.
 | `/decisions/<id>`, `/decisions-by-subject/…` | whoever acts, in the same transaction as the action | one action and its cause; **immutable** | retention (§5) |
 | `/decision-summaries/<kind>/<name>/<action>/<cause-kind>` | the actor of the decisions it counts, in the same transaction | a projection over immutable decisions: count, first and last time, the newest decision's id | with its subject |
 
+A seventh role, `retention`, deletes expired decisions (§5). It may write only `/decisions/`,
+`/decisions-by-subject/` and `/decision-summaries/`, which every role may write.
+
 - **`/assigned/<node>/` replaces the `node` field.** An agent's long-poll watches its own prefix,
   so fan-out is O(replicas on the node), not O(all replicas). The agent endpoint joins each
   assignment with its `/replicas` record, so the agent sees the same shape as today.
@@ -111,8 +114,9 @@ of service `s` on node `n`, all of these must hold at commit, or nothing is writ
 | `/allocations/<n>` at the revision read | no other placement or release on `n` (phantoms, below) |
 | `/audit/allocations/<n>` absent | the node's accounting is not under an open finding (below) |
 
-A move touches two nodes, so it compares both sets: at most 10 compares, within
-`store_txn_compares_max` (16). A release compares `/assigned/<n>/<r>` and `/allocations/<n>`.
+A move touches two nodes, so it compares both sets: at most 8 compares (placement's 6 on the new
+node, release's 2 on the old), within `store_txn_compares_max` (16). A release compares
+`/assigned/<n>/<r>` and `/allocations/<n>`.
 **Readiness is part of every placement's read set**: a scheduler that planned against a ready node
 cannot commit onto one that became lost before the commit (I7).
 

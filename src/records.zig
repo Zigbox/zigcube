@@ -56,6 +56,11 @@ pub const prefix_observed = "/observed/";
 pub const prefix_nodes = "/nodes/";
 pub const prefix_decisions = "/decisions/";
 pub const prefix_index = "/decisions-by-subject/";
+pub const prefix_assigned = "/assigned/";
+pub const prefix_allocations = "/allocations/";
+pub const prefix_audit_allocations = "/audit/allocations/";
+pub const prefix_node_status = "/node-status/";
+pub const prefix_summaries = "/decision-summaries/";
 
 pub fn service_key(name: []const u8) Key {
     assert(name_problem(name, constants.service_name_bytes_max) == null);
@@ -103,7 +108,47 @@ pub fn index_key(kind: SubjectKind, name: []const u8, id: []const u8) Key {
     return Key.build(&.{ prefix_index, @tagName(kind), "/", name, "/", id });
 }
 
+pub fn assigned_prefix(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_assigned, node, "/" });
+}
+
+pub fn assigned_key(node: []const u8, replica: []const u8) Key {
+    assert(name_problem(replica, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_assigned, node, "/", replica });
+}
+
+pub fn allocation_key(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_allocations, node });
+}
+
+pub fn audit_key(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_audit_allocations, node });
+}
+
+pub fn node_status_key(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_node_status, node });
+}
+
+pub fn summary_key(kind: SubjectKind, name: []const u8, action: []const u8, cause: CauseKind) Key {
+    assert(name_problem(name, constants.node_name_bytes_max) == null);
+    assert(action.len > 0);
+    assert(action.len <= action_bytes_max);
+    const parts = [_][]const u8{ prefix_summaries, @tagName(kind), "/", name, "/", action, "/" };
+    return Key.build(&(parts ++ .{@tagName(cause)}));
+}
+
+/// The longest action name of a decision; it is part of a summary key.
+pub const action_bytes_max: u32 = 48;
+
 comptime {
+    // The longest summary key.
+    const summary = prefix_summaries.len + "service".len + 1 + constants.node_name_bytes_max + 1 +
+        action_bytes_max + 1 + "lease_expired".len;
+    assert(summary <= constants.store_key_bytes_max);
     // The longest key: the index entry of a replica decision.
     const longest = prefix_index.len + "service".len + 1 + constants.node_name_bytes_max + 1 +
         decision_id_bytes;
@@ -230,7 +275,7 @@ pub const Exit = struct {
 };
 
 pub const Observed = struct {
-    v: u32 = 1,
+    v: u32 = 2,
     replica: []const u8,
     node: []const u8,
     generation: u64,
@@ -239,7 +284,70 @@ pub const Observed = struct {
     diagnostic: ?Raw = null,
     started_at_ms: ?u64 = null,
     reported_at_ms: u64,
+    /// The `/nodes/<node>` revision of the agent's tenure when it reported. Absent in C0 records.
+    tenure: ?u64 = null,
+    /// The `/assigned/<node>/<replica>` revision it ran under (the placement epoch). Absent in C0
+    /// records.
+    assignment: ?u64 = null,
 };
+
+/// The placement: the scheduler's decision to run a replica on a node.
+pub const Assigned = struct {
+    v: u32 = 1,
+    replica: []const u8,
+    service: []const u8,
+    requests: Requests,
+    reason: []const u8,
+};
+
+/// The authoritative accounting of a node: the sum of the `requests` of its assignments.
+pub const Allocation = struct {
+    v: u32 = 1,
+    allocated: Requests,
+    count: u32,
+    /// The `/nodes/<node>` revision whose capacity this record was checked against.
+    node_revision: u64,
+};
+
+pub const Tally = struct {
+    allocated: Requests,
+    count: u32,
+};
+
+/// An open finding of the allocation auditor.
+pub const Audit = struct {
+    v: u32 = 1,
+    recorded: Tally,
+    reconstructed: Tally,
+    revision: u64,
+    decision: []const u8,
+};
+
+pub const NodeState = enum { ready, lost, fenced };
+
+pub const NodeStatus = struct {
+    v: u32 = 1,
+    state: NodeState,
+    /// The `/nodes/<node>` revision the state judged.
+    tenure: u64,
+    at_ms: u64,
+    decision: []const u8,
+};
+
+/// A count over immutable decisions; never a cause.
+pub const Summary = struct {
+    v: u32 = 1,
+    count: u64,
+    first_at_ms: u64,
+    last_at_ms: u64,
+    newest: []const u8,
+};
+
+/// The format version each record kind is written in: the default of its `v` member, the one
+/// place it is set. A reader accepts every version up to it.
+pub fn version_current(comptime T: type) u32 {
+    return std.meta.fieldInfo(T, .v).attrs.defaultValue(u32).?;
+}
 
 pub const SubjectKind = enum { service, replica, node };
 
@@ -261,7 +369,7 @@ pub const Cause = struct {
 };
 
 pub const Decision = struct {
-    v: u32 = 1,
+    v: u32 = 2,
     id: []const u8,
     at_ms: u64,
     actor: []const u8,
@@ -271,6 +379,9 @@ pub const Decision = struct {
     change: ?[]const u8 = null,
     cause: Cause,
     cause_diagnostic: ?Raw = null,
+    /// The fields of the cause's key that the decision used, as a JSON object of at most
+    /// `decision_evidence_bytes_max` bytes. Absent in C0 records.
+    cause_evidence: ?Raw = null,
 };
 
 pub const IndexEntry = struct {
@@ -329,11 +440,32 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
 pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag) Error!T {
     assert(kv.key.len > 0);
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
-    const parsed = std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
+    if (@hasField(T, "v")) {
+        // The version comes before the shape: a newer release may have changed the shape.
+        const Head = struct { v: ?u32 = null };
+        const head = std.json.parseFromSliceLeaky(Head, arena, kv.value, options) catch |err| {
+            if (err == error.OutOfMemory) return failures.no_memory(diag);
+            return malformed(diag, kv.key, @typeName(T));
+        };
+        const known = version_current(T);
+        if ((head.v orelse 0) > known) return too_new(diag, kv.key, head.v.?, known);
+    }
+    return std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
         if (err == error.OutOfMemory) return failures.no_memory(diag);
         return malformed(diag, kv.key, @typeName(T));
     };
-    return parsed;
+}
+
+/// Raises ZC-E0303: the value at `key` was written in a newer format than this release reads.
+fn too_new(diag: *Diag, key: []const u8, found: u32, known: u32) error{Malformed} {
+    assert(found > known);
+    assert(diag.code == null);
+    diag.raise(.E0303);
+    diag.cause("the value at {s} is version {d}; this release reads up to version {d}", .{
+        key, found, known,
+    });
+    diag.fix(.{ .sentence = "run the zcube release that wrote it, or upgrade this one" });
+    return error.Malformed;
 }
 
 /// Raises ZC-E0301 for the key and returns the error.
@@ -530,4 +662,285 @@ test "a cause carries only the members of its kind" {
     const bytes = try encode(arena_state.allocator(), cause, &diag);
     const expected = "{\"kind\":\"observed\",\"key\":\"/observed/n/r\",\"revision\":4}";
     try testing.expectEqualStrings(expected, bytes);
+}
+
+test "the keys of C1 follow authority.md" {
+    // Goal: one implementation of the new layout. Method: build each and compare.
+    try testing.expectEqualStrings("/assigned/node1/", assigned_prefix("node1").slice());
+    const placed = assigned_key("node1", "hello-9");
+    try testing.expectEqualStrings("/assigned/node1/hello-9", placed.slice());
+    try testing.expectEqualStrings("/allocations/node1", allocation_key("node1").slice());
+    try testing.expectEqualStrings("/audit/allocations/node1", audit_key("node1").slice());
+    try testing.expectEqualStrings("/node-status/node1", node_status_key("node1").slice());
+    const summary = summary_key(.service, "hello", "replace_replica", .observed);
+    const expected = "/decision-summaries/service/hello/replace_replica/observed";
+    try testing.expectEqualStrings(expected, summary.slice());
+}
+
+test "the longest of the new keys fit the key limit" {
+    // Goal: every key stays within 512 bytes by construction. Method: build each at its bounds.
+    const node: [constants.node_name_bytes_max]u8 = @splat('n');
+    const action: [action_bytes_max]u8 = @splat('a');
+    const summary = summary_key(.service, &node, &action, .lease_expired);
+    try testing.expect(summary.len <= constants.store_key_bytes_max);
+    try testing.expect(assigned_key(&node, &node).len <= constants.store_key_bytes_max);
+    try testing.expect(audit_key(&node).len <= constants.store_key_bytes_max);
+}
+
+fn kv_of(key: []const u8, value: []const u8) store.KeyValue {
+    return .{ .key = key, .value = value, .create_revision = 1, .mod_revision = 1 };
+}
+
+test "each record of C1 encodes and reads back" {
+    // Goal: the shapes of keys.md survive encode and read, and the size of an assignment is
+    // known. Method: round-trip one of each.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+
+    const requests: Requests = .{ .cpu_millis = 250, .memory_bytes = 134217728 };
+    const assigned: Assigned = .{
+        .replica = "hello-1",
+        .service = "hello",
+        .requests = requests,
+        .reason = "node1 is the only node, and it fits 250m CPU and 128 MiB",
+    };
+    const assigned_bytes = try encode(arena, assigned, &diag);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"replica\":\"hello-1\",\"service\":\"hello\"," ++
+            "\"requests\":{\"cpu_millis\":250,\"memory_bytes\":134217728}," ++
+            "\"reason\":\"node1 is the only node, and it fits 250m CPU and 128 MiB\"}",
+        assigned_bytes,
+    );
+    // A node holds at most agent_node_replicas_max of these in one list page; the value is far
+    // below the store's bound even with the longest names and a reason of the longest sort.
+    try testing.expect(assigned_bytes.len < 256);
+    const back = try read(Assigned, arena, kv_of("/assigned/node1/hello-1", assigned_bytes), &diag);
+    try testing.expectEqual(@as(u64, 134217728), back.requests.memory_bytes);
+
+    const allocation: Allocation = .{ .allocated = requests, .count = 1, .node_revision = 3 };
+    const allocation_bytes = try encode(arena, allocation, &diag);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"allocated\":{\"cpu_millis\":250,\"memory_bytes\":134217728}," ++
+            "\"count\":1,\"node_revision\":3}",
+        allocation_bytes,
+    );
+    const alloc_kv = kv_of("/allocations/node1", allocation_bytes);
+    try testing.expectEqual(@as(u32, 1), (try read(Allocation, arena, alloc_kv, &diag)).count);
+}
+
+test "an audit finding, a node status and a summary encode and read back" {
+    // Goal: the rest of the shapes of keys.md; their JSON here is the JSON documented there.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const requests: Requests = .{ .cpu_millis = 250, .memory_bytes = 134217728 };
+    const tally: Tally = .{ .allocated = requests, .count = 1 };
+    const empty: Tally = .{ .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 }, .count = 0 };
+    const audit: Audit = .{
+        .recorded = tally,
+        .reconstructed = empty,
+        .revision = 9,
+        .decision = "1761350000123-0001-0007",
+    };
+    const audit_bytes = try encode(arena, audit, &diag);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"recorded\":{\"allocated\":{\"cpu_millis\":250," ++
+            "\"memory_bytes\":134217728},\"count\":1}," ++
+            "\"reconstructed\":{\"allocated\":{\"cpu_millis\":0," ++
+            "\"memory_bytes\":0},\"count\":0}," ++
+            "\"revision\":9,\"decision\":\"1761350000123-0001-0007\"}",
+        audit_bytes,
+    );
+    const audit_kv = kv_of("/audit/allocations/node1", audit_bytes);
+    try testing.expectEqual(@as(u64, 9), (try read(Audit, arena, audit_kv, &diag)).revision);
+
+    const status: NodeStatus = .{
+        .state = .fenced,
+        .tenure = 3,
+        .at_ms = 10,
+        .decision = "1761350000123-0001-0008",
+    };
+    const status_bytes = try encode(arena, status, &diag);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"state\":\"fenced\",\"tenure\":3,\"at_ms\":10," ++
+            "\"decision\":\"1761350000123-0001-0008\"}",
+        status_bytes,
+    );
+    try testing.expect(std.mem.indexOf(u8, status_bytes, "\"state\":\"fenced\"") != null);
+    const status_kv = kv_of("/node-status/node1", status_bytes);
+    const status_back = try read(NodeStatus, arena, status_kv, &diag);
+    try testing.expectEqual(NodeState.fenced, status_back.state);
+
+    const summary: Summary = .{
+        .count = 142,
+        .first_at_ms = 1,
+        .last_at_ms = 2,
+        .newest = "1761350000123-0001-0009",
+    };
+    const summary_bytes = try encode(arena, summary, &diag);
+    try testing.expectEqualStrings(
+        "{\"v\":1,\"count\":142,\"first_at_ms\":1,\"last_at_ms\":2," ++
+            "\"newest\":\"1761350000123-0001-0009\"}",
+        summary_bytes,
+    );
+    const summary_name = "/decision-summaries/service/hello/replace_replica/observed";
+    const summary_kv = kv_of(summary_name, summary_bytes);
+    try testing.expectEqual(@as(u64, 142), (try read(Summary, arena, summary_kv, &diag)).count);
+}
+
+test "observed and decision write version 2 with their new members, and read them back" {
+    // Goal: the members C1 adds are optional, and the version moves with the shape.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const observed: Observed = .{
+        .replica = "hello-1",
+        .node = "node1",
+        .generation = 1,
+        .status = .running,
+        .reported_at_ms = 5,
+        .tenure = 3,
+        .assignment = 4,
+    };
+    const bytes = try encode(arena, observed, &diag);
+    try testing.expect(std.mem.startsWith(u8, bytes, "{\"v\":2,"));
+    const kv = kv_of("/observed/node1/hello-1", bytes);
+    const back = try read(Observed, arena, kv, &diag);
+    try testing.expectEqual(@as(?u64, 4), back.assignment);
+
+    const decision: Decision = .{
+        .id = "1761350000123-0001-0007",
+        .at_ms = 1,
+        .actor = "scheduler",
+        .action = "place_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "r",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 2 },
+        .cause_evidence = .{ .text = "{\"replicas\":3,\"generation\":1}" },
+    };
+    const decision_bytes = try encode(arena, decision, &diag);
+    try testing.expect(std.mem.startsWith(u8, decision_bytes, "{\"v\":2,"));
+    const decision_kv = kv_of("/decisions/1761350000123-0001-0007", decision_bytes);
+    const decoded = try read(Decision, arena, decision_kv, &diag);
+    const evidence = decoded.cause_evidence.?.text;
+    try testing.expectEqualStrings("{\"replicas\":3,\"generation\":1}", evidence);
+}
+
+/// Records captured from a real C0 server and agent (src/testdata/README.md), one `key<TAB>value`
+/// per line, values exactly as the store held them.
+const c0_store = @embedFile("testdata/c0_store.txt");
+
+test "records a C0 build wrote still read" {
+    // Goal: a stored value is read by the next release. Method: read every record of a store a C0
+    // build produced, as the type its key says, and check what C1 adds is absent.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var seen: [5]u32 = @splat(0);
+    var lines = std.mem.splitScalar(u8, c0_store, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t').?;
+        const kv = kv_of(line[0..tab], line[tab + 1 ..]);
+        if (std.mem.startsWith(u8, kv.key, prefix_services)) {
+            const record = try read(Service, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 1), record.v);
+            seen[0] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
+            const record = try read(Replica, arena, kv, &diag);
+            try testing.expect(record.node.len > 0 or record.requests == null);
+            seen[1] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
+            const record = try read(Observed, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 1), record.v);
+            try testing.expectEqual(@as(?u64, null), record.tenure);
+            try testing.expectEqual(@as(?u64, null), record.assignment);
+            seen[2] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_decisions)) {
+            const record = try read(Decision, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 1), record.v);
+            try testing.expect(record.cause_evidence == null);
+            seen[3] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_nodes)) {
+            _ = try read(Node, arena, kv, &diag);
+            seen[4] += 1;
+        }
+    }
+    for (seen) |count| try testing.expect(count > 0);
+}
+
+test "a newer version is refused with ZC-E0303, not as malformed" {
+    // Goal: a value from a newer release is named and left alone. Method: bump the version of a
+    // real record, and of a kind that is still at 1.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const observed = "{\"v\":3,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
+        "\"status\":\"running\",\"reported_at_ms\":5}";
+    const kv = kv_of("/observed/node1/hello-1", observed);
+    try testing.expectError(error.Malformed, read(Observed, arena, kv, &diag));
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
+    try testing.expectEqualStrings(
+        "the value at /observed/node1/hello-1 is version 3; this release reads up to version 2",
+        diag.last_cause().?,
+    );
+    // Version 1 of a record that C1 has not changed is the newest there is.
+    diag.reset();
+    const node_kv = kv_of("/nodes/n", "{\"v\":2,\"name\":\"n\",\"capacity\":{\"cpu_millis\":1," ++
+        "\"memory_bytes\":1}}");
+    try testing.expectError(error.Malformed, read(Node, arena, node_kv, &diag));
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
+}
+
+test "a newer version is refused before the shape is parsed" {
+    // Goal: E0303, not E0301, for a too-new value whose shape this release cannot parse.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const kv = kv_of("/nodes/n", "{\"v\":9,\"name\":7,\"capacity\":\"big\"}");
+    try testing.expectError(error.Malformed, read(Node, arena_state.allocator(), kv, &diag));
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
+    try testing.expectEqualStrings(
+        "the value at /nodes/n is version 9; this release reads up to version 1",
+        diag.last_cause().?,
+    );
+}
+
+test "the version a record is written in is the version the reader accepts" {
+    // Goal: one source for the version. Method: for every versioned record, a value at the
+    // version it is written in encodes with that `v` and reads back, and one more is refused.
+    // (`std.mem.zeroes` zeroes `v` too, so it is set to the default it would otherwise take.)
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    inline for (.{
+        Service,  Replica,    Node, Observed, Assigned, Allocation, Audit, NodeStatus, Summary,
+        Decision, IndexEntry,
+    }) |T| {
+        var value = std.mem.zeroes(T);
+        value.v = version_current(T);
+        const bytes = try encode(arena, value, &diag);
+        const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
+        try testing.expect(std.mem.startsWith(u8, bytes, prefix));
+        _ = try read(T, arena, kv_of("/k", bytes), &diag);
+        const newer = try std.fmt.allocPrint(arena, "{{\"v\":{d}}}", .{version_current(T) + 1});
+        diag.reset();
+        try testing.expectError(error.Malformed, read(T, arena, kv_of("/k", newer), &diag));
+        try testing.expectEqual(codes.Code.E0303, diag.code.?);
+        diag.reset();
+    }
 }

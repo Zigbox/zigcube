@@ -122,6 +122,20 @@ pub const decisions_scan_max: u32 = 16;
 /// The agent's wait between looks at the runtime when nothing wakes it sooner.
 pub const agent_resync_ms: u32 = 1000;
 pub const node_lease_ttl_ms: u32 = 10 * 1000;
+/// The fencing constants of docs/briefs/c1.md ("Settled here") and docs/authority.md §3. The
+/// agent stops its containers at `s + ttl - fence_margin`; the node controller declares a node
+/// lost at expiry and places elsewhere `lost_grace_ms` later.
+pub const lease_ttl_ms: u32 = node_lease_ttl_ms;
+/// How long the agent waits for containers to stop, when it fences, before it kills them.
+pub const fence_stop_ms: u32 = 2000;
+/// The bound on the difference of two hosts' clock rates, in parts per thousand (1 %).
+pub const clock_skew_per_mille: u32 = 10;
+pub const fence_margin_ms: u32 = 3000;
+pub const lost_grace_ms: u32 = 1000;
+/// What the margin leaves for the kernel to deliver SIGKILL and the process to exit.
+pub const fence_kill_latency_ms: u32 = 900;
+/// Bytes a decision's `cause_evidence` may take.
+pub const decision_evidence_bytes_max: u32 = 1024;
 /// A grace period for a stop, then a kill.
 pub const stop_grace_ms: u32 = 5000;
 /// Containers whose stop the agent has asked for and is waiting on.
@@ -349,6 +363,11 @@ comptime {
     assert(fake_poll_ms < fake_start_timeout_ms);
     assert(fake_file_bytes_max <= store_value_bytes_max);
     assert(agent_io_timeout_ms > agent_watch_slice_ms);
+    // docs/authority.md §3: fence_margin >= fence_stop + ttl * skew + kill latency.
+    const skew_ms = lease_ttl_ms * clock_skew_per_mille / 1000;
+    assert(fence_margin_ms >= fence_stop_ms + skew_ms + fence_kill_latency_ms);
+    assert(fence_margin_ms < lease_ttl_ms);
+    assert(decision_evidence_bytes_max < store_value_bytes_max);
 
     assert(service_file_bytes_max < api_request_bytes_max);
     assert(cli_reply_bytes_max <= request_arena_bytes_max);

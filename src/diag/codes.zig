@@ -60,6 +60,7 @@ pub const Code = enum(u8) {
     E0213,
     E0301,
     E0302,
+    E0303,
     E0501,
     E0502,
     E0503,
@@ -600,6 +601,23 @@ pub const registry = [_]Entry{
         \\The cause line names the bound. Delete services that are no longer
         \\needed; if the fleet really is this large, the bound is a constant in
         \\src/constants.zig and the next release raises it.
+        ,
+    },
+    .{
+        .code = .E0303,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a stored record is from a newer release",
+        .explanation =
+        \\A value in the store carries a format version this release does not know:
+        \\a newer zcube wrote it, and this one is older. The value is not
+        \\malformed, so nothing was changed and nothing was skipped; this release
+        \\just cannot say what the newer fields mean, and acting on a half-read
+        \\record could undo the newer release's work.
+        \\
+        \\The cause line names the key and both versions. Run the release that
+        \\wrote the record, or upgrade this one; if you downgraded on purpose,
+        \\restore the store from the backup taken before the upgrade.
         ,
     },
     .{
