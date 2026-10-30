@@ -6,7 +6,7 @@
 
 The owner decides; the supervisor runs the work. You:
 
-- write each slice's brief and start a **fresh implementer session** for it (`create_session`, a Sonnet model; a Haiku one for small mechanical jobs such as a CI tweak);
+- write each slice's brief and start a **fresh implementer session** for it (`create_session`, a Sonnet model; a Haiku one for purely mechanical jobs, which AGENTS.md now requires (owner, 2026-10-30), and each brief names its slice's mechanical parts for the implementer to hand to Haiku);
 - review every slice adversarially against `REVIEW.md`, `docs/STYLE.md`, `DIAGNOSTICS.md` and `docs/authority.md`, and start a fresh session for the fixes;
 - open the PRs, watch CI (`subscribe_pr_activity`), and tell the owner when a PR is ready;
 - merge your own green PRs that change only docs, the site or CI, when the owner has asked you to ship (they have, since C0); leave code PRs to the owner unless told otherwise;
@@ -32,7 +32,7 @@ Zigbox (`Zigbox/zigbox`) is the sister project and ahead of us on process and di
 - **Authority model, revision 3** (`docs/authority.md`) is approved and is what C1 is built to. The architecture page shows it; `docs/keys.md` points at it.
 - **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` does not exist yet.
 - **The CI skip for documentation-only PRs works live:** on PR #22 (run 41071276402) only `changes` ran, and every code job was skipped.
-- **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md). Slice 1 (`docs/briefs/c1-1.md`, `zig build check`) is with implementer session `session_01RfMZXNa4KK8VBrvJQo7vv6` (Sonnet), branched from `claude/fervent-meitner-cc9k8g`.
+- **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md). Slice 1 (`zig build check`) merged in Zigbox/zigcube#23 after a clean supervisor review and a green CI run. Slice 2 (`docs/briefs/c1-2.md`, keys and writers) is with a fresh Sonnet implementer session. Zigbox's SPEC.md resync to live doc rev 86 is in Zigbox/zigbox#23, the owner's to merge.
 - **Local mode settled (owner, 2026-10-30):** C1 builds `zcube local up` only; names and grants moved to C4; the demo keeps agents on one machine. The live doc is at rev 86 with this; Zigbox's `docs/SPEC.md` snapshot is still rev 78 and needs a resync (Zigbox's supervisor owns that file).
 
 ## The plan: C1 · Fleet
