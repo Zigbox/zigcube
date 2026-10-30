@@ -16,7 +16,7 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 | Milestone | What it adds | Status |
 | --- | --- | --- |
 | C0 · Loop | One node keeps a promise: apply, get, why | **Demonstrated** 2026-10-27, [CI run](https://github.com/Zigbox/zigcube/actions/runs/40556942364) |
-| C1 · Fleet | Placement across nodes, failover on lease expiry | Not started (next); slice plan in [docs/supervisor-handoff.md](docs/supervisor-handoff.md) |
+| C1 · Fleet | Placement across nodes, failover on lease expiry | In progress: slice 1 of 8 merged, slice 2 (keys and writers) in review; plan in [docs/briefs/c1.md](docs/briefs/c1.md) |
 | C2–C8 | Swarm, Rollout, Mesh, Edge, Trust, State, Jobs | Not started |
 
 A milestone is marked **demonstrated** only when its `demo-cN` job is green in CI, with a link to that run.
