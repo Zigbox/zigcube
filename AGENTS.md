@@ -57,6 +57,13 @@ These arrive with the scaffold; keep this list current as they land.
   owns that database's `zcube` schema (it drops it before and after), and stops and starts the database with
   `pg_dev stop` / `pg_dev up` (`zig build pg-stop`, `pg-up`) or with `ZCUBE_DEMO_PG_STOP` / `ZCUBE_DEMO_PG_START`.
   `docs/demos/c0.md` says what it asserts. Not `zig build sim-c0`, which is a simulation.
+- `zig build check [-Dcheck-user=<user>|-]` runs every gate a slice must pass and ends in one line,
+  `check: PASS <commit> (build test tidy errors-site wasm-check wasm-test console-wasm store:memory,sqlite sim-c0, test as tester)`
+  or `check: FAIL <commit> (what failed)`. The gates are build-step dependencies; then
+  `src/testing/check.zig` runs the Postgres suite (only when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` with a
+  fresh seed (printed as `sim-c0: seed N` first) and, as root, `zig build test` as `tester` in a scratch
+  worktree of HEAD (`-Dcheck-user=-` skips it; `useradd -m tester` creates the user). `+dirty` after the commit
+  means uncommitted changes the user run did not see. It leaves out `agent-smoke` and `demo-c0`.
 - `zig build demo-cN` runs milestone N's demo.
 
 ## Working as the implementer
@@ -64,7 +71,7 @@ These arrive with the scaffold; keep this list current as they land.
 - Work in slices as the brief defines them (`docs/briefs/`). At the end of each slice, commit and stop with a report. The supervisor reviews each slice adversarially; what the review finds is fixed before the next slice, by a fresh session (see below).
 - In a cloud session the container is ephemeral, so push each slice to your own session branch. Never push to `main`, and never to another session's branch.
 - **Before you report, run [REVIEW.md](REVIEW.md) on your own diff**, and say which of its items your slice touched and what you checked.
-- **Gates, on the commit you report:** `zig build check` once it exists (it is C1's first slice); until then `zig build`, `zig build test`, `zig build tidy`, `zig build errors-site-check`, `zig build wasm-check` and `zig build test-store -Dbackend=sqlite`, plus `-Dbackend=postgres` when the store changed. Name the commit they ran on. A report without them, or with another commit's, is not a report.
+- **Gates, on the commit you report:** `zig build check`; paste its last line (`check: PASS <commit>`, without `+dirty`). A report without that line, or with another commit's, is not a report. It does not run `agent-smoke` or `demo-c0` (CI does), nor the Postgres suite unless `ZCUBE_TEST_POSTGRES` is set: when the store changed, set it (`zig build pg-up` prints it) so the PASS line names `postgres`.
 - Report what you ran and its output (the last lines, not the log), what you did not run and why, every deviation from HANDOFF or the brief, and anything in HANDOFF, DIAGNOSTICS or the Zigbox code that seemed wrong. End the report with the handoff note described below.
 
 ## Agent context discipline

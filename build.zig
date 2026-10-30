@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .zigbox = zigbox_module,
         .library = library,
     });
+    add_check_step(b);
 }
 
 const Shared = struct {
@@ -91,7 +92,8 @@ const Shared = struct {
 fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Shared) void {
     const backend = b.option(Backend, "backend", "Store backend for test-store and demo-c0");
     const postgres = postgres_conninfo(b);
-    add_store_step(b, .{
+    const store_help = "Run the store conformance suite (-Dbackend=...)";
+    const store_options: StoreStepOptions = .{
         .backend = backend orelse .memory,
         .postgres = postgres,
         .seed = seed,
@@ -100,7 +102,16 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
         .sqlite = shared.sqlite,
         .libpq = shared.libpq,
         .zigbox = shared.zigbox,
-    });
+    };
+    add_store_step(b, "test-store", store_help, store_options);
+    // `check` runs the suite on the two backends that need no server, as steps of its own: the
+    // `test-store` step takes one backend from the command line.
+    for ([_]Backend{ .memory, .sqlite }) |fixed| {
+        var options = store_options;
+        options.backend = fixed;
+        const name = b.fmt("check-store-{s}", .{@tagName(fixed)});
+        add_store_step(b, name, "Run the store conformance suite for check", options);
+    }
     const pg_dev = add_pg_dev_steps(b);
     // The demo needs a real store: `-Dbackend=memory` (which test-store takes) runs it on SQLite.
     const demo_backend: Backend = switch (backend orelse .sqlite) {
@@ -394,10 +405,15 @@ fn postgres_conninfo(b: *std.Build) []const u8 {
 /// test binary written against the `Store` interface, run against the chosen backend. The
 /// backend's own tests come with it (they are in the same compilation), so for Postgres the
 /// binary needs the database even for those.
-fn add_store_step(b: *std.Build, step_options: StoreStepOptions) void {
+fn add_store_step(
+    b: *std.Build,
+    name: []const u8,
+    help: []const u8,
+    step_options: StoreStepOptions,
+) void {
     const backend = step_options.backend;
     const seed = step_options.seed;
-    const step = b.step("test-store", "Run the store conformance suite (-Dbackend=...)");
+    const step = b.step(name, help);
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
     options.addOption(?u64, "seed", seed);
@@ -654,4 +670,39 @@ fn add_web_files(b: *std.Build, console: *std.Build.Step.Compile) *std.Build.Mod
     run.addDirectoryArg(b.path("web"));
     run.addFileArg(console.getEmittedBin());
     return b.createModule(.{ .root_source_file = out.path(b, "web_files.zig") });
+}
+
+/// `zig build check`: every gate a slice must pass, in one command, ending in the one line a
+/// report quotes (`check: PASS <commit>`). The cheap gates run first, as dependencies; then the
+/// tool (src/testing/check.zig) runs what a dependency cannot express: the Postgres conformance
+/// suite when `ZCUBE_TEST_POSTGRES` is set, `sim-c0` with a fresh seed, and, as root,
+/// `zig build test` again as -Dcheck-user (default tester) in a scratch worktree, because CI runs
+/// as an ordinary user. -Dcheck-user=- skips that. Not in `check`: `agent-smoke` and `demo-c0`
+/// (CI runs them; they are slow and start servers).
+fn add_check_step(b: *std.Build) void {
+    const user = b.option([]const u8, "check-user", "User for the non-root test run, or -") orelse
+        "tester";
+    const tool = b.addExecutable(.{
+        .name = "check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ b.graph.zig_exe, user });
+    run.has_side_effects = true;
+    const gates = [_][]const u8{
+        "install",            "test",      "tidy",         "errors-site-check",
+        "wasm-check",         "wasm-test", "console-wasm", "check-store-memory",
+        "check-store-sqlite",
+    };
+    for (gates) |name| {
+        const gate = b.top_level_steps.get(name) orelse @panic(name);
+        run.step.dependOn(&gate.step);
+    }
+    const step = b.step("check", "Every gate, then the test suite as a non-root user; one line");
+    step.dependOn(&run.step);
 }

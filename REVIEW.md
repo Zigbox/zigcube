@@ -36,7 +36,7 @@ The supervisor reviews every slice against this list, so run it yourself first, 
 
 ## Tests and gates
 
-- **The gates run on the exact commit you report** (AGENTS.md lists them), with their last lines pasted.
+- **The gates run on the exact commit you report**: `zig build check` (AGENTS.md), with its last line pasted.
 - **A test reachable from no test root never runs.** A new file of tests is imported from a root in `build.zig`, and you have seen it run (`zig build test --summary all`).
 - **A test fills memory with a known byte before checking that something wrote it.** Never rely on what `undefined` holds.
 - **A fixture parsed from text is checked against real output**, captured from a real run, not written from what the code is believed to print.
