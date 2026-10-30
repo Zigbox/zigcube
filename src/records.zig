@@ -919,8 +919,9 @@ test "a newer version is refused before the shape is parsed" {
 }
 
 test "the version a record is written in is the version the reader accepts" {
-    // Goal: one source for the version. Method: for every versioned record, encode a zeroed
-    // value and check the `v` it writes is what `read` takes as current, and one more is refused.
+    // Goal: one source for the version. Method: for every versioned record, a value at the
+    // version it is written in encodes with that `v` and reads back, and one more is refused.
+    // (`std.mem.zeroes` zeroes `v` too, so it is set to the default it would otherwise take.)
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -930,9 +931,12 @@ test "the version a record is written in is the version the reader accepts" {
         Service, Replica, Node, Observed, Assigned, Allocation, Audit, NodeStatus, Summary,
         Decision, IndexEntry,
     }) |T| {
-        const bytes = try encode(arena, std.mem.zeroes(T), &diag);
+        var value = std.mem.zeroes(T);
+        value.v = version_current(T);
+        const bytes = try encode(arena, value, &diag);
         const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
         try testing.expect(std.mem.startsWith(u8, bytes, prefix));
+        _ = try read(T, arena, kv_of("/k", bytes), &diag);
         const newer = try std.fmt.allocPrint(arena, "{{\"v\":{d}}}", .{version_current(T) + 1});
         diag.reset();
         try testing.expectError(error.Malformed, read(T, arena, kv_of("/k", newer), &diag));
