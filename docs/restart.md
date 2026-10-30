@@ -12,7 +12,7 @@ These orders restart Zigcube after a pause in which Zigbox shipped M3 to M6, M4b
 
 ## The order of work
 
-1. **R1 · Re-pin and the contract.** Pin Zigbox at the merge of its M6b (or, if M6b is not merged when you start, at its `main` and again at M6b). Revise the `Runtime` contract to what the library offers, as drafted below. **Decided: the owner reviews the revised contract before anything is built on it** (it is an **Ask first** item in `HANDOFF.md`). Copy Zigbox's `DIAGNOSTICS.md` over Zigcube's, redo the `E0410` switch on current `main`, and close PR #10 in favour of that.
+1. **R1 · Re-pin and the contract.** Pin Zigbox at the merge of its M6b, which brings logs, exec and pull in the library (or, if M6b is not merged when you start, at its `main` and again at M6b). Revise the `Runtime` contract to what the library offers, as drafted below. **Decided: the owner reviews the revised contract before anything is built on it** (it is an **Ask first** item in `HANDOFF.md`). Copy Zigbox's `DIAGNOSTICS.md` over Zigcube's, redo the `E0410` switch on current `main`, and close PR #10 in favour of that.
 2. **R2 · C0 on the real runtime.** A `ZigboxRuntime` beside `FakeRuntime`, the agent able to use either, and `demo-c0` passing on real Zigbox in a VM (Ubuntu 24.04, as Zigbox's demos run), with `FakeRuntime` kept for the simulator and the fast tests. Every C0 acceptance criterion holds on the real runtime: re-adoption after an agent restart, no duplicates, `why` chains ending in Zigbox's real diagnostics.
 3. **C1 · Fleet, with local mode.** Write C1's brief from the spec's C1 (rev 76), with local mode as its own slices. Its new demo step: on a laptop, local mode started by one command, a file with an app and postgres, the app granted `db:5432`, data reaching the app by the name `db`, and without the grant a refused connection that `zcube why` explains.
 
@@ -54,7 +54,7 @@ Semantics to approve:
 
 ## What Zigcube needs from Zigbox
 
-- **Pull in the library.** Today Zigbox's pull lives in its CLI's code; the `zigbox` module cannot fetch an image. `ensure_image` needs it. Raise it with the owner as a Zigbox item; until it lands, R2 may shell out to `zbx pull` and read its `--output json`, as a stated and temporary cut.
+- **Pull in the library.** Today Zigbox's pull lives in its CLI's code; the `zigbox` module cannot fetch an image, and `ensure_image` needs it. **Decided:** it comes with Zigbox M6b (its slice 4), so re-pinning at M6b's merge brings it. If R2 starts before that, it may shell out to `zbx pull` and read its `--output json`, as a stated and temporary cut, removed at the re-pin.
 - **Logs and exec** come with Zigbox M6b, in the library.
 - **The re-pin itself**: Zigbox's `zigbox` module at a merged commit, fetched as a package as today.
 
@@ -75,4 +75,4 @@ zcube-server and the CLI need no containers and can run natively on macOS; the a
 
 - The revised `Runtime` contract, before R2 builds on it.
 - How local mode runs on the Mac.
-- Any dependency on a Zigbox change that is not merged (pull in the library is the known one).
+- Any dependency on a Zigbox change that is not merged (M6b's pull, logs and exec, until it merges).
