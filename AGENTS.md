@@ -28,6 +28,8 @@ Zigcube is the orchestrator for Zigbox workloads, written in Zig. The coding han
 - Postgres 16 is installed without the OrioleDB extension, so the plain-heap schema path is what runs here. `initdb` refuses root: run it as `postgres` in a directory that user owns, e.g. `su postgres -c "initdb -D $DIR -A trust -U zcube"`.
 - SQLite 3 headers and the library are present.
 - Zig downloads from https://ziglang.org/download/ work through the proxy.
+- Zig's own package fetch does not (`ConnectionResetByPeer` at `build.zig.zon`), and `zig fetch <file>` stores a tarball that the build then unpacks under the wrong hash. Download the pinned tarball with `curl -sSL -o <file> <url from build.zig.zon>` and unpack it by hand: `mkdir -p zig-pkg/<hash> && tar -xzf <file> -C zig-pkg/<hash> --strip-components=1`, with `<hash>` the `.hash` in `build.zig.zon`. (Checked 2026-10-30.)
+- A fresh container may lack Zig (run `.claude/hooks/session-start.sh` if `zig` is not on PATH) and has no `tester` user: `useradd -m tester` before `zig build check`.
 
 ## Commands
 
