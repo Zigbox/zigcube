@@ -4,6 +4,7 @@ Lasting decisions, newest first, each with where its reasoning lives. Implemente
 
 | Date | Decision | Where |
 | --- | --- | --- |
+| 2026-10-30 | Purely mechanical work goes to Haiku (owner): implementers and the supervisor hand pattern-specified changes to a Haiku subagent or session and check its diff; briefs name each slice's mechanical parts. | `AGENTS.md` |
 | 2026-10-30 | Local mode (owner): C1 builds the one-command local start (`zcube local up`, `FakeRuntime` until Zigbox is linked); names and grants between local services move to C4; C1's demo keeps three agents on one machine. Live doc rev 86. | `docs/briefs/c1.md`, live design doc |
 | 2026-10-30 | Fencing constants (owner): `ttl` 10 s, `fence_stop_ms` 2 s, `skew` 1 %, `fence_margin` 3 s, `lost_grace_ms` 1 s. | `docs/briefs/c1.md` |
 | 2026-10-30 | `zig build check` is the one gate command (ported from Zigbox's): cheap gates as build-step dependencies, then `src/testing/check.zig` runs Postgres (when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` with a fresh seed and, as root, `zig build test` as `tester`; it ends in `check: PASS <commit> (...)`. `agent-smoke` and `demo-c0` stay CI-only. | `docs/briefs/c1-1.md`, `AGENTS.md` |
