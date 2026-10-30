@@ -343,12 +343,10 @@ pub const Summary = struct {
     newest: []const u8,
 };
 
-/// The format version each record kind is written in. A reader accepts every version up to it.
+/// The format version each record kind is written in: the default of its `v` member, the one
+/// place it is set. A reader accepts every version up to it.
 pub fn version_current(comptime T: type) u32 {
-    return switch (T) {
-        Observed, Decision => 2,
-        else => 1,
-    };
+    return std.meta.fieldInfo(T, .v).attrs.defaultValue(u32).?;
 }
 
 pub const SubjectKind = enum { service, replica, node };
@@ -442,15 +440,20 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
 pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag) Error!T {
     assert(kv.key.len > 0);
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
-    const parsed = std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
+    if (@hasField(T, "v")) {
+        // The version comes before the shape: a newer release may have changed the shape.
+        const Head = struct { v: ?u32 = null };
+        const head = std.json.parseFromSliceLeaky(Head, arena, kv.value, options) catch |err| {
+            if (err == error.OutOfMemory) return failures.no_memory(diag);
+            return malformed(diag, kv.key, @typeName(T));
+        };
+        const known = version_current(T);
+        if ((head.v orelse 0) > known) return too_new(diag, kv.key, head.v.?, known);
+    }
+    return std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
         if (err == error.OutOfMemory) return failures.no_memory(diag);
         return malformed(diag, kv.key, @typeName(T));
     };
-    if (@hasField(T, "v")) {
-        const known = version_current(T);
-        if (parsed.v > known) return too_new(diag, kv.key, parsed.v, known);
-    }
-    return parsed;
 }
 
 /// Raises ZC-E0303: the value at `key` was written in a newer format than this release reads.
@@ -898,4 +901,42 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
         "\"memory_bytes\":1}}");
     try testing.expectError(error.Malformed, read(Node, arena, node_kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
+}
+
+test "a newer version is refused before the shape is parsed" {
+    // Goal: E0303, not E0301, for a too-new value whose shape this release cannot parse.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const kv = kv_of("/nodes/n", "{\"v\":9,\"name\":7,\"capacity\":\"big\"}");
+    try testing.expectError(error.Malformed, read(Node, arena_state.allocator(), kv, &diag));
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
+    try testing.expectEqualStrings(
+        "the value at /nodes/n is version 9; this release reads up to version 1",
+        diag.last_cause().?,
+    );
+}
+
+test "the version a record is written in is the version the reader accepts" {
+    // Goal: one source for the version. Method: for every versioned record, encode a zeroed
+    // value and check the `v` it writes is what `read` takes as current, and one more is refused.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    inline for (.{
+        Service, Replica, Node, Observed, Assigned, Allocation, Audit, NodeStatus, Summary,
+        Decision, IndexEntry,
+    }) |T| {
+        const bytes = try encode(arena, std.mem.zeroes(T), &diag);
+        const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
+        try testing.expect(std.mem.startsWith(u8, bytes, prefix));
+        const newer = try std.fmt.allocPrint(arena, "{{\"v\":{d}}}", .{version_current(T) + 1});
+        diag.reset();
+        try testing.expectError(error.Malformed, read(T, arena, kv_of("/k", newer), &diag));
+        try testing.expectEqual(codes.Code.E0303, diag.code.?);
+        diag.reset();
+    }
 }
