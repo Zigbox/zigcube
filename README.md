@@ -5,7 +5,8 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 - **Coding handoff (C0, C1):** [HANDOFF.md](HANDOFF.md).
 - **How the code is written and tested:** [docs/STYLE.md](docs/STYLE.md) (Zigbox's TigerStyle rules, with Zigcube's departures).
 - **Diagnostics standard, shared with Zigbox:** [DIAGNOSTICS.md](DIAGNOSTICS.md).
-- **Rules for contributors and agents:** [AGENTS.md](AGENTS.md).
+- **Rules for contributors and agents:** [AGENTS.md](AGENTS.md), with the self-review checklist [REVIEW.md](REVIEW.md) and the decision log [docs/DECISIONS.md](docs/DECISIONS.md).
+- **Plan and supervisor handoff:** [docs/supervisor-handoff.md](docs/supervisor-handoff.md).
 - **Web console (design and clickable prototype):** [docs/console.md](docs/console.md), with the HTTP API it needs proposed in [docs/api.md](docs/api.md).
 
 ## Status
@@ -15,7 +16,7 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 | Milestone | What it adds | Status |
 | --- | --- | --- |
 | C0 · Loop | One node keeps a promise: apply, get, why | **Demonstrated** 2026-10-27, [CI run](https://github.com/Zigbox/zigcube/actions/runs/40556942364) |
-| C1 · Fleet | Placement across nodes, failover on lease expiry | Not started (next) |
+| C1 · Fleet | Placement across nodes, failover on lease expiry | Not started (next); slice plan in [docs/supervisor-handoff.md](docs/supervisor-handoff.md) |
 | C2–C8 | Swarm, Rollout, Mesh, Edge, Trust, State, Jobs | Not started |
 
 A milestone is marked **demonstrated** only when its `demo-cN` job is green in CI, with a link to that run.
