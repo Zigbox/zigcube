@@ -1,6 +1,6 @@
 # Supervisor handoff
 
-*Written 2026-10-30 by the supervisor session that shipped C0; updated the same day by the session that started C1. Update it when you hand off in turn: replace what changed, keep it short.*
+*Written 2026-10-30 by the supervisor session that shipped C0; updated the same day by the session that started C1 and merged its slices 1 and 2. Update it when you hand off in turn: replace what changed, keep it short.*
 
 ## The role
 
@@ -30,10 +30,20 @@ Zigbox (`Zigbox/zigbox`) is the sister project and ahead of us on process and di
 
 - **C0 · Loop: demonstrated** 2026-10-27 (run 40556942364), nine slices, PRs #4–#15.
 - **Authority model, revision 3** (`docs/authority.md`) is approved and is what C1 is built to. The architecture page shows it; `docs/keys.md` points at it.
-- **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` does not exist yet.
+- **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` exists since C1 slice 1.
 - **The CI skip for documentation-only PRs works live:** on PR #22 (run 41071276402) only `changes` ran, and every code job was skipped.
-- **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md). Slice 1 (`zig build check`) merged in Zigbox/zigcube#23 after a clean supervisor review and a green CI run. Slice 2 (`docs/briefs/c1-2.md`, keys and writers) was reviewed; a fresh session fixed the findings (one version source, version read before shape, authority.md's move count and `retention` role), and its PR is open. Owner, 2026-10-30: `next_replica` gets a key of its own in slice 3 (DECISIONS.md). Zigbox's SPEC.md resync (rev 86) merged in Zigbox/zigbox#23, the Haiku rule in Zigbox/zigbox#25. Trap: an implementer session may be refused `add_repo` for Zigbox/zigbox and then cannot fetch the pinned package to build; give it the tarball or check it can build before it starts.
-- **Local mode settled (owner, 2026-10-30):** C1 builds `zcube local up` only; names and grants moved to C4; the demo keeps agents on one machine. The live doc is at rev 86 with this; Zigbox's `docs/SPEC.md` snapshot is still rev 78 and needs a resync (Zigbox's supervisor owns that file).
+- **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md).
+  - Slice 1 (`zig build check`) merged in Zigbox/zigcube#23.
+  - Slice 2 (keys, versioned records, writer table, compare sets) merged in Zigbox/zigcube#24 after review and a fix session. The review fixes were one version source, the version read before the shape, and authority.md's move count (8) and `retention` role.
+  - **Next: slice 3 (scheduler).** Its brief, `docs/briefs/c1-3.md`, is on `main`; no implementer session has been started. It includes the owner's decision (2026-10-30) that `next_replica` moves to `/replica-numbers/<service>`, and a supervisor call the owner may overrule: no in-place upgrade from a C0 store (a v1 replica's `node` is ignored and it is placed again).
+  - README and site still say slice 2 is in review: update them to 2 of 8 merged in the next PR.
+  - Zigbox: SPEC.md resync to rev 86 merged in Zigbox/zigbox#23, and the Haiku rule in Zigbox/zigbox#25.
+- **Traps from slice 2.**
+  - The fix session was refused `add_repo` for Zigbox/zigbox, so it could not fetch the pinned package and pushed code it never compiled; its new test failed. The slice 3 brief now makes the implementer prove it can build before it writes code. If it still cannot, hand it the tarball or ask the owner to allow `add_repo`.
+  - Always run `zig build check` yourself on a fix branch before opening the PR; tidy (`zig fmt`) caught a line the fix session never formatted.
+  - Do not push to an open PR's branch for docs-only follow-ups: each push restarts its CI. Batch them.
+  - The slice 2 fix session (`session_01RfMZXLxkmaRen5xudyGXBU`) and the slice 2 implementer session are finished; archive them with the owner's OK.
+- **Local mode settled (owner, 2026-10-30):** C1 builds `zcube local up` only; names and grants moved to C4; the demo keeps agents on one machine. The live doc and Zigbox's `docs/SPEC.md` are both at rev 86.
 
 ## The plan: C1 · Fleet
 
@@ -59,6 +69,5 @@ Then: README, site and architecture page updated with the run link; C1 marked de
 ## Open with the owner
 
 - C0's implementer sessions and the CI-skip session are archived (owner's OK, 2026-10-30), except slice 4 (`session_01Jc3KpBnbQjqTJsuVnLZ6uD`), whose archive the permission classifier refused; the owner archives it.
-- Zigbox's `docs/SPEC.md`: resync to live doc rev 86 (C1 local mode, C4 local names and grants).
 - Zigbox items, low priority: a separate diagnostics module (zigbox issue #8), a real code for `ZBX-E0501` and one for `lost`, container start time in `Runtime`.
 - Before C7: a TLA+ model of fencing. Before a second server: a leader lease on `/leader/controllers`.
