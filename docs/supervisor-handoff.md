@@ -33,7 +33,7 @@ Zigbox (`Zigbox/zigbox`) is the sister project and ahead of us on process and di
 - **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` does not exist yet.
 - **The CI skip for documentation-only PRs works live:** on PR #22 (run 41071276402) only `changes` ran, and every code job was skipped.
 - **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md). Slice 1 (`docs/briefs/c1-1.md`, `zig build check`) is with implementer session `session_01RfMZXNa4KK8VBrvJQo7vv6` (Sonnet), branched from `claude/fervent-meitner-cc9k8g`.
-- **Conflict raised with the owner:** the live doc's C1 (rev 76 on) adds local mode with names and grants and a VM demo; HANDOFF keeps networking and real Zigbox out of C1. `c1.md` builds the fleet part and holds local mode until the owner decides.
+- **Local mode settled (owner, 2026-10-30):** C1 builds `zcube local up` only; names and grants moved to C4; the demo keeps agents on one machine. The live doc is at rev 86 with this; Zigbox's `docs/SPEC.md` snapshot is still rev 78 and needs a resync (Zigbox's supervisor owns that file).
 
 ## The plan: C1 · Fleet
 
@@ -51,7 +51,7 @@ Slices are cut small so that each fits one implementer session under the context
 4. **Node controller and auditor.** Lease expiry to `lost` after `lost_grace_ms`, rescheduling, the auditor's `ZC-B` findings blocking placement, `zcube repair allocations <node> --confirm` as a `repair_allocation` decision.
 5. **sim-c1.** Invariants I1a–I7, the negative tests that must find I1b, I6 and I7 violations, the evidence acceptance test, native against WASM.
 6. **Agent.** Registration with a lease, tenure-checked observed writes, self-fencing on `CLOCK_BOOTTIME` with `s` persisted, the partition test.
-7. **Surfaces.** `zcube get nodes`, `get replicas -o wide`, `why node`, `repair`; `docs/api.md` (`completeness` on `why`), the console.
+7. **Surfaces.** `zcube get nodes`, `get replicas -o wide`, `why node`, `repair`, `local up`; `docs/api.md` (`completeness` on `why`), the console.
 8. **demo-c1.** The demo script from HANDOFF, three agents on one machine, as `zig build demo-c1` on SQLite and Postgres, in CI.
 
 Then: README, site and architecture page updated with the run link; C1 marked demonstrated.
@@ -59,7 +59,6 @@ Then: README, site and architecture page updated with the run link; C1 marked de
 ## Open with the owner
 
 - C0's implementer sessions and the CI-skip session are archived (owner's OK, 2026-10-30), except slice 4 (`session_01Jc3KpBnbQjqTJsuVnLZ6uD`), whose archive the permission classifier refused; the owner archives it.
-- Zigbox's `docs/SPEC.md` already matches the live doc (both rev 78, C4 epoch and C7 fencing proof in): nothing to do.
-- Local mode in C1 (see Where things stand): the owner's call.
+- Zigbox's `docs/SPEC.md`: resync to live doc rev 86 (C1 local mode, C4 local names and grants).
 - Zigbox items, low priority: a separate diagnostics module (zigbox issue #8), a real code for `ZBX-E0501` and one for `lost`, container start time in `Runtime`.
 - Before C7: a TLA+ model of fencing. Before a second server: a leader lease on `/leader/controllers`.

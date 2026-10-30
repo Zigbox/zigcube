@@ -157,6 +157,8 @@ Example service file:
 
 Build: node registration attached to a store lease; a scheduler with resource fit (CPU, memory from the node's declared capacity) and spread; lost-node detection on lease expiry; rescheduling; `zcube get nodes`.
 
+**Added by the owner, 2026-10-30:** local mode's one-command start, `zcube local up` (server on SQLite and one agent on the same machine, `FakeRuntime` until Zigbox is linked). Names and grants between local services are C4's. See `docs/briefs/c1.md`.
+
 With the fake runtime, "nodes" can be several agent processes on one machine with separate state directories, or a few VMs. A script in `demo/` must bring the demo environment up from nothing.
 
 **Demo script** (`zig build demo-c1`):
