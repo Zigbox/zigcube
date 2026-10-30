@@ -4,6 +4,7 @@ Lasting decisions, newest first, each with where its reasoning lives. Implemente
 
 | Date | Decision | Where |
 | --- | --- | --- |
+| 2026-10-30 | Fencing constants (owner): `ttl` 10 s, `fence_stop_ms` 2 s, `skew` 1 %, `fence_margin` 3 s, `lost_grace_ms` 1 s. | `docs/briefs/c1.md` |
 | 2026-10-30 | Agent context discipline adopted from Zigbox: one session per slice, handoff notes, a 250K-token / 60-turn ceiling, fixes by fresh sessions. `REVIEW.md` is the self-review checklist; `zig build check` becomes the one gate command (C1's first slice). | `AGENTS.md`, `REVIEW.md` |
 | 2026-10-27 | CI skips its jobs for documentation-only changes; `.zig`, `.zon` and `.sh` files are code anywhere, and a guard that cannot decide runs everything. | `.github/workflows/ci.yml` |
 | 2026-10-27 | C4 workload identity binds service, image digest and placement epoch; C7 enforces the epoch for stateful services and moves a stateful replica only with a fencing proof. | `docs/authority.md`, live design doc |

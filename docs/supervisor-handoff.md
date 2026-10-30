@@ -1,6 +1,6 @@
 # Supervisor handoff
 
-*Written 2026-10-30 by the supervisor session that shipped C0, for the next one. Update it when you hand off in turn: replace what changed, keep it short.*
+*Written 2026-10-30 by the supervisor session that shipped C0; updated the same day by the session that started C1. Update it when you hand off in turn: replace what changed, keep it short.*
 
 ## The role
 
@@ -32,12 +32,14 @@ Zigbox (`Zigbox/zigbox`) is the sister project and ahead of us on process and di
 - **Authority model, revision 3** (`docs/authority.md`) is approved and is what C1 is built to. The architecture page shows it; `docs/keys.md` points at it.
 - **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` does not exist yet.
 - **The CI skip for documentation-only PRs works live:** on PR #22 (run 41071276402) only `changes` ran, and every code job was skipped.
+- **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md). Slice 1 (`docs/briefs/c1-1.md`, `zig build check`) is with implementer session `session_01RfMZXNa4KK8VBrvJQo7vv6` (Sonnet), branched from `claude/fervent-meitner-cc9k8g`.
+- **Conflict raised with the owner:** the live doc's C1 (rev 76 on) adds local mode with names and grants and a VM demo; HANDOFF keeps networking and real Zigbox out of C1. `c1.md` builds the fleet part and holds local mode until the owner decides.
 
 ## The plan: C1 · Fleet
 
 Slices are cut small so that each fits one implementer session under the context ceiling. Each has its own brief in `docs/briefs/c1-<n>.md`, written by the supervisor from `docs/briefs/c1.md`.
 
-0. **Brief.** Write `docs/briefs/c1.md` (supervisor). It must settle, with the owner where marked:
+0. **Brief.** Done: `docs/briefs/c1.md`, which settled:
    - a replica that fits no node: held pending, with the shortfall in its decision;
    - the fencing constants (proposed: ttl 10 s, fence_stop 2 s, skew 1 %, fence_margin 3 s, `lost_grace_ms` 1 s) — **owner**;
    - a random part in server-assigned request IDs;
@@ -56,7 +58,8 @@ Then: README, site and architecture page updated with the run link; C1 marked de
 
 ## Open with the owner
 
-- Archive the finished implementer sessions from C0 (slices 4, 5a, 5b, 6a, 6b, 6c) and the CI-skip Haiku session.
-- Update Zigbox's `docs/SPEC.md` to match the live doc (C4 epoch, C7 fencing proof): offered, not answered.
+- C0's implementer sessions and the CI-skip session are archived (owner's OK, 2026-10-30), except slice 4 (`session_01Jc3KpBnbQjqTJsuVnLZ6uD`), whose archive the permission classifier refused; the owner archives it.
+- Zigbox's `docs/SPEC.md` already matches the live doc (both rev 78, C4 epoch and C7 fencing proof in): nothing to do.
+- Local mode in C1 (see Where things stand): the owner's call.
 - Zigbox items, low priority: a separate diagnostics module (zigbox issue #8), a real code for `ZBX-E0501` and one for `lost`, container start time in `Runtime`.
 - Before C7: a TLA+ model of fencing. Before a second server: a leader lease on `/leader/controllers`.
