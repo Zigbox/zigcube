@@ -64,8 +64,9 @@ Slices are cut small so that each fits one implementer session under the context
 6. **Agent.** Registration with a lease, tenure-checked observed writes, self-fencing on `CLOCK_BOOTTIME` with `s` persisted, the partition test.
 7. **Surfaces.** `zcube get nodes`, `get replicas -o wide`, `why node`, `repair`, `local up`; `docs/api.md` (`completeness` on `why`), the console.
 8. **demo-c1.** The demo script from HANDOFF, three agents on one machine, as `zig build demo-c1` on SQLite and Postgres, in CI.
+9. **Simulation fleet** (owner, 2026-10-30). An always-on instance runs `sim-cluster` 24/7 at `main` and files a GitHub issue per new failure (shrunk, deduplicated, with the replay command). Can start as soon as 2b lands. Needs from the owner: the instance and a fine-grained token with issues:write on `Zigbox/zigcube` only.
 
-Then: README, site and architecture page updated with the run link; C1 marked demonstrated.
+Then: README, site and architecture page updated with the run link; C1 marked demonstrated. **C1 ships only when demo-c1 is green and the fleet has run 24 hours on the shipping commit with every issue it filed closed or recorded as a cut** (`docs/briefs/c1.md`, "Gate for shipping C1").
 
 ## Open with the owner
 
