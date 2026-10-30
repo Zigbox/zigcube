@@ -152,7 +152,7 @@ fn test_as(
     defer run(io, &.{ "git", "worktree", "remove", "--force", scratch }, null) catch {};
     const absolute = try Io.Dir.cwd().realPathFileAlloc(io, scratch, gpa);
     const global = try std.fmt.allocPrint(gpa, "{s}/.zig-global", .{absolute});
-    try seed_packages(gpa, io, zig, global);
+    try seed_packages(gpa, io, zig, global, absolute);
     try run(io, &.{ "chown", "-R", user, scratch }, null);
     const cache = try std.fmt.allocPrint(gpa, "ZIG_GLOBAL_CACHE_DIR={s}", .{global});
     const home = try std.fmt.allocPrint(gpa, "HOME={s}", .{absolute});
@@ -173,9 +173,19 @@ fn test_as(
     }
 }
 
-/// The scratch cache starts empty, so the pinned `zigbox` package would be fetched again. Copy
-/// the packages the invoking user's cache already holds, which the build just used.
-fn seed_packages(gpa: std.mem.Allocator, io: Io, zig: []const u8, global: []const u8) !void {
+/// The scratch tree starts without packages, so the pinned `zigbox` package would be fetched
+/// again. Copy what the build just used: the unpacked `zig-pkg` of this tree and the packages
+/// of the invoking user's global cache.
+fn seed_packages(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    global: []const u8,
+    tree: []const u8,
+) !void {
+    if (Io.Dir.cwd().access(io, "zig-pkg", .{})) |_| {
+        try run(io, &.{ "cp", "-a", "zig-pkg", tree }, null);
+    } else |_| {}
     const env = try output(gpa, io, &.{ zig, "env" });
     const key = ".global_cache_dir = \"";
     const start = (std.mem.indexOf(u8, env, key) orelse return) + key.len;
