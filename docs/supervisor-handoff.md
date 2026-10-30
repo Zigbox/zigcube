@@ -31,7 +31,7 @@ Zigbox (`Zigbox/zigbox`) is the sister project and ahead of us on process and di
 - **C0 · Loop: demonstrated** 2026-10-27 (run 40556942364), nine slices, PRs #4–#15.
 - **Authority model, revision 3** (`docs/authority.md`) is approved and is what C1 is built to. The architecture page shows it; `docs/keys.md` points at it.
 - **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` does not exist yet.
-- **Unverified:** the CI skip for documentation-only PRs has not yet been seen live. The PR that adds this file is the first test: only `changes` should run.
+- **The CI skip for documentation-only PRs works live:** on PR #22 (run 41071276402) only `changes` ran, and every code job was skipped.
 
 ## The plan: C1 · Fleet
 
