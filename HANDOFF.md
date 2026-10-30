@@ -2,6 +2,8 @@
 
 You are starting Zigcube, the orchestrator for Zigbox. Zigbox (a rootless, content-addressed container runtime in Zig, repo `Zigbox/zigbox`) is being built in parallel and does not exist yet. Your job is the control plane and node agent, developed against a **fake runtime**, so that real Zigbox drops in later behind a fixed interface.
 
+**Restarting after the pause (2026-10-30): read [docs/restart.md](docs/restart.md) first.** It supersedes this file where they disagree: the re-pin, the revised `Runtime` contract (for the owner's review), C0 on the real runtime, and C1 with local mode.
+
 Read this whole file and `DIAGNOSTICS.md` before writing code. When something here is ambiguous, ask the human rather than guessing; the decisions marked **Ask first** below are not yours to make alone.
 
 ## What Zigcube is
