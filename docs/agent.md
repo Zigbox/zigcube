@@ -11,7 +11,10 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 | --- | --- | --- |
 | `agent.zig` | core | The reconcile step: desired replicas against what the runtime lists |
 | `agent_api.zig` | core | The server's side of the agent endpoints, bytes in and bytes out |
-| `agent_remote.zig` | shell | `Store` implemented over those endpoints; the wait between steps |
+| `agent_client.zig` | core | `Store` implemented over those endpoints, on a `Transport` (a call that may not answer) |
+| `agent_loop.zig` | core | The loop policy as a state machine over virtual time: step, pause, watch, stop; what to report |
+| `agent_state.zig` | core | `AgentState` (what the agent persists) and `SimState`, which models the files and crashes at write points |
+| `agent_remote.zig` | shell | `HttpTransport`: the `Transport` over the HTTP client |
 | `agent_http.zig` | shell | The HTTP client: one request per connection, the agent closes first |
 | `agent_run.zig` | shell | The loop: step, wait, report failures once, back off, stop on a signal |
 | `agent_config.zig` | shell | Flags and the ZON file; the images fixture |

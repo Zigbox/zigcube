@@ -203,6 +203,11 @@ pub const SimRuntime = struct {
         };
     }
 
+    /// True if a container of that name is known, running or stopped.
+    pub fn has(self: *SimRuntime, name: []const u8) bool {
+        return self.find(name) != null;
+    }
+
     /// Containers that have not stopped.
     pub fn running_count(self: *const SimRuntime) u32 {
         var count: u32 = 0;
