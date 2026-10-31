@@ -15,6 +15,10 @@ const store = @import("store.zig");
 const harness_mod = @import("store_harness.zig");
 const compare_sets = @import("compare_sets.zig");
 const writers = @import("writers.zig");
+const controller = @import("controller.zig");
+const records = @import("records.zig");
+const scheduler = @import("scheduler.zig");
+const ManualClock = @import("clock.zig").ManualClock;
 
 const Allocator = std.mem.Allocator;
 const Revision = store.Revision;
@@ -1133,4 +1137,288 @@ test "compare set: two placements planned on one allocation revision cannot both
     defer arena_state.deinit();
     const missing = try s.get(arena_state.allocator(), "/assigned/n1/hello-2", null, &diag);
     try testing.expect(missing.kv == null);
+}
+
+// ---- The scheduler's transactions (docs/authority.md §2) ----------------------------------------
+
+/// A cluster of records on the backend under test, written as the roles that own them, and the
+/// scheduler's passes over it. Everything lives in one arena that the test frees.
+const Rig = struct {
+    s: Store,
+    diag: *Diag,
+    arena: Allocator,
+    clock: @import("clock.zig").Clock,
+
+    fn context(rig: *const Rig) controller.Context {
+        return .{ .store = rig.s, .clock = rig.clock, .arena = rig.arena, .diag = rig.diag };
+    }
+
+    fn put(rig: *const Rig, role: writers.Role, key: []const u8, value: anytype) !void {
+        const bytes = try records.encode(rig.arena, value, rig.diag);
+        const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+        const done = try writers.txn(rig.s, role, .{ .on_success = &.{op} }, rig.diag);
+        try testing.expect(done.succeeded);
+    }
+
+    /// Registers a node of 4 CPUs and 8 GiB, ready for its tenure.
+    fn node(rig: *const Rig, name: []const u8) !void {
+        const value: records.Node = .{
+            .name = name,
+            .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
+        };
+        try rig.put(.{ .agent = name }, records.node_key(name).slice(), value);
+        const got = try rig.s.get(rig.arena, records.node_key(name).slice(), null, rig.diag);
+        const status: records.NodeStatus = .{
+            .state = .ready,
+            .tenure = got.kv.?.mod_revision,
+            .at_ms = 1,
+            .decision = "x",
+        };
+        try rig.put(.node_controller, records.node_status_key(name).slice(), status);
+    }
+
+    /// A replica of service `hello` asking for 500m CPU and 1 GiB.
+    fn replica(rig: *const Rig, id: []const u8) !void {
+        const value: records.Replica = .{
+            .id = id,
+            .service = "hello",
+            .generation = 1,
+            .node = "",
+            .image = "b3:51aa9c03",
+            .command = &.{"true"},
+            .limits = .{ .cpu_millis = 500, .memory_bytes = 1024 * 1024 * 1024 },
+        };
+        try rig.put(.replica_controller, records.replica_key("hello", id).slice(), value);
+    }
+
+    fn world(rig: *const Rig) !scheduler.World {
+        const ctx = rig.context();
+        return scheduler.read_world(&ctx);
+    }
+
+    /// One whole pass of `sc`, read fresh; the transactions it committed.
+    fn pass(rig: *const Rig, sc: *scheduler.Scheduler) !u32 {
+        const ctx = rig.context();
+        const wake = try sc.reconcile(&ctx);
+        try rig.accounting_holds();
+        return wake.acted;
+    }
+
+    fn settle(rig: *const Rig, sc: *scheduler.Scheduler) !void {
+        for (0..16) |_| {
+            if (try rig.pass(sc) == 0) return;
+        }
+        return error.DidNotSettle;
+    }
+
+    /// I6: every node's allocation record is the sum of its assignments.
+    fn accounting_holds(rig: *const Rig) !void {
+        const ctx = rig.context();
+        try testing.expect((try scheduler.find_mismatch(&ctx)) == null);
+    }
+
+    fn revision(rig: *const Rig) !Revision {
+        return (try rig.s.status(rig.diag)).revision;
+    }
+
+    fn assigned(rig: *const Rig, node_name: []const u8, id: []const u8) !bool {
+        const key = records.assigned_key(node_name, id);
+        const got = try rig.s.get(rig.arena, key.slice(), null, rig.diag);
+        return got.kv != null;
+    }
+};
+
+test "scheduler: a place, a release and a move commit, and I6 holds after every pass" {
+    // Goal: the scheduler's three transactions on this backend, written by the scheduler code.
+    // Method: place two replicas on two nodes, release one by deleting its record, move the other.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000000 };
+    const rig: Rig = .{
+        .s = (try harness.connect()).interface(),
+        .diag = &diag,
+        .arena = arena_state.allocator(),
+        .clock = manual.clock(),
+    };
+    var sc = scheduler.Scheduler.init(1);
+    try rig.node("n1");
+    try rig.node("n2");
+    try rig.replica("hello-1");
+    try rig.replica("hello-2");
+    try rig.settle(&sc);
+    try testing.expect(try rig.assigned("n1", "hello-1"));
+    try testing.expect(try rig.assigned("n2", "hello-2"));
+
+    const gone = records.replica_key("hello", "hello-1");
+    _ = try delete_one(rig.s, &diag, gone.slice());
+    try rig.settle(&sc);
+    try testing.expect(!try rig.assigned("n1", "hello-1"));
+
+    const ctx = rig.context();
+    var world = try rig.world();
+    const spec: scheduler.MoveSpec = .{ .replica = "hello-2", .to = "n1", .reason = "test" };
+    try testing.expect((try sc.move_replica(&ctx, &world, spec)) == .moved);
+    try rig.accounting_holds();
+    try testing.expect(try rig.assigned("n1", "hello-2"));
+    try testing.expect(!try rig.assigned("n2", "hello-2"));
+}
+
+test "scheduler: a placement is refused when any one of its six compared keys moved" {
+    // Goal: the read-set rule through the scheduler. Method: read the world, move one key the
+    // placement compared, let the scheduler plan from the stale read: nothing is written.
+    const moved = [_][]const u8{
+        "/replicas/hello/hello-1",
+        "/assigned/n1/hello-1",
+        "/nodes/n1",
+        "/node-status/n1",
+        "/allocations/n1",
+        "/audit/allocations/n1",
+    };
+    for (moved) |key| {
+        const harness = try Harness.start();
+        defer harness.stop();
+        errdefer harness.report_seed();
+        var diag: Diag = undefined;
+        diag.reset();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var manual: ManualClock = .{ .ms = 1761350000000 };
+        const rig: Rig = .{
+            .s = (try harness.connect()).interface(),
+            .diag = &diag,
+            .arena = arena_state.allocator(),
+            .clock = manual.clock(),
+        };
+        var sc = scheduler.Scheduler.init(1);
+        try rig.node("n1");
+        try rig.replica("hello-1");
+        var world = try rig.world();
+        const changed = try put_one(rig.s, &diag, key, "{\"other\":true}");
+        const ctx = rig.context();
+        const wake = try sc.reconcile_world(&ctx, &world);
+        try testing.expectEqual(@as(u32, 0), wake.acted);
+        try testing.expectEqual(changed, try rig.revision());
+    }
+}
+
+test "scheduler: a release is refused when its assignment or its allocation moved" {
+    // Goal: the two compares of a release. Method: as for the placement, with an assignment
+    // whose replica record is then deleted.
+    const moved = [_][]const u8{ "/assigned/n1/hello-1", "/allocations/n1" };
+    for (moved) |key| {
+        const harness = try Harness.start();
+        defer harness.stop();
+        errdefer harness.report_seed();
+        var diag: Diag = undefined;
+        diag.reset();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var manual: ManualClock = .{ .ms = 1761350000000 };
+        const rig: Rig = .{
+            .s = (try harness.connect()).interface(),
+            .diag = &diag,
+            .arena = arena_state.allocator(),
+            .clock = manual.clock(),
+        };
+        var sc = scheduler.Scheduler.init(1);
+        try rig.node("n1");
+        try rig.replica("hello-1");
+        try rig.settle(&sc);
+        const gone = records.replica_key("hello", "hello-1");
+        _ = try delete_one(rig.s, &diag, gone.slice());
+        var world = try rig.world();
+        const changed = try put_one(rig.s, &diag, key, "{\"other\":true}");
+        const ctx = rig.context();
+        const wake = try sc.reconcile_world(&ctx, &world);
+        try testing.expectEqual(@as(u32, 0), wake.acted);
+        try testing.expectEqual(changed, try rig.revision());
+    }
+}
+
+test "scheduler: a move is refused when any one of its eight compared keys moved" {
+    // Goal: the eight compares of a move. Method: hello-1 on n1; read; move one key of either
+    // node; ask for the move to n2 from the stale read.
+    const moved = [_][]const u8{
+        "/replicas/hello/hello-1",
+        "/assigned/n2/hello-1",
+        "/nodes/n2",
+        "/node-status/n2",
+        "/allocations/n2",
+        "/audit/allocations/n2",
+        "/assigned/n1/hello-1",
+        "/allocations/n1",
+    };
+    for (moved) |key| {
+        const harness = try Harness.start();
+        defer harness.stop();
+        errdefer harness.report_seed();
+        var diag: Diag = undefined;
+        diag.reset();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var manual: ManualClock = .{ .ms = 1761350000000 };
+        const rig: Rig = .{
+            .s = (try harness.connect()).interface(),
+            .diag = &diag,
+            .arena = arena_state.allocator(),
+            .clock = manual.clock(),
+        };
+        var sc = scheduler.Scheduler.init(1);
+        try rig.node("n1");
+        try rig.node("n2");
+        try rig.replica("hello-1");
+        try rig.settle(&sc);
+        try testing.expect(try rig.assigned("n1", "hello-1"));
+        var world = try rig.world();
+        const changed = try put_one(rig.s, &diag, key, "{\"other\":true}");
+        const ctx = rig.context();
+        const spec: scheduler.MoveSpec = .{ .replica = "hello-1", .to = "n2", .reason = "test" };
+        try testing.expect((try sc.move_replica(&ctx, &world, spec)) == .conflict);
+        try testing.expectEqual(changed, try rig.revision());
+    }
+}
+
+test "scheduler: two schedulers planning on one allocation revision cannot both commit" {
+    // Goal: the phantom case through the scheduler. Method: n1 holds one replica; `b-1` is
+    // unplaced when scheduler A reads, and `a-1` appears before scheduler B reads, so B plans
+    // `a-1` while A places `b-1`: different assignments, one node, one allocation revision. A
+    // commits; B, on the stale allocation, writes nothing, and its next pass places `a-1`.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000000 };
+    const rig: Rig = .{
+        .s = (try harness.connect()).interface(),
+        .diag = &diag,
+        .arena = arena_state.allocator(),
+        .clock = manual.clock(),
+    };
+    var first = scheduler.Scheduler.init(1);
+    var second = scheduler.Scheduler.init(2);
+    try rig.node("n1");
+    try rig.replica("hello-1");
+    try rig.settle(&first);
+    try rig.replica("hello-3");
+    var world_first = try rig.world();
+    try rig.replica("hello-2");
+    var world_second = try rig.world();
+    const ctx = rig.context();
+    try testing.expectEqual(@as(u32, 1), (try first.reconcile_world(&ctx, &world_first)).acted);
+    const before = try rig.revision();
+    // `hello-2` sorts before `hello-3`, so the second scheduler plans it first, and both of its
+    // placements rest on the allocation revision the first scheduler has since moved.
+    try testing.expectEqual(@as(u32, 0), (try second.reconcile_world(&ctx, &world_second)).acted);
+    try testing.expectEqual(before, try rig.revision());
+    try testing.expect(!try rig.assigned("n1", "hello-2"));
+    try rig.settle(&second);
+    try testing.expect(try rig.assigned("n1", "hello-2"));
 }

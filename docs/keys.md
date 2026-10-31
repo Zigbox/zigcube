@@ -20,6 +20,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | --- | --- | --- |
 | `/services/<name>` | API | C0 |
 | `/replicas/<service>/<id>` | replica controller | C0 |
+| `/replica-numbers/<service>` | replica controller | C1 slice 3 |
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
 | `/nodes/<node>` | that node's agent | C0 |
 | `/allocations/<node>` | scheduler | C1 slice 3 |
@@ -32,7 +33,8 @@ and deletes is that role's; a refusal is a defect, never an error.
 An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. Two departures from
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes; and the replica controller may still
-*put* `/services/<name>` (never delete it) because C0 keeps the `next_replica` counter there.
+*put* `/services/<name>` (never delete it) only while a C0 record still carries `next_replica`; from slice 3 the counter
+is `/replica-numbers/<service>` and `Service` v2 reads `next_replica` but never writes it.
 
 ## Versions
 
@@ -62,8 +64,9 @@ so a decision can say which version it acted on: the image, the command, `env` a
 **A change of `replicas` alone does not bump it** (owner, 2026-10-26): scaling from 3 to 5 must
 not replace the three that run. The replica controller replaces replicas whose `generation` is
 behind, and only a change of the replica's own inputs puts one behind. `next_replica` is the
-counter that makes replica ids unique forever (below); only the replica controller moves it, in
-the same transaction that creates the replica (the exception to "sole writer API" above).
+counter that makes replica ids unique forever (below). From slice 3 it lives in
+`/replica-numbers/<service>` (`{"next": N}`), which only the replica controller writes, in the
+same transaction that creates the replica; a legacy `next_replica` on the service seeds it.
 
 `applied_by` (the authenticated actor) and `request_id` (the API request that wrote this
 version, the same id as in `--verbose` output and bundles) say who changed the service last

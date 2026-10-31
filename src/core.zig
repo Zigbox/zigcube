@@ -33,6 +33,7 @@ pub const modules = .{
     @import("replica_controller.zig"),
     @import("runtime_codes.zig"),
     @import("retention.zig"),
+    @import("scheduler.zig"),
     @import("runtime.zig"),
     @import("sim_c0.zig"),
     @import("sim_clock.zig"),
@@ -107,6 +108,7 @@ test "the controllers' tests are in this root" {
     // Goal: the controllers' tests run under WASI too. Method: import them (they use only the
     // memory store, a manual clock and the testing allocator).
     _ = @import("replica_controller_test.zig");
+    _ = @import("scheduler_test.zig");
     _ = @import("api_test.zig");
     _ = @import("agent_api_test.zig");
 }
