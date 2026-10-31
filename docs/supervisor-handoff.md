@@ -69,6 +69,14 @@ Slices are cut small so that each fits one implementer session under the context
 
 Then: README, site and architecture page updated with the run link; C1 marked demonstrated. **C1 ships only when demo-c1 and test-store-faults are green and the fleet has run 24 hours on the shipping commit with every issue it filed closed or recorded as a cut** (`docs/briefs/c1.md`, "Gate for shipping C1").
 
+## After C1: real Zigbox (from closed PR #21, owner 2026-10-31)
+
+PR #21's restart orders were closed: local mode's names and grants went to C4, and C1 runs on `FakeRuntime`. Three of its items remain, in this order:
+
+1. Re-pin Zigbox. The pin `90b6f1c` is from about M2.
+2. The owner reviews the revised `Runtime` contract before anything is built on it: `Spec` gains name, workdir, user, network, published ports, state volumes and mounts; new `ensure_image`, `logs`, `exec`; no network unless asked, volumes stay on their node, env values never stored, no writable host mounts for services. The draft is in PR #21's `docs/restart.md`.
+3. C0 on the real runtime in a VM. `zbx pull --output json` is allowed as a stated, temporary cut until Zigbox ships the library (with M6b).
+
 ## Open with the owner
 
 - C0's implementer sessions and the CI-skip session are archived (owner's OK, 2026-10-30), except slice 4 (`session_01Jc3KpBnbQjqTJsuVnLZ6uD`), whose archive the permission classifier refused; the owner archives it.
