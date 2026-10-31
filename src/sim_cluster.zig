@@ -658,6 +658,9 @@ pub const Cluster = struct {
     fn set_store_down(c: *Cluster, down: bool) void {
         c.switched.down = down;
         c.switched.fail_after = null;
+        // Nothing converges while the store is off, and the checks only look between operations:
+        // the grace period for excess containers starts again when it is back.
+        if (!down) c.excess_since_ms = null;
     }
 
     fn dropped_total(c: *const Cluster) u64 {
