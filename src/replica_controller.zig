@@ -105,7 +105,6 @@ pub const ReplicaController = struct {
         try run.place_unplaced();
         for (snapshot.services) |*service| try run.reconcile_service(service);
         try run.reconcile_orphans();
-        try run.reconcile_numbers();
         if (now >= rc.retention.due_ms) {
             rc.retention.due_ms = try retention.prune(ctx, &rc.retention, &snapshot, now);
         }
@@ -492,7 +491,8 @@ const Run = struct {
 
     /// The first number of a service that has no counter yet: the larger of a v1 service
     /// record's `next_replica` and one past the highest replica number there is, so a number is
-    /// never reused.
+    /// never reused. A counter is never deleted (one small key per service name ever applied), so
+    /// this runs only for a name never counted before.
     fn first_number(run: *Run, service: *const ServiceEntry) u64 {
         var first: u64 = service.rec.next_replica orelse 1;
         for (run.snap.replicas) |replica| {
@@ -501,32 +501,6 @@ const Run = struct {
             first = @max(first, @as(u64, number) + 1);
         }
         return first;
-    }
-
-    /// Deletes the counter of a service that is gone once none of its replicas remain.
-    fn reconcile_numbers(run: *Run) Error!void {
-        var batch: Batch = .{};
-        for (run.numbers) |*entry| {
-            const name = entry.kv.key[records.prefix_replica_numbers.len..];
-            if (run.snap.service_of(name) != null) continue;
-            if (run.has_replicas(name)) continue;
-            if (batch.ops_count == batch_replicas_max) {
-                run.more = true;
-                break;
-            }
-            batch.expect(entry.kv.key, entry.kv.mod_revision);
-            batch.delete(entry.kv.key);
-        }
-        if (batch.ops_count == 0) return;
-        if (!run.budget()) return;
-        _ = try run.finish(&batch);
-    }
-
-    fn has_replicas(run: *Run, service: []const u8) bool {
-        for (run.snap.replicas) |replica| {
-            if (std.mem.eql(u8, replica.rec.service, service)) return true;
-        }
-        return false;
     }
 
     fn numbers_used_up(run: *Run, service: *const Entry(records.Service)) error{NoCapacity} {

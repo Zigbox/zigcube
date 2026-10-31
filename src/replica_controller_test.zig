@@ -541,8 +541,8 @@ fn counter_next(fixture: *Fixture, service: []const u8) !?u64 {
 
 test "replica numbers are never reused across scale down, scale up and a re-apply" {
     // Goal: the counter lives in `/replica-numbers/hello`, moves with the replicas it creates,
-    // and survives while the service's replicas do. Method: 3 replicas, down to 1, up to 3; then
-    // delete the service and apply it again before the next pass clears the counter.
+    // and is never deleted. Method: 3 replicas, down to 1, up to 3; then delete the service, let
+    // every replica go, and only then apply it again.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -565,7 +565,11 @@ test "replica numbers are never reused across scale down, scale up and a re-appl
     var ctx = fixture.context();
     const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000003");
     try testing.expect(done == .written);
-    _ = try fixture.step(); // stops the replicas; the counter waits for the next pass
+    _ = try fixture.settle(); // every replica is gone before the re-apply
+    const gone = try fixture.ids("hello");
+    defer Fixture.free_ids(gone);
+    try expect_ids(&.{}, gone);
+    try testing.expectEqual(@as(?u64, 6), try counter_next(&fixture, "hello"));
     try fixture.apply(hello);
     _ = try fixture.settle();
     const again = try fixture.ids("hello");
@@ -573,19 +577,19 @@ test "replica numbers are never reused across scale down, scale up and a re-appl
     try expect_ids(&.{ "hello-6", "hello-7", "hello-8" }, again);
 }
 
-test "the counter goes with the last replica of a deleted service" {
-    // Goal: no key outlives its service and replicas. Method: delete, settle, look for the key.
+test "the counter stays after its service and replicas are gone" {
+    // Goal: one small key per service name ever applied, so ids are unique forever. Method:
+    // delete, settle, look for the key.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
     try fixture.register_node("node1");
     try fixture.apply(hello);
     _ = try fixture.settle();
-    try testing.expect((try counter_next(&fixture, "hello")) != null);
     const ctx = fixture.context();
     _ = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000004");
     _ = try fixture.settle();
-    try testing.expectEqual(@as(?u64, null), try counter_next(&fixture, "hello"));
+    try testing.expectEqual(@as(?u64, 4), try counter_next(&fixture, "hello"));
 }
 
 test "a C0 service record's next_replica seeds the counter, or one past the highest replica" {

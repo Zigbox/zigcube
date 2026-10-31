@@ -1384,10 +1384,11 @@ test "scheduler: a move is refused when any one of its eight compared keys moved
 }
 
 test "scheduler: two schedulers planning on one allocation revision cannot both commit" {
-    // Goal: the phantom case through the scheduler. Method: n1 holds one replica; `b-1` is
-    // unplaced when scheduler A reads, and `a-1` appears before scheduler B reads, so B plans
-    // `a-1` while A places `b-1`: different assignments, one node, one allocation revision. A
-    // commits; B, on the stale allocation, writes nothing, and its next pass places `a-1`.
+    // Goal: the phantom case through the scheduler. Method: n1 holds hello-1; `hello-3` is
+    // unplaced when scheduler A reads, and `hello-2` appears before scheduler B reads, so B plans
+    // `hello-2` while A places `hello-3`: different assignments, one node, one allocation
+    // revision. A commits; B, on the stale allocation, writes nothing, and its next pass places
+    // `hello-2`.
     const harness = try Harness.start();
     defer harness.stop();
     errdefer harness.report_seed();

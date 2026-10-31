@@ -843,25 +843,27 @@ fn reapply_before_cleanup(world: *World, end_container: bool) !void {
 }
 
 test "a running container of an earlier replica with the same id is replaced, not adopted" {
-    // Goal: a service deleted and applied again on another image reuses `web-1`; if the node's
-    // agent has not cleaned up yet, the old container (same name) is still running and must
-    // not be taken for the new replica. Method: run web-1, delete and re-apply on another
-    // image before the agent steps, step the agent: the container runs the new image.
-    // (Seed 150 of `sim-cluster` found this.)
+    // Goal: a service deleted and applied again on another image continues the numbering (the
+    // counter is never deleted), so the replacement is `web-2` and the old `web-1` container, if
+    // the node's agent has not cleaned up yet, is an orphan to stop, never the new replica.
+    // Method: run web-1, delete and re-apply on another image before the agent steps, step the
+    // agent: web-2 runs the new image and one container runs. (Seed 150 of `sim-cluster` found
+    // the id-reuse case this once guarded.)
     const world = try World.create(testing.allocator, 1, &fixtures);
     defer world.destroy();
     try reapply_before_cleanup(world, false);
-    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-2")).?);
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
 }
 
 test "a stopped container of an earlier replica with the same id is replaced, not adopted" {
-    // Goal: the same, with the old container already stopped (the known gap in the note of
-    // the change that added `observed_for`). Method: as above, ending the container first.
+    // Goal: the same, with the old container already stopped. Method: as above, ending the
+    // container first; the old service replaces the dead web-1 with web-2 before it is deleted,
+    // so the new image runs as web-3.
     const world = try World.create(testing.allocator, 1, &fixtures);
     defer world.destroy();
     try reapply_before_cleanup(world, true);
-    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-3")).?);
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
 }
 

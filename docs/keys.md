@@ -33,8 +33,9 @@ and deletes is that role's; a refusal is a defect, never an error.
 An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. Two departures from
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes; and the replica controller may still
-*put* `/services/<name>` (never delete it) only while a C0 record still carries `next_replica`; from slice 3 the counter
-is `/replica-numbers/<service>` and `Service` v2 reads `next_replica` but never writes it.
+touch `/services/<name>` (the counter lives in `/replica-numbers/<service>` from slice 3, and
+`writers.zig` refuses a put or delete of a service by any role but the API); `Service` v2 reads
+a legacy `next_replica` to seed the counter and never writes it.
 
 ## Versions
 
@@ -66,7 +67,10 @@ not replace the three that run. The replica controller replaces replicas whose `
 behind, and only a change of the replica's own inputs puts one behind. `next_replica` is the
 counter that makes replica ids unique forever (below). From slice 3 it lives in
 `/replica-numbers/<service>` (`{"next": N}`), which only the replica controller writes, in the
-same transaction that creates the replica; a legacy `next_replica` on the service seeds it.
+same transaction that creates the replica. It is **never deleted**: the key outlives the service
+and its replicas (one small key per service name ever applied), so a re-apply continues the
+numbering. A legacy `next_replica` on the service seeds it, and so does one past the highest
+live replica number, whichever is larger, only when the key is absent.
 
 `applied_by` (the authenticated actor) and `request_id` (the API request that wrote this
 version, the same id as in `--verbose` output and bundles) say who changed the service last
@@ -179,6 +183,14 @@ write wins): the agent is the only source of truth for what it observed.
 fields of the cited key's value that the decision acted on, as the controller read them, so
 `why` can show what justified the action after the key has changed or been compacted. A
 decision is immutable once written.
+
+The scheduler's `hold_pending` cites the replica's `/replicas` key and its `cause_evidence` is
+not fields of that key but the shortfall it computed: `{"need":{"cpu_millis":N,"memory_bytes":N},
+"<reason>":["node",…],"cpu_short":{"node":by,…},"memory_short":{"node":by,…},"omitted":N}`, where
+`<reason>` is one of `unknown_node`, `lost`, `fenced`, `no_status`, `older_tenure`,
+`audit_open`, `over_capacity` (only those that occur appear) and `omitted` counts nodes that did
+not fit in the byte bound. A new `hold_pending` is written only when the *shape* changes (per
+node: why it is excluded, or which resource it lacks), not when the amounts do.
 
 `id` is `<at_ms, 13 digits>-<controller instance, 4 hex>-<counter, 4 digits>`: sortable by
 time, unique without coordination. Written in the same transaction as the action it records,

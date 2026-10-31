@@ -39,8 +39,14 @@ pub const actor = "scheduler";
 /// was missed, not a polling loop: a pass that finds nothing to do writes nothing.
 pub const resync_ms: u64 = 30 * 1000;
 /// Replicas whose hold the scheduler remembers, so a hold is written once per change in its
-/// reason. A restart forgets them and writes each hold once more.
-pub const hold_memory_max: u32 = 256;
+/// reason. A restart forgets them and writes each hold once more. One slot for every replica
+/// there can be: with fewer, a pass over more held replicas than slots would miss every time,
+/// rewrite every hold and never converge.
+pub const hold_memory_max: u32 = constants.replicas_max;
+
+comptime {
+    assert(hold_memory_max >= constants.replicas_max);
+}
 
 pub const watch_prefixes = [_][]const u8{
     records.prefix_replicas,
@@ -79,6 +85,12 @@ pub const Reason = enum {
     short,
     /// The node a replica moves from has no allocation record to release from.
     unaccounted,
+    /// A move of a replica that has no `/replicas` record.
+    unknown_replica,
+    /// A move of a replica that is not assigned to any node.
+    not_assigned,
+    /// A move to the node the replica is already on.
+    same_node,
 };
 
 pub const Verdict = struct {
@@ -279,9 +291,12 @@ fn judge(view: *const NodeView, need: Requests) Verdict {
     if (view.allocated.cpu_millis > capacity.cpu_millis) return .{ .reason = .over_capacity };
     if (view.allocated.memory_bytes > capacity.memory_bytes) return .{ .reason = .over_capacity };
     const cpu_after = @as(u64, view.allocated.cpu_millis) + need.cpu_millis;
-    const memory_after = view.allocated.memory_bytes + need.memory_bytes;
     const cpu_by = cpu_after -| capacity.cpu_millis;
-    const memory_by = memory_after -| capacity.memory_bytes;
+    // A request near the top of u64 overflows the sum: that is short on memory by "everything".
+    const memory_by = if (std.math.add(u64, view.allocated.memory_bytes, need.memory_bytes)) |sum|
+        sum -| capacity.memory_bytes
+    else |_|
+        std.math.maxInt(u64);
     if (cpu_by == 0 and memory_by == 0) return .{ .reason = .fits };
     return .{ .reason = .short, .cpu_by = cpu_by, .memory_by = memory_by };
 }
@@ -399,6 +414,7 @@ pub const Scheduler = struct {
     /// A pass over a world already read: releases first (they free capacity), then places.
     pub fn reconcile_world(sc: *Scheduler, ctx: *const Context, world: *World) Error!Wakeup {
         var pass: Pass = .{};
+        sc.sweep_holds(world);
         var index: u32 = 0;
         while (index < world.assigns.items.len and !pass.stopped) : (index += 1) {
             try sc.release_one(ctx, world, &pass, index);
@@ -433,6 +449,12 @@ pub const Scheduler = struct {
         var set: compare_sets.Set = .{};
         compare_sets.release(&set, name, assign.replica, assign.revision, view.alloc_revision);
         expect_all(&batch, &set);
+        // The replica controller's `stop_replica` retired it, if its decision is still indexed;
+        // else only a pass found it gone, and the store does not say at which revision.
+        const retired = try indexed_decision(ctx, assign.replica, "stop_replica", .last);
+        const cause: records.Cause = if (retired) |*id| controller.cause_decision(id) else .{
+            .kind = .resync,
+        };
         const fmt = "replica {s} is gone; its {d}m CPU and {d} MiB on {s} are released";
         const reason = try controller.format(ctx, fmt, .{
             assign.replica,
@@ -445,7 +467,7 @@ pub const Scheduler = struct {
             .action = "release_replica",
             .subject = .{ .kind = .replica, .name = assign.replica },
             .reason = reason,
-            .cause = .{ .kind = .resync },
+            .cause = cause,
         }, &batch);
         batch.delete(assign.key);
         try put_allocation(ctx, &batch, name, after, view.count - 1, view.alloc_node_revision);
@@ -505,7 +527,7 @@ pub const Scheduler = struct {
         reason: []const u8,
         action: []const u8,
     ) Error!void {
-        const created = try create_decision_of(ctx, replica.rec.id);
+        const created = try indexed_decision(ctx, replica.rec.id, "create_replica", .first);
         const cause: records.Cause = if (created) |*id| controller.cause_decision(id) else .{
             .kind = .desired,
             .key = replica.kv.key,
@@ -530,15 +552,15 @@ pub const Scheduler = struct {
         verdicts: []const Verdict,
     ) Error!void {
         const need = requests_of(&replica.rec);
-        const evidence = try evidence_of(ctx, world, need, verdicts);
-        const evidence_hash = std.hash.Wyhash.hash(0, evidence);
+        const shape_hash = shape_of(world, need, verdicts);
         const slot = sc.hold_slot(replica.rec.id);
         if (sc.holds[slot].replica == hold_key(replica.rec.id)) {
-            if (sc.holds[slot].evidence == evidence_hash) return;
+            if (sc.holds[slot].evidence == shape_hash) return;
         }
         if (!pass.budget()) return;
         var batch: Batch = .{};
         batch.expect(replica.kv.key, replica.kv.mod_revision);
+        const evidence = try evidence_of(ctx, world, need, verdicts);
         const reason = try hold_reason(ctx, world, need, verdicts);
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
@@ -553,7 +575,7 @@ pub const Scheduler = struct {
             .cause_evidence = .{ .text = evidence },
         }, &batch);
         _ = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
-        sc.holds[slot] = .{ .replica = hold_key(replica.rec.id), .evidence = evidence_hash };
+        sc.holds[slot] = .{ .replica = hold_key(replica.rec.id), .evidence = shape_hash };
     }
 
     fn hold_key(replica: []const u8) u64 {
@@ -574,6 +596,18 @@ pub const Scheduler = struct {
         return index;
     }
 
+    /// Forgets the holds of replicas that are gone, so the memory never holds more than the
+    /// replicas there are and `hold_slot` always finds a slot without evicting a live one.
+    fn sweep_holds(sc: *Scheduler, world: *const World) void {
+        for (&sc.holds) |*held| {
+            if (held.replica == 0) continue;
+            const live = for (world.replicas) |replica| {
+                if (hold_key(replica.rec.id) == held.replica) break true;
+            } else false;
+            if (!live) held.* = .{ .replica = 0, .evidence = 0 };
+        }
+    }
+
     fn forget_hold(sc: *Scheduler, replica: []const u8) void {
         const wanted = hold_key(replica);
         for (&sc.holds) |*held| {
@@ -592,18 +626,22 @@ pub const Scheduler = struct {
         world: *World,
         spec: MoveSpec,
     ) Error!MoveResult {
-        const replica_index = world.desired.get(spec.replica).?; // The caller read the world.
-        const from_index = world.assigned_by.get(spec.replica).?; // A replica to move is assigned.
+        const replica_index = world.desired.get(spec.replica) orelse return .{ .refused = .{
+            .reason = .unknown_replica,
+        } };
+        const from_index = world.assigned_by.get(spec.replica) orelse return .{ .refused = .{
+            .reason = .not_assigned,
+        } };
         const replica = &world.replicas[replica_index];
         const from = world.assigns.items[from_index];
         const to_node = world.node_index(spec.to) orelse return .{ .refused = .{
             .reason = .unknown_node,
         } };
+        if (from.node == to_node) return .{ .refused = .{ .reason = .same_node } };
         const need = from.requests;
         const target = &world.nodes[to_node];
         const verdict = judge(target, need);
         if (verdict.reason != .fits) return .{ .refused = verdict };
-        assert(from.node != to_node);
         if (from.node == no_node) return .{ .refused = .{ .reason = .unaccounted } };
         const source = &world.nodes[from.node];
         if (source.alloc_revision == 0) return .{ .refused = .{ .reason = .unaccounted } };
@@ -677,10 +715,13 @@ pub const MoveResult = union(enum) {
 
 // ---- Keeping the world current after a commit ------------------------------------------------
 
+/// The sum of two requests. Saturating: after a fit check the sum is within a capacity and so
+/// cannot saturate, and reconstructing a node's assignments (I6) from a corrupt record must
+/// report a mismatch, not panic.
 fn add(allocated: Requests, need: Requests) Requests {
     return .{
-        .cpu_millis = allocated.cpu_millis + need.cpu_millis,
-        .memory_bytes = allocated.memory_bytes + need.memory_bytes,
+        .cpu_millis = allocated.cpu_millis +| need.cpu_millis,
+        .memory_bytes = allocated.memory_bytes +| need.memory_bytes,
     };
 }
 
@@ -831,6 +872,22 @@ fn hold_reason(
     });
 }
 
+/// What a hold says apart from its numbers: what the replica needs, and per node why it is
+/// excluded or which resources it lacks. A placement elsewhere changes how far short a node is
+/// but not this, and a hold is written again only when this changes.
+fn shape_of(world: *const World, need: Requests, verdicts: []const Verdict) u64 {
+    assert(verdicts.len == world.nodes.len);
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&need.cpu_millis));
+    hasher.update(std.mem.asBytes(&need.memory_bytes));
+    for (verdicts, world.nodes) |verdict, view| {
+        hasher.update(view.node.rec.name);
+        hasher.update(&.{ 0, @backingInt(verdict.reason) });
+        hasher.update(&.{ @intFromBool(verdict.cpu_by > 0), @intFromBool(verdict.memory_by > 0) });
+    }
+    return hasher.final();
+}
+
 const exclusions = [_]Reason{
     .unknown_node, .lost,       .fenced,        .no_status,
     .older_tenure, .audit_open, .over_capacity,
@@ -941,22 +998,32 @@ fn write_short(
     if (!first) e.literal("}");
 }
 
-/// The id of the decision that created a replica, read from its by-subject index.
-fn create_decision_of(ctx: *const Context, replica: []const u8) Error!?records.DecisionId {
+const Which = enum { first, last };
+
+/// The id of the first or last decision of `action` about a replica, from its by-subject index
+/// (one page: a replica with more entries than that has its older ones missed).
+fn indexed_decision(
+    ctx: *const Context,
+    replica: []const u8,
+    action: []const u8,
+    which: Which,
+) Error!?records.DecisionId {
     const prefix = records.index_prefix(.replica, replica);
     const page = try ctx.store.list(ctx.arena, .{
         .prefix = prefix.slice(),
-        .limit = 8,
+        .limit = constants.store_list_limit_max,
     }, ctx.diag);
+    var found: ?records.DecisionId = null;
     for (page.kvs) |kv| {
         const entry = try records.read(records.IndexEntry, ctx.arena, kv, ctx.diag);
-        if (!std.mem.eql(u8, entry.action, "create_replica")) continue;
+        if (!std.mem.eql(u8, entry.action, action)) continue;
         if (entry.id.len != records.decision_id_bytes) continue;
         var id: records.DecisionId = .{};
         @memcpy(&id.bytes, entry.id);
-        return id;
+        if (which == .first) return id;
+        found = id;
     }
-    return null;
+    return found;
 }
 
 // ---- I6 as a check ---------------------------------------------------------------------------

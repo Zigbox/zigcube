@@ -436,3 +436,130 @@ test "a replica without limits takes the defaults, and a move changes both alloc
     try testing.expectEqual(scheduler.Reason.lost, refused.refused.reason);
     try fixture.expect_on("hello-1", "n2");
 }
+
+test "a request near the top of u64 is short on memory, not an overflow" {
+    // Goal: the fit sum cannot overflow. Method: n1 holds 1 GiB; a replica asking for almost
+    // 2^64 bytes would overflow `allocated + need`, and is held with memory short.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 100, gib);
+    try fixture.settle();
+    const huge: u64 = std.math.maxInt(u64) - 1024;
+    try fixture.replica("huge", "huge-1", 100, huge);
+    try fixture.settle();
+    try fixture.expect_on("huge-1", null);
+    const holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    try testing.expectEqual(@as(usize, 1), holds.len);
+    const evidence = holds[0].cause_evidence.?.text;
+    try testing.expect(std.mem.indexOf(u8, evidence, "\"memory_short\":{\"n1\":") != null);
+    try testing.expect(std.mem.indexOf(u8, evidence, "\"cpu_short\"") == null);
+}
+
+test "more held replicas than the old memory held converge: a second pass writes nothing" {
+    // Goal: the hold memory covers every replica there can be. Method: 300 replicas that fit
+    // nowhere; passes settle (the old 256 slots never would), and one more writes nothing.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 1000, 8 * gib, true);
+    for (0..300) |number| {
+        var id: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&id, "big-{d}", .{number + 1}) catch unreachable; // Fits.
+        try fixture.replica("big", name, 2000, gib);
+    }
+    try fixture.settle();
+    try testing.expectEqual(@as(usize, 300), try fixture.count("hold_pending"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try testing.expectEqual(@as(usize, 300), try fixture.count("hold_pending"));
+}
+
+test "a hold is not rewritten when only the amounts change, not the shape" {
+    // Goal: the dedupe key is the shape of the reason. Method: big-1 is short on CPU on both
+    // nodes; a small replica placed on n1 makes n1 short by more, which writes no new hold.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 1000, 8 * gib, true);
+    try fixture.node("n2", 1500, 8 * gib, true);
+    try fixture.replica("big", "big-1", 2000, gib);
+    try fixture.settle();
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try fixture.replica("small", "small-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("small-1", "n1");
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a release cites the decision that stopped the replica, else a resync" {
+    // Goal: `why replica` does not say resync when the replica controller retired it. Method:
+    // one replica gets a `stop_replica` decision in the transaction that deletes it; another
+    // is deleted bare.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    var ctx = fixture.context();
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    var batch: controller.Batch = .{};
+    const stop = try controller.put_decision(&ctx, &source, .{
+        .actor = "replica-controller",
+        .action = "stop_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "removing hello-1",
+        .cause = .{ .kind = .resync },
+    }, &batch);
+    const gone_key = records.replica_key("hello", "hello-1");
+    batch.delete(gone_key.slice());
+    const done = try controller.commit(&ctx, .replica_controller, &batch);
+    try testing.expect(done == .applied);
+    const bare = records.replica_key("hello", "hello-2");
+    const delete: store.Op = .{ .delete = bare.slice() };
+    const ops: store.TxnRequest = .{ .on_success = &.{delete} };
+    _ = try writers.txn(ctx.store, .replica_controller, ops, &fixture.diag);
+    try fixture.settle();
+    const releases = try fixture.decisions("release_replica");
+    defer testing.allocator.free(releases);
+    try testing.expectEqual(@as(usize, 2), releases.len);
+    for (releases) |release| {
+        if (std.mem.eql(u8, release.subject.name, "hello-1")) {
+            try testing.expectEqual(records.CauseKind.decision, release.cause.kind);
+            try testing.expectEqualStrings(stop.slice(), release.cause.id.?);
+        } else try testing.expectEqual(records.CauseKind.resync, release.cause.kind);
+    }
+}
+
+test "a move is refused, not asserted, for a caller's bad input" {
+    // Goal: `move_replica` returns `refused` for an unknown replica, one that is not assigned,
+    // a move to its own node and an unknown node. Method: each against a settled world.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.node("n2", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    try fixture.replica("big", "big-1", 9000, gib);
+    var ctx = fixture.context();
+    ctx.arena = fixture.keep.allocator();
+    var world = try scheduler.read_world(&ctx);
+    const cases = [_]struct { scheduler.MoveSpec, scheduler.Reason }{
+        .{ .{ .replica = "nope-1", .to = "n2", .reason = "t" }, .unknown_replica },
+        .{ .{ .replica = "big-1", .to = "n2", .reason = "t" }, .not_assigned },
+        .{ .{ .replica = "hello-1", .to = "n1", .reason = "t" }, .same_node },
+        .{ .{ .replica = "hello-1", .to = "n9", .reason = "t" }, .unknown_node },
+    };
+    for (cases) |case| {
+        const result = try fixture.sc.move_replica(&ctx, &world, case[0]);
+        try testing.expect(result == .refused);
+        try testing.expectEqual(case[1], result.refused.reason);
+    }
+    try fixture.expect_on("hello-1", "n1");
+    try fixture.accounting_holds();
+}
