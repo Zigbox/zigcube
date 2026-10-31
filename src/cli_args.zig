@@ -38,6 +38,8 @@ pub const Options = struct {
     /// apply: show the change and stop.
     dry_run: bool = false,
     no_redact: bool = false,
+    /// store accept-rollback: the operator has looked at the store.
+    confirm: bool = false,
 };
 
 pub const BundleTarget = union(enum) { last, subject: Subject };
@@ -50,6 +52,8 @@ pub const Command = union(enum) {
     why: Subject,
     explain: []const u8,
     bundle: BundleTarget,
+    /// `store accept-rollback --confirm`.
+    accept_rollback,
     help,
     version,
 };
@@ -178,6 +182,8 @@ fn split(
             options.dry_run = true;
         } else if (std.mem.eql(u8, arg, "--no-redact")) {
             options.no_redact = true;
+        } else if (std.mem.eql(u8, arg, "--confirm")) {
+            options.confirm = true;
         } else if (!std.mem.eql(u8, arg, "--last")) {
             return refuse(diag, "{s} is not a flag zcube has", .{arg});
         } else {
@@ -210,6 +216,10 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     if (std.mem.eql(u8, name, "delete")) return delete_of(diag, rest);
     if (std.mem.eql(u8, name, "why")) return .{ .why = try subject_of(diag, name, rest) };
     if (std.mem.eql(u8, name, "bundle")) return bundle_of(diag, rest);
+    if (std.mem.eql(u8, name, "store")) {
+        if (rest.len == 1 and std.mem.eql(u8, rest[0], "accept-rollback")) return .accept_rollback;
+        return refuse(diag, "store takes accept-rollback", .{});
+    }
     return refuse(diag, "{s} is not a zcube command", .{name});
 }
 
@@ -293,6 +303,12 @@ fn bundle_of(diag: *Diag, rest: []const []const u8) Error!Command {
 fn check_options(options: *const Options, command: Command, diag: *Diag) Error!void {
     if (options.yes and command != .apply and command != .delete) {
         return refuse(diag, "--yes is for zcube apply and delete", .{});
+    }
+    if (command == .accept_rollback and !options.confirm) {
+        return refuse(diag, "accepting a store that went backwards needs --confirm", .{});
+    }
+    if (options.confirm and command != .accept_rollback) {
+        return refuse(diag, "--confirm is for zcube store accept-rollback", .{});
     }
     if (options.dry_run and command != .apply) {
         return refuse(diag, "--dry-run is for zcube apply", .{});

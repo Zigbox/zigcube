@@ -23,6 +23,20 @@ pub fn compacted(diag: *Diag, needed: Revision, compacted_revision: Revision) er
     return error.Compacted;
 }
 
+pub fn no_hash(diag: *Diag, asked: Revision, chain_start: Revision) error{NoHash} {
+    assert(diag.code == null);
+    assert(asked < chain_start);
+    diag.raise(.E0214);
+    diag.cause("the hash of revision {d} was asked for; the store's chain starts at {d}", .{
+        asked, chain_start,
+    });
+    diag.cause("the store was upgraded at revision {d} from a schema without a chain", .{
+        chain_start,
+    });
+    diag.fix(.{ .sentence = "ask for a revision at or above the start of the chain" });
+    return error.NoHash;
+}
+
 pub fn future_read(diag: *Diag, asked: Revision, current: Revision) error{FutureRevision} {
     assert(diag.code == null);
     assert(asked > current);
@@ -96,4 +110,73 @@ pub fn no_memory(diag: *Diag) error{NoCapacity} {
     diag.cause("the memory set aside for this request ran out", .{});
     diag.fix(.{ .sentence = "ask for smaller pages, or raise the request arena limit" });
     return error.NoCapacity;
+}
+
+/// The first four bytes of a chain hash in hex: enough to tell two apart in a diagnostic.
+pub const ShortHash = [8]u8;
+
+pub fn short_hash(hash: store.Hash) ShortHash {
+    return std.fmt.bytesToHex(hash[0..4].*, .lower);
+}
+
+/// What the store answered where the server remembered `remembered`: `now` is the store's
+/// revision and hash at the same revision (or at its head when it is behind). `unverifiable` is
+/// set when the store cannot say what its hash was at the remembered revision, because that is
+/// below the point its chain starts at (`ZC-E0214`): the server fails closed.
+pub const Rollback = struct {
+    remembered_revision: Revision,
+    remembered_hash: store.Hash,
+    now_revision: Revision,
+    now_hash: store.Hash,
+    unverifiable: bool = false,
+};
+
+pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
+    assert(diag.code == null);
+    diag.raise(.E0215);
+    const old = short_hash(rollback.remembered_hash);
+    const new = short_hash(rollback.now_hash);
+    // The innermost cause is the one the default render shows: it carries the evidence.
+    if (rollback.unverifiable) {
+        diag.cause("the store has no hash for revision {d}, so it cannot be checked", .{
+            rollback.remembered_revision,
+        });
+        diag.cause("the server remembers revision {d} ({s}); the store is at revision {d} ({s})", .{
+            rollback.remembered_revision, old, rollback.now_revision, new,
+        });
+    } else if (rollback.now_revision < rollback.remembered_revision) {
+        diag.cause("the store is behind: writes it acknowledged are gone", .{});
+        const line = "the server remembers revision {d} ({s}); the store is at revision {d} ({s})";
+        diag.cause(line, .{ rollback.remembered_revision, old, rollback.now_revision, new });
+    } else {
+        diag.cause("the store holds a different history at that revision", .{});
+        diag.cause("the server remembers revision {d} with hash {s}; the store has hash {s}", .{
+            rollback.remembered_revision, old, new,
+        });
+    }
+    const sentence = "look at which store this is; to keep it as it is, run";
+    diag.fix_with(sentence, "zcube store accept-rollback --confirm", .{});
+    return error.BackendFailed;
+}
+
+/// The remembered pair could not be saved (`ZC-E0216`); the file is behind what the server knows.
+pub fn not_saved(diag: *Diag) error{BackendFailed} {
+    diag.raise(.E0216);
+    diag.cause("the remembered revision could not be saved", .{});
+    diag.fix(.{ .sentence = "check that the server's state directory is writable" });
+    return error.BackendFailed;
+}
+
+/// The remembered revision file could not be read, parsed or written (`store_verified.zig`).
+pub fn remembered_unusable(
+    diag: *Diag,
+    path: []const u8,
+    action: []const u8,
+    reason: []const u8,
+) error{BackendFailed} {
+    assert(diag.code == null);
+    diag.raise(.E0216);
+    diag.cause("can't {s} {s}: {s}", .{ action, path, reason });
+    diag.fix(.{ .sentence = "check the state directory (--state-dir) and its permissions" });
+    return error.BackendFailed;
 }

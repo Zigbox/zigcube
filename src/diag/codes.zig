@@ -58,6 +58,9 @@ pub const Code = enum(u8) {
     E0211,
     E0212,
     E0213,
+    E0214,
+    E0215,
+    E0216,
     E0301,
     E0302,
     E0303,
@@ -569,6 +572,69 @@ pub const registry = [_]Entry{
         \\back. If it says the outcome is unknown, the connection dropped while
         \\the commit was in flight and the write may or may not have been
         \\applied: read the keys again before repeating it.
+        ,
+    },
+    .{
+        .code = .E0214,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store has no chain hash for that revision",
+        .explanation =
+        \\Every revision the store commits gets a chain hash, which a client
+        \\uses to notice a store that went backwards or forked. A store written by
+        \\a zcube from before the chain existed cannot recompute the hashes of
+        \\revisions it had already compacted, so its chain starts at the revision
+        \\it was upgraded at, and the store has no hash for any revision below
+        \\that.
+        \\
+        \\Ask for a revision at or above the start of the chain; the cause line
+        \\names it. Nothing was changed.
+        ,
+    },
+    .{
+        .code = .E0215,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the store went backwards or forked",
+        .explanation =
+        \\The server remembers the highest revision it has seen and the chain
+        \\hash of that revision. The store now answers with a lower revision,
+        \\or with a different hash for the revision the server remembers, so
+        \\writes the store acknowledged are gone or the history has
+        \\diverged. This is what a failover to a replica that was behind, a
+        \\restore from an old backup, or a store pointed at by mistake looks
+        \\like. Acting on it would hand out placements and fences that
+        \\contradict ones already given.
+        \\
+        \\The server stops: controllers do not step and every store call
+        \\fails with this code until an operator looks. It never recovers by
+        \\itself. Look at the store (which database, which replica, which
+        \\backup). If the rolled-back or forked store is the one to keep, run
+        \\zcube store accept-rollback --confirm, which makes the server
+        \\remember the store as it is now. The old and new revision and hash are
+        \\shown in the reply of that command; a decision record that keeps them
+        \\is not written yet.
+        ,
+    },
+    .{
+        .code = .E0216,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the remembered revision file is unusable",
+        .explanation =
+        \\The server keeps the highest store revision and chain hash it has
+        \\seen in a small file in its state directory, so that a restart after
+        \\a lossy failover still notices that the store went backwards
+        \\(ZC-E0215). The file could not be read, is not what the server
+        \\wrote, or could not be written. A file that does not parse stops the
+        \\start: the server does not guess. A save that fails while the server
+        \\runs does not stop it, but the file then lags behind what the server
+        \\knows, and a crash in that time forgets the difference; the failure
+        \\is shown once in the log and in GET /v1/status.
+        \\
+        \\Check the state directory (--state-dir) and its permissions. If the
+        \\file is damaged and the store is the one to trust, delete the file;
+        \\the server then remembers the store as it finds it.
         ,
     },
     .{

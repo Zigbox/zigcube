@@ -63,6 +63,7 @@ pub const SwitchedStore = struct {
         .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
+        .hash_at = hash_at,
     };
 
     pub fn interface(self: *SwitchedStore) store.Store {
@@ -188,6 +189,12 @@ pub const SwitchedStore = struct {
         const self = from(context);
         try self.gate(diag);
         return self.inner.compact(revision, diag);
+    }
+
+    fn hash_at(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!store.Hash {
+        const self = from(context);
+        try self.gate(diag);
+        return self.inner.hash_at(revision, diag);
     }
 };
 

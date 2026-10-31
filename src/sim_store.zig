@@ -38,6 +38,7 @@ pub const AckLossStore = struct {
         .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
+        .hash_at = hash_at,
     };
 
     pub fn init(inner: store.Store, seed: u64, loss_per_mille: u32) AckLossStore {
@@ -164,6 +165,12 @@ pub const AckLossStore = struct {
         const self = from(context);
         try self.inner.compact(revision, diag);
         if (self.loses()) return self.lost(diag);
+    }
+
+    /// A read: passed through, never lost.
+    fn hash_at(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!store.Hash {
+        const self = from(context);
+        return self.inner.hash_at(revision, diag);
     }
 };
 

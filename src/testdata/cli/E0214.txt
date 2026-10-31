@@ -1,0 +1,5 @@
+error[ZC-E0214]: the store has no chain hash for that revision
+  cause  the store was upgraded at revision 380 from a schema without a chain
+  fix    ask for a revision at or above the start of the chain
+  more   zcube explain E0214 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0214.html

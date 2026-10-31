@@ -35,11 +35,14 @@ const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const runtime_codes = @import("runtime_codes.zig");
 const store = @import("store.zig");
+const failures = @import("store_failures.zig");
+const store_verified = @import("store_verified.zig");
 const text_util = @import("text.zig");
 const why_mod = @import("why.zig");
 
 const Allocator = std.mem.Allocator;
 const Context = controller.Context;
+const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 
 pub const Request = struct {
@@ -85,6 +88,10 @@ pub const Api = struct {
     instance: u32 = 0,
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
+    /// The server's guard against a store that went backwards, for
+    /// `POST /v1/store/accept-rollback`.
+    /// Null in the simulation, which has no guard.
+    verified: ?*store_verified.VerifiedStore = null,
 
     /// Answers one request. `ctx.arena` holds the answer: it stays valid until the arena is reset.
     pub fn handle(api: *Api, ctx: *const Context, request: Request) Response {
@@ -208,6 +215,17 @@ const WriteReply = struct {
     revision: ?store.Revision = null,
     decision: ?[]const u8 = null,
 };
+
+fn pair_json(ctx: *const Context, out: *Out, pair: ?store_verified.Pair) Failure!void {
+    try out.begin_object();
+    if (pair) |known| {
+        try out.member("revision", known.revision);
+        const hex = std.fmt.allocPrint(ctx.arena, "{x}", .{&known.hash}) catch
+            return no_memory(ctx);
+        try out.member("hash", hex);
+    }
+    try out.end_object();
+}
 
 fn apply_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!apply_mod.Input {
     if (body.len == 0) return bad_request(ctx, "body", "is required: the service as JSON");
@@ -605,6 +623,22 @@ const Call = struct {
         return out.finish();
     }
 
+    /// The guard's pair and whether it could be saved. Members are added only when there is a
+    /// guard; `remembered_save_failed` is a `ZC-E0216` diagnostic, present only while saving fails.
+    fn remembered_state(call: Call, out: *Out) Failure!void {
+        const guard = call.api.verified orelse return;
+        try out.field("remembered");
+        try pair_json(call.ctx, out, guard.remembered());
+        if (!guard.save_trouble()) return;
+        try out.field("remembered_save_failed");
+        var note: Diag = undefined;
+        note.reset();
+        _ = failures.not_saved(&note) catch {};
+        var diagnostic: Diagnostic = undefined;
+        diag_mod.to_diagnostic(&diagnostic, &note);
+        try out.diagnostic(&diagnostic);
+    }
+
     fn store_state(call: Call, out: *Out) Failure!void {
         const ctx = call.ctx;
         try out.begin_object();
@@ -613,6 +647,7 @@ const Call = struct {
             try out.member("ok", true);
             try out.member("revision", state.revision);
             try out.member("compacted_revision", state.compacted_revision);
+            try call.remembered_state(out);
         } else |_| {
             try out.member("ok", false);
             try out.field("diagnostic");
@@ -806,8 +841,42 @@ const Call = struct {
 
     // ---- Writes: POST /v1/apply and DELETE /v1/services/{name} ----
 
+    /// POST /v1/store/accept-rollback?confirm=true: the operator's decision to keep the store as
+    /// it is (`store_verified.zig`). Answers the pair forgotten and the pair remembered now.
+    fn accept_rollback(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const name = call.parts.next() orelse return no_such(ctx, "/v1/store");
+        if (!std.mem.eql(u8, name, "accept-rollback")) return no_such(ctx, "/v1/store/<name>");
+        try call.query.allow(ctx, &.{"confirm"});
+        try call.no_more();
+        if (!try call.query.flag(ctx, "confirm")) {
+            return bad_request(
+                ctx,
+                "confirm",
+                "is required: pass --confirm after looking at the store",
+            );
+        }
+        const verified = call.api.verified orelse
+            return bad_request(
+                ctx,
+                "store",
+                "this server does not check for a store that went backwards",
+            );
+        const accepted = verified.accept(ctx.diag) catch return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        try out.begin_object();
+        try out.member("accepted", true);
+        try out.field("old");
+        try pair_json(ctx, out, accepted.old);
+        try out.field("new");
+        try pair_json(ctx, out, accepted.new);
+        try out.end_object();
+        return out.finish();
+    }
+
     fn write_post(call: Call, first: []const u8, body: []const u8, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
+        if (std.mem.eql(u8, first, "store")) return call.accept_rollback();
         if (!std.mem.eql(u8, first, "apply")) {
             return bad_request(ctx, "method", "POST is accepted at /v1/apply only");
         }

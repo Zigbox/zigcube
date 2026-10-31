@@ -16,7 +16,9 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const replica_controller = @import("replica_controller.zig");
+const failures = @import("store_failures.zig");
 const store = @import("store.zig");
+const store_verified = @import("store_verified.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -33,6 +35,9 @@ pub const Driver = struct {
     // What was last reported, so that a store that stays down is shown once.
     last_code: ?codes.Code = null,
     last_report_ms: u64 = 0,
+    /// The guard, if the store is wrapped in one: a failed save of its pair is reported here.
+    verified: ?*store_verified.VerifiedStore = null,
+    saving_reported: bool = false,
     /// Steps that ran, for tests and the status line.
     steps: std.atomic.Value(u64) = .init(0),
 
@@ -58,7 +63,7 @@ pub const Driver = struct {
                 .arena = arena.allocator(),
                 .diag = &diag,
             };
-            const wake = driver.replicas.reconcile(&ctx) catch {
+            const wake = driver.step(&ctx) catch {
                 driver.report(&diag);
                 if (watch) |*open| open.close();
                 watch = null;
@@ -73,6 +78,41 @@ pub const Driver = struct {
             if (watch == null) watch = driver.open_watch(&diag);
             _ = driver.wait(&watch, wake, &due, &arena, &diag);
         }
+    }
+
+    /// One step: first the store is checked against what the server remembers (a `status` through
+    /// the `VerifiedStore`, which halts everything on a store that went backwards), then the
+    /// controller runs.
+    fn step(driver: *Driver, ctx: *const controller.Context) controller.Error!controller.Wakeup {
+        _ = try driver.store.status(ctx.diag);
+        driver.report_saving();
+        return driver.replicas.reconcile(ctx);
+    }
+
+    /// A pair that cannot be saved (`ZC-E0216`) is shown once when it starts, and once when it
+    /// stops. The server keeps acting meanwhile: only a crash in that time forgets the pair.
+    fn report_saving(driver: *Driver) void {
+        const verified = driver.verified orelse return;
+        const trouble = verified.save_trouble();
+        if (trouble == driver.saving_reported) return;
+        driver.saving_reported = trouble;
+        if (!driver.report_failures) return;
+        const file = std.Io.File.stderr();
+        if (!trouble) {
+            const line = "zcube-server: the remembered revision saves again\n";
+            file.writeStreamingAll(driver.io, line) catch {};
+            return;
+        }
+        var note: Diag = undefined;
+        note.reset();
+        _ = failures.not_saved(&note) catch {};
+        var diagnostic: diag_mod.Diagnostic = undefined;
+        diag_mod.to_diagnostic(&diagnostic, &note);
+        var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+        const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+        const before = "\nzcube-server: the remembered revision is not saved\n";
+        file.writeStreamingAll(driver.io, before) catch {};
+        file.writeStreamingAll(driver.io, text) catch {};
     }
 
     const Timers = struct { maintenance_due_ms: u64, compact_due_ms: u64 };

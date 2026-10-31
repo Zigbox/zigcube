@@ -21,6 +21,8 @@ const http = @import("server_http.zig");
 const replica_controller = @import("replica_controller.zig");
 const Backend = @import("server_store.zig").Backend;
 const server_listen = @import("server_listen.zig");
+const Remembered = @import("server_remember.zig").Remembered;
+const store_verified = @import("store_verified.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -41,6 +43,9 @@ pub const Server = struct {
     backend: *Backend,
     shared: http.Shared,
     driver: Driver,
+    /// Wraps the backend's store: every call the server makes goes through it.
+    verified: store_verified.VerifiedStore,
+    remembered: ?Remembered,
     listener: net.Server,
     group: std.Io.Group,
     accept_future: ?std.Io.Future(void),
@@ -66,6 +71,9 @@ pub const Server = struct {
         const server = try gpa.create(Server);
         errdefer gpa.destroy(server);
         server.* = try init_value(gpa, io, backend, config, options);
+        try server.guard(config, diag);
+        errdefer server.unguard();
+        server.first_check(diag);
         server.listener = try listen(io, config.listen, diag);
         errdefer server.listener.deinit(io);
         try server.spawn(diag);
@@ -117,12 +125,114 @@ pub const Server = struct {
                 .stopping = undefined,
                 .report_failures = options.report_failures,
             },
+            .verified = undefined,
+            .remembered = null,
             .listener = undefined,
             .group = .init,
             .accept_future = null,
             .driver_future = null,
             .watchdog_future = null,
         };
+    }
+
+    /// Puts the `VerifiedStore` between the server and its backend, with the pair remembered by
+    /// the last run (`server_remember.zig`). A memory store remembers nothing: it cannot outlive
+    /// a restart. A Postgres store needs `--state-dir`: there is no directory beside it.
+    fn guard(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
+        var known: ?store_verified.Pair = null;
+        var remember: ?store_verified.Remember = null;
+        if (state_path(config, diag)) |path| {
+            var name_buffer: [300]u8 = undefined;
+            const database: ?[]const u8 = switch (config.store) {
+                .sqlite => |file| try server.absolute(file, diag),
+                .memory, .postgres => null,
+            };
+            defer if (database) |path_absolute| server.gpa.free(path_absolute);
+            const name = Remembered.file_for(database, &name_buffer) orelse {
+                diag.raise(.E0216);
+                diag.cause("the SQLite file's name is too long to name its remembered file", .{});
+                diag.cause("that file is named after it: its name can be about 260 bytes", .{});
+                diag.fix(.{ .sentence = "give the SQLite file a shorter name" });
+                return error.StartFailed;
+            };
+            server.remembered = Remembered.open(server.io, path, name, diag) catch
+                return error.StartFailed;
+            errdefer server.unguard();
+            known = server.remembered.?.load(diag) catch return error.StartFailed;
+            remember = server.remembered.?.interface();
+        } else if (diag.code != null) {
+            return error.StartFailed;
+        }
+        const raw = server.backend.handle();
+        server.verified = store_verified.VerifiedStore.init(
+            raw,
+            server.backend.clock(),
+            remember,
+            known,
+        );
+        const guarded = server.verified.interface();
+        server.shared.store = guarded;
+        server.shared.api.verified = &server.verified;
+        server.driver.store = guarded;
+        server.driver.verified = &server.verified;
+    }
+
+    /// `file` as an absolute path (working directory plus name, lexically), for keying the
+    /// remembered file by the database it describes. The caller frees it.
+    fn absolute(server: *Server, file: []const u8, diag: *Diag) Error![]u8 {
+        const cwd = std.process.currentPathAlloc(server.io, server.gpa) catch |err| {
+            diag.raise(.E0216);
+            diag.cause("can't tell the working directory to name the remembered file: {s}", .{
+                @errorName(err),
+            });
+            diag.fix(.{ .sentence = "give the SQLite file as an absolute path" });
+            return error.StartFailed;
+        };
+        defer server.gpa.free(cwd);
+        return std.fs.path.resolveAlloc(server.gpa, &.{ cwd, file });
+    }
+
+    /// Checks the store against the remembered pair before anything listens or steps, so that a
+    /// store that went backwards while the server was down is refused from the first request.
+    /// On a halt the server still starts, halted: it logs the diagnostic and every call answers
+    /// `ZC-E0215`. A store that cannot be read now is the driver's to report.
+    fn first_check(server: *Server, diag: *Diag) void {
+        _ = server.verified.interface().status(diag) catch {
+            if (server.verified.halt_state() != null and server.driver.report_failures) {
+                var diagnostic: diag_mod.Diagnostic = undefined;
+                diag_mod.to_diagnostic(&diagnostic, diag);
+                var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+                const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+                const file = std.Io.File.stderr();
+                file.writeStreamingAll(server.io, "\nzcube-server: starting halted\n") catch {};
+                file.writeStreamingAll(server.io, text) catch {};
+            }
+            diag.reset();
+        };
+    }
+
+    fn unguard(server: *Server) void {
+        if (server.remembered) |*remembered| remembered.close();
+        server.remembered = null;
+    }
+
+    /// The state directory, null for a memory store. Raises `ZC-E0106` for Postgres without one.
+    pub fn state_path(config: config_mod.Config, diag: *Diag) ?[]const u8 {
+        if (config.state_dir) |dir| return dir;
+        switch (config.store) {
+            .memory => return null,
+            .sqlite => |path| return std.fs.path.dirname(path) orelse ".",
+            .postgres => {
+                diag.raise(.E0106);
+                diag.cause("a Postgres store needs --state-dir", .{});
+                diag.cause("the server remembers the highest revision it saw in a file there", .{});
+                diag.fix(.{
+                    .sentence = "name a directory outside the store",
+                    .command = "zcube-server --state-dir /var/lib/zcube",
+                });
+                return null;
+            },
+        }
     }
 
     fn listen(io: std.Io, where: net.IpAddress, diag: *Diag) Error!net.Server {
@@ -203,6 +313,12 @@ pub const Server = struct {
         server.cancel_tasks();
         server.listener.deinit(server.io);
         const gpa = server.gpa;
+        if (!server.verified.flush()) {
+            const line = "zcube-server: could not save the remembered revision (ZC-E0216); " ++
+                "the next start remembers an older one\n";
+            std.Io.File.stderr().writeStreamingAll(server.io, line) catch {};
+        }
+        server.unguard();
         server.backend.close();
         gpa.destroy(server);
     }
