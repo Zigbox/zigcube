@@ -18,7 +18,7 @@ A migrated store has no hashes below the revision it was migrated at: `hash_at` 
 
 ## The server's memory of the store (`--state-dir`)
 
-The server remembers the highest store revision and hash it has seen in `<state dir>/remembered`,
+The server remembers the highest store revision and hash it has seen in `<state dir>/<db file name>.remembered` (SQLite; `<state dir>/remembered` for Postgres),
 so that a restart after a failover to a replica that was behind, or a restore from an old backup,
 is noticed (`ZC-E0215`) and the server stops acting. The directory is `--state-dir`; for SQLite it
 defaults to the directory of the database file; for Postgres it is required (`ZC-E0106` without

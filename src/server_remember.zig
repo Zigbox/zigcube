@@ -1,9 +1,12 @@
 //! The server's remembered `(revision, hash)` pair on disk (`store_verified.zig`). Shell code:
 //! files.
 //!
-//! Where: `<state dir>/remembered`. The state directory is `--state-dir` / `.state_dir`; unset,
-//! it is the directory of the SQLite file for a SQLite store and `zcube-state` in the working
-//! directory for Postgres (a memory store remembers nothing across a restart and has no file).
+//! Where: `<state dir>/<db file name>.remembered` for a SQLite store (one file per database, so
+//! two databases in one directory do not share a pair), `<state dir>/remembered` for Postgres.
+//! The state directory is `--state-dir` / `.state_dir`; unset, it is the directory of the SQLite
+//! file. A Postgres store has no such directory: `--state-dir` is required (`ZC-E0106`), and one
+//! directory serves one Postgres database. A memory store remembers nothing across a restart
+//! and has no file.
 //! Why a directory of the server's own and not the store: the point is to outlive a store that
 //! was restored, failed over or replaced, so it must not live in it, and a Postgres store has
 //! no directory the server could use.
@@ -28,8 +31,9 @@ const verified = @import("store_verified.zig");
 const Diag = diag_mod.Diag;
 const Dir = std.Io.Dir;
 
+/// The file of a Postgres store, and the suffix of a SQLite store's: `<db file name>.remembered`.
 pub const file_name = "remembered";
-const temp_name = "remembered.tmp";
+const name_bytes_max = 300;
 const magic = "zcube-remembered 1\n";
 const bytes_max = 256;
 
@@ -39,15 +43,40 @@ pub const Remembered = struct {
     path: []const u8,
     dir: Dir,
     mutex: std.Io.Mutex = .init,
+    name_buffer: [name_bytes_max]u8 = undefined,
+    name_length: u16 = 0,
 
-    /// Opens (creating, with parents) the state directory.
-    pub fn open(io: std.Io, path: []const u8, diag: *Diag) error{BadState}!Remembered {
+    /// The file's name in the state directory.
+    pub fn name(remembered: *const Remembered) []const u8 {
+        return remembered.name_buffer[0..remembered.name_length];
+    }
+
+    /// The name of the file for a store: `<database file name>.remembered` for SQLite (null for
+    /// the others) so that two databases in one directory keep two pairs.
+    pub fn file_for(database: ?[]const u8, buffer: *[name_bytes_max]u8) ?[]const u8 {
+        const path = database orelse return file_name;
+        const base = std.fs.path.basename(path);
+        return std.fmt.bufPrint(buffer, "{s}.{s}", .{ base, file_name }) catch null;
+    }
+
+    /// Opens (creating, with parents) the state directory; the pair lives in `file`.
+    pub fn open(
+        io: std.Io,
+        path: []const u8,
+        file: []const u8,
+        diag: *Diag,
+    ) error{BadState}!Remembered {
         assert(diag.code == null);
+        assert(file.len > 0);
+        assert(file.len + ".tmp".len <= name_bytes_max);
         const cwd = Dir.cwd();
-        cwd.createDirPath(io, path) catch |err| return unusable(diag, path, "create", err);
-        const dir = cwd.openDir(io, path, .{ .iterate = true }) catch |err|
-            return unusable(diag, path, "open", err);
-        return .{ .io = io, .path = path, .dir = dir };
+        var opened: Remembered = .{ .io = io, .path = path, .dir = undefined };
+        @memcpy(opened.name_buffer[0..file.len], file);
+        opened.name_length = @intCast(file.len);
+        cwd.createDirPath(io, path) catch |err| return unusable(diag, &opened, "create", err);
+        opened.dir = cwd.openDir(io, path, .{ .iterate = true }) catch |err|
+            return unusable(diag, &opened, "open", err);
+        return opened;
     }
 
     pub fn close(remembered: *Remembered) void {
@@ -62,12 +91,12 @@ pub const Remembered = struct {
     pub fn load(remembered: *Remembered, diag: *Diag) error{BadState}!?verified.Pair {
         assert(diag.code == null);
         var buffer: [bytes_max]u8 = undefined;
-        const bytes = remembered.dir.readFile(remembered.io, file_name, &buffer) catch |err| {
+        const dir = remembered.dir;
+        const bytes = dir.readFile(remembered.io, remembered.name(), &buffer) catch |err| {
             if (err == error.FileNotFound) return null;
-            return unusable(diag, remembered.path, "read", err);
+            return unusable(diag, remembered, "read", err);
         };
-        return parse(bytes) orelse
-            unusable(diag, remembered.path, "parse", error.InvalidData);
+        return parse(bytes) orelse unusable(diag, remembered, "parse", error.InvalidData);
     }
 
     fn save_impl(context: *anyopaque, pair: verified.Pair) bool {
@@ -81,13 +110,16 @@ pub const Remembered = struct {
         const io = remembered.io;
         var buffer: [bytes_max]u8 = undefined;
         const text = format(&buffer, pair);
+        var temp_buffer: [name_bytes_max]u8 = undefined;
+        const temp_name = std.fmt.bufPrint(&temp_buffer, "{s}.tmp", .{remembered.name()}) catch
+            unreachable; // `open` checked that the name and the suffix fit.
         const file = remembered.dir.createFile(io, temp_name, .{
             .permissions = .fromMode(0o600),
         }) catch return false;
         defer file.close(io);
         file.writeStreamingAll(io, text) catch return false;
         file.sync(io) catch return false;
-        remembered.dir.rename(temp_name, remembered.dir, file_name, io) catch return false;
+        remembered.dir.rename(temp_name, remembered.dir, remembered.name(), io) catch return false;
         // `iterate` opens a real descriptor (not O_PATH), which can be fsynced.
         const flags: std.Io.File.Flags = .{ .nonblocking = false };
         const handle: std.Io.File = .{ .handle = remembered.dir.handle, .flags = flags };
@@ -122,9 +154,15 @@ pub fn parse(text: []const u8) ?verified.Pair {
     return pair;
 }
 
-fn unusable(diag: *Diag, path: []const u8, action: []const u8, err: anyerror) error{BadState} {
-    var where: [512]u8 = undefined;
-    const full = std.fmt.bufPrint(&where, "{s}/{s}", .{ path, file_name }) catch path;
+fn unusable(
+    diag: *Diag,
+    remembered: *const Remembered,
+    action: []const u8,
+    err: anyerror,
+) error{BadState} {
+    var where: [512 + name_bytes_max]u8 = undefined;
+    const path = remembered.path;
+    const full = std.fmt.bufPrint(&where, "{s}/{s}", .{ path, remembered.name() }) catch path;
     _ = failures.remembered_unusable(diag, full, action, @errorName(err)) catch {};
     return error.BadState;
 }

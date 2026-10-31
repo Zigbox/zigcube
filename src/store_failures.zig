@@ -159,6 +159,14 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
     return error.BackendFailed;
 }
 
+/// The remembered pair could not be saved (`ZC-E0216`); the file is behind what the server knows.
+pub fn not_saved(diag: *Diag) error{BackendFailed} {
+    diag.raise(.E0216);
+    diag.cause("the remembered revision could not be saved", .{});
+    diag.fix(.{ .sentence = "check that the server's state directory is writable" });
+    return error.BackendFailed;
+}
+
 /// The remembered revision file could not be read, parsed or written (`store_verified.zig`).
 pub fn remembered_unusable(
     diag: *Diag,

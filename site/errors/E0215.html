@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>The server remembers the highest revision it has seen and the chain hash of that revision. The store now answers with a lower revision, or with a different hash for the revision the server remembers, so writes the store acknowledged are gone or the history has diverged. This is what a failover to a replica that was behind, a restore from an old backup, or a store pointed at by mistake looks like. Acting on it would hand out placements and fences that contradict ones already given.</p>
-<p>The server stops: controllers do not step and every store call fails with this code until an operator looks. It never recovers by itself. Look at the store (which database, which replica, which backup). If the rolled-back or forked store is the one to keep, run zcube store accept-rollback --confirm, which makes the server remember the store as it is now and records a decision with the old and new revision and hash.</p>
+<p>The server stops: controllers do not step and every store call fails with this code until an operator looks. It never recovers by itself. Look at the store (which database, which replica, which backup). If the rolled-back or forked store is the one to keep, run zcube store accept-rollback --confirm, which makes the server remember the store as it is now. The old and new revision and hash are shown in the reply of that command; a decision record that keeps them is not written yet.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0215</pre>

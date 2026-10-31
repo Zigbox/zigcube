@@ -676,9 +676,9 @@ pub const SqliteStore = struct {
             self.rollback(); // Nothing changed: no revision is taken.
             return .{ .succeeded = succeeded, .revision = meta.revision };
         }
-        try self.set_revision(revision, diag);
+        const hash = try self.set_revision(revision, diag);
         try self.commit(diag);
-        return .{ .succeeded = succeeded, .revision = revision };
+        return .{ .succeeded = succeeded, .revision = revision, .hash = hash };
     }
 
     fn compares_hold(
@@ -864,13 +864,15 @@ pub const SqliteStore = struct {
     }
 
     /// Takes the revision and records its chain hash in the same transaction.
-    fn set_revision(self: *SqliteStore, revision: Revision, diag: *Diag) Error!void {
+    fn set_revision(self: *SqliteStore, revision: Revision, diag: *Diag) Error!store.Hash {
         assert(revision > 0);
-        try self.put_hash(revision, self.chain.finish(), diag);
+        const hash = self.chain.finish();
+        try self.put_hash(revision, hash, diag);
         var stmt = try self.prepare(sql_set_revision, diag);
         defer stmt.finalize();
         stmt.bind_unsigned(1, revision);
         try stmt.run(diag);
+        return hash;
     }
 
     // ---- Watch ---------------------------------------------------------------------------
@@ -1051,7 +1053,7 @@ pub const SqliteStore = struct {
         defer stmt.finalize();
         stmt.bind_unsigned(1, id);
         try stmt.run(diag);
-        if (keys.count > 0) try self.set_revision(revision, diag);
+        if (keys.count > 0) _ = try self.set_revision(revision, diag);
         try self.commit(diag);
         return if (keys.count > 0) revision else meta.revision;
     }

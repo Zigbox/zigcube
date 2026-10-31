@@ -247,6 +247,10 @@ pub const TxnResult = struct {
     succeeded: bool,
     /// The revision after the transaction: the new one if it wrote, else the current one.
     revision: Revision,
+    /// The chain hash of `revision`, computed in the transaction that wrote it. Null when the
+    /// transaction wrote nothing (`revision` is then the current one) or the store cannot say
+    /// (the node agent's remote store). `VerifiedStore` advances what it remembers from it.
+    hash: ?Hash = null,
 };
 
 // ---- Watch ---------------------------------------------------------------------------------

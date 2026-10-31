@@ -35,12 +35,14 @@ const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const runtime_codes = @import("runtime_codes.zig");
 const store = @import("store.zig");
+const failures = @import("store_failures.zig");
 const store_verified = @import("store_verified.zig");
 const text_util = @import("text.zig");
 const why_mod = @import("why.zig");
 
 const Allocator = std.mem.Allocator;
 const Context = controller.Context;
+const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 
 pub const Request = struct {
@@ -621,6 +623,22 @@ const Call = struct {
         return out.finish();
     }
 
+    /// The guard's pair and whether it could be saved. Members are added only when there is a
+    /// guard; `remembered_save_failed` is a `ZC-E0216` diagnostic, present only while saving fails.
+    fn remembered_state(call: Call, out: *Out) Failure!void {
+        const guard = call.api.verified orelse return;
+        try out.field("remembered");
+        try pair_json(call.ctx, out, guard.remembered());
+        if (!guard.save_trouble()) return;
+        try out.field("remembered_save_failed");
+        var note: Diag = undefined;
+        note.reset();
+        _ = failures.not_saved(&note) catch {};
+        var diagnostic: Diagnostic = undefined;
+        diag_mod.to_diagnostic(&diagnostic, &note);
+        try out.diagnostic(&diagnostic);
+    }
+
     fn store_state(call: Call, out: *Out) Failure!void {
         const ctx = call.ctx;
         try out.begin_object();
@@ -629,6 +647,7 @@ const Call = struct {
             try out.member("ok", true);
             try out.member("revision", state.revision);
             try out.member("compacted_revision", state.compacted_revision);
+            try call.remembered_state(out);
         } else |_| {
             try out.member("ok", false);
             try out.field("diagnostic");

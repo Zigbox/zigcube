@@ -611,8 +611,9 @@ pub const registry = [_]Entry{
         \\itself. Look at the store (which database, which replica, which
         \\backup). If the rolled-back or forked store is the one to keep, run
         \\zcube store accept-rollback --confirm, which makes the server
-        \\remember the store as it is now and records a decision with the old
-        \\and new revision and hash.
+        \\remember the store as it is now. The old and new revision and hash are
+        \\shown in the reply of that command; a decision record that keeps them
+        \\is not written yet.
         ,
     },
     .{
@@ -625,8 +626,11 @@ pub const registry = [_]Entry{
         \\seen in a small file in its state directory, so that a restart after
         \\a lossy failover still notices that the store went backwards
         \\(ZC-E0215). The file could not be read, is not what the server
-        \\wrote, or could not be written. The server does not guess: it
-        \\neither starts nor accepts a store without it.
+        \\wrote, or could not be written. A file that does not parse stops the
+        \\start: the server does not guess. A save that fails while the server
+        \\runs does not stop it, but the file then lags behind what the server
+        \\knows, and a crash in that time forgets the difference; the failure
+        \\is shown once in the log and in GET /v1/status.
         \\
         \\Check the state directory (--state-dir) and its permissions. If the
         \\file is damaged and the store is the one to trust, delete the file;

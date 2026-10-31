@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">the remembered revision file is unusable</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
-<p>The server keeps the highest store revision and chain hash it has seen in a small file in its state directory, so that a restart after a lossy failover still notices that the store went backwards (ZC-E0215). The file could not be read, is not what the server wrote, or could not be written. The server does not guess: it neither starts nor accepts a store without it.</p>
+<p>The server keeps the highest store revision and chain hash it has seen in a small file in its state directory, so that a restart after a lossy failover still notices that the store went backwards (ZC-E0215). The file could not be read, is not what the server wrote, or could not be written. A file that does not parse stops the start: the server does not guess. A save that fails while the server runs does not stop it, but the file then lags behind what the server knows, and a crash in that time forgets the difference; the failure is shown once in the log and in GET /v1/status.</p>
 <p>Check the state directory (--state-dir) and its permissions. If the file is damaged and the store is the one to trust, delete the file; the server then remembers the store as it finds it.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

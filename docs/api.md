@@ -77,7 +77,10 @@ down" from "store down".
 ```
 
 With the store unreachable, `store` is `{"backend": "postgres", "ok": false, "diagnostic": {…}}`
-and `revision` is absent. `time_ms` is the server's clock: the console shows ages ("3 s ago")
+and `revision` is absent. A server that guards its store (every `zcube-server`) adds, inside
+`store` and beside `revision`, `remembered`: the highest `{"revision", "hash"}` it has seen (an
+empty object before the first status), and, only while saving that pair fails,
+`remembered_save_failed`: a `ZC-E0216` diagnostic. `time_ms` is the server's clock: the console shows ages ("3 s ago")
 against it, so a skewed laptop clock does not make "just now" read "in 4 minutes".
 
 ### `GET /v1/list?prefix=&at=&limit=&continue=&reverse=`

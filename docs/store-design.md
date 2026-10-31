@@ -195,8 +195,10 @@ are not supported. See `docs/operations.md`.
 ## Nothing acts on a store that went backwards (C1 slice 10b)
 
 `VerifiedStore` (`src/store_verified.zig`, core) wraps the `Store` the server and its controllers
-use. It remembers the highest `(revision, hash)` it has seen. On every `status` and after every
-reconnect it checks the store: a revision below the remembered one, or a different `hash_at(remembered revision)`
+use. It remembers the highest `(revision, hash)` it has seen. On every `status`, after every
+acknowledged write (the transaction result carries the chain hash of its revision, which the
+pair advances to), before and after lease expiry, and once at start-up before the server
+listens, it checks the store: a revision below the remembered one, or a different `hash_at(remembered revision)`
 (a fork), halts the server with `ZC-E0215`. Halted, every store call
 fails with that code, so controllers do not step and writes are refused. There is no automatic
 recovery.
@@ -205,12 +207,18 @@ recovery.
   (`ZC-E0214`: the revision is below the point its chain starts, as after a migration from schema
   version 1) is refused as well, since it cannot be told from a rollback. The operator runs
   `accept-rollback` once. A server with nothing remembered (first start) is not affected.
-- **The pair outlives the server.** It is written to `<state dir>/remembered` (temporary file,
-  `fsync`, rename, `fsync` of the directory) whenever it rises; a file that is present and
-  unreadable is `ZC-E0216`, never "no file". The state directory is `--state-dir`; unset, it is
+- **The pair outlives the server.** It is written to `<state dir>/<db file name>.remembered` for SQLite (one file per
+  database) or `<state dir>/remembered` for Postgres (temporary file, `fsync`, rename, `fsync` of
+  the directory), at most once per second and whenever the file is behind the pair, including
+  when the cluster has gone idle, and at a clean stop. A file that is present and unreadable is
+  `ZC-E0216`, never "no file". **Crash window:** the file may lag the pair by up to one save
+  interval (`verified_save_ms`, 1 s), or for as long as saves fail (shown once as `ZC-E0216` in
+  the log and in `GET /v1/status`). A crash plus a rollback inside that window is not noticed. The state directory is `--state-dir`; unset, it is
   the directory of the SQLite file; a memory store remembers nothing; Postgres without
   `--state-dir` refuses to start (`ZC-E0106`), because there is no directory beside it and a file
-  inside the store would be rolled back with it.
+  inside the store would be rolled back with it. One Postgres database per state directory.
+- **Start-up.** The server checks the store before it listens. If the check halts, it starts
+  anyway, halted, and logs the diagnostic: every call answers `ZC-E0215`.
 - **The way out.** `zcube store accept-rollback --confirm` (`POST /v1/store/accept-rollback?confirm=true`)
   makes the server remember the store as it is now. Run it after looking at which store this is.
 

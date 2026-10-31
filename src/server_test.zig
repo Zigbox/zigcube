@@ -567,24 +567,27 @@ fn run_until_running(io: std.Io, server: *server_mod.Server, node: *Node, count:
     return error.NeverConverged;
 }
 
+fn tmp_file(buffer: []u8, tmp: testing.TmpDir, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
 test "a server restarted on a store that went backwards halts until the operator accepts it" {
-    // Goal: the remembered pair outlives the server (10b). Method: a server on `long.db` applies
-    // `hello` (revision N) and stops; a second on a new, shorter `short.db` with the same state
-    // directory answers every store call with ZC-E0215 and does not step; accepting the rollback
-    // resumes it, and a third start on the same files is not refused.
+    // Goal: the remembered pair outlives the server (10b). Method: a server on `data.db` applies
+    // `hello` and stops; a second on a new `data.db` in another directory (a restore), with the
+    // same state directory, answers ZC-E0215 and does not step; accepting resumes it.
     var test_io: TestIo = undefined;
     const io = test_io.start();
     defer test_io.stop();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    var tmp_short = testing.tmpDir(.{});
+    defer tmp_short.cleanup();
     var state_buffer: [128]u8 = undefined;
-    const state = try std.fmt.bufPrint(&state_buffer, ".zig-cache/tmp/{s}/state", .{tmp.sub_path});
+    const state = try tmp_file(&state_buffer, tmp, "state");
     var long_buffer: [128]u8 = undefined;
-    const long_format = ".zig-cache/tmp/{s}/long.db";
-    const long_path = try std.fmt.bufPrint(&long_buffer, long_format, .{tmp.sub_path});
+    const long_path = try tmp_file(&long_buffer, tmp, "data.db");
     var short_buffer: [128]u8 = undefined;
-    const short_format = ".zig-cache/tmp/{s}/short.db";
-    const short_path = try std.fmt.bufPrint(&short_buffer, short_format, .{tmp.sub_path});
+    const short_path = try tmp_file(&short_buffer, tmp_short, "data.db");
     var long_config = config_for(.{ .sqlite = long_path }, true);
     long_config.state_dir = state;
     var short_config = config_for(.{ .sqlite = short_path }, true);
@@ -635,6 +638,66 @@ test "a server restarted on a store that went backwards halts until the operator
     const again = try get(io, third.address(), "/v1/status");
     defer again.free();
     try testing.expectEqual(@as(u16, 200), again.status);
+}
+
+test "two SQLite stores in one directory remember separately" {
+    // Goal: one remembered pair per database (10b review). Method: a server on `one.db` applies
+    // `hello` and stops; a server on a new `two.db` in the same directory, whose state directory
+    // is not named, starts and is not refused; each database has its own remembered file.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var one_buffer: [128]u8 = undefined;
+    const one_path = try tmp_file(&one_buffer, tmp, "one.db");
+    var two_buffer: [128]u8 = undefined;
+    const two_path = try tmp_file(&two_buffer, tmp, "two.db");
+    const first = try start_server(io, config_for(.{ .sqlite = one_path }, true));
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    first.stop();
+    const second = try start_server(io, config_for(.{ .sqlite = two_path }, true));
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    defer status.free();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try status.json(arena_state.allocator());
+    try testing.expect(body.object.get("store").?.object.get("ok").?.bool);
+    const names: [2][]const u8 = .{ "one.db.remembered", "two.db.remembered" };
+    for (names) |name| _ = try tmp.dir.statFile(io, name, .{});
+}
+
+test "an unreadable remembered file stops the start with ZC-E0216, and Postgres needs a state dir" {
+    // Goal: the start-up failures of the guard are coded. Method: a remembered file that does not
+    // parse (ZC-E0216, never "no file"); a Postgres config without `state_dir` (ZC-E0106).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "data.db.remembered", .data = "not a pair\n" });
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/data.db", .{tmp.sub_path});
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test", .report_failures = false };
+    const refused = server_mod.Server.start(
+        testing.allocator,
+        io,
+        config_for(.{ .sqlite = path }, true),
+        options,
+        &diag,
+    );
+    try testing.expectError(error.StartFailed, refused);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0216), diag.code);
+
+    diag.reset();
+    const config = config_for(.{ .postgres = "host=nowhere" }, false);
+    try testing.expect(server_mod.Server.state_path(config, &diag) == null);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
 }
 
 test "request ids are not issued twice across server starts" {

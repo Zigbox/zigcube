@@ -1165,7 +1165,7 @@ const Writer = struct {
     }
 
     /// Tells watchers a revision is coming (delivered at commit, in commit order), then commits.
-    fn finish(writer: Writer, revision: Revision) Error!void {
+    fn finish(writer: Writer, revision: Revision) Error!store.Hash {
         var hashing: Params = .{};
         hashing.add_int8(revision);
         const hash = writer.chain.finish();
@@ -1180,6 +1180,7 @@ const Writer = struct {
         var result = try writer.session.run(sql_notify, &params, writer.diag);
         result.clear();
         try writer.session.commit(writer.diag);
+        return hash;
     }
 
     /// Every lease a put names must be alive, and no lease may end up with too many keys.
@@ -1264,8 +1265,8 @@ fn txn_impl(context: *anyopaque, request: store.TxnRequest, diag: *Diag) Error!s
         session.rollback(); // Nothing changed: the bump goes with it, and no revision is taken.
         return .{ .succeeded = succeeded, .revision = revision - 1 };
     }
-    try writer.finish(revision);
-    return .{ .succeeded = succeeded, .revision = revision };
+    const hash = try writer.finish(revision);
+    return .{ .succeeded = succeeded, .revision = revision, .hash = hash };
 }
 
 // ---- Leases ------------------------------------------------------------------------------------
@@ -1339,7 +1340,7 @@ fn lease_revoke_impl(context: *anyopaque, id: LeaseId, diag: *Diag) Error!Revisi
         try session.commit(diag);
         return revision - 1;
     }
-    try writer.finish(revision);
+    _ = try writer.finish(revision);
     return revision;
 }
 

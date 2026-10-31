@@ -29,8 +29,8 @@ pub const usage =
     \\  --config FILE     a ZON file with .listen, .store and .create_store
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
-    \\  --state-dir DIR   where to remember the highest store revision seen (default: beside the
-    \\                    SQLite file, else ./zcube-state); keep it outside the store
+    \\  --state-dir DIR   where to remember the highest store revision seen (SQLite: default is
+    \\                    the SQLite file's directory; Postgres: required). Keep outside the store
     \\  --create-store    create the store's file or schema if it is not there
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
@@ -53,7 +53,8 @@ pub const Config = struct {
     listen: IpAddress,
     store: Store,
     create_store: bool,
-    /// Where the remembered revision is kept; null: beside the SQLite file, else `zcube-state`.
+    /// Where the remembered revision is kept; null: beside the SQLite file. A Postgres store
+    /// requires it (`ZC-E0106`).
     state_dir: ?[]const u8 = null,
     verbose: bool,
     quiet: bool,

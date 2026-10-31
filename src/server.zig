@@ -73,6 +73,7 @@ pub const Server = struct {
         server.* = try init_value(gpa, io, backend, config, options);
         try server.guard(config, diag);
         errdefer server.unguard();
+        server.first_check(diag);
         server.listener = try listen(io, config.listen, diag);
         errdefer server.listener.deinit(io);
         try server.spawn(diag);
@@ -141,7 +142,18 @@ pub const Server = struct {
         var known: ?store_verified.Pair = null;
         var remember: ?store_verified.Remember = null;
         if (state_path(config, diag)) |path| {
-            server.remembered = Remembered.open(server.io, path, diag) catch
+            var name_buffer: [300]u8 = undefined;
+            const database: ?[]const u8 = switch (config.store) {
+                .sqlite => |file| file,
+                .memory, .postgres => null,
+            };
+            const name = Remembered.file_for(database, &name_buffer) orelse {
+                diag.raise(.E0216);
+                diag.cause("the SQLite file's name is too long to name its remembered file", .{});
+                diag.fix(.{ .sentence = "give the SQLite file a shorter name" });
+                return error.StartFailed;
+            };
+            server.remembered = Remembered.open(server.io, path, name, diag) catch
                 return error.StartFailed;
             errdefer server.unguard();
             known = server.remembered.?.load(diag) catch return error.StartFailed;
@@ -160,6 +172,26 @@ pub const Server = struct {
         server.shared.store = guarded;
         server.shared.api.verified = &server.verified;
         server.driver.store = guarded;
+        server.driver.verified = &server.verified;
+    }
+
+    /// Checks the store against the remembered pair before anything listens or steps, so that a
+    /// store that went backwards while the server was down is refused from the first request.
+    /// On a halt the server still starts, halted: it logs the diagnostic and every call answers
+    /// `ZC-E0215`. A store that cannot be read now is the driver's to report.
+    fn first_check(server: *Server, diag: *Diag) void {
+        _ = server.verified.interface().status(diag) catch {
+            if (server.verified.halt_state() != null and server.driver.report_failures) {
+                var diagnostic: diag_mod.Diagnostic = undefined;
+                diag_mod.to_diagnostic(&diagnostic, diag);
+                var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+                const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+                const file = std.Io.File.stderr();
+                file.writeStreamingAll(server.io, "\nzcube-server: starting halted\n") catch {};
+                file.writeStreamingAll(server.io, text) catch {};
+            }
+            diag.reset();
+        };
     }
 
     fn unguard(server: *Server) void {
@@ -168,7 +200,7 @@ pub const Server = struct {
     }
 
     /// The state directory, null for a memory store. Raises `ZC-E0106` for Postgres without one.
-    fn state_path(config: config_mod.Config, diag: *Diag) ?[]const u8 {
+    pub fn state_path(config: config_mod.Config, diag: *Diag) ?[]const u8 {
         if (config.state_dir) |dir| return dir;
         switch (config.store) {
             .memory => return null,
@@ -264,7 +296,11 @@ pub const Server = struct {
         server.cancel_tasks();
         server.listener.deinit(server.io);
         const gpa = server.gpa;
-        server.verified.flush();
+        if (!server.verified.flush()) {
+            const line = "zcube-server: could not save the remembered revision (ZC-E0216); " ++
+                "the next start remembers an older one\n";
+            std.Io.File.stderr().writeStreamingAll(server.io, line) catch {};
+        }
         server.unguard();
         server.backend.close();
         gpa.destroy(server);

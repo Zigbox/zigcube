@@ -305,7 +305,8 @@ pub const MemoryStore = struct {
             }
         }
         if (bumped) try self.seal_revision(diag);
-        return .{ .succeeded = succeeded, .revision = self.revision };
+        const hash: ?store.Hash = if (bumped) self.chain_hash_now() else null;
+        return .{ .succeeded = succeeded, .revision = self.revision, .hash = hash };
     }
 
     /// Every lease a put names must be alive, and no lease may end up with too many keys.
