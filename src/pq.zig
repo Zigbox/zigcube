@@ -513,23 +513,21 @@ fn fill_database_missing(diag: *Diag, message: []const u8, target: Target) void 
     });
 }
 
-const dropped_commit_cause =
-    "the connection dropped during the commit; the write may or may not apply";
-
-/// True for a ZC-E0213 that happened during a COMMIT: the write may have applied. A drop at any
+/// True for a failure that happened during a COMMIT: the write may have applied. A drop at any
 /// other point (ZC-E0213 too) certainly changed nothing. The fault tests tell the two apart.
 pub fn dropped_during_commit(diag: *const Diag) bool {
-    const code = diag.code orelse return false;
-    if (code != .E0213) return false;
-    const cause = diag.last_cause() orelse return false;
-    return std.mem.eql(u8, cause, dropped_commit_cause);
+    // Only a raised failure can leave a write unknown, and a cleared collector never does.
+    if (diag.write_outcome_unknown) assert(diag.code != null);
+    if (diag.code == null) assert(!diag.write_outcome_unknown);
+    return diag.write_outcome_unknown;
 }
 
 fn fill_dropped(diag: *Diag, message: []const u8, detail: Detail) void {
     diag.raise(.E0213);
     diag.cause("libpq reported: {s}", .{message});
     if (detail.committing) {
-        diag.cause(dropped_commit_cause, .{});
+        diag.cause("the connection dropped during the commit; the write may or may not apply", .{});
+        diag.write_outcome_unknown = true;
         diag.fix(.{ .sentence = "read the keys back before repeating the write" });
     } else {
         diag.cause("the connection to Postgres dropped; nothing was changed", .{});

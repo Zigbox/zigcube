@@ -109,6 +109,10 @@ pub const Diag = struct {
     fixes: Fixes,
     /// The path of the bundle written for this bug, empty for none. Only a bug has one.
     saved: zigbox.diag.Saved,
+    /// True when the failure hit a write whose outcome is unknown (a connection lost during a
+    /// COMMIT): the write may have applied. A structural signal, so rewording a cause cannot
+    /// change how a caller treats the failure; it is never rendered.
+    write_outcome_unknown: bool,
 
     /// Initialises in place: the struct is several kilobytes.
     pub fn reset(diag: *Diag) void {
@@ -118,9 +122,11 @@ pub const Diag = struct {
         diag.pairs.reset();
         diag.fixes.reset();
         diag.saved = .{};
+        diag.write_outcome_unknown = false;
         assert(diag.saved.len == 0);
         assert(diag.causes.count == 0);
         assert(diag.code == null);
+        assert(!diag.write_outcome_unknown);
     }
 
     /// Records where the bundle for this bug was written.
