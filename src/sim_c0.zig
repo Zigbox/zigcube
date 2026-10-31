@@ -729,13 +729,23 @@ fn stale_input(name: []const u8) apply_mod.Input {
 
 /// Puts a stopped observed record of `replica` with `generation`, as the node's agent would.
 fn put_stopped(world: *World, replica: []const u8, generation: u64) !void {
+    try put_record(world, replica, generation, .stopped);
+}
+
+fn put_record(
+    world: *World,
+    replica: []const u8,
+    generation: u64,
+    status: records.ObservedStatus,
+) !void {
     const ctx = world.controller_context();
     const record: records.Observed = .{
         .replica = replica,
         .node = sim_world.node_name,
         .generation = generation,
-        .status = .stopped,
-        .exit = .{ .kind = .exited, .code = 0 },
+        .status = status,
+        .exit = if (status == .stopped) .{ .kind = .exited, .code = 0 } else null,
+        .started_at_ms = if (status == .stopped) null else world.now_ms(),
         .reported_at_ms = world.now_ms(),
     };
     const key = records.observed_key(sim_world.node_name, replica);
@@ -846,4 +856,55 @@ test "a stopped container of an earlier replica with the same id is replaced, no
     try reapply_before_cleanup(world, true);
     try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a replacement leaves no pending stop behind, and the agent sleeps" {
+    // Goal: stopping the earlier replica's container is finished once the right one starts in
+    // its place; a pending stop left for the name would keep the agent awake (its deadline
+    // passes, the next wake is now) and later kill the new container. Method: as above, then let
+    // the stop's grace period pass: no stop is pending and the agent's next wake is in the
+    // future. (Seeds 150, 505, 375 and 329 of `sim-cluster` spun here.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try reapply_before_cleanup(world, false);
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+    world.advance(constants.stop_grace_ms + 1000);
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+    try testing.expect(world.agent_due_ms > world.now_ms());
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a late running record over a stale stopped container is reported lost and recovers" {
+    // Goal: the old agent's last write ("running", generation 1) can land after the service
+    // was deleted and applied again; it is not a leftover (newer than the replica's key), the
+    // stale container is stopped, and nothing would ever correct it. Method: kill web-1,
+    // delete and apply again, plant that record, step agent and server: the agent reports the
+    // replica lost, the controller replaces it, and one replica runs.
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step();
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step();
+    try world.kill("web-1");
+    world.manual.advance(10); // Not `advance`: it would let the agent step.
+    _ = try world.delete_service("web");
+    _ = world.server_step();
+    _ = world.server_step();
+    var again = stale_input("web");
+    again.image = next_digest;
+    _ = try world.apply(again);
+    _ = world.server_step();
+    _ = world.server_step();
+    try put_record(world, "web-1", 1, .running);
+    var rounds: u32 = 0;
+    while (rounds < 30 and world.sim.running_count() != 1) : (rounds += 1) {
+        _ = world.agent_step();
+        _ = world.server_step();
+        _ = world.server_step();
+        world.advance(1000);
+    }
+    try testing.expectEqual(@as(u32, 1), world.sim.running_count());
 }

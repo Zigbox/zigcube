@@ -71,6 +71,9 @@ const excess_slots_max: u32 = 512;
 const starved_ms_max: u64 = 24_000;
 /// Half the slowest node seen over seeds 1 to 300 (10 per up-minute).
 const ok_steps_per_minute_min: u64 = 5;
+/// No node's agent may take more steps than this per minute it was up, over the run. Set from
+/// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
+const steps_per_minute_max: u64 = 200;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -231,6 +234,10 @@ const Node = struct {
     up_ms: u64,
     /// Whether the agent's last step worked: a step that fails says why nothing moved.
     last_ok: bool,
+    /// Every agent step (failed ones too) and the virtual time with the agent up, over the
+    /// whole run: the work ceiling's measure.
+    all_steps: u32,
+    all_up_ms: u64,
 
     fn name(node: *const Node) []const u8 {
         return node.name_buf[0..node.name_len];
@@ -297,6 +304,7 @@ const Node = struct {
             .diag = &node.diag,
         };
         c.stats.agent_steps += 1;
+        node.all_steps += 1;
         const result = node.agent.reconcile(&ctx);
         node.resume_ms = c.manual.ms + node.spent_ms;
         node.check_crashed();
@@ -520,6 +528,8 @@ pub const Cluster = struct {
         node.ok_steps = 0;
         node.last_ok = true;
         node.up_ms = 0;
+        node.all_steps = 0;
+        node.all_up_ms = 0;
         c.net.set_faults(index, c.swarm.net);
         return node;
     }
@@ -639,7 +649,9 @@ pub const Cluster = struct {
             left -= slice;
             if (c.fault_totals == null) c.fault_ms += slice;
             for (c.nodes) |node| {
-                if (c.fault_totals == null and !node.down) node.up_ms += slice;
+                if (node.down) continue;
+                node.all_up_ms += slice;
+                if (c.fault_totals == null) node.up_ms += slice;
             }
             c.diag.reset();
             _ = c.store_handle().expire_leases(&c.diag) catch c.diag.reset();
@@ -1418,6 +1430,25 @@ fn run_steps(c: *Cluster, operations: u32) Failure!void {
     try converged(c);
     try safety(c);
     try enough_work_under_faults(c, operations);
+    try work_under_ceiling(c);
+}
+
+/// The highest rate of agent steps (per minute of agent uptime, over the whole run) among the
+/// nodes that were up for at least a minute; 0 if there is none.
+fn busiest_node_rate(c: *const Cluster) u64 {
+    var busiest: u64 = 0;
+    for (c.nodes) |node| {
+        if (node.all_up_ms < 60_000) continue;
+        busiest = @max(busiest, @as(u64, node.all_steps) * 60_000 / node.all_up_ms);
+    }
+    return busiest;
+}
+
+/// An agent that never sleeps (a wake time that is always now) passes every other check and
+/// burns a core: no node may take more than `steps_per_minute_max` steps per minute it was up.
+fn work_under_ceiling(c: *Cluster) Failure!void {
+    try check(c, busiest_node_rate(c) <= steps_per_minute_max, "an agent took too many " ++
+        "steps for the time it was up (a busy loop)");
 }
 
 /// The slowest rate of successful agent steps (per minute of agent uptime) among the nodes that
@@ -1461,6 +1492,7 @@ fn print_summary(c: *Cluster) void {
     report.print("starved: worst={d}ms; slowest node: {d} ok steps per up-minute\n", .{
         c.starved_worst_ms, slowest_node_rate(c) orelse 0,
     });
+    report.print("busiest node: {d} steps per up-minute\n", .{busiest_node_rate(c)});
     report.print("faults: crashes={d} partitions={d} outages={d} suspends={d} " ++
         "runtime={d} server_restarts={d} ack_lost={d}\n", .{
         s.crashes_injected, s.partitions,      s.outages,             s.suspends,

@@ -72,7 +72,7 @@ replica is adopted, never started twice" does the rest. The agent holds an exclu
 state directory, so two agents cannot share it (`ZC-E0506`).
 
 A listed container is adopted only if it is the replica's own: it carries the labels `zcube.image`
-and `zcube.created` (the revision the replica key was created at), and a service deleted and
+and `zcube.created` (the revision the replica key was created at; a container with neither label is not the replica's), and a service deleted and
 applied again reuses replica ids, so a mismatch means an earlier replica's container. That one is
 stopped (asked once, killed after its grace period) and, once it has stopped, the right one starts.
 

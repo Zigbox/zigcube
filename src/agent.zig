@@ -160,6 +160,18 @@ pub const Agent = struct {
         agent.stops_count = kept;
     }
 
+    /// Forgets the pending stop of the container called `name`, if any: it has stopped.
+    fn forget_stop(agent: *Agent, name: []const u8) void {
+        var kept: u32 = 0;
+        for (agent.stops[0..agent.stops_count]) |stop| {
+            if (std.mem.eql(u8, stop.handle.name(), name)) continue;
+            agent.stops[kept] = stop;
+            kept += 1;
+        }
+        assert(kept <= agent.stops_count);
+        agent.stops_count = kept;
+    }
+
     fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
         for (agent.stops[0..agent.stops_count]) |*stop| {
             if (std.mem.eql(u8, stop.handle.name(), name)) return stop;
@@ -282,6 +294,8 @@ const Pass = struct {
         seen: ?*const records.Observed,
     ) Error!void {
         const ctx = pass.ctx;
+        assert(!is_this_replica(stale, item));
+        assert(std.mem.eql(u8, label_value(stale.labels, runtime.label_replica).?, item.rec.id));
         if (is_running(stale)) {
             try pass.stop_once(stale);
             const status = try ctx.runtime.inspect(stale.handle, ctx.diag);
@@ -289,15 +303,25 @@ const Pass = struct {
                 .starting, .running => return,
                 .stopped => {},
             }
+            // The stop is done: the name's pending stop must not outlive it, or it would
+            // never be forgotten (the listings of this pass still show the old container
+            // running), keep the agent awake, and kill the container started in its place.
+            pass.agent.forget_stop(stale.handle.name());
         }
-        // A record of this replica means it was started already (and, if the start failed, is
-        // not started again); the stale container is only the name's earlier holder.
-        if (seen == null) try pass.start(item);
+        if (seen) |record| {
+            // A record of this replica means it was started already (and, if the start failed,
+            // is not started again); the stale container is only the name's earlier holder. A
+            // record that says it runs, though, is about a container that is gone.
+            if (record.status != .stopped) try pass.report_lost(&item.rec, record);
+            return;
+        }
+        try pass.start(item);
     }
 
     /// Asks for `listing`'s container to stop, once; a later step kills it if it is still
     /// running after its grace period.
     fn stop_once(pass: *Pass, listing: *const runtime.Listing) Error!void {
+        assert(is_running(listing));
         const ctx = pass.ctx;
         const now = ctx.clock.now_ms();
         const name = listing.handle.name();
@@ -313,6 +337,7 @@ const Pass = struct {
             .deadline_ms = now + constants.stop_grace_ms,
         };
         pass.agent.stops_count += 1;
+        assert(pass.agent.pending_stop(name) != null);
     }
 
     /// Writes the observed record for a container the runtime has, if it differs from the
@@ -391,6 +416,8 @@ const Pass = struct {
         const replica = &item.rec;
         const created_revision = item.kv.create_revision;
         const ctx = pass.ctx;
+        assert(created_revision > 0);
+        assert(replica.id.len > 0);
         var created_buffer: [20]u8 = undefined;
         const created = created_text(&created_buffer, created_revision);
         const labels = [_]runtime.Label{
@@ -510,25 +537,24 @@ fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
 }
 
 fn created_text(buffer: *[20]u8, revision: store.Revision) []const u8 {
+    assert(revision > 0);
     // 20 digits hold a u64.
     return std.fmt.bufPrint(buffer, "{d}", .{revision}) catch unreachable;
 }
 
 /// False if the container was started for another replica that had this one's id: its image
-/// or the revision its replica key was created at differ. A container without those labels
-/// (started by an agent that did not write them) is taken to be this replica's.
+/// or the revision its replica key was created at differ. A container without those labels is
+/// not this replica's either (the project is pre-release: no container predates the labels).
 fn is_this_replica(
     listing: *const runtime.Listing,
     item: *const controller.Entry(records.Replica),
 ) bool {
-    if (label_value(listing.labels, runtime.label_image)) |image| {
-        if (!std.mem.eql(u8, image, item.rec.image)) return false;
-    }
-    if (label_value(listing.labels, runtime.label_created)) |text| {
-        var buffer: [20]u8 = undefined;
-        if (!std.mem.eql(u8, text, created_text(&buffer, item.kv.create_revision))) return false;
-    }
-    return true;
+    assert(label_value(listing.labels, runtime.label_replica) != null);
+    const image = label_value(listing.labels, runtime.label_image) orelse return false;
+    if (!std.mem.eql(u8, image, item.rec.image)) return false;
+    const text = label_value(listing.labels, runtime.label_created) orelse return false;
+    var buffer: [20]u8 = undefined;
+    return std.mem.eql(u8, text, created_text(&buffer, item.kv.create_revision));
 }
 
 fn find_listing_by_replica(
