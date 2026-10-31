@@ -183,6 +183,15 @@ cause names `chain_start`); `hash_at(0)` is always zero and a revision above the
 `FutureRevision`. A store migrated at revision 0 is the same as a new one. The upgrade is tested
 from a store written by the previous schema on SQLite and Postgres.
 
+**Stop every v1 server before a v2 server upgrades the store.** The migration seeds the chain at
+the revision it ran at; a version 1 server knows nothing of `store_hash`, so a v1 write after the
+migration commits a revision with no hash. The v2 server then finds a revision without a hash and
+reads the store as damaged (ZC-E0209, "has no hash for a revision"), and nothing in the store says
+which writer was to blame. The schema version does not stop it: v1 servers do not check it
+against a newer one. So the operator stops all v1 servers (and anything else that writes to the
+store) first, starts one v2 server to migrate, and only then starts others. Rolling upgrades
+are not supported. See `docs/operations.md`.
+
 ## OrioleDB
 
 `store_live` takes the update churn (every observed-state report overwrites a row). When the

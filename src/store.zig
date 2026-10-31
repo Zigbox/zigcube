@@ -104,6 +104,16 @@ pub const ChainHasher = struct {
         return hasher;
     }
 
+    /// Like `add`, for an event whose key or value a backend read back from its own storage:
+    /// one that fails validation means the store is damaged, which is no assertion's business.
+    pub fn add_stored(hasher: *ChainHasher, event: Event) error{Malformed}!void {
+        if (key_problem(event.kv.key) != null) return error.Malformed;
+        if (event.kv.value.len > constants.store_value_bytes_max) return error.Malformed;
+        if (event.kind == .delete and event.kv.value.len != 0) return error.Malformed;
+        hasher.add(event);
+    }
+
+    /// For events from callers, which `Store` has already validated: a bad one is a bug.
     pub fn add(hasher: *ChainHasher, event: Event) void {
         assert(key_problem(event.kv.key) == null);
         assert(event.kv.value.len <= constants.store_value_bytes_max);

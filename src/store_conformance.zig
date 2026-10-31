@@ -453,6 +453,31 @@ test "watch: concurrent writers produce an ordered, gap-free stream, one batch p
     defer testing.allocator.free(by_revision);
     try index_by_revision(jobs, head, by_revision);
     try expect_stream(by_revision, seen.items);
+    try expect_chain_recomputes(watcher, head);
+}
+
+/// Walks the whole log from revision 1 and recomputes `h(n)` with `store.chain_hash`: it equals
+/// `hash_at(n)` for every `n` only if no two writers ever chained from the same parent.
+fn expect_chain_recomputes(s: Store, head: Revision) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    var watch = try s.watch(.{ .prefix = "/", .from_revision = 1 }, &diag);
+    defer watch.close();
+    const events = try drain(&watch, arena_state.allocator(), head, &diag);
+    var previous = store.hash_zero;
+    var start: usize = 0;
+    for (1..@as(usize, @intCast(head)) + 1) |revision| {
+        var end = start;
+        while (end < events.len and events[end].kv.mod_revision == revision) end += 1;
+        try testing.expect(end > start);
+        previous = store.chain_hash(previous, revision, events[start..end]);
+        try testing.expectEqual(previous, try s.hash_at(revision, &diag));
+        start = end;
+    }
+    try testing.expectEqual(events.len, start);
+    try testing.expectEqual(previous, (try s.status(&diag)).hash);
 }
 
 /// The watched events of every revision, in order, must equal what the watch delivered.

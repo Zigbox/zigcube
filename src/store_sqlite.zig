@@ -854,13 +854,13 @@ pub const SqliteStore = struct {
         stmt.bind_unsigned(6, row.create_revision);
         stmt.bind_unsigned(7, row.lease);
         try stmt.run(diag);
-        self.chain.add(.{ .kind = if (row.deleted) .delete else .put, .kv = .{
+        self.chain.add_stored(.{ .kind = if (row.deleted) .delete else .put, .kv = .{
             .key = row.key,
             .value = row.value,
             .create_revision = row.create_revision,
             .mod_revision = row.revision,
             .lease = row.lease,
-        } });
+        } }) catch return self.fail_damaged(diag, "holds a key that is not valid");
     }
 
     /// Takes the revision and records its chain hash in the same transaction.

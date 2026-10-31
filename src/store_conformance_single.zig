@@ -1173,21 +1173,7 @@ test "chain hash: each revision's hash is the pure function of its events, on ev
     try chain_history(s, &diag);
     try expect_status(s, &diag, 4, 0);
 
-    var watch = try s.watch(.{ .prefix = "/", .from_revision = 1 }, &diag);
-    defer watch.close();
-    const events = try drain(&watch, arena, 4, &diag);
-    var previous = store.hash_zero;
-    var start: usize = 0;
-    for (1..5) |revision| {
-        var end = start;
-        while (end < events.len and events[end].kv.mod_revision == revision) end += 1;
-        try testing.expect(end > start);
-        previous = store.chain_hash(previous, revision, events[start..end]);
-        try testing.expectEqual(previous, try s.hash_at(revision, &diag));
-        start = end;
-    }
-    try testing.expectEqual(events.len, start);
-    try testing.expectEqual(previous, (try s.status(&diag)).hash);
+    const previous = try expect_chain(s, &diag, arena, 4);
     try testing.expectEqualStrings(chain_pinned_h4, &std.fmt.bytesToHex(previous, .lower));
     try expect_failure(&diag, error.FutureRevision, s.hash_at(5, &diag), .E0204);
 
@@ -1195,6 +1181,66 @@ test "chain hash: each revision's hash is the pure function of its events, on ev
     try testing.expectEqual(previous, try s.hash_at(4, &diag));
     try testing.expectEqual(previous, (try s.status(&diag)).hash);
     try testing.expect(!std.mem.eql(u8, &try s.hash_at(1, &diag), &try s.hash_at(2, &diag)));
+}
+
+/// Recomputes the chain of revisions 1..`head` from a watch with `store.chain_hash`, checks it
+/// against `hash_at` and `status`, and returns `h(head)`.
+fn expect_chain(s: Store, diag: *Diag, arena: std.mem.Allocator, head: Revision) !store.Hash {
+    var watch = try s.watch(.{ .prefix = "/", .from_revision = 1 }, diag);
+    defer watch.close();
+    const events = try drain(&watch, arena, head, diag);
+    var previous = store.hash_zero;
+    var start: usize = 0;
+    for (1..@as(usize, @intCast(head)) + 1) |revision| {
+        var end = start;
+        while (end < events.len and events[end].kv.mod_revision == revision) end += 1;
+        try testing.expect(end > start);
+        previous = store.chain_hash(previous, revision, events[start..end]);
+        try testing.expectEqual(previous, try s.hash_at(revision, diag));
+        start = end;
+    }
+    try testing.expectEqual(events.len, start);
+    try testing.expectEqual(previous, (try s.status(diag)).hash);
+    return previous;
+}
+
+/// `h(5)` of the lease history in the test below.
+const chain_pinned_lease_h5 = "67828da9154d30ef4ac22bf2adde26a95b95699cce019478b2983783a1ab4baf";
+
+test "chain hash: lease fields, revocation and expiry hash the same on every backend" {
+    // Goal: the lease field and the order of the events a store writes itself (revoke, expiry)
+    // are part of the pinned encoding. Method: a plain put; puts on a granted lease in an order
+    // that is not key order; its revocation; puts on a second lease that the manual clock then
+    // lets lapse and `expire_leases` reaps. Recompute from the log, pin h(5).
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    _ = try put_one(s, &diag, "/plain", "p"); // 1
+    const revoked = try s.lease_grant(5000, &diag);
+    const attached = try s.txn(.{ .on_success = &.{
+        .{ .put = .{ .key = "/l/z", .value = "z", .lease = revoked.id } },
+        .{ .put = .{ .key = "/l/a", .value = "a", .lease = revoked.id } },
+        .{ .put = .{ .key = "/l/m", .value = "m", .lease = revoked.id } },
+    } }, &diag); // 2
+    try testing.expectEqual(@as(Revision, 2), attached.revision);
+    try testing.expectEqual(@as(Revision, 3), try s.lease_revoke(revoked.id, &diag)); // 3
+    const lapsing = try s.lease_grant(1000, &diag);
+    const second = try s.txn(.{ .on_success = &.{
+        .{ .put = .{ .key = "/e/2", .value = "2", .lease = lapsing.id } },
+        .{ .put = .{ .key = "/e/1", .value = "1", .lease = lapsing.id } },
+    } }, &diag); // 4
+    try testing.expectEqual(@as(Revision, 4), second.revision);
+    harness.manual.advance(1500);
+    try testing.expectEqual(@as(u32, 1), try s.expire_leases(&diag)); // 5
+    try expect_status(s, &diag, 5, 0);
+    const last = try expect_chain(s, &diag, arena, 5);
+    try testing.expectEqualStrings(chain_pinned_lease_h5, &std.fmt.bytesToHex(last, .lower));
 }
 
 test "chain hash: a transaction that changes nothing leaves the hash alone" {

@@ -289,6 +289,7 @@ pub const MemoryStore = struct {
         }
         const ops = if (succeeded) request.on_success else request.on_failure;
         try self.check_leases(ops, diag);
+        self.hashes.ensureUnusedCapacity(self.gpa, 1) catch return no_memory(diag);
         var bumped = false;
         for (ops) |op| {
             const writes = switch (op) {
@@ -549,6 +550,7 @@ pub const MemoryStore = struct {
         // Sorted, so that the events of one revoke come in a defined order.
         std.mem.sort([]const u8, keys, {}, bytes_less);
         var owned: [constants.store_lease_keys_max][constants.store_key_bytes_max]u8 = undefined;
+        self.hashes.ensureUnusedCapacity(self.gpa, 1) catch return no_memory(diag);
         self.revision += 1;
         for (keys, 0..) |key, slot| {
             @memcpy(owned[slot][0..key.len], key); // `apply_delete` frees the live copy.
