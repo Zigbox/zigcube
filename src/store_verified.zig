@@ -1,6 +1,6 @@
-//! `VerifiedStore`: a `Store` that refuses to act on a store that went backwards (docs/store-design.md,
-//! "Nothing acts on a store that went backwards"). Core code: no files, no threads, no clock but
-//! the `Clock` it is given.
+//! `VerifiedStore`: a `Store` that refuses to act on a store that went backwards
+//! (docs/store-design.md, "Nothing acts on a store that went backwards"). Core code: no files,
+//! no threads, no clock but the `Clock` it is given.
 //!
 //! It wraps the real store, so everything that reaches the store (the controller, the API
 //! handlers, the maintenance timers) goes through it, and one check covers them all. It remembers
@@ -258,7 +258,11 @@ pub const VerifiedStore = struct {
         return self.inner.list(arena, options, diag);
     }
 
-    fn txn(context: *anyopaque, request: store.TxnRequest, diag: *Diag) store.Error!store.TxnResult {
+    fn txn(
+        context: *anyopaque,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
         const self = from(context);
         try self.gate(diag);
         const result = try self.inner.txn(request, diag);
@@ -283,7 +287,11 @@ pub const VerifiedStore = struct {
     /// revisions.
     const hash_zero_unknown: Hash = store.hash_zero;
 
-    fn watch(context: *anyopaque, options: store.WatchOptions, diag: *Diag) store.Error!store.Watch {
+    fn watch(
+        context: *anyopaque,
+        options: store.WatchOptions,
+        diag: *Diag,
+    ) store.Error!store.Watch {
         const self = from(context);
         try self.gate(diag);
         return self.inner.watch(options, diag);
@@ -295,7 +303,11 @@ pub const VerifiedStore = struct {
         return self.inner.lease_grant(ttl_ms, diag);
     }
 
-    fn lease_keepalive(context: *anyopaque, id: store.LeaseId, diag: *Diag) store.Error!store.Lease {
+    fn lease_keepalive(
+        context: *anyopaque,
+        id: store.LeaseId,
+        diag: *Diag,
+    ) store.Error!store.Lease {
         const self = from(context);
         try self.gate(diag);
         return self.inner.lease_keepalive(id, diag);
@@ -472,7 +484,12 @@ test "a store that moves forward on the same history is never refused" {
     memory.init(testing.allocator, manual.clock());
     defer memory.deinit();
     var recorder: Recorder = .{};
-    var verified = VerifiedStore.init(memory.interface(), manual.clock(), recorder.remember(), null);
+    var verified = VerifiedStore.init(
+        memory.interface(),
+        manual.clock(),
+        recorder.remember(),
+        null,
+    );
     const guarded = verified.interface();
     var diag: Diag = undefined;
     diag.reset();

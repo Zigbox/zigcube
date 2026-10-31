@@ -1,5 +1,6 @@
 error[ZC-E0215]: the store went backwards or forked
-  cause  the store is behind: writes it acknowledged are gone
+  cause  the server remembers revision 412 (a1a1a1a1); the store is at revision
+         398 (e5e5e5e5)
   fix    look at which store this is; to keep it as it is, run   zcube store accept-rollback --confirm
   more   zcube explain E0215 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0215.html

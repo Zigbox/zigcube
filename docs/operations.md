@@ -15,3 +15,20 @@ The only way out is a restore from a backup. There are no rolling upgrades.
 
 A migrated store has no hashes below the revision it was migrated at: `hash_at` there fails with
 `ZC-E0214`, which says so. That is expected, not damage.
+
+## The server's memory of the store (`--state-dir`)
+
+The server remembers the highest store revision and hash it has seen in `<state dir>/remembered`,
+so that a restart after a failover to a replica that was behind, or a restore from an old backup,
+is noticed (`ZC-E0215`) and the server stops acting. The directory is `--state-dir`; for SQLite it
+defaults to the directory of the database file; for Postgres it is required (`ZC-E0106` without
+it). Keep it outside the store: a copy inside the store would be rolled back with it.
+
+- **A restore must run `accept-rollback`.** A store restored from a backup is behind what the
+  server remembers, so the server halts. Look at which store this is, then
+  `zcube store accept-rollback --confirm`.
+- **Pre-upgrade stores.** Hashes below the revision the schema was migrated at do not exist
+  (`ZC-E0214`). A server that remembered a revision in that range cannot check it and halts;
+  run `accept-rollback` once.
+- A memory store remembers nothing and has no file.
+

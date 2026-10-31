@@ -192,6 +192,32 @@ against a newer one. So the operator stops all v1 servers (and anything else tha
 store) first, starts one v2 server to migrate, and only then starts others. Rolling upgrades
 are not supported. See `docs/operations.md`.
 
+## Nothing acts on a store that went backwards (C1 slice 10b)
+
+`VerifiedStore` (`src/store_verified.zig`, core) wraps the `Store` the server and its controllers
+use. It remembers the highest `(revision, hash)` it has seen. On every `status` and after every
+reconnect it checks the store: a revision below the remembered one, or a different `hash_at(remembered revision)`
+(a fork), halts the server with `ZC-E0215`. Halted, every store call
+fails with that code, so controllers do not step and writes are refused. There is no automatic
+recovery.
+
+- **Fail closed on `NoHash`.** A store that cannot say what its hash was at the remembered revision
+  (`ZC-E0214`: the revision is below the point its chain starts, as after a migration from schema
+  version 1) is refused as well, since it cannot be told from a rollback. The operator runs
+  `accept-rollback` once. A server with nothing remembered (first start) is not affected.
+- **The pair outlives the server.** It is written to `<state dir>/remembered` (temporary file,
+  `fsync`, rename, `fsync` of the directory) whenever it rises; a file that is present and
+  unreadable is `ZC-E0216`, never "no file". The state directory is `--state-dir`; unset, it is
+  the directory of the SQLite file; a memory store remembers nothing; Postgres without
+  `--state-dir` refuses to start (`ZC-E0106`), because there is no directory beside it and a file
+  inside the store would be rolled back with it.
+- **The way out.** `zcube store accept-rollback --confirm` (`POST /v1/store/accept-rollback?confirm=true`)
+  makes the server remember the store as it is now. Run it after looking at which store this is.
+
+Known gaps: `Watch.next` is not gated on a halt (a watch opened before the halt can still deliver
+events until it is re-opened); and the decision record that should hold both pairs as evidence
+needs a store-level `SubjectKind`, a `docs/keys.md` change that is ask-first.
+
 ## OrioleDB
 
 `store_live` takes the update churn (every observed-state report overwrites a row). When the

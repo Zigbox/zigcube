@@ -136,22 +136,23 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
     diag.raise(.E0215);
     const old = short_hash(rollback.remembered_hash);
     const new = short_hash(rollback.now_hash);
+    // The innermost cause is the one the default render shows: it carries the evidence.
     if (rollback.unverifiable) {
-        diag.cause("the server remembers revision {d} ({s}); the store is at revision {d} ({s})", .{
-            rollback.remembered_revision, old, rollback.now_revision, new,
-        });
         diag.cause("the store has no hash for revision {d}, so it cannot be checked", .{
             rollback.remembered_revision,
         });
+        diag.cause("the server remembers revision {d} ({s}); the store is at revision {d} ({s})", .{
+            rollback.remembered_revision, old, rollback.now_revision, new,
+        });
     } else if (rollback.now_revision < rollback.remembered_revision) {
+        diag.cause("the store is behind: writes it acknowledged are gone", .{});
         const line = "the server remembers revision {d} ({s}); the store is at revision {d} ({s})";
         diag.cause(line, .{ rollback.remembered_revision, old, rollback.now_revision, new });
-        diag.cause("the store is behind: writes it acknowledged are gone", .{});
     } else {
+        diag.cause("the store holds a different history at that revision", .{});
         diag.cause("the server remembers revision {d} with hash {s}; the store has hash {s}", .{
             rollback.remembered_revision, old, new,
         });
-        diag.cause("the store holds a different history at that revision", .{});
     }
     const sentence = "look at which store this is; to keep it as it is, run";
     diag.fix_with(sentence, "zcube store accept-rollback --confirm", .{});
@@ -159,7 +160,12 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
 }
 
 /// The remembered revision file could not be read, parsed or written (`store_verified.zig`).
-pub fn remembered_unusable(diag: *Diag, path: []const u8, action: []const u8, reason: []const u8) error{BackendFailed} {
+pub fn remembered_unusable(
+    diag: *Diag,
+    path: []const u8,
+    action: []const u8,
+    reason: []const u8,
+) error{BackendFailed} {
     assert(diag.code == null);
     diag.raise(.E0216);
     diag.cause("can't {s} {s}: {s}", .{ action, path, reason });

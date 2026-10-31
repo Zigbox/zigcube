@@ -567,6 +567,76 @@ fn run_until_running(io: std.Io, server: *server_mod.Server, node: *Node, count:
     return error.NeverConverged;
 }
 
+test "a server restarted on a store that went backwards halts until the operator accepts it" {
+    // Goal: the remembered pair outlives the server (10b). Method: a server on `long.db` applies
+    // `hello` (revision N) and stops; a second on a new, shorter `short.db` with the same state
+    // directory answers every store call with ZC-E0215 and does not step; accepting the rollback
+    // resumes it, and a third start on the same files is not refused.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buffer: [128]u8 = undefined;
+    const state = try std.fmt.bufPrint(&state_buffer, ".zig-cache/tmp/{s}/state", .{tmp.sub_path});
+    var long_buffer: [128]u8 = undefined;
+    const long_format = ".zig-cache/tmp/{s}/long.db";
+    const long_path = try std.fmt.bufPrint(&long_buffer, long_format, .{tmp.sub_path});
+    var short_buffer: [128]u8 = undefined;
+    const short_format = ".zig-cache/tmp/{s}/short.db";
+    const short_path = try std.fmt.bufPrint(&short_buffer, short_format, .{tmp.sub_path});
+    var long_config = config_for(.{ .sqlite = long_path }, true);
+    long_config.state_dir = state;
+    var short_config = config_for(.{ .sqlite = short_path }, true);
+    short_config.state_dir = state;
+
+    const first = try start_server(io, long_config);
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    const healthy = try get(io, first.address(), "/v1/status");
+    defer healthy.free();
+    try testing.expectEqual(@as(u16, 200), healthy.status);
+    first.stop();
+
+    const second = try start_server(io, short_config);
+    var second_open = true;
+    defer if (second_open) second.stop();
+    const refused = try get(io, second.address(), "/v1/status");
+    defer refused.free();
+    try testing.expectEqual(@as(u16, 200), refused.status);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const status_body = try refused.json(arena_state.allocator());
+    const store_part = status_body.object.get("store").?;
+    try testing.expect(!store_part.object.get("ok").?.bool);
+    const code = store_part.object.get("diagnostic").?.object.get("code").?.string;
+    try testing.expectEqualStrings("ZC-E0215", code);
+    const write_refused = try send(io, second.address(), "POST", "/v1/apply", hello_json);
+    defer write_refused.free();
+    try expect_diagnostic(write_refused, 502, "ZC-E0215");
+    const steps = second.steps();
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try testing.expectEqual(steps, second.steps());
+
+    const accept_path = "/v1/store/accept-rollback?confirm=true";
+    const accepted = try send(io, second.address(), "POST", accept_path, "");
+    defer accepted.free();
+    try testing.expectEqual(@as(u16, 200), accepted.status);
+    const resumed = try get(io, second.address(), "/v1/status");
+    defer resumed.free();
+    try testing.expectEqual(@as(u16, 200), resumed.status);
+    second.stop();
+    second_open = false;
+
+    short_config.create_store = false;
+    const third = try start_server(io, short_config);
+    defer third.stop();
+    const again = try get(io, third.address(), "/v1/status");
+    defer again.free();
+    try testing.expectEqual(@as(u16, 200), again.status);
+}
+
 test "request ids are not issued twice across server starts" {
     // Goal: DIAGNOSTICS, "every API request gets a request ID" so a client's error can be matched
     // to a log: a restart must not repeat the ids of the start before it. Method: start, ask, stop,

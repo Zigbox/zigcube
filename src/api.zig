@@ -86,7 +86,8 @@ pub const Api = struct {
     instance: u32 = 0,
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
-    /// The server's guard against a store that went backwards, for `POST /v1/store/accept-rollback`.
+    /// The server's guard against a store that went backwards, for
+    /// `POST /v1/store/accept-rollback`.
     /// Null in the simulation, which has no guard.
     verified: ?*store_verified.VerifiedStore = null,
 
@@ -217,7 +218,8 @@ fn pair_json(ctx: *const Context, out: *Out, pair: ?store_verified.Pair) Failure
     try out.begin_object();
     if (pair) |known| {
         try out.member("revision", known.revision);
-        const hex = std.fmt.allocPrint(ctx.arena, "{x}", .{&known.hash}) catch return no_memory(ctx);
+        const hex = std.fmt.allocPrint(ctx.arena, "{x}", .{&known.hash}) catch
+            return no_memory(ctx);
         try out.member("hash", hex);
     }
     try out.end_object();
@@ -829,10 +831,18 @@ const Call = struct {
         try call.query.allow(ctx, &.{"confirm"});
         try call.no_more();
         if (!try call.query.flag(ctx, "confirm")) {
-            return bad_request(ctx, "confirm", "is required: pass --confirm after looking at the store");
+            return bad_request(
+                ctx,
+                "confirm",
+                "is required: pass --confirm after looking at the store",
+            );
         }
         const verified = call.api.verified orelse
-            return bad_request(ctx, "store", "this server does not check for a store that went backwards");
+            return bad_request(
+                ctx,
+                "store",
+                "this server does not check for a store that went backwards",
+            );
         const accepted = verified.accept(ctx.diag) catch return propagate(ctx);
         const out = Out.create(ctx) catch return no_memory(ctx);
         try out.begin_object();

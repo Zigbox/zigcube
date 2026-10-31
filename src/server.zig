@@ -150,7 +150,12 @@ pub const Server = struct {
             return error.StartFailed;
         }
         const raw = server.backend.handle();
-        server.verified = store_verified.VerifiedStore.init(raw, server.backend.clock(), remember, known);
+        server.verified = store_verified.VerifiedStore.init(
+            raw,
+            server.backend.clock(),
+            remember,
+            known,
+        );
         const guarded = server.verified.interface();
         server.shared.store = guarded;
         server.shared.api.verified = &server.verified;
@@ -172,7 +177,10 @@ pub const Server = struct {
                 diag.raise(.E0106);
                 diag.cause("a Postgres store needs --state-dir", .{});
                 diag.cause("the server remembers the highest revision it saw in a file there", .{});
-                diag.fix(.{ .sentence = "name a directory outside the store", .command = "zcube-server --state-dir /var/lib/zcube" });
+                diag.fix(.{
+                    .sentence = "name a directory outside the store",
+                    .command = "zcube-server --state-dir /var/lib/zcube",
+                });
                 return null;
             },
         }
