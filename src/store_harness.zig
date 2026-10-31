@@ -162,6 +162,8 @@ pub const Harness = struct {
         }
         const proxy = try fault_proxy.Proxy.start(harness.gpa, port);
         harness.proxy = proxy;
+        // Needs keyword-form settings (`host=... port=N`, not a URI) with a TCP port, on
+        // 127.0.0.1: the proxy listens there and the appended keywords override the originals.
         const format = "{s} host=127.0.0.1 port={d}"; // The last keyword wins in libpq.
         const args = .{ conninfo, proxy.port };
         harness.proxy_conninfo = try std.fmt.allocPrintSentinel(harness.gpa, format, args, 0);

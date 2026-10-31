@@ -14,12 +14,15 @@
 //! the log by what it wrote. Two kinds of key keep the model small:
 //!
 //! - A register key (id below `audit_key_min`) is written by `compare mod_revision == e, put
-//!   key` (compare-and-set) or by a blind put, and read by `get`. A register write puts only its
-//!   own key: the compare key (if any) and every success put name one register key, and every
-//!   failure put is an audit key. A write that breaks this is `bad_history`, never guessed at.
-//! - An audit key (id from `audit_key_min`) is written only by the `on_failure` branch of a
-//!   compare-and-set (a put of a fresh token, so a failed compare leaves a trace in the log). It
-//!   is never compared or read.
+//!   key` (compare-and-set), by a blind put, or by a delete (`Put.delete`, in a compare-and-delete
+//!   or a blind one), and read by `get`. A register write touches only its own key: the compare
+//!   key (if any) and the one put or delete of a success branch name one register key, and every
+//!   failure put is an audit key. A delete resets the register to absent (revision 0) but later
+//!   writes must still be above its revision. A write that breaks this is `bad_history`.
+//! - An audit key (id from `audit_key_min`) is written by the `on_failure` branch of a
+//!   compare-and-set (a put of a fresh token, so a failed compare leaves a trace in the log) and
+//!   by the `on_success` branch of a delete (a delete has no token, so the audit put riding with
+//!   it is how the write is found in the log). It is never compared or read.
 //!
 //! ## What `check` verifies
 //!
@@ -29,7 +32,8 @@
 //!    events are together, revisions rise by exactly one and the last is `final_revision`
 //!    (`log_gap`, `log_disorder`), and no value token appears twice (`duplicate_value`).
 //! 2. Every write the store acknowledged is in the log at the revision it was given, with the
-//!    events its writer sent and no others (`lost_write`, `event_mismatch`); no two writes were
+//!    events its writer sent and no others, a delete matching a delete event of that key
+//!    (`lost_write`, `event_mismatch`); no two writes were
 //!    given one revision (`revision_reused`); and no event is nobody's (`unexplained_event`).
 //! 3. A write reported as failed with nothing changed is absent from the log (`failed_in_log`).
 //! 4. A write whose outcome is unknown (the connection dropped during COMMIT, or the call never
@@ -44,7 +48,14 @@
 //!    bounded: at most `key_calls_max` calls on a key and `search_steps_max` steps, and a search
 //!    that runs out of either is `search_exhausted` or `bad_history` and fails the check; it never
 //!    passes a history it did not decide.
-//! 7. `check_watch`: a watch opened at N + 1 delivered exactly the log after N, up to the
+//! 7. `check_compaction` (a separate call, over the stage-2 history and the log read before any
+//!    compaction): a read served below a compaction acknowledged before it began is
+//!    `compacted_read_served`; a read refused as compacted when no compaction invoked before it
+//!    ended reaches above its revision is `read_above_compaction_failed`; a served read that is
+//!    not the key's state at its revision in the log is `read_at_wrong`; an acknowledged
+//!    compaction above the final revision is `bad_history`. An unacknowledged compaction may
+//!    excuse a refusal and never a served read.
+//! 8. `check_watch`: a watch opened at N + 1 delivered exactly the log after N, up to the
 //!    revision its last batch reported (`watch_mismatch`); a watch that opened at or before the
 //!    log's base, or reported a revision beyond its end, is `bad_history`.
 
@@ -734,10 +745,12 @@ fn precedes_unplaced(steps: []const Step, placed: u64, step: Step) bool {
 ///
 /// A compaction acknowledged above the final revision is `bad_history`.
 pub fn check_compaction(history: []const Entry, log: []const LogEvent, options: Options) Verdict {
+    assert(options.final_revision >= options.base_revision);
+    if (log.len > 0) assert(log[0].revision > options.base_revision);
     for (history, 0..) |entry, index| {
         const bad = switch (entry.call) {
             .compact => |revision| compact_bad(entry, revision, options),
-            .read_at => |read| read_at_bad(history, log, entry, read),
+            .read_at => |read| read_at_bad(history, log, entry, read, options),
             else => null,
         };
         if (bad) |found| {
@@ -756,7 +769,17 @@ fn compact_bad(entry: Entry, revision: u64, options: Options) ?Failure {
     return null;
 }
 
-fn read_at_bad(history: []const Entry, log: []const LogEvent, entry: Entry, read: ReadAt) ?Failure {
+fn read_at_bad(
+    history: []const Entry,
+    log: []const LogEvent,
+    entry: Entry,
+    read: ReadAt,
+    options: Options,
+) ?Failure {
+    assert(read.key < audit_key_min); // Only register keys are read.
+    // A read below the base or above the end has no answer in the log: the caller's mistake.
+    assert(read.revision > options.base_revision);
+    assert(read.revision <= options.final_revision);
     if (entry.outcome != .acked and entry.outcome != .compacted) return null;
     var done: u64 = 0; // The highest compaction finished before the read began.
     var maybe: u64 = 0; // The highest that may have been applied before the read ended.
@@ -1109,11 +1132,18 @@ fn delete_of(key: u8) Put {
     return .{ .key = key, .value = 0, .delete = true };
 }
 
-fn history_read_at(invoke: u64, complete: u64, read: ReadAt, found: ?ReadAck) Entry {
+/// What the store answered to a `read_at` in a test: data (an absent key is data too), or a
+/// refusal as compacted.
+const Answer = union(enum) { served: ReadAck, refused };
+
+fn history_read_at(invoke: u64, complete: u64, read: ReadAt, answer: Answer) Entry {
     const none: ReadAck = .{ .mod_revision = 0, .value = 0 };
-    var entry = read_of(invoke, complete, read.key, found orelse none);
+    var entry = read_of(invoke, complete, read.key, switch (answer) {
+        .served => |found| found,
+        .refused => none,
+    });
     entry.call = .{ .read_at = read };
-    if (found == null and invoke == complete) entry.outcome = .compacted;
+    if (answer == .refused) entry.outcome = .compacted;
     return entry;
 }
 
@@ -1193,28 +1223,35 @@ test "teeth: a delete that is lost, or a compare-and-delete that wins twice, is 
 test "compaction: sound reads pass; each broken rule is caught" {
     const log = [_]LogEvent{ put_event(1, 0, 1), put_event(2, 0, 2), put_event(3, 1, 5) };
     const options: Options = .{ .final_revision = 3 };
-    const first: ReadAck = .{ .mod_revision = 1, .value = 1 };
-    const at_two: ReadAck = .{ .mod_revision = 2, .value = 2 };
+    const first: Answer = .{ .served = .{ .mod_revision = 1, .value = 1 } };
+    const at_two: Answer = .{ .served = .{ .mod_revision = 2, .value = 2 } };
+    const absent: Answer = .{ .served = .{ .mod_revision = 0, .value = 0 } };
     const sound = [_]Entry{
         history_read_at(1, 2, .{ .key = 0, .revision = 1 }, first),
         compact_entry(3, 4, 2, .acked),
-        history_read_at(5, 5, .{ .key = 0, .revision = 1 }, null), // Refused: below 2.
+        history_read_at(5, 5, .{ .key = 0, .revision = 1 }, .refused), // Refused: below 2.
         history_read_at(6, 7, .{ .key = 0, .revision = 2 }, at_two),
-        history_read_at(8, 9, .{ .key = 1, .revision = 2 }, .{ .mod_revision = 0, .value = 0 }),
+        history_read_at(8, 9, .{ .key = 1, .revision = 2 }, absent),
     };
     const fine = check_compaction(&sound, &log, options);
     try testing.expectEqual(@as(?Kind, null), verdict_kind(fine));
     // Served below an acknowledged compaction.
-    const served = [_]Entry{ sound[1], history_read_at(5, 6, .{ .key = 0, .revision = 1 }, first) };
+    const served = [_]Entry{
+        sound[1],
+        history_read_at(5, 6, .{ .key = 0, .revision = 1 }, first),
+    };
     const a = check_compaction(&served, &log, options);
     try testing.expectEqual(@as(?Kind, .compacted_read_served), verdict_kind(a));
     // Refused above every compaction (the store lost history it should have kept).
-    const refused = [_]Entry{ sound[1], history_read_at(5, 5, .{ .key = 0, .revision = 3 }, null) };
+    const refused = [_]Entry{
+        sound[1],
+        history_read_at(5, 5, .{ .key = 0, .revision = 3 }, .refused),
+    };
     const b = check_compaction(&refused, &log, options);
     try testing.expectEqual(@as(?Kind, .read_above_compaction_failed), verdict_kind(b));
     // Served, but not what the log says the key was at that revision.
     const wrong = [_]Entry{
-        history_read_at(1, 2, .{ .key = 0, .revision = 2 }, .{ .mod_revision = 1, .value = 1 }),
+        history_read_at(1, 2, .{ .key = 0, .revision = 2 }, first),
     };
     const c = check_compaction(&wrong, &log, options);
     try testing.expectEqual(@as(?Kind, .read_at_wrong), verdict_kind(c));
@@ -1225,7 +1262,7 @@ test "compaction: an unacknowledged compaction may excuse a refusal, never a ser
     const options: Options = .{ .final_revision = 2 };
     const maybe = [_]Entry{
         compact_entry(1, never, 2, .unknown),
-        history_read_at(3, 3, .{ .key = 0, .revision = 1 }, null),
+        history_read_at(3, 3, .{ .key = 0, .revision = 1 }, .refused),
     };
     const excused = check_compaction(&maybe, &log, options);
     try testing.expectEqual(@as(?Kind, null), verdict_kind(excused));

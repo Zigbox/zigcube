@@ -573,7 +573,7 @@ pub fn main(init: std.process.Init) u8 {
     const options = parse_options(args) orelse {
         say("usage: store_faults --backend postgres|sqlite [--postgres SETTINGS] [--seed N]" ++
             " [--mutate drop_ack|stale_read|reuse_revision|all_unknown|keep_delete|" ++
-            "ignore_compact|over_compact]", .{});
+            "ignore_compact|over_compact|stale_history]", .{});
         return exit_user;
     };
     var seed_bytes: [8]u8 = undefined;
@@ -592,9 +592,13 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 /// How a run ended. `kind` is the checker's verdict when it was the checker that failed it.
+const Stopped = enum { uncovered, bad_value, client };
+
 const Report = struct {
     passed: bool,
     kind: ?history.Kind = null,
+    /// Why a run failed when it was not the checker's verdict.
+    stopped: ?Stopped = null,
     /// Writes whose outcome was unknown, split by what the log says: in it, or absent.
     unknown_applied: u32 = 0,
     unknown_absent: u32 = 0,
@@ -795,12 +799,22 @@ fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !Re
     var report = try verdict(shared, setup, clients, watcher, finished);
     if (!report.passed) return report;
     const stage = try compaction_stage(shared, setup, finished);
+    if (stage.failure) |err| {
+        say("FAILED: a historical read returned bytes that are not a value the runner wrote " ++
+            "({s}): the store corrupted a value", .{@errorName(err)});
+        return .{ .passed = false, .stopped = .bad_value };
+    }
     if (stage.verdict != .ok) {
         say("compaction: {any}", .{stage.verdict});
         report.passed = false;
         report.kind = stage.verdict.failed.kind;
-    } else if (!stage.covered) {
+    } else if (!stage.counts.covered()) {
+        const counts = stage.counts;
+        say("FAILED: the compaction stage lacked coverage (served={d} refused={d} " ++
+            "compactions={d}): it needs a served read, a refused read and an acknowledged " ++
+            "compaction", .{ counts.served, counts.refused, counts.compactions });
         report.passed = false;
+        report.stopped = .uncovered;
     } else {
         say("PASS", .{});
     }
@@ -825,6 +839,7 @@ const Reader = struct {
     rng: std.Random.DefaultPrng,
     base: u64,
     final: u64,
+    failure: ?anyerror = null,
 
     fn s(reader: *Reader) Store {
         const real = reader.conn.interface(reader.shared.run.backend);
@@ -843,17 +858,20 @@ fn reader_main(reader: *Reader) void {
         if (rng.uintLessThan(u32, 100) < compact_percent) {
             // Low in the range, so that most of it stays readable.
             const to = reader.base + 1 + rng.uintAtMost(u64, span / 2);
-            read_compact(reader, to);
+            compact_call(reader, to);
         } else {
             const key = rng.uintLessThan(u8, register_keys);
             const revision = reader.base + 1 + rng.uintLessThan(u64, span);
-            read_at(reader, arena_state.allocator(), key, revision);
+            read_at(reader, arena_state.allocator(), key, revision) catch |err| {
+                reader.failure = err;
+                break;
+            };
         }
     }
     _ = reader.shared.clients_left.fetchSub(1, .acq_rel);
 }
 
-fn read_compact(reader: *Reader, revision: u64) void {
+fn compact_call(reader: *Reader, revision: u64) void {
     const shared = reader.shared;
     const handle = reader.recorder.invoke(&shared.ticker, .{ .compact = revision }) catch return;
     reader.s().compact(revision, &reader.diag) catch {
@@ -864,7 +882,7 @@ fn read_compact(reader: *Reader, revision: u64) void {
     reader.recorder.ack_done(&shared.ticker, handle, .acked);
 }
 
-fn read_at(reader: *Reader, arena: Allocator, key: u8, revision: u64) void {
+fn read_at(reader: *Reader, arena: Allocator, key: u8, revision: u64) !void {
     const shared = reader.shared;
     const call: history.Call = .{ .read_at = .{ .key = key, .revision = revision } };
     const handle = reader.recorder.invoke(&shared.ticker, call) catch return;
@@ -881,9 +899,10 @@ fn read_at(reader: *Reader, arena: Allocator, key: u8, revision: u64) void {
     };
     var ack: history.ReadAck = .{ .mod_revision = 0, .value = 0 };
     if (found.kv) |kv| {
+        // Every value under /h/ is the runner's: bytes that are not a token are a store bug.
         const value = history.parse_value(kv.value) orelse {
-            reader.recorder.fail(&shared.ticker, handle); // Not ours: the checker cannot judge it.
-            return;
+            reader.recorder.fail(&shared.ticker, handle);
+            return error.BadValue;
         };
         ack = .{ .mod_revision = kv.mod_revision, .value = value };
     }
@@ -893,8 +912,35 @@ fn read_at(reader: *Reader, arena: Allocator, key: u8, revision: u64) void {
 const Stage = struct {
     verdict: history.Verdict,
     /// Some read was served, some refused, and some compaction was acknowledged.
-    covered: bool,
+    counts: StageCounts,
+    /// A reader stopped on an error (a value that is not a token).
+    failure: ?anyerror,
 };
+
+const StageCounts = struct {
+    served: u32 = 0,
+    refused: u32 = 0,
+    compactions: u32 = 0,
+
+    fn covered(counts: StageCounts) bool {
+        return counts.served > 0 and counts.refused > 0 and counts.compactions > 0;
+    }
+};
+
+fn stage_counts(entries: []const history.Entry) StageCounts {
+    var counts: StageCounts = .{};
+    for (entries) |entry| switch (entry.call) {
+        .read_at => {
+            if (entry.outcome == .acked) counts.served += 1;
+            if (entry.outcome == .compacted) counts.refused += 1;
+        },
+        .compact => if (entry.outcome == .acked) {
+            counts.compactions += 1;
+        },
+        else => {},
+    };
+    return counts;
+}
 
 fn compaction_stage(shared: *Shared, setup: Setup, finished: Finished) !Stage {
     const run = shared.run;
@@ -948,28 +994,18 @@ fn compaction_stage(shared: *Shared, setup: Setup, finished: Finished) !Stage {
         .final_revision = finished.final,
     };
     const checked = history.check_compaction(entries, finished.log, options);
-    var served: u32 = 0;
-    var refused: u32 = 0;
-    var compactions: u32 = 0;
-    for (entries) |entry| switch (entry.call) {
-        .read_at => {
-            if (entry.outcome == .acked) served += 1;
-            if (entry.outcome == .compacted) refused += 1;
-        },
-        .compact => if (entry.outcome == .acked) {
-            compactions += 1;
-        },
-        else => {},
-    };
+    const counts = stage_counts(entries);
     say("compaction stage: reads served={d} refused={d} compactions={d}", .{
-        served, refused, compactions,
+        counts.served, counts.refused, counts.compactions,
     });
-    return .{ .verdict = checked, .covered = served > 0 and refused > 0 and compactions > 0 };
+    var failure: ?anyerror = null;
+    for (readers) |reader| failure = failure orelse reader.failure;
+    return .{ .verdict = checked, .counts = counts, .failure = failure };
 }
 
 fn fail_client(err: anyerror) Report {
     say("a client thread stopped: {s}", .{@errorName(err)});
-    return .{ .passed = false };
+    return .{ .passed = false, .stopped = .client };
 }
 
 /// Waits until no store backend is still working on a statement. A COMMIT that the proxy held
@@ -1120,6 +1156,7 @@ fn verdict(
     }
     if (!covered_both_cases(setup, &report)) {
         report.passed = false;
+        report.stopped = .uncovered;
         return report;
     }
     return report;
@@ -1156,6 +1193,7 @@ test "the runner passes an honest store and rejects each kind of lie with its ow
         .{ .mutation = .keep_delete, .kind = .event_mismatch },
         .{ .mutation = .ignore_compact, .kind = .compacted_read_served },
         .{ .mutation = .over_compact, .kind = .read_above_compaction_failed },
+        .{ .mutation = .stale_history, .kind = .read_at_wrong },
     };
     for (cases) |case| {
         var caught = false;

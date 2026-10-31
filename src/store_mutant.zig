@@ -28,6 +28,9 @@
 //!   so reads between them are refused though they should be served
 //!   (`read_above_compaction_failed`).
 //!
+//! - `stale_history`: `get(key, rev)` returns the key's current value instead of the one at `rev`
+//!   (for reads the store does not refuse as compacted: `read_at_wrong`).
+//!
 //! Test code only: nothing in the server or the agent imports it.
 
 const std = @import("std");
@@ -48,6 +51,7 @@ pub const Mutation = enum {
     keep_delete,
     ignore_compact,
     over_compact,
+    stale_history,
 };
 
 const phantom_base: u64 = 1 << 40;
@@ -116,6 +120,16 @@ pub const Mutant = struct {
         const mutant = of(context);
         assert(key.len > 0);
         const real = try mutant.inner.get(arena, key, at_revision, diag);
+        if (mutant.kind == .stale_history and at_revision != null) {
+            // Not refused as compacted above, so history exists here: answer from the present.
+            var now = try mutant.inner.get(arena, key, null, diag);
+            now.revision = real.revision; // A read at r reports r.
+            if (now.kv) |*kv| {
+                kv.mod_revision = @min(kv.mod_revision, real.revision);
+                kv.create_revision = @min(kv.create_revision, kv.mod_revision);
+            }
+            return now;
+        }
         if (mutant.kind != .stale_read) return real;
         const id = history.parse_key(key) orelse return real;
         if (id >= mutant.seen.len) return real;
