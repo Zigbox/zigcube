@@ -363,10 +363,18 @@ pub const Proxy = struct {
 
     fn read_lane(proxy: *const Proxy, pair: *Pair, dir: Direction, now: u64) bool {
         const lane = &pair.lanes[@backingInt(dir)];
-        if (lane.eof or lane.end != lane.start) return true;
+        if (lane.eof) return true;
+        const kept = lane.end - lane.start;
+        if (kept != 0) {
+            // Only a held-back tail of a possible COMMIT reply is read past: it moves to the
+            // front, and what arrives next is appended to it.
+            if (!proxy.holds_tail(lane, dir)) return true;
+            std.mem.copyForwards(u8, lane.buffer[0..kept], lane.buffer[lane.start..lane.end]);
+        }
+        assert(kept < commit_reply.len);
         lane.start = 0;
-        lane.end = 0;
-        const rc = linux.read(pair.source(dir), &lane.buffer, lane.buffer.len);
+        lane.end = @intCast(kept);
+        const rc = linux.read(pair.source(dir), lane.buffer[kept..].ptr, lane.buffer.len - kept);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .AGAIN => return true,
@@ -376,7 +384,7 @@ pub const Proxy = struct {
             lane.eof = true;
             return true;
         }
-        lane.end = @intCast(rc);
+        lane.end += @intCast(rc);
         lane.release_ns = now + @as(u64, proxy.latency_ms.load(.acquire)) * ns_per_ms;
         return true;
     }
@@ -434,20 +442,47 @@ pub const Proxy = struct {
         return .fine;
     }
 
+    /// True when everything the lane still holds is the start of a COMMIT reply that
+    /// `commit_reply_fate` kept back, so that more bytes are needed to decide.
+    fn holds_tail(proxy: *const Proxy, lane: *const Lane, dir: Direction) bool {
+        if (dir != .to_client) return false;
+        if (!proxy.commit_cut.load(.acquire)) return false;
+        const pending = lane.buffer[lane.start..lane.end];
+        return pending.len > 0 and partial_commit_reply(pending) == pending.len;
+    }
+
     const CommitFate = union(enum) { fine, cut, limit: u64 };
 
     /// With `cut_on_commit_reply` armed: forward what precedes a COMMIT reply, then cut. One
-    /// shot, like `cut_after`: whoever disarms it cuts.
+    /// shot, like `cut_after`: whoever disarms it cuts. A reply split across reads is found too:
+    /// a tail that could be the start of one is held back until the next read settles it (so
+    /// an armed proxy delays that tail; `heal` disarms it and releases the tail).
     fn commit_reply_fate(proxy: *Proxy, lane: *const Lane, dir: Direction) CommitFate {
+        assert(lane.start <= lane.end);
         if (dir != .to_client) return .fine;
         if (!proxy.commit_cut.load(.acquire)) return .fine;
         const pending = lane.buffer[lane.start..lane.end];
-        const at = std.mem.indexOf(u8, pending, commit_reply) orelse return .fine;
+        const at = std.mem.indexOf(u8, pending, commit_reply) orelse {
+            const held = partial_commit_reply(pending);
+            assert(held < commit_reply.len);
+            return if (held == 0) .fine else .{ .limit = pending.len - held };
+        };
+        assert(at + commit_reply.len <= pending.len);
         if (at != 0) return .{ .limit = at };
         const disarm = proxy.commit_cut.cmpxchgStrong(true, false, .acq_rel, .acquire);
         if (disarm != null) return .fine;
         _ = proxy.commit_cuts.fetchAdd(1, .acq_rel);
         return .cut;
+    }
+
+    /// The length of the longest proper prefix of a COMMIT reply that ends `pending`, 0 if none.
+    fn partial_commit_reply(pending: []const u8) usize {
+        var length: usize = @min(commit_reply.len - 1, pending.len);
+        while (length > 0) : (length -= 1) {
+            if (std.mem.endsWith(u8, pending, commit_reply[0..length])) break;
+        }
+        assert(length < commit_reply.len);
+        return length;
     }
 
     /// How many bytes the lane may write now under the bandwidth limit.
@@ -662,6 +697,12 @@ test "relay: bytes cross both ways, and one connection reaches the upstream once
     defer _ = linux.close(fd);
     try expect_echo(fd, "hello", 1000);
     try expect_echo(fd, "again", 1000);
+    // The counters are bumped after the write, so the client can be ahead of them by a moment.
+    for (0..100) |_| {
+        if (rig.proxy.stats().forwarded[1] == 10) break;
+        const nap: linux.timespec = .{ .sec = 0, .nsec = sleep_ns };
+        _ = linux.nanosleep(&nap, null);
+    }
     const stats = rig.proxy.stats();
     try std.testing.expectEqual(@as(u64, 10), stats.forwarded[0]);
     try std.testing.expectEqual(@as(u64, 10), stats.forwarded[1]);
@@ -811,30 +852,85 @@ test "cut_after zero: the next chunk is cut before any byte, and only that conne
 }
 
 test "cut_on_commit_reply: what precedes a COMMIT reply arrives, the reply does not" {
-    // Goal: the proxy cuts exactly at a COMMIT CommandComplete, once. Method: the echo upstream
-    // sends back "ab", the 12-byte reply and "cd"; the client must see "ab" and then a reset.
+    // Goal: the proxy cuts exactly at a COMMIT CommandComplete, once, however the bytes are
+    // split. Method: the echo upstream sends back "ab", the 12-byte reply and "cd"; the client
+    // must see "ab" and then a reset. The first connection sends it whole, the second splits
+    // the reply in two writes, and the third shows the one shot is spent.
     var rig = try Rig.start();
     defer rig.stop();
     const first = try connect_loopback(rig.proxy.port);
     defer _ = linux.close(first);
     rig.proxy.cut_on_commit_reply();
     try send_all(first, "ab" ++ commit_reply ++ "cd");
+    try expect_text_then_reset(first, "ab");
+    try std.testing.expectEqual(@as(u32, 1), rig.proxy.stats().commit_cuts);
+    rig.proxy.cut_on_commit_reply();
+    const split = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(split);
+    try send_all(split, "ab" ++ commit_reply[0..5]);
+    var buffer: [64]u8 = undefined;
+    switch (recv_within(split, &buffer, 100)) {
+        .bytes => |count| try std.testing.expectEqualStrings("ab", buffer[0..count]),
+        else => return error.NoPrefix,
+    }
+    try send_all(split, commit_reply[5..] ++ "cd");
+    try expect_text_then_reset(split, "");
+    try std.testing.expectEqual(@as(u32, 2), rig.proxy.stats().commit_cuts);
+    const third = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(third);
+    try expect_echo(third, commit_reply, 1000);
+    const stats = rig.proxy.stats();
+    try std.testing.expectEqual(@as(u32, 2), stats.commit_cuts);
+    try std.testing.expectEqual(@as(u32, 2), stats.cuts);
+}
+
+test "heal disarms cut_on_commit_reply, and releases a held tail" {
+    // Goal: after `heal` no COMMIT reply is cut. Method: arm, heal, send a reply and see it
+    // echoed whole; then arm again, send half a reply (held back), heal, and see the half arrive.
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.proxy.cut_on_commit_reply();
+    rig.proxy.heal();
+    const conn = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(conn);
+    try expect_echo(conn, "x" ++ commit_reply, 1000);
+    try std.testing.expectEqual(@as(u32, 0), rig.proxy.stats().commit_cuts);
+    rig.proxy.cut_on_commit_reply();
+    try send_all(conn, commit_reply[0..4]);
+    var buffer: [16]u8 = undefined;
+    switch (recv_within(conn, &buffer, 100)) {
+        .timeout => {},
+        else => return error.NotHeld,
+    }
+    rig.proxy.heal();
+    try expect_echo_pending(conn, commit_reply[0..4]);
+    try std.testing.expectEqual(@as(u32, 0), rig.proxy.stats().commit_cuts);
+}
+
+/// Reads until a reset, which must come after exactly `text` and no more.
+fn expect_text_then_reset(fd: fd_t, text: []const u8) !void {
     var buffer: [64]u8 = undefined;
     var got: usize = 0;
-    for (0..40) |_| switch (recv_within(first, buffer[got..], 100)) {
+    for (0..40) |_| switch (recv_within(fd, buffer[got..], 100)) {
         .bytes => |count| got += count,
         .reset => break,
         .closed => return error.CleanCloseNotReset,
-        else => continue,
+        .timeout => continue,
     } else return error.NotCut;
-    try std.testing.expectEqualStrings("ab", buffer[0..got]);
-    // One shot: the next connection's reply goes through whole.
-    const second = try connect_loopback(rig.proxy.port);
-    defer _ = linux.close(second);
-    try expect_echo(second, commit_reply, 1000);
-    const stats = rig.proxy.stats();
-    try std.testing.expectEqual(@as(u32, 1), stats.commit_cuts);
-    try std.testing.expectEqual(@as(u32, 1), stats.cuts);
+    try std.testing.expectEqualStrings(text, buffer[0..got]);
+}
+
+/// Reads `text`, which was sent before, however the reads split it.
+fn expect_echo_pending(fd: fd_t, text: []const u8) !void {
+    var buffer: [64]u8 = undefined;
+    var got: usize = 0;
+    while (got < text.len) {
+        switch (recv_within(fd, buffer[got..], 1000)) {
+            .bytes => |count| got += count,
+            else => return error.NoEcho,
+        }
+    }
+    try std.testing.expectEqualStrings(text, buffer[0..got]);
 }
 
 test "upstream connect: a refused upstream closes the client instead of hanging the proxy" {
