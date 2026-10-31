@@ -21,6 +21,7 @@ const SqliteStore = if (suite.backend == .sqlite) @import("store_sqlite.zig").Sq
 const OpenOptions = if (suite.backend == .sqlite) @import("store_sqlite.zig").OpenOptions else void;
 const postgres = if (suite.backend == .postgres) @import("store_postgres.zig") else void;
 const PostgresStore = if (suite.backend == .postgres) postgres.PostgresStore else void;
+const fault_proxy = if (suite.backend == .postgres) @import("testing/fault_proxy.zig") else void;
 
 const Allocator = std.mem.Allocator;
 const Revision = store.Revision;
@@ -55,6 +56,12 @@ pub const Harness = struct {
     pg_conninfo: if (backend == .postgres) [:0]const u8 else void,
     pg_schema: if (backend == .postgres) [32]u8 else void,
     pg_schema_len: u32,
+    /// `ZCUBE_TEST_PROXY` set: the connections go through a proxy that delays and stalls.
+    proxy: if (backend == .postgres) ?*fault_proxy.Proxy else void,
+    proxy_conninfo: if (backend == .postgres) ?[:0]u8 else void,
+    proxy_thread: if (backend == .postgres) ?std.Thread else void,
+    proxy_stop: std.atomic.Value(bool),
+    connections_made: u32,
     connections: [connections_max]?*Connection,
 
     pub fn start() !*Harness {
@@ -71,6 +78,11 @@ pub const Harness = struct {
             .pg_conninfo = undefined,
             .pg_schema = undefined,
             .pg_schema_len = 0,
+            .proxy = if (backend == .postgres) null else {},
+            .proxy_conninfo = if (backend == .postgres) null else {},
+            .proxy_thread = if (backend == .postgres) null else {},
+            .proxy_stop = .init(false),
+            .connections_made = 0,
             .connections = @splat(null),
         };
         switch (backend) {
@@ -98,7 +110,10 @@ pub const Harness = struct {
         switch (backend) {
             .memory => harness.memory.deinit(),
             .sqlite => harness.tmp.cleanup(),
-            .postgres => harness.drop_postgres_schema(),
+            .postgres => {
+                harness.stop_proxy();
+                harness.drop_postgres_schema();
+            },
         }
         testing.allocator.destroy(harness);
     }
@@ -128,10 +143,45 @@ pub const Harness = struct {
             return error.PostgresNotConfigured;
         };
         harness.pg_conninfo = conninfo;
+        errdefer harness.stop_proxy();
+        if (testing.environ.getPosix("ZCUBE_TEST_PROXY") != null) try harness.start_proxy(conninfo);
         const now = std.Io.Clock.real.now(testing.io).toNanoseconds();
         const unique = std.hash.Wyhash.hash(harness.seed, std.mem.asBytes(&now));
         const text = try std.fmt.bufPrint(&harness.pg_schema, "zt_{x:0>16}", .{unique});
         harness.pg_schema_len = @intCast(text.len);
+    }
+
+    /// Points the connections at a proxy in front of `conninfo`'s server (the schema is still
+    /// dropped over `conninfo` itself) and starts the thread that disturbs it.
+    fn start_proxy(harness: *Harness, conninfo: []const u8) !void {
+        var port: u16 = 5432;
+        var words = std.mem.tokenizeScalar(u8, conninfo, ' ');
+        while (words.next()) |word| {
+            if (std.mem.startsWith(u8, word, "port=")) port = try std.fmt.parseInt(u16, word[5..], 10);
+        }
+        const proxy = try fault_proxy.Proxy.start(harness.gpa, port);
+        harness.proxy = proxy;
+        const format = "{s} host=127.0.0.1 port={d}"; // The last keyword wins in libpq.
+        harness.proxy_conninfo = try std.fmt.allocPrintSentinel(harness.gpa, format, .{ conninfo, proxy.port }, 0);
+        harness.pg_conninfo = harness.proxy_conninfo.?;
+        harness.proxy_thread = try std.Thread.spawn(.{}, disturb, .{harness});
+    }
+
+    fn stop_proxy(harness: *Harness) void {
+        const proxy = harness.proxy orelse return;
+        harness.proxy_stop.store(true, .release);
+        if (harness.proxy_thread) |thread| thread.join();
+        // The tests must really have gone through it.
+        if (harness.connections_made > 0) assert(proxy.stats().accepted > 0);
+        proxy.stop();
+        harness.proxy = null;
+        if (harness.proxy_conninfo) |text| harness.gpa.free(text);
+        harness.proxy_conninfo = null;
+    }
+
+    fn drop_conninfo(harness: *const Harness) []const u8 {
+        const direct = testing.environ.getPosix("ZCUBE_TEST_POSTGRES").?;
+        return if (harness.proxy != null) direct else harness.pg_conninfo;
     }
 
     fn schema_name(harness: *const Harness) []const u8 {
@@ -154,7 +204,9 @@ pub const Harness = struct {
         diag.reset();
         const dropper = testing.allocator.create(PostgresStore) catch return;
         defer testing.allocator.destroy(dropper);
-        dropper.open(testing.io, harness.pg_options(), &diag) catch return;
+        var options = harness.pg_options();
+        options.conninfo = harness.drop_conninfo();
+        dropper.open(testing.io, options, &diag) catch return;
         defer dropper.close();
         dropper.drop_schema(&diag) catch {};
     }
@@ -186,11 +238,32 @@ pub const Harness = struct {
         for (&harness.connections) |*slot| {
             if (slot.* != null) continue;
             slot.* = conn;
+            harness.connections_made += 1;
             return conn;
         }
         return error.TooManyConnections;
     }
 };
+
+/// Until stopped, makes the network slow, narrow and now and then silent in one direction, in
+/// turns of a few tens of milliseconds, and heals it between turns. Nothing is ever cut, so every
+/// call in the suite still gets its answer, only later.
+fn disturb(harness: *Harness) void {
+    const proxy = harness.proxy.?;
+    var prng = harness.prng("disturb");
+    const rng = prng.random();
+    while (!harness.proxy_stop.load(.acquire)) {
+        proxy.heal();
+        switch (rng.uintLessThan(u32, 3)) {
+            0 => proxy.set_latency(rng.intRangeAtMost(u32, 1, 8)),
+            1 => proxy.set_bandwidth(rng.intRangeAtMost(u64, 20_000, 200_000)),
+            else => proxy.stall(if (rng.boolean()) .to_server else .to_client),
+        }
+        const ms = rng.intRangeAtMost(u64, 10, 60);
+        testing.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch return;
+    }
+    proxy.heal();
+}
 
 pub const Connection = struct {
     sqlite: if (backend == .sqlite) SqliteStore else void,

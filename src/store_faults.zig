@@ -27,6 +27,10 @@
 //!   busy before it reads the final revision, so a COMMIT that finishes late is in the log it
 //!   checks. The checker's own test is below: `--mutate` (hidden) makes the clients' stores lie
 //!   (`store_mutant.zig`) and the test asserts that each lie is rejected.
+//! - Calls also include compare-and-deletes (the success branch carries an audit put, so a lost
+//!   answer is found in the log by its token). After the log is read, stage 2 (`Reader`) runs
+//!   historical reads and compactions, since a compacted log cannot be read back, and
+//!   `history.check_compaction` judges them against that log. Leases are not covered.
 //! - SQLite has no connection to cut, so no proxy applies: it runs the same clients and the
 //!   same checker, without faults. The output says so.
 //! - At the end: `heal`, read `status.revision` on a direct connection (not through the

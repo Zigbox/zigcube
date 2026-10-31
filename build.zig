@@ -412,9 +412,20 @@ fn add_store_step(
     help: []const u8,
     step_options: StoreStepOptions,
 ) void {
+    const run = add_store_tests(b, step_options, false);
+    b.step(name, help).dependOn(&run.step);
+}
+
+/// The conformance test binary and its run. `proxied` points every connection of a Postgres
+/// run at a fault proxy that adds latency, bandwidth limits and short stalls (never a cut: the
+/// suite's tests assert exact outcomes, which a cut connection would turn into errors).
+fn add_store_tests(
+    b: *std.Build,
+    step_options: StoreStepOptions,
+    proxied: bool,
+) *std.Build.Step.Run {
     const backend = step_options.backend;
     const seed = step_options.seed;
-    const step = b.step(name, help);
     const options = b.addOptions();
     options.addOption(Backend, "backend", backend);
     options.addOption(?u64, "seed", seed);
@@ -438,8 +449,9 @@ fn add_store_step(
     if (backend == .postgres) {
         run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", step_options.postgres);
         run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
+        if (proxied) run.setEnvironmentVariable("ZCUBE_TEST_PROXY", "1");
     }
-    step.dependOn(&run.step);
+    return run;
 }
 
 /// `zig build test-store-faults -Dbackend=postgres|sqlite [-Dseed=N] [-Dpostgres=...]`: client
@@ -467,6 +479,8 @@ fn add_store_faults_step(b: *std.Build, step_options: StoreStepOptions) void {
     switch (step_options.backend) {
         .postgres => {
             run.addArgs(&.{ "--backend", "postgres", "--postgres", step_options.postgres });
+            // The conformance suite's tests, through a proxy that delays and stalls but never cuts.
+            step.dependOn(&add_store_tests(b, step_options, true).step);
         },
         .sqlite => run.addArgs(&.{ "--backend", "sqlite" }),
         .memory => {

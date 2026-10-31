@@ -165,6 +165,41 @@ jobs:
             zig build test-store -Dbackend=postgres --summary all
           done
 
+  # Slice 10c: client threads against Postgres through the fault proxy, every call recorded and
+  # checked, and the conformance suite run through the proxy (latency, bandwidth, stalls). The
+  # image is the one of store-postgres. The settings are in libpq keyword form because the runner
+  # adds `host=` and `port=` of the proxy to them. Each run draws a new seed (printed first).
+  store-faults:
+    name: store faults (postgres, sqlite)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: Store faults (postgres)
+        run: zig build test-store-faults -Dbackend=postgres -Dpostgres="${ZCUBE_TEST_POSTGRES}" --summary all
+      - name: Store faults (sqlite, history checker only)
+        run: zig build test-store-faults -Dbackend=sqlite --summary all
+
   # HANDOFF's C0 demo, run for real (docs/demos/c0.md): zcube-server, one zcube-agent with
   # FakeRuntime and the zcube command as real processes, on each backend. Each prints a transcript
   # (also kept as an artifact); the demo fails on the first assertion that does not hold, and kills
