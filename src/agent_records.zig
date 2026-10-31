@@ -101,6 +101,17 @@ fn json_bytes(buffer: []u8, value: anytype) agent_state.Error![]const u8 {
     return writer.buffered();
 }
 
+/// Whether the node has the image. **A start of an image it lacks writes nothing**: no record,
+/// no process, only the refusal (`ZBX-E0501`), so both the real agent and the simulation ask this
+/// before `write_spec`. (A `start_failed` run record is for a command that could not run, which
+/// the supervisor writes after the container exists.)
+pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
+    for (fixtures) |digest| {
+        if (std.mem.eql(u8, digest, image)) return true;
+    }
+    return false;
+}
+
 /// Starts the container's record: clears what an older container of the name left (a stopped
 /// container's directory has no spec by now, see `remove_container`), then puts the spec.
 pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!void {
@@ -138,6 +149,12 @@ pub fn remove_container(
             else => |other| return other,
         };
     }
+    // The empty directory last, so that directories do not pile up past what `scan` reads. A
+    // crash before this leaves a directory with no spec, which is not a container.
+    state.remove(prefix) catch |err| switch (err) {
+        error.Absent => {},
+        else => |other| return other,
+    };
 }
 
 /// The container's spec; null if it is missing, empty or damaged: nothing to adopt or report.
@@ -436,6 +453,14 @@ test "a crash at every write point leaves records a restart reads" {
     try testing.expect(counts.removal_gone > 0);
     try testing.expect(counts.lost_recorded > 0);
     try testing.expect(counts.lost_missing > 0);
+}
+
+test "an image the node lacks is refused before anything is written" {
+    // Goal: the one rule for an unknown image. Method: the fixtures list, known and unknown.
+    const fixtures = [_][]const u8{ "b3:51aa9c03", "b3:9d20c4f1" };
+    try testing.expect(has_image(&fixtures, "b3:9d20c4f1"));
+    try testing.expect(!has_image(&fixtures, "b3:00000000"));
+    try testing.expect(!has_image(&.{}, "b3:51aa9c03"));
 }
 
 test "classify: an ended command, a live supervisor, a young spec, and a dead supervisor" {

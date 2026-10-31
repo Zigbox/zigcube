@@ -239,9 +239,15 @@ pub const DirState = struct {
 
     fn remove_impl(context: *anyopaque, name: []const u8) agent_state.Error!void {
         const self = from(context);
-        const place = try self.locate(name, false);
+        const is_dir = name[name.len - 1] == '/';
+        const place = try self.locate(if (is_dir) name[0 .. name.len - 1] else name, false);
         defer if (place.owned) place.dir.close(self.io);
-        place.dir.deleteFile(self.io, place.base) catch |err| switch (err) {
+        // The parent is synced after either, so the removal itself survives a host crash.
+        const removed = if (is_dir)
+            place.dir.deleteDir(self.io, place.base)
+        else
+            place.dir.deleteFile(self.io, place.base);
+        removed catch |err| switch (err) {
             error.FileNotFound => return error.Absent,
             else => return error.Io,
         };
@@ -339,4 +345,9 @@ test "DirState keeps the AgentState promises the model makes" {
     try testing.expectEqualStrings("containers/a/", dirs[0]);
     try agent.remove("containers/a/log");
     try testing.expectError(error.Absent, agent.remove("containers/a/log"));
+    try testing.expectError(error.Io, agent.remove("containers/a/")); // Not empty.
+    try agent.remove("containers/a/spec.json");
+    try agent.remove("containers/a/");
+    try testing.expectError(error.Absent, agent.remove("containers/a/"));
+    try testing.expectEqual(@as(usize, 0), (try agent.list(arena, "containers/")).len);
 }

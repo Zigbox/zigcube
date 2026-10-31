@@ -76,6 +76,9 @@ pub const AgentState = struct {
         return state.vtable.read(state.context, arena, name);
     }
 
+    /// Unlinks the file. A name that ends in a slash is a directory: it goes if it is empty, and
+    /// is `Absent` if there is none (the model has no directories, so for `SimState` it always
+    /// is, and passes no write point). A directory is removed durably, like a file.
     pub fn remove(state: AgentState, name: []const u8) Error!void {
         assert(name.len > 0);
         return state.vtable.remove(state.context, name);
@@ -312,6 +315,7 @@ pub const SimState = struct {
     fn remove_impl(context: *anyopaque, name: []const u8) Error!void {
         const state = from(context);
         if (state.crashed) return error.Crashed;
+        if (name[name.len - 1] == '/') return error.Absent; // The model has no directories.
         if (state.point()) return error.Crashed;
         if (state.find(name) == null) return error.Absent;
         state.drop(name);

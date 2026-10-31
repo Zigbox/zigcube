@@ -38,6 +38,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
+const agent_records = @import("agent_records.zig");
 const constants = @import("constants.zig");
 const Clock = @import("clock.zig").Clock;
 const diag_mod = @import("diag.zig");
@@ -313,10 +314,7 @@ pub const SimRuntime = struct {
     }
 
     fn has_image(self: *const SimRuntime, image: []const u8) bool {
-        for (self.fixtures) |digest| {
-            if (std.mem.eql(u8, digest, image)) return true;
-        }
-        return false;
+        return agent_records.has_image(self.fixtures, image);
     }
 
     fn copy_spec(self: *SimRuntime, spec: *const runtime.Spec) Allocator.Error!Container {

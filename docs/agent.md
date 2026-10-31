@@ -21,7 +21,7 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 | `zcube_agent.zig` | shell | The process: panic handler, exit codes, `supervise` mode |
 | `fake_runtime.zig` | shell | `Runtime` with real host processes |
 | `fake_supervisor.zig` | shell | `zcube-agent supervise <dir>`: one container's supervisor |
-| `fake_files.zig` | shell | The files the agent and a supervisor meet in |
+| `fake_files.zig` | shell | The files the agent and a supervisor meet in; `DirState` is `AgentState` over them |
 | `agent_smoke.zig` | test | `zig build agent-smoke`, the server and agent as real processes |
 
 The agent is single-threaded. Nothing in it can race what it starts, and `zbx`'s `start` needs a
@@ -81,7 +81,8 @@ records the reason; `lost` kills the supervisor and leaves the verdict to the lo
 fault waits for its replica to exist and run, and is dropped once the container has ended.
 
 **Retention.** The state directory holds at most `fake_containers_max` containers. A start past
-that removes the oldest stopped one, which is safe: the core records a stopped container's end in
+that removes the oldest stopped one (`agent_records.remove_container`: spec first, then the other
+files and the directory, each removal synced), which is safe: the core records a stopped container's end in
 the observed state, and a missing stopped container with a `stopped` record is left alone.
 
 ## What survives what

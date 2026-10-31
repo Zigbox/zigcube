@@ -161,14 +161,15 @@ pub const SimNode = struct {
             .labels = labels[0..spec.labels.len],
             .started_at_ms = node.clock.now_ms(),
         };
+        if (!agent_records.has_image(node.containers.fixtures, spec.image)) {
+            // Refused before anything is written, as the real agent does.
+            return node.containers.interface().start(spec, diag);
+        }
         const state = node.files.interface();
         agent_records.write_spec(state, &record) catch return node.dead(diag);
         if (node.step()) return node.dead(diag);
         const outcome = try node.containers.interface().start(spec, diag);
-        if (outcome == .failed) {
-            // Nothing runs, so nothing is kept (the real agent records `start_failed` instead).
-            node.forget(spec.name) catch return node.dead(diag);
-        }
+        assert(outcome == .started); // The image is known; a failed command is not simulated.
         if (node.step()) return node.dead(diag);
         return outcome;
     }
@@ -377,6 +378,29 @@ test "a restart reads an empty or damaged record as no container" {
     try testing.expectEqual(@as(u32, 0), node.dropped);
     const left = try agent_records.scan(files, arena_state.allocator());
     try testing.expectEqual(@as(usize, 0), left.len);
+}
+
+test "a start of an unknown image is refused and writes nothing" {
+    // Goal: the simulation refuses as the real agent does. Method: start an image the node lacks
+    // and check the outcome, the files and that no write point was passed.
+    var manual: ManualClock = .{};
+    var node: SimNode = undefined;
+    node.init(testing.allocator, manual.clock(), 9, &sim_runtime.default_fixtures);
+    defer node.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    var spec = test_spec();
+    spec.image = "b3:00000000";
+    const outcome = try node.interface().start(&spec, &diag);
+    try testing.expect(outcome == .failed);
+    try testing.expectEqual(@as(u32, 0), node.files.points);
+    try testing.expectEqual(@as(usize, 0), (try agent_records.scan(
+        node.files.interface(),
+        arena_state.allocator(),
+    )).len);
+    try testing.expectEqual(@as(u32, 0), node.containers.running_count());
 }
 
 test "containers outlive the agent: a restart finds them by listing" {
