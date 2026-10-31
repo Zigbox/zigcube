@@ -779,3 +779,71 @@ test "a stopped record written before the replica's key was created is a leftove
     _ = world.agent_step();
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
 }
+
+/// The image of the container the runtime holds under `name`, or null.
+fn container_image(world: *World, name: []const u8) !?[]const u8 {
+    const arena = world.fresh_arena();
+    var collector: @import("diag.zig").Diag = undefined;
+    collector.reset();
+    const listings = try world.sim.interface().list(arena, &collector);
+    for (listings) |listing| {
+        if (!std.mem.eql(u8, listing.handle.name(), name)) continue;
+        for (listing.labels) |label| {
+            if (std.mem.eql(u8, label.key, @import("runtime.zig").label_image)) return label.value;
+        }
+    }
+    return null;
+}
+
+/// Runs `web` on `first`, optionally ends its container, deletes the service and applies it
+/// again on `next_digest` before the agent has seen the deletion, then steps the agent.
+fn reapply_before_cleanup(world: *World, end_container: bool) !void {
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step(); // Registers the node.
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step(); // Starts web-1.
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+    if (end_container) {
+        try world.kill("web-1");
+        world.advance(10);
+    }
+    _ = try world.delete_service("web");
+    _ = world.server_step(); // Deletes the replica keys; the agent has not seen it.
+    _ = world.server_step();
+    try testing.expectEqual(@as(u32, 0), world.replica_count("web"));
+    var again = stale_input("web");
+    again.image = next_digest;
+    _ = try world.apply(again);
+    _ = world.server_step();
+    _ = world.server_step();
+    try testing.expectEqual(@as(u32, 1), world.replica_count("web"));
+    var steps: u32 = 0;
+    while (steps < 4) : (steps += 1) {
+        _ = world.agent_step();
+        world.advance(1000);
+    }
+}
+
+test "a running container of an earlier replica with the same id is replaced, not adopted" {
+    // Goal: a service deleted and applied again on another image reuses `web-1`; if the node's
+    // agent has not cleaned up yet, the old container (same name) is still running and must
+    // not be taken for the new replica. Method: run web-1, delete and re-apply on another
+    // image before the agent steps, step the agent: the container runs the new image.
+    // (Seed 150 of `sim-cluster` found this.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try reapply_before_cleanup(world, false);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a stopped container of an earlier replica with the same id is replaced, not adopted" {
+    // Goal: the same, with the old container already stopped (the known gap in the note of
+    // the change that added `observed_for`). Method: as above, ending the container first.
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try reapply_before_cleanup(world, true);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}

@@ -71,6 +71,11 @@ finds what its predecessor started and the core's rule "a container the runtime 
 replica is adopted, never started twice" does the rest. The agent holds an exclusive lock on the
 state directory, so two agents cannot share it (`ZC-E0506`).
 
+A listed container is adopted only if it is the replica's own: it carries the labels `zcube.image`
+and `zcube.created` (the revision the replica key was created at), and a service deleted and
+applied again reuses replica ids, so a mismatch means an earlier replica's container. That one is
+stopped (asked once, killed after its grace period) and, once it has stopped, the right one starts.
+
 **`lost`.** A container with no `run.json` whose supervisor is gone (the lock is free and the
 supervisor had started) is `lost` with `ZC-E0509`. The first time the agent sees that, it kills the
 supervisor's process group, so a lost container does not run on, and writes `run.json` with `lost`,

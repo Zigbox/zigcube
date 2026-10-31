@@ -257,13 +257,62 @@ const Pass = struct {
             const listing = find_listing_by_replica(pass.listings, replica.id);
             const seen = pass.observed_for(item);
             if (listing) |found| {
+                if (!is_this_replica(found, item)) {
+                    try pass.replace_stale(found, item, seen);
+                    continue;
+                }
                 try pass.report(replica, seen, found.status);
             } else if (seen) |record| {
                 if (record.status != .stopped) try pass.report_lost(replica, record);
             } else {
-                try pass.start(replica);
+                try pass.start(item);
             }
         }
+    }
+
+    /// The runtime holds a container of this name that belongs to an earlier replica with the
+    /// same id (a service deleted and applied again restarts its numbering, and the old
+    /// container may not have been cleaned up yet): it is stopped, never adopted, and once it
+    /// has stopped the right one is started in its place. A stop is asked for once and checked
+    /// on later steps, like an orphan's.
+    fn replace_stale(
+        pass: *Pass,
+        stale: *const runtime.Listing,
+        item: *const controller.Entry(records.Replica),
+        seen: ?*const records.Observed,
+    ) Error!void {
+        const ctx = pass.ctx;
+        if (is_running(stale)) {
+            try pass.stop_once(stale);
+            const status = try ctx.runtime.inspect(stale.handle, ctx.diag);
+            switch (status) {
+                .starting, .running => return,
+                .stopped => {},
+            }
+        }
+        // A record of this replica means it was started already (and, if the start failed, is
+        // not started again); the stale container is only the name's earlier holder.
+        if (seen == null) try pass.start(item);
+    }
+
+    /// Asks for `listing`'s container to stop, once; a later step kills it if it is still
+    /// running after its grace period.
+    fn stop_once(pass: *Pass, listing: *const runtime.Listing) Error!void {
+        const ctx = pass.ctx;
+        const now = ctx.clock.now_ms();
+        const name = listing.handle.name();
+        if (pass.agent.pending_stop(name)) |stop| {
+            if (now < stop.deadline_ms) return;
+            try ctx.runtime.stop(listing.handle, 0, ctx.diag);
+            return;
+        }
+        try ctx.runtime.stop(listing.handle, constants.stop_grace_ms, ctx.diag);
+        if (pass.agent.stops_count == constants.agent_stops_max) return;
+        pass.agent.stops[pass.agent.stops_count] = .{
+            .handle = listing.handle,
+            .deadline_ms = now + constants.stop_grace_ms,
+        };
+        pass.agent.stops_count += 1;
     }
 
     /// Writes the observed record for a container the runtime has, if it differs from the
@@ -338,9 +387,17 @@ const Pass = struct {
         });
     }
 
-    fn start(pass: *Pass, replica: *const records.Replica) Error!void {
+    fn start(pass: *Pass, item: *const controller.Entry(records.Replica)) Error!void {
+        const replica = &item.rec;
+        const created_revision = item.kv.create_revision;
         const ctx = pass.ctx;
-        const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = replica.id }};
+        var created_buffer: [20]u8 = undefined;
+        const created = created_text(&created_buffer, created_revision);
+        const labels = [_]runtime.Label{
+            .{ .key = runtime.label_replica, .value = replica.id },
+            .{ .key = runtime.label_image, .value = replica.image },
+            .{ .key = runtime.label_created, .value = created },
+        };
         const env = ctx.arena.alloc(runtime.EnvVar, replica.env.len) catch
             return failures.no_memory(ctx.diag);
         for (replica.env, env) |pair, *slot| slot.* = .{ .name = pair[0], .value = pair[1] };
@@ -399,25 +456,11 @@ const Pass = struct {
     /// Stops running containers of ours whose replica key is gone. Asked for once; a container
     /// still running after its grace period is killed on a later step.
     fn orphan_containers(pass: *Pass) Error!void {
-        const ctx = pass.ctx;
-        const now = ctx.clock.now_ms();
         for (pass.listings) |listing| {
             const id = label_value(listing.labels, runtime.label_replica) orelse continue;
             if (pass.is_desired(id)) continue;
             if (!is_running(&listing)) continue;
-            const name = listing.handle.name();
-            if (pass.agent.pending_stop(name)) |stop| {
-                if (now < stop.deadline_ms) continue;
-                try ctx.runtime.stop(listing.handle, 0, ctx.diag);
-                continue;
-            }
-            try ctx.runtime.stop(listing.handle, constants.stop_grace_ms, ctx.diag);
-            if (pass.agent.stops_count == constants.agent_stops_max) continue;
-            pass.agent.stops[pass.agent.stops_count] = .{
-                .handle = listing.handle,
-                .deadline_ms = now + constants.stop_grace_ms,
-            };
-            pass.agent.stops_count += 1;
+            try pass.stop_once(&listing);
         }
     }
 
@@ -464,6 +507,28 @@ fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, label.key, key)) return label.value;
     }
     return null;
+}
+
+fn created_text(buffer: *[20]u8, revision: store.Revision) []const u8 {
+    // 20 digits hold a u64.
+    return std.fmt.bufPrint(buffer, "{d}", .{revision}) catch unreachable;
+}
+
+/// False if the container was started for another replica that had this one's id: its image
+/// or the revision its replica key was created at differ. A container without those labels
+/// (started by an agent that did not write them) is taken to be this replica's.
+fn is_this_replica(
+    listing: *const runtime.Listing,
+    item: *const controller.Entry(records.Replica),
+) bool {
+    if (label_value(listing.labels, runtime.label_image)) |image| {
+        if (!std.mem.eql(u8, image, item.rec.image)) return false;
+    }
+    if (label_value(listing.labels, runtime.label_created)) |text| {
+        var buffer: [20]u8 = undefined;
+        if (!std.mem.eql(u8, text, created_text(&buffer, item.kv.create_revision))) return false;
+    }
+    return true;
 }
 
 fn find_listing_by_replica(
