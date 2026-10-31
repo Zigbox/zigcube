@@ -20,6 +20,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const core_smoke = @import("core_smoke.zig");
 const sim_c0 = @import("sim_c0.zig");
+const sim_cluster = @import("sim_cluster.zig");
 
 comptime {
     // Zig analyses only what is referenced; this makes the whole of every core module count.
@@ -46,6 +47,28 @@ export fn zcube_sim_c0(seed: u64) u32 {
 export fn zcube_sim_fuzz(seed: u64, operations: u32) u32 {
     sim_c0.fuzz(std.heap.wasm_allocator, seed, operations, &sim_report);
     return @backingInt(sim_report.failed);
+}
+
+var cluster_report: sim_cluster.Report = .{};
+
+/// Runs the cluster simulation (`sim_cluster.zig`): 0 if every check held, else 1. `nodes` 0 lets
+/// the seed pick; `liveness` is 0 or 1. The report is read with `zcube_cluster_report_ptr` and
+/// `zcube_cluster_report_len`, and is byte for byte what the native `sim-cluster` prints.
+export fn zcube_sim_cluster(seed: u64, operations: u32, nodes: u32, liveness: u32) u32 {
+    const options: sim_cluster.Options = .{
+        .nodes = if (nodes == 0) null else nodes,
+        .liveness = liveness != 0,
+    };
+    sim_cluster.simulate(std.heap.wasm_allocator, seed, operations, options, &cluster_report);
+    return @intFromBool(cluster_report.failed);
+}
+
+export fn zcube_cluster_report_ptr() [*]const u8 {
+    return &cluster_report.bytes;
+}
+
+export fn zcube_cluster_report_len() u32 {
+    return cluster_report.len;
 }
 
 export fn zcube_sim_report_ptr() [*]const u8 {

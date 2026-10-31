@@ -69,12 +69,13 @@ pub fn build(b: *std.Build) void {
     add_tidy_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
-    add_sim_step(b, .{
+    add_sim_steps(b, .{
         .seed = seed,
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
         .library = library,
+        .ops = 0,
     });
     add_check_step(b);
 }
@@ -136,7 +137,9 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
 fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     const memory_suite = memory_suite_options(b);
     const test_step = b.step("test", "Run unit and snapshot tests");
+    const filters = b.option([]const []const u8, "test-filter", "Run only matching tests");
     const unit_tests = b.addTest(.{
+        .filters = filters orelse &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = unit.target,
@@ -560,6 +563,8 @@ fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.
     // A library for a host to instantiate: no `_start`, and the exports stay whatever is `export`.
     library.entry = .disabled;
     library.rdynamic = true;
+    // sim-cluster nests deeper than the 1 MiB default allows (2 MiB still traps, 4 MiB passes).
+    library.stack_size = 8 * 1024 * 1024;
     const install = b.addInstallArtifact(library, .{
         .dest_dir = .{ .override = .{ .custom = "wasm" } },
     });
@@ -585,6 +590,8 @@ const SimStepOptions = struct {
     optimize: std.builtin.OptimizeMode,
     zigbox: *std.Build.Module,
     library: *std.Build.Step.Compile,
+    /// `-Dops`: operations of the fuzz variants of sim-c0 and sim-cluster.
+    ops: u32,
 };
 
 /// `zig build sim-c0 [-Dseed=N] [-Dops=N]`: the deterministic simulation of C0 (src/sim_c0.zig),
@@ -594,8 +601,7 @@ const SimStepOptions = struct {
 /// CI passes its own and prints it.
 fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
     const seed = sim.seed;
-    const ops_help = "Operations of the fuzz variant of sim-c0 (default 100)";
-    const operations = b.option(u32, "ops", ops_help) orelse 100;
+    const operations = sim.ops;
     const exe = b.addExecutable(.{
         .name = "sim_c0",
         .root_module = b.createModule(.{
@@ -630,6 +636,93 @@ fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(fuzz_report);
         step.dependOn(&node.step);
     }
+}
+
+/// Declares `-Dops` once, for sim-c0's fuzz variant and sim-cluster alike.
+fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
+    const ops_help = "Operations of the fuzz variants of sim-c0 and sim-cluster (default 100)";
+    var sim = options;
+    sim.ops = b.option(u32, "ops", ops_help) orelse 100;
+    add_sim_step(b, sim);
+    add_sim_cluster_step(b, sim);
+    add_sim_teeth_step(b, sim);
+}
+
+/// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]`: the cluster
+/// simulation (src/sim_cluster.zig), run natively and as WebAssembly for the same seed, and the
+/// two reports compared byte for byte, as sim-c0 does. `-Dnodes=0` lets the seed pick; `-Dops` is
+/// sim-c0's too; liveness is on unless `-Dliveness=false`.
+fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_cluster",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    const exe_help = "Install the native sim-cluster runner into zig-out/bin";
+    b.step("sim-cluster-exe", exe_help).dependOn(&install.step);
+    const nodes = b.option(u32, "nodes", "Nodes of sim-cluster (default: the seed picks)") orelse 0;
+    const live_help = "sim-cluster: faults end, the world must converge (default true)";
+    const liveness = b.option(bool, "liveness", live_help) orelse true;
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = b.fmt("{d}", .{sim.ops});
+    const nodes_text = b.fmt("{d}", .{nodes});
+    const liveness_text: []const u8 = if (liveness) "true" else "false";
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ seed_text, ops_text, nodes_text });
+    run.addArg(b.fmt("--liveness={s}", .{liveness_text}));
+    const native_report = run.captureStdOut(.{});
+    const help = "Run the cluster simulation natively and as WASM, and compare (-Dseed=N)";
+    const step = b.step("sim-cluster", help);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-cluster");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, liveness_text });
+        node.addFileArg(native_report);
+        step.dependOn(&node.step);
+    }
+}
+
+/// The seeds the teeth test runs and the most the simulator may need to catch the agent's
+/// test-only fault (docs/core.md, "The cluster simulation"): `sim-teeth` fails if none of them
+/// fails. The fault is caught by the first seed or two; the margin is for a change of the model.
+const teeth_seeds_max = 10;
+const teeth_operations = 100;
+
+/// `zig build sim-teeth`: the cluster simulator built with the agent ignoring every stop order
+/// (`src/sim_teeth_main.zig`, the only root that can switch it on), run over seeds 1 to
+/// `teeth_seeds_max`; it passes only if at least one seed fails. Run by `check`, not by `test`:
+/// it compiles the simulator a second time (in Debug, which compiles in seconds and runs seed 1
+/// in about a second). The executable is run, never installed.
+fn add_sim_teeth_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_teeth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_teeth_main.zig"),
+            .target = sim.target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    // For shrinking the fault's failures by hand (`sim_teeth --seeds 1..3 100 --shrink`); only
+    // this named step installs it, so `zig build` never puts it in zig-out.
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("sim-teeth-exe", "Install the fault-on simulator runner (test-only)")
+        .dependOn(&install.step);
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                         b.fmt("1..{d}", .{teeth_seeds_max}),
+        b.fmt("{d}", .{teeth_operations}), "--expect-fail",
+    });
+    const help = b.fmt("Run the cluster simulator with the agent's test-only fault on; it must " ++
+        "fail within {d} seeds", .{teeth_seeds_max});
+    b.step("sim-teeth", help).dependOn(&run.step);
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit

@@ -299,10 +299,22 @@ test "a polite stop ends the command; one that ignores it needs the kill" {
     const reason = try rig.wait_stopped(polite);
     try testing.expectEqual(@as(u8, 15), reason.signaled);
 
-    const stubborn_command = [_][]const u8{
-        "sh", "-c", "trap '' TERM; while true; do sleep 1; done",
-    };
+    // The shell says so once the trap is installed: a TERM sent before that would kill it.
+    var script_buffer: [constants.state_path_bytes_max + 128]u8 = undefined;
+    const script = try std.fmt.bufPrint(
+        &script_buffer,
+        "trap '' TERM; : > '{s}/faults/stubborn-ready'; while true; do sleep 1; done",
+        .{rig.path},
+    );
+    const stubborn_command = [_][]const u8{ "sh", "-c", script };
     const stubborn = try rig.begin("stubborn-1", &stubborn_command);
+    for (0..500) |_| {
+        rig.fake.faults.access(testing.io, "stubborn-ready", .{}) catch {
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+            continue;
+        };
+        break;
+    } else return error.TestUnexpectedResult;
     try rig.fake.interface().stop(stubborn, constants.stop_grace_ms, &local);
     try testing.expect(try rig.status(stubborn) == .running);
     try rig.fake.interface().stop(stubborn, 0, &local);

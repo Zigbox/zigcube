@@ -25,9 +25,9 @@ const build_options = @import("build_options");
 const clock_mod = @import("agent_clock.zig");
 const config_mod = @import("agent_config.zig");
 const constants = @import("constants.zig");
-const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const fake_runtime = @import("fake_runtime.zig");
+const loop_mod = @import("agent_loop.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const store = @import("store.zig");
@@ -60,12 +60,10 @@ const Shell = struct {
     arena: BoundedArena,
     diag: Diag,
     verbose: bool,
-    // What was last reported, so that a server that stays down is shown once.
-    last_code: ?@import("diag/codes.zig").Code = null,
-    last_report_ms: u64 = 0,
+    policy: loop_mod.Loop,
 
-    /// One step of the core. Null if it failed (the failure is reported).
-    fn pass(shell: *Shell) ?controller.Wakeup {
+    /// One step of the core, with what the policy says to tell the person.
+    fn pass(shell: *Shell) loop_mod.Outcome {
         shell.arena.reset();
         shell.diag.reset();
         const ctx: agent_mod.Context = .{
@@ -77,34 +75,28 @@ const Shell = struct {
         };
         const before = shell.agent.lease;
         const wake = shell.agent.reconcile(&ctx) catch {
-            shell.report_failure();
-            return null;
+            const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
+            const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
+            if (report == .failure) shell.report_failure();
+            return outcome;
         };
-        shell.recovered();
+        const outcome: loop_mod.Outcome = .{ .ok = wake };
+        const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
+        if (report == .recovered) shell.recovered();
         shell.notice_lease(before);
-        return wake;
+        return outcome;
     }
 
-    /// Waits for the core's deadline, a replica change, or a container event; returns early on a
-    /// stop request or a failure (the next pass reports and retries).
-    fn wait(shell: *Shell, wake: controller.Wakeup) void {
-        while (!stop_requested.load(.acquire)) {
-            const now = shell.clock.now_ms();
-            if (now >= wake.at_ms) return;
-            const left = wake.at_ms - now;
-            const slice: u32 = @intCast(@min(left, constants.agent_watch_slice_ms));
-            shell.diag.reset();
-            const changed = shell.remote.watch_once(slice, &shell.diag) catch return;
-            if (changed) return;
-            shell.arena.reset();
-            const events = shell.fake.interface().events(
-                shell.arena.allocator(),
-                0,
-                &shell.diag,
-            ) catch
-                return;
-            if (events.len > 0) return;
-        }
+    /// Holds up to `slice_ms` for a replica change or a container event. True if one came, or the
+    /// watch failed (the next pass reports and retries).
+    fn watch(shell: *Shell, slice_ms: u32) bool {
+        shell.diag.reset();
+        const changed = shell.remote.watch_once(slice_ms, &shell.diag) catch return true;
+        if (changed) return true;
+        shell.arena.reset();
+        const events = shell.fake.interface().events(shell.arena.allocator(), 0, &shell.diag) catch
+            return true;
+        return events.len > 0;
     }
 
     fn pause(shell: *Shell, ms: u32) void {
@@ -121,21 +113,12 @@ const Shell = struct {
     // ---- What the person running the agent sees ----
 
     fn report_failure(shell: *Shell) void {
-        const code = shell.diag.code orelse return;
-        const now = shell.clock.now_ms();
-        if (shell.last_code == code) {
-            if (now -| shell.last_report_ms < constants.server_report_ms) return;
-        }
-        shell.last_code = code;
-        shell.last_report_ms = now;
         const before = "\nzcube-agent: the agent could not finish a step\n";
         const after = "zcube-agent: retrying; containers keep running meanwhile\n";
         shell.show(before, &shell.diag, after);
     }
 
     fn recovered(shell: *Shell) void {
-        if (shell.last_code == null) return;
-        shell.last_code = null;
         std.Io.File.stderr().writeStreamingAll(
             shell.io,
             "zcube-agent: the agent is running again\n",
@@ -145,10 +128,10 @@ const Shell = struct {
     /// A lease that was replaced is ZC-W0501, and a first one is a line of news.
     fn notice_lease(shell: *Shell, before: store.LeaseId) void {
         const now = shell.agent.lease;
-        if (now == before) return;
-        assert(now != store.lease_none);
+        const news = loop_mod.lease_news(before, now);
+        if (news == .none) return;
         var buffer: [128]u8 = undefined;
-        if (before == store.lease_none) {
+        if (news == .registered) {
             const text = "zcube-agent: node {s} registered on lease {d}\n";
             const line = std.fmt.bufPrint(&buffer, text, .{
                 shell.agent.config.node, now,
@@ -200,11 +183,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .fixtures = config.images,
     }, &diag) catch return fail(io, &diag, config.verbose);
     defer fake.deinit();
-    var remote = remote_mod.RemoteStore.init(
-        gpa,
-        .{ .io = io, .address = config.server },
-        config.node,
-    );
+    var http_transport: remote_mod.HttpTransport = .{
+        .client = .{ .io = io, .address = config.server },
+    };
+    var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     agent.init(.{
@@ -223,6 +205,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .arena = BoundedArena.init(gpa, constants.request_arena_bytes_max),
         .diag = undefined,
         .verbose = config.verbose,
+        .policy = loop_mod.Loop.init(),
     };
     defer shell.arena.deinit();
     announce(io, config);
@@ -232,16 +215,14 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
 }
 
 fn loop(shell: *Shell) void {
-    var retry_ms: u32 = constants.server_retry_ms_min;
-    while (!stop_requested.load(.acquire)) {
-        const wake = shell.pass() orelse {
-            shell.pause(retry_ms);
-            retry_ms = @min(retry_ms * 2, constants.server_retry_ms_max);
-            continue;
-        };
-        retry_ms = constants.server_retry_ms_min;
-        if (wake.acted > 0) continue;
-        shell.wait(wake);
+    while (true) {
+        if (stop_requested.load(.acquire)) shell.policy.request_stop();
+        switch (shell.policy.next(shell.clock.now_ms())) {
+            .stop => return,
+            .step => _ = shell.pass(),
+            .pause_ms => |ms| shell.pause(ms),
+            .watch_ms => |ms| shell.policy.watch_done(shell.watch(ms)),
+        }
     }
 }
 

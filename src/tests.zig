@@ -19,8 +19,10 @@ test {
     _ = @import("agent_clock.zig");
     _ = @import("agent_config.zig");
     _ = @import("agent_http.zig");
+    _ = @import("agent_client.zig");
     _ = @import("agent_remote.zig");
     _ = @import("agent_remote_test.zig");
+    _ = @import("sim_cluster_main.zig");
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_runtime_test.zig");

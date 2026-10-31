@@ -715,3 +715,240 @@ test "fuzz: random faults, outages and restarts keep the invariants, for many se
         try testing.expectEqual(Step.done, report.failed);
     }
 }
+
+fn stale_input(name: []const u8) apply_mod.Input {
+    return .{
+        .name = name,
+        .image = hello_digest,
+        .replicas = 1,
+        .command = &.{ "sh", "-c", "sleep 1000" },
+        .applied_by = "alex@laptop",
+        .request_id = "r-test",
+    };
+}
+
+/// Puts a stopped observed record of `replica` with `generation`, as the node's agent would.
+fn put_stopped(world: *World, replica: []const u8, generation: u64) !void {
+    try put_record(world, replica, generation, .stopped);
+}
+
+fn put_record(
+    world: *World,
+    replica: []const u8,
+    generation: u64,
+    status: records.ObservedStatus,
+) !void {
+    const ctx = world.controller_context();
+    const record: records.Observed = .{
+        .replica = replica,
+        .node = sim_world.node_name,
+        .generation = generation,
+        .status = status,
+        .exit = if (status == .stopped) .{ .kind = .exited, .code = 0 } else null,
+        .started_at_ms = if (status == .stopped) null else world.now_ms(),
+        .reported_at_ms = world.now_ms(),
+    };
+    const key = records.observed_key(sim_world.node_name, replica);
+    const value = try records.encode(ctx.arena, record, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+    const request: store.TxnRequest = .{ .on_success = &.{op} };
+    const role: @import("writers.zig").Role = .{ .agent = sim_world.node_name };
+    _ = try @import("writers.zig").txn(ctx.store, role, request, ctx.diag);
+}
+
+test "a stopped record left by an earlier replica with the same id never blocks the new one" {
+    // Goal: a service deleted and applied again restarts its replica numbering, so `web-1`
+    // exists twice in the store's life; the first one's stopped observed record, which the agent
+    // had not yet removed, must not stop the second from starting. Method: place `web-1` (the
+    // server steps, the agent does not), plant a stopped record of another generation (what the
+    // first `web-1` left) and another that predates the replica's key, step the agent: it starts
+    // the replica and replaces the record. (Seed 32 of `sim-cluster` found this.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step(); // Registers the node.
+    _ = world.server_step();
+    _ = world.server_step();
+    try testing.expectEqual(@as(u32, 1), world.replica_count("web"));
+    try put_stopped(world, "web-1", 2);
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a stopped record written before the replica's key was created is a leftover" {
+    // Goal: same generation (a service's first generation is 1 each time it is applied), so
+    // only the store's revisions tell the records apart. Method: the record goes in first, then
+    // the service is applied and placed, then the agent steps.
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try put_stopped(world, "web-1", 1);
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step(); // Registers the node.
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+/// The image of the container the runtime holds under `name`, or null.
+fn container_image(world: *World, name: []const u8) !?[]const u8 {
+    const arena = world.fresh_arena();
+    var collector: @import("diag.zig").Diag = undefined;
+    collector.reset();
+    const listings = try world.sim.interface().list(arena, &collector);
+    for (listings) |listing| {
+        if (!std.mem.eql(u8, listing.handle.name(), name)) continue;
+        for (listing.labels) |label| {
+            if (std.mem.eql(u8, label.key, @import("runtime.zig").label_image)) return label.value;
+        }
+    }
+    return null;
+}
+
+/// Runs `web` on `first`, optionally ends its container, deletes the service and applies it
+/// again on `next_digest` before the agent has seen the deletion, then steps the agent.
+fn reapply_before_cleanup(world: *World, end_container: bool) !void {
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step(); // Registers the node.
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step(); // Starts web-1.
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+    if (end_container) {
+        try world.kill("web-1");
+        world.advance(10);
+    }
+    _ = try world.delete_service("web");
+    _ = world.server_step(); // Deletes the replica keys; the agent has not seen it.
+    _ = world.server_step();
+    try testing.expectEqual(@as(u32, 0), world.replica_count("web"));
+    var again = stale_input("web");
+    again.image = next_digest;
+    _ = try world.apply(again);
+    _ = world.server_step();
+    _ = world.server_step();
+    try testing.expectEqual(@as(u32, 1), world.replica_count("web"));
+    var steps: u32 = 0;
+    while (steps < 4) : (steps += 1) {
+        _ = world.agent_step();
+        world.advance(1000);
+    }
+}
+
+test "a running container of an earlier replica with the same id is replaced, not adopted" {
+    // Goal: a service deleted and applied again on another image reuses `web-1`; if the node's
+    // agent has not cleaned up yet, the old container (same name) is still running and must
+    // not be taken for the new replica. Method: run web-1, delete and re-apply on another
+    // image before the agent steps, step the agent: the container runs the new image.
+    // (Seed 150 of `sim-cluster` found this.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try reapply_before_cleanup(world, false);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a stopped container of an earlier replica with the same id is replaced, not adopted" {
+    // Goal: the same, with the old container already stopped (the known gap in the note of
+    // the change that added `observed_for`). Method: as above, ending the container first.
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try reapply_before_cleanup(world, true);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a replacement leaves no pending stop behind, and the agent sleeps" {
+    // Goal: stopping the earlier replica's container is finished once the right one starts in
+    // its place; a pending stop left for the name would keep the agent awake (its deadline
+    // passes, the next wake is now) and later kill the new container. Method: as above, then let
+    // the stop's grace period pass: no stop is pending and the agent's next wake is in the
+    // future. (Seeds 150, 505, 375 and 329 of `sim-cluster` spun here.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try reapply_before_cleanup(world, false);
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+    world.advance(constants.stop_grace_ms + 1000);
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+    try testing.expect(world.agent_due_ms > world.now_ms());
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a late running record over a stale stopped container is reported lost and recovers" {
+    // Goal: the old agent's last write ("running", generation 1) can land after the service
+    // was deleted and applied again; it is not a leftover (newer than the replica's key), the
+    // stale container is stopped, and nothing would ever correct it. Method: kill web-1,
+    // delete and apply again, plant that record, step agent and server: the agent reports the
+    // replica lost, the controller replaces it, and one replica runs.
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step();
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step();
+    try world.kill("web-1");
+    world.manual.advance(10); // Not `advance`: it would let the agent step.
+    _ = try world.delete_service("web");
+    _ = world.server_step();
+    _ = world.server_step();
+    var again = stale_input("web");
+    again.image = next_digest;
+    _ = try world.apply(again);
+    _ = world.server_step();
+    _ = world.server_step();
+    try put_record(world, "web-1", 1, .running);
+    var rounds: u32 = 0;
+    while (rounds < 30 and world.sim.running_count() != 1) : (rounds += 1) {
+        _ = world.agent_step();
+        _ = world.server_step();
+        _ = world.server_step();
+        world.advance(1000);
+    }
+    try testing.expectEqual(@as(u32, 1), world.sim.running_count());
+}
+
+/// Rewrites the first replica record with `node`, as the scheduler would when it moves the
+/// replica (the key and so its create revision stay).
+fn move_first_replica(world: *World, node: []const u8) !void {
+    const ctx = world.controller_context();
+    const all = try controller.list_all(records.Replica, &ctx, records.prefix_replicas, null, 8);
+    try testing.expect(all.items.len > 0);
+    var moved = all.items[0].rec;
+    moved.node = node;
+    const value = try records.encode(ctx.arena, moved, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = all.items[0].kv.key, .value = value } };
+    const request: store.TxnRequest = .{ .on_success = &.{op} };
+    _ = try @import("writers.zig").txn(ctx.store, .replica_controller, request, ctx.diag);
+}
+
+test "a replica that comes back to its node keeps its container and leaves no pending stop" {
+    // Goal: a replica moved away is an orphan on its old node and its container gets a stop
+    // order; if it is moved back before the container ended (one that ignores the polite
+    // stop), the container is wanted again, and the stop order must be dropped: once its
+    // deadline passed it kept the agent awake (next wake now, a busy loop) and would kill a
+    // container that the replica wants. Method: run web-1, make it ignore a stop, move the
+    // replica away and step the agent (stop pending), move it back, step: no stop pending,
+    // and after the grace period the agent sleeps. (Seed 744 of `sim-cluster`, at 100
+    // operations, took 1,078 steps in 20 s on one node.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step();
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+    try world.sim.inject("web-1", .slow_stop);
+    try move_first_replica(world, "elsewhere");
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.agent.stops_count);
+    try move_first_replica(world, sim_world.node_name);
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+    world.manual.advance(constants.stop_grace_ms + 1000);
+    _ = world.agent_step();
+    try testing.expect(world.agent_due_ms > world.now_ms());
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+}
