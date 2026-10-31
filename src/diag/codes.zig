@@ -60,6 +60,7 @@ pub const Code = enum(u8) {
     E0213,
     E0214,
     E0215,
+    E0216,
     E0301,
     E0302,
     E0303,
@@ -612,6 +613,24 @@ pub const registry = [_]Entry{
         \\zcube store accept-rollback --confirm, which makes the server
         \\remember the store as it is now and records a decision with the old
         \\and new revision and hash.
+        ,
+    },
+    .{
+        .code = .E0216,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the remembered revision file is unusable",
+        .explanation =
+        \\The server keeps the highest store revision and chain hash it has
+        \\seen in a small file in its state directory, so that a restart after
+        \\a lossy failover still notices that the store went backwards
+        \\(ZC-E0215). The file could not be read, is not what the server
+        \\wrote, or could not be written. The server does not guess: it
+        \\neither starts nor accepts a store without it.
+        \\
+        \\Check the state directory (--state-dir) and its permissions. If the
+        \\file is damaged and the store is the one to trust, delete the file;
+        \\the server then remembers the store as it finds it.
         ,
     },
     .{

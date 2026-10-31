@@ -120,14 +120,15 @@ pub fn short_hash(hash: store.Hash) ShortHash {
 }
 
 /// What the store answered where the server remembered `remembered`: `now` is the store's
-/// revision and hash at the same revision (or at its head when it is behind). `chain_start` is
-/// set when the store cannot say what its hash was at the remembered revision.
+/// revision and hash at the same revision (or at its head when it is behind). `unverifiable` is
+/// set when the store cannot say what its hash was at the remembered revision, because that is
+/// below the point its chain starts at (`ZC-E0214`): the server fails closed.
 pub const Rollback = struct {
     remembered_revision: Revision,
     remembered_hash: store.Hash,
     now_revision: Revision,
     now_hash: store.Hash,
-    chain_start: ?Revision = null,
+    unverifiable: bool = false,
 };
 
 pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
@@ -135,11 +136,11 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
     diag.raise(.E0215);
     const old = short_hash(rollback.remembered_hash);
     const new = short_hash(rollback.now_hash);
-    if (rollback.chain_start) |start| {
-        diag.cause("the server remembers revision {d} ({s}); the store's chain starts at {d}", .{
-            rollback.remembered_revision, old, start,
+    if (rollback.unverifiable) {
+        diag.cause("the server remembers revision {d} ({s}); the store is at revision {d} ({s})", .{
+            rollback.remembered_revision, old, rollback.now_revision, new,
         });
-        diag.cause("the store cannot say what its hash was at {d}: it is not the store seen", .{
+        diag.cause("the store has no hash for revision {d}, so it cannot be checked", .{
             rollback.remembered_revision,
         });
     } else if (rollback.now_revision < rollback.remembered_revision) {
@@ -154,5 +155,14 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
     }
     const sentence = "look at which store this is; to keep it as it is, run";
     diag.fix_with(sentence, "zcube store accept-rollback --confirm", .{});
+    return error.BackendFailed;
+}
+
+/// The remembered revision file could not be read, parsed or written (`store_verified.zig`).
+pub fn remembered_unusable(diag: *Diag, path: []const u8, action: []const u8, reason: []const u8) error{BackendFailed} {
+    assert(diag.code == null);
+    diag.raise(.E0216);
+    diag.cause("can't {s} {s}: {s}", .{ action, path, reason });
+    diag.fix(.{ .sentence = "check the state directory (--state-dir) and its permissions" });
     return error.BackendFailed;
 }

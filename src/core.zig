@@ -35,6 +35,7 @@ pub const modules = .{
     @import("store.zig"),
     @import("store_failures.zig"),
     @import("store_memory.zig"),
+    @import("store_verified.zig"),
     @import("test_util.zig"),
     @import("text.zig"),
     @import("why.zig"),

@@ -21,6 +21,8 @@ const http = @import("server_http.zig");
 const replica_controller = @import("replica_controller.zig");
 const Backend = @import("server_store.zig").Backend;
 const server_listen = @import("server_listen.zig");
+const Remembered = @import("server_remember.zig").Remembered;
+const store_verified = @import("store_verified.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -41,6 +43,9 @@ pub const Server = struct {
     backend: *Backend,
     shared: http.Shared,
     driver: Driver,
+    /// Wraps the backend's store: every call the server makes goes through it.
+    verified: store_verified.VerifiedStore,
+    remembered: ?Remembered,
     listener: net.Server,
     group: std.Io.Group,
     accept_future: ?std.Io.Future(void),
@@ -66,6 +71,8 @@ pub const Server = struct {
         const server = try gpa.create(Server);
         errdefer gpa.destroy(server);
         server.* = try init_value(gpa, io, backend, config, options);
+        try server.guard(config, diag);
+        errdefer server.unguard();
         server.listener = try listen(io, config.listen, diag);
         errdefer server.listener.deinit(io);
         try server.spawn(diag);
@@ -117,12 +124,58 @@ pub const Server = struct {
                 .stopping = undefined,
                 .report_failures = options.report_failures,
             },
+            .verified = undefined,
+            .remembered = null,
             .listener = undefined,
             .group = .init,
             .accept_future = null,
             .driver_future = null,
             .watchdog_future = null,
         };
+    }
+
+    /// Puts the `VerifiedStore` between the server and its backend, with the pair remembered by
+    /// the last run (`server_remember.zig`). A memory store remembers nothing: it cannot outlive
+    /// a restart. A Postgres store needs `--state-dir`: there is no directory beside it.
+    fn guard(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
+        var known: ?store_verified.Pair = null;
+        var remember: ?store_verified.Remember = null;
+        if (state_path(config, diag)) |path| {
+            server.remembered = Remembered.open(server.io, path, diag) catch
+                return error.StartFailed;
+            errdefer server.unguard();
+            known = server.remembered.?.load(diag) catch return error.StartFailed;
+            remember = server.remembered.?.interface();
+        } else if (diag.code != null) {
+            return error.StartFailed;
+        }
+        const raw = server.backend.handle();
+        server.verified = store_verified.VerifiedStore.init(raw, server.backend.clock(), remember, known);
+        const guarded = server.verified.interface();
+        server.shared.store = guarded;
+        server.shared.api.verified = &server.verified;
+        server.driver.store = guarded;
+    }
+
+    fn unguard(server: *Server) void {
+        if (server.remembered) |*remembered| remembered.close();
+        server.remembered = null;
+    }
+
+    /// The state directory, null for a memory store. Raises `ZC-E0106` for Postgres without one.
+    fn state_path(config: config_mod.Config, diag: *Diag) ?[]const u8 {
+        if (config.state_dir) |dir| return dir;
+        switch (config.store) {
+            .memory => return null,
+            .sqlite => |path| return std.fs.path.dirname(path) orelse ".",
+            .postgres => {
+                diag.raise(.E0106);
+                diag.cause("a Postgres store needs --state-dir", .{});
+                diag.cause("the server remembers the highest revision it saw in a file there", .{});
+                diag.fix(.{ .sentence = "name a directory outside the store", .command = "zcube-server --state-dir /var/lib/zcube" });
+                return null;
+            },
+        }
     }
 
     fn listen(io: std.Io, where: net.IpAddress, diag: *Diag) Error!net.Server {
@@ -203,6 +256,8 @@ pub const Server = struct {
         server.cancel_tasks();
         server.listener.deinit(server.io);
         const gpa = server.gpa;
+        server.verified.flush();
+        server.unguard();
         server.backend.close();
         gpa.destroy(server);
     }

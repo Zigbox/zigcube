@@ -58,7 +58,7 @@ pub const Driver = struct {
                 .arena = arena.allocator(),
                 .diag = &diag,
             };
-            const wake = driver.replicas.reconcile(&ctx) catch {
+            const wake = driver.step(&ctx) catch {
                 driver.report(&diag);
                 if (watch) |*open| open.close();
                 watch = null;
@@ -73,6 +73,14 @@ pub const Driver = struct {
             if (watch == null) watch = driver.open_watch(&diag);
             _ = driver.wait(&watch, wake, &due, &arena, &diag);
         }
+    }
+
+    /// One step: first the store is checked against what the server remembers (a `status` through
+    /// the `VerifiedStore`, which halts everything on a store that went backwards), then the
+    /// controller runs.
+    fn step(driver: *Driver, ctx: *const controller.Context) controller.Error!controller.Wakeup {
+        _ = try driver.store.status(ctx.diag);
+        return driver.replicas.reconcile(ctx);
     }
 
     const Timers = struct { maintenance_due_ms: u64, compact_due_ms: u64 };

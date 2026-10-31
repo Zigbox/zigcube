@@ -173,6 +173,12 @@ fn backwards(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.went_backwards(diag, rollback) == error.BackendFailed);
 }
 
+fn unusable_file(diag: *diag_mod.Diag) void { // store_failures.zig
+    const reason = "AccessDenied";
+    assert(failures.remembered_unusable(diag, "/var/lib/zcube/remembered", "read", reason) ==
+        error.BackendFailed);
+}
+
 fn future(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.future_read(diag, 9000, 412) == error.FutureRevision);
 }
@@ -393,6 +399,7 @@ const cases = [_]Case{
     relayed(.E0213, store_dropped),
     relayed(.E0214, no_hash),
     relayed(.E0215, backwards),
+    relayed(.E0216, unusable_file),
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),
