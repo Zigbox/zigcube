@@ -48,6 +48,7 @@ const Rig = struct {
     tmp: testing.TmpDir,
     path: []u8,
     server: *server_mod.Server,
+    http_transport: remote_mod.HttpTransport,
     remote: remote_mod.RemoteStore,
     clock_source: clock_mod.RealClock,
 
@@ -64,8 +65,14 @@ const Rig = struct {
         errdefer testing.allocator.free(rig.path);
         rig.server = try start_server(rig.io, rig.path, true);
         errdefer rig.server.stop();
-        const client: http.Client = .{ .io = rig.io, .address = rig.server.address() };
-        rig.remote = remote_mod.RemoteStore.init(testing.allocator, client, "node1");
+        rig.http_transport = .{
+            .client = .{ .io = rig.io, .address = rig.server.address() },
+        };
+        rig.remote = remote_mod.RemoteStore.init(
+            testing.allocator,
+            rig.http_transport.transport(),
+            "node1",
+        );
         rig.clock_source = .{ .io = rig.io };
         return rig;
     }
@@ -83,7 +90,7 @@ const Rig = struct {
     fn restart_server(rig: *Rig) !void {
         rig.server.stop();
         rig.server = try start_server(rig.io, rig.path, false);
-        rig.remote.client.address = rig.server.address();
+        rig.http_transport.client.address = rig.server.address();
     }
 
     /// A request to the public API, for the things a person does (apply).
@@ -205,7 +212,7 @@ test "a server that is not there is ZC-E0503, and the same store works when it r
     try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "127.0.0.1") != null);
 
     rig.server = try start_server(rig.io, rig.path, false);
-    rig.remote.client.address = rig.server.address();
+    rig.http_transport.client.address = rig.server.address();
     diag.reset();
     const renewed = try remote.lease_keepalive(lease.id, &diag);
     try testing.expectEqual(lease.id, renewed.id);

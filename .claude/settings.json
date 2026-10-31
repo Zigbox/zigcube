@@ -10,5 +10,11 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "allow": [
+      "mcp__claude-code-remote__add_repo",
+      "mcp__claude-code-remote__create_session"
+    ]
   }
 }

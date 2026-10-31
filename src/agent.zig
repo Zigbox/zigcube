@@ -37,12 +37,25 @@ const store = @import("store.zig");
 const writers = @import("writers.zig");
 const Clock = @import("clock.zig").Clock;
 
+const root = @import("root");
+
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 const Wakeup = controller.Wakeup;
 
 pub const Error = controller.Error || runtime.Error;
+
+/// The agent's test-only fault, for the cluster simulator's teeth test (docs/core.md, "The
+/// cluster simulation"): the agent ignores every order to stop a container. It is a constant
+/// the program's root file can declare as `pub const agent_teeth_ignore_stop = true;` and no
+/// other way: the one root that does is `sim_teeth_main.zig`, which only the `sim-teeth` build
+/// step compiles. The shipped programs, the tests and the WASM core have other roots, so for
+/// them it is false, and `zcube_agent.zig` asserts that at compile time.
+pub const fault_ignore_stop: bool = if (@hasDecl(root, "agent_teeth_ignore_stop"))
+    root.agent_teeth_ignore_stop
+else
+    false;
 
 pub const Context = struct {
     store: store.Store,
@@ -160,6 +173,18 @@ pub const Agent = struct {
         agent.stops_count = kept;
     }
 
+    /// Forgets the pending stop of the container called `name`, if any: it has stopped.
+    fn forget_stop(agent: *Agent, name: []const u8) void {
+        var kept: u32 = 0;
+        for (agent.stops[0..agent.stops_count]) |stop| {
+            if (std.mem.eql(u8, stop.handle.name(), name)) continue;
+            agent.stops[kept] = stop;
+            kept += 1;
+        }
+        assert(kept <= agent.stops_count);
+        agent.stops_count = kept;
+    }
+
     fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
         for (agent.stops[0..agent.stops_count]) |*stop| {
             if (std.mem.eql(u8, stop.handle.name(), name)) return stop;
@@ -169,6 +194,18 @@ pub const Agent = struct {
 };
 
 // ---- One pass --------------------------------------------------------------------------------
+
+/// True if `seen` was written for another replica that had this one's id: for another
+/// generation (a replica's never changes), or before this replica's key was created, so it
+/// cannot be about it (revisions of one store are comparable; a record is only written after
+/// the replica exists).
+fn is_leftover(
+    seen: *const controller.Entry(records.Observed),
+    item: *const controller.Entry(records.Replica),
+) bool {
+    if (seen.rec.generation != item.rec.generation) return true;
+    return seen.kv.mod_revision < item.kv.create_revision;
+}
 
 const Write = struct { key: []const u8, value: ?[]const u8 };
 
@@ -206,9 +243,17 @@ const Pass = struct {
         pass.observed = seen.items;
     }
 
-    fn observed_of(pass: *const Pass, id: []const u8) ?*const records.Observed {
-        for (pass.observed) |*item| {
-            if (std.mem.eql(u8, item.rec.replica, id)) return &item.rec;
+    /// The observed record of `item`'s replica, unless it is a leftover of an earlier replica
+    /// with the same id (a service deleted and applied again restarts its numbering), which
+    /// must never stand in for this one: such a record is replaced, not obeyed.
+    fn observed_for(
+        pass: *const Pass,
+        item: *const controller.Entry(records.Replica),
+    ) ?*const records.Observed {
+        for (pass.observed) |*seen| {
+            if (!std.mem.eql(u8, seen.rec.replica, item.rec.id)) continue;
+            if (is_leftover(seen, item)) return null;
+            return &seen.rec;
         }
         return null;
     }
@@ -235,15 +280,79 @@ const Pass = struct {
         for (pass.mine) |*item| {
             const replica = &item.rec;
             const listing = find_listing_by_replica(pass.listings, replica.id);
-            const seen = pass.observed_of(replica.id);
+            const seen = pass.observed_for(item);
             if (listing) |found| {
+                if (!is_this_replica(found, item)) {
+                    try pass.replace_stale(found, item, seen);
+                    continue;
+                }
+                pass.agent.forget_stop(found.handle.name());
                 try pass.report(replica, seen, found.status);
             } else if (seen) |record| {
                 if (record.status != .stopped) try pass.report_lost(replica, record);
             } else {
-                try pass.start(replica);
+                try pass.start(item);
             }
         }
+    }
+
+    /// The runtime holds a container of this name that belongs to an earlier replica with the
+    /// same id (a service deleted and applied again restarts its numbering, and the old
+    /// container may not have been cleaned up yet): it is stopped, never adopted, and once it
+    /// has stopped the right one is started in its place. A stop is asked for once and checked
+    /// on later steps, like an orphan's.
+    fn replace_stale(
+        pass: *Pass,
+        stale: *const runtime.Listing,
+        item: *const controller.Entry(records.Replica),
+        seen: ?*const records.Observed,
+    ) Error!void {
+        const ctx = pass.ctx;
+        assert(!is_this_replica(stale, item));
+        assert(std.mem.eql(u8, label_value(stale.labels, runtime.label_replica).?, item.rec.id));
+        if (is_running(stale)) {
+            try pass.stop_once(stale);
+            const status = try ctx.runtime.inspect(stale.handle, ctx.diag);
+            switch (status) {
+                .starting, .running => return,
+                .stopped => {},
+            }
+            // The stop is done: the name's pending stop must not outlive it, or it would
+            // never be forgotten (the listings of this pass still show the old container
+            // running), keep the agent awake, and kill the container started in its place.
+            pass.agent.forget_stop(stale.handle.name());
+        }
+        if (seen) |record| {
+            // A record of this replica means it was started already (and, if the start failed,
+            // is not started again); the stale container is only the name's earlier holder. A
+            // record that says it runs, though, is about a container that is gone.
+            if (record.status != .stopped) try pass.report_lost(&item.rec, record);
+            return;
+        }
+        try pass.start(item);
+    }
+
+    /// Asks for `listing`'s container to stop, once; a later step kills it if it is still
+    /// running after its grace period.
+    fn stop_once(pass: *Pass, listing: *const runtime.Listing) Error!void {
+        assert(is_running(listing));
+        const ctx = pass.ctx;
+        const now = ctx.clock.now_ms();
+        const name = listing.handle.name();
+        if (fault_ignore_stop) return;
+        if (pass.agent.pending_stop(name)) |stop| {
+            if (now < stop.deadline_ms) return;
+            try ctx.runtime.stop(listing.handle, 0, ctx.diag);
+            return;
+        }
+        try ctx.runtime.stop(listing.handle, constants.stop_grace_ms, ctx.diag);
+        if (pass.agent.stops_count == constants.agent_stops_max) return;
+        pass.agent.stops[pass.agent.stops_count] = .{
+            .handle = listing.handle,
+            .deadline_ms = now + constants.stop_grace_ms,
+        };
+        pass.agent.stops_count += 1;
+        assert(pass.agent.pending_stop(name) != null);
     }
 
     /// Writes the observed record for a container the runtime has, if it differs from the
@@ -318,9 +427,19 @@ const Pass = struct {
         });
     }
 
-    fn start(pass: *Pass, replica: *const records.Replica) Error!void {
+    fn start(pass: *Pass, item: *const controller.Entry(records.Replica)) Error!void {
+        const replica = &item.rec;
+        const created_revision = item.kv.create_revision;
         const ctx = pass.ctx;
-        const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = replica.id }};
+        assert(created_revision > 0);
+        assert(replica.id.len > 0);
+        var created_buffer: [20]u8 = undefined;
+        const created = created_text(&created_buffer, created_revision);
+        const labels = [_]runtime.Label{
+            .{ .key = runtime.label_replica, .value = replica.id },
+            .{ .key = runtime.label_image, .value = replica.image },
+            .{ .key = runtime.label_created, .value = created },
+        };
         const env = ctx.arena.alloc(runtime.EnvVar, replica.env.len) catch
             return failures.no_memory(ctx.diag);
         for (replica.env, env) |pair, *slot| slot.* = .{ .name = pair[0], .value = pair[1] };
@@ -379,25 +498,11 @@ const Pass = struct {
     /// Stops running containers of ours whose replica key is gone. Asked for once; a container
     /// still running after its grace period is killed on a later step.
     fn orphan_containers(pass: *Pass) Error!void {
-        const ctx = pass.ctx;
-        const now = ctx.clock.now_ms();
         for (pass.listings) |listing| {
             const id = label_value(listing.labels, runtime.label_replica) orelse continue;
             if (pass.is_desired(id)) continue;
             if (!is_running(&listing)) continue;
-            const name = listing.handle.name();
-            if (pass.agent.pending_stop(name)) |stop| {
-                if (now < stop.deadline_ms) continue;
-                try ctx.runtime.stop(listing.handle, 0, ctx.diag);
-                continue;
-            }
-            try ctx.runtime.stop(listing.handle, constants.stop_grace_ms, ctx.diag);
-            if (pass.agent.stops_count == constants.agent_stops_max) continue;
-            pass.agent.stops[pass.agent.stops_count] = .{
-                .handle = listing.handle,
-                .deadline_ms = now + constants.stop_grace_ms,
-            };
-            pass.agent.stops_count += 1;
+            try pass.stop_once(&listing);
         }
     }
 
@@ -446,6 +551,27 @@ fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
     return null;
 }
 
+fn created_text(buffer: *[20]u8, revision: store.Revision) []const u8 {
+    assert(revision > 0);
+    // 20 digits hold a u64.
+    return std.fmt.bufPrint(buffer, "{d}", .{revision}) catch unreachable;
+}
+
+/// False if the container was started for another replica that had this one's id: its image
+/// or the revision its replica key was created at differ. A container without those labels is
+/// not this replica's either (the project is pre-release: no container predates the labels).
+fn is_this_replica(
+    listing: *const runtime.Listing,
+    item: *const controller.Entry(records.Replica),
+) bool {
+    assert(label_value(listing.labels, runtime.label_replica) != null);
+    const image = label_value(listing.labels, runtime.label_image) orelse return false;
+    if (!std.mem.eql(u8, image, item.rec.image)) return false;
+    const text = label_value(listing.labels, runtime.label_created) orelse return false;
+    var buffer: [20]u8 = undefined;
+    return std.mem.eql(u8, text, created_text(&buffer, item.kv.create_revision));
+}
+
 fn find_listing_by_replica(
     listings: []const runtime.Listing,
     id: []const u8,
@@ -484,4 +610,11 @@ fn same_state(first: *const records.Observed, second: *const records.Observed) b
         if (!left.equal(second.exit.?)) return false;
     }
     return true;
+}
+
+// The test-only fault is a constant only a root file can switch on, and no root that runs these
+// tests (or ships) does: so every test here, and every other, sees the agent that stops what it
+// is told to stop. `sim-teeth` is the one build that sees it on.
+test "the test-only fault is off in this build" {
+    try std.testing.expect(!fault_ignore_stop);
 }

@@ -278,7 +278,7 @@ fn agent_unreachable(diag: *diag_mod.Diag) void { // agent_http.zig
     );
 }
 
-fn agent_refused(diag: *diag_mod.Diag) void { // agent_remote.zig
+fn agent_refused(diag: *diag_mod.Diag) void { // agent_client.zig
     sample(diag, .E0504, &.{
         "zcube-server answered 400: the request can't be understood (ZC-E0104)",
         "body: is not what this endpoint takes: see docs/api.md",

@@ -8,6 +8,10 @@
 //!     failure; the PASS line names the backends that ran.
 //!   - `sim-c0` with a fresh seed, native against WASM, as CI's second sim step does. A failure
 //!     prints the seed in the `sim-c0: seed N` line above it.
+//!   - `sim-cluster` with a fresh seed and a small number of operations, native against WASM, and
+//!     `sim-teeth`: the same simulator with the agent's test-only fault on, which must fail
+//!     (docs/core.md, "The cluster simulation"). A failure prints the seed in the
+//!     `sim-cluster: seed N` line above it.
 //!   - The one gate a root build container cannot see: CI runs `zig build test` as an ordinary
 //!     user. When this runs as root and <user> is not "-", the committed tree is checked out into
 //!     a scratch worktree owned by <user> and tested as that user, with its own cache.
@@ -15,7 +19,7 @@
 //! Then it prints the line a report quotes:
 //!
 //!     check: PASS 1a2b3c4d5e6f (build test tidy errors-site wasm-check wasm-test console-wasm
-//!     store:memory,sqlite sim-c0, test as tester)
+//!     store:memory,sqlite sim-c0 sim-cluster sim-teeth, test as tester)
 //!
 //! It also says when the build cache has grown past `cache_note_bytes`, with the command that
 //! empties it, because a full disk costs more than a rebuild.
@@ -30,6 +34,7 @@ const Io = std.Io;
 const scratch = ".zig-cache/zcube-check-tree";
 const cache_note_bytes: u64 = 6 << 30;
 const sim_operations = "200";
+const cluster_operations = "40";
 const gates = "build test tidy errors-site wasm-check wasm-test console-wasm";
 
 /// Runs `argv` (in `cwd` if given) with its errors on stderr; fails unless it exits 0.
@@ -106,6 +111,7 @@ pub fn main(init: std.process.Init) !u8 {
         });
         return 1;
     };
+    sim_cluster_gates(gpa, io, zig, label, err) catch return 1;
     if (as_user) {
         test_as(gpa, io, zig, user, err) catch {
             try err.print("check: FAIL {s} (zig build test as {s})\n", .{ label, user });
@@ -118,8 +124,42 @@ pub fn main(init: std.process.Init) !u8 {
         "";
     note_cache(gpa, io, err);
     const stores = if (postgres) "store:memory,sqlite,postgres" else "store:memory,sqlite";
-    try err.print("check: PASS {s} ({s} {s} sim-c0{s})\n", .{ label, gates, stores, tail });
+    try err.print("check: PASS {s} ({s} {s} sim-c0 sim-cluster sim-teeth{s})\n", .{
+        label, gates, stores, tail,
+    });
     return 0;
+}
+
+/// `sim-cluster` on a fresh seed (native against WASM), then `sim-teeth`. Prints the seed first.
+/// Both build in Debug: the WASM core is already built that way by `wasm-check`, and a
+/// ReleaseSafe build of the runner alone costs a minute of `check`.
+fn sim_cluster_gates(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    label: []const u8,
+    err: *Io.Writer,
+) !void {
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-cluster: seed {d}\n", .{seed});
+    try err.flush();
+    const seed_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{seed});
+    const cluster = [_][]const u8{
+        zig, "build", "sim-cluster", seed_option, "-Dops=" ++ cluster_operations,
+    };
+    run(io, &cluster, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-cluster: its seed is the line above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    run(io, &.{ zig, "build", "sim-teeth" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-teeth: the simulator did not catch " ++
+            "the agent's test-only fault)\n", .{label});
+        return error.CommandFailed;
+    };
 }
 
 /// Says so when `.zig-cache/o` is past `cache_note_bytes`. Every rebuild of a changed binary
