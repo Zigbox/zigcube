@@ -594,6 +594,7 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     sim.ops = b.option(u32, "ops", ops_help) orelse 100;
     add_sim_step(b, sim);
     add_sim_cluster_step(b, sim);
+    add_sim_teeth_step(b, sim);
 }
 
 /// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]`: the cluster
@@ -635,6 +636,42 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }
+}
+
+/// The seeds the teeth test runs and the most the simulator may need to catch the agent's
+/// test-only fault (docs/core.md, "The cluster simulation"): `sim-teeth` fails if none of them
+/// fails. The fault is caught by the first seed or two; the margin is for a change of the model.
+const teeth_seeds_max = 10;
+const teeth_operations = 100;
+
+/// `zig build sim-teeth`: the cluster simulator built with the agent ignoring every stop order
+/// (`src/sim_teeth_main.zig`, the only root that can switch it on), run over seeds 1 to
+/// `teeth_seeds_max`; it passes only if at least one seed fails. Run by `check`, not by `test`:
+/// it compiles the simulator a second time (in Debug, which compiles in seconds and runs seed 1
+/// in about a second). The executable is run, never installed.
+fn add_sim_teeth_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_teeth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_teeth_main.zig"),
+            .target = sim.target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    // For shrinking the fault's failures by hand (`sim_teeth --seeds 1..3 100 --shrink`); only
+    // this named step installs it, so `zig build` never puts it in zig-out.
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("sim-teeth-exe", "Install the fault-on simulator runner (test-only)")
+        .dependOn(&install.step);
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                         b.fmt("1..{d}", .{teeth_seeds_max}),
+        b.fmt("{d}", .{teeth_operations}), "--expect-fail",
+    });
+    const help = b.fmt("Run the cluster simulator with the agent's test-only fault on; it must " ++
+        "fail within {d} seeds", .{teeth_seeds_max});
+    b.step("sim-teeth", help).dependOn(&run.step);
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit

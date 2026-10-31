@@ -1410,7 +1410,17 @@ pub const Options = struct {
     nodes: ?u32 = null,
     /// See `Cluster.liveness`.
     liveness: bool = true,
+    /// Liveness mode: the operation before which the faults end, instead of the seed's choice
+    /// (`heal_operation`). A shrunk replay needs it: the seed's choice is drawn from the number of
+    /// operations, so a shorter run would heal elsewhere and be a different run.
+    heal_at: ?u32 = null,
 };
+
+/// The operation before which the faults end in a liveness run of `operations` operations from
+/// `seed`, as the run prints it; what `Options.heal_at` overrides.
+pub fn heal_point(seed: u64, operations: u32) u32 {
+    return heal_operation(seed, operations);
+}
 
 /// The operation before which the faults end (liveness mode): the second half of the run, or
 /// part of it, is fault-free workload. Drawn from the seed alone.
@@ -1440,7 +1450,10 @@ pub fn simulate(
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
     c.liveness = options.liveness;
-    const heal_at = if (options.liveness) heal_operation(seed, operations) else operations;
+    const heal_at = if (!options.liveness)
+        operations
+    else
+        options.heal_at orelse heal_operation(seed, operations);
     if (options.liveness) {
         report.print("liveness: on; faults for the first {d} of {d} operations, then none; " ++
             "converged {d} ms after the last operation\n", .{
@@ -1474,7 +1487,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         c.fault_totals = c.phase_totals();
     }
     try safety(c);
-    try enough_work_under_faults(c, heal_at);
+    try enough_work_under_faults(c, @min(heal_at, operations));
     try work_under_ceiling(c);
 }
 

@@ -23,6 +23,8 @@ thread, socket, file, libc, `std.Io` value, real clock, source of randomness or 
 | `agent_state.zig` | What the agent persists, behind `AgentState`; `SimState` models what fsynced files guarantee, with `arm_crash` (a crash at a write point) and `crash_now` (between calls) |
 | `agent_records.zig` | The container records and adoption rules, over `AgentState`; shared by `FakeRuntime` and `sim_node.zig` |
 | `sim_net.zig` | The network between agents and server: drop, delay, duplicate, reorder, one-way partitions; parked requests arrive when the cluster calls `tick` with the clock |
+| `sim_clock.zig` | A node's monotonic clock: an offset from the server's, a bounded rate error, jumps forward (a suspend), never backwards |
+| `sim_store.zig` | `AckLossStore`: the lost acknowledgement (a transaction that commits and returns an error) over the memory store, and a switch for outages |
 | `sim_node.zig` | One simulated node: a `SimRuntime` and a `SimState` joined by `agent_records` |
 | `why.zig` | `zcube why`: subject to causal chain, structured steps, and their text |
 | `api.zig` | The read-only endpoints of api.md, bytes to bytes |
@@ -30,6 +32,7 @@ thread, socket, file, libc, `std.Io` value, real clock, source of randomness or 
 | `sim_runtime.zig` | `Runtime` implemented in the core, deterministic, with faults |
 | `sim_world.zig` | The smallest honest shell: server, agent, store, runtime on virtual time |
 | `sim_c0.zig` | The C0 simulation and its fuzz variant |
+| `sim_cluster.zig` | The cluster simulation: N agents, a network, a store, the controllers, one seed ([below](#the-cluster-simulation)) |
 
 ## The step model
 
@@ -217,3 +220,91 @@ of it (`Request.hold`, an atomic request counter), and the rest of what it taugh
   link, delivers what is due: so a stale write can land after the server's own clock has moved on.
 - **Records.** `sim_node.zig` runs the same `agent_records` code as `FakeRuntime`; an unknown image
   is refused and writes nothing in both. `scan` skips a container whose spec the host cannot read.
+
+## The cluster simulation
+
+`zig build sim-cluster` (`src/sim_cluster.zig`, run by `sim_cluster_main.zig` natively and by
+`wasm_core.zig` as WebAssembly) is `sim-c0` for a fleet: the server's controllers and API, up to
+four nodes, each with the real `Agent`, the real `agent_loop` policy and `agent_client` over
+`SimNet`, a clock of its own, a `SimNode` (containers that outlive the agent, agent files that a
+crash leaves as the files would be), and the memory store behind a lost-acknowledgement layer. One
+seed fixes everything; the run's report ends in a hash of the whole store and every node's runtime,
+so one seed twice gives one hash and the native and WASM reports agree byte for byte. `sim_world.zig`
+and `sim_c0.zig` are untouched: `sim-c0`'s report is what it was.
+
+**The swarm.** The seed picks the node count (1 to 4), the rate of every fault below (zero a
+quarter of the time, so some worlds have no partitions and some no crashes) and the weights of the
+workload, and the run prints them first. A report therefore says which world it ran in.
+
+**The faults**, each at the seed's rate and kept low enough that a cluster still works while faulty
+(the run fails if the fault phase got too little agent work done):
+
+| Layer | Faults |
+| --- | --- |
+| Network, per link and direction | drop a request, drop a reply (after the server committed: the agent sees a failure for a write that happened, the case the simulator makes common), delay, duplicate, reorder (a parked request lands when the clock reaches it, even after the world moved on), one-way and two-way partitions that heal |
+| Store | a lost acknowledgement (commit, then an error to the caller), outages |
+| Server | restarts (a new instance number, memory gone, store kept) |
+| Agent | crash at any step boundary or at any write point of its files (`SimState`: a put that is renamed into place is whole or absent, an append can lose its tail), restart that adopts by replica id |
+| Node clock | a rate error up to the swarm's `clock_rate_ppm_max`, an offset, a suspend that jumps the node's `CLOCK_BOOTTIME`-like clock forward |
+| Runtime | `random_fault` of `SimRuntime`: an oom, a pid limit, a lost container, a crash exit |
+| Workload | apply, scale, delete, a broken image, the passage of time |
+
+**What it proves.** Each virtual second and after each operation (during the heal as well): `sim-c0`'s
+invariants read over the whole store (every decision has a reason and a cause that exists; `why`
+terminates and ends in a cause); no container lives longer than 120 s of reachable time on a node
+that no replica assigns it to; a placed replica of a good image is running on its node within 24 s
+of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime)
+and none starves (5 successful steps per minute on a node up for half the fault phase). With
+**liveness mode**, the default, the faults run for the first `H` operations, `H` drawn from the seed
+alone between half the run and all of it, then every fault is off for the rest of the operations,
+and 240 s of virtual time after the last one every service has the replicas it asked for (held ones
+for a broken image), each in the image and generation it asked for, and no node runs anything
+else. `-Dliveness=false` keeps the faults to the end and checks only safety.
+
+**Duplicates are counted, not failed.** Without leases and fencing (slice 6) a partition can leave a
+replica running on two nodes. The report prints the replica-seconds, with the note that the number
+is counted and not a pass; slice 6 turns the counter into a failure. Nobody should read it as a pass.
+
+**What it does not prove.** Real processes, `kill -9` and real supervisors (`agent-smoke` and
+`demo-c0` start those); Postgres and SQLite (the conformance suite covers the store contract; the
+simulator's store is the memory store, and a lost acknowledgement is what a real database's
+connection loss after commit would look like, not a model of its failure modes); the real `zbx`
+(the runtime is `SimRuntime`, which stops at once unless told to be slow); the `zcube` command;
+real time and the real OS clock; TCP and HTTP framing (the network carries the bytes of
+`agent_api`, and the transport faults are the ones above); a disk that corrupts rather than loses a
+tail; the scheduler and node controller (slice 3: placement is C0's). A bug in any of those, and
+anything the models leave out, can pass every seed. A passing simulation is never a passed demo.
+
+**Teeth.** A simulator that never fails proves nothing, so the agent has one test-only fault:
+`agent.fault_ignore_stop`, "the agent ignores every order to stop a container". It is a constant
+that a program's root file switches on by declaring `agent_teeth_ignore_stop`; the only root that
+does is `src/sim_teeth_main.zig`, which only `zig build sim-teeth` compiles. The shipped binaries
+have other roots, and `zcube_agent.zig` asserts at compile time that it is off, as a unit test
+does for the test build. `zig build sim-teeth` runs that simulator over seeds 1 to 10 at 100
+operations and passes only if a seed fails: it fails at seed 1 (20 of 20 seeds fail in a first
+trial) with "a container runs that no replica assigns to its node". `check` runs it. It builds in
+Debug because that takes 7 s where ReleaseSafe takes 50.
+
+**Commands.**
+
+```
+zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]
+zig build -Doptimize=ReleaseSafe sim-cluster-exe
+zig-out/bin/sim_cluster <seed> <ops> [<nodes>] [--liveness=false] [--heal-at=H]
+zig-out/bin/sim_cluster --seeds A..B <ops> [<nodes>] [--liveness=false] [--shrink]
+```
+
+The first runs one seed natively and as WASM and compares. The range form prints a line per failing
+seed (`seed N: FAILED: <what>`) and its replay command, then a count; the exit code is 1 if any
+failed. **Replay:** the printed command reruns exactly that seed; its `--heal-at` is the heal point
+the run printed. **Shrink:** `--shrink` bisects the operations of each failing seed to the smallest
+count that fails with the same symptom, holding `H` where the full run had it (it is drawn from the
+operation count, so a shorter run would otherwise heal elsewhere); the printed replay of the shrunk
+count carries `--heal-at`, so it is the same run, cut short. It assumes that more operations keep
+failing, and checks only that its answer fails and one fewer does not fail the same way, so on a
+failure that comes and goes it may not be the smallest. `zig build sim-teeth-exe` installs the
+fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the teeth fault. A run at
+100 operations takes about 0.7 s natively in ReleaseSafe.
+
+`zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
+operations, native against WASM, and `sim-teeth`.

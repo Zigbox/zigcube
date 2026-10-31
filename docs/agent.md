@@ -7,6 +7,12 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 
 ## The pieces
 
+What moved into the core in slice 2b, so that the cluster simulator runs the code production runs:
+the loop policy (`agent_loop.zig`, out of `agent_run.zig`, which keeps the process, the signal and
+the real wait), the endpoint client (`agent_client.zig`, out of `agent_remote.zig`, which keeps the
+HTTP transport), what the agent persists (`AgentState` in `agent_state.zig`, with `DirState` as the
+shell's files) and the container records (`agent_records.zig`, shared with `FakeRuntime`).
+
 | File | Core or shell | What it is |
 | --- | --- | --- |
 | `agent.zig` | core | The reconcile step: desired replicas against what the runtime lists |
@@ -24,6 +30,7 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 | `fake_supervisor.zig` | shell | `zcube-agent supervise <dir>`: one container's supervisor |
 | `fake_files.zig` | shell | The files the agent and a supervisor meet in; `DirState` is `AgentState` over them |
 | `sim_node.zig` | core | One simulated node: `SimRuntime` plus `SimState` joined by `agent_records`, with crashes at write points and step boundaries |
+| `sim_clock.zig`, `sim_net.zig`, `sim_store.zig`, `sim_cluster.zig` | core | The simulator's node clocks, network, lost acknowledgements and the world that runs the agents of N nodes ([core.md](core.md#the-cluster-simulation)) |
 | `agent_smoke.zig` | test | `zig build agent-smoke`, the server and agent as real processes |
 
 The agent is single-threaded. Nothing in it can race what it starts, and `zbx`'s `start` needs a

@@ -37,12 +37,25 @@ const store = @import("store.zig");
 const writers = @import("writers.zig");
 const Clock = @import("clock.zig").Clock;
 
+const root = @import("root");
+
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 const Wakeup = controller.Wakeup;
 
 pub const Error = controller.Error || runtime.Error;
+
+/// The agent's test-only fault, for the cluster simulator's teeth test (docs/core.md, "The
+/// cluster simulation"): the agent ignores every order to stop a container. It is a constant
+/// the program's root file can declare as `pub const agent_teeth_ignore_stop = true;` and no
+/// other way: the one root that does is `sim_teeth_main.zig`, which only the `sim-teeth` build
+/// step compiles. The shipped programs, the tests and the WASM core have other roots, so for
+/// them it is false, and `zcube_agent.zig` asserts that at compile time.
+pub const fault_ignore_stop: bool = if (@hasDecl(root, "agent_teeth_ignore_stop"))
+    root.agent_teeth_ignore_stop
+else
+    false;
 
 pub const Context = struct {
     store: store.Store,
@@ -325,6 +338,7 @@ const Pass = struct {
         const ctx = pass.ctx;
         const now = ctx.clock.now_ms();
         const name = listing.handle.name();
+        if (fault_ignore_stop) return;
         if (pass.agent.pending_stop(name)) |stop| {
             if (now < stop.deadline_ms) return;
             try ctx.runtime.stop(listing.handle, 0, ctx.diag);
@@ -595,4 +609,11 @@ fn same_state(first: *const records.Observed, second: *const records.Observed) b
         if (!left.equal(second.exit.?)) return false;
     }
     return true;
+}
+
+// The test-only fault is a constant only a root file can switch on, and no root that runs these
+// tests (or ships) does: so every test here, and every other, sees the agent that stops what it
+// is told to stop. `sim-teeth` is the one build that sees it on.
+test "the test-only fault is off in this build" {
+    try std.testing.expect(!fault_ignore_stop);
 }
