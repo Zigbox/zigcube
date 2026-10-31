@@ -1313,7 +1313,8 @@ fn run_steps(c: *Cluster, operations: u32) Failure!void {
 /// the 23 and 39 that the old fault rates left.
 fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
     const during = c.fault_totals.?;
-    try check(c, during.agent_steps >= @divFloor(operations, 2), "too few agent steps while faults were on");
+    const steps_min = @divFloor(operations, 2);
+    try check(c, during.agent_steps >= steps_min, "too few agent steps while faults were on");
     try check(c, during.delivered >= operations, "too few requests reached the server " ++
         "while faults were on");
 }
