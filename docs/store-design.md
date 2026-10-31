@@ -256,6 +256,10 @@ follow the design above, with these differences of detail. Each is also in the s
   (all C1). A result is held whole by libpq, so a watch batch of 256 events can briefly hold
   256 values; only list pages are bounded in bytes.
 
+## Fault tests (C1 slice 10c)
+
+`zig build test-store-faults -Dbackend=postgres|sqlite [-Dseed=N]` (`src/store_faults.zig`) drives four client threads and one reconnecting watcher against a real store. Each client makes 250 calls on a connection of its own: reads and compare-and-set on register keys, blind puts, and compare-and-sets that must fail, whose failure branch puts an audit key. Every call is recorded by `testing/history.zig` with a globally unique value token. For Postgres, the clients connect through `testing/fault_proxy.zig`, and the main thread plays a schedule drawn from the seed: latency, `cut_all`, `cut_after` at varied byte counts (so cuts land mid-transaction and near `COMMIT`), one-way stalls, partitions, the black hole, `heal`. A ZC-E0213 ("outcome unknown") is recorded as unknown, any other store error as failed. At the end the proxy is healed, the revision and the whole log are read on a direct connection, and `history.check` and `check_watch` judge the run; a failure prints the verdict and the seed. SQLite has no connection to cut, so no proxy applies: it runs the same clients and checker with no faults, which tests the checker and the store's concurrency, not recovery.
+
 ## k3s's kine: what I take and what I leave
 
 kine presents an etcd API on SQL. This section is from my knowledge of its design, not from

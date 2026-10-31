@@ -112,6 +112,7 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
         const name = b.fmt("check-store-{s}", .{@tagName(fixed)});
         add_store_step(b, name, "Run the store conformance suite for check", options);
     }
+    add_store_faults_step(b, store_options);
     const pg_dev = add_pg_dev_steps(b);
     // The demo needs a real store: `-Dbackend=memory` (which test-store takes) runs it on SQLite.
     const demo_backend: Backend = switch (backend orelse .sqlite) {
@@ -438,6 +439,42 @@ fn add_store_step(
         run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES", step_options.postgres);
         run.setEnvironmentVariable("ZCUBE_TEST_POSTGRES_REQUIRED", "1");
     }
+    step.dependOn(&run.step);
+}
+
+/// `zig build test-store-faults -Dbackend=postgres|sqlite [-Dseed=N] [-Dpostgres=...]`: client
+/// threads against a store behind the fault proxy (Postgres) or alone (SQLite), every call
+/// recorded and checked (src/store_faults.zig). Never cached; there is no default backend that
+/// needs no database, so `memory` runs on SQLite's step options and is refused.
+fn add_store_faults_step(b: *std.Build, step_options: StoreStepOptions) void {
+    const step = b.step("test-store-faults", "Run the store fault tests (-Dbackend=...)");
+    const exe = b.addExecutable(.{
+        .name = "store_faults",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/store_faults.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    run.setCwd(b.path("."));
+    switch (step_options.backend) {
+        .postgres => {
+            run.addArgs(&.{ "--backend", "postgres", "--postgres", step_options.postgres });
+        },
+        .sqlite => run.addArgs(&.{ "--backend", "sqlite" }),
+        .memory => {
+            step.dependOn(&b.addFail("test-store-faults needs -Dbackend=postgres or sqlite").step);
+            return;
+        },
+    }
+    if (step_options.seed) |seed| run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
     step.dependOn(&run.step);
 }
 
