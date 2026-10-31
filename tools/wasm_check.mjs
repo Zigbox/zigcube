@@ -4,6 +4,8 @@
 //   node tools/wasm_check.mjs --wasi <core_tests.wasm>   the core's unit tests under WASI (zig build wasm-test)
 //   node tools/wasm_check.mjs --sim <zcube_core.wasm> <seed> <operations> <native scenario> <native fuzz>
 //                                                        the C0 simulation, compared with the native run (zig build sim-c0)
+//   node tools/wasm_check.mjs --sim-cluster <zcube_core.wasm> <seed> <operations> <nodes> <liveness> <native report>
+//                                                        the cluster simulation, compared with the native run (zig build sim-cluster)
 //
 // Why JavaScript, when docs/STYLE.md prefers Zig tooling: the check must execute a WebAssembly
 // module, and neither Zig's standard library nor the CI image has a WebAssembly runtime (no
@@ -18,7 +20,8 @@ import { join } from "node:path";
 
 const wasi = process.argv[2] === "--wasi";
 const sim = process.argv[2] === "--sim";
-const path = process.argv[wasi || sim ? 3 : 2];
+const simCluster = process.argv[2] === "--sim-cluster";
+const path = process.argv[wasi || sim || simCluster ? 3 : 2];
 if (!path) {
   console.error("usage: node tools/wasm_check.mjs [--wasi | --sim ...] <module.wasm>");
   process.exit(2);
@@ -42,6 +45,26 @@ function firstDifference(left, right) {
     if (a[i] !== b[i]) return `line ${i + 1}:\n  native: ${a[i]}\n  wasm:   ${b[i]}`;
   }
   return "(no difference found)";
+}
+
+if (simCluster) {
+  // Same contract as --sim: the native report arrives as a file; the two must be equal byte for byte.
+  const [wasmPath, seedText, operationsText, nodesText, livenessText, nativePath] = process.argv.slice(3);
+  const exports = await instantiate(readFileSync(wasmPath));
+  const started = Date.now();
+  const failed = exports.zcube_sim_cluster(BigInt(seedText), Number(operationsText), Number(nodesText), livenessText === "true" ? 1 : 0);
+  const seconds = ((Date.now() - started) / 1000).toFixed(1);
+  const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_cluster_report_ptr(), exports.zcube_cluster_report_len());
+  const wasmText = new TextDecoder().decode(rendered);
+  const nativeText = readFileSync(nativePath, "utf8");
+  if (failed !== 0 || wasmText !== nativeText) {
+    console.error(`sim-cluster (seed ${seedText}): wasm ${failed === 0 ? "held every check" : "failed"}; reports ${wasmText === nativeText ? "agree" : "differ"}`);
+    if (wasmText !== nativeText) console.error(firstDifference(nativeText, wasmText));
+    console.error(wasmText);
+    process.exit(1);
+  }
+  console.log(`sim-cluster: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}; wasm ${seconds} s)`);
+  process.exit(0);
 }
 
 if (sim) {
@@ -88,7 +111,15 @@ if (wasi) {
     returnOnExit: true,
     stderr: logFd,
   });
-  const { instance } = await WebAssembly.instantiate(readFileSync(path), host.getImportObject());
+  // Every WASI import goes through a JavaScript function. Node's native import, called straight
+  // from wasm, allocates in `uvwasi_fd_write`, which reports external memory to V8; with the
+  // test heap grown past ~130 MiB that starts a full GC *inside* the call, and V8 (Node 22.23)
+  // dies in SIGSEGV walking the wasm frame (`IterateTurbofanOptimizedFrame`), under both
+  // compilers and with no trap. A JavaScript import has a frame V8 can walk.
+  const imports = host.getImportObject();
+  const preview1 = imports.wasi_snapshot_preview1;
+  for (const [name, native] of Object.entries(preview1)) preview1[name] = (...args) => native(...args);
+  const { instance } = await WebAssembly.instantiate(readFileSync(path), imports);
   const code = host.start(instance);
   closeSync(logFd);
   const output = readFileSync(log, "utf8");

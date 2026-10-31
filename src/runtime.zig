@@ -69,6 +69,11 @@ pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
 /// The label every container carries so that a restarted agent can re-adopt it.
 pub const label_replica = "zcube.replica";
+/// The image digest the container was started for, and the store revision its replica key was
+/// created at (decimal): together they tell a container from an earlier replica with the same
+/// id (a service deleted and applied again) from this one's.
+pub const label_image = "zcube.image";
+pub const label_created = "zcube.created";
 
 pub const Limits = struct {
     cpu_millis: ?u32 = null,

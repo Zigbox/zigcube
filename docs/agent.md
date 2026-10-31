@@ -7,18 +7,30 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 
 ## The pieces
 
+What moved into the core in slice 2b, so that the cluster simulator runs the code production runs:
+the loop policy (`agent_loop.zig`, out of `agent_run.zig`, which keeps the process, the signal and
+the real wait), the endpoint client (`agent_client.zig`, out of `agent_remote.zig`, which keeps the
+HTTP transport), what the agent persists (`AgentState` in `agent_state.zig`, with `DirState` as the
+shell's files) and the container records (`agent_records.zig`, shared with `FakeRuntime`).
+
 | File | Core or shell | What it is |
 | --- | --- | --- |
 | `agent.zig` | core | The reconcile step: desired replicas against what the runtime lists |
 | `agent_api.zig` | core | The server's side of the agent endpoints, bytes in and bytes out |
-| `agent_remote.zig` | shell | `Store` implemented over those endpoints; the wait between steps |
+| `agent_client.zig` | core | `Store` implemented over those endpoints, on a `Transport` (a call that may not answer) |
+| `agent_loop.zig` | core | The loop policy as a state machine over virtual time: step, pause, watch, stop; what to report |
+| `agent_records.zig` | core | The container records (`spec.json`, `run.json`), the order of their writes, `scan`, and `classify`: the one record layer for `FakeRuntime` and the simulator |
+| `agent_state.zig` | core | `AgentState` (what the agent persists) and `SimState`, which models the files and crashes at write points |
+| `agent_remote.zig` | shell | `HttpTransport`: the `Transport` over the HTTP client |
 | `agent_http.zig` | shell | The HTTP client: one request per connection, the agent closes first |
 | `agent_run.zig` | shell | The loop: step, wait, report failures once, back off, stop on a signal |
 | `agent_config.zig` | shell | Flags and the ZON file; the images fixture |
 | `zcube_agent.zig` | shell | The process: panic handler, exit codes, `supervise` mode |
 | `fake_runtime.zig` | shell | `Runtime` with real host processes |
 | `fake_supervisor.zig` | shell | `zcube-agent supervise <dir>`: one container's supervisor |
-| `fake_files.zig` | shell | The files the agent and a supervisor meet in |
+| `fake_files.zig` | shell | The files the agent and a supervisor meet in; `DirState` is `AgentState` over them |
+| `sim_node.zig` | core | One simulated node: `SimRuntime` plus `SimState` joined by `agent_records`, with crashes at write points and step boundaries |
+| `sim_clock.zig`, `sim_net.zig`, `sim_store.zig`, `sim_cluster.zig` | core | The simulator's node clocks, network, lost acknowledgements and the world that runs the agents of N nodes ([core.md](core.md#the-cluster-simulation)) |
 | `agent_smoke.zig` | test | `zig build agent-smoke`, the server and agent as real processes |
 
 The agent is single-threaded. Nothing in it can race what it starts, and `zbx`'s `start` needs a
@@ -66,6 +78,11 @@ finds what its predecessor started and the core's rule "a container the runtime 
 replica is adopted, never started twice" does the rest. The agent holds an exclusive lock on the
 state directory, so two agents cannot share it (`ZC-E0506`).
 
+A listed container is adopted only if it is the replica's own: it carries the labels `zcube.image`
+and `zcube.created` (the revision the replica key was created at; a container with neither label is not the replica's), and a service deleted and
+applied again reuses replica ids, so a mismatch means an earlier replica's container. That one is
+stopped (asked once, killed after its grace period) and, once it has stopped, the right one starts.
+
 **`lost`.** A container with no `run.json` whose supervisor is gone (the lock is free and the
 supervisor had started) is `lost` with `ZC-E0509`. The first time the agent sees that, it kills the
 supervisor's process group, so a lost container does not run on, and writes `run.json` with `lost`,
@@ -78,8 +95,25 @@ records the reason; `lost` kills the supervisor and leaves the verdict to the lo
 fault waits for its replica to exist and run, and is dropped once the container has ended.
 
 **Retention.** The state directory holds at most `fake_containers_max` containers. A start past
-that removes the oldest stopped one, which is safe: the core records a stopped container's end in
+that removes the oldest stopped one (`agent_records.remove_container`: spec first, then the other
+files and the directory, each removal synced), which is safe: the core records a stopped container's end in
 the observed state, and a missing stopped container with a `stopped` record is left alone.
+
+**One record layer.** `FakeRuntime` and the simulator's `SimNode` both persist through
+`agent_records` over `AgentState` (`DirState` here, `SimState` in the simulation), so the crash tests
+exercise production's write sequence. A start puts `spec.json` before anything runs; a removal
+unlinks it first, so a directory without a readable spec is not a container. `scan` skips a
+container whose spec is empty, damaged or unreadable (the host refused to read it, or it is too
+large), and the others are still listed; ZC-E0502 is for the state directory itself failing (a
+refused directory listing included: only a missing one means "no containers"). `SimNode` goes
+through the same `classify` as production: a spec whose container never started is `starting` until
+`fake_start_timeout_ms` on the simulation's clock, then lost with ZC-E0509; a stop keeps the record
+and `run.json`, and `make_room` evicts the oldest stopped one before the next `spec.json` is written. A start
+of an image not in the fixtures is refused with `ZBX-E0501` before anything is written, in both paths
+(`agent_records.has_image`). `AgentState.remove` of a name ending in `/` removes an empty directory,
+durably; that is how `remove_container` finishes. `DirState` fsyncs a file and then its directory on
+every put and remove; `SimState` models exactly that (see `agent_state.zig`'s header) and loses the
+unsynced tail of an append in a simulated host crash.
 
 ## What survives what
 

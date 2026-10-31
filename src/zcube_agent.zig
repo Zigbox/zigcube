@@ -10,6 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const build_options = @import("build_options");
+const agent = @import("agent.zig");
 const agent_run = @import("agent_run.zig");
 const config_mod = @import("agent_config.zig");
 const constants = @import("constants.zig");
@@ -17,6 +18,11 @@ const diag_mod = @import("diag.zig");
 const fake_supervisor = @import("fake_supervisor.zig");
 
 const Diag = diag_mod.Diag;
+
+// The agent's test-only fault (agent.zig) must be unreachable from the shipped program.
+comptime {
+    assert(!agent.fault_ignore_stop);
+}
 
 /// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`
 /// (DIAGNOSTICS.md); a panic writes no bundle, because writing one from a panic handler could

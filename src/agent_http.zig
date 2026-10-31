@@ -20,21 +20,11 @@ const diag_mod = @import("diag.zig");
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 
-pub const Error = error{ Unreachable, BadReply, OutOfMemory };
+const client_mod = @import("agent_client.zig");
 
-pub const Request = struct {
-    method: []const u8,
-    /// Path and query: "/v1/agent/nodes/node1/replicas".
-    target: []const u8,
-    body: []const u8 = "",
-    /// How long the server may hold the reply (a long poll), on top of the I/O timeout.
-    hold_ms: u32 = 0,
-};
-
-pub const Reply = struct {
-    status: u16,
-    body: []const u8,
-};
+pub const Error = client_mod.Error;
+pub const Request = client_mod.Request;
+pub const Reply = client_mod.Reply;
 
 pub const Client = struct {
     io: std.Io,
@@ -189,13 +179,7 @@ pub fn bad_reply(diag: *Diag, problem: []const u8) Error {
     return error.BadReply;
 }
 
-/// ZC-E0504 on `diag`, for a caller that returns an error of its own.
-pub fn raise_bad_reply(diag: *Diag, problem: []const u8) void {
-    assert(diag.code == null);
-    diag.raise(.E0504);
-    diag.cause("{s}", .{problem});
-    diag.fix(.{ .sentence = "use the agent that came with the server" });
-}
+pub const raise_bad_reply = client_mod.raise_bad_reply;
 
 const testing = std.testing;
 
