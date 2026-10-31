@@ -14,6 +14,11 @@
 //!   client's previous write (two writes with one revision: `revision_reused`; the checker finds
 //!   that before it compares real time across keys, which is why this is not `revision_order`).
 //!
+//! - `all_unknown`: every failed write is reported to the runner as one of unknown outcome, as
+//!   if each had been lost during its COMMIT (a drop before the COMMIT, which changed nothing,
+//!   recorded as "may have applied"). The checker cannot see this one in a history; the runner
+//!   catches it by requiring a faulted run to record some writes as definitely failed.
+//!
 //! Test code only: nothing in the server or the agent imports it.
 
 const std = @import("std");
@@ -25,7 +30,7 @@ const history = @import("testing/history.zig");
 const Store = store.Store;
 const Error = store.Error;
 
-pub const Mutation = enum { none, drop_ack, stale_read, reuse_revision };
+pub const Mutation = enum { none, drop_ack, stale_read, reuse_revision, all_unknown };
 
 const phantom_base: u64 = 1 << 40;
 const drop_period = 5;
@@ -50,6 +55,7 @@ pub const Mutant = struct {
 
     pub fn init(inner: Store, kind: Mutation) Mutant {
         assert(kind != .none);
+        assert(@intFromPtr(inner.vtable) != 0);
         return .{ .inner = inner, .kind = kind };
     }
 
@@ -72,7 +78,10 @@ pub const Mutant = struct {
     };
 
     fn of(context: *anyopaque) *Mutant {
-        return @ptrCast(@alignCast(context));
+        const mutant: *Mutant = @ptrCast(@alignCast(context));
+        assert(mutant.kind != .none);
+        assert(mutant.phantom >= phantom_base);
+        return mutant;
     }
 
     fn status(context: *anyopaque, diag: *Diag) Error!store.Status {
@@ -87,6 +96,7 @@ pub const Mutant = struct {
         diag: *Diag,
     ) Error!store.GetResult {
         const mutant = of(context);
+        assert(key.len > 0);
         const real = try mutant.inner.get(arena, key, at_revision, diag);
         if (mutant.kind != .stale_read) return real;
         const id = history.parse_key(key) orelse return real;
@@ -115,11 +125,18 @@ pub const Mutant = struct {
 
     fn txn(context: *anyopaque, request: store.TxnRequest, diag: *Diag) Error!store.TxnResult {
         const mutant = of(context);
+        assert(request.on_success.len + request.on_failure.len <= 2);
         switch (mutant.kind) {
+            .all_unknown => return mutant.inner.txn(request, diag) catch |err| {
+                assert(diag.code != null); // The inner store raised a diagnostic for its error.
+                diag.write_outcome_unknown = true;
+                return err;
+            },
             .drop_ack => {
                 mutant.writes += 1;
                 if (mutant.writes % drop_period != 0) return mutant.inner.txn(request, diag);
                 mutant.phantom += 1;
+                assert(mutant.phantom > phantom_base);
                 return .{ .succeeded = true, .revision = mutant.phantom };
             },
             .reuse_revision => return mutant.reuse(request, diag),
@@ -128,7 +145,9 @@ pub const Mutant = struct {
     }
 
     fn reuse(mutant: *Mutant, request: store.TxnRequest, diag: *Diag) Error!store.TxnResult {
+        assert(mutant.kind == .reuse_revision);
         const real = try mutant.inner.txn(request, diag);
+        assert(mutant.writes < std.math.maxInt(u32));
         const branch = if (real.succeeded) request.on_success else request.on_failure;
         const wrote = branch.len > 0;
         if (!wrote) return real;

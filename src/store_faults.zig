@@ -38,7 +38,9 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Diag = @import("diag.zig").Diag;
+const diag_mod = @import("diag.zig");
+const constants = @import("constants.zig");
+const Diag = diag_mod.Diag;
 const RealClock = @import("agent_clock.zig").RealClock;
 const store = @import("store.zig");
 const pq = @import("pq.zig");
@@ -151,7 +153,10 @@ const Shared = struct {
 
     /// Counts a call on `key`; false if the key has had its share.
     fn reserve(shared: *Shared, key: u8) bool {
-        return shared.key_calls[key].fetchAdd(1, .monotonic) < key_calls_cap;
+        assert(key < register_keys);
+        const before = shared.key_calls[key].fetchAdd(1, .monotonic);
+        assert(before < std.math.maxInt(u32) / 2); // A runaway loop, not a busy key.
+        return before < key_calls_cap;
     }
 
     fn token(shared: *Shared) u64 {
@@ -497,6 +502,17 @@ fn say(comptime format: []const u8, args: anytype) void {
     std.debug.print("store-faults: " ++ format ++ "\n", args);
 }
 
+/// Prints a failed store call as the diagnostic it raised, after `what` was being done.
+fn say_failure(what: []const u8, diag: *const Diag) void {
+    assert(what.len > 0);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    if (diag.code == null) return say("{s}", .{what});
+    diag_mod.to_diagnostic(&diagnostic, diag);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    say("{s}:\n{s}", .{ what, text });
+}
+
 fn parse_options(args: []const []const u8) ?Options {
     var options: Options = .{ .backend = .postgres, .postgres = "", .seed = null };
     var index: usize = 1;
@@ -524,7 +540,7 @@ pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return exit_user;
     const options = parse_options(args) orelse {
         say("usage: store_faults --backend postgres|sqlite [--postgres SETTINGS] [--seed N]" ++
-            " [--mutate drop_ack|stale_read|reuse_revision]", .{});
+            " [--mutate drop_ack|stale_read|reuse_revision|all_unknown]", .{});
         return exit_user;
     };
     var seed_bytes: [8]u8 = undefined;
@@ -549,6 +565,8 @@ const Report = struct {
     /// Writes whose outcome was unknown, split by what the log says: in it, or absent.
     unknown_applied: u32 = 0,
     unknown_absent: u32 = 0,
+    /// Writes whose call failed with a certainty that nothing was written.
+    failed_writes: u32 = 0,
 };
 
 fn execute(gpa: Allocator, io: std.Io, options: Options, seed: u64) !Report {
@@ -587,24 +605,24 @@ fn drive(run: *const Run, options: Options) !Report {
     const diag = try gpa.create(Diag);
     defer gpa.destroy(diag);
     diag.reset();
-    // The direct connection: never through the proxy. It creates the store and drops it.
+    // The direct connection: never through the proxy. It creates the store and drops it. A
+    // schema left by an earlier run of this seed goes first, and before the store is opened: a
+    // half-made one would make the open fail (ZC-E0209) and the drop would never run.
+    if (run.backend == .postgres) {
+        drop_leftover_schema(run, options.postgres, diag) catch |err| {
+            say_failure("cannot drop a left-over schema", diag);
+            return err;
+        };
+    }
     const direct = try gpa.create(Conn);
     defer gpa.destroy(direct);
     direct.open(&shared, options.postgres, diag) catch |err| {
-        say("cannot open the store: {s}", .{@errorName(err)});
+        say_failure("cannot open the store", diag);
         return err;
     };
-    if (run.backend == .postgres) {
-        // A schema left by an earlier run of this seed goes first, then the store is made anew.
-        direct.postgres.drop_schema(diag) catch |err| {
-            say("cannot drop a left-over schema: {s}", .{@errorName(err)});
-            return err;
-        };
-        direct.close(run.backend);
-        try direct.open(&shared, options.postgres, diag);
-    }
+    // Every path from here closes `direct`, and drops the schema it made.
     defer {
-        if (run.backend == .postgres) direct.postgres.drop_schema(diag) catch {};
+        if (run.backend == .postgres) direct.postgres.drop_schema(diag) catch {}; // Scratch.
         direct.close(run.backend);
     }
     const direct_store = direct.interface(run.backend);
@@ -629,6 +647,28 @@ fn drive(run: *const Run, options: Options) !Report {
         .conninfo = client_conninfo,
         .direct_conninfo = options.postgres,
     });
+}
+
+/// Drops the schema of this run's seed over a plain connection, so that it works whatever
+/// state the schema is in.
+fn drop_leftover_schema(run: *const Run, conninfo: []const u8, diag: *Diag) !void {
+    assert(run.backend == .postgres);
+    assert(run.schema.len > 0);
+    var conninfo_buffer: [512]u8 = undefined;
+    const settings = std.fmt.bufPrintSentinel(&conninfo_buffer, "{s}", .{conninfo}, 0) catch {
+        return error.ConninfoTooLong;
+    };
+    const conn = try pq.connect(diag, settings, "SELECT 1");
+    defer pq.close(conn);
+    var sql_buffer: [128]u8 = undefined;
+    const sql = try std.fmt.bufPrintSentinel(
+        &sql_buffer,
+        "DROP SCHEMA IF EXISTS \"{s}\" CASCADE",
+        .{run.schema},
+        0,
+    );
+    var result = try pq.exec_simple(diag, conn, sql, .{});
+    result.clear();
 }
 
 const Setup = struct {
@@ -775,6 +815,7 @@ fn split_unknowns(
     }
     var report: Report = .{ .passed = true };
     for (entries) |entry| {
+        if (entry.call == .txn and entry.outcome == .failed) report.failed_writes += 1;
         if (entry.outcome != .unknown) continue;
         if (entry.call != .txn) continue;
         var found = false;
@@ -784,6 +825,29 @@ fn split_unknowns(
         if (found) report.unknown_applied += 1 else report.unknown_absent += 1;
     }
     return report;
+}
+
+/// A faulted run must have met both outcomes of a lost connection, or it has not tested them.
+fn covered_both_cases(setup: Setup, report: *const Report) bool {
+    if (setup.proxy == null) {
+        assert(report.unknown_applied == 0); // Without faults no write is ever left unknown.
+        return true;
+    }
+    if (report.unknown_applied == 0) {
+        // The point of the cuts at COMMIT replies is a write that was made and never
+        // acknowledged. A run that never met one has not tested that case.
+        say("FAILED: no unknown write was found in the log: the lost acknowledgement " ++
+            "(commit made, reply cut) was never exercised", .{});
+        return false;
+    }
+    if (report.failed_writes == 0) {
+        // A drop before the COMMIT certainly wrote nothing and is recorded as failed. A run
+        // with none took every store error for a lost acknowledgement (`all_unknown`).
+        say("FAILED: no write was recorded as failed: every store error was taken to be a " ++
+            "lost acknowledgement, which hides a lost write", .{});
+        return false;
+    }
+    return true;
 }
 
 fn verdict(
@@ -837,11 +901,7 @@ fn verdict(
         report.kind = watched.failed.kind;
         return report;
     }
-    if (setup.proxy != null and report.unknown_applied == 0) {
-        // The point of the cuts at COMMIT replies is a write that was made and never
-        // acknowledged. A run that never met one has not tested that case.
-        say("FAILED: no unknown write was found in the log: the lost acknowledgement " ++
-            "(commit made, reply cut) was never exercised", .{});
+    if (!covered_both_cases(setup, &report)) {
         report.passed = false;
         return report;
     }
