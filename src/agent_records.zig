@@ -610,3 +610,14 @@ test "classify: an ended command, a live supervisor, a young spec, and a dead su
     facts.supervisor_pid_exists = true;
     try testing.expect(classify(facts) == .declare_lost);
 }
+
+test "a vanished state file is a ZC-E0502 diagnostic, never a panic" {
+    // Goal: `Absent` from a state call (a directory removed under the agent) has a code. Method:
+    // map every state error but the simulated crash; the first diagnostic stands.
+    var collector: Diag = undefined;
+    for ([_]agent_state.Error{ error.Absent, error.Io, error.TooBig, error.OutOfMemory }) |err| {
+        collector.reset();
+        try testing.expectEqual(error.RuntimeFailed, state_failed(&collector, err, "list"));
+        try testing.expectEqual(@as(?@TypeOf(collector.code.?), .E0502), collector.code);
+    }
+}

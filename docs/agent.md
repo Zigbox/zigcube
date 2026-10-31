@@ -92,7 +92,11 @@ the observed state, and a missing stopped container with a `stopped` record is l
 exercise production's write sequence. A start puts `spec.json` before anything runs; a removal
 unlinks it first, so a directory without a readable spec is not a container. `scan` skips a
 container whose spec is empty, damaged or unreadable (the host refused to read it, or it is too
-large), and the others are still listed; ZC-E0502 is for the state directory itself failing. A start
+large), and the others are still listed; ZC-E0502 is for the state directory itself failing (a
+refused directory listing included: only a missing one means "no containers"). `SimNode` goes
+through the same `classify` as production: a spec whose container never started is `starting` until
+`fake_start_timeout_ms` on the simulation's clock, then lost with ZC-E0509; a stop keeps the record
+and `run.json`, and `make_room` evicts the oldest stopped one before the next `spec.json` is written. A start
 of an image not in the fixtures is refused with `ZBX-E0501` before anything is written, in both paths
 (`agent_records.has_image`). `AgentState.remove` of a name ending in `/` removes an empty directory,
 durably; that is how `remove_container` finishes. `DirState` fsyncs a file and then its directory on

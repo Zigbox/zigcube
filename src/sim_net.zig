@@ -15,8 +15,10 @@
 //! * **Duplicate** (requests): the server gets the request twice, back to back, and the agent
 //!   sees the first answer. A write that is not idempotent shows here.
 //! * **Reorder** (requests): the request is parked with a delivery time drawn from the seed
-//!   (between `reorder_delay_ms_min` and `reorder_delay_ms_max` after it was sent), and the agent
-//!   sees a timeout. It reaches the server when the simulation's clock passes that time, which
+//!   (between `reorder_delay_ms_min` and `reorder_delay_ms_max` after the server would have
+//!   answered it: a long poll's `hold_ms` comes first, as its caller waits that long too),
+//!   and the agent sees a timeout. It reaches the server when the simulation's clock passes that
+//!   time (requests due together arrive in the order they were parked), which
 //!   the cluster reports with `tick`, independent of any call on the link: after newer requests
 //!   from the same agent, and possibly after the server's own clock has moved on (a lease that
 //!   expired meanwhile). The default bounds straddle the agent's timeout, so a stale write can
@@ -97,6 +99,8 @@ const Parked = struct {
     hold_ms: u32,
     /// The simulation time at which it reaches the server.
     due_ms: u64,
+    /// Order of parking: requests due at the same time arrive oldest first.
+    sequence: u64,
 };
 
 const Link = struct {
@@ -116,6 +120,8 @@ pub const SimNet = struct {
     last_call_ms: u32,
     /// The simulation time as the cluster last reported it with `tick`.
     now_ms: u64,
+    /// Parked requests so far, to order those due together.
+    parked_total: u64,
 
     const Port = struct { net: *SimNet, node: u32 };
 
@@ -130,6 +136,7 @@ pub const SimNet = struct {
             .ports = undefined,
             .last_call_ms = 0,
             .now_ms = 0,
+            .parked_total = 0,
         };
         for (&net.ports, 0..) |*port, node| port.* = .{ .net = net, .node = @intCast(node) };
     }
@@ -188,15 +195,18 @@ pub const SimNet = struct {
     fn earliest_due(net: *const SimNet) ?Due {
         var best: ?Due = null;
         var best_ms: u64 = 0;
+        var best_sequence: u64 = 0;
         for (&net.links, 0..) |*link, node| {
             for (link.parked, 0..) |slot, index| {
                 const parked = slot orelse continue;
                 if (parked.due_ms > net.now_ms) continue;
                 if (best != null) {
-                    if (parked.due_ms >= best_ms) continue;
+                    if (parked.due_ms > best_ms) continue;
+                    if (parked.due_ms == best_ms and parked.sequence > best_sequence) continue;
                 }
                 best = .{ .node = @intCast(node), .slot = @intCast(index) };
                 best_ms = parked.due_ms;
+                best_sequence = parked.sequence;
             }
         }
         return best;
@@ -301,15 +311,27 @@ pub const SimNet = struct {
 
     // ---- Parked requests ----
 
+    /// The request's strings in memory of its own; all or nothing.
+    fn copy_request(net: *SimNet, request: client.Request) !struct {
+        method: []u8,
+        target: []u8,
+        body: []u8,
+    } {
+        const method = try net.gpa.dupe(u8, request.method);
+        errdefer net.gpa.free(method);
+        const target = try net.gpa.dupe(u8, request.target);
+        errdefer net.gpa.free(target);
+        const body = try net.gpa.dupe(u8, request.body);
+        return .{ .method = method, .target = target, .body = body };
+    }
+
     /// Keeps a copy to deliver at a time drawn from the link's bounds. False if all the slots
     /// are full or memory is.
     fn park(net: *SimNet, link: *Link, request: client.Request, faults: Faults) bool {
         assert(faults.reorder_delay_ms_min <= faults.reorder_delay_ms_max);
         for (&link.parked) |*slot| {
             if (slot.* != null) continue;
-            const method = net.gpa.dupe(u8, request.method) catch return false;
-            const target = net.gpa.dupe(u8, request.target) catch return false;
-            const body = net.gpa.dupe(u8, request.body) catch return false;
+            const copy = net.copy_request(request) catch return false;
             const random = net.prng.random();
             const wait_ms = random.intRangeAtMost(
                 u32,
@@ -317,12 +339,14 @@ pub const SimNet = struct {
                 faults.reorder_delay_ms_max,
             );
             slot.* = .{
-                .method = method,
-                .target = target,
-                .body = body,
+                .method = copy.method,
+                .target = copy.target,
+                .body = copy.body,
                 .hold_ms = request.hold_ms,
-                .due_ms = net.now_ms + wait_ms,
+                .due_ms = net.now_ms + request.hold_ms + wait_ms,
+                .sequence = net.parked_total,
             };
+            net.parked_total += 1;
             link.stats.parked += 1;
             return true;
         }
@@ -601,4 +625,52 @@ test "the same seed draws the same faults" {
         }
     }
     try testing.expectEqual(outcomes[0], outcomes[1]);
+}
+
+test "requests due together arrive in the order they were parked, not by slot" {
+    // Goal: ties break by age. Method: park a read on link 1, then a write on link 0, both due at
+    // the same time; link 0 comes first by index, but the read is older and must arrive first.
+    var counter: Counter = .{};
+    var net: SimNet = undefined;
+    net.init(testing.allocator, counter.handler(), 5);
+    defer net.deinit();
+    var diag: Diag = undefined;
+    const same: Faults = .{
+        .reorder_per_mille = 1000,
+        .reorder_delay_ms_min = 3000,
+        .reorder_delay_ms_max = 3000,
+    };
+    net.set_faults(0, same);
+    net.set_faults(1, same);
+    diag.reset();
+    const first = net.transport(1).call(testing.allocator, read, &diag);
+    try testing.expectError(error.Unreachable, first);
+    diag.reset();
+    const second = net.transport(0).call(testing.allocator, write, &diag);
+    try testing.expectError(error.Unreachable, second);
+    net.tick(3000);
+    try testing.expectEqualStrings("GW", counter.order[0..counter.order_len]);
+}
+
+test "a long poll is delayed after its hold, as its caller waits that long too" {
+    // Goal: the reorder bounds are measured from the end of the hold. Method: park a long poll
+    // and tick to just before and at hold + delay.
+    var counter: Counter = .{};
+    var net: SimNet = undefined;
+    const link = make(&counter, &net);
+    defer net.deinit();
+    var diag: Diag = undefined;
+    net.set_faults(0, .{
+        .reorder_per_mille = 1000,
+        .reorder_delay_ms_min = 2000,
+        .reorder_delay_ms_max = 2000,
+    });
+    var poll = write;
+    poll.hold_ms = 10_000;
+    diag.reset();
+    try testing.expectError(error.Unreachable, link.call(testing.allocator, poll, &diag));
+    net.tick(11_999);
+    try testing.expectEqual(@as(u32, 0), counter.writes);
+    net.tick(12_000);
+    try testing.expectEqual(@as(u32, 1), counter.writes);
 }
