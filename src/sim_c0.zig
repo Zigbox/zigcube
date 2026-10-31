@@ -715,3 +715,67 @@ test "fuzz: random faults, outages and restarts keep the invariants, for many se
         try testing.expectEqual(Step.done, report.failed);
     }
 }
+
+fn stale_input(name: []const u8) apply_mod.Input {
+    return .{
+        .name = name,
+        .image = hello_digest,
+        .replicas = 1,
+        .command = &.{ "sh", "-c", "sleep 1000" },
+        .applied_by = "alex@laptop",
+        .request_id = "r-test",
+    };
+}
+
+/// Puts a stopped observed record of `replica` with `generation`, as the node's agent would.
+fn put_stopped(world: *World, replica: []const u8, generation: u64) !void {
+    const ctx = world.controller_context();
+    const record: records.Observed = .{
+        .replica = replica,
+        .node = sim_world.node_name,
+        .generation = generation,
+        .status = .stopped,
+        .exit = .{ .kind = .exited, .code = 0 },
+        .reported_at_ms = world.now_ms(),
+    };
+    const key = records.observed_key(sim_world.node_name, replica);
+    const value = try records.encode(ctx.arena, record, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+    const request: store.TxnRequest = .{ .on_success = &.{op} };
+    const role: @import("writers.zig").Role = .{ .agent = sim_world.node_name };
+    _ = try @import("writers.zig").txn(ctx.store, role, request, ctx.diag);
+}
+
+test "a stopped record left by an earlier replica with the same id never blocks the new one" {
+    // Goal: a service deleted and applied again restarts its replica numbering, so `web-1`
+    // exists twice in the store's life; the first one's stopped observed record, which the agent
+    // had not yet removed, must not stop the second from starting. Method: place `web-1` (the
+    // server steps, the agent does not), plant a stopped record of another generation (what the
+    // first `web-1` left) and another that predates the replica's key, step the agent: it starts
+    // the replica and replaces the record. (Seed 32 of `sim-cluster` found this.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step(); // Registers the node.
+    _ = world.server_step();
+    _ = world.server_step();
+    try testing.expectEqual(@as(u32, 1), world.replica_count("web"));
+    try put_stopped(world, "web-1", 2);
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}
+
+test "a stopped record written before the replica's key was created is a leftover" {
+    // Goal: same generation (a service's first generation is 1 each time it is applied), so
+    // only the store's revisions tell the records apart. Method: the record goes in first, then
+    // the service is applied and placed, then the agent steps.
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    try put_stopped(world, "web-1", 1);
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step(); // Registers the node.
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+}

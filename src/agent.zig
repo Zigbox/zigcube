@@ -170,6 +170,18 @@ pub const Agent = struct {
 
 // ---- One pass --------------------------------------------------------------------------------
 
+/// True if `seen` was written for another replica that had this one's id: for another
+/// generation (a replica's never changes), or before this replica's key was created, so it
+/// cannot be about it (revisions of one store are comparable; a record is only written after
+/// the replica exists).
+fn is_leftover(
+    seen: *const controller.Entry(records.Observed),
+    item: *const controller.Entry(records.Replica),
+) bool {
+    if (seen.rec.generation != item.rec.generation) return true;
+    return seen.kv.mod_revision < item.kv.create_revision;
+}
+
 const Write = struct { key: []const u8, value: ?[]const u8 };
 
 const Pass = struct {
@@ -206,9 +218,17 @@ const Pass = struct {
         pass.observed = seen.items;
     }
 
-    fn observed_of(pass: *const Pass, id: []const u8) ?*const records.Observed {
-        for (pass.observed) |*item| {
-            if (std.mem.eql(u8, item.rec.replica, id)) return &item.rec;
+    /// The observed record of `item`'s replica, unless it is a leftover of an earlier replica
+    /// with the same id (a service deleted and applied again restarts its numbering), which
+    /// must never stand in for this one: such a record is replaced, not obeyed.
+    fn observed_for(
+        pass: *const Pass,
+        item: *const controller.Entry(records.Replica),
+    ) ?*const records.Observed {
+        for (pass.observed) |*seen| {
+            if (!std.mem.eql(u8, seen.rec.replica, item.rec.id)) continue;
+            if (is_leftover(seen, item)) return null;
+            return &seen.rec;
         }
         return null;
     }
@@ -235,7 +255,7 @@ const Pass = struct {
         for (pass.mine) |*item| {
             const replica = &item.rec;
             const listing = find_listing_by_replica(pass.listings, replica.id);
-            const seen = pass.observed_of(replica.id);
+            const seen = pass.observed_for(item);
             if (listing) |found| {
                 try pass.report(replica, seen, found.status);
             } else if (seen) |record| {
