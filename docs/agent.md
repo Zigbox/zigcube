@@ -13,6 +13,7 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 | `agent_api.zig` | core | The server's side of the agent endpoints, bytes in and bytes out |
 | `agent_client.zig` | core | `Store` implemented over those endpoints, on a `Transport` (a call that may not answer) |
 | `agent_loop.zig` | core | The loop policy as a state machine over virtual time: step, pause, watch, stop; what to report |
+| `agent_records.zig` | core | The container records (`spec.json`, `run.json`), the order of their writes, `scan`, and `classify`: the one record layer for `FakeRuntime` and the simulator |
 | `agent_state.zig` | core | `AgentState` (what the agent persists) and `SimState`, which models the files and crashes at write points |
 | `agent_remote.zig` | shell | `HttpTransport`: the `Transport` over the HTTP client |
 | `agent_http.zig` | shell | The HTTP client: one request per connection, the agent closes first |
@@ -22,6 +23,7 @@ the decision-making is `src/agent.zig`, described in [core.md](core.md).
 | `fake_runtime.zig` | shell | `Runtime` with real host processes |
 | `fake_supervisor.zig` | shell | `zcube-agent supervise <dir>`: one container's supervisor |
 | `fake_files.zig` | shell | The files the agent and a supervisor meet in; `DirState` is `AgentState` over them |
+| `sim_node.zig` | core | One simulated node: `SimRuntime` plus `SimState` joined by `agent_records`, with crashes at write points and step boundaries |
 | `agent_smoke.zig` | test | `zig build agent-smoke`, the server and agent as real processes |
 
 The agent is single-threaded. Nothing in it can race what it starts, and `zbx`'s `start` needs a
@@ -84,6 +86,18 @@ fault waits for its replica to exist and run, and is dropped once the container 
 that removes the oldest stopped one (`agent_records.remove_container`: spec first, then the other
 files and the directory, each removal synced), which is safe: the core records a stopped container's end in
 the observed state, and a missing stopped container with a `stopped` record is left alone.
+
+**One record layer.** `FakeRuntime` and the simulator's `SimNode` both persist through
+`agent_records` over `AgentState` (`DirState` here, `SimState` in the simulation), so the crash tests
+exercise production's write sequence. A start puts `spec.json` before anything runs; a removal
+unlinks it first, so a directory without a readable spec is not a container. `scan` skips a
+container whose spec is empty, damaged or unreadable (the host refused to read it, or it is too
+large), and the others are still listed; ZC-E0502 is for the state directory itself failing. A start
+of an image not in the fixtures is refused with `ZBX-E0501` before anything is written, in both paths
+(`agent_records.has_image`). `AgentState.remove` of a name ending in `/` removes an empty directory,
+durably; that is how `remove_container` finishes. `DirState` fsyncs a file and then its directory on
+every put and remove; `SimState` models exactly that (see `agent_state.zig`'s header) and loses the
+unsynced tail of an append in a simulated host crash.
 
 ## What survives what
 

@@ -135,7 +135,9 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
 fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     const memory_suite = memory_suite_options(b);
     const test_step = b.step("test", "Run unit and snapshot tests");
+    const filters = b.option([]const []const u8, "test-filter", "Run only matching tests");
     const unit_tests = b.addTest(.{
+        .filters = filters orelse &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = unit.target,

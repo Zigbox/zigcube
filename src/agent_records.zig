@@ -206,7 +206,9 @@ fn parse(comptime T: type, arena: Allocator, bytes: []const u8) agent_state.Erro
 pub const Record = struct { name: []const u8, spec: SpecFile };
 
 /// Every container with a readable spec, by name. This is the agent's whole memory of what it
-/// started: after a restart, adoption is this and nothing else.
+/// started: after a restart, adoption is this and nothing else. A spec the host cannot read (`Io`,
+/// or too large) is skipped like a damaged one, so one bad container does not blind the agent to
+/// the others; a failing directory listing, the simulated crash and a lack of memory fail the scan.
 pub fn scan(state: AgentState, arena: Allocator) agent_state.Error![]const Record {
     var found: std.ArrayList(Record) = .empty;
     const entries = try state.list(arena, dir_containers);
@@ -214,7 +216,11 @@ pub fn scan(state: AgentState, arena: Allocator) agent_state.Error![]const Recor
         if (!std.mem.endsWith(u8, entry, "/")) continue;
         const name = entry[dir_containers.len .. entry.len - 1];
         if (runtime.name_problem(name) != null) continue;
-        const spec = try read_spec(state, arena, name) orelse continue;
+        const read = read_spec(state, arena, name) catch |err| switch (err) {
+            error.Io, error.TooBig => continue,
+            error.Absent, error.Crashed, error.OutOfMemory => |fatal| return fatal,
+        };
+        const spec = read orelse continue;
         try found.append(arena, .{ .name = name, .spec = spec });
     }
     return found.items;
@@ -349,6 +355,71 @@ test "a spec is written, scanned back, and removed spec-first" {
     try remove_container(agent, arena, "web-1");
     try testing.expectEqual(@as(usize, 1), (try scan(agent, arena)).len);
     try testing.expectEqual(@as(usize, 0), (try agent.list(arena, "containers/web-1/")).len);
+}
+
+/// A state over `SimState` that refuses to read one file, as a failing disk can.
+const UnreadableState = struct {
+    inner: *agent_state.SimState,
+    unreadable: []const u8,
+
+    const vtable: AgentState.VTable = .{
+        .put_atomic = put_atomic,
+        .append = append,
+        .read = read,
+        .remove = remove,
+        .list = list,
+    };
+
+    fn interface(self: *UnreadableState) AgentState {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn base(context: *anyopaque) *UnreadableState {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn put_atomic(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return base(context).inner.interface().put_atomic(name, data);
+    }
+
+    fn append(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return base(context).inner.interface().append(name, data);
+    }
+
+    fn read(context: *anyopaque, arena: Allocator, name: []const u8) agent_state.Error![]const u8 {
+        const self = base(context);
+        if (std.mem.eql(u8, name, self.unreadable)) return error.Io;
+        return self.inner.interface().read(arena, name);
+    }
+
+    fn remove(context: *anyopaque, name: []const u8) agent_state.Error!void {
+        return base(context).inner.interface().remove(name);
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: Allocator,
+        prefix: []const u8,
+    ) agent_state.Error![]const []const u8 {
+        return base(context).inner.interface().list(arena, prefix);
+    }
+};
+
+test "a spec the host cannot read hides only its own container from a scan" {
+    // Goal: one unreadable spec (Io, not damage) is skipped and the others are still found.
+    // Method: a state that refuses to read one file.
+    var sim = agent_state.SimState.init(testing.allocator, 1);
+    defer sim.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try write_spec(sim.interface(), &test_spec("web-1"));
+    try write_spec(sim.interface(), &test_spec("web-2"));
+    var refusing: UnreadableState = .{ .inner = &sim, .unreadable = "containers/web-1/spec.json" };
+    const found = try scan(refusing.interface(), arena);
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings("web-2", found[0].name);
+    try testing.expectError(error.Io, read_spec(refusing.interface(), arena, "web-1"));
 }
 
 const Counts = struct {

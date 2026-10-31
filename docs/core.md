@@ -18,6 +18,12 @@ thread, socket, file, libc, `std.Io` value, real clock, source of randomness or 
 | `retention.zig` | Decision retention, a page of the index at a time |
 | `apply.zig` | What the API writes on apply and delete (generation rules, change summary) |
 | `agent.zig` | The node agent's reconcile step |
+| `agent_api.zig`, `agent_client.zig` | The server's side of the agent endpoints, and `Store` over them on a `Transport` |
+| `agent_loop.zig` | The agent's loop policy as a state machine over virtual time |
+| `agent_state.zig` | What the agent persists, behind `AgentState`; `SimState` models what fsynced files guarantee, with `arm_crash` (a crash at a write point) and `crash_now` (between calls) |
+| `agent_records.zig` | The container records and adoption rules, over `AgentState`; shared by `FakeRuntime` and `sim_node.zig` |
+| `sim_net.zig` | The network between agents and server: drop, delay, duplicate, reorder, one-way partitions; parked requests arrive when the cluster calls `tick` with the clock |
+| `sim_node.zig` | One simulated node: a `SimRuntime` and a `SimState` joined by `agent_records` |
 | `why.zig` | `zcube why`: subject to causal chain, structured steps, and their text |
 | `api.zig` | The read-only endpoints of api.md, bytes to bytes |
 | `runtime_codes.zig` | The placeholder `ZBX-` codes ([runtime-codes.md](runtime-codes.md)) |
@@ -197,3 +203,17 @@ of it (`Request.hold`, an atomic request counter), and the rest of what it taugh
   (which sent `Connection: close` and read to the end), made the server close first. Both clients now
   close first, which is still good manners, but the server no longer depends on it; review showed that
   an idle connection, a browser or `curl` could still block a restart.
+
+## The cluster simulator's pieces so far (C1 slice 2b)
+
+- **Crash model.** `SimState` models what the agent's files guarantee. A `put_atomic` is whole after
+  any crash and durable once it returns (temporary file and directory both fsynced); a `remove` is
+  durable once it returns; an `append` guarantees nothing, and a simulated host crash can drop the
+  unsynced tail of any file. `arm_crash(n, kind)` crashes at the nth write point of the next calls;
+  `crash_now(kind)` crashes between two calls, which a write point cannot express (the step
+  boundaries). After a crash every call fails with `Crashed` until `restart`.
+- **Delivery by the clock.** `SimNet` parks a reordered request with a delivery time. The cluster
+  calls `SimNet.tick(now_ms)` after every advance of the clock, and that, not a later call on the
+  link, delivers what is due: so a stale write can land after the server's own clock has moved on.
+- **Records.** `sim_node.zig` runs the same `agent_records` code as `FakeRuntime`; an unknown image
+  is refused and writes nothing in both. `scan` skips a container whose spec the host cannot read.
