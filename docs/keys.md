@@ -30,12 +30,14 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
 
-An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. Two departures from
+An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. One departure from
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
-decisions and so may touch only the decision prefixes; and the replica controller may still
-touch `/services/<name>` (the counter lives in `/replica-numbers/<service>` from slice 3, and
-`writers.zig` refuses a put or delete of a service by any role but the API); `Service` v2 reads
-a legacy `next_replica` to seed the counter and never writes it.
+decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
+the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
+refuses a put or delete of a service by any role but the API. `Service` v2 reads a legacy
+`next_replica` to seed the counter and never writes it. The replica controller reads a counter
+only with a `get` when it is about to create replicas for that service, never by listing, so the
+number of counters bounds nothing.
 
 ## Versions
 

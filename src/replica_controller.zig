@@ -88,18 +88,10 @@ pub const ReplicaController = struct {
         assert(ctx.diag.code == null);
         const now = ctx.clock.now_ms();
         const snapshot = try controller.read_snapshot(ctx);
-        const numbers = try controller.list_all(
-            records.ReplicaNumber,
-            ctx,
-            records.prefix_replica_numbers,
-            snapshot.revision,
-            constants.services_max,
-        );
         var run: Run = .{
             .rc = rc,
             .ctx = ctx,
             .snap = &snapshot,
-            .numbers = numbers.items,
             .txns_left = constants.controller_txns_per_step_max,
         };
         try run.place_unplaced();
@@ -145,8 +137,6 @@ const Run = struct {
     rc: *ReplicaController,
     ctx: *const Context,
     snap: *const Snapshot,
-    /// `/replica-numbers/`, read at the snapshot's revision.
-    numbers: []const NumberEntry,
     txns_left: u32,
     acted: u32 = 0,
     /// Work is left for the next step (a conflict, a spent budget, a partial change).
@@ -444,7 +434,7 @@ const Run = struct {
         count: u32,
     ) Error!void {
         if (count == 0) return;
-        const counter = run.counter_of(service.rec.name);
+        const counter = try run.counter_of(service.rec.name);
         var next = if (counter) |found| found.rec.next else run.first_number(service);
         for (0..count) |_| {
             if (next > constants.replica_number_max) return run.numbers_used_up(service);
@@ -481,12 +471,20 @@ const Run = struct {
         batch.put(key, bytes);
     }
 
-    fn counter_of(run: *Run, service: []const u8) ?*const NumberEntry {
+    /// The service's counter at the snapshot's revision, or null if it has none. One read per
+    /// service about to get replicas; the counters are never listed, so how many there are
+    /// bounds nothing.
+    fn counter_of(run: *Run, service: []const u8) Error!?NumberEntry {
         const key = records.replica_numbers_key(service);
-        for (run.numbers) |*entry| {
-            if (std.mem.eql(u8, entry.kv.key, key.slice())) return entry;
-        }
-        return null;
+        const got = try run.ctx.store.get(
+            run.ctx.arena,
+            key.slice(),
+            run.snap.revision,
+            run.ctx.diag,
+        );
+        const kv = got.kv orelse return null;
+        const rec = try records.read(records.ReplicaNumber, run.ctx.arena, kv, run.ctx.diag);
+        return .{ .kv = kv, .rec = rec };
     }
 
     /// The first number of a service that has no counter yet: the larger of a v1 service

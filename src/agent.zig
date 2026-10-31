@@ -244,7 +244,7 @@ const Pass = struct {
     }
 
     /// The observed record of `item`'s replica, unless it is a leftover of an earlier replica
-    /// with the same id (a service deleted and applied again restarts its numbering), which
+    /// with the same id (an older store, or one removed before its cleanup), which
     /// must never stand in for this one: such a record is replaced, not obeyed.
     fn observed_for(
         pass: *const Pass,
@@ -297,7 +297,7 @@ const Pass = struct {
     }
 
     /// The runtime holds a container of this name that belongs to an earlier replica with the
-    /// same id (a service deleted and applied again restarts its numbering, and the old
+    /// same id (an older store, or one removed before its cleanup, and the old
     /// container may not have been cleaned up yet): it is stopped, never adopted, and once it
     /// has stopped the right one is started in its place. A stop is asked for once and checked
     /// on later steps, like an orphan's.

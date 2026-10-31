@@ -763,10 +763,10 @@ fn put_record(
     _ = try @import("writers.zig").txn(ctx.store, role, request, ctx.diag);
 }
 
-test "a stopped record left by an earlier replica with the same id never blocks the new one" {
-    // Goal: a service deleted and applied again restarts its replica numbering, so `web-1`
-    // exists twice in the store's life; the first one's stopped observed record, which the agent
-    // had not yet removed, must not stop the second from starting. Method: place `web-1` (the
+test "a stopped record left by an earlier replica of the same name never blocks the new one" {
+    // Goal: ids are unique forever now (the counter continues the numbering), but a stopped
+    // observed record planted under a replica's id (an older store, or a lost removal) must not
+    // stop that replica from starting. Method: place `web-1` (the
     // server steps, the agent does not), plant a stopped record of another generation (what the
     // first `web-1` left) and another that predates the replica's key, step the agent: it starts
     // the replica and replaces the record. (Seed 32 of `sim-cluster` found this.)
@@ -842,7 +842,7 @@ fn reapply_before_cleanup(world: *World, end_container: bool) !void {
     }
 }
 
-test "a running container of an earlier replica with the same id is replaced, not adopted" {
+test "a running container of an earlier replica of a re-applied service is stopped, not adopted" {
     // Goal: a service deleted and applied again on another image continues the numbering (the
     // counter is never deleted), so the replacement is `web-2` and the old `web-1` container, if
     // the node's agent has not cleaned up yet, is an orphan to stop, never the new replica.
@@ -856,7 +856,7 @@ test "a running container of an earlier replica with the same id is replaced, no
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
 }
 
-test "a stopped container of an earlier replica with the same id is replaced, not adopted" {
+test "a stopped container of an earlier replica of a re-applied service is replaced, not adopted" {
     // Goal: the same, with the old container already stopped. Method: as above, ending the
     // container first; the old service replaces the dead web-1 with web-2 before it is deleted,
     // so the new image runs as web-3.

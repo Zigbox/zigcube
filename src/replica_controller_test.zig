@@ -592,6 +592,41 @@ test "the counter stays after its service and replicas are gone" {
     try testing.expectEqual(@as(?u64, 4), try counter_next(&fixture, "hello"));
 }
 
+test "the counters never bound the controller: more service names than services_max" {
+    // Goal: counters are kept forever, so the number of them must bound nothing. Method: apply
+    // and delete more than `services_max` distinct names, one live at a time, then reconcile a
+    // live service and a re-applied first name: both work and numbering is right.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var one = hello;
+    one.replicas = 1;
+    var name_buffer: [32]u8 = undefined;
+    var request_buffer: [32]u8 = undefined;
+    for (0..constants.services_max + 10) |i| {
+        one.name = try std.fmt.bufPrint(&name_buffer, "svc-{d}", .{i});
+        try fixture.apply(one);
+        _ = try fixture.settle();
+        const request = try std.fmt.bufPrint(&request_buffer, "r-{x:0>8}", .{i + 100});
+        const ctx = fixture.context();
+        const done = try apply_mod.delete_service(&ctx, &fixture.api, one.name, "alex", request);
+        try testing.expect(done == .written);
+        _ = try fixture.settle();
+    }
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const live = try fixture.ids("hello");
+    defer Fixture.free_ids(live);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, live);
+    one.name = "svc-0";
+    try fixture.apply(one);
+    _ = try fixture.settle();
+    const again = try fixture.ids("svc-0");
+    defer Fixture.free_ids(again);
+    try expect_ids(&.{"svc-0-2"}, again);
+}
+
 test "a C0 service record's next_replica seeds the counter, or one past the highest replica" {
     // Goal: a number is never reused when the counter is first created. Method: a v1 service
     // record with next_replica 7 starts the numbers at 7; with the counter removed and a lower
