@@ -336,8 +336,15 @@ fn dump_service(run: *Run, name: []const u8) void {
     const snapshot = controller.read_snapshot(&ctx) catch return;
     if (snapshot.service_of(name)) |service| {
         const record = service.rec;
+        var next: u64 = 0;
+        const counter_at = records.replica_numbers_key(name);
+        const got = ctx.store.get(ctx.arena, counter_at.slice(), null, ctx.diag) catch null;
+        if (got) |found| if (found.kv) |kv| {
+            next = (records.read(records.ReplicaNumber, ctx.arena, kv, ctx.diag) catch
+                records.ReplicaNumber{ .next = 0 }).next;
+        };
         run.say("service {s}: want {d}, generation {d}, image {s}, next {d}\n", .{
-            name, record.replicas, record.generation, record.image, record.next_replica,
+            name, record.replicas, record.generation, record.image, next,
         });
     }
     for (snapshot.replicas) |replica| {

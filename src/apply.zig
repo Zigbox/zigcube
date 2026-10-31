@@ -88,7 +88,9 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         .env = input.env,
         .limits = input.limits,
         .generation = planned.generation,
-        .next_replica = if (planned.existing) |old| old.next_replica else 1,
+        // A v1 record's counter is carried until the replica controller has moved it to
+        // `/replica-numbers/`; a new service has none.
+        .next_replica = if (planned.existing) |old| old.next_replica else null,
         .applied_by = input.applied_by,
         .request_id = input.request_id,
     };

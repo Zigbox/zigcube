@@ -61,10 +61,16 @@ pub const prefix_allocations = "/allocations/";
 pub const prefix_audit_allocations = "/audit/allocations/";
 pub const prefix_node_status = "/node-status/";
 pub const prefix_summaries = "/decision-summaries/";
+pub const prefix_replica_numbers = "/replica-numbers/";
 
 pub fn service_key(name: []const u8) Key {
     assert(name_problem(name, constants.service_name_bytes_max) == null);
     return Key.build(&.{ prefix_services, name });
+}
+
+pub fn replica_numbers_key(service: []const u8) Key {
+    assert(name_problem(service, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_replica_numbers, service });
 }
 
 pub fn replicas_prefix(service: []const u8) Key {
@@ -223,7 +229,7 @@ pub const Requests = struct {
 pub const Pair = [2][]const u8;
 
 pub const Service = struct {
-    v: u32 = 1,
+    v: u32 = 2,
     name: []const u8,
     image: []const u8,
     replicas: u32,
@@ -231,9 +237,16 @@ pub const Service = struct {
     env: []const Pair = &.{},
     limits: Limits = .{},
     generation: u64,
-    next_replica: u64,
+    /// Read from a v1 record only, to seed `/replica-numbers/<service>`; v2 records omit it.
+    next_replica: ?u64 = null,
     applied_by: []const u8 = "",
     request_id: []const u8 = "",
+};
+
+/// The counter that keeps replica ids unique forever: the number the next replica takes.
+pub const ReplicaNumber = struct {
+    v: u32 = 1,
+    next: u64,
 };
 
 pub const Replica = struct {
@@ -928,8 +941,8 @@ test "the version a record is written in is the version the reader accepts" {
     var diag: Diag = undefined;
     diag.reset();
     inline for (.{
-        Service,  Replica,    Node, Observed, Assigned, Allocation, Audit, NodeStatus, Summary,
-        Decision, IndexEntry,
+        Service, Replica,       Node,     Observed,   Assigned, Allocation, Audit, NodeStatus,
+        Summary, ReplicaNumber, Decision, IndexEntry,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);

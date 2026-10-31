@@ -405,3 +405,249 @@ test "a malformed record is ZC-E0301 naming its key" {
     try testing.expectError(error.Malformed, fixture.step());
     try testing.expectEqual(codes.Code.E0301, fixture.diag.code.?);
 }
+
+// ---- The replica counter (`/replica-numbers/<service>`) ---------------------------------------
+
+/// A store that, just before the first `txn`, puts `key` through the inner store: a peer that
+/// writes between a controller's read and its commit.
+const MovingStore = struct {
+    inner: store.Store,
+    key: []const u8,
+    armed: bool = true,
+    fired: bool = false,
+
+    const vtable: store.Store.VTable = .{
+        .status = status,
+        .get = get,
+        .list = list,
+        .txn = txn,
+        .watch = watch,
+        .lease_grant = lease_grant,
+        .lease_keepalive = lease_keepalive,
+        .lease_revoke = lease_revoke,
+        .lease_list = lease_list,
+        .expire_leases = expire_leases,
+        .compact = compact,
+    };
+
+    fn interface(self: *MovingStore) store.Store {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *MovingStore {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn status(context: *anyopaque, diag: *Diag) store.Error!store.Status {
+        return from(context).inner.vtable.status(from(context).inner.context, diag);
+    }
+
+    fn get(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        key: []const u8,
+        at_revision: ?store.Revision,
+        diag: *Diag,
+    ) store.Error!store.GetResult {
+        const inner = from(context).inner;
+        return inner.vtable.get(inner.context, arena, key, at_revision, diag);
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        options: store.ListOptions,
+        diag: *Diag,
+    ) store.Error!store.ListResult {
+        const inner = from(context).inner;
+        return inner.vtable.list(inner.context, arena, options, diag);
+    }
+
+    fn txn(
+        context: *anyopaque,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
+        const self = from(context);
+        if (self.armed) {
+            self.armed = false;
+            self.fired = true;
+            const op: store.Op = .{ .put = .{ .key = self.key, .value = "{\"v\":1,\"next\":99}" } };
+            _ = try self.inner.vtable.txn(self.inner.context, .{ .on_success = &.{op} }, diag);
+        }
+        return self.inner.vtable.txn(self.inner.context, request, diag);
+    }
+
+    fn watch(
+        context: *anyopaque,
+        options: store.WatchOptions,
+        diag: *Diag,
+    ) store.Error!store.Watch {
+        const inner = from(context).inner;
+        return inner.vtable.watch(inner.context, options, diag);
+    }
+
+    fn lease_grant(context: *anyopaque, ttl_ms: u32, diag: *Diag) store.Error!store.Lease {
+        const inner = from(context).inner;
+        return inner.vtable.lease_grant(inner.context, ttl_ms, diag);
+    }
+
+    fn lease_keepalive(
+        context: *anyopaque,
+        id: store.LeaseId,
+        diag: *Diag,
+    ) store.Error!store.Lease {
+        const inner = from(context).inner;
+        return inner.vtable.lease_keepalive(inner.context, id, diag);
+    }
+
+    fn lease_revoke(
+        context: *anyopaque,
+        id: store.LeaseId,
+        diag: *Diag,
+    ) store.Error!store.Revision {
+        const inner = from(context).inner;
+        return inner.vtable.lease_revoke(inner.context, id, diag);
+    }
+
+    fn lease_list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        diag: *Diag,
+    ) store.Error![]const store.LeaseInfo {
+        const inner = from(context).inner;
+        return inner.vtable.lease_list(inner.context, arena, diag);
+    }
+
+    fn expire_leases(context: *anyopaque, diag: *Diag) store.Error!u32 {
+        const inner = from(context).inner;
+        return inner.vtable.expire_leases(inner.context, diag);
+    }
+
+    fn compact(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!void {
+        const inner = from(context).inner;
+        return inner.vtable.compact(inner.context, revision, diag);
+    }
+};
+
+/// The counter's `next`, or null if the key is absent.
+fn counter_next(fixture: *Fixture, service: []const u8) !?u64 {
+    const ctx = fixture.context();
+    const key = records.replica_numbers_key(service);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    const kv = got.kv orelse return null;
+    return (try records.read(records.ReplicaNumber, ctx.arena, kv, &fixture.diag)).next;
+}
+
+test "replica numbers are never reused across scale down, scale up and a re-apply" {
+    // Goal: the counter lives in `/replica-numbers/hello`, moves with the replicas it creates,
+    // and survives while the service's replicas do. Method: 3 replicas, down to 1, up to 3; then
+    // delete the service and apply it again before the next pass clears the counter.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 4), try counter_next(&fixture, "hello"));
+
+    var down = hello;
+    down.replicas = 1;
+    try fixture.apply(down);
+    _ = try fixture.settle();
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const regrown = try fixture.ids("hello");
+    defer Fixture.free_ids(regrown);
+    try expect_ids(&.{ "hello-1", "hello-4", "hello-5" }, regrown);
+    try testing.expectEqual(@as(?u64, 6), try counter_next(&fixture, "hello"));
+
+    var ctx = fixture.context();
+    const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000003");
+    try testing.expect(done == .written);
+    _ = try fixture.step(); // stops the replicas; the counter waits for the next pass
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const again = try fixture.ids("hello");
+    defer Fixture.free_ids(again);
+    try expect_ids(&.{ "hello-6", "hello-7", "hello-8" }, again);
+}
+
+test "the counter goes with the last replica of a deleted service" {
+    // Goal: no key outlives its service and replicas. Method: delete, settle, look for the key.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try testing.expect((try counter_next(&fixture, "hello")) != null);
+    const ctx = fixture.context();
+    _ = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000004");
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, null), try counter_next(&fixture, "hello"));
+}
+
+test "a C0 service record's next_replica seeds the counter, or one past the highest replica" {
+    // Goal: a number is never reused when the counter is first created. Method: a v1 service
+    // record with next_replica 7 starts the numbers at 7; with the counter removed and a lower
+    // legacy value, one past the highest replica number wins.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    const legacy: records.Service = .{
+        .v = 1,
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 2,
+        .command = hello.command,
+        .generation = 1,
+        .next_replica = 7,
+    };
+    try fixture.put(.api, records.service_key("hello").slice(), legacy);
+    _ = try fixture.settle();
+    const first = try fixture.ids("hello");
+    defer Fixture.free_ids(first);
+    try expect_ids(&.{ "hello-7", "hello-8" }, first);
+    try testing.expectEqual(@as(?u64, 9), try counter_next(&fixture, "hello"));
+
+    const ctx = fixture.context();
+    const key = records.replica_numbers_key("hello");
+    const drop: store.Op = .{ .delete = key.slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{drop} }, &fixture.diag);
+    var more = hello;
+    more.replicas = 3;
+    try fixture.apply(more);
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 10), try counter_next(&fixture, "hello"));
+}
+
+test "the creating transaction fails when the counter moved, and the next pass plans again" {
+    // Goal: the counter is in the read set. Method: a store that moves the counter just before
+    // the first commit; that pass writes nothing, the next one creates the replicas from 99.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = records.replica_numbers_key("hello").slice(),
+        .armed = false,
+    };
+    var more = hello;
+    more.replicas = 4;
+    try fixture.apply(more);
+    moving.armed = true;
+    var ctx = fixture.context();
+    ctx.store = moving.interface();
+    const wake = try fixture.rc.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    try testing.expectEqual(@as(?u64, 99), try counter_next(&fixture, "hello"));
+    _ = try fixture.settle();
+    const ids = try fixture.ids("hello");
+    defer Fixture.free_ids(ids);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3", "hello-99" }, ids);
+}

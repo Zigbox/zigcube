@@ -256,6 +256,9 @@ pub const DecisionSpec = struct {
     cause: records.Cause,
     change: ?[]const u8 = null,
     cause_diagnostic: ?records.Raw = null,
+    /// The fields of the cause's key that the decision used (at most
+    /// `constants.decision_evidence_bytes_max` bytes of JSON).
+    cause_evidence: ?records.Raw = null,
 };
 
 /// Adds a decision and its by-subject index entry to `batch` (two operations) and returns its id.
@@ -268,6 +271,9 @@ pub fn put_decision(
 ) Error!records.DecisionId {
     assert(spec.reason.len > 0);
     assert(batch.has_room(2));
+    if (spec.cause_evidence) |evidence| {
+        assert(evidence.text.len <= constants.decision_evidence_bytes_max);
+    }
     const at_ms = ctx.clock.now_ms();
     assert(at_ms <= constants.decision_time_ms_max);
     const id = source.next(at_ms);
@@ -281,6 +287,7 @@ pub fn put_decision(
         .change = spec.change,
         .cause = spec.cause,
         .cause_diagnostic = spec.cause_diagnostic,
+        .cause_evidence = spec.cause_evidence,
     };
     const entry: records.IndexEntry = .{
         .id = id.slice(),

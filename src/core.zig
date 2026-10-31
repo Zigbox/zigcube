@@ -28,6 +28,7 @@ pub const modules = .{
     @import("core_smoke.zig"),
     @import("diag.zig"),
     @import("diag/codes.zig"),
+    @import("node_controller.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
     @import("runtime_codes.zig"),

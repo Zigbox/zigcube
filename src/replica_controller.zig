@@ -46,6 +46,7 @@ const DecisionId = records.DecisionId;
 const ServiceEntry = Entry(records.Service);
 const ReplicaEntry = Entry(records.Replica);
 const ObservedEntry = Entry(records.Observed);
+const NumberEntry = Entry(records.ReplicaNumber);
 
 pub const actor = "replica-controller";
 pub const scheduler_actor = "scheduler";
@@ -62,6 +63,7 @@ pub const watch_prefixes = [_][]const u8{
     records.prefix_replicas,
     records.prefix_observed,
     records.prefix_nodes,
+    records.prefix_replica_numbers,
 };
 
 comptime {
@@ -86,15 +88,24 @@ pub const ReplicaController = struct {
         assert(ctx.diag.code == null);
         const now = ctx.clock.now_ms();
         const snapshot = try controller.read_snapshot(ctx);
+        const numbers = try controller.list_all(
+            records.ReplicaNumber,
+            ctx,
+            records.prefix_replica_numbers,
+            snapshot.revision,
+            constants.services_max,
+        );
         var run: Run = .{
             .rc = rc,
             .ctx = ctx,
             .snap = &snapshot,
+            .numbers = numbers.items,
             .txns_left = constants.controller_txns_per_step_max,
         };
         try run.place_unplaced();
         for (snapshot.services) |*service| try run.reconcile_service(service);
         try run.reconcile_orphans();
+        try run.reconcile_numbers();
         if (now >= rc.retention.due_ms) {
             rc.retention.due_ms = try retention.prune(ctx, &rc.retention, &snapshot, now);
         }
@@ -135,6 +146,8 @@ const Run = struct {
     rc: *ReplicaController,
     ctx: *const Context,
     snap: *const Snapshot,
+    /// `/replica-numbers/`, read at the snapshot's revision.
+    numbers: []const NumberEntry,
     txns_left: u32,
     acted: u32 = 0,
     /// Work is left for the next step (a conflict, a spent budget, a partial change).
@@ -421,8 +434,9 @@ const Run = struct {
 
     // ---- Creating ----
 
-    /// Adds `count` replicas to `batch`, each with its decision, and moves the service's
-    /// `next_replica` in the same transaction (docs/keys.md).
+    /// Adds `count` replicas to `batch`, each with its decision, and moves the service's counter
+    /// (`/replica-numbers/<service>`) in the same transaction, compared at the revision read
+    /// (docs/keys.md).
     fn create_replicas(
         run: *Run,
         batch: *Batch,
@@ -431,7 +445,8 @@ const Run = struct {
         count: u32,
     ) Error!void {
         if (count == 0) return;
-        var next = service.rec.next_replica;
+        const counter = run.counter_of(service.rec.name);
+        var next = if (counter) |found| found.rec.next else run.first_number(service);
         for (0..count) |_| {
             if (next > constants.replica_number_max) return run.numbers_used_up(service);
             const id = try controller.format(run.ctx, "{s}-{d}", .{ service.rec.name, next });
@@ -459,10 +474,59 @@ const Run = struct {
             batch.put(try controller.key_copy(run.ctx, &key), value);
             next += 1;
         }
-        var updated = service.rec;
-        updated.next_replica = next;
-        const bytes = try records.encode(run.ctx.arena, updated, run.ctx.diag);
-        batch.put(service.kv.key, bytes);
+        const counter_at = records.replica_numbers_key(service.rec.name);
+        const key = try controller.key_copy(run.ctx, &counter_at);
+        batch.expect(key, if (counter) |found| found.kv.mod_revision else 0);
+        const number: records.ReplicaNumber = .{ .next = next };
+        const bytes = try records.encode(run.ctx.arena, number, run.ctx.diag);
+        batch.put(key, bytes);
+    }
+
+    fn counter_of(run: *Run, service: []const u8) ?*const NumberEntry {
+        const key = records.replica_numbers_key(service);
+        for (run.numbers) |*entry| {
+            if (std.mem.eql(u8, entry.kv.key, key.slice())) return entry;
+        }
+        return null;
+    }
+
+    /// The first number of a service that has no counter yet: the larger of a v1 service
+    /// record's `next_replica` and one past the highest replica number there is, so a number is
+    /// never reused.
+    fn first_number(run: *Run, service: *const ServiceEntry) u64 {
+        var first: u64 = service.rec.next_replica orelse 1;
+        for (run.snap.replicas) |replica| {
+            if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
+            const number = records.replica_number(service.rec.name, replica.rec.id) orelse continue;
+            first = @max(first, @as(u64, number) + 1);
+        }
+        return first;
+    }
+
+    /// Deletes the counter of a service that is gone once none of its replicas remain.
+    fn reconcile_numbers(run: *Run) Error!void {
+        var batch: Batch = .{};
+        for (run.numbers) |*entry| {
+            const name = entry.kv.key[records.prefix_replica_numbers.len..];
+            if (run.snap.service_of(name) != null) continue;
+            if (run.has_replicas(name)) continue;
+            if (batch.ops_count == batch_replicas_max) {
+                run.more = true;
+                break;
+            }
+            batch.expect(entry.kv.key, entry.kv.mod_revision);
+            batch.delete(entry.kv.key);
+        }
+        if (batch.ops_count == 0) return;
+        if (!run.budget()) return;
+        _ = try run.finish(&batch);
+    }
+
+    fn has_replicas(run: *Run, service: []const u8) bool {
+        for (run.snap.replicas) |replica| {
+            if (std.mem.eql(u8, replica.rec.service, service)) return true;
+        }
+        return false;
     }
 
     fn numbers_used_up(run: *Run, service: *const Entry(records.Service)) error{NoCapacity} {

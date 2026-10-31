@@ -328,7 +328,6 @@ test "decisions older than seven days go, with their index entries, and newer on
         .replicas = 1,
         .command = &.{"x"},
         .generation = 1,
-        .next_replica = 1,
     };
     const services = [_]Entry{.{ .kv = undefined, .rec = service }};
     var snapshot = empty_snapshot;
@@ -356,7 +355,6 @@ test "a subject keeps its newest two hundred and drops the older ones" {
         .replicas = 1,
         .command = &.{"x"},
         .generation = 1,
-        .next_replica = 1,
     };
     const services = [_]Entry{.{ .kv = undefined, .rec = service }};
     var snapshot = empty_snapshot;
