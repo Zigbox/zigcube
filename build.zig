@@ -69,23 +69,13 @@ pub fn build(b: *std.Build) void {
     add_tidy_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
-    const ops_help = "Operations of the fuzz variants of sim-c0 and sim-cluster (default 100)";
-    const ops = b.option(u32, "ops", ops_help) orelse 100;
-    add_sim_step(b, .{
+    add_sim_steps(b, .{
         .seed = seed,
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
         .library = library,
-        .ops = ops,
-    });
-    add_sim_cluster_step(b, .{
-        .seed = seed,
-        .target = target,
-        .optimize = optimize,
-        .zigbox = zigbox_module,
-        .library = library,
-        .ops = ops,
+        .ops = 0,
     });
     add_check_step(b);
 }
@@ -595,8 +585,17 @@ fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
     }
 }
 
+/// Declares `-Dops` once, for sim-c0's fuzz variant and sim-cluster alike.
+fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
+    const ops_help = "Operations of the fuzz variants of sim-c0 and sim-cluster (default 100)";
+    var sim = options;
+    sim.ops = b.option(u32, "ops", ops_help) orelse 100;
+    add_sim_step(b, sim);
+    add_sim_cluster_step(b, sim);
+}
+
 /// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation
-/// (src/sim_cluster.zig), native only. `-Dnodes=0` lets the seed pick. `-Dops` is shared with sim-c0.
+/// (src/sim_cluster.zig), native only. `-Dnodes=0` lets the seed pick; `-Dops` is sim-c0's too.
 fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",

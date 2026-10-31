@@ -236,7 +236,8 @@ const Node = struct {
         node.sim.restart();
         node.agent.init(node.config());
         node.loop = agent_loop.Loop.init();
-        node.remote = agent_client.RemoteStore.init(node.cluster.gpa, node.transport(), node.name());
+        const gpa = node.cluster.gpa;
+        node.remote = agent_client.RemoteStore.init(gpa, node.transport(), node.name());
         node.down = false;
         node.resume_ms = 0;
     }
@@ -410,8 +411,9 @@ pub const Cluster = struct {
         const ppm = if (ppm_max == 0) 0 else random.intRangeAtMost(i32, -ppm_max, ppm_max);
         node.cluster = c;
         node.index = index;
+        // "node" and at most two digits fit the buffer, since `nodes_max` is 16.
         const name = std.fmt.bufPrint(&node.name_buf, "node{d}", .{index + 1}) catch unreachable;
-        node.name_len = @intCast(name.len); // "node" and at most two digits fit the buffer.
+        node.name_len = @intCast(name.len);
         node.nclock = sim_clock.NodeClock.init(
             c.manual.clock(),
             random.uintLessThan(u64, 1_000_000),
