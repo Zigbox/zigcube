@@ -208,7 +208,8 @@ pub const SimState = struct {
     fn lose_unsynced(state: *SimState) void {
         for (state.files.items) |*file| {
             if (file.data.len <= file.synced_len) continue;
-            const kept = state.prng.random().intRangeAtMost(usize, file.synced_len, file.data.len);
+            const length: u32 = @intCast(file.data.len);
+            const kept = state.prng.random().intRangeAtMost(u32, file.synced_len, length);
             // If the allocator refuses to shrink, nothing is lost: keeping the whole tail is one
             // of the outcomes the model allows, and the slice keeps its allocated length.
             file.data = state.gpa.realloc(file.data, kept) catch continue;
@@ -297,7 +298,8 @@ pub const SimState = struct {
         if (before + data.len > file_bytes_max) return error.TooBig;
         // One write point. If the crash fires here, a prefix of `data` got to the file.
         const crashes = state.point();
-        const kept = if (crashes) state.prng.random().uintAtMost(usize, data.len) else data.len;
+        const cut: u32 = @intCast(data.len);
+        const kept = if (crashes) state.prng.random().uintAtMost(u32, cut) else data.len;
         // The point may have cut the file's unsynced tail (a host crash): append to what is left.
         const base = state.find(name);
         const have: usize = if (base) |i| state.files.items[i].data.len else 0;
