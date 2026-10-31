@@ -17,6 +17,12 @@
 //!                             connection that forwarded the last of them (n = 0: the next chunk
 //!                             is cut before any byte). One shot. Mid-transaction and mid-COMMIT
 //!                             cuts are this with the byte count of the message to be cut
+//!     cut_on_commit_reply()   one shot: the first Postgres CommandComplete "COMMIT" message on
+//!                             its way to a client is held back and that connection is reset
+//!                             instead, after every byte before it. The server has committed
+//!                             and the client never hears: the lost acknowledgement. It looks
+//!                             for the 12 bytes of the message inside one chunk (a message
+//!                             split across two reads escapes it, which only misses a cut)
 //!     stall(dir)              half-open: bytes in `dir` stop (nothing is read from the sender,
 //!                             nothing is written to the receiver) and the other direction runs
 //!     partition()             both directions dropped: stall(to_server) and stall(to_client).
@@ -68,7 +74,15 @@ pub const Stats = struct {
     upstream_connects: u32,
     /// Connections reset by `cut_all` or `cut_after`.
     cuts: u32,
+    /// How many of those were `cut_on_commit_reply`.
+    commit_cuts: u32,
 };
+
+/// A CommandComplete message with the tag "COMMIT": 'C', length 11, then the NUL-ended tag.
+const commit_reply = "C\x00\x00\x00\x0bCOMMIT\x00";
+comptime {
+    assert(commit_reply.len == 12);
+}
 
 const Lane = struct {
     buffer: [chunk_bytes]u8,
@@ -120,6 +134,8 @@ pub const Proxy = struct {
     accepted: std.atomic.Value(u32),
     upstream_connects: std.atomic.Value(u32),
     cuts: std.atomic.Value(u32),
+    commit_cut: std.atomic.Value(bool),
+    commit_cuts: std.atomic.Value(u32),
     pairs: [pairs_max]?*Pair,
 
     /// Listens on an ephemeral loopback port and relays to `upstream_port` on 127.0.0.1.
@@ -147,6 +163,8 @@ pub const Proxy = struct {
             .accepted = .init(0),
             .upstream_connects = .init(0),
             .cuts = .init(0),
+            .commit_cut = .init(false),
+            .commit_cuts = .init(0),
             .pairs = @splat(null),
         };
         proxy.thread = try std.Thread.spawn(.{}, run, .{proxy});
@@ -182,6 +200,10 @@ pub const Proxy = struct {
         proxy.cut_budget[@backingInt(dir)].store(bytes, .release);
     }
 
+    pub fn cut_on_commit_reply(proxy: *Proxy) void {
+        proxy.commit_cut.store(true, .release);
+    }
+
     pub fn stall(proxy: *Proxy, dir: Direction) void {
         proxy.stalled[@backingInt(dir)].store(true, .release);
     }
@@ -200,6 +222,7 @@ pub const Proxy = struct {
         proxy.set_bandwidth(0);
         proxy.hole.store(false, .release);
         _ = proxy.heal_generation.fetchAdd(1, .acq_rel);
+        proxy.commit_cut.store(false, .release);
         for (0..2) |index| {
             proxy.stalled[index].store(false, .release);
             proxy.cut_budget[index].store(disarmed, .release);
@@ -212,6 +235,7 @@ pub const Proxy = struct {
             .accepted = proxy.accepted.load(.acquire),
             .upstream_connects = proxy.upstream_connects.load(.acquire),
             .cuts = proxy.cuts.load(.acquire),
+            .commit_cuts = proxy.commit_cuts.load(.acquire),
         };
     }
 
@@ -371,6 +395,11 @@ pub const Proxy = struct {
         if (now < lane.release_ns) return .fine;
         var allowed: u64 = lane.end - lane.start;
         allowed = @min(allowed, proxy.bandwidth_allowance(lane, now));
+        switch (proxy.commit_reply_fate(lane, dir)) {
+            .fine => {},
+            .cut => return .cut,
+            .limit => |before| allowed = @min(allowed, before),
+        }
         const budget = proxy.cut_budget[@backingInt(dir)].load(.acquire);
         if (budget == 0) {
             // One shot: whoever disarms it cuts; a lost race leaves the connection alone.
@@ -403,6 +432,22 @@ pub const Proxy = struct {
         );
         if (swapped == null and left == 0) return .cut;
         return .fine;
+    }
+
+    const CommitFate = union(enum) { fine, cut, limit: u64 };
+
+    /// With `cut_on_commit_reply` armed: forward what precedes a COMMIT reply, then cut. One
+    /// shot, like `cut_after`: whoever disarms it cuts.
+    fn commit_reply_fate(proxy: *Proxy, lane: *const Lane, dir: Direction) CommitFate {
+        if (dir != .to_client) return .fine;
+        if (!proxy.commit_cut.load(.acquire)) return .fine;
+        const pending = lane.buffer[lane.start..lane.end];
+        const at = std.mem.indexOf(u8, pending, commit_reply) orelse return .fine;
+        if (at != 0) return .{ .limit = at };
+        const disarm = proxy.commit_cut.cmpxchgStrong(true, false, .acq_rel, .acquire);
+        if (disarm != null) return .fine;
+        _ = proxy.commit_cuts.fetchAdd(1, .acq_rel);
+        return .cut;
     }
 
     /// How many bytes the lane may write now under the bandwidth limit.
@@ -763,6 +808,33 @@ test "cut_after zero: the next chunk is cut before any byte, and only that conne
         try expect_echo(later, text, 1000);
     }
     try std.testing.expectEqual(@as(u32, 1), rig.proxy.stats().cuts);
+}
+
+test "cut_on_commit_reply: what precedes a COMMIT reply arrives, the reply does not" {
+    // Goal: the proxy cuts exactly at a COMMIT CommandComplete, once. Method: the echo upstream
+    // sends back "ab", the 12-byte reply and "cd"; the client must see "ab" and then a reset.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const first = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(first);
+    rig.proxy.cut_on_commit_reply();
+    try send_all(first, "ab" ++ commit_reply ++ "cd");
+    var buffer: [64]u8 = undefined;
+    var got: usize = 0;
+    for (0..40) |_| switch (recv_within(first, buffer[got..], 100)) {
+        .bytes => |count| got += count,
+        .reset => break,
+        .closed => return error.CleanCloseNotReset,
+        else => continue,
+    } else return error.NotCut;
+    try std.testing.expectEqualStrings("ab", buffer[0..got]);
+    // One shot: the next connection's reply goes through whole.
+    const second = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(second);
+    try expect_echo(second, commit_reply, 1000);
+    const stats = rig.proxy.stats();
+    try std.testing.expectEqual(@as(u32, 1), stats.commit_cuts);
+    try std.testing.expectEqual(@as(u32, 1), stats.cuts);
 }
 
 test "upstream connect: a refused upstream closes the client instead of hanging the proxy" {

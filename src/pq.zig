@@ -513,11 +513,22 @@ fn fill_database_missing(diag: *Diag, message: []const u8, target: Target) void 
     });
 }
 
+const dropped_commit_cause = "the connection dropped during the commit; the write may or may not apply";
+
+/// True for a ZC-E0213 that happened during a COMMIT: the write may have applied. A drop at any
+/// other point (ZC-E0213 too) certainly changed nothing. The fault tests tell the two apart.
+pub fn dropped_during_commit(diag: *const Diag) bool {
+    const code = diag.code orelse return false;
+    if (code != .E0213) return false;
+    const cause = diag.last_cause() orelse return false;
+    return std.mem.eql(u8, cause, dropped_commit_cause);
+}
+
 fn fill_dropped(diag: *Diag, message: []const u8, detail: Detail) void {
     diag.raise(.E0213);
     diag.cause("libpq reported: {s}", .{message});
     if (detail.committing) {
-        diag.cause("the connection dropped during the commit; the write may or may not apply", .{});
+        diag.cause(dropped_commit_cause, .{});
         diag.fix(.{ .sentence = "read the keys back before repeating the write" });
     } else {
         diag.cause("the connection to Postgres dropped; nothing was changed", .{});
@@ -720,8 +731,10 @@ test "a commit that drops says the outcome is unknown; any other statement says 
     try testing.expectEqual(error.BackendFailed, dropped);
     try testing.expectEqual(@as(@import("diag/codes.zig").Code, .E0213), diag.code.?);
     try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "may or may not apply") != null);
+    try testing.expect(dropped_during_commit(&diag));
     diag.reset();
     const quiet = fill(&diag, .dropped, "server closed the connection", target, .{});
     try testing.expectEqual(error.BackendFailed, quiet);
     try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "nothing was changed") != null);
+    try testing.expect(!dropped_during_commit(&diag));
 }
