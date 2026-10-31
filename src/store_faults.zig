@@ -943,7 +943,10 @@ fn compaction_stage(shared: *Shared, setup: Setup, finished: Finished) !Stage {
     for (&readers, 0..) |*reader, index| recorders[index] = &reader.recorder;
     const entries = try history.merge(gpa, &recorders);
     defer gpa.free(entries);
-    const options: history.Options = .{ .base_revision = setup.base, .final_revision = finished.final };
+    const options: history.Options = .{
+        .base_revision = setup.base,
+        .final_revision = finished.final,
+    };
     const checked = history.check_compaction(entries, finished.log, options);
     var served: u32 = 0;
     var refused: u32 = 0;

@@ -181,7 +181,8 @@ pub const Recorder = struct {
 
     pub fn ack_read(recorder: *Recorder, ticker: *Ticker, handle: usize, found: ReadAck) void {
         const entry = &recorder.entries.items[handle];
-        assert(entry.call == .read or entry.call == .read_at);
+        const call_fits = entry.call == .read or entry.call == .read_at;
+        assert(call_fits);
         entry.outcome = .acked;
         entry.revision = found.mod_revision;
         entry.value = found.value;

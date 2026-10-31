@@ -157,12 +157,14 @@ pub const Harness = struct {
         var port: u16 = 5432;
         var words = std.mem.tokenizeScalar(u8, conninfo, ' ');
         while (words.next()) |word| {
-            if (std.mem.startsWith(u8, word, "port=")) port = try std.fmt.parseInt(u16, word[5..], 10);
+            if (!std.mem.startsWith(u8, word, "port=")) continue;
+            port = try std.fmt.parseInt(u16, word[5..], 10);
         }
         const proxy = try fault_proxy.Proxy.start(harness.gpa, port);
         harness.proxy = proxy;
         const format = "{s} host=127.0.0.1 port={d}"; // The last keyword wins in libpq.
-        harness.proxy_conninfo = try std.fmt.allocPrintSentinel(harness.gpa, format, .{ conninfo, proxy.port }, 0);
+        const args = .{ conninfo, proxy.port };
+        harness.proxy_conninfo = try std.fmt.allocPrintSentinel(harness.gpa, format, args, 0);
         harness.pg_conninfo = harness.proxy_conninfo.?;
         harness.proxy_thread = try std.Thread.spawn(.{}, disturb, .{harness});
     }
