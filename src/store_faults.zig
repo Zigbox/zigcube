@@ -488,7 +488,12 @@ fn tally(entries: []const history.Entry) Outcome {
     return total;
 }
 
+/// Off in the runner's own test: a passing test prints nothing (the build runner reports any
+/// stderr of a passing step as a failure). Set before the threads start, never while they run.
+var say_enabled = true;
+
 fn say(comptime format: []const u8, args: anytype) void {
+    if (!say_enabled) return;
     std.debug.print("store-faults: " ++ format ++ "\n", args);
 }
 
@@ -863,6 +868,8 @@ test "the runner passes an honest store and rejects each kind of lie with its ow
     // start), the full run, a fixed seed. Threads interleave as the machine likes, so a lie
     // that needs a coincidence to show (a stale read needs a write in between) gets three
     // seeds; the other two are certain on the first.
+    say_enabled = false;
+    defer say_enabled = true;
     const honest = try mutated_report(.none, 7);
     try std.testing.expect(honest.passed);
     try std.testing.expectEqual(@as(?history.Kind, null), honest.kind);
