@@ -6,7 +6,11 @@
 //!
 //! ## What a test can script
 //!
-//!     set_latency(ms)         every chunk waits this long before it is forwarded
+//!     set_latency(ms)         every chunk waits this long before it is forwarded. A lane holds
+//!                             one chunk (16 KiB) at a time and reads the next only after it
+//!                             is written, so under latency a lane carries at most 16 KiB per
+//!                             period: bulk transfers are slowed as well as delayed. The fault
+//!                             tests send small messages, where the two are the same
 //!     set_bandwidth(bytes)    at most this many bytes per second in each direction (0: no limit)
 //!     cut_all()               reset every open connection now (a TCP RST, not a quiet close)
 //!     cut_after(dir, n)       once n more bytes have been forwarded in `dir`, reset the
@@ -20,11 +24,17 @@
 //!     black_hole(on)          new connections are accepted and nobody answers; what they send
 //!                             is read and discarded; nothing reaches the upstream
 //!     heal()                  undo every one of the above except connections already cut:
-//!                             latency, bandwidth, stalls, the black hole and an armed cut_after
+//!                             latency, bandwidth, stalls, the black hole and an armed cut_after.
+//!                             A connection the black hole swallowed has no upstream and cannot
+//!                             be resumed, so heal resets it (counted in `cuts`): its client
+//!                             sees the failure at once and reconnects through the healed proxy
 //!
 //! A stalled direction holds its bytes, as a partition delays packets and TCP retransmits them:
 //! after `heal` they arrive, in order, unless the endpoints gave up in the meantime. "Dropped,
 //! then healed" is `partition()`, wait, `heal()`.
+//!
+//! The proxy thread does everything, including the upstream connect, which gives up after
+//! `connect_timeout_ms` (the client is then closed); nothing is served meanwhile.
 //!
 //! The proxy keeps no log of what it forwarded; `stats` counts bytes and connections.
 
@@ -46,6 +56,7 @@ pub const chunk_bytes = 16 * 1024;
 const sleep_ns = 1_000_000;
 const ns_per_s = 1_000_000_000;
 const ns_per_ms = 1_000_000;
+const connect_timeout_ms = 1000;
 const burst_ns = 50 * ns_per_ms;
 const disarmed = std.math.maxInt(u64);
 
@@ -78,6 +89,8 @@ const Pair = struct {
     server: fd_t,
     lanes: [2]Lane,
     seen_cut: u32,
+    /// The heal generation at accept: a swallowed connection older than a `heal` is reset.
+    seen_heal: u32,
 
     fn source(pair: *const Pair, dir: Direction) fd_t {
         return if (dir == .to_server) pair.client else pair.server;
@@ -101,6 +114,7 @@ pub const Proxy = struct {
     stalled: [2]std.atomic.Value(bool),
     hole: std.atomic.Value(bool),
     cut_generation: std.atomic.Value(u32),
+    heal_generation: std.atomic.Value(u32),
     cut_budget: [2]std.atomic.Value(u64),
     forwarded: [2]std.atomic.Value(u64),
     accepted: std.atomic.Value(u32),
@@ -127,6 +141,7 @@ pub const Proxy = struct {
             .stalled = .{ .init(false), .init(false) },
             .hole = .init(false),
             .cut_generation = .init(0),
+            .heal_generation = .init(0),
             .cut_budget = .{ .init(disarmed), .init(disarmed) },
             .forwarded = .{ .init(0), .init(0) },
             .accepted = .init(0),
@@ -184,6 +199,7 @@ pub const Proxy = struct {
         proxy.set_latency(0);
         proxy.set_bandwidth(0);
         proxy.hole.store(false, .release);
+        _ = proxy.heal_generation.fetchAdd(1, .acq_rel);
         for (0..2) |index| {
             proxy.stalled[index].store(false, .release);
             proxy.cut_budget[index].store(disarmed, .release);
@@ -206,9 +222,11 @@ pub const Proxy = struct {
             proxy.accept_all();
             const now = monotonic_ns();
             const generation = proxy.cut_generation.load(.acquire);
+            const healed = proxy.heal_generation.load(.acquire);
             for (&proxy.pairs) |*slot| {
                 const pair = slot.* orelse continue;
-                if (pair.seen_cut != generation) {
+                const swallowed = pair.server < 0 and pair.seen_heal != healed;
+                if (pair.seen_cut != generation or swallowed) {
                     proxy.drop(pair, true);
                     slot.* = null;
                 } else if (!proxy.service(pair, now)) {
@@ -235,8 +253,10 @@ pub const Proxy = struct {
     /// the upstream refused; the caller closes the client.
     fn admit(proxy: *Proxy, client: fd_t) bool {
         var server: fd_t = -1;
+        // Before the hole is read: a `heal` in between leaves this pair older than it.
+        const healed = proxy.heal_generation.load(.acquire);
         if (!proxy.hole.load(.acquire)) {
-            server = connect_loopback(proxy.upstream_port) catch return false;
+            server = connect_within(proxy.upstream_port, connect_timeout_ms) catch return false;
             _ = proxy.upstream_connects.fetchAdd(1, .acq_rel);
         }
         for (&proxy.pairs) |*slot| {
@@ -255,8 +275,8 @@ pub const Proxy = struct {
                     .shut = false,
                 }),
                 .seen_cut = proxy.cut_generation.load(.acquire),
+                .seen_heal = healed,
             };
-            if (server >= 0) set_nonblocking(server);
             set_nodelay(client);
             slot.* = pair;
             return true;
@@ -352,7 +372,16 @@ pub const Proxy = struct {
         var allowed: u64 = lane.end - lane.start;
         allowed = @min(allowed, proxy.bandwidth_allowance(lane, now));
         const budget = proxy.cut_budget[@backingInt(dir)].load(.acquire);
-        if (budget == 0) return .cut;
+        if (budget == 0) {
+            // One shot: whoever disarms it cuts; a lost race leaves the connection alone.
+            const disarm = proxy.cut_budget[@backingInt(dir)].cmpxchgStrong(
+                0,
+                disarmed,
+                .acq_rel,
+                .acquire,
+            );
+            return if (disarm == null) .cut else .fine;
+        }
         allowed = @min(allowed, budget);
         if (allowed == 0) return .fine;
         const rc = linux.write(pair.sink(dir), lane.buffer[lane.start..].ptr, allowed);
@@ -420,6 +449,31 @@ pub fn listen_loopback(port: u16) !Bound {
         return error.SocketFailed;
     }
     return .{ .fd = fd, .port = std.mem.bigToNative(u16, address.port) };
+}
+
+/// A nonblocking connection to 127.0.0.1:`port` that gives up after `ms`, with Nagle off.
+fn connect_within(port: u16, ms: i32) !fd_t {
+    const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | nonblock_cloexec, 0);
+    if (linux.errno(made) != .SUCCESS) return error.SocketFailed;
+    const fd: fd_t = @intCast(made);
+    errdefer _ = linux.close(fd);
+    const address = loopback(port);
+    const size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    switch (linux.errno(linux.connect(fd, &address, size))) {
+        .SUCCESS => {},
+        .INPROGRESS => {
+            var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT }};
+            if (linux.poll(&fds, 1, ms) == 0) return error.ConnectTimeout;
+            var failed: c_int = 0;
+            var length: linux.socklen_t = @sizeOf(c_int);
+            const out: [*]u8 = @ptrCast(&failed);
+            const got = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.ERROR, out, &length);
+            if (linux.errno(got) != .SUCCESS or failed != 0) return error.ConnectFailed;
+        },
+        else => return error.ConnectFailed,
+    }
+    set_nodelay(fd);
+    return fd;
 }
 
 /// A blocking connection to 127.0.0.1:`port`, with Nagle off.
@@ -527,7 +581,11 @@ const Rig = struct {
         const echo = try std.testing.allocator.create(Echo);
         errdefer std.testing.allocator.destroy(echo);
         echo.* = .{ .listener = try listen_loopback(0) };
-        echo.thread = try std.Thread.spawn(.{}, Echo.run, .{echo});
+        echo.thread = std.Thread.spawn(.{}, Echo.run, .{echo}) catch |err| {
+            _ = linux.close(echo.listener.fd);
+            return err;
+        };
+        errdefer echo.stop();
         const proxy = try Proxy.start(std.testing.allocator, echo.listener.port);
         return .{ .echo = echo, .proxy = proxy };
     }
@@ -612,7 +670,8 @@ test "cut_after: exactly n bytes pass in the direction, then the connection is r
     var saw_reset = false;
     for (0..20) |_| {
         switch (recv_within(fd, &buffer, 200)) {
-            .reset, .closed => saw_reset = true,
+            .reset => saw_reset = true,
+            .closed => return error.CleanCloseNotReset,
             else => continue,
         }
         break;
@@ -675,7 +734,46 @@ test "black hole: the connection is accepted, nothing answers, nothing reaches t
     try std.testing.expectEqual(@as(u32, 1), stats.accepted);
     try std.testing.expectEqual(@as(u32, 0), stats.upstream_connects);
     rig.proxy.heal();
+    // The swallowed connection cannot be resumed: heal resets it.
+    try std.testing.expect(recv_within(fd, &buffer, 1000) == .reset);
     const after = try connect_loopback(rig.proxy.port);
     defer _ = linux.close(after);
     try expect_echo(after, "back", 1000);
+}
+
+test "cut_after zero: the next chunk is cut before any byte, and only that connection" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    // The echo upstream serves one connection at a time, so the connections go one after another.
+    const first = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(first);
+    rig.proxy.cut_after(.to_server, 0);
+    try send_all(first, "doomed");
+    var buffer: [16]u8 = undefined;
+    for (0..20) |_| switch (recv_within(first, &buffer, 200)) {
+        .reset => break,
+        .closed => return error.CleanCloseNotReset,
+        else => continue,
+    } else return error.NotCut;
+    try std.testing.expectEqual(@as(u64, 0), rig.proxy.stats().forwarded[0]);
+    // Disarmed by the first cut: two later connections are not cut.
+    for ([_][]const u8{ "second", "third" }) |text| {
+        const later = try connect_loopback(rig.proxy.port);
+        defer _ = linux.close(later);
+        try expect_echo(later, text, 1000);
+    }
+    try std.testing.expectEqual(@as(u32, 1), rig.proxy.stats().cuts);
+}
+
+test "upstream connect: a refused upstream closes the client instead of hanging the proxy" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const gone = try listen_loopback(0);
+    _ = linux.close(gone.fd);
+    rig.proxy.upstream_port = gone.port;
+    const fd = try connect_loopback(rig.proxy.port);
+    defer _ = linux.close(fd);
+    var buffer: [8]u8 = undefined;
+    try std.testing.expect(recv_within(fd, &buffer, 1000) == .closed);
+    try std.testing.expectEqual(@as(u32, 0), rig.proxy.stats().upstream_connects);
 }

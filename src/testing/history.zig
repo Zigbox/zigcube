@@ -14,13 +14,17 @@
 //! the log by what it wrote. Two kinds of key keep the model small:
 //!
 //! - A register key (id below `audit_key_min`) is written by `compare mod_revision == e, put
-//!   key` (compare-and-set) or by a blind put, and read by `get`. Its writes put only that key.
+//!   key` (compare-and-set) or by a blind put, and read by `get`. A register write puts only its
+//!   own key: the compare key (if any) and every success put name one register key, and every
+//!   failure put is an audit key. A write that breaks this is `bad_history`, never guessed at.
 //! - An audit key (id from `audit_key_min`) is written only by the `on_failure` branch of a
 //!   compare-and-set (a put of a fresh token, so a failed compare leaves a trace in the log). It
 //!   is never compared or read.
 //!
 //! ## What `check` verifies
 //!
+//! 0. Every value token is unique across the history (`bad_history`): a token is how a write is
+//!    found in the log, so a repeated one makes every later verdict misleading.
 //! 1. The log is gap-free and in commit order: it starts at `base_revision + 1`, a revision's
 //!    events are together, revisions rise by exactly one and the last is `final_revision`
 //!    (`log_gap`, `log_disorder`), and no value token appears twice (`duplicate_value`).
@@ -32,14 +36,17 @@
 //!    returned) is wholly in the log, as exactly its success branch or exactly its failure
 //!    branch, or wholly absent (`unknown_partial`). One that is in is then treated as a write
 //!    that never returned: it may take effect at any point after it was invoked.
-//! 5. Per register key, the acknowledged calls are linearizable (`not_linearizable`): there is
+//! 5. Revisions follow real time across keys: when one write that created a revision returned
+//!    before another was invoked, it has the lower revision (`revision_order`).
+//! 6. Per register key, the acknowledged calls are linearizable (`not_linearizable`): there is
 //!    one order, consistent with real time, in which a sequential register gives every result.
 //!    The search is Wing and Gong's, depth first over the calls no pending call precedes. It is
 //!    bounded: at most `key_calls_max` calls on a key and `search_steps_max` steps, and a search
 //!    that runs out of either is `search_exhausted` or `bad_history` and fails the check; it never
 //!    passes a history it did not decide.
-//! 6. `check_watch`: a watch opened at N + 1 delivered exactly the log after N, up to the
-//!    revision its last batch reported (`watch_mismatch`).
+//! 7. `check_watch`: a watch opened at N + 1 delivered exactly the log after N, up to the
+//!    revision its last batch reported (`watch_mismatch`); a watch that opened at or before the
+//!    log's base, or reported a revision beyond its end, is `bad_history`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -243,6 +250,7 @@ pub const Kind = enum {
     event_mismatch,
     revision_reused,
     unexplained_event,
+    revision_order,
     failed_in_log,
     unknown_partial,
     not_linearizable,
@@ -280,6 +288,7 @@ pub fn check(
     log: []const LogEvent,
     options: Options,
 ) !Verdict {
+    if (try check_unique_tokens(gpa, history)) |bad| return .{ .failed = bad };
     if (check_log_order(log, options)) |bad| return .{ .failed = bad };
     var tokens: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer tokens.deinit(gpa);
@@ -304,26 +313,68 @@ pub fn check(
     for (claimed, 0..) |was, index| {
         if (!was) return failure(.unexplained_event, .{ .revision = log[index].revision });
     }
+    if (check_revision_order(history, resolved)) |bad| return .{ .failed = bad };
     return check_registers(history, resolved);
 }
 
+/// No value token is put by two calls, or twice by one.
+fn check_unique_tokens(gpa: Allocator, history: []const Entry) !?Failure {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(gpa);
+    for (history, 0..) |entry, index| {
+        if (entry.call != .txn) continue;
+        const txn = entry.call.txn;
+        for ([_][]const Put{ txn.success, txn.failure }) |puts| {
+            for (puts) |put| {
+                const slot = try seen.getOrPut(gpa, put.value);
+                if (slot.found_existing) return .{ .kind = .bad_history, .entry = @intCast(index) };
+            }
+        }
+    }
+    return null;
+}
+
+/// The puts of the branch that took effect; empty for a read or a write that did not apply.
+fn applied_puts(entry: Entry, how: Resolved) []const Put {
+    if (entry.call != .txn or !how.applied) return &.{};
+    return if (how.succeeded) entry.call.txn.success else entry.call.txn.failure;
+}
+
+/// Across all keys: a write that returned before another was invoked has the lower revision. Only
+/// writes that made a revision count (a compare-and-set that changed nothing reports the current
+/// one). Quadratic in the writes; a run has a few thousand at most.
+fn check_revision_order(history: []const Entry, resolved: []const Resolved) ?Failure {
+    for (history, resolved) |early, early_how| {
+        if (early.outcome != .acked) continue;
+        if (applied_puts(early, early_how).len == 0) continue;
+        for (history, resolved, 0..) |late, late_how, late_index| {
+            if (applied_puts(late, late_how).len == 0) continue;
+            if (early.complete >= late.invoke) continue;
+            if (early_how.revision < late_how.revision) continue;
+            return .{
+                .kind = .revision_order,
+                .revision = late_how.revision,
+                .entry = @intCast(late_index),
+            };
+        }
+    }
+    return null;
+}
+
 fn check_log_order(log: []const LogEvent, options: Options) ?Failure {
-    var expected = options.base_revision + 1;
     var previous = options.base_revision;
     for (log) |event| {
-        if (event.revision < previous) {
+        if (event.revision <= options.base_revision or event.revision < previous) {
             return .{ .kind = .log_disorder, .revision = event.revision };
         }
         if (event.revision > previous) {
             if (event.revision != previous + 1) {
                 return .{ .kind = .log_gap, .revision = event.revision };
             }
-            expected = event.revision + 1;
         }
         previous = event.revision;
     }
     if (previous != options.final_revision) return .{ .kind = .log_gap, .revision = previous };
-    assert(expected > options.base_revision);
     return null;
 }
 
@@ -455,7 +506,8 @@ const Step = struct {
 fn check_registers(history: []const Entry, resolved: []const Resolved) Verdict {
     var keys: [audit_key_min]bool = @splat(false);
     for (history) |entry| {
-        const key = register_key(entry) orelse continue;
+        const found = register_key(entry) catch return failure(.bad_history, .{});
+        const key = found orelse continue;
         if (key >= audit_key_min) return failure(.bad_history, .{ .key = key });
         keys[key] = true;
     }
@@ -464,8 +516,12 @@ fn check_registers(history: []const Entry, resolved: []const Resolved) Verdict {
         if (!present) continue;
         var count: usize = 0;
         for (history, resolved) |entry, how| {
-            if (register_key(entry) != @as(u8, @intCast(key))) continue;
-            const step = step_of(entry, how) orelse continue;
+            const found = register_key(entry) catch unreachable; // Checked above.
+            if (found != @as(u8, @intCast(key))) continue;
+            const made = step_of(entry, how) catch {
+                return failure(.bad_history, .{ .key = @intCast(key) });
+            };
+            const step = made orelse continue;
             if (count == steps.len) return failure(.bad_history, .{ .key = @intCast(key) });
             steps[count] = step;
             count += 1;
@@ -479,19 +535,31 @@ fn check_registers(history: []const Entry, resolved: []const Resolved) Verdict {
     return .ok;
 }
 
-/// The register a call is about; null for a write to nothing a register model covers.
-fn register_key(entry: Entry) ?u8 {
+const BadHistory = error{BadHistory};
+
+/// The register a call is about; null for a write to nothing a register model covers. A register
+/// write puts only its own key (see the header): a compare on another key, success puts on
+/// several keys, or a failure put on a register key is `BadHistory`.
+fn register_key(entry: Entry) BadHistory!?u8 {
     switch (entry.call) {
         .read => |key| return key,
         .txn => |txn| {
-            if (txn.compare) |compare| return compare.key;
-            if (txn.success.len == 0) return null;
-            return txn.success[0].key;
+            for (txn.failure) |put| {
+                if (put.key < audit_key_min) return error.BadHistory;
+            }
+            const own: ?u8 = if (txn.compare) |compare| compare.key else null;
+            if (txn.success.len == 0) return own;
+            const key = txn.success[0].key;
+            for (txn.success) |put| {
+                if (put.key != key) return error.BadHistory;
+            }
+            if (own != null and own.? != key) return error.BadHistory;
+            return key;
         },
     }
 }
 
-fn step_of(entry: Entry, how: Resolved) ?Step {
+fn step_of(entry: Entry, how: Resolved) BadHistory!?Step {
     switch (entry.call) {
         .read => {
             if (entry.outcome != .acked) return null;
@@ -505,6 +573,7 @@ fn step_of(entry: Entry, how: Resolved) ?Step {
         .txn => |txn| {
             if (!how.applied) return null;
             const expect: ?u64 = if (txn.compare) |compare| compare.mod_revision else null;
+            if (how.succeeded and txn.success.len == 0) return error.BadHistory;
             const value = if (how.succeeded) txn.success[txn.success.len - 1].value else 0;
             const complete = if (entry.outcome == .acked) entry.complete else never;
             return .{ .invoke = entry.invoke, .complete = complete, .action = .{ .write = .{
@@ -598,8 +667,11 @@ pub const WatchRecord = struct {
 };
 
 /// The watch delivered exactly the log's events from `from_revision` to `bookmark`: none missed,
-/// none repeated, none reordered, none invented.
-pub fn check_watch(log: []const LogEvent, watch: WatchRecord) Verdict {
+/// none repeated, none reordered, none invented. `options` are the log's: a watch that opened at
+/// or before its base, or reported a revision beyond its end, cannot be judged (`bad_history`).
+pub fn check_watch(log: []const LogEvent, watch: WatchRecord, options: Options) Verdict {
+    if (watch.from_revision <= options.base_revision) return failure(.bad_history, .{});
+    if (watch.bookmark > options.final_revision) return failure(.bad_history, .{});
     var seen: usize = 0;
     for (log) |event| {
         if (event.revision < watch.from_revision or event.revision > watch.bookmark) continue;
@@ -786,9 +858,12 @@ test "a watch from N + 1 must deliver exactly the log after N" {
     const missed = WatchRecord{ .from_revision = 2, .bookmark = 3, .events = log[2..] };
     const twice = [_]LogEvent{ log[1], log[1], log[2] };
     const repeated = WatchRecord{ .from_revision = 2, .bookmark = 3, .events = &twice };
-    try testing.expectEqual(@as(?Kind, null), verdict_kind(check_watch(&log, exact)));
-    try testing.expectEqual(@as(?Kind, .watch_mismatch), verdict_kind(check_watch(&log, missed)));
-    try testing.expectEqual(@as(?Kind, .watch_mismatch), verdict_kind(check_watch(&log, repeated)));
+    const options: Options = .{ .final_revision = 3 };
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(check_watch(&log, exact, options)));
+    const a = verdict_kind(check_watch(&log, missed, options));
+    const b = verdict_kind(check_watch(&log, repeated, options));
+    try testing.expectEqual(@as(?Kind, .watch_mismatch), a);
+    try testing.expectEqual(@as(?Kind, .watch_mismatch), b);
 }
 
 test "names round trip, and a recorder keeps what it was told" {
@@ -807,4 +882,91 @@ test "names round trip, and a recorder keeps what it was told" {
     const merged = try merge(testing.allocator, &.{&recorder});
     defer testing.allocator.free(merged);
     try testing.expectEqual(@as(usize, 1), merged.len);
+}
+
+test "teeth: revisions must follow real time across keys" {
+    // A (key 0) returned at tick 2 with revision 2; B (key 1) began at tick 3 and got revision 1.
+    const first = write(.{ .key = 0, .mod_revision = 0 }, &.{.{ .key = 0, .value = 1 }}, &.{});
+    const second = write(.{ .key = 1, .mod_revision = 0 }, &.{.{ .key = 1, .value = 2 }}, &.{});
+    const history = [_]Entry{
+        acked(1, 2, first, .{ .succeeded = true, .revision = 2 }),
+        acked(3, 4, second, .{ .succeeded = true, .revision = 1 }),
+    };
+    const log = [_]LogEvent{ put_event(1, 1, 2), put_event(2, 0, 1) };
+    const verdict = try check(testing.allocator, &history, &log, .{ .final_revision = 2 });
+    try testing.expectEqual(@as(?Kind, .revision_order), verdict_kind(verdict));
+    // Overlapping calls may take either order.
+    var overlap = history;
+    overlap[1].invoke = 2;
+    const fine = try check(testing.allocator, &overlap, &log, .{ .final_revision = 2 });
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(fine));
+}
+
+test "teeth: a register write that puts another key, or several, is a bad history" {
+    const moved = write(.{ .key = 0, .mod_revision = 0 }, &.{.{ .key = 1, .value = 1 }}, &.{});
+    const blind = write(null, &.{ .{ .key = 0, .value = 2 }, .{ .key = 1, .value = 3 } }, &.{});
+    const on_register = write(null, &.{.{ .key = 0, .value = 4 }}, &.{.{ .key = 1, .value = 5 }});
+    const calls = [_]Call{ moved, blind, on_register };
+    for (calls, 0..) |call, index| {
+        const history = [_]Entry{acked(1, 2, call, .{ .succeeded = true, .revision = 1 })};
+        const puts = call.txn.success;
+        var events: [2]LogEvent = undefined;
+        for (puts, 0..) |put, at| events[at] = put_event(1, put.key, put.value);
+        const verdict = try check(testing.allocator, &history, events[0..puts.len], .{
+            .final_revision = 1,
+        });
+        errdefer std.debug.print("call {d}\n", .{index});
+        try testing.expectEqual(@as(?Kind, .bad_history), verdict_kind(verdict));
+    }
+}
+
+test "teeth: a successful compare-and-set with an empty success branch is a bad history" {
+    const empty = write(.{ .key = 0, .mod_revision = 0 }, &.{}, &.{});
+    const history = [_]Entry{acked(1, 2, empty, .{ .succeeded = true, .revision = 0 })};
+    const verdict = try check(testing.allocator, &history, &.{}, .{ .final_revision = 0 });
+    try testing.expectEqual(@as(?Kind, .bad_history), verdict_kind(verdict));
+}
+
+test "teeth: an event at the base revision is not part of the log" {
+    const log = [_]LogEvent{put_event(5, 0, 1)};
+    const none: []const Entry = &.{};
+    const verdict = try check(testing.allocator, none, &log, .{
+        .base_revision = 5,
+        .final_revision = 5,
+    });
+    try testing.expectEqual(@as(?Kind, .log_disorder), verdict_kind(verdict));
+    const after = [_]LogEvent{put_event(6, 0, 1)};
+    const fine = try check(testing.allocator, &.{acked(
+        1,
+        2,
+        create_one,
+        .{ .succeeded = true, .revision = 6 },
+    )}, &after, .{ .base_revision = 5, .final_revision = 6 });
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(fine));
+}
+
+test "teeth: a value token used by two calls is a bad history, not a misleading verdict" {
+    const same = write(.{ .key = 1, .mod_revision = 0 }, &.{.{ .key = 1, .value = 1 }}, &.{});
+    var dropped = acked(3, 4, same, .{ .succeeded = true, .revision = 0 });
+    dropped.outcome = .failed;
+    const history = [_]Entry{
+        acked(1, 2, create_one, .{ .succeeded = true, .revision = 1 }),
+        dropped,
+    };
+    const log = [_]LogEvent{put_event(1, 0, 1)};
+    const verdict = try check(testing.allocator, &history, &log, .{ .final_revision = 1 });
+    try testing.expectEqual(@as(?Kind, .bad_history), verdict_kind(verdict));
+}
+
+test "teeth: a watch must open after the log's base and report no further than its end" {
+    const log = [_]LogEvent{ put_event(6, 0, 1), put_event(7, 0, 2) };
+    const options: Options = .{ .base_revision = 5, .final_revision = 7 };
+    const early = WatchRecord{ .from_revision = 5, .bookmark = 7, .events = &log };
+    const beyond = WatchRecord{ .from_revision = 6, .bookmark = 8, .events = &log };
+    const exact = WatchRecord{ .from_revision = 6, .bookmark = 7, .events = &log };
+    const a = verdict_kind(check_watch(&log, early, options));
+    const b = verdict_kind(check_watch(&log, beyond, options));
+    try testing.expectEqual(@as(?Kind, .bad_history), a);
+    try testing.expectEqual(@as(?Kind, .bad_history), b);
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(check_watch(&log, exact, options)));
 }
