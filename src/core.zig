@@ -35,6 +35,7 @@ pub const modules = .{
     @import("runtime.zig"),
     @import("sim_c0.zig"),
     @import("sim_clock.zig"),
+    @import("sim_cluster.zig"),
     @import("sim_net.zig"),
     @import("sim_node.zig"),
     @import("sim_runtime.zig"),

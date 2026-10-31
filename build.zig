@@ -69,12 +69,23 @@ pub fn build(b: *std.Build) void {
     add_tidy_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
+    const ops_help = "Operations of the fuzz variants of sim-c0 and sim-cluster (default 100)";
+    const ops = b.option(u32, "ops", ops_help) orelse 100;
     add_sim_step(b, .{
         .seed = seed,
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
         .library = library,
+        .ops = ops,
+    });
+    add_sim_cluster_step(b, .{
+        .seed = seed,
+        .target = target,
+        .optimize = optimize,
+        .zigbox = zigbox_module,
+        .library = library,
+        .ops = ops,
     });
     add_check_step(b);
 }
@@ -536,6 +547,8 @@ const SimStepOptions = struct {
     optimize: std.builtin.OptimizeMode,
     zigbox: *std.Build.Module,
     library: *std.Build.Step.Compile,
+    /// `-Dops`: operations of the fuzz variants of sim-c0 and sim-cluster.
+    ops: u32,
 };
 
 /// `zig build sim-c0 [-Dseed=N] [-Dops=N]`: the deterministic simulation of C0 (src/sim_c0.zig),
@@ -545,8 +558,7 @@ const SimStepOptions = struct {
 /// CI passes its own and prints it.
 fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
     const seed = sim.seed;
-    const ops_help = "Operations of the fuzz variant of sim-c0 (default 100)";
-    const operations = b.option(u32, "ops", ops_help) orelse 100;
+    const operations = sim.ops;
     const exe = b.addExecutable(.{
         .name = "sim_c0",
         .root_module = b.createModule(.{
@@ -581,6 +593,30 @@ fn add_sim_step(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(fuzz_report);
         step.dependOn(&node.step);
     }
+}
+
+/// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation
+/// (src/sim_cluster.zig), native only. `-Dnodes=0` lets the seed pick. `-Dops` is shared with sim-c0.
+fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_cluster",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    const exe_help = "Install the native sim-cluster runner into zig-out/bin";
+    b.step("sim-cluster-exe", exe_help).dependOn(&install.step);
+    const ops = sim.ops;
+    const nodes = b.option(u32, "nodes", "Nodes of sim-cluster (default: the seed picks)") orelse 0;
+    const run = b.addRunArtifact(exe);
+    run.addArg(b.fmt("{d}", .{sim.seed orelse 1}));
+    run.addArg(b.fmt("{d}", .{ops}));
+    if (nodes != 0) run.addArg(b.fmt("{d}", .{nodes}));
+    b.step("sim-cluster", "Run the cluster simulation natively (-Dseed=N)").dependOn(&run.step);
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit
