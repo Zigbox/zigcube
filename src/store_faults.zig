@@ -203,14 +203,16 @@ fn run_client(client: *Client) !void {
         _ = arena_state.reset(.retain_capacity);
         const key = pick_key(client.shared, rng, op_index);
         const roll = rng.uintLessThan(u32, 100);
-        if (roll < 40) {
+        if (roll < 35) {
             try do_read(client, arena_state.allocator(), key);
-        } else if (roll < 75) {
+        } else if (roll < 65) {
             try do_cas(client, key, client.last_seen[key]);
-        } else if (roll < 85) {
+        } else if (roll < 75) {
             try do_cas(client, key, client.last_seen[key] + wrong_revision_offset);
-        } else {
+        } else if (roll < 88) {
             try do_blind(client, key);
+        } else {
+            try do_delete(client, key);
         }
     }
 }
@@ -269,12 +271,36 @@ fn do_blind(client: *Client, key: u8) !void {
     if (try do_txn(client, txn)) |result| client.last_seen[key] = result.revision;
 }
 
+/// Deletes the key if this client last saw it present, at the revision it saw: compare-and-
+/// delete. The success branch carries an audit put too, so that a delete whose answer is lost
+/// can be found in the log by the token (a delete event has no value of its own). Otherwise
+/// it is a compare-and-set, since a delete of an absent key makes no revision.
+fn do_delete(client: *Client, key: u8) !void {
+    const expected = client.last_seen[key];
+    if (expected == 0) return do_cas(client, key, expected);
+    const shared = client.shared;
+    const audit: u8 = @intCast(history.audit_key_min + client.id);
+    const success: [2]history.Put = .{
+        .{ .key = key, .value = 0, .delete = true },
+        .{ .key = audit, .value = shared.token() },
+    };
+    const failure: [1]history.Put = .{.{ .key = audit, .value = shared.token() }};
+    const txn: history.Txn = .{
+        .compare = .{ .key = key, .mod_revision = expected },
+        .success = &success,
+        .failure = &failure,
+    };
+    if (try do_txn(client, txn)) |result| {
+        if (result.succeeded) client.last_seen[key] = 0;
+    }
+}
+
 /// Makes the call and records it; null if it did not return an answer.
 fn do_txn(client: *Client, txn: history.Txn) !?history.TxnAck {
     const shared = client.shared;
     const handle = try client.recorder.invoke(&shared.ticker, .{ .txn = txn });
-    var texts: [3]struct { key: [8]u8, value: [24]u8 } = undefined;
-    var success_ops: [1]store.Op = undefined;
+    var texts: [4]struct { key: [8]u8, value: [24]u8 } = undefined;
+    var success_ops: [2]store.Op = undefined;
     var failure_ops: [1]store.Op = undefined;
     var compares: [1]store.Compare = undefined;
     var used: usize = 0;
@@ -311,6 +337,7 @@ fn do_txn(client: *Client, txn: history.Txn) !?history.TxnAck {
 }
 
 fn op_of(key_buffer: *[8]u8, value_buffer: *[24]u8, put: history.Put) store.Op {
+    if (put.delete) return .{ .delete = history.key_text(key_buffer, put.key) };
     return .{ .put = .{
         .key = history.key_text(key_buffer, put.key),
         .value = history.value_text(value_buffer, put.value),
@@ -489,6 +516,7 @@ fn tally(entries: []const history.Entry) Outcome {
         .acked => total.ok += 1,
         .failed => total.failed += 1,
         .unknown => total.unknown += 1,
+        .compacted => {}, // Only a historical read is refused so; stage 1 has none.
     };
     return total;
 }
@@ -540,7 +568,8 @@ pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return exit_user;
     const options = parse_options(args) orelse {
         say("usage: store_faults --backend postgres|sqlite [--postgres SETTINGS] [--seed N]" ++
-            " [--mutate drop_ack|stale_read|reuse_revision|all_unknown]", .{});
+            " [--mutate drop_ack|stale_read|reuse_revision|all_unknown|keep_delete|" ++
+            "ignore_compact|over_compact]", .{});
         return exit_user;
     };
     var seed_bytes: [8]u8 = undefined;
@@ -567,6 +596,8 @@ const Report = struct {
     unknown_absent: u32 = 0,
     /// Writes whose call failed with a certainty that nothing was written.
     failed_writes: u32 = 0,
+    /// Deletes the store acknowledged as made.
+    deletes: u32 = 0,
 };
 
 fn execute(gpa: Allocator, io: std.Io, options: Options, seed: u64) !Report {
@@ -756,7 +787,177 @@ fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !Re
     if (watcher.failure) |err| return fail_client(err);
     var log = try read_log(gpa, setup.direct, setup.base + 1, final, setup.diag);
     defer log.deinit(gpa);
-    return try verdict(shared, setup, clients, watcher, .{ .log = log.items, .final = final });
+    const finished: Finished = .{ .log = log.items, .final = final };
+    var report = try verdict(shared, setup, clients, watcher, finished);
+    if (!report.passed) return report;
+    const stage = try compaction_stage(shared, setup, finished);
+    if (stage.verdict != .ok) {
+        say("compaction: {any}", .{stage.verdict});
+        report.passed = false;
+        report.kind = stage.verdict.failed.kind;
+    } else if (!stage.covered) {
+        report.passed = false;
+    } else {
+        say("PASS", .{});
+    }
+    return report;
+}
+
+// ---- Stage 2: historical reads and compaction ---------------------------------------------------
+
+const readers_count = 3;
+const reader_ops = 60;
+const compact_percent = 15;
+
+/// A client of the second stage: it reads keys as they were at some revision and compacts. The
+/// stage runs after the log was read (a compacted log cannot be read back), under the same
+/// fault schedule, and its history is judged against that log by `history.check_compaction`.
+const Reader = struct {
+    shared: *Shared,
+    recorder: history.Recorder,
+    conn: Conn,
+    mutant: Mutant,
+    diag: Diag,
+    rng: std.Random.DefaultPrng,
+    base: u64,
+    final: u64,
+
+    fn s(reader: *Reader) Store {
+        const real = reader.conn.interface(reader.shared.run.backend);
+        if (reader.shared.run.mutation == .none) return real;
+        return reader.mutant.interface();
+    }
+};
+
+fn reader_main(reader: *Reader) void {
+    var arena_state = std.heap.ArenaAllocator.init(reader.shared.run.gpa);
+    defer arena_state.deinit();
+    const rng = reader.rng.random();
+    for (0..reader_ops) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        const span = reader.final - reader.base;
+        if (rng.uintLessThan(u32, 100) < compact_percent) {
+            // Low in the range, so that most of it stays readable.
+            const to = reader.base + 1 + rng.uintAtMost(u64, span / 2);
+            read_compact(reader, to);
+        } else {
+            const key = rng.uintLessThan(u8, register_keys);
+            const revision = reader.base + 1 + rng.uintLessThan(u64, span);
+            read_at(reader, arena_state.allocator(), key, revision);
+        }
+    }
+    _ = reader.shared.clients_left.fetchSub(1, .acq_rel);
+}
+
+fn read_compact(reader: *Reader, revision: u64) void {
+    const shared = reader.shared;
+    const handle = reader.recorder.invoke(&shared.ticker, .{ .compact = revision }) catch return;
+    reader.s().compact(revision, &reader.diag) catch {
+        reader.diag.reset();
+        reader.recorder.unknown(handle); // It may have been applied.
+        return;
+    };
+    reader.recorder.ack_done(&shared.ticker, handle, .acked);
+}
+
+fn read_at(reader: *Reader, arena: Allocator, key: u8, revision: u64) void {
+    const shared = reader.shared;
+    const call: history.Call = .{ .read_at = .{ .key = key, .revision = revision } };
+    const handle = reader.recorder.invoke(&shared.ticker, call) catch return;
+    var key_buffer: [8]u8 = undefined;
+    const name = history.key_text(&key_buffer, key);
+    const found = reader.s().get(arena, name, revision, &reader.diag) catch |err| {
+        reader.diag.reset();
+        if (err == error.Compacted) {
+            reader.recorder.ack_done(&shared.ticker, handle, .compacted);
+        } else {
+            reader.recorder.fail(&shared.ticker, handle);
+        }
+        return;
+    };
+    var ack: history.ReadAck = .{ .mod_revision = 0, .value = 0 };
+    if (found.kv) |kv| {
+        const value = history.parse_value(kv.value) orelse {
+            reader.recorder.fail(&shared.ticker, handle); // Not ours: the checker cannot judge it.
+            return;
+        };
+        ack = .{ .mod_revision = kv.mod_revision, .value = value };
+    }
+    reader.recorder.ack_read(&shared.ticker, handle, ack);
+}
+
+const Stage = struct {
+    verdict: history.Verdict,
+    /// Some read was served, some refused, and some compaction was acknowledged.
+    covered: bool,
+};
+
+fn compaction_stage(shared: *Shared, setup: Setup, finished: Finished) !Stage {
+    const run = shared.run;
+    const gpa = run.gpa;
+    assert(finished.final > setup.base);
+    var readers: [readers_count]Reader = undefined;
+    var opened: usize = 0;
+    defer for (readers[0..opened]) |*reader| {
+        reader.recorder.deinit();
+        reader.conn.close(run.backend);
+    };
+    for (&readers, 0..) |*reader, index| {
+        reader.* = .{
+            .shared = shared,
+            .recorder = history.Recorder.init(gpa, @intCast(index)),
+            .conn = undefined,
+            .mutant = undefined,
+            .diag = undefined,
+            .rng = .init(run.seed ^ (0xd1b54a32d192ed03 *% (index + 1))),
+            .base = setup.base,
+            .final = finished.final,
+        };
+        reader.diag.reset();
+        try reader.conn.open(shared, setup.conninfo, &reader.diag);
+        opened += 1;
+        if (run.mutation != .none) {
+            reader.mutant = Mutant.init(reader.conn.interface(run.backend), run.mutation);
+        }
+    }
+    shared.clients_left.store(readers_count, .release);
+    var threads: [readers_count]std.Thread = undefined;
+    for (&readers, 0..) |*reader, index| {
+        threads[index] = try std.Thread.spawn(.{}, reader_main, .{reader});
+    }
+    var schedule = std.Random.DefaultPrng.init(run.seed ^ 0x2545f4914f6cdd1d);
+    while (shared.clients_left.load(.acquire) != 0) {
+        if (setup.proxy) |proxy| {
+            fault_step(proxy, schedule.random(), run.io);
+        } else {
+            nap(run.io, 20);
+        }
+    }
+    for (threads) |thread| thread.join();
+    if (setup.proxy) |proxy| proxy.heal();
+    var recorders: [readers_count]*const history.Recorder = undefined;
+    for (&readers, 0..) |*reader, index| recorders[index] = &reader.recorder;
+    const entries = try history.merge(gpa, &recorders);
+    defer gpa.free(entries);
+    const options: history.Options = .{ .base_revision = setup.base, .final_revision = finished.final };
+    const checked = history.check_compaction(entries, finished.log, options);
+    var served: u32 = 0;
+    var refused: u32 = 0;
+    var compactions: u32 = 0;
+    for (entries) |entry| switch (entry.call) {
+        .read_at => {
+            if (entry.outcome == .acked) served += 1;
+            if (entry.outcome == .compacted) refused += 1;
+        },
+        .compact => if (entry.outcome == .acked) {
+            compactions += 1;
+        },
+        else => {},
+    };
+    say("compaction stage: reads served={d} refused={d} compactions={d}", .{
+        served, refused, compactions,
+    });
+    return .{ .verdict = checked, .covered = served > 0 and refused > 0 and compactions > 0 };
 }
 
 fn fail_client(err: anyerror) Report {
@@ -816,6 +1017,11 @@ fn split_unknowns(
     var report: Report = .{ .passed = true };
     for (entries) |entry| {
         if (entry.call == .txn and entry.outcome == .failed) report.failed_writes += 1;
+        if (entry.call == .txn and entry.outcome == .acked and entry.succeeded) {
+            for (entry.call.txn.success) |put| {
+                if (put.delete) report.deletes += 1;
+            }
+        }
         if (entry.outcome != .unknown) continue;
         if (entry.call != .txn) continue;
         var found = false;
@@ -829,6 +1035,10 @@ fn split_unknowns(
 
 /// A faulted run must have met both outcomes of a lost connection, or it has not tested them.
 fn covered_both_cases(setup: Setup, report: *const Report) bool {
+    if (report.deletes == 0) {
+        say("FAILED: no delete was acknowledged: deletes were never exercised", .{});
+        return false;
+    }
     if (setup.proxy == null) {
         assert(report.unknown_applied == 0); // Without faults no write is ever left unknown.
         return true;
@@ -905,7 +1115,6 @@ fn verdict(
         report.passed = false;
         return report;
     }
-    say("PASS", .{});
     return report;
 }
 
@@ -937,6 +1146,9 @@ test "the runner passes an honest store and rejects each kind of lie with its ow
         .{ .mutation = .drop_ack, .kind = .lost_write },
         .{ .mutation = .stale_read, .kind = .not_linearizable },
         .{ .mutation = .reuse_revision, .kind = .revision_reused },
+        .{ .mutation = .keep_delete, .kind = .event_mismatch },
+        .{ .mutation = .ignore_compact, .kind = .compacted_read_served },
+        .{ .mutation = .over_compact, .kind = .read_above_compaction_failed },
     };
     for (cases) |case| {
         var caught = false;

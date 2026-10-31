@@ -19,6 +19,15 @@
 //!   recorded as "may have applied"). The checker cannot see this one in a history; the runner
 //!   catches it by requiring a faulted run to record some writes as definitely failed.
 //!
+//! - `keep_delete`: a delete in a transaction's success branch is left out, and the answer is the
+//!   real one (the store says the key was deleted and keeps it: `event_mismatch`, the revision's
+//!   events are not the ones sent).
+//! - `ignore_compact`: `compact` answers success and does nothing, so a read below the point
+//!   still returns data (`compacted_read_served`).
+//! - `over_compact`: `compact(r)` compacts to the store's current revision and answers for `r`,
+//!   so reads between them are refused though they should be served
+//!   (`read_above_compaction_failed`).
+//!
 //! Test code only: nothing in the server or the agent imports it.
 
 const std = @import("std");
@@ -30,7 +39,16 @@ const history = @import("testing/history.zig");
 const Store = store.Store;
 const Error = store.Error;
 
-pub const Mutation = enum { none, drop_ack, stale_read, reuse_revision, all_unknown };
+pub const Mutation = enum {
+    none,
+    drop_ack,
+    stale_read,
+    reuse_revision,
+    all_unknown,
+    keep_delete,
+    ignore_compact,
+    over_compact,
+};
 
 const phantom_base: u64 = 1 << 40;
 const drop_period = 5;
@@ -125,7 +143,7 @@ pub const Mutant = struct {
 
     fn txn(context: *anyopaque, request: store.TxnRequest, diag: *Diag) Error!store.TxnResult {
         const mutant = of(context);
-        assert(request.on_success.len + request.on_failure.len <= 2);
+        assert(request.on_success.len + request.on_failure.len <= 4);
         switch (mutant.kind) {
             .all_unknown => return mutant.inner.txn(request, diag) catch |err| {
                 assert(diag.code != null); // The inner store raised a diagnostic for its error.
@@ -140,8 +158,22 @@ pub const Mutant = struct {
                 return .{ .succeeded = true, .revision = mutant.phantom };
             },
             .reuse_revision => return mutant.reuse(request, diag),
+            .keep_delete => return mutant.keep_delete(request, diag),
             else => return mutant.inner.txn(request, diag),
         }
+    }
+
+    fn keep_delete(mutant: *Mutant, request: store.TxnRequest, diag: *Diag) Error!store.TxnResult {
+        var kept: [4]store.Op = undefined;
+        var count: usize = 0;
+        for (request.on_success) |op| {
+            if (op == .delete) continue;
+            kept[count] = op;
+            count += 1;
+        }
+        var changed = request;
+        changed.on_success = kept[0..count];
+        return mutant.inner.txn(changed, diag);
     }
 
     fn reuse(mutant: *Mutant, request: store.TxnRequest, diag: *Diag) Error!store.TxnResult {
@@ -197,6 +229,14 @@ pub const Mutant = struct {
     }
 
     fn compact(context: *anyopaque, revision: store.Revision, diag: *Diag) Error!void {
-        return of(context).inner.compact(revision, diag);
+        const mutant = of(context);
+        switch (mutant.kind) {
+            .ignore_compact => return,
+            .over_compact => {
+                const now = (try mutant.inner.status(diag)).revision;
+                return mutant.inner.compact(@max(now, revision), diag);
+            },
+            else => return mutant.inner.compact(revision, diag),
+        }
     }
 };

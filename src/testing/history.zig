@@ -70,9 +70,12 @@ pub const Ticker = struct {
     }
 };
 
+/// A put of `value` to `key`, or, with `delete`, a delete of `key` (its `value` is 0 and is not
+/// a token: a delete is found in the log by the audit put that rides with it).
 pub const Put = struct {
     key: u8,
     value: u64,
+    delete: bool = false,
 };
 
 pub const Compare = struct {
@@ -86,9 +89,18 @@ pub const Txn = struct {
     failure: []const Put,
 };
 
+/// A read of `key` as it was at `revision` (`get` with `at_revision`).
+pub const ReadAt = struct {
+    key: u8,
+    revision: u64,
+};
+
 pub const Call = union(enum) {
     txn: Txn,
     read: u8,
+    /// Compaction and historical reads are checked by `check_compaction`, not by `check`.
+    read_at: ReadAt,
+    compact: u64,
 };
 
 pub const Outcome = enum {
@@ -98,6 +110,8 @@ pub const Outcome = enum {
     failed,
     /// The answer was lost, or never came.
     unknown,
+    /// A `read_at` that the store refused with `Compacted`.
+    compacted,
 };
 
 pub const Entry = struct {
@@ -128,7 +142,7 @@ pub const Recorder = struct {
                 recorder.gpa.free(txn.success);
                 recorder.gpa.free(txn.failure);
             },
-            .read => {},
+            else => {},
         };
         recorder.entries.deinit(recorder.gpa);
     }
@@ -167,10 +181,21 @@ pub const Recorder = struct {
 
     pub fn ack_read(recorder: *Recorder, ticker: *Ticker, handle: usize, found: ReadAck) void {
         const entry = &recorder.entries.items[handle];
-        assert(entry.call == .read);
+        assert(entry.call == .read or entry.call == .read_at);
         entry.outcome = .acked;
         entry.revision = found.mod_revision;
         entry.value = found.value;
+        entry.complete = ticker.tick();
+    }
+
+    /// A `read_at` was refused with `Compacted`, or a `compact` was done.
+    pub fn ack_done(recorder: *Recorder, ticker: *Ticker, handle: usize, outcome: Outcome) void {
+        const entry = &recorder.entries.items[handle];
+        const call_fits = entry.call == .read_at or entry.call == .compact;
+        assert(call_fits);
+        const outcome_fits = outcome == .compacted or outcome == .acked;
+        assert(outcome_fits);
+        entry.outcome = outcome;
         entry.complete = ticker.tick();
     }
 
@@ -254,6 +279,9 @@ pub const Kind = enum {
     failed_in_log,
     unknown_partial,
     not_linearizable,
+    compacted_read_served,
+    read_above_compaction_failed,
+    read_at_wrong,
     search_exhausted,
     bad_history,
     watch_mismatch,
@@ -326,6 +354,7 @@ fn check_unique_tokens(gpa: Allocator, history: []const Entry) !?Failure {
         const txn = entry.call.txn;
         for ([_][]const Put{ txn.success, txn.failure }) |puts| {
             for (puts) |put| {
+                if (put.delete) continue;
                 const slot = try seen.getOrPut(gpa, put.value);
                 if (slot.found_existing) return .{ .kind = .bad_history, .entry = @intCast(index) };
             }
@@ -401,6 +430,7 @@ const Context = struct {
             const bad = switch (entry.outcome) {
                 .acked => context.account_acked(entry, &resolved[index]),
                 .failed => context.account_failed(txn),
+                .compacted => @as(?Failure, .{ .kind = .bad_history }), // Only a read is.
                 .unknown => context.account_unknown(txn, &resolved[index]),
             };
             if (bad) |found| {
@@ -428,6 +458,7 @@ const Context = struct {
     fn account_failed(context: Context, txn: Txn) ?Failure {
         for ([_][]const Put{ txn.success, txn.failure }) |puts| {
             for (puts) |put| {
+                if (put.delete) continue;
                 if (context.tokens.get(put.value)) |at| {
                     return .{ .kind = .failed_in_log, .revision = context.log[at].revision };
                 }
@@ -450,6 +481,7 @@ const Context = struct {
 
     fn first_present(context: Context, puts: []const Put) ?u32 {
         for (puts) |put| {
+            if (put.delete) continue;
             if (context.tokens.get(put.value)) |at| return at;
         }
         return null;
@@ -465,7 +497,8 @@ const Context = struct {
         }
         if (run.hi - run.lo != puts.len) return .{ .kind = mismatch, .revision = revision };
         for (puts, context.log[run.lo..run.hi]) |put, event| {
-            const same = event.kind == .put and event.key == put.key and event.value == put.value;
+            const kind: EventKind = if (put.delete) .delete else .put;
+            const same = event.kind == kind and event.key == put.key and event.value == put.value;
             if (!same) return .{ .kind = mismatch, .revision = revision };
         }
         @memset(context.claimed[run.lo..run.hi], true);
@@ -491,14 +524,22 @@ const Context = struct {
 
 // ---- Linearizability of one register -----------------------------------------------------------
 
-const Register = struct { revision: u64, value: u64 };
+/// `floor` is the highest revision of any write the register has had: a delete resets the
+/// register to absent (revision 0) but later writes must still be above the delete.
+const Register = struct { revision: u64, value: u64, floor: u64 = 0 };
 
 const Step = struct {
     invoke: u64,
     complete: u64,
     action: union(enum) {
         /// `expect` is null for a blind put. `succeeded` is what the store answered.
-        write: struct { expect: ?u64, succeeded: bool, revision: u64, value: u64 },
+        write: struct {
+            expect: ?u64,
+            succeeded: bool,
+            revision: u64,
+            value: u64,
+            delete: bool,
+        },
         read: Register,
     },
 };
@@ -538,29 +579,42 @@ fn check_registers(history: []const Entry, resolved: []const Resolved) Verdict {
 const BadHistory = error{BadHistory};
 
 /// The register a call is about; null for a write to nothing a register model covers. A register
-/// write puts only its own key (see the header): a compare on another key, success puts on
-/// several keys, or a failure put on a register key is `BadHistory`.
+/// write touches only its own key (see the header): a compare on another key, success ops on
+/// several register keys, or a failure op on a register key is `BadHistory`.
 fn register_key(entry: Entry) BadHistory!?u8 {
     switch (entry.call) {
         .read => |key| return key,
+        .read_at, .compact => return null,
         .txn => |txn| {
             for (txn.failure) |put| {
-                if (put.key < audit_key_min) return error.BadHistory;
+                if (put.key < audit_key_min or put.delete) return error.BadHistory;
             }
             const own: ?u8 = if (txn.compare) |compare| compare.key else null;
-            if (txn.success.len == 0) return own;
-            const key = txn.success[0].key;
-            for (txn.success) |put| {
-                if (put.key != key) return error.BadHistory;
-            }
-            if (own != null and own.? != key) return error.BadHistory;
-            return key;
+            const key = (try register_put(txn.success)) orelse return own;
+            if (own != null and own.? != key.key) return error.BadHistory;
+            return key.key;
         },
     }
 }
 
+/// The last put or delete of a register key in `puts`; audit puts may ride along. All of them
+/// name one key, or the history is bad.
+fn register_put(puts: []const Put) BadHistory!?Put {
+    var found: ?Put = null;
+    for (puts) |put| {
+        if (put.key >= audit_key_min) {
+            if (put.delete) return error.BadHistory;
+            continue;
+        }
+        if (found != null and found.?.key != put.key) return error.BadHistory;
+        found = put;
+    }
+    return found;
+}
+
 fn step_of(entry: Entry, how: Resolved) BadHistory!?Step {
     switch (entry.call) {
+        .read_at, .compact => return null,
         .read => {
             if (entry.outcome != .acked) return null;
             const found: Register = .{ .revision = entry.revision, .value = entry.value };
@@ -573,14 +627,17 @@ fn step_of(entry: Entry, how: Resolved) BadHistory!?Step {
         .txn => |txn| {
             if (!how.applied) return null;
             const expect: ?u64 = if (txn.compare) |compare| compare.mod_revision else null;
-            if (how.succeeded and txn.success.len == 0) return error.BadHistory;
-            const value = if (how.succeeded) txn.success[txn.success.len - 1].value else 0;
+            const last = try register_put(txn.success);
+            if (how.succeeded and last == null) return error.BadHistory;
+            const value = if (how.succeeded) last.?.value else 0;
+            const delete = how.succeeded and last.?.delete;
             const complete = if (entry.outcome == .acked) entry.complete else never;
             return .{ .invoke = entry.invoke, .complete = complete, .action = .{ .write = .{
                 .expect = expect,
                 .succeeded = how.succeeded,
                 .revision = how.revision,
                 .value = value,
+                .delete = delete,
             } } };
         },
     }
@@ -597,8 +654,9 @@ fn apply(state: Register, step: Step) ?Register {
             const holds = if (put.expect) |expected| expected == state.revision else true;
             if (holds != put.succeeded) return null;
             if (!holds) return state;
-            if (put.revision <= state.revision) return null; // Revisions only rise.
-            return .{ .revision = put.revision, .value = put.value };
+            if (put.revision <= state.floor) return null; // Revisions only rise.
+            if (put.delete) return .{ .revision = 0, .value = 0, .floor = put.revision };
+            return .{ .revision = put.revision, .value = put.value, .floor = put.revision };
         },
     }
 }
@@ -655,6 +713,81 @@ fn precedes_unplaced(steps: []const Step, placed: u64, step: Step) bool {
         if (other.complete < step.invoke) return true;
     }
     return false;
+}
+
+// ---- Compaction and historical reads ------------------------------------------------------------
+
+/// The rules for `read_at` and `compact` calls, judged against the log (read after the run, and
+/// so complete: compaction is run in a stage of its own, after the log was read, because a
+/// compacted log cannot be read back). Calls on keys must be keys of the log; the log starts at
+/// `options.base_revision + 1` and the keys were not written before it. Per read:
+///
+/// - a read at revision r that returned data, when a compaction acknowledged before the read was
+///   invoked covered r (the highest such revision is above r): `compacted_read_served`;
+/// - a read that was refused as compacted, when no compaction that could have been applied by then
+///   (every `compact` invoked before the read completed, acknowledged or not) reaches above r:
+///   `read_above_compaction_failed`, history the store should still have;
+/// - a read that returned data, that is not the key's state at r in the log (the last event of the
+///   key at or below r: a put's revision and value, or absent): `read_at_wrong`, which is what
+///   losing history above the compaction point looks like.
+///
+/// A compaction acknowledged above the final revision is `bad_history`.
+pub fn check_compaction(history: []const Entry, log: []const LogEvent, options: Options) Verdict {
+    for (history, 0..) |entry, index| {
+        const bad = switch (entry.call) {
+            .compact => |revision| compact_bad(entry, revision, options),
+            .read_at => |read| read_at_bad(history, log, entry, read),
+            else => null,
+        };
+        if (bad) |found| {
+            var detailed = found;
+            detailed.entry = @intCast(index);
+            return .{ .failed = detailed };
+        }
+    }
+    return .ok;
+}
+
+fn compact_bad(entry: Entry, revision: u64, options: Options) ?Failure {
+    if (entry.outcome == .acked and revision > options.final_revision) {
+        return .{ .kind = .bad_history, .revision = revision };
+    }
+    return null;
+}
+
+fn read_at_bad(history: []const Entry, log: []const LogEvent, entry: Entry, read: ReadAt) ?Failure {
+    if (entry.outcome != .acked and entry.outcome != .compacted) return null;
+    var done: u64 = 0; // The highest compaction finished before the read began.
+    var maybe: u64 = 0; // The highest that may have been applied before the read ended.
+    for (history) |other| {
+        if (other.call != .compact or other.outcome == .failed) continue;
+        const revision = other.call.compact;
+        if (other.outcome == .acked and other.complete < entry.invoke) done = @max(done, revision);
+        if (other.invoke < entry.complete) maybe = @max(maybe, revision);
+    }
+    const detail: Failure = .{ .kind = .read_at_wrong, .revision = read.revision, .key = read.key };
+    if (entry.outcome == .compacted) {
+        if (read.revision < maybe) return null;
+        return .{
+            .kind = .read_above_compaction_failed,
+            .revision = read.revision,
+            .key = read.key,
+        };
+    }
+    if (read.revision < done) {
+        return .{ .kind = .compacted_read_served, .revision = read.revision, .key = read.key };
+    }
+    var expected: Register = .{ .revision = 0, .value = 0 };
+    for (log) |event| {
+        if (event.revision > read.revision) break;
+        if (event.key != read.key) continue;
+        expected = if (event.kind == .put)
+            .{ .revision = event.revision, .value = event.value }
+        else
+            .{ .revision = 0, .value = 0 };
+    }
+    if (entry.revision != expected.revision or entry.value != expected.value) return detail;
+    return null;
 }
 
 // ---- Watches ------------------------------------------------------------------------------------
@@ -969,4 +1102,133 @@ test "teeth: a watch must open after the log's base and report no further than i
     try testing.expectEqual(@as(?Kind, .bad_history), a);
     try testing.expectEqual(@as(?Kind, .bad_history), b);
     try testing.expectEqual(@as(?Kind, null), verdict_kind(check_watch(&log, exact, options)));
+}
+
+fn delete_of(key: u8) Put {
+    return .{ .key = key, .value = 0, .delete = true };
+}
+
+fn history_read_at(invoke: u64, complete: u64, read: ReadAt, found: ?ReadAck) Entry {
+    const none: ReadAck = .{ .mod_revision = 0, .value = 0 };
+    var entry = read_of(invoke, complete, read.key, found orelse none);
+    entry.call = .{ .read_at = read };
+    if (found == null and invoke == complete) entry.outcome = .compacted;
+    return entry;
+}
+
+fn compact_entry(invoke: u64, complete: u64, revision: u64, outcome: Outcome) Entry {
+    var entry = read_of(invoke, complete, 0, .{ .mod_revision = 0, .value = 0 });
+    entry.call = .{ .compact = revision };
+    entry.outcome = outcome;
+    return entry;
+}
+
+const delete_one = write(
+    .{ .key = 0, .mod_revision = 1 },
+    &.{ delete_of(0), .{ .key = 130, .value = 7 } },
+    &.{.{ .key = 130, .value = 8 }},
+);
+
+fn delete_log(with_delete: bool) [3]LogEvent {
+    const second: LogEvent = if (with_delete)
+        .{ .revision = 2, .kind = .delete, .key = 0, .value = 0 }
+    else
+        put_event(2, 0, 9);
+    return .{ put_event(1, 0, 1), second, put_event(2, 130, 7) };
+}
+
+test "a delete is checked: sound passes, a kept key, a stale read and a bad revision are caught" {
+    const sound = [_]Entry{
+        acked(1, 2, create_one, .{ .succeeded = true, .revision = 1 }),
+        acked(3, 4, delete_one, .{ .succeeded = true, .revision = 2 }),
+        read_of(5, 6, 0, .{ .mod_revision = 0, .value = 0 }),
+        acked(7, 8, write(.{ .key = 0, .mod_revision = 0 }, &.{.{ .key = 0, .value = 3 }}, &.{}), .{
+            .succeeded = true,
+            .revision = 3,
+        }),
+    };
+    var log = delete_log(true);
+    const log3 = [_]LogEvent{ log[0], log[1], log[2], put_event(3, 0, 3) };
+    const ok = try check(testing.allocator, &sound, &log3, .{ .final_revision = 3 });
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(ok));
+    // Teeth 1: the delete was acknowledged and the log has a put there instead (the key stays).
+    log = delete_log(false);
+    const kept = try check(testing.allocator, sound[0..2], &log, .{ .final_revision = 2 });
+    try testing.expectEqual(@as(?Kind, .event_mismatch), verdict_kind(kept));
+    // Teeth 2: a read after the acknowledged delete still sees the key.
+    const old = read_of(5, 6, 0, .{ .mod_revision = 1, .value = 1 });
+    const stale = [_]Entry{ sound[0], sound[1], old };
+    log = delete_log(true);
+    const seen = try check(testing.allocator, &stale, &log, .{ .final_revision = 2 });
+    try testing.expectEqual(@as(?Kind, .not_linearizable), verdict_kind(seen));
+    // Teeth 3: a write after the delete at a revision no higher than the delete's.
+    const again = write(.{ .key = 0, .mod_revision = 0 }, &.{.{ .key = 0, .value = 3 }}, &.{});
+    const reused = acked(5, 6, again, .{ .succeeded = true, .revision = 2 });
+    const low = [_]Entry{ sound[0], sound[1], reused };
+    const lowered = try check(testing.allocator, &low, &log3, .{ .final_revision = 3 });
+    try testing.expect(verdict_kind(lowered) != null);
+}
+
+test "teeth: a delete that is lost, or a compare-and-delete that wins twice, is caught" {
+    const rival = write(
+        .{ .key = 0, .mod_revision = 1 },
+        &.{ delete_of(0), .{ .key = 131, .value = 9 } },
+        &.{},
+    );
+    const both = [_]Entry{
+        acked(1, 2, create_one, .{ .succeeded = true, .revision = 1 }),
+        acked(3, 6, delete_one, .{ .succeeded = true, .revision = 2 }),
+        acked(4, 7, rival, .{ .succeeded = true, .revision = 3 }),
+    };
+    const log = [_]LogEvent{ put_event(1, 0, 1), delete_log(true)[1], put_event(2, 130, 7) };
+    const twice = try check(testing.allocator, &both, &log, .{ .final_revision = 2 });
+    try testing.expect(verdict_kind(twice) != null);
+    const lost = [_]Entry{ both[0], both[1] };
+    const only = [_]LogEvent{put_event(1, 0, 1)};
+    const gone = try check(testing.allocator, &lost, &only, .{ .final_revision = 1 });
+    try testing.expectEqual(@as(?Kind, .lost_write), verdict_kind(gone));
+}
+
+test "compaction: sound reads pass; each broken rule is caught" {
+    const log = [_]LogEvent{ put_event(1, 0, 1), put_event(2, 0, 2), put_event(3, 1, 5) };
+    const options: Options = .{ .final_revision = 3 };
+    const first: ReadAck = .{ .mod_revision = 1, .value = 1 };
+    const at_two: ReadAck = .{ .mod_revision = 2, .value = 2 };
+    const sound = [_]Entry{
+        history_read_at(1, 2, .{ .key = 0, .revision = 1 }, first),
+        compact_entry(3, 4, 2, .acked),
+        history_read_at(5, 5, .{ .key = 0, .revision = 1 }, null), // Refused: below 2.
+        history_read_at(6, 7, .{ .key = 0, .revision = 2 }, at_two),
+        history_read_at(8, 9, .{ .key = 1, .revision = 2 }, .{ .mod_revision = 0, .value = 0 }),
+    };
+    const fine = check_compaction(&sound, &log, options);
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(fine));
+    // Served below an acknowledged compaction.
+    const served = [_]Entry{ sound[1], history_read_at(5, 6, .{ .key = 0, .revision = 1 }, first) };
+    const a = check_compaction(&served, &log, options);
+    try testing.expectEqual(@as(?Kind, .compacted_read_served), verdict_kind(a));
+    // Refused above every compaction (the store lost history it should have kept).
+    const refused = [_]Entry{ sound[1], history_read_at(5, 5, .{ .key = 0, .revision = 3 }, null) };
+    const b = check_compaction(&refused, &log, options);
+    try testing.expectEqual(@as(?Kind, .read_above_compaction_failed), verdict_kind(b));
+    // Served, but not what the log says the key was at that revision.
+    const wrong = [_]Entry{
+        history_read_at(1, 2, .{ .key = 0, .revision = 2 }, .{ .mod_revision = 1, .value = 1 }),
+    };
+    const c = check_compaction(&wrong, &log, options);
+    try testing.expectEqual(@as(?Kind, .read_at_wrong), verdict_kind(c));
+}
+
+test "compaction: an unacknowledged compaction may excuse a refusal, never a served read" {
+    const log = [_]LogEvent{ put_event(1, 0, 1), put_event(2, 0, 2) };
+    const options: Options = .{ .final_revision = 2 };
+    const maybe = [_]Entry{
+        compact_entry(1, never, 2, .unknown),
+        history_read_at(3, 3, .{ .key = 0, .revision = 1 }, null),
+    };
+    const excused = check_compaction(&maybe, &log, options);
+    try testing.expectEqual(@as(?Kind, null), verdict_kind(excused));
+    const future = [_]Entry{compact_entry(1, 2, 9, .acked)};
+    const bad = check_compaction(&future, &log, options);
+    try testing.expectEqual(@as(?Kind, .bad_history), verdict_kind(bad));
 }
