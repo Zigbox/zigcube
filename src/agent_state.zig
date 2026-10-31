@@ -39,7 +39,14 @@ pub const Error = error{ Absent, Crashed, Io, TooBig, OutOfMemory };
 /// the last part through `write_atomic`, whose buffer is sized from this.
 pub const name_bytes_max: u32 = 96;
 pub const file_bytes_max: u32 = constants.fake_file_bytes_max;
-pub const files_max: u32 = 256;
+/// Room for a full node: per container a spec, a run record and the temporary files a crash can
+/// leave beside them (`files_per_container_max`), for `runtime_handles_max` containers.
+pub const files_per_container_max: u32 = 4;
+pub const files_max: u32 = files_per_container_max * constants.runtime_handles_max;
+comptime {
+    assert(files_max >= constants.fake_containers_max * files_per_container_max);
+    assert(constants.fake_containers_max <= constants.runtime_handles_max);
+}
 
 pub const AgentState = struct {
     context: *anyopaque,
@@ -202,7 +209,9 @@ pub const SimState = struct {
         for (state.files.items) |*file| {
             if (file.data.len <= file.synced_len) continue;
             const kept = state.prng.random().intRangeAtMost(usize, file.synced_len, file.data.len);
-            file.data = state.gpa.realloc(file.data, kept) catch file.data[0..kept];
+            // If the allocator refuses to shrink, nothing is lost: keeping the whole tail is one
+            // of the outcomes the model allows, and the slice keeps its allocated length.
+            file.data = state.gpa.realloc(file.data, kept) catch continue;
         }
     }
 

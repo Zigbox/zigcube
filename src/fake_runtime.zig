@@ -181,7 +181,7 @@ pub const FakeRuntime = struct {
         const io = self.io;
         const file = self.spec_file(spec);
         agent_records.write_spec(self.state.interface(), &file) catch |err| switch (err) {
-            error.TooBig => return too_large(diag, spec.name),
+            error.TooBig => return agent_records.too_large(diag, spec.name),
             else => |other| return state_failed(diag, other, "write the container's record"),
         };
         const dir = self.containers.openDir(io, spec.name, .{}) catch
@@ -700,11 +700,7 @@ fn signal(pid: i32, sig: std.posix.SIG) void {
 // ---- Diagnostics -------------------------------------------------------------------------------
 
 fn not_found(diag: *Diag, handle: runtime.Handle) error{NotFound} {
-    assert(diag.code == null);
-    diag.raise(.E0501);
-    diag.cause("the runtime has no container named {s}", .{handle.name()});
-    diag.fix(.{ .sentence = "treat the replica as lost; the controller replaces it" });
-    return error.NotFound;
+    return agent_records.not_found(diag, handle.name());
 }
 
 fn no_memory(diag: *Diag) error{RuntimeFailed} {
@@ -713,15 +709,6 @@ fn no_memory(diag: *Diag) error{RuntimeFailed} {
         diag.cause("the memory set aside for this pass ran out", .{});
         diag.fix(.{ .sentence = "run fewer containers on this node" });
     }
-    return error.RuntimeFailed;
-}
-
-fn too_large(diag: *Diag, name: []const u8) error{RuntimeFailed} {
-    assert(diag.code == null);
-    diag.raise(.E0502);
-    const limit = constants.fake_file_bytes_max;
-    diag.cause("the spec of {s} is larger than {d} bytes", .{ name, limit });
-    diag.fix(.{ .sentence = "shorten the command or the environment in the service file" });
     return error.RuntimeFailed;
 }
 
@@ -735,21 +722,8 @@ fn runtime_failed(diag: *Diag, operation: []const u8) error{RuntimeFailed} {
     return error.RuntimeFailed;
 }
 
-/// ZC-E0502 for a state-directory operation the host refused (`error.Io`): what was refused, and
-/// that the host did it. The other errors cannot come from files: `Absent` is handled where it is
-/// expected, and `Crashed` is only the simulation's.
 fn state_failed(diag: *Diag, err: agent_state.Error, operation: []const u8) error{RuntimeFailed} {
-    switch (err) {
-        error.OutOfMemory => return no_memory(diag),
-        error.Io, error.TooBig => {},
-        error.Absent, error.Crashed => unreachable, // Not for the callers: see above.
-    }
-    assert(diag.code == null);
-    diag.raise(.E0502);
-    diag.cause("the host refused to {s} in the agent's state directory", .{operation});
-    const sentence = "check the disk space and permissions of the agent's state directory";
-    diag.fix(.{ .sentence = sentence });
-    return error.RuntimeFailed;
+    return agent_records.state_failed(diag, err, operation);
 }
 
 fn supervisor_failed(diag: *Diag, name: []const u8) error{RuntimeFailed} {

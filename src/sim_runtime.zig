@@ -270,18 +270,55 @@ pub const SimRuntime = struct {
     fn status_of(container: *const Container) runtime.Status {
         return switch (container.phase) {
             .running, .stopping => .running,
-            .stopped => |ended| .{ .stopped = exit_reason(ended) },
+            .stopped => |ended| .{ .stopped = exit_reason(container.name, ended) },
         };
     }
 
-    fn exit_reason(ended: Ended) runtime.ExitReason {
+    /// `lost` carries ZC-E0509, as `FakeRuntime` reports it.
+    fn exit_reason(name: []const u8, ended: Ended) runtime.ExitReason {
         return switch (ended) {
             .exited => |code| .{ .exited = code },
             .signaled => |number| .{ .signaled = number },
             .oom => .oom,
             .pid_limit => .pid_limit,
-            .lost => .{ .lost = null },
+            .lost => .{ .lost = agent_records.lost_diagnostic(name) },
         };
+    }
+
+    /// What the process side of a container is, as the files of a real node would show it.
+    pub const Process = union(enum) {
+        /// No supervisor ever ran for the name.
+        absent,
+        /// The command runs (or is being stopped).
+        alive,
+        /// The supervisor wrote how the command ended.
+        ended: agent_records.RunFile,
+        /// The supervisor or the process vanished and nothing recorded how the command ended.
+        vanished,
+    };
+
+    pub fn process(self: *SimRuntime, name: []const u8) Process {
+        self.tick();
+        const container = self.find(name) orelse return .absent;
+        const ended = switch (container.phase) {
+            .running, .stopping => return .alive,
+            .stopped => |ended| ended,
+        };
+        return switch (ended) {
+            .exited => |code| .{ .ended = .{ .kind = .exited, .code = code } },
+            .signaled => |number| .{ .ended = .{ .kind = .signaled, .signal = number } },
+            .oom => .{ .ended = .{ .kind = .oom } },
+            .pid_limit => .{ .ended = .{ .kind = .pid_limit } },
+            .lost => .vanished,
+        };
+    }
+
+    /// Forgets a container that has stopped (its record was evicted). A container that has not
+    /// stopped is never forgotten.
+    pub fn evict(self: *SimRuntime, name: []const u8) void {
+        const container = self.find(name) orelse return;
+        assert(container.phase == .stopped);
+        self.remove(container);
     }
 
     // ---- The Runtime interface ----
@@ -453,7 +490,7 @@ pub const SimRuntime = struct {
         const out = arena.alloc(runtime.StatusChange, count) catch return no_memory(diag);
         for (self.changes[0..count], out) |change, *slot| {
             const status: runtime.Status = if (change.ended) |ended|
-                .{ .stopped = exit_reason(ended) }
+                .{ .stopped = exit_reason(change.handle.name(), ended) }
             else
                 .running;
             slot.* = .{ .handle = change.handle, .status = status };
@@ -607,7 +644,7 @@ test "faults end a container the way a real one ends, and list says how" {
     try testing.expectEqual(@as(u8, 3), listed[0].status.stopped.exited);
     try testing.expectEqual(@as(u8, 9), listed[1].status.stopped.signaled);
     try testing.expect(listed[2].status.stopped == .oom);
-    try testing.expect(listed[3].status.stopped.lost == null);
+    try testing.expectEqualStrings("ZC-E0509", listed[3].status.stopped.lost.?.code.slice());
     try testing.expect(listed[4].status.stopped == .pid_limit);
     try testing.expectEqualStrings("a-1", listed[0].labels[0].value[0..3]);
     const changes = try rt.events(arena_state.allocator(), 0, &diag);

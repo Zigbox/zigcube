@@ -308,6 +308,56 @@ pub fn lost_diagnostic(name: []const u8) Diagnostic {
     return out;
 }
 
+// ---- Diagnostics for a state operation that failed -------------------------------------------
+
+/// ZC-E0501 for a container the runtime has no record of.
+pub fn not_found(diag: *Diag, name: []const u8) error{NotFound} {
+    assert(diag.code == null);
+    diag.raise(.E0501);
+    diag.cause("the runtime has no container named {s}", .{name});
+    diag.fix(.{ .sentence = "treat the replica as lost; the controller replaces it" });
+    return error.NotFound;
+}
+
+/// ZC-E0502: a spec too large for a record file.
+pub fn too_large(diag: *Diag, name: []const u8) error{RuntimeFailed} {
+    assert(diag.code == null);
+    diag.raise(.E0502);
+    const limit = constants.fake_file_bytes_max;
+    diag.cause("the spec of {s} is larger than {d} bytes", .{ name, limit });
+    diag.fix(.{ .sentence = "shorten the command or the environment in the service file" });
+    return error.RuntimeFailed;
+}
+
+/// ZC-E0502 for a state operation that failed: what was being done, and that the host refused.
+/// The host's own word is not shown: error names are not for users (DIAGNOSTICS.md). `Absent` is
+/// a file that was there a moment ago (a directory removed under the agent); `Crashed` is only the
+/// simulation's, which its caller handles first.
+pub fn state_failed(
+    diag: *Diag,
+    err: agent_state.Error,
+    operation: []const u8,
+) error{RuntimeFailed} {
+    if (diag.code != null) return error.RuntimeFailed; // The first diagnostic stands.
+    diag.raise(.E0502);
+    switch (err) {
+        error.OutOfMemory => {
+            diag.cause("the memory set aside for this pass ran out", .{});
+            diag.fix(.{ .sentence = "run fewer containers on this node" });
+            return error.RuntimeFailed;
+        },
+        error.Absent => diag.cause("a file the agent needed to {s} disappeared from its state " ++
+            "directory", .{operation}),
+        error.Io, error.TooBig => {
+            diag.cause("the host refused to {s} in the agent's state directory", .{operation});
+        },
+        error.Crashed => unreachable, // Only `SimState` raises it, and `SimNode` handles it first.
+    }
+    const sentence = "check the disk space and permissions of the agent's state directory";
+    diag.fix(.{ .sentence = sentence });
+    return error.RuntimeFailed;
+}
+
 // ---- Tests ----------------------------------------------------------------------------------
 
 const testing = std.testing;
