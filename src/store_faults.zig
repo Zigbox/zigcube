@@ -5,7 +5,8 @@
 //!
 //! ## What a run does
 //!
-//! - `clients_count` threads each make `ops_per_client` calls on a `Store` of their own:
+//! - `clients_count` threads each make `ops_per_client` calls on a `Store` of their own,
+//!   spread over a few hot keys per phase so that clients overlap on a key (`hot_keys`):
 //!   reads and compare-and-set on register keys (ids below `history.audit_key_min`), blind
 //!   puts, and compare-and-sets that cannot succeed, whose `on_failure` branch puts an audit
 //!   key (id from `audit_key_min`). Every value is a token from one shared counter, so each
@@ -14,10 +15,18 @@
 //!   now and then on purpose).
 //! - Postgres: the clients and the watcher connect through a `FaultProxy` in front of the
 //!   database; the main thread plays the schedule drawn from the seed (latency, `cut_all`,
-//!   `cut_after` at varied byte counts so cuts land mid-transaction and near `COMMIT`, one-way
-//!   stalls, partitions, the black hole, `heal`). A store error with code ZC-E0213 ("outcome
-//!   unknown": the write may or may not have been applied) is recorded as `unknown`; any other
-//!   store error as `fail`, which the checker takes to mean nothing was changed.
+//!   `cut_after` at varied byte counts so cuts land mid-transaction, `cut_on_commit_reply`, which
+//!   resets the connection on the server's COMMIT reply (the commit is made, the client never
+//!   hears), one-way stalls, partitions, the black hole, `heal`). A ZC-E0213 raised while
+//!   committing ("outcome unknown": the write may or may not have been applied) is recorded as
+//!   `unknown`; any other store error, a drop before the COMMIT included, as `fail`, which the
+//!   checker takes to mean nothing was changed. The summary splits the unknowns into those found
+//!   in the log (`applied`) and those absent; a faulted run with no `applied` unknown has not
+//!   exercised the lost acknowledgement and fails.
+//! - After the clients finish and the proxy is healed, the runner waits until no store backend is
+//!   busy before it reads the final revision, so a COMMIT that finishes late is in the log it
+//!   checks. The checker's own test is below: `--mutate` (hidden) makes the clients' stores lie
+//!   (`store_mutant.zig`) and the test asserts that each lie is rejected.
 //! - SQLite has no connection to cut, so no proxy applies: it runs the same clients and the
 //!   same checker, without faults. The output says so.
 //! - At the end: `heal`, read `status.revision` on a direct connection (not through the
@@ -30,9 +39,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Diag = @import("diag.zig").Diag;
-const codes = @import("diag/codes.zig");
 const RealClock = @import("agent_clock.zig").RealClock;
 const store = @import("store.zig");
+const pq = @import("pq.zig");
+const Mutant = @import("store_mutant.zig").Mutant;
+const Mutation = @import("store_mutant.zig").Mutation;
 const PostgresStore = @import("store_postgres.zig").PostgresStore;
 const SqliteStore = @import("store_sqlite.zig").SqliteStore;
 const fault_proxy = @import("testing/fault_proxy.zig");
@@ -43,7 +54,23 @@ const Store = store.Store;
 
 const clients_count = 4;
 const ops_per_client = 250;
+/// Calls are spread over a few hot keys at a time, so that clients really overlap on a key: a
+/// client's `phase_ops` calls go to `hot_keys` keys of its current phase, and each phase has keys
+/// of its own. The checker's search is bounded per key (`history.key_calls_max`), so a key takes
+/// at most `key_calls_cap` calls; `register_keys` holds every phase of a full run.
+const hot_keys = 4;
+const phase_ops = 16;
 const register_keys = 64;
+const key_calls_cap = 56;
+const quiet_polls_max = 200;
+const quiet_samples = 3;
+const quiet_poll_ms = 50;
+comptime {
+    assert(key_calls_cap < history.key_calls_max);
+    assert(register_keys < history.audit_key_min);
+    assert(@divExact(register_keys, hot_keys) * phase_ops >= ops_per_client);
+    assert(clients_count * phase_ops <= hot_keys * key_calls_cap);
+}
 const wrong_revision_offset = 1_000_000;
 const watch_prefix = "/h/";
 const watch_poll_ms = 30;
@@ -58,6 +85,9 @@ const Options = struct {
     backend: Backend,
     postgres: []const u8,
     seed: ?u64,
+    /// Test hook (hidden flag `--mutate`): the clients' stores lie, and the run must fail.
+    mutation: Mutation = .none,
+    ops_per_client: u32 = ops_per_client,
 };
 
 /// A store connection of either kind. In place: stores point back at themselves.
@@ -103,6 +133,8 @@ const Run = struct {
     seed: u64,
     schema: []const u8,
     sqlite_path: []const u8,
+    mutation: Mutation,
+    ops_per_client: u32,
     clock: @import("clock.zig").Clock,
 };
 
@@ -112,8 +144,15 @@ const Shared = struct {
     next_token: std.atomic.Value(u64) = .init(1),
     clients_left: std.atomic.Value(u32) = .init(clients_count),
     watch_stop: std.atomic.Value(bool) = .init(false),
+    /// Calls made on each register key, so that none passes the checker's bound.
+    key_calls: [register_keys]std.atomic.Value(u32) = @splat(.init(0)),
     /// The revision the watcher must reach once the clients are done; 0 until known.
     watch_final: std.atomic.Value(u64) = .init(0),
+
+    /// Counts a call on `key`; false if the key has had its share.
+    fn reserve(shared: *Shared, key: u8) bool {
+        return shared.key_calls[key].fetchAdd(1, .monotonic) < key_calls_cap;
+    }
 
     fn token(shared: *Shared) u64 {
         return shared.next_token.fetchAdd(1, .monotonic);
@@ -131,13 +170,16 @@ const Client = struct {
     id: u32,
     recorder: history.Recorder,
     conn: Conn,
+    mutant: Mutant,
     diag: Diag,
     rng: std.Random.DefaultPrng,
     last_seen: [register_keys]u64,
     failure: ?anyerror,
 
     fn s(client: *Client) Store {
-        return client.conn.interface(client.shared.run.backend);
+        const real = client.conn.interface(client.shared.run.backend);
+        if (client.shared.run.mutation == .none) return real;
+        return client.mutant.interface();
     }
 };
 
@@ -152,9 +194,9 @@ fn run_client(client: *Client) !void {
     var arena_state = std.heap.ArenaAllocator.init(client.shared.run.gpa);
     defer arena_state.deinit();
     const rng = client.rng.random();
-    for (0..ops_per_client) |_| {
+    for (0..client.shared.run.ops_per_client) |op_index| {
         _ = arena_state.reset(.retain_capacity);
-        const key = rng.uintLessThan(u8, register_keys);
+        const key = pick_key(client.shared, rng, op_index);
         const roll = rng.uintLessThan(u32, 100);
         if (roll < 40) {
             try do_read(client, arena_state.allocator(), key);
@@ -166,6 +208,18 @@ fn run_client(client: *Client) !void {
             try do_blind(client, key);
         }
     }
+}
+
+/// A key of the current phase that has calls left (see `hot_keys`).
+fn pick_key(shared: *Shared, rng: std.Random, op_index: usize) u8 {
+    const base: usize = op_index / phase_ops * hot_keys;
+    assert(base + hot_keys <= register_keys);
+    const first = rng.uintLessThan(usize, hot_keys);
+    for (0..hot_keys) |step| {
+        const key: u8 = @intCast(base + (first + step) % hot_keys);
+        if (shared.reserve(key)) return key;
+    }
+    unreachable; // The cap of every key of a phase cannot be spent by one phase's calls.
 }
 
 fn do_read(client: *Client, arena: Allocator, key: u8) !void {
@@ -239,7 +293,9 @@ fn do_txn(client: *Client, txn: history.Txn) !?history.TxnAck {
         request.compares = &compares;
     }
     const result = client.s().txn(request, &client.diag) catch {
-        const lost = client.diag.code.? == codes.Code.E0213;
+        // Only a connection that dropped while committing may have written; a drop before the
+        // COMMIT (ZC-E0213 as well) certainly changed nothing.
+        const lost = pq.dropped_during_commit(&client.diag);
         client.diag.reset();
         if (lost) client.recorder.unknown(handle) else client.recorder.fail(&shared.ticker, handle);
         return null;
@@ -345,7 +401,8 @@ fn pick_direction(rng: std.Random) fault_proxy.Direction {
 
 /// One step of the schedule, then a pause. Every fault but `cut_all` is undone by `heal`.
 fn fault_step(proxy: *fault_proxy.Proxy, rng: std.Random, io: std.Io) void {
-    switch (rng.uintLessThan(u32, 8)) {
+    var armed_commit = false;
+    switch (rng.uintLessThan(u32, 10)) {
         0 => {
             proxy.set_latency(rng.intRangeAtMost(u32, 1, 15));
             nap(io, rng.intRangeAtMost(u64, 100, 300));
@@ -368,9 +425,15 @@ fn fault_step(proxy: *fault_proxy.Proxy, rng: std.Random, io: std.Io) void {
             proxy.partition();
             nap(io, rng.intRangeAtMost(u64, 50, 200));
         },
+        // The lost acknowledgement: the COMMIT is applied and its reply never arrives. Left
+        // armed (no heal) until a COMMIT reply passes, so it is seldom wasted.
+        7, 8 => {
+            proxy.cut_on_commit_reply();
+            armed_commit = true;
+        },
         else => {},
     }
-    if (rng.uintLessThan(u32, 3) != 0) proxy.heal();
+    if (!armed_commit and rng.uintLessThan(u32, 3) != 0) proxy.heal();
     nap(io, rng.intRangeAtMost(u64, 20, 120));
 }
 
@@ -439,6 +502,8 @@ fn parse_options(args: []const []const u8) ?Options {
             options.backend = std.meta.stringToEnum(Backend, value) orelse return null;
         } else if (std.mem.eql(u8, name, "--postgres")) {
             options.postgres = value;
+        } else if (std.mem.eql(u8, name, "--mutate")) {
+            options.mutation = std.meta.stringToEnum(Mutation, value) orelse return null;
         } else if (std.mem.eql(u8, name, "--seed")) {
             options.seed = std.fmt.parseInt(u64, value, 10) catch return null;
         } else {
@@ -453,7 +518,8 @@ fn parse_options(args: []const []const u8) ?Options {
 pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return exit_user;
     const options = parse_options(args) orelse {
-        say("usage: store_faults --backend postgres|sqlite [--postgres SETTINGS] [--seed N]", .{});
+        say("usage: store_faults --backend postgres|sqlite [--postgres SETTINGS] [--seed N]" ++
+            " [--mutate drop_ack|stale_read|reuse_revision]", .{});
         return exit_user;
     };
     var seed_bytes: [8]u8 = undefined;
@@ -463,40 +529,54 @@ pub fn main(init: std.process.Init) u8 {
     if (options.backend == .sqlite) {
         say("sqlite: no proxy applies; history checker only, no faults", .{});
     }
-    const passed = execute(init, options, seed) catch |err| {
+    const report = execute(init.gpa, init.io, options, seed) catch |err| {
         say("ERROR {s} seed={d}", .{ @errorName(err), seed });
         return 1;
     };
-    if (!passed) say("FAIL seed={d} (replay: -Dseed={d})", .{ seed, seed });
-    return if (passed) 0 else 1;
+    if (!report.passed) say("FAIL seed={d} (replay: -Dseed={d})", .{ seed, seed });
+    return if (report.passed) 0 else 1;
 }
 
-fn execute(init: std.process.Init, options: Options, seed: u64) !bool {
-    const gpa = init.gpa;
+/// How a run ended. `kind` is the checker's verdict when it was the checker that failed it.
+const Report = struct {
+    passed: bool,
+    kind: ?history.Kind = null,
+    /// Writes whose outcome was unknown, split by what the log says: in it, or absent.
+    unknown_applied: u32 = 0,
+    unknown_absent: u32 = 0,
+};
+
+fn execute(gpa: Allocator, io: std.Io, options: Options, seed: u64) !Report {
     var schema_buffer: [32]u8 = undefined;
     const schema = try std.fmt.bufPrint(&schema_buffer, "zf_{x:0>16}", .{seed});
     var path_buffer: [96]u8 = undefined;
     const directory = try std.fmt.bufPrint(&path_buffer, ".zig-cache/store-faults-{d}", .{seed});
     var file_buffer: [128]u8 = undefined;
     const file = try std.fmt.bufPrint(&file_buffer, "{s}/s.db", .{directory});
-    var real: RealClock = .{ .io = init.io };
+    var real: RealClock = .{ .io = io };
     const run: Run = .{
         .gpa = gpa,
-        .io = init.io,
+        .io = io,
+        .mutation = options.mutation,
+        .ops_per_client = options.ops_per_client,
         .backend = options.backend,
         .seed = seed,
         .schema = schema,
         .sqlite_path = file,
         .clock = real.clock(),
     };
-    if (options.backend == .sqlite) try std.Io.Dir.cwd().createDirPath(init.io, directory);
+    if (options.backend == .sqlite) {
+        // A directory left by an earlier run of this seed (one that was killed) goes first.
+        std.Io.Dir.cwd().deleteTree(io, directory) catch {}; // Best effort: it is scratch.
+        try std.Io.Dir.cwd().createDirPath(io, directory);
+    }
     defer if (options.backend == .sqlite) {
-        std.Io.Dir.cwd().deleteTree(init.io, directory) catch {}; // Best effort: it is scratch.
+        std.Io.Dir.cwd().deleteTree(io, directory) catch {}; // Best effort: it is scratch.
     };
     return try drive(&run, options);
 }
 
-fn drive(run: *const Run, options: Options) !bool {
+fn drive(run: *const Run, options: Options) !Report {
     const gpa = run.gpa;
     var shared: Shared = .{ .run = run };
     const diag = try gpa.create(Diag);
@@ -509,6 +589,15 @@ fn drive(run: *const Run, options: Options) !bool {
         say("cannot open the store: {s}", .{@errorName(err)});
         return err;
     };
+    if (run.backend == .postgres) {
+        // A schema left by an earlier run of this seed goes first, then the store is made anew.
+        direct.postgres.drop_schema(diag) catch |err| {
+            say("cannot drop a left-over schema: {s}", .{@errorName(err)});
+            return err;
+        };
+        direct.close(run.backend);
+        try direct.open(&shared, options.postgres, diag);
+    }
     defer {
         if (run.backend == .postgres) direct.postgres.drop_schema(diag) catch {};
         direct.close(run.backend);
@@ -533,10 +622,13 @@ fn drive(run: *const Run, options: Options) !bool {
         .base = base,
         .proxy = proxy,
         .conninfo = client_conninfo,
+        .direct_conninfo = options.postgres,
     });
 }
 
 const Setup = struct {
+    /// The settings of a connection that does not go through the proxy.
+    direct_conninfo: []const u8,
     direct: Store,
     diag: *Diag,
     base: u64,
@@ -544,7 +636,7 @@ const Setup = struct {
     conninfo: []const u8,
 };
 
-fn run_and_check(shared: *Shared, setup: Setup) !bool {
+fn run_and_check(shared: *Shared, setup: Setup) !Report {
     const run = shared.run;
     const gpa = run.gpa;
     const clients = try gpa.alloc(Client, clients_count);
@@ -560,6 +652,7 @@ fn run_and_check(shared: *Shared, setup: Setup) !bool {
             .id = @intCast(index),
             .recorder = history.Recorder.init(gpa, @intCast(index)),
             .conn = undefined,
+            .mutant = undefined,
             .diag = undefined,
             .rng = .init(run.seed ^ (0x9e3779b97f4a7c15 *% (index + 1))),
             .last_seen = @splat(0),
@@ -568,6 +661,9 @@ fn run_and_check(shared: *Shared, setup: Setup) !bool {
         client.diag.reset();
         try client.conn.open(shared, setup.conninfo, &client.diag);
         opened += 1;
+        if (run.mutation != .none) {
+            client.mutant = Mutant.init(client.conn.interface(run.backend), run.mutation);
+        }
     }
     const watcher = try gpa.create(Watcher);
     defer gpa.destroy(watcher);
@@ -588,7 +684,7 @@ fn run_and_check(shared: *Shared, setup: Setup) !bool {
     return try play(shared, setup, clients, watcher);
 }
 
-fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !bool {
+fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !Report {
     const run = shared.run;
     const gpa = run.gpa;
     var threads: [clients_count]std.Thread = undefined;
@@ -606,6 +702,7 @@ fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !bo
     }
     for (threads) |thread| thread.join();
     if (setup.proxy) |proxy| proxy.heal();
+    if (setup.proxy != null) try wait_quiet(shared, setup);
     const final = (try setup.direct.status(setup.diag)).revision;
     shared.watch_final.store(final, .release);
     shared.watch_stop.store(true, .release);
@@ -617,15 +714,68 @@ fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !bo
     return try verdict(shared, setup, clients, watcher, .{ .log = log.items, .final = final });
 }
 
-fn fail_client(err: anyerror) bool {
+fn fail_client(err: anyerror) Report {
     say("a client thread stopped: {s}", .{@errorName(err)});
-    return false;
+    return .{ .passed = false };
 }
+
+/// Waits until no store backend is still working on a statement. A COMMIT that the proxy held
+/// back, or that a backend was part-way through when its client was cut, can finish after the
+/// last client returned; the log must be read after it, or the final revision would be one too
+/// low and the checker would report a gap that is not there. Quiet means `quiet_samples`
+/// readings in a row with nothing running; it gives up after `quiet_polls_max` readings (other
+/// users of the database can keep it busy) and says so.
+fn wait_quiet(shared: *Shared, setup: Setup) !void {
+    const run = shared.run;
+    var text: [512]u8 = undefined;
+    const conninfo = std.fmt.bufPrintSentinel(&text, "{s}", .{setup.direct_conninfo}, 0) catch {
+        return error.ConninfoTooLong;
+    };
+    const conn = try pq.connect(setup.diag, conninfo, "SELECT 1");
+    defer pq.close(conn);
+    var quiet: u32 = 0;
+    for (0..quiet_polls_max) |_| {
+        nap(run.io, quiet_poll_ms);
+        var result = try pq.exec_simple(setup.diag, conn, busy_sql, .{});
+        defer result.clear();
+        assert(result.rows() == 1);
+        const busy = std.fmt.parseInt(u32, result.bytes(0, 0), 10) catch return error.BadCount;
+        quiet = if (busy == 0) quiet + 1 else 0;
+        if (quiet == quiet_samples) return;
+    }
+    say("warning: store backends were still busy after the run; the log may be short", .{});
+}
+
+/// Statements of the store's own connections that are not idle (this poll excepted).
+const busy_sql: [:0]const u8 =
+    "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'zcube-store' " ++
+    "AND datname = current_database() AND pid <> pg_backend_pid() " ++
+    "AND state IN ('active', 'idle in transaction', 'idle in transaction (aborted)')";
 
 const Finished = struct {
     log: []const history.LogEvent,
     final: u64,
 };
+
+/// Splits the writes of unknown outcome by what the log says: some branch in it, or none.
+fn split_unknowns(gpa: Allocator, entries: []const history.Entry, log: []const history.LogEvent) !Report {
+    var present: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer present.deinit(gpa);
+    for (log) |event| {
+        if (event.kind == .put) try present.put(gpa, event.value, {});
+    }
+    var report: Report = .{ .passed = true };
+    for (entries) |entry| {
+        if (entry.outcome != .unknown) continue;
+        if (entry.call != .txn) continue;
+        var found = false;
+        for ([_][]const history.Put{ entry.call.txn.success, entry.call.txn.failure }) |puts| {
+            for (puts) |put| found = found or present.contains(put.value);
+        }
+        if (found) report.unknown_applied += 1 else report.unknown_absent += 1;
+    }
+    return report;
+}
 
 fn verdict(
     shared: *Shared,
@@ -633,7 +783,7 @@ fn verdict(
     clients: []Client,
     watcher: *const Watcher,
     finished: Finished,
-) !bool {
+) !Report {
     const gpa = shared.run.gpa;
     var recorders: [clients_count]*const history.Recorder = undefined;
     for (clients, 0..) |*client, index| recorders[index] = &client.recorder;
@@ -644,22 +794,27 @@ fn verdict(
         .final_revision = finished.final,
     };
     const total = tally(entries);
-    say("calls={d} acked={d} failed={d} unknown={d} log_events={d} " ++
+    var report = try split_unknowns(gpa, entries, finished.log);
+    assert(report.unknown_applied + report.unknown_absent == total.unknown);
+    say("calls={d} acked={d} failed={d} unknown={d} (applied={d} absent={d}) log_events={d} " ++
         "revision={d} watch_opens={d}", .{
-        entries.len,      total.ok,       total.failed,  total.unknown,
-        finished.log.len, finished.final, watcher.opens,
+        entries.len,      total.ok,               total.failed,
+        total.unknown,    report.unknown_applied, report.unknown_absent,
+        finished.log.len, finished.final,         watcher.opens,
     });
     if (setup.proxy) |proxy| {
         const stats = proxy.stats();
-        say("proxy: accepted={d} upstream_connects={d} cuts={d}", .{
-            stats.accepted, stats.upstream_connects, stats.cuts,
+        say("proxy: accepted={d} upstream_connects={d} cuts={d} commit_cuts={d}", .{
+            stats.accepted, stats.upstream_connects, stats.cuts, stats.commit_cuts,
         });
         if (stats.accepted == 0) return error.ProxyUnused;
     }
     const checked = try history.check(gpa, entries, finished.log, options);
     if (checked != .ok) {
         say("history: {any}", .{checked});
-        return false;
+        report.passed = false;
+        report.kind = checked.failed.kind;
+        return report;
     }
     const record: history.WatchRecord = .{
         .from_revision = watcher.from_revision,
@@ -669,8 +824,58 @@ fn verdict(
     const watched = history.check_watch(finished.log, record, options);
     if (watched != .ok) {
         say("watch: {any}", .{watched});
-        return false;
+        report.passed = false;
+        report.kind = watched.failed.kind;
+        return report;
+    }
+    if (setup.proxy != null and report.unknown_applied == 0) {
+        // The point of the cuts at COMMIT replies is a write that was made and never
+        // acknowledged. A run that never met one has not tested that case.
+        say("FAILED: no unknown write was found in the log: the lost acknowledgement " ++
+            "(commit made, reply cut) was never exercised", .{});
+        report.passed = false;
+        return report;
     }
     say("PASS", .{});
-    return true;
+    return report;
+}
+
+// ---- The runner's own test ----------------------------------------------------------------------
+
+fn mutated_report(mutation: Mutation, seed: u64) !Report {
+    const options: Options = .{
+        .backend = .sqlite,
+        .postgres = "",
+        .seed = seed,
+        .mutation = mutation,
+    };
+    return execute(std.testing.allocator, std.testing.io, options, seed);
+}
+
+test "the runner passes an honest store and rejects each kind of lie with its own verdict" {
+    // Goal: prove the runner can fail. A checker that has never rejected a real run might be
+    // checking nothing, so each `Mutation` makes the clients' store lie in one way and the run
+    // must end with the verdict that lie earns. Method: the SQLite backend (no database to
+    // start), the full run, a fixed seed. Threads interleave as the machine likes, so a lie
+    // that needs a coincidence to show (a stale read needs a write in between) gets three
+    // seeds; the other two are certain on the first.
+    const honest = try mutated_report(.none, 7);
+    try std.testing.expect(honest.passed);
+    try std.testing.expectEqual(@as(?history.Kind, null), honest.kind);
+    const cases = [_]struct { mutation: Mutation, kind: history.Kind }{
+        .{ .mutation = .drop_ack, .kind = .lost_write },
+        .{ .mutation = .stale_read, .kind = .not_linearizable },
+        .{ .mutation = .reuse_revision, .kind = .revision_reused },
+    };
+    for (cases) |case| {
+        var caught = false;
+        for (0..3) |attempt| {
+            const report = try mutated_report(case.mutation, 100 + attempt);
+            if (report.passed) continue; // The lie did not show this time: try another seed.
+            try std.testing.expectEqual(@as(?history.Kind, case.kind), report.kind);
+            caught = true;
+            break;
+        }
+        try std.testing.expect(caught);
+    }
 }
