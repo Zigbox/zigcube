@@ -223,9 +223,9 @@ recovery.
   makes the server remember the store as it is now. Run it after looking at which store this is.
 
 - **What a check compares with.** A call takes a snapshot of the remembered pair (and the epoch) before it
-  calls the store, and its answer is compared with that snapshot only: a linearizable store answers a
-  call that began after a write was acknowledged with at least that revision. A write acknowledged
-  while the call ran only makes an answer *below* the pair late. An answer at or above the pair as it
+  calls the store. An answer below the current pair is compared with that snapshot only: a
+  linearizable store answers a call that began after a write was acknowledged with at least that
+  revision, and a write acknowledged while the call ran only makes an answer *below* the pair late. An answer at or above the pair as it
   stands now cannot be late, so it is compared with the current pair too (up to 4 rounds, then it is
   dropped and the pair stays; the next status compares). The pair moves forward by maximum, never back.
 - **Reads.** `get`, `list` and `watch` pass the halt gate. Until one check has passed (the store could
@@ -237,6 +237,9 @@ Known gaps (not fixed in 10b): `accept` reads the store's status and then bumps 
 acknowledged between the two is not in the pair it remembers (the pair is lower than the store: weaker,
 never unsafe). The round-1 `<db>.remembered` files (before the file was keyed by the database path) are
 left behind and never read. A database restored at a new path is unchecked (documented above).
+An answer below a pair that moved while the call ran is compared with the snapshot only, so a forked
+answer there passes (it is never adopted; the next `status` halts). An answer dropped after 4 rounds
+leaves the pair below it, so a rollback to between the pair and that answer goes unnoticed.
 `Watch.next` is not gated on a halt (a watch opened before the halt can still deliver
 events until it is re-opened); and the decision record that should hold both pairs as evidence
 needs a store-level `SubjectKind`, a `docs/keys.md` change that is ask-first.
