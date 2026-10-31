@@ -637,10 +637,6 @@ test "a record whose container never started is starting, then lost" {
 }
 
 test "a stop keeps the record; make_room evicts the oldest stopped one before the spec is written" {
-    // Node's V8 dies with SEGV (both compilers) in the `scan` of a full 512-record node under
-    // `wasm-test`, with no trap; 511 records, and the same scale in the long-run test, pass.
-    // Cause not found (see the slice report); native runs cover it.
-    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
     // Goal: the node holds `fake_containers_max` containers and a start at the limit evicts the
     // oldest stopped one, record and container, then writes its own (N3). Method: fill the node
     // with stopped containers (each older than the next), start one more, and look.
@@ -677,8 +673,6 @@ test "a stop keeps the record; make_room evicts the oldest stopped one before th
 }
 
 test "a long run with crashes never fills the state" {
-    // Skipped under `wasm-test` for the reason given at the "stop keeps" test above.
-    if (@import("builtin").cpu.arch == .wasm32) return error.SkipZigTest;
     // Goal: `SimState` holds the records of a full node with their files, so a long run with
     // faults never fails for room (N4: it once did, and the failure was called a crash). Method:
     // more starts than the node holds, each stopped, with a crash armed at a random write point

@@ -88,7 +88,15 @@ if (wasi) {
     returnOnExit: true,
     stderr: logFd,
   });
-  const { instance } = await WebAssembly.instantiate(readFileSync(path), host.getImportObject());
+  // Every WASI import goes through a JavaScript function. Node's native import, called straight
+  // from wasm, allocates in `uvwasi_fd_write`, which reports external memory to V8; with the
+  // test heap grown past ~130 MiB that starts a full GC *inside* the call, and V8 (Node 22.23)
+  // dies in SIGSEGV walking the wasm frame (`IterateTurbofanOptimizedFrame`), under both
+  // compilers and with no trap. A JavaScript import has a frame V8 can walk.
+  const imports = host.getImportObject();
+  const preview1 = imports.wasi_snapshot_preview1;
+  for (const [name, native] of Object.entries(preview1)) preview1[name] = (...args) => native(...args);
+  const { instance } = await WebAssembly.instantiate(readFileSync(path), imports);
   const code = host.start(instance);
   closeSync(logFd);
   const output = readFileSync(log, "utf8");
