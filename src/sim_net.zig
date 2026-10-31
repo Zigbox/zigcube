@@ -533,9 +533,11 @@ test "a parked request is delivered in due order, across a cut link and a heal" 
     net.set_faults(0, slow);
     net.set_faults(1, quick);
     diag.reset();
-    try testing.expectError(error.Unreachable, net.transport(0).call(testing.allocator, write, &diag));
+    const call0 = net.transport(0).call(testing.allocator, write, &diag);
+    try testing.expectError(error.Unreachable, call0);
     diag.reset();
-    try testing.expectError(error.Unreachable, net.transport(1).call(testing.allocator, read, &diag));
+    const call1 = net.transport(1).call(testing.allocator, read, &diag);
+    try testing.expectError(error.Unreachable, call1);
     net.set_faults(0, .{ .partition_up = true });
     net.heal();
     net.tick(2000);

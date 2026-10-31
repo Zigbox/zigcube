@@ -101,7 +101,7 @@ const File = struct {
     name: []u8,
     data: []u8,
     /// How many leading bytes a host crash cannot take away: what the last put synced.
-    synced_len: usize,
+    synced_len: u32,
 };
 
 /// Which kind of crash `SimState` imitates when it fires.
@@ -205,7 +205,7 @@ pub const SimState = struct {
 
     /// What survived a crash is on disk now.
     fn settle(state: *SimState) void {
-        for (state.files.items) |*file| file.synced_len = file.data.len;
+        for (state.files.items) |*file| file.synced_len = @intCast(file.data.len);
     }
 
     // ---- The files ----
@@ -226,7 +226,7 @@ pub const SimState = struct {
     fn store(state: *SimState, name: []const u8, data: []const u8, synced: bool) Error!void {
         const copy = try state.gpa.dupe(u8, data);
         errdefer state.gpa.free(copy);
-        const synced_len: usize = if (synced) data.len else 0;
+        const synced_len: u32 = if (synced) @intCast(data.len) else 0;
         if (state.find(name)) |index| {
             state.gpa.free(state.files.items[index].data);
             state.files.items[index].data = copy;
@@ -236,7 +236,11 @@ pub const SimState = struct {
         if (state.files.items.len >= files_max) return error.TooBig;
         const owned = try state.gpa.dupe(u8, name);
         errdefer state.gpa.free(owned);
-        try state.files.append(state.gpa, .{ .name = owned, .data = copy, .synced_len = synced_len });
+        try state.files.append(state.gpa, .{
+            .name = owned,
+            .data = copy,
+            .synced_len = synced_len,
+        });
     }
 
     fn drop(state: *SimState, name: []const u8) void {
@@ -285,7 +289,7 @@ pub const SimState = struct {
         // The point may have cut the file's unsynced tail (a host crash): append to what is left.
         const base = state.find(name);
         const have: usize = if (base) |i| state.files.items[i].data.len else 0;
-        const synced: usize = if (base) |i| state.files.items[i].synced_len else 0;
+        const synced: u32 = if (base) |i| state.files.items[i].synced_len else 0;
         const joined = try state.gpa.alloc(u8, have + kept);
         defer state.gpa.free(joined);
         if (base) |i| @memcpy(joined[0..have], state.files.items[i].data);
