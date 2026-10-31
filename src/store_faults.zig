@@ -758,7 +758,11 @@ const Finished = struct {
 };
 
 /// Splits the writes of unknown outcome by what the log says: some branch in it, or none.
-fn split_unknowns(gpa: Allocator, entries: []const history.Entry, log: []const history.LogEvent) !Report {
+fn split_unknowns(
+    gpa: Allocator,
+    entries: []const history.Entry,
+    log: []const history.LogEvent,
+) !Report {
     var present: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer present.deinit(gpa);
     for (log) |event| {

@@ -129,7 +129,8 @@ pub const Mutant = struct {
 
     fn reuse(mutant: *Mutant, request: store.TxnRequest, diag: *Diag) Error!store.TxnResult {
         const real = try mutant.inner.txn(request, diag);
-        const wrote = if (real.succeeded) request.on_success.len > 0 else request.on_failure.len > 0;
+        const branch = if (real.succeeded) request.on_success else request.on_failure;
+        const wrote = branch.len > 0;
         if (!wrote) return real;
         mutant.writes += 1;
         if (mutant.last_revision != 0 and mutant.writes % reuse_period == 0) {

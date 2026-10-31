@@ -513,7 +513,8 @@ fn fill_database_missing(diag: *Diag, message: []const u8, target: Target) void 
     });
 }
 
-const dropped_commit_cause = "the connection dropped during the commit; the write may or may not apply";
+const dropped_commit_cause =
+    "the connection dropped during the commit; the write may or may not apply";
 
 /// True for a ZC-E0213 that happened during a COMMIT: the write may have applied. A drop at any
 /// other point (ZC-E0213 too) certainly changed nothing. The fault tests tell the two apart.
