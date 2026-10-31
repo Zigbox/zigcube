@@ -23,6 +23,20 @@ pub fn compacted(diag: *Diag, needed: Revision, compacted_revision: Revision) er
     return error.Compacted;
 }
 
+pub fn no_hash(diag: *Diag, asked: Revision, chain_start: Revision) error{NoHash} {
+    assert(diag.code == null);
+    assert(asked < chain_start);
+    diag.raise(.E0214);
+    diag.cause("the hash of revision {d} was asked for; the store's chain starts at {d}", .{
+        asked, chain_start,
+    });
+    diag.cause("the store was upgraded at revision {d} from a schema without a chain", .{
+        chain_start,
+    });
+    diag.fix(.{ .sentence = "ask for a revision at or above the start of the chain" });
+    return error.NoHash;
+}
+
 pub fn future_read(diag: *Diag, asked: Revision, current: Revision) error{FutureRevision} {
     assert(diag.code == null);
     assert(asked > current);

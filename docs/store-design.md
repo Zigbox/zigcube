@@ -150,6 +150,39 @@ fails with `Compacted` if it moved above the read's revision, so it never return
 answer. The server compacts on a schedule to a revision a configurable window behind the head
 (default: a few minutes of history, enough for a restarting agent to resume rather than relist).
 
+## The chain hash
+
+Every revision carries a hash that commits to the whole history before it:
+
+```
+h(0) = 32 zero bytes
+h(n) = SHA-256( h(n-1) || u64be(n) || event_1 || ... || event_k )
+event = kind u8 (1 put, 2 delete) || u32be(len key) || key || u32be(len value) || value
+        || u64be(create_revision) || u64be(lease)
+```
+
+The events are the revision's events in position order (`idx`). A delete event has an empty
+value and carries the create revision and lease of the key it removed. A transaction that
+changes nothing takes no revision and has no hash. The hash is computed by one Zig function,
+`ChainHasher` / `chain_hash` in `store.zig`, which is core code (wasm-clean); no backend hashes
+in SQL, so all three produce the same bytes (the conformance suite pins `h(4)` of a fixed
+history). Hashes are small (32 bytes per revision) and are never compacted away.
+
+**Stored with the revision.** Memory keeps a hash list indexed by revision. SQLite and Postgres
+have `store_hash(revision, hash)`, one row per revision, inserted in the same transaction as the
+revision's log rows (Postgres: before `NOTIFY` and commit), so a revision never exists without
+its hash. Writers are already serialised, so the previous hash is read once after the revision
+is taken. `Store.status` returns the current hash and `Store.hash_at(revision)` any other.
+
+**Upgrade (schema version 2).** A version 1 store has no hash and its older history may be
+compacted, so it cannot be hashed retroactively. The migration adds `store_hash` and
+`store_meta.chain_start`, sets `chain_start` to the revision it ran at and records
+`h(chain_start) = SHA-256("zcube chain seed 1" || u64be(chain_start))`. From there the chain
+continues as normal. `hash_at(r)` for `0 < r < chain_start` fails with `NoHash` (ZC-E0214, the
+cause names `chain_start`); `hash_at(0)` is always zero and a revision above the head is
+`FutureRevision`. A store migrated at revision 0 is the same as a new one. The upgrade is tested
+from a store written by the previous schema on SQLite and Postgres.
+
 ## OrioleDB
 
 `store_live` takes the update churn (every observed-state report overwrites a row). When the

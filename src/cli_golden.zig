@@ -159,6 +159,10 @@ fn compacted(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.compacted(diag, 10, 380) == error.Compacted);
 }
 
+fn no_hash(diag: *diag_mod.Diag) void { // store_failures.zig
+    assert(failures.no_hash(diag, 5, 380) == error.NoHash);
+}
+
 fn future(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.future_read(diag, 9000, 412) == error.FutureRevision);
 }
@@ -377,6 +381,7 @@ const cases = [_]Case{
     relayed(.E0211, store_credentials),
     relayed(.E0212, store_no_database),
     relayed(.E0213, store_dropped),
+    relayed(.E0214, no_hash),
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),

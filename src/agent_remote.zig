@@ -55,6 +55,7 @@ pub const RemoteStore = struct {
         .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
+        .hash_at = hash_at_impl,
     };
 
     pub fn init(gpa: Allocator, client: http.Client, node: []const u8) RemoteStore {
@@ -396,6 +397,16 @@ pub const RemoteStore = struct {
         _ = context;
         _ = revision;
         return unsupported(diag, "compact");
+    }
+
+    fn hash_at_impl(
+        context: *anyopaque,
+        revision: store.Revision,
+        diag: *Diag,
+    ) store.Error!store.Hash {
+        _ = context;
+        _ = revision;
+        return unsupported(diag, "hash_at");
     }
 
     // ---- Requests and replies ----

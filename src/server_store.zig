@@ -145,6 +145,7 @@ pub const Locked = struct {
         .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
+        .hash_at = hash_at,
     };
 
     const watch_vtable: store.Watch.WatchVTable = .{ .next = watch_next, .close = watch_close };
@@ -293,6 +294,13 @@ pub const Locked = struct {
         self.enter();
         defer self.leave();
         return self.inner.compact(revision, diag);
+    }
+
+    fn hash_at(context: *anyopaque, revision: Revision, diag: *Diag) store.Error!store.Hash {
+        const self = from(context);
+        self.enter();
+        defer self.leave();
+        return self.inner.hash_at(revision, diag);
     }
 };
 

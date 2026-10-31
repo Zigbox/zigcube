@@ -55,7 +55,7 @@ const Error = store.Error;
 const Params = pq.Params;
 
 /// Bumped when the schema changes. A schema with a higher number is refused (ZC-E0210).
-pub const schema_version: u32 = 1;
+pub const schema_version: u32 = 2;
 /// Marks a schema as ours, so a foreign one is not initialised over.
 const application = "zcube-store";
 pub const schema_default = "zcube";
@@ -68,9 +68,14 @@ const schema_head = std.fmt.comptimePrint(
     \\    application text NOT NULL,
     \\    schema_version int NOT NULL,
     \\    revision bigint NOT NULL,
-    \\    compacted_revision bigint NOT NULL
+    \\    compacted_revision bigint NOT NULL,
+    \\    chain_start bigint NOT NULL
     \\);
-    \\INSERT INTO store_meta VALUES (1, '{s}', {d}, 0, 0);
+    \\INSERT INTO store_meta VALUES (1, '{s}', {d}, 0, 0, 0);
+    \\CREATE TABLE store_hash (
+    \\    revision bigint PRIMARY KEY,
+    \\    hash bytea NOT NULL
+    \\);
     \\CREATE TABLE store_log (
     \\    revision bigint NOT NULL,
     \\    idx int NOT NULL,
@@ -158,6 +163,27 @@ const lease_now =
     "COALESCE($1::bigint, FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint)";
 
 const sql_meta = "SELECT revision, compacted_revision FROM store_meta WHERE id = 1";
+// The meta row and one hash row in one statement: columns 0 revision, 1 compacted revision,
+// 2 chain start, 3 hash (NULL if the revision has none: 0, or before the chain's start).
+const sql_status =
+    \\SELECT m.revision, m.compacted_revision, m.chain_start, h.hash
+    \\FROM store_meta m LEFT JOIN store_hash h ON h.revision = m.revision WHERE m.id = 1
+;
+const sql_hash_at =
+    \\SELECT m.revision, m.compacted_revision, m.chain_start, h.hash
+    \\FROM store_meta m LEFT JOIN store_hash h ON h.revision = $1 WHERE m.id = 1
+;
+const sql_hash_get = "SELECT hash FROM store_hash WHERE revision = $1";
+const sql_hash_put = "INSERT INTO store_hash (revision, hash) VALUES ($1, $2)";
+// The migration from schema version 1 (no chain): `chain_start` is the revision it ran at.
+const sql_migrate_1_to_2 =
+    \\ALTER TABLE store_meta ADD COLUMN chain_start bigint NOT NULL DEFAULT 0;
+    \\CREATE TABLE store_hash (
+    \\    revision bigint PRIMARY KEY,
+    \\    hash bytea NOT NULL
+    \\);
+    \\UPDATE store_meta SET chain_start = revision, schema_version = 2 WHERE id = 1;
+;
 const sql_bump = "UPDATE store_meta SET revision = revision + 1 WHERE id = 1 RETURNING revision";
 const sql_unbump = "UPDATE store_meta SET revision = revision - 1 WHERE id = 1";
 const sql_lock_meta =
@@ -272,11 +298,13 @@ const sql_put =
     \\    RETURNING create_revision)
     \\INSERT INTO store_log (revision, idx, key, deleted, value, create_revision, lease)
     \\SELECT $3, $5, $1, false, $2, up.create_revision, $4 FROM up
+    \\RETURNING create_revision
 ;
 const sql_delete =
     \\WITH del AS (DELETE FROM store_live WHERE key = $1 RETURNING create_revision, lease)
     \\INSERT INTO store_log (revision, idx, key, deleted, value, create_revision, lease)
     \\SELECT $2, $3, $1, true, ''::bytea, del.create_revision, del.lease FROM del
+    \\RETURNING create_revision, lease
 ;
 const sql_notify = "SELECT pg_notify($1, $2)";
 const sql_live_lease = "SELECT lease FROM store_live WHERE key = $1";
@@ -409,6 +437,7 @@ pub const PostgresStore = struct {
         .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
+        .hash_at = hash_at_impl,
     };
 
     const watch_vtable: store.Watch.WatchVTable = .{
@@ -897,8 +926,50 @@ fn checked_meta(self: *const PostgresStore, result: *const pq.Result, diag: *Dia
 }
 
 fn status_impl(context: *anyopaque, diag: *Diag) Error!store.Status {
-    const meta = try read_meta(PostgresStore.from(context), diag);
-    return .{ .revision = meta.revision, .compacted_revision = meta.compacted_revision };
+    const self = PostgresStore.from(context);
+    var session = try self.acquire(diag);
+    defer session.release();
+    var result = try session.query(sql_status, &no_params, diag);
+    defer result.clear();
+    const meta = try checked_meta(self, &result, diag);
+    return .{
+        .revision = meta.revision,
+        .compacted_revision = meta.compacted_revision,
+        .hash = try row_hash(self, &result, meta, meta.revision, diag),
+    };
+}
+
+fn hash_at_impl(context: *anyopaque, revision: Revision, diag: *Diag) Error!store.Hash {
+    const self = PostgresStore.from(context);
+    var session = try self.acquire(diag);
+    defer session.release();
+    var params: Params = .{};
+    params.add_int8(revision);
+    var result = try session.query(sql_hash_at, &params, diag);
+    defer result.clear();
+    const meta = try checked_meta(self, &result, diag);
+    if (revision > meta.revision) return failures.future_read(diag, revision, meta.revision);
+    if (revision == 0) return store.hash_zero;
+    const chain_start = result.unsigned(0, 2);
+    if (revision < chain_start) return failures.no_hash(diag, revision, chain_start);
+    return row_hash(self, &result, meta, revision, diag);
+}
+
+/// The hash in column 3 of a `sql_status` or `sql_hash_at` answer: zero for revision 0, else it
+/// must be there, or the schema is damaged.
+fn row_hash(
+    self: *const PostgresStore,
+    result: *const pq.Result,
+    meta: Meta,
+    revision: Revision,
+    diag: *Diag,
+) Error!store.Hash {
+    assert(revision <= meta.revision);
+    if (revision == 0) return store.hash_zero;
+    if (result.is_null(0, 3)) return fail_damaged(self, diag, "has no hash for a revision");
+    const bytes = result.bytes(0, 3);
+    if (bytes.len != store.hash_bytes) return fail_damaged(self, diag, "has a malformed hash");
+    return bytes[0..store.hash_bytes].*;
 }
 
 fn get_impl(
@@ -966,6 +1037,8 @@ fn list_impl(
 const Writer = struct {
     session: *Session,
     diag: *Diag,
+    /// The hash of the revision being written; `begin_chain` starts it, `finish` records it.
+    chain: *store.ChainHasher,
 
     /// Takes the next revision and, with it, the writer lock (held until commit or rollback).
     fn bump(writer: Writer) Error!Revision {
@@ -975,6 +1048,25 @@ const Writer = struct {
         const revision = result.unsigned(0, 0);
         assert(revision > 0);
         return revision;
+    }
+
+    /// Starts the hash of `revision` (just taken by `bump`) from the previous revision's.
+    fn begin_chain(writer: Writer, revision: Revision) Error!void {
+        assert(revision > 0);
+        var previous = store.hash_zero;
+        if (revision > 1) {
+            var params: Params = .{};
+            params.add_int8(revision - 1);
+            var result = try writer.session.run(sql_hash_get, &params, writer.diag);
+            defer result.clear();
+            const bytes = if (result.rows() == 1) result.bytes(0, 0) else "";
+            if (bytes.len != store.hash_bytes) {
+                const owner = writer.session.owner;
+                return fail_damaged(owner, writer.diag, "has no hash for a revision");
+            }
+            previous = bytes[0..store.hash_bytes].*;
+        }
+        writer.chain.* = store.ChainHasher.begin(previous, revision);
     }
 
     /// Gives the revision back without letting go of the lock, for a transaction that still has
@@ -1023,6 +1115,13 @@ const Writer = struct {
                 var result = try writer.session.run(sql_put, &params, writer.diag);
                 defer result.clear();
                 assert(result.affected() == 1);
+                writer.chain.add(.{ .kind = .put, .kv = .{
+                    .key = put.key,
+                    .value = put.value,
+                    .create_revision = result.unsigned(0, 0),
+                    .mod_revision = revision,
+                    .lease = put.lease,
+                } });
                 return true;
             },
             .delete => |key| return writer.apply_delete(key, revision, idx),
@@ -1038,11 +1137,24 @@ const Writer = struct {
         defer result.clear();
         const deleted = result.affected();
         assert(deleted <= 1);
+        if (deleted == 1) writer.chain.add(.{ .kind = .delete, .kv = .{
+            .key = key,
+            .value = "",
+            .create_revision = result.unsigned(0, 0),
+            .mod_revision = revision,
+            .lease = result.unsigned(0, 1),
+        } });
         return deleted == 1;
     }
 
     /// Tells watchers a revision is coming (delivered at commit, in commit order), then commits.
     fn finish(writer: Writer, revision: Revision) Error!void {
+        var hashing: Params = .{};
+        hashing.add_int8(revision);
+        const hash = writer.chain.finish();
+        hashing.add_bytes(.bytea, &hash);
+        var stored = try writer.session.run(sql_hash_put, &hashing, writer.diag);
+        stored.clear();
         var number: [24]u8 = undefined;
         const text = std.fmt.bufPrint(&number, "{d}", .{revision}) catch unreachable; // u64 fits.
         var params: Params = .{};
@@ -1120,8 +1232,10 @@ fn txn_impl(context: *anyopaque, request: store.TxnRequest, diag: *Diag) Error!s
     var session = try self.acquire(diag);
     defer session.release();
     try session.begin(diag);
-    const writer: Writer = .{ .session = &session, .diag = diag };
+    var chain: store.ChainHasher = undefined;
+    const writer: Writer = .{ .session = &session, .diag = diag, .chain = &chain };
     const revision = try writer.bump();
+    try writer.begin_chain(revision);
     const succeeded = try writer.compares_hold(request.compares);
     const ops = if (succeeded) request.on_success else request.on_failure;
     try writer.check_leases(ops);
@@ -1184,8 +1298,10 @@ fn lease_revoke_impl(context: *anyopaque, id: LeaseId, diag: *Diag) Error!Revisi
     var session = try self.acquire(diag);
     defer session.release();
     try session.begin(diag);
-    const writer: Writer = .{ .session = &session, .diag = diag };
+    var chain: store.ChainHasher = undefined;
+    const writer: Writer = .{ .session = &session, .diag = diag, .chain = &chain };
     const revision = try writer.bump();
+    try writer.begin_chain(revision);
     var params: Params = .{};
     params.add_int8(id);
     var found = try session.run(sql_lease_lock, &params, diag);
@@ -1429,7 +1545,24 @@ fn check_identity(session: *Session, diag: *Diag) Error!void {
     }
     const found = result.int4(0, 1);
     if (found > schema_version) return fail_too_new(self, diag, found);
+    if (found == 1) return migrate_1_to_2(session, diag);
     if (found != schema_version) return fail_damaged(self, diag, "has no usable schema version");
+}
+
+/// Schema 1 had no chain. Revisions already compacted cannot be hashed again, so the chain
+/// starts at the revision the schema has now, from `store.chain_seed` (docs/store-design.md).
+fn migrate_1_to_2(session: *Session, diag: *Diag) Error!void {
+    try session.simple(sql_migrate_1_to_2, diag);
+    var meta = try session.query(sql_meta, &no_params, diag);
+    defer meta.clear();
+    const revision = meta.unsigned(0, 0);
+    if (revision == 0) return;
+    const seed = store.chain_seed(revision);
+    var params: Params = .{};
+    params.add_int8(revision);
+    params.add_bytes(.bytea, &seed);
+    var stored = try session.run(sql_hash_put, &params, diag);
+    stored.clear();
 }
 
 fn create_schema(session: *Session, diag: *Diag) Error!void {
@@ -2065,7 +2198,8 @@ test "a connection lost inside a transaction is ZC-E0213, rolled back, and the s
     defer release(db);
     var session = try db.acquire(&fixture.diag);
     try session.begin(&fixture.diag);
-    const writer: Writer = .{ .session = &session, .diag = &fixture.diag };
+    var chain: store.ChainHasher = undefined;
+    const writer: Writer = .{ .session = &session, .diag = &fixture.diag, .chain = &chain };
     _ = try writer.bump();
     try terminate(fixture, c.PQbackendPID(session.conn.?));
     try testing.expectError(error.BackendFailed, writer.apply_op(put_a, 1, 0));
@@ -2095,7 +2229,8 @@ test "a writer that waits too long for the lock is ZC-E0208, and nothing is left
     defer release(holder);
     var session = try holder.acquire(&fixture.diag);
     try session.begin(&fixture.diag);
-    const writer: Writer = .{ .session = &session, .diag = &fixture.diag };
+    var chain: store.ChainHasher = undefined;
+    const writer: Writer = .{ .session = &session, .diag = &fixture.diag, .chain = &chain };
     _ = try writer.bump();
     const s = waiter.interface();
     const refused = s.txn(.{ .on_success = &.{put_a} }, &fixture.diag);
@@ -2383,4 +2518,56 @@ test "drop_schema removes the store and only the store" {
     const count = "SELECT count(*) FROM pg_namespace WHERE nspname IN ('{s}', '{s}')";
     const left = try fixture.admin_value(count, .{ fixture.schema(), other_name });
     try testing.expectEqual(@as(i64, 1), left);
+}
+
+test "upgrade: a store written by schema version 1 gets its chain seeded at the revision it had" {
+    // Goal: as for SQLite: the migration keeps the data, seeds the chain at the upgrade revision,
+    // refuses hashes below it (ZC-E0214) and hashes the next revision on top of the seed.
+    // Method: write three revisions, turn the schema back into version 1 (no `store_hash`, no
+    // `chain_start`), reopen, check, write, reopen again (nothing to migrate).
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var diag: Diag = undefined;
+    diag.reset();
+    const first = try fixture.open_new(fixture.options(true));
+    var s = first.interface();
+    _ = try s.txn(.{ .on_success = &.{.{ .put = .{ .key = "/a", .value = "1" } }} }, &diag);
+    _ = try s.txn(.{ .on_success = &.{.{ .put = .{ .key = "/b", .value = "2" } }} }, &diag);
+    _ = try s.txn(.{ .on_success = &.{.{ .put = .{ .key = "/a", .value = "3" } }} }, &diag);
+    release(first);
+    const name = fixture.schema();
+    try fixture.admin_sql("DROP TABLE \"{s}\".store_hash", .{name});
+    try fixture.admin_sql("ALTER TABLE \"{s}\".store_meta DROP COLUMN chain_start", .{name});
+    try fixture.admin_sql("UPDATE \"{s}\".store_meta SET schema_version = 1", .{name});
+
+    const second = try fixture.open_new(fixture.options(false));
+    s = second.interface();
+    const version = "SELECT schema_version::bigint FROM \"{s}\".store_meta";
+    try testing.expectEqual(@as(i64, schema_version), try fixture.admin_value(version, .{name}));
+    const seed = store.chain_seed(3);
+    const status = try s.status(&diag);
+    try testing.expectEqual(@as(Revision, 3), status.revision);
+    try testing.expectEqual(seed, status.hash);
+    try testing.expectEqual(seed, try s.hash_at(3, &diag));
+    try testing.expectError(error.NoHash, s.hash_at(2, &diag));
+    try testing.expectEqual(codes.Code.E0214, diag.code.?);
+    diag.reset();
+    try testing.expectEqual(store.hash_zero, try s.hash_at(0, &diag));
+    const written = try s.txn(.{ .on_success = &.{.{ .delete = "/b" }} }, &diag);
+    try testing.expectEqual(@as(Revision, 4), written.revision);
+    const gone: store.Event = .{ .kind = .delete, .kv = .{
+        .key = "/b",
+        .value = "",
+        .create_revision = 2,
+        .mod_revision = 4,
+        .lease = 0,
+    } };
+    const want = store.chain_hash(seed, 4, &.{gone});
+    try testing.expectEqual(want, try s.hash_at(4, &diag));
+    release(second);
+
+    const third = try fixture.open_new(fixture.options(false));
+    defer release(third);
+    try testing.expectEqual(want, (try third.interface().status(&diag)).hash);
+    try testing.expectEqual(seed, try third.interface().hash_at(3, &diag));
 }

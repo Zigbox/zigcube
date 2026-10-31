@@ -58,6 +58,7 @@ pub const Code = enum(u8) {
     E0211,
     E0212,
     E0213,
+    E0214,
     E0301,
     E0302,
     E0303,
@@ -569,6 +570,23 @@ pub const registry = [_]Entry{
         \\back. If it says the outcome is unknown, the connection dropped while
         \\the commit was in flight and the write may or may not have been
         \\applied: read the keys again before repeating it.
+        ,
+    },
+    .{
+        .code = .E0214,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the store has no chain hash for that revision",
+        .explanation =
+        \\Every revision the store commits gets a chain hash, which a client
+        \\uses to notice a store that went backwards or forked. A store written by
+        \\a zcube from before the chain existed cannot recompute the hashes of
+        \\revisions it had already compacted, so its chain starts at the revision
+        \\it was upgraded at, and the store has no hash for any revision below
+        \\that.
+        \\
+        \\Ask for a revision at or above the start of the chain; the cause line
+        \\names it. Nothing was changed.
         ,
     },
     .{

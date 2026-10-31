@@ -1134,3 +1134,87 @@ test "compare set: two placements planned on one allocation revision cannot both
     const missing = try s.get(arena_state.allocator(), "/assigned/n1/hello-2", null, &diag);
     try testing.expect(missing.kv == null);
 }
+
+// ---- The chain hash ----------------------------------------------------------------------------
+
+/// `h(4)` of the history `chain_history` writes, the same on every backend: the encoding is one
+/// function in `store.zig`, so a backend that hashed anything else would differ here.
+const chain_pinned_h4 = "95b3d622081e481de5d20580c74cdb3528ee197f8dc2337be10a528484e350e7";
+
+fn chain_history(s: Store, diag: *Diag) !void {
+    _ = try put_one(s, diag, "/a", "one"); // 1
+    const two = try s.txn(.{ .on_success = &.{
+        .{ .put = .{ .key = "/b", .value = "" } },
+        .{ .put = .{ .key = "/c", .value = "three" } },
+    } }, diag); // 2
+    try testing.expectEqual(@as(Revision, 2), two.revision);
+    _ = try delete_one(s, diag, "/a"); // 3
+    _ = try put_one(s, diag, "/b", "again"); // 4
+    _ = try delete_one(s, diag, "/absent"); // Changes nothing: no revision, no hash.
+}
+
+test "chain hash: each revision's hash is the pure function of its events, on every backend" {
+    // Goal: h(n) = SHA-256(h(n-1) || revision || events) as docs/store-design.md says, written
+    // with the revision. Method: write a history with a multi-event revision, a delete and an
+    // empty value; read every event back through a watch and recompute the chain with
+    // `store.chain_hash`; compare with `hash_at` and with `status`; pin h(4) so the encoding
+    // cannot change unnoticed; then compact and check that no hash went away.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    try testing.expectEqual(store.hash_zero, (try s.status(&diag)).hash);
+    try testing.expectEqual(store.hash_zero, try s.hash_at(0, &diag));
+    try chain_history(s, &diag);
+    try expect_status(s, &diag, 4, 0);
+
+    var watch = try s.watch(.{ .prefix = "/", .from_revision = 1 }, &diag);
+    defer watch.close();
+    const events = try drain(&watch, arena, 4, &diag);
+    var previous = store.hash_zero;
+    var start: usize = 0;
+    for (1..5) |revision| {
+        var end = start;
+        while (end < events.len and events[end].kv.mod_revision == revision) end += 1;
+        try testing.expect(end > start);
+        previous = store.chain_hash(previous, revision, events[start..end]);
+        try testing.expectEqual(previous, try s.hash_at(revision, &diag));
+        start = end;
+    }
+    try testing.expectEqual(events.len, start);
+    try testing.expectEqual(previous, (try s.status(&diag)).hash);
+    try testing.expectEqualStrings(chain_pinned_h4, &std.fmt.bytesToHex(previous, .lower));
+    try expect_failure(&diag, error.FutureRevision, s.hash_at(5, &diag), .E0204);
+
+    try s.compact(4, &diag);
+    try testing.expectEqual(previous, try s.hash_at(4, &diag));
+    try testing.expectEqual(previous, (try s.status(&diag)).hash);
+    try testing.expect(!std.mem.eql(u8, &try s.hash_at(1, &diag), &try s.hash_at(2, &diag)));
+}
+
+test "chain hash: a transaction that changes nothing leaves the hash alone" {
+    // Goal: no revision means no new hash. Method: a failed compare, a delete of an absent key
+    // and an empty transaction, each followed by a status; the hash must not move.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    const s = (try harness.connect()).interface();
+    _ = try put_one(s, &diag, "/k", "v");
+    const before = (try s.status(&diag)).hash;
+    _ = try delete_one(s, &diag, "/absent");
+    _ = try s.txn(.{}, &diag);
+    const lost = try s.txn(.{
+        .compares = &.{.{ .key = "/k", .mod_revision = 0 }},
+        .on_success = &.{.{ .put = .{ .key = "/k", .value = "no" } }},
+    }, &diag);
+    try testing.expect(!lost.succeeded);
+    try testing.expectEqual(before, (try s.status(&diag)).hash);
+    try testing.expectEqual(before, try s.hash_at(1, &diag));
+}

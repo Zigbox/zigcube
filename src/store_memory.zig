@@ -58,6 +58,8 @@ pub const MemoryStore = struct {
     lease_next: LeaseId,
     live: std.ArrayList(Entry),
     log: std.ArrayList(Entry),
+    /// `hashes.items[n]` is the chain hash of revision n: never compacted, never empty.
+    hashes: std.ArrayList(store.Hash),
     leases: std.ArrayList(LeaseState),
     watches: [constants.store_watches_max]WatchSlot,
 
@@ -73,6 +75,7 @@ pub const MemoryStore = struct {
         .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
+        .hash_at = hash_at_impl,
     };
 
     const watch_vtable: store.Watch.WatchVTable = .{
@@ -90,6 +93,7 @@ pub const MemoryStore = struct {
             .lease_next = 1,
             .live = .empty,
             .log = .empty,
+            .hashes = .empty,
             .leases = .empty,
             .watches = undefined,
         };
@@ -102,6 +106,7 @@ pub const MemoryStore = struct {
         for (self.log.items) |entry| free_entry(self.gpa, entry);
         self.live.deinit(self.gpa);
         self.log.deinit(self.gpa);
+        self.hashes.deinit(self.gpa);
         self.leases.deinit(self.gpa);
         self.* = undefined;
     }
@@ -119,7 +124,51 @@ pub const MemoryStore = struct {
     fn status_impl(context: *anyopaque, diag: *Diag) Error!store.Status {
         _ = diag;
         const self = from(context);
-        return .{ .revision = self.revision, .compacted_revision = self.compacted_revision };
+        return .{
+            .revision = self.revision,
+            .compacted_revision = self.compacted_revision,
+            .hash = self.chain_hash_now(),
+        };
+    }
+
+    /// The hash of the current revision; `hash_zero` before the first write.
+    fn chain_hash_now(self: *const MemoryStore) store.Hash {
+        if (self.revision == 0) return store.hash_zero;
+        assert(self.hashes.items.len == self.revision);
+        return self.hashes.items[@intCast(self.revision - 1)];
+    }
+
+    fn hash_at_impl(context: *anyopaque, revision: Revision, diag: *Diag) Error!store.Hash {
+        const self = from(context);
+        if (revision > self.revision) return failures.future_read(diag, revision, self.revision);
+        if (revision == 0) return store.hash_zero;
+        return self.hashes.items[@intCast(revision - 1)];
+    }
+
+    /// Records the hash of the revision just written: its events are the log's tail.
+    fn seal_revision(self: *MemoryStore, diag: *Diag) Error!void {
+        const revision = self.revision;
+        assert(revision > 0);
+        assert(self.hashes.items.len == revision - 1);
+        var hasher = store.ChainHasher.begin(self.hash_before(revision), revision);
+        var start = self.log.items.len;
+        while (start > 0 and self.log.items[start - 1].mod_revision == revision) start -= 1;
+        assert(start < self.log.items.len);
+        for (self.log.items[start..]) |entry| {
+            hasher.add(.{ .kind = entry.kind, .kv = .{
+                .key = entry.key,
+                .value = entry.value,
+                .create_revision = entry.create_revision,
+                .mod_revision = entry.mod_revision,
+                .lease = entry.lease,
+            } });
+        }
+        self.hashes.append(self.gpa, hasher.finish()) catch return no_memory(diag);
+    }
+
+    fn hash_before(self: *const MemoryStore, revision: Revision) store.Hash {
+        if (revision == 1) return store.hash_zero;
+        return self.hashes.items[@intCast(revision - 2)];
     }
 
     /// Fails unless `revision` can be read: not older than the compaction point, not future.
@@ -254,6 +303,7 @@ pub const MemoryStore = struct {
                 .delete => |key| try self.apply_delete(key, diag),
             }
         }
+        if (bumped) try self.seal_revision(diag);
         return .{ .succeeded = succeeded, .revision = self.revision };
     }
 
@@ -504,6 +554,7 @@ pub const MemoryStore = struct {
             @memcpy(owned[slot][0..key.len], key); // `apply_delete` frees the live copy.
             try self.apply_delete(owned[slot][0..key.len], diag);
         }
+        try self.seal_revision(diag);
         assert(count == keys.len);
     }
 
