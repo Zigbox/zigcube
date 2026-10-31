@@ -11,15 +11,19 @@
 //! **What is checked.** Every virtual second and after every operation, also during the heal:
 //! the decisions' causes and `why` (sim-c0's invariants, read over the whole store), and, per
 //! container, that none lives past a grace period on a node that no replica of the store assigns
-//! it to (time counts only while its node is up, its link is not cut and the store is up). After
-//! the faults are healed: replica by replica, its container runs on the node the replica names
-//! and nowhere else, and no node runs a container no replica owns. The faults are rationed so
-//! the cluster works while faulty (short outages and cuts, at most half the nodes cut at once,
-//! low per-call loss), and the run fails if the fault phase did too little agent work.
+//! it to (time counts only while its node is up, its link is not cut and the store is up). The
+//! faults are rationed so the cluster works while faulty (short outages and cuts, at most half
+//! the nodes cut at once, low per-call loss), and the run fails if the fault phase did too
+//! little agent work.
+//! **Liveness mode** (the default, `Options.liveness`): the faults run for the first operations
+//! up to a heal point the seed chose (between half and all of the run), then every fault is off
+//! for the rest of the operations (workload only), and `liveness_bound_ms` after the last one,
+//! replica by replica, its container runs on the node the replica names and nowhere else, and
+//! no node runs a container no replica owns. Without it the faults stay on to the end and only
+//! the safety checks run.
 //! **Duplicates are counted, never failed**: without leases and fencing (slice 6) a partition can
 //! leave one replica running on two nodes. The report prints the replica-seconds with a note that
-//! the number is not a pass. The full checker set, the liveness bound and the comparison with
-//! WASM are slice 2b part F.
+//! the number is not a pass. `zig build sim-cluster` compares the report with the WASM build's.
 //!
 //! The report ends with a hash of the whole store and every node's runtime: the same seed twice
 //! gives the same hash.
@@ -82,9 +86,11 @@ const partition_ms_spread: u32 = 8000;
 const outage_ms_max: u32 = 4000;
 /// Checks run once per this much virtual time, and after every operation.
 const check_interval_ms: u64 = 1000;
-/// Virtual time given to the healed world to converge: parked requests (up to 40 s), leases
-/// (10 s), back-offs and the controllers' own pacing.
-const heal_ms: u64 = 240_000;
+/// The liveness bound: virtual time given to the healed world, after its last operation, to
+/// converge: parked requests (up to 40 s), leases (10 s), back-offs and the controllers' own
+/// pacing. Every service then has its replicas and no node runs anything else. The report states
+/// it (docs/DECISIONS.md, "sim-cluster liveness mode").
+pub const liveness_bound_ms: u64 = 240_000;
 
 const hello_digest = "b3:51aa9c03";
 const next_digest = "b3:9d20c4f1";
@@ -444,6 +450,9 @@ pub const Cluster = struct {
     stats: Stats,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
+    /// Liveness mode: the faults end mid-run and the end state must converge within
+    /// `liveness_bound_ms`; else faults stay on and only the safety checks run.
+    liveness: bool,
     report: *Report,
 
     pub fn create(
@@ -490,6 +499,7 @@ pub const Cluster = struct {
         c.check_ms = 0;
         c.stats = .{};
         c.fault_totals = null;
+        c.liveness = true;
         c.report = report;
         c.server = replica_controller.ReplicaController.init(c.take_instance());
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
@@ -889,11 +899,14 @@ const Op = enum {
     suspend_node,
 };
 
-fn pick_op(swarm: *const Swarm, random: std.Random) Op {
+/// With `faults_on` false (after the heal) the fault operations get no weight.
+fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
+    const f: u32 = @intFromBool(faults_on);
     const weights = [_]u32{
-        swarm.w_advance, swarm.w_apply,   swarm.w_scale,   swarm.w_delete,
-        swarm.w_broken,  swarm.w_runtime, swarm.w_crash,   swarm.w_partition,
-        swarm.w_outage,  swarm.w_server,  swarm.w_suspend,
+        swarm.w_advance,    swarm.w_apply,         swarm.w_scale,
+        swarm.w_delete,     swarm.w_broken,        swarm.w_runtime * f,
+        swarm.w_crash * f,  swarm.w_partition * f, swarm.w_outage * f,
+        swarm.w_server * f, swarm.w_suspend * f,
     };
     comptime assert(weights.len == @typeInfo(Op).@"enum".field_names.len);
     var total: u32 = 0;
@@ -909,7 +922,7 @@ fn pick_op(swarm: *const Swarm, random: std.Random) Op {
 fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
-    switch (pick_op(&c.swarm, random)) {
+    switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
         .advance => c.advance(100 + random.uintLessThan(u32, 6000)),
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
         .scale => c.apply(name, hello_digest, c.replicas_for(random, 8)),
@@ -1185,7 +1198,7 @@ fn track_starved(
     c.starved_count = count;
 }
 
-/// Every fault off, every agent up, time to settle. The checks run during the wait.
+/// Every fault off; the agents come back up as time passes. Ends the fault phase.
 fn heal(c: *Cluster) void {
     c.fault_totals = c.phase_totals();
     c.set_store_down(false);
@@ -1193,7 +1206,6 @@ fn heal(c: *Cluster) void {
     c.swarm.net = .{};
     c.net.heal();
     for (c.nodes) |node| node.partitioned_until_ms = null;
-    c.advance(heal_ms);
 }
 
 /// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
@@ -1393,17 +1405,33 @@ fn hash_net(hasher: *std.hash.Wyhash, net: *const sim_net.SimNet) void {
 
 // ---- A run --------------------------------------------------------------------------------------
 
-/// Runs `operations` operations drawn from `seed` in the world the seed chose, heals it, checks
-/// that it converged, and ends the report with the hash. The verdict is `report.failed`.
+pub const Options = struct {
+    /// Null: the seed picks the node count.
+    nodes: ?u32 = null,
+    /// See `Cluster.liveness`.
+    liveness: bool = true,
+};
+
+/// The operation before which the faults end (liveness mode): the second half of the run, or
+/// part of it, is fault-free workload. Drawn from the seed alone.
+fn heal_operation(seed: u64, operations: u32) u32 {
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x4ea1);
+    return operations / 2 + prng.random().uintLessThan(u32, operations - operations / 2 + 1);
+}
+
+/// Runs `operations` operations drawn from `seed` in the world the seed chose. In liveness mode
+/// (the default) every fault ends at a time the seed chose, the world gets `liveness_bound_ms`
+/// to settle, and it must have converged; without it the faults stay on and only the safety
+/// checks run. The report ends with the hash. The verdict is `report.failed`.
 pub fn simulate(
     gpa: Allocator,
     seed: u64,
     operations: u32,
-    nodes_wanted: ?u32,
+    options: Options,
     report: *Report,
 ) void {
     report.* = .{};
-    const c = Cluster.create(gpa, seed, nodes_wanted, report) catch {
+    const c = Cluster.create(gpa, seed, options.nodes, report) catch {
         report.failed = true;
         report.print("FAILED: out of memory\n", .{});
         return;
@@ -1411,7 +1439,18 @@ pub fn simulate(
     defer c.destroy();
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
-    run_steps(c, operations) catch {
+    c.liveness = options.liveness;
+    const heal_at = if (options.liveness) heal_operation(seed, operations) else operations;
+    if (options.liveness) {
+        report.print("liveness: on; faults for the first {d} of {d} operations, then none; " ++
+            "converged {d} ms after the last operation\n", .{
+            heal_at, operations, liveness_bound_ms,
+        });
+    } else {
+        report.print("liveness: off; faults stay on, safety checks only, no convergence " ++
+            "check\n", .{});
+    }
+    run_steps(c, operations, heal_at) catch {
         assert(report.failed);
         if (c.fault_totals != null) print_phases(c);
         return;
@@ -1419,17 +1458,23 @@ pub fn simulate(
     print_summary(c);
 }
 
-fn run_steps(c: *Cluster, operations: u32) Failure!void {
-    for (0..operations) |_| {
+fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
+    for (0..operations) |index| {
+        if (c.liveness and index == heal_at) heal(c);
         operation(c);
         if (c.report.failed) return error.StepFailed;
         try safety(c);
     }
-    heal(c);
-    if (c.report.failed) return error.StepFailed;
-    try converged(c);
+    if (c.liveness) {
+        if (c.fault_totals == null) heal(c);
+        c.advance(liveness_bound_ms);
+        if (c.report.failed) return error.StepFailed;
+        try converged(c);
+    } else {
+        c.fault_totals = c.phase_totals();
+    }
     try safety(c);
-    try enough_work_under_faults(c, operations);
+    try enough_work_under_faults(c, heal_at);
     try work_under_ceiling(c);
 }
 
@@ -1523,7 +1568,7 @@ fn print_phases(c: *Cluster) void {
     const end = c.phase_totals();
     const during = c.fault_totals.?;
     print_phase(c.report, "fault phase", during);
-    print_phase(c.report, "heal phase", end.minus(during));
+    if (c.liveness) print_phase(c.report, "heal phase", end.minus(during));
 }
 
 fn print_phase(report: *Report, label: []const u8, p: PhaseTotals) void {
@@ -1545,8 +1590,8 @@ test "the same seed gives the same report and the same hash" {
     var first: Report = undefined;
     var second: Report = undefined;
     for ([_]u64{ 3, 9 }) |seed| {
-        simulate(testing.allocator, seed, 30, null, &first);
-        simulate(testing.allocator, seed, 30, null, &second);
+        simulate(testing.allocator, seed, 30, .{}, &first);
+        simulate(testing.allocator, seed, 30, .{}, &second);
         try testing.expectEqualStrings(first.text(), second.text());
         try testing.expect(std.mem.indexOf(u8, first.text(), "world hash: ") != null);
     }
@@ -1558,7 +1603,7 @@ test "a few seeds hold every invariant, and the swarm differs between them" {
     var report: Report = undefined;
     var swarm_lines: [4][80]u8 = undefined;
     for (0..4) |index| {
-        simulate(testing.allocator, 100 + index, 40, null, &report);
+        simulate(testing.allocator, 100 + index, 40, .{}, &report);
         if (report.failed) std.debug.print("{s}\n", .{report.text()});
         try testing.expect(!report.failed);
         const line = report.text();
@@ -1571,7 +1616,7 @@ test "a few seeds hold every invariant, and the swarm differs between them" {
 test "a node count can be asked for" {
     // Goal: -Dnodes. Method: ask for 3 and read the swarm line.
     var report: Report = undefined;
-    simulate(testing.allocator, 5, 10, 3, &report);
+    simulate(testing.allocator, 5, 10, .{ .nodes = 3 }, &report);
     try testing.expect(!report.failed);
     try testing.expect(std.mem.indexOf(u8, report.text(), "swarm: nodes=3 ") != null);
 }

@@ -512,6 +512,8 @@ fn add_wasm_steps(b: *std.Build, optimize: std.builtin.OptimizeMode) *std.Build.
     // A library for a host to instantiate: no `_start`, and the exports stay whatever is `export`.
     library.entry = .disabled;
     library.rdynamic = true;
+    // sim-cluster nests deeper than the 1 MiB default allows (2 MiB still traps, 4 MiB passes).
+    library.stack_size = 8 * 1024 * 1024;
     const install = b.addInstallArtifact(library, .{
         .dest_dir = .{ .override = .{ .custom = "wasm" } },
     });
@@ -594,8 +596,10 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     add_sim_cluster_step(b, sim);
 }
 
-/// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation
-/// (src/sim_cluster.zig), native only. `-Dnodes=0` lets the seed pick; `-Dops` is sim-c0's too.
+/// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]`: the cluster
+/// simulation (src/sim_cluster.zig), run natively and as WebAssembly for the same seed, and the
+/// two reports compared byte for byte, as sim-c0 does. `-Dnodes=0` lets the seed pick; `-Dops` is
+/// sim-c0's too; liveness is on unless `-Dliveness=false`.
 fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -609,13 +613,28 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
     const install = b.addInstallArtifact(exe, .{});
     const exe_help = "Install the native sim-cluster runner into zig-out/bin";
     b.step("sim-cluster-exe", exe_help).dependOn(&install.step);
-    const ops = sim.ops;
     const nodes = b.option(u32, "nodes", "Nodes of sim-cluster (default: the seed picks)") orelse 0;
+    const live_help = "sim-cluster: faults end, the world must converge (default true)";
+    const liveness = b.option(bool, "liveness", live_help) orelse true;
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = b.fmt("{d}", .{sim.ops});
+    const nodes_text = b.fmt("{d}", .{nodes});
+    const liveness_text: []const u8 = if (liveness) "true" else "false";
     const run = b.addRunArtifact(exe);
-    run.addArg(b.fmt("{d}", .{sim.seed orelse 1}));
-    run.addArg(b.fmt("{d}", .{ops}));
-    if (nodes != 0) run.addArg(b.fmt("{d}", .{nodes}));
-    b.step("sim-cluster", "Run the cluster simulation natively (-Dseed=N)").dependOn(&run.step);
+    run.addArgs(&.{ seed_text, ops_text, nodes_text });
+    run.addArg(b.fmt("--liveness={s}", .{liveness_text}));
+    const native_report = run.captureStdOut(.{});
+    const help = "Run the cluster simulation natively and as WASM, and compare (-Dseed=N)";
+    const step = b.step("sim-cluster", help);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-cluster");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, liveness_text });
+        node.addFileArg(native_report);
+        step.dependOn(&node.step);
+    }
 }
 
 /// `zig build wasm-test` runs the unit tests of the core modules under WASI in Node: a 32-bit
