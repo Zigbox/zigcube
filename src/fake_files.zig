@@ -264,18 +264,32 @@ pub const DirState = struct {
         const parent = prefix[0..cut];
         var names: std.ArrayList([]const u8) = .empty;
         const open: Dir.OpenOptions = .{ .iterate = true };
+        // Only a missing directory means "nothing there"; a refused one must fail the scan, or
+        // the agent would take containers it cannot see for containers that do not exist.
         const dir = if (parent.len == 0) self.root else self.root.openDir(
             self.io,
             parent[0 .. parent.len - 1],
             open,
-        ) catch return names.items;
+        ) catch |err| switch (err) {
+            error.FileNotFound => return names.items,
+            else => return error.Io,
+        };
         defer if (parent.len > 0) dir.close(self.io);
         var iterator = dir.iterate();
         for (0..constants.fake_dir_entries_max) |_| {
             const entry = (iterator.next(self.io) catch return error.Io) orelse break;
-            if (entry.kind != .file and entry.kind != .directory) continue;
             if (!std.mem.startsWith(u8, entry.name, prefix[cut..])) continue;
-            const slash = if (entry.kind == .directory) "/" else "";
+            // Some file systems report no type while iterating: ask for it.
+            const kind = if (entry.kind != .unknown) entry.kind else (dir.statFile(
+                self.io,
+                entry.name,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => continue, // Removed since it was listed.
+                else => return error.Io,
+            }).kind;
+            if (kind != .file and kind != .directory) continue;
+            const slash = if (kind == .directory) "/" else "";
             const full = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ parent, entry.name, slash });
             try names.append(arena, full);
         }
@@ -316,6 +330,30 @@ test "a file is written whole, read back, and absent when it was never written" 
     try testing.expectError(error.Unreadable, read_json(SpecFile, io, tmp.dir, file_spec, arena));
     try tmp.dir.writeFile(io, .{ .sub_path = file_child, .data = "1\n" });
     try testing.expectError(error.Unreadable, read_pid(io, tmp.dir, file_child));
+}
+
+test "listing a directory the host refuses fails, and a missing one is empty" {
+    // Goal: only FileNotFound means "no containers". Method: a mode 000 directory listed through
+    // DirState; skipped when the process ignores permissions (root), where it cannot be provoked.
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var state: DirState = .{ .io = io, .root = tmp.dir };
+    const agent = state.interface();
+    try testing.expectEqual(@as(usize, 0), (try agent.list(arena, "nothing/x")).len);
+    try tmp.dir.createDirPath(io, "c");
+    var sub = try tmp.dir.openDir(io, "c", .{ .iterate = true });
+    defer sub.close(io);
+    try sub.setPermissions(io, .fromMode(0));
+    defer sub.setPermissions(io, .fromMode(0o755)) catch {};
+    if (tmp.dir.openDir(io, "c", .{ .iterate = true })) |open| {
+        open.close(io);
+        return error.SkipZigTest;
+    } else |_| {}
+    try testing.expectError(error.Io, agent.list(arena, "c/o"));
 }
 
 test "DirState keeps the AgentState promises the model makes" {
