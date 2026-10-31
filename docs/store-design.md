@@ -225,13 +225,19 @@ recovery.
 - **What a check compares with.** A call takes a snapshot of the remembered pair (and the epoch) before it
   calls the store, and its answer is compared with that snapshot only: a linearizable store answers a
   call that began after a write was acknowledged with at least that revision. A write acknowledged
-  while the call ran only makes the answer late. The pair moves forward by maximum, never back.
+  while the call ran only makes an answer *below* the pair late. An answer at or above the pair as it
+  stands now cannot be late, so it is compared with the current pair too (up to 4 rounds, then it is
+  dropped and the pair stays; the next status compares). The pair moves forward by maximum, never back.
 - **Reads.** `get`, `list` and `watch` pass the halt gate. Until one check has passed (the store could
   not be reached at start, so `first_check` found nothing), the first of them verifies the store
   itself and fails with the store's own error if it cannot. After that, between steps they pass only
   the gate: a rollback is noticed at the next `status` or write, not at the next read.
 
-Known gaps: `Watch.next` is not gated on a halt (a watch opened before the halt can still deliver
+Known gaps (not fixed in 10b): `accept` reads the store's status and then bumps the epoch, so a write
+acknowledged between the two is not in the pair it remembers (the pair is lower than the store: weaker,
+never unsafe). The round-1 `<db>.remembered` files (before the file was keyed by the database path) are
+left behind and never read. A database restored at a new path is unchecked (documented above).
+`Watch.next` is not gated on a halt (a watch opened before the halt can still deliver
 events until it is re-opened); and the decision record that should hold both pairs as evidence
 needs a store-level `SubjectKind`, a `docs/keys.md` change that is ask-first.
 

@@ -142,6 +142,30 @@ test "txn: the result's hash is the chain hash of its revision" {
     }
 }
 
+test "txn: a failed compare with no on_failure ops writes nothing and the head's hash stays" {
+    // Goal: a failed transaction that writes nothing answers with the current revision and no
+    // hash (`TxnResult.hash`: null when nothing was written), and the head's hash is unchanged
+    // and is what `hash_at` says, on every backend. Method: one put, then a create-only compare
+    // that fails with an empty `on_failure`.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    const s = (try harness.connect()).interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const put: store.Op = .{ .put = .{ .key = "/h/e", .value = "1" } };
+    const first = try s.txn(.{ .on_success = &.{put} }, &diag);
+    const failed = try s.txn(.{
+        .compares = &.{.{ .key = "/h/e", .mod_revision = 0 }},
+        .on_success = &.{put},
+    }, &diag);
+    try testing.expect(!failed.succeeded);
+    try testing.expectEqual(first.revision, failed.revision);
+    try testing.expect(failed.hash == null);
+    try testing.expectEqual(first.hash.?, try s.hash_at(failed.revision, &diag));
+    try testing.expectEqual(first.hash.?, (try s.status(&diag)).hash);
+}
+
 test "cas: of several writers racing to create a key, exactly one wins" {
     // Goal: create-only compare-and-swap is atomic across connections. Method: each writer on its
     // own connection and thread creates "/c/key" if absent, and records an audit key if it

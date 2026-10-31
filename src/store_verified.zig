@@ -27,6 +27,7 @@
 //! unnoticed). A failed save is retried at the next interval and visible in `save_trouble`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Clock = @import("clock.zig").Clock;
 const constants = @import("constants.zig");
@@ -72,8 +73,8 @@ pub const VerifiedStore = struct {
     checked: bool = false,
     saved_ms: u64 = 0,
     halted: ?failures.Rollback = null,
-    /// Bumped by `accept`. A result or a save that began under an older epoch is dropped: it
-    /// describes the store as it was before the operator's decision.
+    /// Bumped by `accept`. A result that began under an older epoch is dropped: it describes the
+    /// store as it was before the operator's decision. (Saves are ordered by `save_issued`.)
     epoch: u32 = 0,
     /// The last save failed; cleared by the next that succeeds.
     save_failed: bool = false,
@@ -179,15 +180,18 @@ pub const VerifiedStore = struct {
         return @ptrCast(@alignCast(context));
     }
 
-    /// The lock guards a few field reads and writes; holding it for longer than this many tries
-    /// is a bug (a call into `inner` made under it), not load.
+    /// The lock guards a few field reads and writes. Holding it this long is a bug (a call into
+    /// `inner` made under it, or a re-entrant `enter`), which a Debug build (the tests) turns
+    /// into a failed assertion. A release build only spins: a holder descheduled by the host
+    /// (VM steal) comes back, and a server must not crash because it was slow. The lock stays a
+    /// spinlock because the core has no threads, `std.Io` or clock to block with (wasm32).
     const spins_max: u32 = 1 << 24;
 
     fn enter(self: *VerifiedStore) void {
         var spins: u32 = 0;
         while (!self.lock.tryLock()) {
-            spins += 1;
-            assert(spins < spins_max);
+            spins +|= 1;
+            if (builtin.mode == .debug) assert(spins < spins_max);
             std.atomic.spinLoopHint();
         }
     }
@@ -254,9 +258,18 @@ pub const VerifiedStore = struct {
         return failures.went_backwards(diag, kept);
     }
 
+    /// Rounds `check` makes while the pair keeps moving under it (see `check`).
+    const check_rounds_max: u32 = 4;
+
     /// Compares `now` with the pair as it was in `snap`, taken before the call that produced
     /// `now` began, and moves the pair forward (never back). A write that was acknowledged while
-    /// the call ran may have moved the pair past `now`: that is lateness, not a rollback.
+    /// the call ran may have moved the pair past `now`: an answer *below* the pair is late, not a
+    /// rollback, and is compared with the snapshot alone. An answer at or above the current pair
+    /// cannot be late: it is compared with the current pair too (`hash_at` is called outside the
+    /// lock), else a store that failed over to a fork would pass against the older snapshot and
+    /// the pair would move onto the fork, hiding the writes in between. If the pair moves again
+    /// after each of `check_rounds_max` comparisons, the answer is dropped: the pair stays, and
+    /// the next status compares the store with it.
     fn check(
         self: *VerifiedStore,
         now: store.Status,
@@ -265,8 +278,22 @@ pub const VerifiedStore = struct {
     ) store.Error!void {
         assert(diag.code == null);
         const epoch = snap.epoch;
-        if (self.epoch_now() != epoch) return;
-        const pair = snap.known orelse return self.advance(now, epoch);
+        var base = snap.known;
+        for (0..check_rounds_max) |_| {
+            if (self.epoch_now() != epoch) return;
+            if (base) |pair| try self.compare(now, pair, epoch, diag);
+            base = self.advance(now, base, epoch) orelse return;
+        }
+    }
+
+    /// Halts unless `now` is the pair's revision with its hash or a later point of its history.
+    fn compare(
+        self: *VerifiedStore,
+        now: store.Status,
+        pair: Pair,
+        epoch: u32,
+        diag: *Diag,
+    ) store.Error!void {
         var rollback: failures.Rollback = .{
             .remembered_revision = pair.revision,
             .remembered_hash = pair.hash,
@@ -287,18 +314,26 @@ pub const VerifiedStore = struct {
             rollback.now_hash = there;
             return self.halt(diag, rollback, epoch);
         }
-        self.advance(now, epoch);
     }
 
-    fn advance(self: *VerifiedStore, now: store.Status, epoch: u32) void {
+    /// Moves the pair to `now` if `now` was compared with the pair as it stands. Returns the
+    /// pair `now` still has to be compared with, when the pair moved since `base` and `now` is
+    /// not behind it; null when there is nothing more to do.
+    fn advance(self: *VerifiedStore, now: store.Status, base: ?Pair, epoch: u32) ?Pair {
         self.enter();
         defer self.leave();
-        if (self.epoch != epoch) return;
+        if (self.epoch != epoch) return null;
         self.checked = true;
         if (self.known) |known| {
-            if (now.revision <= known.revision) return;
+            const moved = if (base) |was| known.revision > was.revision else true;
+            if (moved) {
+                if (now.revision < known.revision) return null; // Late behind a newer write.
+                return known;
+            }
+            if (now.revision <= known.revision) return null;
         }
         self.known = .{ .revision = now.revision, .hash = now.hash };
+        return null;
     }
 
     /// Saves the remembered pair if the file is behind it and the last save is older than
@@ -434,7 +469,7 @@ pub const VerifiedStore = struct {
 
     fn lease_grant(context: *anyopaque, ttl_ms: u32, diag: *Diag) store.Error!store.Lease {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.lease_grant(ttl_ms, diag);
     }
 
@@ -444,7 +479,7 @@ pub const VerifiedStore = struct {
         diag: *Diag,
     ) store.Error!store.Lease {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.lease_keepalive(id, diag);
     }
 
@@ -463,7 +498,7 @@ pub const VerifiedStore = struct {
         diag: *Diag,
     ) store.Error![]const store.LeaseInfo {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.lease_list(arena, diag);
     }
 
@@ -478,13 +513,13 @@ pub const VerifiedStore = struct {
 
     fn compact(context: *anyopaque, revision: Revision, diag: *Diag) store.Error!void {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.compact(revision, diag);
     }
 
     fn hash_at(context: *anyopaque, revision: Revision, diag: *Diag) store.Error!Hash {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.hash_at(revision, diag);
     }
 };
@@ -729,6 +764,10 @@ const Hooked = struct {
     after_txn: ?*const fn (*Hooked) void = null,
     verified: *VerifiedStore = undefined,
     status_calls: u32 = 0,
+    /// A store the hooks fail over to, and the answers it gave that replace the real ones.
+    fork: Store = undefined,
+    forced_status: ?store.Status = null,
+    forced_txn: ?store.TxnResult = null,
 
     fn interface(hooked: *Hooked) Store {
         return .{ .context = hooked, .vtable = &vtable };
@@ -761,7 +800,7 @@ const Hooked = struct {
             hooked.after_status = null;
             hook(hooked);
         }
-        return answer;
+        return hooked.forced_status orelse answer;
     }
 
     fn h_txn(
@@ -775,7 +814,7 @@ const Hooked = struct {
             hooked.after_txn = null;
             hook(hooked);
         }
-        return answer;
+        return hooked.forced_txn orelse answer;
     }
 
     fn h_get(
@@ -844,6 +883,26 @@ const Hooked = struct {
     /// The hook: a write through the wrapper, as another client's would be.
     fn write_through(hooked: *Hooked) void {
         _ = write(hooked.verified.interface(), "/other", "1") catch unreachable; // Memory store.
+    }
+
+    /// Another client's write is acknowledged, then the store fails over to a fork that is
+    /// ahead, and the call in flight is answered by the fork.
+    fn fail_over_status(hooked: *Hooked) void {
+        write_through(hooked);
+        hooked.inner = hooked.fork;
+        var diag: Diag = undefined;
+        diag.reset();
+        hooked.forced_status = hooked.fork.status(&diag) catch unreachable; // Memory store.
+    }
+
+    fn fail_over_txn(hooked: *Hooked) void {
+        write_through(hooked);
+        hooked.inner = hooked.fork;
+        var diag: Diag = undefined;
+        diag.reset();
+        const op: store.Op = .{ .put = .{ .key = "/x", .value = "fork" } };
+        // Memory store: cannot fail.
+        hooked.forced_txn = hooked.fork.txn(.{ .on_success = &.{op} }, &diag) catch unreachable;
     }
 };
 
@@ -1046,4 +1105,64 @@ test "a result that began before accept is dropped" {
     try verified.check(stale, snap, &diag);
     try testing.expect(verified.halt_state() == null);
     try testing.expectEqual(@as(Revision, 2), verified.remembered().?.revision);
+}
+
+/// Two memory stores with the same writes up to revision 2 and different ones after.
+fn forked_stores(main: *MemoryStore, fork: *MemoryStore, fork_writes: u32, clock: Clock) !void {
+    main.init(testing.allocator, clock);
+    fork.init(testing.allocator, clock);
+    for ([_][]const u8{ "/a", "/b" }) |key| {
+        _ = try write(main.interface(), key, "1");
+        _ = try write(fork.interface(), key, "1");
+    }
+    for (0..fork_writes) |_| _ = try write(fork.interface(), "/c", "fork");
+}
+
+test "a fork that answers a call late is refused, not adopted, when a write moved the pair" {
+    // Goal: an answer at or above the current pair cannot be late, so it is checked against the
+    // current pair, not only the snapshot. Method: a status begins with the pair at revision 2;
+    // another client's write is acknowledged (the pair is 3 on the main history); the store
+    // fails over to a fork that matches up to revision 2, differs after, and is at revision 4.
+    // The fork's answer passes against the snapshot; against the pair at 3 it does not.
+    var manual: ManualClock = .{};
+    var main: MemoryStore = undefined;
+    var fork: MemoryStore = undefined;
+    try forked_stores(&main, &fork, 2, manual.clock());
+    defer main.deinit();
+    defer fork.deinit();
+    var hooked: Hooked = .{ .inner = main.interface(), .fork = fork.interface() };
+    var verified = VerifiedStore.init(hooked.interface(), manual.clock(), null, null);
+    hooked.verified = &verified;
+    const guarded = verified.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    try testing.expectEqual(@as(Revision, 2), (try guarded.status(&diag)).revision);
+    hooked.after_status = Hooked.fail_over_status;
+    try expect_halted(guarded.status(&diag), &diag);
+    try testing.expectEqual(@as(Revision, 3), verified.halt_state().?.remembered_revision);
+    try testing.expectEqual(@as(Revision, 3), verified.remembered().?.revision);
+}
+
+test "a fork that answers a write late is refused, not adopted, when a write moved the pair" {
+    // Goal: the same for `txn`. Method: a write is answered by the main store at revision 3;
+    // before the answer is checked another write is acknowledged (the pair is 4), and the answer
+    // becomes the fork's, at revision 5, which matches up to revision 2 only.
+    var manual: ManualClock = .{};
+    var main: MemoryStore = undefined;
+    var fork: MemoryStore = undefined;
+    try forked_stores(&main, &fork, 3, manual.clock());
+    defer main.deinit();
+    defer fork.deinit();
+    var hooked: Hooked = .{ .inner = main.interface(), .fork = fork.interface() };
+    var verified = VerifiedStore.init(hooked.interface(), manual.clock(), null, null);
+    hooked.verified = &verified;
+    const guarded = verified.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try guarded.status(&diag);
+    hooked.after_txn = Hooked.fail_over_txn;
+    const op: store.Op = .{ .put = .{ .key = "/y", .value = "1" } };
+    try expect_halted(guarded.txn(.{ .on_success = &.{op} }, &diag), &diag);
+    try testing.expectEqual(@as(Revision, 4), verified.halt_state().?.remembered_revision);
+    try testing.expectEqual(@as(Revision, 4), verified.remembered().?.revision);
 }
