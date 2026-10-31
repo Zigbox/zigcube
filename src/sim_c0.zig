@@ -908,3 +908,47 @@ test "a late running record over a stale stopped container is reported lost and 
     }
     try testing.expectEqual(@as(u32, 1), world.sim.running_count());
 }
+
+/// Rewrites the first replica record with `node`, as the scheduler would when it moves the
+/// replica (the key and so its create revision stay).
+fn move_first_replica(world: *World, node: []const u8) !void {
+    const ctx = world.controller_context();
+    const all = try controller.list_all(records.Replica, &ctx, records.prefix_replicas, null, 8);
+    try testing.expect(all.items.len > 0);
+    var moved = all.items[0].rec;
+    moved.node = node;
+    const value = try records.encode(ctx.arena, moved, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = all.items[0].kv.key, .value = value } };
+    const request: store.TxnRequest = .{ .on_success = &.{op} };
+    _ = try @import("writers.zig").txn(ctx.store, .replica_controller, request, ctx.diag);
+}
+
+test "a replica that comes back to its node keeps its container and leaves no pending stop" {
+    // Goal: a replica moved away is an orphan on its old node and its container gets a stop
+    // order; if it is moved back before the container ended (one that ignores the polite
+    // stop), the container is wanted again, and the stop order must be dropped: once its
+    // deadline passed it kept the agent awake (next wake now, a busy loop) and would kill a
+    // container that the replica wants. Method: run web-1, make it ignore a stop, move the
+    // replica away and step the agent (stop pending), move it back, step: no stop pending,
+    // and after the grace period the agent sleeps. (Seed 744 of `sim-cluster`, at 100
+    // operations, took 1,078 steps in 20 s on one node.)
+    const world = try World.create(testing.allocator, 1, &fixtures);
+    defer world.destroy();
+    _ = try world.apply(stale_input("web"));
+    _ = world.agent_step();
+    _ = world.server_step();
+    _ = world.server_step();
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.running_count("web"));
+    try world.sim.inject("web-1", .slow_stop);
+    try move_first_replica(world, "elsewhere");
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.agent.stops_count);
+    try move_first_replica(world, sim_world.node_name);
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+    world.manual.advance(constants.stop_grace_ms + 1000);
+    _ = world.agent_step();
+    try testing.expect(world.agent_due_ms > world.now_ms());
+    try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
+}

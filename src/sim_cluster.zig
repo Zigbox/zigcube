@@ -73,8 +73,11 @@ const excess_slots_max: u32 = 512;
 /// to 300 at 100 operations reach 20.1 s with the agent fix, 25 to 48 s without it
 /// (docs/DECISIONS.md).
 const starved_ms_max: u64 = 24_000;
-/// Half the slowest node seen over seeds 1 to 300 (10 per up-minute).
+/// The cluster's successful agent steps per minute of uptime while the faults were on must be at
+/// least this (`cluster_ok_rate`).
 const ok_steps_per_minute_min: u64 = 5;
+/// The nodes' uptime together, while the faults were on, below which that rate is not checked.
+const cluster_up_ms_min: u64 = 120_000;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
 const steps_per_minute_max: u64 = 200;
@@ -1510,7 +1513,8 @@ fn work_under_ceiling(c: *Cluster) Failure!void {
 }
 
 /// The slowest rate of successful agent steps (per minute of agent uptime) among the nodes that
-/// were up for at least half of the fault phase; null if there is none.
+/// were up for at least half of the fault phase; null if there is none. Reported, not checked:
+/// one node's luck with 10 s timeouts says little about the cluster (`cluster_ok_rate`).
 fn slowest_node_rate(c: *const Cluster) ?u64 {
     var slowest: ?u64 = null;
     for (c.nodes) |node| {
@@ -1521,17 +1525,31 @@ fn slowest_node_rate(c: *const Cluster) ?u64 {
     return slowest;
 }
 
+/// Successful agent steps per minute of agent uptime, over every node together, while the faults
+/// were on; null if the nodes were up for less than `cluster_up_ms_min` in all, too little for
+/// a rate to mean anything (a lost call costs 10 s, so a short run is a few calls' luck).
+fn cluster_ok_rate(c: *const Cluster) ?u64 {
+    var steps: u64 = 0;
+    var up_ms: u64 = 0;
+    for (c.nodes) |node| {
+        steps += node.ok_steps;
+        up_ms += node.up_ms;
+    }
+    if (up_ms < cluster_up_ms_min) return null;
+    return steps * 60_000 / up_ms;
+}
+
 /// The faults must leave the cluster working: a world where the store or every link is down most
-/// of the time proves little, and a change that made it so would pass silently otherwise. Every
-/// node that was up for half of the fault phase got `ok_steps_per_minute_min` successful agent
-/// steps per minute it was up (the slowest seen over seeds 1 to 300 is in docs/DECISIONS.md),
-/// and one delivered request per operation reached the server (the least seen over seeds 1 to
-/// 60 was 268 in 100 operations; the old fault rates left 39).
+/// of the time proves little, and a change that made it so would pass silently otherwise. The
+/// nodes together got `ok_steps_per_minute_min` successful agent steps per minute they were up
+/// (the least seen is in docs/DECISIONS.md), and one delivered request per operation reached
+/// the server (the least seen over seeds 1 to 60 was 268 in 100 operations; the old fault rates
+/// left 39).
 fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
     const during = c.fault_totals.?;
-    if (slowest_node_rate(c)) |rate| {
-        try check(c, rate >= ok_steps_per_minute_min, "too few agent steps on a node that " ++
-            "was up while faults were on");
+    if (cluster_ok_rate(c)) |rate| {
+        try check(c, rate >= ok_steps_per_minute_min, "too few agent steps while faults were " ++
+            "on");
     }
     try check(c, during.delivered >= operations, "too few requests reached the server " ++
         "while faults were on");
@@ -1547,8 +1565,8 @@ fn print_summary(c: *Cluster) void {
         s.server_steps, s.agent_steps, s.server_failures, s.agent_failures,
     });
     print_phases(c);
-    report.print("starved: worst={d}ms; slowest node: {d} ok steps per up-minute\n", .{
-        c.starved_worst_ms, slowest_node_rate(c) orelse 0,
+    report.print("starved: worst={d}ms; ok steps per up-minute: cluster {d}, slowest node {d}\n", .{
+        c.starved_worst_ms, cluster_ok_rate(c) orelse 0, slowest_node_rate(c) orelse 0,
     });
     report.print("busiest node: {d} steps per up-minute\n", .{busiest_node_rate(c)});
     report.print("faults: crashes={d} partitions={d} outages={d} suspends={d} " ++

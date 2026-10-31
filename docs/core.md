@@ -254,7 +254,8 @@ invariants read over the whole store (every decision has a reason and a cause th
 terminates and ends in a cause); no container lives longer than 120 s of reachable time on a node
 that no replica assigns it to; a placed replica of a good image is running on its node within 24 s
 of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime)
-and none starves (5 successful steps per minute on a node up for half the fault phase). With
+and the cluster does not starve (5 successful agent steps per minute of uptime over all nodes
+together, checked when they were up 120 s in the fault phase). With
 **liveness mode**, the default, the faults run for the first `H` operations, `H` drawn from the seed
 alone between half the run and all of it, then every fault is off for the rest of the operations,
 and 240 s of virtual time after the last one every service has the replicas it asked for (held ones

@@ -286,6 +286,7 @@ const Pass = struct {
                     try pass.replace_stale(found, item, seen);
                     continue;
                 }
+                pass.agent.forget_stop(found.handle.name());
                 try pass.report(replica, seen, found.status);
             } else if (seen) |record| {
                 if (record.status != .stopped) try pass.report_lost(replica, record);
