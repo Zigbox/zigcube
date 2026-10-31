@@ -8,9 +8,14 @@
 //! **Swarm.** The seed picks the node count, the rate of every fault (zero included: some worlds
 //! have no partitions, some no crashes) and the workload mix, and the report prints them first.
 //!
-//! **What is checked.** After every operation: the decisions' causes and `why` (sim-c0's
-//! invariants, read over the whole store), and that nothing runs for long that no service wants.
-//! After the faults are healed: every service has its replicas, and no node runs anything else.
+//! **What is checked.** Every virtual second and after every operation, also during the heal:
+//! the decisions' causes and `why` (sim-c0's invariants, read over the whole store), and, per
+//! container, that none lives past a grace period on a node that no replica of the store assigns
+//! it to (time counts only while its node is up, its link is not cut and the store is up). After
+//! the faults are healed: replica by replica, its container runs on the node the replica names
+//! and nowhere else, and no node runs a container no replica owns. The faults are rationed so
+//! the cluster works while faulty (short outages and cuts, at most half the nodes cut at once,
+//! low per-call loss), and the run fails if the fault phase did too little agent work.
 //! **Duplicates are counted, never failed**: without leases and fencing (slice 6) a partition can
 //! leave one replica running on two nodes. The report prints the replica-seconds with a note that
 //! the number is not a pass. The full checker set, the liveness bound and the comparison with
@@ -52,8 +57,20 @@ const epoch_ms = sim_world.epoch_ms;
 const rounds_max: u32 = 16;
 const drive_rounds_max: u32 = 8;
 const compact_interval_ms: u64 = 60 * 1000;
-/// More containers running than services want, on nodes that can be corrected, for this long.
+/// A container that no replica assigns to its node may live this long, counted only while its
+/// node can be told to stop it (agent up, link not cut) and the store is up.
 const excess_ms_max: u64 = 120_000;
+/// Excess containers tracked at once; more than that are not timed (never reached in practice:
+/// a node holds a few dozen containers).
+const excess_slots_max: u32 = 512;
+/// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
+/// cut link takes 10 s, so a cut is already long.
+const partition_ms_min: u32 = 1000;
+const partition_ms_spread: u32 = 8000;
+/// A store outage advances time by up to this much.
+const outage_ms_max: u32 = 4000;
+/// Checks run once per this much virtual time, and after every operation.
+const check_interval_ms: u64 = 1000;
 /// Virtual time given to the healed world to converge: parked requests (up to 40 s), leases
 /// (10 s), back-offs and the controllers' own pacing.
 const heal_ms: u64 = 240_000;
@@ -116,14 +133,15 @@ pub const Swarm = struct {
 
     fn delay(random: std.Random) u32 {
         if (random.uintLessThan(u32, 3) == 0) return 0;
-        return random.uintLessThan(u32, 4000);
+        return random.uintLessThan(u32, 600);
     }
 
     /// The reply lost after the server acted is the common case: when it is on at all, it is
-    /// frequent.
+    /// frequent, but a lost call costs the agent 10 s, so not so frequent that no step gets
+    /// through.
     fn lost_reply(random: std.Random) u32 {
         if (random.uintLessThan(u32, 4) == 0) return 0;
-        return 50 + random.uintLessThan(u32, 200);
+        return 1 + random.uintLessThan(u32, 8);
     }
 
     pub fn draw(seed: u64, nodes_wanted: ?u32) Swarm {
@@ -135,10 +153,10 @@ pub const Swarm = struct {
         return .{
             .nodes = nodes,
             .net = .{
-                .request = .{ .drop_per_mille = rate(r, 150), .delay_ms_max = delay(r) },
+                .request = .{ .drop_per_mille = rate(r, 5), .delay_ms_max = delay(r) },
                 .reply = .{ .drop_per_mille = lost_reply(r), .delay_ms_max = delay(r) },
                 .duplicate_per_mille = rate(r, 100),
-                .reorder_per_mille = rate(r, 80),
+                .reorder_per_mille = rate(r, 10),
             },
             .ack_loss_per_mille = rate(r, 100),
             .clock_ppm = if (r.uintLessThan(u32, 3) == 0) 0 else r.uintLessThan(u32, 10_001),
@@ -148,7 +166,7 @@ pub const Swarm = struct {
             .w_broken = rate(r, 6),
             .w_runtime = rate(r, 20),
             .w_crash = rate(r, 12),
-            .w_partition = rate(r, 10),
+            .w_partition = if (nodes == 1) 0 else rate(r, 10),
             .w_outage = rate(r, 6),
             .w_server = rate(r, 4),
             .w_suspend = rate(r, 4),
@@ -335,6 +353,34 @@ pub const Stats = struct {
     duplicate_seconds: u64 = 0,
 };
 
+/// Counters read at the end of the faults and again at the end of the run, so the report can say
+/// how much work each phase did.
+pub const PhaseTotals = struct {
+    agent_steps: u32,
+    agent_failures: u32,
+    server_steps: u32,
+    transactions: u32,
+    revision: u64,
+    delivered: u32,
+    requests_dropped: u32,
+    replies_lost: u32,
+    partitioned: u32,
+
+    fn minus(a: PhaseTotals, b: PhaseTotals) PhaseTotals {
+        return .{
+            .agent_steps = a.agent_steps - b.agent_steps,
+            .agent_failures = a.agent_failures - b.agent_failures,
+            .server_steps = a.server_steps - b.server_steps,
+            .transactions = a.transactions - b.transactions,
+            .revision = a.revision - b.revision,
+            .delivered = a.delivered - b.delivered,
+            .requests_dropped = a.requests_dropped - b.requests_dropped,
+            .replies_lost = a.replies_lost - b.replies_lost,
+            .partitioned = a.partitioned - b.partitioned,
+        };
+    }
+};
+
 pub const Cluster = struct {
     gpa: Allocator,
     seed: u64,
@@ -358,9 +404,14 @@ pub const Cluster = struct {
     instance_next: u16,
     request_next: u32,
     dropped_before_restart: u64,
-    excess_since_ms: ?u64,
+    excess: [excess_slots_max]Excess,
+    excess_count: u32,
+    excess_last_ms: u64,
     second_ms: u64,
+    check_ms: u64,
     stats: Stats,
+    /// The totals when the faults ended and the heal began.
+    fault_totals: ?PhaseTotals,
     report: *Report,
 
     pub fn create(
@@ -394,9 +445,13 @@ pub const Cluster = struct {
         c.instance_next = 1;
         c.request_next = 1;
         c.dropped_before_restart = 0;
-        c.excess_since_ms = null;
+        c.excess = undefined;
+        c.excess_count = 0;
+        c.excess_last_ms = epoch_ms;
         c.second_ms = 0;
+        c.check_ms = 0;
         c.stats = .{};
+        c.fault_totals = null;
         c.report = report;
         c.server = replica_controller.ReplicaController.init(c.take_instance());
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
@@ -545,6 +600,7 @@ pub const Cluster = struct {
     pub fn advance(c: *Cluster, ms: u64) void {
         var left = ms;
         while (left > 0) {
+            if (c.report.failed) return;
             const slice = @min(left, tick_ms);
             c.manual.advance(slice);
             left -= slice;
@@ -558,6 +614,11 @@ pub const Cluster = struct {
             if (c.second_ms >= 1000) {
                 c.second_ms -= 1000;
                 c.stats.duplicate_seconds += c.duplicates();
+            }
+            c.check_ms += slice;
+            if (c.check_ms >= check_interval_ms) {
+                c.check_ms = 0;
+                safety(c) catch return; // The report says what failed.
             }
         }
     }
@@ -588,6 +649,28 @@ pub const Cluster = struct {
         return random.uintLessThan(u32, @min(most, fit - 1) + 1);
     }
 
+    fn phase_totals(c: *Cluster) PhaseTotals {
+        var net: sim_net.Stats = .{};
+        for (c.nodes) |node| {
+            const link = c.net.stats(node.index);
+            net.delivered += link.delivered;
+            net.requests_dropped += link.requests_dropped;
+            net.replies_lost += link.replies_lost;
+            net.partitioned += link.partitioned;
+        }
+        return .{
+            .agent_steps = c.stats.agent_steps,
+            .agent_failures = c.stats.agent_failures,
+            .server_steps = c.stats.server_steps,
+            .transactions = c.stats.transactions,
+            .revision = c.revision() orelse 0,
+            .delivered = net.delivered,
+            .requests_dropped = net.requests_dropped,
+            .replies_lost = net.replies_lost,
+            .partitioned = net.partitioned,
+        };
+    }
+
     pub fn revision(c: *Cluster) ?store.Revision {
         c.diag.reset();
         const status = c.store_handle().status(&c.diag) catch {
@@ -597,25 +680,31 @@ pub const Cluster = struct {
         return status.revision;
     }
 
-    /// How many replicas run on more than one node right now.
+    /// How many replicas run on more than one node right now, each counted once. A container
+    /// that is `stopping` is on its way out and does not count as running.
     fn duplicates(c: *Cluster) u64 {
         var count: u64 = 0;
         for (c.nodes, 0..) |node, index| {
             for (node.sim.containers.containers.items) |container| {
-                if (container.phase == .stopped) continue;
-                if (c.runs_elsewhere(index, container.name)) count += 1;
+                if (container.phase != .running) continue;
+                if (c.runs_before(index, container.name)) continue;
+                if (c.runs_after(index, container.name)) count += 1;
             }
         }
         return count;
     }
 
-    /// Whether a later node also runs `name`, so a pair is counted once.
-    fn runs_elsewhere(c: *Cluster, index: usize, name: []const u8) bool {
+    /// Whether an earlier node runs `name`, so a replica on three nodes is counted once.
+    fn runs_before(c: *Cluster, index: usize, name: []const u8) bool {
+        for (c.nodes[0..index]) |other| {
+            if (runs(other, name)) return true;
+        }
+        return false;
+    }
+
+    fn runs_after(c: *Cluster, index: usize, name: []const u8) bool {
         for (c.nodes[index + 1 ..]) |other| {
-            for (other.sim.containers.containers.items) |container| {
-                if (container.phase == .stopped) continue;
-                if (std.mem.eql(u8, container.name, name)) return true;
-            }
+            if (runs(other, name)) return true;
         }
         return false;
     }
@@ -660,17 +749,26 @@ pub const Cluster = struct {
     fn set_store_down(c: *Cluster, down: bool) void {
         c.switched.down = down;
         c.switched.fail_after = null;
-        // Nothing converges while the store is off, and the checks only look between operations:
-        // the grace period for excess containers starts again when it is back.
-        if (!down) c.excess_since_ms = null;
     }
 
     fn dropped_total(c: *const Cluster) u64 {
         return c.dropped_before_restart + c.server.retention.dropped;
     }
 
+    fn cut_count(c: *const Cluster) u32 {
+        var count: u32 = 0;
+        for (c.nodes) |node| count += @intFromBool(node.partitioned_until_ms != null);
+        return count;
+    }
+
     /// Cuts or damages a node's link for a while: a request-side, a reply-side or a full cut.
+    /// At most half the nodes are cut at once (so a one-node world has no partitions: its only
+    /// agent would be cut a third of the time, and the cluster must be mostly working while it is
+    /// faulty); a node already cut is left as it is.
     fn partition(c: *Cluster, node: *Node) void {
+        const cuts_max: u32 = @divFloor(@as(u32, @intCast(c.nodes.len)), 2);
+        if (node.partitioned_until_ms != null) return;
+        if (c.cut_count() >= cuts_max) return;
         const random = c.prng.random();
         var faults = c.swarm.net;
         switch (random.uintLessThan(u32, 3)) {
@@ -682,7 +780,8 @@ pub const Cluster = struct {
             },
         }
         c.net.set_faults(node.index, faults);
-        node.partitioned_until_ms = c.manual.ms + 3000 + random.uintLessThan(u32, 60_000);
+        node.partitioned_until_ms =
+            c.manual.ms + partition_ms_min + random.uintLessThan(u32, partition_ms_spread);
         c.stats.partitions += 1;
     }
 
@@ -704,9 +803,19 @@ pub const Cluster = struct {
     }
 
     fn pick_node(c: *Cluster) *Node {
-        return c.nodes[c.prng.random().uintLessThan(usize, c.nodes.len)];
+        // A `u32` draw: the stream is the same on every target, which `usize` would not give.
+        const count: u32 = @intCast(c.nodes.len);
+        return c.nodes[c.prng.random().uintLessThan(u32, count)];
     }
 };
+
+fn runs(node: *const Node, name: []const u8) bool {
+    for (node.sim.containers.containers.items) |container| {
+        if (container.phase != .running) continue;
+        if (std.mem.eql(u8, container.name, name)) return true;
+    }
+    return false;
+}
 
 // ---- The workload -------------------------------------------------------------------------------
 
@@ -745,21 +854,21 @@ fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
     switch (pick_op(&c.swarm, random)) {
-        .advance => c.advance(100 + random.uintLessThan(u32, 3000)),
+        .advance => c.advance(100 + random.uintLessThan(u32, 6000)),
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
         .scale => c.apply(name, hello_digest, c.replicas_for(random, 8)),
         .delete => c.delete_service(name),
         .broken => c.apply(name, broken_digest, 1 + c.replicas_for(random, 2)),
         .runtime_fault => {
-            c.stats.runtime_faults += 1;
-            _ = c.pick_node().sim.containers.random_fault();
+            const injected = c.pick_node().sim.containers.random_fault();
+            if (injected != null) c.stats.runtime_faults += 1;
         },
         .crash => c.crash(c.pick_node()),
         .partition => c.partition(c.pick_node()),
         .outage => {
             c.stats.outages += 1;
             c.switched.fail_after = 1 + random.uintLessThan(u32, 40);
-            c.advance(random.uintLessThan(u32, 40_000));
+            c.advance(random.uintLessThan(u32, outage_ms_max));
             c.set_store_down(false);
         },
         .server_restart => c.restart_server(),
@@ -787,7 +896,7 @@ fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
 /// sim-c0's invariants over the whole store: every decision has a reason and a cause that
 /// exists, `why` terminates, every replica has its create (and place) decision.
 fn invariants(c: *Cluster) Failure!void {
-    if (c.switched.down) return;
+    if (store_faulty(c)) return;
     try check(c, c.revision() != null, "the store cannot be read");
     const ctx = c.controller_context();
     try decisions_have_causes(c, &ctx);
@@ -879,48 +988,93 @@ fn replica_has_decisions(
     if (replica.node.len > 0) try check(c, placed, "a placed replica has no place decision");
 }
 
-/// The replicas the services want, or null if the store cannot be read.
-fn desired_total(c: *Cluster) ?u32 {
-    const ctx = c.controller_context();
-    const list = controller.list_all(
-        records.Service,
-        &ctx,
-        records.prefix_services,
-        null,
-        constants.services_max,
-    ) catch return null;
-    var total: u32 = 0;
-    for (list.items) |service| total += service.rec.replicas;
-    return total;
+/// The store is down, or about to be: reads would fail and would use up the countdown.
+fn store_faulty(c: *const Cluster) bool {
+    if (c.switched.fail_after != null) return true;
+    return c.switched.down;
 }
 
-/// Containers running on nodes that could be told to stop them: agent up, link not cut.
-fn correctable_running(c: *Cluster) u32 {
-    var count: u32 = 0;
-    for (c.nodes) |node| {
-        if (node.down) continue;
-        if (node.partitioned_until_ms != null) continue;
-        count += node.sim.containers.running_count();
+/// One container that no replica assigns to its node: when it was first seen is not kept, only
+/// how long its node could have stopped it, so an outage or a cut link does not run the clock.
+const Excess = struct { node: u32, name_hash: u64, accrued_ms: u64 };
+
+/// What is checked every `check_interval_ms` and after every operation.
+fn safety(c: *Cluster) Failure!void {
+    try invariants(c);
+    try track_excess(c);
+}
+
+/// Whether the replicas list says `name` runs on `node`.
+fn assigned_to(
+    replicas: []const controller.Entry(records.Replica),
+    node: []const u8,
+    name: []const u8,
+) bool {
+    for (replicas) |replica| {
+        if (!std.mem.eql(u8, replica.rec.id, name)) continue;
+        return std.mem.eql(u8, replica.rec.node, node);
     }
-    return count;
+    return false;
 }
 
+fn excess_accrued(c: *const Cluster, node: u32, name_hash: u64) u64 {
+    for (c.excess[0..c.excess_count]) |entry| {
+        if (entry.node == node and entry.name_hash == name_hash) return entry.accrued_ms;
+    }
+    return 0;
+}
+
+/// Per container: one that is not stopped and that no replica of the store assigns to its own
+/// node (a deleted replica, or one that lives on another node now) must be stopped within
+/// `excess_ms_max` of the time its node could be told to: agent up, link not cut, store up. The
+/// replicas are read once per call; when the store cannot be read nothing accrues.
 fn track_excess(c: *Cluster) Failure!void {
-    const wanted = desired_total(c) orelse {
-        c.excess_since_ms = null;
+    const delta_ms = c.manual.ms - c.excess_last_ms;
+    c.excess_last_ms = c.manual.ms;
+    if (store_faulty(c)) return;
+    var scratch = std.heap.ArenaAllocator.init(c.gpa);
+    defer scratch.deinit();
+    c.diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.store_handle(),
+        .clock = c.manual.clock(),
+        .arena = scratch.allocator(),
+        .diag = &c.diag,
+    };
+    const replicas = controller.list_all(
+        records.Replica,
+        &ctx,
+        records.prefix_replicas,
+        null,
+        constants.replicas_max,
+    ) catch {
+        c.diag.reset();
         return;
     };
-    if (c.switched.down or correctable_running(c) <= wanted) {
-        c.excess_since_ms = null;
-        return;
+    var next: [excess_slots_max]Excess = undefined;
+    var count: u32 = 0;
+    for (c.nodes) |node| {
+        const reachable = !node.down and node.partitioned_until_ms == null;
+        for (node.sim.containers.containers.items) |container| {
+            if (container.phase == .stopped) continue;
+            if (assigned_to(replicas.items, node.name(), container.name)) continue;
+            const hash = std.hash.Wyhash.hash(0, container.name);
+            var accrued = excess_accrued(c, node.index, hash);
+            if (reachable) accrued += delta_ms;
+            try check(c, accrued <= excess_ms_max, "a container runs that no replica assigns " ++
+                "to its node");
+            if (count == excess_slots_max) continue;
+            next[count] = .{ .node = node.index, .name_hash = hash, .accrued_ms = accrued };
+            count += 1;
+        }
     }
-    const since = c.excess_since_ms orelse c.manual.ms;
-    c.excess_since_ms = since;
-    try check(c, c.manual.ms - since <= excess_ms_max, "more containers run than desired");
+    @memcpy(c.excess[0..count], next[0..count]);
+    c.excess_count = count;
 }
 
-/// Every fault off, every agent up, time to settle.
+/// Every fault off, every agent up, time to settle. The checks run during the wait.
 fn heal(c: *Cluster) void {
+    c.fault_totals = c.phase_totals();
     c.set_store_down(false);
     c.ack_loss.loss_per_mille = 0;
     c.swarm.net = .{};
@@ -929,8 +1083,19 @@ fn heal(c: *Cluster) void {
     c.advance(heal_ms);
 }
 
-/// Every service has what it asked for (or is held, if its image is broken), and no node runs
-/// anything else.
+/// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
+/// (and not `stopping`).
+fn live_container(node: *const Node, name: []const u8) ?bool {
+    for (node.sim.containers.containers.items) |container| {
+        if (container.phase == .stopped) continue;
+        if (std.mem.eql(u8, container.name, name)) return container.phase == .running;
+    }
+    return null;
+}
+
+/// Replica by replica: it exists as the service says, its container runs on the node the replica
+/// names (a good image) or nowhere (a broken one), no other node has one, and the server's view
+/// agrees; then every container still alive on any node belongs to a replica.
 fn converged(c: *Cluster) Failure!void {
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
@@ -941,57 +1106,81 @@ fn converged(c: *Cluster) Failure!void {
         .arena = scratch.allocator(),
         .diag = &c.diag,
     };
-    const list = controller.list_all(
+    const services = controller.list_all(
         records.Service,
         &ctx,
         records.prefix_services,
         null,
         constants.services_max,
     ) catch return check(c, false, "the services cannot be read");
-    var running_total: u32 = 0;
-    for (list.items) |service| {
-        const counts = service_counts(c, &ctx, service.rec.name);
-        running_total += counts.running;
-        const wanted = service.rec.replicas;
-        const good = !std.mem.eql(u8, service.rec.image, broken_digest);
-        try check(c, counts.replicas == wanted, "a service lacks replicas");
-        if (good) try check(c, counts.running == wanted, "a good service is not all running");
-        if (!good) try check(c, counts.running == 0, "a broken service is running");
-    }
-    var left: u32 = 0;
-    for (c.nodes) |node| left += node.sim.containers.running_count();
-    try check(c, left == running_total, "containers left behind");
-}
-
-const Counts = struct { replicas: u32, running: u32 };
-
-fn service_counts(c: *Cluster, ctx: *const controller.Context, service: []const u8) Counts {
-    _ = c;
-    var counts: Counts = .{ .replicas = 0, .running = 0 };
-    const prefix = records.replicas_prefix(service);
-    const replicas = controller.list_all(
-        records.Replica,
-        ctx,
-        prefix.slice(),
-        null,
-        constants.replicas_max,
-    ) catch
-        return counts;
     const observed = controller.list_all(
         records.Observed,
-        ctx,
+        &ctx,
         records.prefix_observed,
         null,
         constants.replicas_max,
-    ) catch return counts;
-    for (replicas.items) |replica| {
-        counts.replicas += 1;
-        for (observed.items) |item| {
-            if (!std.mem.eql(u8, item.rec.replica, replica.rec.id)) continue;
-            if (item.rec.status == .running) counts.running += 1;
+    ) catch return check(c, false, "the observed records cannot be read");
+    for (services.items) |service| {
+        const prefix = records.replicas_prefix(service.rec.name);
+        const replicas = controller.list_all(
+            records.Replica,
+            &ctx,
+            prefix.slice(),
+            null,
+            constants.replicas_max,
+        ) catch return check(c, false, "the replicas cannot be read");
+        try check(c, replicas.items.len == service.rec.replicas, "a service lacks replicas");
+        const good = !std.mem.eql(u8, service.rec.image, broken_digest);
+        for (replicas.items) |replica| try replica_converged(c, observed.items, &replica.rec, good);
+    }
+    try no_strays(c, &ctx);
+}
+
+/// Every container alive on any node is the container of a replica placed on that node.
+fn no_strays(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    const replicas = controller.list_all(
+        records.Replica,
+        ctx,
+        records.prefix_replicas,
+        null,
+        constants.replicas_max,
+    ) catch return check(c, false, "the replicas cannot be read");
+    for (c.nodes) |node| {
+        for (node.sim.containers.containers.items) |container| {
+            if (container.phase == .stopped) continue;
+            const mine = assigned_to(replicas.items, node.name(), container.name);
+            try check(c, mine, "a container is left behind");
         }
     }
-    return counts;
+}
+
+fn replica_converged(
+    c: *Cluster,
+    observed: []const controller.Entry(records.Observed),
+    replica: *const records.Replica,
+    good: bool,
+) Failure!void {
+    try check(c, replica.node.len > 0, "a replica is not placed");
+    var homes: u32 = 0;
+    for (c.nodes) |node| {
+        const running = live_container(node, replica.id) orelse continue;
+        homes += 1;
+        try check(c, std.mem.eql(u8, node.name(), replica.node), "a replica runs on a node " ++
+            "other than its own");
+        try check(c, good, "a replica of a broken service is running");
+        try check(c, running, "a replica is still stopping");
+    }
+    try check(c, homes == @intFromBool(good), "a replica is not running exactly once");
+    var seen = false;
+    for (observed) |item| {
+        if (!std.mem.eql(u8, item.rec.replica, replica.id)) continue;
+        seen = true;
+        const running = item.rec.status == .running;
+        try check(c, running == good, "the server's view of a replica disagrees with its node");
+        if (good) try check(c, std.mem.eql(u8, item.rec.node, replica.node), "observed on " ++
+            "another node");
+    }
+    if (good) try check(c, seen, "a running replica was never reported");
 }
 
 /// A hash of everything the store holds, then of every node's containers and restarts.
@@ -1023,16 +1212,56 @@ fn world_hash(c: *Cluster) u64 {
         if (after == null) break;
     }
     for (c.nodes) |node| hash_node(&hasher, node);
+    hash_net(&hasher, &c.net);
+    hash_value(&hasher, .{ c.manual.ms, c.switched.down, c.excess_count });
     return hasher.final();
 }
 
 fn hash_node(hasher: *std.hash.Wyhash, node: *Node) void {
     hasher.update(node.name());
     hasher.update(std.mem.asBytes(&node.sim.restarts));
+    hash_value(hasher, .{ node.down, node.restart_at_ms, node.resume_ms, node.spent_ms });
+    hash_value(hasher, .{ node.partitioned_until_ms, node.crashes, node.sim.crashed });
+    const loop = &node.loop;
+    hash_value(hasher, .{ loop.state, loop.retry_ms, loop.wake_at_ms, loop.last_code });
+    hash_value(hasher, .{ loop.last_report_ms, loop.stop_requested });
     for (node.sim.containers.containers.items) |container| {
         hasher.update(container.name);
-        const tag: u8 = @backingInt(std.meta.activeTag(container.phase));
-        hasher.update(&.{tag});
+        hasher.update(container.image);
+        hash_value(hasher, .{ container.phase, container.pid, container.started_at_ms });
+        hash_value(hasher, container.ignores_stop);
+    }
+    // The agent's files: names and bytes, and how much of each a host crash would keep.
+    for (node.sim.files.files.items) |file| {
+        hasher.update(file.name);
+        hasher.update(file.data);
+        hash_value(hasher, file.synced_len);
+    }
+    hash_value(hasher, .{ node.sim.files.points, node.sim.files.crashed });
+}
+
+fn hash_value(hasher: *std.hash.Wyhash, value: anytype) void {
+    std.hash.autoHash(hasher, value);
+}
+
+/// The requests in flight on every link, and the link's faults and counters.
+fn hash_net(hasher: *std.hash.Wyhash, net: *const sim_net.SimNet) void {
+    for (&net.links) |*link| {
+        hash_value(hasher, .{
+            link.faults.request.drop_per_mille, link.faults.reply.drop_per_mille,
+            link.faults.partition_up,           link.faults.partition_down,
+            link.stats.delivered,               link.stats.requests_dropped,
+            link.stats.replies_lost,            link.stats.duplicated,
+            link.stats.parked,                  link.stats.delivered_late,
+            link.stats.partitioned,
+        });
+        for (link.parked) |slot| {
+            const parked = slot orelse continue;
+            hasher.update(parked.method);
+            hasher.update(parked.target);
+            hasher.update(parked.body);
+            hash_value(hasher, .{ parked.hold_ms, parked.due_ms, parked.sequence });
+        }
     }
 }
 
@@ -1058,6 +1287,7 @@ pub fn simulate(
     c.swarm.print(report);
     run_steps(c, operations) catch {
         assert(report.failed);
+        if (c.fault_totals != null) print_phases(c);
         return;
     };
     print_summary(c);
@@ -1066,12 +1296,26 @@ pub fn simulate(
 fn run_steps(c: *Cluster, operations: u32) Failure!void {
     for (0..operations) |_| {
         operation(c);
-        try invariants(c);
-        try track_excess(c);
+        if (c.report.failed) return error.StepFailed;
+        try safety(c);
     }
     heal(c);
+    if (c.report.failed) return error.StepFailed;
     try converged(c);
-    try invariants(c);
+    try safety(c);
+    try enough_work_under_faults(c, operations);
+}
+
+/// The faults must leave the cluster working: a world where the store or every link is down most
+/// of the time proves little, and a change that made it so would pass silently otherwise. The
+/// floors (half an agent step and one delivered request per operation) are below the least the
+/// swarm gave over seeds 1 to 60 (77 steps and 268 requests in 100 operations) and far above
+/// the 23 and 39 that the old fault rates left.
+fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
+    const during = c.fault_totals.?;
+    try check(c, during.agent_steps >= @divFloor(operations, 2), "too few agent steps while faults were on");
+    try check(c, during.delivered >= operations, "too few requests reached the server " ++
+        "while faults were on");
 }
 
 fn print_summary(c: *Cluster) void {
@@ -1083,6 +1327,7 @@ fn print_summary(c: *Cluster) void {
     report.print("steps: server={d} agent={d} failures: server={d} agent={d}\n", .{
         s.server_steps, s.agent_steps, s.server_failures, s.agent_failures,
     });
+    print_phases(c);
     report.print("faults: crashes={d} partitions={d} outages={d} suspends={d} " ++
         "runtime={d} server_restarts={d} ack_lost={d}\n", .{
         s.crashes_injected, s.partitions,      s.outages,             s.suspends,
@@ -1107,6 +1352,22 @@ fn print_summary(c: *Cluster) void {
     report.print("duplicates: {d} replica-seconds on two nodes (counted, NOT a pass: without " ++
         "leases and fencing, slice 6, a partition can cause them)\n", .{s.duplicate_seconds});
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
+}
+
+fn print_phases(c: *Cluster) void {
+    const end = c.phase_totals();
+    const during = c.fault_totals.?;
+    print_phase(c.report, "fault phase", during);
+    print_phase(c.report, "heal phase", end.minus(during));
+}
+
+fn print_phase(report: *Report, label: []const u8, p: PhaseTotals) void {
+    report.print("{s}: agent_steps={d} agent_failures={d} server_steps={d} writes={d} " ++
+        "delivered={d} requests_dropped={d} replies_lost={d} partitioned={d} revisions={d}\n", .{
+        label,          p.agent_steps, p.agent_failures,   p.server_steps,
+        p.transactions, p.delivered,   p.requests_dropped, p.replies_lost,
+        p.partitioned,  p.revision,
+    });
 }
 
 // ---- Tests --------------------------------------------------------------------------------------
