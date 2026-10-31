@@ -63,6 +63,14 @@ const excess_ms_max: u64 = 120_000;
 /// Excess containers tracked at once; more than that are not timed (never reached in practice:
 /// a node holds a few dozen containers).
 const excess_slots_max: u32 = 512;
+/// A placed replica of a good image must have a running container on its own node within this
+/// long, counted like `excess_ms_max` (agent up, link not cut, store up) and only while the
+/// agent's last step worked: a failing step (a flaky link) explains why nothing moved. Seeds 1
+/// to 300 at 100 operations reach 20.1 s with the agent fix, 25 to 48 s without it
+/// (docs/DECISIONS.md).
+const starved_ms_max: u64 = 24_000;
+/// Half the slowest node seen over seeds 1 to 300 (10 per up-minute).
+const ok_steps_per_minute_min: u64 = 5;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -218,6 +226,11 @@ const Node = struct {
     /// The link is cut until this true time.
     partitioned_until_ms: ?u64,
     crashes: u32,
+    /// Successful agent steps and virtual time with the agent up, while the faults were on.
+    ok_steps: u32,
+    up_ms: u64,
+    /// Whether the agent's last step worked: a step that fails says why nothing moved.
+    last_ok: bool,
 
     fn name(node: *const Node) []const u8 {
         return node.name_buf[0..node.name_len];
@@ -289,10 +302,13 @@ const Node = struct {
         node.check_crashed();
         const wake = result catch {
             c.stats.agent_failures += 1;
+            node.last_ok = false;
             _ = node.loop.step_done(clock.now_ms(), .{ .failed = node.diag.code });
             return 0;
         };
         _ = node.loop.step_done(clock.now_ms(), .{ .ok = wake });
+        node.last_ok = true;
+        if (c.fault_totals == null) node.ok_steps += 1;
         return wake.acted;
     }
 
@@ -407,6 +423,14 @@ pub const Cluster = struct {
     excess: [excess_slots_max]Excess,
     excess_count: u32,
     excess_last_ms: u64,
+    starved: [excess_slots_max]Excess,
+    starved_count: u32,
+    starved_worst_ms: u64,
+    /// Virtual time the faults were on.
+    fault_ms: u64,
+    /// The store revision and drop count the invariants last passed at.
+    checked_revision: ?store.Revision,
+    checked_dropped: u64,
     second_ms: u64,
     check_ms: u64,
     stats: Stats,
@@ -448,6 +472,12 @@ pub const Cluster = struct {
         c.excess = undefined;
         c.excess_count = 0;
         c.excess_last_ms = epoch_ms;
+        c.starved = undefined;
+        c.starved_count = 0;
+        c.starved_worst_ms = 0;
+        c.fault_ms = 0;
+        c.checked_revision = null;
+        c.checked_dropped = 0;
         c.second_ms = 0;
         c.check_ms = 0;
         c.stats = .{};
@@ -487,6 +517,9 @@ pub const Cluster = struct {
         node.spent_ms = 0;
         node.partitioned_until_ms = null;
         node.crashes = 0;
+        node.ok_steps = 0;
+        node.last_ok = true;
+        node.up_ms = 0;
         c.net.set_faults(index, c.swarm.net);
         return node;
     }
@@ -604,6 +637,10 @@ pub const Cluster = struct {
             const slice = @min(left, tick_ms);
             c.manual.advance(slice);
             left -= slice;
+            if (c.fault_totals == null) c.fault_ms += slice;
+            for (c.nodes) |node| {
+                if (c.fault_totals == null and !node.down) node.up_ms += slice;
+            }
             c.diag.reset();
             _ = c.store_handle().expire_leases(&c.diag) catch c.diag.reset();
             c.maintain();
@@ -621,6 +658,13 @@ pub const Cluster = struct {
                 safety(c) catch return; // The report says what failed.
             }
         }
+    }
+
+    fn node_named(c: *const Cluster, name: []const u8) ?*Node {
+        for (c.nodes) |node| {
+            if (std.mem.eql(u8, node.name(), name)) return node;
+        }
+        return null;
     }
 
     fn maintain(c: *Cluster) void {
@@ -897,7 +941,12 @@ fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
 /// exists, `why` terminates, every replica has its create (and place) decision.
 fn invariants(c: *Cluster) Failure!void {
     if (store_faulty(c)) return;
-    try check(c, c.revision() != null, "the store cannot be read");
+    const head = c.revision();
+    try check(c, head != null, "the store cannot be read");
+    // These checks read only the store (and whether a write was dropped): the same revision and
+    // drop count as the last time that passed means the same answer.
+    const dropped = c.dropped_total();
+    if (c.checked_revision == head and c.checked_dropped == dropped) return;
     const ctx = c.controller_context();
     try decisions_have_causes(c, &ctx);
     const snapshot = controller.read_snapshot(&ctx) catch
@@ -909,6 +958,8 @@ fn invariants(c: *Cluster) Failure!void {
         try why_terminates(c, &ctx, .{ .kind = .replica, .name = replica.rec.id });
         try replica_has_decisions(c, &ctx, &replica.rec);
     }
+    c.checked_revision = head;
+    c.checked_dropped = dropped;
 }
 
 fn why_terminates(
@@ -1051,16 +1102,28 @@ fn track_excess(c: *Cluster) Failure!void {
         c.diag.reset();
         return;
     };
+    try track_unassigned(c, replicas.items, delta_ms);
+    try track_starved(c, replicas.items, delta_ms);
+}
+
+fn reachable(node: *const Node) bool {
+    return !node.down and node.partitioned_until_ms == null;
+}
+
+fn track_unassigned(
+    c: *Cluster,
+    replicas: []const controller.Entry(records.Replica),
+    delta_ms: u64,
+) Failure!void {
     var next: [excess_slots_max]Excess = undefined;
     var count: u32 = 0;
     for (c.nodes) |node| {
-        const reachable = !node.down and node.partitioned_until_ms == null;
         for (node.sim.containers.containers.items) |container| {
             if (container.phase == .stopped) continue;
-            if (assigned_to(replicas.items, node.name(), container.name)) continue;
+            if (assigned_to(replicas, node.name(), container.name)) continue;
             const hash = std.hash.Wyhash.hash(0, container.name);
             var accrued = excess_accrued(c, node.index, hash);
-            if (reachable) accrued += delta_ms;
+            if (reachable(node)) accrued += delta_ms;
             try check(c, accrued <= excess_ms_max, "a container runs that no replica assigns " ++
                 "to its node");
             if (count == excess_slots_max) continue;
@@ -1070,6 +1133,44 @@ fn track_excess(c: *Cluster) Failure!void {
     }
     @memcpy(c.excess[0..count], next[0..count]);
     c.excess_count = count;
+}
+
+fn starved_accrued(c: *const Cluster, node: u32, name_hash: u64) u64 {
+    for (c.starved[0..c.starved_count]) |entry| {
+        if (entry.node == node and entry.name_hash == name_hash) return entry.accrued_ms;
+    }
+    return 0;
+}
+
+/// Per placed replica of a good image: its own node must come to hold a running container of
+/// it. Time accrues while the node's agent is up and its link is not cut (the store is up, or
+/// this is not reached); a running container resets it. A replica of a service whose image is
+/// the broken one is skipped.
+fn track_starved(
+    c: *Cluster,
+    replicas: []const controller.Entry(records.Replica),
+    delta_ms: u64,
+) Failure!void {
+    var next: [excess_slots_max]Excess = undefined;
+    var count: u32 = 0;
+    for (replicas) |entry| {
+        const replica = &entry.rec;
+        if (replica.node.len == 0) continue;
+        if (std.mem.eql(u8, replica.image, broken_digest)) continue;
+        const node = c.node_named(replica.node) orelse continue;
+        if (live_container(node, replica.id) == true) continue;
+        const hash = std.hash.Wyhash.hash(0, replica.id);
+        var accrued = starved_accrued(c, node.index, hash);
+        if (reachable(node) and node.last_ok) accrued += delta_ms;
+        c.starved_worst_ms = @max(c.starved_worst_ms, accrued);
+        try check(c, accrued <= starved_ms_max, "a placed replica has no running container " ++
+            "on its node");
+        if (count == excess_slots_max) continue;
+        next[count] = .{ .node = node.index, .name_hash = hash, .accrued_ms = accrued };
+        count += 1;
+    }
+    @memcpy(c.starved[0..count], next[0..count]);
+    c.starved_count = count;
 }
 
 /// Every fault off, every agent up, time to settle. The checks run during the wait.
@@ -1084,13 +1185,21 @@ fn heal(c: *Cluster) void {
 }
 
 /// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
-/// (and not `stopping`).
-fn live_container(node: *const Node, name: []const u8) ?bool {
+/// (and not `stopping`), and its image.
+const Live = struct { running: bool, image: []const u8 };
+
+fn find_live(node: *const Node, name: []const u8) ?Live {
     for (node.sim.containers.containers.items) |container| {
         if (container.phase == .stopped) continue;
-        if (std.mem.eql(u8, container.name, name)) return container.phase == .running;
+        if (!std.mem.eql(u8, container.name, name)) continue;
+        return .{ .running = container.phase == .running, .image = container.image };
     }
     return null;
+}
+
+fn live_container(node: *const Node, name: []const u8) ?bool {
+    const live = find_live(node, name) orelse return null;
+    return live.running;
 }
 
 /// Replica by replica: it exists as the service says, its container runs on the node the replica
@@ -1169,6 +1278,9 @@ fn replica_converged(
             "other than its own");
         try check(c, good, "a replica of a broken service is running");
         try check(c, running, "a replica is still stopping");
+        const live = find_live(node, replica.id).?; // live_container found it.
+        try check(c, std.mem.eql(u8, live.image, replica.image), "a replica runs " ++
+            "another image than its own");
     }
     try check(c, homes == @intFromBool(good), "a replica is not running exactly once");
     var seen = false;
@@ -1176,6 +1288,8 @@ fn replica_converged(
         if (!std.mem.eql(u8, item.rec.replica, replica.id)) continue;
         seen = true;
         const running = item.rec.status == .running;
+        try check(c, item.rec.generation == replica.generation, "the server's view of a " ++
+            "replica is of another generation");
         try check(c, running == good, "the server's view of a replica disagrees with its node");
         if (good) try check(c, std.mem.eql(u8, item.rec.node, replica.node), "observed on " ++
             "another node");
@@ -1213,7 +1327,7 @@ fn world_hash(c: *Cluster) u64 {
     }
     for (c.nodes) |node| hash_node(&hasher, node);
     hash_net(&hasher, &c.net);
-    hash_value(&hasher, .{ c.manual.ms, c.switched.down, c.excess_count });
+    hash_value(&hasher, .{ c.manual.ms, c.switched.down, c.excess_count, c.starved_count });
     return hasher.final();
 }
 
@@ -1306,15 +1420,30 @@ fn run_steps(c: *Cluster, operations: u32) Failure!void {
     try enough_work_under_faults(c, operations);
 }
 
+/// The slowest rate of successful agent steps (per minute of agent uptime) among the nodes that
+/// were up for at least half of the fault phase; null if there is none.
+fn slowest_node_rate(c: *const Cluster) ?u64 {
+    var slowest: ?u64 = null;
+    for (c.nodes) |node| {
+        if (node.up_ms * 2 < c.fault_ms or node.up_ms == 0) continue;
+        const rate = @as(u64, node.ok_steps) * 60_000 / node.up_ms;
+        slowest = if (slowest) |s| @min(s, rate) else rate;
+    }
+    return slowest;
+}
+
 /// The faults must leave the cluster working: a world where the store or every link is down most
-/// of the time proves little, and a change that made it so would pass silently otherwise. The
-/// floors (half an agent step and one delivered request per operation) are below the least the
-/// swarm gave over seeds 1 to 60 (77 steps and 268 requests in 100 operations) and far above
-/// the 23 and 39 that the old fault rates left.
+/// of the time proves little, and a change that made it so would pass silently otherwise. Every
+/// node that was up for half of the fault phase got `ok_steps_per_minute_min` successful agent
+/// steps per minute it was up (the slowest seen over seeds 1 to 300 is in docs/DECISIONS.md),
+/// and one delivered request per operation reached the server (the least seen over seeds 1 to
+/// 60 was 268 in 100 operations; the old fault rates left 39).
 fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
     const during = c.fault_totals.?;
-    const steps_min = @divFloor(operations, 2);
-    try check(c, during.agent_steps >= steps_min, "too few agent steps while faults were on");
+    if (slowest_node_rate(c)) |rate| {
+        try check(c, rate >= ok_steps_per_minute_min, "too few agent steps on a node that " ++
+            "was up while faults were on");
+    }
     try check(c, during.delivered >= operations, "too few requests reached the server " ++
         "while faults were on");
 }
@@ -1329,6 +1458,9 @@ fn print_summary(c: *Cluster) void {
         s.server_steps, s.agent_steps, s.server_failures, s.agent_failures,
     });
     print_phases(c);
+    report.print("starved: worst={d}ms; slowest node: {d} ok steps per up-minute\n", .{
+        c.starved_worst_ms, slowest_node_rate(c) orelse 0,
+    });
     report.print("faults: crashes={d} partitions={d} outages={d} suspends={d} " ++
         "runtime={d} server_restarts={d} ack_lost={d}\n", .{
         s.crashes_injected, s.partitions,      s.outages,             s.suspends,
