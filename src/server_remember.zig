@@ -1,8 +1,11 @@
 //! The server's remembered `(revision, hash)` pair on disk (`store_verified.zig`). Shell code:
 //! files.
 //!
-//! Where: `<state dir>/<db file name>.remembered` for a SQLite store (one file per database, so
-//! two databases in one directory do not share a pair), `<state dir>/remembered` for Postgres.
+//! Where: `<state dir>/<db file name>.<hash of the db's absolute path>.remembered` for a SQLite
+//! store (one file per database path, so two databases do not share a pair even with one file
+//! name and one `--state-dir`), `<state dir>/remembered` for Postgres. The path is made absolute
+//! lexically (the working directory plus the name, no symlinks resolved): a database restored
+//! under a new path starts with no file and is not checked (docs/operations.md).
 //! The state directory is `--state-dir` / `.state_dir`; unset, it is the directory of the SQLite
 //! file. A Postgres store has no such directory: `--state-dir` is required (`ZC-E0106`), and one
 //! directory serves one Postgres database. A memory store remembers nothing across a restart
@@ -31,9 +34,10 @@ const verified = @import("store_verified.zig");
 const Diag = diag_mod.Diag;
 const Dir = std.Io.Dir;
 
-/// The file of a Postgres store, and the suffix of a SQLite store's: `<db file name>.remembered`.
+/// The file of a Postgres store, and the suffix of a SQLite store's.
 pub const file_name = "remembered";
 const name_bytes_max = 300;
+const temp_suffix = ".tmp";
 const magic = "zcube-remembered 1\n";
 const bytes_max = 256;
 
@@ -51,12 +55,19 @@ pub const Remembered = struct {
         return remembered.name_buffer[0..remembered.name_length];
     }
 
-    /// The name of the file for a store: `<database file name>.remembered` for SQLite (null for
-    /// the others) so that two databases in one directory keep two pairs.
+    /// The name of the file for a store: for SQLite (`database` is its absolute path, null for
+    /// the others) `<database file name>.<16 hex digits of a hash of its path>.remembered`,
+    /// so that two databases keep two pairs even when they share a file name and a state
+    /// directory. Null if the name does not fit (`open` needs room for its `.tmp`).
     pub fn file_for(database: ?[]const u8, buffer: *[name_bytes_max]u8) ?[]const u8 {
         const path = database orelse return file_name;
+        assert(std.fs.path.isAbsolute(path));
         const base = std.fs.path.basename(path);
-        return std.fmt.bufPrint(buffer, "{s}.{s}", .{ base, file_name }) catch null;
+        const text = std.fmt.bufPrint(buffer, "{s}.{x:0>16}.{s}", .{
+            base, std.hash.Wyhash.hash(0, path), file_name,
+        }) catch return null;
+        if (text.len + temp_suffix.len > name_bytes_max) return null;
+        return text;
     }
 
     /// Opens (creating, with parents) the state directory; the pair lives in `file`.
@@ -68,7 +79,7 @@ pub const Remembered = struct {
     ) error{BadState}!Remembered {
         assert(diag.code == null);
         assert(file.len > 0);
-        assert(file.len + ".tmp".len <= name_bytes_max);
+        assert(file.len + temp_suffix.len <= name_bytes_max);
         const cwd = Dir.cwd();
         var opened: Remembered = .{ .io = io, .path = path, .dir = undefined };
         @memcpy(opened.name_buffer[0..file.len], file);
@@ -111,7 +122,9 @@ pub const Remembered = struct {
         var buffer: [bytes_max]u8 = undefined;
         const text = format(&buffer, pair);
         var temp_buffer: [name_bytes_max]u8 = undefined;
-        const temp_name = std.fmt.bufPrint(&temp_buffer, "{s}.tmp", .{remembered.name()}) catch
+        const temp_name = std.fmt.bufPrint(&temp_buffer, "{s}{s}", .{
+            remembered.name(), temp_suffix,
+        }) catch
             unreachable; // `open` checked that the name and the suffix fit.
         const file = remembered.dir.createFile(io, temp_name, .{
             .permissions = .fromMode(0o600),
@@ -181,4 +194,27 @@ test "the format round-trips and refuses anything else" {
     @memcpy(bad[0..text.len], text);
     bad[text.len - 3] = 'g';
     try std.testing.expect(parse(bad[0..text.len]) == null);
+}
+
+test "a SQLite store's file is keyed by its absolute path; a long name is refused" {
+    // Goal: two databases never share a pair, and `open`'s size assert cannot fire. Method: the
+    // same file name in two directories; names around the limit.
+    var one_buffer: [name_bytes_max]u8 = undefined;
+    var two_buffer: [name_bytes_max]u8 = undefined;
+    const one = Remembered.file_for("/srv/a/zcube.db", &one_buffer).?;
+    const two = Remembered.file_for("/srv/b/zcube.db", &two_buffer).?;
+    try std.testing.expect(!std.mem.eql(u8, one, two));
+    try std.testing.expect(std.mem.startsWith(u8, one, "zcube.db."));
+    try std.testing.expect(std.mem.endsWith(u8, one, ".remembered"));
+    try std.testing.expectEqualStrings(one, Remembered.file_for("/srv/a/zcube.db", &two_buffer).?);
+    try std.testing.expectEqualStrings("remembered", Remembered.file_for(null, &one_buffer).?);
+
+    // The longest base that fits: name = base + "." + 16 hex + ".remembered", plus ".tmp".
+    const overhead = 1 + 16 + 1 + file_name.len + temp_suffix.len;
+    var long: [1 + name_bytes_max]u8 = @splat('x');
+    long[0] = '/';
+    const fits = long[0 .. 1 + name_bytes_max - overhead];
+    const name = Remembered.file_for(fits, &one_buffer).?;
+    try std.testing.expect(name.len + temp_suffix.len <= name_bytes_max);
+    try std.testing.expect(Remembered.file_for(long[0 .. fits.len + 1], &two_buffer) == null);
 }

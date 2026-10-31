@@ -144,12 +144,14 @@ pub const Server = struct {
         if (state_path(config, diag)) |path| {
             var name_buffer: [300]u8 = undefined;
             const database: ?[]const u8 = switch (config.store) {
-                .sqlite => |file| file,
+                .sqlite => |file| try server.absolute(file, diag),
                 .memory, .postgres => null,
             };
+            defer if (database) |path_absolute| server.gpa.free(path_absolute);
             const name = Remembered.file_for(database, &name_buffer) orelse {
                 diag.raise(.E0216);
                 diag.cause("the SQLite file's name is too long to name its remembered file", .{});
+                diag.cause("that file is named after it: its name can be about 260 bytes", .{});
                 diag.fix(.{ .sentence = "give the SQLite file a shorter name" });
                 return error.StartFailed;
             };
@@ -173,6 +175,21 @@ pub const Server = struct {
         server.shared.api.verified = &server.verified;
         server.driver.store = guarded;
         server.driver.verified = &server.verified;
+    }
+
+    /// `file` as an absolute path (working directory plus name, lexically), for keying the
+    /// remembered file by the database it describes. The caller frees it.
+    fn absolute(server: *Server, file: []const u8, diag: *Diag) Error![]u8 {
+        const cwd = std.process.currentPathAlloc(server.io, server.gpa) catch |err| {
+            diag.raise(.E0216);
+            diag.cause("can't tell the working directory to name the remembered file: {s}", .{
+                @errorName(err),
+            });
+            diag.fix(.{ .sentence = "give the SQLite file as an absolute path" });
+            return error.StartFailed;
+        };
+        defer server.gpa.free(cwd);
+        return std.fs.path.resolveAlloc(server.gpa, &.{ cwd, file });
     }
 
     /// Checks the store against the remembered pair before anything listens or steps, so that a

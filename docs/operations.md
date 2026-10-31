@@ -18,7 +18,7 @@ A migrated store has no hashes below the revision it was migrated at: `hash_at` 
 
 ## The server's memory of the store (`--state-dir`)
 
-The server remembers the highest store revision and hash it has seen in `<state dir>/<db file name>.remembered` (SQLite; `<state dir>/remembered` for Postgres),
+The server remembers the highest store revision and hash it has seen in `<state dir>/<db file name>.<16 hex digits>.remembered` (SQLite; `<state dir>/remembered` for Postgres),
 so that a restart after a failover to a replica that was behind, or a restore from an old backup,
 is noticed (`ZC-E0215`) and the server stops acting. The directory is `--state-dir`; for SQLite it
 defaults to the directory of the database file; for Postgres it is required (`ZC-E0106` without
@@ -32,3 +32,11 @@ it). Keep it outside the store: a copy inside the store would be rolled back wit
   run `accept-rollback` once.
 - A memory store remembers nothing and has no file.
 
+**The file is keyed by the database's absolute path** (the working directory plus the name given,
+no symlinks resolved; the hex digits are a hash of it), so two databases named `zcube.db` in
+different directories can share one `--state-dir` and keep two pairs. The consequence: a database
+restored **under a new path or name is a new database to the server**. It has no file, is not
+checked, and starts a pair of its own. Restore an old backup *over the same path* (the case the
+check exists for) and it is caught; to keep the check across a move, start the server with the
+database at its old path, or copy the old `.remembered` file to the new name. A SQLite file name
+longer than about 260 bytes is refused at start (`ZC-E0216`).

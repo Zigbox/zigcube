@@ -207,8 +207,8 @@ recovery.
   (`ZC-E0214`: the revision is below the point its chain starts, as after a migration from schema
   version 1) is refused as well, since it cannot be told from a rollback. The operator runs
   `accept-rollback` once. A server with nothing remembered (first start) is not affected.
-- **The pair outlives the server.** It is written to `<state dir>/<db file name>.remembered` for SQLite (one file per
-  database) or `<state dir>/remembered` for Postgres (temporary file, `fsync`, rename, `fsync` of
+- **The pair outlives the server.** It is written to `<state dir>/<db file name>.<hash of its absolute path>.remembered` for SQLite (one file per
+  database path; a restore under a new path is unchecked) or `<state dir>/remembered` for Postgres (temporary file, `fsync`, rename, `fsync` of
   the directory), at most once per second and whenever the file is behind the pair, including
   when the cluster has gone idle, and at a clean stop. A file that is present and unreadable is
   `ZC-E0216`, never "no file". **Crash window:** the file may lag the pair by up to one save
@@ -221,6 +221,15 @@ recovery.
   anyway, halted, and logs the diagnostic: every call answers `ZC-E0215`.
 - **The way out.** `zcube store accept-rollback --confirm` (`POST /v1/store/accept-rollback?confirm=true`)
   makes the server remember the store as it is now. Run it after looking at which store this is.
+
+- **What a check compares with.** A call takes a snapshot of the remembered pair (and the epoch) before it
+  calls the store, and its answer is compared with that snapshot only: a linearizable store answers a
+  call that began after a write was acknowledged with at least that revision. A write acknowledged
+  while the call ran only makes the answer late. The pair moves forward by maximum, never back.
+- **Reads.** `get`, `list` and `watch` pass the halt gate. Until one check has passed (the store could
+  not be reached at start, so `first_check` found nothing), the first of them verifies the store
+  itself and fails with the store's own error if it cannot. After that, between steps they pass only
+  the gate: a rollback is noticed at the next `status` or write, not at the next read.
 
 Known gaps: `Watch.next` is not gated on a halt (a watch opened before the halt can still deliver
 events until it is re-opened); and the decision record that should hold both pairs as evidence

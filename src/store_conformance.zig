@@ -113,6 +113,35 @@ const CreateRace = struct {
     }
 };
 
+test "txn: the result's hash is the chain hash of its revision" {
+    // Goal: the verified store advances its pair from a transaction's result, so the result's hash
+    // must be what `hash_at` says for that revision, on every backend. Method: a put, a failed
+    // compare that takes the `on_failure` branch, and a delete; each result is compared.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    const s = (try harness.connect()).interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const put: store.Op = .{ .put = .{ .key = "/h/a", .value = "1" } };
+    const other: store.Op = .{ .put = .{ .key = "/h/b", .value = "2" } };
+    const gone: store.Op = .{ .delete = "/h/a" };
+    const results = [_]store.TxnResult{
+        try s.txn(.{ .on_success = &.{put} }, &diag),
+        try s.txn(.{
+            .compares = &.{.{ .key = "/h/a", .mod_revision = 0 }},
+            .on_success = &.{put},
+            .on_failure = &.{other},
+        }, &diag),
+        try s.txn(.{ .on_success = &.{gone} }, &diag),
+    };
+    try testing.expect(!results[1].succeeded);
+    for (results) |result| {
+        try testing.expect(result.hash != null);
+        try testing.expectEqual(result.hash.?, try s.hash_at(result.revision, &diag));
+    }
+}
+
 test "cas: of several writers racing to create a key, exactly one wins" {
     // Goal: create-only compare-and-swap is atomic across connections. Method: each writer on its
     // own connection and thread creates "/c/key" if absent, and records an audit key if it

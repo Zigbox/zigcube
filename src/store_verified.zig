@@ -61,8 +61,15 @@ pub const VerifiedStore = struct {
     // across a call into `inner` or `remember`.
     lock: std.atomic.Mutex = .unlocked,
     known: ?Pair,
-    /// The last pair handed to `remember` that it accepted.
+    /// What the file is known to hold: the pair of the newest save issued, once it was
+    /// acknowledged. Null when nothing was saved, or when an older save may have landed after a
+    /// newer one (the contents are then unknown and the next save rewrites them).
     saved: ?Pair,
+    /// Counts saves issued. Saves can finish in any order; only the newest one's answer says
+    /// what the file holds.
+    save_issued: u64 = 0,
+    /// True once a check has passed (or the operator accepted): reads before that verify first.
+    checked: bool = false,
     saved_ms: u64 = 0,
     halted: ?failures.Rollback = null,
     /// Bumped by `accept`. A result or a save that began under an older epoch is dropped: it
@@ -134,27 +141,35 @@ pub const VerifiedStore = struct {
         assert(diag.code == null);
         const now = try self.inner.status(diag);
         const pair: Pair = .{ .revision = now.revision, .hash = now.hash };
+        var seq: u64 = 0;
         if (self.remember) |remember| {
+            self.enter();
+            self.save_issued +%= 1;
+            seq = self.save_issued;
+            self.leave();
             if (!remember.save_fn(remember.context, pair)) return not_saved(diag);
         }
         self.enter();
         const old = self.known;
         self.known = pair;
-        self.saved = pair;
+        // Newer than ours may have been issued meanwhile: then the file's contents are unknown.
+        self.saved = if (self.remember == null or self.save_issued == seq) pair else null;
+        self.checked = true;
         self.saved_ms = self.clock.now_ms();
         self.save_failed = false;
         self.halted = null;
         self.epoch +%= 1;
         self.leave();
-        // A save that began before the bump may have written after ours: write the pair again.
-        self.persist();
+        // A save that began before the bump may land after ours: write the pair again, whatever
+        // `saved` says. If that one lands late too, `saved` is unknown and the next call fixes it.
+        self.persist(true);
         return .{ .old = old, .new = pair };
     }
 
     /// Saves the remembered pair if the file is behind it; the server calls it as it stops.
     /// False if that failed: the next start remembers an older pair.
     pub fn flush(self: *VerifiedStore) bool {
-        self.persist();
+        self.persist(false);
         return !self.save_trouble();
     }
 
@@ -187,6 +202,16 @@ pub const VerifiedStore = struct {
         return self.epoch;
     }
 
+    /// What was acknowledged before a call began. A linearizable store answers a call that
+    /// began after that with a revision at least as high, whatever finishes meanwhile.
+    const Snapshot = struct { known: ?Pair, epoch: u32 };
+
+    fn snapshot(self: *VerifiedStore) Snapshot {
+        self.enter();
+        defer self.leave();
+        return .{ .known = self.known, .epoch = self.epoch };
+    }
+
     fn not_saved(diag: *Diag) store.Error {
         return failures.not_saved(diag);
     }
@@ -197,6 +222,16 @@ pub const VerifiedStore = struct {
         const halted = self.halted;
         self.leave();
         if (halted) |rollback| return failures.went_backwards(diag, rollback);
+    }
+
+    /// `gate` for reads of data: until a check has passed (a store that could not be reached at
+    /// start), the first read verifies the store itself, and fails if it cannot.
+    fn gate_read(self: *VerifiedStore, diag: *Diag) store.Error!void {
+        try self.gate(diag);
+        self.enter();
+        const checked = self.checked;
+        self.leave();
+        if (!checked) _ = try self.verify(diag);
     }
 
     /// Halts, unless the operator accepted since `epoch` began (the evidence is then stale and
@@ -219,15 +254,19 @@ pub const VerifiedStore = struct {
         return failures.went_backwards(diag, kept);
     }
 
-    /// Compares `now` with the remembered pair, and moves the pair forward.
-    fn check(self: *VerifiedStore, now: store.Status, epoch: u32, diag: *Diag) store.Error!void {
+    /// Compares `now` with the pair as it was in `snap`, taken before the call that produced
+    /// `now` began, and moves the pair forward (never back). A write that was acknowledged while
+    /// the call ran may have moved the pair past `now`: that is lateness, not a rollback.
+    fn check(
+        self: *VerifiedStore,
+        now: store.Status,
+        snap: Snapshot,
+        diag: *Diag,
+    ) store.Error!void {
         assert(diag.code == null);
-        self.enter();
-        const known = self.known;
-        const current = self.epoch;
-        self.leave();
-        if (current != epoch) return;
-        const pair = known orelse return self.advance(now, epoch);
+        const epoch = snap.epoch;
+        if (self.epoch_now() != epoch) return;
+        const pair = snap.known orelse return self.advance(now, epoch);
         var rollback: failures.Rollback = .{
             .remembered_revision = pair.revision,
             .remembered_hash = pair.hash,
@@ -253,12 +292,13 @@ pub const VerifiedStore = struct {
 
     fn advance(self: *VerifiedStore, now: store.Status, epoch: u32) void {
         self.enter();
-        if (self.epoch != epoch) return self.leave();
+        defer self.leave();
+        if (self.epoch != epoch) return;
+        self.checked = true;
         if (self.known) |known| {
-            if (now.revision <= known.revision) return self.leave();
+            if (now.revision <= known.revision) return;
         }
         self.known = .{ .revision = now.revision, .hash = now.hash };
-        self.leave();
     }
 
     /// Saves the remembered pair if the file is behind it and the last save is older than
@@ -270,45 +310,47 @@ pub const VerifiedStore = struct {
         const known = self.known;
         const saved = self.saved;
         const waited = self.clock.now_ms() -| self.saved_ms;
+        const retrying = self.save_failed;
         self.leave();
         const pair = known orelse return;
         if (saved) |done| if (done.eql(pair)) return;
-        if (saved != null and waited < constants.verified_save_ms) return;
-        self.persist();
+        if ((saved != null or retrying) and waited < constants.verified_save_ms) return;
+        self.persist(false);
     }
 
-    /// Saves the remembered pair now. If `accept` ran meanwhile the pair written may be the old
-    /// one: write again, the current one (twice at most; the next save repairs the rest).
-    fn persist(self: *VerifiedStore) void {
+    /// Saves the remembered pair now (`force`: even if `saved` says the file has it). Saves may
+    /// finish in any order, so each takes a number, and only the newest one's answer is
+    /// recorded; an older one that finishes after a newer one leaves `saved` unknown, and the
+    /// next save rewrites the file.
+    fn persist(self: *VerifiedStore, force: bool) void {
         const remember = self.remember orelse return;
-        for (0..2) |_| {
-            self.enter();
-            const pair = self.known;
-            const epoch = self.epoch;
-            const saved = self.saved;
-            self.leave();
-            const current = pair orelse return;
-            if (saved) |done| if (done.eql(current)) return;
-            const ok = remember.save_fn(remember.context, current);
-            self.enter();
-            const same = self.epoch == epoch;
-            if (same) {
-                // A failed save is retried at the next interval, not at every call.
-                self.saved_ms = self.clock.now_ms();
-                self.save_failed = !ok;
-                if (ok) self.saved = current;
-            }
-            self.leave();
-            if (same) return;
+        self.enter();
+        const current = self.known orelse return self.leave();
+        if (!force) {
+            if (self.saved) |done| if (done.eql(current)) return self.leave();
+        }
+        self.save_issued +%= 1;
+        const seq = self.save_issued;
+        self.leave();
+        const ok = remember.save_fn(remember.context, current);
+        self.enter();
+        defer self.leave();
+        if (seq == self.save_issued) {
+            // A failed save is retried at the next interval, not at every call.
+            self.saved_ms = self.clock.now_ms();
+            self.save_failed = !ok;
+            if (ok) self.saved = current;
+        } else if (ok) {
+            self.saved = null;
         }
     }
 
     /// Reads the store's head and checks it. The store may be reached before and after a call
     /// that changes it; a write that already happened stands whatever this finds out.
     fn verify(self: *VerifiedStore, diag: *Diag) store.Error!store.Status {
-        const epoch = self.epoch_now();
+        const snap = self.snapshot();
         const now = try self.inner.status(diag);
-        try self.check(now, epoch, diag);
+        try self.check(now, snap, diag);
         self.save_if_due();
         return now;
     }
@@ -337,7 +379,7 @@ pub const VerifiedStore = struct {
         diag: *Diag,
     ) store.Error!store.GetResult {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.get(arena, key, at_revision, diag);
     }
 
@@ -348,7 +390,7 @@ pub const VerifiedStore = struct {
         diag: *Diag,
     ) store.Error!store.ListResult {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.list(arena, options, diag);
     }
 
@@ -359,30 +401,23 @@ pub const VerifiedStore = struct {
     ) store.Error!store.TxnResult {
         const self = from(context);
         try self.gate(diag);
-        const epoch = self.epoch_now();
+        const snap = self.snapshot();
         const result = try self.inner.txn(request, diag);
         // The write is done; what is left is to learn whether the store it went to is the one
         // remembered. The result carries the chain hash of its revision, so the pair advances
-        // with every acknowledged write, not only at a `status`.
-        self.enter();
-        const known = self.known;
-        self.leave();
-        const behind = if (known) |pair| result.revision < pair.revision else false;
-        if (result.hash != null and !behind) {
+        // with every acknowledged write, not only at a `status`. It is compared with the pair
+        // as it was before the call: a write acknowledged meanwhile only makes this one late.
+        if (result.hash) |hash| {
             const now: store.Status = .{
                 .revision = result.revision,
                 .compacted_revision = 0,
-                .hash = result.hash.?,
+                .hash = hash,
             };
-            self.check(now, epoch, diag) catch |err| {
+            self.check(now, snap, diag) catch |err| {
                 if (self.halt_state() != null) return err;
                 diag.reset(); // Could not read: the write stands, the next status verifies.
             };
             self.save_if_due();
-        } else if (behind) {
-            // Below the remembered revision: a write that finished out of order, or a store
-            // that is behind. The store's head and its hash at the remembered revision tell.
-            try self.settle(diag);
         }
         return result;
     }
@@ -393,7 +428,7 @@ pub const VerifiedStore = struct {
         diag: *Diag,
     ) store.Error!store.Watch {
         const self = from(context);
-        try self.gate(diag);
+        try self.gate_read(diag);
         return self.inner.watch(options, diag);
     }
 
@@ -686,25 +721,274 @@ test "a write acknowledged after the last status is remembered, so a stale repli
     try testing.expectEqual(@as(Revision, 4), verified.halt_state().?.now_revision);
 }
 
-test "a write that finishes after a later one is not a rollback" {
-    // Goal: no false alarm from two writers whose answers arrive out of order. Method: the pair
-    // is at revision 3; a result for revision 2 (as a slow writer would deliver) is checked
-    // against the store's head, which is on the same history.
+/// A store that forwards to another and runs a hook after its `status` or `txn` answered and
+/// before the answer is returned: a write that is acknowledged while a call is in flight.
+const Hooked = struct {
+    inner: Store,
+    after_status: ?*const fn (*Hooked) void = null,
+    after_txn: ?*const fn (*Hooked) void = null,
+    verified: *VerifiedStore = undefined,
+    status_calls: u32 = 0,
+
+    fn interface(hooked: *Hooked) Store {
+        return .{ .context = hooked, .vtable = &vtable };
+    }
+
+    fn of(context: *anyopaque) *Hooked {
+        return @ptrCast(@alignCast(context));
+    }
+
+    const vtable: Store.VTable = .{
+        .status = h_status,
+        .get = h_get,
+        .list = h_list,
+        .txn = h_txn,
+        .watch = h_watch,
+        .lease_grant = h_lease_grant,
+        .lease_keepalive = h_lease_keepalive,
+        .lease_revoke = h_lease_revoke,
+        .lease_list = h_lease_list,
+        .expire_leases = h_expire_leases,
+        .compact = h_compact,
+        .hash_at = h_hash_at,
+    };
+
+    fn h_status(context: *anyopaque, diag: *Diag) store.Error!store.Status {
+        const hooked = of(context);
+        hooked.status_calls += 1;
+        const answer = try hooked.inner.status(diag);
+        if (hooked.after_status) |hook| {
+            hooked.after_status = null;
+            hook(hooked);
+        }
+        return answer;
+    }
+
+    fn h_txn(
+        context: *anyopaque,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
+        const hooked = of(context);
+        const answer = try hooked.inner.txn(request, diag);
+        if (hooked.after_txn) |hook| {
+            hooked.after_txn = null;
+            hook(hooked);
+        }
+        return answer;
+    }
+
+    fn h_get(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        key: []const u8,
+        at_revision: ?Revision,
+        diag: *Diag,
+    ) store.Error!store.GetResult {
+        return of(context).inner.get(arena, key, at_revision, diag);
+    }
+
+    fn h_list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        options: store.ListOptions,
+        diag: *Diag,
+    ) store.Error!store.ListResult {
+        return of(context).inner.list(arena, options, diag);
+    }
+
+    fn h_watch(
+        context: *anyopaque,
+        options: store.WatchOptions,
+        diag: *Diag,
+    ) store.Error!store.Watch {
+        return of(context).inner.watch(options, diag);
+    }
+
+    fn h_lease_grant(context: *anyopaque, ttl_ms: u32, diag: *Diag) store.Error!store.Lease {
+        return of(context).inner.lease_grant(ttl_ms, diag);
+    }
+
+    fn h_lease_keepalive(
+        context: *anyopaque,
+        id: store.LeaseId,
+        diag: *Diag,
+    ) store.Error!store.Lease {
+        return of(context).inner.lease_keepalive(id, diag);
+    }
+
+    fn h_lease_revoke(context: *anyopaque, id: store.LeaseId, diag: *Diag) store.Error!Revision {
+        return of(context).inner.lease_revoke(id, diag);
+    }
+
+    fn h_lease_list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        diag: *Diag,
+    ) store.Error![]const store.LeaseInfo {
+        return of(context).inner.lease_list(arena, diag);
+    }
+
+    fn h_expire_leases(context: *anyopaque, diag: *Diag) store.Error!u32 {
+        return of(context).inner.expire_leases(diag);
+    }
+
+    fn h_compact(context: *anyopaque, revision: Revision, diag: *Diag) store.Error!void {
+        return of(context).inner.compact(revision, diag);
+    }
+
+    fn h_hash_at(context: *anyopaque, revision: Revision, diag: *Diag) store.Error!Hash {
+        return of(context).inner.hash_at(revision, diag);
+    }
+
+    /// The hook: a write through the wrapper, as another client's would be.
+    fn write_through(hooked: *Hooked) void {
+        _ = write(hooked.verified.interface(), "/other", "1") catch unreachable; // Memory store.
+    }
+};
+
+test "a write acknowledged while a status is in flight is not a rollback" {
+    // Goal: no false halt under normal concurrency. Method: the pair is at revision 1; the store
+    // answers a status with revision 1, and before that answer is checked another client's
+    // write is acknowledged (the pair moves to 2). The answer is late, not a rollback.
     var manual: ManualClock = .{};
     var memory: MemoryStore = undefined;
     memory.init(testing.allocator, manual.clock());
     defer memory.deinit();
-    var verified = VerifiedStore.init(memory.interface(), manual.clock(), null, null);
+    var hooked: Hooked = .{ .inner = memory.interface() };
+    var verified = VerifiedStore.init(hooked.interface(), manual.clock(), null, null);
+    hooked.verified = &verified;
     const guarded = verified.interface();
-    for ([_][]const u8{ "/a", "/b", "/c" }) |key| _ = try write(guarded, key, "1");
     var diag: Diag = undefined;
     diag.reset();
-    const early = try memory.interface().hash_at(2, &diag);
-    const result: store.TxnResult = .{ .succeeded = true, .revision = 2, .hash = early };
-    const behind = result.revision < verified.remembered().?.revision;
-    try testing.expect(behind);
-    try verified.settle(&diag);
+    _ = try write(guarded, "/a", "1");
+    hooked.after_status = Hooked.write_through;
+    const answer = try guarded.status(&diag);
+    try testing.expectEqual(@as(Revision, 1), answer.revision);
     try testing.expect(verified.halt_state() == null);
+    try testing.expectEqual(@as(Revision, 2), verified.remembered().?.revision);
+    // The pair never moves back, and the next status is the head.
+    try testing.expectEqual(@as(Revision, 2), (try guarded.status(&diag)).revision);
+    try testing.expectEqual(@as(Revision, 2), verified.remembered().?.revision);
+}
+
+test "a write result that is late behind a newer acknowledged write is not a rollback" {
+    // Goal: the same for `txn`: another writer's result (revision 3) is acknowledged while this
+    // one (revision 2) is being checked. Method: the hook writes after the inner txn answered.
+    // The case that matters most is the true rollback below, which still halts.
+    var manual: ManualClock = .{};
+    var memory: MemoryStore = undefined;
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var hooked: Hooked = .{ .inner = memory.interface() };
+    var verified = VerifiedStore.init(hooked.interface(), manual.clock(), null, null);
+    hooked.verified = &verified;
+    const guarded = verified.interface();
+    _ = try write(guarded, "/a", "1");
+    hooked.after_txn = Hooked.write_through;
+    try testing.expectEqual(@as(Revision, 2), try write(guarded, "/b", "1"));
+    try testing.expect(verified.halt_state() == null);
+    try testing.expectEqual(@as(Revision, 3), verified.remembered().?.revision);
+    // A result below what was acknowledged before the call began is a rollback.
+    var short: MemoryStore = undefined;
+    short.init(testing.allocator, manual.clock());
+    defer short.deinit();
+    _ = try write(short.interface(), "/a", "1");
+    hooked.inner = short.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const op: store.Op = .{ .put = .{ .key = "/c", .value = "1" } };
+    try expect_halted(guarded.txn(.{ .on_success = &.{op} }, &diag), &diag);
+}
+
+test "a read before any check passed verifies the store first" {
+    // Goal: a server that could not reach the store at start does not serve reads unchecked.
+    // Method: no check has run; the first `get` makes the wrapper read the status (and would
+    // halt on a store that went backwards), the second does not.
+    var manual: ManualClock = .{};
+    var memory: MemoryStore = undefined;
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    _ = try write(memory.interface(), "/a", "1");
+    var hooked: Hooked = .{ .inner = memory.interface() };
+    const made_up: Pair = .{ .revision = 5, .hash = @splat(0x42) };
+    var verified = VerifiedStore.init(hooked.interface(), manual.clock(), null, made_up);
+    const guarded = verified.interface();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    try expect_halted(guarded.get(arena_state.allocator(), "/a", null, &diag), &diag);
+    try testing.expectEqual(@as(u32, 1), hooked.status_calls);
+
+    var fresh = VerifiedStore.init(hooked.interface(), manual.clock(), null, null);
+    _ = try fresh.interface().get(arena_state.allocator(), "/a", null, &diag);
+    try testing.expectEqual(@as(u32, 2), hooked.status_calls);
+    _ = try fresh.interface().get(arena_state.allocator(), "/a", null, &diag);
+    try testing.expectEqual(@as(u32, 2), hooked.status_calls);
+}
+
+/// A `Remember` whose first save is held up: it runs a hook, then lands (a slow disk).
+const Reordering = struct {
+    file: ?Pair = null,
+    hook: ?*const fn (*Reordering) void = null,
+    verified: *VerifiedStore = undefined,
+    inner: Store = undefined,
+
+    fn remember(reordering: *Reordering) Remember {
+        return .{ .context = reordering, .save_fn = save };
+    }
+
+    fn save(context: *anyopaque, pair: Pair) bool {
+        const reordering: *Reordering = @ptrCast(@alignCast(context));
+        if (reordering.hook) |hook| {
+            reordering.hook = null;
+            hook(reordering);
+        }
+        reordering.file = pair;
+        return true;
+    }
+
+    fn accept_meanwhile(reordering: *Reordering) void {
+        var diag: Diag = undefined;
+        diag.reset();
+        reordering.verified.inner = reordering.inner;
+        _ = reordering.verified.accept(&diag) catch unreachable; // Memory store.
+    }
+};
+
+test "an old save that lands after accept's is rewritten" {
+    // Goal: after `accept`, the file holds the accepted pair even if a save that began earlier
+    // lands later. Method: a status saves revision 2 and is held up; meanwhile the operator
+    // accepts a store at revision 1 (written, then the slow save lands over it). The next status
+    // repairs the file, and a restart on the accepted store is not refused.
+    var manual: ManualClock = .{};
+    var long: MemoryStore = undefined;
+    long.init(testing.allocator, manual.clock());
+    defer long.deinit();
+    var short: MemoryStore = undefined;
+    short.init(testing.allocator, manual.clock());
+    defer short.deinit();
+    _ = try write(short.interface(), "/a", "1");
+    _ = try write(long.interface(), "/a", "1");
+    _ = try write(long.interface(), "/b", "1");
+    var reordering: Reordering = .{
+        .hook = Reordering.accept_meanwhile,
+        .inner = short.interface(),
+    };
+    const remember = reordering.remember();
+    var verified = VerifiedStore.init(long.interface(), manual.clock(), remember, null);
+    reordering.verified = &verified;
+    const guarded = verified.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try guarded.status(&diag);
+    try testing.expectEqual(@as(Revision, 2), reordering.file.?.revision); // The late one won.
+    try testing.expectEqual(@as(Revision, 1), verified.remembered().?.revision);
+    _ = try guarded.status(&diag);
+    try testing.expectEqual(@as(Revision, 1), reordering.file.?.revision);
+    var restarted = VerifiedStore.init(short.interface(), manual.clock(), null, reordering.file);
+    _ = try restarted.interface().status(&diag);
 }
 
 test "the newest pair is saved when the cluster goes idle, and a failed save is reported" {
@@ -756,10 +1040,10 @@ test "a result that began before accept is dropped" {
     });
     var diag: Diag = undefined;
     diag.reset();
-    const epoch = verified.epoch_now();
+    const snap = verified.snapshot();
     _ = try verified.accept(&diag);
     const stale: store.Status = .{ .revision = 1, .compacted_revision = 0, .hash = @splat(0x22) };
-    try verified.check(stale, epoch, &diag);
+    try verified.check(stale, snap, &diag);
     try testing.expect(verified.halt_state() == null);
     try testing.expectEqual(@as(Revision, 2), verified.remembered().?.revision);
 }
