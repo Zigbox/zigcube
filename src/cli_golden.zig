@@ -163,6 +163,16 @@ fn no_hash(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.no_hash(diag, 5, 380) == error.NoHash);
 }
 
+fn backwards(diag: *diag_mod.Diag) void { // store_failures.zig
+    const rollback: failures.Rollback = .{
+        .remembered_revision = 412,
+        .remembered_hash = @splat(0xa1),
+        .now_revision = 398,
+        .now_hash = @splat(0xe5),
+    };
+    assert(failures.went_backwards(diag, rollback) == error.BackendFailed);
+}
+
 fn future(diag: *diag_mod.Diag) void { // store_failures.zig
     assert(failures.future_read(diag, 9000, 412) == error.FutureRevision);
 }
@@ -382,6 +392,7 @@ const cases = [_]Case{
     relayed(.E0212, store_no_database),
     relayed(.E0213, store_dropped),
     relayed(.E0214, no_hash),
+    relayed(.E0215, backwards),
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),

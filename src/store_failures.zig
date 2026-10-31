@@ -111,3 +111,48 @@ pub fn no_memory(diag: *Diag) error{NoCapacity} {
     diag.fix(.{ .sentence = "ask for smaller pages, or raise the request arena limit" });
     return error.NoCapacity;
 }
+
+/// The first four bytes of a chain hash in hex: enough to tell two apart in a diagnostic.
+pub const ShortHash = [8]u8;
+
+pub fn short_hash(hash: store.Hash) ShortHash {
+    return std.fmt.bytesToHex(hash[0..4].*, .lower);
+}
+
+/// What the store answered where the server remembered `remembered`: `now` is the store's
+/// revision and hash at the same revision (or at its head when it is behind). `chain_start` is
+/// set when the store cannot say what its hash was at the remembered revision.
+pub const Rollback = struct {
+    remembered_revision: Revision,
+    remembered_hash: store.Hash,
+    now_revision: Revision,
+    now_hash: store.Hash,
+    chain_start: ?Revision = null,
+};
+
+pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
+    assert(diag.code == null);
+    diag.raise(.E0215);
+    const old = short_hash(rollback.remembered_hash);
+    const new = short_hash(rollback.now_hash);
+    if (rollback.chain_start) |start| {
+        diag.cause("the server remembers revision {d} ({s}); the store's chain starts at {d}", .{
+            rollback.remembered_revision, old, start,
+        });
+        diag.cause("the store cannot say what its hash was at {d}: it is not the store seen", .{
+            rollback.remembered_revision,
+        });
+    } else if (rollback.now_revision < rollback.remembered_revision) {
+        const line = "the server remembers revision {d} ({s}); the store is at revision {d} ({s})";
+        diag.cause(line, .{ rollback.remembered_revision, old, rollback.now_revision, new });
+        diag.cause("the store is behind: writes it acknowledged are gone", .{});
+    } else {
+        diag.cause("the server remembers revision {d} with hash {s}; the store has hash {s}", .{
+            rollback.remembered_revision, old, new,
+        });
+        diag.cause("the store holds a different history at that revision", .{});
+    }
+    const sentence = "look at which store this is; to keep it as it is, run";
+    diag.fix_with(sentence, "zcube store accept-rollback --confirm", .{});
+    return error.BackendFailed;
+}

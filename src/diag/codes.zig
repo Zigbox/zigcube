@@ -59,6 +59,7 @@ pub const Code = enum(u8) {
     E0212,
     E0213,
     E0214,
+    E0215,
     E0301,
     E0302,
     E0303,
@@ -587,6 +588,30 @@ pub const registry = [_]Entry{
         \\
         \\Ask for a revision at or above the start of the chain; the cause line
         \\names it. Nothing was changed.
+        ,
+    },
+    .{
+        .code = .E0215,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the store went backwards or forked",
+        .explanation =
+        \\The server remembers the highest revision it has seen and the chain
+        \\hash of that revision. The store now answers with a lower revision,
+        \\or with a different hash for the revision the server remembers, so
+        \\writes the store acknowledged are gone or the history has
+        \\diverged. This is what a failover to a replica that was behind, a
+        \\restore from an old backup, or a store pointed at by mistake looks
+        \\like. Acting on it would hand out placements and fences that
+        \\contradict ones already given.
+        \\
+        \\The server stops: controllers do not step and every store call
+        \\fails with this code until an operator looks. It never recovers by
+        \\itself. Look at the store (which database, which replica, which
+        \\backup). If the rolled-back or forked store is the one to keep, run
+        \\zcube store accept-rollback --confirm, which makes the server
+        \\remember the store as it is now and records a decision with the old
+        \\and new revision and hash.
         ,
     },
     .{
