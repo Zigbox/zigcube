@@ -14,17 +14,26 @@
 //!   a failure for the agent whose server acted: the same shape as a dropped reply, later.
 //! * **Duplicate** (requests): the server gets the request twice, back to back, and the agent
 //!   sees the first answer. A write that is not idempotent shows here.
-//! * **Reorder** (requests): the request is parked, the agent sees a timeout, and the request
-//!   reaches the server at the *next* call on that link, ahead of it. Stale writes arrive late,
-//!   after the agent has retried or moved on.
+//! * **Reorder** (requests): the request is parked with a delivery time drawn from the seed
+//!   (between `reorder_delay_ms_min` and `reorder_delay_ms_max` after it was sent), and the agent
+//!   sees a timeout. It reaches the server when the simulation's clock passes that time, which
+//!   the cluster reports with `tick`, independent of any call on the link: after newer requests
+//!   from the same agent, and possibly after the server's own clock has moved on (a lease that
+//!   expired meanwhile). The default bounds straddle the agent's timeout, so a stale write can
+//!   land after the agent's retry.
 //! * **Partition**, one-way and per link: `partition_up` stops requests, `partition_down` stops
-//!   replies. `heal` turns every fault off and drops what was parked.
+//!   replies. `heal` turns every fault off. It does not touch what is parked: a request that was
+//!   already in flight when the link was healed (or cut) still arrives, as a packet on the wire
+//!   does. A liveness bound after a heal must therefore allow `reorder_delay_ms_max` for the
+//!   stragglers.
 //!
 //! Duplicate and reorder act on requests only: a duplicated or late reply is read once by a
 //! synchronous caller and can change nothing, so the model leaves it out.
 //!
-//! The network owns no time. `last_call_ms` is how long the call took on the simulation's clock,
+//! The network owns no clock. `last_call_ms` is how long the call took on the simulation's clock,
 //! for the cluster to add; a call that fails takes the whole timeout, as a real agent waits it out.
+//! The cluster calls `tick` with the time after every advance, and that is when parked requests
+//! are due.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -60,6 +69,8 @@ pub const Faults = struct {
     reply: Direction = .{},
     duplicate_per_mille: u32 = 0,
     reorder_per_mille: u32 = 0,
+    reorder_delay_ms_min: u32 = constants.agent_io_timeout_ms,
+    reorder_delay_ms_max: u32 = 4 * constants.agent_io_timeout_ms,
     partition_up: bool = false,
     partition_down: bool = false,
 
@@ -84,6 +95,8 @@ const Parked = struct {
     target: []u8,
     body: []u8,
     hold_ms: u32,
+    /// The simulation time at which it reaches the server.
+    due_ms: u64,
 };
 
 const Link = struct {
@@ -101,6 +114,8 @@ pub const SimNet = struct {
     ports: [nodes_max]Port,
     /// How long the last call took, on the simulation's clock.
     last_call_ms: u32,
+    /// The simulation time as the cluster last reported it with `tick`.
+    now_ms: u64,
 
     const Port = struct { net: *SimNet, node: u32 };
 
@@ -114,6 +129,7 @@ pub const SimNet = struct {
             .links = @splat(.{}),
             .ports = undefined,
             .last_call_ms = 0,
+            .now_ms = 0,
         };
         for (&net.ports, 0..) |*port, node| port.* = .{ .net = net, .node = @intCast(node) };
     }
@@ -139,20 +155,63 @@ pub const SimNet = struct {
         return net.links[node].stats;
     }
 
-    /// Every fault off on every link; requests that were parked are gone.
+    /// Every fault off on every link. Requests already parked stay in flight (see the module doc).
     pub fn heal(net: *SimNet) void {
-        for (&net.links) |*link| {
-            link.faults = .{};
-            net.drop_parked(link);
+        for (&net.links) |*link| link.faults = .{};
+    }
+
+    /// The simulation is now at `now_ms`: every parked request that is due reaches the server,
+    /// earliest first (a tie goes to the lower node, then the older slot), whatever the state of
+    /// its link. Replies to them are dropped, because the agent gave up on them long ago.
+    pub fn tick(net: *SimNet, now_ms: u64) void {
+        assert(now_ms >= net.now_ms);
+        net.now_ms = now_ms;
+        for (0..nodes_max * parked_max) |_| {
+            const next = net.earliest_due() orelse return;
+            const link = &net.links[next.node];
+            const parked = link.parked[next.slot].?; // `earliest_due` found it there.
+            link.parked[next.slot] = null;
+            defer net.free_parked(parked);
+            link.stats.delivered_late += 1;
+            _ = net.hand_over(next.node, .{
+                .method = parked.method,
+                .target = parked.target,
+                .body = parked.body,
+                .hold_ms = parked.hold_ms,
+            });
         }
+        assert(net.earliest_due() == null); // Every slot was visited at most once above.
+    }
+
+    const Due = struct { node: u32, slot: u32 };
+
+    fn earliest_due(net: *const SimNet) ?Due {
+        var best: ?Due = null;
+        var best_ms: u64 = 0;
+        for (&net.links, 0..) |*link, node| {
+            for (link.parked, 0..) |slot, index| {
+                const parked = slot orelse continue;
+                if (parked.due_ms > net.now_ms) continue;
+                if (best != null) {
+                    if (parked.due_ms >= best_ms) continue;
+                }
+                best = .{ .node = @intCast(node), .slot = @intCast(index) };
+                best_ms = parked.due_ms;
+            }
+        }
+        return best;
+    }
+
+    fn free_parked(net: *SimNet, parked: Parked) void {
+        net.gpa.free(parked.method);
+        net.gpa.free(parked.target);
+        net.gpa.free(parked.body);
     }
 
     fn drop_parked(net: *SimNet, link: *Link) void {
         for (&link.parked) |*slot| {
             const parked = slot.* orelse continue;
-            net.gpa.free(parked.method);
-            net.gpa.free(parked.target);
-            net.gpa.free(parked.body);
+            net.free_parked(parked);
             slot.* = null;
         }
     }
@@ -181,7 +240,6 @@ pub const SimNet = struct {
         const faults = link.faults;
         const timeout_ms = request.hold_ms + constants.agent_io_timeout_ms;
         net.last_call_ms = 0;
-        net.deliver_parked(port.node);
         if (faults.partition_up) {
             link.stats.partitioned += 1;
             return net.no_answer(diag, port.node, timeout_ms, "the link is cut: requests are lost");
@@ -191,7 +249,7 @@ pub const SimNet = struct {
             return net.no_answer(diag, port.node, timeout_ms, "the request was lost");
         }
         if (net.roll(faults.reorder_per_mille)) {
-            if (net.park(link, request)) {
+            if (net.park(link, request, faults)) {
                 return net.no_answer(diag, port.node, timeout_ms, "the request was delayed");
             }
         }
@@ -243,46 +301,32 @@ pub const SimNet = struct {
 
     // ---- Parked requests ----
 
-    /// Keeps a copy to deliver at the next call. False if all the slots are full.
-    fn park(net: *SimNet, link: *Link, request: client.Request) bool {
+    /// Keeps a copy to deliver at a time drawn from the link's bounds. False if all the slots
+    /// are full or memory is.
+    fn park(net: *SimNet, link: *Link, request: client.Request, faults: Faults) bool {
+        assert(faults.reorder_delay_ms_min <= faults.reorder_delay_ms_max);
         for (&link.parked) |*slot| {
             if (slot.* != null) continue;
             const method = net.gpa.dupe(u8, request.method) catch return false;
             const target = net.gpa.dupe(u8, request.target) catch return false;
             const body = net.gpa.dupe(u8, request.body) catch return false;
+            const random = net.prng.random();
+            const wait_ms = random.intRangeAtMost(
+                u32,
+                faults.reorder_delay_ms_min,
+                faults.reorder_delay_ms_max,
+            );
             slot.* = .{
                 .method = method,
                 .target = target,
                 .body = body,
                 .hold_ms = request.hold_ms,
+                .due_ms = net.now_ms + wait_ms,
             };
             link.stats.parked += 1;
             return true;
         }
         return false;
-    }
-
-    /// Late requests reach the server now, ahead of the call that found them, unless the link has
-    /// been cut since.
-    fn deliver_parked(net: *SimNet, node: u32) void {
-        const link = &net.links[node];
-        for (&link.parked) |*slot| {
-            const parked = slot.* orelse continue;
-            slot.* = null;
-            defer {
-                net.gpa.free(parked.method);
-                net.gpa.free(parked.target);
-                net.gpa.free(parked.body);
-            }
-            if (link.faults.partition_up) continue;
-            link.stats.delivered_late += 1;
-            _ = net.hand_over(node, .{
-                .method = parked.method,
-                .target = parked.target,
-                .body = parked.body,
-                .hold_ms = parked.hold_ms,
-            });
-        }
     }
 };
 
@@ -294,6 +338,9 @@ const Counter = struct {
     writes: u32 = 0,
     last_body: [64]u8 = undefined,
     last_body_len: u32 = 0,
+    /// What reached the server, in order: 'G' for a read, 'W' for a write.
+    order: [16]u8 = @splat('-'),
+    order_len: u32 = 0,
 
     fn handler(counter: *Counter) Handler {
         return .{ .context = counter, .handle_fn = handle };
@@ -307,7 +354,12 @@ const Counter = struct {
     ) client.Reply {
         _ = node;
         const counter: *Counter = @ptrCast(@alignCast(context));
-        if (std.mem.eql(u8, request.method, "GET")) counter.gets += 1 else counter.writes += 1;
+        const is_read = std.mem.eql(u8, request.method, "GET");
+        if (is_read) counter.gets += 1 else counter.writes += 1;
+        if (counter.order_len < counter.order.len) {
+            counter.order[counter.order_len] = if (is_read) 'G' else 'W';
+            counter.order_len += 1;
+        }
         counter.last_body_len = @intCast(request.body.len);
         @memcpy(counter.last_body[0..request.body.len], request.body);
         const total = counter.gets + counter.writes;
@@ -419,32 +471,84 @@ test "a duplicated write reaches the server twice and the agent sees one answer"
     try testing.expectEqual(@as(u32, 1), net.stats(0).duplicated);
 }
 
-test "a reordered request arrives at the next call, ahead of it" {
-    // Goal: reorder. Method: park the first write (the agent sees a timeout), then call again
-    // with reordering off; the server sees the parked write first, then the new request.
+test "a reordered request arrives by the clock, after a newer write from the same agent" {
+    // Goal: reorder that really reorders. Method: park a write with a delivery time well past the
+    // agent's timeout, as the cluster would run it: the agent times out, sends a newer write that
+    // the server gets, and only then does the clock pass the stale one's time. The server must
+    // see newer, then stale; the stale one must not arrive at any call on the link.
     var counter: Counter = .{};
     var net: SimNet = undefined;
     const link = make(&counter, &net);
     defer net.deinit();
     var diag: Diag = undefined;
-    net.set_faults(0, .{ .reorder_per_mille = 1000 });
+    const late_ms: u32 = 5 * constants.agent_io_timeout_ms;
+    net.set_faults(0, .{
+        .reorder_per_mille = 1000,
+        .reorder_delay_ms_min = late_ms,
+        .reorder_delay_ms_max = late_ms,
+    });
     diag.reset();
     try testing.expectError(error.Unreachable, link.call(testing.allocator, write, &diag));
     try testing.expectEqual(@as(u32, 0), counter.writes);
-    net.links[0].faults.reorder_per_mille = 0;
+    var now_ms: u64 = net.last_call_ms;
+    net.tick(now_ms);
+    net.set_faults(0, .{});
     diag.reset();
-    const reply = try link.call(testing.allocator, read, &diag);
-    defer testing.allocator.free(reply.body);
+    const newer = try link.call(testing.allocator, read, &diag); // A newer request: the link works.
+    testing.allocator.free(newer.body);
+    now_ms += net.last_call_ms + constants.agent_io_timeout_ms;
+    net.tick(now_ms);
+    try testing.expectEqual(@as(u32, 0), counter.writes);
+    diag.reset();
+    const again = try link.call(testing.allocator, read, &diag);
+    testing.allocator.free(again.body);
+    try testing.expectEqual(@as(u32, 0), counter.writes); // Calls alone never deliver it.
+    net.tick(late_ms - 1);
+    try testing.expectEqual(@as(u32, 0), counter.writes);
+    net.tick(late_ms);
     try testing.expectEqual(@as(u32, 1), counter.writes);
-    try testing.expectEqual(@as(u32, 1), counter.gets);
-    try testing.expectEqualStrings("{\"n\":2}", reply.body);
+    try testing.expectEqualStrings("GGW", counter.order[0..counter.order_len]);
     try testing.expectEqual(@as(u32, 1), net.stats(0).delivered_late);
+    net.tick(late_ms * 2);
+    try testing.expectEqual(@as(u32, 1), counter.writes); // Delivered once.
+}
+
+test "a parked request is delivered in due order, across a cut link and a heal" {
+    // Goal: packets already in flight arrive whatever happens to the link, earliest first.
+    // Method: park two writes with different times on two links, cut one link and heal the
+    // other, and tick past both.
+    var counter: Counter = .{};
+    var net: SimNet = undefined;
+    net.init(testing.allocator, counter.handler(), 5);
+    defer net.deinit();
+    var diag: Diag = undefined;
+    const slow: Faults = .{
+        .reorder_per_mille = 1000,
+        .reorder_delay_ms_min = 9000,
+        .reorder_delay_ms_max = 9000,
+    };
+    var quick = slow;
+    quick.reorder_delay_ms_min = 2000;
+    quick.reorder_delay_ms_max = 2000;
+    net.set_faults(0, slow);
+    net.set_faults(1, quick);
+    diag.reset();
+    try testing.expectError(error.Unreachable, net.transport(0).call(testing.allocator, write, &diag));
+    diag.reset();
+    try testing.expectError(error.Unreachable, net.transport(1).call(testing.allocator, read, &diag));
+    net.set_faults(0, .{ .partition_up = true });
+    net.heal();
+    net.tick(2000);
+    try testing.expectEqualStrings("G", counter.order[0..counter.order_len]);
+    net.tick(9000);
+    try testing.expectEqualStrings("GW", counter.order[0..counter.order_len]);
+    try testing.expectEqual(@as(u32, 2), net.stats(0).delivered_late + net.stats(1).delivered_late);
 }
 
 test "a one-way partition and its heal" {
     // Goal: partitions. Method: cut requests (the server sees nothing), then replies (the server
     // acts and the agent hears nothing), then heal and see both directions work; a request parked
-    // before the heal is gone.
+    // before the heal still arrives (it was in flight), when its time comes.
     var counter: Counter = .{};
     var net: SimNet = undefined;
     const link = make(&counter, &net);
@@ -464,12 +568,15 @@ test "a one-way partition and its heal" {
     net.set_faults(0, .{ .reorder_per_mille = 1000 });
     diag.reset();
     try testing.expectError(error.Unreachable, link.call(testing.allocator, write, &diag));
+    net.set_faults(0, .{ .partition_up = true });
     net.heal();
     diag.reset();
     const reply = try link.call(testing.allocator, write, &diag);
     defer testing.allocator.free(reply.body);
     try testing.expectEqual(@as(u32, 2), counter.writes);
-    try testing.expectEqual(@as(u32, 0), net.stats(0).delivered_late);
+    net.tick(10 * constants.agent_io_timeout_ms);
+    try testing.expectEqual(@as(u32, 3), counter.writes);
+    try testing.expectEqual(@as(u32, 1), net.stats(0).delivered_late);
 }
 
 test "the same seed draws the same faults" {
