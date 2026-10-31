@@ -17,61 +17,57 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const constants = @import("constants.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 
-pub const file_spec = "spec.json";
-pub const file_run = "run.json";
-pub const file_child = "child.pid";
-pub const file_supervisor = "supervisor.pid";
-pub const file_lock = "lock";
-pub const file_forced = "forced";
+pub const file_spec = agent_records.file_spec;
+pub const file_run = agent_records.file_run;
+pub const file_child = agent_records.file_child;
+pub const file_supervisor = agent_records.file_supervisor;
+pub const file_lock = agent_records.file_lock;
+pub const file_forced = agent_records.file_forced;
 
-pub const Pair = [2][]const u8;
-
-/// `spec.json`: the `runtime.Spec` the container was started with, and when.
-pub const SpecFile = struct {
-    name: []const u8,
-    image: []const u8,
-    command: []const []const u8,
-    env: []const Pair = &.{},
-    labels: []const Pair = &.{},
-    started_at_ms: u64,
-};
-
-pub const RunKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
-
-/// Whose fault a start that failed was, so that the agent can blame correctly.
-pub const Blame = enum { user, environment };
-
-/// `run.json`.
-pub const RunFile = struct {
-    kind: RunKind,
-    code: ?u8 = null,
-    signal: ?u8 = null,
-    /// For `start_failed`: what the host said, in one sentence.
-    cause: ?[]const u8 = null,
-    blame: ?Blame = null,
-};
+pub const Pair = agent_records.Pair;
+pub const SpecFile = agent_records.SpecFile;
+pub const RunKind = agent_records.RunKind;
+pub const Blame = agent_records.Blame;
+pub const RunFile = agent_records.RunFile;
 
 pub const WriteError = error{WriteFailed};
 pub const ReadError = error{ Absent, Unreadable, OutOfMemory };
 
-/// Writes `data` as `name` in `dir`, whole or not at all.
+/// Writes `data` as `name` in `dir`, whole or not at all, and durably: the temporary file is
+/// fsynced before the rename (so a host crash cannot leave the new name on empty contents) and
+/// the directory after it (so the rename itself survives). Names are at most
+/// `agent_state.name_bytes_max` long, the same limit `SimState` enforces.
 pub fn write_atomic(io: std.Io, dir: Dir, name: []const u8, data: []const u8) WriteError!void {
     assert(name.len > 0);
-    assert(name.len + ".tmp".len <= temp_name_bytes_max);
+    assert(name.len <= agent_state.name_bytes_max);
     if (data.len > constants.fake_file_bytes_max) return error.WriteFailed;
     var temp: [temp_name_bytes_max]u8 = undefined;
     const temp_name = std.fmt.bufPrint(&temp, "{s}.tmp", .{name}) catch unreachable; // Sized.
-    dir.writeFile(io, .{ .sub_path = temp_name, .data = data }) catch return error.WriteFailed;
+    {
+        const file = dir.createFile(io, temp_name, .{}) catch return error.WriteFailed;
+        defer file.close(io);
+        file.writeStreamingAll(io, data) catch return error.WriteFailed;
+        file.sync(io) catch return error.WriteFailed;
+    }
     dir.rename(temp_name, dir, name, io) catch return error.WriteFailed;
+    sync_dir(io, dir) catch return error.WriteFailed;
 }
 
-const temp_name_bytes_max: u32 = 32;
+/// fsync of a directory: opened read-only like a file, which POSIX allows, then synced.
+pub fn sync_dir(io: std.Io, dir: Dir) error{WriteFailed}!void {
+    const handle = dir.openFile(io, ".", .{}) catch return error.WriteFailed;
+    defer handle.close(io);
+    handle.sync(io) catch return error.WriteFailed;
+}
+
+const temp_name_bytes_max: u32 = agent_state.name_bytes_max + ".tmp".len;
 
 pub fn write_json(io: std.Io, dir: Dir, name: []const u8, value: anytype) WriteError!void {
     var buffer: [constants.fake_file_bytes_max]u8 = undefined;
@@ -134,9 +130,11 @@ pub fn exists(io: std.Io, dir: Dir, name: []const u8) bool {
 
 /// `AgentState` over a directory: the shell's implementation of the interface that `SimState`
 /// models. A name is a path under `root` ("containers/a/spec.json"); a put is `write_atomic`.
-/// An append reads the file and writes it back whole, which is stronger than the model allows
-/// (the model may lose a tail), so anything that survives the model survives this. `list` reads
-/// one directory: the prefix's directory part, filtered by its last part.
+/// An append reads the file and writes it back whole and synced, which is stronger than the model
+/// allows (the model may lose an unsynced tail), so anything that survives the model survives
+/// this. `list` reads one directory: the prefix's directory part, filtered by its last part, with
+/// subdirectories shown once as `name/`. A real I/O failure is `error.Io`, never `Crashed`,
+/// which only the simulation raises.
 pub const DirState = struct {
     io: std.Io,
     root: Dir,
@@ -163,14 +161,36 @@ pub const DirState = struct {
         name: []const u8,
         create: bool,
     ) agent_state.Error!struct { dir: Dir, base: []const u8, owned: bool } {
+        assert(name.len > 0);
+        assert(name.len <= agent_state.name_bytes_max);
         const cut = std.mem.lastIndexOfScalar(u8, name, '/') orelse
             return .{ .dir = self.root, .base = name, .owned = false };
-        if (create) self.root.createDirPath(self.io, name[0..cut]) catch return error.Crashed;
+        if (create) try self.make_path(name[0..cut]);
         const dir = self.root.openDir(self.io, name[0..cut], .{}) catch |err| switch (err) {
             error.FileNotFound => return error.Absent,
-            else => return error.Crashed,
+            else => return error.Io,
         };
         return .{ .dir = dir, .base = name[cut + 1 ..], .owned = true };
+    }
+
+    /// The directories of `path`, each made durable in its parent, so that a file written below
+    /// them is not lost with a directory entry that never reached the disk.
+    fn make_path(self: *DirState, path: []const u8) agent_state.Error!void {
+        var end: usize = 0;
+        while (end < path.len) {
+            end = std.mem.indexOfScalarPos(u8, path, end, '/') orelse path.len;
+            self.root.createDirPath(self.io, path[0..end]) catch return error.Io;
+            const cut = std.mem.lastIndexOfScalar(u8, path[0..end], '/');
+            const parent = if (cut) |i| path[0..i] else "";
+            if (parent.len == 0) {
+                sync_dir(self.io, self.root) catch return error.Io;
+            } else {
+                const dir = self.root.openDir(self.io, parent, .{}) catch return error.Io;
+                defer dir.close(self.io);
+                sync_dir(self.io, dir) catch return error.Io;
+            }
+            end += 1;
+        }
     }
 
     fn put_atomic_impl(
@@ -182,7 +202,7 @@ pub const DirState = struct {
         if (data.len > agent_state.file_bytes_max) return error.TooBig;
         const place = try self.locate(name, true);
         defer if (place.owned) place.dir.close(self.io);
-        write_atomic(self.io, place.dir, place.base, data) catch return error.Crashed;
+        write_atomic(self.io, place.dir, place.base, data) catch return error.Io;
     }
 
     fn append_impl(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
@@ -199,7 +219,7 @@ pub const DirState = struct {
         const joined = fixed.allocator().alloc(u8, before.len + data.len) catch return error.TooBig;
         @memcpy(joined[0..before.len], before);
         @memcpy(joined[before.len..], data);
-        write_atomic(self.io, place.dir, place.base, joined) catch return error.Crashed;
+        write_atomic(self.io, place.dir, place.base, joined) catch return error.Io;
     }
 
     fn read_impl(
@@ -213,7 +233,7 @@ pub const DirState = struct {
         return read_bytes(self.io, place.dir, place.base, arena) catch |err| switch (err) {
             error.Absent => error.Absent,
             error.OutOfMemory => error.OutOfMemory,
-            error.Unreadable => error.Crashed,
+            error.Unreadable => error.Io,
         };
     }
 
@@ -223,8 +243,9 @@ pub const DirState = struct {
         defer if (place.owned) place.dir.close(self.io);
         place.dir.deleteFile(self.io, place.base) catch |err| switch (err) {
             error.FileNotFound => return error.Absent,
-            else => return error.Crashed,
+            else => return error.Io,
         };
+        sync_dir(self.io, place.dir) catch return error.Io;
     }
 
     fn list_impl(
@@ -245,10 +266,11 @@ pub const DirState = struct {
         defer if (parent.len > 0) dir.close(self.io);
         var iterator = dir.iterate();
         for (0..constants.fake_dir_entries_max) |_| {
-            const entry = (iterator.next(self.io) catch return error.Crashed) orelse break;
-            if (entry.kind != .file) continue;
+            const entry = (iterator.next(self.io) catch return error.Io) orelse break;
+            if (entry.kind != .file and entry.kind != .directory) continue;
             if (!std.mem.startsWith(u8, entry.name, prefix[cut..])) continue;
-            const full = try std.fmt.allocPrint(arena, "{s}{s}", .{ parent, entry.name });
+            const slash = if (entry.kind == .directory) "/" else "";
+            const full = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ parent, entry.name, slash });
             try names.append(arena, full);
         }
         std.mem.sort([]const u8, names.items, {}, name_less);
@@ -312,6 +334,9 @@ test "DirState keeps the AgentState promises the model makes" {
     const names = try agent.list(arena, "containers/a/");
     try testing.expectEqual(@as(usize, 2), names.len);
     try testing.expectEqualStrings("containers/a/log", names[0]);
+    const dirs = try agent.list(arena, "containers/");
+    try testing.expectEqual(@as(usize, 1), dirs.len);
+    try testing.expectEqualStrings("containers/a/", dirs[0]);
     try agent.remove("containers/a/log");
     try testing.expectError(error.Absent, agent.remove("containers/a/log"));
 }
