@@ -447,7 +447,8 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
         .user => {
             if (code == .E0101) return 404;
             if (code == .E0203) return 410;
-            if (code == .E0105) return 409;
+            // The state the request rested on is not (or no longer) there.
+            if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
             return 400;
         },
         .environment => return 503,
@@ -1077,7 +1078,8 @@ const Call = struct {
         if (std.mem.eql(u8, first, "store")) return call.accept_rollback();
         if (std.mem.eql(u8, first, "repair")) return call.repair_allocation(id);
         if (!std.mem.eql(u8, first, "apply")) {
-            return bad_request(ctx, "method", "POST is accepted at /v1/apply only");
+            const where = "POST is accepted at /v1/apply, /v1/store and /v1/repair";
+            return bad_request(ctx, "method", where);
         }
         try call.query.allow(ctx, &.{"dry_run"});
         try call.no_more();

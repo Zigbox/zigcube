@@ -310,7 +310,13 @@ fn read_body(
         refuse_request(work, ctx, request, 411, .E0104, cause);
         return error.Refused;
     }
-    const length = parsed.content_length orelse return "";
+    // RFC 9112 6.3: a request with neither Content-Length nor Transfer-Encoding has no body. A
+    // POST without either (`curl -X POST`) is told so, or std.http asserts when it responds.
+    if (parsed.content_length == null) {
+        if (!parsed.has_body_method) return "";
+        request.head.content_length = 0;
+    }
+    const length = request.head.content_length.?;
     if (length > constants.http_body_bytes_max) {
         const cause = "the request body is larger than 65536 bytes";
         refuse_request(work, ctx, request, 413, .E0108, cause);

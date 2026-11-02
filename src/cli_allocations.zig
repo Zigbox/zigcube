@@ -24,7 +24,12 @@ const Options = cli_args.Options;
 const Report = cli_report.Report;
 const Writer = std.Io.Writer;
 
-const Tally = struct { cpu_millis: u64, memory_bytes: u64, count: u32 };
+const Allocated = struct { cpu_millis: u64, memory_bytes: u64 };
+
+/// `records.Tally` as the server writes it.
+const Tally = struct { allocated: Allocated, count: u32 };
+
+const zero: Tally = .{ .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 }, .count = 0 };
 
 const Finding = struct { decision: []const u8, revision: u64 };
 
@@ -100,15 +105,15 @@ fn check_text(arena: Allocator, body: *const Check) Error![]const u8 {
 fn tally_text(arena: Allocator, tally: Tally) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{d}, {d}m, {d}B", .{
         tally.count,
-        tally.cpu_millis,
-        tally.memory_bytes,
+        tally.allocated.cpu_millis,
+        tally.allocated.memory_bytes,
     });
 }
 
 fn inconsistent(report: *Report, body: *const Check, node: *const CheckNode) Error {
     assert(report.diag.code == null);
     assert(!node.consistent);
-    const recorded = node.recorded orelse Tally{ .cpu_millis = 0, .memory_bytes = 0, .count = 0 };
+    const recorded = node.recorded orelse zero;
     report.diag.raise(.E0404);
     report.diag.while_("checking the allocation accounting at revision {d}", .{body.revision});
     report.diag.cause(
@@ -119,9 +124,9 @@ fn inconsistent(report: *Report, body: *const Check, node: *const CheckNode) Err
             body.nodes.len,
             node.node,
             recorded.count,
-            recorded.cpu_millis,
+            recorded.allocated.cpu_millis,
             node.reconstructed.count,
-            node.reconstructed.cpu_millis,
+            node.reconstructed.allocated.cpu_millis,
         },
     );
     report.diag.fix_with("see what a repair would write:", "zcube repair allocations {s}", .{
@@ -177,15 +182,18 @@ test "check: the table names both totals, the disagreement and the finding" {
     const nodes = [_]CheckNode{
         .{
             .node = "node1",
-            .recorded = .{ .cpu_millis = 300, .memory_bytes = 3072, .count = 3 },
-            .reconstructed = .{ .cpu_millis = 200, .memory_bytes = 2048, .count = 2 },
+            .recorded = .{ .allocated = .{ .cpu_millis = 300, .memory_bytes = 3072 }, .count = 3 },
+            .reconstructed = .{
+                .allocated = .{ .cpu_millis = 200, .memory_bytes = 2048 },
+                .count = 2,
+            },
             .consistent = false,
             .finding = .{ .decision = "0000000000042-0003-0001", .revision = 6 },
         },
         .{
             .node = "node2",
             .recorded = null,
-            .reconstructed = .{ .cpu_millis = 0, .memory_bytes = 0, .count = 0 },
+            .reconstructed = zero,
             .consistent = true,
             .finding = null,
         },
