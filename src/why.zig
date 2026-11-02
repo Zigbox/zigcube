@@ -52,6 +52,16 @@ pub const Step = struct {
     diagnostic: ?records.Raw = null,
 };
 
+/// How often the controllers took one action on the subject for one kind of cause
+/// (`/decision-summaries/`). Shown beside the chain, never as a step of it.
+pub const SummaryLine = struct {
+    action: []const u8,
+    cause: []const u8,
+    count: u64,
+    first_at_ms: u64,
+    last_at_ms: u64,
+};
+
 pub const Result = struct {
     v: u32 = 1,
     revision: store.Revision,
@@ -59,6 +69,8 @@ pub const Result = struct {
     at_decision: ?[]const u8,
     state: State,
     steps: []const Step,
+    /// The subject's summaries, by action and then cause (additive in the JSON).
+    summaries: []const SummaryLine = &.{},
 };
 
 /// Explains `subject`. `at_decision` starts the chain at that decision instead of the newest.
@@ -80,7 +92,34 @@ pub fn why(
         .at_decision = at_decision,
         .state = state,
         .steps = steps.items,
+        .summaries = try summaries_of(ctx, subject),
     };
+}
+
+/// The summaries of `subject`: one page of the store's list, which holds far more than any
+/// subject has (one per action and kind of cause).
+fn summaries_of(ctx: *const Context, subject: records.Subject) Error![]const SummaryLine {
+    const prefix = records.summary_prefix(subject.kind, subject.name);
+    const page = try ctx.store.list(ctx.arena, .{
+        .prefix = prefix.slice(),
+        .limit = constants.store_list_limit_max,
+    }, ctx.diag);
+    var lines: std.ArrayList(SummaryLine) = .empty;
+    for (page.kvs) |kv| {
+        const rest = kv.key[prefix.len..];
+        const slash = std.mem.lastIndexOfScalar(u8, rest, '/') orelse
+            return records.malformed(ctx.diag, kv.key, "Summary");
+        const record = try records.read(records.Summary, ctx.arena, kv, ctx.diag);
+        lines.append(ctx.arena, .{
+            .action = rest[0..slash],
+            .cause = rest[slash + 1 ..],
+            .count = record.count,
+            .first_at_ms = record.first_at_ms,
+            .last_at_ms = record.last_at_ms,
+        }) catch return failures.no_memory(ctx.diag);
+    }
+    assert(lines.items.len == page.kvs.len);
+    return lines.items;
 }
 
 // ---- The state line ----------------------------------------------------------------------------
@@ -446,7 +485,29 @@ pub fn render_text(
         }
         writer.print("  \u{2190} {s}\n", .{step.text}) catch return error.OutOfMemory;
     }
+    for (result.summaries) |line| try render_summary(writer, line);
     return out.toOwnedSlice();
+}
+
+/// "replace_replica (observed): 142 times since 2025-10-24 23:13:20Z", under the chain.
+fn render_summary(writer: *std.Io.Writer, line: SummaryLine) Allocator.Error!void {
+    assert(line.count > 0);
+    const times = if (line.count == 1) "time" else "times";
+    writer.print("  {s} ({s}): {d} {s} since ", .{
+        line.action, line.cause, line.count, times,
+    }) catch return error.OutOfMemory;
+    const since: std.time.epoch.EpochSeconds = .{ .secs = line.first_at_ms / 1000 };
+    const date = since.getEpochDay().calculateYearDay();
+    const month = date.calculateMonthDay();
+    const clock = since.getDaySeconds();
+    writer.print("{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}Z\n", .{
+        date.year,
+        @backingInt(month.month),
+        month.day_index + 1,
+        clock.getHoursIntoDay(),
+        clock.getMinutesIntoHour(),
+        clock.getSecondsIntoMinute(),
+    }) catch return error.OutOfMemory;
 }
 
 /// Writes a diagnostic as the step's block: the arrow before its first line, the rest indented
@@ -559,6 +620,18 @@ test "why follows a replacement back through the decisions to the observed exit"
     try testing.expectEqualStrings("create_replica", replica.steps[1].decision.?.action);
     try testing.expectEqualStrings("replace_replica", replica.steps[2].decision.?.action);
     try testing.expectEqual(StepType.observed, replica.steps[replica.steps.len - 1].type);
+
+    // The repetition is counted beside the chain, never in it.
+    var counted = false;
+    for (service.summaries) |line| {
+        if (!std.mem.eql(u8, line.action, "replace_replica")) continue;
+        try testing.expectEqual(@as(u64, 1), line.count);
+        counted = true;
+    }
+    try testing.expect(counted);
+    const text = try render_text(ctx.arena, &service, false);
+    const wanted = "replace_replica (";
+    try testing.expect(std.mem.indexOf(u8, text, wanted) != null);
 }
 
 test "why ends at the desired spec for a scale-up, and a missing link is a gone step" {
