@@ -12,6 +12,9 @@ zcube [options] delete service <name>   delete a service; its replicas are stopp
 zcube [options] get service [name]      services and how many replicas run
 zcube [options] get replicas [service]  replicas, where they run and how they are doing
 zcube [options] why <kind> <name>       why a service, replica or node is as it is
+zcube [options] check allocations       every node's allocation record against its assignments
+zcube [options] repair allocations <node> [--confirm]
+                                        rewrite a node's record from its assignments
 zcube [options] explain <code>          explain a diagnostic code, offline
 zcube [options] bundle --last           the evidence for the last failure
 zcube [options] bundle <kind> <name>    the evidence for a service, replica or node
@@ -26,6 +29,7 @@ zcube help | version
 | `-y`, `--yes` | `apply`, `delete`: do not ask first |
 | `--dry-run` | `apply`: show the change and stop |
 | `--no-redact` | `bundle`: keep secrets in the bundle (prints a warning) |
+| `--confirm` | `repair allocations`, `store accept-rollback`: do it (without it, say what it would do) |
 
 Options may come before or after the command. `--` ends them. Anything else that starts with `-`
 is `ZC-E0111`.
@@ -104,6 +108,31 @@ service broken: 0/1 running
 ```
 
 `--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step.
+
+## check and repair allocations
+
+The scheduler keeps a record per node of what it has placed there (`/allocations/<node>`,
+[keys.md](keys.md)); the allocation auditor rebuilds that total from the node's assignments after
+every scheduler pass and opens a finding (`ZC-B0003`, in `zcube why node`) on a node where they
+disagree. The scheduler places nothing on such a node until it is repaired.
+`zcube check allocations` (`GET /v1/check/allocations`, [api.md](api.md)) shows both totals for
+every node, as assignments, cpu millis and memory bytes:
+
+```
+NODE   RECORDED        ASSIGNED        AGREE  FINDING
+node1  3, 300m, 3072B  2, 200m, 2048B  NO     0000000000042-0003-0001
+node2  none            0, 0m, 0B       yes    -
+at revision 7: 1 of 2 nodes disagree (assignments, cpu, memory)
+```
+
+It exits 0 when every node agrees and fails with `ZC-E0404` (exit 1) when one does not, so a
+script notices; `-o json` prints the server's answer as it is. `zcube repair allocations node1`
+says what it would write and stops (`ZC-E0401`); with `--confirm` it writes, records a
+`repair_allocation` decision that cites the finding, and prints
+`repaired node1: recorded 3, 300m, 3072B, now 2, 200m, 2048B (revision 8, decision …)`. A node with
+no open finding is `ZC-E0402`; one whose accounting kept moving during the request is `ZC-E0403`
+(run it again). The texts above are the CLI's unit and golden tests (`src/cli_allocations.zig`,
+`src/testdata/cli/E040*.txt`).
 
 ## explain
 
@@ -209,7 +238,8 @@ reads; with none it is `ZC-E0117`.
 ## Codes the command line raises
 
 `ZC-E0101` to `E0108` are documented in [api.md](api.md); the command line raises `E0101` (a service
-that does not exist), `E0102`, `E0103` and relays the rest from the server.
+that does not exist), `E0102`, `E0103` and relays the rest from the server, as it relays the
+repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 
 | Code | Blame | Summary |
 | --- | --- | --- |
@@ -226,6 +256,7 @@ that does not exist), `E0102`, `E0103` and relays the rest from the server.
 | `ZC-W0119` | (warning) | `--no-redact` keeps secrets in the bundle |
 | `ZC-E0120` | environment | zcube ran out of memory |
 | `ZC-E0121` | user | the lease ttl is one an agent cannot fence in time |
+| `ZC-E0404` | user | a node's accounting disagrees with its assignments (`check allocations`, exit 1) |
 | `ZC-B0002` | internal | zcube failed in a way it should not (a command failed and said nothing) |
 
 ## How it is tested

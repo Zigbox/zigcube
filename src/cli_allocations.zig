@@ -129,7 +129,7 @@ fn inconsistent(report: *Report, body: *const Check, node: *const CheckNode) Err
             node.reconstructed.allocated.cpu_millis,
         },
     );
-    report.diag.fix_with("see what a repair would write:", "zcube repair allocations {s}", .{
+    report.diag.fix_with("see what a repair would write", "zcube repair allocations {s}", .{
         node.node,
     });
     return error.Failed;

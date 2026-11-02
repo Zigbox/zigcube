@@ -325,7 +325,14 @@ both commit (no phantoms). Lifetime: while the node exists.
 Written by the allocation auditor when the sum it reconstructs from `/assigned/<node>/` differs
 from `/allocations/<node>`, both read at `revision`. While it exists the scheduler places nothing
 on the node (its absence is in the placement compare set). It never repairs. Lifetime: until a
-later audit finds the node consistent.
+later audit finds the node consistent, when the auditor deletes it with an `audit_clear` decision.
+
+**The repair** (`zcube repair allocations <node> --confirm`, `POST /v1/repair/allocations/<node>`)
+is the scheduler's, run in the request (role `scheduler`, actor `scheduler`): one transaction
+compares `/allocations/<node>` and this finding at the revision the tally was rebuilt at (every
+placement and release rewrites `/allocations/<node>`, so that compare also catches an assignment
+the scheduler changed meanwhile), puts the rebuilt tally into `/allocations/<node>` and writes a
+`repair_allocation` decision that cites the finding's `decision`. It leaves the finding in place; the auditor's next pass clears it.
 
 ## `/node-status/<node>`: the node controller's judgement (C1 slice 3)
 
