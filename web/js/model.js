@@ -4,7 +4,7 @@
 
 import { setClockOffset } from "./ui.js";
 
-const PREFIXES = ["/services/", "/replicas/", "/nodes/", "/observed/", "/decisions/"];
+const PREFIXES = ["/services/", "/replicas/", "/assigned/", "/nodes/", "/observed/", "/decisions/"];
 const WATCH_TIMEOUT_MS = 25000;
 const POLL_MS = 2000;
 const STALE_AFTER_MS = 10000;
@@ -49,6 +49,7 @@ export class Model {
     this.rev = 0;
     this.services = new Map();
     this.replicas = new Map();
+    this.assigned = new Map(); // replica id -> node, from /assigned/<node>/<replica> (the scheduler's)
     this.nodes = new Map();
     this.observed = new Map();
     this.decisions = new Map();
@@ -140,7 +141,7 @@ export class Model {
     const first = await this.listAll(PREFIXES[0], 0);
     const at = first.revision;
     const rest = await Promise.all([
-      this.listAll("/replicas/", at), this.listAll("/nodes/", at), this.listAll("/observed/", at),
+      this.listAll("/replicas/", at), this.listAll("/assigned/", at), this.listAll("/nodes/", at), this.listAll("/observed/", at),
       this.listAll("/decisions/", at, "&reverse=true", DECISIONS_KEPT),
     ]);
     this.reset();
@@ -184,6 +185,7 @@ export class Model {
     const [, kind, a, b] = key.split("/");
     if (kind === "services") this.services.set(a, { value, mod: mod_revision });
     else if (kind === "replicas") this.replicas.set(b, { value, mod: mod_revision });
+    else if (kind === "assigned") this.assigned.set(b, a);
     else if (kind === "nodes") this.nodes.set(a, { value, mod: mod_revision, lease });
     else if (kind === "observed") this.observed.set(`${a}/${b}`, { value, mod: mod_revision, key });
     else if (kind === "decisions") {
@@ -198,6 +200,7 @@ export class Model {
     const [, kind, a, b] = key.split("/");
     if (kind === "services") this.services.delete(a);
     else if (kind === "replicas") this.replicas.delete(b);
+    else if (kind === "assigned") { if (this.assigned.get(b) === a) this.assigned.delete(b); }
     else if (kind === "nodes") this.nodes.delete(a);
     else if (kind === "observed") this.observed.delete(`${a}/${b}`);
     else if (kind === "decisions") this.decisions.delete(a);
@@ -214,10 +217,12 @@ export class Model {
     return this.memoized("replicas", () => {
       const out = [];
       for (const { value: r } of this.replicas.values()) {
-        const obs = r.node ? this.observed.get(`${r.node}/${r.id}`)?.value : null;
-        const registered = r.node ? this.nodes.has(r.node) : true;
+        // Where a replica runs is /assigned/<node>/<id> (docs/keys.md); the replica record carries no node.
+        const node = this.assigned.get(r.id) || "";
+        const obs = node ? this.observed.get(`${node}/${r.id}`)?.value : null;
+        const registered = node ? this.nodes.has(node) : true;
         let state;
-        if (!r.node) state = "unscheduled";
+        if (!node) state = "unscheduled";
         else if (!registered) state = "lost";
         else if (!obs) state = "pending";
         else if (obs.status === "starting") state = "starting";
@@ -226,10 +231,10 @@ export class Model {
         else if (obs.exit?.kind === "lost") state = "lost";
         else state = "failed";
         let reason = "";
-        if (state === "lost" && !registered) reason = `node ${r.node} is gone`;
+        if (state === "lost" && !registered) reason = `node ${node} is gone`;
         else if (obs?.status === "stopped") reason = exitText(obs.exit);
         else if (state === "unscheduled") reason = "no node assigned yet";
-        out.push({ id: r.id, service: r.service, node: r.node, image: r.image, generation: r.generation, limits: r.limits || {}, state, reason, obs, diagnostic: obs?.diagnostic || null, reportedAt: obs?.reported_at_ms || 0, spec: r });
+        out.push({ id: r.id, service: r.service, node, image: r.image, generation: r.generation, limits: r.limits || {}, state, reason, obs, diagnostic: obs?.diagnostic || null, reportedAt: obs?.reported_at_ms || 0, spec: r });
       }
       return out.sort((a, b) => (a.service < b.service ? -1 : a.service > b.service ? 1 : numOf(a.id) - numOf(b.id)));
     });
