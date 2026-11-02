@@ -178,6 +178,27 @@ pub const Snapshot = struct {
         return snapshot.node_by_replica.get(replica);
     }
 
+    /// The assignment of a replica, or null while it is unassigned: its `mod_revision` is what a
+    /// transaction that acted on where the replica runs compares.
+    pub fn assigned_of(snapshot: *const Snapshot, replica: []const u8) ?*const Entry(
+        records.Assigned,
+    ) {
+        const node = snapshot.node_of(replica) orelse return null;
+        const key = records.assigned_key(node, replica);
+        const Order = struct {
+            fn compare(wanted: []const u8, item: Entry(records.Assigned)) std.math.Order {
+                return std.mem.order(u8, wanted, item.kv.key);
+            }
+        };
+        const index = std.sort.binarySearch(
+            Entry(records.Assigned),
+            snapshot.assigned,
+            key.slice(),
+            Order.compare,
+        ) orelse return null;
+        return &snapshot.assigned[index];
+    }
+
     /// The observed record of a replica, or null if it is unassigned or its node has not
     /// reported it.
     pub fn observed_of(snapshot: *const Snapshot, replica: *const records.Replica) ?*const Entry(

@@ -62,7 +62,8 @@ pub const watch_prefixes = [_][]const u8{
 
 comptime {
     assert(2 + batch_replicas_max * 3 + 1 <= constants.store_txn_ops_max);
-    assert(1 + batch_replicas_max <= constants.store_txn_compares_max);
+    // The service, the counter, and per replica its key and (when it is dead) its assignment.
+    assert(2 + batch_replicas_max * 2 <= constants.store_txn_compares_max);
 }
 
 pub const ReplicaController = struct {
@@ -376,6 +377,10 @@ const Run = struct {
             .cause_diagnostic = observed.rec.diagnostic,
         }, batch);
         batch.expect(replica.kv.key, replica.kv.mod_revision);
+        // The observed record was found through the assignment: if the replica moved, the
+        // judgement was about another placement, so the assignment is in the read set.
+        const placed = run.snap.assigned_of(replica.rec.id).?;
+        batch.expect(placed.kv.key, placed.kv.mod_revision);
         batch.delete(replica.kv.key);
         return id;
     }

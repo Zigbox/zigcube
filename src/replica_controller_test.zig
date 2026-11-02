@@ -422,6 +422,8 @@ test "a malformed record is ZC-E0301 naming its key" {
 const MovingStore = struct {
     inner: store.Store,
     key: []const u8,
+    /// What is written to `key` just before the armed commit.
+    value: []const u8 = "{\"v\":1,\"next\":99}",
     armed: bool = true,
     fired: bool = false,
 
@@ -481,7 +483,7 @@ const MovingStore = struct {
         if (self.armed) {
             self.armed = false;
             self.fired = true;
-            const op: store.Op = .{ .put = .{ .key = self.key, .value = "{\"v\":1,\"next\":99}" } };
+            const op: store.Op = .{ .put = .{ .key = self.key, .value = self.value } };
             _ = try self.inner.vtable.txn(self.inner.context, .{ .on_success = &.{op} }, diag);
         }
         return self.inner.vtable.txn(self.inner.context, request, diag);
@@ -770,4 +772,42 @@ test "the creating transaction fails when the counter moved, and the next pass p
     const ids = try fixture.ids("hello");
     defer Fixture.free_ids(ids);
     try expect_ids(&.{ "hello-1", "hello-2", "hello-3", "hello-99" }, ids);
+}
+
+test "the replace transaction fails when the dead replica's assignment moved" {
+    // Goal: `/assigned/<node>/<replica>` is in the replace transaction's read set. Method: hello-2
+    // is observed killed; a store rewrites its assignment just before the commit; that pass writes
+    // nothing and hello-2 is still there. The next passes replace it as usual.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    for ([_][]const u8{ "hello-1", "hello-2", "hello-3" }) |id| {
+        try fixture.observe(id, .running, null, null);
+    }
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.observe("hello-2", .stopped, .{ .kind = .signaled, .signal = 9 }, null);
+
+    var ctx = fixture.context();
+    const key = records.assigned_key("node1", "hello-2");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = got.kv.?.value,
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+
+    _ = try fixture.settle();
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-1", "hello-3", "hello-4" }, now);
 }

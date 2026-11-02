@@ -310,7 +310,8 @@ fn ready_now(demo: *Demo, _: *Host) !bool {
 /// Waits for the node controller to judge the current tenure ready, then says so.
 pub fn expect_node_ready(demo: *Demo, comptime label: []const u8) !void {
     const host = demo.host;
-    try host.wait_for(demo, ready_now, "the node controller to judge the current tenure", converge_ms);
+    const what = "the node controller to judge the current tenure";
+    try host.wait_for(demo, ready_now, what, converge_ms);
     const tenure = try node_tenure(demo);
     try host.check(true, label ++ ": /node-status/{s} is ready with tenure {d}, the current " ++
         "/nodes/{s} revision", .{ node, tenure, node });
