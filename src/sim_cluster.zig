@@ -453,6 +453,9 @@ pub const Cluster = struct {
     stats: Stats,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
+    /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
+    /// report names it (the simulation fleet files a failure by its check and this step).
+    step: []const u8,
     /// Liveness mode: the faults end mid-run and the end state must converge within
     /// `liveness_bound_ms`; else faults stay on and only the safety checks run.
     liveness: bool,
@@ -502,6 +505,7 @@ pub const Cluster = struct {
         c.check_ms = 0;
         c.stats = .{};
         c.fault_totals = null;
+        c.step = "faults";
         c.liveness = true;
         c.report = report;
         c.server = replica_controller.ReplicaController.init(c.take_instance());
@@ -962,6 +966,7 @@ fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
     c.report.print("FAILED: {s} (seed {d}, at {d} ms)\n", .{
         what, c.seed, c.manual.ms - epoch_ms,
     });
+    c.report.print("step: {s}\n", .{c.step});
     return error.StepFailed;
 }
 
@@ -1476,7 +1481,10 @@ pub fn simulate(
 
 fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     for (0..operations) |index| {
-        if (c.liveness and index == heal_at) heal(c);
+        if (c.liveness and index == heal_at) {
+            heal(c);
+            c.step = "healed";
+        }
         operation(c);
         if (c.report.failed) return error.StepFailed;
         try safety(c);
@@ -1485,10 +1493,12 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.fault_totals == null) heal(c);
         c.advance(liveness_bound_ms);
         if (c.report.failed) return error.StepFailed;
+        c.step = "convergence";
         try converged(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
+    c.step = "end";
     try safety(c);
     try enough_work_under_faults(c, @min(heal_at, operations));
     try work_under_ceiling(c);

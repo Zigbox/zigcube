@@ -9,7 +9,8 @@
 //! is). `--heal-at=N` makes the faults end before operation N instead of where the seed chose.
 //!
 //! A single seed prints its whole report. A range (`A..B` is inclusive of both) prints one line
-//! per failing seed, `seed N: FAILED: <what>`, then the command that replays it, and a last line
+//! per failing seed, `seed N: FAILED: <what>`, `  step: <faults|healed|convergence|end>` (where the
+//! run was), then the command that replays it, and a last line
 //! with the counts. `--shrink` bisects the operations of each failing seed down to the smallest
 //! count that still fails the same way, with the heal point held where the full run had it, so
 //! the printed replay command (with `--heal-at`) reproduces exactly that shorter run.
@@ -132,6 +133,16 @@ fn symptom(report: *const sim_cluster.Report) []const u8 {
     return line[0..tail];
 }
 
+/// The step line of the report ("faults", "healed", "convergence" or "end"): where the run was
+/// when the check failed. Empty if the report has none.
+fn step_of(report: *const sim_cluster.Report) []const u8 {
+    const text = report.text();
+    const start = std.mem.indexOf(u8, text, "\nstep: ") orelse return "";
+    const from = start + "\nstep: ".len;
+    const line_end = std.mem.indexOfScalarPos(u8, text, from, '\n') orelse text.len;
+    return text[from..line_end];
+}
+
 /// The smallest number of operations at most `failing` that fails with `what`, with the faults
 /// ending before operation `heal_at` as in the full run. A bisection: it assumes that if `n`
 /// operations fail, so do `n + 1`, and checks only that the answer fails and one fewer does not
@@ -218,6 +229,7 @@ fn report_failure(
     const what = what_buffer[0..@min(what_text.len, what_buffer.len)];
     @memcpy(what, what_text[0..what.len]);
     try out.print("seed {d}: FAILED: {s}\n", .{ seed, what });
+    try out.print("  step: {s}\n", .{step_of(report)});
     const heal_at: ?u32 = if (parsed.options.liveness)
         sim_cluster.heal_point(seed, parsed.operations)
     else

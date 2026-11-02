@@ -296,7 +296,8 @@ zig-out/bin/sim_cluster --seeds A..B <ops> [<nodes>] [--liveness=false] [--shrin
 ```
 
 The first runs one seed natively and as WASM and compares. The range form prints a line per failing
-seed (`seed N: FAILED: <what>`) and its replay command, then a count; the exit code is 1 if any
+seed (`seed N: FAILED: <what>`, `  step: <faults|healed|convergence|end>`: where in the run the check
+failed) and its replay command, then a count; the exit code is 1 if any
 failed. **Replay:** the printed command reruns exactly that seed; its `--heal-at` is the heal point
 the run printed. **Shrink:** `--shrink` bisects the operations of each failing seed to the smallest
 count that fails with the same symptom, holding `H` where the full run had it (it is drawn from the
@@ -305,7 +306,9 @@ count carries `--heal-at`, so it is the same run, cut short. It assumes that mor
 failing, and checks only that its answer fails and one fewer does not fail the same way, so on a
 failure that comes and goes it may not be the smallest. `zig build sim-teeth-exe` installs the
 fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the teeth fault. A run at
-100 operations takes about 0.7 s natively in ReleaseSafe.
+100 operations takes about 0.7 s natively in ReleaseSafe. The range output is what the simulation
+fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and step, so a change to
+either line's format is a change to `src/sim_fleet_issue.zig` too.
 
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations, native against WASM, and `sim-teeth`.
