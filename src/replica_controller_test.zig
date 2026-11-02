@@ -249,7 +249,7 @@ test "a replica whose container was killed is replaced, and the decisions say wh
     var dead = try fixture.decisions(.replica, "hello-2");
     defer dead.deinit(testing.allocator);
     const dead_chain = "create_replica<decision;place_replica<decision;" ++
-        "delete_replica<observed;release_replica<resync;";
+        "delete_replica<observed;release_replica<decision;";
     try testing.expectEqualStrings(dead_chain, dead.items);
     var fresh = try fixture.decisions(.replica, "hello-4");
     defer fresh.deinit(testing.allocator);
