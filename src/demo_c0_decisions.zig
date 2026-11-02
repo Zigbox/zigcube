@@ -23,14 +23,11 @@ pub const Decision = struct {
     cause_ref: []const u8,
 };
 
-/// What a step should have decided: `count` decisions of this actor and action.
-/// `optional`: `count` is the most; none is also right (a timing-dependent decision, such as the
-/// node controller's judgement of an agent that registered again during an outage).
+/// What a step should have decided: exactly `count` decisions of this actor and action.
 pub const Expect = struct {
     actor: []const u8,
     action: []const u8,
     count: u32,
-    optional: bool = false,
 };
 
 fn text_of(object: std.json.ObjectMap, name: []const u8) []const u8 {
@@ -111,10 +108,8 @@ pub fn expect_new(demo: *Demo, comptime label: []const u8, expected: []const Exp
     for (expected) |expect| {
         const count = count_of(new, expect);
         total += count;
-        const right = if (expect.optional) count <= expect.count else count == expect.count;
-        const most = if (expect.optional) " at most" else "";
-        try host.check(right, label ++ ": {d} x {s} {s} (expected {d}{s})", .{
-            count, expect.actor, expect.action, expect.count, most,
+        try host.check(count == expect.count, label ++ ": {d} x {s} {s} (expected {d})", .{
+            count, expect.actor, expect.action, expect.count,
         });
     }
     try host.check(new.len == total, label ++ ": no decision beyond those ({d} of {d})", .{

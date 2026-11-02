@@ -226,6 +226,7 @@ pub fn restart_agent(demo: *Demo) !void {
     const host = demo.host;
     host.section("Acceptance: restarting zcube-agent re-adopts, it does not duplicate");
     const before = try snapshot(demo);
+    const tenure = try state.node_tenure(demo);
     host.say("$ kill -TERM {d}    # zcube-agent", .{host.agent.?.id.?});
     try host.stop_child(&host.agent, "zcube-agent");
     const kept = state.same_containers(before.containers, try host.procs().running_containers());
@@ -236,8 +237,15 @@ pub fn restart_agent(demo: *Demo) !void {
     try expect_unchanged(demo, before, "after the agent restart", false);
     try state.expect_processes(demo, "no duplicates", 3);
     try state.expect_ready(demo, "hello", "3/3");
+    try state.expect_node_ready(demo, "after the agent restart");
+    const now = try state.node_tenure(demo);
+    host.say("  tenure before the restart {d}, after {d}", .{ tenure, now });
     try decisions.expect_new(demo, "agent restart", &.{
-        .{ .actor = "node-controller", .action = "mark_ready", .count = 1 },
+        .{
+            .actor = "node-controller",
+            .action = "mark_ready",
+            .count = state.mark_ready_count(tenure, now),
+        },
     });
 }
 
