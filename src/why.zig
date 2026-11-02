@@ -236,16 +236,17 @@ fn node_state(
             .health = .healthy,
             .desired = 1,
             .running = 1,
-            .text = try controller.format(ctx, "node {s}: {s}, lease {d} with {d} replicas " ++
-                "assigned, {d}m of {d}m CPU and {d} MiB of {d} MiB memory in use", .{
+            .text = try controller.format(ctx, "node {s}: {s}, lease {d} with {d} {s} " ++
+                "assigned, {d}m of {d}m CPU and {s} of {s} memory in use", .{
                 name,
                 verdict,
                 node.kv.lease,
                 load.count,
+                if (load.count == 1) "replica" else "replicas",
                 load.cpu_millis,
                 node.rec.capacity.cpu_millis,
-                load.memory_bytes >> 20,
-                node.rec.capacity.memory_bytes >> 20,
+                try bytes_text(ctx, load.memory_bytes),
+                try bytes_text(ctx, node.rec.capacity.memory_bytes),
             }),
         };
     }
@@ -572,10 +573,27 @@ fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched)
     });
 }
 
+/// `0B`, `512Ki`, `128Mi`, `8.0Gi`: the CLI's style (cli_view.zig, a shell module this core
+/// module may not import).
+fn bytes_text(ctx: *const Context, bytes: u64) Error![]const u8 {
+    const kib: u64 = 1024;
+    const gib = kib * kib * kib;
+    if (bytes >= gib) {
+        const tenths = bytes * 10 / gib;
+        return controller.format(ctx, "{d}.{d}Gi", .{ tenths / 10, tenths % 10 });
+    }
+    if (bytes >= kib * kib) return controller.format(ctx, "{d}Mi", .{bytes / kib / kib});
+    if (bytes >= kib) return controller.format(ctx, "{d}Ki", .{bytes / kib});
+    return controller.format(ctx, "{d}B", .{bytes});
+}
+
 const Read = union(enum) { found: store.KeyValue, absent, compacted };
 
-/// A key at a revision; `compacted` when the store no longer keeps that revision. With no
-/// revision to ask for, the key now.
+/// A key at a revision. `compacted` when the store no longer keeps that revision and the key has
+/// changed since (authority.md section 5), or when the revision is not one the store has yet (the
+/// cited record cannot be shown as it was, so the chain may not claim to be complete). A key
+/// that has not changed since the cited revision is read now: its value now is its value then.
+/// With no revision to ask for, the key now.
 fn read_at(ctx: *const Context, key: []const u8, revision: ?store.Revision) Error!Read {
     if (store.key_problem(key) != null) return .absent;
     if (revision) |at| {
@@ -583,12 +601,18 @@ fn read_at(ctx: *const Context, key: []const u8, revision: ?store.Revision) Erro
         if (attempt) |got| {
             return if (got.kv) |kv| .{ .found = kv } else .absent;
         } else |err| {
-            if (err == error.Compacted) {
+            if (err == error.FutureRevision) {
                 ctx.diag.reset();
-                return .compacted;
+                // Not a revision the store has yet: a key that is not there now was not there at
+                // it either; one that is there cannot be shown as it was.
+                const now = try ctx.store.get(ctx.arena, key, null, ctx.diag);
+                return if (now.kv == null) .absent else .compacted;
             }
-            if (err != error.FutureRevision) return err;
+            if (err != error.Compacted) return err;
             ctx.diag.reset();
+            const now = try ctx.store.get(ctx.arena, key, null, ctx.diag);
+            const kv = now.kv orelse return .compacted; // Deleted since: the value then is gone.
+            return if (kv.mod_revision <= at) .{ .found = kv } else .compacted;
         }
     }
     const now = try ctx.store.get(ctx.arena, key, null, ctx.diag);
@@ -849,7 +873,7 @@ test "why node states its load and its judgement, and notes that nothing is reba
     const before = try why(&ctx, .{ .kind = .node, .name = "node1" }, null);
     try testing.expectEqualStrings(
         "node node1: ready (tenure 1), lease 1 with 0 replicas assigned, " ++
-            "0m of 4000m CPU and 0 MiB of 8192 MiB memory in use",
+            "0m of 4000m CPU and 0B of 8.0Gi memory in use",
         before.state.text,
     );
     const assigned: records.Assigned = .{
@@ -869,7 +893,7 @@ test "why node states its load and its judgement, and notes that nothing is reba
     try put_status(world, "node2", .ready, tenure);
     ctx = world.controller_context();
     const node1 = try why(&ctx, .{ .kind = .node, .name = "node1" }, null);
-    try expect_contains(node1.state.text, "1 replicas assigned, 250m of 4000m CPU and 128 MiB");
+    try expect_contains(node1.state.text, "1 replica assigned, 250m of 4000m CPU and 128Mi");
     try testing.expect(note_of(node1.steps) == null);
     const idle = try why(&ctx, .{ .kind = .node, .name = "node2" }, null);
     try expect_contains(idle.state.text, "ready (tenure");
@@ -1004,14 +1028,34 @@ test "why is complete when the chain reaches its cause, truncated when a decisio
     _ = try world.delete_service("hello");
     world.advance(5000);
     ctx = world.controller_context();
-    const left = why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null) catch |err| {
-        // A replica with no decision left at all is a 404; the chain below is the other case.
-        try testing.expectEqual(error.NotFound, err);
-        return;
-    };
-    if (left.steps[left.steps.len - 1].type == .gone and !left.state.exists) {
-        try testing.expectEqual(Reason.subject_deleted, left.completeness.reason.?);
-    }
+    // The service is gone; retention drops the decision at the end of the chain (the delete's
+    // own), keeping the ones before it: the subject is gone, so the reason is `subject_deleted`.
+    const gone_chain = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
+    try testing.expectEqual(.complete, gone_chain.completeness.verdict);
+    const tail = gone_chain.steps[gone_chain.steps.len - 2].decision.?;
+    const tail_key = records.decision_key(tail.id);
+    const drop: store.Op = .{ .delete = tail_key.slice() };
+    _ = try writers.txn(ctx.store, .retention, .{ .on_success = &.{drop} }, ctx.diag);
+    ctx = world.controller_context();
+    const left = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
+    try testing.expect(!left.state.exists);
+    try testing.expectEqual(.truncated, left.completeness.verdict);
+    try testing.expectEqual(Reason.subject_deleted, left.completeness.reason.?);
+}
+
+test "why treats a compacted key that never changed as complete" {
+    // Goal: authority.md section 5: `compacted` means the cited key has changed since. Method:
+    // compact to the head with /services/hello untouched; the chain still ends at its desired
+    // record, read now.
+    const world = try new_world(10);
+    defer world.destroy();
+    _ = try world.apply(hello);
+    world.advance(2000);
+    try compact_to_head(world);
+    var ctx = world.controller_context();
+    const result = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
+    try testing.expectEqual(.complete, result.completeness.verdict);
+    try testing.expect(result.steps[result.steps.len - 1].type != .gone);
 }
 
 test "why never shows the current value as the reason for a compacted record" {
@@ -1022,6 +1066,12 @@ test "why never shows the current value as the reason for a compacted record" {
     const world = try new_world(9);
     defer world.destroy();
     _ = try world.apply(hello);
+    world.advance(2000);
+    // The service changes after hello-1's decision cited it: only then is the cited value gone.
+    var scaled = hello;
+    scaled.replicas = 4;
+    scaled.request_id = "r-0000002";
+    _ = try world.apply(scaled);
     world.advance(2000);
     try compact_to_head(world);
     var ctx = world.controller_context();

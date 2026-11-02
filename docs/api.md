@@ -155,8 +155,8 @@ terminal.
   chain may end in one more step of type `note` (C1 slice 7): a statement of the scheduler's rule,
   not a reading of the store. A client that does not know a step type prints its `text`.
 - `why node`'s `state.text` names the judgement and the load:
-  `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0 MiB of
-  8192 MiB memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
+  `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
+  8.0Gi memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
   status is for an earlier tenure says so, and one that is not registered says `not registered`
   and, if a status remains, `last judged <state> (tenure N)`. The `note` step is added when the
   node is `ready` for its current tenure and holds fewer replicas than another registered node:

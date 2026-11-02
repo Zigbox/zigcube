@@ -115,21 +115,23 @@ const Shell = struct {
         return outcome;
     }
 
-    /// Holds up to `slice_ms` for a replica change or a container event. True if one came, or the
-    /// watch failed (the next pass reports and retries).
-    fn watch(shell: *Shell, slice_ms: u32) bool {
+    const Watched = enum { ended, timed_out, failed };
+
+    /// Holds up to `slice_ms` for a replica change or a container event. `failed` if the server
+    /// refused or could not be reached: the loop pauses, then steps (which reports and retries).
+    fn watch(shell: *Shell, slice_ms: u32) Watched {
         shell.diag.reset();
         const mono = shell.boot.now_ms();
         const held = shell.agent.watch_hold_ms(mono, slice_ms);
         const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
         shell.remote.set_deadline(shell.boot, deadline);
-        const changed = shell.remote.watch_once(held, &shell.diag) catch return true;
+        const changed = shell.remote.watch_once(held, &shell.diag) catch return .failed;
         shell.notice_pair();
-        if (changed) return true;
+        if (changed) return .ended;
         shell.arena.reset();
         const events = shell.fake.interface().events(shell.arena.allocator(), 0, &shell.diag) catch
-            return true;
-        return events.len > 0;
+            return .failed;
+        return if (events.len > 0) .ended else .timed_out;
     }
 
     /// `ms`, or less if the fence falls sooner: the agent never sleeps through it.
@@ -321,7 +323,11 @@ fn loop(shell: *Shell) void {
             .stop => return,
             .step => _ = shell.pass(),
             .pause_ms => |ms| shell.pause(ms),
-            .watch_ms => |ms| shell.policy.watch_done(shell.watch(ms)),
+            .watch_ms => |ms| switch (shell.watch(ms)) {
+                .ended => shell.policy.watch_done(true),
+                .timed_out => shell.policy.watch_done(false),
+                .failed => shell.policy.watch_failed(),
+            },
         }
     }
 }
