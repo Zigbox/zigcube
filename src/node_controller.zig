@@ -608,7 +608,8 @@ test "a node whose lease ran out is lost, with the ttl and when it was last hear
     try testing.expectEqual(@as(u32, 0), wake.acted);
     try testing.expectEqual(heard + 10_000, wake.at_ms); // Sampled again at the predicted expiry.
     fixture.manual.ms = wake.at_ms + 1;
-    try testing.expectEqual(@as(u32, 1), try fixture.memory.interface().expire_leases(&fixture.diag));
+    const expired = try fixture.memory.interface().expire_leases(&fixture.diag);
+    try testing.expectEqual(@as(u32, 1), expired);
     try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
     const status = (try fixture.status("n1")).?;
     try testing.expectEqual(records.NodeState.lost, status.rec.state);

@@ -77,7 +77,8 @@ const SummarySlot = struct {
 
 comptime {
     assert(summaries_max > 0);
-    assert(decision_ops >= 3 and decision_compares == 1);
+    assert(decision_ops >= 3);
+    assert(decision_compares == 1);
     assert(decision_compares * summaries_max <= constants.store_txn_compares_max);
 }
 

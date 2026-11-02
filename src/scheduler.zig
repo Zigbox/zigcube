@@ -613,7 +613,8 @@ pub const Scheduler = struct {
         };
         const to = world.nodes[chosen.index].node.rec.name;
         const fmt = "node {s} is lost; replica {s} moves to {s}, the best of {d} nodes that fit";
-        const reason = try controller.format(ctx, fmt, .{ from, assign.replica, to, chosen.candidates });
+        const args = .{ from, assign.replica, to, chosen.candidates };
+        const reason = try controller.format(ctx, fmt, args);
         const moved = try sc.move_replica(ctx, world, .{
             .replica = assign.replica,
             .to = to,
