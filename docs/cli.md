@@ -225,6 +225,7 @@ that does not exist), `E0102`, `E0103` and relays the rest from the server.
 | `ZC-E0118` | user | no such diagnostic code |
 | `ZC-W0119` | (warning) | `--no-redact` keeps secrets in the bundle |
 | `ZC-E0120` | environment | zcube ran out of memory |
+| `ZC-E0121` | user | the lease ttl is one an agent cannot fence in time |
 | `ZC-B0002` | internal | zcube failed in a way it should not (a command failed and said nothing) |
 
 ## How it is tested

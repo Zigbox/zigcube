@@ -348,8 +348,11 @@ runs unchanged on the far side of HTTP:
 
 ### `POST /v1/agent/nodes/{node}/lease`
 
-Body `{"ttl_ms": 10000}`; answer `{"lease": {"id": 43, "ttl_ms": 10000}}`. A ttl outside the
-store's range is `400` and `ZC-E0206`. The lease is the store's: it expires by the store's clock.
+Body `{"ttl_ms": 10000}`; answer `{"lease": {"id": 43, "ttl_ms": 10000}}`. The server grants its
+own configured ttl (`--lease-ttl-ms`, default 10 s, refused with `ZC-E0121` if an agent could not
+fence in time under it) and ignores the body's, so the body's ttl is never checked or refused;
+the agent adopts the ttl in the answer, and refuses one it could not fence under with
+`ZC-E0504` (it then registers nothing). The lease is the store's: it expires by the store's clock.
 The server does not remember which node asked, so a lease is tied to the node only by the key
 registered on it.
 
@@ -418,9 +421,14 @@ The key's `mod_revision` is the replica's placement epoch (keys.md).
 `POST` is one transaction, without compares (the agent is the only writer, keys.md):
 
 ```json
-{ "puts": [ { "key": "/observed/node1/hello-3", "value": {"v": 1, "replica": "hello-3", "…": "…"} } ],
+{ "tenure": 412,
+  "puts": [ { "key": "/observed/node1/hello-3", "value": {"v": 1, "replica": "hello-3", "…": "…"} } ],
   "deletes": [ "/observed/node1/hello-2" ] }
 ```
+
+`tenure` is the revision of the agent's `/nodes/<node>` registration (0 or missing is `400`). The
+transaction compares the registration's `mod_revision` with it: a node whose registration was
+replaced or deleted is refused with `503` and `ZC-E0510` and nothing is written (I2).
 
 Answer `{"revision": 431}`. The `value` is the observed record, **including `diagnostic`**: the
 runtime's own diagnostic (`ZBX-E0501` for an image that is not in the node's store) reaches the
@@ -494,6 +502,8 @@ rest are about the agent's own host.
 | `ZC-E0504` | external | zcube-server refused the agent's request | the agent, for a reply it cannot use |
 | `ZC-E0505` | user | the agent's configuration can't be used | the agent at start-up |
 | `ZC-E0506` | environment | the agent's state directory can't be used | the agent at start-up, `FakeRuntime` |
+| `ZC-E0121` | user | the lease ttl is one an agent cannot fence in time | `zcube-server` at start |
+| `ZC-E0510` | environment | an observed write under a tenure that has ended | the agent endpoint |
 | `ZC-E0507` | environment | the agent can't start a container's supervisor | `FakeRuntime` |
 | `ZC-E0508` | user | the container's command can't be run | the supervisor, as `start_failed` |
 | `ZC-E0509` | environment | the container's supervisor is gone | `FakeRuntime`, as `lost` |

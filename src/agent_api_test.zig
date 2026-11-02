@@ -33,6 +33,9 @@ const Rig = struct {
     world: *sim_world.World,
     api: api_mod.Api,
     parsed: std.heap.ArenaAllocator,
+    /// The tenure `join` made; reports to `/observed` carry it (see `call`).
+    tenure: i64 = 0,
+    patched: [4096]u8 = undefined,
 
     fn start(seed: u64) !Rig {
         const fixtures = &sim_runtime.default_fixtures;
@@ -65,8 +68,29 @@ const Rig = struct {
             .method = method,
             .path = path,
             .query = query,
-            .body = body,
+            .body = rig.with_tenure(method, path, body),
         });
+    }
+
+    /// A report to `/observed` names the tenure it rests on; the tests write it once, in `join`.
+    fn with_tenure(rig: *Rig, method: []const u8, path: []const u8, body: []const u8) []const u8 {
+        const posting = std.mem.eql(u8, method, "POST");
+        const reporting = posting and std.mem.endsWith(u8, path, "/observed");
+        if (!reporting or rig.tenure == 0 or body.len < 3 or body[0] != '{') return body;
+        const format = "{{\"tenure\":{d},{s}";
+        return std.fmt.bufPrint(&rig.patched, format, .{ rig.tenure, body[1..] }) catch
+            unreachable; // The test bodies are far smaller than the buffer.
+    }
+
+    /// Grants a lease, registers `node` on it and keeps the registration's revision as the tenure.
+    fn join(rig: *Rig, node: []const u8) !void {
+        const lease = try rig.grant(node);
+        var buffer: [512]u8 = undefined;
+        var path: [96]u8 = undefined;
+        const target = try std.fmt.bufPrint(&path, "/v1/agent/nodes/{s}", .{node});
+        const registered = try rig.ok("PUT", target, "", try register_text(&buffer, lease));
+        rig.tenure = field(registered, "revision").integer;
+        std.debug.assert(rig.tenure > 0);
     }
 
     /// The body parsed, copied out of the world's arena so a later call cannot disturb it.
@@ -196,8 +220,6 @@ test "a request the endpoints cannot understand is ZC-E0104 or ZC-E0101 and writ
         .{ "PUT", base, "", typo, 400, "ZC-E0104" },
         .{ "GET", base, "", "", 400, "ZC-E0104" },
         .{ "PUT", base, "x=1", "{}", 400, "ZC-E0104" },
-        .{ "POST", base ++ "/lease", "", "{\"ttl_ms\":5}", 400, "ZC-E0206" },
-        .{ "POST", base ++ "/lease", "", "{}", 400, "ZC-E0104" },
         .{ "POST", base ++ "/lease/x/keepalive", "", "", 400, "ZC-E0104" },
         .{ "POST", base ++ "/lease/0/keepalive", "", "", 400, "ZC-E0104" },
         .{ "POST", base ++ "/lease/1/other", "", "", 404, "ZC-E0101" },
@@ -249,6 +271,7 @@ test "observed records are reported, read back, and removed, for the node's own 
     // diagnostic), read them, delete one; then every rule of the validation once.
     var rig = try Rig.start(5);
     defer rig.stop();
+    try rig.join("node2");
     var first: [256]u8 = undefined;
     var second: [256]u8 = undefined;
     const one = try observed_text(&first, "node2", "hello-1");
@@ -280,6 +303,7 @@ test "an observed record keeps the diagnostic it carries" {
     // read it through the generic list, and compare the code and a cause.
     var rig = try Rig.start(6);
     defer rig.stop();
+    try rig.join("node2");
     const record = "{\"v\":1,\"replica\":\"broken-1\",\"node\":\"node2\",\"generation\":1," ++
         "\"status\":\"stopped\",\"exit\":{\"kind\":\"start_failed\"},\"diagnostic\":" ++
         "{\"code\":\"ZBX-E0501\",\"severity\":\"error\",\"blame\":\"user\"," ++
@@ -307,6 +331,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     // must not move.
     var rig = try Rig.start(7);
     defer rig.stop();
+    try rig.join("node2");
     const before = try rig.revision();
     var record: [256]u8 = undefined;
     const mine = try observed_text(&record, "node2", "hello-1");
@@ -417,6 +442,33 @@ test "the watch says whether a replica changed since a revision, and holds when 
     try rig.refused(rig.call("GET", base, "from=1", ""), 410, "ZC-E0203");
 }
 
+test "a report under a tenure that has been replaced is ZC-E0510 and writes nothing" {
+    // Goal: I2, an observation from an old tenure is refused. Method: join, join again (a new
+    // registration, a new revision), then report under the first tenure and under the second.
+    var rig = try Rig.start(8);
+    defer rig.stop();
+    try rig.join("node2");
+    const old = rig.tenure;
+    try rig.join("node2");
+    try testing.expect(rig.tenure > old);
+    var record: [256]u8 = undefined;
+    const text = try observed_text(&record, "node2", "hello-1");
+    var body: [1024]u8 = undefined;
+    const put = try std.fmt.bufPrint(
+        &body,
+        "{{\"puts\":[{{\"key\":\"/observed/node2/hello-1\",\"value\":{s}}}]}}",
+        .{text},
+    );
+    const current = rig.tenure;
+    rig.tenure = old;
+    const before = try rig.revision();
+    const response = rig.call("POST", "/v1/agent/nodes/node2/observed", "", put);
+    try rig.refused(response, 503, "ZC-E0510");
+    try testing.expectEqual(before, try rig.revision());
+    rig.tenure = current;
+    _ = try rig.ok("POST", "/v1/agent/nodes/node2/observed", "", put);
+}
+
 /// The answer's `chain`, checked against the store: `revision` and `hash` are its head now, and
 /// `known_hash` is its hash at `known` when one was sent.
 fn expect_chain(rig: *Rig, answer: Json, known: ?u64) !void {
@@ -481,6 +533,7 @@ test "known on the lease grant, assigned and observed endpoints, and on a watch 
     defer rig.stop();
     _ = try rig.world.apply(hello);
     rig.world.advance(2000);
+    try rig.join("node2"); // A report names the tenure it rests on.
     const base = "/v1/agent/nodes/node2";
     const head: u64 = @intCast(try rig.revision());
     var query_buffer: [64]u8 = undefined;

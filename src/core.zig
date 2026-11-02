@@ -16,6 +16,7 @@ pub const modules = .{
     @import("agent_api.zig"),
     @import("agent_client.zig"),
     @import("agent_loop.zig"),
+    @import("fencing.zig"),
     @import("agent_records.zig"),
     @import("agent_state.zig"),
     @import("api.zig"),
@@ -114,5 +115,6 @@ test "the controllers' tests are in this root" {
     _ = @import("scheduler_test.zig");
     _ = @import("api_test.zig");
     _ = @import("agent_api_test.zig");
+    _ = @import("agent_fence_test.zig");
     _ = @import("agent_client_test.zig");
 }

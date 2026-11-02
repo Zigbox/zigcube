@@ -173,8 +173,10 @@ declared by the agent's configuration (see the open questions in `docs/contracts
   `assignment` are current and `/node-status/<node>` is `ready`.
 
 Lifetime: until the agent or the node controller removes it. One writer per key (the node's agent), written on every status change, not on a timer, so the
-store's revision tells when the node last learned something. Written without compare (last
-write wins): the agent is the only source of truth for what it observed.
+store's revision tells when the node last learned something. Written with one compare, never
+last-write-wins: every record the agent writes carries its current `tenure`, and the agent
+endpoint writes it only while `/nodes/<node>` is still at that revision (else `ZC-E0510`), so a
+replaced or fenced agent cannot overwrite what its successor observed.
 
 ## `/decisions/<id>`: one controller decision
 

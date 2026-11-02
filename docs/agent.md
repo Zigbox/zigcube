@@ -154,10 +154,12 @@ behind; the server's keeps the controllers and every write from building on one.
 | --- | --- | --- |
 | agent stopped or killed | keep running | a new agent adopts them |
 | server down or restarted | keep running | the agent backs off, reports `ZC-E0503` once, carries on when it returns |
-| lease lost (the server was away longer than the ttl) | keep running (C0; C1 stops them) | grants a new lease, registers again, prints `ZC-W0501` |
+| the lease cannot be kept (the server is away, or the lease is gone) | stopped at `s + ttl − fence_margin` (the agent fences itself; `s` is the send time of the last acknowledged keepalive, on `CLOCK_BOOTTIME`), or at once if the server says the lease is gone | grants a new lease, registers again empty under a new tenure, prints `ZC-W0501` |
+| an observed write is refused (`ZC-E0510`: its tenure was replaced) | stopped at once | as above |
 | a command is killed | the supervisor records it | reported; the controller replaces the replica |
 | a supervisor is killed | the command is killed by the agent | reported `lost` with `ZC-E0509`; replaced |
-| the host restarts | none | everything is `lost`; replaced |
+| the host restarts | none | everything is `lost`; replaced; a kept lease of another boot (`/proc/sys/kernel/random/boot_id` in `lease.json`) fences |
+| the agent dies while fencing | keep fencing: the kept `fencing` flag makes the next agent finish the fence by the first kill time | as above |
 
 ## What the real-process model showed about `Runtime`
 
@@ -198,11 +200,13 @@ real processes, for the owner and for the Zigbox adapter:
 
 ## Known limits
 
-- **Connecting has no timeout.** The standard library's threaded `Io` panics if `connect` is given
-  one on POSIX, and a socket option can only be set after the socket exists. A server that is down
-  refuses at once (the case on one network); a host that drops packets makes the agent wait as long
-  as the kernel does. A read waits at most `agent_io_timeout_ms` (plus a long poll's own hold) for
-  the next piece of a reply: the client `poll`s before each read. It does not use a receive timeout
+- **A whole call is bounded, connect included; Linux only.** The standard library's threaded `Io`
+  panics if `connect` is given a timeout on POSIX, so `agent_http.zig` opens a non-blocking socket
+  itself (`std.os.linux`), `poll`s it for the connection until the call's end, and hands the
+  connected socket back to `Io` in blocking mode. One deadline, the hold plus
+  `agent_io_timeout_ms`, covers connect, send and every read; the client `poll`s before each read.
+  While the agent holds a lease the deadline is cut to the fence (`fence_at`): no call waits past
+  it, and a call that would start after it is not made (`ZC-E0503`, the fence goes on). It does not use a receive timeout
   on the socket, which makes the standard library's reader panic when it fires; the agent died
   with `ZC-B0001` whenever a server held a request that long (a store outage does), which slice 6c
   found. A request is small and is written at once, so a write has no timeout.

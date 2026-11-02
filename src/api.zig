@@ -86,6 +86,9 @@ pub const Api = struct {
     /// starts, or two servers, never issue the same id. The shell supplies it (it may read the
     /// clock; the core may not). 0 means "none": ids are then `r-<counter>`, as in the simulation.
     instance: u32 = 0,
+    /// The ttl of the leases the agent endpoints grant. `server_config.zig` refuses a value an
+    /// agent cannot fence in time for (ZC-E0121).
+    lease_ttl_ms: u32 = constants.lease_ttl_ms,
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
     /// The server's guard against a store that went backwards, for
@@ -145,6 +148,7 @@ pub const Api = struct {
                 request.query,
                 request.body,
                 request.hold,
+                api.lease_ttl_ms,
                 api.pair_kept,
             );
             return .{

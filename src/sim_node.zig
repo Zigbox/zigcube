@@ -234,7 +234,9 @@ pub const SimNode = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const node = from(context);
-        assert(!node.crashed);
+        // A fence goes on past a failed stop, so a stop can follow the crash in the same step:
+        // the dead agent's call fails again and does nothing.
+        if (node.crashed) return node.dead(diag);
         var arena_state = std.heap.ArenaAllocator.init(node.files.gpa);
         defer arena_state.deinit();
         const state = node.files.interface();

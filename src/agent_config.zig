@@ -12,7 +12,6 @@
 //!     .memory_bytes = 8589934592,
 //!     .images = "fixtures/images.zon", // the digests the fake runtime has; the default
 //!     .address = "", // what to record in /nodes/<node>, for people to read
-//!     .lease_ttl_ms = 10000,
 //! }
 //! ```
 //!
@@ -29,18 +28,16 @@ const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const IpAddress = std.Io.net.IpAddress;
 
-const ttl_fix = "choose a time inside the range";
-
 pub const images_default = "fixtures/images.zon";
 
 pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
-    \\                   [--lease-ttl-ms N] [--verbose]
+    \\                   [--verbose]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
-    \\                     .images, .address and .lease_ttl_ms
+    \\                     .images and .address
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -48,7 +45,6 @@ pub const usage =
     \\  --memory-bytes N   the memory this node offers, in bytes
     \\  --images FILE      the image digests the fake runtime has (default fixtures/images.zon)
     \\  --address TEXT     recorded with the node for people to read
-    \\  --lease-ttl-ms N   how long the node's lease lasts without renewal (default 10000)
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -64,7 +60,6 @@ pub const Config = struct {
     images: []const []const u8,
     capacity: records.Requests,
     address: []const u8,
-    lease_ttl_ms: u32,
     verbose: bool,
 };
 
@@ -87,7 +82,6 @@ const File = struct {
     memory_bytes: ?u64 = null,
     images: ?[]const u8 = null,
     address: ?[]const u8 = null,
-    lease_ttl_ms: ?u32 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -103,7 +97,6 @@ const Flags = struct {
     memory_bytes: ?u64 = null,
     images: ?[]const u8 = null,
     address: ?[]const u8 = null,
-    lease_ttl_ms: ?u32 = null,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -161,10 +154,6 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     const empty = "declare what the node offers";
     if (cpu == 0) return bad(diag, "the node's CPU must be above 0", .{}, empty);
     if (memory == 0) return bad(diag, "the node's memory must be above 0", .{}, empty);
-    const ttl = flags.lease_ttl_ms orelse file.lease_ttl_ms orelse constants.node_lease_ttl_ms;
-    const range = "the lease time {d} ms is outside 100 to 3600000";
-    if (ttl < constants.lease_ttl_ms_min) return bad(diag, range, .{ttl}, ttl_fix);
-    if (ttl > constants.lease_ttl_ms_max) return bad(diag, range, .{ttl}, ttl_fix);
     const address = flags.address orelse file.address orelse "";
     if (address.len > constants.listen_bytes_max) {
         return bad(diag, "the address text is longer than 128 bytes", .{}, "shorten it");
@@ -177,7 +166,6 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .images = try read_images(arena, io, images_path, diag),
         .capacity = .{ .cpu_millis = cpu, .memory_bytes = memory },
         .address = address,
-        .lease_ttl_ms = ttl,
         .verbose = flags.verbose,
     };
 }
@@ -211,8 +199,6 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
             flags.memory_bytes = try number_of(u64, args, &index, diag);
-        } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
-            flags.lease_ttl_ms = try number_of(u32, args, &index, diag);
         } else {
             return bad(
                 diag,
@@ -448,8 +434,8 @@ test "the server address is an IP address and a port, and nothing else" {
 }
 
 test "flags win over the file; unknown flags and settings are refused" {
-    // Goal: precedence and strictness. Method: a file that sets a node and a ttl, flags that
-    // override the ttl, a stray flag, a flag without its value, a typo in the file.
+    // Goal: precedence and strictness. Method: a file that sets a node, flags that
+    // set the CPU, a stray flag, a flag without its value, a typo in the file.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -457,16 +443,16 @@ test "flags win over the file; unknown flags and settings are refused" {
     diag.reset();
     const file = try parse_file(
         arena,
-        ".{ .node = \"node7\", .lease_ttl_ms = 3000 }",
+        ".{ .node = \"node7\", .cpu_millis = 3000 }",
         "agent.zon",
         &diag,
     );
     try testing.expectEqualStrings("node7", file.node.?);
     const flags = try parse_flags(
-        &.{ "--lease-ttl-ms", "4000", "-v", "--cpu-millis", "250" },
+        &.{ "-v", "--cpu-millis", "250" },
         &diag,
     );
-    try testing.expectEqual(@as(?u32, 4000), flags.lease_ttl_ms);
+    try testing.expectEqual(@as(?u32, 3000), file.cpu_millis);
     try testing.expect(flags.verbose);
     try testing.expectEqual(@as(?u32, 250), flags.cpu_millis);
 

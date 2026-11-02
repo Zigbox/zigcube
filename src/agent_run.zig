@@ -62,6 +62,8 @@ fn install_signals() void {
 const Shell = struct {
     io: std.Io,
     clock: @import("clock.zig").Clock,
+    /// CLOCK_BOOTTIME: the clock of the fence.
+    boot: @import("clock.zig").Clock,
     remote: *remote_mod.RemoteStore,
     fake: *fake_runtime.FakeRuntime,
     agent: *agent_mod.Agent,
@@ -69,6 +71,8 @@ const Shell = struct {
     diag: Diag,
     verbose: bool,
     policy: loop_mod.Loop,
+    /// This boot's id, kept with the lease (`agent.Context.boot_id`).
+    boot_id: []const u8,
     /// The last save of the remembered pair failed; shown once, cleared by one that works.
     save_failed: bool = false,
 
@@ -82,11 +86,22 @@ const Shell = struct {
             .clock = shell.clock,
             .arena = shell.arena.allocator(),
             .diag = &shell.diag,
+            .mono = shell.boot,
+            .state = shell.fake.state.interface(),
+            .boot_id = shell.boot_id,
+            // No exchange may run past the fence: the agent moves the cap as the lease moves,
+            // before its first call and after a grant or keepalive.
+            .deadline = .{ .context = shell.remote, .set_fn = remote_mod.RemoteStore.deadline_fn },
         };
         const before = shell.agent.lease;
+        const fences = shell.agent.fences;
         const result = shell.agent.reconcile(&ctx);
         shell.save_pair(false);
         shell.notice_pair();
+        // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
+        // goes on to register again, which fails while the server cannot write.
+        const fenced = shell.agent.fences != fences;
+        if (fenced) shell.notice_fence(before);
         const wake = result catch {
             const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
             const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
@@ -96,7 +111,7 @@ const Shell = struct {
         const outcome: loop_mod.Outcome = .{ .ok = wake };
         const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
         if (report == .recovered) shell.recovered();
-        shell.notice_lease(before);
+        if (!fenced) shell.notice_lease(before);
         return outcome;
     }
 
@@ -104,13 +119,22 @@ const Shell = struct {
     /// watch failed (the next pass reports and retries).
     fn watch(shell: *Shell, slice_ms: u32) bool {
         shell.diag.reset();
-        const changed = shell.remote.watch_once(slice_ms, &shell.diag) catch return true;
+        const mono = shell.boot.now_ms();
+        const held = shell.agent.watch_hold_ms(mono, slice_ms);
+        const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
+        shell.remote.set_deadline(shell.boot, deadline);
+        const changed = shell.remote.watch_once(held, &shell.diag) catch return true;
         shell.notice_pair();
         if (changed) return true;
         shell.arena.reset();
         const events = shell.fake.interface().events(shell.arena.allocator(), 0, &shell.diag) catch
             return true;
         return events.len > 0;
+    }
+
+    /// `ms`, or less if the fence falls sooner: the agent never sleeps through it.
+    fn before_fence(shell: *Shell, ms: u32) u32 {
+        return @min(ms, shell.agent.fence_in_ms(shell.boot.now_ms()));
     }
 
     /// Saves the pair if it is due; `final` (a clean stop) saves it whatever the time.
@@ -159,9 +183,9 @@ const Shell = struct {
         std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
     }
 
-    fn pause(shell: *Shell, ms: u32) void {
+    fn pause(shell: *Shell, wanted_ms: u32) void {
         // Slept in slices so that a stop request is noticed within one.
-        var left = ms;
+        var left = shell.before_fence(wanted_ms);
         while (left > 0) {
             if (stop_requested.load(.acquire)) return;
             const slice = @min(left, constants.server_poll_ms * 10);
@@ -185,7 +209,7 @@ const Shell = struct {
         ) catch {};
     }
 
-    /// A lease that was replaced is ZC-W0501, and a first one is a line of news.
+    /// A first lease is a line of news (a fence is `notice_fence`).
     fn notice_lease(shell: *Shell, before: store.LeaseId) void {
         const now = shell.agent.lease;
         const news = loop_mod.lease_news(before, now);
@@ -199,16 +223,20 @@ const Shell = struct {
             std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {};
             return;
         }
+    }
+
+    /// The agent fenced itself (ZC-W0501): its containers were stopped, and it registers again.
+    fn notice_fence(shell: *Shell, before: store.LeaseId) void {
         var warning: Diag = undefined;
         warning.reset();
         warning.raise(.W0501);
-        warning.cause("lease {d} ended; node {s} registered again on lease {d}", .{
-            before, shell.agent.config.node, now,
+        warning.cause("lease {d} could not be kept; node {s} stopped its containers", .{
+            before, shell.agent.config.node,
         });
         warning.fix(
             .{ .sentence = "if this repeats, check the network between the agent and the server" },
         );
-        shell.show("\n", &warning, "zcube-agent: its containers were left running\n");
+        shell.show("\n", &warning, "zcube-agent: registering the node again, with no containers\n");
     }
 
     fn show(shell: *Shell, before: []const u8, diag: *const Diag, after: []const u8) void {
@@ -234,6 +262,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const exe_length = std.process.executablePath(io, &exe_buffer) catch
         return fail_start(io, &diag, config.verbose, "can't find its own executable");
     var real: clock_mod.RealClock = .{ .io = io };
+    var boot: clock_mod.BootClock = .{ .io = io };
     const fake = gpa.create(fake_runtime.FakeRuntime) catch return constants.exit_environment;
     defer gpa.destroy(fake);
     fake.init(io, real.clock(), .{
@@ -247,6 +276,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .client = .{ .io = io, .address = config.server },
     };
     var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
+    remote.set_deadline(boot.clock(), std.math.maxInt(u64));
+    var boot_id_buffer: [64]u8 = undefined;
+    const boot_id = read_boot_id(io, &boot_id_buffer);
     var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
     // An IP address and a port always fit.
     const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
@@ -259,11 +291,11 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .capacity = config.capacity,
         .address = config.address,
         .agent_version = build_options.version,
-        .lease_ttl_ms = config.lease_ttl_ms,
     });
     var shell: Shell = .{
         .io = io,
         .clock = real.clock(),
+        .boot = boot.clock(),
         .remote = &remote,
         .fake = fake,
         .agent = agent,
@@ -271,6 +303,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .diag = undefined,
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
+        .boot_id = boot_id,
     };
     defer shell.arena.deinit();
     announce(io, config);
@@ -291,6 +324,14 @@ fn loop(shell: *Shell) void {
             .watch_ms => |ms| shell.policy.watch_done(shell.watch(ms)),
         }
     }
+}
+
+/// The kernel's id of this boot, or "" where it has none: the agent then tells a reboot only by
+/// a kept send time later than its clock (docs/agent.md).
+fn read_boot_id(io: std.Io, buffer: *[64]u8) []const u8 {
+    const path = "/proc/sys/kernel/random/boot_id";
+    const text = std.Io.Dir.cwd().readFile(io, path, buffer) catch return "";
+    return std.mem.trim(u8, text, " \n");
 }
 
 fn load_pair(
