@@ -1,0 +1,5 @@
+error[ZC-E0514]: the service does not fit Zigbox's limits
+  cause  an environment variable value is too long
+  fix    shorten it in the service file, then apply it again
+  more   zcube explain E0514 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0514.html

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0512]: the node can't apply limits: no user systemd bus
+  cause  the user running the agent has no systemd user bus, which limits need
+  reqid  r-0000001
+  fix    enable lingering for the agent's user, or remove the limits from the service file
+  more   zcube explain E0512
+  docs   https://zigbox.github.io/zigcube/errors/E0512.html

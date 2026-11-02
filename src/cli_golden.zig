@@ -325,6 +325,42 @@ fn agent_lost(diag: *diag_mod.Diag) void { // fake_runtime.zig
     );
 }
 
+fn agent_tree(diag: *diag_mod.Diag) void { // zigbox_image.zig
+    sample(
+        diag,
+        .E0510,
+        &.{"the image at ghcr.io/o/r@sha256:00 unpacks to b3:aa11, not b3:51aa9c03"},
+        "pull the reference with zbx, and put the tree digest it prints in the service file",
+    );
+}
+
+fn agent_no_bus(diag: *diag_mod.Diag) void { // zigbox_supervisor.zig
+    sample(
+        diag,
+        .E0511,
+        &.{"the user running the agent has no systemd user bus, which limits need"},
+        "enable lingering for the agent's user, or remove the limits from the service file",
+    );
+}
+
+fn agent_host(diag: *diag_mod.Diag) void { // zcube_agent.zig
+    sample(
+        diag,
+        .E0512,
+        &.{"this host can't run rootless containers: cgroup v2 is not mounted"},
+        "run zbx doctor as the agent's user and fix what it names, or use --runtime fake",
+    );
+}
+
+fn agent_too_long(diag: *diag_mod.Diag) void { // zigbox_runtime.zig
+    sample(
+        diag,
+        .E0513,
+        &.{"an environment variable value is too long"},
+        "shorten it in the service file, then apply it again",
+    );
+}
+
 fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
     sample(
         diag,
@@ -424,6 +460,10 @@ const cases = [_]Case{
     relayed(.E0508, agent_command),
     relayed(.E0509, agent_lost),
     relayed(.E0510, tenure_ended),
+    relayed(.E0511, agent_tree),
+    relayed(.E0512, agent_no_bus),
+    relayed(.E0513, agent_host),
+    relayed(.E0514, agent_too_long),
     relayed(.W0501, agent_lease),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
 };

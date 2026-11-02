@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0511]: the image does not give the tree the service names
+  cause  the image at ghcr.io/o/r@sha256:00 unpacks to b3:aa11, not b3:51aa9c03
+  reqid  r-0000001
+  fix    pull the reference with zbx, and put the tree digest it prints in the service file
+  more   zcube explain E0511
+  docs   https://zigbox.github.io/zigcube/errors/E0511.html
