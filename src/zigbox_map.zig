@@ -107,6 +107,10 @@ pub const bounds = struct {
     pub const env_name_bytes_max: usize = 64;
     pub const env_value_bytes_max: usize = 4096;
     pub const record_command_bytes_max: usize = 2048;
+    pub const runs_max: usize = 32;
+    pub const scopes_listed_max: usize = 16;
+    pub const signal_term: u8 = 15;
+    pub const signal_kill: u8 = 9;
 };
 
 pub fn refusal(spec: *const runtime.Spec) ?Refusal {
