@@ -81,6 +81,21 @@ const Rig = struct {
         }, &rig.diag);
     }
 
+    fn load(rig: *Rig, files: *agent_state.SimState, server: []const u8) !void {
+        rig.diag.reset();
+        const arena = rig.arena.allocator();
+        try rig.remote.load(files.interface(), "/state", server, arena, &rig.diag);
+    }
+
+    /// The file does not load: ZC-E0216, and the cause gives `reason`.
+    fn expect_unusable(rig: *Rig, files: *agent_state.SimState, reason: []const u8) !void {
+        try testing.expectError(error.BackendFailed, rig.load(files, "127.0.0.1:7070"));
+        try testing.expectEqual(.E0216, rig.diag.code.?);
+        const cause = rig.diag.causes.slice()[0].slice();
+        try testing.expect(std.mem.endsWith(u8, cause, reason));
+        try testing.expectEqual(null, rig.remote.known);
+    }
+
     fn refused(rig: *Rig) !void {
         try testing.expectError(error.BackendFailed, rig.list());
         try testing.expectEqual(.E0215, rig.diag.code.?);
@@ -171,7 +186,7 @@ test "a fork that grew past the remembered revision is ZC-E0215 through known_ha
     // The fix line tells the operator which file to remove.
     var found = false;
     for (rig.diag.fixes.slice()) |fix| {
-        if (std.mem.indexOf(u8, fix.command.slice(), "rm <state dir>/remembered") != null) {
+        if (std.mem.eql(u8, fix.command.slice(), "rm '<state dir>/remembered'")) {
             found = true;
         }
     }
@@ -213,7 +228,7 @@ test "the pair survives a restart through the state directory, and an old one lo
     rig.init(bodies[0..1]);
     defer rig.deinit();
     // A state directory from before the pair: nothing remembered, and the agent starts.
-    try rig.remote.load(files.interface(), "/state", rig.arena.allocator(), &rig.diag);
+    try rig.load(&files, "127.0.0.1:7070");
     try testing.expectEqual(null, rig.remote.known);
     _ = try rig.list();
     try rig.remote.save(files.interface(), 0);
@@ -223,7 +238,7 @@ test "the pair survives a restart through the state directory, and an old one lo
     var again: Rig = undefined;
     again.init(bodies[1..2]);
     defer again.deinit();
-    try again.remote.load(files.interface(), "/state", again.arena.allocator(), &again.diag);
+    try again.load(&files, "127.0.0.1:7070");
     try expect_known(&again, 9, hash_a);
     try again.refused();
 }
@@ -255,7 +270,164 @@ test "saves are throttled, and a damaged file is ZC-E0216" {
     var damaged: Rig = undefined;
     damaged.init(&.{});
     defer damaged.deinit();
-    const loaded = damaged.remote.load(files.interface(), "/state", arena, &damaged.diag);
-    try testing.expectError(error.BackendFailed, loaded);
-    try testing.expectEqual(.E0216, damaged.diag.code.?);
+    try damaged.expect_unusable(&files, "it is not what the agent writes");
+}
+
+fn read_file(files: *agent_state.SimState, arena: std.mem.Allocator) ![]const u8 {
+    return files.interface().read(arena, client.remembered_file);
+}
+
+test "a server that keeps no pair: the agent neither refuses nor keeps one, and says so once" {
+    // Goal: a memory-store server starts empty with every restart and does not hold that against
+    // its store (`"verified": false`); the agent must not either, or a restart bricks it.
+    // Method: a pair remembered at 9, then unverified answers at 2 and 1 (a restarted memory
+    // store), then a verified one again.
+    var b: [3][384]u8 = undefined;
+    const bodies = [_][]const u8{
+        answer(&b[0], 2, "{\"revision\":2,\"hash\":\"" ++ hash_b ++ "\",\"verified\":false}"),
+        answer(&b[1], 1, "{\"revision\":1,\"hash\":\"" ++ hash_c ++ "\",\"verified\":false}"),
+        answer(&b[2], 3, "{\"revision\":3,\"hash\":\"" ++ hash_c ++ "\",\"verified\":true}"),
+    };
+    var files = agent_state.SimState.init(testing.allocator, 3);
+    defer files.deinit();
+    const before = "{\"v\":2,\"server\":\"127.0.0.1:7070\",\"revision\":9,\"hash\":\"" ++
+        hash_a ++ "\"}\n";
+    try files.interface().put_atomic(client.remembered_file, before);
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    try rig.load(&files, "127.0.0.1:7070");
+    try expect_known(&rig, 9, hash_a);
+    try testing.expectEqual(null, rig.remote.take_notice());
+
+    try testing.expectEqual(@as(usize, 1), (try rig.list()).kvs.len);
+    try testing.expectEqual(null, rig.remote.known);
+    try testing.expectEqual(client.Notice.unverified, rig.remote.take_notice().?);
+    try rig.remote.save(files.interface(), 0);
+    try testing.expectEqualStrings(before, try read_file(&files, rig.arena.allocator()));
+    // No `known` is sent any more, nothing is refused, and the news is not repeated.
+    _ = try rig.list();
+    try testing.expectEqualStrings("/v1/agent/nodes/node1/replicas", rig.script.targets[1]);
+    try testing.expectEqual(null, rig.remote.take_notice());
+    // A server that keeps its pair again is remembered from its first answer, and saved at once.
+    _ = try rig.list();
+    try expect_known(&rig, 3, hash_c);
+    try rig.remote.save(files.interface(), 1);
+    const after = "{\"v\":2,\"server\":\"127.0.0.1:7070\",\"revision\":3,\"hash\":\"" ++
+        hash_c ++ "\"}\n";
+    try testing.expectEqualStrings(after, try read_file(&files, rig.arena.allocator()));
+}
+
+test "a pair saved for another server is not compared; a version 1 file is kept as it is" {
+    // Goal: the file names the server it was saved for, so an agent pointed at another server
+    // starts fresh instead of refusing it; a file from before the address (version 1) is kept.
+    var b: [2][384]u8 = undefined;
+    const bodies = [_][]const u8{
+        answer(&b[0], 2, "{\"revision\":2,\"hash\":\"" ++ hash_b ++ "\"}"),
+        answer(&b[1], 4, "{\"revision\":4,\"hash\":\"" ++ hash_b ++ "\"}"),
+    };
+    var files = agent_state.SimState.init(testing.allocator, 4);
+    defer files.deinit();
+    const old = "{\"v\":2,\"server\":\"10.0.0.1:7070\",\"revision\":9,\"hash\":\"" ++
+        hash_a ++ "\"}";
+    try files.interface().put_atomic(client.remembered_file, old);
+    var rig: Rig = undefined;
+    rig.init(bodies[0..1]);
+    defer rig.deinit();
+    try rig.load(&files, "10.0.0.2:7070");
+    try testing.expectEqual(null, rig.remote.known);
+    try testing.expectEqual(client.Notice.server_changed, rig.remote.take_notice().?);
+    try testing.expectEqualStrings("10.0.0.1:7070", rig.remote.previous_server_name());
+    _ = try rig.list();
+    try rig.remote.save(files.interface(), 0);
+    const saved = try read_file(&files, rig.arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, saved, "\"server\":\"10.0.0.2:7070\",\"revision\":2,") !=
+        null);
+
+    const v1 = "{\"v\":1,\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}\n";
+    try files.interface().put_atomic(client.remembered_file, v1);
+    var older: Rig = undefined;
+    older.init(bodies[1..2]);
+    defer older.deinit();
+    try older.load(&files, "10.0.0.2:7070");
+    try expect_known(&older, 9, hash_a);
+    try testing.expectEqual(null, older.remote.take_notice());
+    try older.refused();
+}
+
+test "a file version of 0 or not a number is damaged, and only a higher one is newer" {
+    var files = agent_state.SimState.init(testing.allocator, 5);
+    defer files.deinit();
+    const damaged = "it is not what the agent writes";
+    const cases = [_]struct { text: []const u8, reason: []const u8 }{
+        .{ .text = "{\"v\":0,\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}", .reason = damaged },
+        .{
+            .text = "{\"v\":\"2\",\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}",
+            .reason = damaged,
+        },
+        .{ .text = "{\"v\":-1,\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}", .reason = damaged },
+        .{ .text = "{\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}", .reason = damaged },
+        // Version 2 always names its server, version 1 never does.
+        .{ .text = "{\"v\":2,\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}", .reason = damaged },
+        .{
+            .text = "{\"v\":1,\"server\":\"a\",\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}",
+            .reason = damaged,
+        },
+        .{
+            .text = "{\"v\":3,\"other\":true}",
+            .reason = "it was written by a newer zcube-agent",
+        },
+    };
+    for (cases) |case| {
+        try files.interface().put_atomic(client.remembered_file, case.text);
+        var rig: Rig = undefined;
+        rig.init(&.{});
+        defer rig.deinit();
+        try rig.expect_unusable(&files, case.reason);
+    }
+}
+
+test "the fix line quotes the state directory for the shell" {
+    var b: [2][384]u8 = undefined;
+    const bodies = [_][]const u8{
+        answer(&b[0], 9, "{\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}"),
+        answer(&b[1], 6, "{\"revision\":6,\"hash\":\"" ++ hash_b ++ "\"}"),
+    };
+    var files = agent_state.SimState.init(testing.allocator, 6);
+    defer files.deinit();
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    rig.diag.reset();
+    const arena = rig.arena.allocator();
+    try rig.remote.load(files.interface(), "/var/lib/it's here", "a:1", arena, &rig.diag);
+    _ = try rig.list();
+    try rig.refused();
+    const fixes = rig.diag.fixes.slice();
+    const last = fixes[fixes.len - 1].command.slice();
+    try testing.expectEqualStrings("rm '/var/lib/it'\\''s here/remembered'", last);
+}
+
+test "a clean stop saves the pair whatever the time since the last save" {
+    var b: [2][384]u8 = undefined;
+    const bodies = [_][]const u8{
+        answer(&b[0], 9, "{\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}"),
+        answer(&b[1], 11, "{\"revision\":11,\"hash\":\"" ++ hash_b ++ "\",\"known_hash\":\"" ++
+            hash_a ++ "\"}"),
+    };
+    var files = agent_state.SimState.init(testing.allocator, 7);
+    defer files.deinit();
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    try rig.load(&files, "a:1");
+    _ = try rig.list();
+    try rig.remote.save(files.interface(), 1000);
+    _ = try rig.list();
+    try rig.remote.save(files.interface(), 1001);
+    const throttled = try read_file(&files, rig.arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, throttled, "\"revision\":9,") != null);
+    try rig.remote.save_final(files.interface(), 1002);
+    const final = try read_file(&files, rig.arena.allocator());
+    try testing.expect(std.mem.indexOf(u8, final, "\"revision\":11,") != null);
 }

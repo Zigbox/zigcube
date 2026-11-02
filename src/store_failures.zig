@@ -143,7 +143,8 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
         const look = "look at which store the server uses; to keep it as it is, run there";
         diag.fix_with(look, "zcube store accept-rollback --confirm", .{});
         const forget = "then make this agent forget its pair, and restart it";
-        diag.fix_with(forget, "rm {s}/remembered", .{state_dir});
+        const file: ShellQuoted = .{ .text = state_dir, .suffix = "/remembered" };
+        diag.fix_with(forget, "rm {f}", .{file});
     } else {
         backwards_causes(diag, rollback, server_words);
         const sentence = "look at which store this is; to keep it as it is, run";
@@ -151,6 +152,27 @@ pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
     }
     return error.BackendFailed;
 }
+
+/// `text` and `suffix` as one shell word in single quotes, a `'` inside written `'\''`, so a
+/// state directory with spaces or quotes in its name pastes as it is.
+const ShellQuoted = struct {
+    text: []const u8,
+    suffix: []const u8,
+
+    pub fn format(quoted: ShellQuoted, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeByte('\'');
+        for ([_][]const u8{ quoted.text, quoted.suffix }) |part| {
+            for (part) |byte| {
+                if (byte == '\'') {
+                    try writer.writeAll("'\\''");
+                } else {
+                    try writer.writeByte(byte);
+                }
+            }
+        }
+        try writer.writeByte('\'');
+    }
+};
 
 /// Who remembers, and what answered: the server about its store, or an agent about the server.
 const Words = struct {

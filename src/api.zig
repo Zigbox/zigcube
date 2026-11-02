@@ -92,6 +92,10 @@ pub const Api = struct {
     /// `POST /v1/store/accept-rollback`.
     /// Null in the simulation, which has no guard.
     verified: ?*store_verified.VerifiedStore = null,
+    /// False when the server keeps no pair for its store across its own restarts (a memory
+    /// store, which starts empty every time): the agent's answers then say `"verified": false`
+    /// and the agent keeps no pair either (`agent_api.zig`). True in the simulation and tests.
+    pair_kept: bool = true,
 
     /// Answers one request. `ctx.arena` holds the answer: it stays valid until the arena is reset.
     pub fn handle(api: *Api, ctx: *const Context, request: Request) Response {
@@ -141,6 +145,7 @@ pub const Api = struct {
                 request.query,
                 request.body,
                 request.hold,
+                api.pair_kept,
             );
             return .{
                 .body = agent.body,

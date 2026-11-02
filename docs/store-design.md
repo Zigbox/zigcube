@@ -243,7 +243,14 @@ nothing from it. This catches a server that was restarted on a rolled-back store
 `rm <state dir>/remembered` and a restart. `RemoteStore.hash_at` stays unsupported: the check
 rides on the answer it guards, with no second round trip and no gap between check and use. An
 agent's crash window is the server's (one save interval); a server older than the agent sends no
-pair and is `ZC-E0504`.
+pair and is `ZC-E0504`. The file also names the server address it was saved for: a pair saved for
+another address is not compared, and a server on a memory store says `"verified": false` and is
+not checked (docs/agent.md, "The remembered pair").
+
+**Where writes are gated.** Write gating is the server's `VerifiedStore` alone: once it has seen
+its store go backwards it refuses every store call, writes from agent endpoints included. The
+agent's check guards only what the agent acts on (which containers it starts, stops or adopts);
+it neither gates nor delays writes, and an agent that never calls cannot see a rollback.
 
 Known gaps (not fixed in 10b): `accept` reads the store's status and then bumps the epoch, so a write
 acknowledged between the two is not in the pair it remembers (the pair is lower than the store: weaker,

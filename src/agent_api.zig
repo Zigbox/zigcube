@@ -19,7 +19,10 @@
 //! taken after the endpoint's work (the watch: the head it answered at). Every endpoint takes
 //! `known=K`, the revision the agent remembers; when `K <= R` the pair adds `known_hash`, the
 //! store's hash at `K` (left out on `NoHash`). The agent refuses an answer from behind with them
-//! (`agent_client.zig`, "Nothing from behind"); the server only reports.
+//! (`agent_client.zig`, "Nothing from behind"); the server only reports. `verified` says whether
+//! the server keeps the store's pair across its own restarts (`Api.pair_kept`): false for a
+//! memory store, which starts empty with every start, and then the agent keeps no pair either.
+//! The write endpoints take the pair from their own transaction when it wrote (`hash`).
 //!
 //! **The watch carries no events.** It answers whether a key under the watched prefix changed
 //! since revision `from`, with a bookmark. The agent reconciles by level, so it lists again and
@@ -71,6 +74,7 @@ pub fn route(
     query: []const u8,
     body: []const u8,
     hold: bool,
+    pair_kept: bool,
 ) Failure!Reply {
     assert(ctx.diag.code == null);
     const nodes = parts.next() orelse return no_such(ctx, "/v1/agent");
@@ -87,6 +91,7 @@ pub fn route(
         .numbers = numbers,
         .body = body,
         .hold = hold,
+        .pair_kept = pair_kept,
         .parts = parts,
     };
     const what = parts.next() orelse return call.register();
@@ -104,6 +109,7 @@ const Call = struct {
     numbers: Numbers,
     body: []const u8,
     hold: bool,
+    pair_kept: bool,
     parts: *Parts,
 
     fn require_method(call: Call, wanted: []const u8) Failure!void {
@@ -125,21 +131,38 @@ const Call = struct {
     /// The pair the answer carries: the store's status, read after the endpoint did its work, so
     /// it is at least as new as anything else in the answer; and the hash at the agent's `known`
     /// revision when the store has one (docs/api.md, "The chain pair").
+    ///
+    /// Read after the work by a second call, the pair and what the work saw are two moments: a
+    /// store that went back between them and forward again past what the agent remembers is not
+    /// seen. The write endpoints close that window with `chain_written`; the leases (no
+    /// transaction result) and a transaction that wrote nothing keep it.
     fn chain(call: Call) Failure!Chain {
         const head = call.ctx.store.status(call.ctx.diag) catch return propagate(call.ctx);
-        return call.chain_of(head);
+        return call.chain_of(head.revision, head.hash);
     }
 
-    fn chain_of(call: Call, head: store.Status) Failure!Chain {
+    /// The pair of the revision a transaction wrote, from its own result: the same moment as the
+    /// write. A transaction that wrote nothing (or a store that cannot say) has no hash: `status`.
+    fn chain_written(call: Call, result: store.TxnResult) Failure!Chain {
+        const hash = result.hash orelse return call.chain();
+        return call.chain_of(result.revision, hash);
+    }
+
+    fn chain_of(call: Call, revision: store.Revision, hash: store.Hash) Failure!Chain {
         const ctx = call.ctx;
         var result: Chain = .{
-            .revision = head.revision,
-            .hash = try hex(ctx, head.hash),
+            .revision = revision,
+            .hash = try hex(ctx, hash),
+            .verified = call.pair_kept,
         };
         const known = call.numbers.known orelse return result;
         // Above the store's revision there is no hash: the agent sees the lower revision and
         // refuses on that.
-        if (known > head.revision) return result;
+        if (known > revision) return result;
+        if (known == revision) {
+            result.known_hash = result.hash;
+            return result;
+        }
         const there = ctx.store.hash_at(known, ctx.diag) catch |err| {
             if (err != error.NoHash) return propagate(ctx);
             // Before the chain's start: left out, and the agent refuses it as unverifiable.
@@ -180,7 +203,8 @@ const Call = struct {
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
-        return reply(ctx, .{ .revision = result.revision, .chain = try call.chain() });
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
     // ---- POST /v1/agent/nodes/{node}/lease[/{id}/keepalive] ----
@@ -288,7 +312,8 @@ const Call = struct {
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
-        return reply(ctx, .{ .revision = result.revision, .chain = try call.chain() });
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
     /// The key is this node's observed key for the replica the record names, and the record says
@@ -350,7 +375,7 @@ const Call = struct {
             }
         }
         // The head was read before the watch, after every earlier request of this agent.
-        const pair = try call.chain_of(head);
+        const pair = try call.chain_of(head.revision, head.hash);
         var answer = try reply(ctx, .{ .revision = bookmark, .changed = changed, .chain = pair });
         if (!changed) {
             if (call.hold) {
@@ -389,6 +414,8 @@ const Chain = struct {
     revision: u64,
     hash: []const u8,
     known_hash: ?[]const u8 = null,
+    /// False when the server does not keep this store's pair across its restarts.
+    verified: bool,
 };
 
 fn hex(ctx: *const Context, hash: store.Hash) Failure![]const u8 {

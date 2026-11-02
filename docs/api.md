@@ -427,11 +427,17 @@ compaction point is `410` and `ZC-E0203`, and the agent treats that as "changed"
 
 ### The chain pair (C1 slice 10b)
 
-Every `200` answer of these endpoints carries `"chain": {"revision": R, "hash": "<64 hex>"}`:
-the store's `status` taken after the endpoint did its work (for the watch, the head it answered
-at), so it is at least as new as anything in the answer. Every endpoint takes `known=K`, the
+Every `200` answer of these endpoints carries
+`"chain": {"revision": R, "hash": "<64 hex>", "verified": V}`: for a write (registration, report),
+the revision and hash of the transaction itself; otherwise the store's `status` taken after the
+endpoint did its work (for the watch, the head it answered at), so it is at least as new as
+anything in the answer. `verified` is `false` when the server keeps no pair for its store across
+restarts (a memory store, which starts empty each time) and so does not enforce the
+never-backwards rule; the agent then neither refuses such an answer nor keeps a pair, and says so
+once. An answer without `verified` is read as `true`. Every endpoint takes `known=K`, the
 revision the agent remembers (no other query parameter, except the watch's `from` and `timeout`).
-When `K <= R`, the pair adds `"known_hash"`: the store's hash at `K`. It is left out when the store
+When `K <= R`, the pair adds `"known_hash"`: the store's hash at `K` (`hash` itself when
+`K == R`). It is left out when the store
 has no hash there (`K` below the chain's start). A refusal carries no pair.
 
 The agent remembers the highest pair it was given, in `<state dir>/remembered`, and refuses an

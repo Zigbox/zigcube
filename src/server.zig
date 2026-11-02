@@ -173,6 +173,7 @@ pub const Server = struct {
         const guarded = server.verified.interface();
         server.shared.store = guarded;
         server.shared.api.verified = &server.verified;
+        server.shared.api.pair_kept = remember != null;
         server.driver.store = guarded;
         server.driver.verified = &server.verified;
     }

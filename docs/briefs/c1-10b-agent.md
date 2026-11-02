@@ -56,3 +56,13 @@ Parent brief: [c1-10.md](c1-10.md), 10b, third bullet. The server side (`Verifie
 
 An agent-side `accept-rollback` command or flag; any change to `Store` or `Runtime`; the
 decision record of a rollback (a known 10b gap); the 10d failover test.
+
+## Review fixes (2026-11-02)
+
+The supervisor's review of the first pass decided M1-M5 and L6-L11; what was done is in
+docs/DECISIONS.md (row of 2026-11-02, "review fixes") and docs/agent.md, "The remembered pair".
+
+**Cut (M3), a gap for the owner:** after `zcube store accept-rollback --confirm`, recovery is per
+node: each agent that refused needs `rm '<state dir>/remembered'` and a restart. An accepted
+rollback could travel in `chain` as `{from, to}`, and an agent whose pair equals `from` would
+adopt `to`; not built in this slice.

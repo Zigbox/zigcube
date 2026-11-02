@@ -290,14 +290,20 @@ const Node = struct {
         node.resume_ms = 0;
     }
 
-    /// The agent's remembered pair, as `zcube-agent` loads it at start. `SimState` keeps every
-    /// put whole, so a file the agent wrote always parses.
+    /// The agent's remembered pair, as `zcube-agent` loads it at start. `restart` has just
+    /// cleared the crash (a first start has none), and `SimState.read` fails only while crashed
+    /// (a read is no write point, so it cannot crash); `SimState` keeps every put whole, so a
+    /// file the agent wrote parses; and the address is always the same. So the load cannot fail.
     fn load_pair(node: *Node) void {
+        assert(!node.sim.crashed);
+        assert(!node.sim.files.crashed);
         node.diag.reset();
         _ = node.arena.reset(.retain_capacity);
         const state = node.sim.files.interface();
-        node.remote.load(state, "/sim", node.arena.allocator(), &node.diag) catch
-            unreachable; // Only a file the agent did not write fails to load.
+        const arena = node.arena.allocator();
+        const loaded = node.remote.load(state, "/sim", "sim-server", arena, &node.diag);
+        loaded catch unreachable; // Cannot fail: see above.
+        assert(node.remote.notice == null);
     }
 
     /// The pair saved after a step, as `zcube-agent` does; a crash at its write point is the
@@ -552,6 +558,7 @@ pub const Cluster = struct {
         node.remote = agent_client.RemoteStore.init(c.gpa, node.transport(), node.name());
         node.diag.reset();
         node.arena = .init(c.gpa);
+        node.load_pair(); // A fresh state directory: nothing remembered, the address set.
         node.down = false;
         node.restart_at_ms = 0;
         node.resume_ms = 0;

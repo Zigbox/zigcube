@@ -31,8 +31,16 @@
 //! second request that would check another moment.
 //!
 //! The pair lives in `AgentState` as `remembered` (`load` at start, `save` between steps, at most
-//! every `verified_save_ms`; a copy that lags is safe, only weaker). A state directory from
-//! before this file existed loads with nothing remembered.
+//! every `verified_save_ms`, and once more at a clean stop; a copy that lags is safe, only
+//! weaker), with the server address the agent was given (`--server`). A state directory from
+//! before this file existed loads with nothing remembered; a pair saved for another address is
+//! not compared (`Notice.server_changed`): the agent starts fresh. A store recreated at the same
+//! address is not told apart from one that went back, and is refused the same way.
+//!
+//! **A server that keeps no pair.** An answer whose `chain` says `"verified": false` comes from a
+//! server whose store does not outlive its restarts (a memory store), which the server itself
+//! does not hold against it. The agent matches that: it neither refuses nor keeps a pair for such
+//! a server, and forgets one it had (`Notice.unverified`, once).
 //!
 //! The server's `ZC-E0205` (the lease is gone) becomes `error.LeaseNotFound`, because the agent
 //! core grants a new lease on exactly that error. Every other refusal is ZC-E0504 with the
@@ -55,9 +63,22 @@ const Pair = verified.Pair;
 
 /// The agent's remembered pair, in its state directory.
 pub const remembered_file = "remembered";
-/// `{"v":1,"revision":<u64>,"hash":"<64 hex>"}` and room to spare.
-const remembered_bytes_max: u32 = 160;
-const remembered_version: u32 = 1;
+/// The longest server address the file keeps: an IPv6 address with a zone and a port fits.
+pub const remembered_server_bytes_max: u32 = 96;
+/// `{"v":2,"server":"<address>","revision":<u64>,"hash":"<64 hex>"}` and room to spare, with
+/// every byte of the address escaped (six bytes each at most).
+const remembered_bytes_max: u32 = 192 + 6 * remembered_server_bytes_max;
+/// Version 1 had no `server`: its pair is kept and compared, for the address is unknown.
+const remembered_version: u32 = 2;
+
+/// News about the remembered pair for the person running the agent (`take_notice`).
+pub const Notice = enum {
+    /// The file's pair was saved for another server address: not compared, the agent starts
+    /// fresh. Raised by `load`; `previous_server` names the old address.
+    server_changed,
+    /// The server keeps no pair for its store (`"verified": false`): the agent keeps none.
+    unverified,
+};
 
 pub const Error = error{ Unreachable, BadReply, OutOfMemory };
 
@@ -118,6 +139,15 @@ pub const RemoteStore = struct {
     saved_ms: u64 = 0,
     /// The state directory as the person running the agent named it, for the fix line.
     state_dir: []const u8 = "<state dir>",
+    /// The server address the agent was given, borrowed (`load`); saved with the pair.
+    server: []const u8 = "",
+    /// What to tell the person, taken by `take_notice`.
+    notice: ?Notice = null,
+    /// `Notice.unverified` is raised once per process.
+    unverified_noted: bool = false,
+    /// The address the file named, for `Notice.server_changed`.
+    previous_server: [remembered_server_bytes_max]u8 = undefined,
+    previous_server_len: u32 = 0,
 
     const vtable: store.Store.VTable = .{
         .status = status_impl,
@@ -141,6 +171,18 @@ pub const RemoteStore = struct {
 
     pub fn interface(remote: *RemoteStore) store.Store {
         return .{ .context = remote, .vtable = &vtable };
+    }
+
+    /// The news about the pair since the last call, if any.
+    pub fn take_notice(remote: *RemoteStore) ?Notice {
+        const notice = remote.notice;
+        remote.notice = null;
+        return notice;
+    }
+
+    /// For `Notice.server_changed`: the address the file named.
+    pub fn previous_server_name(remote: *const RemoteStore) []const u8 {
+        return remote.previous_server[0..remote.previous_server_len];
     }
 
     fn from(context: *anyopaque) *RemoteStore {
@@ -524,12 +566,15 @@ pub const RemoteStore = struct {
             revision: u64,
             hash: []const u8,
             known_hash: ?[]const u8 = null,
+            // Absent from the first 10b servers, which kept a pair for every store.
+            verified: bool = true,
         };
         const Answer = struct { chain: ?ChainJson = null };
         const answer = try parse(Answer, arena, body, diag);
         const chain = answer.chain orelse
             return bad(diag, "the reply carries no chain pair: the server is older than the agent");
         const now: Pair = .{ .revision = chain.revision, .hash = try parse_hash(chain.hash, diag) };
+        if (!chain.verified) return remote.forget_unverified();
         const known = remote.known orelse {
             remote.known = now;
             return;
@@ -537,6 +582,17 @@ pub const RemoteStore = struct {
         try remote.compare(known, now, chain.known_hash, diag);
         assert(now.revision >= known.revision);
         if (now.revision > known.revision) remote.known = now;
+    }
+
+    /// The server does not hold its own store to the pair, so the agent does not either: it
+    /// drops what it remembers (the file is rewritten by the first save once a pair is kept
+    /// again) and says so once.
+    fn forget_unverified(remote: *RemoteStore) void {
+        remote.known = null;
+        remote.saved = null;
+        if (remote.unverified_noted) return;
+        remote.unverified_noted = true;
+        remote.notice = .unverified;
     }
 
     fn compare(
@@ -577,30 +633,58 @@ pub const RemoteStore = struct {
     /// Reads the pair the agent saved before it stopped. No file (a first start, or a state
     /// directory from before 10b) is nothing remembered; a file that does not parse is
     /// `ZC-E0216`, and the agent does not start on a guess.
+    ///
+    /// `server` is the address the agent was given, borrowed: it is saved with the pair, and a
+    /// pair saved for another address is not loaded (`Notice.server_changed`). A version 1 file
+    /// names no address and is loaded as it is.
     pub fn load(
         remote: *RemoteStore,
         state: agent_state.AgentState,
         state_dir: []const u8,
+        server: []const u8,
         arena: Allocator,
         diag: *Diag,
     ) error{BackendFailed}!void {
         assert(diag.code == null);
         assert(remote.known == null);
+        assert(server.len <= remembered_server_bytes_max);
         remote.state_dir = state_dir;
+        remote.server = server;
         const text = state.read(arena, remembered_file) catch |err| switch (err) {
             error.Absent => return,
             else => return remote.unusable(diag, @errorName(err)),
         };
-        const File = struct { v: u32, revision: u64, hash: []const u8 };
-        const file = std.json.parseFromSliceLeaky(File, arena, text, .{}) catch
-            return remote.unusable(diag, "it is not what the agent writes");
-        if (file.v != remembered_version) {
+        const damaged = "it is not what the agent writes";
+        const Version = struct { v: u32 };
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const version = std.json.parseFromSliceLeaky(Version, arena, text, options) catch
+            return remote.unusable(diag, damaged);
+        if (version.v == 0) return remote.unusable(diag, damaged);
+        if (version.v > remembered_version) {
             return remote.unusable(diag, "it was written by a newer zcube-agent");
         }
+        const File = struct { v: u32, server: ?[]const u8 = null, revision: u64, hash: []const u8 };
+        const file = std.json.parseFromSliceLeaky(File, arena, text, .{}) catch
+            return remote.unusable(diag, damaged);
+        // Version 1 has no address and version 2 always has one.
+        if ((file.server == null) != (file.v == 1)) return remote.unusable(diag, damaged);
         const hash = parse_hash(file.hash, diag) catch {
             diag.reset();
             return remote.unusable(diag, "its hash is not a chain hash");
         };
+        if (file.server) |saved_for| {
+            if (saved_for.len > remembered_server_bytes_max) {
+                return remote.unusable(diag, damaged);
+            }
+            if (!std.mem.eql(u8, saved_for, server)) {
+                // Another server's pair says nothing about this one: start fresh, and the
+                // first save replaces the file.
+                @memcpy(remote.previous_server[0..saved_for.len], saved_for);
+                remote.previous_server_len = @intCast(saved_for.len);
+                remote.notice = .server_changed;
+                return;
+            }
+        }
         remote.known = .{ .revision = file.revision, .hash = hash };
         remote.saved = remote.known;
     }
@@ -613,27 +697,57 @@ pub const RemoteStore = struct {
         state: agent_state.AgentState,
         now_ms: u64,
     ) agent_state.Error!void {
+        return remote.save_pair(state, now_ms, true);
+    }
+
+    /// `save` without the wait between writes: at a clean stop, so the next start loses nothing.
+    pub fn save_final(
+        remote: *RemoteStore,
+        state: agent_state.AgentState,
+        now_ms: u64,
+    ) agent_state.Error!void {
+        return remote.save_pair(state, now_ms, false);
+    }
+
+    fn save_pair(
+        remote: *RemoteStore,
+        state: agent_state.AgentState,
+        now_ms: u64,
+        throttled: bool,
+    ) agent_state.Error!void {
         const known = remote.known orelse return;
         if (remote.saved) |saved| {
             assert(saved.revision <= known.revision);
             if (saved.eql(known)) return;
-            if (now_ms -| remote.saved_ms < constants.verified_save_ms) return;
+            if (throttled and now_ms -| remote.saved_ms < constants.verified_save_ms) return;
         }
+        const hex = std.fmt.bytesToHex(known.hash, .lower);
+        const File = struct { v: u32, server: []const u8, revision: u64, hash: []const u8 };
+        const file: File = .{
+            .v = remembered_version,
+            .server = remote.server,
+            .revision = known.revision,
+            .hash = &hex,
+        };
         var buffer: [remembered_bytes_max]u8 = undefined;
-        const format = "{{\"v\":{d},\"revision\":{d},\"hash\":\"{x}\"}}\n";
-        const fields = .{ remembered_version, known.revision, &known.hash };
-        // The buffer holds the longest line: 20 digits and 64 hex digits.
-        const text = std.fmt.bufPrint(&buffer, format, fields) catch unreachable;
-        try state.put_atomic(remembered_file, text);
+        var writer: std.Io.Writer = .fixed(&buffer);
+        // The buffer holds the longest file: `load` bounds the address, the rest is fixed.
+        std.json.Stringify.value(file, .{}, &writer) catch unreachable;
+        writer.writeByte('\n') catch unreachable; // As above.
+        try state.put_atomic(remembered_file, writer.buffered());
         remote.saved = known;
         remote.saved_ms = now_ms;
     }
 
+    /// `<state dir>/remembered`, or the file's name alone if the directory is too long to name.
+    pub fn remembered_path(remote: *const RemoteStore, buffer: []u8) []const u8 {
+        const parts = .{ remote.state_dir, remembered_file };
+        return std.fmt.bufPrint(buffer, "{s}/{s}", parts) catch remembered_file;
+    }
+
     fn unusable(remote: *const RemoteStore, diag: *Diag, reason: []const u8) error{BackendFailed} {
         var buffer: [constants.state_path_bytes_max + 16]u8 = undefined;
-        const parts = .{ remote.state_dir, remembered_file };
-        // A state directory too long to name: the file's name alone.
-        const where = std.fmt.bufPrint(&buffer, "{s}/{s}", parts) catch remembered_file;
+        const where = remote.remembered_path(&buffer);
         return failures.remembered_unusable(diag, where, "read", reason);
     }
 
