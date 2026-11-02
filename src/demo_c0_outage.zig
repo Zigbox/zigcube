@@ -2,6 +2,11 @@
 //! with a registered `ZC-` diagnostic and a fix (never a connection library's text), `zcube bundle
 //! --last` must write a bundle, and when the backend is back the system recovers.
 //!
+//! The outage lasts at least `outage_ms`, longer than the agent may run on a lease it cannot
+//! renew (owner, 2026-11-02): the agent fences itself, every replica's command is dead by the
+//! time its last renewed lease would run out, nothing runs while the store stays down, and when
+//! it is back the node registers again (a higher tenure) and the replicas run as new processes.
+//!
 //! **Postgres** is a server of its own, so it is stopped (`pg_ctl stop` for a local database,
 //! `docker stop` for CI's service container) and started again with its data.
 //!
@@ -27,6 +32,23 @@ const Demo = state.Demo;
 const Host = state.Host;
 const Json = state.Json;
 
+/// How long the store refuses writes, at least, from the moment it stops (`stopped_ms`): 11 s.
+/// The owner's 9 s (2026-11-02) outlasts the fence: the agent renews every `ttl / 3`, so its
+/// last renewal `s` was at most `ttl / 3` before the store stopped; it fences at
+/// `s + ttl - fence_margin` and its containers are dead by `s + ttl`. C1 slice 4 makes it longer
+/// than the ttl as well, so the node's lease has always ended when the store is back
+/// (supervisor, 2026-11-02: an outage longer than the ttl ends the lease, and the node is lost),
+/// and the node controller records `mark_lost` whatever it sees first, the record gone or the
+/// node registered again.
+const outage_ms: u64 = constants.lease_ttl_ms + 1000;
+
+comptime {
+    const fence_latest_ms = constants.lease_ttl_ms / 3 + constants.lease_ttl_ms -
+        constants.fence_margin_ms - constants.lease_ttl_ms;
+    assert(outage_ms >= fence_latest_ms + 2000);
+    assert(outage_ms > constants.lease_ttl_ms);
+}
+
 pub fn run(demo: *Demo) !void {
     const host = demo.host;
     host.section("5. The store backend stops");
@@ -38,18 +60,24 @@ pub fn run(demo: *Demo) !void {
     });
     try state.write_service(demo, "hello", state.hello_image, 3);
     switch (demo.backend) {
-        .postgres => |control| try postgres_outage(demo, control),
-        .sqlite => try sqlite_outage(demo),
+        .postgres => |control| try postgres_outage(demo, control, before),
+        .sqlite => try sqlite_outage(demo, before),
     }
     try recovered(demo, before, counts, tenure);
 }
 
 // ---- Postgres ----
 
-fn postgres_outage(demo: *Demo, control: state.PostgresControl) !void {
+fn postgres_outage(
+    demo: *Demo,
+    control: state.PostgresControl,
+    before: []const host_procs.Pids,
+) !void {
     const host = demo.host;
     try run_command(host, "the Postgres server is stopped", control.stop_command);
     demo.store_stopped = true;
+    // The server is down once the command returns: no renewal is sent later and succeeds.
+    const stopped_ms = host.now_ms();
     const refused = struct {
         fn check(_: *Demo, h: *Host) !bool {
             const cli = try h.zcube_quiet(&.{ "get", "service", "hello" });
@@ -84,6 +112,7 @@ fn postgres_outage(demo: *Demo, control: state.PostgresControl) !void {
     try bundle_last(demo, "ZC-E0201", .store_down);
     const apply = try host.zcube(&.{ "apply", "--yes", "hello.zon" });
     try expect_store_error(host, apply, "ZC-E0201", "can't reach the store backend");
+    try fenced(demo, before, stopped_ms);
 }
 
 // ---- SQLite ----
@@ -117,7 +146,7 @@ const SqliteLock = struct {
     }
 };
 
-fn sqlite_outage(demo: *Demo) !void {
+fn sqlite_outage(demo: *Demo, before: []const host_procs.Pids) !void {
     const host = demo.host;
     const path = try std.fmt.allocPrintSentinel(host.arena(), "{s}/store.db", .{host.work}, 0);
     host.say("  (a second process takes the write lock on store.db: BEGIN EXCLUSIVE)", .{});
@@ -125,6 +154,8 @@ fn sqlite_outage(demo: *Demo) !void {
         return host.fail("could not take SQLite's write lock on {s}", .{path});
     };
     defer lock.release();
+    // Held: no renewal is sent later and succeeds.
+    const stopped_ms = host.now_ms();
     const get = try host.zcube(&.{ "get", "service", "hello" });
     try host.check(
         get.code == 0 and std.mem.eql(u8, state.ready_of(get.out, "hello") orelse "", "2/2"),
@@ -144,11 +175,80 @@ fn sqlite_outage(demo: *Demo) !void {
         .{},
     );
     try bundle_last(demo, "ZC-E0208", .store_busy);
+    try fenced(demo, before, stopped_ms);
     host.say("  (the second process lets go of the lock)", .{});
     lock.release();
 }
 
 // ---- What both do ----
+
+/// While the store still refuses writes: the agent fences itself. Every replica's command is
+/// dead by `stopped_ms + ttl` (the last renewal was sent no later than `stopped_ms`, so this
+/// bound is at or after `s + ttl`; it does not wait for the old lease to expire, which the
+/// server cannot record while it cannot write), the agent prints ZC-W0501, and nothing runs on
+/// the node until the outage has lasted `outage_ms`.
+fn fenced(demo: *Demo, before: []const host_procs.Pids, stopped_ms: u64) !void {
+    const host = demo.host;
+    const procs = host.procs();
+    const dead_by_ms = stopped_ms + constants.lease_ttl_ms;
+    while (true) {
+        const alive = alive_commands(procs, before);
+        if (alive == 0) break;
+        if (host.now_ms() >= dead_by_ms) {
+            return host.fail("{d} replica commands still run {d} ms after the store stopped " ++
+                "writing, past their lease", .{ alive, host.now_ms() - stopped_ms });
+        }
+        try host.io.sleep(.fromMilliseconds(demo_host.poll_ms), .awake);
+    }
+    try host.check(true, "the agent fenced itself: all {d} replica commands were dead {d} ms " ++
+        "after the store stopped writing (bound: the lease ttl, {d} ms)", .{
+        before.len, host.now_ms() - stopped_ms, constants.lease_ttl_ms,
+    });
+    const warned = struct {
+        fn check(_: void, h: *Host) !bool {
+            return state.contains(try agent_log(h), "[ZC-W0501]");
+        }
+    };
+    try host.wait_for({}, warned.check, "the agent to print ZC-W0501", state.converge_ms);
+    const log = try agent_log(host);
+    try host.check(
+        state.contains(log, "warning[ZC-W0501]: the agent fenced itself and registered again"),
+        "the agent printed warning[ZC-W0501]: the agent fenced itself and registered again",
+        .{},
+    );
+    while (host.now_ms() - stopped_ms < outage_ms) {
+        const running = try procs.running_containers();
+        if (running.len > 0) {
+            return host.fail("{s} runs while the store is down, after the fence", .{
+                running[0].name(),
+            });
+        }
+        try host.io.sleep(.fromMilliseconds(demo_host.poll_ms), .awake);
+    }
+    try host.check(
+        (try procs.running_containers()).len == 0,
+        "nothing ran on the node from the fence to the end of the outage ({d} ms)",
+        .{host.now_ms() - stopped_ms},
+    );
+}
+
+fn alive_commands(procs: host_procs.Procs, before: []const host_procs.Pids) u32 {
+    var alive: u32 = 0;
+    for (before) |pids| {
+        if (procs.alive(pids.command)) alive += 1;
+    }
+    return alive;
+}
+
+/// What the running agent has printed so far.
+fn agent_log(host: *Host) ![]const u8 {
+    const name = try std.fmt.allocPrint(host.arena(), "agent-{d}.log", .{host.agent_starts});
+    const path = try host.path_in_work(name);
+    const cwd = std.Io.Dir.cwd();
+    return cwd.readFileAlloc(host.io, path, host.arena(), .limited(agent_log_bytes_max));
+}
+
+const agent_log_bytes_max: usize = 16 * 1024 * 1024;
 
 /// A refused command: the exit code of its blame, and the registered code and summary.
 fn expect_store_error(
@@ -275,8 +375,9 @@ pub fn start_postgres(demo: *Demo, control: state.PostgresControl) !void {
     demo.store_stopped = false;
 }
 
-/// The backend is back: `zcube` answers, nothing that ran stopped, the apply that was refused
-/// changed nothing, and the controllers work again (the same apply now goes through).
+/// The backend is back: `zcube` answers, the node registered again (a higher tenure) and runs
+/// the replicas again as new processes with no duplicates, the apply that was refused changed
+/// nothing, and the controllers work again (the same apply now goes through).
 fn recovered(
     demo: *Demo,
     before: []const host_procs.Pids,
@@ -285,19 +386,32 @@ fn recovered(
 ) !void {
     const host = demo.host;
     switch (demo.backend) {
-        .postgres => |control| try start_postgres(demo, control),
+        .postgres => |control| {
+            try start_postgres(demo, control);
+            try wait_store_answers(demo);
+        },
         .sqlite => {},
     }
-    const answering = struct {
-        fn check(d: *Demo, _: *Host) !bool {
-            return (try state.service_counts(d, "hello")) != null;
+    // The observed records the agent could not rewrite still say "running" until it registers
+    // again, so the wait is for a new tenure, the commands on the host, and the records.
+    const Wait = struct { demo: *Demo, tenure: u64, count: usize };
+    const running = struct {
+        fn check(wait: Wait, h: *Host) !bool {
+            const registered = (try state.read_key(wait.demo, "/nodes/" ++ state.node)) orelse
+                return false;
+            if (registered.mod_revision <= wait.tenure) return false;
+            if ((try h.procs().running_containers()).len != wait.count) return false;
+            const now = (try state.service_counts(wait.demo, "hello")) orelse return false;
+            return now.running == now.desired;
         }
     };
-    try host.wait_for(demo, answering.check, "zcube get to answer again", state.recover_ms);
+    const what = "the node to register again and run hello's replicas";
+    const wait: Wait = .{ .demo = demo, .tenure = tenure, .count = before.len };
+    try host.wait_for(wait, running.check, what, state.recover_ms);
     const get = try host.zcube(&.{ "get", "service", "hello" });
     try host.check(
         std.mem.eql(u8, state.ready_of(get.out, "hello") orelse "", "2/2"),
-        "after the outage hello is still 2/2",
+        "after the outage hello is 2/2 again",
         .{},
     );
     const after = (try state.service_counts(demo, "hello")).?;
@@ -306,25 +420,89 @@ fn recovered(
         "the refused apply changed nothing (generation {d}, {d} replicas)",
         .{ after.generation, after.desired },
     );
-    try host.check(
-        state.same_containers(before, try host.procs().running_containers()),
-        "the workloads kept running through the outage: the same processes",
-        .{},
-    );
-    // If the agent could not renew its lease while the store refused writes, it registered
-    // again (a new tenure) and the node controller judged it: one `mark_ready` exactly when
-    // `/nodes/<node>` moved, none when it did not.
     try state.expect_node_ready(demo, "after the outage");
     const now = try state.node_tenure(demo);
-    host.say("  tenure before the outage {d}, after {d}", .{ tenure, now });
-    try decisions.expect_new(demo, "outage", &.{
-        .{
-            .actor = "node-controller",
-            .action = "mark_ready",
-            .count = state.mark_ready_count(tenure, now),
-        },
-    });
+    try host.check(now > tenure, "the node registered again: tenure {d} before the outage, " ++
+        "{d} after", .{ tenure, now });
+    try state.expect_processes(demo, "after the outage, no duplicates", @intCast(before.len));
+    const replaced = try host.procs().running_containers();
+    try host.check(
+        no_old_pids(before, replaced),
+        "the replicas run as new processes: no command or supervisor from before the fence",
+        .{},
+    );
+    try expect_outage_decisions(demo, @intCast(before.len), tenure);
     try apply_again(demo);
+}
+
+/// The agent reports its fenced replicas as stopped (SIGTERM) under its new tenure, in one
+/// write, and the controllers replace them as they would any replica that stopped.
+fn expect_outage_decisions(demo: *Demo, stopped: u32, tenure: u64) !void {
+    // The lease ended in the outage, so the old tenure is lost (C1 slice 4) and the new one
+    // ready. A transaction holds three replicas' changes with their decisions and summaries, so
+    // the replacement deletes both and creates one, and the next pass creates the other as a
+    // scale-up.
+    try decisions.expect_new(demo, "outage", &.{
+        .{ .actor = "node-controller", .action = "mark_lost", .count = 1 },
+        .{ .actor = "node-controller", .action = "mark_ready", .count = 1 },
+        .{ .actor = "replica-controller", .action = "delete_replica", .count = stopped },
+        .{ .actor = "replica-controller", .action = "replace_replica", .count = 1 },
+        .{ .actor = "replica-controller", .action = "scale_up", .count = 1 },
+        .{ .actor = "replica-controller", .action = "create_replica", .count = stopped },
+        .{ .actor = "scheduler", .action = "release_replica", .count = stopped },
+        .{ .actor = "scheduler", .action = "place_replica", .count = stopped },
+    });
+    try expect_lost(demo, tenure);
+}
+
+/// The step's `mark_lost` names the tenure before the outage and the lease's ttl.
+fn expect_lost(demo: *Demo, tenure: u64) !void {
+    const host = demo.host;
+    const all = try decisions.read_all(demo);
+    var found: ?decisions.Decision = null;
+    for (all) |decision| {
+        if (std.mem.eql(u8, decision.action, "mark_lost")) found = decision;
+    }
+    const lost = found.?;
+    try host.check(
+        std.mem.eql(u8, lost.cause_kind, "lease_expired"),
+        "mark_lost's cause is lease_expired ({s})",
+        .{lost.cause_kind},
+    );
+    const evidence = lost.evidence.?.object;
+    const lost_tenure = evidence.get("tenure").?.integer;
+    try host.check(
+        lost_tenure == tenure,
+        "mark_lost is for tenure {d}, the one before the outage ({d})",
+        .{ lost_tenure, tenure },
+    );
+    const ttl = evidence.get("ttl_ms").?.integer;
+    const cites = ttl == constants.lease_ttl_ms;
+    try host.check(cites, "mark_lost cites the lease's ttl, {d} ms", .{ttl});
+}
+
+/// The start command may return before Postgres accepts connections: `pg_ctl start -w` waits
+/// for it, `docker start` (CI's service container) returns once the container runs, and the
+/// database is ready some time later. Until then the server answers 503 with ZC-E0201, so the
+/// demo waits, within `recover_ms`, for `zcube get` to answer before it reads the store itself.
+fn wait_store_answers(demo: *Demo) !void {
+    const answers = struct {
+        fn check(_: *Demo, h: *Host) !bool {
+            const cli = try h.zcube_quiet(&.{ "get", "service", "hello" });
+            return cli.code == 0;
+        }
+    };
+    const what = "zcube to reach the store again";
+    try demo.host.wait_for(demo, answers.check, what, state.recover_ms);
+}
+
+fn no_old_pids(before: []const host_procs.Pids, now: []const host_procs.Pids) bool {
+    for (now) |new| {
+        for (before) |old| {
+            if (new.command == old.command or new.supervisor == old.supervisor) return false;
+        }
+    }
+    return true;
 }
 
 fn apply_again(demo: *Demo) !void {

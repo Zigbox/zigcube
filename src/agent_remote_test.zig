@@ -186,8 +186,10 @@ test "a node joins: lease, registration, keepalive, and a lease that has ended" 
     const got = try direct.get(arena_state.allocator(), "/nodes/node1", null, &diag);
     try testing.expectEqual(lease.id, got.kv.?.lease);
 
+    // The server grants its own ttl whatever is asked; a revoked lease is a lease that ended.
     const short = try remote.lease_grant(constants.lease_ttl_ms_min, &diag);
-    try rig.io.sleep(.fromMilliseconds(constants.lease_ttl_ms_min + 200), .awake);
+    try testing.expectEqual(constants.lease_ttl_ms, short.ttl_ms);
+    _ = try direct.lease_revoke(short.id, &diag);
     diag.reset();
     try testing.expectError(error.LeaseNotFound, remote.lease_keepalive(short.id, &diag));
     try testing.expectEqual(@as(?codes.Code, .E0205), diag.code);
@@ -272,7 +274,7 @@ test "the node's replicas come back with env values, and its reports go in and o
     diag.reset();
     const lease = try remote.lease_grant(10_000, &diag);
     const put = register_op(lease.id);
-    _ = try remote.txn(.{ .on_success = &.{put} }, &diag);
+    const joined = try remote.txn(.{ .on_success = &.{put} }, &diag);
     try rig.apply(2);
 
     const Ready = struct {
@@ -312,12 +314,13 @@ test "the node's replicas come back with env values, and its reports go in and o
         .{ .put = .{ .key = "/observed/node1/hello-1", .value = first } },
         .{ .put = .{ .key = "/observed/node1/hello-2", .value = second } },
     };
-    _ = try remote.txn(.{ .on_success = &ops }, &diag);
+    const tenure = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = joined.revision }};
+    _ = try remote.txn(.{ .compares = &tenure, .on_success = &ops }, &diag);
     const prefix = records.observed_prefix("node1");
     var seen = try remote.list(arena, .{ .prefix = prefix.slice(), .limit = 500 }, &diag);
     try testing.expectEqual(@as(usize, 2), seen.kvs.len);
     const drop = [_]store.Op{.{ .delete = "/observed/node1/hello-1" }};
-    _ = try remote.txn(.{ .on_success = &drop }, &diag);
+    _ = try remote.txn(.{ .compares = &tenure, .on_success = &drop }, &diag);
     seen = try remote.list(arena, .{ .prefix = prefix.slice(), .limit = 500 }, &diag);
     try testing.expectEqual(@as(usize, 1), seen.kvs.len);
     try testing.expectEqualStrings("/observed/node1/hello-2", seen.kvs[0].key);

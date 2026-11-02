@@ -131,7 +131,11 @@ pub const fence_stop_ms: u32 = 2000;
 /// The bound on the difference of two hosts' clock rates, in parts per thousand (1 %).
 pub const clock_skew_per_mille: u32 = 10;
 pub const fence_margin_ms: u32 = 3000;
+/// How often a fencing agent looks at its containers while it waits for them to stop.
+pub const fence_poll_ms: u32 = 100;
 pub const lost_grace_ms: u32 = 1000;
+/// The longest `zcube-server --lost-grace-ms` accepts: an hour.
+pub const lost_grace_ms_max: u32 = 60 * 60 * 1000;
 /// What the margin leaves for the kernel to deliver SIGKILL and the process to exit.
 pub const fence_kill_latency_ms: u32 = 900;
 /// Bytes a decision's `cause_evidence` may take.

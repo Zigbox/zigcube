@@ -12,6 +12,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const agent_mod = @import("agent.zig");
+const agent_state = @import("agent_state.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
@@ -227,6 +228,8 @@ pub const World = struct {
     sim: sim_runtime.SimRuntime,
     server: control_plane.ControlPlane,
     agent: *agent_mod.Agent,
+    /// The agent's files (the kept lease), which a restart of the agent finds again.
+    files: agent_state.SimState,
     api_source: controller.DecisionSource,
     diag: Diag,
     arena_state: std.heap.ArenaAllocator,
@@ -243,6 +246,8 @@ pub const World = struct {
     dropped_before_restart: u64,
     /// The last diagnostic that failed a step, kept for the caller to render.
     last_failure: ?codes.Code,
+    /// The host's boot id the agent sees; a test changes it to reboot the host.
+    boot_id: []const u8 = "",
 
     pub fn create(gpa: Allocator, seed: u64, fixtures: []const []const u8) Allocator.Error!*World {
         const world = try gpa.create(World);
@@ -261,6 +266,7 @@ pub const World = struct {
         world.server = control_plane.ControlPlane.init(world.take_instance());
         world.server.check_i6 = true;
         world.agent = agent;
+        world.files = .init(gpa, seed ^ 0x5eed);
         agent.init(agent_config());
         world.api_source = .{ .instance = 0 };
         world.diag.reset();
@@ -274,12 +280,14 @@ pub const World = struct {
         world.compact_due_ms = epoch_ms + compact_interval_ms;
         world.dropped_before_restart = 0;
         world.last_failure = null;
+        world.boot_id = "";
         return world;
     }
 
     pub fn destroy(world: *World) void {
         const gpa = world.gpa;
         world.arena_state.deinit();
+        world.files.deinit();
         world.sim.deinit();
         world.memory.deinit();
         gpa.destroy(world.memory);
@@ -346,6 +354,8 @@ pub const World = struct {
             .clock = world.manual.clock(),
             .arena = world.fresh_arena(),
             .diag = &world.diag,
+            .state = world.files.interface(),
+            .boot_id = world.boot_id,
         };
         world.stats.agent_steps += 1;
         const wake = world.agent.reconcile(&ctx) catch return world.failed_step(.agent);
@@ -482,6 +492,7 @@ pub const World = struct {
     /// in the runtime, and the agent must find them again.
     pub fn restart_agent(world: *World) void {
         world.agent.init(agent_config());
+        world.files.restart();
         world.agent_due_ms = 0;
     }
 

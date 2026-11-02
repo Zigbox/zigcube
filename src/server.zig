@@ -90,6 +90,8 @@ pub const Server = struct {
         const clock = backend.clock();
         const now = clock.now_ms();
         const instance: u16 = @intCast(1 + @mod(@divFloor(now, 1000), 60_000));
+        var plane = control_plane.ControlPlane.init(instance);
+        plane.set_lost_grace(config.lost_grace_ms);
         return .{
             .gpa = gpa,
             .io = io,
@@ -102,6 +104,7 @@ pub const Server = struct {
                 .api = .{
                     .version = options.version,
                     .backend = config.store.backend(),
+                    .lease_ttl_ms = config.lease_ttl_ms,
                     .started_at_ms = now,
                     // The low 32 bits of the start time in milliseconds, never 0: a restart
                     // is later, so its ids differ from the last start's.
@@ -121,7 +124,7 @@ pub const Server = struct {
                 .io = io,
                 .store = backend.handle(),
                 .clock = clock,
-                .plane = control_plane.ControlPlane.init(instance),
+                .plane = plane,
                 .stopping = undefined,
                 .report_failures = options.report_failures,
             },

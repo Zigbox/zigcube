@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-W0501 · Zigcube</title>
-<meta name="description" content="the agent's lease ended and it registered again">
+<meta name="description" content="the agent fenced itself and registered again">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/W0501.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,11 +73,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-W0501</h1>
-<p class="summary">the agent's lease ended and it registered again</p>
+<p class="summary">the agent fenced itself and registered again</p>
 <dl class="facts"><div><dt>Kind</dt><dd>warning</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>The agent could not renew its lease in time, so the store deleted the node's registration. The agent granted a new lease and registered again. Its workloads keep running: stopping them when a node is cut off is planned for a later milestone.</p>
-<p>This happens when the agent was paused or cut off from the server for longer than the lease time to live.</p>
+<p>The agent could not renew its lease in time, or the server said its lease or tenure had ended. It stopped every container, so that nothing runs on this node that the cluster may have placed elsewhere, then granted a new lease and registered again with nothing running.</p>
+<p>This happens when the agent was paused or cut off from the server for longer than the lease time to live less the fencing margin.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain W0501</pre>

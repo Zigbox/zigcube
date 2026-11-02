@@ -53,6 +53,8 @@ const agent_state = @import("agent_state.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
+const Clock = @import("clock.zig").Clock;
+const fencing = @import("fencing.zig");
 const store = @import("store.zig");
 const verified = @import("store_verified.zig");
 
@@ -89,6 +91,10 @@ pub const Request = struct {
     body: []const u8 = "",
     /// How long the server may hold the reply (a long poll), on top of the I/O timeout.
     hold_ms: u32 = 0,
+    /// A cap on the I/O timeout, for a caller that must not wait past a deadline of its own (the
+    /// agent's fence). Null leaves the transport's timeout. A transport ends the whole call,
+    /// connecting included, within `hold_ms` plus this.
+    timeout_ms: ?u32 = null,
 };
 
 pub const Reply = struct {
@@ -132,6 +138,10 @@ pub const RemoteStore = struct {
     /// Where the next `watch_once` resumes: the revision of the last replica list, plus one.
     /// 0 until the first list, which makes the first watch answer "changed" at once.
     watch_from: store.Revision,
+    /// The agent's monotonic clock and the time before which every exchange must end (the
+    /// fence): a request's I/O timeout is capped by what is left. No clock, no cap.
+    mono: ?Clock = null,
+    deadline_ms: u64 = std.math.maxInt(u64),
     /// The highest pair an answer carried (or the file held): never lowered.
     known: ?Pair = null,
     /// What the file is known to hold, and when it was written (`save`).
@@ -167,6 +177,20 @@ pub const RemoteStore = struct {
     pub fn init(gpa: Allocator, transport: Transport, node: []const u8) RemoteStore {
         assert(records.name_problem(node, constants.node_name_bytes_max) == null);
         return .{ .gpa = gpa, .transport = transport, .node = node, .watch_from = 0 };
+    }
+
+    /// Caps every later exchange so that it ends by `deadline_ms` on `mono`.
+    pub fn set_deadline(remote: *RemoteStore, mono: Clock, deadline_ms: u64) void {
+        remote.mono = mono;
+        remote.deadline_ms = deadline_ms;
+    }
+
+    /// The agent's `Context.deadline` for this store: the agent moves the cap within a step,
+    /// on the clock given to `set_deadline` first.
+    pub fn deadline_fn(context: *anyopaque, deadline_ms: u64) void {
+        const remote = from(context);
+        assert(remote.mono != null);
+        remote.deadline_ms = deadline_ms;
     }
 
     pub fn interface(remote: *RemoteStore) store.Store {
@@ -277,6 +301,9 @@ pub const RemoteStore = struct {
         if (answer.lease.id == store.lease_none) {
             return bad(diag, "the server granted lease 0");
         }
+        if (fencing.inequality_problem(answer.lease.ttl_ms) != null) {
+            return bad(diag, "the server granted a lease too short for the agent to fence in");
+        }
         return .{ .id = answer.lease.id, .ttl_ms = answer.lease.ttl_ms };
     }
 
@@ -359,7 +386,7 @@ pub const RemoteStore = struct {
         diag: *Diag,
     ) store.Error!store.TxnResult {
         const remote = from(context);
-        if (request.compares.len > 0) return unsupported(diag, "a transaction with compares");
+        const tenure = try remote.tenure_of(request.compares, diag);
         if (request.on_failure.len > 0) return unsupported(
             diag,
             "a transaction with a failure branch",
@@ -370,15 +397,40 @@ pub const RemoteStore = struct {
         const arena = arena_state.allocator();
         const node_key = records.node_key(remote.node);
         const first = store.op_key(request.on_success[0]);
-        const sent: Request = if (std.mem.eql(u8, first, node_key.slice()))
+        const registering = std.mem.eql(u8, first, node_key.slice());
+        if (registering and tenure != 0) return unsupported(diag, "a registration with a compare");
+        const sent: Request = if (registering)
             try remote.registration(arena, request.on_success, diag)
         else
-            try remote.report(arena, request.on_success, diag);
+            try remote.report(arena, request.on_success, tenure, diag);
         const reply = try remote.exchange(arena, sent, diag);
-        if (reply.status != 200) return refused(arena, reply, diag);
+        if (reply.status != 200) {
+            // The tenure ended (I2): a transaction whose compare failed, as in any store.
+            if (refusal_code(arena, reply.body)) |text| {
+                if (std.mem.eql(u8, text, "ZC-E0510")) {
+                    return .{ .succeeded = false, .revision = 0 };
+                }
+            }
+            return refused(arena, reply, diag);
+        }
         const Answer = struct { revision: u64 };
         const answer = try parse(Answer, arena, reply.body, diag);
         return .{ .succeeded = true, .revision = answer.revision };
+    }
+
+    /// The tenure a transaction's one compare names: a compare on this node's `/nodes/<node>`
+    /// key, the only one the agent endpoints can carry. 0 for no compare.
+    fn tenure_of(
+        remote: *RemoteStore,
+        compares: []const store.Compare,
+        diag: *Diag,
+    ) store.Error!u64 {
+        if (compares.len == 0) return 0;
+        const node_key = records.node_key(remote.node);
+        const fits = compares.len == 1 and compares[0].mod_revision > 0 and
+            std.mem.eql(u8, compares[0].key, node_key.slice());
+        if (!fits) return unsupported(diag, "a transaction with compares other than the tenure");
+        return compares[0].mod_revision;
     }
 
     /// `PUT /v1/agent/nodes/{node}`: the one put of `/nodes/<node>` on a lease.
@@ -413,12 +465,16 @@ pub const RemoteStore = struct {
         remote: *RemoteStore,
         arena: Allocator,
         ops: []const store.Op,
+        tenure: u64,
         diag: *Diag,
     ) store.Error!Request {
+        if (tenure == 0) return unsupported(diag, "an observed write without a tenure");
         const prefix = records.observed_prefix(remote.node);
         var out: std.Io.Writer.Allocating = .init(arena);
         var json: std.json.Stringify = .{ .writer = &out.writer };
         json.beginObject() catch return failures.no_memory(diag);
+        json.objectField("tenure") catch return failures.no_memory(diag);
+        json.write(tenure) catch return failures.no_memory(diag);
         json.objectField("puts") catch return failures.no_memory(diag);
         json.beginArray() catch return failures.no_memory(diag);
         for (ops) |op| {
@@ -540,6 +596,17 @@ pub const RemoteStore = struct {
         diag: *Diag,
     ) store.Error!Reply {
         var sent = request;
+        if (remote.mono) |clock| {
+            // The hold and the I/O after it together end by the deadline; a hold takes at most
+            // half of what is left, so that a reply has time to come.
+            const left = remote.deadline_ms -| clock.now_ms();
+            if (left == 0) return fence_due(diag);
+            if (left < std.math.maxInt(u32)) {
+                const hold: u32 = @intCast(@min(request.hold_ms, left / 2));
+                sent.hold_ms = hold;
+                sent.timeout_ms = @intCast(@max(1, @min(left - hold, io_cap(request))));
+            }
+        }
         if (remote.known) |known| {
             const separator: u8 = if (std.mem.indexOfScalar(u8, request.target, '?') == null)
                 '?'
@@ -836,6 +903,21 @@ fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
 }
 
 /// ZC-E0504 for a reply that cannot be right.
+fn io_cap(request: Request) u64 {
+    return request.timeout_ms orelse constants.agent_io_timeout_ms;
+}
+
+/// The deadline of a call has passed before it was made: nothing is sent.
+fn fence_due(diag: *Diag) store.Error {
+    assert(diag.code == null);
+    diag.raise(.E0503);
+    diag.cause("the agent did not call zcube-server: its lease's fence deadline has come", .{});
+    diag.fix(.{
+        .sentence = "make zcube-server reachable from the node; the agent fences meanwhile",
+    });
+    return error.BackendFailed;
+}
+
 fn bad(diag: *Diag, problem: []const u8) store.Error {
     raise_bad_reply(diag, problem);
     return error.BackendFailed;

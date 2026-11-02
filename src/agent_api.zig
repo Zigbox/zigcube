@@ -42,6 +42,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const compare_sets = @import("compare_sets.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
@@ -75,6 +76,7 @@ pub fn route(
     query: []const u8,
     body: []const u8,
     hold: bool,
+    lease_ttl_ms: u32,
     pair_kept: bool,
 ) Failure!Reply {
     assert(ctx.diag.code == null);
@@ -94,6 +96,7 @@ pub fn route(
         .hold = hold,
         .pair_kept = pair_kept,
         .parts = parts,
+        .lease_ttl_ms = lease_ttl_ms,
     };
     const what = parts.next() orelse return call.register();
     if (std.mem.eql(u8, what, "lease")) return call.lease();
@@ -113,6 +116,8 @@ const Call = struct {
     hold: bool,
     pair_kept: bool,
     parts: *Parts,
+    /// The ttl of the leases this server grants: the agent learns it from the grant.
+    lease_ttl_ms: u32,
 
     fn require_method(call: Call, wanted: []const u8) Failure!void {
         if (std.mem.eql(u8, call.method, wanted)) return;
@@ -229,8 +234,9 @@ const Call = struct {
 
     fn lease_grant(call: Call) Failure!Reply {
         const ctx = call.ctx;
-        const input = try parse_body(LeaseBody, ctx, call.body);
-        const granted = ctx.store.lease_grant(input.ttl_ms, ctx.diag) catch return propagate(ctx);
+        _ = try parse_body(LeaseBody, ctx, call.body); // The agent's ttl is a hint; ours stands.
+        const granted = ctx.store.lease_grant(call.lease_ttl_ms, ctx.diag) catch
+            return propagate(ctx);
         const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
         return reply(ctx, .{ .lease = lease_reply, .chain = try call.chain() });
     }
@@ -321,6 +327,7 @@ const Call = struct {
     fn report(call: Call) Failure!Reply {
         const ctx = call.ctx;
         const input = try parse_body(ObservedBody, ctx, call.body);
+        if (input.tenure == 0) return bad_request(ctx, "tenure", "is needed: it must not be 0");
         const total = input.puts.len + input.deletes.len;
         if (total == 0) return bad_request(ctx, "body", "needs at least one put or delete");
         if (total > constants.agent_report_ops_max) {
@@ -342,10 +349,16 @@ const Call = struct {
         }
         try no_duplicates(ctx, ops[0..count]);
         assert(count == total);
-        const request: store.TxnRequest = .{ .on_success = ops[0..count] };
+        var tenure: compare_sets.Set = .{};
+        compare_sets.observed_write(&tenure, call.node, input.tenure);
+        const request: store.TxnRequest = .{
+            .compares = tenure.compares(),
+            .on_success = ops[0..count],
+        };
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
+        if (!result.succeeded) return tenure_ended(ctx, call.node);
         const pair = try call.chain_written(result);
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
@@ -461,7 +474,7 @@ const RegisterBody = struct {
     labels: []const []const u8 = &.{},
 };
 
-const LeaseBody = struct { ttl_ms: u32 };
+const LeaseBody = struct { ttl_ms: u32 = 0 };
 
 const ObservedPut = struct { key: []const u8, value: records.Observed };
 
@@ -479,6 +492,8 @@ fn hex(ctx: *const Context, hash: store.Hash) Failure![]const u8 {
 }
 
 const ObservedBody = struct {
+    /// The revision of the registration the agent writes under (its tenure).
+    tenure: u64 = 0,
     puts: []const ObservedPut = &.{},
     deletes: []const []const u8 = &.{},
 };
@@ -582,6 +597,15 @@ fn number_slot(numbers: *Numbers, name: []const u8) ?*?u64 {
 }
 
 // ---- Failures ----------------------------------------------------------------------------------
+
+/// I2: the registration the agent wrote under is not the node's current one.
+fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0510);
+    ctx.diag.cause("node {s} is not registered under the tenure this write names", .{node});
+    ctx.diag.fix(.{ .sentence = "the agent stops its containers and registers the node again" });
+    return error.Failed;
+}
 
 fn bad_request(ctx: *const Context, what: []const u8, problem: []const u8) Failure {
     assert(ctx.diag.code == null);

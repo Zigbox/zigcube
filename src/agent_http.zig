@@ -5,11 +5,13 @@
 //!
 //! A connection serves one request and the agent closes it first (see `parse_head`).
 //!
-//! Everything is bounded: a reply is read for at most the request's own wait plus
-//! `agent_io_timeout_ms` (a `poll` before each read, so a server that accepts and then says nothing
-//! cannot stop the agent), and a reply is at most `agent_response_bytes_max`. Connecting is
-//! bounded by the kernel only (see `connect`). A failure is ZC-E0503 (the server did not answer) or
-//! ZC-E0504 (it answered something the agent cannot use), never a Zig error name.
+//! Everything is bounded: the whole call, connecting included, ends within the request's own wait
+//! plus its I/O timeout (`agent_io_timeout_ms` unless the request caps it: the agent's fence
+//! does), with a `poll` before the connection completes and before each read, so a server that
+//! accepts and then says nothing, or a host that drops packets, cannot stop the agent. A reply is
+//! at most `agent_response_bytes_max`. A failure is ZC-E0503 (the server did not answer) or
+//! ZC-E0504 (it answered something the agent cannot use), never a Zig error name. Linux only,
+//! as the agent is.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -46,27 +48,84 @@ pub const Client = struct {
         if (request.body.len > constants.agent_request_bytes_max) {
             return bad_reply(diag, "the request the agent built is larger than the server accepts");
         }
-        var stream = client.connect(diag) catch |err| return err;
+        const io_ms = request.timeout_ms orelse client.io_timeout_ms;
+        const end_ms = client.now_ms() + request.hold_ms + io_ms;
+        var stream = try client.connect(end_ms, diag);
         defer stream.close(client.io);
         try client.send(&stream, request, diag);
-        return client.receive(arena, &stream, request.hold_ms + client.io_timeout_ms, diag);
+        return client.receive(arena, &stream, end_ms, diag);
     }
 
-    /// The standard library's threaded `Io` does not implement a connect timeout on POSIX (it
-    /// panics), and a socket's timeout can only be set once the socket exists, so a connect to a
-    /// host that drops packets waits as long as the kernel does (about two minutes). A server
-    /// that is down answers with a refusal at once, which is the case that matters on one
-    /// network (docs/agent.md).
-    fn connect(client: *const Client, diag: *Diag) Error!net.Stream {
-        return client.address.connect(client.io, .{ .mode = .stream }) catch |err| {
-            const reason: []const u8 = switch (err) {
-                error.ConnectionRefused => "the connection was refused",
-                error.Timeout => "it did not answer in time",
-                error.NetworkUnreachable, error.HostUnreachable => "the network has no route to it",
-                else => "the connection could not be made",
-            };
-            return unreachable_server(diag, client, reason);
+    /// CLOCK_BOOTTIME, the clock of the agent's fence.
+    fn now_ms(client: *const Client) u64 {
+        const ms = std.Io.Clock.boot.now(client.io).toMilliseconds();
+        assert(ms >= 0);
+        return @intCast(ms);
+    }
+
+    /// What is left until `end_ms`, as `poll` takes it.
+    fn left_ms(client: *const Client, end_ms: u64) i32 {
+        return @intCast(@min(end_ms -| client.now_ms(), std.math.maxInt(i32)));
+    }
+
+    /// A non-blocking connect and a `poll` until `end_ms`: the standard library's threaded `Io`
+    /// has no connect timeout on POSIX (it panics), and the kernel's own waits about two minutes
+    /// for a host that drops packets, which is longer than the agent may wait before its fence.
+    /// The socket is made blocking again for the standard library's writer.
+    fn connect(client: *const Client, end_ms: u64, diag: *Diag) Error!net.Stream {
+        const linux = std.os.linux;
+        var storage: std.Io.Threaded.PosixAddress = undefined;
+        const length = std.Io.Threaded.addressToPosix(&client.address, &storage);
+        const family: u32 = switch (client.address) {
+            .ip4 => linux.AF.INET,
+            .ip6 => linux.AF.INET6,
         };
+        const kind = linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
+        const opened = linux.socket(family, kind, linux.IPPROTO.TCP);
+        if (linux.errno(opened) != .SUCCESS) {
+            return unreachable_server(diag, client, "the agent could not open a socket");
+        }
+        const fd: std.posix.fd_t = @intCast(opened);
+        errdefer _ = linux.close(fd);
+        const started = linux.connect(fd, &storage, length);
+        switch (linux.errno(started)) {
+            .SUCCESS => {},
+            .INPROGRESS => try client.connected(fd, end_ms, diag),
+            else => |code| return unreachable_server(diag, client, connect_reason(code)),
+        }
+        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        var mode: linux.O = @bitCast(@as(u32, @truncate(flags)));
+        mode.NONBLOCK = false;
+        const set = linux.fcntl(fd, linux.F.SETFL, @as(u32, @bitCast(mode)));
+        if (linux.errno(flags) != .SUCCESS or linux.errno(set) != .SUCCESS) {
+            return unreachable_server(diag, client, "the connection could not be made");
+        }
+        return .{ .socket = .{ .handle = fd, .address = client.address } };
+    }
+
+    /// Waits for a connect in progress to end, until `end_ms`.
+    fn connected(client: *const Client, fd: std.posix.fd_t, end_ms: u64, diag: *Diag) Error!void {
+        const linux = std.os.linux;
+        var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const ready = std.posix.poll(&wait, client.left_ms(end_ms)) catch
+            return unreachable_server(diag, client, "the connection could not be made");
+        if (ready == 0) return unreachable_server(diag, client, "it did not answer in time");
+        var code: i32 = 0;
+        var code_len: std.posix.socklen_t = @sizeOf(i32);
+        const asked = linux.getsockopt(
+            fd,
+            linux.SOL.SOCKET,
+            linux.SO.ERROR,
+            @ptrCast(&code),
+            &code_len,
+        );
+        if (linux.errno(asked) != .SUCCESS) {
+            return unreachable_server(diag, client, "the connection could not be made");
+        }
+        if (code != 0) {
+            const reason = connect_reason(@fromBackingInt(@intCast(@as(u16, @intCast(code)))));
+            return unreachable_server(diag, client, reason);
+        }
     }
 
     fn send(client: *const Client, stream: *net.Stream, request: Request, diag: *Diag) Error!void {
@@ -93,7 +152,7 @@ pub const Client = struct {
         client: *const Client,
         arena: Allocator,
         stream: *net.Stream,
-        wait_ms: u32,
+        end_ms: u64,
         diag: *Diag,
     ) Error!Reply {
         const fd = stream.socket.handle;
@@ -105,7 +164,7 @@ pub const Client = struct {
         while (true) {
             const events = std.posix.POLL.IN;
             var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
-            const ready = std.posix.poll(&wait, @intCast(wait_ms)) catch
+            const ready = std.posix.poll(&wait, client.left_ms(end_ms)) catch
                 return unreachable_server(diag, client, lost);
             if (ready == 0) return unreachable_server(diag, client, "it did not answer in time");
             const length = std.posix.read(fd, &chunk) catch
@@ -134,6 +193,15 @@ pub const Client = struct {
         }
     }
 };
+
+fn connect_reason(code: std.os.linux.E) []const u8 {
+    return switch (code) {
+        .CONNREFUSED => "the connection was refused",
+        .TIMEDOUT => "it did not answer in time",
+        .NETUNREACH, .HOSTUNREACH => "the network has no route to it",
+        else => "the connection could not be made",
+    };
+}
 
 /// The status line and headers of a reply fit in this many bytes, or the reply is not the server's.
 const head_bytes_max: u32 = 16 * 1024;
