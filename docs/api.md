@@ -196,7 +196,9 @@ are refused (`ZC-E0104`), so a typo cannot be silently ignored.
 
 `name`, `image`, `replicas` and `command` are required; `env`, `limits` and `applied_by` are
 optional (`applied_by` defaults to `anonymous`). The rules are `apply.zig`'s: a count change alone
-does not bump `generation`; a change to the image, command, env or limits does.
+does not bump `generation`; a change to the image, command, env or limits does. `env` holds at
+most 16 variables (Zigbox's `run_env_count_max`; it was 64 before C2 slice 1, which tightened it so
+a service the real runtime would refuse is refused at apply).
 
 The answer is the decision id and the one-line summary (api.md item 5), whether or not it wrote:
 
