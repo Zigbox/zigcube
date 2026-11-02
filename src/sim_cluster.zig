@@ -49,6 +49,7 @@ const store = @import("store.zig");
 const why_mod = @import("why.zig");
 const repeat = @import("test_util.zig").repeat;
 const ManualClock = @import("clock.zig").ManualClock;
+const Clock = @import("clock.zig").Clock;
 const MemoryStore = @import("store_memory.zig").MemoryStore;
 
 const Allocator = std.mem.Allocator;
@@ -243,6 +244,11 @@ const Node = struct {
     up_ms: u64,
     /// Whether the agent's last step worked: a step that fails says why nothing moved.
     last_ok: bool,
+    /// Since when the server has had no registration of this node (its lease ran out), while
+    /// the agent was up; null while it has one. The fencing invariant's clock.
+    unregistered_since_ms: ?u64,
+    /// Times the agent fenced itself, over the whole run (all agent lives).
+    fences: u32,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -316,6 +322,8 @@ const Node = struct {
 
     /// Notes that a call found the agent dead.
     fn check_crashed(node: *Node) void {
+        // A crash at a write point of the lease file kills the agent as one of a container's does.
+        if (node.sim.files.crashed) node.sim.crashed = true;
         if (!node.sim.crashed) return;
         node.down = true;
         node.crashes += 1;
@@ -336,10 +344,19 @@ const Node = struct {
             .clock = clock,
             .arena = node.arena.allocator(),
             .diag = &node.diag,
+            .mono = clock,
+            .state = node.sim.files.interface(),
+            .deadline = .{
+                .context = &node.remote,
+                .set_fn = agent_client.RemoteStore.deadline_fn,
+            },
         };
+        node.remote.set_deadline(clock, std.math.maxInt(u64));
         c.stats.agent_steps += 1;
         node.all_steps += 1;
+        const fences_before = node.agent.fences;
         const result = node.agent.reconcile(&ctx);
+        node.fences += node.agent.fences - fences_before;
         node.resume_ms = c.manual.ms + node.spent_ms;
         if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
@@ -355,11 +372,29 @@ const Node = struct {
         return wake.acted;
     }
 
+    /// The agent's calls end by the fence deadline, as the real agent's do (`agent_run.zig`);
+    /// with no lease there is no deadline.
+    fn cap_calls(node: *Node, clock: Clock) void {
+        const deadline = node.agent.fence_at_ms() orelse std.math.maxInt(u64);
+        node.remote.set_deadline(clock, deadline);
+    }
+
+    /// Time left to the fence, on the node's clock: a pause or a wait never runs past it.
+    fn before_fence(node: *Node, ms: u32) u32 {
+        const left = node.agent.fence_in_ms(node.nclock.clock().now_ms());
+        return @min(ms, @max(left, 1));
+    }
+
     /// One slice of the wait: true if it ended (a replica changed, an event came, or it failed).
-    fn watch_once(node: *Node) bool {
+    /// It holds the server as the real agent's does (`agent_run.zig`): a slice, cut at the fence,
+    /// so a call that is not answered costs the same time here as there.
+    fn watch_once(node: *Node, slice_ms: u32) bool {
         node.diag.reset();
         node.spent_ms = 0;
-        var ended = node.remote.watch_once(0, &node.diag) catch true;
+        const clock = node.nclock.clock();
+        node.cap_calls(clock);
+        const held = node.agent.watch_hold_ms(clock.now_ms(), slice_ms);
+        var ended = node.remote.watch_once(held, &node.diag) catch true;
         if (!ended) {
             _ = node.arena.reset(.retain_capacity);
             const events = node.sim.interface().events(node.arena.allocator(), 0, &node.diag);
@@ -386,8 +421,8 @@ const Node = struct {
                     acted += node.step_once();
                     if (node.down) return acted;
                 },
-                .pause_ms => |ms| node.resume_ms = c.manual.ms + ms,
-                .watch_ms => if (!node.watch_once()) return acted,
+                .pause_ms => |ms| node.resume_ms = c.manual.ms + node.before_fence(ms),
+                .watch_ms => |ms| if (!node.watch_once(ms)) return acted,
             }
         }
         return acted;
@@ -578,6 +613,8 @@ pub const Cluster = struct {
         node.crashes = 0;
         node.ok_steps = 0;
         node.last_ok = true;
+        node.unregistered_since_ms = null;
+        node.fences = 0;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -1132,7 +1169,45 @@ const Excess = struct { node: u32, name_hash: u64, accrued_ms: u64 };
 fn safety(c: *Cluster) Failure!void {
     try invariants(c);
     try track_excess(c);
+    try track_fencing(c);
 }
+
+/// I3 (docs/authority.md §3): no container runs on a node the server has given up on for longer
+/// than the grace plus the simulator's own granularity. The server has given up on a node when
+/// its `/nodes/<node>` key is gone (its lease ran out). The clock restarts while the agent is
+/// down (a dead agent cannot fence; its restart does, at its first step).
+fn track_fencing(c: *Cluster) Failure!void {
+    if (store_faulty(c)) return;
+    var scratch = std.heap.ArenaAllocator.init(c.gpa);
+    defer scratch.deinit();
+    for (c.nodes) |node| {
+        if (node.down) {
+            node.unregistered_since_ms = null;
+            continue;
+        }
+        const key = records.node_key(node.name());
+        c.diag.reset();
+        const got = c.store_handle().get(scratch.allocator(), key.slice(), null, &c.diag) catch {
+            c.diag.reset();
+            continue;
+        };
+        if (got.kv != null) {
+            node.unregistered_since_ms = null;
+            continue;
+        }
+        const since = node.unregistered_since_ms orelse c.manual.ms;
+        node.unregistered_since_ms = since;
+        if (c.manual.ms - since <= fencing_ms_max) continue;
+        for (node.sim.containers.containers.items) |container| {
+            try check(c, container.phase == .stopped, "a container runs on a node whose lease " ++
+                "ran out longer ago than the lost grace (self-fencing failed)");
+        }
+    }
+}
+
+/// How long a node may run containers after the server's lease on it ran out: the lost grace,
+/// and the checks' and the ticks' granularity.
+const fencing_ms_max: u64 = constants.lost_grace_ms + 2 * check_interval_ms;
 
 /// Replica id to the node `/assigned/` puts it on.
 const Homes = std.StringHashMapUnmanaged([]const u8);
@@ -1697,8 +1772,13 @@ fn print_summary(c: *Cluster) void {
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
         total.parked,    total.delivered_late,   total.partitioned,
     });
-    report.print("duplicates: {d} replica-seconds on two nodes (counted, NOT a pass: without " ++
-        "leases and fencing, slice 6, a partition can cause them)\n", .{s.duplicate_seconds});
+    var fences: u32 = 0;
+    for (c.nodes) |node| fences += node.fences;
+    report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
+    report.print("duplicates: {d} replica-seconds on two nodes (counted, NOT a pass: a " ++
+        "replacement waits for the lease, so a duplicate is a bug the invariant misses)\n", .{
+        s.duplicate_seconds,
+    });
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
 }
 
@@ -1757,4 +1837,32 @@ test "a node count can be asked for" {
     simulate(testing.allocator, 5, 10, .{ .nodes = 3 }, &report);
     try testing.expect(!report.failed);
     try testing.expect(std.mem.indexOf(u8, report.text(), "swarm: nodes=3 ") != null);
+}
+
+test "the fencing check fires on a node that runs containers long after it lost its lease" {
+    // Goal: track_fencing has teeth. Method: run replicas, delete the node's registration, then
+    // move the clock past the bound without letting any node step: the containers still run.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, 1, &report);
+    defer c.destroy();
+    c.apply("hello", hello_digest, 2);
+    c.advance(5_000);
+    try testing.expect(!report.failed);
+    const node = c.nodes[0];
+    var running: u32 = 0;
+    for (node.sim.containers.containers.items) |container| {
+        if (container.phase != .stopped) running += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), running);
+    const key = records.node_key(node.name());
+    c.diag.reset();
+    const delete: store.Op = .{ .delete = key.slice() };
+    // Straight to the memory store: the cluster's own handle may lose the acknowledgement.
+    _ = try c.memory.interface().txn(.{ .on_success = &.{delete} }, &c.diag);
+    try track_fencing(c);
+    c.manual.advance(fencing_ms_max);
+    try track_fencing(c);
+    c.manual.advance(1);
+    try testing.expectError(error.StepFailed, track_fencing(c));
+    try testing.expect(report.failed);
 }

@@ -248,7 +248,8 @@ pub const SimNet = struct {
         const net = port.net;
         const link = &net.links[port.node];
         const faults = link.faults;
-        const timeout_ms = request.hold_ms + constants.agent_io_timeout_ms;
+        const io_ms = request.timeout_ms orelse constants.agent_io_timeout_ms;
+        const timeout_ms = request.hold_ms + io_ms;
         net.last_call_ms = 0;
         if (faults.partition_up) {
             link.stats.partitioned += 1;

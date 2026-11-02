@@ -119,6 +119,7 @@ and WASM builds agree (the report ends with a hash of the whole store); and, wit
 variant, that under random applies, deletes, runtime faults, store outages that begin mid-step,
 restarts and compaction:
 
+- a node that cannot reach the store stops its containers within `lost_grace_ms + 2 × check_interval_ms` of its fence deadline (a node that is down is not counted);
 - the runtime never holds more running containers than services want for more than 30 s of store
   uptime;
 - every decision has a reason and a cause; a cause that names a decision names one that exists,
