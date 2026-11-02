@@ -115,6 +115,18 @@ durably; that is how `remove_container` finishes. `DirState` fsyncs a file and t
 every put and remove; `SimState` models exactly that (see `agent_state.zig`'s header) and loses the
 unsynced tail of an append in a simulated host crash.
 
+## The remembered pair
+
+Every answer of the agent endpoints carries the store's revision and chain hash (docs/api.md,
+"The chain pair"). The agent keeps the highest pair in `<state dir>/remembered`
+(`{"v":1,"revision":N,"hash":"<hex>"}`, written with `put_atomic`: temporary file, fsync, rename,
+fsync of the directory), saved after a step when it advanced, at most every `verified_save_ms`.
+It refuses an answer from behind it with `ZC-E0215` and does nothing with it; the step fails and is
+retried, so the refusal shows once and the containers run on. A state directory without the file
+(an agent from before C1 slice 10b) starts with nothing remembered; a file that does not parse
+stops the start with `ZC-E0216`. After `zcube store accept-rollback --confirm` on the server,
+`rm <state dir>/remembered` and restart the agent.
+
 ## What survives what
 
 | Event | Containers | The agent's work |

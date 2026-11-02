@@ -233,6 +233,18 @@ recovery.
   itself and fails with the store's own error if it cannot. After that, between steps they pass only
   the gate: a rollback is noticed at the next `status` or write, not at the next read.
 
+**Agents check too.** Every agent endpoint's answer carries the store's pair after its work, and
+`known_hash` at the revision the agent sends as `known` (docs/api.md, "The chain pair"). The
+agent's `RemoteStore` (`agent_client.zig`, core) remembers the highest pair, in
+`<state dir>/remembered` (`put_atomic`, at most every `verified_save_ms`), and refuses an answer
+from behind it with `ZC-E0215` before parsing it for anything else, so the agent core acts on
+nothing from it. This catches a server that was restarted on a rolled-back store and then told to
+`accept-rollback`, or a second server on another store: the agent still remembers. Its way out is
+`rm <state dir>/remembered` and a restart. `RemoteStore.hash_at` stays unsupported: the check
+rides on the answer it guards, with no second round trip and no gap between check and use. An
+agent's crash window is the server's (one save interval); a server older than the agent sends no
+pair and is `ZC-E0504`.
+
 Known gaps (not fixed in 10b): `accept` reads the store's status and then bumps the epoch, so a write
 acknowledged between the two is not in the pair it remembers (the pair is lower than the store: weaker,
 never unsafe). The round-1 `<db>.remembered` files (before the file was keyed by the database path) are

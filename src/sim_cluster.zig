@@ -285,8 +285,27 @@ const Node = struct {
         node.loop = agent_loop.Loop.init();
         const gpa = node.cluster.gpa;
         node.remote = agent_client.RemoteStore.init(gpa, node.transport(), node.name());
+        node.load_pair();
         node.down = false;
         node.resume_ms = 0;
+    }
+
+    /// The agent's remembered pair, as `zcube-agent` loads it at start. `SimState` keeps every
+    /// put whole, so a file the agent wrote always parses.
+    fn load_pair(node: *Node) void {
+        node.diag.reset();
+        _ = node.arena.reset(.retain_capacity);
+        const state = node.sim.files.interface();
+        node.remote.load(state, "/sim", node.arena.allocator(), &node.diag) catch
+            unreachable; // Only a file the agent did not write fails to load.
+    }
+
+    /// The pair saved after a step, as `zcube-agent` does; a crash at its write point is the
+    /// agent dying there.
+    fn save_pair(node: *Node, now_ms: u64) void {
+        node.remote.save(node.sim.files.interface(), now_ms) catch |err| {
+            if (err == error.Crashed) node.sim.crashed = true;
+        };
     }
 
     /// Notes that a call found the agent dead.
@@ -316,6 +335,7 @@ const Node = struct {
         node.all_steps += 1;
         const result = node.agent.reconcile(&ctx);
         node.resume_ms = c.manual.ms + node.spent_ms;
+        if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
         const wake = result catch {
             c.stats.agent_failures += 1;

@@ -412,3 +412,59 @@ test "the watch says whether a replica changed since a revision, and holds when 
     try rig.world.store_handle().compact(@intCast(world_head), &rig.world.diag);
     try rig.refused(rig.call("GET", base, "from=1", ""), 410, "ZC-E0203");
 }
+
+/// The answer's `chain`, checked against the store: `revision` and `hash` are its head now, and
+/// `known_hash` is its hash at `known` when one was sent.
+fn expect_chain(rig: *Rig, answer: Json, known: ?u64) !void {
+    const chain = field(answer, "chain");
+    rig.world.diag.reset();
+    const handle = rig.world.store_handle();
+    const head = try handle.status(&rig.world.diag);
+    try testing.expectEqual(@as(i64, @intCast(head.revision)), field(chain, "revision").integer);
+    var text: [64]u8 = undefined;
+    const hash = try std.fmt.bufPrint(&text, "{x}", .{&head.hash});
+    try testing.expectEqualStrings(hash, field(chain, "hash").string);
+    const at = known orelse {
+        try testing.expect(chain.object.get("known_hash") == null);
+        return;
+    };
+    const there = try handle.hash_at(at, &rig.world.diag);
+    const expected = try std.fmt.bufPrint(&text, "{x}", .{&there});
+    try testing.expectEqualStrings(expected, field(chain, "known_hash").string);
+}
+
+test "every agent answer carries the store's chain pair, and its hash at the agent's revision" {
+    // Goal: what the agent checks (agent_client.zig, "Nothing from behind") is the store's own
+    // pair. Method: call each endpoint without and with `known`, compare `chain` with `status`
+    // and `hash_at`; a `known` above the head gets no `known_hash`, and `known` is the only
+    // parameter the other endpoints take.
+    var rig = try Rig.start(9);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const base = "/v1/agent/nodes/node2";
+    const lease = try rig.grant("node2");
+    var buffer: [512]u8 = undefined;
+    const body = try register_text(&buffer, lease);
+    const registered = try rig.ok("PUT", base, "known=1", body);
+    try expect_chain(&rig, registered, 1);
+    const head: u64 = @intCast(try rig.revision());
+    var query_buffer: [64]u8 = undefined;
+    const at_head = try std.fmt.bufPrint(&query_buffer, "known={d}", .{head});
+
+    var path: [96]u8 = undefined;
+    const renewed = try rig.ok("POST", try keepalive_path(&path, lease), at_head, "");
+    try expect_chain(&rig, renewed, head);
+    const replicas = try rig.ok("GET", "/v1/agent/nodes/node1/replicas", at_head, "");
+    try expect_chain(&rig, replicas, head);
+    const observed = try rig.ok("GET", base ++ "/observed", "", "");
+    try expect_chain(&rig, observed, null);
+    var watch_buffer: [64]u8 = undefined;
+    const watch = try std.fmt.bufPrint(&watch_buffer, "from=1&timeout=0&known={d}", .{head});
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/watch", watch, ""), head);
+
+    const ahead = try std.fmt.bufPrint(&query_buffer, "known={d}", .{head + 100});
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/replicas", ahead, ""), null);
+    try rig.refused(rig.call("GET", base ++ "/replicas", "from=1", ""), 400, "ZC-E0104");
+    try rig.refused(rig.call("GET", base ++ "/replicas", "known=x", ""), 400, "ZC-E0104");
+}

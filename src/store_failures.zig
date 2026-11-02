@@ -129,34 +129,70 @@ pub const Rollback = struct {
     now_revision: Revision,
     now_hash: store.Hash,
     unverifiable: bool = false,
+    /// Set when a node agent raises it about the server's answer (`agent_client.zig`): the
+    /// agent's state directory, borrowed, which holds the file the operator removes. Null when
+    /// the server raises it about its store.
+    agent_state_dir: ?[]const u8 = null,
 };
 
 pub fn went_backwards(diag: *Diag, rollback: Rollback) error{BackendFailed} {
     assert(diag.code == null);
     diag.raise(.E0215);
+    if (rollback.agent_state_dir) |state_dir| {
+        backwards_causes(diag, rollback, agent_words);
+        const look = "look at which store the server uses; to keep it as it is, run there";
+        diag.fix_with(look, "zcube store accept-rollback --confirm", .{});
+        const forget = "then make this agent forget its pair, and restart it";
+        diag.fix_with(forget, "rm {s}/remembered", .{state_dir});
+    } else {
+        backwards_causes(diag, rollback, server_words);
+        const sentence = "look at which store this is; to keep it as it is, run";
+        diag.fix_with(sentence, "zcube store accept-rollback --confirm", .{});
+    }
+    return error.BackendFailed;
+}
+
+/// Who remembers, and what answered: the server about its store, or an agent about the server.
+const Words = struct {
+    no_hash: []const u8,
+    behind: []const u8,
+    forked: []const u8,
+    pair_line: []const u8,
+    hash_line: []const u8,
+};
+
+const server_words: Words = .{
+    .no_hash = "the store has no hash for revision {d}, so it cannot be checked",
+    .behind = "the store is behind: writes it acknowledged are gone",
+    .forked = "the store holds a different history at that revision",
+    .pair_line = "the server remembers revision {d} ({s}); the store is at revision {d} ({s})",
+    .hash_line = "the server remembers revision {d} with hash {s}; the store has hash {s}",
+};
+
+const agent_words: Words = .{
+    .no_hash = "the server has no hash for revision {d}, so it cannot be checked",
+    .behind = "the server answered from behind: writes it acknowledged are gone",
+    .forked = "the server's store holds a different history at that revision",
+    .pair_line = "this agent remembers revision {d} ({s}); " ++
+        "the server answered at revision {d} ({s})",
+    .hash_line = "this agent remembers revision {d} with hash {s}; the server has hash {s}",
+};
+
+fn backwards_causes(diag: *Diag, rollback: Rollback, comptime words: Words) void {
     const old = short_hash(rollback.remembered_hash);
     const new = short_hash(rollback.now_hash);
+    const remembered = rollback.remembered_revision;
     // The innermost cause is the one the default render shows: it carries the evidence.
     if (rollback.unverifiable) {
-        diag.cause("the store has no hash for revision {d}, so it cannot be checked", .{
-            rollback.remembered_revision,
-        });
-        diag.cause("the server remembers revision {d} ({s}); the store is at revision {d} ({s})", .{
-            rollback.remembered_revision, old, rollback.now_revision, new,
-        });
-    } else if (rollback.now_revision < rollback.remembered_revision) {
-        diag.cause("the store is behind: writes it acknowledged are gone", .{});
-        const line = "the server remembers revision {d} ({s}); the store is at revision {d} ({s})";
-        diag.cause(line, .{ rollback.remembered_revision, old, rollback.now_revision, new });
+        diag.cause(words.no_hash, .{remembered});
+        diag.cause(words.pair_line, .{ remembered, old, rollback.now_revision, new });
+    } else if (rollback.now_revision < remembered) {
+        diag.cause(words.behind, .{});
+        diag.cause(words.pair_line, .{ remembered, old, rollback.now_revision, new });
     } else {
-        diag.cause("the store holds a different history at that revision", .{});
-        diag.cause("the server remembers revision {d} with hash {s}; the store has hash {s}", .{
-            rollback.remembered_revision, old, new,
-        });
+        diag.cause(words.forked, .{});
+        diag.cause(words.hash_line, .{ remembered, old, new });
     }
-    const sentence = "look at which store this is; to keep it as it is, run";
-    diag.fix_with(sentence, "zcube store accept-rollback --confirm", .{});
-    return error.BackendFailed;
 }
 
 /// The remembered pair could not be saved (`ZC-E0216`); the file is behind what the server knows.

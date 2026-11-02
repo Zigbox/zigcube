@@ -425,6 +425,22 @@ event cannot matter. The agent lists, remembers the list's `revision`, and watch
 `from` more than one past the store's revision is `400` and `ZC-E0204`; `from` below the
 compaction point is `410` and `ZC-E0203`, and the agent treats that as "changed" and lists again.
 
+### The chain pair (C1 slice 10b)
+
+Every `200` answer of these endpoints carries `"chain": {"revision": R, "hash": "<64 hex>"}`:
+the store's `status` taken after the endpoint did its work (for the watch, the head it answered
+at), so it is at least as new as anything in the answer. Every endpoint takes `known=K`, the
+revision the agent remembers (no other query parameter, except the watch's `from` and `timeout`).
+When `K <= R`, the pair adds `"known_hash"`: the store's hash at `K`. It is left out when the store
+has no hash there (`K` below the chain's start). A refusal carries no pair.
+
+The agent remembers the highest pair it was given, in `<state dir>/remembered`, and refuses an
+answer with a lower `revision`, a `known_hash` that differs from the remembered hash or is
+missing, or the same revision with a different `hash`: `ZC-E0215`, as the server raises for its
+store, and it acts on nothing in that answer. An answer without `chain` is `ZC-E0504` (the
+server is older than the agent: upgrade the server first). The way out is the server's
+`zcube store accept-rollback --confirm`, then `rm <state dir>/remembered` and an agent restart.
+
 ### What the agent does with them
 
 1. Grant a lease, `PUT` its registration, and `POST` a keepalive every third of the ttl

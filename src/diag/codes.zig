@@ -614,6 +614,11 @@ pub const registry = [_]Entry{
         \\remember the store as it is now. The old and new revision and hash are
         \\shown in the reply of that command; a decision record that keeps them
         \\is not written yet.
+        \\
+        \\An agent raises it too: it remembers the highest revision and hash
+        \\the server's answers carried, and refuses an answer from behind them.
+        \\After accept-rollback on the server, remove the file remembered in
+        \\the agent's state directory and restart the agent.
         ,
     },
     .{

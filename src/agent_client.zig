@@ -19,6 +19,21 @@
 //! The wait between steps is `watch_once`, which is not part of `Store`: it asks the server
 //! whether a replica changed since the revision of the last list, and holds up to the time given.
 //!
+//! **Nothing from behind** (C1 10b; docs/store-design.md, "Nothing acts on a store that went
+//! backwards"). Every answer of the agent endpoints carries `chain`: the store's revision and
+//! chain hash when the server answered, and, for the `known` revision every request sends (the
+//! pair this store remembers), the store's hash at that revision. `exchange` checks it before
+//! anything reads the answer: a lower revision, a different hash at the remembered revision, or
+//! none at all (the store cannot say) is `ZC-E0215`, the server's own diagnostic worded for an
+//! agent, and the call fails, so the agent core acts on nothing from that answer. The pair never
+//! moves down, so the refusal lasts until an operator removes the agent's file. `hash_at` stays
+//! unsupported: the check needs the hash at one revision, carried on the answer it guards, not a
+//! second request that would check another moment.
+//!
+//! The pair lives in `AgentState` as `remembered` (`load` at start, `save` between steps, at most
+//! every `verified_save_ms`; a copy that lags is safe, only weaker). A state directory from
+//! before this file existed loads with nothing remembered.
+//!
 //! The server's `ZC-E0205` (the lease is gone) becomes `error.LeaseNotFound`, because the agent
 //! core grants a new lease on exactly that error. Every other refusal is ZC-E0504 with the
 //! server's own diagnostic in the cause lines.
@@ -26,14 +41,23 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const agent_state = @import("agent_state.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const verified = @import("store_verified.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const Json = std.json.Value;
+const Pair = verified.Pair;
+
+/// The agent's remembered pair, in its state directory.
+pub const remembered_file = "remembered";
+/// `{"v":1,"revision":<u64>,"hash":"<64 hex>"}` and room to spare.
+const remembered_bytes_max: u32 = 160;
+const remembered_version: u32 = 1;
 
 pub const Error = error{ Unreachable, BadReply, OutOfMemory };
 
@@ -87,6 +111,13 @@ pub const RemoteStore = struct {
     /// Where the next `watch_once` resumes: the revision of the last replica list, plus one.
     /// 0 until the first list, which makes the first watch answer "changed" at once.
     watch_from: store.Revision,
+    /// The highest pair an answer carried (or the file held): never lowered.
+    known: ?Pair = null,
+    /// What the file is known to hold, and when it was written (`save`).
+    saved: ?Pair = null,
+    saved_ms: u64 = 0,
+    /// The state directory as the person running the agent named it, for the fix line.
+    state_dir: []const u8 = "<state dir>",
 
     const vtable: store.Store.VTable = .{
         .status = status_impl,
@@ -456,16 +487,154 @@ pub const RemoteStore = struct {
 
     // ---- Requests and replies ----
 
+    /// One request with the remembered revision added, and its answer checked against it.
     fn exchange(
         remote: *RemoteStore,
         arena: Allocator,
         request: Request,
         diag: *Diag,
     ) store.Error!Reply {
-        return remote.transport.call(arena, request, diag) catch |err| switch (err) {
-            error.OutOfMemory => failures.no_memory(diag),
-            error.Unreachable, error.BadReply => error.BackendFailed,
+        var sent = request;
+        if (remote.known) |known| {
+            const separator: u8 = if (std.mem.indexOfScalar(u8, request.target, '?') == null)
+                '?'
+            else
+                '&';
+            sent.target = std.fmt.allocPrint(arena, "{s}{c}known={d}", .{
+                request.target, separator, known.revision,
+            }) catch return failures.no_memory(diag);
+        }
+        const reply = remote.transport.call(arena, sent, diag) catch |err| switch (err) {
+            error.OutOfMemory => return failures.no_memory(diag),
+            error.Unreachable, error.BadReply => return error.BackendFailed,
         };
+        // A refusal carries no pair and is not acted on; every answer that is, is checked.
+        if (reply.status == 200) try remote.check(arena, reply.body, diag);
+        return reply;
+    }
+
+    /// Refuses an answer from behind the remembered pair, else moves the pair up to it.
+    fn check(
+        remote: *RemoteStore,
+        arena: Allocator,
+        body: []const u8,
+        diag: *Diag,
+    ) store.Error!void {
+        const ChainJson = struct {
+            revision: u64,
+            hash: []const u8,
+            known_hash: ?[]const u8 = null,
+        };
+        const Answer = struct { chain: ?ChainJson = null };
+        const answer = try parse(Answer, arena, body, diag);
+        const chain = answer.chain orelse
+            return bad(diag, "the reply carries no chain pair: the server is older than the agent");
+        const now: Pair = .{ .revision = chain.revision, .hash = try parse_hash(chain.hash, diag) };
+        const known = remote.known orelse {
+            remote.known = now;
+            return;
+        };
+        try remote.compare(known, now, chain.known_hash, diag);
+        assert(now.revision >= known.revision);
+        if (now.revision > known.revision) remote.known = now;
+    }
+
+    fn compare(
+        remote: *const RemoteStore,
+        known: Pair,
+        now: Pair,
+        known_hash: ?[]const u8,
+        diag: *Diag,
+    ) store.Error!void {
+        var rollback: failures.Rollback = .{
+            .remembered_revision = known.revision,
+            .remembered_hash = known.hash,
+            .now_revision = now.revision,
+            .now_hash = now.hash,
+            .agent_state_dir = remote.state_dir,
+        };
+        if (now.revision < known.revision) return failures.went_backwards(diag, rollback);
+        const text = known_hash orelse {
+            rollback.unverifiable = true;
+            return failures.went_backwards(diag, rollback);
+        };
+        const there = try parse_hash(text, diag);
+        if (!std.mem.eql(u8, &there, &known.hash)) {
+            rollback.now_hash = there;
+            return failures.went_backwards(diag, rollback);
+        }
+        // The same revision must be the same pair; `known_hash` already said so on an honest
+        // server, and a server that contradicts itself is not believed either.
+        if (now.revision == known.revision) {
+            if (!std.mem.eql(u8, &now.hash, &known.hash)) {
+                return failures.went_backwards(diag, rollback);
+            }
+        }
+    }
+
+    // ---- The remembered pair in the state directory ----
+
+    /// Reads the pair the agent saved before it stopped. No file (a first start, or a state
+    /// directory from before 10b) is nothing remembered; a file that does not parse is
+    /// `ZC-E0216`, and the agent does not start on a guess.
+    pub fn load(
+        remote: *RemoteStore,
+        state: agent_state.AgentState,
+        state_dir: []const u8,
+        arena: Allocator,
+        diag: *Diag,
+    ) error{BackendFailed}!void {
+        assert(diag.code == null);
+        assert(remote.known == null);
+        remote.state_dir = state_dir;
+        const text = state.read(arena, remembered_file) catch |err| switch (err) {
+            error.Absent => return,
+            else => return remote.unusable(diag, @errorName(err)),
+        };
+        const File = struct { v: u32, revision: u64, hash: []const u8 };
+        const file = std.json.parseFromSliceLeaky(File, arena, text, .{}) catch
+            return remote.unusable(diag, "it is not what the agent writes");
+        if (file.v != remembered_version) {
+            return remote.unusable(diag, "it was written by a newer zcube-agent");
+        }
+        const hash = parse_hash(file.hash, diag) catch {
+            diag.reset();
+            return remote.unusable(diag, "its hash is not a chain hash");
+        };
+        remote.known = .{ .revision = file.revision, .hash = hash };
+        remote.saved = remote.known;
+    }
+
+    /// Writes the pair if the file is behind it and the last write is `verified_save_ms` old (the
+    /// first one at once). Crash-safe through `put_atomic`. A failure leaves the file behind,
+    /// which is safe, and the next call tries again.
+    pub fn save(
+        remote: *RemoteStore,
+        state: agent_state.AgentState,
+        now_ms: u64,
+    ) agent_state.Error!void {
+        const known = remote.known orelse return;
+        if (remote.saved) |saved| {
+            assert(saved.revision <= known.revision);
+            if (saved.eql(known)) return;
+            if (now_ms -| remote.saved_ms < constants.verified_save_ms) return;
+        }
+        var buffer: [remembered_bytes_max]u8 = undefined;
+        const format = "{{\"v\":{d},\"revision\":{d},\"hash\":\"{x}\"}}\n";
+        const fields = .{ remembered_version, known.revision, &known.hash };
+        // The buffer holds the longest line: 20 digits and 64 hex digits.
+        const text = std.fmt.bufPrint(&buffer, format, fields) catch unreachable;
+        try state.put_atomic(remembered_file, text);
+        remote.saved = known;
+        remote.saved_ms = now_ms;
+    }
+
+    fn unusable(remote: *const RemoteStore, diag: *Diag, reason: []const u8) error{BackendFailed} {
+        var buffer: [constants.state_path_bytes_max + 16]u8 = undefined;
+        const parts = .{ remote.state_dir, remembered_file };
+        // A state directory too long to name: the file's name alone.
+        const where = std.fmt.bufPrint(&buffer, "{s}/{s}", parts) catch remembered_file;
+        return failures.remembered_unusable(diag, where, "read", reason);
     }
 
     /// "/v1/agent/nodes/<node>" and `suffix`.
@@ -487,6 +656,16 @@ fn resync_code(text: []const u8) bool {
 }
 
 // ---- Parsing and failures ----------------------------------------------------------------------
+
+/// A chain hash as the server writes it: 64 lower-case hex digits.
+fn parse_hash(text: []const u8, diag: *Diag) store.Error!store.Hash {
+    var hash: store.Hash = undefined;
+    if (text.len != store.hash_bytes * 2) return bad(diag, "the reply's chain hash is not a hash");
+    const decoded = std.fmt.hexToBytes(&hash, text) catch
+        return bad(diag, "the reply's chain hash is not a hash");
+    assert(decoded.len == store.hash_bytes);
+    return hash;
+}
 
 fn encode(arena: Allocator, value: anytype, diag: *Diag) store.Error![]const u8 {
     return std.json.Stringify.valueAlloc(arena, value, .{}) catch failures.no_memory(diag);
