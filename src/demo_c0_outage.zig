@@ -305,10 +305,10 @@ fn recovered(demo: *Demo, before: []const host_procs.Pids, counts: state.Counts)
         "the workloads kept running through the outage: the same processes",
         .{},
     );
-    // The agent could not renew its lease while the store refused writes, so it registered
-    // again; the node controller judged the new tenure.
+    // If the agent could not renew its lease while the store refused writes, it registered
+    // again and the node controller judged the new tenure: at most one, depending on timing.
     try decisions.expect_new(demo, "outage", &.{
-        .{ .actor = "node-controller", .action = "mark_ready", .count = 1 },
+        .{ .actor = "node-controller", .action = "mark_ready", .count = 1, .optional = true },
     });
     try apply_again(demo);
 }
