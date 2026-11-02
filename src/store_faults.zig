@@ -54,12 +54,13 @@ const PostgresStore = @import("store_postgres.zig").PostgresStore;
 const SqliteStore = @import("store_sqlite.zig").SqliteStore;
 const fault_proxy = @import("testing/fault_proxy.zig");
 const history = @import("testing/history.zig");
+const failover = @import("store_failover.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store.Store;
 
-const clients_count = 4;
-const ops_per_client = 250;
+pub const clients_count = 4;
+pub const ops_per_client = 250;
 /// Calls are spread over a few hot keys at a time, so that clients really overlap on a key: a
 /// client's `phase_ops` calls go to `hot_keys` keys of its current phase, and each phase has keys
 /// of its own. The checker's search is bounded per key (`history.key_calls_max`), so a key takes
@@ -85,23 +86,28 @@ const watch_polls_max = 100_000;
 const catch_up_ms = 30_000;
 const exit_user = 2;
 
-const Backend = enum { postgres, sqlite };
+pub const Backend = enum { postgres, sqlite };
 
-const Options = struct {
+pub const Options = struct {
     backend: Backend,
     postgres: []const u8,
     seed: ?u64,
     /// Test hook (hidden flag `--mutate`): the clients' stores lie, and the run must fail.
     mutation: Mutation = .none,
     ops_per_client: u32 = ops_per_client,
+    /// `--failover sync|async`: the run of `store_failover.zig` instead of the fault schedule.
+    failover: ?failover.Mode = null,
+    /// The `pg_dev` and `zcube-server` programs a failover run starts.
+    pg_dev: []const u8 = "",
+    server: []const u8 = "",
 };
 
 /// A store connection of either kind. In place: stores point back at themselves.
-const Conn = struct {
+pub const Conn = struct {
     postgres: PostgresStore,
     sqlite: SqliteStore,
 
-    fn open(conn: *Conn, shared: *const Shared, conninfo: []const u8, diag: *Diag) !void {
+    pub fn open(conn: *Conn, shared: *const Shared, conninfo: []const u8, diag: *Diag) !void {
         const run = shared.run;
         switch (run.backend) {
             .postgres => try conn.postgres.open(run.io, .{
@@ -116,14 +122,14 @@ const Conn = struct {
         }
     }
 
-    fn interface(conn: *Conn, backend: Backend) Store {
+    pub fn interface(conn: *Conn, backend: Backend) Store {
         return switch (backend) {
             .postgres => conn.postgres.interface(),
             .sqlite => conn.sqlite.interface(),
         };
     }
 
-    fn close(conn: *Conn, backend: Backend) void {
+    pub fn close(conn: *Conn, backend: Backend) void {
         switch (backend) {
             .postgres => conn.postgres.close(),
             .sqlite => conn.sqlite.close(),
@@ -132,7 +138,7 @@ const Conn = struct {
 };
 
 /// What stays fixed for the run.
-const Run = struct {
+pub const Run = struct {
     gpa: Allocator,
     io: std.Io,
     backend: Backend,
@@ -142,9 +148,11 @@ const Run = struct {
     mutation: Mutation,
     ops_per_client: u32,
     clock: @import("clock.zig").Clock,
+    /// A pause after each client call, so that a failover run's load lasts while it is staged.
+    op_pause_ms: u32 = 0,
 };
 
-const Shared = struct {
+pub const Shared = struct {
     run: *const Run,
     ticker: history.Ticker = .{},
     next_token: std.atomic.Value(u64) = .init(1),
@@ -154,6 +162,10 @@ const Shared = struct {
     key_calls: [register_keys]std.atomic.Value(u32) = @splat(.init(0)),
     /// The revision the watcher must reach once the clients are done; 0 until known.
     watch_final: std.atomic.Value(u64) = .init(0),
+    /// Client calls made so far (a failover run stages its moments by it).
+    ops_done: std.atomic.Value(u32) = .init(0),
+    /// Set by a failover run that ends the load early: clients and watcher stop at once.
+    stop_load: std.atomic.Value(bool) = .init(false),
 
     /// Counts a call on `key`; false if the key has had its share.
     fn reserve(shared: *Shared, key: u8) bool {
@@ -168,13 +180,13 @@ const Shared = struct {
     }
 };
 
-fn nap(io: std.Io, ms: u64) void {
+pub fn nap(io: std.Io, ms: u64) void {
     io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {}; // Cancelled: the run is over.
 }
 
 // ---- Clients ------------------------------------------------------------------------------------
 
-const Client = struct {
+pub const Client = struct {
     shared: *Shared,
     id: u32,
     recorder: history.Recorder,
@@ -204,6 +216,9 @@ fn run_client(client: *Client) !void {
     defer arena_state.deinit();
     const rng = client.rng.random();
     for (0..client.shared.run.ops_per_client) |op_index| {
+        if (client.shared.stop_load.load(.acquire)) return;
+        if (op_index > 0) nap(client.shared.run.io, client.shared.run.op_pause_ms);
+        defer _ = client.shared.ops_done.fetchAdd(1, .monotonic);
         _ = arena_state.reset(.retain_capacity);
         const key = pick_key(client.shared, rng, op_index);
         const roll = rng.uintLessThan(u32, 100);
@@ -350,7 +365,7 @@ fn op_of(key_buffer: *[8]u8, value_buffer: *[24]u8, put: history.Put) store.Op {
 
 // ---- The watcher --------------------------------------------------------------------------------
 
-const Watcher = struct {
+pub const Watcher = struct {
     shared: *Shared,
     conn: Conn,
     diag: Diag,
@@ -395,6 +410,7 @@ fn watch_until_caught_up(watcher: *Watcher) !void {
     while (true) {
         const final = shared.watch_final.load(.acquire);
         if (final != 0 and watcher.bookmark >= final) return;
+        if (shared.stop_load.load(.acquire)) return;
         if (shared.watch_stop.load(.acquire)) {
             if (deadline == 0) deadline = run.clock.now_ms() + catch_up_ms;
             if (run.clock.now_ms() > deadline) return error.WatcherDidNotCatchUp;
@@ -476,7 +492,7 @@ fn fault_step(proxy: *fault_proxy.Proxy, rng: std.Random, io: std.Io) void {
 // ---- Setup and verdict --------------------------------------------------------------------------
 
 /// The log from `from` to `final`, read through `s`.
-fn read_log(
+pub fn read_log(
     gpa: Allocator,
     s: Store,
     from: u64,
@@ -499,7 +515,7 @@ fn read_log(
 }
 
 /// The port in libpq settings in keyword/value form (5432 if none is given).
-fn upstream_port(conninfo: []const u8) !u16 {
+pub fn upstream_port(conninfo: []const u8) !u16 {
     var words = std.mem.tokenizeScalar(u8, conninfo, ' ');
     var port: u16 = 5432;
     while (words.next()) |word| {
@@ -529,13 +545,13 @@ fn tally(entries: []const history.Entry) Outcome {
 /// stderr of a passing step as a failure). Set before the threads start, never while they run.
 var say_enabled = true;
 
-fn say(comptime format: []const u8, args: anytype) void {
+pub fn say(comptime format: []const u8, args: anytype) void {
     if (!say_enabled) return;
     std.debug.print("store-faults: " ++ format ++ "\n", args);
 }
 
 /// Prints a failed store call as the diagnostic it raised, after `what` was being done.
-fn say_failure(what: []const u8, diag: *const Diag) void {
+pub fn say_failure(what: []const u8, diag: *const Diag) void {
     assert(what.len > 0);
     var diagnostic: diag_mod.Diagnostic = undefined;
     if (diag.code == null) return say("{s}", .{what});
@@ -557,6 +573,12 @@ fn parse_options(args: []const []const u8) ?Options {
             options.postgres = value;
         } else if (std.mem.eql(u8, name, "--mutate")) {
             options.mutation = std.meta.stringToEnum(Mutation, value) orelse return null;
+        } else if (std.mem.eql(u8, name, "--failover")) {
+            options.failover = std.meta.stringToEnum(failover.Mode, value) orelse return null;
+        } else if (std.mem.eql(u8, name, "--pg-dev")) {
+            options.pg_dev = value;
+        } else if (std.mem.eql(u8, name, "--server")) {
+            options.server = value;
         } else if (std.mem.eql(u8, name, "--seed")) {
             options.seed = std.fmt.parseInt(u64, value, 10) catch return null;
         } else {
@@ -564,6 +586,11 @@ fn parse_options(args: []const []const u8) ?Options {
         }
     }
     if (index != args.len) return null;
+    if (options.failover != null) {
+        if (options.backend != .postgres) return null;
+        if (options.pg_dev.len == 0 or options.server.len == 0) return null;
+        return options;
+    }
     if (options.backend == .postgres and options.postgres.len == 0) return null;
     return options;
 }
@@ -572,6 +599,7 @@ pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return exit_user;
     const options = parse_options(args) orelse {
         say("usage: store_faults --backend postgres|sqlite [--postgres SETTINGS] [--seed N]" ++
+            " [--failover sync|async --pg-dev PG_DEV --server ZCUBE_SERVER]" ++
             " [--mutate drop_ack|stale_read|reuse_revision|all_unknown|keep_delete|" ++
             "ignore_compact|over_compact|stale_history]", .{});
         return exit_user;
@@ -583,7 +611,12 @@ pub fn main(init: std.process.Init) u8 {
     if (options.backend == .sqlite) {
         say("sqlite: no proxy applies; history checker only, no faults", .{});
     }
-    const report = execute(init.gpa, init.io, options, seed) catch |err| {
+    if (options.failover) |mode| say("failover run: {s} standby", .{@tagName(mode)});
+    const executed = if (options.failover != null)
+        failover.run(init.gpa, init.io, options, seed)
+    else
+        execute(init.gpa, init.io, options, seed);
+    const report = executed catch |err| {
         say("ERROR {s} seed={d}", .{ @errorName(err), seed });
         return 1;
     };
@@ -592,9 +625,9 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 /// How a run ended. `kind` is the checker's verdict when it was the checker that failed it.
-const Stopped = enum { uncovered, bad_value, client };
+pub const Stopped = enum { uncovered, bad_value, client };
 
-const Report = struct {
+pub const Report = struct {
     passed: bool,
     kind: ?history.Kind = null,
     /// Why a run failed when it was not the checker's verdict.
@@ -685,7 +718,7 @@ fn drive(run: *const Run, options: Options) !Report {
         .proxy = proxy,
         .conninfo = client_conninfo,
         .direct_conninfo = options.postgres,
-    });
+    }, null);
 }
 
 /// Drops the schema of this run's seed over a plain connection, so that it works whatever
@@ -710,7 +743,7 @@ fn drop_leftover_schema(run: *const Run, conninfo: []const u8, diag: *Diag) !voi
     result.clear();
 }
 
-const Setup = struct {
+pub const Setup = struct {
     /// The settings of a connection that does not go through the proxy.
     direct_conninfo: []const u8,
     direct: Store,
@@ -718,9 +751,47 @@ const Setup = struct {
     base: u64,
     proxy: ?*fault_proxy.Proxy,
     conninfo: []const u8,
+    coverage: Coverage = .faults,
 };
 
-fn run_and_check(shared: *Shared, setup: Setup) !Report {
+/// What a run must have exercised: a faulted run both outcomes of a lost connection, a failover
+/// run deletes only (its one fault is the failover).
+pub const Coverage = enum { faults, failover };
+
+/// A run staged by someone other than `play`: it starts the threads, makes its moments, joins
+/// them, and judges.
+pub const Conduct = struct {
+    context: *anyopaque,
+    conduct_fn: *const fn (*anyopaque, *Shared, Setup, []Client, *Watcher) anyerror!Report,
+};
+
+/// The client and watcher threads of a run.
+pub const Threads = struct {
+    clients: [clients_count]std.Thread = undefined,
+    watcher: std.Thread = undefined,
+
+    /// On an error, the threads already started are stopped (`stop_load`) and joined.
+    pub fn start(threads: *Threads, shared: *Shared, clients: []Client, watcher: *Watcher) !void {
+        assert(clients.len == clients_count);
+        threads.watcher = try std.Thread.spawn(.{}, watcher_main, .{watcher});
+        var started: usize = 0;
+        errdefer {
+            shared.stop_load.store(true, .release);
+            for (threads.clients[0..started]) |thread| thread.join();
+            threads.watcher.join();
+        }
+        for (clients, 0..) |*client, index| {
+            threads.clients[index] = try std.Thread.spawn(.{}, client_main, .{client});
+            started += 1;
+        }
+    }
+
+    pub fn join_clients(threads: *Threads) void {
+        for (threads.clients) |thread| thread.join();
+    }
+};
+
+pub fn run_and_check(shared: *Shared, setup: Setup, conduct: ?Conduct) !Report {
     const run = shared.run;
     const gpa = run.gpa;
     const clients = try gpa.alloc(Client, clients_count);
@@ -765,17 +836,16 @@ fn run_and_check(shared: *Shared, setup: Setup) !Report {
     watcher.diag.reset();
     try watcher.conn.open(shared, setup.conninfo, &watcher.diag);
     defer watcher.conn.close(run.backend);
+    if (conduct) |c| return try c.conduct_fn(c.context, shared, setup, clients, watcher);
     return try play(shared, setup, clients, watcher);
 }
 
 fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !Report {
     const run = shared.run;
     const gpa = run.gpa;
-    var threads: [clients_count]std.Thread = undefined;
-    const watch_thread = try std.Thread.spawn(.{}, watcher_main, .{watcher});
-    for (clients, 0..) |*client, index| {
-        threads[index] = try std.Thread.spawn(.{}, client_main, .{client});
-    }
+    var threads: Threads = .{};
+    try threads.start(shared, clients, watcher);
+    const watch_thread = threads.watcher;
     var schedule = std.Random.DefaultPrng.init(run.seed ^ 0x5851f42d4c957f2d);
     while (shared.clients_left.load(.acquire) != 0) {
         if (setup.proxy) |proxy| {
@@ -784,7 +854,7 @@ fn play(shared: *Shared, setup: Setup, clients: []Client, watcher: *Watcher) !Re
             nap(run.io, 20);
         }
     }
-    for (threads) |thread| thread.join();
+    threads.join_clients();
     if (setup.proxy) |proxy| proxy.heal();
     if (setup.proxy != null) try wait_quiet(shared, setup);
     const final = (try setup.direct.status(setup.diag)).revision;
@@ -1003,7 +1073,7 @@ fn compaction_stage(shared: *Shared, setup: Setup, finished: Finished) !Stage {
     return .{ .verdict = checked, .counts = counts, .failure = failure };
 }
 
-fn fail_client(err: anyerror) Report {
+pub fn fail_client(err: anyerror) Report {
     say("a client thread stopped: {s}", .{@errorName(err)});
     return .{ .passed = false, .stopped = .client };
 }
@@ -1014,7 +1084,7 @@ fn fail_client(err: anyerror) Report {
 /// low and the checker would report a gap that is not there. Quiet means `quiet_samples`
 /// readings in a row with nothing running; it gives up after `quiet_polls_max` readings (other
 /// users of the database can keep it busy) and says so.
-fn wait_quiet(shared: *Shared, setup: Setup) !void {
+pub fn wait_quiet(shared: *Shared, setup: Setup) !void {
     const run = shared.run;
     var text: [512]u8 = undefined;
     const conninfo = std.fmt.bufPrintSentinel(&text, "{s}", .{setup.direct_conninfo}, 0) catch {
@@ -1041,7 +1111,7 @@ const busy_sql: [:0]const u8 =
     "AND datname = current_database() AND pid <> pg_backend_pid() " ++
     "AND state IN ('active', 'idle in transaction', 'idle in transaction (aborted)')";
 
-const Finished = struct {
+pub const Finished = struct {
     log: []const history.LogEvent,
     final: u64,
 };
@@ -1082,6 +1152,7 @@ fn covered_both_cases(setup: Setup, report: *const Report) bool {
         say("FAILED: no delete was acknowledged: deletes were never exercised", .{});
         return false;
     }
+    if (setup.coverage == .failover) return true;
     if (setup.proxy == null) {
         assert(report.unknown_applied == 0); // Without faults no write is ever left unknown.
         return true;
@@ -1103,7 +1174,7 @@ fn covered_both_cases(setup: Setup, report: *const Report) bool {
     return true;
 }
 
-fn verdict(
+pub fn verdict(
     shared: *Shared,
     setup: Setup,
     clients: []Client,

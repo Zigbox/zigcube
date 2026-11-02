@@ -113,8 +113,14 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
         const name = b.fmt("check-store-{s}", .{@tagName(fixed)});
         add_store_step(b, name, "Run the store conformance suite for check", options);
     }
-    add_store_faults_step(b, store_options);
     const pg_dev = add_pg_dev_steps(b);
+    const failover_help = "test-store-faults on Postgres: also run the failover runs " ++
+        "(default true; they need the Postgres 16 programs, as pg-up does)";
+    add_store_faults_step(b, store_options, .{
+        .enabled = b.option(bool, "failover", failover_help) orelse true,
+        .pg_dev = pg_dev,
+        .server = built.server,
+    });
     // The demo needs a real store: `-Dbackend=memory` (which test-store takes) runs it on SQLite.
     const demo_backend: Backend = switch (backend orelse .sqlite) {
         .postgres => .postgres,
@@ -293,11 +299,12 @@ fn add_pg_dev_steps(b: *std.Build) *std.Build.Step.Compile {
             .optimize = .Debug,
         }),
     });
-    const commands = [_][]const u8{ "up", "down", "stop" };
+    const commands = [_][]const u8{ "up", "down", "stop", "pair-down" };
     const descriptions = [_][]const u8{
         "Start a throwaway Postgres for test-store (prints its ZCUBE_TEST_POSTGRES)",
         "Stop the throwaway Postgres and delete its files",
         "Stop the throwaway Postgres and keep its files",
+        "Stop the failover runs' primary and standby and delete their files",
     };
     for (commands, descriptions) |command, description| {
         const run = b.addRunArtifact(tool);
@@ -461,7 +468,18 @@ fn add_store_tests(
 /// threads against a store behind the fault proxy (Postgres) or alone (SQLite), every call
 /// recorded and checked (src/store_faults.zig). Never cached; there is no default backend that
 /// needs no database, so `memory` runs on SQLite's step options and is refused.
-fn add_store_faults_step(b: *std.Build, step_options: StoreStepOptions) void {
+/// Slice 10d's failover runs (`src/store_failover.zig`): a `pg_dev` pair and a real server.
+const FailoverOptions = struct {
+    enabled: bool,
+    pg_dev: *std.Build.Step.Compile,
+    server: *std.Build.Step.Compile,
+};
+
+fn add_store_faults_step(
+    b: *std.Build,
+    step_options: StoreStepOptions,
+    failover: FailoverOptions,
+) void {
     const step = b.step("test-store-faults", "Run the store fault tests (-Dbackend=...)");
     const exe = b.addExecutable(.{
         .name = "store_faults",
@@ -493,6 +511,25 @@ fn add_store_faults_step(b: *std.Build, step_options: StoreStepOptions) void {
     }
     if (step_options.seed) |seed| run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
     step.dependOn(&run.step);
+    if (step_options.backend != .postgres) return;
+    if (!failover.enabled) return;
+    // One after the other, after 10c's run: each makes and removes the same pair of servers.
+    var before: *std.Build.Step = &run.step;
+    for ([_][]const u8{ "sync", "async" }) |mode| {
+        const failover_run = b.addRunArtifact(exe);
+        failover_run.has_side_effects = true;
+        failover_run.setCwd(b.path("."));
+        failover_run.addArgs(&.{ "--backend", "postgres", "--failover", mode, "--pg-dev" });
+        failover_run.addArtifactArg(failover.pg_dev);
+        failover_run.addArg("--server");
+        failover_run.addArtifactArg(failover.server);
+        if (step_options.seed) |seed| {
+            failover_run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
+        }
+        failover_run.step.dependOn(before);
+        before = &failover_run.step;
+        step.dependOn(&failover_run.step);
+    }
 }
 
 fn add_tidy_step(b: *std.Build) void {

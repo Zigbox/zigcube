@@ -21,6 +21,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("libpq_c");
+/// A libpq connection, for callers that hold one between calls.
+pub const Connection = c.PGconn;
 const constants = @import("constants.zig");
 const Diag = @import("diag.zig").Diag;
 
