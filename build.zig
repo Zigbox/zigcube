@@ -645,6 +645,7 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     sim.ops = b.option(u32, "ops", ops_help) orelse 100;
     add_sim_step(b, sim);
     add_sim_cluster_step(b, sim);
+    add_sim_fleet_step(b, sim);
     add_sim_teeth_step(b, sim);
 }
 
@@ -687,6 +688,23 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }
+}
+
+/// `zig build sim-fleet-exe` installs `zig-out/bin/sim_fleet`, the reporter of the simulation fleet
+/// (ops/sim-fleet/README.md): it files the failures `sim_cluster` finds. A host tool with no
+/// dependency; its tests run in `zig build test`.
+fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_fleet",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_fleet.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("sim-fleet-exe", "Install the simulation fleet's reporter into zig-out/bin")
+        .dependOn(&install.step);
 }
 
 /// The seeds the teeth test runs and the most the simulator may need to catch the agent's
