@@ -259,7 +259,8 @@ test "apply, get, why, scale and delete against a live server on SQLite" {
     try testing.expectEqualStrings("service hello: unchanged\n", world.out());
 
     try testing.expectEqual(@as(u8, 0), world.run(&.{ "get", "replicas", "hello", "-o", "wide" }));
-    const header = "REPLICA  SERVICE  NODE   STATUS   AGE  GEN  IMAGE        DETAIL\n";
+    const header =
+        "REPLICA  SERVICE  NODE   STATUS   AGE  GEN  CPU   MEMORY  IMAGE        DETAIL\n";
     try expect_contains(world.out(), header);
     try expect_contains(world.out(), "hello-1  hello    node1  running");
 
@@ -271,8 +272,21 @@ test "apply, get, why, scale and delete against a live server on SQLite" {
     try apply_hello(&world, path, 2);
     try world.converge("hello", "2/2");
 
+    try check_nodes(&world);
     try check_broken_chain(&world);
     try check_delete(&world);
+}
+
+/// `get nodes` joins the node's registration, judgement and allocation with its lease.
+fn check_nodes(world: *World) !void {
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "get", "nodes" }));
+    try expect_contains(world.out(), "NODE   STATUS  TENURE  LEASE");
+    try expect_contains(world.out(), "node1  ");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "get", "nodes", "node1", "-o", "json" }));
+    try expect_contains(world.out(), "\"kind\":\"nodes\"");
+    try expect_contains(world.out(), "\"name\":\"node1\"");
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "get", "nodes", "nosuch" }));
+    try expect_contains(world.err(), "ZC-E0101");
 }
 
 /// Step 4 of the demo: a digest that is not in the fixtures, and the chain that explains it.

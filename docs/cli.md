@@ -11,6 +11,7 @@ zcube [options] apply <file.zon>        show what the file would change, then ap
 zcube [options] delete service <name>   delete a service; its replicas are stopped
 zcube [options] get service [name]      services and how many replicas run
 zcube [options] get replicas [service]  replicas, where they run and how they are doing
+zcube [options] get nodes [name]        nodes, their status, lease, capacity and last contact
 zcube [options] why <kind> <name>       why a service, replica or node is as it is
 zcube [options] explain <code>          explain a diagnostic code, offline
 zcube [options] bundle --last           the evidence for the last failure
@@ -66,11 +67,28 @@ NAME   READY  IMAGE
 hello  3/3    b3:51aa9c03
 
 $ zcube get replicas hello -o wide
-REPLICA  SERVICE  NODE   STATUS   AGE  GEN  IMAGE        DETAIL
-hello-1  hello    node1  running  12s  1    b3:51aa9c03
-hello-2  hello    node1  running  12s  1    b3:51aa9c03
-hello-3  hello    node1  running  12s  1    b3:51aa9c03
+REPLICA  SERVICE  NODE   STATUS   AGE  GEN  CPU   MEMORY  IMAGE        DETAIL
+hello-1  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
+hello-2  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
+hello-3  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
+
+$ zcube get nodes
+NODE   STATUS  TENURE  LEASE     CAPACITY       ALLOCATED      LAST-HEARD
+node1  ready   14      7.9s/10s  4000m / 8.0Gi  2000m / 1.0Gi  2s ago
+node2  ready   17      8.4s/10s  4000m / 8.0Gi  2000m / 1.0Gi  1s ago
 ```
+
+`CPU` and `MEMORY` (wide) are the `requests` of the replica's `/assigned/<node>/<id>`, what the
+scheduler resolved it to need; `-` while it is unassigned.
+
+`get nodes` joins `/nodes/`, `/node-status/`, `/allocations/` and `GET /v1/leases`; the rows are
+the names under `/nodes/` and `/node-status/` together. `STATUS` is the node controller's `state`
+as stored (`-` before it has judged the node); `ready*` means the status is for an earlier tenure
+than the registration, which the scheduler does not count. `TENURE` is the `/nodes/<node>`
+revision. `LEASE` is remaining over ttl. `LAST-HEARD` is `ttl - remaining` of the lease, against
+the server's clock: a keepalive creates no revision, so the lease is the only record of contact;
+`-` when the node has no lease. `-o wide` adds `ADDRESS`, `AGENT`, `REPLICAS` and `LEASE-ID`.
+`get nodes node2` shows one node; an unknown name is `ZC-E0101`.
 
 `READY` is running replicas over desired. `STATUS` is the agent's report: `running`, `starting`,
 `exited`, `killed`, `oom`, `pid-limit`, `start-failed`, `lost`, or `pending` (no report yet). `DETAIL`
@@ -129,7 +147,8 @@ JSON on standard output, for `--output json`:
 | Command | Shape |
 | --- | --- |
 | `get service` | `{"kind":"service","items":[{"name","image","desired","running","generation","applied_by","command"}]}` |
-| `get replicas` | `{"kind":"replicas","items":[{"id","service","node","generation","image","status","detail","started_at_ms"}]}` |
+| `get replicas` | `{"kind":"replicas","items":[{"id","service","node","generation","image","status","detail","started_at_ms","requests"}]}` (`requests`: `{"cpu_millis","memory_bytes"}` or null) |
+| `get nodes` | `{"kind":"nodes","items":[{"name","status","status_tenure","tenure","lease":{"id","ttl_ms","remaining_ms"},"capacity":{"cpu_millis","memory_bytes"},"allocated":{"cpu_millis","memory_bytes"},"count","last_heard_ms_ago","address","agent_version"}]}` (`status`, `status_tenure`, `tenure`, `lease`, `capacity`, `last_heard_ms_ago` are null when unknown) |
 | `why` | the server's body of `GET /v1/why`, unchanged |
 | `apply`, `delete` | the server's answer (`action`, `change`, `revision`, `decision`, ...), unchanged |
 | `explain` | `{"code","severity","blame","summary","explanation","exit_code"}` |
