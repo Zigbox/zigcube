@@ -39,15 +39,15 @@ On the host, as root:
 
 ```
 curl -sSfLO https://raw.githubusercontent.com/Zigbox/zigcube/main/ops/sim-fleet/setup.sh
-sh setup.sh
-install -m 600 /dev/null /etc/sim-fleet/token
-$EDITOR /etc/sim-fleet/token            # the token, one line
+sh setup.sh --token-file /root/github/token   # copies the token to /etc/sim-fleet/token, mode 600
 $EDITOR /etc/sim-fleet/fleet.env        # SIM_FLEET_TRACKER=<issue number>
-systemctl start sim-fleet
+systemctl restart sim-fleet
 journalctl -u sim-fleet -f
 ```
 
-`setup.sh` is safe to run again. It installs the pinned Zig (checksum verified; the version is in `build.zig.zon`, CI and `.claude/hooks/session-start.sh` too, and `setup.sh` refuses a checkout that wants another), creates the `simfleet` user, clones the repo to `/var/lib/sim-fleet/zigcube`, builds once, installs the unit and enables it. It starts the service only if the token file is not empty.
+`setup.sh` is safe to run again. It installs the pinned Zig (checksum verified; the version is in `build.zig.zon`, CI and `.claude/hooks/session-start.sh` too, and `setup.sh` refuses a checkout that wants another), creates the `simfleet` user, clones the repo to `/var/lib/sim-fleet/zigcube`, builds once, installs the unit and enables it. `--token-file PATH` takes the token from a file, never from an argument value or the environment: it is copied (not printed) to `/etc/sim-fleet/token` with mode 600, and the source file is left alone. Without it, create `/etc/sim-fleet/token` by hand (`install -m 600 /dev/null ...`). The service starts only if the token file is not empty. It also caps the journal at 2 GB.
+
+Defaults are sized for 4 vCPU, 8 GB, 160 GB: `SIM_FLEET_WORKERS=3` parallel `sim_cluster` runs (one core each, one left for the reporter and builds), batches and outputs overwritten in place (a few MB of state), and `.zig-cache` emptied before a build once it passes `SIM_FLEET_CACHE_MB=8192`.
 
 The journal shows `building <sha>` when `main` moves and `sim_fleet: N seeds, F failed: ...` after each batch. After changing anything in `ops/`, copy the unit again (`setup.sh`) and `systemctl restart sim-fleet`; `run.sh` itself is read from the checkout, so a restart picks up the new one.
 

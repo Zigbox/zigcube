@@ -1,6 +1,8 @@
 #!/bin/sh
 # Sets up the simulation fleet on a fresh Ubuntu 24.04 host (ops/sim-fleet/README.md). Run as
-# root: `sh setup.sh`. Safe to run again. It starts the service only when a token is present.
+# root: `sh setup.sh [--token-file PATH]`. Safe to run again. With --token-file the token is
+# copied (never printed, never passed as an argument value) to /etc/sim-fleet/token, mode 0600.
+# It starts the service only when a token is present.
 set -eu
 
 # Keep in step with build.zig.zon (minimum_zig_version), CI and .claude/hooks/session-start.sh.
@@ -9,6 +11,24 @@ ZIG_SHA256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 REMOTE=${SIM_FLEET_REMOTE:-https://github.com/Zigbox/zigcube}
 HOME_DIR=/var/lib/sim-fleet
 ZIG_DIR=/opt/zig-x86_64-linux-$ZIG_VERSION
+
+TOKEN_SRC=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --token-file)
+        if [ $# -lt 2 ]; then
+            echo "setup.sh: --token-file needs a path" >&2
+            exit 1
+        fi
+        TOKEN_SRC=$2
+        shift 2
+        ;;
+    *)
+        echo "usage: setup.sh [--token-file PATH]" >&2
+        exit 1
+        ;;
+    esac
+done
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "setup.sh: run as root" >&2
@@ -52,6 +72,21 @@ fi
 cp "$HOME_DIR/zigcube/ops/sim-fleet/sim-fleet.service" /etc/systemd/system/sim-fleet.service
 systemctl daemon-reload
 systemctl enable sim-fleet.service
+
+# Keep the journal from filling the disk (160 GB host: 2 GB is plenty for this service's logs).
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=2G\n' >/etc/systemd/journald.conf.d/sim-fleet.conf
+systemctl restart systemd-journald
+
+if [ -n "$TOKEN_SRC" ]; then
+    if [ ! -s "$TOKEN_SRC" ]; then
+        echo "setup.sh: $TOKEN_SRC is missing or empty" >&2
+        exit 1
+    fi
+    (umask 077 && cat "$TOKEN_SRC" >/etc/sim-fleet/token.new)
+    chmod 600 /etc/sim-fleet/token.new
+    mv /etc/sim-fleet/token.new /etc/sim-fleet/token
+fi
 
 if [ -s /etc/sim-fleet/token ]; then
     chmod 600 /etc/sim-fleet/token
