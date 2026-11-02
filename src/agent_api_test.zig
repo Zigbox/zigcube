@@ -392,7 +392,6 @@ test "the watch says whether an assignment of the node changed, and holds when n
     const head = try rig.revision();
     var hold_buffer: [64]u8 = undefined;
     var now_buffer: [64]u8 = undefined;
-    var future_buffer: [64]u8 = undefined;
 
     const hold_query = try watch_query(&hold_buffer, head + 1, 3000);
     const quiet = rig.call("GET", base, hold_query, "");
@@ -445,7 +444,17 @@ test "the watch says whether an assignment of the node changed, and holds when n
     _ = try rig.world.store_handle().txn(.{ .on_success = &put_mine }, &rig.world.diag);
     const changed = try rig.ok("GET", base, after_query, "");
     try testing.expect(field(changed, "changed").bool);
+}
 
+test "the watch refuses a revision too far ahead, a bad query and a compacted revision" {
+    // Goal: the long poll's refusals. Method: ask for a revision past the head, for malformed
+    // queries, and for a revision below the compaction point.
+    var rig = try Rig.start(8);
+    defer rig.stop();
+    const base = "/v1/agent/nodes/node2/watch";
+    var future_buffer: [64]u8 = undefined;
+    _ = try rig.world.apply(hello);
+    rig.world.advance(1000);
     const future = try std.fmt.bufPrint(&future_buffer, "from={d}", .{(try rig.revision()) + 5});
     try rig.refused(rig.call("GET", base, future, ""), 400, "ZC-E0204");
     try rig.refused(rig.call("GET", base, "", ""), 400, "ZC-E0104");
