@@ -385,17 +385,8 @@ fn route_disagreeing(path: []const u8) ?Canned {
     if (!std.mem.startsWith(u8, path, "/v1/check/allocations")) return null;
     return .{
         .status = 200,
-        .body =
-        \\{"revision":7,"nodes":[
-        \\{"node":"node1","consistent":false,
-        \\ "recorded":{"allocated":{"cpu_millis":300,"memory_bytes":3072},"count":3},
-        \\ "reconstructed":{"allocated":{"cpu_millis":200,"memory_bytes":2048},"count":2},
-        \\ "finding":{"decision":"0000000000042-0003-0001","revision":6}},
-        \\{"node":"node2","consistent":true,"recorded":null,
-        \\ "reconstructed":{"allocated":{"cpu_millis":0,"memory_bytes":0},"count":0},
-        \\ "finding":null}],
-        \\"inconsistent":1}
-        ,
+        // Captured from api_test.zig's "check shows it" test (a corrupted node1), verbatim.
+        .body = @embedFile("testdata/cli/check_allocations.json"),
     };
 }
 
