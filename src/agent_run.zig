@@ -15,6 +15,13 @@
 //! agent backs off (`server_retry_ms_min` doubling to `server_retry_ms_max`). Containers run on:
 //! each is under a supervisor of its own. When the server returns, one line says so.
 //!
+//! **The remembered pair.** The pair the server's answers carried (`agent_client.zig`, "Nothing
+//! from behind") is loaded from the state directory at start and saved after every step, at most
+//! every `verified_save_ms`, and once more at a clean stop. A save that fails is shown once
+//! (`ZC-E0216`) and retried; the agent runs on, since a file that lags is only weaker. A pair
+//! saved for another `--server`, or a server that keeps no pair (a memory store), is a line of
+//! news on stdout, and the agent runs on without that pair.
+//!
 //! **Stopping.** SIGINT or SIGTERM ends the loop. The containers are not stopped: that is what
 //! lets a restarted agent adopt them, and an agent that loses its lease does the same in C0.
 
@@ -30,6 +37,7 @@ const fake_runtime = @import("fake_runtime.zig");
 const loop_mod = @import("agent_loop.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
+const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 
 const Diag = diag_mod.Diag;
@@ -61,6 +69,8 @@ const Shell = struct {
     diag: Diag,
     verbose: bool,
     policy: loop_mod.Loop,
+    /// The last save of the remembered pair failed; shown once, cleared by one that works.
+    save_failed: bool = false,
 
     /// One step of the core, with what the policy says to tell the person.
     fn pass(shell: *Shell) loop_mod.Outcome {
@@ -74,7 +84,10 @@ const Shell = struct {
             .diag = &shell.diag,
         };
         const before = shell.agent.lease;
-        const wake = shell.agent.reconcile(&ctx) catch {
+        const result = shell.agent.reconcile(&ctx);
+        shell.save_pair(false);
+        shell.notice_pair();
+        const wake = result catch {
             const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
             const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
             if (report == .failure) shell.report_failure();
@@ -92,11 +105,58 @@ const Shell = struct {
     fn watch(shell: *Shell, slice_ms: u32) bool {
         shell.diag.reset();
         const changed = shell.remote.watch_once(slice_ms, &shell.diag) catch return true;
+        shell.notice_pair();
         if (changed) return true;
         shell.arena.reset();
         const events = shell.fake.interface().events(shell.arena.allocator(), 0, &shell.diag) catch
             return true;
         return events.len > 0;
+    }
+
+    /// Saves the pair if it is due; `final` (a clean stop) saves it whatever the time.
+    fn save_pair(shell: *Shell, final: bool) void {
+        const state = shell.fake.state.interface();
+        const now_ms = shell.clock.now_ms();
+        const saved = if (final)
+            shell.remote.save_final(state, now_ms)
+        else
+            shell.remote.save(state, now_ms);
+        saved catch |err| {
+            if (shell.save_failed) return;
+            shell.save_failed = true;
+            var warning: Diag = undefined;
+            warning.reset();
+            var buffer: [constants.state_path_bytes_max + 16]u8 = undefined;
+            const path = shell.remote.remembered_path(&buffer);
+            _ = failures.remembered_unusable(&warning, path, "write", @errorName(err)) catch {};
+            shell.show("\n", &warning, "zcube-agent: running on; it will try again\n");
+            return;
+        };
+        shell.save_failed = false;
+    }
+
+    /// News about the remembered pair, one line on stdout.
+    fn notice_pair(shell: *Shell) void {
+        const notice = shell.remote.take_notice() orelse return;
+        var buffer: [512]u8 = undefined;
+        const line = switch (notice) {
+            .server_changed => std.fmt.bufPrint(
+                &buffer,
+                "zcube-agent: {s} was saved for server {s}, not {s}; starting fresh\n",
+                .{
+                    remote_mod.client.remembered_file,
+                    shell.remote.previous_server_name(),
+                    shell.remote.server,
+                },
+            ),
+            .unverified => std.fmt.bufPrint(
+                &buffer,
+                "zcube-agent: the server keeps no revision for its store across restarts " ++
+                    "(a memory store); this agent keeps none either\n",
+                .{},
+            ),
+        } catch return;
+        std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
     }
 
     fn pause(shell: *Shell, ms: u32) void {
@@ -187,6 +247,11 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .client = .{ .io = io, .address = config.server },
     };
     var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
+    var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
+    // An IP address and a port always fit.
+    const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
+    load_pair(gpa, &remote, fake, config.state_dir, server, &diag) catch
+        return fail(io, &diag, config.verbose);
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     agent.init(.{
@@ -209,8 +274,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     };
     defer shell.arena.deinit();
     announce(io, config);
+    shell.notice_pair();
     install_signals();
     loop(&shell);
+    shell.save_pair(true);
     return constants.exit_ok;
 }
 
@@ -224,6 +291,20 @@ fn loop(shell: *Shell) void {
             .watch_ms => |ms| shell.policy.watch_done(shell.watch(ms)),
         }
     }
+}
+
+fn load_pair(
+    gpa: std.mem.Allocator,
+    remote: *remote_mod.RemoteStore,
+    fake: *fake_runtime.FakeRuntime,
+    state_dir: []const u8,
+    server: []const u8,
+    diag: *Diag,
+) error{BackendFailed}!void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const state = fake.state.interface();
+    return remote.load(state, state_dir, server, arena_state.allocator(), diag);
 }
 
 fn announce(io: std.Io, config: config_mod.Config) void {

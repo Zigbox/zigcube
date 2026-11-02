@@ -285,8 +285,33 @@ const Node = struct {
         node.loop = agent_loop.Loop.init();
         const gpa = node.cluster.gpa;
         node.remote = agent_client.RemoteStore.init(gpa, node.transport(), node.name());
+        node.load_pair();
         node.down = false;
         node.resume_ms = 0;
+    }
+
+    /// The agent's remembered pair, as `zcube-agent` loads it at start. `restart` has just
+    /// cleared the crash (a first start has none), and `SimState.read` fails only while crashed
+    /// (a read is no write point, so it cannot crash); `SimState` keeps every put whole, so a
+    /// file the agent wrote parses; and the address is always the same. So the load cannot fail.
+    fn load_pair(node: *Node) void {
+        assert(!node.sim.crashed);
+        assert(!node.sim.files.crashed);
+        node.diag.reset();
+        _ = node.arena.reset(.retain_capacity);
+        const state = node.sim.files.interface();
+        const arena = node.arena.allocator();
+        const loaded = node.remote.load(state, "/sim", "sim-server", arena, &node.diag);
+        loaded catch unreachable; // Cannot fail: see above.
+        assert(node.remote.notice == null);
+    }
+
+    /// The pair saved after a step, as `zcube-agent` does; a crash at its write point is the
+    /// agent dying there.
+    fn save_pair(node: *Node, now_ms: u64) void {
+        node.remote.save(node.sim.files.interface(), now_ms) catch |err| {
+            if (err == error.Crashed) node.sim.crashed = true;
+        };
     }
 
     /// Notes that a call found the agent dead.
@@ -316,6 +341,7 @@ const Node = struct {
         node.all_steps += 1;
         const result = node.agent.reconcile(&ctx);
         node.resume_ms = c.manual.ms + node.spent_ms;
+        if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
         const wake = result catch {
             c.stats.agent_failures += 1;
@@ -539,6 +565,7 @@ pub const Cluster = struct {
         node.remote = agent_client.RemoteStore.init(c.gpa, node.transport(), node.name());
         node.diag.reset();
         node.arena = .init(c.gpa);
+        node.load_pair(); // A fresh state directory: nothing remembered, the address set.
         node.down = false;
         node.restart_at_ms = 0;
         node.resume_ms = 0;

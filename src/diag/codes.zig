@@ -614,6 +614,11 @@ pub const registry = [_]Entry{
         \\remember the store as it is now. The old and new revision and hash are
         \\shown in the reply of that command; a decision record that keeps them
         \\is not written yet.
+        \\
+        \\An agent raises it too: it remembers the highest revision and hash
+        \\the server's answers carried, and refuses an answer from behind them.
+        \\After accept-rollback on the server, remove the file remembered in
+        \\the agent's state directory and restart the agent.
         ,
     },
     .{
@@ -635,6 +640,15 @@ pub const registry = [_]Entry{
         \\Check the state directory (--state-dir) and its permissions. If the
         \\file is damaged and the store is the one to trust, delete the file;
         \\the server then remembers the store as it finds it.
+        \\
+        \\An agent raises it too, about the file remembered in its own state
+        \\directory, which holds the highest revision and hash the server's
+        \\answers carried and the server address they came from. A file the
+        \\agent cannot read, or did not write, stops its start; one written
+        \\by a newer zcube-agent says so. A save that fails while the agent
+        \\runs does not stop it: it warns once, naming the file, and tries
+        \\again. If the file is damaged, delete it and restart the agent; it
+        \\then remembers the server as it finds it.
         ,
     },
     .{

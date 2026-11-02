@@ -10,6 +10,7 @@ const diag_mod = @import("diag.zig");
 const http = @import("agent_http.zig");
 
 pub const RemoteStore = client_mod.RemoteStore;
+pub const client = client_mod;
 
 /// One request per connection over `http.Client`, with the failures the client already raises.
 pub const HttpTransport = struct {
