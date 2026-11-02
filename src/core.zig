@@ -40,6 +40,7 @@ pub const modules = .{
     @import("scheduler.zig"),
     @import("runtime.zig"),
     @import("sim_c0.zig"),
+    @import("sim_checks.zig"),
     @import("sim_clock.zig"),
     @import("sim_cluster.zig"),
     @import("sim_net.zig"),

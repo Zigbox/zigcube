@@ -27,6 +27,7 @@ const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
+const sim_checks = @import("sim_checks.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
 const store = @import("store.zig");
@@ -94,6 +95,8 @@ const Run = struct {
     api: api_mod.Api,
     report: *Report,
     seed: u64,
+    /// Assignments written after this revision have not yet been checked against I7.
+    i7_revision: store.Revision = 0,
 
     /// Records the step and fails if `ok` is false.
     fn check(run: *Run, step: Step, ok: bool, what: []const u8) Failure!void {
@@ -103,6 +106,10 @@ const Run = struct {
             @tagName(step), what, run.seed, run.world.now_ms() - sim_world.epoch_ms,
         });
         return error.StepFailed;
+    }
+
+    fn verdict(run: *Run, step: Step, found: sim_checks.Found) Failure!void {
+        if (found) |what| return run.check(step, false, what);
     }
 
     fn say(run: *Run, comptime format: []const u8, args: anytype) void {
@@ -405,11 +412,15 @@ fn store_hash(world: *World) u64 {
 /// The checks read the store directly; the world must have a store that answers.
 fn invariants(run: *Run, step: Step) Failure!void {
     const world = run.world;
-    try run.check(step, world.revision() != null, "the store cannot be read");
+    const head = world.revision();
+    try run.check(step, head != null, "the store cannot be read");
     const ctx = world.controller_context();
     const i6_ok = world.stats.i6_violations == 0;
     try run.check(step, i6_ok, "I6: an allocation disagrees with its assignments");
     try decisions_have_causes(run, step, &ctx);
+    try run.verdict(step, sim_checks.no_findings(&ctx));
+    try run.verdict(step, sim_checks.placements(&ctx, run.i7_revision, head.?));
+    run.i7_revision = head.?;
     const snapshot = controller.read_snapshot(&ctx) catch
         return run.check(step, false, "the snapshot cannot be read");
     for (snapshot.services) |service| {
@@ -439,8 +450,10 @@ fn why_terminates(
 }
 
 /// Every decision in the store has a well-formed cause, and a cause that names another decision
-/// names one that exists (retention has not run for long enough to remove any in a simulation).
+/// names one that exists (retention has not run for long enough to remove any in a simulation);
+/// while none was dropped, every summary counts its decisions exactly.
 fn decisions_have_causes(run: *Run, step: Step, ctx: *const controller.Context) Failure!void {
+    var counts: sim_checks.Counts = .empty;
     var after: ?[]const u8 = null;
     var at: ?store.Revision = null;
     for (0..64) |_| {
@@ -451,9 +464,16 @@ fn decisions_have_causes(run: *Run, step: Step, ctx: *const controller.Context) 
             .continue_after = after,
         }, ctx.diag) catch return run.check(step, false, "the decisions cannot be listed");
         at = page.revision;
-        for (page.kvs) |kv| try decision_has_cause(run, step, ctx, kv);
+        for (page.kvs) |kv| {
+            const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch
+                return run.check(step, false, "a decision cannot be read");
+            try decision_has_cause(run, step, ctx, &decision);
+            try run.verdict(step, sim_checks.count(ctx, &counts, &decision));
+        }
         after = page.continue_after;
-        if (after == null) return;
+        if (after != null) continue;
+        if (run.world.decisions_dropped() > 0) return;
+        return run.verdict(step, sim_checks.summaries(ctx, &counts, at.?));
     }
     return run.check(step, false, "there are more decisions than the check reads");
 }
@@ -462,10 +482,8 @@ fn decision_has_cause(
     run: *Run,
     step: Step,
     ctx: *const controller.Context,
-    kv: store.KeyValue,
+    decision: *const records.Decision,
 ) Failure!void {
-    const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch
-        return run.check(step, false, "a decision cannot be read");
     try run.check(step, decision.reason.len > 0, "a decision has no reason");
     const cause = decision.cause;
     switch (cause.kind) {
@@ -478,6 +496,8 @@ fn decision_has_cause(
             // missing when nothing was dropped was never written, which is the bug to catch.
             const dropped = run.world.decisions_dropped() > 0;
             try run.check(step, got.kv != null or dropped, "a decision's cause was never written");
+            const grace_ms = run.world.server.replicas.lost_grace_ms;
+            try run.verdict(step, sim_checks.lost_grace(ctx, decision, got.kv, grace_ms));
         },
         .observed, .desired => {
             try run.check(step, cause.key != null, "a cause names no key");

@@ -40,6 +40,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
+const sim_checks = @import("sim_checks.zig");
 const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
@@ -508,6 +509,8 @@ pub const Cluster = struct {
     starved_worst_ms: u64,
     /// Virtual time the faults were on.
     fault_ms: u64,
+    /// Assignments written after this revision have not yet been checked against I7.
+    i7_revision: store.Revision,
     /// The store revision and drop count the invariants last passed at.
     checked_revision: ?store.Revision,
     checked_dropped: u64,
@@ -567,6 +570,7 @@ pub const Cluster = struct {
         c.checked_revision = null;
         c.checked_dropped = 0;
         c.i6_violations = 0;
+        c.i7_revision = 0;
         c.second_ms = 0;
         c.check_ms = 0;
         c.stats = .{};
@@ -1064,6 +1068,9 @@ fn invariants(c: *Cluster) Failure!void {
     if (c.checked_revision == head and c.checked_dropped == dropped) return;
     const ctx = c.controller_context();
     try decisions_have_causes(c, &ctx);
+    try verdict(c, sim_checks.no_findings(&ctx));
+    try verdict(c, sim_checks.placements(&ctx, c.i7_revision, head.?));
+    c.i7_revision = head.?;
     const snapshot = controller.read_snapshot(&ctx) catch
         return check(c, false, "the snapshot cannot be read");
     for (snapshot.services) |service| {
@@ -1092,7 +1099,12 @@ fn why_terminates(
     try check(c, last.type != .decision, "a why chain ends in a decision, not a cause");
 }
 
+/// Every decision has a reason and a cause that exists; a replica of a lost node is replaced no
+/// earlier than the grace after its node's `mark_lost`; and, while retention has dropped nothing,
+/// every summary's `count` is the number of decisions written for its subject, action and kind
+/// of cause, read at one revision.
 fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    var counts: sim_checks.Counts = .empty;
     var after: ?[]const u8 = null;
     var at: ?store.Revision = null;
     for (0..64) |_| {
@@ -1103,20 +1115,29 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
             .continue_after = after,
         }, ctx.diag) catch return check(c, false, "the decisions cannot be listed");
         at = page.revision;
-        for (page.kvs) |kv| try decision_has_cause(c, ctx, kv);
+        for (page.kvs) |kv| {
+            const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch
+                return check(c, false, "a decision cannot be read");
+            try decision_has_cause(c, ctx, &decision);
+            try verdict(c, sim_checks.count(ctx, &counts, &decision));
+        }
         after = page.continue_after;
-        if (after == null) return;
+        if (after != null) continue;
+        if (c.dropped_total() > 0) return;
+        return verdict(c, sim_checks.summaries(ctx, &counts, at.?));
     }
     return check(c, false, "there are more decisions than the check reads");
+}
+
+fn verdict(c: *Cluster, found: sim_checks.Found) Failure!void {
+    if (found) |what| return check(c, false, what);
 }
 
 fn decision_has_cause(
     c: *Cluster,
     ctx: *const controller.Context,
-    kv: store.KeyValue,
+    decision: *const records.Decision,
 ) Failure!void {
-    const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch
-        return check(c, false, "a decision cannot be read");
     try check(c, decision.reason.len > 0, "a decision has no reason");
     const cause = decision.cause;
     switch (cause.kind) {
@@ -1127,6 +1148,8 @@ fn decision_has_cause(
                 return check(c, false, "a cause cannot be read");
             const dropped = c.dropped_total() > 0;
             try check(c, got.kv != null or dropped, "a decision's cause was never written");
+            const grace_ms = c.server.replicas.lost_grace_ms;
+            try verdict(c, sim_checks.lost_grace(ctx, decision, got.kv, grace_ms));
         },
         .observed, .desired => try check(c, cause.key != null, "a cause names no key"),
         .lease_expired, .resync => {},
