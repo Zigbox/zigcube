@@ -76,6 +76,18 @@ pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     };
 }
 
+/// A C0 record's `next_replica`, carried only until the replica controller has seeded
+/// `/replica-numbers/<service>` from it (docs/keys.md); null once the counter exists, and for a
+/// new service.
+fn legacy_counter(ctx: *const Context, existing: ?records.Service) Error!?u64 {
+    const old = existing orelse return null;
+    const next = old.next_replica orelse return null;
+    const key = records.replica_numbers_key(old.name);
+    const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+    if (found.kv != null) return null;
+    return next;
+}
+
 /// Applies a service. Invalid input is ZC-E0104 and nothing is read or written.
 pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
     const planned = try plan(ctx, input);
@@ -88,9 +100,7 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         .env = input.env,
         .limits = input.limits,
         .generation = planned.generation,
-        // A v1 record's counter is carried until the replica controller has moved it to
-        // `/replica-numbers/`; a new service has none.
-        .next_replica = if (planned.existing) |old| old.next_replica else null,
+        .next_replica = try legacy_counter(ctx, planned.existing),
         .applied_by = input.applied_by,
         .request_id = input.request_id,
     };

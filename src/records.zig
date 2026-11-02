@@ -237,7 +237,8 @@ pub const Service = struct {
     env: []const Pair = &.{},
     limits: Limits = .{},
     generation: u64,
-    /// Read from a v1 record only, to seed `/replica-numbers/<service>`; v2 records omit it.
+    /// A C0 record's counter, carried forward by `apply` only until `/replica-numbers/<service>`
+    /// exists (the replica controller seeds it from this); absent for a service created later.
     next_replica: ?u64 = null,
     applied_by: []const u8 = "",
     request_id: []const u8 = "",

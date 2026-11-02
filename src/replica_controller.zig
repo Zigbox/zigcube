@@ -162,6 +162,7 @@ const Run = struct {
     }
 
     fn reconcile_service(run: *Run, service: *const Entry(records.Service)) Error!void {
+        if (try run.seed_counter(service)) return;
         var plan: ServicePlan = .{};
         try run.classify(service, &plan);
         if (!try run.hold_pass(service, &plan)) return;
@@ -462,6 +463,30 @@ const Run = struct {
         batch.put(key, bytes);
     }
 
+    /// A service record that still carries a C0 `next_replica` gets its counter at once, not
+    /// only when it next needs a replica: a C0 service at full count that is deleted and applied
+    /// again would otherwise start from 1 and reuse an id. True if it tried (the next pass goes
+    /// on); false if there was nothing to seed.
+    fn seed_counter(run: *Run, service: *const ServiceEntry) Error!bool {
+        if (service.rec.next_replica == null) return false;
+        if (try run.counter_of(service.rec.name) != null) return false;
+        if (!run.budget()) return true;
+        var batch: Batch = .{};
+        batch.expect(service.kv.key, service.kv.mod_revision);
+        try run.put_counter(&batch, service.rec.name, run.first_number(service));
+        _ = try run.finish(&batch);
+        return true;
+    }
+
+    /// Creates a counter that is absent at the snapshot's revision (compared as absent).
+    fn put_counter(run: *Run, batch: *Batch, service: []const u8, next: u64) Error!void {
+        const counter_at = records.replica_numbers_key(service);
+        const key = try controller.key_copy(run.ctx, &counter_at);
+        batch.expect(key, 0);
+        const number: records.ReplicaNumber = .{ .next = next };
+        batch.put(key, try records.encode(run.ctx.arena, number, run.ctx.diag));
+    }
+
     /// The service's counter at the snapshot's revision, or null if it has none. One read per
     /// service about to get replicas; the counters are never listed, so how many there are
     /// bounds nothing.
@@ -483,10 +508,15 @@ const Run = struct {
     /// never reused. A counter is never deleted (one small key per service name ever applied), so
     /// this runs only for a name never counted before.
     fn first_number(run: *Run, service: *const ServiceEntry) u64 {
-        var first: u64 = service.rec.next_replica orelse 1;
+        return @max(service.rec.next_replica orelse 1, run.past_highest(service.rec.name));
+    }
+
+    /// One past the highest replica number of `service` in the snapshot, or 1 if it has none.
+    fn past_highest(run: *Run, service: []const u8) u64 {
+        var first: u64 = 1;
         for (run.snap.replicas) |replica| {
-            if (!std.mem.eql(u8, replica.rec.service, service.rec.name)) continue;
-            const number = records.replica_number(service.rec.name, replica.rec.id) orelse continue;
+            if (!std.mem.eql(u8, replica.rec.service, service)) continue;
+            const number = records.replica_number(service, replica.rec.id) orelse continue;
             first = @max(first, @as(u64, number) + 1);
         }
         return first;
@@ -584,6 +614,11 @@ const Run = struct {
         }
         if (count == 0) return;
         if (!run.budget()) return;
+        // A deleted service that never had a counter (deleted before the seeding pass) leaves
+        // one past its highest replica, so a re-apply cannot reuse an id.
+        if (try run.counter_of(gone.?) == null) {
+            try run.put_counter(&batch, gone.?, run.past_highest(gone.?));
+        }
         _ = try run.finish(&batch);
     }
 

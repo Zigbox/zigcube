@@ -34,8 +34,8 @@ An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. One dep
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
-refuses a put or delete of a service by any role but the API. `Service` v2 reads a legacy
-`next_replica` to seed the counter and never writes it. The replica controller reads a counter
+refuses a put or delete of a service by any role but the API. `Service` v2 never starts a
+`next_replica`: it carries a C0 record's value forward only until the counter exists (below). The replica controller reads a counter
 only with a `get` when it is about to create replicas for that service, never by listing, so the
 number of counters bounds nothing.
 
@@ -72,7 +72,14 @@ counter that makes replica ids unique forever (below). From slice 3 it lives in
 same transaction that creates the replica. It is **never deleted**: the key outlives the service
 and its replicas (one small key per service name ever applied), so a re-apply continues the
 numbering. A legacy `next_replica` on the service seeds it, and so does one past the highest
-live replica number, whichever is larger, only when the key is absent.
+live replica number, whichever is larger, only when the key is absent. The seed is written on
+the first pass that sees a service carrying `next_replica` without a counter, whether or not
+it needs a replica, and a pass that stops the replicas of a deleted service with no counter
+writes one past their highest number, so a C0 service deleted and applied again never reuses
+an id. **What `"v": 2` holds:** no `next_replica` for a service created from slice 3; for a
+service that was a C0 record, `apply` carries its `next_replica` forward while
+`/replica-numbers/<service>` is absent and drops it once the counter exists. Readers ignore it
+when the counter exists.
 
 `applied_by` (the authenticated actor) and `request_id` (the API request that wrote this
 version, the same id as in `--verbose` output and bundles) say who changed the service last
@@ -86,7 +93,8 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 
 ## `/replicas/<service>/<id>`: desired replica
 
-`<id>` is `<service>-<n>` with `n` from `next_replica`, never reused: a replacement for
+`<id>` is `<service>-<n>` with `n` from `/replica-numbers/<service>` (C0: the service's
+`next_replica`), never reused: a replacement for
 `hello-3` is `hello-9`, so an old container and its observed record can never be mistaken for
 the new one. The id is also the container name and the `zcube.replica` label.
 
@@ -102,13 +110,9 @@ for the replicas in `/assigned/<node>/` only; an assignment whose replica is gon
 The replica copies what it needs from the service at creation, so editing the service does not
 change a running replica; the controller replaces replicas whose `generation` is behind.
 **From C1 slice 3 the replica carries no placement:** `/assigned/<node>/<id>` (below) is where
-it runs, and `requests` is on the assignment (C0 wrote `node` and `requests` here).
-
-`requests` is what the scheduler **resolved** the replica to need: its `limits` where the
-service sets them, else a default the scheduler states in the decision that placed the replica.
-A node's used capacity is `/allocations/<node>` (below), the sum of the `requests` of the replicas assigned to it, so a replica
-with no limits no longer counts as zero. Both numbers are always present once the replica has
-been scheduled; they are absent only while the replica is unassigned.
+it runs, and `requests` is on the assignment (C0 wrote `node` and `requests` here). A replica
+with no assignment is unscheduled. `requests`, and how a node's used capacity is counted, are
+described with `/assigned` and `/allocations` below.
 
 **A replica whose start failed through the user's fault is held, not replaced** (owner,
 2026-10-26). When `/observed/<node>/<replica>` says `start_failed` with a diagnostic whose blame
@@ -287,6 +291,11 @@ Written by the scheduler, which is the only role that removes it; it releases th
 allocation in the same transaction. An agent long-polls its own `/assigned/<node>/` prefix, so
 fan-out is the replicas on the node, not all replicas. The key's `mod_revision` is the replica's
 **placement epoch**. Lifetime: until unassigned. The value is under 256 bytes.
+
+`requests` is what the scheduler **resolved** the replica to need: its `limits` where the
+service sets them, else a default the scheduler states in the decision that placed it. A node's
+used capacity is `/allocations/<node>` (below), the sum of the `requests` of its assignments, so
+a replica with no limits does not count as zero.
 
 ## `/allocations/<node>`: the accounting (C1 slice 3)
 

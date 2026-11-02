@@ -671,6 +671,78 @@ test "a C0 service record's next_replica seeds the counter, or one past the high
     try testing.expectEqual(@as(?u64, 10), try counter_next(&fixture, "hello"));
 }
 
+/// A C0 store: a v1 service at full count with next_replica 10 and its replicas 7 to 9, and no
+/// counter (C0 never wrote one).
+fn put_c0_service_at_full_count(fixture: *Fixture) !void {
+    const legacy: records.Service = .{
+        .v = 1,
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 3,
+        .command = hello.command,
+        .generation = 1,
+        .next_replica = 10,
+    };
+    try fixture.put(.api, records.service_key("hello").slice(), legacy);
+    for ([_][]const u8{ "hello-7", "hello-8", "hello-9" }) |id| {
+        const replica: records.Replica = .{
+            .id = id,
+            .service = "hello",
+            .generation = 1,
+            .image = legacy.image,
+            .command = legacy.command,
+        };
+        try fixture.put(.replica_controller, records.replica_key("hello", id).slice(), replica);
+    }
+}
+
+fn reapply_one(fixture: *Fixture, request: []const u8) !void {
+    const ctx = fixture.context();
+    const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", request);
+    try testing.expect(done == .written);
+    _ = try fixture.settle();
+    var one = hello;
+    one.replicas = 1;
+    try fixture.apply(one);
+    _ = try fixture.settle();
+}
+
+test "a C0 service at full count, deleted and applied again, does not reuse a number" {
+    // Goal: a C0 next_replica reaches the counter even when the service never needs a new
+    // replica. Method: a C0 service at full count (replicas 7-9, next_replica 10, no counter);
+    // a pass seeds the counter at 10 without creating anything; delete and re-apply gives
+    // hello-10, not hello-1.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try put_c0_service_at_full_count(&fixture);
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 10), try counter_next(&fixture, "hello"));
+    const before = try fixture.ids("hello");
+    defer Fixture.free_ids(before);
+    try expect_ids(&.{ "hello-7", "hello-8", "hello-9" }, before);
+    try reapply_one(&fixture, "r-00000010");
+    const after = try fixture.ids("hello");
+    defer Fixture.free_ids(after);
+    try expect_ids(&.{"hello-10"}, after);
+}
+
+test "a C0 service deleted before any pass leaves a counter past its highest replica" {
+    // Goal: the delete path seeds the counter too. Method: the C0 store above, deleted before
+    // the controller first runs; stopping its replicas writes the counter at 10, so the
+    // re-apply gives hello-10.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try put_c0_service_at_full_count(&fixture);
+    try reapply_one(&fixture, "r-00000011");
+    const after = try fixture.ids("hello");
+    defer Fixture.free_ids(after);
+    try expect_ids(&.{"hello-10"}, after);
+}
+
 test "the creating transaction fails when the counter moved, and the next pass plans again" {
     // Goal: the counter is in the read set. Method: a store that moves the counter just before
     // the first commit; that pass writes nothing, the next one creates the replicas from 99.
