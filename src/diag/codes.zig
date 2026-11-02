@@ -45,6 +45,7 @@ pub const Code = enum(u8) {
     E0118,
     W0119,
     E0120,
+    E0121,
     E0201,
     E0202,
     E0203,
@@ -70,6 +71,7 @@ pub const Code = enum(u8) {
     E0507,
     E0508,
     E0509,
+    E0510,
     W0501,
     B0001,
     B0002,
@@ -369,6 +371,24 @@ pub const registry = [_]Entry{
         \\
         \\Ask for less (one service by name instead of all of them), or free
         \\memory on this machine.
+        ,
+    },
+    .{
+        .code = .E0121,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the lease settings cannot fence an agent in time",
+        .explanation =
+        \\An agent that loses contact with the server stops its containers a fixed
+        \\margin before its lease can run out, and the server places replacements
+        \\only after the lease has run out and a grace period has passed. The
+        \\margin must cover the time the agent needs to stop its containers, the
+        \\drift between the two clocks over one lease, and the time the kernel
+        \\needs to kill a process. These settings leave too little, so two copies
+        \\of a replica could run at once.
+        \\
+        \\The cause line names the numbers. Shorten the lease time to live, or
+        \\leave the fencing constants as they are.
         ,
     },
     .{
@@ -753,18 +773,35 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0510,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the agent's tenure on its node has ended",
+        .explanation =
+        \\An agent writes what it observed only while it holds tenure on its node:
+        \\while the node's registration is the one it made. This write named a
+        \\registration that has since ended or been replaced, because the lease
+        \\ran out or another registration took its place. Nothing was written.
+        \\
+        \\The agent stops its containers, registers again and reports from the
+        \\new tenure. Nothing needs doing unless this repeats: then two agents
+        \\may be using one node name, or the agent is cut off for longer than
+        \\the lease time to live.
+        ,
+    },
+    .{
         .code = .W0501,
         .severity = .warning,
         .blame = .environment,
-        .summary = "the agent's lease ended and it registered again",
+        .summary = "the agent fenced itself and registered again",
         .explanation =
-        \\The agent could not renew its lease in time, so the store deleted the
-        \\node's registration. The agent granted a new lease and registered again.
-        \\Its workloads keep running: stopping them when a node is cut off is
-        \\planned for a later milestone.
+        \\The agent could not renew its lease in time, or the server said its
+        \\lease or tenure had ended. It stopped every container, so that nothing
+        \\runs on this node that the cluster may have placed elsewhere, then
+        \\granted a new lease and registered again with nothing running.
         \\
         \\This happens when the agent was paused or cut off from the server for
-        \\longer than the lease time to live.
+        \\longer than the lease time to live less the fencing margin.
         ,
     },
     .{

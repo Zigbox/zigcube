@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0510]: the agent's tenure on its node has ended
+  cause  node node1 was registered again since this agent registered it
+  reqid  r-0000001
+  fix    nothing: the agent registers again and reports anew
+  more   zcube explain E0510
+  docs   https://zigbox.github.io/zigcube/errors/E0510.html

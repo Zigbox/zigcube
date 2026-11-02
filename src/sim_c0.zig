@@ -255,9 +255,10 @@ fn broken(run: *Run) Failure!void {
 fn outage(run: *Run) Failure!void {
     const world = run.world;
     world.set_store_down(true);
-    // Long enough for the server's resync timer to fire (it wakes on a change or every 30 s) and
-    // for the node's lease to run out, so the agent has to register again when the store is back.
-    world.advance(35_000);
+    // Short of the agent's fence (slice 6): an agent that cannot renew its lease stops its
+    // containers `fence_margin_ms` before the lease could run out, so "the workloads run through
+    // the outage" holds for an outage of a few seconds, and fencing is the cluster simulation's.
+    world.advance(3_000);
     const status = run.api_get("/v1/status", "");
     try run.check(.store_outage, status.status == 200, "status must answer with the store down");
     try run.check(.store_outage, has(status.body, "\"ok\":false"), "status does not say ok:false");
@@ -268,7 +269,8 @@ fn outage(run: *Run) Failure!void {
     try run.check(.store_outage, has(list.body, "\"fixes\":[{"), "the diagnostic has no fix");
     try run.check(.store_outage, world.sim.running_count() == 2, "workloads stopped");
     try run.check(.store_outage, world.stats.agent_failures > 0, "the agent saw no failure");
-    try run.check(.store_outage, world.stats.server_failures > 0, "the server saw no failure");
+    // The server's resync timer fires every 30 s, longer than an outage an agent rides out
+    // (slice 6), so the server's side of an outage is `demo-c0`'s, not this scenario's.
     const victim = kill_a_container(world) orelse
         return run.check(.store_outage, false, "no container runs to kill");
     run.say("store_outage: 503 ZC-E0201 ({d} bytes), {s} killed meanwhile\n", .{

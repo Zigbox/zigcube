@@ -18,12 +18,19 @@
 //!     it"), and once it has stopped the observed record is removed. A stop is asked for once and
 //!     checked on later steps: if the container is still running after its grace period the next
 //!     step kills it. The step never waits for a stop.
-//!   - The node registers `/nodes/<node>` on a lease it keeps alive. A lease that is gone is
-//!     granted again and the node registers again; the workloads keep running (stopping them on
-//!     a lost lease is C1, docs/core.md).
+//!   - The node registers `/nodes/<node>` on a lease it keeps alive. The lease's ttl is the
+//!     server's: the agent learns it from the grant. The revision of its registration is its
+//!     **tenure**, and every observed write is checked against it (I2): a write from a tenure
+//!     that has ended is refused.
+//!   - The agent **fences itself** (docs/authority.md §3). It records `s`, the time on its
+//!     monotonic clock at which it sent the last keepalive the server acknowledged, and at
+//!     `s + ttl - fence_margin` it stops every container (`fencing.zig`), killing what is left
+//!     `fence_stop_ms` later. `s`, the lease and the tenure are in the agent's state directory,
+//!     so a restarted agent honours them. A lease that is gone, or a refused observed write,
+//!     fences at once. Then the node registers again, empty, under a new tenure.
 //!
-//! Observed records are written on every change of what the agent knows, not on a timer, and
-//! without a compare: the agent is their only writer.
+//! Observed records are written on every change of what the agent knows, not on a timer, with a
+//! compare on the agent's tenure.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -31,6 +38,9 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const fencing = @import("fencing.zig");
+const agent_records = @import("agent_records.zig");
+const agent_state = @import("agent_state.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
 const store = @import("store.zig");
@@ -63,6 +73,17 @@ pub const Context = struct {
     clock: Clock,
     arena: Allocator,
     diag: *Diag,
+    /// The clock the fence deadline is on: monotonic, and not stopped by a suspended host
+    /// (CLOCK_BOOTTIME). Null means `clock` is it, which is what the tests and the simulator use.
+    mono: ?Clock = null,
+    /// Where the lease, its send time and the tenure are kept across a restart. Null keeps
+    /// nothing (the tests that do not restart).
+    state: ?agent_state.AgentState = null,
+
+    pub fn mono_ms(ctx: *const Context) u64 {
+        const clock = ctx.mono orelse ctx.clock;
+        return clock.now_ms();
+    }
 
     fn as_controller(ctx: *const Context) controller.Context {
         return .{ .store = ctx.store, .clock = ctx.clock, .arena = ctx.arena, .diag = ctx.diag };
@@ -75,8 +96,28 @@ pub const Config = struct {
     capacity: records.Requests,
     address: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
-    lease_ttl_ms: u32 = constants.node_lease_ttl_ms,
 };
+
+/// The state file that holds the lease, in the agent's state directory.
+pub const lease_file = "lease.json";
+
+/// What the agent keeps in `lease_file`.
+const LeaseFile = struct {
+    lease: u64,
+    ttl_ms: u32,
+    /// `s`, on the monotonic clock.
+    sent_ms: u64,
+    tenure: u64,
+};
+
+/// The fence in progress: containers are being stopped, and killed at `kill_at_ms` (monotonic).
+const Fence = struct {
+    active: bool = false,
+    asked: bool = false,
+    kill_at_ms: u64 = 0,
+};
+
+const Beat = enum { idle, acted, fenced };
 
 const PendingStop = struct {
     handle: runtime.Handle,
@@ -89,41 +130,92 @@ pub const watch_prefixes = [_][]const u8{records.prefix_replicas};
 pub const Agent = struct {
     config: Config,
     lease: store.LeaseId,
+    /// The lease's ttl as the server granted it; 0 with no lease.
+    lease_ttl_ms: u32,
+    /// The revision of the node's registration: the agent's tenure. 0 with no lease.
+    tenure: store.Revision,
+    /// `s`: when the last acknowledged keepalive (or the grant) was sent, monotonic.
+    sent_ms: u64,
+    /// When the next keepalive is due, monotonic.
     renew_at_ms: u64,
+    fence: Fence,
+    /// How many times the agent has fenced itself; the shell says so when it grows.
+    fences: u32,
+    restored: bool,
     stops: [constants.agent_stops_max]PendingStop,
     stops_count: u32,
 
     /// Initialises in place: the stop table is large.
     pub fn init(agent: *Agent, config: Config) void {
         assert(records.name_problem(config.node, constants.node_name_bytes_max) == null);
-        assert(config.lease_ttl_ms >= constants.lease_ttl_ms_min);
         agent.config = config;
         agent.lease = store.lease_none;
+        agent.lease_ttl_ms = 0;
+        agent.tenure = 0;
+        agent.sent_ms = 0;
         agent.renew_at_ms = 0;
+        agent.fence = .{};
+        agent.fences = 0;
+        agent.restored = false;
         agent.stops_count = 0;
+    }
+
+    /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is
+    /// already fencing.
+    pub fn fence_at_ms(agent: *const Agent) ?u64 {
+        if (agent.lease == store.lease_none or agent.fence.active) return null;
+        return fencing.fence_at_ms(agent.sent_ms, agent.lease_ttl_ms);
+    }
+
+    /// How long until the fence, so a caller that waits does not wait past it (`maxInt` if
+    /// there is none).
+    pub fn fence_in_ms(agent: *const Agent, mono_now: u64) u32 {
+        const at = agent.fence_at_ms() orelse return std.math.maxInt(u32);
+        return @intCast(@min(at -| mono_now, std.math.maxInt(u32)));
     }
 
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
         assert(ctx.diag.code == null);
         const now = ctx.clock.now_ms();
+        const mono = ctx.mono_ms();
+        // The fence comes first and needs no server: an agent cut off from everything still stops.
+        if (!agent.restored) try agent.restore(ctx, mono);
+        if (agent.fence_at_ms()) |at| {
+            if (mono >= at) agent.begin_fence(at);
+        }
+        if (agent.fence.active) return agent.fence_step(ctx, mono, now);
         var acted: u32 = 0;
-        if (try agent.heartbeat(ctx)) acted += 1;
+        switch (try agent.heartbeat(ctx)) {
+            .idle => {},
+            .acted => acted += 1,
+            .fenced => return agent.fence_step(ctx, ctx.mono_ms(), now),
+        }
         const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
-        var pass: Pass = .{ .agent = agent, .ctx = ctx, .listings = listings };
+        var pass: Pass = .{
+            .agent = agent,
+            .ctx = ctx,
+            .listings = listings,
+            .node_key = records.node_key(agent.config.node),
+        };
         try pass.load();
         try pass.replicas();
         try pass.orphan_containers();
         try pass.orphan_records();
         acted += try pass.flush();
         agent.forget_finished_stops(listings);
-        return .{ .at_ms = agent.next_wake(now), .prefixes = &watch_prefixes, .acted = acted };
+        if (agent.fence.active) return agent.fence_step(ctx, ctx.mono_ms(), now);
+        const at_ms = agent.next_wake(now, mono);
+        return .{ .at_ms = at_ms, .prefixes = &watch_prefixes, .acted = acted };
     }
 
-    /// The soonest the agent needs to run again: its lease renewal, a stop's deadline, or the
-    /// resync that notices a container that ended.
-    fn next_wake(agent: *const Agent, now: u64) u64 {
+    /// The soonest the agent needs to run again: its lease renewal, the fence, a stop's deadline,
+    /// or the resync that notices a container that ended.
+    fn next_wake(agent: *const Agent, now: u64, mono: u64) u64 {
         var wake = now + constants.agent_resync_ms;
-        if (agent.lease != store.lease_none and agent.renew_at_ms < wake) wake = agent.renew_at_ms;
+        if (agent.lease != store.lease_none) {
+            wake = @min(wake, now + (agent.renew_at_ms -| mono));
+            wake = @min(wake, now + (agent.fence_at_ms().? -| mono));
+        }
         for (agent.stops[0..agent.stops_count]) |stop| {
             if (stop.deadline_ms < wake) wake = stop.deadline_ms;
         }
@@ -132,21 +224,23 @@ pub const Agent = struct {
 
     // ---- The lease and the node's registration ----
 
-    /// Keeps the node's lease alive, or grants one and registers. True if a transaction was made.
-    fn heartbeat(agent: *Agent, ctx: *const Context) Error!bool {
-        const now = ctx.clock.now_ms();
+    /// Keeps the node's lease alive, or grants one and registers.
+    fn heartbeat(agent: *Agent, ctx: *const Context) Error!Beat {
+        const sent = ctx.mono_ms();
         if (agent.lease != store.lease_none) {
-            if (now < agent.renew_at_ms) return false;
-            if (ctx.store.lease_keepalive(agent.lease, ctx.diag)) |_| {
-                agent.renew_at_ms = now + @divFloor(agent.config.lease_ttl_ms, 3);
-                return false;
+            if (sent < agent.renew_at_ms) return .idle;
+            if (ctx.store.lease_keepalive(agent.lease, ctx.diag)) |granted| {
+                try agent.acknowledged(ctx, sent, granted.ttl_ms);
+                return .idle;
             } else |err| {
                 if (err != error.LeaseNotFound) return err;
+                // The lease has ended, so the server will take the node for lost: stop at once.
                 ctx.diag.reset();
-                agent.lease = store.lease_none;
+                agent.begin_fence(sent);
+                return .fenced;
             }
         }
-        const lease = try ctx.store.lease_grant(agent.config.lease_ttl_ms, ctx.diag);
+        const lease = try ctx.store.lease_grant(constants.lease_ttl_ms, ctx.diag);
         const node: records.Node = .{
             .name = agent.config.node,
             .agent_version = agent.config.agent_version,
@@ -157,10 +251,119 @@ pub const Agent = struct {
         const value = try records.encode(ctx.arena, node, ctx.diag);
         const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = lease.id } };
         const request: store.TxnRequest = .{ .on_success = &.{op} };
-        _ = try writers.txn(ctx.store, .{ .agent = agent.config.node }, request, ctx.diag);
+        const done = try writers.txn(ctx.store, .{ .agent = agent.config.node }, request, ctx.diag);
+        assert(done.succeeded);
+        assert(done.revision > 0);
         agent.lease = lease.id;
-        agent.renew_at_ms = now + @divFloor(agent.config.lease_ttl_ms, 3);
-        return true;
+        agent.tenure = done.revision;
+        try agent.acknowledged(ctx, sent, lease.ttl_ms);
+        return .acted;
+    }
+
+    /// The server acknowledged a request sent at `sent`: the lease runs `ttl_ms` from then at
+    /// the least. The state is kept after it is held, so a failure to keep it leaves an older
+    /// `s` in the file, which fences earlier, never later.
+    fn acknowledged(agent: *Agent, ctx: *const Context, sent: u64, ttl_ms: u32) Error!void {
+        assert(agent.lease != store.lease_none);
+        assert(fencing.inequality_problem(ttl_ms) == null);
+        agent.lease_ttl_ms = ttl_ms;
+        agent.sent_ms = sent;
+        agent.renew_at_ms = sent + @divFloor(ttl_ms, 3);
+        try agent.persist(ctx);
+    }
+
+    fn persist(agent: *const Agent, ctx: *const Context) Error!void {
+        const state = ctx.state orelse return;
+        const file: LeaseFile = .{
+            .lease = agent.lease,
+            .ttl_ms = agent.lease_ttl_ms,
+            .sent_ms = agent.sent_ms,
+            .tenure = agent.tenure,
+        };
+        const text = try records.encode(ctx.arena, file, ctx.diag);
+        state.put_atomic(lease_file, text) catch |err| {
+            return state_failed(ctx, err, "keep the lease");
+        };
+    }
+
+    /// Reads what a previous run kept. A file that is not there is a first start or a finished
+    /// fence; one that cannot be read or understood fences (the agent cannot know how long it
+    /// has), and a send time in the future means the host restarted, which fences too.
+    fn restore(agent: *Agent, ctx: *const Context, mono: u64) Error!void {
+        assert(!agent.restored);
+        const state = ctx.state orelse {
+            agent.restored = true;
+            return;
+        };
+        const text = state.read(ctx.arena, lease_file) catch |err| switch (err) {
+            error.Absent => {
+                agent.restored = true;
+                return;
+            },
+            else => return state_failed(ctx, err, "read the lease"),
+        };
+        agent.restored = true;
+        const parsed = std.json.parseFromSliceLeaky(LeaseFile, ctx.arena, text, .{}) catch
+            return agent.begin_fence(mono);
+        const usable = parsed.lease != store.lease_none and parsed.tenure > 0 and
+            fencing.inequality_problem(parsed.ttl_ms) == null and parsed.sent_ms <= mono;
+        if (!usable) return agent.begin_fence(mono);
+        agent.lease = parsed.lease;
+        agent.tenure = parsed.tenure;
+        agent.lease_ttl_ms = parsed.ttl_ms;
+        agent.sent_ms = parsed.sent_ms;
+        agent.renew_at_ms = parsed.sent_ms + @divFloor(parsed.ttl_ms, 3);
+    }
+
+    /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.
+    fn begin_fence(agent: *Agent, nominal_ms: u64) void {
+        if (agent.fence.active) return;
+        const kill_at_ms = fencing.kill_at_ms(nominal_ms);
+        agent.fence = .{ .active = true, .asked = false, .kill_at_ms = kill_at_ms };
+    }
+
+    /// One step of a fence: ask every running container of this node to stop, kill what is
+    /// left at the deadline, and when none runs any longer forget the lease, so the next step
+    /// registers the node again, empty. Needs no server.
+    fn fence_step(agent: *Agent, ctx: *const Context, mono: u64, now: u64) Error!Wakeup {
+        assert(agent.fence.active);
+        const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
+        var running: u32 = 0;
+        for (listings) |*listing| {
+            if (label_value(listing.labels, runtime.label_replica) == null) continue;
+            if (!is_running(listing)) continue;
+            running += 1;
+            if (fault_ignore_stop) continue;
+            if (mono >= agent.fence.kill_at_ms) {
+                try ctx.runtime.stop(listing.handle, 0, ctx.diag);
+            } else if (!agent.fence.asked) {
+                const grace: u32 = @intCast(agent.fence.kill_at_ms - mono);
+                try ctx.runtime.stop(listing.handle, grace, ctx.diag);
+            }
+        }
+        agent.fence.asked = true;
+        if (running == 0) try agent.fenced(ctx);
+        const poll = now + constants.fence_poll_ms;
+        const at_ms = if (running == 0) now else poll;
+        return .{ .at_ms = at_ms, .prefixes = &watch_prefixes, .acted = 0 };
+    }
+
+    /// Every container has stopped: the lease and the tenure are over.
+    fn fenced(agent: *Agent, ctx: *const Context) Error!void {
+        if (ctx.state) |state| {
+            state.remove(lease_file) catch |err| switch (err) {
+                error.Absent => {},
+                else => return state_failed(ctx, err, "forget the lease"),
+            };
+        }
+        agent.lease = store.lease_none;
+        agent.lease_ttl_ms = 0;
+        agent.tenure = 0;
+        agent.sent_ms = 0;
+        agent.renew_at_ms = 0;
+        agent.stops_count = 0;
+        agent.fence = .{};
+        agent.fences += 1;
     }
 
     fn forget_finished_stops(agent: *Agent, listings: []const runtime.Listing) void {
@@ -216,6 +419,7 @@ const Pass = struct {
     mine: []const controller.Entry(records.Replica) = &.{},
     observed: []const controller.Entry(records.Observed) = &.{},
     writes: std.ArrayList(Write) = .empty,
+    node_key: records.Key = undefined,
 
     fn load(pass: *Pass) Error!void {
         const ctx = pass.ctx.as_controller();
@@ -523,26 +727,53 @@ const Pass = struct {
 
     /// Commits the collected writes in transactions of the store's size. Returns how many.
     fn flush(pass: *Pass) Error!u32 {
-        var batch: controller.Batch = .{};
+        var batch = pass.new_batch();
         var commits: u32 = 0;
-        const ctx = pass.ctx.as_controller();
         for (pass.writes.items) |write| {
             if (!batch.has_room(1)) {
-                _ = try controller.commit(&ctx, .{ .agent = pass.agent.config.node }, &batch);
+                if (!try pass.commit(&batch)) return commits;
                 commits += 1;
-                batch = .{};
+                batch = pass.new_batch();
             }
             if (write.value) |value| batch.put(write.key, value) else batch.delete(write.key);
         }
         if (batch.ops_count > 0) {
-            _ = try controller.commit(&ctx, .{ .agent = pass.agent.config.node }, &batch);
+            if (!try pass.commit(&batch)) return commits;
             commits += 1;
         }
         return commits;
     }
+
+    /// An observed write rests on the agent's tenure (I2).
+    fn new_batch(pass: *Pass) controller.Batch {
+        var batch: controller.Batch = .{};
+        assert(pass.agent.tenure > 0);
+        batch.expect(pass.node_key.slice(), pass.agent.tenure);
+        return batch;
+    }
+
+    /// False if the tenure had ended: nothing was written, and the agent fences (its lease is
+    /// not the one the server holds for this node).
+    fn commit(pass: *Pass, batch: *const controller.Batch) Error!bool {
+        const ctx = pass.ctx.as_controller();
+        const result = try controller.commit(&ctx, .{ .agent = pass.agent.config.node }, batch);
+        switch (result) {
+            .applied => return true,
+            .conflict => {
+                pass.agent.begin_fence(pass.ctx.mono_ms());
+                return false;
+            },
+        }
+    }
 };
 
 // ---- Pure helpers ------------------------------------------------------------------------------
+
+fn state_failed(ctx: *const Context, err: agent_state.Error, operation: []const u8) Error {
+    // `Crashed` is the simulator's, which looks for its own flag before it reads a result.
+    const mapped: agent_state.Error = if (err == error.Crashed) error.Io else err;
+    return agent_records.state_failed(ctx.diag, mapped, operation);
+}
 
 fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
     for (labels) |label| {

@@ -314,6 +314,16 @@ fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
     );
 }
 
+fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
+    const cause = "lease time to live 30000 ms needs a fence margin of 4000 ms; it is 3000 ms";
+    sample(diag, .E0121, &.{cause}, "shorten --lease-ttl-ms, or leave the fencing constants alone");
+}
+
+fn tenure_ended(diag: *diag_mod.Diag) void { // agent_api.zig
+    const cause = "node node1 was registered again since this agent registered it";
+    sample(diag, .E0510, &.{cause}, "nothing: the agent registers again and reports anew");
+}
+
 /// A bug the server reports (it has written its own bundle, on its own machine).
 fn server_bug(diag: *diag_mod.Diag) void { // store_postgres.zig
     diag.raise(.B0001);
@@ -364,6 +374,7 @@ const cases = [_]Case{
     raised(.E0118, &.{ "explain", "nope" }),
     with_flags(routed(.W0119, bundle_unredacted, route_empty), .{ .warning = true }),
     with_flags(raised(.E0120, &.{ "explain", "E0102" }), .{ .no_memory = true }),
+    relayed(.E0121, bad_lease),
     relayed(.E0201, store_down),
     relayed(.E0202, store_failed),
     relayed(.E0203, compacted),
@@ -389,6 +400,7 @@ const cases = [_]Case{
     relayed(.E0507, agent_supervisor),
     relayed(.E0508, agent_command),
     relayed(.E0509, agent_lost),
+    relayed(.E0510, tenure_ended),
     relayed(.W0501, agent_lease),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
 };

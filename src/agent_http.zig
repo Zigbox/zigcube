@@ -49,7 +49,8 @@ pub const Client = struct {
         var stream = client.connect(diag) catch |err| return err;
         defer stream.close(client.io);
         try client.send(&stream, request, diag);
-        return client.receive(arena, &stream, request.hold_ms + client.io_timeout_ms, diag);
+        const io_ms = request.timeout_ms orelse client.io_timeout_ms;
+        return client.receive(arena, &stream, request.hold_ms + io_ms, diag);
     }
 
     /// The standard library's threaded `Io` does not implement a connect timeout on POSIX (it

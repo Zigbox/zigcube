@@ -388,7 +388,10 @@ pub const Store = struct {
         try check_ttl(ttl_ms, diag);
         const lease = try finish(diag, store.vtable.lease_grant(store.context, ttl_ms, diag));
         assert(lease.id != lease_none);
-        assert(lease.ttl_ms == ttl_ms);
+        // The backends grant what was asked; a remote store (the agent's) carries the server's
+        // choice of ttl, which the caller learns from the grant.
+        assert(lease.ttl_ms >= constants.lease_ttl_ms_min);
+        assert(lease.ttl_ms <= constants.lease_ttl_ms_max);
         return lease;
     }
 

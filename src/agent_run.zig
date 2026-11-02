@@ -54,6 +54,8 @@ fn install_signals() void {
 const Shell = struct {
     io: std.Io,
     clock: @import("clock.zig").Clock,
+    /// CLOCK_BOOTTIME: the clock of the fence.
+    boot: @import("clock.zig").Clock,
     remote: *remote_mod.RemoteStore,
     fake: *fake_runtime.FakeRuntime,
     agent: *agent_mod.Agent,
@@ -72,8 +74,14 @@ const Shell = struct {
             .clock = shell.clock,
             .arena = shell.arena.allocator(),
             .diag = &shell.diag,
+            .mono = shell.boot,
+            .state = shell.fake.state.interface(),
         };
         const before = shell.agent.lease;
+        const fences = shell.agent.fences;
+        // No exchange may run past the fence; with no lease there is none.
+        const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
+        shell.remote.set_deadline(shell.boot, deadline);
         const wake = shell.agent.reconcile(&ctx) catch {
             const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
             const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
@@ -83,7 +91,7 @@ const Shell = struct {
         const outcome: loop_mod.Outcome = .{ .ok = wake };
         const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
         if (report == .recovered) shell.recovered();
-        shell.notice_lease(before);
+        shell.notice_lease(before, fences);
         return outcome;
     }
 
@@ -91,7 +99,9 @@ const Shell = struct {
     /// watch failed (the next pass reports and retries).
     fn watch(shell: *Shell, slice_ms: u32) bool {
         shell.diag.reset();
-        const changed = shell.remote.watch_once(slice_ms, &shell.diag) catch return true;
+        const held = @max(1, shell.before_fence(slice_ms));
+        shell.remote.set_deadline(shell.boot, std.math.maxInt(u64));
+        const changed = shell.remote.watch_once(held, &shell.diag) catch return true;
         if (changed) return true;
         shell.arena.reset();
         const events = shell.fake.interface().events(shell.arena.allocator(), 0, &shell.diag) catch
@@ -99,9 +109,14 @@ const Shell = struct {
         return events.len > 0;
     }
 
-    fn pause(shell: *Shell, ms: u32) void {
+    /// `ms`, or less if the fence falls sooner: the agent never sleeps through it.
+    fn before_fence(shell: *Shell, ms: u32) u32 {
+        return @min(ms, shell.agent.fence_in_ms(shell.boot.now_ms()));
+    }
+
+    fn pause(shell: *Shell, wanted_ms: u32) void {
         // Slept in slices so that a stop request is noticed within one.
-        var left = ms;
+        var left = shell.before_fence(wanted_ms);
         while (left > 0) {
             if (stop_requested.load(.acquire)) return;
             const slice = @min(left, constants.server_poll_ms * 10);
@@ -126,8 +141,9 @@ const Shell = struct {
     }
 
     /// A lease that was replaced is ZC-W0501, and a first one is a line of news.
-    fn notice_lease(shell: *Shell, before: store.LeaseId) void {
+    fn notice_lease(shell: *Shell, before: store.LeaseId, fences: u32) void {
         const now = shell.agent.lease;
+        if (shell.agent.fences != fences) return shell.notice_fence(before);
         const news = loop_mod.lease_news(before, now);
         if (news == .none) return;
         var buffer: [128]u8 = undefined;
@@ -139,16 +155,20 @@ const Shell = struct {
             std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {};
             return;
         }
+    }
+
+    /// The agent fenced itself (ZC-W0501): its containers were stopped, and it registers again.
+    fn notice_fence(shell: *Shell, before: store.LeaseId) void {
         var warning: Diag = undefined;
         warning.reset();
         warning.raise(.W0501);
-        warning.cause("lease {d} ended; node {s} registered again on lease {d}", .{
-            before, shell.agent.config.node, now,
+        warning.cause("lease {d} could not be kept; node {s} stopped its containers", .{
+            before, shell.agent.config.node,
         });
         warning.fix(
             .{ .sentence = "if this repeats, check the network between the agent and the server" },
         );
-        shell.show("\n", &warning, "zcube-agent: its containers were left running\n");
+        shell.show("\n", &warning, "zcube-agent: registering the node again, with no containers\n");
     }
 
     fn show(shell: *Shell, before: []const u8, diag: *const Diag, after: []const u8) void {
@@ -174,6 +194,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const exe_length = std.process.executablePath(io, &exe_buffer) catch
         return fail_start(io, &diag, config.verbose, "can't find its own executable");
     var real: clock_mod.RealClock = .{ .io = io };
+    var boot: clock_mod.BootClock = .{ .io = io };
     const fake = gpa.create(fake_runtime.FakeRuntime) catch return constants.exit_environment;
     defer gpa.destroy(fake);
     fake.init(io, real.clock(), .{
@@ -194,11 +215,11 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .capacity = config.capacity,
         .address = config.address,
         .agent_version = build_options.version,
-        .lease_ttl_ms = config.lease_ttl_ms,
     });
     var shell: Shell = .{
         .io = io,
         .clock = real.clock(),
+        .boot = boot.clock(),
         .remote = &remote,
         .fake = fake,
         .agent = agent,

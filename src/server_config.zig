@@ -11,6 +11,7 @@
 //! ```
 
 const std = @import("std");
+const fencing = @import("fencing.zig");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
@@ -29,6 +30,7 @@ pub const usage =
     \\  --config FILE     a ZON file with .listen, .store and .create_store
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
+    \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
     \\  --create-store    create the store's file or schema if it is not there
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
@@ -53,6 +55,8 @@ pub const Config = struct {
     create_store: bool,
     verbose: bool,
     quiet: bool,
+    /// The ttl of the leases the server grants to agents.
+    lease_ttl_ms: u32 = constants.lease_ttl_ms,
 };
 
 pub const Command = union(enum) { run: Config, version, help };
@@ -62,6 +66,7 @@ const File = struct {
     listen: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
+    lease_ttl_ms: ?u32 = null,
 };
 
 /// The flags as typed, before they are merged over the file.
@@ -70,6 +75,7 @@ const Flags = struct {
     listen: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: bool = false,
+    lease_ttl_ms: ?u32 = null,
     verbose: bool = false,
     quiet: bool = false,
     version: bool = false,
@@ -98,7 +104,32 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .create_store = if (flags.create_store) true else (file.create_store orelse false),
         .verbose = flags.verbose,
         .quiet = flags.quiet,
+        .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
     };
+}
+
+/// ZC-E0121 for a ttl an agent cannot fence in time (docs/authority.md §3).
+fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
+    const ttl = given orelse constants.lease_ttl_ms;
+    if (ttl < constants.lease_ttl_ms_min or ttl > constants.lease_ttl_ms_max) {
+        return bad(diag, "a lease ttl of {d} ms is outside {d} to {d} ms", .{
+            ttl, constants.lease_ttl_ms_min, constants.lease_ttl_ms_max,
+        }, "choose a ttl inside the range");
+    }
+    const problem = fencing.inequality_problem(ttl) orelse return ttl;
+    diag.raise(.E0121);
+    switch (problem) {
+        .ttl_too_short => diag.cause(
+            "a lease ttl of {d} ms leaves no time before the {d} ms fence margin",
+            .{ ttl, constants.fence_margin_ms },
+        ),
+        .margin_too_small => diag.cause(
+            "a lease ttl of {d} ms needs a fence margin of {d} ms; it is {d} ms",
+            .{ ttl, fencing.margin_needed_ms(ttl), constants.fence_margin_ms },
+        ),
+    }
+    diag.fix(.{ .sentence = "use a ttl the fence margin covers, such as the default of 10000" });
+    return error.BadConfig;
 }
 
 // ---- Flags -------------------------------------------------------------------------------------
@@ -128,6 +159,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.listen = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--store")) {
             flags.store = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
+            flags.lease_ttl_ms = try number_of(u32, args, &index, diag);
         } else {
             const problem = "the flag {s} is not one zcube-server has";
             return bad(diag, problem, .{arg}, "run it with --help");
@@ -143,6 +176,13 @@ fn value_of(args: []const []const u8, index: *usize, diag: *Diag) Error![]const 
     }
     index.* += 1;
     return args[index.*];
+}
+
+fn number_of(comptime T: type, args: []const []const u8, index: *usize, diag: *Diag) Error!T {
+    const flag = args[index.*];
+    const text = try value_of(args, index, diag);
+    return std.fmt.parseInt(T, text, 10) catch
+        bad(diag, "{s} needs a whole number, not {s}", .{ flag, text }, "run it with --help");
 }
 
 // ---- The file -----------------------------------------------------------------------------------
