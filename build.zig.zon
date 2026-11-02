@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // The runtime as a library, and the diagnostics both products share (the `diagnostic`,
-        // `product`, `render` and `explain` modules). Pinned to Zigbox main at 600939c (0.2.0,
-        // 2026-10-30):
+        // `product`, `render` and `explain` modules). Pinned to Zigbox main at edecd39 (0.2.1,
+        // 2026-11-02; 600939c plus the `zigbox_vm` module, which C2's real smoke uses):
         // lifecycle (list, adopt, stop), image runs, pull as a library call, limits and exit reasons.
         .zigbox = .{
-            .url = "https://github.com/Zigbox/zigbox/archive/600939c3b161c0b51a553ad321f019b217ed3123.tar.gz",
-            .hash = "zigbox-0.2.0-RBMWEFNAagD_ER6nqPnn0inaLinQi7VjG7QPIm5KaK2c",
+            .url = "https://github.com/Zigbox/zigbox/archive/edecd3900770fac808c36190e1079f2f9f45c293.tar.gz",
+            .hash = "zigbox-0.2.1-RBMWENzFagBLF1nMj6oftHBblszjHIdApgF497lSjbew",
         },
     },
     .paths = .{
