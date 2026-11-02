@@ -34,6 +34,9 @@ const config_mod = @import("agent_config.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fake_runtime = @import("fake_runtime.zig");
+const runtime_mod = @import("runtime.zig");
+const zigbox = @import("zigbox");
+const zigbox_runtime = @import("zigbox_runtime.zig");
 const loop_mod = @import("agent_loop.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
@@ -63,7 +66,9 @@ const Shell = struct {
     io: std.Io,
     clock: @import("clock.zig").Clock,
     remote: *remote_mod.RemoteStore,
-    fake: *fake_runtime.FakeRuntime,
+    runtime: runtime_mod.Runtime,
+    /// The state directory as `AgentState`, for the remembered server pair.
+    pair_state: *@import("fake_files.zig").DirState,
     agent: *agent_mod.Agent,
     arena: BoundedArena,
     diag: Diag,
@@ -78,7 +83,7 @@ const Shell = struct {
         shell.diag.reset();
         const ctx: agent_mod.Context = .{
             .store = shell.remote.interface(),
-            .runtime = shell.fake.interface(),
+            .runtime = shell.runtime,
             .clock = shell.clock,
             .arena = shell.arena.allocator(),
             .diag = &shell.diag,
@@ -108,14 +113,14 @@ const Shell = struct {
         shell.notice_pair();
         if (changed) return true;
         shell.arena.reset();
-        const events = shell.fake.interface().events(shell.arena.allocator(), 0, &shell.diag) catch
+        const events = shell.runtime.events(shell.arena.allocator(), 0, &shell.diag) catch
             return true;
         return events.len > 0;
     }
 
     /// Saves the pair if it is due; `final` (a clean stop) saves it whatever the time.
     fn save_pair(shell: *Shell, final: bool) void {
-        const state = shell.fake.state.interface();
+        const state = shell.pair_state.interface();
         const now_ms = shell.clock.now_ms();
         const saved = if (final)
             shell.remote.save_final(state, now_ms)
@@ -234,15 +239,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const exe_length = std.process.executablePath(io, &exe_buffer) catch
         return fail_start(io, &diag, config.verbose, "can't find its own executable");
     var real: clock_mod.RealClock = .{ .io = io };
-    const fake = gpa.create(fake_runtime.FakeRuntime) catch return constants.exit_environment;
-    defer gpa.destroy(fake);
-    fake.init(io, real.clock(), .{
-        .gpa = gpa,
-        .state_dir = config.state_dir,
-        .supervisor_exe = exe_buffer[0..exe_length],
-        .fixtures = config.images,
-    }, &diag) catch return fail(io, &diag, config.verbose);
-    defer fake.deinit();
+    var backend: Backend = undefined;
+    backend.start(init, &real, config, exe_buffer[0..exe_length], &diag) catch
+        return fail(io, &diag, config.verbose);
+    defer backend.stop(gpa);
     var http_transport: remote_mod.HttpTransport = .{
         .client = .{ .io = io, .address = config.server },
     };
@@ -250,7 +250,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
     // An IP address and a port always fit.
     const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
-    load_pair(gpa, &remote, fake, config.state_dir, server, &diag) catch
+    load_pair(gpa, &remote, backend.pair_state, config.state_dir, server, &diag) catch
         return fail(io, &diag, config.verbose);
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
@@ -265,7 +265,8 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .io = io,
         .clock = real.clock(),
         .remote = &remote,
-        .fake = fake,
+        .runtime = backend.runtime,
+        .pair_state = backend.pair_state,
         .agent = agent,
         .arena = BoundedArena.init(gpa, constants.request_arena_bytes_max),
         .diag = undefined,
@@ -296,14 +297,14 @@ fn loop(shell: *Shell) void {
 fn load_pair(
     gpa: std.mem.Allocator,
     remote: *remote_mod.RemoteStore,
-    fake: *fake_runtime.FakeRuntime,
+    pair_state: *@import("fake_files.zig").DirState,
     state_dir: []const u8,
     server: []const u8,
     diag: *Diag,
 ) error{BackendFailed}!void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const state = fake.state.interface();
+    const state = pair_state.interface();
     return remote.load(state, state_dir, server, arena_state.allocator(), diag);
 }
 
@@ -334,3 +335,87 @@ pub fn fail(io: std.Io, diag: *const Diag, verbose: bool) u8 {
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to report it.
     return diag.exit_code();
 }
+
+/// The runtime the agent was asked for, started in place, with the state it shares.
+const Backend = struct {
+    runtime: runtime_mod.Runtime,
+    pair_state: *@import("fake_files.zig").DirState,
+    which: union(enum) { fake: *fake_runtime.FakeRuntime, zigbox: *ZigboxBackend },
+
+    const ZigboxBackend = struct {
+        host_real: zigbox.host_real.HostReal,
+        runtime: zigbox_runtime.ZigboxRuntime,
+        images: [constants.fixture_images_max]zigbox_runtime.Image,
+    };
+
+    fn start(
+        self: *Backend,
+        init: std.process.Init,
+        real: *clock_mod.RealClock,
+        config: config_mod.Config,
+        exe: []const u8,
+        diag: *Diag,
+    ) error{StartFailed}!void {
+        const gpa = init.gpa;
+        switch (config.runtime) {
+            .fake => {
+                const fake = gpa.create(fake_runtime.FakeRuntime) catch return error.StartFailed;
+                errdefer gpa.destroy(fake);
+                fake.init(init.io, real.clock(), .{
+                    .gpa = gpa,
+                    .state_dir = config.state_dir,
+                    .supervisor_exe = exe,
+                    .fixtures = config.images,
+                }, diag) catch return error.StartFailed;
+                self.* = .{
+                    .runtime = fake.interface(),
+                    .pair_state = &fake.state,
+                    .which = .{ .fake = fake },
+                };
+            },
+            .zigbox => try self.start_zigbox(init, config, exe, diag),
+        }
+    }
+
+    fn start_zigbox(
+        self: *Backend,
+        init: std.process.Init,
+        config: config_mod.Config,
+        exe: []const u8,
+        diag: *Diag,
+    ) error{StartFailed}!void {
+        const gpa = init.gpa;
+        const box = gpa.create(ZigboxBackend) catch return error.StartFailed;
+        errdefer gpa.destroy(box);
+        box.host_real = .{ .environ = init.minimal.environ };
+        for (config.pulls, 0..) |pull, index| {
+            box.images[index] = .{ .digest = pull.digest, .reference = pull.reference };
+        }
+        box.runtime.init(init.io, box.host_real.interface(), .{
+            .gpa = gpa,
+            .state_dir = config.state_dir,
+            .supervisor_exe = exe,
+            .images = box.images[0..config.pulls.len],
+        }, diag) catch return error.StartFailed;
+        errdefer box.runtime.deinit();
+        box.runtime.preflight(diag) catch return error.StartFailed;
+        self.* = .{
+            .runtime = box.runtime.interface(),
+            .pair_state = &box.runtime.pair_state,
+            .which = .{ .zigbox = box },
+        };
+    }
+
+    fn stop(self: *Backend, gpa: std.mem.Allocator) void {
+        switch (self.which) {
+            .fake => |fake| {
+                fake.deinit();
+                gpa.destroy(fake);
+            },
+            .zigbox => |box| {
+                box.runtime.deinit();
+                gpa.destroy(box);
+            },
+        }
+    }
+};

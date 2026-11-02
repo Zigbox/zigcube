@@ -84,6 +84,8 @@ pub const ZigboxRuntime = struct {
     /// `<state>/zigbox/`.
     root: Dir,
     state: Dir,
+    /// The state directory as `AgentState`: the remembered server pair is kept in it.
+    pair_state: files.DirState,
     lock: std.Io.File,
     /// `zigbox.list`'s room, kept between calls (each entry holds a whole record).
     entries: []zigbox.Entry,
@@ -117,6 +119,7 @@ pub const ZigboxRuntime = struct {
         self.state = Dir.openDirAbsolute(io, options.state_dir, .{}) catch
             return state_dir_failed(diag, options.state_dir, "open it");
         errdefer self.state.close(io);
+        self.pair_state = .{ .io = io, .root = self.state };
         self.root = launch.open_root(io, self.state) catch
             return state_dir_failed(diag, options.state_dir, "create zigbox/ in it");
         errdefer self.root.close(io);
@@ -124,6 +127,15 @@ pub const ZigboxRuntime = struct {
         errdefer self.lock.close(io);
         self.entries = options.gpa.alloc(zigbox.Entry, entries_max) catch
             return state_dir_failed(diag, options.state_dir, "set aside memory for");
+    }
+
+    /// Refuses a host that can't run Zigbox containers (ZC-E0512). Zigbox's doctor is not part
+    /// of the linked module, so this is the cheap test: Linux, and a run directory it can read.
+    /// Whatever else is missing is named by Zigbox itself at the first start (ZBX-E04xx).
+    pub fn preflight(self: *ZigboxRuntime, diag: *Diag) error{HostUnsupported}!void {
+        if (@import("builtin").os.tag != .linux) return host_unsupported(diag, "it is not Linux");
+        _ = lifecycle.list(self.host, self.entries) catch
+            return host_unsupported(diag, "Zigbox can't read its run records here");
     }
 
     pub fn deinit(self: *ZigboxRuntime) void {
@@ -585,6 +597,15 @@ fn runtime_failed(diag: *Diag, operation: []const u8) error{RuntimeFailed} {
     diag.cause("can't {s}", .{operation});
     diag.fix(.{ .sentence = "check the agent's state directory and the host's limits" });
     return error.RuntimeFailed;
+}
+
+fn host_unsupported(diag: *Diag, why: []const u8) error{HostUnsupported} {
+    assert(diag.code == null);
+    diag.raise(.E0512);
+    diag.cause("this host can't run Zigbox containers: {s}", .{why});
+    diag.fix(.{ .sentence = "run zbx doctor as the agent's user and fix what it names, " ++
+        "or use --runtime fake" });
+    return error.HostUnsupported;
 }
 
 fn supervisor_failed(diag: *Diag, name: []const u8) error{RuntimeFailed} {
