@@ -147,6 +147,12 @@ pub fn summary_key(kind: SubjectKind, name: []const u8, action: []const u8, caus
     return Key.build(&(parts ++ .{@tagName(cause)}));
 }
 
+/// The prefix of every summary of one subject: `/decision-summaries/<kind>/<name>/`.
+pub fn summary_prefix(kind: SubjectKind, name: []const u8) Key {
+    assert(name_problem(name, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_summaries, @tagName(kind), "/", name, "/" });
+}
+
 /// The longest action name of a decision; it is part of a summary key.
 pub const action_bytes_max: u32 = 48;
 

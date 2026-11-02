@@ -58,18 +58,37 @@ pub fn key_copy(ctx: *const Context, key: *const records.Key) Error![]const u8 {
 
 // ---- Transactions of bounded size ------------------------------------------------------------
 
-/// The operations and compares of one transaction, within the store's bounds.
 /// What one `put_decision` adds to a batch, at most: the decision, its index entry and its
-/// summary (`/decision-summaries/`), and the summary's compare. Every batch bound that holds
+/// summary (`/decision-summaries/`), and the summary's compare. A second decision for the same
+/// summary in one batch adds two operations and no compare. Every batch bound that holds
 /// decisions is derived from these.
-pub const decision_ops: u32 = 2;
-pub const decision_compares: u32 = 0;
+pub const decision_ops: u32 = 3;
+pub const decision_compares: u32 = 1;
 
+/// Summaries one batch can hold: every one has a decision, which takes `decision_ops`.
+const summaries_max = constants.store_txn_ops_max / decision_ops;
+
+/// A summary put already in a batch: where it is, and the record it holds.
+const SummarySlot = struct {
+    key: []const u8,
+    op_index: u32,
+    record: records.Summary,
+};
+
+comptime {
+    assert(summaries_max > 0);
+    assert(decision_ops >= 3 and decision_compares == 1);
+    assert(decision_compares * summaries_max <= constants.store_txn_compares_max);
+}
+
+/// The operations and compares of one transaction, within the store's bounds.
 pub const Batch = struct {
     ops: [constants.store_txn_ops_max]store.Op = undefined,
     ops_count: u32 = 0,
     compares: [constants.store_txn_compares_max]store.Compare = undefined,
     compares_count: u32 = 0,
+    summaries: [summaries_max]SummarySlot = undefined,
+    summaries_count: u32 = 0,
 
     pub fn put(batch: *Batch, key: []const u8, value: []const u8) void {
         assert(batch.ops_count < constants.store_txn_ops_max);
@@ -92,6 +111,13 @@ pub const Batch = struct {
 
     pub fn has_room(batch: *const Batch, ops: u32) bool {
         return batch.ops_count + ops <= constants.store_txn_ops_max;
+    }
+
+    fn summary_slot(batch: *Batch, key: []const u8) ?*SummarySlot {
+        for (batch.summaries[0..batch.summaries_count]) |*slot| {
+            if (std.mem.eql(u8, slot.key, key)) return slot;
+        }
+        return null;
     }
 };
 
@@ -315,8 +341,12 @@ pub const DecisionSpec = struct {
     cause_evidence: ?records.Raw = null,
 };
 
-/// Adds a decision and its by-subject index entry to `batch` (two operations) and returns its id.
-/// The decision is committed with the action it records, or not at all.
+/// Adds a decision, its by-subject index entry and the update of its summary to `batch` (at most
+/// `decision_ops` operations and `decision_compares` compare) and returns its id. The decision
+/// is committed with the action it records, or not at all. The summary is read here and compared
+/// at the revision read (0: absent), so its count is exact: a concurrent writer of the same
+/// summary makes the transaction a conflict. A second decision for the same summary in one batch
+/// updates the put already there. A summary is never a cause.
 pub fn put_decision(
     ctx: *const Context,
     source: *DecisionSource,
@@ -353,7 +383,58 @@ pub fn put_decision(
     const index_at = records.index_key(spec.subject.kind, spec.subject.name, id.slice());
     batch.put(try key_copy(ctx, &decision_at), try records.encode(ctx.arena, decision, ctx.diag));
     batch.put(try key_copy(ctx, &index_at), try records.encode(ctx.arena, entry, ctx.diag));
+    try count_decision(ctx, batch, spec, &decision);
     return id;
+}
+
+/// Adds one to the summary of the decision's subject, action and kind of cause.
+fn count_decision(
+    ctx: *const Context,
+    batch: *Batch,
+    spec: DecisionSpec,
+    decision: *const records.Decision,
+) Error!void {
+    const summary_at = records.summary_key(
+        spec.subject.kind,
+        spec.subject.name,
+        spec.action,
+        spec.cause.kind,
+    );
+    const key = try key_copy(ctx, &summary_at);
+    const newest = ctx.arena.dupe(u8, decision.id) catch return failures.no_memory(ctx.diag);
+    if (batch.summary_slot(key)) |slot| {
+        assert(slot.record.count > 0);
+        slot.record.count += 1;
+        slot.record.last_at_ms = @max(slot.record.last_at_ms, decision.at_ms);
+        slot.record.newest = newest;
+        const bytes = try records.encode(ctx.arena, slot.record, ctx.diag);
+        batch.ops[slot.op_index] = .{ .put = .{ .key = key, .value = bytes } };
+        return;
+    }
+    assert(batch.summaries_count < summaries_max);
+    const got = try ctx.store.get(ctx.arena, key, null, ctx.diag);
+    var record: records.Summary = .{
+        .count = 1,
+        .first_at_ms = decision.at_ms,
+        .last_at_ms = decision.at_ms,
+        .newest = newest,
+    };
+    var revision: Revision = 0;
+    if (got.kv) |kv| {
+        const old = try records.read(records.Summary, ctx.arena, kv, ctx.diag);
+        record.count = old.count + 1;
+        record.first_at_ms = @min(old.first_at_ms, decision.at_ms);
+        record.last_at_ms = @max(old.last_at_ms, decision.at_ms);
+        revision = kv.mod_revision;
+    }
+    batch.expect(key, revision);
+    batch.summaries[batch.summaries_count] = .{
+        .key = key,
+        .op_index = batch.ops_count,
+        .record = record,
+    };
+    batch.summaries_count += 1;
+    batch.put(key, try records.encode(ctx.arena, record, ctx.diag));
 }
 
 /// A cause that points at another decision.
@@ -402,7 +483,8 @@ test "a decision and its index entry are written together, with a unique sortabl
         .reason = "creating hello-1",
         .cause = cause_decision(&first),
     }, &batch);
-    try testing.expectEqual(@as(u32, 4), batch.ops_count);
+    // Each decision: the record, the index entry and (these two share a key? no) the summary.
+    try testing.expectEqual(@as(u32, 6), batch.ops_count);
     try testing.expect(std.mem.order(u8, first.slice(), second.slice()) == .lt);
     try testing.expectEqualStrings("1761350000123-0001-0000", first.slice());
     const done = try commit(&ctx, .replica_controller, &batch);

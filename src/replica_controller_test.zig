@@ -393,7 +393,7 @@ test "a pass stops after one batch and says it has more to do" {
     try testing.expectEqual(fixture.manual.ms, first.at_ms);
     const partial = try fixture.ids("hello");
     defer Fixture.free_ids(partial);
-    try testing.expectEqual(@as(usize, 4), partial.len);
+    try testing.expectEqual(@as(usize, 3), partial.len);
     _ = try fixture.settle();
     const done = try fixture.ids("hello");
     defer Fixture.free_ids(done);

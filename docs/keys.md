@@ -279,6 +279,10 @@ C1 changes this rule: decisions on a live subject's current chain are never evic
 (`authority.md` section 5): for each live subject its newest decision of each action is a root,
 retention walks each root's chain and pins every decision on it, and only an unpinned decision
 beyond the budget is evicted. A deleted subject's decisions are no longer roots and stay 24 hours.
+Implemented in `src/retention.zig`. A pass computes the pinned set only when it has candidates,
+reading through a 1 MiB scratch region and bounded by `retention_pinned_max`; if a walk exceeds
+that bound or meets a malformed record, the pass drops nothing for live subjects (fail safe).
+A deleted subject's summaries go with its last decisions.
 A chain that needed an evicted decision is reported `truncated` by `zcube why`, with its reason.
 
 ## `/assigned/<node>/<replica>`: the placement (C1 slice 3)

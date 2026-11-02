@@ -46,6 +46,10 @@ pub const hold_memory_max: u32 = constants.replicas_max;
 
 comptime {
     assert(hold_memory_max >= constants.replicas_max);
+    // The largest compare set and the summary compare of the one decision in the transaction.
+    const compares = compare_sets.set_max + controller.decision_compares;
+    assert(compares <= constants.store_txn_compares_max);
+    assert(controller.decision_ops + 4 <= constants.store_txn_ops_max); // A move's writes.
 }
 
 pub const watch_prefixes = [_][]const u8{

@@ -47,9 +47,10 @@ const NumberEntry = Entry(records.ReplicaNumber);
 
 pub const actor = "replica-controller";
 
-/// Replicas one transaction creates or removes: 2 operations for the service decision, 3 for each
-/// replica (a decision with its index entry, and the replica), and 1 for the service itself.
-const batch_replicas_max: u32 = 4;
+/// Replicas one transaction creates or removes: `decision_ops` operations for the service
+/// decision, `decision_ops + 1` for each replica (its decision, and the replica record or its
+/// delete), and 1 for the counter.
+const batch_replicas_max: u32 = 3;
 const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{
@@ -61,9 +62,15 @@ pub const watch_prefixes = [_][]const u8{
 };
 
 comptime {
-    assert(2 + batch_replicas_max * 3 + 1 <= constants.store_txn_ops_max);
-    // The service, the counter, and per replica its key and (when it is dead) its assignment.
-    assert(2 + batch_replicas_max * 2 <= constants.store_txn_compares_max);
+    const decision = controller.decision_ops;
+    assert(decision + batch_replicas_max * (decision + 1) + 1 <= constants.store_txn_ops_max);
+    // A batch of one more replica would not fit: the bound moved with the summaries.
+    assert(decision + (batch_replicas_max + 1) * (decision + 1) + 1 > constants.store_txn_ops_max);
+    // The service, the counter and the service decision's summary, and per replica its key,
+    // (when it is dead) its assignment and its decision's summary.
+    const fixed = 2 + controller.decision_compares;
+    const per_replica = 2 + controller.decision_compares;
+    assert(fixed + batch_replicas_max * per_replica <= constants.store_txn_compares_max);
 }
 
 pub const ReplicaController = struct {

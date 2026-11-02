@@ -152,6 +152,9 @@ terminal.
 
 - `step.type` is `decision`, or a terminal: `observed`, `desired`, `resync`, `lease_expired`
   (new, below), or `gone` when a decision in the chain has been removed by retention.
+- `summaries` (additive) is `[{action, cause, count, first_at_ms, last_at_ms}]`, the subject's
+  `/decision-summaries` counts. A summary is a projection, never a step. The CLI prints one line
+  each after the chain: `replace_replica (observed): 142 times since 2025-10-24 23:13:20Z`.
 - **`state.text` and every `step.text` are the sentences the CLI prints.** The CLI renders
   `state.text`, then `← <text>` per step, and a step with a `diagnostic` as the full diagnostic
   block instead (HANDOFF's `← error[ZBX-E0501]: image not found …` form). The console may add

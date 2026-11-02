@@ -27,12 +27,15 @@ pub const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{ records.prefix_nodes, records.prefix_node_status };
 
-/// Nodes one transaction marks: 3 operations and 2 compares each.
-const batch_nodes_max: u32 = 5;
+/// Nodes one transaction marks: a status record and a decision (`decision_ops`) each, with two
+/// compares and the decision's.
+const batch_nodes_max: u32 = 4;
 
 comptime {
-    assert(batch_nodes_max * 3 <= constants.store_txn_ops_max);
-    assert(batch_nodes_max * 2 <= constants.store_txn_compares_max);
+    assert(batch_nodes_max * (1 + controller.decision_ops) <= constants.store_txn_ops_max);
+    assert((batch_nodes_max + 1) * (1 + controller.decision_ops) > constants.store_txn_ops_max);
+    const compares = 2 + controller.decision_compares;
+    assert(batch_nodes_max * compares <= constants.store_txn_compares_max);
 }
 
 pub const NodeController = struct {
@@ -280,7 +283,7 @@ test "more nodes than a batch take several passes" {
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    const names = [_][]const u8{ "n1", "n2", "n3", "n4", "n5", "n6", "n7" };
+    const names = [_][]const u8{ "n1", "n2", "n3", "n4", "n5", "n6" };
     comptime assert(names.len == batch_nodes_max + 2);
     for (names) |name| try fixture.register(name);
     const first = try fixture.step();
