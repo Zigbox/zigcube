@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     const console = add_console_steps(b);
     const web_files = add_web_files(b, console);
 
-    const built = add_executables(b, .{
+    const shared_options: ExecutablesOptions = .{
         .target = target,
         .optimize = optimize,
         .options = options,
@@ -43,17 +43,9 @@ pub fn build(b: *std.Build) void {
         .sqlite = sqlite,
         .libpq = libpq_module,
         .web_files = web_files,
-    });
-
-    add_unit_tests(b, .{
-        .target = target,
-        .optimize = optimize,
-        .options = options,
-        .zigbox = zigbox_module,
-        .sqlite = sqlite,
-        .libpq = libpq_module,
-        .web_files = web_files,
-    }, built);
+    };
+    const built = add_executables(b, shared_options);
+    add_unit_tests(b, shared_options, built);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
@@ -66,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, zigbox_module);
+    add_bench_watch_step(b, shared_options);
     add_tidy_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
@@ -286,6 +279,32 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     run.has_side_effects = true;
     const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
     b.step("agent-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build bench-watch`: the watch fan-out row of docs/c1.md (src/bench_watch.zig), a real
+/// server over SQLite with 50 held agent polls in one process. Never cached, not in `check`; a
+/// miss is the result, and the exit code says so.
+fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "bench_watch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_watch.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.options.createModule() },
+                .{ .name = "zigbox", .module = options.zigbox },
+                .{ .name = "sqlite_c", .module = options.sqlite },
+                .{ .name = "libpq_c", .module = options.libpq },
+                .{ .name = "web_files", .module = options.web_files },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    run.setCwd(b.path("."));
+    b.step("bench-watch", "Run the watch fan-out benchmark (50 agents, 2,000 assignments)")
+        .dependOn(&run.step);
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it;

@@ -61,10 +61,20 @@ pub const Reply = struct {
     hold_prefixes: []const []const u8 = &.{},
 };
 
-/// The keys whose change ends a held watch. C0 has one node and the scheduler writes no index, so
-/// it is every replica; C1 narrows it to `/assigned/<node>/` (docs/keys.md) without changing
-/// the endpoint's shape.
-pub const watch_prefixes = [_][]const u8{ records.prefix_replicas, records.prefix_assigned };
+/// The keys whose change ends a held watch: this node's assignments, `/assigned/<node>/`
+/// (authority.md §2), and nothing else. An agent reconciles by level: it lists its assignments
+/// and joins each replica record. A replica record is written once and removed, never changed in
+/// place (the replica controller replaces a replica rather than editing it), and the scheduler
+/// deletes the assignment of a replica that is gone, so every change an agent must act on is a
+/// change of its own `/assigned/<node>/`.
+pub fn watch_prefixes(ctx: *const Context, node: []const u8) Failure![]const []const u8 {
+    const key = records.assigned_prefix(node);
+    const prefixes = ctx.arena.alloc([]const u8, 1) catch return no_memory(ctx);
+    prefixes[0] = ctx.arena.dupe(u8, key.slice()) catch return no_memory(ctx);
+    assert(prefixes.len == 1);
+    assert(prefixes[0].len > node.len);
+    return prefixes;
+}
 
 const Parts = std.mem.SplitIterator(u8, .scalar);
 
@@ -411,7 +421,8 @@ const Call = struct {
         // short of the head), so resuming from it skips no revision of either prefix.
         var bookmark: store.Revision = std.math.maxInt(store.Revision);
         var changed = false;
-        for (watch_prefixes) |prefix| {
+        const prefixes = try watch_prefixes(ctx, call.node);
+        for (prefixes) |prefix| {
             const seen = try scan_watch(ctx, prefix, from, head.revision);
             bookmark = @min(bookmark, seen.bookmark);
             if (seen.changed) {
@@ -427,7 +438,7 @@ const Call = struct {
             if (call.hold) {
                 if (timeout > 0) {
                     answer.hold_ms = @intCast(timeout);
-                    answer.hold_prefixes = &watch_prefixes;
+                    answer.hold_prefixes = prefixes;
                 }
             }
         }

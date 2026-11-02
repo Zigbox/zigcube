@@ -463,10 +463,13 @@ The long poll, the provisional transport of HANDOFF. `from` is a revision (at le
 { "revision": 415, "changed": true }
 ```
 
-`changed` is true if any key under the watched prefixes, `/replicas/` and (from C1 slice 3)
-`/assigned/`, was written or deleted at a revision `>= from`. Each prefix is scanned in turn;
-with nothing changed, `revision` is the smaller of the two scans' bookmarks, so watching from
-`revision + 1` skips no change under either. If nothing has changed the
+`changed` is true if any key under `/assigned/<node>/` was written or deleted at a revision `>= from`
+(C1 slice 7; before it the watch also woke on every `/replicas/` change and on any node's
+assignment, so every agent woke for every placement). The agent lists its assignments and joins each
+replica record, and every change it must act on is a change of its own assignments: a replica
+record is written once and removed, never edited, and the scheduler deletes the assignment of a
+replica that is gone. With nothing changed, `revision` is the scan's bookmark, so watching from
+`revision + 1` skips no change. If nothing has changed the
 server holds the reply up to `timeout`, as for `GET /v1/watch`, and answers with `changed: false`
 and the bookmark when the time is up. **The reply carries no events**, because the agent
 reconciles by level: it reads the list again and lets the core decide, so a lost or compacted
