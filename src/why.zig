@@ -339,7 +339,11 @@ fn observed_step(
     var text = try controller.format(ctx, "{s}: the record the controller saw has been removed", .{
         key,
     });
-    if (try read_at(ctx, key, cause.revision)) |kv| {
+    if (std.mem.startsWith(u8, key, records.prefix_nodes)) {
+        // The node controller reacted to a node's registration, not to a replica's report.
+        const name = key[records.prefix_nodes.len..];
+        text = try controller.format(ctx, "node {s} registered ({s})", .{ name, key });
+    } else if (try read_at(ctx, key, cause.revision)) |kv| {
         const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
         const phrase = try observed_phrase(ctx, &observed);
         text = try controller.format(ctx, "{s} on {s}: {s}", .{

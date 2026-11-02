@@ -449,9 +449,12 @@ pub const Scheduler = struct {
         var set: compare_sets.Set = .{};
         compare_sets.release(&set, name, assign.replica, assign.revision, view.alloc_revision);
         expect_all(&batch, &set);
-        // The replica controller's `stop_replica` retired it, if its decision is still indexed;
-        // else only a pass found it gone, and the store does not say at which revision.
-        const retired = try indexed_decision(ctx, assign.replica, "stop_replica", .last);
+        // The replica controller's `stop_replica` (scale down) or `delete_replica` (a replacement)
+        // retired it, if its decision is still indexed; else only a pass found it gone, and the
+        // store does not say at which revision.
+        const stopped = try indexed_decision(ctx, assign.replica, "stop_replica", .last);
+        const retired = stopped orelse
+            try indexed_decision(ctx, assign.replica, "delete_replica", .last);
         const cause: records.Cause = if (retired) |*id| controller.cause_decision(id) else .{
             .kind = .resync,
         };

@@ -121,6 +121,7 @@ pub fn kill(demo: *Demo) !void {
     try host.check(state.contains(why.out, "SIGKILL"), "zcube why says {s} was killed", .{name});
     try decisions.expect_new(demo, "step 2", &.{
         .{ .actor = "replica-controller", .action = "delete_replica", .count = 1 },
+        .{ .actor = "scheduler", .action = "release_replica", .count = 1 },
         .{ .actor = "replica-controller", .action = "replace_replica", .count = 1 },
         .{ .actor = "replica-controller", .action = "create_replica", .count = 1 },
         .{ .actor = "scheduler", .action = "place_replica", .count = 1 },
@@ -161,14 +162,23 @@ fn snapshot(demo: *Demo) !Snapshot {
     };
 }
 
-fn expect_unchanged(demo: *Demo, before: Snapshot, comptime when: []const u8) !void {
+/// `decisions_same` is false where the node controller is expected to judge a new lease (an
+/// agent restart): the decisions are then checked by `decisions.expect_new` instead.
+fn expect_unchanged(
+    demo: *Demo,
+    before: Snapshot,
+    comptime when: []const u8,
+    decisions_same: bool,
+) !void {
     const host = demo.host;
     const after = try snapshot(demo);
     const equal = state.expect_equal;
     const bytes = ": the same, byte for byte";
     try equal(host, before.services, after.services, when ++ ": /services/" ++ bytes);
     try equal(host, before.replicas, after.replicas, when ++ ": /replicas/" ++ bytes);
-    try equal(host, before.decisions, after.decisions, when ++ ": /decisions/" ++ bytes);
+    if (decisions_same) {
+        try equal(host, before.decisions, after.decisions, when ++ ": /decisions/" ++ bytes);
+    }
     try equal(host, before.get_json, after.get_json, when ++ ": zcube get replicas -o json");
     const same = state.same_containers(before.containers, after.containers);
     try host.check(same, when ++ ": the same processes run", .{});
@@ -196,7 +206,7 @@ pub fn restart_server(demo: *Demo) !void {
     try host.start_server(state.start_wait_ms);
     try host.settle("the agent and the controllers catch up", state.settle_ms);
     try state.expect_ready(demo, "hello", "3/3");
-    try expect_unchanged(demo, before, "after the server restart");
+    try expect_unchanged(demo, before, "after the server restart", true);
     try decisions.expect_new(demo, "server restart", &.{});
 }
 
@@ -223,10 +233,12 @@ pub fn restart_agent(demo: *Demo) !void {
     try host.start_agent(state.node);
     try host.wait_for({}, AgentRegistered.check, "the new agent to register", state.start_wait_ms);
     try host.settle("several agent passes: a duplicate would start in the first", state.settle_ms);
-    try expect_unchanged(demo, before, "after the agent restart");
+    try expect_unchanged(demo, before, "after the agent restart", false);
     try state.expect_processes(demo, "no duplicates", 3);
     try state.expect_ready(demo, "hello", "3/3");
-    try decisions.expect_new(demo, "agent restart", &.{});
+    try decisions.expect_new(demo, "agent restart", &.{
+        .{ .actor = "node-controller", .action = "mark_ready", .count = 1 },
+    });
 }
 
 // ---- 3 ----
@@ -305,6 +317,7 @@ fn scale_down(demo: *Demo, five: []const Pids) !void {
         .{ .actor = "api", .action = "apply", .count = 1 },
         .{ .actor = "replica-controller", .action = "scale_down", .count = 1 },
         .{ .actor = "replica-controller", .action = "stop_replica", .count = 3 },
+        .{ .actor = "scheduler", .action = "release_replica", .count = 3 },
     });
 }
 

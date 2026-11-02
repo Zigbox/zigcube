@@ -253,4 +253,14 @@ fn step_start(demo: *Demo) !void {
     };
     try host.wait_for({}, registered.check, "the node to register", state.start_wait_ms);
     try host.check(true, "one zcube-agent (FakeRuntime) registered as {s}", .{state.node});
+    // The node controller judges the node ready; that decision belongs to this step, not step 1.
+    const judged = struct {
+        fn check(d: *Demo, _: *Host) !bool {
+            return (decisions.read_all(d) catch return false).len > 0;
+        }
+    };
+    try host.wait_for(demo, judged.check, "the node to be marked", state.start_wait_ms);
+    try decisions.expect_new(demo, "step 0", &.{
+        .{ .actor = "node-controller", .action = "mark_ready", .count = 1 },
+    });
 }
