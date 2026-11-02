@@ -78,6 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>The server keeps the highest store revision and chain hash it has seen in a small file in its state directory, so that a restart after a lossy failover still notices that the store went backwards (ZC-E0215). The file could not be read, is not what the server wrote, or could not be written. A file that does not parse stops the start: the server does not guess. A save that fails while the server runs does not stop it, but the file then lags behind what the server knows, and a crash in that time forgets the difference; the failure is shown once in the log and in GET /v1/status.</p>
 <p>Check the state directory (--state-dir) and its permissions. If the file is damaged and the store is the one to trust, delete the file; the server then remembers the store as it finds it.</p>
+<p>An agent raises it too, about the file remembered in its own state directory, which holds the highest revision and hash the server's answers carried and the server address they came from. A file the agent cannot read, or did not write, stops its start; one written by a newer zcube-agent says so. A save that fails while the agent runs does not stop it: it warns once, naming the file, and tries again. If the file is damaged, delete it and restart the agent; it then remembers the server as it finds it.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0216</pre>

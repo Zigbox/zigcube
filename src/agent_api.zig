@@ -15,6 +15,15 @@
 //!   POST /v1/agent/nodes/{node}/observed               one transaction of puts and deletes
 //!   GET  /v1/agent/nodes/{node}/watch?from=&timeout=   "something changed", a long poll
 //!
+//! **Every answer carries `chain`**: `{"revision": R, "hash": "<hex>"}`, the store's `status`
+//! taken after the endpoint's work (the watch: the head it answered at). Every endpoint takes
+//! `known=K`, the revision the agent remembers; when `K <= R` the pair adds `known_hash`, the
+//! store's hash at `K` (left out on `NoHash`). The agent refuses an answer from behind with them
+//! (`agent_client.zig`, "Nothing from behind"); the server only reports. `verified` says whether
+//! the server keeps the store's pair across its own restarts (`Api.pair_kept`): false for a
+//! memory store, which starts empty with every start, and then the agent keeps no pair either.
+//! The write endpoints take the pair from their own transaction when it wrote (`hash`).
+//!
 //! **The watch carries no events.** It answers whether a key under the watched prefix changed
 //! since revision `from`, with a bookmark. The agent reconciles by level, so it lists again and
 //! lets the core decide; there is no gap to close and no event to lose. The wait is the shell's
@@ -65,6 +74,7 @@ pub fn route(
     query: []const u8,
     body: []const u8,
     hold: bool,
+    pair_kept: bool,
 ) Failure!Reply {
     assert(ctx.diag.code == null);
     const nodes = parts.next() orelse return no_such(ctx, "/v1/agent");
@@ -73,13 +83,15 @@ pub fn route(
     if (records.name_problem(node, constants.node_name_bytes_max) != null) {
         return bad_request(ctx, "node", "is not a valid node name");
     }
+    const numbers = try query_numbers(ctx, query);
     const call: Call = .{
         .ctx = ctx,
         .node = node,
         .method = method,
-        .query = query,
+        .numbers = numbers,
         .body = body,
         .hold = hold,
+        .pair_kept = pair_kept,
         .parts = parts,
     };
     const what = parts.next() orelse return call.register();
@@ -94,9 +106,10 @@ const Call = struct {
     ctx: *const Context,
     node: []const u8,
     method: []const u8,
-    query: []const u8,
+    numbers: Numbers,
     body: []const u8,
     hold: bool,
+    pair_kept: bool,
     parts: *Parts,
 
     fn require_method(call: Call, wanted: []const u8) Failure!void {
@@ -109,12 +122,63 @@ const Call = struct {
         if (call.parts.next() != null) return no_such(call.ctx, "that path");
     }
 
+    /// Every endpoint but the watch takes `known` alone.
+    fn only_known(call: Call) Failure!void {
+        if (call.numbers.from != null) return no_parameter(call.ctx, "from");
+        if (call.numbers.timeout != null) return no_parameter(call.ctx, "timeout");
+    }
+
+    /// The pair the answer carries: the store's status, read after the endpoint did its work, so
+    /// it is at least as new as anything else in the answer; and the hash at the agent's `known`
+    /// revision when the store has one (docs/api.md, "The chain pair").
+    ///
+    /// Read after the work by a second call, the pair and what the work saw are two moments: a
+    /// store that went back between them and forward again past what the agent remembers is not
+    /// seen. The write endpoints close that window with `chain_written`; the leases (no
+    /// transaction result) and a transaction that wrote nothing keep it.
+    fn chain(call: Call) Failure!Chain {
+        const head = call.ctx.store.status(call.ctx.diag) catch return propagate(call.ctx);
+        return call.chain_of(head.revision, head.hash);
+    }
+
+    /// The pair of the revision a transaction wrote, from its own result: the same moment as the
+    /// write. A transaction that wrote nothing (or a store that cannot say) has no hash: `status`.
+    fn chain_written(call: Call, result: store.TxnResult) Failure!Chain {
+        const hash = result.hash orelse return call.chain();
+        return call.chain_of(result.revision, hash);
+    }
+
+    fn chain_of(call: Call, revision: store.Revision, hash: store.Hash) Failure!Chain {
+        const ctx = call.ctx;
+        var result: Chain = .{
+            .revision = revision,
+            .hash = try hex(ctx, hash),
+            .verified = call.pair_kept,
+        };
+        const known = call.numbers.known orelse return result;
+        // Above the store's revision there is no hash: the agent sees the lower revision and
+        // refuses on that.
+        if (known > revision) return result;
+        if (known == revision) {
+            result.known_hash = result.hash;
+            return result;
+        }
+        const there = ctx.store.hash_at(known, ctx.diag) catch |err| {
+            if (err != error.NoHash) return propagate(ctx);
+            // Before the chain's start: left out, and the agent refuses it as unverifiable.
+            ctx.diag.reset();
+            return result;
+        };
+        result.known_hash = try hex(ctx, there);
+        return result;
+    }
+
     // ---- PUT /v1/agent/nodes/{node} ----
 
     fn register(call: Call) Failure!Reply {
         const ctx = call.ctx;
         try call.require_method("PUT");
-        try no_query(ctx, call.query);
+        try call.only_known();
         const input = try parse_body(RegisterBody, ctx, call.body);
         if (input.lease == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
         const capacity = input.capacity;
@@ -139,7 +203,8 @@ const Call = struct {
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
-        return reply(ctx, .{ .revision = result.revision });
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
     // ---- POST /v1/agent/nodes/{node}/lease[/{id}/keepalive] ----
@@ -147,7 +212,7 @@ const Call = struct {
     fn lease(call: Call) Failure!Reply {
         const ctx = call.ctx;
         try call.require_method("POST");
-        try no_query(ctx, call.query);
+        try call.only_known();
         const id_text = call.parts.next() orelse return call.lease_grant();
         const keepalive = call.parts.next() orelse return no_such(ctx, "that path");
         if (!std.mem.eql(u8, keepalive, "keepalive")) return no_such(ctx, "that path");
@@ -156,14 +221,16 @@ const Call = struct {
             return bad_request(ctx, "lease", "is not a number");
         if (id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
         const granted = ctx.store.lease_keepalive(id, ctx.diag) catch return propagate(ctx);
-        return reply(ctx, .{ .lease = .{ .id = granted.id, .ttl_ms = granted.ttl_ms } });
+        const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
+        return reply(ctx, .{ .lease = lease_reply, .chain = try call.chain() });
     }
 
     fn lease_grant(call: Call) Failure!Reply {
         const ctx = call.ctx;
         const input = try parse_body(LeaseBody, ctx, call.body);
         const granted = ctx.store.lease_grant(input.ttl_ms, ctx.diag) catch return propagate(ctx);
-        return reply(ctx, .{ .lease = .{ .id = granted.id, .ttl_ms = granted.ttl_ms } });
+        const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
+        return reply(ctx, .{ .lease = lease_reply, .chain = try call.chain() });
     }
 
     // ---- GET /v1/agent/nodes/{node}/replicas ----
@@ -171,7 +238,7 @@ const Call = struct {
     fn replicas(call: Call) Failure!Reply {
         const ctx = call.ctx;
         try call.require_method("GET");
-        try no_query(ctx, call.query);
+        try call.only_known();
         try call.no_more();
         const all = controller.list_all(
             records.Replica,
@@ -188,14 +255,15 @@ const Call = struct {
             }
             mine.append(ctx.arena, item_of(records.Replica, entry)) catch return no_memory(ctx);
         }
-        return reply(ctx, .{ .revision = all.revision, .kvs = mine.items });
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = all.revision, .kvs = mine.items, .chain = pair });
     }
 
     // ---- GET and POST /v1/agent/nodes/{node}/observed ----
 
     fn observed(call: Call) Failure!Reply {
         const ctx = call.ctx;
-        try no_query(ctx, call.query);
+        try call.only_known();
         try call.no_more();
         if (std.mem.eql(u8, call.method, "POST")) return call.report();
         try call.require_method("GET");
@@ -211,7 +279,8 @@ const Call = struct {
         const items = ctx.arena.alloc(Item(records.Observed), all.items.len) catch
             return no_memory(ctx);
         for (all.items, items) |entry, *slot| slot.* = item_of(records.Observed, entry);
-        return reply(ctx, .{ .revision = all.revision, .kvs = items });
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = all.revision, .kvs = items, .chain = pair });
     }
 
     /// One transaction: the observed records to write and the replica ids whose records go.
@@ -243,7 +312,8 @@ const Call = struct {
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
-        return reply(ctx, .{ .revision = result.revision });
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
     /// The key is this node's observed key for the replica the record names, and the record says
@@ -281,7 +351,7 @@ const Call = struct {
         const ctx = call.ctx;
         try call.require_method("GET");
         try call.no_more();
-        const numbers = try query_numbers(ctx, call.query);
+        const numbers = call.numbers;
         const from = numbers.from orelse
             return bad_request(ctx, "from", "is required: the revision to resume from");
         if (from == 0) return bad_request(ctx, "from", "must be at least 1");
@@ -304,7 +374,9 @@ const Call = struct {
                 break;
             }
         }
-        var answer = try reply(ctx, .{ .revision = bookmark, .changed = changed });
+        // The head was read before the watch, after every earlier request of this agent.
+        const pair = try call.chain_of(head.revision, head.hash);
+        var answer = try reply(ctx, .{ .revision = bookmark, .changed = changed, .chain = pair });
         if (!changed) {
             if (call.hold) {
                 if (timeout > 0) {
@@ -336,6 +408,19 @@ const RegisterBody = struct {
 const LeaseBody = struct { ttl_ms: u32 };
 
 const ObservedPut = struct { key: []const u8, value: records.Observed };
+
+/// The chain pair every answer carries (docs/api.md, "The chain pair"): hashes in lower-case hex.
+const Chain = struct {
+    revision: u64,
+    hash: []const u8,
+    known_hash: ?[]const u8 = null,
+    /// False when the server does not keep this store's pair across its restarts.
+    verified: bool,
+};
+
+fn hex(ctx: *const Context, hash: store.Hash) Failure![]const u8 {
+    return std.fmt.allocPrint(ctx.arena, "{x}", .{&hash}) catch no_memory(ctx);
+}
 
 const ObservedBody = struct {
     puts: []const ObservedPut = &.{},
@@ -407,13 +492,12 @@ fn no_duplicates(ctx: *const Context, ops: []const store.Op) Failure!void {
     }
 }
 
-// ---- The query string: `from` and `timeout` only ----------------------------------------------
+// ---- The query string: `known` everywhere, `from` and `timeout` for the watch -----------------
 
-const Numbers = struct { from: ?u64 = null, timeout: ?u64 = null };
+const Numbers = struct { from: ?u64 = null, timeout: ?u64 = null, known: ?u64 = null };
 
-fn no_query(ctx: *const Context, text: []const u8) Failure!void {
-    if (text.len == 0) return;
-    return bad_request(ctx, "query", "this endpoint takes no parameters");
+fn no_parameter(ctx: *const Context, name: []const u8) Failure {
+    return bad_request(ctx, name, "this endpoint takes no such parameter");
 }
 
 fn query_numbers(ctx: *const Context, text: []const u8) Failure!Numbers {
@@ -437,6 +521,7 @@ fn query_numbers(ctx: *const Context, text: []const u8) Failure!Numbers {
 fn number_slot(numbers: *Numbers, name: []const u8) ?*?u64 {
     if (std.mem.eql(u8, name, "from")) return &numbers.from;
     if (std.mem.eql(u8, name, "timeout")) return &numbers.timeout;
+    if (std.mem.eql(u8, name, "known")) return &numbers.known;
     return null;
 }
 
