@@ -70,6 +70,14 @@ if (mode === "sim") {
     must(why.body.state.text === "service hello: 2/2 running", `state: ${why.body.state.text}`);
     await shot(page, "sim-overview");
   });
+  await check("sim: hello's replicas show the node they are assigned to", async () => {
+    // Placement is /assigned/<node>/<id> (Replica v2 has no node): the replicas list joins on it.
+    await page.evaluate(() => { location.hash = "#/replicas"; });
+    await page.waitForFunction(() => document.querySelector("main")?.innerText.includes("hello-"), null, { timeout: 10000 });
+    const rows = await page.$$eval("main tr", trs => trs.map(tr => tr.innerText).filter(t => t.includes("hello-")));
+    must(rows.length > 0, "no hello replica rows");
+    for (const row of rows) must(row.includes("node1") && !row.includes("unscheduled"), `row: ${row.replace(/\s+/g, " ")}`);
+  });
   await check("sim: the why chain for broken comes from the real core", async () => {
     await page.evaluate(() => { location.hash = "#/why/service/broken"; });
     await page.waitForFunction(() => document.querySelector("main")?.innerText.includes("ZBX-E0501"), null, { timeout: 10000 });

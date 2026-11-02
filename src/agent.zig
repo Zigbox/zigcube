@@ -84,7 +84,7 @@ const PendingStop = struct {
     deadline_ms: u64,
 };
 
-pub const watch_prefixes = [_][]const u8{records.prefix_replicas};
+pub const watch_prefixes = [_][]const u8{ records.prefix_replicas, records.prefix_assigned };
 
 pub const Agent = struct {
     config: Config,
@@ -226,9 +226,24 @@ const Pass = struct {
             null,
             constants.replicas_max,
         );
+        // Mine are the replicas the scheduler assigned to this node; an assignment whose replica
+        // is gone has nothing to run, so its container is stopped.
+        const assigned_prefix = records.assigned_prefix(pass.agent.config.node);
+        const given = try controller.list_all(
+            records.Assigned,
+            &ctx,
+            assigned_prefix.slice(),
+            null,
+            constants.replicas_max,
+        );
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (given.items) |entry| {
+            wanted.put(ctx.arena, entry.rec.replica, {}) catch
+                return failures.no_memory(ctx.diag);
+        }
         var mine: std.ArrayList(controller.Entry(records.Replica)) = .empty;
         for (all.items) |item| {
-            if (!std.mem.eql(u8, item.rec.node, pass.agent.config.node)) continue;
+            if (!wanted.contains(item.rec.id)) continue;
             mine.append(ctx.arena, item) catch return failures.no_memory(ctx.diag);
         }
         pass.mine = mine.items;
@@ -244,7 +259,7 @@ const Pass = struct {
     }
 
     /// The observed record of `item`'s replica, unless it is a leftover of an earlier replica
-    /// with the same id (a service deleted and applied again restarts its numbering), which
+    /// with the same id (an older store, or one removed before its cleanup), which
     /// must never stand in for this one: such a record is replaced, not obeyed.
     fn observed_for(
         pass: *const Pass,
@@ -297,7 +312,7 @@ const Pass = struct {
     }
 
     /// The runtime holds a container of this name that belongs to an earlier replica with the
-    /// same id (a service deleted and applied again restarts its numbering, and the old
+    /// same id (an older store, or one removed before its cleanup, and the old
     /// container may not have been cleaned up yet): it is stopped, never adopted, and once it
     /// has stopped the right one is started in its place. A stop is asked for once and checked
     /// on later steps, like an orphan's.
@@ -366,7 +381,7 @@ const Pass = struct {
         const now = pass.ctx.clock.now_ms();
         var wanted: records.Observed = .{
             .replica = replica.id,
-            .node = replica.node,
+            .node = pass.agent.config.node,
             .generation = replica.generation,
             .status = .running,
             .started_at_ms = if (seen) |record| record.started_at_ms orelse now else now,
@@ -418,7 +433,7 @@ const Pass = struct {
         const now = pass.ctx.clock.now_ms();
         try pass.put_observed(.{
             .replica = replica.id,
-            .node = replica.node,
+            .node = pass.agent.config.node,
             .generation = replica.generation,
             .status = .stopped,
             .exit = .{ .kind = .lost },
@@ -457,7 +472,7 @@ const Pass = struct {
         const now = ctx.clock.now_ms();
         var observed: records.Observed = .{
             .replica = replica.id,
-            .node = replica.node,
+            .node = pass.agent.config.node,
             .generation = replica.generation,
             .status = .running,
             .started_at_ms = now,

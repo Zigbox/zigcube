@@ -75,6 +75,19 @@ export class Engine {
 
   values(prefix) { return this.list(prefix, { limit: 100000 }).kvs.map(kv => kv.value); }
 
+  /** Replica records (v2: no node) joined with where they are assigned, /assigned/<node>/<id>. */
+  replicasIn(prefix) {
+    const where = new Map(this.list("/assigned/", { limit: 100000 }).kvs.map(kv => [kv.value.replica, kv.key.split("/")[2]]));
+    return this.values(prefix).map(r => ({ ...r, node: where.get(r.id) || "" }));
+  }
+
+  /** Ops that delete a replica and its assignment (the scheduler releases it in C1). */
+  dropReplica(r) {
+    const ops = [{ del: `/replicas/${r.service}/${r.id}` }];
+    if (r.node) ops.push({ del: `/assigned/${r.node}/${r.id}` });
+    return ops;
+  }
+
   /** One transaction, one revision. ops: {put:[key, value, lease?]} | {del:key}. */
   commit(ops) {
     this.requireUp();
@@ -207,11 +220,10 @@ export class Engine {
     const existing = this.getKv(key);
     const same = existing && ["image", "command", "env", "limits"].every(k => JSON.stringify(existing.value[k]) === JSON.stringify(spec[k] ?? (k === "env" ? [] : k === "limits" ? {} : undefined)));
     const value = {
-      v: 1, name: spec.name, image: spec.image, replicas: spec.replicas, command: spec.command,
+      v: 2, name: spec.name, image: spec.image, replicas: spec.replicas, command: spec.command,
       env: spec.env || [], limits: spec.limits || {},
       // A change of the replica count alone does not bump the generation here; keys.md is silent on it.
       generation: existing ? existing.value.generation + (same ? 0 : 1) : 1,
-      next_replica: existing ? existing.value.next_replica : 1,
       applied_by: actor, request_id: requestId, // proposed additions to /services/<name>, see docs/api.md
     };
     this.commit([{ put: [key, value] }]);
@@ -240,7 +252,7 @@ export class Engine {
         cause: { kind: "observed", key: kv.key, revision: kv.mod_revision },
       });
       const ops = [...joined.ops];
-      const all = this.values("/replicas/");
+      const all = this.replicasIn("/replicas/");
       const others = all.filter(r => r.node && r.node !== name).length;
       if (rejoin && others > 0 && !all.some(r => r.node === name)) {
         ops.push(...this.decision({
@@ -268,7 +280,7 @@ export class Engine {
   observedOf(r) { return r.node ? this.get(`/observed/${r.node}/${r.id}`) : null; }
 
   serviceController(svc) {
-    const replicas = this.values(`/replicas/${svc.name}/`);
+    const replicas = this.replicasIn(`/replicas/${svc.name}/`);
     const svcKv = this.getKv(`/services/${svc.name}`);
     const live = [];
     const removed = [];
@@ -284,7 +296,7 @@ export class Engine {
           reason: `node ${r.node} is gone, so ${r.id} can no longer be running there`,
           cause: lostId ? { kind: "decision", id: lostId } : { kind: "resync" },
         });
-        ops.push(...d.ops, { del: `/replicas/${svc.name}/${r.id}` });
+        ops.push(...d.ops, ...this.dropReplica(r));
         removed.push({ replica: r, decisionId: d.id, why: `${r.id} was lost with node ${r.node}` });
       } else if (obs && obs.status === "stopped") {
         const obsKv = this.getKv(`/observed/${r.node}/${r.id}`);
@@ -308,14 +320,16 @@ export class Engine {
             cause: { kind: "observed", key: obsKv.key, revision: obsKv.mod_revision },
             causeDiagnostic: obs.diagnostic,
           });
-          ops.push(...d.ops, { del: `/replicas/${svc.name}/${r.id}` });
+          ops.push(...d.ops, ...this.dropReplica(r));
           removed.push({ replica: r, decisionId: d.id, why: `${r.id} ${this.exitText(obs.exit)}` });
         }
       } else live.push(r);
     }
 
     const want = svc.replicas;
-    let next = svc.next_replica;
+    const counterKey = `/replica-numbers/${svc.name}`;
+    const counted = this.get(counterKey)?.next ?? 1;
+    let next = counted;
     const baseCause = removed.length
       ? { kind: "decision", id: removed[0].decisionId }
       : { kind: "desired", key: svcKv.key, revision: svcKv.mod_revision };
@@ -338,9 +352,13 @@ export class Engine {
           cause: { kind: "decision", id: sd.id },
         });
         const placed = this.place(svc, placing, create.id, id);
-        const replica = { v: 1, id, service: svc.name, generation: svc.generation, node: placed ? placed.node : "", image: svc.image, command: svc.command, env: svc.env, limits: svc.limits };
+        const replica = { v: 2, id, service: svc.name, generation: svc.generation, image: svc.image, command: svc.command, env: svc.env, limits: svc.limits };
         ops.push(...create.ops, { put: [`/replicas/${svc.name}/${id}`, replica] });
-        if (placed) ops.push(...placed.ops);
+        if (placed) {
+          ops.push(...placed.ops);
+          const assignment = { v: 1, replica: id, service: svc.name, requests: placed.requests, reason: placed.reason };
+          ops.push({ put: [`/assigned/${placed.node}/${id}`, assignment] });
+        }
       }
     } else if (live.length > want) {
       const victims = [...live].sort((a, b) => this.rank(a) - this.rank(b) || this.num(b.id) - this.num(a.id)).slice(0, live.length - want);
@@ -354,11 +372,11 @@ export class Engine {
         ops.push(...this.decision({
           actor: "replica-controller", action: "delete_replica", subject: { kind: "replica", name: v.id },
           reason: `removing ${v.id} to get from ${live.length} to ${want} ${want === 1 ? "replica" : "replicas"}`, cause: { kind: "decision", id: sd.id },
-        }).ops, { del: `/replicas/${svc.name}/${v.id}` });
+        }).ops, ...this.dropReplica(v));
       }
     }
 
-    if (next !== svc.next_replica) ops.push({ put: [`/services/${svc.name}`, { ...svc, next_replica: next }] });
+    if (next !== counted) ops.push({ put: [counterKey, { v: 1, next }] });
     if (ops.length) this.commit(ops);
   }
 
@@ -379,7 +397,7 @@ export class Engine {
 
   placementState() {
     const nodes = this.list("/nodes/").kvs.map(kv => kv.value);
-    const replicas = this.values("/replicas/");
+    const replicas = this.replicasIn("/replicas/");
     return { nodes, replicas: [...replicas] };
   }
 
@@ -401,7 +419,7 @@ export class Engine {
       ? `${pick.name} is the only node, and it fits ${need.cpu}m CPU and ${Math.round(need.mem / 1048576)} MiB`
       : `${pick.name} has the fewest ${svc.name} replicas of the ${fits.length} nodes that fit (${counts})`;
     const d = this.decision({ actor: "scheduler", action: "place_replica", subject: { kind: "replica", name: replicaId }, reason, cause: { kind: "decision", id: causeId } });
-    return { node: pick.name, ops: d.ops };
+    return { node: pick.name, ops: d.ops, reason, requests: { cpu_millis: need.cpu, memory_bytes: need.mem } };
   }
 
   // ---- Agents ------------------------------------------------------------------------------
@@ -427,7 +445,7 @@ export class Engine {
       this.commit([{ put: [`/nodes/${a.name}`, { v: 1, name: a.name, agent_version: "0.0.0", address: a.address, capacity: a.capacity, labels: [] }, a.lease.id] }]);
     } else a.lease.deadline = this.t + a.lease.ttl; // keepalive: not a revision
 
-    const mine = this.list("/replicas/").kvs.map(kv => kv.value).filter(r => r.node === a.name);
+    const mine = this.replicasIn("/replicas/").filter(r => r.node === a.name);
     if (a.fresh) { // a restarted agent finds no process for what it had been running: it reports them lost
       a.fresh = false;
       const lost = mine.filter(r => ["running", "starting"].includes(this.get(`/observed/${a.name}/${r.id}`)?.status));
@@ -457,7 +475,7 @@ export class Engine {
   }
 
   runningReplicas(service) {
-    return this.values(`/replicas/${service}/`).filter(r => this.observedOf(r)?.status === "running").map(r => r.id);
+    return this.replicasIn(`/replicas/${service}/`).filter(r => this.observedOf(r)?.status === "running").map(r => r.id);
   }
 
   storeDiagnostic() { return diagStoreDown(this.backend); }

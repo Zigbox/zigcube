@@ -1,5 +1,5 @@
 //! The service and replica controller of C0: it keeps `/replicas/<service>/*` matching
-//! `/services/<name>`, and places each replica on a node. One step, level-triggered and
+//! `/services/<name>`. It does not place them (`scheduler.zig` does). One step, level-triggered and
 //! idempotent (see `controller.zig` for the step model): it compares what is desired with what
 //! the agents observed, and for every difference it commits the action together with a decision
 //! record that names its cause (docs/keys.md, "Decisions"). On a converged system a step writes
@@ -20,9 +20,6 @@
 //!     does not bump `generation`, so scaling never replaces what runs);
 //!   - replicas of a service that no longer exists: `scale_down` on the (gone) service and
 //!     `stop_replica` for each;
-//!   - a replica with no node: placed by `place` (the C0 scheduler: a node whose declared
-//!     capacity fits the replica's resolved requests, the fewest replicas of the same service
-//!     first), with a `place_replica` decision.
 //!
 //! A transaction touches at most `batch_replicas_max` replicas, so a big change takes several
 //! steps; each leaves the system in a state the next step can continue from.
@@ -46,28 +43,27 @@ const DecisionId = records.DecisionId;
 const ServiceEntry = Entry(records.Service);
 const ReplicaEntry = Entry(records.Replica);
 const ObservedEntry = Entry(records.Observed);
+const NumberEntry = Entry(records.ReplicaNumber);
 
 pub const actor = "replica-controller";
-pub const scheduler_actor = "scheduler";
 
 /// Replicas one transaction creates or removes: 2 operations for the service decision, 3 for each
 /// replica (a decision with its index entry, and the replica), and 1 for the service itself.
 const batch_replicas_max: u32 = 4;
-/// Placements per transaction: 3 operations each.
-const batch_places_max: u32 = 5;
 const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{
     records.prefix_services,
     records.prefix_replicas,
     records.prefix_observed,
-    records.prefix_nodes,
+    records.prefix_assigned,
+    records.prefix_replica_numbers,
 };
 
 comptime {
     assert(2 + batch_replicas_max * 3 + 1 <= constants.store_txn_ops_max);
-    assert(batch_places_max * 3 <= constants.store_txn_ops_max);
-    assert(1 + batch_replicas_max <= constants.store_txn_compares_max);
+    // The service, the counter, and per replica its key and (when it is dead) its assignment.
+    assert(2 + batch_replicas_max * 2 <= constants.store_txn_compares_max);
 }
 
 pub const ReplicaController = struct {
@@ -92,7 +88,6 @@ pub const ReplicaController = struct {
             .snap = &snapshot,
             .txns_left = constants.controller_txns_per_step_max,
         };
-        try run.place_unplaced();
         for (snapshot.services) |*service| try run.reconcile_service(service);
         try run.reconcile_orphans();
         if (now >= rc.retention.due_ms) {
@@ -168,6 +163,7 @@ const Run = struct {
     }
 
     fn reconcile_service(run: *Run, service: *const Entry(records.Service)) Error!void {
+        if (try run.seed_counter(service)) return;
         var plan: ServicePlan = .{};
         try run.classify(service, &plan);
         if (!try run.hold_pass(service, &plan)) return;
@@ -228,7 +224,7 @@ const Run = struct {
             batch.expect(observed.kv.key, observed.kv.mod_revision);
             const reason = try controller.format(run.ctx, "replica {s} failed to start on {s}; " ++
                 "it was not replaced because a new one would fail the same way", .{
-                item.replica.rec.id, item.replica.rec.node,
+                item.replica.rec.id, observed.rec.node,
             });
             _ = try controller.put_decision(run.ctx, &run.rc.source, .{
                 .actor = actor,
@@ -363,10 +359,10 @@ const Run = struct {
         const lost = exit.kind == .lost;
         const reason = if (lost)
             try controller.format(run.ctx, "{s} was lost on {s}: its supervisor or process " ++
-                "vanished, so it is being removed", .{ replica.rec.id, replica.rec.node })
+                "vanished, so it is being removed", .{ replica.rec.id, observed.rec.node })
         else
             try controller.format(run.ctx, "{s} {s} on {s}, so it is being removed", .{
-                replica.rec.id, records.exit_text(exit, &buffer), replica.rec.node,
+                replica.rec.id, records.exit_text(exit, &buffer), observed.rec.node,
             });
         const id = try controller.put_decision(run.ctx, &run.rc.source, .{
             .actor = actor,
@@ -381,6 +377,10 @@ const Run = struct {
             .cause_diagnostic = observed.rec.diagnostic,
         }, batch);
         batch.expect(replica.kv.key, replica.kv.mod_revision);
+        // The observed record was found through the assignment: if the replica moved, the
+        // judgement was about another placement, so the assignment is in the read set.
+        const placed = run.snap.assigned_of(replica.rec.id).?;
+        batch.expect(placed.kv.key, placed.kv.mod_revision);
         batch.delete(replica.kv.key);
         return id;
     }
@@ -421,8 +421,9 @@ const Run = struct {
 
     // ---- Creating ----
 
-    /// Adds `count` replicas to `batch`, each with its decision, and moves the service's
-    /// `next_replica` in the same transaction (docs/keys.md).
+    /// Adds `count` replicas to `batch`, each with its decision, and moves the service's counter
+    /// (`/replica-numbers/<service>`) in the same transaction, compared at the revision read
+    /// (docs/keys.md).
     fn create_replicas(
         run: *Run,
         batch: *Batch,
@@ -431,7 +432,8 @@ const Run = struct {
         count: u32,
     ) Error!void {
         if (count == 0) return;
-        var next = service.rec.next_replica;
+        const counter = try run.counter_of(service.rec.name);
+        var next = if (counter) |found| found.rec.next else run.first_number(service);
         for (0..count) |_| {
             if (next > constants.replica_number_max) return run.numbers_used_up(service);
             const id = try controller.format(run.ctx, "{s}-{d}", .{ service.rec.name, next });
@@ -448,7 +450,6 @@ const Run = struct {
                 .id = id,
                 .service = service.rec.name,
                 .generation = service.rec.generation,
-                .node = "",
                 .image = service.rec.image,
                 .command = service.rec.command,
                 .env = service.rec.env,
@@ -459,10 +460,71 @@ const Run = struct {
             batch.put(try controller.key_copy(run.ctx, &key), value);
             next += 1;
         }
-        var updated = service.rec;
-        updated.next_replica = next;
-        const bytes = try records.encode(run.ctx.arena, updated, run.ctx.diag);
-        batch.put(service.kv.key, bytes);
+        const counter_at = records.replica_numbers_key(service.rec.name);
+        const key = try controller.key_copy(run.ctx, &counter_at);
+        batch.expect(key, if (counter) |found| found.kv.mod_revision else 0);
+        const number: records.ReplicaNumber = .{ .next = next };
+        const bytes = try records.encode(run.ctx.arena, number, run.ctx.diag);
+        batch.put(key, bytes);
+    }
+
+    /// A service record that still carries a C0 `next_replica` gets its counter at once, not
+    /// only when it next needs a replica: a C0 service at full count that is deleted and applied
+    /// again would otherwise start from 1 and reuse an id. True if it tried (the next pass goes
+    /// on); false if there was nothing to seed.
+    fn seed_counter(run: *Run, service: *const ServiceEntry) Error!bool {
+        if (service.rec.next_replica == null) return false;
+        if (try run.counter_of(service.rec.name) != null) return false;
+        if (!run.budget()) return true;
+        var batch: Batch = .{};
+        batch.expect(service.kv.key, service.kv.mod_revision);
+        try run.put_counter(&batch, service.rec.name, run.first_number(service));
+        _ = try run.finish(&batch);
+        return true;
+    }
+
+    /// Creates a counter that is absent at the snapshot's revision (compared as absent).
+    fn put_counter(run: *Run, batch: *Batch, service: []const u8, next: u64) Error!void {
+        const counter_at = records.replica_numbers_key(service);
+        const key = try controller.key_copy(run.ctx, &counter_at);
+        batch.expect(key, 0);
+        const number: records.ReplicaNumber = .{ .next = next };
+        batch.put(key, try records.encode(run.ctx.arena, number, run.ctx.diag));
+    }
+
+    /// The service's counter at the snapshot's revision, or null if it has none. One read per
+    /// service about to get replicas; the counters are never listed, so how many there are
+    /// bounds nothing.
+    fn counter_of(run: *Run, service: []const u8) Error!?NumberEntry {
+        const key = records.replica_numbers_key(service);
+        const got = try run.ctx.store.get(
+            run.ctx.arena,
+            key.slice(),
+            run.snap.revision,
+            run.ctx.diag,
+        );
+        const kv = got.kv orelse return null;
+        const rec = try records.read(records.ReplicaNumber, run.ctx.arena, kv, run.ctx.diag);
+        return .{ .kv = kv, .rec = rec };
+    }
+
+    /// The first number of a service that has no counter yet: the larger of a v1 service
+    /// record's `next_replica` and one past the highest replica number there is, so a number is
+    /// never reused. A counter is never deleted (one small key per service name ever applied), so
+    /// this runs only for a name never counted before.
+    fn first_number(run: *Run, service: *const ServiceEntry) u64 {
+        return @max(service.rec.next_replica orelse 1, run.past_highest(service.rec.name));
+    }
+
+    /// One past the highest replica number of `service` in the snapshot, or 1 if it has none.
+    fn past_highest(run: *Run, service: []const u8) u64 {
+        var first: u64 = 1;
+        for (run.snap.replicas) |replica| {
+            if (!std.mem.eql(u8, replica.rec.service, service)) continue;
+            const number = records.replica_number(service, replica.rec.id) orelse continue;
+            first = @max(first, @as(u64, number) + 1);
+        }
+        return first;
     }
 
     fn numbers_used_up(run: *Run, service: *const Entry(records.Service)) error{NoCapacity} {
@@ -557,6 +619,11 @@ const Run = struct {
         }
         if (count == 0) return;
         if (!run.budget()) return;
+        // A deleted service that never had a counter (deleted before the seeding pass) leaves
+        // one past its highest replica, so a re-apply cannot reuse an id.
+        if (try run.counter_of(gone.?) == null) {
+            try run.put_counter(&batch, gone.?, run.past_highest(gone.?));
+        }
         _ = try run.finish(&batch);
     }
 
@@ -575,99 +642,6 @@ const Run = struct {
                 .revision = run.snap.revision,
             },
         }, batch);
-    }
-
-    // ---- Scheduling ----
-
-    fn place_unplaced(run: *Run) Error!void {
-        var batch: Batch = .{};
-        var placed: u32 = 0;
-        var loads: [constants.nodes_max]Load = undefined;
-        const nodes = run.snap.nodes;
-        for (nodes, 0..) |node, index| loads[index] = load_of(run.snap, node.rec);
-        for (run.snap.replicas) |*replica| {
-            if (replica.rec.node.len != 0) continue;
-            if (run.snap.service_of(replica.rec.service) == null) continue;
-            if (placed == batch_places_max) break;
-            const chosen = choose_node(run.snap, replica, loads[0..nodes.len]) orelse continue;
-            try run.place(&batch, replica, nodes[chosen].rec, loads[chosen..][0..1]);
-            placed += 1;
-        }
-        if (placed == 0) return;
-        if (!run.budget()) return;
-        _ = try run.finish(&batch);
-    }
-
-    fn place(
-        run: *Run,
-        batch: *Batch,
-        replica: *const Entry(records.Replica),
-        node: records.Node,
-        load: []Load,
-    ) Error!void {
-        const need = requests_of(&replica.rec);
-        const defaulted = replica.rec.limits.cpu_millis == null or
-            replica.rec.limits.memory_bytes == null;
-        const node_count: u32 = @intCast(run.snap.nodes.len);
-        const reason = try run.place_reason(node, need, defaulted, node_count);
-        const created = try run.create_decision_of(replica.rec.id);
-        const cause: records.Cause = if (created) |*id| controller.cause_decision(id) else .{
-            .kind = .resync,
-        };
-        _ = try controller.put_decision(run.ctx, &run.rc.source, .{
-            .actor = scheduler_actor,
-            .action = "place_replica",
-            .subject = .{ .kind = .replica, .name = replica.rec.id },
-            .reason = reason,
-            .cause = cause,
-        }, batch);
-        var placed = replica.rec;
-        placed.node = node.name;
-        placed.requests = need;
-        const value = try records.encode(run.ctx.arena, placed, run.ctx.diag);
-        batch.expect(replica.kv.key, replica.kv.mod_revision);
-        batch.put(replica.kv.key, value);
-        load[0].cpu += need.cpu_millis;
-        load[0].memory += need.memory_bytes;
-        load[0].count += 1;
-    }
-
-    fn place_reason(
-        run: *Run,
-        node: records.Node,
-        need: records.Requests,
-        defaulted: bool,
-        node_count: u32,
-    ) Error![]const u8 {
-        const mib = @divFloor(need.memory_bytes, 1024 * 1024);
-        const note = if (defaulted) " (a default: the service sets no limits)" else "";
-        if (node_count == 1) {
-            return controller.format(run.ctx, "{s} is the only node, and it fits {d}m CPU and " ++
-                "{d} MiB{s}", .{ node.name, need.cpu_millis, mib, note });
-        }
-        return controller.format(run.ctx, "{s} has the fewest replicas of this service of the " ++
-            "{d} nodes, and it fits {d}m CPU and {d} MiB{s}", .{
-            node.name, node_count, need.cpu_millis, mib, note,
-        });
-    }
-
-    /// The id of the decision that created a replica, read from its by-subject index.
-    fn create_decision_of(run: *Run, replica: []const u8) Error!?DecisionId {
-        const ctx = run.ctx;
-        const prefix = records.index_prefix(.replica, replica);
-        const page = try ctx.store.list(ctx.arena, .{
-            .prefix = prefix.slice(),
-            .limit = 8,
-        }, ctx.diag);
-        for (page.kvs) |kv| {
-            const entry = try records.read(records.IndexEntry, ctx.arena, kv, ctx.diag);
-            if (!std.mem.eql(u8, entry.action, "create_replica")) continue;
-            var id: DecisionId = .{};
-            if (entry.id.len != records.decision_id_bytes) continue;
-            @memcpy(&id.bytes, entry.id);
-            return id;
-        }
-        return null;
     }
 };
 
@@ -715,61 +689,4 @@ fn plural(count: u32, one: []const u8, many: []const u8) []const u8 {
 
 fn nomem(ctx: *const Context) error{NoCapacity} {
     return @import("store_failures.zig").no_memory(ctx.diag);
-}
-
-/// What the scheduler resolves a replica to need: its limits, else the default.
-pub fn requests_of(replica: *const records.Replica) records.Requests {
-    return .{
-        .cpu_millis = replica.limits.cpu_millis orelse constants.request_default_cpu_millis,
-        .memory_bytes = replica.limits.memory_bytes orelse constants.request_default_memory_bytes,
-    };
-}
-
-/// A node's used capacity, from the replicas assigned to it.
-const Load = struct { cpu: u64, memory: u64, count: u32 };
-
-fn load_of(snapshot: *const Snapshot, node: records.Node) Load {
-    var load: Load = .{ .cpu = 0, .memory = 0, .count = 0 };
-    for (snapshot.replicas) |replica| {
-        if (!std.mem.eql(u8, replica.rec.node, node.name)) continue;
-        const need = replica.rec.requests orelse requests_of(&replica.rec);
-        load.cpu += need.cpu_millis;
-        load.memory += need.memory_bytes;
-        load.count += 1;
-    }
-    return load;
-}
-
-/// The node for a replica: one whose capacity fits it, with the fewest replicas of the same
-/// service, then the lowest name. Null if none fits.
-fn choose_node(
-    snapshot: *const Snapshot,
-    replica: *const ReplicaEntry,
-    loads: []const Load,
-) ?usize {
-    const need = requests_of(&replica.rec);
-    var best: ?usize = null;
-    var best_count: u32 = 0;
-    for (snapshot.nodes, 0..) |node, index| {
-        const fits_cpu = loads[index].cpu + need.cpu_millis <= node.rec.capacity.cpu_millis;
-        const memory_after = loads[index].memory + need.memory_bytes;
-        const fits_memory = memory_after <= node.rec.capacity.memory_bytes;
-        if (!fits_cpu) continue;
-        if (!fits_memory) continue;
-        const count = service_count_on(snapshot, node.rec.name, replica.rec.service);
-        if (best == null or count < best_count) {
-            best = index;
-            best_count = count;
-        }
-    }
-    return best;
-}
-
-fn service_count_on(snapshot: *const Snapshot, node: []const u8, service: []const u8) u32 {
-    var count: u32 = 0;
-    for (snapshot.replicas) |replica| {
-        if (!std.mem.eql(u8, replica.rec.node, node)) continue;
-        if (std.mem.eql(u8, replica.rec.service, service)) count += 1;
-    }
-    return count;
 }

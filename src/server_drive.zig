@@ -15,7 +15,7 @@ const Clock = @import("clock.zig").Clock;
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 const store_verified = @import("store_verified.zig");
@@ -28,7 +28,7 @@ pub const Driver = struct {
     io: std.Io,
     store: store.Store,
     clock: Clock,
-    replicas: replica_controller.ReplicaController,
+    plane: control_plane.ControlPlane,
     stopping: *const std.atomic.Value(bool),
     /// Print a coded diagnostic for a failing step; false in tests that make the store fail.
     report_failures: bool,
@@ -82,11 +82,11 @@ pub const Driver = struct {
 
     /// One step: first the store is checked against what the server remembers (a `status` through
     /// the `VerifiedStore`, which halts everything on a store that went backwards), then the
-    /// controller runs.
+    /// control plane runs every controller.
     fn step(driver: *Driver, ctx: *const controller.Context) controller.Error!controller.Wakeup {
         _ = try driver.store.status(ctx.diag);
         driver.report_saving();
-        return driver.replicas.reconcile(ctx);
+        return driver.plane.reconcile(ctx);
     }
 
     /// A pair that cannot be saved (`ZC-E0216`) is shown once when it starts, and once when it

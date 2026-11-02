@@ -230,7 +230,6 @@ test "a node is given its own replicas, with the env values the container needs"
     try testing.expectEqual(@as(usize, 2), kvs.len);
     for (kvs) |kv| {
         const replica = field(kv, "value");
-        try testing.expectEqualStrings("node1", field(replica, "node").string);
         const pair = field(replica, "env").array.items[0];
         try testing.expectEqualStrings("s3cr3t", pair.array.items[1].string);
         try testing.expect(std.mem.startsWith(u8, field(kv, "key").string, "/replicas/hello/"));
@@ -475,7 +474,7 @@ test "every agent answer carries the store's chain pair, and its hash at the age
     try rig.refused(rig.call("GET", base ++ "/replicas", "known=x", ""), 400, "ZC-E0104");
 }
 
-test "known on the lease grant and the observed endpoints, and on a watch above the head" {
+test "known on the lease grant, assigned and observed endpoints, and on a watch above the head" {
     // Goal: the endpoints the first test leaves out take `known` too, and a write's pair is its
     // own transaction's (it equals the head here: nothing else writes between the calls).
     var rig = try Rig.start(10);
@@ -506,6 +505,10 @@ test "known on the lease grant and the observed endpoints, and on a watch above 
     );
     const listed = try rig.ok("GET", base ++ "/observed", below, "");
     try expect_chain(&rig, listed, head - 1);
+    const assigned = try rig.ok("GET", base ++ "/assigned", below, "");
+    try expect_chain(&rig, assigned, head - 1);
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/assigned", "", ""), null);
+    try rig.refused(rig.call("GET", base ++ "/assigned", "from=1", ""), 400, "ZC-E0104");
 
     // The agent remembers no more than the head it was last told, so a `known` above the head
     // the watch reads first is from another history: no `known_hash`.

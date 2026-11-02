@@ -302,7 +302,7 @@ test "the node's replicas come back with env values, and its reports go in and o
     try testing.expect(std.mem.startsWith(u8, page.kvs[0].key, "/replicas/hello/hello-"));
     try testing.expect(std.mem.indexOf(u8, page.kvs[0].value, "s3cr3t") != null);
     const replica = try records.read(records.Replica, arena, page.kvs[0], &diag);
-    try testing.expectEqualStrings("node1", replica.node);
+    try testing.expectEqualStrings("hello", replica.service);
 
     const first = "{\"v\":1,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
         "\"status\":\"running\",\"started_at_ms\":1,\"reported_at_ms\":2}";

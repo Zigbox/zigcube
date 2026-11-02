@@ -33,11 +33,6 @@ pub const Role = union(enum) {
 /// The role a prefix belongs to. `agent` stands for the agent of the node in the key.
 const Owner = enum {
     api,
-    /// `/services/<name>`: the API writes it, and C0's replica controller moves its
-    /// `next_replica` counter in the transaction that creates replicas. That is an exception to
-    /// authority.md §2's "sole writer", kept until the counter has a key of its own (see
-    /// docs/DECISIONS.md); it may put the record and never delete it.
-    api_with_counter,
     replica_controller,
     scheduler,
     node_controller,
@@ -50,7 +45,8 @@ const Rule = struct { prefix: []const u8, owner: Owner };
 
 /// The one table of authority.md §2. Longest prefix first where one contains another.
 pub const rules = [_]Rule{
-    .{ .prefix = records.prefix_services, .owner = .api_with_counter },
+    .{ .prefix = records.prefix_services, .owner = .api },
+    .{ .prefix = records.prefix_replica_numbers, .owner = .replica_controller },
     .{ .prefix = records.prefix_replicas, .owner = .replica_controller },
     .{ .prefix = records.prefix_assigned, .owner = .scheduler },
     .{ .prefix = records.prefix_nodes, .owner = .agent },
@@ -103,11 +99,6 @@ fn may_write(role: Role, key: []const u8, op: store.Op) bool {
     switch (rule.owner) {
         .anyone => return true,
         .api => return role == .api,
-        .api_with_counter => switch (role) {
-            .api => return true,
-            .replica_controller => return op == .put,
-            else => return false,
-        },
         .replica_controller => return role == .replica_controller,
         .scheduler => return role == .scheduler,
         .node_controller => return role == .node_controller,
@@ -138,7 +129,6 @@ fn owner_name(key: []const u8) []const u8 {
     return switch (rule.owner) {
         .agent => "the agent of the node in the key",
         .anyone => "every role",
-        .api_with_counter => "api",
         else => |owner| @tagName(owner),
     };
 }
@@ -177,11 +167,12 @@ fn request_of(ops: []const store.Op) store.TxnRequest {
     return .{ .on_success = ops };
 }
 
-/// A key under each prefix of the table, with the role that owns it. `/services/` is also open
-/// to the replica controller's puts, which its own test checks.
+/// A key under each prefix of the table, with the role that owns it. `/services/` is the API's
+/// alone.
 const samples = [_]struct { key: []const u8, role: Role }{
     .{ .key = "/services/hello", .role = .api },
     .{ .key = "/replicas/hello/hello-1", .role = .replica_controller },
+    .{ .key = "/replica-numbers/hello", .role = .replica_controller },
     .{ .key = "/assigned/n1/hello-1", .role = .scheduler },
     .{ .key = "/allocations/n1", .role = .scheduler },
     .{ .key = "/audit/allocations/n1", .role = .auditor },
@@ -208,21 +199,24 @@ test "every prefix has one writer and every other role is refused" {
         const request = request_of(&.{put_op(sample.key)});
         for (every_role) |role| {
             const verdict = allowed(role, request);
-            const is_service = std.mem.eql(u8, sample.key, "/services/hello");
-            const counter = role == .replica_controller and is_service;
-            const should = counter or same_role(role, sample.role);
-            try testing.expectEqual(should, verdict == .allowed);
+            try testing.expectEqual(same_role(role, sample.role), verdict == .allowed);
         }
     }
 }
 
-test "the replica controller may put a service for its counter and never delete one" {
-    // Goal: the one exception to the table of authority.md §2 is as narrow as C0 needs.
+test "/services/ is the API's alone, and the counter is the replica controller's" {
+    // Goal: the exception C0 kept for `next_replica` is gone (authority.md §2). Method: the
+    // replica controller can neither put nor delete a service, and it owns the counter key.
     const key = "/services/hello";
-    try testing.expect(allowed(.replica_controller, request_of(&.{put_op(key)})) == .allowed);
-    const drop = allowed(.replica_controller, request_of(&.{.{ .delete = key }}));
-    try testing.expectEqualStrings("api", drop.refused.owner);
-    try testing.expect(allowed(.scheduler, request_of(&.{put_op(key)})) == .refused);
+    for ([_]Role{ .replica_controller, .scheduler, .node_controller }) |role| {
+        try testing.expect(allowed(role, request_of(&.{put_op(key)})) == .refused);
+        try testing.expect(allowed(role, request_of(&.{.{ .delete = key }})) == .refused);
+    }
+    const counter = "/replica-numbers/hello";
+    try testing.expect(allowed(.replica_controller, request_of(&.{put_op(counter)})) == .allowed);
+    const drop = allowed(.replica_controller, request_of(&.{.{ .delete = counter }}));
+    try testing.expect(drop == .allowed);
+    try testing.expect(allowed(.api, request_of(&.{put_op(counter)})) == .refused);
 }
 
 test "every role may write the decision prefixes" {

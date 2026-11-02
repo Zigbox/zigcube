@@ -292,14 +292,17 @@ pub const RemoteStore = struct {
         assert(options.continue_after == null); // The reply is never paged: see agent_api.zig.
         assert(!options.reverse);
         const observed = records.observed_prefix(remote.node);
+        const assigned = records.assigned_prefix(remote.node);
         const is_replicas = std.mem.eql(u8, options.prefix, records.prefix_replicas);
         const is_observed = std.mem.eql(u8, options.prefix, observed.slice());
-        if (!is_replicas) {
-            if (!is_observed) {
-                return unsupported(diag, "a list of anything but the node's replicas and records");
-            }
+        const is_assigned = std.mem.eql(u8, options.prefix, assigned.slice());
+        if (!is_replicas and !is_observed and !is_assigned) {
+            return unsupported(diag, "a list of anything but the node's replicas and records");
         }
-        const suffix: []const u8 = if (is_replicas) "/replicas" else "/observed";
+        const suffix: []const u8 = if (is_replicas) "/replicas" else if (is_assigned)
+            "/assigned"
+        else
+            "/observed";
         const target = try remote.path(arena, suffix, diag);
         const reply = try remote.exchange(arena, .{ .method = "GET", .target = target }, diag);
         if (reply.status != 200) return refused(arena, reply, diag);
