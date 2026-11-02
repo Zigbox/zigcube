@@ -16,6 +16,19 @@ The only way out is a restore from a backup. There are no rolling upgrades.
 A migrated store has no hashes below the revision it was migrated at: `hash_at` there fails with
 `ZC-E0214`, which says so. That is expected, not damage.
 
+## Postgres high availability: the supported setup
+
+- **One primary.** Zigcube writes to one Postgres server and reads only from it. No reader
+  endpoint, no pooler that routes reads to a replica.
+- **High availability only through a synchronous standby**: `synchronous_commit = remote_apply`
+  (or `on`), and the standby named in `synchronous_standby_names`. A failover to it loses no
+  acknowledged commit, and the server carries on once its address points at the new primary (a
+  virtual IP or a DNS name; the server has no multi-host connection string).
+- **An asynchronous standby is not supported.** A failover to one that was behind loses
+  acknowledged writes. The server notices (next section): it halts with `ZC-E0215`, which names
+  both revisions, and acts on nothing until an operator decides.
+- Both are run for real by `zig build test-store-faults -Dbackend=postgres` (`docs/demos/c1.md`).
+
 ## The server's memory of the store (`--state-dir`)
 
 The server remembers the highest store revision and hash it has seen in `<state dir>/<db file name>.<16 hex digits>.remembered` (SQLite; `<state dir>/remembered` for Postgres),

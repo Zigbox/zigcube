@@ -373,6 +373,21 @@ follow the design above, with these differences of detail. Each is also in the s
 
 `zig build test-store-faults -Dbackend=postgres|sqlite [-Dseed=N]` (`src/store_faults.zig`) drives four client threads and one reconnecting watcher against a real store. Each client makes 250 calls on a connection of its own: reads and compare-and-set on register keys, blind puts, and compare-and-sets that must fail, whose failure branch puts an audit key. Every call is recorded by `testing/history.zig` with a globally unique value token. For Postgres, the clients connect through `testing/fault_proxy.zig`, and the main thread plays a schedule drawn from the seed: latency, `cut_all`, `cut_after` at varied byte counts (so cuts land mid-transaction and near `COMMIT`), one-way stalls, partitions, the black hole, `heal`. A ZC-E0213 ("outcome unknown") is recorded as unknown, any other store error as failed. At the end the proxy is healed, the revision and the whole log are read on a direct connection, and `history.check` and `check_watch` judge the run; a failure prints the verdict and the seed. The clients also delete (compare-and-delete, with an audit put riding in the success branch so a lost answer can be found in the log). After the log is read, a second stage runs historical reads (`get` at a revision) and compactions from three more threads under the same schedule; `history.check_compaction` requires that a read below an acknowledged compaction is refused with `Compacted`, that a read no compaction can have reached is served, and that a served read is what the log says the key was at that revision. For Postgres the step also runs the conformance suite through the proxy with latency, bandwidth limits and stalls only (no cuts: its tests assert exact outcomes). Leases are not modelled yet (`docs/DECISIONS.md`). SQLite has no connection to cut, so no proxy applies: it runs the same clients and checker with no faults, which tests the checker and the store's concurrency, not recovery.
 
+## Failover (C1 slice 10d)
+
+The supported setup is one primary and a synchronous standby (`synchronous_commit = remote_apply`
+or `on`, the standby in `synchronous_standby_names`; only `remote_apply` is tested); nothing reads
+from a replica (`docs/operations.md`). `test-store-faults -Dbackend=postgres` ends with two failover runs
+(`src/store_failover.zig`, plan in `docs/briefs/c1-10d.md`): a primary and a streaming standby
+made by `pg_dev pair-up sync|async`, replication through a fault proxy, a real `zcube-server` and
+10c's recorded clients through a second proxy that is repointed at the promoted standby. With a
+synchronous standby the primary acknowledges no write while replication is cut off, the crash
+lands mid-commit, the load carries on past the promotion, the history checker passes across it and
+the server carries on. With an asynchronous one held back by a partition, the loss is made certain (the
+promoted revision is asserted below the server's remembered one) and the server halts with
+`ZC-E0215`, on status, on apply and after a restart, while the checker reports the lost writes.
+`docs/demos/c1.md` says what each asserts.
+
 ## k3s's kine: what I take and what I leave
 
 kine presents an etcd API on SQL. This section is from my knowledge of its design, not from
