@@ -110,4 +110,5 @@ test "the controllers' tests are in this root" {
     _ = @import("replica_controller_test.zig");
     _ = @import("api_test.zig");
     _ = @import("agent_api_test.zig");
+    _ = @import("agent_fence_test.zig");
 }

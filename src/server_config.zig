@@ -362,3 +362,18 @@ test "flags win over the file, unknown flags and settings are refused" {
     diag.reset();
     try expect_bad(parse_zon(arena, "this is not zon", "server.zon", &diag), &diag);
 }
+
+test "a lease ttl an agent cannot fence in time is ZC-E0121" {
+    // Goal: the inequality of docs/authority.md §3 is enforced at start. Method: the shipped
+    // ttl passes; 20000 and 30000 (margin too small) and 3000 (ttl too short) are refused.
+    var diag: Diag = undefined;
+    diag.reset();
+    const ok = try merge(.{}, .{}, &diag);
+    try testing.expectEqual(constants.lease_ttl_ms, ok.lease_ttl_ms);
+    const refused = [_]u32{ 20_000, 30_000, 3_000 };
+    for (refused) |ttl| {
+        diag.reset();
+        try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = ttl }, .{}, &diag));
+        try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0121), diag.code);
+    }
+}
