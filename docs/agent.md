@@ -196,6 +196,40 @@ real processes, for the owner and for the Zigbox adapter:
    some containers does not reap). `zcube-agent` is not PID 1 and cannot fix that; the smoke test
    counts live supervisors by state, not by `kill(pid, 0)`, for this reason.
 
+## The Zigbox runtime (`--runtime zigbox`)
+
+`zcube-agent --runtime zigbox` runs containers with Zigbox (`src/zigbox_runtime.zig`); `fake` is
+the default and what every test and demo uses. The shape is the fake runtime's: **one supervisor
+per container**, `zcube-agent supervise-zigbox <state>/zigbox/<name>`
+(`src/zigbox_supervisor.zig`), so stopping the agent leaves the containers running and a restart
+adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never holds a Zigbox
+`Handle`.
+
+- **Launch directory** (`zigbox_launch.zig`): `spec.json` (written first by the agent), `lock`
+  (held by the supervisor while it lives), `failed.json` (Zigbox's diagnostic if it could not
+  start). A pull can take minutes before Zigbox has any record, so the replica is `starting`
+  while the lock is held and no record of this launch exists; `lost` if the supervisor is gone and
+  left nothing; `start_failed` with `failed.json`. A Zigbox record older than the launch is an
+  earlier container of the same name and is ignored.
+- **Images** (`zigbox_image.zig`): the supervisor tries `zigbox.start` with the locked tree
+  digest; on ZBX-E0410 (tree not in the store) and a known reference it pulls once, checks the
+  tree it got is the locked one (ZC-E0510 if not) and starts again. `--images FILE` for this
+  runtime is `.{ .images = .{ .{ .digest = "b3:...", .reference = "ghcr.io/o/r@sha256:..." } } }`;
+  the digest-only form is the fake runtime's. Without it nothing is pulled.
+- **Stop**: SIGTERM and a wait of at most 500 ms when there is a grace, SIGKILL when there is
+  none; the caller asks again as with the fake runtime. A fence over N containers costs up to
+  N times 500 ms until the non-blocking `signal` (proposal P2) lands.
+- **Limits** are Zigbox's (`zigbox_map.zig` mirrors its bounds; apply refuses more, ZC-E0513).
+  CPU, memory and pids limits need the user's systemd bus; ZC-E0511 is registered for the case
+  of none.
+- **Preflight**: the agent refuses a host that is not Linux or cannot read Zigbox's run records
+  (ZC-E0512). Zigbox's doctor is not exported, so the rest is named by Zigbox at the first start.
+- **Tests**: the lifecycle calls run over Zigbox's `HostSim` (`zigbox_runtime.zig`); the image
+  decisions are table tests (`zigbox_image.zig`). `start` and the supervisor need a real host:
+  `ZCUBE_REAL_HOST=1 zig build zigbox-smoke` (QEMU guest through Zigbox's `zigbox_vm` module).
+  Today it checks the agent starts and stays up under `--runtime zigbox`; a container from a
+  pulled image is not covered.
+
 ## Known limits
 
 - **Connecting has no timeout.** The standard library's threaded `Io` panics if `connect` is given

@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, zigbox_module);
+    add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
@@ -286,6 +287,26 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     run.has_side_effects = true;
     const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
     b.step("agent-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build zigbox-smoke`: the Zigbox runtime on a real host, in a QEMU guest booted through
+/// Zigbox's exported `zigbox_vm` module (src/zigbox_smoke.zig). Skips unless `ZCUBE_REAL_HOST=1`.
+fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
+    const vm = b.dependency("zigbox", .{}).module("zigbox_vm");
+    const exe = b.addExecutable(.{
+        .name = "zigbox_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zigbox_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox_vm", .module = vm }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArtifactArg(built.agent);
+    run.has_side_effects = true;
+    const help = "Run the Zigbox runtime on a real host in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
+    b.step("zigbox-smoke", help).dependOn(&run.step);
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it;
