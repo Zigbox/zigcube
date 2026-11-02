@@ -1,0 +1,5 @@
+error[ZC-E0403]: the node's accounting changed during the repair
+  cause  the accounting of node1 kept changing during the request
+  fix    run it again   zcube repair allocations node1 --confirm
+  more   zcube explain E0403 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0403.html

@@ -1,0 +1,8 @@
+request  r-0000001  POST /v1/repair/allocations/node1  400
+error[ZC-E0401]: a repair needs confirming
+  cause  would write 2 assignments, 200 cpu millis and 2048 memory bytes to
+         /allocations/node1, which records 3, 300 and 3072
+  reqid  r-0000001
+  fix    if that is right, confirm it   zcube repair allocations node1 --confirm
+  more   zcube explain E0401
+  docs   https://zigbox.github.io/zigcube/errors/E0401.html

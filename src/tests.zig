@@ -48,6 +48,7 @@ test {
     _ = @import("bundle_redact.zig");
     _ = @import("bundle_redact_fuzz.zig");
     _ = @import("cli.zig");
+    _ = @import("cli_allocations.zig");
     _ = @import("cli_args.zig");
     _ = @import("cli_commands.zig");
     _ = @import("cli_data.zig");

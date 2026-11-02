@@ -23,6 +23,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const compare_sets = @import("compare_sets.zig");
+const accounting = @import("allocations.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const failures = @import("store_failures.zig");
@@ -1135,81 +1136,14 @@ pub const Mismatch = struct {
 };
 
 /// Reconstructs every node's allocation from its assignments and compares it with the record
-/// (authority.md I6), both read at one revision. Returns the first node that disagrees, or null.
-/// The auditor and the simulations run the same reconstruction.
+/// (authority.md I6), both read at one revision. Returns the first node, by name, that disagrees,
+/// or null. The auditor and the simulations run the same reconstruction (`allocations.zig`).
 pub fn find_mismatch(ctx: *const Context) Error!?Mismatch {
-    const assigned = try controller.list_all(
-        records.Assigned,
-        ctx,
-        records.prefix_assigned,
-        null,
-        constants.replicas_max,
-    );
-    const allocations = try controller.list_all(
-        records.Allocation,
-        ctx,
-        records.prefix_allocations,
-        assigned.revision,
-        constants.nodes_max,
-    );
-    var sums: [constants.nodes_max]records.Tally = undefined;
-    var names: [constants.nodes_max][]const u8 = undefined;
-    var seen: u32 = 0;
-    for (assigned.items) |entry| {
-        const rest = entry.kv.key[records.prefix_assigned.len..];
-        const node = rest[0..std.mem.indexOfScalar(u8, rest, '/').?];
-        const slot = for (names[0..seen], 0..) |name, index| {
-            if (std.mem.eql(u8, name, node)) break index;
-        } else blk: {
-            if (seen == constants.nodes_max) return failures.no_memory(ctx.diag);
-            names[seen] = node;
-            sums[seen] = .{ .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 }, .count = 0 };
-            seen += 1;
-            break :blk seen - 1;
-        };
-        sums[slot] = .{
-            .allocated = add(sums[slot].allocated, entry.rec.requests),
-            .count = sums[slot].count + 1,
-        };
-    }
-    return mismatch_in(names[0..seen], sums[0..seen], allocations.items);
-}
-
-fn mismatch_in(
-    names: []const []const u8,
-    sums: []const records.Tally,
-    allocations: []const Entry(records.Allocation),
-) ?Mismatch {
-    const zero: records.Tally = .{
-        .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 },
-        .count = 0,
+    const reconstruction = try accounting.reconstruct(ctx);
+    const tally = reconstruction.first_mismatch() orelse return null;
+    return .{
+        .node = tally.node,
+        .recorded = tally.recorded orelse accounting.zero,
+        .reconstructed = tally.reconstructed,
     };
-    for (allocations) |entry| {
-        const node = entry.kv.key[records.prefix_allocations.len..];
-        var rebuilt = zero;
-        for (names, sums) |name, sum| {
-            if (std.mem.eql(u8, name, node)) rebuilt = sum;
-        }
-        const recorded: records.Tally = .{
-            .allocated = entry.rec.allocated,
-            .count = entry.rec.count,
-        };
-        if (!tally_equal(recorded, rebuilt)) return .{
-            .node = node,
-            .recorded = recorded,
-            .reconstructed = rebuilt,
-        };
-    }
-    for (names, sums) |name, sum| {
-        const key = records.allocation_key(name);
-        if (find_by_key(records.Allocation, allocations, key.slice()) != null) continue;
-        return .{ .node = name, .recorded = zero, .reconstructed = sum };
-    }
-    return null;
-}
-
-fn tally_equal(first: records.Tally, second: records.Tally) bool {
-    if (first.count != second.count) return false;
-    if (first.allocated.cpu_millis != second.allocated.cpu_millis) return false;
-    return first.allocated.memory_bytes == second.allocated.memory_bytes;
 }

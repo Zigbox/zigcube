@@ -65,6 +65,10 @@ pub const Code = enum(u8) {
     E0301,
     E0302,
     E0303,
+    E0401,
+    E0402,
+    E0403,
+    E0404,
     E0501,
     E0502,
     E0503,
@@ -78,6 +82,7 @@ pub const Code = enum(u8) {
     W0501,
     B0001,
     B0002,
+    B0003,
 };
 
 pub const Entry = struct {
@@ -721,6 +726,68 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0401,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a repair needs confirming",
+        .explanation =
+        \\zcube repair allocations rewrites a node's allocation record, the
+        \\scheduler's accounting of what is placed there, with the total rebuilt
+        \\from the node's assignments. It changes authoritative state, so it runs
+        \\only when asked twice: the cause line says what it would write, and
+        \\nothing was changed.
+        \\
+        \\Look at zcube check allocations first. If the rebuilt total is right,
+        \\run the same command again with --confirm.
+        ,
+    },
+    .{
+        .code = .E0402,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the node has no open allocation finding",
+        .explanation =
+        \\A node's allocation record is repaired only while the allocation auditor
+        \\has an open finding on it: the finding is the evidence the repair cites.
+        \\This node has none, so its accounting agreed with its assignments when
+        \\last audited, or the node is not known. Nothing was changed.
+        \\
+        \\Run zcube check allocations to see every node's accounting.
+        ,
+    },
+    .{
+        .code = .E0403,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the node's accounting changed during the repair",
+        .explanation =
+        \\The repair read a node's assignments and allocation record, and before
+        \\it could write the rebuilt total the scheduler placed or released a
+        \\replica there, or the auditor changed its finding. It tried again a few
+        \\times and the accounting kept moving, so nothing was written.
+        \\
+        \\Run the command again. zcube check allocations shows whether the node
+        \\still needs it.
+        ,
+    },
+    .{
+        .code = .E0404,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a node's accounting disagrees with its assignments",
+        .explanation =
+        \\zcube check allocations rebuilt each node's allocation from its
+        \\assignments and found at least one node whose allocation record says
+        \\otherwise. The table on standard output shows both totals; the command
+        \\exits 1 so that a script notices. Nothing was changed.
+        \\
+        \\A disagreement is a bug (ZC-B0003, which the allocation auditor records
+        \\on the node). While it stands the scheduler places nothing on that node.
+        \\Collect a bundle of the node, then repair its accounting with zcube
+        \\repair allocations <node>, which says what it would write.
+        ,
+    },
+    .{
         .code = .E0501,
         .severity = .@"error",
         .blame = .environment,
@@ -912,6 +979,26 @@ pub const registry = [_]Entry{
         \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
         ,
     },
+    .{
+        .code = .B0003,
+        .severity = .bug,
+        .blame = .internal,
+        .summary = "allocation accounting disagrees with assignments",
+        .explanation =
+        \\The allocation auditor rebuilt a node's allocation from its assignments
+        \\and found a total that differs from the node's allocation record. Every
+        \\transaction that places or releases a replica updates that record, so a
+        \\difference can only come from a defect in zcube, never from the
+        \\environment. The auditor records a finding and never repairs it: while
+        \\the finding is open the scheduler places nothing on the node, but it
+        \\still releases.
+        \\
+        \\Run zcube check allocations to see both totals. If the rebuilt one is
+        \\right, zcube repair allocations <node> --confirm writes it. Please
+        \\report it at https://github.com/Zigbox/zigcube/issues/new with the
+        \\output of zcube why node <node>.
+        ,
+    },
 };
 
 /// The longest tag: a kind letter and four digits.
@@ -925,7 +1012,7 @@ comptime {
     assert(registry.len == fields.len);
     assert(fields.len <= std.math.maxInt(u8));
     assert(prefix.len + tag_bytes <= constants.diag_code_bytes_max);
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(200_000);
     for (registry, fields, 0..) |item, name, index| {
         assert(@backingInt(item.code) == index);
         assert(std.mem.eql(u8, @tagName(item.code), name));
