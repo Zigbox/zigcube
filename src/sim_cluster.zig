@@ -479,6 +479,11 @@ pub const Cluster = struct {
     stats: Stats,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
+    /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
+    /// report names it (the simulation fleet files a failure by its check and this step).
+    step: []const u8,
+    /// Told each step as the run enters it (`Options.on_step`).
+    on_step: ?*const fn (step: []const u8) void,
     /// Liveness mode: the faults end mid-run and the end state must converge within
     /// `liveness_bound_ms`; else faults stay on and only the safety checks run.
     liveness: bool,
@@ -528,6 +533,8 @@ pub const Cluster = struct {
         c.check_ms = 0;
         c.stats = .{};
         c.fault_totals = null;
+        c.step = "faults";
+        c.on_step = null;
         c.liveness = true;
         c.report = report;
         c.server = replica_controller.ReplicaController.init(c.take_instance());
@@ -572,6 +579,14 @@ pub const Cluster = struct {
         node.all_up_ms = 0;
         c.net.set_faults(index, c.swarm.net);
         return node;
+    }
+
+    /// Moves the run to `step` and tells the runner's hook, if any.
+    fn enter(c: *Cluster, step: []const u8) void {
+        assert(step.len > 0);
+        assert(!c.report.failed);
+        c.step = step;
+        if (c.on_step) |hook| hook(step);
     }
 
     pub fn destroy(c: *Cluster) void {
@@ -989,6 +1004,7 @@ fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
     c.report.print("FAILED: {s} (seed {d}, at {d} ms)\n", .{
         what, c.seed, c.manual.ms - epoch_ms,
     });
+    c.report.print("step: {s}\n", .{c.step});
     return error.StepFailed;
 }
 
@@ -1444,6 +1460,10 @@ pub const Options = struct {
     /// (`heal_operation`). A shrunk replay needs it: the seed's choice is drawn from the number of
     /// operations, so a shorter run would heal elsewhere and be a different run.
     heal_at: ?u32 = null,
+    /// Called with each step ("faults", "healed", "convergence", "end") as the run enters it,
+    /// so a runner can say where a run that panics was (`sim_cluster --trace-steps`). It must
+    /// not touch the run.
+    on_step: ?*const fn (step: []const u8) void = null,
 };
 
 /// The operation before which the faults end in a liveness run of `operations` operations from
@@ -1474,9 +1494,13 @@ pub fn simulate(
     const c = Cluster.create(gpa, seed, options.nodes, report) catch {
         report.failed = true;
         report.print("FAILED: out of memory\n", .{});
+        // The run never started: the host's trouble, which the fleet counts and never files.
+        report.print("step: setup\n", .{});
         return;
     };
     defer c.destroy();
+    c.on_step = options.on_step;
+    c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
     c.liveness = options.liveness;
@@ -1503,7 +1527,10 @@ pub fn simulate(
 
 fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     for (0..operations) |index| {
-        if (c.liveness and index == heal_at) heal(c);
+        if (c.liveness and index == heal_at) {
+            heal(c);
+            c.enter("healed");
+        }
         operation(c);
         if (c.report.failed) return error.StepFailed;
         try safety(c);
@@ -1512,10 +1539,12 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.fault_totals == null) heal(c);
         c.advance(liveness_bound_ms);
         if (c.report.failed) return error.StepFailed;
+        c.enter("convergence");
         try converged(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
+    c.enter("end");
     try safety(c);
     try enough_work_under_faults(c, @min(heal_at, operations));
     try work_under_ceiling(c);

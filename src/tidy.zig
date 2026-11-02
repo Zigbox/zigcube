@@ -39,6 +39,11 @@ const shell_allowlist = [_][]const u8{
     // The cloud container's SessionStart hook installs the pinned Zig and libpq before any Zig
     // exists to run a program written in Zig. The CI action that does the same is YAML.
     ".claude/hooks/session-start.sh",
+    // The simulation fleet's host side (ops/sim-fleet/README.md): `setup.sh` runs on a bare host
+    // before any Zig exists there, and `run.sh` is the loop systemd runs, which only fetches,
+    // calls `zig build` and pipes `sim_cluster` into `sim_fleet`; the logic is Zig.
+    "ops/sim-fleet/setup.sh",
+    "ops/sim-fleet/run.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
