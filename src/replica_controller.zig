@@ -220,7 +220,7 @@ const Run = struct {
             if (item.class != .held) continue;
             const observed = item.observed.?;
             if (try run.already_held(service.rec.name, observed)) continue;
-            if (!batch.has_room(2)) break;
+            if (!batch.has_room(controller.decision_ops)) break;
             batch.expect(observed.kv.key, observed.kv.mod_revision);
             const reason = try controller.format(run.ctx, "replica {s} failed to start on {s}; " ++
                 "it was not replaced because a new one would fail the same way", .{

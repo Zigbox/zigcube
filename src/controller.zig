@@ -59,6 +59,12 @@ pub fn key_copy(ctx: *const Context, key: *const records.Key) Error![]const u8 {
 // ---- Transactions of bounded size ------------------------------------------------------------
 
 /// The operations and compares of one transaction, within the store's bounds.
+/// What one `put_decision` adds to a batch, at most: the decision, its index entry and its
+/// summary (`/decision-summaries/`), and the summary's compare. Every batch bound that holds
+/// decisions is derived from these.
+pub const decision_ops: u32 = 2;
+pub const decision_compares: u32 = 0;
+
 pub const Batch = struct {
     ops: [constants.store_txn_ops_max]store.Op = undefined,
     ops_count: u32 = 0,
@@ -318,7 +324,7 @@ pub fn put_decision(
     batch: *Batch,
 ) Error!records.DecisionId {
     assert(spec.reason.len > 0);
-    assert(batch.has_room(2));
+    assert(batch.has_room(decision_ops));
     if (spec.cause_evidence) |evidence| {
         assert(evidence.text.len <= constants.decision_evidence_bytes_max);
     }
