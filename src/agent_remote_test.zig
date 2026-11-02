@@ -130,11 +130,15 @@ const Rig = struct {
 };
 
 fn start_server(io: std.Io, path: []const u8, create: bool) !*server_mod.Server {
+    return start_server_on(io, .{ .sqlite = path }, create);
+}
+
+fn start_server_on(io: std.Io, store_config: config_mod.Store, create: bool) !*server_mod.Server {
     var diag: Diag = undefined;
     diag.reset();
     const config: config_mod.Config = .{
         .listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable, // A literal.
-        .store = .{ .sqlite = path },
+        .store = store_config,
         .create_store = create,
         .verbose = false,
         .quiet = true,
@@ -216,6 +220,45 @@ test "a server that is not there is ZC-E0503, and the same store works when it r
     diag.reset();
     const renewed = try remote.lease_keepalive(lease.id, &diag);
     try testing.expectEqual(lease.id, renewed.id);
+}
+
+test "a memory-store server restarts under the agent: nothing is refused, nothing is kept" {
+    // Goal: M1 of the slice 10b review. A memory store starts empty each time, and the server
+    // says so (`"verified": false` in `chain`), so the agent neither refuses its answers as a
+    // rollback nor keeps a pair to compare. Method: register against a memory server, check the
+    // agent keeps nothing and notes it once, start a fresh memory server and call it again: the
+    // revision went back to the start, and the call is answered.
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.server.stop();
+    rig.server = try start_server_on(rig.io, .memory, false);
+    rig.http_transport.client.address = rig.server.address();
+    const remote = rig.remote.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    for (0..3) |_| {
+        const lease = try remote.lease_grant(10_000, &diag);
+        const done = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+        try testing.expect(done.succeeded);
+    }
+    try testing.expect(rig.remote.known == null);
+    try testing.expectEqual(@as(?remote_mod.client.Notice, .unverified), rig.remote.take_notice());
+
+    rig.server.stop();
+    rig.server = try start_server_on(rig.io, .memory, false);
+    rig.http_transport.client.address = rig.server.address();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    diag.reset();
+    const options: store.ListOptions = .{ .prefix = records.prefix_replicas, .limit = 10 };
+    const page = try remote.list(arena_state.allocator(), options, &diag);
+    try testing.expectEqual(@as(usize, 0), page.kvs.len);
+    const lease = try remote.lease_grant(10_000, &diag);
+    const done = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    try testing.expect(done.succeeded);
+    try testing.expectEqual(@as(?codes.Code, null), diag.code);
+    try testing.expect(rig.remote.known == null);
+    try testing.expectEqual(@as(?remote_mod.client.Notice, null), rig.remote.take_notice());
 }
 
 test "the node's replicas come back with env values, and its reports go in and out" {

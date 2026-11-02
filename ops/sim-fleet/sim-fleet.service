@@ -1,0 +1,46 @@
+[Unit]
+Description=Zigcube simulation fleet (sim-cluster on fresh seeds at the tip of main)
+Documentation=https://github.com/Zigbox/zigcube/blob/main/ops/sim-fleet/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=simfleet
+Group=simfleet
+WorkingDirectory=/var/lib/sim-fleet
+EnvironmentFile=-/etc/sim-fleet/fleet.env
+# systemd reads the token as root and hands the service a private copy under
+# $CREDENTIALS_DIRECTORY; the service user cannot read /etc/sim-fleet/token itself.
+LoadCredential=token:/etc/sim-fleet/token
+ExecStart=/var/lib/sim-fleet/zigcube/ops/sim-fleet/run.sh
+Restart=always
+RestartSec=30
+Nice=10
+# The loop has its own deadlines (run.sh); this bounds a hang of the shell itself.
+TimeoutStopSec=60
+# 8 GB host: the fleet may not take the last GB from sshd and the journal. A sim_cluster the
+# kernel kills for memory is logged by run.sh and not counted; the service goes on.
+MemoryMax=7G
+OOMPolicy=continue
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sim-fleet
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

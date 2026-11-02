@@ -120,7 +120,8 @@ pub const Proxy = struct {
     listener: fd_t,
     /// The loopback port clients connect to.
     port: u16,
-    upstream_port: u16,
+    /// Read at every connect, so `repoint` moves new connections (not open ones) elsewhere.
+    upstream_port: std.atomic.Value(u16),
     thread: ?std.Thread,
     stopping: std.atomic.Value(bool),
     latency_ms: std.atomic.Value(u32),
@@ -149,7 +150,7 @@ pub const Proxy = struct {
             .gpa = gpa,
             .listener = bound.fd,
             .port = bound.port,
-            .upstream_port = upstream_port,
+            .upstream_port = .init(upstream_port),
             .thread = null,
             .stopping = .init(false),
             .latency_ms = .init(0),
@@ -217,6 +218,13 @@ pub const Proxy = struct {
         proxy.hole.store(on, .release);
     }
 
+    /// New connections go to `port` from now on; open ones keep their upstream (a failover
+    /// cuts them, or `heal` resets them out of the black hole).
+    pub fn repoint(proxy: *Proxy, port: u16) void {
+        assert(port != 0);
+        proxy.upstream_port.store(port, .release);
+    }
+
     pub fn heal(proxy: *Proxy) void {
         proxy.set_latency(0);
         proxy.set_bandwidth(0);
@@ -280,7 +288,8 @@ pub const Proxy = struct {
         // Before the hole is read: a `heal` in between leaves this pair older than it.
         const healed = proxy.heal_generation.load(.acquire);
         if (!proxy.hole.load(.acquire)) {
-            server = connect_within(proxy.upstream_port, connect_timeout_ms) catch return false;
+            const upstream = proxy.upstream_port.load(.acquire);
+            server = connect_within(upstream, connect_timeout_ms) catch return false;
             _ = proxy.upstream_connects.fetchAdd(1, .acq_rel);
         }
         for (&proxy.pairs) |*slot| {
@@ -938,7 +947,7 @@ test "upstream connect: a refused upstream closes the client instead of hanging 
     defer rig.stop();
     const gone = try listen_loopback(0);
     _ = linux.close(gone.fd);
-    rig.proxy.upstream_port = gone.port;
+    rig.proxy.repoint(gone.port);
     const fd = try connect_loopback(rig.proxy.port);
     defer _ = linux.close(fd);
     var buffer: [8]u8 = undefined;

@@ -206,6 +206,8 @@ pub const server_compact_ms: u32 = 60 * 1000;
 /// resume its watch and a paged list can finish.
 pub const server_compact_keep_revisions: u32 = 1000;
 /// After a failed step the controller waits this long, doubling up to the maximum.
+/// The remembered revision is saved at most this often (a lagging copy is safe, only weaker).
+pub const verified_save_ms: u32 = 1000;
 pub const server_retry_ms_min: u32 = 250;
 pub const server_retry_ms_max: u32 = 5000;
 /// A repeated failure is shown again only after this long (a new code is shown at once).
@@ -306,9 +308,44 @@ pub const errors_page_bytes_max: u32 = 24 * 1024;
 /// A container's name as the host tooling reads it from the state directory (`hello-12`).
 pub const demo_name_bytes_max: u32 = 64;
 
+// ---- The simulation fleet's reporter (`sim_fleet`, ops/sim-fleet/README.md) ----------------
+
+/// One round's input: a few lines per failing seed of every worker's batch.
+pub const fleet_input_bytes_max: u32 = 1024 * 1024;
+/// Failures one round may report; more is refused as input that is not the runner's.
+pub const fleet_round_failures_max: u32 = 4096;
+pub const fleet_state_bytes_max: u32 = 1024 * 1024;
+pub const fleet_token_bytes_max: u32 = 4096;
+/// Distinct failures the state file remembers as filed. Reaching it is an operating error.
+pub const fleet_filed_max: u32 = 1024;
+/// UTC days the state file keeps counts for; the oldest is dropped past this.
+pub const fleet_days_kept: u32 = 31;
+/// Distinct failures counted per day for the tracker comment; more are in the day's total only.
+pub const fleet_seen_per_day_max: u32 = 256;
+/// Comments one failure gets per UTC day, and never two for the same commit.
+pub const fleet_comments_per_failure_per_day_max: u32 = 4;
+/// Other seeds of a round listed in an issue or comment.
+pub const fleet_seeds_listed_max: u32 = 20;
+/// The longest failing check (sim_cluster's own buffer) or crash message kept.
+pub const fleet_check_bytes_max: u32 = 256;
+/// A GitHub response body; 100 issues with long bodies fit.
+pub const fleet_response_bytes_max: u32 = 8 * 1024 * 1024;
+/// Pages of 100 labelled issues searched for a marker when the state file is lost.
+pub const fleet_find_pages_max: u32 = 5;
+pub const fleet_find_page_size: u32 = 100;
+/// How long GitHub writes stop after a rate limit that names no wait, and the most any wait is
+/// honoured for.
+pub const fleet_hold_seconds_default: u32 = 3600;
+pub const fleet_hold_seconds_max: u32 = 24 * 3600;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
+    assert(fleet_seen_per_day_max <= fleet_filed_max);
+    assert(fleet_comments_per_failure_per_day_max > 0);
+    assert(fleet_hold_seconds_default <= fleet_hold_seconds_max);
+    assert(fleet_find_page_size * fleet_find_pages_max >= 100);
+    assert(fleet_state_bytes_max >= fleet_token_bytes_max);
     assert(diag_command_bytes_max <= diag_field_bytes_max);
     assert(diag_summary_bytes_max < diag_wrap_columns);
     assert(diag_explanation_line_bytes_max < diag_wrap_columns);

@@ -439,6 +439,7 @@ const MovingStore = struct {
         .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
+        .hash_at = hash_at,
     };
 
     fn interface(self: *MovingStore) store.Store {
@@ -538,6 +539,10 @@ const MovingStore = struct {
     fn compact(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!void {
         const inner = from(context).inner;
         return inner.vtable.compact(inner.context, revision, diag);
+    }
+
+    fn hash_at(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!store.Hash {
+        return from(context).inner.hash_at(revision, diag);
     }
 };
 

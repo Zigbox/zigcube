@@ -77,7 +77,10 @@ down" from "store down".
 ```
 
 With the store unreachable, `store` is `{"backend": "postgres", "ok": false, "diagnostic": {…}}`
-and `revision` is absent. `time_ms` is the server's clock: the console shows ages ("3 s ago")
+and `revision` is absent. A server that guards its store (every `zcube-server`) adds, inside
+`store` and beside `revision`, `remembered`: the highest `{"revision", "hash"}` it has seen (an
+empty object before the first status), and, only while saving that pair fails,
+`remembered_save_failed`: a `ZC-E0216` diagnostic. `time_ms` is the server's clock: the console shows ages ("3 s ago")
 against it, so a skewed laptop clock does not make "just now" read "in 4 minutes".
 
 ### `GET /v1/list?prefix=&at=&limit=&continue=&reverse=`
@@ -405,7 +408,8 @@ The node's assignments, as stored: `{"revision": R, "kvs": [...]}` in `/v1/list`
              "create_revision": 398, "mod_revision": 398, "lease": 0 } ] }
 ```
 
-`GET` only, no query. At most `agent_node_replicas_max` (500) assignments; more is `ZC-E0302`.
+`GET` only; no query but `known` ("The chain pair" below), and the answer carries `chain`
+like every other agent endpoint. At most `agent_node_replicas_max` (500) assignments; more is `ZC-E0302`.
 The key's `mod_revision` is the replica's placement epoch (keys.md).
 
 ### `GET /v1/agent/nodes/{node}/observed` and `POST ...`
@@ -445,6 +449,28 @@ event cannot matter. The agent lists, remembers the list's `revision`, and watch
 
 `from` more than one past the store's revision is `400` and `ZC-E0204`; `from` below the
 compaction point is `410` and `ZC-E0203`, and the agent treats that as "changed" and lists again.
+
+### The chain pair (C1 slice 10b)
+
+Every `200` answer of these endpoints carries
+`"chain": {"revision": R, "hash": "<64 hex>", "verified": V}`: for a write (registration, report),
+the revision and hash of the transaction itself; otherwise the store's `status` taken after the
+endpoint did its work (for the watch, the head it answered at), so it is at least as new as
+anything in the answer. `verified` is `false` when the server keeps no pair for its store across
+restarts (a memory store, which starts empty each time) and so does not enforce the
+never-backwards rule; the agent then neither refuses such an answer nor keeps a pair, and says so
+once. An answer without `verified` is read as `true`. Every endpoint takes `known=K`, the
+revision the agent remembers (no other query parameter, except the watch's `from` and `timeout`).
+When `K <= R`, the pair adds `"known_hash"`: the store's hash at `K` (`hash` itself when
+`K == R`). It is left out when the store
+has no hash there (`K` below the chain's start). A refusal carries no pair.
+
+The agent remembers the highest pair it was given, in `<state dir>/remembered`, and refuses an
+answer with a lower `revision`, a `known_hash` that differs from the remembered hash or is
+missing, or the same revision with a different `hash`: `ZC-E0215`, as the server raises for its
+store, and it acts on nothing in that answer. An answer without `chain` is `ZC-E0504` (the
+server is older than the agent: upgrade the server first). The way out is the server's
+`zcube store accept-rollback --confirm`, then `rm <state dir>/remembered` and an agent restart.
 
 ### What the agent does with them
 

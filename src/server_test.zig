@@ -567,6 +567,221 @@ fn run_until_running(io: std.Io, server: *server_mod.Server, node: *Node, count:
     return error.NeverConverged;
 }
 
+fn tmp_file(buffer: []u8, tmp: testing.TmpDir, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "a server restarted on a store that went backwards halts until the operator accepts it" {
+    // Goal: the remembered pair outlives the server (10b). Method: a server on `data.db` applies
+    // `hello` and stops; the file is replaced by an empty database at the same path (a restore of
+    // an old backup), and a second server on it answers ZC-E0215 and does not step; accepting
+    // resumes it. A restore under another path is a new database, not checked (operations.md).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buffer: [128]u8 = undefined;
+    const state = try tmp_file(&state_buffer, tmp, "state");
+    var long_buffer: [128]u8 = undefined;
+    const long_path = try tmp_file(&long_buffer, tmp, "data.db");
+    var long_config = config_for(.{ .sqlite = long_path }, true);
+    long_config.state_dir = state;
+    var short_config = long_config;
+
+    const first = try start_server(io, long_config);
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    const healthy = try get(io, first.address(), "/v1/status");
+    defer healthy.free();
+    try testing.expectEqual(@as(u16, 200), healthy.status);
+    first.stop();
+    for ([_][]const u8{ "data.db", "data.db-wal", "data.db-shm", "data.db-journal" }) |name| {
+        tmp.dir.deleteFile(io, name) catch {};
+    }
+
+    const second = try start_server(io, short_config);
+    var second_open = true;
+    defer if (second_open) second.stop();
+    const refused = try get(io, second.address(), "/v1/status");
+    defer refused.free();
+    try testing.expectEqual(@as(u16, 200), refused.status);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const status_body = try refused.json(arena_state.allocator());
+    const store_part = status_body.object.get("store").?;
+    try testing.expect(!store_part.object.get("ok").?.bool);
+    const code = store_part.object.get("diagnostic").?.object.get("code").?.string;
+    try testing.expectEqualStrings("ZC-E0215", code);
+    const write_refused = try send(io, second.address(), "POST", "/v1/apply", hello_json);
+    defer write_refused.free();
+    try expect_diagnostic(write_refused, 502, "ZC-E0215");
+    const steps = second.steps();
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try testing.expectEqual(steps, second.steps());
+
+    const accept_path = "/v1/store/accept-rollback?confirm=true";
+    const accepted = try send(io, second.address(), "POST", accept_path, "");
+    defer accepted.free();
+    try testing.expectEqual(@as(u16, 200), accepted.status);
+    const resumed = try get(io, second.address(), "/v1/status");
+    defer resumed.free();
+    try testing.expectEqual(@as(u16, 200), resumed.status);
+    second.stop();
+    second_open = false;
+
+    short_config.create_store = false;
+    const third = try start_server(io, short_config);
+    defer third.stop();
+    const again = try get(io, third.address(), "/v1/status");
+    defer again.free();
+    try testing.expectEqual(@as(u16, 200), again.status);
+}
+
+test "two SQLite stores in one directory remember separately" {
+    // Goal: one remembered pair per database (10b review). Method: a server on `one.db` applies
+    // `hello` and stops; a server on a new `two.db` in the same directory, whose state directory
+    // is not named, starts and is not refused; each database has its own remembered file.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var one_buffer: [128]u8 = undefined;
+    const one_path = try tmp_file(&one_buffer, tmp, "one.db");
+    var two_buffer: [128]u8 = undefined;
+    const two_path = try tmp_file(&two_buffer, tmp, "two.db");
+    const first = try start_server(io, config_for(.{ .sqlite = one_path }, true));
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    first.stop();
+    const second = try start_server(io, config_for(.{ .sqlite = two_path }, true));
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    defer status.free();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try status.json(arena_state.allocator());
+    try testing.expect(body.object.get("store").?.object.get("ok").?.bool);
+    for ([_][]const u8{ one_path, two_path }) |path| {
+        const name = try remembered_name(io, arena_state.allocator(), path);
+        _ = try tmp.dir.statFile(io, name, .{});
+    }
+}
+
+test "a restore under another path is a new database and is not checked" {
+    // Goal: pin the documented limit of keying by path. Method: the long store at `a/data.db`
+    // applies `hello`; an empty store at `b/data.db` starts with the same state directory and is
+    // served, not halted.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    var state_buffer: [128]u8 = undefined;
+    const state = try tmp_file(&state_buffer, tmp, "state");
+    var a_buffer: [128]u8 = undefined;
+    var b_buffer: [128]u8 = undefined;
+    var config = config_for(.{ .sqlite = try tmp_file(&a_buffer, tmp, "a/data.db") }, true);
+    config.state_dir = state;
+    const first = try start_server(io, config);
+    const applied = try send(io, first.address(), "POST", "/v1/apply", hello_json);
+    defer applied.free();
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    first.stop();
+    config.store = .{ .sqlite = try tmp_file(&b_buffer, tmp, "b/data.db") };
+    const second = try start_server(io, config);
+    defer second.stop();
+    const status = try get(io, second.address(), "/v1/status");
+    defer status.free();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try status.json(arena_state.allocator());
+    try testing.expect(body.object.get("store").?.object.get("ok").?.bool);
+}
+
+test "two databases with one file name share a state directory and keep two pairs" {
+    // Goal: the file is keyed by the database's path, not its base name (10b second review).
+    // Method: `a/zcube.db` and `b/zcube.db`, one `state_dir`; each starts, and there are two files.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.createDirPath(io, "state");
+    var state_buffer: [128]u8 = undefined;
+    const state = try std.fmt.bufPrint(&state_buffer, ".zig-cache/tmp/{s}/state", .{tmp.sub_path});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var names: [2][]const u8 = undefined;
+    for ([_][]const u8{ "a", "b" }, &names) |dir, *name| {
+        var buffer: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, ".zig-cache/tmp/{s}/{s}/zcube.db", .{
+            tmp.sub_path, dir,
+        });
+        var config = config_for(.{ .sqlite = path }, true);
+        config.state_dir = state;
+        const running = try start_server(io, config);
+        const reply = try get(io, running.address(), "/v1/status");
+        reply.free();
+        running.stop();
+        name.* = try remembered_name(io, arena_state.allocator(), path);
+    }
+    try testing.expect(!std.mem.eql(u8, names[0], names[1]));
+    for (names) |name| {
+        var buffer: [256]u8 = undefined;
+        const sub = try std.fmt.bufPrint(&buffer, "state/{s}", .{name});
+        _ = try tmp.dir.statFile(io, sub, .{});
+    }
+}
+
+/// The remembered file's name for the SQLite file at `path` (relative to the working directory).
+fn remembered_name(io: std.Io, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const absolute = try std.fs.path.resolveAlloc(arena, &.{ cwd, path });
+    const buffer = try arena.create([300]u8);
+    return @import("server_remember.zig").Remembered.file_for(absolute, buffer).?;
+}
+
+test "an unreadable remembered file stops the start with ZC-E0216, and Postgres needs a state dir" {
+    // Goal: the start-up failures of the guard are coded. Method: a remembered file that does not
+    // parse (ZC-E0216, never "no file"); a Postgres config without `state_dir` (ZC-E0106).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/data.db", .{tmp.sub_path});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const file = try remembered_name(io, arena_state.allocator(), path);
+    try tmp.dir.writeFile(io, .{ .sub_path = file, .data = "not a pair\n" });
+    var diag: Diag = undefined;
+    diag.reset();
+    const options: server_mod.Options = .{ .version = "0.0.0-test", .report_failures = false };
+    const refused = server_mod.Server.start(
+        testing.allocator,
+        io,
+        config_for(.{ .sqlite = path }, true),
+        options,
+        &diag,
+    );
+    try testing.expectError(error.StartFailed, refused);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0216), diag.code);
+
+    diag.reset();
+    const config = config_for(.{ .postgres = "host=nowhere" }, false);
+    try testing.expect(server_mod.Server.state_path(config, &diag) == null);
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
+}
+
 test "request ids are not issued twice across server starts" {
     // Goal: DIAGNOSTICS, "every API request gets a request ID" so a client's error can be matched
     // to a log: a restart must not repeat the ids of the start before it. Method: start, ask, stop,

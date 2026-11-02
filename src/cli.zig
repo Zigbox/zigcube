@@ -128,6 +128,7 @@ pub fn execute(
             const out = try bundle_collect.run(env, client, options, target, line, report);
             try cli_commands.emit(env, .stdout, out, report);
         },
+        .accept_rollback => try cli_commands.accept_rollback(env, client, options, report),
         .help, .version, .explain => unreachable, // Handled before a client exists.
     }
 }

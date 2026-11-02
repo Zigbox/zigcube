@@ -183,6 +183,41 @@ pub fn delete(
     try emit(env, .stdout, try done_text(arena, "deleted", done, options.verbose), report);
 }
 
+/// `zcube store accept-rollback --confirm`: tells the server to remember the store as it is.
+pub fn accept_rollback(
+    env: *const Env,
+    client: *Client,
+    options: Options,
+    report: *Report,
+) Error!void {
+    const arena = env.arena;
+    assert(options.confirm); // The parser requires it.
+    const reply = try client.send("POST", "/v1/store/accept-rollback?confirm=true", "", report);
+    if (options.output == .json) {
+        return emit(env, .stdout, try json_line(arena, reply.body), report);
+    }
+    const Pair = struct { revision: ?u64 = null, hash: ?[]const u8 = null };
+    const Body = struct { old: Pair, new: Pair };
+    const body = std.json.parseFromSliceLeaky(Body, arena, reply.body, .{
+        .ignore_unknown_fields = true,
+    }) catch return cli_data.contract(report, reply.request_id, "is not an accepted rollback");
+    const was = if (body.old.revision) |revision|
+        try std.fmt.allocPrint(arena, "{d} ({s})", .{ revision, short(body.old.hash) })
+    else
+        "none";
+    const text = try std.fmt.allocPrint(
+        arena,
+        "accepted: the server now remembers revision {d} ({s}); it remembered {s}\n",
+        .{ body.new.revision orelse 0, short(body.new.hash), was },
+    );
+    try emit(env, .stdout, text, report);
+}
+
+fn short(hash: ?[]const u8) []const u8 {
+    const text = hash orelse return "none";
+    return text[0..@min(text.len, 8)];
+}
+
 fn json_line(arena: Allocator, body: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}\n", .{std.mem.trimEnd(u8, body, "\n")});
 }

@@ -115,6 +115,39 @@ durably; that is how `remove_container` finishes. `DirState` fsyncs a file and t
 every put and remove; `SimState` models exactly that (see `agent_state.zig`'s header) and loses the
 unsynced tail of an append in a simulated host crash.
 
+## The remembered pair
+
+Every answer of the agent endpoints carries the store's revision and chain hash (docs/api.md,
+"The chain pair"). The agent keeps the highest pair in `<state dir>/remembered`
+(`{"v":2,"server":"HOST:PORT","revision":N,"hash":"<hex>"}`, written with `put_atomic`: temporary
+file, fsync, rename, fsync of the directory), saved after a step when it advanced, at most every
+`verified_save_ms`, and once more, whatever the time, when the agent stops cleanly.
+It refuses an answer from behind it with `ZC-E0215` and does nothing with it; the step fails and is
+retried, so the refusal shows once and the containers run on.
+
+- A state directory without the file (an agent from before C1 slice 10b) starts with nothing
+  remembered. A version 1 file (no `server`) is read as saved for an unknown address and its pair
+  is kept as it is.
+- A pair saved for a different `--server` is not compared: the agent prints one line saying the
+  server changed and starts fresh.
+- A file that does not parse, or whose `v` is 0 or not a number, stops the start with `ZC-E0216`
+  ("not what the agent writes"); a higher `v` says it was written by a newer zcube-agent. A save
+  that fails while the agent runs warns once, naming the file's full path, and is tried again.
+- A server whose answers say `"verified": false` (a memory store, which starts empty each time)
+  is not checked: the agent drops any pair it remembers, keeps none, and says so once on stdout.
+- A store recreated at the same address (a new SQLite file, a fresh database) is not told apart
+  from a rollback: it is refused with `ZC-E0215`, and the fix is the same `rm`.
+
+After `zcube store accept-rollback --confirm` on the server, `rm '<state dir>/remembered'` and
+restart the agent. Recovery is per node: every agent that refused must have its file removed and
+be restarted; the server does not tell agents about an accepted rollback (a gap recorded in
+docs/DECISIONS.md).
+
+What the agent check guards is what the agent acts on. It does not gate writes to the store: that
+is the server's `VerifiedStore`, which refuses every store call once its store went backwards. An
+agent's refusal keeps it from starting or stopping containers on the strength of an answer from
+behind; the server's keeps the controllers and every write from building on one.
+
 ## What survives what
 
 | Event | Containers | The agent's work |
