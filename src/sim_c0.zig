@@ -926,8 +926,9 @@ test "a late running record over a stale stopped container is reported lost and 
 }
 
 /// Moves the first assignment to `node`, as the scheduler would move the replica (the replica
-/// record and so its create revision stay). It writes `/assigned` alone, as the scheduler role:
-/// the test is about the agent, so the allocations are left to the next scheduler pass.
+/// record and so its create revision stay). It writes `/assigned` alone, as the scheduler role,
+/// and leaves `/allocations` as they were: no scheduler pass repairs them (a mismatch is the
+/// auditor's to report), but the test steps only the agent, which reads `/assigned` alone.
 fn move_first_replica(world: *World, node: []const u8) !void {
     const ctx = world.controller_context();
     const all = try controller.list_all(records.Assigned, &ctx, records.prefix_assigned, null, 8);
