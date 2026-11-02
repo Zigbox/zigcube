@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0512]: this host can't run Zigbox containers
+  cause  this host can't run rootless containers: cgroup v2 is not mounted
+  reqid  r-0000001
+  fix    run zbx doctor as the agent's user and fix what it names, or use --runtime fake
+  more   zcube explain E0512
+  docs   https://zigbox.github.io/zigcube/errors/E0512.html

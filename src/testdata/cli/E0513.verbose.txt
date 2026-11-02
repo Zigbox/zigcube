@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0513]: the service does not fit Zigbox's limits
+  cause  an environment variable value is too long
+  reqid  r-0000001
+  fix    shorten it in the service file, then apply it again
+  more   zcube explain E0513
+  docs   https://zigbox.github.io/zigcube/errors/E0513.html
