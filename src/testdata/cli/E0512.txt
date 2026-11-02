@@ -1,0 +1,5 @@
+error[ZC-E0512]: the node can't apply limits: no user systemd bus
+  cause  the user running the agent has no systemd user bus, which limits need
+  fix    enable lingering for the agent's user, or remove the limits from the service file
+  more   zcube explain E0512 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0512.html

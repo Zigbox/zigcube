@@ -553,7 +553,7 @@ fn pending_listing(
 fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
-    collector.raise(.E0508);
+    collector.raise(.E0514);
     switch (reason) {
         .env_name_empty => collector.cause("an environment variable has no name", .{}),
         .env_name_too_long => collector.cause("an environment variable name is too long", .{}),

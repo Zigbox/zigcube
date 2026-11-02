@@ -1,0 +1,5 @@
+error[ZC-E0513]: this host can't run Zigbox containers
+  cause  this host can't run rootless containers: cgroup v2 is not mounted
+  fix    run zbx doctor as the agent's user and fix what it names, or use --runtime fake
+  more   zcube explain E0513 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0513.html
