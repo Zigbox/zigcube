@@ -419,7 +419,12 @@ fn image_not_found(out: *Diagnostic) void {
     out.causes.items[0] = .{};
     out.causes.items[0].print("digest b3:00ff is not in this node's store", .{});
     out.fixes.count = 1;
-    out.fixes.items[0] = .{ .sentence = .{}, .command = .{} };
+    out.fixes.items[0] = .{
+        .sentence = .{},
+        .command = .{},
+        .needs_root = false,
+        .template = false,
+    };
     out.fixes.items[0].sentence.print("check the digest in broken.zon", .{});
     out.set_docs(&Product.zbx);
 }

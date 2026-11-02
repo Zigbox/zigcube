@@ -5,11 +5,12 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // The runtime as a library, and the diagnostics both products share (the `diagnostic`,
-        // `product`, `render` and `explain` modules). Pinned to Zigbox main at 90b6f1c, the merge
-        // of the PR that made a second product's diagnostics pluggable.
+        // `product`, `render` and `explain` modules). Pinned to Zigbox main at 600939c (0.2.0,
+        // 2026-10-30):
+        // lifecycle (list, adopt, stop), image runs, pull as a library call, limits and exit reasons.
         .zigbox = .{
-            .url = "https://github.com/Zigbox/zigbox/archive/90b6f1c9a973bc0e95ed50cbbd4db7ad27df2cdb.tar.gz",
-            .hash = "zigbox-0.0.0-RBMWEBtIGQC9CitEhpSgWCefmYYiC01NPxNFwcjjcROc",
+            .url = "https://github.com/Zigbox/zigbox/archive/600939c3b161c0b51a553ad321f019b217ed3123.tar.gz",
+            .hash = "zigbox-0.2.0-RBMWEFNAagD_ER6nqPnn0inaLinQi7VjG7QPIm5KaK2c",
         },
     },
     .paths = .{
