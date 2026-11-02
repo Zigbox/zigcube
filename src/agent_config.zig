@@ -72,6 +72,8 @@ pub const Command = union(enum) {
     run: Config,
     /// `zcube-agent supervise <directory>`.
     supervise: []const u8,
+    /// `zcube-agent supervise-zigbox <launch directory>` (`zigbox_supervisor.zig`).
+    supervise_zigbox: []const u8,
     version,
     help,
 };
@@ -113,13 +115,15 @@ const Flags = struct {
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     if (args.len >= 1) {
-        if (std.mem.eql(u8, args[0], "supervise")) {
+        const zigbox_mode = std.mem.eql(u8, args[0], "supervise-zigbox");
+        if (zigbox_mode or std.mem.eql(u8, args[0], "supervise")) {
             if (args.len != 2) return bad(
                 diag,
                 "supervise takes one directory",
                 .{},
                 "it is run by the agent itself",
             );
+            if (zigbox_mode) return .{ .supervise_zigbox = args[1] };
             return .{ .supervise = args[1] };
         }
     }

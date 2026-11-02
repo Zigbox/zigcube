@@ -16,6 +16,7 @@ const config_mod = @import("agent_config.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fake_supervisor = @import("fake_supervisor.zig");
+const zigbox_supervisor = @import("zigbox_supervisor.zig");
 
 const Diag = diag_mod.Diag;
 
@@ -64,6 +65,7 @@ pub fn main(init: std.process.Init) u8 {
         .version => return say(init.io, "zcube-agent " ++ build_options.version ++ "\n"),
         .help => return say(init.io, config_mod.usage),
         .supervise => |directory| return fake_supervisor.run(init, directory),
+        .supervise_zigbox => |directory| return zigbox_supervisor.run(init, directory),
         .run => |config| {
             verbose_panics = config.verbose;
             return agent_run.run(init, config);
