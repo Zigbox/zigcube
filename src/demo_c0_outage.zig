@@ -381,7 +381,10 @@ fn recovered(
 ) !void {
     const host = demo.host;
     switch (demo.backend) {
-        .postgres => |control| try start_postgres(demo, control),
+        .postgres => |control| {
+            try start_postgres(demo, control);
+            try wait_store_answers(demo);
+        },
         .sqlite => {},
     }
     // The observed records the agent could not rewrite still say "running" until it registers
@@ -435,6 +438,21 @@ fn recovered(
         .{ .actor = "scheduler", .action = "place_replica", .count = stopped },
     });
     try apply_again(demo);
+}
+
+/// The start command may return before Postgres accepts connections: `pg_ctl start -w` waits
+/// for it, `docker start` (CI's service container) returns once the container runs, and the
+/// database is ready some time later. Until then the server answers 503 with ZC-E0201, so the
+/// demo waits, within `recover_ms`, for `zcube get` to answer before it reads the store itself.
+fn wait_store_answers(demo: *Demo) !void {
+    const answers = struct {
+        fn check(_: *Demo, h: *Host) !bool {
+            const cli = try h.zcube_quiet(&.{ "get", "service", "hello" });
+            return cli.code == 0;
+        }
+    };
+    const what = "zcube to reach the store again";
+    try demo.host.wait_for(demo, answers.check, what, state.recover_ms);
 }
 
 fn no_old_pids(before: []const host_procs.Pids, now: []const host_procs.Pids) bool {
