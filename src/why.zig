@@ -28,7 +28,7 @@ pub const Error = controller.Error || error{NotFound};
 
 pub const Health = enum { healthy, degraded, failing, gone };
 
-pub const StepType = enum { decision, observed, desired, resync, lease_expired, gone };
+pub const StepType = enum { decision, observed, desired, resync, lease_expired, gone, note };
 
 pub const State = struct {
     exists: bool,
@@ -74,6 +74,7 @@ pub fn why(
     if (first == null and !state.exists) return not_found(ctx, subject);
     var steps: std.ArrayList(Step) = .empty;
     if (first) |start| try follow(ctx, start, &steps);
+    if (subject.kind == .node) try rebalance_note(ctx, &snapshot, subject.name, &steps);
     return .{
         .revision = snapshot.revision,
         .subject = subject,
@@ -190,25 +191,121 @@ fn node_state(
     snapshot: *const controller.Snapshot,
     name: []const u8,
 ) Error!State {
+    const judged = try node_judgement(ctx, name);
     for (snapshot.nodes) |node| {
         if (!std.mem.eql(u8, node.rec.name, name)) continue;
+        const load = node_load(snapshot, name);
+        const verdict = try judgement_phrase(ctx, judged, node.kv.mod_revision);
         return .{
             .exists = true,
             .health = .healthy,
             .desired = 1,
             .running = 1,
-            .text = try controller.format(ctx, "node {s}: registered on lease {d}", .{
-                name, node.kv.lease,
+            .text = try controller.format(ctx, "node {s}: {s}, lease {d} with {d} replicas " ++
+                "assigned, {d}m of {d}m CPU and {d} MiB of {d} MiB memory in use", .{
+                name,
+                verdict,
+                node.kv.lease,
+                load.count,
+                load.cpu_millis,
+                node.rec.capacity.cpu_millis,
+                load.memory_bytes >> 20,
+                node.rec.capacity.memory_bytes >> 20,
             }),
         };
     }
+    const last: []const u8 = if (judged) |status|
+        try controller.format(ctx, ", last judged {s} (tenure {d})", .{
+            @tagName(status.state), status.tenure,
+        })
+    else
+        "";
     return .{
         .exists = false,
         .health = .gone,
         .desired = 0,
         .running = 0,
-        .text = try controller.format(ctx, "node {s}: not registered", .{name}),
+        .text = try controller.format(ctx, "node {s}: not registered{s}", .{ name, last }),
     };
+}
+
+/// A ready node that holds fewer replicas than another one: say why they are not moved to it.
+/// The step is a statement of the scheduler's rule (docs/briefs/c1.md, non-goals), not a reading
+/// of the store, and its type says so.
+fn rebalance_note(
+    ctx: *const Context,
+    snapshot: *const controller.Snapshot,
+    name: []const u8,
+    steps: *std.ArrayList(Step),
+) Error!void {
+    const judged = try node_judgement(ctx, name);
+    var tenure: ?u64 = null;
+    var busiest: u32 = 0;
+    for (snapshot.nodes) |node| {
+        if (std.mem.eql(u8, node.rec.name, name)) {
+            tenure = node.kv.mod_revision;
+        } else busiest = @max(busiest, node_load(snapshot, node.rec.name).count);
+    }
+    const status = judged orelse return;
+    if (status.state != .ready or status.tenure != (tenure orelse return)) return;
+    if (node_load(snapshot, name).count >= busiest) return;
+    try append(ctx, steps, .{
+        .type = .note,
+        .text = "replicas that are already running on other nodes are not moved back: the " ++
+            "scheduler places a replica when it is created or its node is lost, and does " ++
+            "not rebalance",
+    });
+}
+
+/// `/node-status/<node>`, or null before the node controller has judged the node.
+fn node_judgement(ctx: *const Context, name: []const u8) Error!?records.NodeStatus {
+    const key = records.node_status_key(name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+    const kv = got.kv orelse return null;
+    return try records.read(records.NodeStatus, ctx.arena, kv, ctx.diag);
+}
+
+/// "ready (tenure 22)", "registered, not yet judged", or a judgement for an earlier tenure.
+fn judgement_phrase(
+    ctx: *const Context,
+    judged: ?records.NodeStatus,
+    tenure: u64,
+) Error![]const u8 {
+    const status = judged orelse return "registered, not yet judged";
+    if (status.tenure == tenure) {
+        return controller.format(ctx, "{s} (tenure {d})", .{ @tagName(status.state), tenure });
+    }
+    return controller.format(
+        ctx,
+        "tenure {d}, not yet judged (last judged {s} for tenure {d})",
+        .{ tenure, @tagName(status.state), status.tenure },
+    );
+}
+
+const Load = struct { count: u32, cpu_millis: u64, memory_bytes: u64 };
+
+/// What `/assigned/<node>/` holds: the count and the sum of the requests.
+fn node_load(snapshot: *const controller.Snapshot, name: []const u8) Load {
+    var load: Load = .{ .count = 0, .cpu_millis = 0, .memory_bytes = 0 };
+    for (snapshot.assigned) |entry| {
+        const node = assigned_node(entry.kv.key) orelse continue;
+        if (!std.mem.eql(u8, node, name)) continue;
+        load.count += 1;
+        load.cpu_millis += entry.rec.requests.cpu_millis;
+        load.memory_bytes += entry.rec.requests.memory_bytes;
+    }
+    assert(load.count <= snapshot.assigned.len);
+    assert(name.len > 0);
+    return load;
+}
+
+/// The node of `/assigned/<node>/<replica>`.
+fn assigned_node(key: []const u8) ?[]const u8 {
+    const prefix = "/assigned/";
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const rest = key[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    return rest[0..slash];
 }
 
 /// "running", "starting", "stopped (failed to start)".
@@ -644,4 +741,138 @@ test "why says a node registered only while the store has its key" {
         "/nodes/node9: the record the controller saw has been removed",
         node9.steps[node9.steps.len - 1].text,
     );
+}
+
+test "why node states its load and its judgement, and notes that nothing is rebalanced" {
+    // Goal: HANDOFF step 4's question, "why does node2 hold nothing". Method: the world's node1
+    // holds an assignment written by hand, node2 registers and is judged ready with none: the
+    // note is on node2's chain and not on node1's.
+    const world = try new_world(6);
+    defer world.destroy();
+    world.advance(2000);
+    var ctx = world.controller_context();
+    const before = try why(&ctx, .{ .kind = .node, .name = "node1" }, null);
+    try testing.expectEqualStrings(
+        "node node1: ready (tenure 1), lease 1 with 0 replicas assigned, " ++
+            "0m of 4000m CPU and 0 MiB of 8192 MiB memory in use",
+        before.state.text,
+    );
+    const assigned: records.Assigned = .{
+        .replica = "hello-1",
+        .service = "hello",
+        .requests = .{ .cpu_millis = 250, .memory_bytes = 128 << 20 },
+        .reason = "test",
+    };
+    const assigned_key = records.assigned_key("node1", "hello-1");
+    try put_record(world, .scheduler, assigned_key.slice(), assigned);
+    const tenure = try register_node2(world);
+    ctx = world.controller_context();
+    const waiting = try why(&ctx, .{ .kind = .node, .name = "node2" }, null);
+    try expect_contains(waiting.state.text, "registered, not yet judged");
+    try testing.expect(note_of(waiting.steps) == null);
+
+    try put_status(world, "node2", .ready, tenure);
+    ctx = world.controller_context();
+    const node1 = try why(&ctx, .{ .kind = .node, .name = "node1" }, null);
+    try expect_contains(node1.state.text, "1 replicas assigned, 250m of 4000m CPU and 128 MiB");
+    try testing.expect(note_of(node1.steps) == null);
+    const idle = try why(&ctx, .{ .kind = .node, .name = "node2" }, null);
+    try expect_contains(idle.state.text, "ready (tenure");
+    const note = note_of(idle.steps).?;
+    try expect_contains(note.text, "does not rebalance");
+    try testing.expect(note.decision == null);
+}
+
+test "why node says a judgement for an older tenure, and a status with no registration" {
+    // Goal: the state line does not pass a stale judgement off as current, and a node that left
+    // keeps its last judgement in the line. Method: node2's status one tenure behind; node7 has a
+    // status and a decision and no registration.
+    const world = try new_world(7);
+    defer world.destroy();
+    world.advance(2000);
+    const tenure = try register_node2(world);
+    try put_status(world, "node2", .ready, tenure - 1);
+    var ctx = world.controller_context();
+    const stale = try why(&ctx, .{ .kind = .node, .name = "node2" }, null);
+    try expect_contains(stale.state.text, "not yet judged (last judged ready for tenure");
+    try testing.expect(note_of(stale.steps) == null);
+
+    try put_status(world, "node7", .lost, 4);
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    var batch: controller.Batch = .{};
+    ctx = world.controller_context();
+    _ = try controller.put_decision(&ctx, &source, .{
+        .actor = "node-controller",
+        .action = "node_lost",
+        .subject = .{ .kind = .node, .name = "node7" },
+        .reason = "node node7 stopped renewing lease 9",
+        .cause = .{
+            .kind = .lease_expired,
+            .key = "/nodes/node7",
+            .lease = 9,
+            .ttl_ms = 10000,
+            .revision = 3,
+        },
+    }, &batch);
+    _ = try controller.commit(&ctx, .replica_controller, &batch);
+    ctx = world.controller_context();
+    const left = try why(&ctx, .{ .kind = .node, .name = "node7" }, null);
+    try testing.expectEqualStrings(
+        "node node7: not registered, last judged lost (tenure 4)",
+        left.state.text,
+    );
+}
+
+fn expect_contains(text: []const u8, wanted: []const u8) !void {
+    if (std.mem.indexOf(u8, text, wanted) != null) return;
+    std.debug.print("expected to find {s} in {s}\n", .{ wanted, text });
+    return error.TestExpectedContains;
+}
+
+fn note_of(steps: []const Step) ?Step {
+    for (steps) |step| {
+        if (step.type == .note) return step;
+    }
+    return null;
+}
+
+/// Registers `node2` (4 CPUs, 8 GiB) and returns its tenure revision.
+fn register_node2(world: *sim_world.World) !u64 {
+    const node: records.Node = .{
+        .name = "node2",
+        .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 << 30 },
+    };
+    try put_record(world, .{ .agent = "node2" }, records.node_key("node2").slice(), node);
+    const ctx = world.controller_context();
+    const got = try ctx.store.get(ctx.arena, "/nodes/node2", null, ctx.diag);
+    return got.kv.?.mod_revision;
+}
+
+fn put_status(
+    world: *sim_world.World,
+    name: []const u8,
+    state: records.NodeState,
+    tenure: u64,
+) !void {
+    const status: records.NodeStatus = .{
+        .state = state,
+        .tenure = tenure,
+        .at_ms = 1,
+        .decision = "x",
+    };
+    const key = records.node_status_key(name);
+    try put_record(world, .node_controller, key.slice(), status);
+}
+
+fn put_record(
+    world: *sim_world.World,
+    role: writers.Role,
+    key: []const u8,
+    value: anytype,
+) !void {
+    const ctx = world.controller_context();
+    const bytes = try records.encode(ctx.arena, value, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+    const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, ctx.diag);
+    try testing.expect(done.succeeded);
 }

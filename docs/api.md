@@ -151,7 +151,16 @@ terminal.
 ```
 
 - `step.type` is `decision`, or a terminal: `observed`, `desired`, `resync`, `lease_expired`
-  (new, below), or `gone` when a decision in the chain has been removed by retention.
+  (new, below), or `gone` when a decision in the chain has been removed by retention. A `why node`
+  chain may end in one more step of type `note` (C1 slice 7): a statement of the scheduler's rule,
+  not a reading of the store. A client that does not know a step type prints its `text`.
+- `why node`'s `state.text` names the judgement and the load:
+  `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0 MiB of
+  8192 MiB memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
+  status is for an earlier tenure says so, and one that is not registered says `not registered`
+  and, if a status remains, `last judged <state> (tenure N)`. The `note` step is added when the
+  node is `ready` for its current tenure and holds fewer replicas than another registered node:
+  replicas already running elsewhere are not moved back, because the scheduler does not rebalance.
 - **`state.text` and every `step.text` are the sentences the CLI prints.** The CLI renders
   `state.text`, then `← <text>` per step, and a step with a `diagnostic` as the full diagnostic
   block instead (HANDOFF's `← error[ZBX-E0501]: image not found …` form). The console may add

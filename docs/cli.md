@@ -123,6 +123,13 @@ service broken: 0/1 running
 
 `--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step.
 
+`zcube why node node3` starts from the state line, which names the judgement and the load
+(`node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0 MiB of
+8192 MiB memory in use`), then the node's newest decision. A `ready` node that holds fewer
+replicas than another gets one more line, a note and not a reading of the store: replicas already
+running elsewhere are not moved back, because the scheduler places a replica when it is created or
+its node is lost and does not rebalance.
+
 ## explain
 
 `zcube explain E0201` (also `ZC-E0201`, in any letter case) prints the registry's long explanation,
