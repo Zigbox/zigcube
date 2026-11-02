@@ -79,7 +79,9 @@ const Shell = struct {
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
-        // No exchange may run past the fence; with no lease there is none.
+        // No exchange may run past the fence; with no lease there is none. A lease kept by an
+        // earlier run counts from the first call.
+        shell.agent.restore_lease(&ctx) catch shell.diag.reset();
         const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
         shell.remote.set_deadline(shell.boot, deadline);
         const wake = shell.agent.reconcile(&ctx) catch {

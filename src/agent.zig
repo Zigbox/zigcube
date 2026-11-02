@@ -179,7 +179,7 @@ pub const Agent = struct {
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
         // The fence comes first and needs no server: an agent cut off from everything still stops.
-        if (!agent.restored) try agent.restore(ctx, mono);
+        try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {
             if (mono >= at) agent.begin_fence(at);
         }
@@ -284,6 +284,12 @@ pub const Agent = struct {
         state.put_atomic(lease_file, text) catch |err| {
             return state_failed(ctx, err, "keep the lease");
         };
+    }
+
+    /// Reads the kept lease once, so the caller can cap its calls by the fence before the step's
+    /// first call. `reconcile` does it too; later calls change nothing.
+    pub fn restore_lease(agent: *Agent, ctx: *const Context) Error!void {
+        if (!agent.restored) try agent.restore(ctx, ctx.mono_ms());
     }
 
     /// Reads what a previous run kept. A file that is not there is a first start or a finished

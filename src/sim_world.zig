@@ -12,6 +12,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const agent_mod = @import("agent.zig");
+const agent_state = @import("agent_state.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
@@ -217,6 +218,8 @@ pub const World = struct {
     sim: sim_runtime.SimRuntime,
     server: replica_controller.ReplicaController,
     agent: *agent_mod.Agent,
+    /// The agent's files (the kept lease), which a restart of the agent finds again.
+    files: agent_state.SimState,
     api_source: controller.DecisionSource,
     diag: Diag,
     arena_state: std.heap.ArenaAllocator,
@@ -250,6 +253,7 @@ pub const World = struct {
         world.instance_next = 1;
         world.server = replica_controller.ReplicaController.init(world.take_instance());
         world.agent = agent;
+        world.files = .init(gpa, seed ^ 0x5eed);
         agent.init(agent_config());
         world.api_source = .{ .instance = 0 };
         world.diag.reset();
@@ -269,6 +273,7 @@ pub const World = struct {
     pub fn destroy(world: *World) void {
         const gpa = world.gpa;
         world.arena_state.deinit();
+        world.files.deinit();
         world.sim.deinit();
         world.memory.deinit();
         gpa.destroy(world.memory);
@@ -334,6 +339,7 @@ pub const World = struct {
             .clock = world.manual.clock(),
             .arena = world.fresh_arena(),
             .diag = &world.diag,
+            .state = world.files.interface(),
         };
         world.stats.agent_steps += 1;
         const wake = world.agent.reconcile(&ctx) catch return world.failed_step(.agent);
@@ -469,6 +475,7 @@ pub const World = struct {
     /// in the runtime, and the agent must find them again.
     pub fn restart_agent(world: *World) void {
         world.agent.init(agent_config());
+        world.files.restart();
         world.agent_due_ms = 0;
     }
 
