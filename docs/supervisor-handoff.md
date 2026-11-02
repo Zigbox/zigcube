@@ -72,5 +72,5 @@ Then: README, site and architecture page updated with the run link; C1 marked de
 ## Open with the owner
 
 - C0's implementer sessions and the CI-skip session are archived (owner's OK, 2026-10-30), except slice 4 (`session_01Jc3KpBnbQjqTJsuVnLZ6uD`), whose archive the permission classifier refused; the owner archives it.
-- Zigbox items, low priority: a separate diagnostics module (zigbox issue #8), a real code for `ZBX-E0501` and one for `lost`, container start time in `Runtime`.
+- Zigbox items, low priority: a separate diagnostics module (zigbox issue #8), a real code for `ZBX-E0410` and one for `lost`, container start time in `Runtime`.
 - Before C7: a TLA+ model of fencing. Before a second server: a leader lease on `/leader/controllers`.

@@ -12,7 +12,7 @@ const constants = @import("constants.zig");
 const text_util = @import("text.zig");
 
 pub const Entry = struct {
-    /// "ZBX-E0501".
+    /// "ZBX-E0410".
     full_name: []const u8,
     severity: zigbox.codes.Severity,
     blame: zigbox.codes.Blame,
@@ -20,25 +20,9 @@ pub const Entry = struct {
     explanation: []const u8,
 };
 
-/// A start whose image digest is not in the node's store (HANDOFF, C0 demo step 4). Zigbox's
-/// numbering puts registry and pull problems in `05xx`.
-pub const image_not_found: Entry = .{
-    .full_name = "ZBX-E0501",
-    .severity = .@"error",
-    .blame = .user,
-    .summary = "image not found",
-    .explanation =
-    \\The runtime on the node has no image with that digest in its store, so the
-    \\container cannot start. The digest in the service file is wrong, or the
-    \\image was never pulled to this node.
-    \\
-    \\Check the digest in the service file against the images the node has, or
-    \\pull the image first, then apply the corrected file. The replica is held,
-    \\not retried: a new one would fail the same way.
-    ,
-};
-
-pub const placeholders = [_]Entry{image_not_found};
+/// Empty since Zigbox 600939c registered `ZBX-E0410`, the code the simulated runtime used to
+/// keep here. The mechanism stays for the next code Zigbox lacks.
+pub const placeholders = [_]Entry{};
 
 pub fn find(full_name: []const u8) ?*const Entry {
     for (&placeholders) |*entry| {
@@ -63,9 +47,7 @@ comptime {
     }
 }
 
-test "a placeholder is found by its full name and by nothing else" {
-    // Goal: `find` is exact, so the API never explains a code it does not own.
-    try std.testing.expect(find("ZBX-E0501") == &placeholders[0]);
-    try std.testing.expect(find("ZBX-E0502") == null);
-    try std.testing.expect(find("E0501") == null);
+test "find is exact, so the API never explains a code it does not own" {
+    try std.testing.expect(find("ZBX-E0410") == null);
+    try std.testing.expect(find("E0410") == null);
 }

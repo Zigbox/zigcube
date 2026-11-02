@@ -1,5 +1,5 @@
 // The image digests the fake runtime treats as present on the node. A start with any other digest
-// fails with the placeholder ZBX-E0501, "image not found" (docs/runtime-codes.md). A real runtime
+// fails with ZBX-E0410, "no tree with that digest". A real runtime
 // has a store of images; this list stands in for it until Zigbox's M4.
 //
 // Read by `zcube-agent --images` (default: fixtures/images.zon, relative to where it runs).

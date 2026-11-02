@@ -237,7 +237,7 @@ fn broken(run: *Run) Failure!void {
         "service broken: 0/1 running\n",
         "  \u{2190} replica broken-1 failed to start on node1; it was not replaced because " ++
             "a new one would fail the same way\n",
-        "  \u{2190} error[ZBX-E0501]: image not found\n",
+        "  \u{2190} error[ZBX-E0410]: no tree with that digest\n",
         "      cause  digest b3:00ff...e1 is not in this node's store\n",
         "      fix    check the digest in the service file, or pull the image first\n",
     };
@@ -702,7 +702,7 @@ test "the C0 scenario holds, and prints HANDOFF's chain" {
         if (report.failed != .done) std.debug.print("{s}\n", .{report.text()});
         try testing.expectEqual(Step.done, report.failed);
     }
-    try testing.expect(has(report.text(), "error[ZBX-E0501]: image not found"));
+    try testing.expect(has(report.text(), "error[ZBX-E0410]: no tree with that digest"));
     try testing.expect(has(report.text(), "sim-c0: every step held"));
 }
 

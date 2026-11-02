@@ -153,9 +153,9 @@ const expected = [
   "error[ZC-E0203]:",
   "zcube explain E0203",
   "https://zigbox.github.io/zigcube/errors/E0203.html",
-  "error[ZBX-E0501]: image not found",
-  "zbx explain E0501",
-  "https://zigbox.github.io/zigbox/errors/E0501.html",
+  "error[ZBX-E0410]: no tree with that digest",
+  "zbx explain E0410",
+  "https://zigbox.github.io/zigbox/errors/E0410.html",
 ];
 const missing = expected.filter((line) => !report.includes(line));
 
@@ -177,7 +177,7 @@ for (const seed of simSeeds) {
   const stopped = sim.zcube_sim_c0(seed);
   const text = simReport(sim);
   simBytes += text.length;
-  const expectedText = ["sim-c0: every step held", "error[ZBX-E0501]: image not found", "service broken: 0/1 running"];
+  const expectedText = ["sim-c0: every step held", "error[ZBX-E0410]: no tree with that digest", "service broken: 0/1 running"];
   const absent = expectedText.filter((line) => !text.includes(line));
   if (stopped !== 0 || absent.length > 0) simProblems.push(`scenario seed ${seed}: stopped at step ${stopped}, missing ${JSON.stringify(absent)}\n${text}`);
 }

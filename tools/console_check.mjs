@@ -4,7 +4,7 @@
 //
 // It fails unless the module (1) imports exactly one function, env.zc_panic, and nothing else;
 // (2) starts, answers GET /v1/status and runs the whole C0 scenario to the story the console
-// tells (hello at 2 running, broken explained by ZBX-E0501, the store down and back); and (3)
+// tells (hello at 2 running, broken explained by ZBX-E0410, the store down and back); and (3)
 // reports a panic through its one import before it traps. Why JavaScript, and why Node twice (one
 // run per V8 compiler): docs/wasm.md, "Why JavaScript for the runner" and "Node 22 crashes when
 // V8 mixes its compiler tiers". This file holds no logic of the core: it writes request frames
@@ -100,7 +100,7 @@ expect(hello.json.state.text === "service hello: 2/2 running", `hello: ${hello.j
 const broken = request(host, "GET", "/v1/why/service/broken");
 expect(broken.json.state.text === "service broken: 0/1 running", `broken: ${broken.json.state.text}`);
 const last = broken.json.steps[broken.json.steps.length - 1];
-expect(last.diagnostic?.code === "ZBX-E0501", "the chain for broken does not end in ZBX-E0501");
+expect(last.diagnostic?.code === "ZBX-E0410", "the chain for broken does not end in ZBX-E0410");
 
 // A watch with nothing to report asks to be held, and a compaction makes an old bookmark a 410.
 const head = e.zc_revision();
