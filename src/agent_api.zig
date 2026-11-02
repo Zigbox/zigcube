@@ -322,11 +322,13 @@ const Call = struct {
             return bad_request(ctx, "timeout", "must be at most 25000");
         }
         const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
-        var bookmark: store.Revision = 0;
+        // With nothing changed, the bookmark is the smaller of the prefixes' (each scan may stop
+        // short of the head), so resuming from it skips no revision of either prefix.
+        var bookmark: store.Revision = std.math.maxInt(store.Revision);
         var changed = false;
         for (watch_prefixes) |prefix| {
             const seen = try scan_watch(ctx, prefix, from, head.revision);
-            bookmark = @max(bookmark, seen.bookmark);
+            bookmark = @min(bookmark, seen.bookmark);
             if (seen.changed) {
                 bookmark = seen.bookmark;
                 changed = true;

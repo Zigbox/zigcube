@@ -375,16 +375,38 @@ The node's desired replicas, and nothing else:
 
 ```json
 { "revision": 412,
-  "kvs": [ { "key": "/replicas/hello/hello-3", "value": {"v": 1, "id": "hello-3", "…": "…"},
+  "kvs": [ { "key": "/replicas/hello/hello-3", "value": {"v": 2, "id": "hello-3", "…": "…"},
              "create_revision": 390, "mod_revision": 398, "lease": 0 } ] }
 ```
 
 The shape is `/v1/list`'s, the `value` is the replica record of keys.md **with its `env` values**,
 and `revision` is the revision the list was read at. A node has at most `agent_node_replicas_max`
-(500, one page of a store list); more is `ZC-E0302`. **C0 filters `/replicas/` by the record's `node` field on the server.**
-For C1 this is the place for the `/assigned/<node>/<replica>` index that keys.md proposes: the
-scheduler would write it with `node`, and this handler would read that prefix instead. The
-endpoint's shape does not change, which is why it is a list of replicas and not of keys.
+(500, one page of a store list); more is `ZC-E0302`. **From C1 slice 3 the server serves the
+replicas named under `/assigned/<node>/`** (the scheduler's), read at the revision of the replica
+list; an assignment whose replica is gone is not served, so the agent stops that container. (C0
+filtered `/replicas/` by the record's `node` field, which a `"v": 2` replica no longer has.) The
+endpoint's shape did not change, which is why it is a list of replicas and not of keys.
+
+**A C0 agent cannot run against a C1 server.** The records are `"v": 2`, and a C0 agent refuses
+a value whose version is newer than it knows with `ZC-E0303`, naming the key and both versions
+(keys.md, "Versions"). Upgrade the agents with the server.
+
+### `GET /v1/agent/nodes/{node}/assigned`
+
+The node's assignments, as stored: `{"revision": R, "kvs": [...]}` in `/v1/list`'s shape for
+`/assigned/<node>/`, each `value` the assignment record of keys.md:
+
+```json
+{ "revision": 415,
+  "kvs": [ { "key": "/assigned/node1/hello-3",
+             "value": {"v": 1, "replica": "hello-3", "service": "hello",
+                       "requests": {"cpu_millis": 250, "memory_bytes": 134217728},
+                       "reason": "node1 is the only node, and it fits 250m CPU and 128 MiB"},
+             "create_revision": 398, "mod_revision": 398, "lease": 0 } ] }
+```
+
+`GET` only, no query. At most `agent_node_replicas_max` (500) assignments; more is `ZC-E0302`.
+The key's `mod_revision` is the replica's placement epoch (keys.md).
 
 ### `GET /v1/agent/nodes/{node}/observed` and `POST ...`
 
@@ -411,8 +433,10 @@ The long poll, the provisional transport of HANDOFF. `from` is a revision (at le
 { "revision": 415, "changed": true }
 ```
 
-`changed` is true if any key under the watched prefix (C0: `/replicas/`; C1: the node's
-`/assigned/` prefix) was written or deleted at a revision `>= from`. If nothing has changed the
+`changed` is true if any key under the watched prefixes, `/replicas/` and (from C1 slice 3)
+`/assigned/`, was written or deleted at a revision `>= from`. Each prefix is scanned in turn;
+with nothing changed, `revision` is the smaller of the two scans' bookmarks, so watching from
+`revision + 1` skips no change under either. If nothing has changed the
 server holds the reply up to `timeout`, as for `GET /v1/watch`, and answers with `changed: false`
 and the bookmark when the time is up. **The reply carries no events**, because the agent
 reconciles by level: it reads the list again and lets the core decide, so a lost or compacted
