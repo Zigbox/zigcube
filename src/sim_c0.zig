@@ -352,7 +352,10 @@ fn dump_service(run: *Run, name: []const u8) void {
         const observed = snapshot.observed_of(&replica.rec);
         const status = if (observed) |found| @tagName(found.rec.status) else "none";
         run.say("  replica {s} node={s} generation={d} observed={s}\n", .{
-            replica.rec.id, replica.rec.node, replica.rec.generation, status,
+            replica.rec.id,
+            snapshot.node_of(replica.rec.id) orelse "",
+            replica.rec.generation,
+            status,
         });
     }
     for (world.sim.containers.items) |container| {
@@ -402,6 +405,8 @@ fn invariants(run: *Run, step: Step) Failure!void {
     const world = run.world;
     try run.check(step, world.revision() != null, "the store cannot be read");
     const ctx = world.controller_context();
+    const i6_ok = world.stats.i6_violations == 0;
+    try run.check(step, i6_ok, "I6: an allocation disagrees with its assignments");
     try decisions_have_causes(run, step, &ctx);
     const snapshot = controller.read_snapshot(&ctx) catch
         return run.check(step, false, "the snapshot cannot be read");
@@ -410,7 +415,8 @@ fn invariants(run: *Run, step: Step) Failure!void {
     }
     for (snapshot.replicas) |replica| {
         try why_terminates(run, step, &ctx, .{ .kind = .replica, .name = replica.rec.id });
-        try replica_has_decisions(run, step, &ctx, &replica.rec);
+        const assigned = snapshot.node_of(replica.rec.id) != null;
+        try replica_has_decisions(run, step, &ctx, &replica.rec, assigned);
     }
 }
 
@@ -483,6 +489,7 @@ fn replica_has_decisions(
     step: Step,
     ctx: *const controller.Context,
     replica: *const records.Replica,
+    assigned: bool,
 ) Failure!void {
     const prefix = records.index_prefix(.replica, replica.id);
     const page = ctx.store.list(ctx.arena, .{
@@ -498,7 +505,7 @@ fn replica_has_decisions(
         if (std.mem.eql(u8, entry.action, "place_replica")) placed = true;
     }
     try run.check(step, created, "a replica has no create_replica decision");
-    if (replica.node.len > 0) try run.check(step, placed, "a placed replica has no place decision");
+    if (assigned) try run.check(step, placed, "a placed replica has no place decision");
 }
 
 // ---- The fuzz variant ---------------------------------------------------------------------
@@ -918,18 +925,22 @@ test "a late running record over a stale stopped container is reported lost and 
     try testing.expectEqual(@as(u32, 1), world.sim.running_count());
 }
 
-/// Rewrites the first replica record with `node`, as the scheduler would when it moves the
-/// replica (the key and so its create revision stay).
+/// Moves the first assignment to `node`, as the scheduler would move the replica (the replica
+/// record and so its create revision stay). It writes `/assigned` alone, as the scheduler role:
+/// the test is about the agent, so the allocations are left to the next scheduler pass.
 fn move_first_replica(world: *World, node: []const u8) !void {
     const ctx = world.controller_context();
-    const all = try controller.list_all(records.Replica, &ctx, records.prefix_replicas, null, 8);
+    const all = try controller.list_all(records.Assigned, &ctx, records.prefix_assigned, null, 8);
     try testing.expect(all.items.len > 0);
-    var moved = all.items[0].rec;
-    moved.node = node;
+    const moved = all.items[0].rec;
     const value = try records.encode(ctx.arena, moved, ctx.diag);
-    const op: store.Op = .{ .put = .{ .key = all.items[0].kv.key, .value = value } };
-    const request: store.TxnRequest = .{ .on_success = &.{op} };
-    _ = try @import("writers.zig").txn(ctx.store, .replica_controller, request, ctx.diag);
+    const key = records.assigned_key(node, moved.replica);
+    const ops = [_]store.Op{
+        .{ .delete = all.items[0].kv.key },
+        .{ .put = .{ .key = key.slice(), .value = value } },
+    };
+    const request: store.TxnRequest = .{ .on_success = &ops };
+    _ = try @import("writers.zig").txn(ctx.store, .scheduler, request, ctx.diag);
 }
 
 test "a replica that comes back to its node keeps its container and leaves no pending stop" {

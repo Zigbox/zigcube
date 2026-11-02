@@ -153,7 +153,7 @@ fn replica_line(
     snapshot: *const controller.Snapshot,
     replica: *const records.Replica,
 ) Error!State {
-    if (replica.node.len == 0) return .{
+    const node = snapshot.node_of(replica.id) orelse return .{
         .exists = true,
         .health = .degraded,
         .desired = 1,
@@ -166,7 +166,7 @@ fn replica_line(
         .desired = 1,
         .running = 0,
         .text = try controller.format(ctx, "replica {s}: assigned to {s}, not yet reported", .{
-            replica.id, replica.node,
+            replica.id, node,
         }),
     };
     const status = try observed_phrase(ctx, &observed.rec);
@@ -180,7 +180,7 @@ fn replica_line(
         .desired = 1,
         .running = running,
         .text = try controller.format(ctx, "replica {s} on {s}: {s}", .{
-            replica.id, replica.node, status,
+            replica.id, node, status,
         }),
     };
 }

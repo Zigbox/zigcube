@@ -53,7 +53,7 @@ pub const Reply = struct {
 /// The keys whose change ends a held watch. C0 has one node and the scheduler writes no index, so
 /// it is every replica; C1 narrows it to `/assigned/<node>/` (docs/keys.md) without changing
 /// the endpoint's shape.
-pub const watch_prefixes = [_][]const u8{records.prefix_replicas};
+pub const watch_prefixes = [_][]const u8{ records.prefix_replicas, records.prefix_assigned };
 
 const Parts = std.mem.SplitIterator(u8, .scalar);
 
@@ -85,6 +85,7 @@ pub fn route(
     const what = parts.next() orelse return call.register();
     if (std.mem.eql(u8, what, "lease")) return call.lease();
     if (std.mem.eql(u8, what, "replicas")) return call.replicas();
+    if (std.mem.eql(u8, what, "assigned")) return call.assigned();
     if (std.mem.eql(u8, what, "observed")) return call.observed();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
@@ -180,15 +181,46 @@ const Call = struct {
             null,
             constants.replicas_max,
         ) catch return propagate(ctx);
+        const given = controller.list_all(
+            records.Assigned,
+            ctx,
+            records.assigned_prefix(call.node).slice(),
+            all.revision,
+            constants.agent_node_replicas_max,
+        ) catch return propagate(ctx);
+        // The replicas the scheduler assigned to this node, in `/replicas` order. An assignment
+        // whose replica is gone is not served, so the agent stops the container.
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (given.items) |entry| {
+            wanted.put(ctx.arena, entry.rec.replica, {}) catch return no_memory(ctx);
+        }
         var mine: std.ArrayList(Item(records.Replica)) = .empty;
         for (all.items) |entry| {
-            if (!std.mem.eql(u8, entry.rec.node, call.node)) continue;
-            if (mine.items.len == constants.agent_node_replicas_max) {
-                return too_many(ctx, "replicas");
-            }
+            if (!wanted.contains(entry.rec.id)) continue;
             mine.append(ctx.arena, item_of(records.Replica, entry)) catch return no_memory(ctx);
         }
         return reply(ctx, .{ .revision = all.revision, .kvs = mine.items });
+    }
+
+    // ---- GET /v1/agent/nodes/{node}/assigned ----
+
+    /// The node's assignments, as stored.
+    fn assigned(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("GET");
+        try no_query(ctx, call.query);
+        try call.no_more();
+        const given = controller.list_all(
+            records.Assigned,
+            ctx,
+            records.assigned_prefix(call.node).slice(),
+            null,
+            constants.agent_node_replicas_max,
+        ) catch return propagate(ctx);
+        const items = ctx.arena.alloc(Item(records.Assigned), given.items.len) catch
+            return no_memory(ctx);
+        for (given.items, items) |entry, *slot| slot.* = item_of(records.Assigned, entry);
+        return reply(ctx, .{ .revision = given.revision, .kvs = items });
     }
 
     // ---- GET and POST /v1/agent/nodes/{node}/observed ----
@@ -290,16 +322,13 @@ const Call = struct {
             return bad_request(ctx, "timeout", "must be at most 25000");
         }
         const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
-        const options: store.WatchOptions = .{ .prefix = watch_prefixes[0], .from_revision = from };
-        var open = ctx.store.watch(options, ctx.diag) catch return propagate(ctx);
-        defer open.close();
-        var bookmark = open.delivered;
+        var bookmark: store.Revision = 0;
         var changed = false;
-        for (0..watch_batches_max) |_| {
-            if (bookmark >= head.revision) break;
-            const batch = open.next(ctx.arena, 0, ctx.diag) catch return propagate(ctx);
-            bookmark = batch.revision;
-            if (batch.events.len > 0) {
+        for (watch_prefixes) |prefix| {
+            const seen = try scan_watch(ctx, prefix, from, head.revision);
+            bookmark = @max(bookmark, seen.bookmark);
+            if (seen.changed) {
+                bookmark = seen.bookmark;
                 changed = true;
                 break;
             }
@@ -316,6 +345,29 @@ const Call = struct {
         return answer;
     }
 };
+
+const Scan = struct { bookmark: store.Revision, changed: bool };
+
+/// Reads the events of `prefix` from `from` up to `head`: whether there are any, and the
+/// revision read up to.
+fn scan_watch(
+    ctx: *const Context,
+    prefix: []const u8,
+    from: u64,
+    head: store.Revision,
+) Failure!Scan {
+    const options: store.WatchOptions = .{ .prefix = prefix, .from_revision = from };
+    var open = ctx.store.watch(options, ctx.diag) catch return propagate(ctx);
+    defer open.close();
+    var bookmark = open.delivered;
+    for (0..watch_batches_max) |_| {
+        if (bookmark >= head) break;
+        const batch = open.next(ctx.arena, 0, ctx.diag) catch return propagate(ctx);
+        bookmark = batch.revision;
+        if (batch.events.len > 0) return .{ .bookmark = bookmark, .changed = true };
+    }
+    return .{ .bookmark = bookmark, .changed = false };
+}
 
 /// Batches one watch request reads before it answers; each is at most `store_watch_batch_max`
 /// events, and a store that has this many unread batches has changed.

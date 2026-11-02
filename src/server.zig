@@ -18,7 +18,7 @@ const diag_mod = @import("diag.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const Driver = @import("server_drive.zig").Driver;
 const http = @import("server_http.zig");
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const Backend = @import("server_store.zig").Backend;
 const server_listen = @import("server_listen.zig");
 
@@ -113,7 +113,7 @@ pub const Server = struct {
                 .io = io,
                 .store = backend.handle(),
                 .clock = clock,
-                .replicas = replica_controller.ReplicaController.init(instance),
+                .plane = control_plane.ControlPlane.init(instance),
                 .stopping = undefined,
                 .report_failures = options.report_failures,
             },

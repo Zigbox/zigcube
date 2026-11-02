@@ -1183,7 +1183,6 @@ const Rig = struct {
             .id = id,
             .service = "hello",
             .generation = 1,
-            .node = "",
             .image = "b3:51aa9c03",
             .command = &.{"true"},
             .limits = .{ .cpu_millis = 500, .memory_bytes = 1024 * 1024 * 1024 },

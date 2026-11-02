@@ -12,7 +12,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
 const ManualClock = @import("clock.zig").ManualClock;
@@ -34,7 +34,7 @@ const Fixture = struct {
     memory: *MemoryStore,
     arena_state: std.heap.ArenaAllocator,
     diag: Diag,
-    rc: replica_controller.ReplicaController,
+    plane: control_plane.ControlPlane,
     api: controller.DecisionSource,
 
     fn start(self: *Fixture) !void {
@@ -43,7 +43,8 @@ const Fixture = struct {
         self.memory.init(testing.allocator, self.manual.clock());
         self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         self.diag.reset();
-        self.rc = replica_controller.ReplicaController.init(1);
+        self.plane = control_plane.ControlPlane.init(1);
+        self.plane.check_i6 = true;
         self.api = .{ .instance = 0 };
     }
 
@@ -110,7 +111,9 @@ const Fixture = struct {
     /// One pass; returns what it said.
     fn step(self: *Fixture) !controller.Wakeup {
         const ctx = self.context();
-        return self.rc.reconcile(&ctx);
+        const wake = try self.plane.reconcile(&ctx);
+        try testing.expect(self.plane.mismatch == null);
+        return wake;
     }
 
     /// Steps until a pass writes nothing; returns how many passes wrote something.
@@ -207,12 +210,16 @@ test "an applied service gets its replicas, placed on the node, each with a deci
     const key = records.replica_key("hello", "hello-2");
     const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
     const replica = try records.read(records.Replica, ctx.arena, got.kv.?, &fixture.diag);
-    try testing.expectEqualStrings("node1", replica.node);
-    try testing.expectEqual(@as(u32, 250), replica.requests.?.cpu_millis);
+    _ = replica;
+    const assigned_at = records.assigned_key("node1", "hello-2");
+    const assigned = try ctx.store.get(ctx.arena, assigned_at.slice(), null, &fixture.diag);
+    const given = try records.read(records.Assigned, ctx.arena, assigned.kv.?, &fixture.diag);
+    try testing.expectEqual(@as(u32, 250), given.requests.cpu_millis);
 
     var chain = try fixture.decisions(.replica, "hello-2");
     defer chain.deinit(testing.allocator);
-    try testing.expectEqualStrings("create_replica<decision;place_replica<decision;", chain.items);
+    const expected = "create_replica<decision;hold_pending<desired;place_replica<decision;";
+    try testing.expectEqualStrings(expected, chain.items);
     var service_chain = try fixture.decisions(.service, "hello");
     defer service_chain.deinit(testing.allocator);
     try testing.expectEqualStrings("apply<desired;scale_up<desired;", service_chain.items);
@@ -241,7 +248,8 @@ test "a replica whose container was killed is replaced, and the decisions say wh
 
     var dead = try fixture.decisions(.replica, "hello-2");
     defer dead.deinit(testing.allocator);
-    const dead_chain = "create_replica<decision;place_replica<decision;delete_replica<observed;";
+    const dead_chain = "create_replica<decision;place_replica<decision;" ++
+        "delete_replica<observed;release_replica<resync;";
     try testing.expectEqualStrings(dead_chain, dead.items);
     var fresh = try fixture.decisions(.replica, "hello-4");
     defer fresh.deinit(testing.allocator);
@@ -380,7 +388,8 @@ test "a pass stops after one batch and says it has more to do" {
     many.replicas = 10;
     try fixture.apply(many);
     const first = try fixture.step();
-    try testing.expectEqual(@as(u32, 1), first.acted);
+    // The node controller's first write (the node's status) counts beside the batch.
+    try testing.expectEqual(@as(u32, 2), first.acted);
     try testing.expectEqual(fixture.manual.ms, first.at_ms);
     const partial = try fixture.ids("hello");
     defer Fixture.free_ids(partial);
@@ -681,7 +690,7 @@ test "the creating transaction fails when the counter moved, and the next pass p
     moving.armed = true;
     var ctx = fixture.context();
     ctx.store = moving.interface();
-    const wake = try fixture.rc.reconcile(&ctx);
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
     try testing.expect(moving.fired);
     try testing.expectEqual(@as(u32, 0), wake.acted);
     try testing.expectEqual(@as(?u64, 99), try counter_next(&fixture, "hello"));

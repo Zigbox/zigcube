@@ -100,7 +100,6 @@ const Fixture = struct {
             .id = id,
             .service = service,
             .generation = 1,
-            .node = "",
             .image = "b3:51aa9c03",
             .command = &.{"true"},
             .limits = .{ .cpu_millis = cpu, .memory_bytes = memory },

@@ -249,17 +249,17 @@ pub const ReplicaNumber = struct {
     next: u64,
 };
 
+/// What a service asks for, once per replica. Where it runs is `/assigned`'s (the scheduler's);
+/// a v1 record's `node` and `requests` are ignored on read.
 pub const Replica = struct {
-    v: u32 = 1,
+    v: u32 = 2,
     id: []const u8,
     service: []const u8,
     generation: u64,
-    node: []const u8,
     image: []const u8,
     command: []const []const u8,
     env: []const Pair = &.{},
     limits: Limits = .{},
-    requests: ?Requests = null,
 };
 
 pub const Node = struct {
@@ -870,7 +870,7 @@ test "records a C0 build wrote still read" {
             seen[0] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
             const record = try read(Replica, arena, kv, &diag);
-            try testing.expect(record.node.len > 0 or record.requests == null);
+            try testing.expectEqual(@as(u32, 1), record.v);
             seen[1] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
             const record = try read(Observed, arena, kv, &diag);

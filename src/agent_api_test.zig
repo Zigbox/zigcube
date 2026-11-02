@@ -225,7 +225,6 @@ test "a node is given its own replicas, with the env values the container needs"
     try testing.expectEqual(@as(usize, 2), kvs.len);
     for (kvs) |kv| {
         const replica = field(kv, "value");
-        try testing.expectEqualStrings("node1", field(replica, "node").string);
         const pair = field(replica, "env").array.items[0];
         try testing.expectEqualStrings("s3cr3t", pair.array.items[1].string);
         try testing.expect(std.mem.startsWith(u8, field(kv, "key").string, "/replicas/hello/"));

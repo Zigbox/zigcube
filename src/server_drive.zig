@@ -15,7 +15,7 @@ const Clock = @import("clock.zig").Clock;
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const store = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -26,7 +26,7 @@ pub const Driver = struct {
     io: std.Io,
     store: store.Store,
     clock: Clock,
-    replicas: replica_controller.ReplicaController,
+    plane: control_plane.ControlPlane,
     stopping: *const std.atomic.Value(bool),
     /// Print a coded diagnostic for a failing step; false in tests that make the store fail.
     report_failures: bool,
@@ -58,7 +58,7 @@ pub const Driver = struct {
                 .arena = arena.allocator(),
                 .diag = &diag,
             };
-            const wake = driver.replicas.reconcile(&ctx) catch {
+            const wake = driver.plane.reconcile(&ctx) catch {
                 driver.report(&diag);
                 if (watch) |*open| open.close();
                 watch = null;

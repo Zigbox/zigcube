@@ -168,13 +168,23 @@ pub const Snapshot = struct {
     replicas: []const Entry(records.Replica),
     observed: []const Entry(records.Observed),
     nodes: []const Entry(records.Node),
+    /// The scheduler's assignments (`/assigned/`), at the same revision.
+    assigned: []const Entry(records.Assigned) = &.{},
+    /// Replica id to the node it is assigned to.
+    node_by_replica: std.StringHashMapUnmanaged([]const u8) = .empty,
 
-    /// The observed record of a replica, or null if its node has not reported it.
+    /// The node a replica is assigned to, or null while it is unassigned.
+    pub fn node_of(snapshot: *const Snapshot, replica: []const u8) ?[]const u8 {
+        return snapshot.node_by_replica.get(replica);
+    }
+
+    /// The observed record of a replica, or null if it is unassigned or its node has not
+    /// reported it.
     pub fn observed_of(snapshot: *const Snapshot, replica: *const records.Replica) ?*const Entry(
         records.Observed,
     ) {
-        if (replica.node.len == 0) return null;
-        const key = records.observed_key(replica.node, replica.id);
+        const node = snapshot.node_of(replica.id) orelse return null;
+        const key = records.observed_key(node, replica.id);
         const Order = struct {
             fn compare(wanted: []const u8, item: Entry(records.Observed)) std.math.Order {
                 return std.mem.order(u8, wanted, item.kv.key);
@@ -223,12 +233,29 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         constants.replicas_max,
     );
     const nodes = try list_all(records.Node, ctx, records.prefix_nodes, at, constants.nodes_max);
+    const assigned = try list_all(
+        records.Assigned,
+        ctx,
+        records.prefix_assigned,
+        at,
+        constants.replicas_max,
+    );
+    var by_replica: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (assigned.items) |entry| {
+        const rest = entry.kv.key[records.prefix_assigned.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+            return records.malformed(ctx.diag, entry.kv.key, "Assigned");
+        by_replica.put(ctx.arena, entry.rec.replica, rest[0..slash]) catch
+            return failures.no_memory(ctx.diag);
+    }
     return .{
         .revision = at,
         .services = services.items,
         .replicas = replicas.items,
         .observed = observed.items,
         .nodes = nodes.items,
+        .assigned = assigned.items,
+        .node_by_replica = by_replica,
     };
 }
 
