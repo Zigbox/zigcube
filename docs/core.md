@@ -292,7 +292,7 @@ Debug because that takes 7 s where ReleaseSafe takes 50.
 zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]
 zig build -Doptimize=ReleaseSafe sim-cluster-exe
 zig-out/bin/sim_cluster <seed> <ops> [<nodes>] [--liveness=false] [--heal-at=H]
-zig-out/bin/sim_cluster --seeds A..B <ops> [<nodes>] [--liveness=false] [--shrink]
+zig-out/bin/sim_cluster --seeds A..B <ops> [<nodes>] [--liveness=false] [--shrink] [--trace-steps]
 ```
 
 The first runs one seed natively and as WASM and compares. The range form prints a line per failing
@@ -309,6 +309,11 @@ fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the te
 100 operations takes about 0.7 s natively in ReleaseSafe. The range output is what the simulation
 fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and step, so a change to
 either line's format is a change to `src/sim_fleet_issue.zig` too.
+**Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
+that panics loses no earlier one. `--trace-steps` (either form) writes `step: <name>` to stderr,
+unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end`), so the step a
+crashed seed was in is the last such line; the fleet replays a crashed range seed by seed with it.
+A seed whose world cannot be built (out of memory) reports `step: setup`.
 
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations, native against WASM, and `sim-teeth`.

@@ -2,8 +2,9 @@
 //! one seed or for a range of them.
 //!
 //!     sim-cluster <seed> <operations> [<nodes>] [--liveness=true|false] [--heal-at=N]
+//!                 [--trace-steps]
 //!     sim-cluster --seeds A..B <operations> [<nodes>] [--liveness=true|false] [--shrink]
-//!                 [--expect-fail]
+//!                 [--expect-fail] [--trace-steps]
 //!
 //! `<nodes>` 0 lets the seed pick. Liveness is on by default (src/sim_cluster.zig says what it
 //! is). `--heal-at=N` makes the faults end before operation N instead of where the seed chose.
@@ -17,6 +18,11 @@
 //! `--expect-fail` turns the range into the teeth test (`sim_teeth_main.zig`): it stops at the
 //! first seed that fails and exits 0 only if there was one.
 //!
+//! `--trace-steps` writes `step: <name>` to stderr, unbuffered, as each run enters a step
+//! ("faults", "healed", "convergence", "end"), so a run that panics leaves where it was: the
+//! simulation fleet's runner files a crash under that step (ops/sim-fleet/run.sh). A range writes
+//! each failing seed's lines as soon as it has them, so a later crash does not lose them.
+//!
 //! Exit code 0 if every check held (or, with `--expect-fail`, one failed), 1 if one did not (or,
 //! with `--expect-fail`, none did), and 2 for a usage error. A simulation, not a demo.
 
@@ -26,8 +32,8 @@ const constants = @import("constants.zig");
 const sim_cluster = @import("sim_cluster.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations> [<nodes>] [--liveness=true|false] " ++
-    "[--heal-at=N]\n       sim-cluster --seeds A..B <operations> [<nodes>] " ++
-    "[--liveness=true|false] [--shrink] [--expect-fail]\n";
+    "[--heal-at=N] [--trace-steps]\n       sim-cluster --seeds A..B <operations> [<nodes>] " ++
+    "[--liveness=true|false] [--shrink] [--expect-fail] [--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -38,6 +44,7 @@ const Args = struct {
     options: sim_cluster.Options = .{},
     shrink: bool = false,
     expect_fail: bool = false,
+    trace_steps: bool = false,
 };
 
 /// Null if the arguments are not a valid command line.
@@ -96,6 +103,8 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.shrink = true;
     } else if (std.mem.eql(u8, arg, "--expect-fail")) {
         parsed.expect_fail = true;
+    } else if (std.mem.eql(u8, arg, "--trace-steps")) {
+        parsed.trace_steps = true;
     } else if (std.mem.startsWith(u8, arg, "--heal-at=")) {
         parsed.options.heal_at = std.fmt.parseInt(u32, arg["--heal-at=".len..], 10) catch
             return false;
@@ -107,8 +116,12 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
 
 pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return constants.exit_user;
-    const parsed = parse(args) orelse return usage(init.io);
+    var parsed = parse(args) orelse return usage(init.io);
     if (parsed.operations == 0) return usage(init.io);
+    if (parsed.trace_steps) {
+        trace_io = init.io;
+        parsed.options.on_step = trace_step;
+    }
     const report = init.gpa.create(sim_cluster.Report) catch return constants.exit_environment;
     defer init.gpa.destroy(report);
     if (parsed.range) return run_range(init, &parsed, report);
@@ -116,6 +129,19 @@ pub fn main(init: std.process.Init) u8 {
     write(init.io, report.text()) catch return constants.exit_environment;
     if (report.failed) return constants.exit_user;
     return constants.exit_ok;
+}
+
+/// The process's I/O, for `trace_step`, which the simulation calls without one.
+var trace_io: ?std.Io = null;
+
+/// `--trace-steps`: one unbuffered stderr line per step, so it survives a panic.
+fn trace_step(step: []const u8) void {
+    assert(step.len > 0);
+    const io = trace_io.?;
+    var line_buffer: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buffer, "step: {s}\n", .{step}) catch
+        "step: (name too long)\n";
+    std.Io.File.stderr().writeStreamingAll(io, line) catch {}; // Nowhere else to report it.
 }
 
 fn write(io: std.Io, text: []const u8) !void {
@@ -199,6 +225,8 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         if (report.failed) {
             failures += 1;
             report_failure(init, parsed, seed, report, out) catch return constants.exit_environment;
+            // Out now: a crash on a later seed must not lose it.
+            out.flush() catch return constants.exit_environment;
             if (parsed.expect_fail) break; // Caught: that is all the teeth test asks.
         }
         if (seed == parsed.last_seed) break;
@@ -269,6 +297,8 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--shrink" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--nope" }) == null);
+    const traced = parse(&.{ "sim", "--seeds", "1..1", "60", "--trace-steps" }).?;
+    try std.testing.expect(traced.trace_steps);
 }
 
 test "a shrunk run is the run: the heal point held, the same symptom" {
@@ -282,4 +312,29 @@ test "a shrunk run is the run: the heal point held, the same symptom" {
     sim_cluster.simulate(gpa, seed, 60, .{}, &full);
     // Pinning the heal point to the seed's own choice changes nothing.
     try std.testing.expectEqualStrings(full.text(), report.text());
+}
+
+var traced_steps: [8][]const u8 = undefined;
+var traced_count: usize = 0;
+
+fn record_step(step: []const u8) void {
+    assert(traced_count < traced_steps.len);
+    traced_steps[traced_count] = step;
+    traced_count += 1;
+}
+
+test "the step hook hears every step the run enters, in order" {
+    // Goal: H3, `--trace-steps` can say where a crashing run was. Method: run a passing seed
+    // with a recording hook and check the steps it heard.
+    const gpa = std.testing.allocator;
+    const report = try gpa.create(sim_cluster.Report);
+    defer gpa.destroy(report);
+    traced_count = 0;
+    sim_cluster.simulate(gpa, 3, 60, .{ .on_step = record_step }, report);
+    try std.testing.expect(!report.failed);
+    try std.testing.expectEqual(@as(usize, 4), traced_count);
+    try std.testing.expectEqualStrings("faults", traced_steps[0]);
+    try std.testing.expectEqualStrings("healed", traced_steps[1]);
+    try std.testing.expectEqualStrings("convergence", traced_steps[2]);
+    try std.testing.expectEqualStrings("end", traced_steps[3]);
 }

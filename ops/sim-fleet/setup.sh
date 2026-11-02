@@ -2,8 +2,11 @@
 # Sets up the simulation fleet on a fresh Ubuntu 24.04 host (ops/sim-fleet/README.md). Run as
 # root: `sh setup.sh [--token-file PATH]`. Safe to run again. With --token-file the token is
 # copied (never printed, never passed as an argument value) to /etc/sim-fleet/token, mode 0600.
-# It starts the service only when a token is present.
+# It starts the service only when a token is present. It stops a running service first, so its
+# build never races the service's, and starts it again at the end.
 set -eu
+# `su simfleet` keeps the working directory, which simfleet may not be allowed to read.
+cd /
 
 # Keep in step with build.zig.zon (minimum_zig_version), CI and .claude/hooks/session-start.sh.
 ZIG_VERSION=0.17.0
@@ -52,6 +55,11 @@ if ! id simfleet >/dev/null 2>&1; then
     useradd --system --create-home --home-dir "$HOME_DIR" --shell /usr/sbin/nologin simfleet
 fi
 
+if systemctl is-active --quiet sim-fleet.service; then
+    echo "sim-fleet: stopping the service for the setup build"
+    systemctl stop sim-fleet.service
+fi
+
 if [ ! -d "$HOME_DIR/zigcube/.git" ]; then
     su -s /bin/sh simfleet -c "git clone --quiet '$REMOTE' '$HOME_DIR/zigcube'"
 fi
@@ -61,7 +69,7 @@ if [ "$wanted" != "$ZIG_VERSION" ]; then
     exit 1
 fi
 # A first build, so the Zig package cache is warm and a broken host shows now, not at 3 a.m.
-su -s /bin/sh simfleet -c "cd '$HOME_DIR/zigcube' && git fetch --quiet origin main && \
+su -s /bin/sh simfleet -c "cd '$HOME_DIR/zigcube' && timeout 300 git fetch --quiet origin main && \
     git checkout --quiet --detach FETCH_HEAD && \
     zig build -Doptimize=ReleaseSafe sim-cluster-exe sim-fleet-exe"
 
