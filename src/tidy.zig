@@ -58,6 +58,7 @@ const module_allowlist = [_][]const u8{
     "libpq_c",
     "conformance_options",
     "zigbox",
+    "zigbox_vm",
     "web_files",
 };
 
