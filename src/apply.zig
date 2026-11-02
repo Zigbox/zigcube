@@ -267,7 +267,7 @@ fn validate(ctx: *const Context, input: Input) Error!void {
     }
     if (input.command[0].len == 0) return invalid(ctx, "the command's first word is empty");
     if (input.env.len > constants.runtime_env_count_max) {
-        return invalid(ctx, "a service may set at most 64 environment variables");
+        return invalid(ctx, "a service may set at most 16 environment variables");
     }
     for (input.env) |pair| {
         if (pair[0].len == 0) return invalid(ctx, "an environment variable has no name");
@@ -383,4 +383,36 @@ test "invalid input is ZC-E0104 and a missing service is ZC-E0101" {
     try testing.expectEqual(@import("diag/codes.zig").Code.E0101, diag.code.?);
     diag.reset();
     try testing.expectEqual(@as(store.Revision, 0), (try ctx.store.status(&diag)).revision);
+}
+
+test "apply refuses more environment variables than Zigbox runs" {
+    // Goal: P3 of docs/briefs/c2-1.md. `runtime_env_count_max` is Zigbox's `run_env_count_max`
+    // (16), so a service the real runtime would refuse is refused at apply, not held later.
+    // Method: 16 variables are accepted, 17 are ZC-E0104, and nothing is written.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    var pairs: [17][2][]const u8 = undefined;
+    for (&pairs) |*pair| pair.* = .{ "KEY", "value" };
+    var many = hello;
+    many.env = pairs[0..16];
+    _ = try apply(&ctx, &source, many);
+    diag.reset();
+    many.name = "hello2";
+    many.env = pairs[0..17];
+    try testing.expectError(error.Invalid, apply(&ctx, &source, many));
+    try testing.expectEqual(@import("diag/codes.zig").Code.E0104, diag.code.?);
 }
