@@ -184,6 +184,7 @@ td.lease .muted { font-size: .85rem; }
 
 /* ---- Why ---- */
 .why-head { display: grid; gap: 6px; min-height: 4rem; }
+.why-complete { margin: 6px 0 0; font-size: .9rem; } .why-complete.ok strong { color: var(--ok); } .why-complete.cut strong { color: var(--warn); }
 .why-state { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; } .why-text { font-size: 1.15rem; font-weight: 650; font-variant-numeric: tabular-nums; }
 .chain { list-style: none; margin: 0; padding: 0; display: grid; gap: 0; }
 .step { display: grid; grid-template-columns: 1fr; position: relative; padding-left: 28px; }

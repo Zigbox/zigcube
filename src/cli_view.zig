@@ -280,7 +280,25 @@ pub fn why_text(
     for (steps) |step| {
         try write_step(arena, writer, step, verbose, report, request_id);
     }
+    if (verbose) try write_completeness(writer, body);
     return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
+/// `completeness: complete` or `completeness: truncated (compacted) at <key>`; nothing when the
+/// server's answer has none (an older server).
+fn write_completeness(writer: *Writer, body: Value) Error!void {
+    const found = cli_data.member(body, "completeness") orelse return;
+    const verdict = cli_data.text(found, "verdict") orelse return;
+    if (!std.mem.eql(u8, verdict, "truncated")) {
+        writer.print("completeness: {s}\n", .{verdict}) catch return error.OutOfMemory;
+        return;
+    }
+    const reason = cli_data.text(found, "reason") orelse "unknown";
+    const at = cli_data.text(found, "at") orelse "?";
+    writer.print(
+        "completeness: truncated ({s}) at {s}\n",
+        .{ reason, at },
+    ) catch return error.OutOfMemory;
 }
 
 fn write_step(

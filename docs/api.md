@@ -165,6 +165,15 @@ terminal.
   `state.text`, then `← <text>` per step, and a step with a `diagnostic` as the full diagnostic
   block instead (HANDOFF's `← error[ZBX-E0501]: image not found …` form). The console may add
   structure around the text (who, when, links, the revision) but never different claims.
+- `completeness` (C1 slice 7, authority.md §5) says whether the chain reaches its cause:
+  `{"verdict": "complete"}`, or `{"verdict": "truncated", "at": "<decision id or key>", "reason": R}`
+  with `R` one of `retention` (a decision was removed by the 24 h retention), `subject_deleted`
+  (the same, and the subject no longer exists) or `compacted` (a key the chain cites was compacted
+  and no decision kept evidence of it). A `gone` step carries the same `reason`, and for `compacted`
+  the `key`. The current value of a compacted key is never shown as the reason for it. The field is
+  always present (an empty chain is `complete`); a client reading an older server may find it absent. Only the scheduler and the node
+  controller write `cause_evidence`; the replica controller writes none, so its `observed` and
+  `desired` terminals past compaction end `truncated`/`compacted` (a gap, reported with slice 7).
 - `state.health` is `healthy`, `degraded`, `failing` or `gone`.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
   survive (24 h, keys.md) answers `200` with `state.exists: false`.

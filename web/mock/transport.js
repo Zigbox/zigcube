@@ -103,17 +103,30 @@ export function createMockTransport(engine, faults) {
     const known = state.exists || index.length;
     if (!known) throw Object.assign(new Error("none"), { status: 404, diagnostic: diagNotFound(`${kind} ${name}`) });
     const steps = [];
+    let completeness = null;
     let entry = fromDecision ? index.find(e => e.id === fromDecision) : index[index.length - 1];
     if (fromDecision && !entry) throw Object.assign(new Error("none"), { status: 404, diagnostic: diagNotFound(`decision ${fromDecision}`) });
     let d = entry && engine.get(`/decisions/${entry.id}`);
     while (d) {
       steps.push({ type: "decision", text: d.reason, decision: d });
       const c = d.cause;
-      if (c.kind === "decision") { d = engine.get(`/decisions/${c.id}`); if (!d) steps.push({ type: "gone", text: `decision ${c.id} has been removed by retention` }); continue; }
+      if (c.kind === "decision") {
+        d = engine.get(`/decisions/${c.id}`);
+        if (!d) {
+          // The server's rule (api.md, completeness): a chain that ends in a gone step is truncated.
+          const reason = state.exists ? "retention" : "subject_deleted";
+          steps.push({ type: "gone", reason, text: `decision ${c.id} has been removed by retention` });
+          completeness = { verdict: "truncated", at: steps.filter(s => s.type === "decision").pop().decision.id, reason };
+        }
+        continue;
+      }
       steps.push(terminal(c, d));
       break;
     }
-    return { v: 1, revision: engine.rev, subject: { kind, name }, at_decision: fromDecision || null, state, steps };
+    if (!completeness) completeness = { verdict: "complete" };
+    const out = { v: 1, revision: engine.rev, subject: { kind, name }, at_decision: fromDecision || null, state, steps };
+    out.completeness = completeness;
+    return out;
   }
 
   function terminal(c, d) {

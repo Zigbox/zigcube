@@ -121,7 +121,10 @@ service broken: 0/1 running
       docs   https://zigbox.github.io/zigbox/errors/E0501.html
 ```
 
-`--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step.
+`--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step,
+and a last line on whether the chain reaches its cause: `completeness: complete`, or
+`completeness: truncated (retention) at <decision id>`; the reason is `retention`,
+`subject_deleted` or `compacted` (api.md). Without the field (an older server) the line is left out.
 
 `zcube why node node3` starts from the state line, which names the judgement and the load
 (`node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0 MiB of

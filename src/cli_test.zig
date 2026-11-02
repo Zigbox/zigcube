@@ -315,6 +315,13 @@ fn check_broken_chain(world: *World) !void {
             "      docs   https://zigbox.github.io/zigbox/errors/E0501.html\n",
         world.out(),
     );
+    // The verbose chain says whether it reached its cause, and the JSON carries the same fact.
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "why", "service", "broken", "-v" }));
+    try expect_contains(world.out(), "completeness: complete\n");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{
+        "why", "service", "broken", "-o", "json",
+    }));
+    try expect_contains(world.out(), "\"completeness\":{\"verdict\":\"complete\"}");
 }
 
 /// Delete asks first, and with --yes removes the service and stops its replicas.

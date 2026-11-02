@@ -97,6 +97,13 @@ export function why(ctx, params, query) {
     render();
   }
 
+  function completenessEl(c) {
+    if (!c) return null;
+    if (c.verdict === "complete") return h("p", { class: "why-complete ok" }, h("strong", {}, "complete"), " · the chain reaches its cause");
+    const why = ({ retention: "a decision was removed by retention", subject_deleted: "the subject was deleted and a decision was removed", compacted: "a record the chain cites was compacted" })[c.reason] || c.reason;
+    return h("p", { class: "why-complete cut" }, h("strong", {}, `truncated: ${c.reason}`), ` · ${why}`, c.at ? [" · at ", h("code", {}, c.at)] : "");
+  }
+
   function stepEl(step, i) {
     const li = h("li", { class: `step ${step.type}` });
     const mark = h("span", { class: "because", "aria-hidden": "true" }, "because");
@@ -161,6 +168,7 @@ export function why(ctx, params, query) {
     const st = chain.state;
     rebuild(headline, JSON.stringify([st, chain.steps.length]), () => [
       h("div", { class: "why-state" }, pill(st.health === "gone" ? "gone" : st.health), h("p", { class: "why-text" }, st.text)),
+      completenessEl(chain.completeness),
       chain.steps.length ? null : h("p", { class: "muted" }, "No decisions are recorded for this subject. Decisions are kept for a limited time (docs/keys.md, retention)."),
     ]);
     rebuild(chainEl, JSON.stringify(chain.steps), () => chain.steps.map(stepEl));

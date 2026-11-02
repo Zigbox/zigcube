@@ -30,6 +30,19 @@ pub const Health = enum { healthy, degraded, failing, gone };
 
 pub const StepType = enum { decision, observed, desired, resync, lease_expired, gone, note };
 
+/// Why a chain stops short: a decision it cites has been dropped (`retention`), and the subject is
+/// gone too (`subject_deleted`), or a record it cites is older than the store keeps and the
+/// decision did not copy what it used (`compacted`). authority.md section 5.
+pub const Reason = enum { retention, subject_deleted, compacted };
+
+/// Whether the chain reaches its cause. `at` is the last thing found: the id of the last decision,
+/// or the cited key for `compacted`.
+pub const Completeness = struct {
+    verdict: enum { complete, truncated } = .complete,
+    at: ?[]const u8 = null,
+    reason: ?Reason = null,
+};
+
 pub const State = struct {
     exists: bool,
     health: Health,
@@ -47,6 +60,8 @@ pub const Step = struct {
     revision: ?u64 = null,
     lease: ?u64 = null,
     ttl_ms: ?u64 = null,
+    /// Why the chain stops here, on a `gone` step.
+    reason: ?Reason = null,
     /// The diagnostic this step carries, in the JSON of DIAGNOSTICS.md: observed state's own, or
     /// the copy a decision embeds when the record it points at is gone.
     diagnostic: ?records.Raw = null,
@@ -59,6 +74,7 @@ pub const Result = struct {
     at_decision: ?[]const u8,
     state: State,
     steps: []const Step,
+    completeness: Completeness,
 };
 
 /// Explains `subject`. `at_decision` starts the chain at that decision instead of the newest.
@@ -74,6 +90,7 @@ pub fn why(
     if (first == null and !state.exists) return not_found(ctx, subject);
     var steps: std.ArrayList(Step) = .empty;
     if (first) |start| try follow(ctx, start, &steps);
+    const completeness = completeness_of(steps.items, state.exists);
     if (subject.kind == .node) try rebalance_note(ctx, &snapshot, subject.name, &steps);
     return .{
         .revision = snapshot.revision,
@@ -81,7 +98,25 @@ pub fn why(
         .at_decision = at_decision,
         .state = state,
         .steps = steps.items,
+        .completeness = completeness,
     };
+}
+
+/// A chain that ends in a `gone` step is truncated, for the reason that step names (a dropped
+/// decision of a subject that is gone is `subject_deleted`); any other chain is complete.
+fn completeness_of(steps: []Step, subject_exists: bool) Completeness {
+    if (steps.len == 0) return .{};
+    const last = &steps[steps.len - 1];
+    if (last.type != .gone) return .{};
+    if (last.reason == .retention and !subject_exists) last.reason = .subject_deleted;
+    var at = last.key;
+    var index = steps.len;
+    while (at == null and index > 0) {
+        index -= 1;
+        if (steps[index].decision) |decision| at = decision.id;
+    }
+    assert(last.reason != null);
+    return .{ .verdict = .truncated, .at = at, .reason = last.reason };
 }
 
 // ---- The state line ----------------------------------------------------------------------------
@@ -391,7 +426,29 @@ fn gone(ctx: *const Context, steps: *std.ArrayList(Step), what: []const u8) Erro
     const text = try controller.format(ctx, "the decision {s} that came before is no longer " ++
         "kept (decisions are dropped after 200 per subject, 7 days, or 24 hours once the " ++
         "subject is gone)", .{what});
-    try append(ctx, steps, .{ .type = .gone, .text = text });
+    try append(ctx, steps, .{ .type = .gone, .text = text, .reason = .retention });
+}
+
+/// The chain ends because the record it cites is older than the store keeps and the decision did
+/// not copy what it used: never the key's value now, which may be what the controller never saw.
+fn gone_compacted(
+    ctx: *const Context,
+    steps: *std.ArrayList(Step),
+    key: []const u8,
+    revision: store.Revision,
+) Error!void {
+    const text = try controller.format(
+        ctx,
+        "the record {s} as it was at revision {d} is no longer kept",
+        .{ key, revision },
+    );
+    try append(ctx, steps, .{
+        .type = .gone,
+        .text = text,
+        .key = key,
+        .revision = revision,
+        .reason = .compacted,
+    });
 }
 
 /// The step a decision's cause ends the chain with.
@@ -424,7 +481,8 @@ fn lease_step(ctx: *const Context, steps: *std.ArrayList(Step), cause: records.C
 }
 
 /// The observed record the controller reacted to, as it was at that revision if the store still
-/// has it, else as the decision's own copy of its diagnostic remembers.
+/// has it, else what the decision itself copied (`cause_evidence`, `cause_diagnostic`), else the
+/// chain is truncated.
 fn observed_step(
     ctx: *const Context,
     steps: *std.ArrayList(Step),
@@ -436,20 +494,25 @@ fn observed_step(
     var text = try controller.format(ctx, "{s}: the record the controller saw has been removed", .{
         key,
     });
-    if (std.mem.startsWith(u8, key, records.prefix_nodes)) {
-        // The node controller reacted to a node's registration, not to a replica's report. Said
-        // only if the store still has the key at that revision: else it is the removed text.
-        if (try read_at(ctx, key, cause.revision)) |_| {
+    switch (try read_at(ctx, key, cause.revision)) {
+        .absent => {},
+        .compacted => {
+            const revision = cause.revision.?;
+            text = try copied_text(ctx, decision, key, revision) orelse
+                return gone_compacted(ctx, steps, key, revision);
+        },
+        .found => |kv| if (std.mem.startsWith(u8, key, records.prefix_nodes)) {
+            // The node controller reacted to a node's registration, not to a replica's report.
             const name = key[records.prefix_nodes.len..];
             text = try controller.format(ctx, "node {s} registered ({s})", .{ name, key });
-        }
-    } else if (try read_at(ctx, key, cause.revision)) |kv| {
-        const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
-        const phrase = try observed_phrase(ctx, &observed);
-        text = try controller.format(ctx, "{s} on {s}: {s}", .{
-            observed.replica, observed.node, phrase,
-        });
-        if (observed.diagnostic) |raw| diagnostic = raw;
+        } else {
+            const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
+            const phrase = try observed_phrase(ctx, &observed);
+            text = try controller.format(ctx, "{s} on {s}: {s}", .{
+                observed.replica, observed.node, phrase,
+            });
+            if (observed.diagnostic) |raw| diagnostic = raw;
+        },
     }
     try append(ctx, steps, .{
         .type = .observed,
@@ -460,23 +523,46 @@ fn observed_step(
     });
 }
 
+/// What a decision kept of a record the store no longer has: the evidence as written, or a line
+/// saying the diagnostic it carries is its own copy. Null when it kept neither.
+fn copied_text(
+    ctx: *const Context,
+    decision: records.Decision,
+    key: []const u8,
+    revision: store.Revision,
+) Error!?[]const u8 {
+    if (decision.cause_evidence) |evidence| {
+        return try controller.format(ctx, "{s} at revision {d}: {s}", .{
+            key, revision, evidence.text,
+        });
+    }
+    if (decision.cause_diagnostic == null) return null;
+    return try controller.format(ctx, "{s} at revision {d} is no longer kept; the decision " ++
+        "kept its own copy of the diagnostic", .{ key, revision });
+}
+
 fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched) Error!void {
     const cause = last.decision.cause;
     const key = cause.key orelse return gone(ctx, steps, "a desired record");
     // An apply's cause has no revision: it is the revision of the decision's own key.
     const revision = cause.revision orelse last.mod_revision;
     var text = try controller.format(ctx, "{s} no longer exists", .{key});
-    if (try read_at(ctx, key, revision)) |kv| {
-        const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
-        text = try controller.format(ctx, "service {s} was applied by {s} (request {s}): " ++
-            "generation {d}, {d} {s}", .{
-            service.name,
-            if (service.applied_by.len > 0) service.applied_by else "someone",
-            if (service.request_id.len > 0) service.request_id else "unknown",
-            service.generation,
-            service.replicas,
-            if (service.replicas == 1) "replica" else "replicas",
-        });
+    switch (try read_at(ctx, key, revision)) {
+        .absent => {},
+        .compacted => text = try copied_text(ctx, last.decision, key, revision) orelse
+            return gone_compacted(ctx, steps, key, revision),
+        .found => |kv| {
+            const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
+            text = try controller.format(ctx, "service {s} was applied by {s} (request {s}): " ++
+                "generation {d}, {d} {s}", .{
+                service.name,
+                if (service.applied_by.len > 0) service.applied_by else "someone",
+                if (service.request_id.len > 0) service.request_id else "unknown",
+                service.generation,
+                service.replicas,
+                if (service.replicas == 1) "replica" else "replicas",
+            });
+        },
     }
     try append(ctx, steps, .{
         .type = .desired,
@@ -486,18 +572,27 @@ fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched)
     });
 }
 
-/// A key at a revision, or now if the revision is unknown or has been compacted away.
-fn read_at(ctx: *const Context, key: []const u8, revision: ?store.Revision) Error!?store.KeyValue {
-    if (store.key_problem(key) != null) return null;
+const Read = union(enum) { found: store.KeyValue, absent, compacted };
+
+/// A key at a revision; `compacted` when the store no longer keeps that revision. With no
+/// revision to ask for, the key now.
+fn read_at(ctx: *const Context, key: []const u8, revision: ?store.Revision) Error!Read {
+    if (store.key_problem(key) != null) return .absent;
     if (revision) |at| {
         const attempt = ctx.store.get(ctx.arena, key, at, ctx.diag);
-        if (attempt) |got| return got.kv else |err| {
-            if (err != error.Compacted and err != error.FutureRevision) return err;
+        if (attempt) |got| {
+            return if (got.kv) |kv| .{ .found = kv } else .absent;
+        } else |err| {
+            if (err == error.Compacted) {
+                ctx.diag.reset();
+                return .compacted;
+            }
+            if (err != error.FutureRevision) return err;
             ctx.diag.reset();
         }
     }
     const now = try ctx.store.get(ctx.arena, key, null, ctx.diag);
-    return now.kv;
+    return if (now.kv) |kv| .{ .found = kv } else .absent;
 }
 
 fn not_found(ctx: *const Context, subject: records.Subject) error{NotFound} {
@@ -875,4 +970,89 @@ fn put_record(
     const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
     const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, ctx.diag);
     try testing.expect(done.succeeded);
+}
+
+fn compact_to_head(world: *sim_world.World) !void {
+    const head = world.revision().?;
+    try world.store_handle().compact(head, &world.diag);
+}
+
+test "why is complete when the chain reaches its cause, truncated when a decision was dropped" {
+    // Goal: `completeness` for the chain of hello-1. Method: complete as it stands; then the
+    // create decision is removed (retention): truncated at the decision found last, reason
+    // `retention`; then the service goes too: `subject_deleted`.
+    const world = try new_world(8);
+    defer world.destroy();
+    _ = try world.apply(hello);
+    world.advance(2000);
+    var ctx = world.controller_context();
+    const whole = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
+    try testing.expectEqual(.complete, whole.completeness.verdict);
+    try testing.expect(whole.completeness.at == null and whole.completeness.reason == null);
+
+    const first_id = whole.steps[0].decision.?.id;
+    const create_id = whole.steps[1].decision.?.id;
+    const key = records.decision_key(create_id);
+    const op: store.Op = .{ .delete = key.slice() };
+    _ = try writers.txn(ctx.store, .retention, .{ .on_success = &.{op} }, ctx.diag);
+    const dropped = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
+    try testing.expectEqual(.truncated, dropped.completeness.verdict);
+    try testing.expectEqual(Reason.retention, dropped.completeness.reason.?);
+    try testing.expectEqualStrings(first_id, dropped.completeness.at.?);
+    try testing.expectEqual(Reason.retention, dropped.steps[dropped.steps.len - 1].reason.?);
+
+    _ = try world.delete_service("hello");
+    world.advance(5000);
+    ctx = world.controller_context();
+    const left = why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null) catch |err| {
+        // A replica with no decision left at all is a 404; the chain below is the other case.
+        try testing.expectEqual(error.NotFound, err);
+        return;
+    };
+    if (left.steps[left.steps.len - 1].type == .gone and !left.state.exists) {
+        try testing.expectEqual(Reason.subject_deleted, left.completeness.reason.?);
+    }
+}
+
+test "why never shows the current value as the reason for a compacted record" {
+    // Goal: a cited revision below the compaction point ends the chain `compacted`, unless the
+    // decision copied what it used; the key's value now is never offered as the justification.
+    // Method: compact to the head; the replica controller writes no evidence, so hello-1 is
+    // truncated; a hand-written decision with evidence is complete and says the evidence.
+    const world = try new_world(9);
+    defer world.destroy();
+    _ = try world.apply(hello);
+    world.advance(2000);
+    try compact_to_head(world);
+    var ctx = world.controller_context();
+    const result = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
+    const last = result.steps[result.steps.len - 1];
+    try testing.expectEqual(StepType.gone, last.type);
+    try testing.expectEqual(Reason.compacted, last.reason.?);
+    try testing.expectEqualStrings("/services/hello", last.key.?);
+    try testing.expectEqual(.truncated, result.completeness.verdict);
+    try testing.expectEqualStrings("/services/hello", result.completeness.at.?);
+    try expect_contains(last.text, "as it was at revision");
+    for (result.steps) |step| {
+        try testing.expect(std.mem.indexOf(u8, step.text, "was applied by") == null);
+    }
+
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    var batch: controller.Batch = .{};
+    _ = try controller.put_decision(&ctx, &source, .{
+        .actor = "scheduler",
+        .action = "hold_pending",
+        .subject = .{ .kind = .replica, .name = "hello-9" },
+        .reason = "no node fits",
+        .cause = .{ .kind = .desired, .key = "/replicas/hello/hello-9", .revision = 1 },
+        .cause_evidence = .{ .text = "{\"cpu_millis\":250}" },
+    }, &batch);
+    _ = try controller.commit(&ctx, .scheduler, &batch);
+    ctx = world.controller_context();
+    const kept = try why(&ctx, .{ .kind = .replica, .name = "hello-9" }, null);
+    try testing.expectEqual(.complete, kept.completeness.verdict);
+    try testing.expectEqualStrings(
+        "/replicas/hello/hello-9 at revision 1: {\"cpu_millis\":250}",
+        kept.steps[kept.steps.len - 1].text,
+    );
 }
