@@ -68,16 +68,18 @@ hello  3/3    b3:51aa9c03
 
 $ zcube get replicas hello -o wide
 REPLICA  SERVICE  NODE   STATUS   AGE  GEN  CPU   MEMORY  IMAGE        DETAIL
-hello-1  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
-hello-2  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
-hello-3  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
+hello-1  hello    node1  running  8s   1    250m  128Mi   b3:51aa9c03
+hello-2  hello    node2  running  8s   1    250m  128Mi   b3:51aa9c03
+hello-3  hello    node3  running  8s   1    250m  128Mi   b3:51aa9c03
 
 $ zcube get nodes
 NODE   STATUS  TENURE  LEASE     CAPACITY       ALLOCATED     LAST-HEARD
-node1  ready   3       7.5s/10s  4000m / 8.0Gi  250m / 128Mi  2s ago
-node2  ready   4       7.5s/10s  4000m / 8.0Gi  250m / 128Mi  2s ago
-node3  ready   1       7.3s/10s  4000m / 8.0Gi  250m / 128Mi  2s ago
+node1  ready   1       8.3s/10s  4000m / 8.0Gi  250m / 128Mi  1s ago
+node2  ready   2       8.3s/10s  4000m / 8.0Gi  250m / 128Mi  1s ago
+node3  ready   4       8.3s/10s  4000m / 8.0Gi  250m / 128Mi  1s ago
 ```
+
+(Both from one run of `demo/up.sh` and `zcube apply` of a 3-replica `hello`.)
 
 `CPU` and `MEMORY` (wide) are the `requests` of the replica's `/assigned/<node>/<id>`, what the
 scheduler resolved it to need; `-` while it is unassigned.
