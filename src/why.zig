@@ -477,7 +477,7 @@ const hello: apply_mod.Input = .{
 test "why explains a service whose image is not in the node's store, as HANDOFF shows" {
     // Goal: C0 demo step 4. Method: apply `broken` with a digest that is not in the fixtures and
     // let the cores run; the chain is the hold decision, then the observed failure rendered as
-    // the full ZBX-E0501 block.
+    // the full ZBX-E0410 block.
     const world = try new_world(1);
     defer world.destroy();
     var broken = hello;
@@ -501,7 +501,7 @@ test "why explains a service whose image is not in the node's store, as HANDOFF 
         "service broken: 0/1 running\n",
         "  \u{2190} replica broken-1 failed to start on node1; it was not replaced because " ++
             "a new one would fail the same way\n",
-        "  \u{2190} error[ZBX-E0501]: image not found\n",
+        "  \u{2190} error[ZBX-E0410]: no tree with that digest\n",
         "      cause  digest b3:00ff7be1 is not in this node's store\n",
         "      fix    check the digest in the service file, or pull the image first\n",
     };

@@ -36,8 +36,8 @@ pub const ReplicaRow = struct {
     generation: u64,
     image: []const u8,
     status: []const u8,
-    /// What the agent said went wrong, as `ZBX-E0501: image not found`, or the exit; empty for a
-    /// clean state.
+    /// What the agent said went wrong, as `ZBX-E0410: no tree with that digest`, or the
+    /// exit; empty for a clean state.
     detail: []const u8,
     started_at_ms: ?u64,
 };

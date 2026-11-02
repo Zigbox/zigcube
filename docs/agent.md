@@ -45,7 +45,7 @@ zcube-agent --node node1 --server 127.0.0.1:7070 --state-dir /var/lib/zcube-agen
 
 Everything can also be set in a ZON file (`--config FILE`); flags win. `--help` lists the rest.
 The images the fake runtime "has" are read from `fixtures/images.zon` (`--images FILE`); any other
-digest is `start_failed` with the placeholder `ZBX-E0501` ([runtime-codes.md](runtime-codes.md)).
+digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)).
 Capacity is declared, as HANDOFF's provisional answer says.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
@@ -109,7 +109,7 @@ refused directory listing included: only a missing one means "no containers"). `
 through the same `classify` as production: a spec whose container never started is `starting` until
 `fake_start_timeout_ms` on the simulation's clock, then lost with ZC-E0509; a stop keeps the record
 and `run.json`, and `make_room` evicts the oldest stopped one before the next `spec.json` is written. A start
-of an image not in the fixtures is refused with `ZBX-E0501` before anything is written, in both paths
+of an image not in the fixtures is refused with `ZBX-E0410` before anything is written, in both paths
 (`agent_records.has_image`). `AgentState.remove` of a name ending in `/` removes an empty directory,
 durably; that is how `remove_container` finishes. `DirState` fsyncs a file and then its directory on
 every put and remove; `SimState` models exactly that (see `agent_state.zig`'s header) and loses the

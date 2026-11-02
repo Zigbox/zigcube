@@ -293,12 +293,12 @@ fn check_broken_chain(world: *World) !void {
         "service broken: 0/1 running\n" ++
             "  \u{2190} replica broken-1 failed to start on node1; it was not replaced " ++
             "because a new one would fail the same way\n" ++
-            "  \u{2190} error[ZBX-E0501]: image not found\n" ++
+            "  \u{2190} error[ZBX-E0410]: no tree with that digest\n" ++
             "      cause  digest b3:00ff7be1 is not in this node's store\n" ++
             "      fix    check the digest in the service file, or pull the image first\n" ++
-            "      more   zbx explain E0501 \u{b7} rerun with --verbose for the full cause " ++
+            "      more   zbx explain E0410 \u{b7} rerun with --verbose for the full cause " ++
             "chain\n" ++
-            "      docs   https://zigbox.github.io/zigbox/errors/E0501.html\n",
+            "      docs   https://zigbox.github.io/zigbox/errors/E0410.html\n",
         world.out(),
     );
 }

@@ -283,8 +283,9 @@ test "an observed record keeps the diagnostic it carries" {
     defer rig.stop();
     const record = "{\"v\":1,\"replica\":\"broken-1\",\"node\":\"node2\",\"generation\":1," ++
         "\"status\":\"stopped\",\"exit\":{\"kind\":\"start_failed\"},\"diagnostic\":" ++
-        "{\"code\":\"ZBX-E0501\",\"severity\":\"error\",\"blame\":\"user\"," ++
-        "\"summary\":\"image not found\",\"causes\":[\"digest b3:00ff is not in the store\"]," ++
+        "{\"code\":\"ZBX-E0410\",\"severity\":\"error\",\"blame\":\"user\"," ++
+        "\"summary\":\"no tree with that digest\"," ++
+        "\"causes\":[\"digest b3:00ff is not in the store\"]," ++
         "\"while\":[],\"context\":{},\"fixes\":[{\"sentence\":\"check the digest\"}]," ++
         "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}},\"reported_at_ms\":2}";
     var body: [1024]u8 = undefined;
@@ -298,8 +299,8 @@ test "an observed record keeps the diagnostic it carries" {
     const value = field(field(listed, "kvs").array.items[0], "value");
     try testing.expectEqualStrings("start_failed", field(field(value, "exit"), "kind").string);
     const diagnostic = field(value, "diagnostic");
-    try testing.expectEqualStrings("ZBX-E0501", field(diagnostic, "code").string);
-    try testing.expectEqualStrings("image not found", field(diagnostic, "summary").string);
+    try testing.expectEqualStrings("ZBX-E0410", field(diagnostic, "code").string);
+    try testing.expectEqualStrings("no tree with that digest", field(diagnostic, "summary").string);
 }
 
 test "a report that is not this node's own, or not one transaction, is refused" {

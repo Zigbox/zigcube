@@ -104,12 +104,12 @@ service broken: 0/1 running                         ← headline, with a state p
 [replica-controller] hold_failed_replica            ← a decision: actor, action, reason, time
    because ↓
 [observed] broken-1 on node1: stopped               ← a terminal: the thing that happened
-   ┌ error ZBX-E0501  blame: your input             ← a diagnostic block, DIAGNOSTICS.md anatomy
-   │ image not found
+   ┌ error ZBX-E0410  blame: your input             ← a diagnostic block, DIAGNOSTICS.md anatomy
+   │ no tree with that digest
    │ cause  digest b3:00ff7be1 is not in this node's store
    │ fix    check the digest in broken.zon, or pull the image first
    │ or     then apply the corrected file   $ zcube apply broken.zon   [Copy]
-   └ more   zbx explain E0501 · docs …
+   └ more   zbx explain E0410 · docs …
 ```
 
 Rules:
@@ -320,7 +320,7 @@ core's own JSON, never rewritten.
 | 1 | apply `hello` with 3 replicas; three start |
 | 2 | `kill -9` one; a replacement starts |
 | 3, 4 | scale to 5, then back to 2 |
-| 5 | apply `broken` (digest not in the node's store); the chain ends at `ZBX-E0501` |
+| 5 | apply `broken` (digest not in the node's store); the chain ends at `ZBX-E0410` |
 | 6, 7 | the store goes down (`ZC-E0201`); it comes back |
 
 **What the simulation is not:** real processes, Postgres or SQLite, real time, `zbx`. It shows

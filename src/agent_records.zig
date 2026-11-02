@@ -102,7 +102,7 @@ fn json_bytes(buffer: []u8, value: anytype) agent_state.Error![]const u8 {
 }
 
 /// Whether the node has the image. **A start of an image it lacks writes nothing**: no record,
-/// no process, only the refusal (`ZBX-E0501`), so both the real agent and the simulation ask this
+/// no process, only the refusal (`ZBX-E0410`), so both the real agent and the simulation ask this
 /// before `write_spec`. (A `start_failed` run record is for a command that could not run, which
 /// the supervisor writes after the container exists.)
 pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {

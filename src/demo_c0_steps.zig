@@ -316,11 +316,11 @@ const broken_why = [_][]const u8{
     "service broken: 0/1 running",
     "  ← replica broken-1 failed to start on node1; " ++
         "it was not replaced because a new one would fail the same way",
-    "  ← error[ZBX-E0501]: image not found",
+    "  ← error[ZBX-E0410]: no tree with that digest",
     "      cause  digest b3:00ff7be1 is not in this node's store",
     "      fix    check the digest in the service file, or pull the image first",
-    "      more   zbx explain E0501 · rerun with --verbose for the full cause chain",
-    "      docs   https://zigbox.github.io/zigbox/errors/E0501.html",
+    "      more   zbx explain E0410 · rerun with --verbose for the full cause chain",
+    "      docs   https://zigbox.github.io/zigbox/errors/E0410.html",
 };
 
 fn why_is_broken_chain(text: []const u8) bool {
@@ -350,7 +350,7 @@ pub fn broken(demo: *Demo) !void {
     const why = try host.zcube(&.{ "why", "service", "broken" });
     try host.check(
         why.code == 0 and why_is_broken_chain(why.out),
-        "the chain is HANDOFF's: state, replica, then the ZBX-E0501 block with cause and fix",
+        "the chain is HANDOFF's: state, replica, then the ZBX-E0410 block with cause and fix",
         .{},
     );
     try expect_broken_held(demo);
@@ -363,13 +363,13 @@ pub fn broken(demo: *Demo) !void {
     });
 }
 
-/// `broken-1` failed to start with ZBX-E0501 and is held, not replaced; nothing else is disturbed.
+/// `broken-1` failed to start with ZBX-E0410 and is held, not replaced; nothing else is disturbed.
 fn expect_broken_held(demo: *Demo) !void {
     const host = demo.host;
     const table = try host.zcube(&.{ "get", "replicas", "broken", "-o", "wide" });
     const failed = state.wide_rows(table.out, "broken", state.node, "start-failed");
     try host.check(failed == 1, "broken-1 is start-failed on {s}", .{state.node});
-    const detail = "ZBX-E0501: image not found";
+    const detail = "ZBX-E0410: no tree with that digest";
     try host.check(state.contains(table.out, detail), "its DETAIL is " ++ detail, .{});
     const first = (try state.replica_rows(demo, "broken")).?;
     try host.settle("broken is held, not replaced; hello is not disturbed", state.settle_ms);
