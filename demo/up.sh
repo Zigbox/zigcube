@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Why this is shell: it starts and supervises a handful of long-lived processes (a server and three
 # agents) and waits for them, which is what a shell is for; a Zig program would only wrap
-# fork/exec. `zcube local up` (src/cli_local.zig) is the Zig version for one machine and one agent.
+# fork/exec. (`zcube local up|down` was cut from C1, brief c1-7; these scripts are what is left.)
 #
 # usage: demo/up.sh [sqlite|postgres]     (default sqlite)
 #
@@ -16,6 +16,15 @@ backend=${1:-sqlite}
 addr=127.0.0.1:7070
 bin=$root/zig-out/bin
 
+# Anything this script started is stopped again if it fails, so a failed start leaks nothing.
+finished=0
+cleanup() {
+    if [ "$finished" -ne 1 ]; then
+        echo "demo/up.sh: failed; running demo/down.sh to stop what it started" >&2
+        "$root/demo/down.sh" >&2 || true
+    fi
+}
+
 if [ -e "$run/server.pid" ] && kill -0 "$(cat "$run/server.pid")" 2>/dev/null; then
     echo "demo/up.sh: already up (server pid $(cat "$run/server.pid")); run demo/down.sh first" >&2
     exit 1
@@ -26,15 +35,23 @@ if [ ! -x "$bin/zcube-server" ] || [ ! -x "$bin/zcube-agent" ] || [ ! -x "$bin/z
 fi
 
 mkdir -p "$run"
+trap cleanup EXIT
+pg_port=${ZCUBE_PG_PORT:-55432}
 case $backend in
 sqlite) store=sqlite:$run/store.db ;;
 postgres)
-    (cd "$root" && zig build pg-up) >"$run/pg-up.log" 2>&1
-    touch "$run/started-postgres"
-    store="postgres:host=127.0.0.1 port=55432 user=zcube dbname=postgres"
+    # Only a server this script starts is one down.sh may stop (pg-down deletes its directory).
+    if (exec 3<>"/dev/tcp/127.0.0.1/$pg_port") 2>/dev/null; then
+        echo "demo/up.sh: a Postgres already listens on port $pg_port; using it, and down.sh will leave it" >&2
+    else
+        (cd "$root" && zig build pg-up) >"$run/pg-up.log" 2>&1
+        touch "$run/started-postgres"
+    fi
+    store="postgres:host=127.0.0.1 port=$pg_port user=zcube dbname=postgres"
     ;;
 *)
     echo "usage: demo/up.sh [sqlite|postgres]" >&2
+    finished=1
     exit 1
     ;;
 esac
@@ -61,12 +78,13 @@ if [ "$ready" -ne 3 ]; then
     echo "demo/up.sh: the three nodes did not register; see $run/*.log" >&2
     exit 1
 fi
+finished=1
 
 cat <<USAGE
 up: server $addr ($backend), nodes node1 node2 node3, logs in demo/run/
   export ZCUBE_SERVER=$addr
   zcube get nodes
-  zcube apply hello.zon
+  zcube apply hello.zon       # a service file you write; docs/cli.md shows one
   demo/kill-node.sh node2     # kill -9 the agent and its containers
   demo/down.sh                # stop everything
 USAGE

@@ -11,6 +11,16 @@ set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 run=$root/demo/run
 
+# Kills a process and everything below it, children first, so a supervisor cannot restart one and
+# a container's own children are not orphaned.
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" || true); do
+        kill_tree "$child"
+    done
+    kill -9 "$1" 2>/dev/null || true
+}
+
 if [ ! -d "$run" ]; then
     echo "down: nothing to stop"
     exit 0
@@ -19,11 +29,10 @@ fi
 # Agents and supervisors first, so nothing restarts a container; then the server.
 pkill -9 -f "[z]cube-agent .*--state-dir $run/" || true
 for sup in $(pgrep -f "[z]cube-agent supervise $run/" || true); do
-    pkill -9 -P "$sup" || true
-    kill -9 "$sup" 2>/dev/null || true
+    kill_tree "$sup"
 done
 if [ -e "$run/server.pid" ]; then
-    kill -9 "$(cat "$run/server.pid")" 2>/dev/null || true
+    kill_tree "$(cat "$run/server.pid")"
 fi
 if [ -e "$run/started-postgres" ]; then
     (cd "$root" && zig build pg-down) >/dev/null 2>&1 || true

@@ -417,8 +417,8 @@ const Call = struct {
             return bad_request(ctx, "timeout", "must be at most 25000");
         }
         const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
-        // With nothing changed, the bookmark is the smaller of the prefixes' (each scan may stop
-        // short of the head), so resuming from it skips no revision of either prefix.
+        // With nothing changed, the bookmark is the prefix's (the scan may stop
+        // short of the head), so resuming from it skips no revision of the prefix.
         var bookmark: store.Revision = std.math.maxInt(store.Revision);
         var changed = false;
         const prefixes = try watch_prefixes(ctx, call.node);

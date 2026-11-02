@@ -120,13 +120,40 @@ export function createMockTransport(engine, faults) {
         }
         continue;
       }
+      const gone = compactedStep(c, d);
+      if (gone) {
+        steps.push(gone);
+        completeness = { verdict: "truncated", at: c.key, reason: "compacted" };
+        break;
+      }
       steps.push(terminal(c, d));
       break;
     }
     if (!completeness) completeness = { verdict: "complete" };
+    if (kind === "node" && rebalanceNote(name)) steps.push(rebalanceNote(name));
     const out = { v: 1, revision: engine.rev, subject: { kind, name }, at_decision: fromDecision || null, state, steps };
     out.completeness = completeness;
     return out;
+  }
+
+  // The core's rule (docs/authority.md section 5): a cited key read below the compaction point is
+  // `compacted` only if the key has changed since and the decision kept no copy of it.
+  function compactedStep(c, d) {
+    if (!c.key || c.revision == null || c.revision >= engine.compacted) return null;
+    const kv = engine.getKv(c.key);
+    if (kv && kv.mod_revision <= c.revision) return null;
+    if (d.cause_evidence || d.cause_diagnostic) return null;
+    return { type: "gone", reason: "compacted", key: c.key, revision: c.revision, text: `the record ${c.key} as it was at revision ${c.revision} is no longer kept` };
+  }
+
+  // The core's note: a ready node with fewer replicas than another is not rebalanced.
+  function rebalanceNote(name) {
+    if (!engine.get(`/nodes/${name}`)) return null;
+    const all = engine.replicasIn("/replicas/");
+    const mine = all.filter(r => r.node === name).length;
+    const busiest = Math.max(0, ...[...new Set(all.map(r => r.node).filter(n => n && n !== name))].map(n => all.filter(r => r.node === n).length));
+    if (mine >= busiest) return null;
+    return { type: "note", text: "replicas that are already running on other nodes are not moved back: the scheduler places a replica when it is created or its node is lost, and does not rebalance" };
   }
 
   function terminal(c, d) {
@@ -169,7 +196,7 @@ export function createMockTransport(engine, faults) {
     const n = engine.get(`/nodes/${name}`);
     if (!n) return { exists: false, health: "gone", text: `node ${name}: not registered` };
     const count = engine.replicasIn("/replicas/").filter(r => r.node === name).length;
-    return { exists: true, health: "healthy", text: `node ${name}: ready, ${count} ${count === 1 ? "replica" : "replicas"}` };
+    return { exists: true, health: "healthy", text: `node ${name}: ready, lease ${engine.getKv(`/nodes/${name}`)?.lease} with ${count} ${count === 1 ? "replica" : "replicas"} assigned` };
   }
 
   return { request };

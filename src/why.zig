@@ -654,7 +654,9 @@ pub fn render_text(
         if (step.diagnostic) |raw| {
             if (try render_diagnostic_step(writer, buffer, raw, verbose)) continue;
         }
-        writer.print("  \u{2190} {s}\n", .{step.text}) catch return error.OutOfMemory;
+        // A note states a rule; it is not a cause, so it has no arrow.
+        const arrow = if (step.type == .note) "  " else "  \u{2190} ";
+        writer.print("{s}{s}\n", .{ arrow, step.text }) catch return error.OutOfMemory;
     }
     return out.toOwnedSlice();
 }

@@ -246,16 +246,7 @@ pub const Agent = struct {
         agent.forget_finished_stops(listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
         const at_ms = agent.next_wake(now, mono);
-        return .{ .at_ms = at_ms, .prefixes = try agent.watch_prefixes(ctx), .acted = acted };
-    }
-
-    /// The keys whose change wakes the agent: its own `/assigned/<node>/` (see `agent_api.zig`).
-    fn watch_prefixes(agent: *const Agent, ctx: *const Context) Error![]const []const u8 {
-        const key = records.assigned_prefix(agent.config.node);
-        const prefixes = ctx.arena.alloc([]const u8, 1) catch return failures.no_memory(ctx.diag);
-        prefixes[0] = ctx.arena.dupe(u8, key.slice()) catch return failures.no_memory(ctx.diag);
-        assert(prefixes.len == 1);
-        return prefixes;
+        return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = acted };
     }
 
     /// The soonest the agent needs to run again: its lease renewal, the fence, a stop's deadline,
@@ -423,7 +414,7 @@ pub const Agent = struct {
         if (running == 0) try agent.fenced(ctx);
         const poll = now + constants.fence_poll_ms;
         const at_ms = if (running == 0) now else poll;
-        return .{ .at_ms = at_ms, .prefixes = try agent.watch_prefixes(ctx), .acted = 0 };
+        return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = 0 };
     }
 
     /// Every container has stopped: the lease and the tenure are over.

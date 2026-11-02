@@ -20,6 +20,17 @@ export const SCENARIOS = {
   },
 };
 
+// `?mock=c1-compacted`: the C1 run, then the service is scaled and the store compacted, so the
+// replicas' causes (the old /services/hello) are gone: `why replica hello-1` ends `compacted`.
+SCENARIOS["c1-compacted"] = {
+  title: "C1 · Fleet, then compaction",
+  setup() {},
+  steps: [
+    ...SCENARIOS.c1.steps.slice(0, 2),
+    { title: "Scale hello and compact the store", cli: "zcube scale hello 7 # then the store compacts", go: "#/why/replica/hello-1", run: e => { e.apply(helloWith(7)); e.advance(1500); e.compact(e.rev); } },
+  ],
+};
+
 /** Runs steps and exposes the controls the dev panel needs. */
 export class Runner {
   constructor(engine, faults, name) {

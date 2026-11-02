@@ -13,6 +13,16 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 run=$root/demo/run
 node=${1:?usage: demo/kill-node.sh <node>}
 
+# Kills a process and everything below it, children first, so a supervisor cannot restart one and
+# a container's own children are not orphaned.
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" || true); do
+        kill_tree "$child"
+    done
+    kill -9 "$1" 2>/dev/null || true
+}
+
 if [ ! -d "$run/$node" ]; then
     echo "demo/kill-node.sh: no node '$node' under demo/run/; run demo/up.sh first" >&2
     exit 1
@@ -22,8 +32,7 @@ fi
 # then the supervisor. A supervisor killed first would leave its command running.
 pkill -9 -f "[z]cube-agent .*--state-dir $run/$node( |\$)" || true
 for sup in $(pgrep -f "[z]cube-agent supervise $run/$node/" || true); do
-    pkill -9 -P "$sup" || true
-    kill -9 "$sup" 2>/dev/null || true
+    kill_tree "$sup"
 done
 rm -f "$run/$node.pid"
 echo "killed $node"
