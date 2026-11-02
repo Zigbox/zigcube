@@ -310,6 +310,8 @@ fn add_pg_dev_steps(b: *std.Build) *std.Build.Step.Compile {
         const run = b.addRunArtifact(tool);
         run.addArg(command);
         run.has_side_effects = true;
+        // The pair's default ports and directory come from the working directory (pg_dev.zig).
+        run.setCwd(b.path("."));
         const step_name = b.fmt("pg-{s}", .{command});
         b.step(step_name, description).dependOn(&run.step);
     }

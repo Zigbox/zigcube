@@ -357,13 +357,14 @@ follow the design above, with these differences of detail. Each is also in the s
 ## Failover (C1 slice 10d)
 
 The supported setup is one primary and a synchronous standby (`synchronous_commit = remote_apply`
-or `on`, the standby in `synchronous_standby_names`); nothing reads from a replica
-(`docs/operations.md`). `test-store-faults -Dbackend=postgres` ends with two failover runs
+or `on`, the standby in `synchronous_standby_names`; only `remote_apply` is tested); nothing reads
+from a replica (`docs/operations.md`). `test-store-faults -Dbackend=postgres` ends with two failover runs
 (`src/store_failover.zig`, plan in `docs/briefs/c1-10d.md`): a primary and a streaming standby
 made by `pg_dev pair-up sync|async`, replication through a fault proxy, a real `zcube-server` and
 10c's recorded clients through a second proxy that is repointed at the promoted standby. With a
-synchronous standby the history checker passes across the crash and promotion and the server
-carries on. With an asynchronous one held back by a partition, the loss is made certain (the
+synchronous standby the primary acknowledges no write while replication is cut off, the crash
+lands mid-commit, the load carries on past the promotion, the history checker passes across it and
+the server carries on. With an asynchronous one held back by a partition, the loss is made certain (the
 promoted revision is asserted below the server's remembered one) and the server halts with
 `ZC-E0215`, on status, on apply and after a restart, while the checker reports the lost writes.
 `docs/demos/c1.md` says what each asserts.

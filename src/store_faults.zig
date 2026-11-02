@@ -84,6 +84,7 @@ const watch_poll_ms = 30;
 const watch_polls_per_open = 20;
 const watch_polls_max = 100_000;
 const catch_up_ms = 30_000;
+const hold_poll_ms = 5;
 const exit_user = 2;
 
 pub const Backend = enum { postgres, sqlite };
@@ -166,6 +167,11 @@ pub const Shared = struct {
     ops_done: std.atomic.Value(u32) = .init(0),
     /// Set by a failover run that ends the load early: clients and watcher stop at once.
     stop_load: std.atomic.Value(bool) = .init(false),
+    /// Set by a failover run while it stages: clients wait before their next call, so that the
+    /// load outlasts the staging however slow the machine is.
+    hold: std.atomic.Value(bool) = .init(false),
+    /// Writes the store acknowledged (either branch), for a failover run's moments.
+    acked_writes: std.atomic.Value(u32) = .init(0),
 
     /// Counts a call on `key`; false if the key has had its share.
     fn reserve(shared: *Shared, key: u8) bool {
@@ -216,6 +222,10 @@ fn run_client(client: *Client) !void {
     defer arena_state.deinit();
     const rng = client.rng.random();
     for (0..client.shared.run.ops_per_client) |op_index| {
+        while (client.shared.hold.load(.acquire)) {
+            if (client.shared.stop_load.load(.acquire)) return;
+            nap(client.shared.run.io, hold_poll_ms);
+        }
         if (client.shared.stop_load.load(.acquire)) return;
         if (op_index > 0) nap(client.shared.run.io, client.shared.run.op_pause_ms);
         defer _ = client.shared.ops_done.fetchAdd(1, .monotonic);
@@ -352,6 +362,7 @@ fn do_txn(client: *Client, txn: history.Txn) !?history.TxnAck {
     };
     const ack: history.TxnAck = .{ .succeeded = result.succeeded, .revision = result.revision };
     client.recorder.ack_txn(&shared.ticker, handle, ack);
+    _ = shared.acked_writes.fetchAdd(1, .monotonic);
     return ack;
 }
 

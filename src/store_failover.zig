@@ -9,15 +9,28 @@
 //! Mid-load it fails over: `C` black-holes new connections, the primary is crashed
 //! (`pg_ctl -m immediate`), the standby promoted, `C` repointed at it and healed.
 //!
-//! - `sync` (`synchronous_commit = remote_apply`, the standby in `synchronous_standby_names`): the
-//!   clients carry on on the promoted standby and the checker must pass over the whole run; the
+//! A quarter of the way in, the run holds the clients while the server sees and saves
+//! `lead_revisions` revisions, releases them, and cuts replication off (partitions `R`) for a
+//! window in which it counts the clients' acknowledged writes.
+//!
+//! - `sync` (`synchronous_commit = remote_apply`, the standby in `synchronous_standby_names`): `R`
+//!   is cut after the lead. In the window the primary must acknowledge no write (a commit waits
+//!   for the standby, which cannot hear it), so the crash lands mid-commit: the run requires a
+//!   write of unknown outcome. The clients carry on on the promoted standby, must acknowledge
+//!   `writes_after_heal_min` writes there, and the checker must pass over the whole run; the
 //!   server must still answer with `store.ok` and a remembered revision at least the one before
 //!   the failover. The positive control: a lossless failover does not halt the server.
-//! - `async`, the teeth test: `R` is partitioned first, then the run waits until the server has
-//!   seen `lead_revisions` more revisions and saved them, so the loss is certain, not lucky (and
-//!   asserted: the promoted store's revision must be below the remembered one). The clients stop
-//!   at the failover. The server must refuse the promoted store with ZC-E0215 (status and apply),
-//!   and again after a restart; the checker must report the clients' lost acknowledged writes.
+//! - `async`, the teeth test: `R` is cut before the lead, so the server's remembered revision is
+//!   past what the standby has, and the window must see writes acknowledged, so the loss is
+//!   certain, not lucky (and asserted: the promoted store's revision must be below the
+//!   remembered one). The clients stop at the failover. The server must refuse the promoted
+//!   store with ZC-E0215 (apply first, then status), and again after a restart; the promoted
+//!   store's revision must not move; the checker must report the clients' lost acknowledged
+//!   writes.
+//!
+//! The clients are held, not timed, so a slow machine stretches the run instead of letting the
+//! load end before the failover. A run killed with SIGKILL leaves its server's pid in its work
+//! directory; the next run of the mode kills that server first.
 //!
 //! Every path kills the server, stops the proxies and removes the pair (`pg_dev pair-down`).
 
@@ -48,8 +61,18 @@ const ops_per_client = 160;
 const op_pause_ms = 15;
 /// The failover is staged once this share of the calls has been made.
 const stage_percent = 25;
-/// Revisions the server must see past the moment the standby stopped hearing the primary.
+/// Revisions the server must see past the moment the run held (async: past the partition).
 const lead_revisions = 20;
+/// With replication cut off, the run lets this pass before it counts acknowledged writes, and
+/// then counts them over the window: a synchronous primary must acknowledge none, an
+/// asynchronous one some.
+const cut_settle_ms = 100;
+const cut_window_ms = 300;
+/// Writes the clients must have acknowledged on the promoted store (`sync`): the load crossed
+/// the failover.
+const writes_after_heal_min = 20;
+/// Server ports of the two modes differ even for one seed.
+const port_salt = 104_729;
 const poll_ms = 50;
 const wait_ms_max = 30_000;
 const output_bytes_max = 64 * 1024;
@@ -77,6 +100,10 @@ const Rig = struct {
     server_starts: u32 = 0,
     /// The server's remembered revision just before the failover.
     remembered: u64 = 0,
+    /// `async`: the server's store's revision on the standby just after its promotion.
+    promoted_at: u64 = 0,
+    /// Writes the clients had acknowledged when `C` was healed onto the promoted store.
+    acked_at_heal: u32 = 0,
     applies: u32 = 0,
 
     fn fail(rig: *const Rig, comptime format: []const u8, args: anytype) error{FailoverFailed} {
@@ -98,9 +125,10 @@ pub fn run(gpa: Allocator, io: std.Io, options: faults.Options, seed: u64) !faul
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const work = try std.fmt.allocPrint(arena, ".zig-cache/store-failover-{d}-{s}", .{
-        seed, @tagName(mode),
-    });
+    // One directory per mode, whatever the seed, so that the next run finds what a killed one
+    // left: its server is killed first, then its scratch removed.
+    const work = try std.fmt.allocPrint(arena, ".zig-cache/store-failover-{s}", .{@tagName(mode)});
+    kill_stale_server(io, arena, work);
     std.Io.Dir.cwd().deleteTree(io, work) catch {}; // Best effort: scratch of an earlier run.
     try std.Io.Dir.cwd().createDirPath(io, work);
     const pair = try pair_up(gpa, io, arena, options.pg_dev, mode);
@@ -109,6 +137,7 @@ pub fn run(gpa: Allocator, io: std.Io, options: faults.Options, seed: u64) !faul
     defer replication.stop();
     const client = try Proxy.start(gpa, pair.primary_port);
     defer client.stop();
+    const server_seed = seed +% @as(u64, @backingInt(mode)) * port_salt;
     var rig: Rig = .{
         .gpa = gpa,
         .io = io,
@@ -124,7 +153,7 @@ pub fn run(gpa: Allocator, io: std.Io, options: faults.Options, seed: u64) !faul
         .client = client,
         .through = try std.fmt.allocPrint(arena, "host=127.0.0.1 port={d} user=zcube " ++
             "dbname=postgres", .{client.port}),
-        .server_port = try demo_host.free_port(io, seed),
+        .server_port = try demo_host.free_port(io, server_seed),
     };
     defer stop_server(&rig);
     try route_replication(&rig);
@@ -287,6 +316,10 @@ fn start_server(rig: *Rig) !void {
         .stdout = .{ .file = file },
         .stderr = .{ .file = file },
     });
+    // For the next run, should this one be killed before it kills the server.
+    const pid = try std.fmt.allocPrint(arena, "{d}\n", .{rig.server.?.id.?});
+    const pid_path = try std.fmt.allocPrint(arena, "{s}/server.pid", .{rig.work});
+    try std.Io.Dir.cwd().writeFile(rig.io, .{ .sub_path = pid_path, .data = pid });
     var waited: u32 = 0;
     while (waited < wait_ms_max) : (waited += poll_ms) {
         if (call(rig, "GET", "/v1/status", "")) |reply| {
@@ -302,6 +335,25 @@ fn stop_server(rig: *Rig) void {
     var child = rig.server orelse return;
     child.kill(rig.io);
     rig.server = null;
+}
+
+/// Kills the server a killed earlier run of this mode left running: the pid in its work
+/// directory, if that process is still a `zcube-server` with its state there (a pid is reused).
+fn kill_stale_server(io: std.Io, arena: Allocator, work: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    const pid_path = std.fmt.allocPrint(arena, "{s}/server.pid", .{work}) catch return;
+    // No file: no earlier run left a server.
+    const text = cwd.readFileAlloc(io, pid_path, arena, .limited(32)) catch return;
+    const pid_text = std.mem.trim(u8, text, " \n");
+    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch return; // Not ours.
+    if (pid <= 1) return;
+    const proc_path = std.fmt.allocPrint(arena, "/proc/{d}/cmdline", .{pid}) catch return;
+    // `readFile`, not `readFileAlloc`: a /proc file's size is 0. Gone: nothing to kill.
+    var buffer: [4096]u8 = undefined;
+    const cmdline = cwd.readFile(io, proc_path, &buffer) catch return;
+    if (!contains(cmdline, "zcube-server") or !contains(cmdline, work)) return;
+    std.posix.kill(pid, .KILL) catch return; // It exited meanwhile.
+    say("failover: killed zcube-server {d}, left running by a killed earlier run", .{pid});
 }
 
 fn call(rig: *const Rig, method: []const u8, target: []const u8, body: []const u8) !http.Reply {
@@ -364,16 +416,21 @@ fn apply(rig: *Rig) !http.Reply {
     return call(rig, "POST", "/v1/apply", body);
 }
 
+/// An apply that must succeed; `when` says where the run was.
+fn apply_ok(rig: *Rig, comptime when: []const u8) !void {
+    const reply = try apply(rig);
+    if (reply.status / 100 != 2) {
+        return rig.fail("an apply " ++ when ++ " answered {d}:\n{s}", .{
+            reply.status, reply.body,
+        });
+    }
+}
+
 /// Applies until the server remembers at least `target`.
 fn lead_to(rig: *Rig, target: u64) !Seen {
     var waited: u32 = 0;
     while (waited < wait_ms_max) : (waited += poll_ms) {
-        const reply = try apply(rig);
-        if (reply.status / 100 != 2) {
-            return rig.fail("an apply before the failover answered {d}:\n{s}", .{
-                reply.status, reply.body,
-            });
-        }
+        try apply_ok(rig, "before the failover");
         const seen = try status(rig);
         if (seen.remembered >= target) return seen;
         faults.nap(rig.io, poll_ms);
@@ -469,23 +526,34 @@ fn conduct(
     const finished: faults.Finished = .{ .log = log.items, .final = final };
     const report = try faults.verdict(shared, after, clients, watcher, finished);
     return switch (rig.mode) {
-        .sync => try judge_sync(rig, report),
+        .sync => try judge_sync(rig, shared, report),
         .async => try judge_async(rig, report),
     };
 }
 
-/// Waits for a quarter of the load, cuts replication off (`async`), and makes the server see and
-/// save `lead_revisions` revisions past that point.
+/// Waits for a quarter of the load, then holds the clients while the server sees and saves
+/// `lead_revisions` revisions, and cuts replication off: `async` before the lead (so the
+/// server's revisions are past what the standby has), `sync` after it (so the window shows
+/// that the primary acknowledges nothing its standby has not applied).
 fn stage(rig: *Rig, shared: *faults.Shared) !void {
     const stage_ops = faults.clients_count * ops_per_client * stage_percent / 100;
     var waited: u32 = 0;
     while (shared.ops_done.load(.monotonic) < stage_ops) : (waited += poll_ms) {
         if (waited > wait_ms_max) return rig.fail("the load never reached the failover", .{});
         if (shared.clients_left.load(.acquire) == 0) return rig.fail("the load ended early", .{});
-        _ = try apply(rig);
+        try apply_ok(rig, "before the failover");
         faults.nap(rig.io, poll_ms);
     }
     if (rig.mode == .async) rig.replication.partition();
+    try lead(rig, shared);
+    if (rig.mode == .sync) rig.replication.partition();
+    try cut_window(rig, shared);
+}
+
+/// With the clients held, makes the server see and save `lead_revisions` revisions.
+fn lead(rig: *Rig, shared: *faults.Shared) !void {
+    shared.hold.store(true, .release);
+    defer shared.hold.store(false, .release);
     const held = (try status(rig)).revision;
     _ = try lead_to(rig, held + lead_revisions);
     // The remembered pair is saved at most every `verified_save_ms`, from a status or a write.
@@ -499,9 +567,33 @@ fn stage(rig: *Rig, shared: *faults.Shared) !void {
     });
 }
 
+/// Counts the clients' acknowledged writes while the standby cannot hear the primary. `sync`:
+/// none, as every commit waits for the standby to apply it (the clients block in COMMIT, so the
+/// failover lands mid-commit). `async`: some, which the failover then loses.
+fn cut_window(rig: *Rig, shared: *faults.Shared) !void {
+    faults.nap(rig.io, cut_settle_ms); // A reply already on its way is not the primary's choice.
+    const before = shared.acked_writes.load(.monotonic);
+    faults.nap(rig.io, cut_window_ms);
+    const acked = shared.acked_writes.load(.monotonic) - before;
+    rig.note("replication cut off: {d} writes acknowledged in {d} ms", .{ acked, cut_window_ms });
+    switch (rig.mode) {
+        .sync => if (acked != 0) {
+            return rig.fail("the primary acknowledged {d} writes its synchronous standby " ++
+                "could not have applied", .{acked});
+        },
+        .async => if (acked == 0) {
+            return rig.fail("no write was acknowledged with replication cut off: the loss " ++
+                "would not be certain", .{});
+        },
+    }
+}
+
 /// The failover: new connections to the old primary hang, it crashes, the standby is promoted
 /// and `C` sends new connections there. `async` stops the clients first.
 fn fail_over(rig: *Rig, shared: *faults.Shared) !void {
+    if (shared.clients_left.load(.acquire) == 0) {
+        return rig.fail("the load ended before the failover", .{});
+    }
     if (rig.mode == .async) shared.stop_load.store(true, .release);
     rig.client.black_hole(true);
     try pg_dev_do(rig.gpa, rig.io, rig.options.pg_dev, "pair-crash");
@@ -514,25 +606,36 @@ fn fail_over(rig: *Rig, shared: *faults.Shared) !void {
         }
     }
     try pg_dev_do(rig.gpa, rig.io, rig.options.pg_dev, "pair-promote");
+    // Read before anything can reach the promoted store: nothing may write there later.
+    if (rig.mode == .async) rig.promoted_at = try promoted_revision(rig);
     rig.client.repoint(rig.standby_port);
     rig.client.heal();
+    rig.acked_at_heal = shared.acked_writes.load(.monotonic);
     rig.note("failed over at {d} client calls", .{shared.ops_done.load(.monotonic)});
 }
 
 // ---- Verdicts -----------------------------------------------------------------------------------
 
-/// A lossless failover: the checker passed, and the server carries on on the promoted store.
-fn judge_sync(rig: *Rig, report: faults.Report) !faults.Report {
+/// A lossless failover: the checker passed, the failover landed mid-commit, the load carried on
+/// past it, and the server carries on on the promoted store.
+fn judge_sync(rig: *Rig, shared: *faults.Shared, report: faults.Report) !faults.Report {
     if (!report.passed) {
         rig.note("FAILED: the history checker rejected a failover to a synchronous standby", .{});
         return report;
     }
-    const reply = try apply(rig);
-    if (reply.status / 100 != 2) {
-        return rig.fail("an apply after the failover answered {d}:\n{s}", .{
-            reply.status, reply.body,
-        });
+    // The store serialises commits on its meta row, so in the window one client waits in
+    // COMMIT and the others wait before theirs (recorded as failed: nothing written). One
+    // unknown per run is what a crash mid-commit leaves; none means it never landed there.
+    const in_flight = report.unknown_applied + report.unknown_absent;
+    if (in_flight == 0) {
+        return rig.fail("no commit was in flight at the crash: the run did not test one", .{});
     }
+    const after = shared.acked_writes.load(.monotonic) - rig.acked_at_heal;
+    if (after < writes_after_heal_min) {
+        return rig.fail("the clients acknowledged {d} writes on the promoted store, below " ++
+            "{d}: the load did not cross the failover", .{ after, writes_after_heal_min });
+    }
+    try apply_ok(rig, "after the failover");
     const seen = try status(rig);
     if (!seen.ok) return rig.fail("the server refused the promoted store:\n{s}", .{seen.body});
     if (seen.remembered < rig.remembered) {
@@ -540,16 +643,18 @@ fn judge_sync(rig: *Rig, report: faults.Report) !faults.Report {
             seen.remembered, rig.remembered,
         });
     }
-    rig.note("PASS: no acknowledged write lost; the server carries on at revision {d}", .{
-        seen.remembered,
+    rig.note("PASS: no acknowledged write lost; {d} commits in flight at the crash; {d} writes " ++
+        "acknowledged after it; the server carries on at revision {d}", .{
+        in_flight, after, seen.remembered,
     });
     return report;
 }
 
-/// A lossy failover: the server must refuse the promoted store (ZC-E0215) and stay halted across
-/// a restart, and the checker must report the lost acknowledged writes.
+/// A lossy failover: the server must refuse the promoted store (ZC-E0215) on a write, on
+/// status and across a restart, nothing may have written there, and the checker must report the
+/// lost acknowledged writes.
 fn judge_async(rig: *Rig, report: faults.Report) !faults.Report {
-    const promoted = try promoted_revision(rig);
+    const promoted = rig.promoted_at;
     if (promoted >= rig.remembered) {
         return rig.fail("the loss was not certain: the promoted store is at {d}, the server " ++
             "remembers {d}", .{ promoted, rig.remembered });
@@ -557,22 +662,28 @@ fn judge_async(rig: *Rig, report: faults.Report) !faults.Report {
     const expected = try std.fmt.allocPrint(rig.arena, "the store is at revision {d}", .{
         promoted,
     });
-    const seen = try status(rig);
-    try expect_halted(rig, seen, expected, "after the failover");
+    // The write path first, on its own: no status call has told the server yet.
     const reply = try apply(rig);
     if (reply.status != 502 or !contains(reply.body, "ZC-E0215")) {
         return rig.fail("an apply on the promoted store answered {d}, not 502 with " ++
             "ZC-E0215:\n{s}", .{ reply.status, reply.body });
     }
+    try expect_halted(rig, try status(rig), expected, "after the failover");
     stop_server(rig);
     try start_server(rig);
     try expect_halted(rig, try status(rig), expected, "after a restart");
+    const now = try promoted_revision(rig);
+    if (now != promoted) {
+        return rig.fail("the promoted store moved from {d} to {d}: a halted server wrote", .{
+            promoted, now,
+        });
+    }
     if (report.passed or report.kind != .lost_write) {
         return rig.fail("the history checker did not report a lost write (passed={}, " ++
             "kind={any})", .{ report.passed, report.kind });
     }
     rig.note("PASS: the promoted store is at {d}, the server remembers {d}; ZC-E0215 on " ++
-        "status, apply and restart; the checker reports a lost write", .{
+        "apply, status and restart; the store did not move; the checker reports a lost write", .{
         promoted, rig.remembered,
     });
     return .{ .passed = true };

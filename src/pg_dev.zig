@@ -13,21 +13,27 @@
 //! ## The pair (slice 10d)
 //!
 //! `pair-up sync|async` makes a primary and a streaming standby for the failover runs of
-//! `test-store-faults` (`src/store_failover.zig`), in `ZCUBE_PG_PAIR_DIR` (default
-//! `/tmp/zcube-pg-pair`, data in `primary/` and `standby/`), the primary on `ZCUBE_PG_PAIR_PORT`
-//! (default `55433`) and the standby on the next port. A pair left by an earlier run is removed
-//! first: each failover run kills its primary, so a pair is never reused. The standby is made with
-//! `pg_basebackup -R` and reports itself as `zcube_standby`. `sync` is the supported setup
-//! (docs/briefs/c1.md, "Supported Postgres setup"): the primary runs with `synchronous_commit =
-//! remote_apply` and the standby in `synchronous_standby_names`. `async` has neither, which is the
-//! setup the failover run shows is refused after a loss. `pair-crash` stops the primary with
-//! `pg_ctl -m immediate` (no shutdown checkpoint: a crash), `pair-promote` promotes the standby
-//! and waits until it accepts writes, `pair-down` stops both and deletes the directory. It prints
-//! nothing on success but `pair-up`'s two connection lines.
+//! `test-store-faults` (`src/store_failover.zig`), in `ZCUBE_PG_PAIR_DIR` (data in `primary/` and
+//! `standby/`), the primary on `ZCUBE_PG_PAIR_PORT` and the standby on the next port. The
+//! defaults are the worktree's own: `/tmp/zcube-pg-pair-<hash>` and an even port from 21000 to
+//! 22998, both from a hash of the working directory, so that two worktrees running the failover
+//! runs at once never touch each other's pair. A pair left by an earlier run of this worktree is
+//! removed first: each failover run kills its primary, so a pair is never reused. The standby is
+//! made with `pg_basebackup -R` and reports itself as `zcube_standby`. `sync` is the supported
+//! setup (docs/briefs/c1.md, "Supported Postgres setup"): the primary runs with `synchronous_commit
+//! = remote_apply` and the standby in `synchronous_standby_names`. `async` has neither, which is
+//! the setup the failover run shows is refused after a loss. `pair-crash` stops the primary with
+//! `pg_ctl -m immediate` (no shutdown checkpoint: a crash), `pair-promote` promotes the standby and
+//! waits until it accepts writes, `pair-down` stops both and deletes the directory. Both nodes run
+//! with `fsync` off, like the single server: that is sound for the crash `pair-crash` makes (a
+//! process crash leaves written WAL in the page cache, where a restart finds it), and would not be
+//! for a host crash, which the runs do not make. It prints nothing on success but `pair-up`'s two
+//! connection lines.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const exit_environment = constants.exit_environment;
 
 const Config = struct {
     dir: []const u8,
@@ -45,8 +51,31 @@ const Config = struct {
     }
 };
 
-pub const pair_port_default: u16 = 55433;
-pub const pair_dir_default = "/tmp/zcube-pg-pair";
+/// The pair's default ports and directory are the worktree's own (a hash of the working
+/// directory picks a slot), so that runs in two worktrees never share, or delete, one pair.
+/// Below the kernel's ephemeral range (as `demo_host.free_port`): after `pair-crash` the proxy
+/// keeps connecting to the dead primary's port, and a connection from an ephemeral port to a
+/// port in that range with no listener can connect to itself and hold the port.
+const pair_port_base: u16 = 21_000;
+const pair_port_slots = 1000;
+const pair_dir_prefix = "/tmp/zcube-pg-pair-";
+
+const PairDefaults = struct { dir: []const u8, port: u16 };
+
+fn pair_defaults(init: std.process.Init) !PairDefaults {
+    const arena = init.arena.allocator();
+    const cwd = try std.process.currentPathAlloc(init.io, arena);
+    const hash = std.hash.Wyhash.hash(0, cwd);
+    const slot: u16 = @intCast(hash % pair_port_slots);
+    return .{
+        .dir = try std.fmt.allocPrint(arena, "{s}{x:0>8}", .{ pair_dir_prefix, hash >> 32 }),
+        .port = pair_port_base + slot * 2,
+    };
+}
+
+comptime {
+    assert(pair_port_base + pair_port_slots * 2 < std.math.maxInt(u16));
+}
 /// The name the standby reports to the primary, and the one `synchronous_standby_names` lists.
 pub const standby_name = "zcube_standby";
 
@@ -56,11 +85,15 @@ pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return constants.exit_user;
     if (args.len < 2) return usage(init.io);
     if (args.len > 3) return usage(init.io);
+    const defaults = pair_defaults(init) catch {
+        say(init.io, "pg_dev: cannot read the working directory\n");
+        return constants.exit_environment;
+    };
     const port_text = init.environ_map.get("ZCUBE_PG_PAIR_PORT");
     const pair_port = if (port_text) |text| std.fmt.parseInt(u16, text, 10) catch {
         say(init.io, "ZCUBE_PG_PAIR_PORT is not a port number\n");
         return constants.exit_user;
-    } else pair_port_default;
+    } else defaults.port;
     if (pair_port == 0) return usage(init.io);
     if (pair_port == std.math.maxInt(u16)) return usage(init.io);
     const config: Config = .{
@@ -68,7 +101,7 @@ pub fn main(init: std.process.Init) u8 {
         .port = init.environ_map.get("ZCUBE_PG_PORT") orelse "55432",
         .bin = init.environ_map.get("ZCUBE_PG_BIN"),
         .as_postgres = std.os.linux.geteuid() == 0,
-        .pair_dir = init.environ_map.get("ZCUBE_PG_PAIR_DIR") orelse pair_dir_default,
+        .pair_dir = init.environ_map.get("ZCUBE_PG_PAIR_DIR") orelse defaults.dir,
         .pair_port = pair_port,
     };
     const command = args[1];
@@ -148,19 +181,20 @@ fn program(arena: std.mem.Allocator, config: Config, name: []const u8) ![]const 
 
 fn up(init: std.process.Init, config: Config) u8 {
     const arena = init.arena.allocator();
-    const initdb = program(arena, config, "initdb") catch return constants.exit_environment;
-    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
-    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return 2;
-    const log = std.fmt.allocPrint(arena, "{s}/log", .{config.dir}) catch return 2;
+    const initdb = program(arena, config, "initdb") catch return exit_environment;
+    const pg_ctl = program(arena, config, "pg_ctl") catch return exit_environment;
+    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return exit_environment;
+    const log = std.fmt.allocPrint(arena, "{s}/log", .{config.dir}) catch return exit_environment;
     const options = std.fmt.allocPrint(
         arena,
         "-p {s} -k {s} -c listen_addresses=127.0.0.1 -c fsync=off -c max_connections=200",
         .{ config.port, config.dir },
-    ) catch return constants.exit_environment;
+    ) catch return exit_environment;
     if (!run(init, config, &.{ "mkdir", "-p", config.dir })) return constants.exit_environment;
     // A cluster that exists but is stopped is started, not made again (`initdb` refuses a
     // directory that is not empty, and `pg_ctl status` says "no" for a stopped one).
-    const marker = std.fmt.allocPrint(arena, "{s}/PG_VERSION", .{data}) catch return 2;
+    const marker = std.fmt.allocPrint(arena, "{s}/PG_VERSION", .{data}) catch
+        return exit_environment;
     const present = run(init, config, &.{ "test", "-f", marker });
     if (!present) {
         const made = run(init, config, &.{ initdb, "-D", data, "-A", "trust", "-U", "zcube" });
@@ -173,8 +207,9 @@ fn up(init: std.process.Init, config: Config) u8 {
     }
     var buffer: [128]u8 = undefined;
     const format = "ZCUBE_TEST_POSTGRES={s}\n";
-    const line = std.fmt.allocPrint(arena, format, .{config.conninfo(&buffer)}) catch return 2;
-    std.Io.File.stdout().writeStreamingAll(init.io, line) catch return 2;
+    const line = std.fmt.allocPrint(arena, format, .{config.conninfo(&buffer)}) catch
+        return exit_environment;
+    std.Io.File.stdout().writeStreamingAll(init.io, line) catch return exit_environment;
     return constants.exit_ok;
 }
 
@@ -182,8 +217,8 @@ fn up(init: std.process.Init, config: Config) u8 {
 /// with `up` (which starts a cluster that exists). Fails if the server was not running.
 fn stop(init: std.process.Init, config: Config) u8 {
     const arena = init.arena.allocator();
-    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
-    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return 2;
+    const pg_ctl = program(arena, config, "pg_ctl") catch return exit_environment;
+    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return exit_environment;
     if (!run(init, config, &.{ pg_ctl, "-D", data, "-m", "fast", "-w", "stop" })) {
         return constants.exit_environment;
     }
@@ -192,8 +227,8 @@ fn stop(init: std.process.Init, config: Config) u8 {
 
 fn down(init: std.process.Init, config: Config) u8 {
     const arena = init.arena.allocator();
-    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
-    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return 2;
+    const pg_ctl = program(arena, config, "pg_ctl") catch return exit_environment;
+    const data = std.fmt.allocPrint(arena, "{s}/data", .{config.dir}) catch return exit_environment;
     // A server that is not running is the state we want, so a failed stop is not an error.
     _ = run(init, config, &.{ pg_ctl, "-D", data, "-m", "fast", "-w", "stop" });
     if (!run(init, config, &.{ "rm", "-rf", config.dir })) return constants.exit_environment;
@@ -244,8 +279,8 @@ fn pair_up(init: std.process.Init, config: Config, mode: Mode) u8 {
     const format = "ZCUBE_PG_PRIMARY=host=127.0.0.1 port={d} user=zcube dbname=postgres\n" ++
         "ZCUBE_PG_STANDBY=host=127.0.0.1 port={d} user=zcube dbname=postgres\n";
     const ports = .{ node_port(config, .primary), node_port(config, .standby) };
-    const lines = std.fmt.allocPrint(arena, format, ports) catch return constants.exit_environment;
-    std.Io.File.stdout().writeStreamingAll(init.io, lines) catch return constants.exit_environment;
+    const lines = std.fmt.allocPrint(arena, format, ports) catch return exit_environment;
+    std.Io.File.stdout().writeStreamingAll(init.io, lines) catch return exit_environment;
     return constants.exit_ok;
 }
 
@@ -276,8 +311,8 @@ fn pair_make(init: std.process.Init, config: Config, mode: Mode) !void {
 
 fn pair_crash(init: std.process.Init, config: Config) u8 {
     const arena = init.arena.allocator();
-    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
-    const data = node_data(arena, config, .primary) catch return constants.exit_environment;
+    const pg_ctl = program(arena, config, "pg_ctl") catch return exit_environment;
+    const data = node_data(arena, config, .primary) catch return exit_environment;
     if (!run(init, config, &.{ pg_ctl, "-D", data, "-m", "immediate", "-w", "stop" })) {
         return constants.exit_environment;
     }
@@ -286,8 +321,8 @@ fn pair_crash(init: std.process.Init, config: Config) u8 {
 
 fn pair_promote(init: std.process.Init, config: Config) u8 {
     const arena = init.arena.allocator();
-    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
-    const data = node_data(arena, config, .standby) catch return constants.exit_environment;
+    const pg_ctl = program(arena, config, "pg_ctl") catch return exit_environment;
+    const data = node_data(arena, config, .standby) catch return exit_environment;
     if (!run(init, config, &.{ pg_ctl, "-D", data, "-w", "promote" })) {
         return constants.exit_environment;
     }
@@ -298,10 +333,11 @@ fn pair_promote(init: std.process.Init, config: Config) u8 {
 /// directory. A node that is not running is the state we want, so a failed stop is not an error.
 fn pair_down(init: std.process.Init, config: Config) u8 {
     const arena = init.arena.allocator();
-    const pg_ctl = program(arena, config, "pg_ctl") catch return constants.exit_environment;
+    const pg_ctl = program(arena, config, "pg_ctl") catch return exit_environment;
     for ([_]Node{ .standby, .primary }) |node| {
-        const data = node_data(arena, config, node) catch return constants.exit_environment;
-        const marker = std.fmt.allocPrint(arena, "{s}/PG_VERSION", .{data}) catch return 2;
+        const data = node_data(arena, config, node) catch return exit_environment;
+        const marker = std.fmt.allocPrint(arena, "{s}/PG_VERSION", .{data}) catch
+            return exit_environment;
         if (!run_quiet(init, config, &.{ "test", "-f", marker })) continue;
         _ = run_quiet(init, config, &.{ pg_ctl, "-D", data, "-m", "immediate", "-w", "stop" });
     }

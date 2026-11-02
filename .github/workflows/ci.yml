@@ -202,7 +202,10 @@ jobs:
       - name: Postgres 16 programs for the failover pair
         run: |
           if [ ! -x /usr/lib/postgresql/16/bin/pg_ctl ]; then
+            sudo apt-get update
             sudo apt-get install -y --no-install-recommends postgresql-16
+            # The package starts a cluster of its own on 5432, the service container's port.
+            sudo pg_dropcluster --stop 16 main || true
           fi
           echo "ZCUBE_PG_BIN=/usr/lib/postgresql/16/bin" >> "${GITHUB_ENV}"
       - name: Store faults (postgres, then the failover runs)
