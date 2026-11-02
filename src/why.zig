@@ -369,7 +369,13 @@ fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched)
     // An apply's cause has no revision: it is the revision of the decision's own key.
     const revision = cause.revision orelse last.mod_revision;
     var text = try controller.format(ctx, "{s} no longer exists", .{key});
-    if (try read_at(ctx, key, revision)) |kv| {
+    const found = try read_at(ctx, key, revision);
+    if (found != null and std.mem.startsWith(u8, key, records.prefix_replicas)) {
+        // A hold or a placement with no creation indexed is caused by the replica record.
+        const replica = try records.read(records.Replica, ctx.arena, found.?, ctx.diag);
+        text = try controller.format(ctx, "replica {s} of service {s} is desired " ++
+            "(generation {d})", .{ replica.id, replica.service, replica.generation });
+    } else if (found) |kv| {
         const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
         text = try controller.format(ctx, "service {s} was applied by {s} (request {s}): " ++
             "generation {d}, {d} {s}", .{
