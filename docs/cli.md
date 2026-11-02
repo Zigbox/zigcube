@@ -73,9 +73,10 @@ hello-2  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
 hello-3  hello    node1  running  12s  1    250m  128Mi   b3:51aa9c03
 
 $ zcube get nodes
-NODE   STATUS  TENURE  LEASE     CAPACITY       ALLOCATED      LAST-HEARD
-node1  ready   14      7.9s/10s  4000m / 8.0Gi  2000m / 1.0Gi  2s ago
-node2  ready   17      8.4s/10s  4000m / 8.0Gi  2000m / 1.0Gi  1s ago
+NODE   STATUS  TENURE  LEASE     CAPACITY       ALLOCATED     LAST-HEARD
+node1  ready   3       7.5s/10s  4000m / 8.0Gi  250m / 128Mi  2s ago
+node2  ready   4       7.5s/10s  4000m / 8.0Gi  250m / 128Mi  2s ago
+node3  ready   1       7.3s/10s  4000m / 8.0Gi  250m / 128Mi  2s ago
 ```
 
 `CPU` and `MEMORY` (wide) are the `requests` of the replica's `/assigned/<node>/<id>`, what the
@@ -89,6 +90,9 @@ revision. `LEASE` is remaining over ttl. `LAST-HEARD` is `ttl - remaining` of th
 the server's clock: a keepalive creates no revision, so the lease is the only record of contact;
 `-` when the node has no lease. `-o wide` adds `ADDRESS`, `AGENT`, `REPLICAS` and `LEASE-ID`.
 `get nodes node2` shows one node; an unknown name is `ZC-E0101`.
+
+The output above is `demo/up.sh` (three nodes, one `hello` service of 3 replicas); `demo/kill-node.sh
+node2` kills a node's agent and containers with `kill -9`, and `demo/down.sh` stops everything.
 
 `READY` is running replicas over desired. `STATUS` is the agent's report: `running`, `starting`,
 `exited`, `killed`, `oom`, `pid-limit`, `start-failed`, `lost`, or `pending` (no report yet). `DETAIL`
