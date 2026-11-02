@@ -141,13 +141,13 @@ export function createMockTransport(engine, faults) {
     if (kind === "service") {
       const svc = engine.get(`/services/${name}`);
       if (!svc) return { exists: false, health: "gone", text: `service ${name}: deleted` };
-      const reps = engine.values(`/replicas/${name}/`);
+      const reps = engine.replicasIn(`/replicas/${name}/`);
       const running = reps.filter(r => engine.observedOf(r)?.status === "running").length;
       const health = running === svc.replicas ? "healthy" : running === 0 && svc.replicas ? "failing" : "degraded";
       return { exists: true, health, desired: svc.replicas, running, text: `service ${name}: ${running}/${svc.replicas} running` };
     }
     if (kind === "replica") {
-      const r = engine.values("/replicas/").find(x => x.id === name);
+      const r = engine.replicasIn("/replicas/").find(x => x.id === name);
       if (!r) return { exists: false, health: "gone", text: `replica ${name}: gone` };
       const o = engine.observedOf(r);
       const st = !r.node ? "unscheduled" : !o ? `pending on ${r.node}` : o.status === "stopped" ? `${engine.exitText(o.exit)} on ${r.node}` : `${o.status} on ${r.node}`;
@@ -155,7 +155,7 @@ export function createMockTransport(engine, faults) {
     }
     const n = engine.get(`/nodes/${name}`);
     if (!n) return { exists: false, health: "gone", text: `node ${name}: not registered` };
-    const count = engine.values("/replicas/").filter(r => r.node === name).length;
+    const count = engine.replicasIn("/replicas/").filter(r => r.node === name).length;
     return { exists: true, health: "healthy", text: `node ${name}: ready, ${count} ${count === 1 ? "replica" : "replicas"}` };
   }
 

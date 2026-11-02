@@ -269,3 +269,57 @@ test "ready_of and the row counters read zcube's tables" {
     try std.testing.expect(has_line(service, "hello  3/3    b3:51aa9c03"));
     try std.testing.expectEqualStrings("NAME   READY  IMAGE", first_line(service));
 }
+
+// ---- The node's tenure and readiness ----
+
+pub const Stored = struct {
+    mod_revision: u64,
+    value: Json,
+};
+
+/// One key as the API lists it, or null if it is absent.
+pub fn read_key(demo: *Demo, key: []const u8) !?Stored {
+    const host = demo.host;
+    const path = try std.fmt.allocPrint(host.arena(), "/v1/list?prefix={s}&limit=500", .{key});
+    const listed = try host.json(path);
+    for (listed.object.get("kvs").?.array.items) |kv| {
+        if (!std.mem.eql(u8, kv.object.get("key").?.string, key)) continue;
+        const revision = kv.object.get("mod_revision").?.integer;
+        return .{ .mod_revision = @intCast(revision), .value = kv.object.get("value").? };
+    }
+    return null;
+}
+
+/// The node's tenure revision: the `mod_revision` of `/nodes/<node>` (docs/keys.md).
+pub fn node_tenure(demo: *Demo) !u64 {
+    const host = demo.host;
+    const registered = try read_key(demo, "/nodes/" ++ node);
+    try host.check_quiet(registered != null, "/nodes/{s} is not registered", .{node});
+    return registered.?.mod_revision;
+}
+
+/// True if `/node-status/<node>` says ready for the node's current tenure. False while the node
+/// is not registered: an agent that lost its lease registers again.
+fn ready_now(demo: *Demo, _: *Host) !bool {
+    const registered = (try read_key(demo, "/nodes/" ++ node)) orelse return false;
+    const tenure = registered.mod_revision;
+    const status = (try read_key(demo, "/node-status/" ++ node)) orelse return false;
+    const fields = status.value.object;
+    const judged: u64 = @intCast(fields.get("tenure").?.integer);
+    return std.mem.eql(u8, fields.get("state").?.string, "ready") and judged == tenure;
+}
+
+/// Waits for the node controller to judge the current tenure ready, then says so.
+pub fn expect_node_ready(demo: *Demo, comptime label: []const u8) !void {
+    const host = demo.host;
+    const what = "the node controller to judge the current tenure";
+    try host.wait_for(demo, ready_now, what, converge_ms);
+    const tenure = try node_tenure(demo);
+    try host.check(true, label ++ ": /node-status/{s} is ready with tenure {d}, the current " ++
+        "/nodes/{s} revision", .{ node, tenure, node });
+}
+
+/// The `mark_ready` decisions a step must have made: one if the tenure changed, else none.
+pub fn mark_ready_count(before: u64, after: u64) u32 {
+    return if (before == after) 0 else 1;
+}

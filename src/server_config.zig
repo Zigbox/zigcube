@@ -31,6 +31,8 @@ pub const usage =
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
+    \\  --state-dir DIR   where to remember the highest store revision seen (SQLite: default is
+    \\                    the SQLite file's directory; Postgres: required). Keep outside the store
     \\  --create-store    create the store's file or schema if it is not there
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
@@ -53,6 +55,9 @@ pub const Config = struct {
     listen: IpAddress,
     store: Store,
     create_store: bool,
+    /// Where the remembered revision is kept; null: beside the SQLite file. A Postgres store
+    /// requires it (`ZC-E0106`).
+    state_dir: ?[]const u8 = null,
     verbose: bool,
     quiet: bool,
     /// The ttl of the leases the server grants to agents.
@@ -67,6 +72,7 @@ const File = struct {
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
+    state_dir: ?[]const u8 = null,
 };
 
 /// The flags as typed, before they are merged over the file.
@@ -76,6 +82,7 @@ const Flags = struct {
     store: ?[]const u8 = null,
     create_store: bool = false,
     lease_ttl_ms: ?u32 = null,
+    state_dir: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
     version: bool = false,
@@ -102,6 +109,7 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .listen = try parse_listen(listen_text, diag),
         .store = try parse_store(store_text, diag),
         .create_store = if (flags.create_store) true else (file.create_store orelse false),
+        .state_dir = flags.state_dir orelse file.state_dir,
         .verbose = flags.verbose,
         .quiet = flags.quiet,
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
@@ -161,6 +169,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
             flags.lease_ttl_ms = try number_of(u32, args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--state-dir")) {
+            flags.state_dir = try value_of(args, &index, diag);
         } else {
             const problem = "the flag {s} is not one zcube-server has";
             return bad(diag, problem, .{arg}, "run it with --help");

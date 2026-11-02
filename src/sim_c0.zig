@@ -338,8 +338,15 @@ fn dump_service(run: *Run, name: []const u8) void {
     const snapshot = controller.read_snapshot(&ctx) catch return;
     if (snapshot.service_of(name)) |service| {
         const record = service.rec;
+        var next: u64 = 0;
+        const counter_at = records.replica_numbers_key(name);
+        const got = ctx.store.get(ctx.arena, counter_at.slice(), null, ctx.diag) catch null;
+        if (got) |found| if (found.kv) |kv| {
+            next = (records.read(records.ReplicaNumber, ctx.arena, kv, ctx.diag) catch
+                records.ReplicaNumber{ .next = 0 }).next;
+        };
         run.say("service {s}: want {d}, generation {d}, image {s}, next {d}\n", .{
-            name, record.replicas, record.generation, record.image, record.next_replica,
+            name, record.replicas, record.generation, record.image, next,
         });
     }
     for (snapshot.replicas) |replica| {
@@ -347,7 +354,10 @@ fn dump_service(run: *Run, name: []const u8) void {
         const observed = snapshot.observed_of(&replica.rec);
         const status = if (observed) |found| @tagName(found.rec.status) else "none";
         run.say("  replica {s} node={s} generation={d} observed={s}\n", .{
-            replica.rec.id, replica.rec.node, replica.rec.generation, status,
+            replica.rec.id,
+            snapshot.node_of(replica.rec.id) orelse "",
+            replica.rec.generation,
+            status,
         });
     }
     for (world.sim.containers.items) |container| {
@@ -397,6 +407,8 @@ fn invariants(run: *Run, step: Step) Failure!void {
     const world = run.world;
     try run.check(step, world.revision() != null, "the store cannot be read");
     const ctx = world.controller_context();
+    const i6_ok = world.stats.i6_violations == 0;
+    try run.check(step, i6_ok, "I6: an allocation disagrees with its assignments");
     try decisions_have_causes(run, step, &ctx);
     const snapshot = controller.read_snapshot(&ctx) catch
         return run.check(step, false, "the snapshot cannot be read");
@@ -405,7 +417,8 @@ fn invariants(run: *Run, step: Step) Failure!void {
     }
     for (snapshot.replicas) |replica| {
         try why_terminates(run, step, &ctx, .{ .kind = .replica, .name = replica.rec.id });
-        try replica_has_decisions(run, step, &ctx, &replica.rec);
+        const assigned = snapshot.node_of(replica.rec.id) != null;
+        try replica_has_decisions(run, step, &ctx, &replica.rec, assigned);
     }
 }
 
@@ -478,6 +491,7 @@ fn replica_has_decisions(
     step: Step,
     ctx: *const controller.Context,
     replica: *const records.Replica,
+    assigned: bool,
 ) Failure!void {
     const prefix = records.index_prefix(.replica, replica.id);
     const page = ctx.store.list(ctx.arena, .{
@@ -493,7 +507,7 @@ fn replica_has_decisions(
         if (std.mem.eql(u8, entry.action, "place_replica")) placed = true;
     }
     try run.check(step, created, "a replica has no create_replica decision");
-    if (replica.node.len > 0) try run.check(step, placed, "a placed replica has no place decision");
+    if (assigned) try run.check(step, placed, "a placed replica has no place decision");
 }
 
 // ---- The fuzz variant ---------------------------------------------------------------------
@@ -758,10 +772,10 @@ fn put_record(
     _ = try @import("writers.zig").txn(ctx.store, role, request, ctx.diag);
 }
 
-test "a stopped record left by an earlier replica with the same id never blocks the new one" {
-    // Goal: a service deleted and applied again restarts its replica numbering, so `web-1`
-    // exists twice in the store's life; the first one's stopped observed record, which the agent
-    // had not yet removed, must not stop the second from starting. Method: place `web-1` (the
+test "a stopped record left by an earlier replica of the same name never blocks the new one" {
+    // Goal: ids are unique forever now (the counter continues the numbering), but a stopped
+    // observed record planted under a replica's id (an older store, or a lost removal) must not
+    // stop that replica from starting. Method: place `web-1` (the
     // server steps, the agent does not), plant a stopped record of another generation (what the
     // first `web-1` left) and another that predates the replica's key, step the agent: it starts
     // the replica and replaces the record. (Seed 32 of `sim-cluster` found this.)
@@ -837,26 +851,28 @@ fn reapply_before_cleanup(world: *World, end_container: bool) !void {
     }
 }
 
-test "a running container of an earlier replica with the same id is replaced, not adopted" {
-    // Goal: a service deleted and applied again on another image reuses `web-1`; if the node's
-    // agent has not cleaned up yet, the old container (same name) is still running and must
-    // not be taken for the new replica. Method: run web-1, delete and re-apply on another
-    // image before the agent steps, step the agent: the container runs the new image.
-    // (Seed 150 of `sim-cluster` found this.)
+test "a running container of an earlier replica of a re-applied service is stopped, not adopted" {
+    // Goal: a service deleted and applied again on another image continues the numbering (the
+    // counter is never deleted), so the replacement is `web-2` and the old `web-1` container, if
+    // the node's agent has not cleaned up yet, is an orphan to stop, never the new replica.
+    // Method: run web-1, delete and re-apply on another image before the agent steps, step the
+    // agent: web-2 runs the new image and one container runs. (Seed 150 of `sim-cluster` found
+    // the id-reuse case this once guarded.)
     const world = try World.create(testing.allocator, 1, &fixtures);
     defer world.destroy();
     try reapply_before_cleanup(world, false);
-    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-2")).?);
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
 }
 
-test "a stopped container of an earlier replica with the same id is replaced, not adopted" {
-    // Goal: the same, with the old container already stopped (the known gap in the note of
-    // the change that added `observed_for`). Method: as above, ending the container first.
+test "a stopped container of an earlier replica of a re-applied service is replaced, not adopted" {
+    // Goal: the same, with the old container already stopped. Method: as above, ending the
+    // container first; the old service replaces the dead web-1 with web-2 before it is deleted,
+    // so the new image runs as web-3.
     const world = try World.create(testing.allocator, 1, &fixtures);
     defer world.destroy();
     try reapply_before_cleanup(world, true);
-    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-1")).?);
+    try testing.expectEqualStrings(next_digest, (try container_image(world, "web-3")).?);
     try testing.expectEqual(@as(u32, 1), world.running_count("web"));
 }
 
@@ -911,18 +927,23 @@ test "a late running record over a stale stopped container is reported lost and 
     try testing.expectEqual(@as(u32, 1), world.sim.running_count());
 }
 
-/// Rewrites the first replica record with `node`, as the scheduler would when it moves the
-/// replica (the key and so its create revision stay).
+/// Moves the first assignment to `node`, as the scheduler would move the replica (the replica
+/// record and so its create revision stay). It writes `/assigned` alone, as the scheduler role,
+/// and leaves `/allocations` as they were: no scheduler pass repairs them (a mismatch is the
+/// auditor's to report), but the test steps only the agent, which reads `/assigned` alone.
 fn move_first_replica(world: *World, node: []const u8) !void {
     const ctx = world.controller_context();
-    const all = try controller.list_all(records.Replica, &ctx, records.prefix_replicas, null, 8);
+    const all = try controller.list_all(records.Assigned, &ctx, records.prefix_assigned, null, 8);
     try testing.expect(all.items.len > 0);
-    var moved = all.items[0].rec;
-    moved.node = node;
+    const moved = all.items[0].rec;
     const value = try records.encode(ctx.arena, moved, ctx.diag);
-    const op: store.Op = .{ .put = .{ .key = all.items[0].kv.key, .value = value } };
-    const request: store.TxnRequest = .{ .on_success = &.{op} };
-    _ = try @import("writers.zig").txn(ctx.store, .replica_controller, request, ctx.diag);
+    const key = records.assigned_key(node, moved.replica);
+    const ops = [_]store.Op{
+        .{ .delete = all.items[0].kv.key },
+        .{ .put = .{ .key = key.slice(), .value = value } },
+    };
+    const request: store.TxnRequest = .{ .on_success = &ops };
+    _ = try @import("writers.zig").txn(ctx.store, .scheduler, request, ctx.diag);
 }
 
 test "a replica that comes back to its node keeps its container and leaves no pending stop" {

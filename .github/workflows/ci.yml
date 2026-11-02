@@ -169,6 +169,9 @@ jobs:
   # checked, and the conformance suite run through the proxy (latency, bandwidth, stalls). The
   # image is the one of store-postgres. The settings are in libpq keyword form because the runner
   # adds `host=` and `port=` of the proxy to them. Each run draws a new seed (printed first).
+  # Slice 10d: the Postgres step also runs the two failover runs (src/store_failover.zig), each on
+  # a primary and a streaming standby that pg_dev makes on the runner from its preinstalled
+  # Postgres 16 (the service container cannot be half of a pair behind a proxy); about 20 s more.
   store-faults:
     name: store faults (postgres, sqlite)
     needs: changes
@@ -196,7 +199,16 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files
         run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
-      - name: Store faults (postgres)
+      - name: Postgres 16 programs for the failover pair
+        run: |
+          if [ ! -x /usr/lib/postgresql/16/bin/pg_ctl ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-16
+            # The package starts a cluster of its own on 5432, the service container's port.
+            sudo pg_dropcluster --stop 16 main || true
+          fi
+          echo "ZCUBE_PG_BIN=/usr/lib/postgresql/16/bin" >> "${GITHUB_ENV}"
+      - name: Store faults (postgres, then the failover runs)
         run: zig build test-store-faults -Dbackend=postgres -Dpostgres="${ZCUBE_TEST_POSTGRES}" --summary all
       - name: Store faults (sqlite, history checker only)
         run: zig build test-store-faults -Dbackend=sqlite --summary all

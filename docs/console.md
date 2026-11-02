@@ -168,9 +168,10 @@ store ones in the connection banner, and the console's own.
 
 The console lists once and then follows the watch, the same way an agent does.
 
-1. **Sync.** List `/services/` and take its `revision` R; list `/replicas/`, `/nodes/`,
-   `/observed/` at R, and the newest 500 `/decisions/` at R (`reverse=true`). Then
-   `GET /v1/watch?prefix=…×5&from=R+1`. Each response applies its events to the mirror in
+1. **Sync.** List `/services/` and take its `revision` R; list `/replicas/`, `/assigned/`,
+   `/nodes/`, `/observed/` at R, and the newest 500 `/decisions/` at R (`reverse=true`). Then
+   `GET /v1/watch?prefix=…×6&from=R+1`. A replica's node is its `/assigned/<node>/<id>` key (a
+   `"v": 2` replica carries none); a replica with no assignment shows as unscheduled. Each response applies its events to the mirror in
    `web/js/model.js`, moves the bookmark, and the next watch starts at once.
 2. **A second, slower loop** polls `/v1/status` (clock offset, store health) and `/v1/leases` every
    2 s, because keepalives are not revisions.

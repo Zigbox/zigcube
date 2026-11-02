@@ -32,6 +32,7 @@ pub fn run(demo: *Demo) !void {
     host.section("5. The store backend stops");
     const before = try host.procs().running_containers();
     const counts = (try state.service_counts(demo, "hello")).?;
+    const tenure = try state.node_tenure(demo);
     host.say("  hello before the outage: {d}/{d} running, generation {d}", .{
         counts.running, counts.desired, counts.generation,
     });
@@ -40,7 +41,7 @@ pub fn run(demo: *Demo) !void {
         .postgres => |control| try postgres_outage(demo, control),
         .sqlite => try sqlite_outage(demo),
     }
-    try recovered(demo, before, counts);
+    try recovered(demo, before, counts, tenure);
 }
 
 // ---- Postgres ----
@@ -276,7 +277,12 @@ pub fn start_postgres(demo: *Demo, control: state.PostgresControl) !void {
 
 /// The backend is back: `zcube` answers, nothing that ran stopped, the apply that was refused
 /// changed nothing, and the controllers work again (the same apply now goes through).
-fn recovered(demo: *Demo, before: []const host_procs.Pids, counts: state.Counts) !void {
+fn recovered(
+    demo: *Demo,
+    before: []const host_procs.Pids,
+    counts: state.Counts,
+    tenure: u64,
+) !void {
     const host = demo.host;
     switch (demo.backend) {
         .postgres => |control| try start_postgres(demo, control),
@@ -305,7 +311,19 @@ fn recovered(demo: *Demo, before: []const host_procs.Pids, counts: state.Counts)
         "the workloads kept running through the outage: the same processes",
         .{},
     );
-    try decisions.expect_new(demo, "outage", &.{});
+    // If the agent could not renew its lease while the store refused writes, it registered
+    // again (a new tenure) and the node controller judged it: one `mark_ready` exactly when
+    // `/nodes/<node>` moved, none when it did not.
+    try state.expect_node_ready(demo, "after the outage");
+    const now = try state.node_tenure(demo);
+    host.say("  tenure before the outage {d}, after {d}", .{ tenure, now });
+    try decisions.expect_new(demo, "outage", &.{
+        .{
+            .actor = "node-controller",
+            .action = "mark_ready",
+            .count = state.mark_ready_count(tenure, now),
+        },
+    });
     try apply_again(demo);
 }
 

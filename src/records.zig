@@ -61,10 +61,16 @@ pub const prefix_allocations = "/allocations/";
 pub const prefix_audit_allocations = "/audit/allocations/";
 pub const prefix_node_status = "/node-status/";
 pub const prefix_summaries = "/decision-summaries/";
+pub const prefix_replica_numbers = "/replica-numbers/";
 
 pub fn service_key(name: []const u8) Key {
     assert(name_problem(name, constants.service_name_bytes_max) == null);
     return Key.build(&.{ prefix_services, name });
+}
+
+pub fn replica_numbers_key(service: []const u8) Key {
+    assert(name_problem(service, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_replica_numbers, service });
 }
 
 pub fn replicas_prefix(service: []const u8) Key {
@@ -223,7 +229,7 @@ pub const Requests = struct {
 pub const Pair = [2][]const u8;
 
 pub const Service = struct {
-    v: u32 = 1,
+    v: u32 = 2,
     name: []const u8,
     image: []const u8,
     replicas: u32,
@@ -231,22 +237,30 @@ pub const Service = struct {
     env: []const Pair = &.{},
     limits: Limits = .{},
     generation: u64,
-    next_replica: u64,
+    /// A C0 record's counter, carried forward by `apply` only until `/replica-numbers/<service>`
+    /// exists (the replica controller seeds it from this); absent for a service created later.
+    next_replica: ?u64 = null,
     applied_by: []const u8 = "",
     request_id: []const u8 = "",
 };
 
-pub const Replica = struct {
+/// The counter that keeps replica ids unique forever: the number the next replica takes.
+pub const ReplicaNumber = struct {
     v: u32 = 1,
+    next: u64,
+};
+
+/// What a service asks for, once per replica. Where it runs is `/assigned`'s (the scheduler's);
+/// a v1 record's `node` and `requests` are ignored on read.
+pub const Replica = struct {
+    v: u32 = 2,
     id: []const u8,
     service: []const u8,
     generation: u64,
-    node: []const u8,
     image: []const u8,
     command: []const []const u8,
     env: []const Pair = &.{},
     limits: Limits = .{},
-    requests: ?Requests = null,
 };
 
 pub const Node = struct {
@@ -857,7 +871,7 @@ test "records a C0 build wrote still read" {
             seen[0] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
             const record = try read(Replica, arena, kv, &diag);
-            try testing.expect(record.node.len > 0 or record.requests == null);
+            try testing.expectEqual(@as(u32, 1), record.v);
             seen[1] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
             const record = try read(Observed, arena, kv, &diag);
@@ -928,8 +942,8 @@ test "the version a record is written in is the version the reader accepts" {
     var diag: Diag = undefined;
     diag.reset();
     inline for (.{
-        Service,  Replica,    Node, Observed, Assigned, Allocation, Audit, NodeStatus, Summary,
-        Decision, IndexEntry,
+        Service, Replica,       Node,     Observed,   Assigned, Allocation, Audit, NodeStatus,
+        Summary, ReplicaNumber, Decision, IndexEntry,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);

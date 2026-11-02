@@ -23,6 +23,10 @@ test {
     _ = @import("agent_remote.zig");
     _ = @import("agent_remote_test.zig");
     _ = @import("sim_cluster_main.zig");
+    _ = @import("sim_fleet.zig");
+    _ = @import("sim_fleet_issue.zig");
+    _ = @import("sim_fleet_state.zig");
+    _ = @import("sim_fleet_github.zig");
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_runtime_test.zig");

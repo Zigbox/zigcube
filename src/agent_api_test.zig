@@ -9,6 +9,11 @@ const agent_api = @import("agent_api.zig");
 const api_mod = @import("api.zig");
 const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
+const agent_client = @import("agent_client.zig");
+const diag_mod = @import("diag.zig");
+const failures = @import("store_failures.zig");
+const records = @import("records.zig");
+const store = @import("store.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
 
@@ -247,7 +252,6 @@ test "a node is given its own replicas, with the env values the container needs"
     try testing.expectEqual(@as(usize, 2), kvs.len);
     for (kvs) |kv| {
         const replica = field(kv, "value");
-        try testing.expectEqualStrings("node1", field(replica, "node").string);
         const pair = field(replica, "env").array.items[0];
         try testing.expectEqualStrings("s3cr3t", pair.array.items[1].string);
         try testing.expect(std.mem.startsWith(u8, field(kv, "key").string, "/replicas/hello/"));
@@ -463,4 +467,212 @@ test "a report under a tenure that has been replaced is ZC-E0510 and writes noth
     try testing.expectEqual(before, try rig.revision());
     rig.tenure = current;
     _ = try rig.ok("POST", "/v1/agent/nodes/node2/observed", "", put);
+}
+
+/// The answer's `chain`, checked against the store: `revision` and `hash` are its head now, and
+/// `known_hash` is its hash at `known` when one was sent.
+fn expect_chain(rig: *Rig, answer: Json, known: ?u64) !void {
+    const chain = field(answer, "chain");
+    rig.world.diag.reset();
+    const handle = rig.world.store_handle();
+    const head = try handle.status(&rig.world.diag);
+    try testing.expectEqual(@as(i64, @intCast(head.revision)), field(chain, "revision").integer);
+    var text: [64]u8 = undefined;
+    const hash = try std.fmt.bufPrint(&text, "{x}", .{&head.hash});
+    try testing.expectEqualStrings(hash, field(chain, "hash").string);
+    const at = known orelse {
+        try testing.expect(chain.object.get("known_hash") == null);
+        return;
+    };
+    try testing.expectEqual(true, field(chain, "verified").bool);
+    const there = try handle.hash_at(at, &rig.world.diag);
+    const expected = try std.fmt.bufPrint(&text, "{x}", .{&there});
+    try testing.expectEqualStrings(expected, field(chain, "known_hash").string);
+}
+
+test "every agent answer carries the store's chain pair, and its hash at the agent's revision" {
+    // Goal: what the agent checks (agent_client.zig, "Nothing from behind") is the store's own
+    // pair. Method: call each endpoint without and with `known`, compare `chain` with `status`
+    // and `hash_at`; a `known` above the head gets no `known_hash`, and `known` is the only
+    // parameter the other endpoints take.
+    var rig = try Rig.start(9);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const base = "/v1/agent/nodes/node2";
+    const lease = try rig.grant("node2");
+    var buffer: [512]u8 = undefined;
+    const body = try register_text(&buffer, lease);
+    const registered = try rig.ok("PUT", base, "known=1", body);
+    try expect_chain(&rig, registered, 1);
+    const head: u64 = @intCast(try rig.revision());
+    var query_buffer: [64]u8 = undefined;
+    const at_head = try std.fmt.bufPrint(&query_buffer, "known={d}", .{head});
+
+    var path: [96]u8 = undefined;
+    const renewed = try rig.ok("POST", try keepalive_path(&path, lease), at_head, "");
+    try expect_chain(&rig, renewed, head);
+    const replicas = try rig.ok("GET", "/v1/agent/nodes/node1/replicas", at_head, "");
+    try expect_chain(&rig, replicas, head);
+    const observed = try rig.ok("GET", base ++ "/observed", "", "");
+    try expect_chain(&rig, observed, null);
+    var watch_buffer: [64]u8 = undefined;
+    const watch = try std.fmt.bufPrint(&watch_buffer, "from=1&timeout=0&known={d}", .{head});
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/watch", watch, ""), head);
+
+    const ahead = try std.fmt.bufPrint(&query_buffer, "known={d}", .{head + 100});
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/replicas", ahead, ""), null);
+    try rig.refused(rig.call("GET", base ++ "/replicas", "from=1", ""), 400, "ZC-E0104");
+    try rig.refused(rig.call("GET", base ++ "/replicas", "known=x", ""), 400, "ZC-E0104");
+}
+
+test "known on the lease grant, assigned and observed endpoints, and on a watch above the head" {
+    // Goal: the endpoints the first test leaves out take `known` too, and a write's pair is its
+    // own transaction's (it equals the head here: nothing else writes between the calls).
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    try rig.join("node2"); // A report names the tenure it rests on.
+    const base = "/v1/agent/nodes/node2";
+    const head: u64 = @intCast(try rig.revision());
+    var query_buffer: [64]u8 = undefined;
+    const below = try std.fmt.bufPrint(&query_buffer, "known={d}", .{head - 1});
+    const granted = try rig.ok("POST", base ++ "/lease", below, "{\"ttl_ms\":10000}");
+    try expect_chain(&rig, granted, head - 1);
+
+    var record: [256]u8 = undefined;
+    const value = try observed_text(&record, "node2", "hello-1");
+    var body: [512]u8 = undefined;
+    const put = try std.fmt.bufPrint(
+        &body,
+        "{{\"puts\":[{{\"key\":\"/observed/node2/hello-1\",\"value\":{s}}}]}}",
+        .{value},
+    );
+    const reported = try rig.ok("POST", base ++ "/observed", below, put);
+    try expect_chain(&rig, reported, head - 1);
+    const reported_chain = field(reported, "chain");
+    try testing.expectEqual(
+        field(reported, "revision").integer,
+        field(reported_chain, "revision").integer,
+    );
+    const listed = try rig.ok("GET", base ++ "/observed", below, "");
+    try expect_chain(&rig, listed, head - 1);
+    const assigned = try rig.ok("GET", base ++ "/assigned", below, "");
+    try expect_chain(&rig, assigned, head - 1);
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/assigned", "", ""), null);
+    try rig.refused(rig.call("GET", base ++ "/assigned", "from=1", ""), 400, "ZC-E0104");
+
+    // The agent remembers no more than the head it was last told, so a `known` above the head
+    // the watch reads first is from another history: no `known_hash`.
+    const now: u64 = @intCast(try rig.revision());
+    var watch_buffer: [64]u8 = undefined;
+    const ahead = try std.fmt.bufPrint(&watch_buffer, "from=1&timeout=0&known={d}", .{now + 1});
+    try expect_chain(&rig, try rig.ok("GET", base ++ "/watch", ahead, ""), null);
+}
+
+test "a server that keeps no pair for its store says so in every answer" {
+    var rig = try Rig.start(11);
+    defer rig.stop();
+    rig.api.pair_kept = false;
+    const answer = try rig.ok("GET", "/v1/agent/nodes/node2/replicas", "known=1", "");
+    try testing.expectEqual(false, field(field(answer, "chain"), "verified").bool);
+}
+
+/// The world's store with every call but `hash_at`, which has no hash to give: a store migrated
+/// from one without a chain, asked below the chain's start.
+var no_hash_vtable: store.Store.VTable = undefined;
+
+fn no_hash_at(
+    context: *anyopaque,
+    revision: store.Revision,
+    diag: *diag_mod.Diag,
+) store.Error!store.Hash {
+    _ = context;
+    return failures.no_hash(diag, revision, revision + 1);
+}
+
+/// `RemoteStore`'s transport straight into `Api.handle`, over the store without hashes.
+const NoHashTransport = struct {
+    rig: *Rig,
+
+    fn transport(self: *NoHashTransport) agent_client.Transport {
+        return .{ .context = self, .call_fn = call };
+    }
+
+    fn call(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        request: agent_client.Request,
+        diag: *diag_mod.Diag,
+    ) agent_client.Error!agent_client.Reply {
+        _ = diag;
+        const self: *NoHashTransport = @ptrCast(@alignCast(context));
+        var ctx = self.rig.world.controller_context();
+        ctx.store = .{ .context = ctx.store.context, .vtable = &no_hash_vtable };
+        const split = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
+        const query = if (split < request.target.len) request.target[split + 1 ..] else "";
+        const response = self.rig.api.handle(&ctx, .{
+            .method = request.method,
+            .path = request.target[0..split],
+            .query = query,
+            .body = request.body,
+        });
+        // The world's arena is reset by the next call: the reply is the caller's.
+        const body = try arena.dupe(u8, response.body);
+        return .{ .status = response.status, .body = body };
+    }
+};
+
+test "a store with no hash at the agent's revision: no known_hash, and the agent refuses it" {
+    // Goal: the NoHash branch end to end. Method: the agent's `RemoteStore` over `Api.handle`
+    // and the world's store with `hash_at` answering NoHash; the first list remembers a pair, the
+    // second sends it as `known`, gets no `known_hash` and is refused as unverifiable.
+    var rig = try Rig.start(12);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    no_hash_vtable = rig.world.store_handle().vtable.*;
+    no_hash_vtable.hash_at = no_hash_at;
+    const head: u64 = @intCast(try rig.revision());
+    var query_buffer: [64]u8 = undefined;
+    const below = try std.fmt.bufPrint(&query_buffer, "known={d}", .{head - 1});
+    var plain = rig.world.controller_context();
+    plain.store = .{ .context = plain.store.context, .vtable = &no_hash_vtable };
+    const response = rig.api.handle(&plain, .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node1/replicas",
+        .query = below,
+    });
+    try testing.expectEqual(@as(u16, 200), response.status);
+    const chain = field(try rig.json(response), "chain");
+    try testing.expect(chain.object.get("known_hash") == null);
+
+    var through: NoHashTransport = .{ .rig = &rig };
+    var remote = agent_client.RemoteStore.init(testing.allocator, through.transport(), "node1");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const options: store.ListOptions = .{ .prefix = records.prefix_replicas, .limit = 100 };
+    _ = try remote.interface().list(arena_state.allocator(), options, &diag);
+    try testing.expectEqual(head, remote.known.?.revision);
+    // A write moves the head on, so the next answer's `known` is below it and needs `hash_at`.
+    var other = hello;
+    other.name = "other";
+    other.request_id = "r-0000002";
+    _ = try rig.world.apply(other);
+    try testing.expectError(
+        error.BackendFailed,
+        remote.interface().list(arena_state.allocator(), options, &diag),
+    );
+    try testing.expectEqual(.E0215, diag.code.?);
+    var cause: [128]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &cause,
+        "the server has no hash for revision {d}, so it cannot be checked",
+        .{head},
+    );
+    try testing.expectEqualStrings(expected, diag.causes.slice()[0].slice());
+    try testing.expectEqual(head, remote.known.?.revision);
 }

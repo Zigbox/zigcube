@@ -23,8 +23,12 @@ pub const Decision = struct {
     cause_ref: []const u8,
 };
 
-/// What a step should have decided: `count` decisions of this actor and action.
-pub const Expect = struct { actor: []const u8, action: []const u8, count: u32 };
+/// What a step should have decided: exactly `count` decisions of this actor and action.
+pub const Expect = struct {
+    actor: []const u8,
+    action: []const u8,
+    count: u32,
+};
 
 fn text_of(object: std.json.ObjectMap, name: []const u8) []const u8 {
     const value = object.get(name) orelse return "";
@@ -103,7 +107,7 @@ pub fn expect_new(demo: *Demo, comptime label: []const u8, expected: []const Exp
     var total: u32 = 0;
     for (expected) |expect| {
         const count = count_of(new, expect);
-        total += expect.count;
+        total += count;
         try host.check(count == expect.count, label ++ ": {d} x {s} {s} (expected {d})", .{
             count, expect.actor, expect.action, expect.count,
         });

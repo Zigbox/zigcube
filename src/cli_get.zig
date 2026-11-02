@@ -174,13 +174,14 @@ pub fn replicas(
     const prefix = try prefix_for(arena, "/replicas/", name, "/");
     const listed = try cli_data.list(arena, client, prefix, report);
     const observed = try cli_data.list(arena, client, "/observed/", report);
+    const assigned = try cli_data.list(arena, client, "/assigned/", report);
     const status = try client.get("/v1/status", report);
     const status_body = try cli_data.parse(arena, status, report);
     const now = cli_data.number(status_body, "time_ms") orelse
         return cli_data.contract(report, status.request_id, "has no time_ms");
     var rows: std.ArrayList(ReplicaRow) = .empty;
     for (listed.items) |kv| {
-        const row = try replica_row(arena, kv, observed.items, report);
+        const row = try replica_row(arena, kv, observed.items, assigned.items, report);
         rows.append(arena, row) catch return error.OutOfMemory;
     }
     return .{ .rows = rows.items, .now_ms = now };
@@ -190,13 +191,14 @@ fn replica_row(
     arena: Allocator,
     kv: cli_data.Kv,
     observed: []const cli_data.Kv,
+    assigned: []const cli_data.Kv,
     report: *Report,
 ) Error!ReplicaRow {
     const id = cli_data.text(kv.value, "id") orelse return bad_record(report, kv.key);
     var row: ReplicaRow = .{
         .id = id,
         .service = cli_data.text(kv.value, "service") orelse "",
-        .node = cli_data.text(kv.value, "node") orelse "",
+        .node = node_of(assigned, id),
         .generation = cli_data.number(kv.value, "generation") orelse 0,
         .image = cli_data.text(kv.value, "image") orelse "",
         .status = "pending",
@@ -212,6 +214,18 @@ fn replica_row(
         break;
     }
     return row;
+}
+
+/// The node `/assigned/<node>/<id>` names, or empty while the replica is unassigned.
+fn node_of(assigned: []const cli_data.Kv, id: []const u8) []const u8 {
+    const prefix = "/assigned/";
+    for (assigned) |kv| {
+        if (!std.mem.endsWith(u8, kv.key, id)) continue;
+        const slash = kv.key.len - id.len - 1;
+        if (kv.key[slash] != '/') continue;
+        return kv.key[prefix.len..slash];
+    }
+    return "";
 }
 
 fn is_observed_of(key: []const u8, id: []const u8) bool {

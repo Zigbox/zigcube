@@ -77,7 +77,10 @@ down" from "store down".
 ```
 
 With the store unreachable, `store` is `{"backend": "postgres", "ok": false, "diagnostic": {…}}`
-and `revision` is absent. `time_ms` is the server's clock: the console shows ages ("3 s ago")
+and `revision` is absent. A server that guards its store (every `zcube-server`) adds, inside
+`store` and beside `revision`, `remembered`: the highest `{"revision", "hash"}` it has seen (an
+empty object before the first status), and, only while saving that pair fails,
+`remembered_save_failed`: a `ZC-E0216` diagnostic. `time_ms` is the server's clock: the console shows ages ("3 s ago")
 against it, so a skewed laptop clock does not make "just now" read "in 4 minutes".
 
 ### `GET /v1/list?prefix=&at=&limit=&continue=&reverse=`
@@ -378,16 +381,39 @@ The node's desired replicas, and nothing else:
 
 ```json
 { "revision": 412,
-  "kvs": [ { "key": "/replicas/hello/hello-3", "value": {"v": 1, "id": "hello-3", "…": "…"},
+  "kvs": [ { "key": "/replicas/hello/hello-3", "value": {"v": 2, "id": "hello-3", "…": "…"},
              "create_revision": 390, "mod_revision": 398, "lease": 0 } ] }
 ```
 
 The shape is `/v1/list`'s, the `value` is the replica record of keys.md **with its `env` values**,
 and `revision` is the revision the list was read at. A node has at most `agent_node_replicas_max`
-(500, one page of a store list); more is `ZC-E0302`. **C0 filters `/replicas/` by the record's `node` field on the server.**
-For C1 this is the place for the `/assigned/<node>/<replica>` index that keys.md proposes: the
-scheduler would write it with `node`, and this handler would read that prefix instead. The
-endpoint's shape does not change, which is why it is a list of replicas and not of keys.
+(500, one page of a store list); more is `ZC-E0302`. **From C1 slice 3 the server serves the
+replicas named under `/assigned/<node>/`** (the scheduler's), read at the revision of the replica
+list; an assignment whose replica is gone is not served, so the agent stops that container. (C0
+filtered `/replicas/` by the record's `node` field, which a `"v": 2` replica no longer has.) The
+endpoint's shape did not change, which is why it is a list of replicas and not of keys.
+
+**A C0 agent cannot run against a C1 server.** The records are `"v": 2`, and a C0 agent refuses
+a value whose version is newer than it knows with `ZC-E0303`, naming the key and both versions
+(keys.md, "Versions"). Upgrade the agents with the server.
+
+### `GET /v1/agent/nodes/{node}/assigned`
+
+The node's assignments, as stored: `{"revision": R, "kvs": [...]}` in `/v1/list`'s shape for
+`/assigned/<node>/`, each `value` the assignment record of keys.md:
+
+```json
+{ "revision": 415,
+  "kvs": [ { "key": "/assigned/node1/hello-3",
+             "value": {"v": 1, "replica": "hello-3", "service": "hello",
+                       "requests": {"cpu_millis": 250, "memory_bytes": 134217728},
+                       "reason": "node1 is the only node, and it fits 250m CPU and 128 MiB"},
+             "create_revision": 398, "mod_revision": 398, "lease": 0 } ] }
+```
+
+`GET` only; no query but `known` ("The chain pair" below), and the answer carries `chain`
+like every other agent endpoint. At most `agent_node_replicas_max` (500) assignments; more is `ZC-E0302`.
+The key's `mod_revision` is the replica's placement epoch (keys.md).
 
 ### `GET /v1/agent/nodes/{node}/observed` and `POST ...`
 
@@ -419,8 +445,10 @@ The long poll, the provisional transport of HANDOFF. `from` is a revision (at le
 { "revision": 415, "changed": true }
 ```
 
-`changed` is true if any key under the watched prefix (C0: `/replicas/`; C1: the node's
-`/assigned/` prefix) was written or deleted at a revision `>= from`. If nothing has changed the
+`changed` is true if any key under the watched prefixes, `/replicas/` and (from C1 slice 3)
+`/assigned/`, was written or deleted at a revision `>= from`. Each prefix is scanned in turn;
+with nothing changed, `revision` is the smaller of the two scans' bookmarks, so watching from
+`revision + 1` skips no change under either. If nothing has changed the
 server holds the reply up to `timeout`, as for `GET /v1/watch`, and answers with `changed: false`
 and the bookmark when the time is up. **The reply carries no events**, because the agent
 reconciles by level: it reads the list again and lets the core decide, so a lost or compacted
@@ -429,6 +457,28 @@ event cannot matter. The agent lists, remembers the list's `revision`, and watch
 
 `from` more than one past the store's revision is `400` and `ZC-E0204`; `from` below the
 compaction point is `410` and `ZC-E0203`, and the agent treats that as "changed" and lists again.
+
+### The chain pair (C1 slice 10b)
+
+Every `200` answer of these endpoints carries
+`"chain": {"revision": R, "hash": "<64 hex>", "verified": V}`: for a write (registration, report),
+the revision and hash of the transaction itself; otherwise the store's `status` taken after the
+endpoint did its work (for the watch, the head it answered at), so it is at least as new as
+anything in the answer. `verified` is `false` when the server keeps no pair for its store across
+restarts (a memory store, which starts empty each time) and so does not enforce the
+never-backwards rule; the agent then neither refuses such an answer nor keeps a pair, and says so
+once. An answer without `verified` is read as `true`. Every endpoint takes `known=K`, the
+revision the agent remembers (no other query parameter, except the watch's `from` and `timeout`).
+When `K <= R`, the pair adds `"known_hash"`: the store's hash at `K` (`hash` itself when
+`K == R`). It is left out when the store
+has no hash there (`K` below the chain's start). A refusal carries no pair.
+
+The agent remembers the highest pair it was given, in `<state dir>/remembered`, and refuses an
+answer with a lower `revision`, a `known_hash` that differs from the remembered hash or is
+missing, or the same revision with a different `hash`: `ZC-E0215`, as the server raises for its
+store, and it acts on nothing in that answer. An answer without `chain` is `ZC-E0504` (the
+server is older than the agent: upgrade the server first). The way out is the server's
+`zcube store accept-rollback --confirm`, then `rm <state dir>/remembered` and an agent restart.
 
 ### What the agent does with them
 

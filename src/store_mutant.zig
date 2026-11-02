@@ -97,6 +97,7 @@ pub const Mutant = struct {
         .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
+        .hash_at = hash_at,
     };
 
     fn of(context: *anyopaque) *Mutant {
@@ -252,5 +253,10 @@ pub const Mutant = struct {
             },
             else => return mutant.inner.compact(revision, diag),
         }
+    }
+
+    /// Passed through: no mutation targets the chain hash.
+    fn hash_at(context: *anyopaque, revision: store.Revision, diag: *Diag) Error!store.Hash {
+        return of(context).inner.hash_at(revision, diag);
     }
 };

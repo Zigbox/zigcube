@@ -148,6 +148,13 @@ export const ZC_CODES = [
     "explanation": "The connection to Postgres ended while an operation was in progress: the\nserver restarted or was stopped, a backend was terminated, or the\nnetwork between them failed. zcube reconnects before the next\noperation, but cannot retry this one.\n\nIf the cause line says nothing was changed, the operation was rolled\nback. If it says the outcome is unknown, the connection dropped while\nthe commit was in flight and the write may or may not have been\napplied: read the keys again before repeating it."
   },
   {
+    "code": "ZC-E0214",
+    "severity": "error",
+    "blame": "user",
+    "summary": "the store has no chain hash for that revision",
+    "explanation": "Every revision the store commits gets a chain hash, which a client\nuses to notice a store that went backwards or forked. A store written by\na zcube from before the chain existed cannot recompute the hashes of\nrevisions it had already compacted, so its chain starts at the revision\nit was upgraded at, and the store has no hash for any revision below\nthat.\n\nAsk for a revision at or above the start of the chain; the cause line\nnames it. Nothing was changed."
+  },
+  {
     "code": "ZC-E0301",
     "severity": "error",
     "blame": "external",

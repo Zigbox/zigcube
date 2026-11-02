@@ -23,16 +23,19 @@ pub const modules = .{
     @import("apply.zig"),
     @import("clock.zig"),
     @import("compare_sets.zig"),
+    @import("control_plane.zig"),
     @import("controller.zig"),
     @import("console_sim.zig"),
     @import("constants.zig"),
     @import("core_smoke.zig"),
     @import("diag.zig"),
     @import("diag/codes.zig"),
+    @import("node_controller.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
     @import("runtime_codes.zig"),
     @import("retention.zig"),
+    @import("scheduler.zig"),
     @import("runtime.zig"),
     @import("sim_c0.zig"),
     @import("sim_clock.zig"),
@@ -45,6 +48,7 @@ pub const modules = .{
     @import("store.zig"),
     @import("store_failures.zig"),
     @import("store_memory.zig"),
+    @import("store_verified.zig"),
     @import("test_util.zig"),
     @import("testing/history.zig"),
     @import("text.zig"),
@@ -108,7 +112,9 @@ test "the controllers' tests are in this root" {
     // Goal: the controllers' tests run under WASI too. Method: import them (they use only the
     // memory store, a manual clock and the testing allocator).
     _ = @import("replica_controller_test.zig");
+    _ = @import("scheduler_test.zig");
     _ = @import("api_test.zig");
     _ = @import("agent_api_test.zig");
     _ = @import("agent_fence_test.zig");
+    _ = @import("agent_client_test.zig");
 }

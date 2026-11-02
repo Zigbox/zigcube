@@ -20,7 +20,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const runtime = @import("runtime.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const store = @import("store.zig");
@@ -64,6 +64,7 @@ pub const SwitchedStore = struct {
         .lease_list = lease_list,
         .expire_leases = expire_leases,
         .compact = compact,
+        .hash_at = hash_at,
     };
 
     pub fn interface(self: *SwitchedStore) store.Store {
@@ -190,6 +191,12 @@ pub const SwitchedStore = struct {
         try self.gate(diag);
         return self.inner.compact(revision, diag);
     }
+
+    fn hash_at(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!store.Hash {
+        const self = from(context);
+        try self.gate(diag);
+        return self.inner.hash_at(revision, diag);
+    }
 };
 
 // ---- The world --------------------------------------------------------------------------------
@@ -208,6 +215,9 @@ pub const Stats = struct {
     server_failures: u32 = 0,
     agent_failures: u32 = 0,
     transactions: u32 = 0,
+    /// Scheduler passes after which a node's allocation record disagreed with its assignments
+    /// (authority.md I6). Anything but zero is a bug.
+    i6_violations: u32 = 0,
 };
 
 pub const World = struct {
@@ -216,7 +226,7 @@ pub const World = struct {
     memory: *MemoryStore,
     switched: SwitchedStore,
     sim: sim_runtime.SimRuntime,
-    server: replica_controller.ReplicaController,
+    server: control_plane.ControlPlane,
     agent: *agent_mod.Agent,
     /// The agent's files (the kept lease), which a restart of the agent finds again.
     files: agent_state.SimState,
@@ -253,7 +263,8 @@ pub const World = struct {
         world.switched = .{ .inner = memory.interface() };
         world.sim.init(gpa, world.manual.clock(), seed, fixtures);
         world.instance_next = 1;
-        world.server = replica_controller.ReplicaController.init(world.take_instance());
+        world.server = control_plane.ControlPlane.init(world.take_instance());
+        world.server.check_i6 = true;
         world.agent = agent;
         world.files = .init(gpa, seed ^ 0x5eed);
         agent.init(agent_config());
@@ -329,6 +340,7 @@ pub const World = struct {
         const ctx = world.controller_context();
         world.stats.server_steps += 1;
         const wake = world.server.reconcile(&ctx) catch return world.failed_step(.server);
+        if (world.server.mismatch != null) world.stats.i6_violations += 1;
         world.server_due_ms = wake.at_ms;
         world.stats.transactions += wake.acted;
         return .{ .ran = true, .acted = wake.acted, .failed = null };
@@ -470,8 +482,9 @@ pub const World = struct {
 
     /// The server process restarts: a new controller instance with none of the old one's memory.
     pub fn restart_server(world: *World) void {
-        world.dropped_before_restart += world.server.retention.dropped;
-        world.server = replica_controller.ReplicaController.init(world.take_instance());
+        world.dropped_before_restart += world.server.replicas.retention.dropped;
+        world.server = control_plane.ControlPlane.init(world.take_instance());
+        world.server.check_i6 = true;
         world.server_due_ms = 0;
     }
 
@@ -487,7 +500,7 @@ pub const World = struct {
 
     /// Decisions retention has dropped so far, over every controller instance.
     pub fn decisions_dropped(world: *const World) u64 {
-        return world.dropped_before_restart + world.server.retention.dropped;
+        return world.dropped_before_restart + world.server.replicas.retention.dropped;
     }
 
     /// The store's current revision, or null if it cannot be read (it is down).

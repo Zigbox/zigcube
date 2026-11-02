@@ -20,19 +20,24 @@ and deletes is that role's; a refusal is a defect, never an error.
 | --- | --- | --- |
 | `/services/<name>` | API | C0 |
 | `/replicas/<service>/<id>` | replica controller | C0 |
+| `/replica-numbers/<service>` | replica controller | C1 slice 3 |
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
 | `/nodes/<node>` | that node's agent | C0 |
 | `/allocations/<node>` | scheduler | C1 slice 3 |
 | `/audit/allocations/<node>` | allocation auditor | C1 slice 4 |
-| `/node-status/<node>` | node controller | C1 slice 4 |
+| `/node-status/<node>` | node controller | C1 slice 3 |
 | `/observed/<node>/<id>` | that node's agent (the node controller may delete) | C0 |
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
 
-An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. Two departures from
+An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. One departure from
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
-decisions and so may touch only the decision prefixes; and the replica controller may still
-*put* `/services/<name>` (never delete it) because C0 keeps the `next_replica` counter there.
+decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
+the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
+refuses a put or delete of a service by any role but the API. `Service` v2 never starts a
+`next_replica`: it carries a C0 record's value forward only until the counter exists (below). The replica controller reads a counter
+only with a `get` when it is about to create replicas for that service, never by listing, so the
+number of counters bounds nothing.
 
 ## Versions
 
@@ -62,8 +67,19 @@ so a decision can say which version it acted on: the image, the command, `env` a
 **A change of `replicas` alone does not bump it** (owner, 2026-10-26): scaling from 3 to 5 must
 not replace the three that run. The replica controller replaces replicas whose `generation` is
 behind, and only a change of the replica's own inputs puts one behind. `next_replica` is the
-counter that makes replica ids unique forever (below); only the replica controller moves it, in
-the same transaction that creates the replica (the exception to "sole writer API" above).
+counter that makes replica ids unique forever (below). From slice 3 it lives in
+`/replica-numbers/<service>` (`{"next": N}`), which only the replica controller writes, in the
+same transaction that creates the replica. It is **never deleted**: the key outlives the service
+and its replicas (one small key per service name ever applied), so a re-apply continues the
+numbering. A legacy `next_replica` on the service seeds it, and so does one past the highest
+live replica number, whichever is larger, only when the key is absent. The seed is written on
+the first pass that sees a service carrying `next_replica` without a counter, whether or not
+it needs a replica, and a pass that stops the replicas of a deleted service with no counter
+writes one past their highest number, so a C0 service deleted and applied again never reuses
+an id. **What `"v": 2` holds:** no `next_replica` for a service created from slice 3; for a
+service that was a C0 record, `apply` carries its `next_replica` forward while
+`/replica-numbers/<service>` is absent and drops it once the counter exists. Readers ignore it
+when the counter exists.
 
 `applied_by` (the authenticated actor) and `request_id` (the API request that wrote this
 version, the same id as in `--verbose` output and bundles) say who changed the service last
@@ -77,26 +93,26 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 
 ## `/replicas/<service>/<id>`: desired replica
 
-`<id>` is `<service>-<n>` with `n` from `next_replica`, never reused: a replacement for
+`<id>` is `<service>-<n>` with `n` from `/replica-numbers/<service>` (C0: the service's
+`next_replica`), never reused: a replacement for
 `hello-3` is `hello-9`, so an old container and its observed record can never be mistaken for
 the new one. The id is also the container name and the `zcube.replica` label.
 
 ```json
-{ "v": 1, "id": "hello-9", "service": "hello", "generation": 4, "node": "node1",
-  "image": "b3:51aa9c03", "command": ["sh", "-c", "..."], "env": [], "limits": {},
-  "requests": {"cpu_millis": 500, "memory_bytes": 134217728} }
+{ "v": 2, "id": "hello-9", "service": "hello", "generation": 4,
+  "image": "b3:51aa9c03", "command": ["sh", "-c", "..."], "env": [], "limits": {} }
 ```
+
+Version 2 (C1 slice 3) has no `node` and no `requests`; a version 1 record still reads, with
+both ignored. The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
+for the replicas in `/assigned/<node>/` only; an assignment whose replica is gone is not served.
 
 The replica copies what it needs from the service at creation, so editing the service does not
 change a running replica; the controller replaces replicas whose `generation` is behind.
-`node` is empty until the scheduler assigns it (C0: always the one node). **From C1 slice 3
-the replica controller writes no placement:** `/assigned/<node>/<id>` (below) replaces `node`.
-
-`requests` is what the scheduler **resolved** the replica to need: its `limits` where the
-service sets them, else a default the scheduler states in the decision that placed the replica.
-A node's used capacity is `/allocations/<node>` (below), the sum of the `requests` of the replicas assigned to it, so a replica
-with no limits no longer counts as zero. Both numbers are always present once the replica has
-been scheduled; they are absent only while `node` is empty.
+**From C1 slice 3 the replica carries no placement:** `/assigned/<node>/<id>` (below) is where
+it runs, and `requests` is on the assignment (C0 wrote `node` and `requests` here). A replica
+with no assignment is unscheduled. `requests`, and how a node's used capacity is counted, are
+described with `/assigned` and `/allocations` below.
 
 **A replica whose start failed through the user's fault is held, not replaced** (owner,
 2026-10-26). When `/observed/<node>/<replica>` says `start_failed` with a diagnostic whose blame
@@ -178,6 +194,14 @@ replaced or fenced agent cannot overwrite what its successor observed.
 fields of the cited key's value that the decision acted on, as the controller read them, so
 `why` can show what justified the action after the key has changed or been compacted. A
 decision is immutable once written.
+
+The scheduler's `hold_pending` cites the replica's `/replicas` key and its `cause_evidence` is
+not fields of that key but the shortfall it computed: `{"need":{"cpu_millis":N,"memory_bytes":N},
+"<reason>":["node",…],"cpu_short":{"node":by,…},"memory_short":{"node":by,…},"omitted":N}`, where
+`<reason>` is one of `unknown_node`, `lost`, `fenced`, `no_status`, `older_tenure`,
+`audit_open`, `over_capacity` (only those that occur appear) and `omitted` counts nodes that did
+not fit in the byte bound. A new `hold_pending` is written only when the *shape* changes (per
+node: why it is excluded, or which resource it lacks), not when the amounts do.
 
 `id` is `<at_ms, 13 digits>-<controller instance, 4 hex>-<counter, 4 digits>`: sortable by
 time, unique without coordination. Written in the same transaction as the action it records,
@@ -270,6 +294,11 @@ allocation in the same transaction. An agent long-polls its own `/assigned/<node
 fan-out is the replicas on the node, not all replicas. The key's `mod_revision` is the replica's
 **placement epoch**. Lifetime: until unassigned. The value is under 256 bytes.
 
+`requests` is what the scheduler **resolved** the replica to need: its `limits` where the
+service sets them, else a default the scheduler states in the decision that placed it. A node's
+used capacity is `/allocations/<node>` (below), the sum of the `requests` of its assignments, so
+a replica with no limits does not count as zero.
+
 ## `/allocations/<node>`: the accounting (C1 slice 3)
 
 ```json
@@ -292,7 +321,7 @@ from `/allocations/<node>`, both read at `revision`. While it exists the schedul
 on the node (its absence is in the placement compare set). It never repairs. Lifetime: until a
 later audit finds the node consistent.
 
-## `/node-status/<node>`: the node controller's judgement (C1 slice 4)
+## `/node-status/<node>`: the node controller's judgement (C1 slice 3)
 
 ```json
 {"v":1,"state":"fenced","tenure":3,"at_ms":10,"decision":"1761350000123-0001-0008"}

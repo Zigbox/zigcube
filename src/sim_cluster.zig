@@ -39,7 +39,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
@@ -291,8 +291,33 @@ const Node = struct {
         node.loop = agent_loop.Loop.init();
         const gpa = node.cluster.gpa;
         node.remote = agent_client.RemoteStore.init(gpa, node.transport(), node.name());
+        node.load_pair();
         node.down = false;
         node.resume_ms = 0;
+    }
+
+    /// The agent's remembered pair, as `zcube-agent` loads it at start. `restart` has just
+    /// cleared the crash (a first start has none), and `SimState.read` fails only while crashed
+    /// (a read is no write point, so it cannot crash); `SimState` keeps every put whole, so a
+    /// file the agent wrote parses; and the address is always the same. So the load cannot fail.
+    fn load_pair(node: *Node) void {
+        assert(!node.sim.crashed);
+        assert(!node.sim.files.crashed);
+        node.diag.reset();
+        _ = node.arena.reset(.retain_capacity);
+        const state = node.sim.files.interface();
+        const arena = node.arena.allocator();
+        const loaded = node.remote.load(state, "/sim", "sim-server", arena, &node.diag);
+        loaded catch unreachable; // Cannot fail: see above.
+        assert(node.remote.notice == null);
+    }
+
+    /// The pair saved after a step, as `zcube-agent` does; a crash at its write point is the
+    /// agent dying there.
+    fn save_pair(node: *Node, now_ms: u64) void {
+        node.remote.save(node.sim.files.interface(), now_ms) catch |err| {
+            if (err == error.Crashed) node.sim.crashed = true;
+        };
     }
 
     /// Notes that a call found the agent dead.
@@ -333,6 +358,7 @@ const Node = struct {
         const result = node.agent.reconcile(&ctx);
         node.fences += node.agent.fences - fences_before;
         node.resume_ms = c.manual.ms + node.spent_ms;
+        if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
         const wake = result catch {
             c.stats.agent_failures += 1;
@@ -460,13 +486,15 @@ pub const Cluster = struct {
     net: sim_net.SimNet,
     api: api_mod.Api,
     api_source: controller.DecisionSource,
-    server: replica_controller.ReplicaController,
+    server: control_plane.ControlPlane,
     nodes: []*Node,
     prng: std.Random.DefaultPrng,
     diag: Diag,
     net_diag: Diag,
     arena_state: std.heap.ArenaAllocator,
     server_due_ms: u64,
+    /// Scheduler passes after which an allocation disagreed with its assignments (I6).
+    i6_violations: u32,
     server_seen_revision: store.Revision,
     compact_due_ms: u64,
     instance_next: u16,
@@ -488,6 +516,11 @@ pub const Cluster = struct {
     stats: Stats,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
+    /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
+    /// report names it (the simulation fleet files a failure by its check and this step).
+    step: []const u8,
+    /// Told each step as the run enters it (`Options.on_step`).
+    on_step: ?*const fn (step: []const u8) void,
     /// Liveness mode: the faults end mid-run and the end state must converge within
     /// `liveness_bound_ms`; else faults stay on and only the safety checks run.
     liveness: bool,
@@ -533,13 +566,17 @@ pub const Cluster = struct {
         c.fault_ms = 0;
         c.checked_revision = null;
         c.checked_dropped = 0;
+        c.i6_violations = 0;
         c.second_ms = 0;
         c.check_ms = 0;
         c.stats = .{};
         c.fault_totals = null;
+        c.step = "faults";
+        c.on_step = null;
         c.liveness = true;
         c.report = report;
-        c.server = replica_controller.ReplicaController.init(c.take_instance());
+        c.server = control_plane.ControlPlane.init(c.take_instance());
+        c.server.check_i6 = true;
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
@@ -567,6 +604,7 @@ pub const Cluster = struct {
         node.remote = agent_client.RemoteStore.init(c.gpa, node.transport(), node.name());
         node.diag.reset();
         node.arena = .init(c.gpa);
+        node.load_pair(); // A fresh state directory: nothing remembered, the address set.
         node.down = false;
         node.restart_at_ms = 0;
         node.resume_ms = 0;
@@ -582,6 +620,14 @@ pub const Cluster = struct {
         node.all_up_ms = 0;
         c.net.set_faults(index, c.swarm.net);
         return node;
+    }
+
+    /// Moves the run to `step` and tells the runner's hook, if any.
+    fn enter(c: *Cluster, step: []const u8) void {
+        assert(step.len > 0);
+        assert(!c.report.failed);
+        c.step = step;
+        if (c.on_step) |hook| hook(step);
     }
 
     pub fn destroy(c: *Cluster) void {
@@ -663,6 +709,7 @@ pub const Cluster = struct {
             c.server_due_ms = c.manual.ms + tick_ms;
             return 0;
         };
+        if (c.server.mismatch != null) c.i6_violations += 1;
         c.server_due_ms = wake.at_ms;
         c.stats.transactions += wake.acted;
         return wake.acted;
@@ -846,8 +893,9 @@ pub const Cluster = struct {
     }
 
     fn restart_server(c: *Cluster) void {
-        c.dropped_before_restart += c.server.retention.dropped;
-        c.server = replica_controller.ReplicaController.init(c.take_instance());
+        c.dropped_before_restart += c.server.replicas.retention.dropped;
+        c.server = control_plane.ControlPlane.init(c.take_instance());
+        c.server.check_i6 = true;
         c.server_due_ms = 0;
         c.stats.server_restarts += 1;
     }
@@ -858,7 +906,7 @@ pub const Cluster = struct {
     }
 
     fn dropped_total(c: *const Cluster) u64 {
-        return c.dropped_before_restart + c.server.retention.dropped;
+        return c.dropped_before_restart + c.server.replicas.retention.dropped;
     }
 
     fn cut_count(c: *const Cluster) u32 {
@@ -999,12 +1047,14 @@ fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
     c.report.print("FAILED: {s} (seed {d}, at {d} ms)\n", .{
         what, c.seed, c.manual.ms - epoch_ms,
     });
+    c.report.print("step: {s}\n", .{c.step});
     return error.StepFailed;
 }
 
 /// sim-c0's invariants over the whole store: every decision has a reason and a cause that
 /// exists, `why` terminates, every replica has its create (and place) decision.
 fn invariants(c: *Cluster) Failure!void {
+    try check(c, c.i6_violations == 0, "I6: an allocation disagrees with its assignments");
     if (store_faulty(c)) return;
     const head = c.revision();
     try check(c, head != null, "the store cannot be read");
@@ -1021,7 +1071,7 @@ fn invariants(c: *Cluster) Failure!void {
     }
     for (snapshot.replicas) |replica| {
         try why_terminates(c, &ctx, .{ .kind = .replica, .name = replica.rec.id });
-        try replica_has_decisions(c, &ctx, &replica.rec);
+        try replica_has_decisions(c, &ctx, &replica.rec, snapshot.node_of(replica.rec.id) != null);
     }
     c.checked_revision = head;
     c.checked_dropped = dropped;
@@ -1087,6 +1137,7 @@ fn replica_has_decisions(
     c: *Cluster,
     ctx: *const controller.Context,
     replica: *const records.Replica,
+    assigned: bool,
 ) Failure!void {
     const prefix = records.index_prefix(.replica, replica.id);
     const query: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 64 };
@@ -1101,7 +1152,7 @@ fn replica_has_decisions(
         if (std.mem.eql(u8, entry.action, "place_replica")) placed = true;
     }
     try check(c, created, "a replica has no create_replica decision");
-    if (replica.node.len > 0) try check(c, placed, "a placed replica has no place decision");
+    if (assigned) try check(c, placed, "a placed replica has no place decision");
 }
 
 /// The store is down, or about to be: reads would fail and would use up the countdown.
@@ -1158,15 +1209,48 @@ fn track_fencing(c: *Cluster) Failure!void {
 /// and the checks' and the ticks' granularity.
 const fencing_ms_max: u64 = constants.lost_grace_ms + 2 * check_interval_ms;
 
-/// Whether the replicas list says `name` runs on `node`.
+/// Replica id to the node `/assigned/` puts it on.
+const Homes = std.StringHashMapUnmanaged([]const u8);
+
+fn read_homes(c: *Cluster, ctx: *const controller.Context) Failure!Homes {
+    const assigned = controller.list_all(
+        records.Assigned,
+        ctx,
+        records.prefix_assigned,
+        null,
+        constants.replicas_max,
+    ) catch {
+        try check(c, false, "the assignments cannot be read");
+        return error.StepFailed;
+    };
+    var homes: Homes = .empty;
+    for (assigned.items) |entry| {
+        const rest = entry.kv.key[records.prefix_assigned.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+            {
+                try check(c, false, "an assignment has a malformed key");
+                return error.StepFailed;
+            };
+        homes.put(ctx.arena, entry.rec.replica, rest[0..slash]) catch {
+            try check(c, false, "out of memory");
+            return error.StepFailed;
+        };
+    }
+    return homes;
+}
+
+/// Whether the replica `name` exists and `/assigned/` puts it on `node`: what the endpoint serves
+/// the node's agent.
 fn assigned_to(
     replicas: []const controller.Entry(records.Replica),
+    homes: *const Homes,
     node: []const u8,
     name: []const u8,
 ) bool {
     for (replicas) |replica| {
         if (!std.mem.eql(u8, replica.rec.id, name)) continue;
-        return std.mem.eql(u8, replica.rec.node, node);
+        const home = homes.get(name) orelse return false;
+        return std.mem.eql(u8, home, node);
     }
     return false;
 }
@@ -1205,8 +1289,12 @@ fn track_excess(c: *Cluster) Failure!void {
         c.diag.reset();
         return;
     };
-    try track_unassigned(c, replicas.items, delta_ms);
-    try track_starved(c, replicas.items, delta_ms);
+    const homes = read_homes(c, &ctx) catch {
+        c.diag.reset();
+        return;
+    };
+    try track_unassigned(c, replicas.items, &homes, delta_ms);
+    try track_starved(c, replicas.items, &homes, delta_ms);
 }
 
 fn reachable(node: *const Node) bool {
@@ -1216,6 +1304,7 @@ fn reachable(node: *const Node) bool {
 fn track_unassigned(
     c: *Cluster,
     replicas: []const controller.Entry(records.Replica),
+    homes: *const Homes,
     delta_ms: u64,
 ) Failure!void {
     var next: [excess_slots_max]Excess = undefined;
@@ -1223,7 +1312,7 @@ fn track_unassigned(
     for (c.nodes) |node| {
         for (node.sim.containers.containers.items) |container| {
             if (container.phase == .stopped) continue;
-            if (assigned_to(replicas, node.name(), container.name)) continue;
+            if (assigned_to(replicas, homes, node.name(), container.name)) continue;
             const hash = std.hash.Wyhash.hash(0, container.name);
             var accrued = excess_accrued(c, node.index, hash);
             if (reachable(node)) accrued += delta_ms;
@@ -1252,15 +1341,16 @@ fn starved_accrued(c: *const Cluster, node: u32, name_hash: u64) u64 {
 fn track_starved(
     c: *Cluster,
     replicas: []const controller.Entry(records.Replica),
+    homes: *const Homes,
     delta_ms: u64,
 ) Failure!void {
     var next: [excess_slots_max]Excess = undefined;
     var count: u32 = 0;
     for (replicas) |entry| {
         const replica = &entry.rec;
-        if (replica.node.len == 0) continue;
+        const home = homes.get(replica.id) orelse continue;
         if (std.mem.eql(u8, replica.image, broken_digest)) continue;
-        const node = c.node_named(replica.node) orelse continue;
+        const node = c.node_named(home) orelse continue;
         if (live_container(node, replica.id) == true) continue;
         const hash = std.hash.Wyhash.hash(0, replica.id);
         var accrued = starved_accrued(c, node.index, hash);
@@ -1331,6 +1421,7 @@ fn converged(c: *Cluster) Failure!void {
         null,
         constants.replicas_max,
     ) catch return check(c, false, "the observed records cannot be read");
+    const homes = try read_homes(c, &ctx);
     for (services.items) |service| {
         const prefix = records.replicas_prefix(service.rec.name);
         const replicas = controller.list_all(
@@ -1342,13 +1433,15 @@ fn converged(c: *Cluster) Failure!void {
         ) catch return check(c, false, "the replicas cannot be read");
         try check(c, replicas.items.len == service.rec.replicas, "a service lacks replicas");
         const good = !std.mem.eql(u8, service.rec.image, broken_digest);
-        for (replicas.items) |replica| try replica_converged(c, observed.items, &replica.rec, good);
+        for (replicas.items) |replica| {
+            try replica_converged(c, observed.items, &homes, &replica.rec, good);
+        }
     }
-    try no_strays(c, &ctx);
+    try no_strays(c, &ctx, &homes);
 }
 
 /// Every container alive on any node is the container of a replica placed on that node.
-fn no_strays(c: *Cluster, ctx: *const controller.Context) Failure!void {
+fn no_strays(c: *Cluster, ctx: *const controller.Context, homes: *const Homes) Failure!void {
     const replicas = controller.list_all(
         records.Replica,
         ctx,
@@ -1359,7 +1452,7 @@ fn no_strays(c: *Cluster, ctx: *const controller.Context) Failure!void {
     for (c.nodes) |node| {
         for (node.sim.containers.containers.items) |container| {
             if (container.phase == .stopped) continue;
-            const mine = assigned_to(replicas.items, node.name(), container.name);
+            const mine = assigned_to(replicas.items, homes, node.name(), container.name);
             try check(c, mine, "a container is left behind");
         }
     }
@@ -1368,15 +1461,16 @@ fn no_strays(c: *Cluster, ctx: *const controller.Context) Failure!void {
 fn replica_converged(
     c: *Cluster,
     observed: []const controller.Entry(records.Observed),
+    homes: *const Homes,
     replica: *const records.Replica,
     good: bool,
 ) Failure!void {
-    try check(c, replica.node.len > 0, "a replica is not placed");
-    var homes: u32 = 0;
+    const home = homes.get(replica.id) orelse return check(c, false, "a replica is not placed");
+    var copies: u32 = 0;
     for (c.nodes) |node| {
         const running = live_container(node, replica.id) orelse continue;
-        homes += 1;
-        try check(c, std.mem.eql(u8, node.name(), replica.node), "a replica runs on a node " ++
+        copies += 1;
+        try check(c, std.mem.eql(u8, node.name(), home), "a replica runs on a node " ++
             "other than its own");
         try check(c, good, "a replica of a broken service is running");
         try check(c, running, "a replica is still stopping");
@@ -1384,7 +1478,7 @@ fn replica_converged(
         try check(c, std.mem.eql(u8, live.image, replica.image), "a replica runs " ++
             "another image than its own");
     }
-    try check(c, homes == @intFromBool(good), "a replica is not running exactly once");
+    try check(c, copies == @intFromBool(good), "a replica is not running exactly once");
     var seen = false;
     for (observed) |item| {
         if (!std.mem.eql(u8, item.rec.replica, replica.id)) continue;
@@ -1393,7 +1487,7 @@ fn replica_converged(
         try check(c, item.rec.generation == replica.generation, "the server's view of a " ++
             "replica is of another generation");
         try check(c, running == good, "the server's view of a replica disagrees with its node");
-        if (good) try check(c, std.mem.eql(u8, item.rec.node, replica.node), "observed on " ++
+        if (good) try check(c, std.mem.eql(u8, item.rec.node, home), "observed on " ++
             "another node");
     }
     if (good) try check(c, seen, "a running replica was never reported");
@@ -1492,6 +1586,10 @@ pub const Options = struct {
     /// (`heal_operation`). A shrunk replay needs it: the seed's choice is drawn from the number of
     /// operations, so a shorter run would heal elsewhere and be a different run.
     heal_at: ?u32 = null,
+    /// Called with each step ("faults", "healed", "convergence", "end") as the run enters it,
+    /// so a runner can say where a run that panics was (`sim_cluster --trace-steps`). It must
+    /// not touch the run.
+    on_step: ?*const fn (step: []const u8) void = null,
 };
 
 /// The operation before which the faults end in a liveness run of `operations` operations from
@@ -1522,9 +1620,13 @@ pub fn simulate(
     const c = Cluster.create(gpa, seed, options.nodes, report) catch {
         report.failed = true;
         report.print("FAILED: out of memory\n", .{});
+        // The run never started: the host's trouble, which the fleet counts and never files.
+        report.print("step: setup\n", .{});
         return;
     };
     defer c.destroy();
+    c.on_step = options.on_step;
+    c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
     c.liveness = options.liveness;
@@ -1551,7 +1653,10 @@ pub fn simulate(
 
 fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     for (0..operations) |index| {
-        if (c.liveness and index == heal_at) heal(c);
+        if (c.liveness and index == heal_at) {
+            heal(c);
+            c.enter("healed");
+        }
         operation(c);
         if (c.report.failed) return error.StepFailed;
         try safety(c);
@@ -1560,10 +1665,12 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.fault_totals == null) heal(c);
         c.advance(liveness_bound_ms);
         if (c.report.failed) return error.StepFailed;
+        c.enter("convergence");
         try converged(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
+    c.enter("end");
     try safety(c);
     try enough_work_under_faults(c, @min(heal_at, operations));
     try work_under_ceiling(c);

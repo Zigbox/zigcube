@@ -12,7 +12,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
-const replica_controller = @import("replica_controller.zig");
+const control_plane = @import("control_plane.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
 const ManualClock = @import("clock.zig").ManualClock;
@@ -34,7 +34,7 @@ const Fixture = struct {
     memory: *MemoryStore,
     arena_state: std.heap.ArenaAllocator,
     diag: Diag,
-    rc: replica_controller.ReplicaController,
+    plane: control_plane.ControlPlane,
     api: controller.DecisionSource,
 
     fn start(self: *Fixture) !void {
@@ -43,7 +43,8 @@ const Fixture = struct {
         self.memory.init(testing.allocator, self.manual.clock());
         self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         self.diag.reset();
-        self.rc = replica_controller.ReplicaController.init(1);
+        self.plane = control_plane.ControlPlane.init(1);
+        self.plane.check_i6 = true;
         self.api = .{ .instance = 0 };
     }
 
@@ -110,7 +111,9 @@ const Fixture = struct {
     /// One pass; returns what it said.
     fn step(self: *Fixture) !controller.Wakeup {
         const ctx = self.context();
-        return self.rc.reconcile(&ctx);
+        const wake = try self.plane.reconcile(&ctx);
+        try testing.expect(self.plane.mismatch == null);
+        return wake;
     }
 
     /// Steps until a pass writes nothing; returns how many passes wrote something.
@@ -207,12 +210,16 @@ test "an applied service gets its replicas, placed on the node, each with a deci
     const key = records.replica_key("hello", "hello-2");
     const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
     const replica = try records.read(records.Replica, ctx.arena, got.kv.?, &fixture.diag);
-    try testing.expectEqualStrings("node1", replica.node);
-    try testing.expectEqual(@as(u32, 250), replica.requests.?.cpu_millis);
+    _ = replica;
+    const assigned_at = records.assigned_key("node1", "hello-2");
+    const assigned = try ctx.store.get(ctx.arena, assigned_at.slice(), null, &fixture.diag);
+    const given = try records.read(records.Assigned, ctx.arena, assigned.kv.?, &fixture.diag);
+    try testing.expectEqual(@as(u32, 250), given.requests.cpu_millis);
 
     var chain = try fixture.decisions(.replica, "hello-2");
     defer chain.deinit(testing.allocator);
-    try testing.expectEqualStrings("create_replica<decision;place_replica<decision;", chain.items);
+    const expected = "create_replica<decision;hold_pending<desired;place_replica<decision;";
+    try testing.expectEqualStrings(expected, chain.items);
     var service_chain = try fixture.decisions(.service, "hello");
     defer service_chain.deinit(testing.allocator);
     try testing.expectEqualStrings("apply<desired;scale_up<desired;", service_chain.items);
@@ -241,7 +248,8 @@ test "a replica whose container was killed is replaced, and the decisions say wh
 
     var dead = try fixture.decisions(.replica, "hello-2");
     defer dead.deinit(testing.allocator);
-    const dead_chain = "create_replica<decision;place_replica<decision;delete_replica<observed;";
+    const dead_chain = "create_replica<decision;place_replica<decision;" ++
+        "delete_replica<observed;release_replica<decision;";
     try testing.expectEqualStrings(dead_chain, dead.items);
     var fresh = try fixture.decisions(.replica, "hello-4");
     defer fresh.deinit(testing.allocator);
@@ -380,7 +388,8 @@ test "a pass stops after one batch and says it has more to do" {
     many.replicas = 10;
     try fixture.apply(many);
     const first = try fixture.step();
-    try testing.expectEqual(@as(u32, 1), first.acted);
+    // The node controller's first write (the node's status) counts beside the batch.
+    try testing.expectEqual(@as(u32, 2), first.acted);
     try testing.expectEqual(fixture.manual.ms, first.at_ms);
     const partial = try fixture.ids("hello");
     defer Fixture.free_ids(partial);
@@ -404,4 +413,406 @@ test "a malformed record is ZC-E0301 naming its key" {
     _ = try writers.txn(fixture.memory.interface(), .api, .{ .on_success = &.{op} }, &fixture.diag);
     try testing.expectError(error.Malformed, fixture.step());
     try testing.expectEqual(codes.Code.E0301, fixture.diag.code.?);
+}
+
+// ---- The replica counter (`/replica-numbers/<service>`) ---------------------------------------
+
+/// A store that, just before the first `txn`, puts `key` through the inner store: a peer that
+/// writes between a controller's read and its commit.
+const MovingStore = struct {
+    inner: store.Store,
+    key: []const u8,
+    /// What is written to `key` just before the armed commit.
+    value: []const u8 = "{\"v\":1,\"next\":99}",
+    armed: bool = true,
+    fired: bool = false,
+
+    const vtable: store.Store.VTable = .{
+        .status = status,
+        .get = get,
+        .list = list,
+        .txn = txn,
+        .watch = watch,
+        .lease_grant = lease_grant,
+        .lease_keepalive = lease_keepalive,
+        .lease_revoke = lease_revoke,
+        .lease_list = lease_list,
+        .expire_leases = expire_leases,
+        .compact = compact,
+        .hash_at = hash_at,
+    };
+
+    fn interface(self: *MovingStore) store.Store {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *MovingStore {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn status(context: *anyopaque, diag: *Diag) store.Error!store.Status {
+        return from(context).inner.vtable.status(from(context).inner.context, diag);
+    }
+
+    fn get(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        key: []const u8,
+        at_revision: ?store.Revision,
+        diag: *Diag,
+    ) store.Error!store.GetResult {
+        const inner = from(context).inner;
+        return inner.vtable.get(inner.context, arena, key, at_revision, diag);
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        options: store.ListOptions,
+        diag: *Diag,
+    ) store.Error!store.ListResult {
+        const inner = from(context).inner;
+        return inner.vtable.list(inner.context, arena, options, diag);
+    }
+
+    fn txn(
+        context: *anyopaque,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
+        const self = from(context);
+        if (self.armed) {
+            self.armed = false;
+            self.fired = true;
+            const op: store.Op = .{ .put = .{ .key = self.key, .value = self.value } };
+            _ = try self.inner.vtable.txn(self.inner.context, .{ .on_success = &.{op} }, diag);
+        }
+        return self.inner.vtable.txn(self.inner.context, request, diag);
+    }
+
+    fn watch(
+        context: *anyopaque,
+        options: store.WatchOptions,
+        diag: *Diag,
+    ) store.Error!store.Watch {
+        const inner = from(context).inner;
+        return inner.vtable.watch(inner.context, options, diag);
+    }
+
+    fn lease_grant(context: *anyopaque, ttl_ms: u32, diag: *Diag) store.Error!store.Lease {
+        const inner = from(context).inner;
+        return inner.vtable.lease_grant(inner.context, ttl_ms, diag);
+    }
+
+    fn lease_keepalive(
+        context: *anyopaque,
+        id: store.LeaseId,
+        diag: *Diag,
+    ) store.Error!store.Lease {
+        const inner = from(context).inner;
+        return inner.vtable.lease_keepalive(inner.context, id, diag);
+    }
+
+    fn lease_revoke(
+        context: *anyopaque,
+        id: store.LeaseId,
+        diag: *Diag,
+    ) store.Error!store.Revision {
+        const inner = from(context).inner;
+        return inner.vtable.lease_revoke(inner.context, id, diag);
+    }
+
+    fn lease_list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        diag: *Diag,
+    ) store.Error![]const store.LeaseInfo {
+        const inner = from(context).inner;
+        return inner.vtable.lease_list(inner.context, arena, diag);
+    }
+
+    fn expire_leases(context: *anyopaque, diag: *Diag) store.Error!u32 {
+        const inner = from(context).inner;
+        return inner.vtable.expire_leases(inner.context, diag);
+    }
+
+    fn compact(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!void {
+        const inner = from(context).inner;
+        return inner.vtable.compact(inner.context, revision, diag);
+    }
+
+    fn hash_at(context: *anyopaque, revision: store.Revision, diag: *Diag) store.Error!store.Hash {
+        return from(context).inner.hash_at(revision, diag);
+    }
+};
+
+/// The counter's `next`, or null if the key is absent.
+fn counter_next(fixture: *Fixture, service: []const u8) !?u64 {
+    const ctx = fixture.context();
+    const key = records.replica_numbers_key(service);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    const kv = got.kv orelse return null;
+    return (try records.read(records.ReplicaNumber, ctx.arena, kv, &fixture.diag)).next;
+}
+
+test "replica numbers are never reused across scale down, scale up and a re-apply" {
+    // Goal: the counter lives in `/replica-numbers/hello`, moves with the replicas it creates,
+    // and is never deleted. Method: 3 replicas, down to 1, up to 3; then delete the service, let
+    // every replica go, and only then apply it again.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 4), try counter_next(&fixture, "hello"));
+
+    var down = hello;
+    down.replicas = 1;
+    try fixture.apply(down);
+    _ = try fixture.settle();
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const regrown = try fixture.ids("hello");
+    defer Fixture.free_ids(regrown);
+    try expect_ids(&.{ "hello-1", "hello-4", "hello-5" }, regrown);
+    try testing.expectEqual(@as(?u64, 6), try counter_next(&fixture, "hello"));
+
+    var ctx = fixture.context();
+    const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000003");
+    try testing.expect(done == .written);
+    _ = try fixture.settle(); // every replica is gone before the re-apply
+    const gone = try fixture.ids("hello");
+    defer Fixture.free_ids(gone);
+    try expect_ids(&.{}, gone);
+    try testing.expectEqual(@as(?u64, 6), try counter_next(&fixture, "hello"));
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const again = try fixture.ids("hello");
+    defer Fixture.free_ids(again);
+    try expect_ids(&.{ "hello-6", "hello-7", "hello-8" }, again);
+}
+
+test "the counter stays after its service and replicas are gone" {
+    // Goal: one small key per service name ever applied, so ids are unique forever. Method:
+    // delete, settle, look for the key.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const ctx = fixture.context();
+    _ = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000004");
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 4), try counter_next(&fixture, "hello"));
+}
+
+test "the counters never bound the controller: more service names than services_max" {
+    // Goal: counters are kept forever, so the number of them must bound nothing. Method: apply
+    // and delete more than `services_max` distinct names, one live at a time, then reconcile a
+    // live service and a re-applied first name: both work and numbering is right.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var one = hello;
+    one.replicas = 1;
+    var name_buffer: [32]u8 = undefined;
+    var request_buffer: [32]u8 = undefined;
+    for (0..constants.services_max + 10) |i| {
+        one.name = try std.fmt.bufPrint(&name_buffer, "svc-{d}", .{i});
+        try fixture.apply(one);
+        _ = try fixture.settle();
+        const request = try std.fmt.bufPrint(&request_buffer, "r-{x:0>8}", .{i + 100});
+        const ctx = fixture.context();
+        const done = try apply_mod.delete_service(&ctx, &fixture.api, one.name, "alex", request);
+        try testing.expect(done == .written);
+        _ = try fixture.settle();
+    }
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const live = try fixture.ids("hello");
+    defer Fixture.free_ids(live);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, live);
+    one.name = "svc-0";
+    try fixture.apply(one);
+    _ = try fixture.settle();
+    const again = try fixture.ids("svc-0");
+    defer Fixture.free_ids(again);
+    try expect_ids(&.{"svc-0-2"}, again);
+}
+
+test "a C0 service record's next_replica seeds the counter, or one past the highest replica" {
+    // Goal: a number is never reused when the counter is first created. Method: a v1 service
+    // record with next_replica 7 starts the numbers at 7; with the counter removed and a lower
+    // legacy value, one past the highest replica number wins.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    const legacy: records.Service = .{
+        .v = 1,
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 2,
+        .command = hello.command,
+        .generation = 1,
+        .next_replica = 7,
+    };
+    try fixture.put(.api, records.service_key("hello").slice(), legacy);
+    _ = try fixture.settle();
+    const first = try fixture.ids("hello");
+    defer Fixture.free_ids(first);
+    try expect_ids(&.{ "hello-7", "hello-8" }, first);
+    try testing.expectEqual(@as(?u64, 9), try counter_next(&fixture, "hello"));
+
+    const ctx = fixture.context();
+    const key = records.replica_numbers_key("hello");
+    const drop: store.Op = .{ .delete = key.slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{drop} }, &fixture.diag);
+    var more = hello;
+    more.replicas = 3;
+    try fixture.apply(more);
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 10), try counter_next(&fixture, "hello"));
+}
+
+/// A C0 store: a v1 service at full count with next_replica 10 and its replicas 7 to 9, and no
+/// counter (C0 never wrote one).
+fn put_c0_service_at_full_count(fixture: *Fixture) !void {
+    const legacy: records.Service = .{
+        .v = 1,
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 3,
+        .command = hello.command,
+        .generation = 1,
+        .next_replica = 10,
+    };
+    try fixture.put(.api, records.service_key("hello").slice(), legacy);
+    for ([_][]const u8{ "hello-7", "hello-8", "hello-9" }) |id| {
+        const replica: records.Replica = .{
+            .id = id,
+            .service = "hello",
+            .generation = 1,
+            .image = legacy.image,
+            .command = legacy.command,
+        };
+        try fixture.put(.replica_controller, records.replica_key("hello", id).slice(), replica);
+    }
+}
+
+fn reapply_one(fixture: *Fixture, request: []const u8) !void {
+    const ctx = fixture.context();
+    const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", request);
+    try testing.expect(done == .written);
+    _ = try fixture.settle();
+    var one = hello;
+    one.replicas = 1;
+    try fixture.apply(one);
+    _ = try fixture.settle();
+}
+
+test "a C0 service at full count, deleted and applied again, does not reuse a number" {
+    // Goal: a C0 next_replica reaches the counter even when the service never needs a new
+    // replica. Method: a C0 service at full count (replicas 7-9, next_replica 10, no counter);
+    // a pass seeds the counter at 10 without creating anything; delete and re-apply gives
+    // hello-10, not hello-1.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try put_c0_service_at_full_count(&fixture);
+    _ = try fixture.settle();
+    try testing.expectEqual(@as(?u64, 10), try counter_next(&fixture, "hello"));
+    const before = try fixture.ids("hello");
+    defer Fixture.free_ids(before);
+    try expect_ids(&.{ "hello-7", "hello-8", "hello-9" }, before);
+    try reapply_one(&fixture, "r-00000010");
+    const after = try fixture.ids("hello");
+    defer Fixture.free_ids(after);
+    try expect_ids(&.{"hello-10"}, after);
+}
+
+test "a C0 service deleted before any pass leaves a counter past its highest replica" {
+    // Goal: the delete path seeds the counter too. Method: the C0 store above, deleted before
+    // the controller first runs; stopping its replicas writes the counter at 10, so the
+    // re-apply gives hello-10.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try put_c0_service_at_full_count(&fixture);
+    try reapply_one(&fixture, "r-00000011");
+    const after = try fixture.ids("hello");
+    defer Fixture.free_ids(after);
+    try expect_ids(&.{"hello-10"}, after);
+}
+
+test "the creating transaction fails when the counter moved, and the next pass plans again" {
+    // Goal: the counter is in the read set. Method: a store that moves the counter just before
+    // the first commit; that pass writes nothing, the next one creates the replicas from 99.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = records.replica_numbers_key("hello").slice(),
+        .armed = false,
+    };
+    var more = hello;
+    more.replicas = 4;
+    try fixture.apply(more);
+    moving.armed = true;
+    var ctx = fixture.context();
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    try testing.expectEqual(@as(?u64, 99), try counter_next(&fixture, "hello"));
+    _ = try fixture.settle();
+    const ids = try fixture.ids("hello");
+    defer Fixture.free_ids(ids);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3", "hello-99" }, ids);
+}
+
+test "the replace transaction fails when the dead replica's assignment moved" {
+    // Goal: `/assigned/<node>/<replica>` is in the replace transaction's read set. Method: hello-2
+    // is observed killed; a store rewrites its assignment just before the commit; that pass writes
+    // nothing and hello-2 is still there. The next passes replace it as usual.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    for ([_][]const u8{ "hello-1", "hello-2", "hello-3" }) |id| {
+        try fixture.observe(id, .running, null, null);
+    }
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.observe("hello-2", .stopped, .{ .kind = .signaled, .signal = 9 }, null);
+
+    var ctx = fixture.context();
+    const key = records.assigned_key("node1", "hello-2");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = got.kv.?.value,
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+
+    _ = try fixture.settle();
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-1", "hello-3", "hello-4" }, now);
 }

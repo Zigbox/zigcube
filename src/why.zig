@@ -153,7 +153,7 @@ fn replica_line(
     snapshot: *const controller.Snapshot,
     replica: *const records.Replica,
 ) Error!State {
-    if (replica.node.len == 0) return .{
+    const node = snapshot.node_of(replica.id) orelse return .{
         .exists = true,
         .health = .degraded,
         .desired = 1,
@@ -166,7 +166,7 @@ fn replica_line(
         .desired = 1,
         .running = 0,
         .text = try controller.format(ctx, "replica {s}: assigned to {s}, not yet reported", .{
-            replica.id, replica.node,
+            replica.id, node,
         }),
     };
     const status = try observed_phrase(ctx, &observed.rec);
@@ -180,7 +180,7 @@ fn replica_line(
         .desired = 1,
         .running = running,
         .text = try controller.format(ctx, "replica {s} on {s}: {s}", .{
-            replica.id, replica.node, status,
+            replica.id, node, status,
         }),
     };
 }
@@ -339,7 +339,14 @@ fn observed_step(
     var text = try controller.format(ctx, "{s}: the record the controller saw has been removed", .{
         key,
     });
-    if (try read_at(ctx, key, cause.revision)) |kv| {
+    if (std.mem.startsWith(u8, key, records.prefix_nodes)) {
+        // The node controller reacted to a node's registration, not to a replica's report. Said
+        // only if the store still has the key at that revision: else it is the removed text.
+        if (try read_at(ctx, key, cause.revision)) |_| {
+            const name = key[records.prefix_nodes.len..];
+            text = try controller.format(ctx, "node {s} registered ({s})", .{ name, key });
+        }
+    } else if (try read_at(ctx, key, cause.revision)) |kv| {
         const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
         const phrase = try observed_phrase(ctx, &observed);
         text = try controller.format(ctx, "{s} on {s}: {s}", .{
@@ -606,4 +613,35 @@ test "why renders a lease that ran out, and refuses an unknown subject" {
     ctx = world.controller_context();
     try testing.expectError(error.NotFound, why(&ctx, .{ .kind = .service, .name = "nope" }, null));
     try testing.expectEqual(@import("diag/codes.zig").Code.E0101, ctx.diag.code.?);
+}
+
+test "why says a node registered only while the store has its key" {
+    // Goal: a `/nodes/` cause reads as a registration only if the key is there at that revision
+    // (or now); else it reads as removed. Method: node1's own chain, then a mark_ready decision
+    // written by hand whose node never registered.
+    const world = try new_world(5);
+    defer world.destroy();
+    world.advance(2000);
+    var ctx = world.controller_context();
+    const node1 = try why(&ctx, .{ .kind = .node, .name = "node1" }, null);
+    const registered = node1.steps[node1.steps.len - 1];
+    try testing.expectEqual(StepType.observed, registered.type);
+    try testing.expectEqualStrings("node node1 registered (/nodes/node1)", registered.text);
+
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    var batch: controller.Batch = .{};
+    _ = try controller.put_decision(&ctx, &source, .{
+        .actor = "node-controller",
+        .action = "mark_ready",
+        .subject = .{ .kind = .node, .name = "node9" },
+        .reason = "node node9 registered",
+        .cause = .{ .kind = .observed, .key = "/nodes/node9", .revision = 5 },
+    }, &batch);
+    _ = try controller.commit(&ctx, .replica_controller, &batch);
+    ctx = world.controller_context();
+    const node9 = try why(&ctx, .{ .kind = .node, .name = "node9" }, null);
+    try testing.expectEqualStrings(
+        "/nodes/node9: the record the controller saw has been removed",
+        node9.steps[node9.steps.len - 1].text,
+    );
 }
