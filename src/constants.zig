@@ -92,12 +92,12 @@ pub const request_arena_bytes_max: u32 = 16 * 1024 * 1024;
 // ---- Runtime -------------------------------------------------------------------------------
 
 pub const runtime_command_words_max: u32 = 64;
-pub const runtime_env_count_max: u32 = 64;
-pub const runtime_labels_max: u32 = 16;
+pub const runtime_env_count_max: u32 = 16;
+pub const runtime_labels_max: u32 = 8;
 pub const runtime_handles_max: u32 = 512;
 pub const runtime_events_batch_max: u32 = 64;
-pub const label_key_bytes_max: u32 = 63;
-pub const label_value_bytes_max: u32 = 253;
+pub const label_key_bytes_max: u32 = 32;
+pub const label_value_bytes_max: u32 = 128;
 /// "b3:" and 64 hex digits; shorter forms are fixture names in the fake runtime.
 pub const image_digest_bytes_max: u32 = 67;
 
