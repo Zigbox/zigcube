@@ -298,9 +298,11 @@ pub fn node_tenure(demo: *Demo) !u64 {
     return registered.?.mod_revision;
 }
 
-/// True if `/node-status/<node>` says ready for the node's current tenure.
+/// True if `/node-status/<node>` says ready for the node's current tenure. False while the node
+/// is not registered: an agent that lost its lease registers again.
 fn ready_now(demo: *Demo, _: *Host) !bool {
-    const tenure = try node_tenure(demo);
+    const registered = (try read_key(demo, "/nodes/" ++ node)) orelse return false;
+    const tenure = registered.mod_revision;
     const status = (try read_key(demo, "/node-status/" ++ node)) orelse return false;
     const fields = status.value.object;
     const judged: u64 = @intCast(fields.get("tenure").?.integer);
