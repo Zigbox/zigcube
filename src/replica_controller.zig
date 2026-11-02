@@ -56,6 +56,7 @@ pub const watch_prefixes = [_][]const u8{
     records.prefix_services,
     records.prefix_replicas,
     records.prefix_observed,
+    records.prefix_assigned,
     records.prefix_replica_numbers,
 };
 

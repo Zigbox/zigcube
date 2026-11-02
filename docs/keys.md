@@ -25,7 +25,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/nodes/<node>` | that node's agent | C0 |
 | `/allocations/<node>` | scheduler | C1 slice 3 |
 | `/audit/allocations/<node>` | allocation auditor | C1 slice 4 |
-| `/node-status/<node>` | node controller | C1 slice 4 |
+| `/node-status/<node>` | node controller | C1 slice 3 |
 | `/observed/<node>/<id>` | that node's agent (the node controller may delete) | C0 |
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
@@ -91,21 +91,24 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 the new one. The id is also the container name and the `zcube.replica` label.
 
 ```json
-{ "v": 1, "id": "hello-9", "service": "hello", "generation": 4, "node": "node1",
-  "image": "b3:51aa9c03", "command": ["sh", "-c", "..."], "env": [], "limits": {},
-  "requests": {"cpu_millis": 500, "memory_bytes": 134217728} }
+{ "v": 2, "id": "hello-9", "service": "hello", "generation": 4,
+  "image": "b3:51aa9c03", "command": ["sh", "-c", "..."], "env": [], "limits": {} }
 ```
+
+Version 2 (C1 slice 3) has no `node` and no `requests`; a version 1 record still reads, with
+both ignored. The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
+for the replicas in `/assigned/<node>/` only; an assignment whose replica is gone is not served.
 
 The replica copies what it needs from the service at creation, so editing the service does not
 change a running replica; the controller replaces replicas whose `generation` is behind.
-`node` is empty until the scheduler assigns it (C0: always the one node). **From C1 slice 3
-the replica controller writes no placement:** `/assigned/<node>/<id>` (below) replaces `node`.
+**From C1 slice 3 the replica carries no placement:** `/assigned/<node>/<id>` (below) is where
+it runs, and `requests` is on the assignment (C0 wrote `node` and `requests` here).
 
 `requests` is what the scheduler **resolved** the replica to need: its `limits` where the
 service sets them, else a default the scheduler states in the decision that placed the replica.
 A node's used capacity is `/allocations/<node>` (below), the sum of the `requests` of the replicas assigned to it, so a replica
 with no limits no longer counts as zero. Both numbers are always present once the replica has
-been scheduled; they are absent only while `node` is empty.
+been scheduled; they are absent only while the replica is unassigned.
 
 **A replica whose start failed through the user's fault is held, not replaced** (owner,
 2026-10-26). When `/observed/<node>/<replica>` says `start_failed` with a diagnostic whose blame
@@ -307,7 +310,7 @@ from `/allocations/<node>`, both read at `revision`. While it exists the schedul
 on the node (its absence is in the placement compare set). It never repairs. Lifetime: until a
 later audit finds the node consistent.
 
-## `/node-status/<node>`: the node controller's judgement (C1 slice 4)
+## `/node-status/<node>`: the node controller's judgement (C1 slice 3)
 
 ```json
 {"v":1,"state":"fenced","tenure":3,"at_ms":10,"decision":"1761350000123-0001-0008"}
