@@ -15,8 +15,8 @@
 //!
 //! An image is valid only if its digest is in the fixtures list given to `init` (HANDOFF's
 //! `fixtures/images.zon`, parsed by the shell; a list of digests). Any other digest is a start
-//! that fails with `ZBX-E0501`, "image not found", blamed on the user. Zigbox's registry has no
-//! such code yet; it is the placeholder HANDOFF asks for (docs/runtime-codes.md).
+//! that fails with `ZBX-E0410`, "no tree with that digest", blamed on the user
+//! (Zigbox's own code, as the real runtime raises it).
 //!
 //! ## Faults
 //!
@@ -43,7 +43,6 @@ const constants = @import("constants.zig");
 const Clock = @import("clock.zig").Clock;
 const diag_mod = @import("diag.zig");
 const runtime = @import("runtime.zig");
-const runtime_codes = @import("runtime_codes.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -520,7 +519,7 @@ pub const SimRuntime = struct {
 };
 
 /// The diagnostic of a start that failed because the image is not in the node's store: HANDOFF's
-/// `ZBX-E0501`, with the digest shortened as its example shows (in ASCII: diagnostics are).
+/// `ZBX-E0410`, with the digest shortened as its example shows (in ASCII: diagnostics are).
 pub fn image_not_found(out: *Diagnostic, name: []const u8, image: []const u8) void {
     var short_buffer: [32]u8 = undefined;
     var image_buffer: [constants.image_digest_bytes_max]u8 = undefined;
@@ -529,7 +528,7 @@ pub fn image_not_found(out: *Diagnostic, name: []const u8, image: []const u8) vo
     const safe_image = sanitise(&image_buffer, image);
     const safe_name = sanitise(&name_buffer, name);
     var json_buffer: [1024]u8 = undefined;
-    const format = "{{\"code\":\"ZBX-E0501\",\"severity\":\"error\",\"blame\":\"user\"," ++
+    const format = "{{\"code\":\"ZBX-E0410\",\"severity\":\"error\",\"blame\":\"user\"," ++
         "\"summary\":\"{s}\"," ++
         "\"causes\":[\"digest {s} is not in this node's store\"]," ++
         "\"while\":[\"starting container {s}\"]," ++
@@ -537,13 +536,13 @@ pub fn image_not_found(out: *Diagnostic, name: []const u8, image: []const u8) vo
         "\"fixes\":[{{\"sentence\":\"check the digest in the service file, or pull the image " ++
         "first\",\"command\":null}}]," ++
         "\"omitted\":{{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}}}}";
-    const summary = runtime_codes.image_not_found.summary;
+    const summary = "no tree with that digest";
     const json = std.fmt.bufPrint(&json_buffer, format, .{ summary, short, safe_name, safe_image });
     // Cannot fail: the longest result is under 600 bytes, and the buffer holds 1024.
     // Cannot fail: `json` is the format above with sanitised text, which is well formed.
     zigbox.diagnostic.parse_json(out, json catch unreachable) catch unreachable;
     out.set_docs(&zigbox.product.Product.zbx);
-    assert(std.mem.eql(u8, out.code.slice(), "ZBX-E0501"));
+    assert(std.mem.eql(u8, out.code.slice(), "ZBX-E0410"));
 }
 
 /// "b3:00ff...e1": the first seven bytes, three dots and the last two, if it is longer.
@@ -587,7 +586,7 @@ fn spec_for(name: []const u8, image: []const u8, labels: []const runtime.Label) 
     return .{ .name = name, .image = image, .command = &.{"true"}, .labels = labels };
 }
 
-test "a digest in the fixtures starts, and one that is not fails with ZBX-E0501" {
+test "a digest in the fixtures starts, and one that is not fails with ZBX-E0410" {
     // Goal: the start contract: a started container is an outcome, so is a failed start, and the
     // failure carries HANDOFF's diagnostic, blamed on the user. Method: start both kinds.
     var manual: ManualClock = .{ .ms = 5 };
@@ -605,8 +604,8 @@ test "a digest in the fixtures starts, and one that is not fails with ZBX-E0501"
     const bad = spec_for("broken-1", long_digest, &bad_labels);
     const outcome = try rt.start(&bad, &diag);
     const failure = outcome.failed;
-    try testing.expectEqualStrings("ZBX-E0501", failure.code.slice());
-    try testing.expectEqualStrings("image not found", failure.summary.slice());
+    try testing.expectEqualStrings("ZBX-E0410", failure.code.slice());
+    try testing.expectEqualStrings("no tree with that digest", failure.summary.slice());
     try testing.expectEqual(zigbox.codes.Blame.user, failure.blame);
     try testing.expectEqualStrings(
         "digest b3:00ff...e1 is not in this node's store",

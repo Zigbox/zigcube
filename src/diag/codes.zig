@@ -356,7 +356,7 @@ pub const registry = [_]Entry{
         .explanation =
         \\zcube explain was given a code that is not in the registry of Zigcube
         \\(ZC-) or of Zigbox (ZBX-). A code is a letter and four digits, with or
-        \\without its prefix: E0201, ZC-E0201, ZBX-E0501.
+        \\without its prefix: E0201, ZC-E0201, ZBX-E0410.
         \\
         \\The index of every code is at https://zigbox.github.io/zigcube/errors/
         ,

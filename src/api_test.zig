@@ -254,7 +254,7 @@ test "why answers with the chain, and 404 for a subject that never existed" {
     try testing.expectEqualStrings("decision", field(steps[0], "type").string);
     try testing.expectEqualStrings("observed", field(steps[1], "type").string);
     const failure = field(steps[1], "diagnostic");
-    try testing.expectEqualStrings("ZBX-E0501", field(failure, "code").string);
+    try testing.expectEqualStrings("ZBX-E0410", field(failure, "code").string);
     try testing.expect(field(steps[1], "diagnostic").object.get("docs") == null);
 
     const decision = field(field(steps[0], "decision"), "id").string;
@@ -335,20 +335,20 @@ test "the status follows the blame of the first diagnostic" {
     try testing.expectEqual(@as(u16, 500), api_mod.status_for(.B0001, .internal));
 }
 
-test "codes lists both registries and the placeholders; explain prints what the CLI prints" {
-    // Goal: api.md, "GET /v1/codes and /v1/explain": Zigcube's codes, Zigbox's, and the
-    // placeholder ZBX-E0501; the long text is the CLI's text.
+test "codes lists both registries; explain prints what the CLI prints" {
+    // Goal: api.md, "GET /v1/codes and /v1/explain": Zigcube's codes, Zigbox's
+    // (ZBX-E0410 among them); the long text is the CLI's text.
     var rig = try Rig.start(9);
     defer rig.stop();
     const listed = try rig.ok("/v1/codes", "");
     var seen_zc = false;
-    var seen_placeholder = false;
+    var seen_zbx = false;
     for (field(listed, "codes").array.items) |entry| {
         const code = field(entry, "code").string;
         if (std.mem.eql(u8, code, "ZC-E0101")) seen_zc = true;
-        if (std.mem.eql(u8, code, "ZBX-E0501")) seen_placeholder = true;
+        if (std.mem.eql(u8, code, "ZBX-E0410")) seen_zbx = true;
     }
-    try testing.expect(seen_zc and seen_placeholder);
+    try testing.expect(seen_zc and seen_zbx);
 
     const explained = try rig.ok("/v1/explain/ZC-E0203", "");
     const text = field(explained, "explanation").string;
@@ -358,9 +358,9 @@ test "codes lists both registries and the placeholders; explain prints what the 
     const cli = @import("diag.zig").explain(.E0203, &buffer);
     try testing.expectEqualStrings(cli, text);
 
-    const runtime_text = try rig.ok("/v1/explain/ZBX-E0501", "");
-    const placeholder = field(runtime_text, "explanation").string;
-    try testing.expect(std.mem.indexOf(u8, placeholder, "image") != null);
+    const runtime_text = try rig.ok("/v1/explain/ZBX-E0410", "");
+    const zbx_text = field(runtime_text, "explanation").string;
+    try testing.expect(std.mem.indexOf(u8, zbx_text, "tree") != null);
     try rig.refused(rig.get("/v1/explain/ZC-E9999", ""), 404, "ZC-E0101");
     try rig.refused(rig.get("/v1/explain/ZBX-E9999", ""), 404, "ZC-E0101");
 }

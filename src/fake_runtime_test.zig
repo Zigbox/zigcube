@@ -227,13 +227,13 @@ test "the command gets the spec's environment" {
     try testing.expectEqualStrings("a value; with \"quotes\"\n", written);
 }
 
-test "an image that is not in the fixtures fails with ZBX-E0501 and starts nothing" {
+test "an image that is not in the fixtures fails with ZBX-E0410 and starts nothing" {
     // Goal: HANDOFF's placeholder code, and that nothing is left behind. Method: start with an
     // unknown digest; the outcome carries the diagnostic and `list` is empty.
     var rig = try Rig.start();
     defer rig.stop();
     const outcome = try rig.launch("broken-1", "b3:00ffee11", &forever, &.{});
-    try testing.expectEqualStrings("ZBX-E0501", outcome.failed.code.slice());
+    try testing.expectEqualStrings("ZBX-E0410", outcome.failed.code.slice());
     var local: Diag = undefined;
     local.reset();
     const listings = try rig.fake.interface().list(rig.arena.allocator(), &local);

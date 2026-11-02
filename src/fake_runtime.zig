@@ -24,7 +24,7 @@
 //! ## Images, limits, faults
 //!
 //! A digest is valid only if it is in the fixtures list (`fixtures/images.zon`); any other is
-//! `start_failed` with the placeholder `ZBX-E0501`. Limits are not applied: this is a plain host
+//! `start_failed` with the placeholder `ZBX-E0410`. Limits are not applied: this is a plain host
 //! process, as HANDOFF says. A test can end a container with `oom`, `pid_limit` or `lost` by
 //! writing the word into `<state>/faults/<name>`; the next `list` applies it.
 //!
@@ -64,7 +64,7 @@ pub const Options = struct {
     state_dir: []const u8,
     /// The agent's executable, which is run again as `<it> supervise <dir>`.
     supervisor_exe: []const u8,
-    /// The digests the node "has": anything else is `ZBX-E0501`. Borrowed.
+    /// The digests the node "has": anything else is `ZBX-E0410`. Borrowed.
     fixtures: []const []const u8,
 };
 

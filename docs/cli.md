@@ -103,7 +103,7 @@ node2` kills a node's agent and containers with `kill -9`, and `demo/down.sh` st
 
 `READY` is running replicas over desired. `STATUS` is the agent's report: `running`, `starting`,
 `exited`, `killed`, `oom`, `pid-limit`, `start-failed`, `lost`, or `pending` (no report yet). `DETAIL`
-is the diagnostic of a failed start (`ZBX-E0501: image not found`) or how it exited. `AGE` is
+is the diagnostic of a failed start (`ZBX-E0410: no tree with that digest`) or how it exited. `AGE` is
 measured against the server's clock, not the laptop's. The command reads `/services/`, `/replicas/`
 and `/observed/` with `GET /v1/list` and joins them (docs/keys.md is the contract).
 
@@ -125,11 +125,11 @@ With a digest that is not in the node's store (this is the end-to-end test's exp
 ```
 service broken: 0/1 running
   ← replica broken-1 failed to start on node1; it was not replaced because a new one would fail the same way
-  ← error[ZBX-E0501]: image not found
+  ← error[ZBX-E0410]: no tree with that digest
       cause  digest b3:00ff7be1 is not in this node's store
       fix    check the digest in the service file, or pull the image first
-      more   zbx explain E0501 · rerun with --verbose for the full cause chain
-      docs   https://zigbox.github.io/zigbox/errors/E0501.html
+      more   zbx explain E0410 · rerun with --verbose for the full cause chain
+      docs   https://zigbox.github.io/zigbox/errors/E0410.html
 ```
 
 `--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step,

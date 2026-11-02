@@ -263,7 +263,7 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
           <li><b>One supervisor per container</b> (the owner's recorded exception): <code>zcube-agent supervise</code> is the command's parent, runs in its own session, and records the exit, so the agent can restart without losing anything.</li>
           <li><b>Re-adoption is <code>list</code>:</b> a restarted agent reads the state directory and never starts a duplicate.</li>
           <li>A container whose supervisor vanished is <code>lost</code> (<code>ZC-E0509</code>). Its process group is killed once.</li>
-          <li>Images come from <code>fixtures/images.zon</code>. Any other digest fails with the placeholder <code>ZBX-E0501</code>. Limits are recorded but not enforced.</li>
+          <li>Images come from <code>fixtures/images.zon</code>. Any other digest fails with the placeholder <code>ZBX-E0410</code>. Limits are recorded but not enforced.</li>
         </ul>
         <p class="files">zcube_agent.zig · agent_run.zig · agent_remote.zig · runtime.zig · fake_runtime.zig · fake_supervisor.zig · docs/agent.md</p></div>
 
@@ -307,8 +307,8 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
       <li><div><code>zcube apply hello.zon</code> parses the ZON file and asks the server for a dry run, which returns the diff. Once confirmed, <code>POST /v1/apply</code> writes <code>/services/hello</code> with a new generation and an <code>apply</code> decision, in one transaction.</div></li>
       <li><div>The driver wakes on the change under <code>/services/</code>. The replica controller compares desired with actual and writes <code>scale_up</code>, then a <code>create_replica</code> and a <code>place_replica</code> for each new replica. Every one is a <code>/decisions/&lt;id&gt;</code> record with its cause, indexed under <code>/decisions-by-subject/</code>.</div></li>
       <li><div>The agent's long-poll returns. It lists its replicas, compares them with <code>Runtime.list</code>, and calls <code>start</code>. FakeRuntime writes <code>spec.json</code> and launches a supervisor, which runs the command.</div></li>
-      <li><div>The agent reports what it sees under <code>/observed/&lt;node&gt;/&lt;replica&gt;</code>. If a start fails, the report carries the runtime's full diagnostic, for example <code>ZBX-E0501</code>. The controller then holds the replica rather than retrying a start that would fail the same way.</div></li>
-      <li><div><code>zcube why service broken</code> walks from the service through the decisions to that observed diagnostic and prints the chain: <code>service broken: 0/1 running ← replica broken-1 failed to start on node1 ← error[ZBX-E0501]: image not found</code>.</div></li>
+      <li><div>The agent reports what it sees under <code>/observed/&lt;node&gt;/&lt;replica&gt;</code>. If a start fails, the report carries the runtime's full diagnostic, for example <code>ZBX-E0410</code>. The controller then holds the replica rather than retrying a start that would fail the same way.</div></li>
+      <li><div><code>zcube why service broken</code> walks from the service through the decisions to that observed diagnostic and prints the chain: <code>service broken: 0/1 running ← replica broken-1 failed to start on node1 ← error[ZBX-E0410]: no tree with that digest</code>.</div></li>
     </ol>
   </section>
 
