@@ -67,6 +67,14 @@ test "the shipped constants satisfy the inequality, and every ttl in range that 
     try testing.expectEqual(@as(?Problem, .margin_too_small), inequality_problem(20_000));
 }
 
+/// When the last container is dead, in real time after `s`, if the agent's clock runs slow by
+/// `per_mille`: the agent's own elapsed time stretches by that much, then SIGKILL takes its
+/// latency.
+fn real_dead_ms(ttl_ms: u32, per_mille: u32) u64 {
+    const agent_ms = kill_at_ms(fence_at_ms(0, ttl_ms));
+    return (agent_ms * (1000 + per_mille) + 999) / 1000 + constants.fence_kill_latency_ms;
+}
+
 test "the fence and the kill come at the margin and the stop time, and beat the lease's end" {
     // Goal: the deadline arithmetic, skew included. Method: send at s; the agent's clock may
     // run slow by the bound, so real time elapsed is (agent elapsed) * 1.01; the server's lease
@@ -76,11 +84,23 @@ test "the fence and the kill come at the margin and the stop time, and beat the 
     const fence = fence_at_ms(sent, ttl);
     try testing.expectEqual(sent + ttl - constants.fence_margin_ms, fence);
     try testing.expectEqual(fence + constants.fence_stop_ms, kill_at_ms(fence));
-    const dead_agent_ms = worst_case_dead_ms(sent, ttl) - sent;
-    const slow_real_ms = dead_agent_ms; // Skew and kill latency are already inside the bound.
-    try testing.expect(slow_real_ms <= ttl);
-    // With the clock a full per-mille slow the last container still dies before expiry.
-    const real_ms = (kill_at_ms(fence) - sent) * (1000 + constants.clock_skew_per_mille) / 1000 +
-        constants.fence_kill_latency_ms;
-    try testing.expect(real_ms <= ttl);
+    // The worst case the tests use is the kill, the latency and the skew after it.
+    try testing.expectEqual(
+        kill_at_ms(fence) + constants.fence_kill_latency_ms + skew_ms(ttl),
+        worst_case_dead_ms(sent, ttl),
+    );
+    try testing.expect(worst_case_dead_ms(sent, ttl) - sent <= ttl);
+    // With the clock a full bound slow the last container still dies by the lease's end.
+    try testing.expect(real_dead_ms(ttl, constants.clock_skew_per_mille) <= ttl);
+    try testing.expect(real_dead_ms(ttl, 0) <= ttl);
+}
+
+test "a clock that runs slower than the bound kills after the lease has ended" {
+    // Goal: the check has teeth: a skew well past the bound breaks the guarantee. Method: twice
+    // the bound. (The skew term is charged over the whole ttl while the kill comes earlier, so
+    // the bound plus one per mille still fits; that is slack, not a hole.)
+    const ttl = constants.lease_ttl_ms;
+    try testing.expect(real_dead_ms(ttl, 2 * constants.clock_skew_per_mille) > ttl);
+    // A ttl whose skew outgrows the margin is refused, so that cannot be configured.
+    try testing.expectEqual(@as(?Problem, .margin_too_small), inequality_problem(2 * ttl));
 }

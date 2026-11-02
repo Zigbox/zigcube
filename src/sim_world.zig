@@ -236,6 +236,8 @@ pub const World = struct {
     dropped_before_restart: u64,
     /// The last diagnostic that failed a step, kept for the caller to render.
     last_failure: ?codes.Code,
+    /// The host's boot id the agent sees; a test changes it to reboot the host.
+    boot_id: []const u8 = "",
 
     pub fn create(gpa: Allocator, seed: u64, fixtures: []const []const u8) Allocator.Error!*World {
         const world = try gpa.create(World);
@@ -267,6 +269,7 @@ pub const World = struct {
         world.compact_due_ms = epoch_ms + compact_interval_ms;
         world.dropped_before_restart = 0;
         world.last_failure = null;
+        world.boot_id = "";
         return world;
     }
 
@@ -340,6 +343,7 @@ pub const World = struct {
             .arena = world.fresh_arena(),
             .diag = &world.diag,
             .state = world.files.interface(),
+            .boot_id = world.boot_id,
         };
         world.stats.agent_steps += 1;
         const wake = world.agent.reconcile(&ctx) catch return world.failed_step(.agent);

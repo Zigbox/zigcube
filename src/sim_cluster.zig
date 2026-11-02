@@ -321,9 +321,12 @@ const Node = struct {
             .diag = &node.diag,
             .mono = clock,
             .state = node.sim.files.interface(),
+            .deadline = .{
+                .context = &node.remote,
+                .set_fn = agent_client.RemoteStore.deadline_fn,
+            },
         };
-        node.agent.restore_lease(&ctx) catch node.diag.reset();
-        node.cap_calls(clock);
+        node.remote.set_deadline(clock, std.math.maxInt(u64));
         c.stats.agent_steps += 1;
         node.all_steps += 1;
         const fences_before = node.agent.fences;
@@ -343,8 +346,8 @@ const Node = struct {
         return wake.acted;
     }
 
-    /// The agent's calls end by the fence deadline (the real agent's I/O timeout is capped the
-    /// same way); with no lease there is no deadline.
+    /// The agent's calls end by the fence deadline, as the real agent's do (`agent_run.zig`);
+    /// with no lease there is no deadline.
     fn cap_calls(node: *Node, clock: Clock) void {
         const deadline = node.agent.fence_at_ms() orelse std.math.maxInt(u64);
         node.remote.set_deadline(clock, deadline);
@@ -357,11 +360,15 @@ const Node = struct {
     }
 
     /// One slice of the wait: true if it ended (a replica changed, an event came, or it failed).
-    fn watch_once(node: *Node) bool {
+    /// It holds the server as the real agent's does (`agent_run.zig`): a slice, cut at the fence,
+    /// so a call that is not answered costs the same time here as there.
+    fn watch_once(node: *Node, slice_ms: u32) bool {
         node.diag.reset();
         node.spent_ms = 0;
-        node.cap_calls(node.nclock.clock());
-        var ended = node.remote.watch_once(0, &node.diag) catch true;
+        const clock = node.nclock.clock();
+        node.cap_calls(clock);
+        const held = node.agent.watch_hold_ms(clock.now_ms(), slice_ms);
+        var ended = node.remote.watch_once(held, &node.diag) catch true;
         if (!ended) {
             _ = node.arena.reset(.retain_capacity);
             const events = node.sim.interface().events(node.arena.allocator(), 0, &node.diag);
@@ -389,7 +396,7 @@ const Node = struct {
                     if (node.down) return acted;
                 },
                 .pause_ms => |ms| node.resume_ms = c.manual.ms + node.before_fence(ms),
-                .watch_ms => if (!node.watch_once()) return acted,
+                .watch_ms => |ms| if (!node.watch_once(ms)) return acted,
             }
         }
         return acted;
@@ -1723,4 +1730,32 @@ test "a node count can be asked for" {
     simulate(testing.allocator, 5, 10, .{ .nodes = 3 }, &report);
     try testing.expect(!report.failed);
     try testing.expect(std.mem.indexOf(u8, report.text(), "swarm: nodes=3 ") != null);
+}
+
+test "the fencing check fires on a node that runs containers long after it lost its lease" {
+    // Goal: track_fencing has teeth. Method: run replicas, delete the node's registration, then
+    // move the clock past the bound without letting any node step: the containers still run.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, 1, &report);
+    defer c.destroy();
+    c.apply("hello", hello_digest, 2);
+    c.advance(5_000);
+    try testing.expect(!report.failed);
+    const node = c.nodes[0];
+    var running: u32 = 0;
+    for (node.sim.containers.containers.items) |container| {
+        if (container.phase != .stopped) running += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), running);
+    const key = records.node_key(node.name());
+    c.diag.reset();
+    const delete: store.Op = .{ .delete = key.slice() };
+    // Straight to the memory store: the cluster's own handle may lose the acknowledgement.
+    _ = try c.memory.interface().txn(.{ .on_success = &.{delete} }, &c.diag);
+    try track_fencing(c);
+    c.manual.advance(fencing_ms_max);
+    try track_fencing(c);
+    c.manual.advance(1);
+    try testing.expectError(error.StepFailed, track_fencing(c));
+    try testing.expect(report.failed);
 }

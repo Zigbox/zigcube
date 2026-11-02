@@ -347,8 +347,9 @@ runs unchanged on the far side of HTTP:
 
 Body `{"ttl_ms": 10000}`; answer `{"lease": {"id": 43, "ttl_ms": 10000}}`. The server grants its
 own configured ttl (`--lease-ttl-ms`, default 10 s, refused with `ZC-E0121` if an agent could not
-fence in time under it) and ignores the body's; the agent adopts the ttl in the answer. A ttl
-outside the store's range is `ZC-E0206`. The lease is the store's: it expires by the store's clock.
+fence in time under it) and ignores the body's, so the body's ttl is never checked or refused;
+the agent adopts the ttl in the answer, and refuses one it could not fence under with
+`ZC-E0504` (it then registers nothing). The lease is the store's: it expires by the store's clock.
 The server does not remember which node asked, so a lease is tied to the node only by the key
 registered on it.
 

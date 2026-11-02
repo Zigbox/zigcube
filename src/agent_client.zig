@@ -30,6 +30,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const Clock = @import("clock.zig").Clock;
+const fencing = @import("fencing.zig");
 const store = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -46,7 +47,8 @@ pub const Request = struct {
     /// How long the server may hold the reply (a long poll), on top of the I/O timeout.
     hold_ms: u32 = 0,
     /// A cap on the I/O timeout, for a caller that must not wait past a deadline of its own (the
-    /// agent's fence). Null leaves the transport's timeout.
+    /// agent's fence). Null leaves the transport's timeout. A transport ends the whole call,
+    /// connecting included, within `hold_ms` plus this.
     timeout_ms: ?u32 = null,
 };
 
@@ -118,6 +120,14 @@ pub const RemoteStore = struct {
     /// Caps every later exchange so that it ends by `deadline_ms` on `mono`.
     pub fn set_deadline(remote: *RemoteStore, mono: Clock, deadline_ms: u64) void {
         remote.mono = mono;
+        remote.deadline_ms = deadline_ms;
+    }
+
+    /// The agent's `Context.deadline` for this store: the agent moves the cap within a step,
+    /// on the clock given to `set_deadline` first.
+    pub fn deadline_fn(context: *anyopaque, deadline_ms: u64) void {
+        const remote = from(context);
+        assert(remote.mono != null);
         remote.deadline_ms = deadline_ms;
     }
 
@@ -216,6 +226,9 @@ pub const RemoteStore = struct {
         const answer = try parse(Answer, arena, body, diag);
         if (answer.lease.id == store.lease_none) {
             return bad(diag, "the server granted lease 0");
+        }
+        if (fencing.inequality_problem(answer.lease.ttl_ms) != null) {
+            return bad(diag, "the server granted a lease too short for the agent to fence in");
         }
         return .{ .id = answer.lease.id, .ttl_ms = answer.lease.ttl_ms };
     }
@@ -496,9 +509,15 @@ pub const RemoteStore = struct {
     ) store.Error!Reply {
         var capped = request;
         if (remote.mono) |clock| {
+            // The hold and the I/O after it together end by the deadline; a hold takes at most
+            // half of what is left, so that a reply has time to come.
             const left = remote.deadline_ms -| clock.now_ms();
-            const cap: u32 = @intCast(@min(left, constants.agent_io_timeout_ms));
-            capped.timeout_ms = @max(cap, 1);
+            if (left == 0) return fence_due(diag);
+            if (left < std.math.maxInt(u32)) {
+                const hold: u32 = @intCast(@min(request.hold_ms, left / 2));
+                capped.hold_ms = hold;
+                capped.timeout_ms = @intCast(@max(1, @min(left - hold, io_cap(request))));
+            }
         }
         return remote.transport.call(arena, capped, diag) catch |err| switch (err) {
             error.OutOfMemory => failures.no_memory(diag),
@@ -578,6 +597,21 @@ fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
 }
 
 /// ZC-E0504 for a reply that cannot be right.
+fn io_cap(request: Request) u64 {
+    return request.timeout_ms orelse constants.agent_io_timeout_ms;
+}
+
+/// The deadline of a call has passed before it was made: nothing is sent.
+fn fence_due(diag: *Diag) store.Error {
+    assert(diag.code == null);
+    diag.raise(.E0503);
+    diag.cause("the agent did not call zcube-server: its lease's fence deadline has come", .{});
+    diag.fix(.{
+        .sentence = "make zcube-server reachable from the node; the agent fences meanwhile",
+    });
+    return error.BackendFailed;
+}
+
 fn bad(diag: *Diag, problem: []const u8) store.Error {
     raise_bad_reply(diag, problem);
     return error.BackendFailed;

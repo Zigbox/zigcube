@@ -53,6 +53,7 @@ const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
 const Wakeup = controller.Wakeup;
+const maxInt = std.math.maxInt;
 
 pub const Error = controller.Error || runtime.Error;
 
@@ -79,6 +80,13 @@ pub const Context = struct {
     /// Where the lease, its send time and the tenure are kept across a restart. Null keeps
     /// nothing (the tests that do not restart).
     state: ?agent_state.AgentState = null,
+    /// The host's boot id (`/proc/sys/kernel/random/boot_id`), kept with the lease: a kept send
+    /// time is on a clock that restarts at boot, so a lease kept under another boot fences.
+    /// Empty where there is none (the tests and the simulator, which do not reboot).
+    boot_id: []const u8 = "",
+    /// Where the agent says by when every call to the server must end (the fence), as soon as it
+    /// changes within a step. Null caps nothing (a store in memory never waits).
+    deadline: ?Deadline = null,
 
     pub fn mono_ms(ctx: *const Context) u64 {
         const clock = ctx.mono orelse ctx.clock;
@@ -88,6 +96,13 @@ pub const Context = struct {
     fn as_controller(ctx: *const Context) controller.Context {
         return .{ .store = ctx.store, .clock = ctx.clock, .arena = ctx.arena, .diag = ctx.diag };
     }
+};
+
+/// Receives the time, on the monotonic clock, by which every later call to the server must end;
+/// `maxInt` if there is none (no lease, or a fence that makes no call).
+pub const Deadline = struct {
+    context: *anyopaque,
+    set_fn: *const fn (context: *anyopaque, deadline_ms: u64) void,
 };
 
 pub const Config = struct {
@@ -108,6 +123,13 @@ const LeaseFile = struct {
     /// `s`, on the monotonic clock.
     sent_ms: u64,
     tenure: u64,
+    /// The boot the send time was read in (`Context.boot_id`).
+    boot_id: []const u8 = "",
+    /// A fence had begun: a restarted agent finishes it, whatever the lease says, so that it
+    /// never starts again what the fence stopped.
+    fencing: bool = false,
+    /// With `fencing`: when the fence kills what is left, monotonic, in `boot_id`.
+    kill_at_ms: u64 = 0,
 };
 
 /// The fence in progress: containers are being stopped, and killed at `kill_at_ms` (monotonic).
@@ -168,10 +190,28 @@ pub const Agent = struct {
     }
 
     /// How long until the fence, so a caller that waits does not wait past it (`maxInt` if
-    /// there is none).
+    /// there is none). While fencing, how long until the kill, and at most `fence_poll_ms` once
+    /// it is due: a step that failed is retried in time to kill.
     pub fn fence_in_ms(agent: *const Agent, mono_now: u64) u32 {
-        const at = agent.fence_at_ms() orelse return std.math.maxInt(u32);
-        return @intCast(@min(at -| mono_now, std.math.maxInt(u32)));
+        if (agent.fence.active) {
+            const left = agent.fence.kill_at_ms -| mono_now;
+            return @intCast(if (left == 0) constants.fence_poll_ms else @min(left, maxInt(u32)));
+        }
+        const at = agent.fence_at_ms() orelse return maxInt(u32);
+        return @intCast(@min(at -| mono_now, maxInt(u32)));
+    }
+
+    /// How long a wait for a replica change may hold the server: `slice_ms`, or less if the
+    /// fence (or a fence's kill) falls sooner, and at least 1.
+    pub fn watch_hold_ms(agent: *const Agent, mono_now: u64, slice_ms: u32) u32 {
+        const capped = @min(slice_ms, constants.api_watch_timeout_ms_max);
+        return @max(1, @min(capped, agent.fence_in_ms(mono_now)));
+    }
+
+    /// Tells the caller by when every call to the server must end: the fence.
+    fn cap_calls(agent: *const Agent, ctx: *const Context) void {
+        const deadline = ctx.deadline orelse return;
+        deadline.set_fn(deadline.context, agent.fence_at_ms() orelse maxInt(u64));
     }
 
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
@@ -181,15 +221,18 @@ pub const Agent = struct {
         // The fence comes first and needs no server: an agent cut off from everything still stops.
         try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {
-            if (mono >= at) agent.begin_fence(at);
+            if (mono >= at) try agent.begin_fence(ctx, at);
         }
-        if (agent.fence.active) return agent.fence_step(ctx, mono, now);
+        if (agent.fence.active) return agent.fence_step(ctx, now);
+        agent.cap_calls(ctx);
         var acted: u32 = 0;
         switch (try agent.heartbeat(ctx)) {
             .idle => {},
             .acted => acted += 1,
-            .fenced => return agent.fence_step(ctx, ctx.mono_ms(), now),
+            .fenced => return agent.fence_step(ctx, now),
         }
+        // A grant or a keepalive moves the fence: the calls that follow are capped by the new one.
+        agent.cap_calls(ctx);
         const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
         var pass: Pass = .{
             .agent = agent,
@@ -203,7 +246,7 @@ pub const Agent = struct {
         try pass.orphan_records();
         acted += try pass.flush();
         agent.forget_finished_stops(listings);
-        if (agent.fence.active) return agent.fence_step(ctx, ctx.mono_ms(), now);
+        if (agent.fence.active) return agent.fence_step(ctx, now);
         const at_ms = agent.next_wake(now, mono);
         return .{ .at_ms = at_ms, .prefixes = &watch_prefixes, .acted = acted };
     }
@@ -236,7 +279,7 @@ pub const Agent = struct {
                 if (err != error.LeaseNotFound) return err;
                 // The lease has ended, so the server will take the node for lost: stop at once.
                 ctx.diag.reset();
-                agent.begin_fence(sent);
+                try agent.begin_fence(ctx, sent);
                 return .fenced;
             }
         }
@@ -279,6 +322,9 @@ pub const Agent = struct {
             .ttl_ms = agent.lease_ttl_ms,
             .sent_ms = agent.sent_ms,
             .tenure = agent.tenure,
+            .boot_id = ctx.boot_id,
+            .fencing = agent.fence.active,
+            .kill_at_ms = agent.fence.kill_at_ms,
         };
         const text = try records.encode(ctx.arena, file, ctx.diag);
         state.put_atomic(lease_file, text) catch |err| {
@@ -294,26 +340,28 @@ pub const Agent = struct {
 
     /// Reads what a previous run kept. A file that is not there is a first start or a finished
     /// fence; one that cannot be read or understood fences (the agent cannot know how long it
-    /// has), and a send time in the future means the host restarted, which fences too.
+    /// has). A send time in the future, or another boot id, means the host restarted, which
+    /// fences too, and so does a fence the previous run had begun.
     fn restore(agent: *Agent, ctx: *const Context, mono: u64) Error!void {
         assert(!agent.restored);
-        const state = ctx.state orelse {
-            agent.restored = true;
-            return;
-        };
-        const text = state.read(ctx.arena, lease_file) catch |err| switch (err) {
-            error.Absent => {
-                agent.restored = true;
-                return;
-            },
-            else => return state_failed(ctx, err, "read the lease"),
-        };
         agent.restored = true;
+        const state = ctx.state orelse return;
+        const text = state.read(ctx.arena, lease_file) catch |err| switch (err) {
+            error.Absent => return,
+            else => return agent.begin_fence(ctx, mono),
+        };
         const parsed = std.json.parseFromSliceLeaky(LeaseFile, ctx.arena, text, .{}) catch
-            return agent.begin_fence(mono);
+            return agent.begin_fence(ctx, mono);
+        const same_boot = std.mem.eql(u8, parsed.boot_id, ctx.boot_id) and parsed.sent_ms <= mono;
+        if (parsed.fencing) {
+            // The kill stays where the previous run put it, if its clock is still this one.
+            const kill_at = fencing.kill_at_ms(mono);
+            const kept = if (same_boot and parsed.kill_at_ms > 0) parsed.kill_at_ms else kill_at;
+            return agent.start_fence(ctx, @min(kept, kill_at));
+        }
         const usable = parsed.lease != store.lease_none and parsed.tenure > 0 and
-            fencing.inequality_problem(parsed.ttl_ms) == null and parsed.sent_ms <= mono;
-        if (!usable) return agent.begin_fence(mono);
+            fencing.inequality_problem(parsed.ttl_ms) == null and same_boot;
+        if (!usable) return agent.begin_fence(ctx, mono);
         agent.lease = parsed.lease;
         agent.tenure = parsed.tenure;
         agent.lease_ttl_ms = parsed.ttl_ms;
@@ -322,32 +370,49 @@ pub const Agent = struct {
     }
 
     /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.
-    fn begin_fence(agent: *Agent, nominal_ms: u64) void {
+    fn begin_fence(agent: *Agent, ctx: *const Context, nominal_ms: u64) Error!void {
         if (agent.fence.active) return;
-        const kill_at_ms = fencing.kill_at_ms(nominal_ms);
+        return agent.start_fence(ctx, fencing.kill_at_ms(nominal_ms));
+    }
+
+    /// The fence is on from here, and kept so: a crash before it ends finishes it on restart.
+    /// A failure to keep it fails the step, but the fence goes on (it is in memory).
+    fn start_fence(agent: *Agent, ctx: *const Context, kill_at_ms: u64) Error!void {
+        assert(!agent.fence.active);
         agent.fence = .{ .active = true, .asked = false, .kill_at_ms = kill_at_ms };
+        try agent.persist(ctx);
     }
 
     /// One step of a fence: ask every running container of this node to stop, kill what is
     /// left at the deadline, and when none runs any longer forget the lease, so the next step
-    /// registers the node again, empty. Needs no server.
-    fn fence_step(agent: *Agent, ctx: *const Context, mono: u64, now: u64) Error!Wakeup {
+    /// registers the node again, empty. Needs no server. A stop may wait (`Runtime.stop`), so
+    /// the time is read again before each, and a wait never pushes a kill past its deadline; a
+    /// container that cannot be stopped does not keep the others running.
+    fn fence_step(agent: *Agent, ctx: *const Context, now: u64) Error!Wakeup {
         assert(agent.fence.active);
         const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
         var running: u32 = 0;
+        // The first failure is the step's; later ones are dropped (the next step retries).
+        var spare: Diag = undefined;
+        var failed: ?runtime.Error = null;
         for (listings) |*listing| {
             if (label_value(listing.labels, runtime.label_replica) == null) continue;
             if (!is_running(listing)) continue;
             running += 1;
             if (fault_ignore_stop) continue;
-            if (mono >= agent.fence.kill_at_ms) {
-                try ctx.runtime.stop(listing.handle, 0, ctx.diag);
-            } else if (!agent.fence.asked) {
-                const grace: u32 = @intCast(agent.fence.kill_at_ms - mono);
-                try ctx.runtime.stop(listing.handle, grace, ctx.diag);
-            }
+            const mono = ctx.mono_ms();
+            const kill = mono >= agent.fence.kill_at_ms;
+            if (!kill and agent.fence.asked) continue;
+            const grace: u32 = if (kill) 0 else @intCast(agent.fence.kill_at_ms - mono);
+            const diag = if (failed == null) ctx.diag else &spare;
+            spare.reset();
+            ctx.runtime.stop(listing.handle, grace, diag) catch |err| switch (err) {
+                error.NotFound => diag.reset(), // It has gone: what the fence wants.
+                error.RuntimeFailed => failed = failed orelse err,
+            };
         }
         agent.fence.asked = true;
+        if (failed) |err| return err;
         if (running == 0) try agent.fenced(ctx);
         const poll = now + constants.fence_poll_ms;
         const at_ms = if (running == 0) now else poll;
@@ -475,10 +540,14 @@ const Pass = struct {
         return false;
     }
 
+    /// Queues the record, stamped with the tenure it is written under (I2).
     fn put_observed(pass: *Pass, observed: records.Observed) Error!void {
         const ctx = pass.ctx;
         const key = records.observed_key(observed.node, observed.replica);
-        const value = try records.encode(ctx.arena, observed, ctx.diag);
+        assert(pass.agent.tenure > 0);
+        var stamped = observed;
+        stamped.tenure = pass.agent.tenure;
+        const value = try records.encode(ctx.arena, stamped, ctx.diag);
         const copy = ctx.arena.dupe(u8, key.slice()) catch return failures.no_memory(ctx.diag);
         pass.writes.append(ctx.arena, .{ .key = copy, .value = value }) catch
             return failures.no_memory(ctx.diag);
@@ -766,7 +835,7 @@ const Pass = struct {
         switch (result) {
             .applied => return true,
             .conflict => {
-                pass.agent.begin_fence(pass.ctx.mono_ms());
+                try pass.agent.begin_fence(pass.ctx, pass.ctx.mono_ms());
                 return false;
             },
         }

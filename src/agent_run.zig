@@ -63,6 +63,8 @@ const Shell = struct {
     diag: Diag,
     verbose: bool,
     policy: loop_mod.Loop,
+    /// This boot's id, kept with the lease (`agent.Context.boot_id`).
+    boot_id: []const u8,
 
     /// One step of the core, with what the policy says to tell the person.
     fn pass(shell: *Shell) loop_mod.Outcome {
@@ -76,14 +78,13 @@ const Shell = struct {
             .diag = &shell.diag,
             .mono = shell.boot,
             .state = shell.fake.state.interface(),
+            .boot_id = shell.boot_id,
+            // No exchange may run past the fence: the agent moves the cap as the lease moves,
+            // before its first call and after a grant or keepalive.
+            .deadline = .{ .context = shell.remote, .set_fn = remote_mod.RemoteStore.deadline_fn },
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
-        // No exchange may run past the fence; with no lease there is none. A lease kept by an
-        // earlier run counts from the first call.
-        shell.agent.restore_lease(&ctx) catch shell.diag.reset();
-        const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
-        shell.remote.set_deadline(shell.boot, deadline);
         const wake = shell.agent.reconcile(&ctx) catch {
             const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
             const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
@@ -101,8 +102,10 @@ const Shell = struct {
     /// watch failed (the next pass reports and retries).
     fn watch(shell: *Shell, slice_ms: u32) bool {
         shell.diag.reset();
-        const held = @max(1, shell.before_fence(slice_ms));
-        shell.remote.set_deadline(shell.boot, std.math.maxInt(u64));
+        const mono = shell.boot.now_ms();
+        const held = shell.agent.watch_hold_ms(mono, slice_ms);
+        const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
+        shell.remote.set_deadline(shell.boot, deadline);
         const changed = shell.remote.watch_once(held, &shell.diag) catch return true;
         if (changed) return true;
         shell.arena.reset();
@@ -210,6 +213,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .client = .{ .io = io, .address = config.server },
     };
     var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
+    remote.set_deadline(boot.clock(), std.math.maxInt(u64));
+    var boot_id_buffer: [64]u8 = undefined;
+    const boot_id = read_boot_id(io, &boot_id_buffer);
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     agent.init(.{
@@ -229,6 +235,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .diag = undefined,
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
+        .boot_id = boot_id,
     };
     defer shell.arena.deinit();
     announce(io, config);
@@ -247,6 +254,14 @@ fn loop(shell: *Shell) void {
             .watch_ms => |ms| shell.policy.watch_done(shell.watch(ms)),
         }
     }
+}
+
+/// The kernel's id of this boot, or "" where it has none: the agent then tells a reboot only by
+/// a kept send time later than its clock (docs/agent.md).
+fn read_boot_id(io: std.Io, buffer: *[64]u8) []const u8 {
+    const path = "/proc/sys/kernel/random/boot_id";
+    const text = std.Io.Dir.cwd().readFile(io, path, buffer) catch return "";
+    return std.mem.trim(u8, text, " \n");
 }
 
 fn announce(io: std.Io, config: config_mod.Config) void {
