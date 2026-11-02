@@ -1,0 +1,5 @@
+error[ZC-E0216]: the remembered revision file is unusable
+  cause  can't read /var/lib/zcube/remembered: AccessDenied
+  fix    check the state directory (--state-dir) and its permissions
+  more   zcube explain E0216 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0216.html

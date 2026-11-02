@@ -140,9 +140,13 @@ pub const Host = struct {
         const log = try std.fmt.allocPrint(arena_allocator, "server-{d}.log", .{
             host.server_starts,
         });
+        // A Postgres store has no directory beside it, so the server needs one to remember the
+        // highest revision it saw (ZC-E0106 without it); the same one serves every restart.
+        const state_dir = try host.path_in_work("server-state");
         const args = [_][]const u8{
             "--listen",       listen,
             "--store",        host.config.store,
+            "--state-dir",    state_dir,
             "--create-store", "--quiet",
         };
         host.server = try host.spawn(host.config.server_exe, &args, log);

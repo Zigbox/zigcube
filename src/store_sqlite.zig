@@ -44,7 +44,7 @@ const LeaseId = store.LeaseId;
 const Error = store.Error;
 
 /// Bumped when the schema changes. A file with a higher number is refused (ZC-E0210).
-pub const schema_version: u32 = 1;
+pub const schema_version: u32 = 2;
 /// "ZCUB": marks the file as ours, so a foreign database is not initialised over.
 const application_id: u32 = 0x5a43_5542;
 
@@ -52,9 +52,14 @@ const schema_sql =
     \\CREATE TABLE store_meta (
     \\    id INTEGER PRIMARY KEY CHECK (id = 1),
     \\    revision INTEGER NOT NULL,
-    \\    compacted_revision INTEGER NOT NULL
+    \\    compacted_revision INTEGER NOT NULL,
+    \\    chain_start INTEGER NOT NULL
     \\);
-    \\INSERT INTO store_meta (id, revision, compacted_revision) VALUES (1, 0, 0);
+    \\INSERT INTO store_meta (id, revision, compacted_revision, chain_start) VALUES (1, 0, 0, 0);
+    \\CREATE TABLE store_hash (
+    \\    revision INTEGER PRIMARY KEY,
+    \\    hash BLOB NOT NULL
+    \\) WITHOUT ROWID;
     \\CREATE TABLE store_log (
     \\    revision INTEGER NOT NULL,
     \\    idx INTEGER NOT NULL,
@@ -86,7 +91,9 @@ const schema_sql =
 
 // Every query returns the same leading columns, so one function reads a row into a `KeyValue`:
 // key, value, create_revision, mod_revision, lease, deleted.
-const sql_meta = "SELECT revision, compacted_revision FROM store_meta WHERE id = 1";
+const sql_meta = "SELECT revision, compacted_revision, chain_start FROM store_meta WHERE id = 1";
+const sql_hash_get = "SELECT hash FROM store_hash WHERE revision = ?1";
+const sql_hash_put = "INSERT INTO store_hash (revision, hash) VALUES (?1, ?2)";
 const sql_live_get =
     "SELECT key, value, create_revision, mod_revision, lease, 0 FROM store_live WHERE key = ?1";
 const sql_log_get =
@@ -138,6 +145,15 @@ const sql_live_put =
 ;
 const sql_live_delete = "DELETE FROM store_live WHERE key = ?1";
 const sql_set_revision = "UPDATE store_meta SET revision = ?1 WHERE id = 1";
+// The migration from schema version 1 (no chain): `chain_start` is the revision it ran at.
+const sql_migrate_1_to_2 =
+    \\ALTER TABLE store_meta ADD COLUMN chain_start INTEGER NOT NULL DEFAULT 0;
+    \\CREATE TABLE store_hash (
+    \\    revision INTEGER PRIMARY KEY,
+    \\    hash BLOB NOT NULL
+    \\) WITHOUT ROWID;
+    \\UPDATE store_meta SET chain_start = revision WHERE id = 1;
+;
 const sql_set_compacted = "UPDATE store_meta SET compacted_revision = ?1 WHERE id = 1";
 const sql_lease_get = "SELECT deadline_ms, ttl_ms FROM store_lease WHERE id = ?1";
 const sql_lease_count = "SELECT COUNT(*) FROM store_lease";
@@ -182,6 +198,8 @@ const WatchSlot = struct {
 const Meta = struct {
     revision: Revision,
     compacted_revision: Revision,
+    /// The revision the chain starts at: 0 for a store born with it, else where it was upgraded.
+    chain_start: Revision,
 };
 
 /// The create revision and lease of a live key.
@@ -227,6 +245,8 @@ pub const SqliteStore = struct {
     path_buffer: [constants.state_path_bytes_max + 1]u8,
     path_len: u32,
     watches: [constants.store_watches_max]WatchSlot,
+    /// The hash of the revision a write transaction is building (the mutex is held).
+    chain: store.ChainHasher,
 
     const vtable: store.Store.VTable = .{
         .status = status_impl,
@@ -240,6 +260,7 @@ pub const SqliteStore = struct {
         .lease_list = lease_list_impl,
         .expire_leases = expire_leases_impl,
         .compact = compact_impl,
+        .hash_at = hash_at_impl,
     };
 
     const watch_vtable: store.Watch.WatchVTable = .{
@@ -356,7 +377,11 @@ pub const SqliteStore = struct {
         const tables = try self.pragma_value("SELECT COUNT(*) FROM sqlite_master", diag);
         if (app == application_id) {
             if (version > schema_version) return self.fail_too_new(@intCast(version), diag);
-            if (version != schema_version) return self.fail_damaged(diag, "has no schema version");
+            if (version == 1) {
+                try self.migrate_1_to_2(diag);
+            } else if (version != schema_version) {
+                return self.fail_damaged(diag, "has no schema version");
+            }
         } else if (app == 0 and version == 0 and tables == 0) {
             if (!create) return self.fail_damaged(diag, "is empty and was not asked to be created");
             try self.exec(schema_sql, diag);
@@ -364,6 +389,17 @@ pub const SqliteStore = struct {
             return self.fail_damaged(diag, "belongs to another application");
         }
         try self.commit(diag);
+    }
+
+    /// Schema 1 had no chain. Revisions already compacted cannot be hashed again, so the chain
+    /// starts at the revision the file has now, from `store.chain_seed` (docs/store-design.md).
+    fn migrate_1_to_2(self: *SqliteStore, diag: *Diag) Error!void {
+        try self.exec(sql_migrate_1_to_2, diag);
+        const meta = try self.read_meta(diag);
+        if (meta.revision > 0) {
+            try self.put_hash(meta.revision, store.chain_seed(meta.revision), diag);
+        }
+        try self.exec(std.fmt.comptimePrint("PRAGMA user_version = {d}", .{schema_version}), diag);
     }
 
     fn pragma_value(self: *SqliteStore, comptime sql: [:0]const u8, diag: *Diag) Error!i64 {
@@ -453,19 +489,72 @@ pub const SqliteStore = struct {
         const meta: Meta = .{
             .revision = stmt.unsigned(0),
             .compacted_revision = stmt.unsigned(1),
+            .chain_start = stmt.unsigned(2),
         };
         if (meta.compacted_revision > meta.revision) {
             return self.fail_damaged(diag, "records a compaction point above its revision");
         }
+        if (meta.chain_start > meta.revision) {
+            return self.fail_damaged(diag, "records a hash chain starting above its revision");
+        }
         return meta;
+    }
+
+    /// `h(revision)`: zero for revision 0, else the stored row, which must exist from the chain's
+    /// start (the caller has checked the range).
+    fn read_hash(self: *SqliteStore, revision: Revision, diag: *Diag) Error!store.Hash {
+        if (revision == 0) return store.hash_zero;
+        var stmt = try self.prepare(sql_hash_get, diag);
+        defer stmt.finalize();
+        stmt.bind_unsigned(1, revision);
+        if (!(try stmt.step(diag))) return self.fail_damaged(diag, "has no hash for a revision");
+        const bytes = stmt.blob(0);
+        if (bytes.len != store.hash_bytes) return self.fail_damaged(diag, "has a malformed hash");
+        return bytes[0..store.hash_bytes].*;
+    }
+
+    fn put_hash(self: *SqliteStore, revision: Revision, hash: store.Hash, diag: *Diag) Error!void {
+        assert(revision > 0);
+        var stmt = try self.prepare(sql_hash_put, diag);
+        defer stmt.finalize();
+        stmt.bind_unsigned(1, revision);
+        stmt.bind_bytes(2, &hash);
+        try stmt.run(diag);
+    }
+
+    /// Starts the hash of `revision`, the one a write transaction is about to commit.
+    fn begin_chain(self: *SqliteStore, meta: Meta, revision: Revision, diag: *Diag) Error!void {
+        assert(revision == meta.revision + 1);
+        self.chain = store.ChainHasher.begin(try self.read_hash(meta.revision, diag), revision);
+    }
+
+    fn hash_at_impl(context: *anyopaque, revision: Revision, diag: *Diag) Error!store.Hash {
+        const self = from(context);
+        self.lock();
+        defer self.unlock();
+        try self.begin_read(diag);
+        defer self.rollback();
+        const meta = try self.read_meta(diag);
+        if (revision > meta.revision) return failures.future_read(diag, revision, meta.revision);
+        if (revision == 0) return store.hash_zero;
+        if (revision < meta.chain_start) {
+            return failures.no_hash(diag, revision, meta.chain_start);
+        }
+        return self.read_hash(revision, diag);
     }
 
     fn status_impl(context: *anyopaque, diag: *Diag) Error!store.Status {
         const self = from(context);
         self.lock();
         defer self.unlock();
-        const meta = try self.read_meta(diag); // One statement: its own snapshot.
-        return .{ .revision = meta.revision, .compacted_revision = meta.compacted_revision };
+        try self.begin_read(diag); // The revision and its hash share a snapshot.
+        defer self.rollback();
+        const meta = try self.read_meta(diag);
+        return .{
+            .revision = meta.revision,
+            .compacted_revision = meta.compacted_revision,
+            .hash = try self.read_hash(meta.revision, diag),
+        };
     }
 
     fn get_impl(
@@ -578,6 +667,7 @@ pub const SqliteStore = struct {
         const ops = if (succeeded) request.on_success else request.on_failure;
         try self.check_leases(ops, diag);
         const revision = meta.revision + 1;
+        try self.begin_chain(meta, revision, diag);
         var events: u32 = 0;
         for (ops) |op| {
             if (try self.apply_op(op, revision, events, diag)) events += 1;
@@ -586,9 +676,9 @@ pub const SqliteStore = struct {
             self.rollback(); // Nothing changed: no revision is taken.
             return .{ .succeeded = succeeded, .revision = meta.revision };
         }
-        try self.set_revision(revision, diag);
+        const hash = try self.set_revision(revision, diag);
         try self.commit(diag);
-        return .{ .succeeded = succeeded, .revision = revision };
+        return .{ .succeeded = succeeded, .revision = revision, .hash = hash };
     }
 
     fn compares_hold(
@@ -764,14 +854,25 @@ pub const SqliteStore = struct {
         stmt.bind_unsigned(6, row.create_revision);
         stmt.bind_unsigned(7, row.lease);
         try stmt.run(diag);
+        self.chain.add_stored(.{ .kind = if (row.deleted) .delete else .put, .kv = .{
+            .key = row.key,
+            .value = row.value,
+            .create_revision = row.create_revision,
+            .mod_revision = row.revision,
+            .lease = row.lease,
+        } }) catch return self.fail_damaged(diag, "holds a key that is not valid");
     }
 
-    fn set_revision(self: *SqliteStore, revision: Revision, diag: *Diag) Error!void {
+    /// Takes the revision and records its chain hash in the same transaction.
+    fn set_revision(self: *SqliteStore, revision: Revision, diag: *Diag) Error!store.Hash {
         assert(revision > 0);
+        const hash = self.chain.finish();
+        try self.put_hash(revision, hash, diag);
         var stmt = try self.prepare(sql_set_revision, diag);
         defer stmt.finalize();
         stmt.bind_unsigned(1, revision);
         try stmt.run(diag);
+        return hash;
     }
 
     // ---- Watch ---------------------------------------------------------------------------
@@ -942,6 +1043,7 @@ pub const SqliteStore = struct {
         var keys: LeaseKeys = undefined;
         try self.collect_lease_keys(id, &keys, diag);
         const revision = meta.revision + 1;
+        try self.begin_chain(meta, revision, diag);
         for (0..keys.count) |slot| {
             const idx: u32 = @intCast(slot);
             const deleted = try self.apply_delete(keys.key(idx), revision, idx, diag);
@@ -951,7 +1053,7 @@ pub const SqliteStore = struct {
         defer stmt.finalize();
         stmt.bind_unsigned(1, id);
         try stmt.run(diag);
-        if (keys.count > 0) try self.set_revision(revision, diag);
+        if (keys.count > 0) _ = try self.set_revision(revision, diag);
         try self.commit(diag);
         return if (keys.count > 0) revision else meta.revision;
     }
@@ -1626,4 +1728,59 @@ test "compaction deletes the history it no longer needs from the file" {
     try testing.expectEqual(@as(i64, 7), try db.pragma_value(rows, &diag));
     try s.compact(7, &diag);
     try testing.expectEqual(@as(i64, 1), try db.pragma_value(rows, &diag)); // Only /k at 5.
+}
+
+test "upgrade: a store written by schema version 1 gets its chain seeded at the revision it had" {
+    // Goal: the migration keeps the data, starts the chain at the upgrade revision (the older
+    // history cannot be hashed, it may be compacted), and the chain then continues as for any
+    // store. Method: write three revisions, turn the file back into a version 1 file (no
+    // `store_hash`, no `chain_start`, `user_version` 1), reopen it, and check the seed, the
+    // refusal below it (ZC-E0214), a new revision hashed on top of the seed, and a second
+    // reopen that migrates nothing.
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var diag: Diag = undefined;
+    diag.reset();
+    const first = try fixture.open_new(.{ .create = true, .sync = .normal });
+    var s = first.interface();
+    _ = try s.txn(.{ .on_success = &.{.{ .put = .{ .key = "/a", .value = "1" } }} }, &diag);
+    _ = try s.txn(.{ .on_success = &.{.{ .put = .{ .key = "/b", .value = "2" } }} }, &diag);
+    _ = try s.txn(.{ .on_success = &.{.{ .put = .{ .key = "/a", .value = "3" } }} }, &diag);
+    release(first);
+    try fixture.raw_exec(
+        \\DROP TABLE store_hash;
+        \\ALTER TABLE store_meta DROP COLUMN chain_start;
+        \\PRAGMA user_version = 1;
+    );
+    try testing.expectEqual(@as(i64, 1), try fixture.raw_user_version());
+
+    const second = try fixture.open_new(.{ .create = false, .sync = .normal });
+    s = second.interface();
+    try testing.expectEqual(@as(i64, schema_version), try fixture.raw_user_version());
+    const seed = store.chain_seed(3);
+    const status = try s.status(&diag);
+    try testing.expectEqual(@as(Revision, 3), status.revision);
+    try testing.expectEqual(seed, status.hash);
+    try testing.expectEqual(seed, try s.hash_at(3, &diag));
+    try testing.expectError(error.NoHash, s.hash_at(2, &diag));
+    try testing.expectEqual(codes.Code.E0214, diag.code.?);
+    diag.reset();
+    try testing.expectEqual(store.hash_zero, try s.hash_at(0, &diag));
+    const written = try s.txn(.{ .on_success = &.{.{ .delete = "/b" }} }, &diag);
+    try testing.expectEqual(@as(Revision, 4), written.revision);
+    const gone: store.Event = .{ .kind = .delete, .kv = .{
+        .key = "/b",
+        .value = "",
+        .create_revision = 2,
+        .mod_revision = 4,
+        .lease = 0,
+    } };
+    const want = store.chain_hash(seed, 4, &.{gone});
+    try testing.expectEqual(want, try s.hash_at(4, &diag));
+    release(second);
+
+    const third = try fixture.open_new(.{ .create = false, .sync = .normal });
+    defer release(third);
+    try testing.expectEqual(want, (try third.interface().status(&diag)).hash);
+    try testing.expectEqual(seed, try third.interface().hash_at(3, &diag));
 }

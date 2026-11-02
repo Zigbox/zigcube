@@ -11,6 +11,16 @@
 //! key, a failed compare with no failure ops) takes no revision. Revisions never repeat and are
 //! never skipped: a reader that has seen revision N has seen every change up to N.
 //!
+//! ## The chain hash
+//!
+//! Every revision has a hash, `h(n) = SHA-256(h(n-1) || revision || the revision's events)`, with
+//! `h(0)` 32 zero bytes. `ChainHasher` below is the one place that encodes and hashes, so every
+//! backend gives the same bytes for the same history; the encoding is in docs/store-design.md.
+//! `Status.hash` is the hash of the current revision and `Store.hash_at` that of any revision
+//! from the chain's start. Compaction never drops a hash. A store upgraded from a schema that had
+//! no chain starts it at its revision then (`chain_seed`), so `hash_at` below that fails with
+//! `NoHash`.
+//!
 //! ## Failure
 //!
 //! Every operation that can fail takes a `*Diag` and returns a plain `Error`. The error says
@@ -23,6 +33,7 @@
 //!     error.LeaseNotFound   ZC-E0205   unknown, expired or revoked lease
 //!     error.TooLarge        ZC-E0206   key, value, transaction or ttl over its bound
 //!     error.NoCapacity      ZC-E0207   watch slots, lease slots or arena exhausted
+//!     error.NoHash          ZC-E0214   no chain hash for that revision (before the chain's start)
 //!     error.BackendFailed   ZC-E0201 (unreachable) or ZC-E0202 (the backend refused or failed);
 //!                           a SQLite file adds ZC-E0208 (busy), ZC-E0209 (damaged or not a
 //!                           store) and ZC-E0210 (schema from a newer zcube)
@@ -57,8 +68,94 @@ pub const Error = error{
     LeaseNotFound,
     TooLarge,
     NoCapacity,
+    NoHash,
     BackendFailed,
 };
+
+// ---- The chain hash ------------------------------------------------------------------------
+
+pub const hash_bytes = std.crypto.hash.sha2.Sha256.digest_length;
+pub const Hash = [hash_bytes]u8;
+
+/// `h(0)`: the hash before any revision.
+pub const hash_zero: Hash = @splat(0);
+
+/// Where the chain of a store upgraded at `revision` starts: `h(revision)` is not computed from
+/// the log (the log may be compacted) but derived from the revision alone, and recorded.
+pub fn chain_seed(revision: Revision) Hash {
+    assert(revision > 0);
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    sha.update("zcube chain seed 1");
+    update_u64(&sha, revision);
+    return sha.finalResult();
+}
+
+/// Builds `h(n)` from `h(n-1)`, the revision and its events, in order. `begin`, then `add` once
+/// per event of the revision in position order, then `finish`. The encoding of an event is
+/// docs/store-design.md "The chain hash": nothing here depends on a backend.
+pub const ChainHasher = struct {
+    sha: std.crypto.hash.sha2.Sha256,
+
+    pub fn begin(previous: Hash, revision: Revision) ChainHasher {
+        assert(revision > 0);
+        var hasher: ChainHasher = .{ .sha = std.crypto.hash.sha2.Sha256.init(.{}) };
+        hasher.sha.update(&previous);
+        update_u64(&hasher.sha, revision);
+        return hasher;
+    }
+
+    /// Like `add`, for an event whose key or value a backend read back from its own storage:
+    /// one that fails validation means the store is damaged, which is no assertion's business.
+    pub fn add_stored(hasher: *ChainHasher, event: Event) error{Malformed}!void {
+        if (key_problem(event.kv.key) != null) return error.Malformed;
+        if (event.kv.value.len > constants.store_value_bytes_max) return error.Malformed;
+        if (event.kind == .delete and event.kv.value.len != 0) return error.Malformed;
+        hasher.add(event);
+    }
+
+    /// For events from callers, which `Store` has already validated: a bad one is a bug.
+    pub fn add(hasher: *ChainHasher, event: Event) void {
+        assert(key_problem(event.kv.key) == null);
+        assert(event.kv.value.len <= constants.store_value_bytes_max);
+        if (event.kind == .delete) assert(event.kv.value.len == 0);
+        hasher.sha.update(&.{@as(u8, switch (event.kind) {
+            .put => 1,
+            .delete => 2,
+        })});
+        update_u32(&hasher.sha, @intCast(event.kv.key.len));
+        hasher.sha.update(event.kv.key);
+        update_u32(&hasher.sha, @intCast(event.kv.value.len));
+        hasher.sha.update(event.kv.value);
+        update_u64(&hasher.sha, event.kv.create_revision);
+        update_u64(&hasher.sha, event.kv.lease);
+    }
+
+    pub fn finish(hasher: *ChainHasher) Hash {
+        return hasher.sha.finalResult();
+    }
+};
+
+/// `h(revision)` of `events` (every event of the revision, in order) after `previous`.
+pub fn chain_hash(previous: Hash, revision: Revision, events: []const Event) Hash {
+    var hasher = ChainHasher.begin(previous, revision);
+    for (events) |event| {
+        assert(event.kv.mod_revision == revision);
+        hasher.add(event);
+    }
+    return hasher.finish();
+}
+
+fn update_u64(sha: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .big);
+    sha.update(&bytes);
+}
+
+fn update_u32(sha: *std.crypto.hash.sha2.Sha256, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .big);
+    sha.update(&bytes);
+}
 
 pub const KeyValue = struct {
     key: []const u8,
@@ -75,6 +172,8 @@ pub const Status = struct {
     revision: Revision,
     /// History older than this is gone: reads and watches below it fail with `Compacted`.
     compacted_revision: Revision,
+    /// The chain hash of `revision` (`hash_zero` for an empty store).
+    hash: Hash,
 };
 
 // ---- Reads ---------------------------------------------------------------------------------
@@ -148,6 +247,10 @@ pub const TxnResult = struct {
     succeeded: bool,
     /// The revision after the transaction: the new one if it wrote, else the current one.
     revision: Revision,
+    /// The chain hash of `revision`, computed in the transaction that wrote it. Null when the
+    /// transaction wrote nothing (`revision` is then the current one) or the store cannot say
+    /// (the node agent's remote store). `VerifiedStore` advances what it remembers from it.
+    hash: ?Hash = null,
 };
 
 // ---- Watch ---------------------------------------------------------------------------------
@@ -287,13 +390,24 @@ pub const Store = struct {
         ) Error![]const LeaseInfo,
         expire_leases: *const fn (context: *anyopaque, diag: *Diag) Error!u32,
         compact: *const fn (context: *anyopaque, revision: Revision, diag: *Diag) Error!void,
+        hash_at: *const fn (context: *anyopaque, revision: Revision, diag: *Diag) Error!Hash,
     };
 
-    /// The current and compacted revisions.
+    /// The current and compacted revisions, and the chain hash of the current one.
     pub fn status(store: Store, diag: *Diag) Error!Status {
         assert(diag.code == null);
         const result = try finish(diag, store.vtable.status(store.context, diag));
         assert(result.compacted_revision <= result.revision);
+        return result;
+    }
+
+    /// The chain hash of `revision`, from 0 (`hash_zero`) to the current revision; compaction
+    /// never removes one. A store upgraded from a schema without the chain has none below the
+    /// revision it was upgraded at: `NoHash`. Above the current revision: `FutureRevision`.
+    pub fn hash_at(store: Store, revision: Revision, diag: *Diag) Error!Hash {
+        assert(diag.code == null);
+        const result = try finish(diag, store.vtable.hash_at(store.context, revision, diag));
+        if (revision == 0) assert(std.mem.eql(u8, &result, &hash_zero));
         return result;
     }
 
@@ -559,4 +673,34 @@ test "keys are absolute printable paths within the bound" {
     try std.testing.expect(key_problem(longest) == null);
     try std.testing.expectEqual(KeyProblem.too_long, key_problem(longest ++ "k").?);
     try std.testing.expect(prefix_problem("") == null);
+}
+
+test "chain hash: the encoding is fixed, and each part of it matters" {
+    // Goal: the hash depends on the previous hash, the revision and every field of every event,
+    // in order; and `ChainHasher` and `chain_hash` agree. Method: change one thing at a time.
+    const put: Event = .{ .kind = .put, .kv = .{
+        .key = "/k",
+        .value = "v",
+        .create_revision = 1,
+        .mod_revision = 2,
+        .lease = 0,
+    } };
+    var other = put;
+    other.kv.lease = 7;
+    var deleted = put;
+    deleted.kind = .delete;
+    deleted.kv.value = "";
+    const base = chain_hash(hash_zero, 2, &.{put});
+    try std.testing.expectEqual(base, chain_hash(hash_zero, 2, &.{put}));
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(chain_seed(1), 2, &.{put})));
+    other.kv.mod_revision = 3;
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 3, &.{other})));
+    other.kv.mod_revision = 2;
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 2, &.{other})));
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 2, &.{deleted})));
+    try std.testing.expect(!std.mem.eql(u8, &base, &chain_hash(hash_zero, 2, &.{ put, put })));
+    var hasher = ChainHasher.begin(hash_zero, 2);
+    hasher.add(put);
+    try std.testing.expectEqual(base, hasher.finish());
+    try std.testing.expect(!std.mem.eql(u8, &chain_seed(1), &chain_seed(2)));
 }

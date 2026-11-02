@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0214]: the store has no chain hash for that revision
+  cause  the hash of revision 5 was asked for; the store's chain starts at 380
+  cause  the store was upgraded at revision 380 from a schema without a chain
+  reqid  r-0000001
+  fix    ask for a revision at or above the start of the chain
+  more   zcube explain E0214
+  docs   https://zigbox.github.io/zigcube/errors/E0214.html

@@ -150,6 +150,100 @@ fails with `Compacted` if it moved above the read's revision, so it never return
 answer. The server compacts on a schedule to a revision a configurable window behind the head
 (default: a few minutes of history, enough for a restarting agent to resume rather than relist).
 
+## The chain hash
+
+Every revision carries a hash that commits to the whole history before it:
+
+```
+h(0) = 32 zero bytes
+h(n) = SHA-256( h(n-1) || u64be(n) || event_1 || ... || event_k )
+event = kind u8 (1 put, 2 delete) || u32be(len key) || key || u32be(len value) || value
+        || u64be(create_revision) || u64be(lease)
+```
+
+The events are the revision's events in position order (`idx`). A delete event has an empty
+value and carries the create revision and lease of the key it removed. A transaction that
+changes nothing takes no revision and has no hash. The hash is computed by one Zig function,
+`ChainHasher` / `chain_hash` in `store.zig`, which is core code (wasm-clean); no backend hashes
+in SQL, so all three produce the same bytes (the conformance suite pins `h(4)` of a fixed
+history). Hashes are small (32 bytes per revision) and are never compacted away.
+
+**Stored with the revision.** Memory keeps a hash list indexed by revision. SQLite and Postgres
+have `store_hash(revision, hash)`, one row per revision, inserted in the same transaction as the
+revision's log rows (Postgres: before `NOTIFY` and commit), so a revision never exists without
+its hash. Writers are already serialised, so the previous hash is read once after the revision
+is taken. `Store.status` returns the current hash and `Store.hash_at(revision)` any other.
+
+**Upgrade (schema version 2).** A version 1 store has no hash and its older history may be
+compacted, so it cannot be hashed retroactively. The migration adds `store_hash` and
+`store_meta.chain_start`, sets `chain_start` to the revision it ran at and records
+`h(chain_start) = SHA-256("zcube chain seed 1" || u64be(chain_start))`. From there the chain
+continues as normal. `hash_at(r)` for `0 < r < chain_start` fails with `NoHash` (ZC-E0214, the
+cause names `chain_start`); `hash_at(0)` is always zero and a revision above the head is
+`FutureRevision`. A store migrated at revision 0 is the same as a new one. The upgrade is tested
+from a store written by the previous schema on SQLite and Postgres.
+
+**Stop every v1 server before a v2 server upgrades the store.** The migration seeds the chain at
+the revision it ran at; a version 1 server knows nothing of `store_hash`, so a v1 write after the
+migration commits a revision with no hash. The v2 server then finds a revision without a hash and
+reads the store as damaged (ZC-E0209, "has no hash for a revision"), and nothing in the store says
+which writer was to blame. The schema version does not stop it: v1 servers do not check it
+against a newer one. So the operator stops all v1 servers (and anything else that writes to the
+store) first, starts one v2 server to migrate, and only then starts others. Rolling upgrades
+are not supported. See `docs/operations.md`.
+
+## Nothing acts on a store that went backwards (C1 slice 10b)
+
+`VerifiedStore` (`src/store_verified.zig`, core) wraps the `Store` the server and its controllers
+use. It remembers the highest `(revision, hash)` it has seen. On every `status`, after every
+acknowledged write (the transaction result carries the chain hash of its revision, which the
+pair advances to), before and after lease expiry, and once at start-up before the server
+listens, it checks the store: a revision below the remembered one, or a different `hash_at(remembered revision)`
+(a fork), halts the server with `ZC-E0215`. Halted, every store call
+fails with that code, so controllers do not step and writes are refused. There is no automatic
+recovery.
+
+- **Fail closed on `NoHash`.** A store that cannot say what its hash was at the remembered revision
+  (`ZC-E0214`: the revision is below the point its chain starts, as after a migration from schema
+  version 1) is refused as well, since it cannot be told from a rollback. The operator runs
+  `accept-rollback` once. A server with nothing remembered (first start) is not affected.
+- **The pair outlives the server.** It is written to `<state dir>/<db file name>.<hash of its absolute path>.remembered` for SQLite (one file per
+  database path; a restore under a new path is unchecked) or `<state dir>/remembered` for Postgres (temporary file, `fsync`, rename, `fsync` of
+  the directory), at most once per second and whenever the file is behind the pair, including
+  when the cluster has gone idle, and at a clean stop. A file that is present and unreadable is
+  `ZC-E0216`, never "no file". **Crash window:** the file may lag the pair by up to one save
+  interval (`verified_save_ms`, 1 s), or for as long as saves fail (shown once as `ZC-E0216` in
+  the log and in `GET /v1/status`). A crash plus a rollback inside that window is not noticed. The state directory is `--state-dir`; unset, it is
+  the directory of the SQLite file; a memory store remembers nothing; Postgres without
+  `--state-dir` refuses to start (`ZC-E0106`), because there is no directory beside it and a file
+  inside the store would be rolled back with it. One Postgres database per state directory.
+- **Start-up.** The server checks the store before it listens. If the check halts, it starts
+  anyway, halted, and logs the diagnostic: every call answers `ZC-E0215`.
+- **The way out.** `zcube store accept-rollback --confirm` (`POST /v1/store/accept-rollback?confirm=true`)
+  makes the server remember the store as it is now. Run it after looking at which store this is.
+
+- **What a check compares with.** A call takes a snapshot of the remembered pair (and the epoch) before it
+  calls the store. An answer below the current pair is compared with that snapshot only: a
+  linearizable store answers a call that began after a write was acknowledged with at least that
+  revision, and a write acknowledged while the call ran only makes an answer *below* the pair late. An answer at or above the pair as it
+  stands now cannot be late, so it is compared with the current pair too (up to 4 rounds, then it is
+  dropped and the pair stays; the next status compares). The pair moves forward by maximum, never back.
+- **Reads.** `get`, `list` and `watch` pass the halt gate. Until one check has passed (the store could
+  not be reached at start, so `first_check` found nothing), the first of them verifies the store
+  itself and fails with the store's own error if it cannot. After that, between steps they pass only
+  the gate: a rollback is noticed at the next `status` or write, not at the next read.
+
+Known gaps (not fixed in 10b): `accept` reads the store's status and then bumps the epoch, so a write
+acknowledged between the two is not in the pair it remembers (the pair is lower than the store: weaker,
+never unsafe). The round-1 `<db>.remembered` files (before the file was keyed by the database path) are
+left behind and never read. A database restored at a new path is unchecked (documented above).
+An answer below a pair that moved while the call ran is compared with the snapshot only, so a forked
+answer there passes (it is never adopted; the next `status` halts). An answer dropped after 4 rounds
+leaves the pair below it, so a rollback to between the pair and that answer goes unnoticed.
+`Watch.next` is not gated on a halt (a watch opened before the halt can still deliver
+events until it is re-opened); and the decision record that should hold both pairs as evidence
+needs a store-level `SubjectKind`, a `docs/keys.md` change that is ask-first.
+
 ## OrioleDB
 
 `store_live` takes the update churn (every observed-state report overwrites a row). When the

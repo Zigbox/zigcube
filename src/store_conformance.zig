@@ -113,6 +113,59 @@ const CreateRace = struct {
     }
 };
 
+test "txn: the result's hash is the chain hash of its revision" {
+    // Goal: the verified store advances its pair from a transaction's result, so the result's hash
+    // must be what `hash_at` says for that revision, on every backend. Method: a put, a failed
+    // compare that takes the `on_failure` branch, and a delete; each result is compared.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    const s = (try harness.connect()).interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const put: store.Op = .{ .put = .{ .key = "/h/a", .value = "1" } };
+    const other: store.Op = .{ .put = .{ .key = "/h/b", .value = "2" } };
+    const gone: store.Op = .{ .delete = "/h/a" };
+    const results = [_]store.TxnResult{
+        try s.txn(.{ .on_success = &.{put} }, &diag),
+        try s.txn(.{
+            .compares = &.{.{ .key = "/h/a", .mod_revision = 0 }},
+            .on_success = &.{put},
+            .on_failure = &.{other},
+        }, &diag),
+        try s.txn(.{ .on_success = &.{gone} }, &diag),
+    };
+    try testing.expect(!results[1].succeeded);
+    for (results) |result| {
+        try testing.expect(result.hash != null);
+        try testing.expectEqual(result.hash.?, try s.hash_at(result.revision, &diag));
+    }
+}
+
+test "txn: a failed compare with no on_failure ops writes nothing and the head's hash stays" {
+    // Goal: a failed transaction that writes nothing answers with the current revision and no
+    // hash (`TxnResult.hash`: null when nothing was written), and the head's hash is unchanged
+    // and is what `hash_at` says, on every backend. Method: one put, then a create-only compare
+    // that fails with an empty `on_failure`.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    const s = (try harness.connect()).interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const put: store.Op = .{ .put = .{ .key = "/h/e", .value = "1" } };
+    const first = try s.txn(.{ .on_success = &.{put} }, &diag);
+    const failed = try s.txn(.{
+        .compares = &.{.{ .key = "/h/e", .mod_revision = 0 }},
+        .on_success = &.{put},
+    }, &diag);
+    try testing.expect(!failed.succeeded);
+    try testing.expectEqual(first.revision, failed.revision);
+    try testing.expect(failed.hash == null);
+    try testing.expectEqual(first.hash.?, try s.hash_at(failed.revision, &diag));
+    try testing.expectEqual(first.hash.?, (try s.status(&diag)).hash);
+}
+
 test "cas: of several writers racing to create a key, exactly one wins" {
     // Goal: create-only compare-and-swap is atomic across connections. Method: each writer on its
     // own connection and thread creates "/c/key" if absent, and records an audit key if it
@@ -453,6 +506,31 @@ test "watch: concurrent writers produce an ordered, gap-free stream, one batch p
     defer testing.allocator.free(by_revision);
     try index_by_revision(jobs, head, by_revision);
     try expect_stream(by_revision, seen.items);
+    try expect_chain_recomputes(watcher, head);
+}
+
+/// Walks the whole log from revision 1 and recomputes `h(n)` with `store.chain_hash`: it equals
+/// `hash_at(n)` for every `n` only if no two writers ever chained from the same parent.
+fn expect_chain_recomputes(s: Store, head: Revision) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    var watch = try s.watch(.{ .prefix = "/", .from_revision = 1 }, &diag);
+    defer watch.close();
+    const events = try drain(&watch, arena_state.allocator(), head, &diag);
+    var previous = store.hash_zero;
+    var start: usize = 0;
+    for (1..@as(usize, @intCast(head)) + 1) |revision| {
+        var end = start;
+        while (end < events.len and events[end].kv.mod_revision == revision) end += 1;
+        try testing.expect(end > start);
+        previous = store.chain_hash(previous, revision, events[start..end]);
+        try testing.expectEqual(previous, try s.hash_at(revision, &diag));
+        start = end;
+    }
+    try testing.expectEqual(events.len, start);
+    try testing.expectEqual(previous, (try s.status(&diag)).hash);
 }
 
 /// The watched events of every revision, in order, must equal what the watch delivered.

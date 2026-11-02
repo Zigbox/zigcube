@@ -206,6 +206,8 @@ pub const server_compact_ms: u32 = 60 * 1000;
 /// resume its watch and a paged list can finish.
 pub const server_compact_keep_revisions: u32 = 1000;
 /// After a failed step the controller waits this long, doubling up to the maximum.
+/// The remembered revision is saved at most this often (a lagging copy is safe, only weaker).
+pub const verified_save_ms: u32 = 1000;
 pub const server_retry_ms_min: u32 = 250;
 pub const server_retry_ms_max: u32 = 5000;
 /// A repeated failure is shown again only after this long (a new code is shown at once).
