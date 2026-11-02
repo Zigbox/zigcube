@@ -79,18 +79,21 @@ A seventh role, `retention`, deletes expired decisions (§5). It may write only 
 - **`/assigned/<node>/` replaces the `node` field.** An agent's long-poll watches its own prefix,
   so fan-out is O(replicas on the node), not O(all replicas). The agent endpoint joins each
   assignment with its `/replicas` record, so the agent sees the same shape as today.
-- **The scheduler moves a replica in one transaction.** It deletes `/assigned/<old>/<id>`, puts
+- **The scheduler can move a replica in one transaction.** It deletes `/assigned/<old>/<id>`, puts
   `/assigned/<new>/<id>`, updates both nodes' `/allocations` records and writes the
-  `place_replica` decision, with the compare set below for each node it touches.
+  `place_replica` decision, with the compare set below for each node it touches. Nothing in C1
+  moves a replica: a lost node's replicas are replaced under new ids (§3), not moved.
 - **Only the scheduler removes an assignment**, and it releases the allocation in the same
   transaction. A replica retired by the replica controller, or a node marked lost by the node
   controller, is a fact the scheduler reacts to; neither of them touches `/assigned` or
   `/allocations`.
-- **The replica controller never reads `/assigned` to decide anything about the desired set.** It
-  reads only to report (`get replicas` shows where each replica runs). *Exceptions in the code
-  (C1 slices 3 and 4, reported to the owner): it finds a replica's observed record through its
-  assignment, and it replaces a replica whose assigned node is `lost` past `lost_grace_ms` under
-  a new id (§3), reading `/node-status/` too.*
+- **The replica controller reads `/assigned` and `/node-status/` for two purposes only.** It
+  finds a replica's observed record through its assignment, and it replaces a replica whose
+  assigned node is `lost` past `lost_grace_ms` under a new id (§3). It is the only writer of
+  `/replicas/`, so a replacement under a new id is its job. Its compare set covers what it read:
+  the replica, its assignment and `/node-status/<node>`. Otherwise it reads `/assigned` only to
+  report (`get replicas` shows where each replica runs), never to decide the desired set.
+  (Owner, 2026-11-02.)
 
 ### The read-set rule
 
