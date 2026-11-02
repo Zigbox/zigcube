@@ -581,10 +581,9 @@ fn lose(fixture: *Fixture, name: []const u8) !void {
     try fixture.put(.node_controller, records.node_status_key(name).slice(), value);
 }
 
-test "a lost node's replica moves at the grace and not before, caused by its mark_lost" {
-    // Goal: authority.md §2's reaction to a lost node. Method: hello-1 on n1, n1 lost; the
-    // scheduler waits exactly `lost_grace_ms`, then moves it to n2 keeping its id, with a
-    // `place_replica` whose cause is the `mark_lost` decision, both allocations rewritten.
+test "a lost node's replica stays put for the scheduler, past any grace" {
+    // Goal: the scheduler does not move a lost node's replica (the replica controller replaces it
+    // under a new id, authority.md §3), and places nothing more on the lost node.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -593,93 +592,31 @@ test "a lost node's replica moves at the grace and not before, caused by its mar
     try fixture.settle();
     try fixture.node("n2", 4000, 8 * gib, true);
     try lose(&fixture, "n1");
-    const lost_at = fixture.manual.ms;
-    const waiting = try fixture.step();
-    try testing.expectEqual(@as(u32, 0), waiting.acted);
-    try testing.expectEqual(lost_at + constants.lost_grace_ms, waiting.at_ms);
-    fixture.manual.ms = lost_at + constants.lost_grace_ms - 1;
+    fixture.manual.ms += constants.lost_grace_ms_max;
     try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
     try fixture.expect_on("hello-1", "n1");
-    fixture.manual.ms += 1;
-    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
-    try fixture.expect_on("hello-1", "n2");
-    const placed = try fixture.decisions("place_replica");
-    defer testing.allocator.free(placed);
-    try testing.expectEqual(@as(usize, 2), placed.len);
-    try testing.expectEqual(records.CauseKind.decision, placed[1].cause.kind);
-    try testing.expectEqualStrings("mark-lost-1", placed[1].cause.id.?);
-    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
-    try testing.expectEqual(@as(u32, 1), (try fixture.allocation("n2")).count);
-    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    try fixture.expect_on("hello-2", "n2");
 }
 
-test "a lost node's replica is released when nothing fits, then held" {
-    // Goal: no node fits: the assignment is released (cause the `mark_lost`) and the replica
-    // waits like any unassigned one, with a `hold_pending` naming the lost node.
+test "a replica retired off a lost node has its assignment released there" {
+    // Goal: the reaction to the replica controller's replacement: n1 has no `/nodes` record, and
+    // its allocation still comes down with the release, caused by the `mark_replica_lost`.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    fixture.sc.lost_grace_ms = 10;
     try fixture.node("n1", 4000, 8 * gib, true);
     try fixture.replica("hello", "hello-1", 500, gib);
     try fixture.settle();
-    try lose(&fixture, "n1");
-    fixture.manual.ms += 10;
-    try fixture.settle();
-    try fixture.expect_on("hello-1", null);
-    const released = try fixture.decisions("release_replica");
-    defer testing.allocator.free(released);
-    try testing.expectEqual(@as(usize, 1), released.len);
-    try testing.expectEqualStrings("mark-lost-1", released[0].cause.id.?);
-    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
-    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
-}
-
-test "a move off a lost node conflicts when its status moved between plan and commit" {
-    // Goal: the move compares the lost node's status. Method: read the world, rewrite the
-    // status, then run the pass on the stale world: nothing is written and the pass asks again.
-    var fixture: Fixture = undefined;
-    try fixture.start();
-    defer fixture.stop();
-    fixture.sc.lost_grace_ms = 0;
-    try fixture.node("n1", 4000, 8 * gib, true);
-    try fixture.replica("hello", "hello-1", 500, gib);
-    try fixture.settle();
-    try fixture.node("n2", 4000, 8 * gib, true);
     try lose(&fixture, "n1");
     const ctx = fixture.context();
-    var world = try scheduler.read_world(&ctx);
-    const value: records.NodeStatus = .{
-        .state = .lost,
-        .tenure = 1,
-        .at_ms = fixture.manual.ms,
-        .decision = "mark-lost-2",
-    };
-    const bytes = try records.encode(ctx.arena, value, &fixture.diag);
-    const key = records.node_status_key("n1");
-    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
-    _ = try writers.txn(ctx.store, .node_controller, .{ .on_success = &.{op} }, &fixture.diag);
-    const wake = try fixture.sc.reconcile_world(&ctx, &world);
-    try testing.expectEqual(@as(u32, 0), wake.acted);
-    try testing.expectEqual(fixture.manual.ms, wake.at_ms);
-    try fixture.expect_on("hello-1", "n1");
+    const key = records.replica_key("hello", "hello-1");
+    const op: store.Op = .{ .delete = key.slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{op} }, &fixture.diag);
     try fixture.settle();
-    try fixture.expect_on("hello-1", "n2");
-}
-
-test "a lost node that registers again keeps its replicas" {
-    // Goal: a newer `/nodes` record than the lost tenure stops the move; the node controller
-    // judges the new tenure first.
-    var fixture: Fixture = undefined;
-    try fixture.start();
-    defer fixture.stop();
-    fixture.sc.lost_grace_ms = 0;
-    try fixture.node("n1", 4000, 8 * gib, true);
-    try fixture.replica("hello", "hello-1", 500, gib);
-    try fixture.settle();
-    try fixture.node("n2", 4000, 8 * gib, true);
-    try lose(&fixture, "n1");
-    try fixture.node("n1", 4000, 8 * gib, false);
-    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
-    try fixture.expect_on("hello-1", "n1");
+    try fixture.expect_on("hello-1", null);
+    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_replica"));
+    try fixture.accounting_holds();
 }

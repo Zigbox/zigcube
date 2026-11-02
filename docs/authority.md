@@ -87,7 +87,10 @@ A seventh role, `retention`, deletes expired decisions (§5). It may write only 
   controller, is a fact the scheduler reacts to; neither of them touches `/assigned` or
   `/allocations`.
 - **The replica controller never reads `/assigned` to decide anything about the desired set.** It
-  reads only to report (`get replicas` shows where each replica runs).
+  reads only to report (`get replicas` shows where each replica runs). *Exceptions in the code
+  (C1 slices 3 and 4, reported to the owner): it finds a replica's observed record through its
+  assignment, and it replaces a replica whose assigned node is `lost` past `lost_grace_ms` under
+  a new id (§3), reading `/node-status/` too.*
 
 ### The read-set rule
 

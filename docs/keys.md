@@ -254,8 +254,10 @@ controller records its choices about a service's replica set with the service as
 `scale_up`, `scale_down`, `replace_replica` and `hold_failed_replica`, each linking by `cause` to
 the observed record or decision that provoked it. A decision about one replica (`create_replica`,
 `stop_replica`, `mark_replica_lost`) keeps that replica as its subject, with a `cause` that points
-at the service-level decision above it, so the two chains join. A decision with a service as
-subject is indexed under `/decisions-by-subject/service/<name>/<id>` like any other.
+at the service-level decision above it, so the two chains join. (`mark_replica_lost` for a
+replica whose node was lost points at the node's `mark_lost` instead, and the `replace_replica`
+it provokes at it, so `why` on the replacement, a new id, reaches the lease.) A decision with a
+service as subject is indexed under `/decisions-by-subject/service/<name>/<id>` like any other.
 
 ## `/decisions-by-subject/<kind>/<name>/<id>`: the index for `zcube why`
 

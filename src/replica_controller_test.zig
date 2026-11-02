@@ -816,3 +816,138 @@ test "the replace transaction fails when the dead replica's assignment moved" {
     defer Fixture.free_ids(now);
     try expect_ids(&.{ "hello-1", "hello-3", "hello-4" }, now);
 }
+
+/// What the node controller writes when `name`'s lease ends: `/nodes/<name>` gone and the status
+/// `lost` for the tenure it had, by decision "mark-lost-1", at the clock's time.
+fn lose(fixture: *Fixture, name: []const u8) !void {
+    const ctx = fixture.context();
+    const key = records.node_key(name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    const tenure = got.kv.?.mod_revision;
+    const op: store.Op = .{ .delete = key.slice() };
+    const role: writers.Role = .{ .agent = name };
+    _ = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+    const value: records.NodeStatus = .{
+        .state = .lost,
+        .tenure = tenure,
+        .at_ms = fixture.manual.ms,
+        .decision = "mark-lost-1",
+    };
+    try fixture.put(.node_controller, records.node_status_key(name).slice(), value);
+}
+
+/// The cause id of the newest decision `action` on replica `name`.
+fn cause_of(fixture: *Fixture, name: []const u8, action: []const u8) ![]const u8 {
+    const ctx = fixture.context();
+    const prefix = records.index_prefix(.replica, name);
+    const options: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+    const page = try ctx.store.list(ctx.arena, options, &fixture.diag);
+    for (page.kvs) |kv| {
+        const entry = try records.read(records.IndexEntry, ctx.arena, kv, &fixture.diag);
+        if (!std.mem.eql(u8, entry.action, action)) continue;
+        const at = records.decision_key(entry.id);
+        const got = try ctx.store.get(ctx.arena, at.slice(), null, &fixture.diag);
+        const decision = try records.read(records.Decision, ctx.arena, got.kv.?, &fixture.diag);
+        return decision.cause.id.?;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a lost node's replicas are replaced under new ids at the grace, caused by its mark_lost" {
+    // Goal: decision 2 of slice 4 (authority.md §3). Method: three replicas on node1, node2
+    // joins, node1 is lost; nothing changes until `lost_grace_ms` has passed, and the wake-up is
+    // at its end; then each replica gets `mark_replica_lost` (cause the `mark_lost`), the
+    // service a `replace_replica`, and three new ids run on node2; the old assignments are
+    // released.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    for ([_][]const u8{ "hello-1", "hello-2", "hello-3" }) |id| {
+        try fixture.observe(id, .running, null, null);
+    }
+    try fixture.register_node("node2");
+    _ = try fixture.settle();
+    try lose(&fixture, "node1");
+    const lost_at = fixture.manual.ms;
+    const waiting = try fixture.step();
+    try testing.expectEqual(@as(u32, 0), waiting.acted);
+    try testing.expectEqual(lost_at + constants.lost_grace_ms, waiting.at_ms);
+    fixture.manual.ms = lost_at + constants.lost_grace_ms - 1;
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+
+    fixture.manual.ms += 1;
+    _ = try fixture.settle();
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-4", "hello-5", "hello-6" }, now);
+    var old = try fixture.decisions(.replica, "hello-2");
+    defer old.deinit(testing.allocator);
+    const old_chain = "create_replica<decision;place_replica<decision;" ++
+        "mark_replica_lost<decision;release_replica<decision;";
+    try testing.expectEqualStrings(old_chain, old.items);
+    const cause = try cause_of(&fixture, "hello-2", "mark_replica_lost");
+    try testing.expectEqualStrings("mark-lost-1", cause);
+    const ctx = fixture.context();
+    for ([_][]const u8{ "hello-4", "hello-5", "hello-6" }) |id| {
+        const at = records.assigned_key("node2", id);
+        const got = try ctx.store.get(ctx.arena, at.slice(), null, &fixture.diag);
+        try testing.expect(got.kv != null);
+    }
+    const gone = records.assigned_key("node1", "hello-1");
+    const left = try ctx.store.get(ctx.arena, gone.slice(), null, &fixture.diag);
+    try testing.expect(left.kv == null);
+}
+
+test "a lost node that registers again before the grace ends keeps its replicas" {
+    // Goal: a `/nodes` record newer than the lost tenure stops the replacement; the node
+    // controller judges the new tenure.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try lose(&fixture, "node1");
+    try fixture.register_node("node1");
+    fixture.manual.ms += constants.lost_grace_ms;
+    _ = try fixture.settle();
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+}
+
+test "the replacement off a lost node fails when the node's status moved" {
+    // Goal: `/node-status/<node>` is in the read set. Method: a store rewrites node1's status just
+    // before the commit; that pass writes nothing; the next ones replace as usual.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try fixture.register_node("node2");
+    try lose(&fixture, "node1");
+    fixture.manual.ms += constants.lost_grace_ms;
+    var ctx = fixture.context();
+    const key = records.node_status_key("node1");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = got.kv.?.value,
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    _ = try fixture.settle();
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-4", "hello-5", "hello-6" }, now);
+}

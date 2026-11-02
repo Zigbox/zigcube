@@ -44,11 +44,11 @@ pub const ControlPlane = struct {
         };
     }
 
-    /// How long a lost node's replicas and observed records stay before they are moved or
-    /// removed (docs/authority.md §3; `zcube-server --lost-grace-ms`).
+    /// How long a lost node's replicas and observed records stay before they are replaced (under
+    /// new ids) or removed (docs/authority.md §3; `zcube-server --lost-grace-ms`).
     pub fn set_lost_grace(plane: *ControlPlane, grace_ms: u32) void {
         plane.nodes.lost_grace_ms = grace_ms;
-        plane.scheduler.lost_grace_ms = grace_ms;
+        plane.replicas.lost_grace_ms = grace_ms;
     }
 
     /// One pass of all three. The wake-up is the earliest of theirs.

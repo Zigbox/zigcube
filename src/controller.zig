@@ -203,6 +203,8 @@ pub const Snapshot = struct {
     nodes: []const Entry(records.Node),
     /// The scheduler's assignments (`/assigned/`), at the same revision.
     assigned: []const Entry(records.Assigned) = &.{},
+    /// The node controller's judgements (`/node-status/`), at the same revision.
+    statuses: []const Entry(records.NodeStatus) = &.{},
     /// Replica id to the node it is assigned to.
     node_by_replica: std.StringHashMapUnmanaged([]const u8) = .empty,
 
@@ -253,6 +255,25 @@ pub const Snapshot = struct {
         return &snapshot.observed[index];
     }
 
+    /// A node's status, or null if the node controller has not judged it.
+    pub fn status_of(snapshot: *const Snapshot, node: []const u8) ?*const Entry(
+        records.NodeStatus,
+    ) {
+        const key = records.node_status_key(node);
+        for (snapshot.statuses) |*entry| {
+            if (std.mem.eql(u8, entry.kv.key, key.slice())) return entry;
+        }
+        return null;
+    }
+
+    /// A node's `/nodes` record, or null if it has none (its lease ended).
+    pub fn node_entry(snapshot: *const Snapshot, node: []const u8) ?*const Entry(records.Node) {
+        for (snapshot.nodes) |*entry| {
+            if (std.mem.eql(u8, entry.rec.name, node)) return entry;
+        }
+        return null;
+    }
+
     pub fn service_of(snapshot: *const Snapshot, name: []const u8) ?*const Entry(
         records.Service,
     ) {
@@ -294,6 +315,13 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         at,
         constants.replicas_max,
     );
+    const statuses = try list_all(
+        records.NodeStatus,
+        ctx,
+        records.prefix_node_status,
+        at,
+        constants.nodes_max,
+    );
     var by_replica: std.StringHashMapUnmanaged([]const u8) = .empty;
     for (assigned.items) |entry| {
         const rest = entry.kv.key[records.prefix_assigned.len..];
@@ -309,6 +337,7 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         .observed = observed.items,
         .nodes = nodes.items,
         .assigned = assigned.items,
+        .statuses = statuses.items,
         .node_by_replica = by_replica,
     };
 }

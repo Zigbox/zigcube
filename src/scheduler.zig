@@ -14,8 +14,11 @@
 //! `controller_txns_per_step_max` transactions. Level-triggered like every controller: on a
 //! converged cluster a pass writes nothing.
 //!
-//! Not here yet: nothing calls `move_replica` until a node is lost (slice 4), and `/services/` is
-//! not read, so the replica of a deleted service is placed and then released.
+//! A lost node's replicas are not moved: the replica controller replaces each under a new id once
+//! `lost_grace_ms` has passed (authority.md §3), and this scheduler releases the old assignment
+//! like any retired replica's. `move_replica` is built and tested for the moves that keep an id
+//! (rebalancing, C7's fenced stateful replicas); nothing calls it yet. `/services/` is not read,
+//! so the replica of a deleted service is placed and then released.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -118,7 +121,7 @@ const NodeView = struct {
 const no_node: u32 = std.math.maxInt(u32);
 
 /// The most nodes a world holds: every registered node, and the nodes that have a status or an
-/// allocation record but no `/nodes` record (a lost node, whose replicas move off it).
+/// allocation record but no `/nodes` record (a lost node, whose assignments are released).
 pub const views_max: u32 = 2 * constants.nodes_max;
 
 const Assign = struct {
@@ -428,9 +431,6 @@ const Pass = struct {
     acted: u32 = 0,
     more: bool = false,
     stopped: bool = false,
-    /// The earliest time a lost node's grace ends, for a replica still on it.
-    wake_at_ms: u64 = std.math.maxInt(u64),
-
     fn budget(pass: *Pass) bool {
         if (pass.txns_left == 0) {
             pass.more = true;
@@ -459,9 +459,6 @@ const Pass = struct {
 
 pub const Scheduler = struct {
     source: controller.DecisionSource,
-    /// How long after a node is marked lost its replicas are moved (authority.md §2). A
-    /// parameter so the simulations and tests can shorten it; the server keeps the default.
-    lost_grace_ms: u64 = constants.lost_grace_ms,
     holds: [hold_memory_max]Hold = @splat(.{ .replica = 0, .evidence = 0 }),
     holds_next: u32 = 0,
 
@@ -484,16 +481,12 @@ pub const Scheduler = struct {
         while (index < world.assigns.items.len and !pass.stopped) : (index += 1) {
             try sc.release_one(ctx, world, &pass, index);
         }
-        index = 0;
-        while (index < world.assigns.items.len and !pass.stopped) : (index += 1) {
-            try sc.evacuate_one(ctx, world, &pass, index);
-        }
         for (0..world.replicas.len) |replica| {
             if (pass.stopped) break;
             try sc.place_one(ctx, world, &pass, @intCast(replica));
         }
         const now = ctx.clock.now_ms();
-        const wake_at = if (pass.more) now else @min(now + resync_ms, pass.wake_at_ms);
+        const wake_at = if (pass.more) now else now + resync_ms;
         return .{ .at_ms = wake_at, .prefixes = &watch_prefixes, .acted = pass.acted };
     }
 
@@ -513,12 +506,14 @@ pub const Scheduler = struct {
         if (view.alloc_revision == 0) return; // Unaccounted: the auditor's finding, not ours.
         if (subtract(view, assign.requests) == null) return;
         if (!pass.budget()) return;
-        // The replica controller's `stop_replica` (scale down) or `delete_replica` (a replacement)
-        // retired it, if its decision is still indexed; else only a pass found it gone, and the
-        // store does not say at which revision.
+        // The replica controller's `stop_replica` (scale down), `delete_replica` or
+        // `mark_replica_lost` (a replacement) retired it, if its decision is still indexed; else
+        // only a pass found it gone, and the store does not say at which revision.
         const stopped = try indexed_decision(ctx, assign.replica, "stop_replica", .last);
-        const retired = stopped orelse
+        const deleted = stopped orelse
             try indexed_decision(ctx, assign.replica, "delete_replica", .last);
+        const retired = deleted orelse
+            try indexed_decision(ctx, assign.replica, "mark_replica_lost", .last);
         const cause: records.Cause = if (retired) |*id| controller.cause_decision(id) else .{
             .kind = .resync,
         };
@@ -529,11 +524,11 @@ pub const Scheduler = struct {
             mib_of(assign.requests.memory_bytes),
             view.node.rec.name,
         });
-        try sc.commit_release(ctx, world, pass, index, cause, reason, false);
+        try sc.commit_release(ctx, world, pass, index, cause, reason);
     }
 
     /// Releases assignment `index`: its decision, the assignment deleted and the allocation
-    /// lowered, under the release compares (and a lost node's two more).
+    /// lowered, under the release compares.
     fn commit_release(
         sc: *Scheduler,
         ctx: *const Context,
@@ -542,7 +537,6 @@ pub const Scheduler = struct {
         index: u32,
         cause: records.Cause,
         reason: []const u8,
-        from_lost: bool,
     ) Error!void {
         const assign = world.assigns.items[index];
         const view = &world.nodes[assign.node];
@@ -552,7 +546,6 @@ pub const Scheduler = struct {
         var set: compare_sets.Set = .{};
         compare_sets.release(&set, name, assign.replica, assign.revision, view.alloc_revision);
         expect_all(&batch, &set);
-        if (from_lost) try expect_lost(ctx, &batch, view);
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
             .action = "release_replica",
@@ -564,72 +557,6 @@ pub const Scheduler = struct {
         try put_allocation(ctx, &batch, name, after, view.count - 1, view.alloc_node_revision);
         const revision = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
         forget_assign(world, index, after, revision);
-    }
-
-    // ---- Lost nodes ----
-
-    /// A replica on a node that is lost (and not registered again since), once the grace has
-    /// passed: moved to the best node that fits, else released so it waits like any unassigned
-    /// replica. Either decision is caused by the node's `mark_lost`.
-    fn evacuate_one(
-        sc: *Scheduler,
-        ctx: *const Context,
-        world: *World,
-        pass: *Pass,
-        index: u32,
-    ) Error!void {
-        const assign = world.assigns.items[index];
-        if (!assign.live or assign.node == no_node) return;
-        const replica_index = world.desired.get(assign.replica) orelse return;
-        const source = &world.nodes[assign.node];
-        const status = source.status orelse return;
-        if (status.state != .lost) return;
-        // Registered again: the node controller judges the new tenure first.
-        if (source.node.kv.mod_revision > status.tenure) return;
-        const due = status.at_ms +| sc.lost_grace_ms;
-        if (ctx.clock.now_ms() < due) {
-            pass.wake_at_ms = @min(pass.wake_at_ms, due);
-            return;
-        }
-        if (source.alloc_revision == 0) return; // Unaccounted: the auditor's finding.
-        if (subtract(source, assign.requests) == null) return;
-        const replica = &world.replicas[replica_index];
-        var verdicts: [views_max]Verdict = undefined;
-        const judged = verdicts[0..world.nodes.len];
-        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, assign.requests);
-        const cause: records.Cause = .{ .kind = .decision, .id = status.decision };
-        const from = source.node.rec.name;
-        if (!pass.budget()) return;
-        const chosen = choose(world, replica.rec.service, judged) orelse {
-            const fmt = "node {s} is lost and no node fits replica {s}; its {d}m CPU and " ++
-                "{d} MiB are released and it waits to be placed";
-            const reason = try controller.format(ctx, fmt, .{
-                from,
-                assign.replica,
-                assign.requests.cpu_millis,
-                mib_of(assign.requests.memory_bytes),
-            });
-            return sc.commit_release(ctx, world, pass, index, cause, reason, true);
-        };
-        const to = world.nodes[chosen.index].node.rec.name;
-        const fmt = "node {s} is lost; replica {s} moves to {s}, the best of {d} nodes that fit";
-        const args = .{ from, assign.replica, to, chosen.candidates };
-        const reason = try controller.format(ctx, fmt, args);
-        const moved = try sc.move_replica(ctx, world, .{
-            .replica = assign.replica,
-            .to = to,
-            .reason = reason,
-            .cause = cause,
-            .from_lost = true,
-        });
-        switch (moved) {
-            .moved => pass.acted += 1,
-            .conflict => {
-                pass.more = true;
-                pass.stopped = true;
-            },
-            .refused => unreachable, // Judged to fit, and the source accounted, just above.
-        }
     }
 
     // ---- Place and hold ----
@@ -783,7 +710,8 @@ pub const Scheduler = struct {
 
     /// Moves an assigned replica to `spec.to` in one transaction: releases it on the old node and
     /// places it on the new, under the eight compares of `compare_sets.move`. Nothing in C1 asks
-    /// for a move until slice 4 (a lost node); the transaction is built and tested here.
+    /// for a move (a lost node's replicas are replaced under new ids); the transaction is built
+    /// and tested here.
     pub fn move_replica(
         sc: *Scheduler,
         ctx: *const Context,
@@ -821,7 +749,6 @@ pub const Scheduler = struct {
         };
         compare_sets.move(&set, replica_read(replica), read, node_read(target));
         expect_all(&batch, &set);
-        if (spec.from_lost) try expect_lost(ctx, &batch, source);
         try sc.put_place_decision(ctx, &batch, replica, spec.reason, "place_replica", spec.cause);
         batch.delete(from.key);
         const name = target.node.rec.name;
@@ -870,27 +797,11 @@ pub const MoveSpec = struct {
     reason: []const u8,
     /// The decision's cause; null for the replica's creation.
     cause: ?records.Cause = null,
-    /// The source is a lost node: also compare its status and its absent `/nodes` record, so a
-    /// node that registers again or is judged again between plan and commit makes it a conflict.
-    from_lost: bool = false,
 };
 
-/// The two compares a move or release off a lost node adds: the status that judged it lost, and
-/// `/nodes/<node>` as read (absent, or the tenure the status judged).
-fn expect_lost(ctx: *const Context, batch: *Batch, source: *const NodeView) Error!void {
-    assert(source.status_revision > 0);
-    const status_key = records.node_status_key(source.node.rec.name);
-    batch.expect(try controller.key_copy(ctx, &status_key), source.status_revision);
-    batch.expect(source.node.kv.key, source.node.kv.mod_revision);
-}
-
-/// Compares a move off a lost node takes, and the operations: a decision, the old and new
-/// assignment, two allocation records.
-pub const lost_move_compares: u32 = compare_sets.placement_count + compare_sets.release_count + 2;
-
 comptime {
-    const compares = lost_move_compares + controller.decision_compares;
-    assert(compares <= constants.store_txn_compares_max);
+    const compares = compare_sets.placement_count + compare_sets.release_count;
+    assert(compares + controller.decision_compares <= constants.store_txn_compares_max);
     assert(controller.decision_ops + 4 <= constants.store_txn_ops_max);
 }
 
