@@ -98,6 +98,10 @@ const Shell = struct {
         const result = shell.agent.reconcile(&ctx);
         shell.save_pair(false);
         shell.notice_pair();
+        // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
+        // goes on to register again, which fails while the server cannot write.
+        const fenced = shell.agent.fences != fences;
+        if (fenced) shell.notice_fence(before);
         const wake = result catch {
             const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
             const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
@@ -107,7 +111,7 @@ const Shell = struct {
         const outcome: loop_mod.Outcome = .{ .ok = wake };
         const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
         if (report == .recovered) shell.recovered();
-        shell.notice_lease(before, fences);
+        if (!fenced) shell.notice_lease(before);
         return outcome;
     }
 
@@ -205,10 +209,9 @@ const Shell = struct {
         ) catch {};
     }
 
-    /// A lease that was replaced is ZC-W0501, and a first one is a line of news.
-    fn notice_lease(shell: *Shell, before: store.LeaseId, fences: u32) void {
+    /// A first lease is a line of news (a fence is `notice_fence`).
+    fn notice_lease(shell: *Shell, before: store.LeaseId) void {
         const now = shell.agent.lease;
-        if (shell.agent.fences != fences) return shell.notice_fence(before);
         const news = loop_mod.lease_news(before, now);
         if (news == .none) return;
         var buffer: [128]u8 = undefined;
