@@ -121,7 +121,8 @@ unsynced tail of an append in a simulated host crash.
 | --- | --- | --- |
 | agent stopped or killed | keep running | a new agent adopts them |
 | server down or restarted | keep running | the agent backs off, reports `ZC-E0503` once, carries on when it returns |
-| lease lost (the server was away longer than the ttl) | keep running (C0; C1 stops them) | grants a new lease, registers again, prints `ZC-W0501` |
+| the lease cannot be kept (the server is away, or the lease is gone) | stopped at `s + ttl − fence_margin` (the agent fences itself; `s` is the send time of the last acknowledged keepalive, on `CLOCK_BOOTTIME`), or at once if the server says the lease is gone | grants a new lease, registers again empty under a new tenure, prints `ZC-W0501` |
+| an observed write is refused (`ZC-E0510`: its tenure was replaced) | stopped at once | as above |
 | a command is killed | the supervisor records it | reported; the controller replaces the replica |
 | a supervisor is killed | the command is killed by the agent | reported `lost` with `ZC-E0509`; replaced |
 | the host restarts | none | everything is `lost`; replaced |
