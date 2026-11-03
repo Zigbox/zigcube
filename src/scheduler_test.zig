@@ -111,9 +111,11 @@ const Fixture = struct {
     /// Writes the node's `/node-store` summary: the fake trees of `digests`.
     fn summary(self: *Fixture, name: []const u8, digests: []const []const u8) !void {
         var fake: node_store.FakeImages = .{ .digests = digests };
-        const ctx = self.context();
-        const held = try fake.images().summary(ctx.arena, &.{});
-        const record = try node_store.record_of(ctx.arena, name, held);
+        // `put` resets the fixture's arena, so the record lives in a scratch one.
+        var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+        defer scratch.deinit();
+        const held = try fake.images().summary(scratch.allocator(), &.{});
+        const record = try node_store.record_of(scratch.allocator(), name, held);
         try self.put(.{ .agent = name }, records.node_store_key(name).slice(), record);
     }
 
