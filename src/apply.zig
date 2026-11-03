@@ -285,7 +285,9 @@ const source_digest_hex = 64;
 pub fn source_problem(reference: []const u8) ?[]const u8 {
     if (reference.len == 0) return null;
     if (reference.len > constants.source_bytes_max) {
-        return "the source must be at most 1024 bytes";
+        return std.fmt.comptimePrint("the source must be at most {d} bytes", .{
+            constants.source_bytes_max,
+        });
     }
     for (reference) |byte| {
         if (byte <= ' ' or byte == 0x7f) {
@@ -293,6 +295,9 @@ pub fn source_problem(reference: []const u8) ?[]const u8 {
         }
     }
     const tail = source_digest_prefix.len + source_digest_hex;
+    if (reference.len == tail and std.mem.startsWith(u8, reference, source_digest_prefix)) {
+        return "the source needs a repository before @sha256: (registry/name@sha256:<digest>)";
+    }
     if (reference.len <= tail) {
         return "the source must end in @sha256: and 64 lowercase hex digits (a tag can move)";
     }

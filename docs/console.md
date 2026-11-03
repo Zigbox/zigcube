@@ -76,14 +76,17 @@ node ready"), then two columns.
 
 ### Services and service detail
 
-The list adds "what is happening" (the same one-liner as Needs attention) and the generation.
+The list adds "what is happening" (the same one-liner as Needs attention), the generation and the
+`source` (C2 slice 2) shortened to `…@sha256:` and the first 12 digits of its digest, as the CLI
+shows it; `–` when a service has none. The service detail shows it in full.
 The detail screen leads with the replicas table, then the spec (environment values masked) and the
 decision history for the service and its replicas, each linking to "why at that point".
 
 ### Replicas
 
 A wide table inside its own scroll container: replica, service, node, image digest (shortened,
-full value in the tooltip and copyable from the record), status, exit reason, generation, and when
+full value in the tooltip and copyable from the record), the `source` (shortened as on the
+Services list; a service without one shows `–`), status, exit reason, generation, and when
 it was last reported. A diagnostic in the exit reason column is a link to that replica's Why.
 Filter by text and by running or not running.
 

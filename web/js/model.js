@@ -234,7 +234,7 @@ export class Model {
         if (state === "lost" && !registered) reason = `node ${node} is gone`;
         else if (obs?.status === "stopped") reason = exitText(obs.exit);
         else if (state === "unscheduled") reason = "no node assigned yet";
-        out.push({ id: r.id, service: r.service, node, image: r.image, generation: r.generation, limits: r.limits || {}, state, reason, obs, diagnostic: obs?.diagnostic || null, reportedAt: obs?.reported_at_ms || 0, spec: r });
+        out.push({ id: r.id, service: r.service, node, image: r.image, source: r.source || "", generation: r.generation, limits: r.limits || {}, state, reason, obs, diagnostic: obs?.diagnostic || null, reportedAt: obs?.reported_at_ms || 0, spec: r });
       }
       return out.sort((a, b) => (a.service < b.service ? -1 : a.service > b.service ? 1 : numOf(a.id) - numOf(b.id)));
     });

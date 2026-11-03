@@ -905,13 +905,14 @@ const c1_store = @embedFile("testdata/c1_store.txt");
 test "records a C1 build wrote still read" {
     // Goal: a stored value is read by the next release. Method: read every record of a store a C1
     // build produced (services with env and limits, a replaced replica, a held one) as the type
-    // its key says; they are all version 2 and have no `source`.
+    // its key says; services and replicas are version 2 with no `source`, observed and decisions
+    // are version 2 too.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    var seen: [2]u32 = @splat(0);
+    var seen: [5]u32 = @splat(0);
     var lines = std.mem.splitScalar(u8, c1_store, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -927,6 +928,17 @@ test "records a C1 build wrote still read" {
             try testing.expectEqual(@as(u32, 2), record.v);
             try testing.expectEqualStrings("", record.source);
             seen[1] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
+            const record = try read(Observed, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 2), record.v);
+            seen[2] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_decisions)) {
+            const record = try read(Decision, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 2), record.v);
+            seen[3] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_nodes)) {
+            _ = try read(Node, arena, kv, &diag);
+            seen[4] += 1;
         }
     }
     for (seen) |count| try testing.expect(count > 0);
