@@ -154,15 +154,56 @@ stage_restart() {
     ok "agent restart adopted '$before' with no duplicates ($supervisors supervisors)"
 }
 
+# The exit kinds the controller acted on for a service's replicas, from `/decisions/`: the
+# durable witness. The replica controller deletes an ended replica's observed record at once and
+# replaces it, so `stopped oom` is observed for an instant that a poll can miss, but the decision
+# that replaces it keeps what justified it in `cause_evidence` (docs/keys.md).
+decided_exits() {
+    api_get "/v1/list?prefix=/decisions/" | python3 -c '
+import json, sys
+for kv in json.load(sys.stdin)["kvs"]:
+    v = kv["value"]
+    key = (v.get("cause") or {}).get("key", "")
+    if "/observed/" + sys.argv[1] + "/" + sys.argv[2] + "-" in key:
+        print(v.get("action"), key, ((v.get("cause_evidence") or {}).get("exit") or {}).get("kind", "-"))
+' "$NODE" "$1"
+}
+
+# True once the hog was seen to end as oom, observed or decided.
+hog_oom() { has_exit hog oom || decided_exits hog | grep -q ' oom$'; }
+
+# What the oom stage shows when the hog is not seen to end as oom, in one place of the log: the
+# runtime's own records (Zigbox keeps at most 32 and prunes the oldest), what the agent observed,
+# and what the controller decided.
+oom_diagnostics() {
+    echo "--- oom stage diagnostics"
+    runs="${XDG_STATE_HOME:-$HOME/.local/state}/zbx/runs"
+    echo "zbx run records: $(ls "$runs" 2>/dev/null | wc -l) in $runs"
+    "$BIN/zbx" ps --all --output json 2>&1 | head -c 6000
+    echo "observed hog: $(observed hog | tr '\n' ';')"
+    echo "observed box: $(observed box | tr '\n' ';')"
+    echo "decided hog: $(decided_exits hog | sort | uniq -c | tr '\n' ';')"
+    echo "hog containers now: $(pgrep -fc 'tail /dev/zero')"
+    for f in "$runs"/hog-*.zon; do
+        [ -e "$f" ] && { echo "--- $f"; tail -n 40 "$f"; }
+    done
+    dmesg 2>/dev/null | grep -i -E 'out of memory|killed process' | tail -n 6
+}
+
 stage_oom() {
-    # busybox tail keeps a line with no newline in memory: /dev/zero fills the 32 MiB limit.
-    # The sleep paces the restarts: Zigbox keeps at most 32 run records and deletes the oldest,
-    # live containers' included, so a hog restarted every 300 ms pruned box's records and left
-    # box listed as `starting` (a gap reported to the owner; Zigcube has no restart backoff yet).
-    apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' \
-        '["sh","-c","sleep 4; exec tail /dev/zero"]')"
-    until_ok 120 "hog to end as oom" has_exit hog oom
-    ok "a container past its memory limit ends as oom"
+    # busybox tail keeps a line with no newline in memory: /dev/zero fills the 32 MiB limit. It
+    # is the container's PID 1 itself (no `sh -c`), so it is what the OOM killer picks.
+    apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' '["tail","/dev/zero"]')"
+    n=0
+    until hog_oom; do
+        n=$((n + 1))
+        if [ "$n" -gt 240 ]; then
+            oom_diagnostics
+            fail "timed out after 120s waiting for hog to end as oom"
+        fi
+        sleep 0.5
+    done
+    ok "a container past its memory limit ends as oom ($(observed hog | tr '\n' ';') $(decided_exits hog | head -n 1))"
     two_boxes || fail "box was disturbed by the oom stage: $(observed box | tr '\n' ';')"
     curl -sf -X DELETE "$API/v1/services/hog" >/dev/null || fail "delete hog"
 }
