@@ -48,6 +48,7 @@ pub const Code = enum(u8) {
     E0121,
     E0122,
     E0123,
+    E0124,
     E0201,
     E0202,
     E0203,
@@ -325,6 +326,12 @@ pub const registry = [_]Entry{
         \\
         \\Name a directory you can write, for example
         \\export XDG_STATE_HOME=$HOME/.local/state
+        \\
+        \\zcube local keeps its database, logs and containers in a directory of its
+        \\own, $ZCUBE_LOCAL_DIR if that is set, else the local directory under the
+        \\state directory above. The same applies: it must be absolute, and zcube
+        \\must be able to create and write it. If ZCUBE_LOCAL_DIR is set, change or
+        \\unset that one instead; XDG_STATE_HOME does not affect it.
         ,
     },
     .{
@@ -420,7 +427,7 @@ pub const registry = [_]Entry{
         .code = .E0123,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "the local server did not come up",
+        .summary = "the local server or agent did not come up",
         .explanation =
         \\zcube local up started zcube-server and zcube-agent, but the server did
         \\not answer, or the node did not register, within the time zcube waits.
@@ -430,6 +437,21 @@ pub const registry = [_]Entry{
         \\
         \\Read server.log and agent.log there. Your data is kept: zcube local up
         \\tries again with the same files.
+        ,
+    },
+    .{
+        .code = .E0124,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "another zcube local command is running",
+        .explanation =
+        \\zcube local up and zcube local down take turns: each holds a lock on the
+        \\file lock in the local directory while it starts or stops the server and
+        \\the agent, so two of them never fight over the same processes. Another one
+        \\held the lock for longer than this one was willing to wait.
+        \\
+        \\Wait for the other command to finish and run this one again. The lock is
+        \\released when its holder ends, however it ends, so it is never stale.
         ,
     },
     .{

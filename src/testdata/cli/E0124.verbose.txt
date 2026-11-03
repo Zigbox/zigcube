@@ -1,0 +1,7 @@
+error[ZC-E0124]: another zcube local command is running
+  while  waiting for another zcube local command to finish
+  cause  <state>/local/lock was
+         still locked after 0 s
+  fix    wait for the other zcube local command, then run this again
+  more   zcube explain E0124
+  docs   https://zigbox.github.io/zigcube/errors/E0124.html

@@ -318,6 +318,14 @@ pub const local_memory_bytes: u64 = 8 * 1024 * 1024 * 1024;
 /// A pid file, a command line from /proc and an address file are each read into a buffer of
 /// this size; longer content is not ours.
 pub const local_file_bytes_max: u32 = state_path_bytes_max + 256;
+/// A server or agent command line holds the local directory at most twice (the agent's
+/// `--state-dir` and `--images`), plus the fixed arguments.
+pub const local_cmdline_bytes_max: u32 = 2 * state_path_bytes_max + 512;
+/// How long `local up` and `local down` wait for another of them to finish: more than an `up`
+/// that waits for both processes and a `down` that stops both.
+/// Descriptors above stderr are marked close-on-exec up to this number before a start.
+pub const local_fd_scan_max: i32 = 4096;
+pub const local_lock_wait_ms: u32 = 60 * 1000;
 
 /// A bundle (DIAGNOSTICS.md, "Bundles"): files are staged in one fixed workspace, cut at
 /// `bundle_file_bytes_max`, and written through the tar and gzip writers into a second buffer.

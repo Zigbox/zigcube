@@ -47,6 +47,8 @@ pub const Env = struct {
     /// Where `zcube local` looks for zcube-server and zcube-agent; null means beside the running
     /// executable. Only the tests set it.
     bin_dir: ?[]const u8 = null,
+    /// How long `zcube local` waits for another `zcube local` to finish; the tests shorten it.
+    local_lock_wait_ms: u32 = constants.local_lock_wait_ms,
 
     pub fn getenv(env: *const Env, name: []const u8) ?[]const u8 {
         assert(name.len > 0);
