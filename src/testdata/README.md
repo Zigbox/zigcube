@@ -8,3 +8,10 @@ real processes, with `hello` at 3 replicas, every replica process killed with `k
 replaced, and `ghost` applied with a digest the node does not have (so an observed record carries a
 diagnostic). The `store_live` table was dumped with Python's `sqlite3`, one `key<TAB>value` per line,
 unedited. Do not regenerate it from a newer build: it is the proof that C0's records still read.
+
+`c1_store.txt` is the same kind of capture from a C1 build (commit `8ff338e`, before C2 slice 2
+added `source`; `Service` and `Replica` are version 2 in it): `zcube-server` on SQLite and
+`zcube-agent` with `FakeRuntime`, as real processes, with `hello` at 3 replicas with `env` and
+`limits`, one replica killed with `kill -9` and replaced (`hello-1` by `hello-4`), and `ghost`
+applied with an unknown digest. `store_live` was dumped with Python's `sqlite3`, one
+`key<TAB>value` per line, unedited. Never regenerate it: it is the proof that version 2 still reads.

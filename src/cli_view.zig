@@ -64,6 +64,7 @@ pub fn services_text(
     const wide = output == .wide;
     if (rows.len == 0) return "no services\n";
     var cells: std.ArrayList([]const []const u8) = .empty;
+    const with_source = wide and any_source(cli_get.ServiceRow, rows);
     for (rows) |row| {
         const ready = std.fmt.allocPrint(
             arena,
@@ -79,10 +80,13 @@ pub fn services_text(
             &.{ row.name, ready, row.image, generation, row.applied_by, cut(row.command, 40) }
         else
             &.{ row.name, ready, row.image };
-        const copy = arena.dupe([]const u8, line) catch return error.OutOfMemory;
+        const copy = with_source_cell(arena, line, with_source, row.source) catch
+            return error.OutOfMemory;
         cells.append(arena, copy) catch return error.OutOfMemory;
     }
-    const header: []const []const u8 = if (wide)
+    const header: []const []const u8 = if (with_source)
+        &.{ "NAME", "READY", "IMAGE", "GEN", "APPLIED-BY", "COMMAND", "SOURCE" }
+    else if (wide)
         &.{ "NAME", "READY", "IMAGE", "GEN", "APPLIED-BY", "COMMAND" }
     else
         &.{ "NAME", "READY", "IMAGE" };
@@ -102,6 +106,7 @@ pub fn replicas_text(
     const wide = output == .wide;
     if (rows.len == 0) return "no replicas\n";
     var cells: std.ArrayList([]const []const u8) = .empty;
+    const with_source = wide and any_source(cli_get.ReplicaRow, rows);
     for (rows) |row| {
         const age = age_text(arena, row.started_at_ms, now_ms) catch return error.OutOfMemory;
         const generation = std.fmt.allocPrint(
@@ -119,10 +124,16 @@ pub fn replicas_text(
             }
         else
             &.{ row.id, row.service, node, row.status, age };
-        const copy = arena.dupe([]const u8, line) catch return error.OutOfMemory;
+        const copy = with_source_cell(arena, line, with_source, row.source) catch
+            return error.OutOfMemory;
         cells.append(arena, copy) catch return error.OutOfMemory;
     }
-    const header: []const []const u8 = if (wide)
+    const header: []const []const u8 = if (with_source)
+        &.{
+            "REPLICA", "SERVICE", "NODE", "STATUS", "AGE", "GEN", "CPU", "MEMORY", "IMAGE",
+            "DETAIL",  "SOURCE",
+        }
+    else if (wide)
         &.{
             "REPLICA", "SERVICE", "NODE", "STATUS", "AGE", "GEN", "CPU", "MEMORY", "IMAGE",
             "DETAIL",
@@ -230,6 +241,41 @@ fn node_cells(
         row.name, status,  tenure,  lease,    capacity, allocated,
         heard,    address, version, replicas, lease_id,
     }) catch oom;
+}
+
+/// Whether any row has a `source`: only then does `-o wide` show the column, so a listing of
+/// services without one prints as it did before.
+fn any_source(comptime Row: type, rows: []const Row) bool {
+    for (rows) |row| {
+        if (row.source.len > 0) return true;
+    }
+    return false;
+}
+
+/// `line` as a copy in `arena`, with the shortened `source` appended when the table has the column.
+fn with_source_cell(
+    arena: Allocator,
+    line: []const []const u8,
+    with_source: bool,
+    source: []const u8,
+) Allocator.Error![]const []const u8 {
+    const extra: usize = if (with_source) 1 else 0;
+    const copy = try arena.alloc([]const u8, line.len + extra);
+    @memcpy(copy[0..line.len], line);
+    if (with_source) copy[line.len] = try source_cell(arena, source);
+    return copy;
+}
+
+/// "-" for none; a reference that is short enough as it is; else the end that matters, the digest:
+/// "…@sha256:" and its first 12 hex digits (a reference apply took always ends in one).
+fn source_cell(arena: Allocator, source: []const u8) Allocator.Error![]const u8 {
+    if (source.len == 0) return "-";
+    if (source.len <= 60) return source;
+    const marker = std.mem.lastIndexOf(u8, source, "@sha256:") orelse {
+        return std.fmt.allocPrint(arena, "{s}…", .{source[0..59]});
+    };
+    const digest = source[marker + "@sha256:".len ..];
+    return std.fmt.allocPrint(arena, "…@sha256:{s}", .{digest[0..@min(digest.len, 12)]});
 }
 
 fn cut(text: []const u8, length: usize) []const u8 {
@@ -560,4 +606,36 @@ test "nodes print with status, lease, capacity and last contact" {
     const json = try nodes_text(arena, rows[1..2], .json);
     try testing.expect(std.mem.indexOf(u8, json, "\"lease\":null") != null);
     try testing.expect(std.mem.startsWith(u8, json, "{\"kind\":\"nodes\""));
+}
+
+test "get shows source only where there is one" {
+    // Goal: a service without `source` prints exactly as before (text, wide and json), and one
+    // with it gains a SOURCE column in wide and a member in json. Method: the same rows with and
+    // without a reference.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const plain: cli_get.ServiceRow = .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .desired = 1,
+        .running = 1,
+        .generation = 1,
+        .applied_by = "me",
+        .command = "run",
+    };
+    var pinned = plain;
+    pinned.source = "ghcr.io/o/r@sha256:00";
+    const without = try services_text(arena, &.{plain}, .wide);
+    try testing.expect(std.mem.indexOf(u8, without, "SOURCE") == null);
+    const json_without = try services_text(arena, &.{plain}, .json);
+    try testing.expect(std.mem.indexOf(u8, json_without, "source") == null);
+    const with = try services_text(arena, &.{pinned}, .wide);
+    try testing.expect(std.mem.indexOf(u8, with, "SOURCE") != null);
+    try testing.expect(std.mem.indexOf(u8, with, "ghcr.io/o/r@sha256:00") != null);
+    const json_with = try services_text(arena, &.{pinned}, .json);
+    const member = "\"source\":\"ghcr.io/o/r@sha256:00\"";
+    try testing.expect(std.mem.indexOf(u8, json_with, member) != null);
+    const text = try services_text(arena, &.{pinned}, .text);
+    try testing.expect(std.mem.indexOf(u8, text, "SOURCE") == null);
 }

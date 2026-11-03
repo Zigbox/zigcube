@@ -120,6 +120,13 @@ export function mem(b) {
   const mib = b / 1048576;
   return mib >= 1024 ? `${+(mib / 1024).toFixed(1)} GiB` : `${Math.round(mib)} MiB`;
 }
+/** A `source` reference as a table cell shows it: the digest it ends in, shortened; "–" for none. */
+export function sourceShort(s) {
+  if (!s) return "–";
+  if (s.length <= 60) return s;
+  const at = s.lastIndexOf("@sha256:");
+  return at < 0 ? `${s.slice(0, 59)}…` : `…@sha256:${s.slice(at + 8, at + 20)}`;
+}
 export function digest(d) { return d && d.length > 14 ? `${d.slice(0, 7)}…${d.slice(-2)}` : d || "–"; }
 export function plural(n, one, many = one + "s") { return `${n} ${n === 1 ? one : many}`; }
 

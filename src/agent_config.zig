@@ -45,7 +45,8 @@ pub const usage =
     \\  --memory-bytes N   the memory this node offers, in bytes
     \\  --runtime NAME     fake (the default) or zigbox, real containers (docs/agent.md)
     \\  --images FILE      fake: the image digests it has (default fixtures/images.zon);
-    \\                     zigbox: each digest with the reference to pull it from
+    \\                     zigbox (deprecated): each digest with the reference to pull it
+    \\                     from, for a service that names no `source`
     \\  --address TEXT     recorded with the node for people to read
     \\  --verbose          show the internal message of a bug
     \\

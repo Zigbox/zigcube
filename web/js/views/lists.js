@@ -1,6 +1,6 @@
 // The table screens: services, replicas, nodes, decisions. Filters live in module state so they
 // survive a live update and a trip to another screen.
-import { h, keyed, setText, setAttr, pill, setPill, whyHref, digest, plural, emptyState, timeEl, clockTime, cpu, mem, rebuild } from "../ui.js";
+import { h, keyed, setText, setAttr, pill, setPill, whyHref, digest, sourceShort, plural, emptyState, timeEl, clockTime, cpu, mem, rebuild } from "../ui.js";
 import { pageHead, makeReplicaBar, cpuMeter, memMeter, makeMeter, makeDecisionItem } from "./parts.js";
 
 const filters = { service: "", replica: "", replicaState: "all", decision: "", actor: "all" };
@@ -23,15 +23,17 @@ export function makeReplicaRow({ showService = true } = {}) {
   const status = pill("pending");
   const reason = h("span", {});
   const reasonLink = h("a", { class: "diag-ref" });
+  const src = h("code", { class: "dim" });
   const gen = h("span", { class: "num" });
   const at = h("td", { class: "num" });
-  const tr = h("tr", {}, h("td", {}, id), showService && h("td", {}, svc), h("td", {}, node), h("td", { class: "hide-s" }, image), h("td", {}, status), h("td", { class: "reason" }, reason, reasonLink), h("td", { class: "num hide-s" }, gen), at);
+  const tr = h("tr", {}, h("td", {}, id), showService && h("td", {}, svc), h("td", {}, node), h("td", { class: "hide-s" }, image), h("td", { class: "hide-s" }, src), h("td", {}, status), h("td", { class: "reason" }, reason, reasonLink), h("td", { class: "num hide-s" }, gen), at);
   let ts = -1;
   return { el: tr, update(r) {
     setText(id, r.id, { flash: false }); setAttr(id, "href", whyHref("replica", r.id)); setAttr(id, "aria-label", `Why replica ${r.id}`);
     setText(svc, r.service, { flash: false }); setAttr(svc, "href", `#/services/${r.service}`);
     setText(node, r.node || "–", { flash: false }); setAttr(node, "href", r.node ? `#/nodes/${r.node}` : null);
     setText(image, digest(r.image), { flash: false }); setAttr(image, "title", r.image);
+    setText(src, sourceShort(r.source), { flash: false }); setAttr(src, "title", r.source || null);
     setPill(status, r.state);
     setText(reason, r.diagnostic ? "" : r.reason);
     setText(reasonLink, r.diagnostic ? `${r.diagnostic.code} ${r.diagnostic.summary}` : "", { flash: true });
@@ -43,7 +45,7 @@ export function makeReplicaRow({ showService = true } = {}) {
 
 export function replicaTable(body, { showService = true } = {}) {
   return h("div", { class: "table-wrap", tabindex: "0", role: "region", "aria-label": "Replicas table, scrolls sideways on narrow screens" }, h("table", { class: "grid wide" },
-    h("thead", {}, h("tr", {}, h("th", {}, "Replica"), showService && h("th", {}, "Service"), h("th", {}, "Node"), h("th", { class: "hide-s" }, "Image digest"), h("th", {}, "Status"), h("th", {}, "Exit reason"), h("th", { class: "hide-s" }, "Gen"), h("th", {}, "Reported"))), body));
+    h("thead", {}, h("tr", {}, h("th", {}, "Replica"), showService && h("th", {}, "Service"), h("th", {}, "Node"), h("th", { class: "hide-s" }, "Image digest"), h("th", { class: "hide-s" }, "Source"), h("th", {}, "Status"), h("th", {}, "Exit reason"), h("th", { class: "hide-s" }, "Gen"), h("th", {}, "Reported"))), body));
 }
 
 // ---- Services --------------------------------------------------------------------------------
@@ -57,14 +59,14 @@ export function services({ model }) {
     pageHead("Services", null),
     h("div", { class: "toolbar" }, filter, count),
     h("section", { class: "card flush" }, h("div", { class: "table-wrap", tabindex: "0", role: "region", "aria-label": "Services table" }, h("table", { class: "grid wide" },
-      h("thead", {}, h("tr", {}, h("th", {}, "Service"), h("th", {}, "Health"), h("th", {}, "Running"), h("th", {}, "What is happening"), h("th", { class: "hide-s" }, "Image"), h("th", { class: "hide-s" }, "Gen"), h("th", {}, h("span", { class: "sr-only" }, "Explain")))),
+      h("thead", {}, h("tr", {}, h("th", {}, "Service"), h("th", {}, "Health"), h("th", {}, "Running"), h("th", {}, "What is happening"), h("th", { class: "hide-s" }, "Image"), h("th", { class: "hide-s" }, "Source"), h("th", { class: "hide-s" }, "Gen"), h("th", {}, h("span", { class: "sr-only" }, "Explain")))),
       body)), empty));
   function row() {
     const name = h("a", { class: "name" }); const st = pill("idle"); const bar = makeReplicaBar();
-    const why = h("td", { class: "reason" }); const image = h("code", { class: "dim" }); const gen = h("td", { class: "num hide-s" }); const w = h("a", { class: "why-link" }, "why");
-    return { el: h("tr", {}, h("td", {}, name), h("td", {}, st), h("td", {}, bar.el), why, h("td", { class: "hide-s" }, image), gen, h("td", { class: "end" }, w)), update(s) {
+    const why = h("td", { class: "reason" }); const image = h("code", { class: "dim" }); const src = h("code", { class: "dim" }); const gen = h("td", { class: "num hide-s" }); const w = h("a", { class: "why-link" }, "why");
+    return { el: h("tr", {}, h("td", {}, name), h("td", {}, st), h("td", {}, bar.el), why, h("td", { class: "hide-s" }, image), h("td", { class: "hide-s" }, src), gen, h("td", { class: "end" }, w)), update(s) {
       setText(name, s.name, { flash: false }); setAttr(name, "href", `#/services/${s.name}`); setPill(st, s.health); bar.update(s.counts, s.desired);
-      setText(why, s.why); setText(image, digest(s.spec.image), { flash: false }); setAttr(image, "title", s.spec.image); setText(gen, s.spec.generation, { flash: false });
+      setText(why, s.why); setText(image, digest(s.spec.image), { flash: false }); setAttr(image, "title", s.spec.image); setText(src, sourceShort(s.spec.source), { flash: false }); setAttr(src, "title", s.spec.source || null); setText(gen, s.spec.generation, { flash: false });
       setAttr(w, "href", whyHref("service", s.name)); setAttr(w, "aria-label", `Why service ${s.name}`);
     } };
   }

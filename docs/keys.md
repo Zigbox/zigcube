@@ -42,9 +42,10 @@ number of counters bounds nothing.
 ## Versions
 
 Every value has `"v"`. A reader accepts every version up to the one its release writes and
-ignores members it does not know. `Observed` and `Decision` write `"v": 2` (they gained members
-in C1); every other record writes `"v": 1`. Records C0 wrote (`"v": 1`) still read: the fixtures
-in `src/testdata/c0_store.txt` were captured from a real C0 store. A value with a **newer**
+ignores members it does not know. `Service` and `Replica` write `"v": 3` (C2 slice 2 added
+`source`); `Observed` and `Decision` write `"v": 2` (they gained members in C1); every other record
+writes `"v": 1`. Records C0 and C1 wrote still read: the fixtures in `src/testdata/c0_store.txt`
+and `c1_store.txt` were captured from real stores. A value with a **newer**
 version than the reader knows is refused with one line naming the key and both versions,
 `ZC-E0303`, never as a malformed record.
 
@@ -55,7 +56,8 @@ rule at 63 bytes.
 ## `/services/<name>`: desired service
 
 ```json
-{ "v": 1, "name": "hello", "image": "b3:51aa9c03", "replicas": 3,
+{ "v": 3, "name": "hello", "image": "b3:51aa9c03", "replicas": 3,
+  "source": "registry.example/hello@sha256:<64 hex digits>",
   "command": ["sh", "-c", "while true; do sleep 1; done"],
   "env": [["KEY", "value"]], "limits": {"cpu_millis": 500, "memory_bytes": 134217728},
   "generation": 4, "next_replica": 17,
@@ -63,7 +65,8 @@ rule at 63 bytes.
 ```
 
 Written by the API on `apply`. `generation` increases on every change of what a replica runs,
-so a decision can say which version it acted on: the image, the command, `env` and `limits`.
+so a decision can say which version it acted on: the image, `source`, the command, `env` and
+`limits`.
 **A change of `replicas` alone does not bump it** (owner, 2026-10-26): scaling from 3 to 5 must
 not replace the three that run. The replica controller replaces replicas whose `generation` is
 behind, and only a change of the replica's own inputs puts one behind. `next_replica` is the
@@ -83,8 +86,15 @@ when the counter exists.
 
 `applied_by` (the authenticated actor) and `request_id` (the API request that wrote this
 version, the same id as in `--verbose` output and bundles) say who changed the service last
-and let `zcube why` end its chain at a person and a request. A later `source` (git commit, file
+and let `zcube why` end its chain at a person and a request. A later `provenance` (git commit, file
 digest) is reserved and not written yet.
+
+`source` (C2 slice 2) is the OCI reference `image` is pulled from, when the node does not have the
+tree: empty (and omitted by older records, which read as empty) means the tree must already be on
+the node. `apply` accepts it empty, or at most 1024 bytes with no whitespace or control character,
+ending in `@sha256:` and 64 lowercase hex digits (a digest pin: a tag can move). A change of
+`source` bumps `generation`, so that fixing a bad reference reaches a replica held for it. It is
+not a secret. The reference is the same name Zigbox's `pull` takes; the supervisor parses it.
 
 **`env` values are secrets.** They are stored here, but the API never sends them to a
 read-only token: it sends the names only (`"env": [["KEY", null]]` in the API's JSON, a null
@@ -99,12 +109,13 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 the new one. The id is also the container name and the `zcube.replica` label.
 
 ```json
-{ "v": 2, "id": "hello-9", "service": "hello", "generation": 4,
-  "image": "b3:51aa9c03", "command": ["sh", "-c", "..."], "env": [], "limits": {} }
+{ "v": 3, "id": "hello-9", "service": "hello", "generation": 4,
+  "image": "b3:51aa9c03", "source": "", "command": ["sh", "-c", "..."], "env": [], "limits": {} }
 ```
 
 Version 2 (C1 slice 3) has no `node` and no `requests`; a version 1 record still reads, with
-both ignored. The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
+both ignored. Version 3 (C2 slice 2) adds `source`, copied from the service (empty when
+absent). The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
 for the replicas in `/assigned/<node>/` only; an assignment whose replica is gone is not served.
 
 The replica copies what it needs from the service at creation, so editing the service does not

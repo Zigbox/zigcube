@@ -41,7 +41,7 @@ export function serviceDetail({ model }, params) {
     setText(summary, s.why);
     const sp = s.spec;
     rebuild(spec, JSON.stringify([sp, s.mod]), () => dl([
-      ["Image", h("code", {}, sp.image)], ["Replicas wanted", String(sp.replicas)], ["Generation", String(sp.generation)],
+      ["Image", h("code", {}, sp.image)], sp.source && ["Source", h("code", {}, sp.source)], ["Replicas wanted", String(sp.replicas)], ["Generation", String(sp.generation)],
       ["Command", h("code", {}, sp.command.join(" "))],
       ["Environment", sp.env.length ? h("code", {}, sp.env.map(([k]) => `${k}=•••`).join("  ")) : "none"],
       ["Limits", `${cpu(sp.limits.cpu_millis)} CPU · ${mem(sp.limits.memory_bytes)} memory`],
