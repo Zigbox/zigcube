@@ -194,7 +194,7 @@ pub const Peer = struct {
     }
 
     /// Writes `ca.pub` and then `peer.cred`: the credential's presence means the pair is whole.
-    fn store(self: *Peer, diag: *Diag) Error!void {
+    pub fn store(self: *Peer, diag: *Diag) Error!void {
         var ca_text: [65]u8 = undefined;
         const ca_line = std.fmt.bufPrint(&ca_text, "{x}\n", .{&self.ca_public.?}) catch
             unreachable; // Sized.
@@ -248,6 +248,36 @@ pub const Peer = struct {
         self.renew_at_ms = renew_time(&credential);
     }
 };
+
+/// The identity the agent has stored in `state_dir` (`peer.key`, `peer.cred`, `ca.pub`), read
+/// without making or changing anything: null if the agent has not joined yet (or its files do not
+/// fit one another). The peer server and the fetch worker call this per use, so a renewed
+/// credential is picked up. A file that cannot be used is ZC-E0806.
+pub fn load_identity(
+    io: std.Io,
+    state_dir: []const u8,
+    node: []const u8,
+    diag: *Diag,
+) Error!?peer.Identity {
+    assert(diag.code == null);
+    const dir = std.Io.Dir.cwd().openDir(io, state_dir, .{}) catch return null;
+    defer dir.close(io);
+    var seed = (try files.read_seed(io, dir, state_dir, key_file, diag)) orelse return null;
+    defer std.crypto.secureZero(u8, &seed);
+    var loaded: Peer = .{
+        .io = io,
+        .dir = dir,
+        .where = state_dir,
+        .node = node,
+        .key = Ed25519.KeyPair.generateDeterministic(seed) catch
+            return files.unusable(diag, state_dir, key_file, "use", "it is not a usable key seed"),
+    };
+    defer std.crypto.secureZero(u8, &loaded.key.secret_key.bytes);
+    try loaded.load_stored(diag);
+    const credential = loaded.credential orelse return null;
+    const ca_public = loaded.ca_public orelse return null;
+    return .{ .key = loaded.key, .credential = credential, .ca_public = ca_public };
+}
 
 /// ZC-E0801 for the agent's own credential: the server's CA is not the one that signed it. Said
 /// once per change; the agent joins again by itself.

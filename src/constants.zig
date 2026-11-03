@@ -471,6 +471,16 @@ pub const peer_handshake_window_ms: u64 = 10 * 1000;
 /// Sources the limiter tracks at once. A table full of live windows refuses a new source: the
 /// cheapest answer to an address flood, and an agent retries.
 pub const peer_sources_max: u32 = 256;
+/// Peer connections the server serves at once; one more is closed at once.
+pub const peer_connections_max: u32 = 4;
+/// Time a peer has to finish the handshake.
+pub const peer_handshake_ms: u32 = 3 * 1000;
+/// Time a served connection waits for its next request before it closes.
+pub const peer_idle_ms: u32 = 2 * 1000;
+/// Time to send one reply.
+pub const peer_reply_ms: u32 = 5 * 1000;
+/// Requests one connection serves before the client opens another.
+pub const peer_connection_requests_max: u32 = 64;
 
 comptime {
     assert(peer_handshakes_per_source_max > 0);
