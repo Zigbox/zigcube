@@ -1143,8 +1143,9 @@ test "why treats a compacted key that never changed as complete" {
 test "why never shows the current value as the reason for a compacted record" {
     // Goal: a cited revision below the compaction point ends the chain `compacted`, unless the
     // decision copied what it used; the key's value now is never offered as the justification.
-    // Method: compact to the head; the replica controller writes no evidence, so hello-1 is
-    // truncated; a hand-written decision with evidence is complete and says the evidence.
+    // Method: compact to the head; hello-1 ends at the apply, which embeds the service it acted
+    // on, so it is complete and says that service, not the scaled one; a hand-written decision
+    // with no evidence is truncated; one with evidence is complete and says the evidence.
     const world = try new_world(9);
     defer world.destroy();
     _ = try world.apply(hello);
@@ -1159,18 +1160,29 @@ test "why never shows the current value as the reason for a compacted record" {
     var ctx = world.controller_context();
     const result = try why(&ctx, .{ .kind = .replica, .name = "hello-1" }, null);
     const last = result.steps[result.steps.len - 1];
-    try testing.expectEqual(StepType.gone, last.type);
-    try testing.expectEqual(Reason.compacted, last.reason.?);
-    try testing.expectEqualStrings("/services/hello", last.key.?);
-    try testing.expectEqual(.truncated, result.completeness.verdict);
-    try testing.expectEqualStrings("/services/hello", result.completeness.at.?);
-    try expect_contains(last.text, "as it was at revision");
+    try testing.expectEqual(StepType.desired, last.type);
+    try testing.expectEqual(.complete, result.completeness.verdict);
+    try expect_contains(last.text, "/services/hello at revision");
+    try expect_contains(last.text, "\"replicas\":3");
     for (result.steps) |step| {
         try testing.expect(std.mem.indexOf(u8, step.text, "was applied by") == null);
     }
 
     var source: controller.DecisionSource = .{ .instance = 9 };
     var batch: controller.Batch = .{};
+    _ = try controller.put_decision(&ctx, &source, .{
+        .actor = "scheduler",
+        .action = "hold_pending",
+        .subject = .{ .kind = .replica, .name = "hello-8" },
+        .reason = "no node fits",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 1 },
+    }, &batch);
+    _ = try controller.commit(&ctx, .scheduler, &batch);
+    ctx = world.controller_context();
+    const bare = try why(&ctx, .{ .kind = .replica, .name = "hello-8" }, null);
+    try testing.expectEqual(.truncated, bare.completeness.verdict);
+    try testing.expectEqual(Reason.compacted, bare.completeness.reason.?);
+    batch = .{};
     _ = try controller.put_decision(&ctx, &source, .{
         .actor = "scheduler",
         .action = "hold_pending",
