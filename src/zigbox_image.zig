@@ -66,8 +66,52 @@ pub fn start_with_image(
 
 fn foreign_failure(collector: *const zigbox.diag.Diag) Outcome {
     var out: Diagnostic = undefined;
+    // Limits with no user systemd bus: the node's problem, in the words of the agent's operator.
+    if (collector.code == .E0307) return .{ .failed = no_bus() };
     zigbox.diagnostic.from_diag(&out, collector);
     return .{ .failed = out };
+}
+
+/// The number after `Threads:` in the text of `/proc/self/status`.
+pub fn threads_in(status: []const u8) ?u32 {
+    const key = "Threads:";
+    var lines = std.mem.splitScalar(u8, status, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const text = std.mem.trim(u8, line[key.len..], " \t");
+        return std.fmt.parseInt(u32, text, 10) catch null;
+    }
+    return null;
+}
+
+/// What the supervisor says when it has threads: Zigbox's start and pull make namespaces, which
+/// the kernel allows only a single-threaded process. Our bug, not the host's.
+pub fn not_single_threaded(count: ?u32) Diagnostic {
+    var collector: diag_mod.Diag = undefined;
+    collector.reset();
+    collector.raise(.B0002);
+    if (count) |threads| {
+        collector.cause("the supervisor has {d} threads; Zigbox needs exactly one", .{threads});
+    } else {
+        collector.cause("the supervisor can't tell how many threads it has", .{});
+    }
+    collector.fix(.{ .sentence = "report this: the supervisor must start no thread of its own" });
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
+}
+
+fn no_bus() Diagnostic {
+    var collector: diag_mod.Diag = undefined;
+    collector.reset();
+    collector.raise(.E0512);
+    collector.cause("Zigbox refused the service's limits (ZBX-E0307): it can't make a cgroup " ++
+        "scope, because the agent's user has no systemd user bus", .{});
+    collector.fix(.{ .sentence = "enable lingering for the agent's user (loginctl " ++
+        "enable-linger), or remove the limits from the service file" });
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
 }
 
 fn mismatch(reference: []const u8, produced: []const u8, tree: []const u8) Diagnostic {
@@ -186,6 +230,30 @@ test "a pull that gives another tree is ZC-E0511 and nothing is started" {
     try testing.expectEqualStrings("ZC-E0511", outcome.failed.code.slice());
     try testing.expect(trace.pulled);
     try testing.expectEqual(@as(u32, 1), script.starts);
+}
+
+test "limits refused for want of a user bus are ZC-E0512, and nothing is pulled" {
+    var script: Script = .{
+        .first_start = .E0307,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+    };
+    const outcome, _ = run(&script, true);
+    try testing.expectEqualStrings("ZC-E0512", outcome.failed.code.slice());
+    try testing.expectEqual(@as(u32, 0), script.pulls);
+}
+
+test "the thread count is read from the status text, and anything but one is refused" {
+    const one = "Name:\tzcube-agent\nThreads:\t1\nVmRSS:\t5 kB\n";
+    try testing.expectEqual(@as(?u32, 1), threads_in(one));
+    try testing.expectEqual(@as(?u32, 3), threads_in("Threads:\t3\n"));
+    try testing.expectEqual(@as(?u32, null), threads_in("Name:\tx\n"));
+    try testing.expectEqual(@as(?u32, null), threads_in("Threads:\tmany\n"));
+    const many = not_single_threaded(3);
+    try testing.expectEqualStrings("ZC-B0002", many.code.slice());
+    const unknown = not_single_threaded(null);
+    try testing.expectEqualStrings("ZC-B0002", unknown.code.slice());
 }
 
 test "a pull that fails keeps Zigbox's diagnostic" {
