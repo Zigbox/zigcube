@@ -58,8 +58,12 @@ apply() { curl -sf -X POST "$API/v1/apply" -d "$1" >/dev/null || fail "apply $1"
 
 # The command of every service, ending in a comment that names it, so `pgrep -f` finds the
 # container's PID 1 (the host sees it as an ordinary process).
-service_json() { # name tree replicas limits command
-    echo "{\"name\":\"$1\",\"image\":\"$2\",\"replicas\":$3,\"limits\":$4,\"command\":$5}"
+# `source` (the OCI reference the tree is pulled from) is left out when $6 is empty: that service
+# relies on its tree being in the node's store already.
+service_json() { # name tree replicas limits command [source]
+    src=""
+    [ -n "${6:-}" ] && src=",\"source\":\"$6\""
+    echo "{\"name\":\"$1\",\"image\":\"$2\",\"replicas\":$3,\"limits\":$4,\"command\":$5$src}"
 }
 
 loop_json() { echo "[\"sh\",\"-c\",\"while true; do sleep 1; done # $1\"]"; }
@@ -88,20 +92,13 @@ two_boxes() { [ "$(count box)" -eq 2 ] && [ "$(running_count box)" -eq 2 ]; }
 start_agent() {
     setsid "$BIN/zcube-agent" --runtime zigbox --node $NODE --server 127.0.0.1:$PORT \
         --state-dir "$STATE" --cpu-millis 2000 --memory-bytes 1073741824 \
-        --images "$HOME/images.zon" >>"$LOG/agent.log" 2>&1 </dev/null &
+        >>"$LOG/agent.log" 2>&1 </dev/null &
 }
 
 agent_pid() { pgrep -f "^$BIN/zcube-agent --runtime"; }
 
 stage_setup() {
     mkdir -p "$STATE" "$LOG"
-    cat >"$HOME/images.zon" <<EOF
-.{ .images = .{
-    .{ .digest = "$ALPINE_TREE", .reference = "$ALPINE_REF" },
-    .{ .digest = "$PYTHON_TREE", .reference = "$PYTHON_REF" },
-    .{ .digest = "$WRONG_TREE", .reference = "$ALPINE_REF" },
-} }
-EOF
     "$BIN/zbx" doctor >"$LOG/doctor.log" 2>&1 || fail "zbx doctor"
     setsid "$BIN/zcube-server" --listen 127.0.0.1:$PORT --store memory --quiet \
         >"$LOG/server.log" 2>&1 </dev/null &
@@ -112,9 +109,14 @@ EOF
 
 stage_replicas() {
     # 128 MiB and half a CPU. The first start pulls alpine through the mirror.
-    apply "$(service_json box $ALPINE_TREE 2 '{"cpu_millis":500,"memory_bytes":134217728}' "$(loop_json box)")"
+    apply "$(service_json box $ALPINE_TREE 2 '{"cpu_millis":500,"memory_bytes":134217728}' "$(loop_json box)" $ALPINE_REF)"
     until_ok 240 "2 box replicas running" two_boxes
-    ok "2 replicas of an image pulled from $ALPINE_REF run as 2 containers"
+    ok "2 replicas of an image pulled from $ALPINE_REF (the service's source) run as 2 containers"
+    # The fallback: no source, and the tree is in the node's store now, so it starts without a pull.
+    apply "$(service_json cached $ALPINE_TREE 1 '{}' "$(loop_json cached)")"
+    cached_up() { [ "$(running_count cached)" -eq 1 ]; }
+    until_ok 90 "the cached replica (no source) running" cached_up
+    ok "a service with no source starts from the tree already in the node's store"
     for pid in $(box_pids box); do
         scope=$(sed -n 's/^0:://p' /proc/"$pid"/cgroup)
         memory=$(cat "/sys/fs/cgroup$scope/memory.max")
@@ -196,7 +198,7 @@ stage_oom() {
     # hog replicas in 14 s and Zigbox, which keeps at most 32 run records and prunes the oldest,
     # live ones included, pruned box's, so box showed `starting`. `exec` makes tail PID 1.
     apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' \
-        '["sh","-c","sleep 4; exec tail /dev/zero"]')"
+        '["sh","-c","sleep 4; exec tail /dev/zero"]' $ALPINE_REF)"
     n=0
     until hog_oom; do
         n=$((n + 1))
@@ -212,7 +214,7 @@ stage_oom() {
 }
 
 stage_refusals() {
-    apply "$(service_json wrong $WRONG_TREE 1 '{}' "$(loop_json wrong)")"
+    apply "$(service_json wrong $WRONG_TREE 1 '{}' "$(loop_json wrong)" $ALPINE_REF)"
     until_ok 120 "wrong to be refused" has_code wrong ZC-E0511
     ok "a pull whose tree is not the locked one is refused (ZC-E0511), the replica held"
     apply "$(service_json unknown $UNKNOWN_TREE 1 '{}' "$(loop_json unknown)")"
@@ -225,7 +227,7 @@ stage_refusals() {
 
 stage_scale0() {
     # A larger image, so the pull is still running when the service goes away.
-    apply "$(service_json big $PYTHON_TREE 1 '{}' '["sleep","1000"]')"
+    apply "$(service_json big $PYTHON_TREE 1 '{}' '["sleep","1000"]' $PYTHON_REF)"
     started() { [ -d "$STATE/zigbox" ] && pgrep -f 'supervise-zigbox.*big-' >/dev/null; }
     until_ok 60 "big's supervisor to start" started
     curl -sf -X DELETE "$API/v1/services/big" >/dev/null || fail "delete big"
