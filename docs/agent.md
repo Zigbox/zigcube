@@ -175,6 +175,11 @@ real processes, for the owner and for the Zigbox adapter:
    simulated runtime departs the same way, which `core.md` records. **Recommendation:** document
    that `stop` may return early, and that the caller checks `inspect`; the adapter should do the
    same, or the agent must run stops off the thread that holds the lease.
+   **Done for the fence (C2 slice 3, P2):** `Runtime.signal(handle, number)` takes TERM or KILL
+   and returns at once. The fence signals TERM to every container in its first step, then looks
+   at `list` every `fence_poll_ms` and signals KILL to what is left at the kill time, so N
+   containers cost one `fence_stop_ms`, not N waits of `stop_wait_ms`. The reconcile loop's own
+   stops still use `stop` and the pending-stop logic.
 2. **The runtime does not report when a container started.** `Listing` has no start time, so the
    agent's `started_at_ms` is when it started or first saw the container. `FakeRuntime` knows it
    (`spec.json`), and Zigbox's run record could carry it. Adding a field to `Listing` is the
@@ -233,8 +238,11 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   `Spec`, and wins over this file; the file is the fallback for a service without one (the agent
   says so on stderr at start). With neither, nothing is pulled.
 - **Stop**: SIGTERM and a wait of at most 500 ms when there is a grace, SIGKILL and the same
-  single wait of at most 500 ms when there is none; the caller asks again as with the fake runtime. A fence over N containers costs up to
-  N times 500 ms until the non-blocking `signal` (proposal P2) lands.
+  single wait of at most 500 ms when there is none; the caller asks again as with the fake runtime.
+- **Signal** (the fence's call): the same delivery as `stop`, TERM through `lifecycle.signal`
+  (Zigbox sends SIGKILL in its place for a PID 1 with no handler) and KILL through the host, and
+  no wait at all. Only TERM and KILL are accepted. A container that is still starting has its
+  supervisor killed, as with `stop`; a stopped one is left alone.
 - **Limits** are Zigbox's (`zigbox_map.zig` mirrors its bounds; apply refuses more, ZC-E0514).
   CPU, memory and pids limits need the user's systemd bus; Zigbox's ZBX-E0307 (no bus) is
   reported as ZC-E0512 with the fix.

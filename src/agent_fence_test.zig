@@ -78,6 +78,44 @@ test "a node cut off from the store fences at its deadline and registers again, 
     try testing.expect(world.agent.tenure > first);
 }
 
+test "a fence over sixteen containers ends within one deadline, killing those that ignore TERM" {
+    // Goal: P2's point. Sixteen containers cost one `fence_stop_ms`, not sixteen waits: every
+    // polite one is gone in the first step, every one that ignores TERM is still there until the
+    // kill time and gone by it. Method: sixteen replicas, the odd ones `slow_stop`; cut the store;
+    // look at the runtime just after the fence begins, just before the kill, and just after it.
+    const world = try sim_world.World.create(testing.allocator, 31, &sim_runtime.default_fixtures);
+    defer world.destroy();
+    var many = hello;
+    many.replicas = 16;
+    _ = try world.apply(many);
+    world.advance(10_000);
+    try testing.expectEqual(@as(u32, 16), world.running_count("hello"));
+    for (1..17) |number| {
+        if (number % 2 == 0) continue;
+        var name: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "hello-{d}", .{number});
+        try world.sim.inject(text, .slow_stop);
+    }
+
+    world.set_store_down(true);
+    const sent = world.agent.sent_ms;
+    const ttl = world.agent.lease_ttl_ms;
+    const fence_at = fencing.fence_at_ms(sent, ttl);
+    const kill_at = fencing.kill_at_ms(fence_at);
+    const tick = sim_world.tick_ms;
+    advance_to(world, fence_at - tick);
+    try testing.expectEqual(@as(u32, 16), world.sim.running_count());
+    advance_to(world, fence_at + tick);
+    try testing.expect(world.agent.fence.active);
+    try testing.expectEqual(@as(u32, 8), world.sim.running_count());
+    advance_to(world, kill_at - tick);
+    try testing.expectEqual(@as(u32, 8), world.sim.running_count());
+    advance_to(world, kill_at + tick + constants.fence_poll_ms);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    try testing.expectEqual(@as(u32, 1), world.agent.fences);
+    try testing.expect(world.now_ms() <= fencing.worst_case_dead_ms(sent, ttl));
+}
+
 /// Long enough for a fence that needs no kill: a step that stops everything, and the poll after
 /// it that finds nothing left running.
 const fence_steps_ms = sim_world.tick_ms + constants.fence_poll_ms;
@@ -215,6 +253,7 @@ const SourceSpy = struct {
     const vtable: rt.Runtime.VTable = .{
         .start = on_start,
         .stop = on_stop,
+        .signal = on_signal,
         .inspect = on_inspect,
         .list = on_list,
         .events = on_events,
@@ -246,6 +285,16 @@ const SourceSpy = struct {
     ) rt.Error!void {
         const self = me(context);
         return self.inner.vtable.stop(self.inner.context, handle, grace_ms, diag);
+    }
+
+    fn on_signal(
+        context: *anyopaque,
+        handle: rt.Handle,
+        number: u8,
+        diag: *Diag,
+    ) rt.Error!void {
+        const self = me(context);
+        return self.inner.vtable.signal(self.inner.context, handle, number, diag);
     }
 
     fn on_inspect(context: *anyopaque, handle: rt.Handle, diag: *Diag) rt.Error!rt.Status {

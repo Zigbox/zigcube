@@ -144,6 +144,8 @@ built with `-Doptimize=ReleaseSafe`).
   (`slow_stop`). The contract says it returns once the container has stopped; a runtime in
   virtual time cannot wait. The agent never relies on a stop having completed, so a blocking
   adapter is also correct for it. This is the one place the simulated runtime departs.
+  `Runtime.signal` has no such departure: it acts at once (TERM is ignored by a `slow_stop`
+  container, KILL ends any), and the fence uses it.
 - **The runtime does not report when a container started**, so the agent's `started_at_ms` is
   the time it started or first saw it (kept across re-adoption if a record exists). Zigbox's
   `Listing` could carry it.
