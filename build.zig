@@ -312,6 +312,10 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
 /// Zigbox's exported `zigbox_vm` module (src/zigbox_smoke.zig). Skips unless `ZCUBE_REAL_HOST=1`.
 fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
     const vm = b.dependency("zigbox", .{}).module("zigbox_vm");
+    // The guest runs the host's architecture; Zigbox's zbx is static and libc-free, and the guest
+    // gets it only to run `zbx doctor` for the log of a failure.
+    const zbx = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe })
+        .artifact("zbx");
     const exe = b.addExecutable(.{
         .name = "zigbox_smoke",
         .root_module = b.createModule(.{
@@ -323,6 +327,9 @@ fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
     });
     const run = b.addRunArtifact(exe);
     run.addArtifactArg(built.agent);
+    run.addArtifactArg(built.server);
+    run.addArtifactArg(zbx);
+    run.addFileArg(b.path("ops/zigbox-smoke/guest.sh"));
     run.has_side_effects = true;
     const help = "Run the Zigbox runtime on a real host in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
     b.step("zigbox-smoke", help).dependOn(&run.step);
