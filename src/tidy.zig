@@ -50,6 +50,9 @@ const shell_allowlist = [_][]const u8{
     "demo/up.sh",
     "demo/down.sh",
     "demo/kill-node.sh",
+    // `zig build local-smoke` (c1-7 slice 7.6): drives the `zcube` command line the way a person
+    // does, and counts supervisors with pgrep; like the demo scripts it is a sequence of commands.
+    "tools/local_smoke.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
