@@ -201,14 +201,10 @@ fn lower_bound(entries: []const Entry, key: u64) u32 {
     return low;
 }
 
-/// The bottom-K of the union of several trees' chunks: the K smallest keys among theirs. It is
-/// exact only below the smallest limit of the trees it merges.
-fn union_of(held: []const Sketch) Sketch {
-    var merged: Sketch = .{};
-    for (held) |*tree| {
-        for (tree.slice()) |entry| merged.add_entry(entry);
-    }
-    return merged;
+/// Whether the sample `sketch` has `key`. Only meaningful below the sketch's limit.
+fn has_key(sketch: *const Sketch, key: u64) bool {
+    const found = lower_bound(sketch.slice(), key);
+    return found < sketch.count and sketch.entries[found].key == key;
 }
 
 /// What the node's summary says it holds, for `locality_bytes`: the sketches of the complete
@@ -221,10 +217,10 @@ pub fn locality_bytes(target: *const Sketch, held: []const Sketch) u64 {
             if (std.mem.eql(u8, &tree.tree, &target.tree)) return target.total_bytes;
         }
     }
-    const node = union_of(held);
-    // Each sketch is exact below its own limit, so the union of the held ones is exact below the
-    // smallest held limit (not below the union's own limit, which can be far lower), and the
-    // target is exact below its own: compare in the range all of them cover.
+    // Each sketch is exact below its own limit, so the held trees together are known exactly below
+    // the smallest held limit (a merged bottom-K would be exact only below its own, far lower
+    // limit, so the held sketches are searched one by one), and the target is exact below its own:
+    // compare in the range all of them cover.
     var cutoff: ?u64 = target.limit();
     for (held) |*tree| {
         const tree_limit = tree.limit() orelse continue;
@@ -237,9 +233,11 @@ pub fn locality_bytes(target: *const Sketch, held: []const Sketch) u64 {
             if (entry.key > limit) break;
         }
         sampled += entry.bytes;
-        const found = lower_bound(node.slice(), entry.key);
-        if (found < node.count and node.entries[found].key == entry.key) {
-            hit += entry.bytes;
+        for (held) |*tree| {
+            if (has_key(tree, entry.key)) {
+                hit += entry.bytes;
+                break;
+            }
         }
     }
     if (sampled == 0) return 0; // Nothing to judge by: advisory, so no credit.
