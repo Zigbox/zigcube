@@ -444,6 +444,10 @@ pub const Stats = struct {
     suspends: u32 = 0,
     runtime_faults: u32 = 0,
     server_restarts: u32 = 0,
+    /// `mark_lost` and `mark_replica_lost` decisions in the store at the last decisions check:
+    /// a run that prints 0 never exercised the lost-node path.
+    nodes_marked_lost: u32 = 0,
+    replicas_marked_lost: u32 = 0,
     /// Replica-seconds with one replica running on two nodes: counted, not failed.
     duplicate_seconds: u64 = 0,
 };
@@ -1107,6 +1111,8 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
     var counts: sim_checks.Counts = .empty;
     var after: ?[]const u8 = null;
     var at: ?store.Revision = null;
+    var nodes_lost: u32 = 0;
+    var replicas_lost: u32 = 0;
     for (0..64) |_| {
         const page = ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_decisions,
@@ -1120,9 +1126,18 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
                 return check(c, false, "a decision cannot be read");
             try decision_has_cause(c, ctx, &decision);
             try verdict(c, sim_checks.count(ctx, &counts, &decision));
+            if (std.mem.eql(u8, decision.action, "mark_lost")) nodes_lost += 1;
+            // A `mark_replica_lost` caused by a decision is the grace's end (the others are
+            // caused by an observed record).
+            const by_node = decision.cause.kind == .decision;
+            if (std.mem.eql(u8, decision.action, "mark_replica_lost") and by_node) {
+                replicas_lost += 1;
+            }
         }
         after = page.continue_after;
         if (after != null) continue;
+        c.stats.nodes_marked_lost = @max(c.stats.nodes_marked_lost, nodes_lost);
+        c.stats.replicas_marked_lost = @max(c.stats.replicas_marked_lost, replicas_lost);
         if (c.dropped_total() > 0) return;
         return verdict(c, sim_checks.summaries(ctx, &counts, at.?));
     }
@@ -1778,6 +1793,9 @@ fn print_summary(c: *Cluster) void {
         "runtime={d} server_restarts={d} ack_lost={d}\n", .{
         s.crashes_injected, s.partitions,      s.outages,             s.suspends,
         s.runtime_faults,   s.server_restarts, c.ack_loss.lost_count,
+    });
+    report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
+        s.nodes_marked_lost, s.replicas_marked_lost,
     });
     var total: sim_net.Stats = .{};
     for (c.nodes) |node| {

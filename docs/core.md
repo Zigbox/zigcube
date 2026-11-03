@@ -316,5 +316,13 @@ unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end
 crashed seed was in is the last such line; the fleet replays a crashed range seed by seed with it.
 A seed whose world cannot be built (out of memory) reports `step: setup`.
 
+**Lost nodes in the report.** The report's `lost nodes:` line counts the `mark_lost` decisions and
+the replicas replaced after a lost node's grace (a `mark_replica_lost` caused by a decision). A
+leased node's partition (1 to 9 s) is shorter than the 10 s lease, so it alone never expires a
+lease; the crashes, suspends and store outages the seeds also draw do. Seeds 1 to 40 at 100
+operations: 30 of 40 mark a node lost and 27 replace replicas after the grace, which the
+`lost_grace` check judges; the rest never reach it, so a change to the lost path is judged over a
+range of seeds, not one.
+
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations, native against WASM, and `sim-teeth`.

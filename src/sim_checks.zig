@@ -144,3 +144,199 @@ fn ready_at(ctx: *const Context, node: []const u8, at: store.Revision) Found {
     }
     return null;
 }
+
+// ---- Tests -----------------------------------------------------------------------------------
+
+const testing = std.testing;
+const diag_mod = @import("diag.zig");
+const ManualClock = @import("clock.zig").ManualClock;
+const MemoryStore = @import("store_memory.zig").MemoryStore;
+
+/// A memory store with a manual clock, written raw (no writer roles: these tests hand the
+/// checks a store that is wrong on purpose, which no role could write).
+const Fixture = struct {
+    manual: ManualClock,
+    memory: *MemoryStore,
+    arena_state: std.heap.ArenaAllocator,
+    diag: diag_mod.Diag,
+
+    fn start(self: *Fixture) !void {
+        self.manual = .{ .ms = 1761350000000 };
+        self.memory = try testing.allocator.create(MemoryStore);
+        self.memory.init(testing.allocator, self.manual.clock());
+        self.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        self.diag.reset();
+    }
+
+    fn stop(self: *Fixture) void {
+        self.arena_state.deinit();
+        self.memory.deinit();
+        testing.allocator.destroy(self.memory);
+    }
+
+    fn context(self: *Fixture) Context {
+        return .{
+            .store = self.memory.interface(),
+            .clock = self.manual.clock(),
+            .arena = self.arena_state.allocator(),
+            .diag = &self.diag,
+        };
+    }
+
+    /// Puts `value` at `key`; returns the revision of the write.
+    fn put(self: *Fixture, key: []const u8, value: anytype) !store.Revision {
+        const ctx = self.context();
+        const bytes = try records.encode(ctx.arena, value, &self.diag);
+        const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+        const done = try ctx.store.txn(.{ .on_success = &.{op} }, &self.diag);
+        try testing.expect(done.succeeded);
+        return done.revision;
+    }
+
+    fn head(self: *Fixture) !store.Revision {
+        return (try self.context().store.status(&self.diag)).revision;
+    }
+};
+
+fn sample_decision(action: []const u8, at_ms: u64, cause: records.Cause) records.Decision {
+    return .{
+        .id = "1761350000000-0001-0001",
+        .at_ms = at_ms,
+        .actor = "test",
+        .action = action,
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "a test decision",
+        .cause = cause,
+    };
+}
+
+test "summaries finds a count that is not the decisions' and a decision no summary counts" {
+    // Goal: the exact-count check (4e) has teeth. Method: a store whose summary counts 2 for one
+    // decision is Found; the right count passes; a counted decision with no summary is Found.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const ctx = fixture.context();
+    const decision = sample_decision("create_replica", 1, .{ .kind = .desired });
+    var counts: Counts = .empty;
+    try testing.expectEqual(@as(Found, null), count(&ctx, &counts, &decision));
+    const key = records.summary_key(.replica, "hello-1", "create_replica", .desired);
+    const wrong: records.Summary = .{
+        .count = 2,
+        .first_at_ms = 1,
+        .last_at_ms = 1,
+        .newest = "x",
+    };
+    const at = try fixture.put(key.slice(), wrong);
+    try testing.expect(summaries(&ctx, &counts, at) != null);
+
+    const right: records.Summary = .{
+        .count = 1,
+        .first_at_ms = 1,
+        .last_at_ms = 1,
+        .newest = "x",
+    };
+    const fixed = try fixture.put(key.slice(), right);
+    try testing.expectEqual(@as(Found, null), summaries(&ctx, &counts, fixed));
+
+    _ = count(&ctx, &counts, &sample_decision("other", 2, .{ .kind = .resync }));
+    try testing.expect(summaries(&ctx, &counts, fixed) != null);
+}
+
+test "lost_grace finds a replacement inside the grace and a cause that is not a mark_lost" {
+    // Goal: no replica of a lost node is replaced before `lost_grace_ms`. Method: a
+    // `mark_replica_lost` 1 ms early is Found; at exactly the grace it passes; a cause that is
+    // not a `mark_lost` is Found; other actions are not judged.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const ctx = fixture.context();
+    const grace: u64 = 1000;
+    const cause: records.Cause = .{ .kind = .decision, .id = "mark-lost-1" };
+    const lost = sample_decision("mark_lost", 5000, .{ .kind = .lease_expired });
+    const bytes = try records.encode(ctx.arena, lost, ctx.diag);
+    const kv: store.KeyValue = .{
+        .key = "/decisions/mark-lost-1",
+        .value = bytes,
+        .create_revision = 1,
+        .mod_revision = 1,
+    };
+    const early = sample_decision("mark_replica_lost", 5000 + grace - 1, cause);
+    try testing.expect(lost_grace(&ctx, &early, kv, grace) != null);
+    const on_time = sample_decision("mark_replica_lost", 5000 + grace, cause);
+    try testing.expectEqual(@as(Found, null), lost_grace(&ctx, &on_time, kv, grace));
+    const other = sample_decision("delete_replica", 5000, cause);
+    try testing.expectEqual(@as(Found, null), lost_grace(&ctx, &other, kv, grace));
+    const not_lost = try records.encode(ctx.arena, early, ctx.diag);
+    const wrong_kv: store.KeyValue = .{
+        .key = kv.key,
+        .value = not_lost,
+        .create_revision = 1,
+        .mod_revision = 1,
+    };
+    try testing.expect(lost_grace(&ctx, &on_time, wrong_kv, grace) != null);
+}
+
+test "no_findings finds an open allocation finding" {
+    // Goal: the quiet-auditor check fails on a healthy run's first finding. Method: empty
+    // `/audit/allocations/` passes; one record there is Found.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const ctx = fixture.context();
+    try testing.expectEqual(@as(Found, null), no_findings(&ctx));
+    const key = records.audit_key("node1");
+    _ = try fixture.put(key.slice(), .{ .v = 1 });
+    try testing.expect(no_findings(&ctx) != null);
+}
+
+test "placements finds an assignment onto an unregistered, unready or other-tenure node" {
+    // Goal: I7 has teeth. Method: an assignment onto a node with no record, then a registered
+    // node with no status, a `lost` status, a `ready` status of another tenure are each Found;
+    // a `ready` status for the node's tenure passes; assignments at or below `checked` are not
+    // read.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const ctx = fixture.context();
+    const assigned: records.Assigned = .{
+        .replica = "hello-1",
+        .service = "hello",
+        .requests = .{ .cpu_millis = 1, .memory_bytes = 1 },
+        .reason = "a test",
+    };
+    const slot = "/assigned/node1/hello-1";
+    const first = try fixture.put(slot, assigned);
+    try testing.expect(placements(&ctx, 0, first) != null);
+    try testing.expectEqual(@as(Found, null), placements(&ctx, first, first));
+
+    const node: records.Node = .{
+        .name = "node1",
+        .capacity = .{ .cpu_millis = 4000, .memory_bytes = 1 << 30 },
+    };
+    const tenure = try fixture.put(records.node_key("node1").slice(), node);
+    const placed = try fixture.put(slot, assigned);
+    try testing.expect(placements(&ctx, first, placed) != null);
+
+    const status_key = records.node_status_key("node1");
+    var status: records.NodeStatus = .{
+        .state = .lost,
+        .tenure = tenure,
+        .at_ms = 1,
+        .decision = "d",
+    };
+    _ = try fixture.put(status_key.slice(), status);
+    const on_lost = try fixture.put(slot, assigned);
+    try testing.expect(placements(&ctx, placed, on_lost) != null);
+
+    status.state = .ready;
+    status.tenure = tenure + 1;
+    _ = try fixture.put(status_key.slice(), status);
+    const on_other = try fixture.put(slot, assigned);
+    try testing.expect(placements(&ctx, on_lost, on_other) != null);
+
+    status.tenure = tenure;
+    _ = try fixture.put(status_key.slice(), status);
+    const good = try fixture.put(slot, assigned);
+    try testing.expectEqual(@as(Found, null), placements(&ctx, on_other, good));
+}
