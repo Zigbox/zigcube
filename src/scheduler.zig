@@ -27,7 +27,9 @@ const compare_sets = @import("compare_sets.zig");
 const accounting = @import("allocations.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
+const chunk_summary = @import("chunk_summary.zig");
 const failures = @import("store_failures.zig");
+const node_store = @import("node_store.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 
@@ -118,6 +120,10 @@ const NodeView = struct {
     alloc_node_revision: u64,
     allocated: Requests,
     count: u32,
+    /// The `/node-store/<node>` the pass read: its revision (0 if the node has none) and the
+    /// trees it advertises. Advisory evidence; never compared (authority.md section 2).
+    store_revision: Revision,
+    held: []const records.HeldTree,
 };
 
 const no_node: u32 = std.math.maxInt(u32);
@@ -207,10 +213,22 @@ pub fn read_world(ctx: *const Context) Error!World {
         at,
         constants.nodes_max,
     );
+    const summaries = try controller.list_all(
+        records.NodeStore,
+        ctx,
+        records.prefix_node_store,
+        at,
+        constants.nodes_max,
+    );
     var world: World = .{
         .revision = at,
         .replicas = replicas.items,
-        .nodes = try views_of(ctx, nodes.items, statuses.items, allocations.items, audits.items),
+        .nodes = try views_of(ctx, nodes.items, .{
+            .statuses = statuses.items,
+            .allocations = allocations.items,
+            .audits = audits.items,
+            .summaries = summaries.items,
+        }),
         .assigns = .empty,
         .assigned_by = .empty,
         .desired = .empty,
@@ -220,29 +238,35 @@ pub fn read_world(ctx: *const Context) Error!World {
     return world;
 }
 
-fn views_of(
-    ctx: *const Context,
-    nodes: []const Entry(records.Node),
+/// The per-node records a view is made from.
+const Sources = struct {
     statuses: []const Entry(records.NodeStatus),
     allocations: []const Entry(records.Allocation),
     audits: []const Entry(records.Audit),
+    summaries: []const Entry(records.NodeStore),
+};
+
+fn views_of(
+    ctx: *const Context,
+    nodes: []const Entry(records.Node),
+    sources: Sources,
 ) Error![]NodeView {
     const views = ctx.arena.alloc(NodeView, views_max) catch return failures.no_memory(ctx.diag);
     var count: u32 = 0;
     for (nodes) |*node| {
-        views[count] = view_of(node, statuses, allocations, audits);
+        views[count] = view_of(node, sources);
         count += 1;
     }
     // A node with no `/nodes` record is named by its status or allocation record. Its view has
     // no capacity and tenure 0, so nothing fits on it, and the compare on `/nodes/<node>` at
     // revision 0 says "still absent".
-    for (statuses) |entry| {
+    for (sources.statuses) |entry| {
         const name = entry.kv.key[records.prefix_node_status.len..];
-        try add_ghost(ctx, views, &count, name, statuses, allocations, audits);
+        try add_ghost(ctx, views, &count, name, sources);
     }
-    for (allocations) |entry| {
+    for (sources.allocations) |entry| {
         const name = entry.kv.key[records.prefix_allocations.len..];
-        try add_ghost(ctx, views, &count, name, statuses, allocations, audits);
+        try add_ghost(ctx, views, &count, name, sources);
     }
     return views[0..count];
 }
@@ -252,9 +276,7 @@ fn add_ghost(
     views: []NodeView,
     count: *u32,
     name: []const u8,
-    statuses: []const Entry(records.NodeStatus),
-    allocations: []const Entry(records.Allocation),
-    audits: []const Entry(records.Audit),
+    sources: Sources,
 ) Error!void {
     for (views[0..count.*]) |view| {
         if (std.mem.eql(u8, view.node.rec.name, name)) return;
@@ -273,17 +295,17 @@ fn add_ghost(
         },
         .rec = .{ .name = name, .capacity = .{ .cpu_millis = 0, .memory_bytes = 0 } },
     };
-    views[count.*] = view_of(ghost, statuses, allocations, audits);
+    views[count.*] = view_of(ghost, sources);
     count.* += 1;
 }
 
-fn view_of(
-    node: *const Entry(records.Node),
-    statuses: []const Entry(records.NodeStatus),
-    allocations: []const Entry(records.Allocation),
-    audits: []const Entry(records.Audit),
-) NodeView {
+fn view_of(node: *const Entry(records.Node), sources: Sources) NodeView {
     const name = node.rec.name;
+    const statuses = sources.statuses;
+    const allocations = sources.allocations;
+    const audits = sources.audits;
+    const summary_key = records.node_store_key(name);
+    const summary = find_by_key(records.NodeStore, sources.summaries, summary_key.slice());
     const status_key = records.node_status_key(name);
     const status = find_by_key(records.NodeStatus, statuses, status_key.slice());
     const alloc_key = records.allocation_key(name);
@@ -301,6 +323,8 @@ fn view_of(
             .memory_bytes = 0,
         },
         .count = if (alloc) |found| found.rec.count else 0,
+        .store_revision = if (summary) |found| found.kv.mod_revision else 0,
+        .held = if (summary) |found| found.rec.trees else &.{},
     };
 }
 
@@ -376,10 +400,19 @@ fn service_counts(world: *const World, service: []const u8, counts: []u32) void 
     }
 }
 
-/// Whether node `first` is a better home than `second`: fewest assignments of the same service,
-/// then least allocated (CPU, then memory, as a fraction of capacity), then the lower name.
-fn precedes(world: *const World, counts: []const u32, first: u32, second: u32) bool {
-    if (counts[first] != counts[second]) return counts[first] < counts[second];
+/// Whether node `first` is a better home than `second`: fewest assignments of the same service
+/// (spread), then the most bytes of the replica's image already held (locality), then least
+/// allocated (CPU, then memory, as a fraction of capacity), then the lower name. Fit is decided
+/// before: only nodes that fit are compared.
+fn precedes(world: *const World, rank: Rank, first: u32, second: u32) bool {
+    // The teeth fault: locality ahead of spread (a build whose root switched it on).
+    if (c1_teeth.locality_before_spread and rank.locality[first] != rank.locality[second]) {
+        return rank.locality[first] > rank.locality[second];
+    }
+    if (rank.counts[first] != rank.counts[second]) return rank.counts[first] < rank.counts[second];
+    if (rank.locality[first] != rank.locality[second]) {
+        return rank.locality[first] > rank.locality[second];
+    }
     const left = &world.nodes[first];
     const right = &world.nodes[second];
     const cpu = fraction_order(
@@ -399,6 +432,41 @@ fn precedes(world: *const World, counts: []const u32, first: u32, second: u32) b
     return std.mem.order(u8, left.node.rec.name, right.node.rec.name) == .lt;
 }
 
+/// What `precedes` ranks by, per node index.
+const Rank = struct {
+    counts: []const u32,
+    locality: []const u64,
+};
+
+/// Bytes of `image`'s tree each node holds by its summary. The tree's sketch is taken from the
+/// first node whose summary lists the tree: a tree no node holds scores 0 everywhere, because the
+/// scheduler has no other source of a tree's chunks (docs/swarm.md, limits). A summary that does
+/// not decode scores 0.
+fn locality_of(world: *const World, image: []const u8, out: []u64) void {
+    assert(out.len == world.nodes.len);
+    @memset(out, 0);
+    var target: ?chunk_summary.Sketch = null;
+    for (world.nodes) |*view| {
+        for (view.held) |tree| {
+            if (!std.mem.eql(u8, tree.tree, image)) continue;
+            target = node_store.sketch_of(tree);
+            break;
+        }
+        if (target != null) break;
+    }
+    const wanted = target orelse return;
+    for (world.nodes, out) |*view, *slot| {
+        var held: [constants.summary_trees_max]chunk_summary.Sketch = undefined;
+        var count: u32 = 0;
+        for (view.held) |tree| {
+            if (count == held.len) break;
+            held[count] = node_store.sketch_of(tree) orelse continue;
+            count += 1;
+        }
+        slot.* = chunk_summary.locality_bytes(&wanted, held[0..count]);
+    }
+}
+
 /// Compares `used_a / cap_a` with `used_b / cap_b` without dividing.
 fn fraction_order(used_a: u64, cap_a: u64, used_b: u64, cap_b: u64) std.math.Order {
     const left = @as(u128, used_a) * cap_b;
@@ -406,22 +474,50 @@ fn fraction_order(used_a: u64, cap_a: u64, used_b: u64, cap_b: u64) std.math.Ord
     return std.math.order(left, right);
 }
 
-const Chosen = struct { index: u32, candidates: u32, service_count: u32 };
+/// What a placement decision records of the locality step (Decision v3).
+const Placed = struct { locality_bytes: u64, store_revision: Revision };
 
-fn choose(world: *const World, service: []const u8, verdicts: []const Verdict) ?Chosen {
+const Chosen = struct {
+    index: u32,
+    candidates: u32,
+    service_count: u32,
+    /// Bytes of the replica's image the node holds by its summary, and the revision of the
+    /// summary read (0 if it has none).
+    locality_bytes: u64,
+    store_revision: Revision,
+};
+
+fn choose(
+    world: *const World,
+    service: []const u8,
+    image: []const u8,
+    verdicts: []const Verdict,
+) ?Chosen {
     assert(verdicts.len == world.nodes.len);
     var counts: [views_max]u32 = undefined;
     service_counts(world, service, counts[0..world.nodes.len]);
+    var locality: [views_max]u64 = undefined;
+    locality_of(world, image, locality[0..world.nodes.len]);
+    const rank: Rank = .{
+        .counts = counts[0..world.nodes.len],
+        .locality = locality[0..world.nodes.len],
+    };
     var best: ?u32 = null;
     var candidates: u32 = 0;
     for (verdicts, 0..) |verdict, index| {
         if (verdict.reason != .fits) continue;
         candidates += 1;
         const at: u32 = @intCast(index);
-        if (best == null or precedes(world, &counts, at, best.?)) best = at;
+        if (best == null or precedes(world, rank, at, best.?)) best = at;
     }
     const index = best orelse return null;
-    return .{ .index = index, .candidates = candidates, .service_count = counts[index] };
+    return .{
+        .index = index,
+        .candidates = candidates,
+        .service_count = counts[index],
+        .locality_bytes = locality[index],
+        .store_revision = world.nodes[index].store_revision,
+    };
 }
 
 // ---- The scheduler ---------------------------------------------------------------------------
@@ -576,7 +672,7 @@ pub const Scheduler = struct {
         var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];
         for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need);
-        const chosen = choose(world, replica.rec.service, judged) orelse {
+        const chosen = choose(world, replica.rec.service, replica.rec.image, judged) orelse {
             return sc.hold(ctx, world, pass, replica, judged);
         };
         if (!pass.budget()) return;
@@ -587,7 +683,11 @@ pub const Scheduler = struct {
         compare_sets.placement(&set, replica_read(replica), node_read(view));
         expect_placement(&batch, &set);
         const reason = try place_reason(ctx, world, replica, chosen, need);
-        try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null);
+        const evidence: Placed = .{
+            .locality_bytes = chosen.locality_bytes,
+            .store_revision = chosen.store_revision,
+        };
+        try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null, evidence);
         const key = try assign_key(ctx, name, replica.rec.id);
         const value: records.Assigned = .{
             .replica = replica.rec.id,
@@ -613,6 +713,7 @@ pub const Scheduler = struct {
         reason: []const u8,
         action: []const u8,
         given: ?records.Cause,
+        placed: ?Placed,
     ) Error!void {
         const created = if (given == null)
             try indexed_decision(ctx, replica.rec.id, "create_replica", .first)
@@ -632,6 +733,8 @@ pub const Scheduler = struct {
             .subject = .{ .kind = .replica, .name = replica.rec.id },
             .reason = reason,
             .cause = cause,
+            .locality_bytes = if (placed) |found| found.locality_bytes else null,
+            .node_store_revision = if (placed) |found| found.store_revision else null,
         }, batch);
     }
 
@@ -751,7 +854,7 @@ pub const Scheduler = struct {
         };
         compare_sets.move(&set, replica_read(replica), read, node_read(target));
         expect_all(&batch, &set);
-        try sc.put_place_decision(ctx, &batch, replica, spec.reason, "place_replica", spec.cause);
+        try sc.put_place_decision(ctx, &batch, replica, spec.reason, "place_replica", spec.cause, null);
         batch.delete(from.key);
         const name = target.node.rec.name;
         const key = try assign_key(ctx, name, spec.replica);
@@ -962,7 +1065,8 @@ fn place_reason(
             "MiB{s}", .{ name, need.cpu_millis, mib_of(need.memory_bytes), note });
     }
     return controller.format(ctx, "{s} is the best of the {d} of {d} nodes that fit {d}m CPU " ++
-        "and {d} MiB{s}: {d} replicas of this service there, then least allocated, then name", .{
+        "and {d} MiB{s}: {d} replicas of this service there, then {d} MiB of the image already " ++
+        "there ({s}), then least allocated, then name", .{
         name,
         chosen.candidates,
         total,
@@ -970,6 +1074,8 @@ fn place_reason(
         mib_of(need.memory_bytes),
         note,
         chosen.service_count,
+        mib_of(chosen.locality_bytes),
+        if (chosen.store_revision == 0) "no summary" else "by its summary",
     });
 }
 

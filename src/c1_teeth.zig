@@ -25,5 +25,9 @@ pub const wedge = declared("c1_teeth_wedge");
 /// if the controller did not compare the report's tenure (must break I3).
 pub const stale_observation = declared("c1_teeth_stale_observation");
 
+/// The scheduler ranks locality ahead of spread (C2 slice 5; must break the placement-order
+/// invariant of `sim-cluster`).
+pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
+
 pub const any = skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge or
-    stale_observation;
+    stale_observation or locality_before_spread;

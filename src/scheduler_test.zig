@@ -7,6 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
+const node_store = @import("node_store.zig");
 const records = @import("records.zig");
 const scheduler = @import("scheduler.zig");
 const store = @import("store.zig");
@@ -105,6 +106,15 @@ const Fixture = struct {
             .limits = .{ .cpu_millis = cpu, .memory_bytes = memory },
         };
         try self.put(.replica_controller, records.replica_key(service, id).slice(), value);
+    }
+
+    /// Writes the node's `/node-store` summary: the fake trees of `digests`.
+    fn summary(self: *Fixture, name: []const u8, digests: []const []const u8) !void {
+        var fake: node_store.FakeImages = .{ .digests = digests };
+        const ctx = self.context();
+        const held = try fake.images().summary(ctx.arena, &.{});
+        const record = try node_store.record_of(ctx.arena, name, held);
+        try self.put(.{ .agent = name }, records.node_store_key(name).slice(), record);
     }
 
     /// One pass, then the I6 check.
@@ -733,4 +743,95 @@ test "repair writes the reconstruction, cites the finding, and the next audit cl
     try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
     const later = fixture.context();
     try testing.expect(try allocations.repair(&later, &source, "n1", "r-2") == .no_finding);
+}
+
+const image = "b3:51aa9c03";
+
+test "locality breaks a tie, and the decision records what it read" {
+    // Goal: with fit and spread equal, the node that holds the image wins over a lower name, and
+    // the decision carries the bytes and the revision of the summary it read.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.summary("c", &.{image});
+    try fixture.summary("b", &.{"b3:9d20c4f1"}); // Holds another tree: no credit.
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "c");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expect(placed[0].locality_bytes.? > 0);
+    try testing.expect(placed[0].node_store_revision.? > 0);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, "already there") != null);
+}
+
+test "spread outranks locality, and locality outranks least allocated" {
+    // Goal: the order of the middle steps. Method: c holds the image. web-1 goes to c (locality);
+    // web-2 must not (spread: c has one web); a load on c does not move web-1 off it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.summary("c", &.{image});
+    try fixture.replica("load", "load-1", 2000, gib); // Another image's service: loads a or c by name.
+    try fixture.settle();
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "c"); // Locality ahead of least allocated (c is loaded or equal).
+    try fixture.replica("web", "web-2", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-2", "a"); // Spread ahead of locality.
+}
+
+test "fit comes first: a node that holds the image but cannot fit is not chosen" {
+    // Goal: locality never overrides fit. Method: c holds the image and has 1 CPU; the replica
+    // needs 2.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 1000, 8 * gib, true);
+    try fixture.summary("c", &.{image});
+    try fixture.replica("web", "web-1", 2000, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+}
+
+test "no summary anywhere: the order is as before, and the decision says no summary" {
+    // Goal: a world without /node-store behaves as C1 did. Method: three nodes, no summaries.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(u64, 0), placed[0].locality_bytes.?);
+    try testing.expectEqual(@as(u64, 0), placed[0].node_store_revision.?);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, "no summary") != null);
+}
+
+test "a damaged summary entry is ignored, not an error" {
+    // Goal: advisory means a bad sample scores 0. Method: c's tree has a sample that is not hex.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    const bad: records.NodeStore = .{
+        .node = "c",
+        .trees = &.{.{ .tree = image, .bytes = 1, .chunks = 1, .sample = "zz" }},
+    };
+    try fixture.put(.{ .agent = "c" }, records.node_store_key("c").slice(), bad);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
 }

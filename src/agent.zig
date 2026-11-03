@@ -41,6 +41,8 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
+const compare_sets = @import("compare_sets.zig");
+const node_store = @import("node_store.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
 const store = @import("store.zig");
@@ -87,6 +89,9 @@ pub const Context = struct {
     /// Where the agent says by when every call to the server must end (the fence), as soon as it
     /// changes within a step. Null caps nothing (a store in memory never waits).
     deadline: ?Deadline = null,
+    /// The agent's image store, for the summary it publishes as `/node-store/<node>`. Null
+    /// publishes none (the tests that do not look at locality).
+    images: ?node_store.Images = null,
 
     pub fn mono_ms(ctx: *const Context) u64 {
         const clock = ctx.mono orelse ctx.clock;
@@ -164,6 +169,10 @@ pub const Agent = struct {
     restored: bool,
     stops: [constants.agent_stops_max]PendingStop,
     stops_count: u32,
+    /// The lease and the hash of the `/node-store` value last written: the summary is written
+    /// again only when it changes or the lease does (a new lease deleted the old key).
+    store_lease: store.LeaseId,
+    store_hash: u64,
 
     /// Initialises in place: the stop table is large.
     pub fn init(agent: *Agent, config: Config) void {
@@ -178,6 +187,8 @@ pub const Agent = struct {
         agent.fences = 0;
         agent.restored = false;
         agent.stops_count = 0;
+        agent.store_lease = store.lease_none;
+        agent.store_hash = 0;
     }
 
     /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is
@@ -232,6 +243,8 @@ pub const Agent = struct {
         // A grant or a keepalive moves the fence: the calls that follow are capped by the new one.
         agent.cap_calls(ctx);
         const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
+        try agent.publish_store(ctx, listings);
+        if (agent.fence.active) return agent.fence_step(ctx, now);
         var pass: Pass = .{
             .agent = agent,
             .ctx = ctx,
@@ -264,6 +277,35 @@ pub const Agent = struct {
     }
 
     // ---- The lease and the node's registration ----
+
+    /// Writes the image summary (`/node-store/<node>`, advisory, bound to the node's lease) when
+    /// it changed. A failed tenure compare fences, as for an observed write.
+    fn publish_store(agent: *Agent, ctx: *const Context, listings: []const runtime.Listing) Error!void {
+        const images = ctx.images orelse return;
+        assert(agent.lease != store.lease_none);
+        var started: std.ArrayList([]const u8) = .empty;
+        for (listings) |listing| {
+            const digest = label_value(listing.labels, runtime.label_image) orelse continue;
+            started.append(ctx.arena, digest) catch return failures.no_memory(ctx.diag);
+        }
+        const summary = images.summary(ctx.arena, started.items) catch
+            return failures.no_memory(ctx.diag);
+        const record = node_store.record_of(ctx.arena, agent.config.node, summary) catch
+            return failures.no_memory(ctx.diag);
+        const value = try records.encode(ctx.arena, record, ctx.diag);
+        const hash = std.hash.Wyhash.hash(0, value);
+        if (agent.store_lease == agent.lease and agent.store_hash == hash) return;
+        const key = records.node_store_key(agent.config.node);
+        var tenure: compare_sets.Set = .{};
+        compare_sets.observed_write(&tenure, agent.config.node, agent.tenure);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = agent.lease } };
+        const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = agent.config.node };
+        const done = try writers.txn(ctx.store, role, request, ctx.diag);
+        if (!done.succeeded) return agent.begin_fence(ctx, ctx.mono_ms());
+        agent.store_lease = agent.lease;
+        agent.store_hash = hash;
+    }
 
     /// Keeps the node's lease alive, or grants one and registers.
     fn heartbeat(agent: *Agent, ctx: *const Context) Error!Beat {

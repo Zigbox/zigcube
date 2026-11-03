@@ -24,6 +24,7 @@ pub const modules = .{
     @import("auditor.zig"),
     @import("apply.zig"),
     @import("chunk_summary.zig"),
+    @import("node_store.zig"),
     @import("fetch_plan.zig"),
     @import("sim_images.zig"),
     @import("sim_swarm.zig"),

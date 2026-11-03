@@ -113,6 +113,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "replicas")) return call.replicas();
     if (std.mem.eql(u8, what, "assigned")) return call.assigned();
     if (std.mem.eql(u8, what, "observed")) return call.observed();
+    if (std.mem.eql(u8, what, "store")) return call.summary();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
@@ -373,6 +374,39 @@ const Call = struct {
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
+    // ---- PUT /v1/agent/nodes/{node}/store ----
+
+    /// The node's image summary, on the lease the agent names, under its tenure. Advisory, so
+    /// the checks are on shape and size, not on content.
+    fn summary(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("PUT");
+        try call.only_known();
+        try call.no_more();
+        const input = try parse_body(SummaryBody, ctx, call.body);
+        if (input.tenure == 0) return bad_request(ctx, "tenure", "is needed: it must not be 0");
+        if (input.lease == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        if (!std.mem.eql(u8, input.summary.node, call.node)) {
+            return bad_request(ctx, "summary", "is for another node");
+        }
+        if (input.summary.trees.len > constants.summary_trees_max) {
+            return bad_request(ctx, "summary", "holds more trees than a summary may");
+        }
+        const value = records.encode(ctx.arena, input.summary, ctx.diag) catch
+            return propagate(ctx);
+        const key = records.node_store_key(call.node);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = input.lease } };
+        var tenure: compare_sets.Set = .{};
+        compare_sets.observed_write(&tenure, call.node, input.tenure);
+        const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = call.node };
+        const result = writers.txn(ctx.store, role, request, ctx.diag) catch
+            return propagate(ctx);
+        if (!result.succeeded) return tenure_ended(ctx, call.node);
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
+    }
+
     /// The key is this node's observed key for the replica the record names, and the record says
     /// it is this node's: an agent can write its own node's reports and no other key.
     fn check_put(call: Call, put: *const ObservedPut) Failure!void {
@@ -501,6 +535,12 @@ const Chain = struct {
 fn hex(ctx: *const Context, hash: store.Hash) Failure![]const u8 {
     return std.fmt.allocPrint(ctx.arena, "{x}", .{&hash}) catch no_memory(ctx);
 }
+
+const SummaryBody = struct {
+    tenure: u64 = 0,
+    lease: u64 = 0,
+    summary: records.NodeStore,
+};
 
 const ObservedBody = struct {
     /// The revision of the registration the agent writes under (its tenure).

@@ -399,8 +399,12 @@ pub const RemoteStore = struct {
         const first = store.op_key(request.on_success[0]);
         const registering = std.mem.eql(u8, first, node_key.slice());
         if (registering and tenure != 0) return unsupported(diag, "a registration with a compare");
+        const summary_key = records.node_store_key(remote.node);
+        const publishing = std.mem.eql(u8, first, summary_key.slice());
         const sent: Request = if (registering)
             try remote.registration(arena, request.on_success, diag)
+        else if (publishing)
+            try remote.summary(arena, request.on_success, tenure, diag)
         else
             try remote.report(arena, request.on_success, tenure, diag);
         const reply = try remote.exchange(arena, sent, diag);
@@ -457,6 +461,39 @@ pub const RemoteStore = struct {
             .labels = node.labels,
         }, diag);
         const target = try remote.path(arena, "", diag);
+        return .{ .method = "PUT", .target = target, .body = body };
+    }
+
+    /// `PUT /v1/agent/nodes/{node}/store`: the one put of `/node-store/<node>` on the node's
+    /// lease, under the tenure.
+    fn summary(
+        remote: *RemoteStore,
+        arena: Allocator,
+        ops: []const store.Op,
+        tenure: u64,
+        diag: *Diag,
+    ) store.Error!Request {
+        if (tenure == 0) return unsupported(diag, "a summary without a tenure");
+        if (ops.len != 1) return unsupported(diag, "a summary with other operations");
+        const put = switch (ops[0]) {
+            .put => |value| value,
+            .delete => return unsupported(diag, "the delete of the node's summary"),
+        };
+        if (put.lease == store.lease_none) return unsupported(diag, "a summary with no lease");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var json: std.json.Stringify = .{ .writer = &out.writer };
+        json.beginObject() catch return failures.no_memory(diag);
+        json.objectField("tenure") catch return failures.no_memory(diag);
+        json.write(tenure) catch return failures.no_memory(diag);
+        json.objectField("lease") catch return failures.no_memory(diag);
+        json.write(put.lease) catch return failures.no_memory(diag);
+        json.objectField("summary") catch return failures.no_memory(diag);
+        json.beginWriteRaw() catch return failures.no_memory(diag);
+        json.writer.writeAll(put.value) catch return failures.no_memory(diag);
+        json.endWriteRaw();
+        json.endObject() catch return failures.no_memory(diag);
+        const body = out.toOwnedSlice() catch return failures.no_memory(diag);
+        const target = try remote.path(arena, "/store", diag);
         return .{ .method = "PUT", .target = target, .body = body };
     }
 
