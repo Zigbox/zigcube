@@ -148,6 +148,18 @@ is the server's `VerifiedStore`, which refuses every store call once its store w
 agent's refusal keeps it from starting or stopping containers on the strength of an answer from
 behind; the server's keeps the controllers and every write from building on one.
 
+## The peer identity (C2 slice 6a)
+
+At start the agent opens its state directory and loads `peer.key` (an Ed25519 seed, 64 hex
+digits, mode 0600; made on the first run), `peer.cred` and `ca.pub`. A file others can read, or
+one that does not parse, is `ZC-E0806` and the agent does not start. A stored pair that belongs to
+another key, node or CA is ignored and the agent joins again. Before each step the agent calls
+`POST /v1/agent/nodes/{node}/credential` if it has no credential or half of its life has passed
+(`agent_peer.zig`); the call's timeout stays short of the lease's fence. A failure (an
+unreachable server, `ZC-E0807` for a removed node) is shown once and retried every
+`peer_join_retry_ms`; it never stops the agent or its containers. Nothing yet uses the credential:
+slice 6b's chunk server does.
+
 ## What survives what
 
 | Event | Containers | The agent's work |

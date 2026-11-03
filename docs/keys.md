@@ -31,7 +31,9 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
 
-An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`. One departure from
+The cluster CA (`ca.key`, docs/peer.md) is not a writer: it signs credentials and writes no key.
+Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer.cred` and
+`ca.pub`, live in the state directories, not in the store. An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`. One departure from
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`

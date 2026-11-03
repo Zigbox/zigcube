@@ -41,6 +41,7 @@ const loop_mod = @import("agent_loop.zig");
 const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
+const agent_peer = @import("agent_peer.zig");
 const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 
@@ -83,9 +84,40 @@ const Shell = struct {
     images: ?node_store.Images = null,
     /// The last save of the remembered pair failed; shown once, cleared by one that works.
     save_failed: bool = false,
+    /// The node's peer identity (docs/peer.md) and the transport its join calls use.
+    peer: *agent_peer.Peer,
+    peer_transport: remote_mod.client.Transport,
+
+    /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
+    /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
+    fn peer_step(shell: *Shell) void {
+        const now_ms = shell.clock.now_ms();
+        if (!shell.peer.due(now_ms)) return;
+        const timeout_ms = shell.before_fence(constants.peer_join_timeout_ms);
+        if (timeout_ms == 0) return;
+        shell.arena.reset();
+        shell.diag.reset();
+        const had = shell.peer.credential != null;
+        const arena = shell.arena.allocator();
+        shell.peer.step(shell.peer_transport, arena, now_ms, timeout_ms, &shell.diag) catch {
+            if (!shell.peer.reported) {
+                shell.peer.reported = true;
+                shell.show("\n", &shell.diag, "zcube-agent: running on; it will try again\n");
+            }
+            shell.diag.reset();
+            return;
+        };
+        const verb = if (had) "renewed" else "joined";
+        var buffer: [128]u8 = undefined;
+        const text = "zcube-agent: node {s} {s} the cluster CA\n";
+        const line = std.fmt.bufPrint(&buffer, text, .{ shell.agent.config.node, verb }) catch
+            return;
+        std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
+    }
 
     /// One step of the core, with what the policy says to tell the person.
     fn pass(shell: *Shell) loop_mod.Outcome {
+        shell.peer_step();
         shell.arena.reset();
         shell.diag.reset();
         const ctx: agent_mod.Context = .{
@@ -302,6 +334,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
     load_pair(gpa, &remote, backend.pair_state, config.state_dir, server, &diag) catch
         return fail(io, &diag, config.verbose);
+    var peer_identity = agent_peer.Peer.open(io, config.state_dir, config.node, &diag) catch
+        return fail(io, &diag, config.verbose);
+    defer peer_identity.close();
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     agent.init(.{
@@ -325,6 +360,8 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
         .boot_id = boot_id,
+        .peer = &peer_identity,
+        .peer_transport = http_transport.transport(),
     };
     defer shell.arena.deinit();
     announce(io, config);

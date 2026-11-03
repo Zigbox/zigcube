@@ -220,6 +220,11 @@ changes the transcript, so the client fails when it opens M2); replay, reorderin
 and tampering of records, and counter exhaustion; a teeth test (`set_test_fault`: a test-only
 fault that skips the credential signature check must let a forged credential in, which proves
 the refusal tests would fail). `src/peer_fuzz.zig` is the seeded decoder fuzzer
-(`ZCUBE_FUZZ_SEED`). **Not yet written (rest of 6a):** `src/server_ca.zig`, the agent's key
-files, the join endpoint and their tests for issuance, persistence across a restart, renewal and
-refusal after removal.
+(`ZCUBE_FUZZ_SEED`). The rest of 6a is `src/peer_ca.zig` (core: the `Ca`, the
+`revoked` list and its parser), `src/peer_files.zig` and `src/server_ca.zig` (shell: `ca.key`
+mode 0600, atomic writes, ZC-E0806), `src/agent_peer.zig` (the agent's files, join, renewal at
+half the life), and the join endpoint in `src/agent_api.zig`. Their tests: unit tests in each
+file, and in `src/agent_remote_test.zig` a live server and agent files for issuance, persistence
+across a server restart, renewal and the refusal of a removed node (ZC-E0807). With a memory
+store the CA is made again at each start, which says so on stderr, and every agent rejoins.
+The handshake is interim: see `docs/decisions/2026-11-03-peer-handshake-interim.md`.

@@ -452,16 +452,23 @@ pub const peer_record_bytes_max: u32 = 16 * 1024;
 /// Records a direction may carry before the connection must be replaced (2^32).
 pub const peer_record_counter_max: u64 = 1 << 32;
 /// The `revoked` file and the key files are small; this bounds the read.
-pub const peer_file_bytes_max: u32 = 16 * 1024;
+pub const peer_file_bytes_max: u32 = 32 * 1024;
 /// Names on the server's `revoked` list.
 pub const peer_revoked_max: u32 = 256;
-/// A credential request body: `{"public_key": "<64 hex>"}` with room to spare.
+/// A credential request body: `{"node_key": "<64 hex>"}` with room to spare.
 pub const peer_join_request_bytes_max: u32 = 512;
+/// A failed join or renewal is tried again after this long.
+pub const peer_join_retry_ms: u32 = 5 * 1000;
+/// One join call waits this long at most (less near the lease's fence).
+pub const peer_join_timeout_ms: u32 = 3 * 1000;
 
 comptime {
     assert(peer_credential_ttl_ms < peer_credential_ttl_ms_max);
     assert(peer_record_bytes_max + 16 <= std.math.maxInt(u16));
     assert(peer_clock_skew_ms < peer_credential_ttl_ms / 2);
+    // 256 names of the longest length, a newline each, fit the file bound.
+    assert(peer_revoked_max * (node_name_bytes_max + 1) <= peer_file_bytes_max);
+    assert(peer_join_timeout_ms < agent_io_timeout_ms);
 }
 
 comptime {

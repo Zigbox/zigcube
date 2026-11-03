@@ -441,6 +441,25 @@ the agent adopts the ttl in the answer, and refuses one it could not fence under
 The server does not remember which node asked, so a lease is tied to the node only by the key
 registered on it.
 
+### `POST /v1/agent/nodes/{node}/credential` (C2 slice 6a)
+
+The join of docs/peer.md. Body `{"node_key": "<64 hex digits>"}` (the node's Ed25519 public key;
+at most `peer_join_request_bytes_max` bytes, no unknown fields). The server's CA signs a
+credential binding that key to `{node}` for `peer_credential_ttl_ms` from its wall clock, and
+answers
+
+```json
+{ "credential": "<hex, 185 bytes>", "ca_public": "<64 hex digits>",
+  "not_before_ms": 1767225600000, "not_after_ms": 1767312000000 }
+```
+
+The agent calls it again at half the credential's life. Refusals: `400` for a key that is not 64
+hex digits or not a point on the curve, or a node name that is not a node name; `ZC-E0807` for a
+node on the server's `revoked` file (read at start); `404` where the server has no CA (the
+simulation's `Api`). The reply carries **no chain pair**: the call reads and writes no store
+key, and the CA is not a store writer (authority.md, section 2). Like every agent endpoint it is
+unauthenticated until the API has auth (docs/peer.md, "Trust model").
+
 ### `POST /v1/agent/nodes/{node}/lease/{id}/keepalive`
 
 No body; the same answer. **A lease that has ended is `503` and `ZC-E0205`**, and that code is how
@@ -617,3 +636,5 @@ rest are about the agent's own host.
 | `ZC-E0508` | user | the container's command can't be run | the supervisor, as `start_failed` |
 | `ZC-E0509` | environment | the container's supervisor is gone | `FakeRuntime`, as `lost` |
 | `ZC-W0501` | environment | the agent's lease ended and it registered again | the agent, a warning |
+| `ZC-E0806` | environment | the CA key, a node key or a credential file can't be used | `zcube-server` and the agent at start |
+| `ZC-E0807` | user | the node was removed from the cluster and is refused a credential | the credential endpoint |

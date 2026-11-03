@@ -16,6 +16,7 @@
 //!   POST /v1/agent/nodes/{node}/observed               one transaction of puts and deletes
 //!   PUT  /v1/agent/nodes/{node}/store                  the node's image summary (advisory)
 //!   GET  /v1/agent/nodes/{node}/watch?from=&timeout=   "something changed", a long poll
+//!   POST /v1/agent/nodes/{node}/credential             a peer credential for the node's key
 //!
 //! **Every answer carries `chain`**: `{"revision": R, "hash": "<hex>"}`, the store's `status`
 //! taken after the endpoint's work (the watch: the head it answered at). Every endpoint takes
@@ -51,6 +52,8 @@ const writers = @import("writers.zig");
 const text_util = @import("text.zig");
 
 const Context = controller.Context;
+const peer = @import("peer.zig");
+const peer_ca = @import("peer_ca.zig");
 
 /// The route failed and `ctx.diag` says why. Same set as `api.zig`'s, so `try` passes it up.
 pub const Failure = error{Failed};
@@ -88,6 +91,7 @@ pub fn body_bytes_max(path: []const u8) u32 {
     const rest = path[prefix.len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
         return constants.agent_request_bytes_max;
+    if (std.mem.eql(u8, rest[slash..], "/credential")) return constants.peer_join_request_bytes_max;
     if (!std.mem.eql(u8, rest[slash..], "/store")) return constants.agent_request_bytes_max;
     return constants.summary_request_bytes_max;
 }
@@ -101,6 +105,7 @@ pub fn route(
     hold: bool,
     lease_ttl_ms: u32,
     pair_kept: bool,
+    ca: ?*const peer_ca.Ca,
 ) Failure!Reply {
     assert(ctx.diag.code == null);
     const nodes = parts.next() orelse return no_such(ctx, "/v1/agent");
@@ -120,6 +125,7 @@ pub fn route(
         .pair_kept = pair_kept,
         .parts = parts,
         .lease_ttl_ms = lease_ttl_ms,
+        .ca = ca,
     };
     const what = parts.next() orelse return call.register();
     if (std.mem.eql(u8, what, "lease")) return call.lease();
@@ -128,6 +134,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "observed")) return call.observed();
     if (std.mem.eql(u8, what, "store")) return call.summary();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
+    if (std.mem.eql(u8, what, "credential")) return call.credential();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
 
@@ -142,6 +149,8 @@ const Call = struct {
     parts: *Parts,
     /// The ttl of the leases this server grants: the agent learns it from the grant.
     lease_ttl_ms: u32,
+    /// The cluster CA, null where the server has none (the simulation).
+    ca: ?*const peer_ca.Ca,
 
     fn require_method(call: Call, wanted: []const u8) Failure!void {
         if (std.mem.eql(u8, call.method, wanted)) return;
@@ -202,6 +211,43 @@ const Call = struct {
         };
         result.known_hash = try hex(ctx, there);
         return result;
+    }
+
+    // ---- POST /v1/agent/nodes/{node}/credential ----
+
+    /// Signs the node's peer key (docs/peer.md). It reads and writes no store key: the CA is not a
+    /// store writer (authority.md), so there is no chain pair in the answer either.
+    fn credential(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("POST");
+        try call.only_known();
+        try call.no_more();
+        const ca = call.ca orelse return no_such(ctx, "a peer credential: this server has no CA");
+        const limits: BodyLimits = .{
+            .bytes_max = constants.peer_join_request_bytes_max,
+            .ignore_unknown_fields = false,
+        };
+        const input = try parse_body_up_to(CredentialBody, ctx, call.body, limits);
+        var node_key: [32]u8 = undefined;
+        const decoded = std.fmt.hexToBytes(&node_key, input.node_key) catch
+            return bad_request(ctx, "node_key", "is not 64 hex digits");
+        if (decoded.len != node_key.len) {
+            return bad_request(ctx, "node_key", "is not 64 hex digits");
+        }
+        const issued = ca.issue(call.node, node_key) catch |err| switch (err) {
+            error.Removed => return removed(ctx, call.node),
+            error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
+        };
+        const bytes = peer.encode(&issued);
+        const ca_public = ca.public();
+        return reply(ctx, .{
+            .credential = std.fmt.allocPrint(ctx.arena, "{x}", .{&bytes}) catch
+                return no_memory(ctx),
+            .ca_public = std.fmt.allocPrint(ctx.arena, "{x}", .{&ca_public}) catch
+                return no_memory(ctx),
+            .not_before_ms = issued.not_before_ms,
+            .not_after_ms = issued.not_after_ms,
+        });
     }
 
     // ---- PUT /v1/agent/nodes/{node} ----
@@ -559,6 +605,8 @@ const RegisterBody = struct {
     labels: []const []const u8 = &.{},
 };
 
+const CredentialBody = struct { node_key: []const u8 };
+
 const LeaseBody = struct { ttl_ms: u32 = 0 };
 
 const ObservedPut = struct { key: []const u8, value: records.Observed };
@@ -728,6 +776,14 @@ fn no_such(ctx: *const Context, path: []const u8) Failure {
     ctx.diag.raise(.E0101);
     ctx.diag.cause("the API serves nothing at {s}", .{path});
     ctx.diag.fix(.{ .sentence = "the agent's endpoints are under /v1/agent/nodes/{node}/" });
+    return error.Failed;
+}
+
+fn removed(ctx: *const Context, node: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0807);
+    ctx.diag.cause("node {s} is on the server's list of removed nodes", .{node});
+    ctx.diag.fix(.{ .sentence = "take the name out of the revoked file and restart zcube-server" });
     return error.Failed;
 }
 

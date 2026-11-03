@@ -910,7 +910,7 @@ const Refusal = struct {
 };
 
 /// The code of the first diagnostic in an error body, if it has one.
-fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
+pub fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
     const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return null;
     if (parsed.diagnostics.len == 0) return null;
@@ -918,7 +918,7 @@ fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
 }
 
 /// ZC-E0504 carrying the server's own diagnostic: its code and summary, and its innermost cause.
-fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
+pub fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
     assert(diag.code == null);
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
     const parsed = std.json.parseFromSliceLeaky(Refusal, arena, reply.body, options) catch

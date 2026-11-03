@@ -11,6 +11,7 @@ const std = @import("std");
 const testing = std.testing;
 const net = std.Io.net;
 const agent_mod = @import("agent.zig");
+const agent_peer = @import("agent_peer.zig");
 const clock_mod = @import("agent_clock.zig");
 const codes = @import("diag/codes.zig");
 const config_mod = @import("server_config.zig");
@@ -505,4 +506,87 @@ fn running_names(rig: *Rig, out: *[2]runtime_name) !void {
         found += 1;
     }
     try testing.expectEqual(@as(usize, 2), found);
+}
+
+test "a node joins the CA, keeps its pair, renews at half life, is refused once removed" {
+    // Goal: docs/peer.md's issuance, persistence, renewal and removal through real HTTP and the
+    // real files. Method: join; restart the server (the CA key is the same) and the peer (the
+    // stored pair is reused, nothing is due); step at the renewal time; then list the node as
+    // removed (the server's `revoked` file, read at start) and see ZC-E0807, the old pair kept.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var base: [constants.state_path_bytes_max]u8 = undefined;
+    const base_length = try rig.tmp.dir.realPath(rig.io, &base);
+    const state_dir = try std.fmt.allocPrint(arena, "{s}/agent", .{base[0..base_length]});
+
+    var identity = try agent_peer.Peer.open(rig.io, state_dir, "node1", &diag);
+    defer identity.close();
+    try testing.expect(identity.credential == null);
+    const wall = rig.clock_source.clock().now_ms();
+    try identity.step(rig.http_transport.transport(), arena, wall, 3000, &diag);
+    const first = identity.credential.?;
+    try testing.expect(identity.ca_public != null);
+    const life_ms = first.not_after_ms - first.not_before_ms;
+    try testing.expectEqual(@as(u64, constants.peer_credential_ttl_ms), life_ms);
+    for ([_][]const u8{ "peer.key", "peer.cred", "ca.pub" }) |name| {
+        var dir = try std.Io.Dir.cwd().openDir(rig.io, state_dir, .{});
+        defer dir.close(rig.io);
+        const file = try dir.openFile(rig.io, name, .{});
+        defer file.close(rig.io);
+        const stat = try file.stat(rig.io);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    }
+    try testing.expect(!identity.due(wall + 1000));
+
+    // The server restarts over the same state directory: the same CA, so the stored pair holds.
+    try rig.restart_server();
+    var again = try agent_peer.Peer.open(rig.io, state_dir, "node1", &diag);
+    defer again.close();
+    try testing.expectEqualSlices(u8, &first.node_key, &again.credential.?.node_key);
+    try testing.expectEqual(identity.ca_public.?, again.ca_public.?);
+    try testing.expect(!again.due(wall + 1000));
+
+    // Renewal at half the life: a new credential, signed by the same CA.
+    const renew_at = again.renew_at_ms;
+    try testing.expect(again.due(renew_at));
+    try again.step(rig.http_transport.transport(), arena, renew_at, 3000, &diag);
+    try testing.expect(again.credential.?.not_before_ms >= first.not_before_ms);
+    try testing.expectEqual(identity.ca_public.?, again.ca_public.?);
+
+    // Removal: the file is read at start, and then the node is refused, not stopped.
+    var dir = try std.Io.Dir.cwd().openDir(rig.io, base[0..base_length], .{});
+    defer dir.close(rig.io);
+    try dir.writeFile(rig.io, .{ .sub_path = "revoked", .data = "# gone\nnode1\n" });
+    try rig.restart_server();
+    const kept = again.credential.?;
+    try testing.expectError(
+        error.Failed,
+        again.step(rig.http_transport.transport(), arena, again.renew_at_ms, 3000, &diag),
+    );
+    try testing.expectEqual(@as(?codes.Code, .E0807), diag.code);
+    try testing.expectEqualSlices(u8, &kept.signature, &again.credential.?.signature);
+    try testing.expect(!again.due(again.retry_at_ms - 1));
+}
+
+test "the credential endpoint refuses what it should: a bad key, a big body, a wrong method" {
+    // Goal: docs/api.md's refusals for the credential call. Method: send each wrong request to a
+    // live server and read the status; none may issue anything.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const path = "/v1/agent/nodes/node1/credential";
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, "{\"node_key\":\"zz\"}"));
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, "{\"node_key\":\"00\"}"));
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, "{}"));
+    const off_curve = "{\"node_key\":\"" ++ "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" ++ "\"}";
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, off_curve));
+    var big: [constants.peer_join_request_bytes_max + 8]u8 = @splat(' ');
+    // A body over the cap is refused before it is read: a status, or the connection closed.
+    const refused = rig.post(path, &big) catch 400;
+    try testing.expect(refused >= 400);
+    try testing.expectEqual(@as(u16, 400), try rig.post("/v1/agent/nodes/Bad%20Name/credential", off_curve));
 }

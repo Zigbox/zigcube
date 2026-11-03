@@ -75,3 +75,10 @@ test "the peer handshake's seeded fuzzer is in this root" {
     // it is native only. Method: import it; the handshake's own tests come with the core.
     _ = @import("peer_fuzz.zig");
 }
+
+test "the peer files and the CA's shell are in this root" {
+    // Goal: the shell halves of docs/peer.md (key files, CA, agent identity) are tested natively.
+    _ = @import("agent_peer.zig");
+    _ = @import("peer_files.zig");
+    _ = @import("server_ca.zig");
+}

@@ -22,6 +22,9 @@ const control_plane = @import("control_plane.zig");
 const Backend = @import("server_store.zig").Backend;
 const server_listen = @import("server_listen.zig");
 const Remembered = @import("server_remember.zig").Remembered;
+const peer_ca = @import("peer_ca.zig");
+const server_ca = @import("server_ca.zig");
+const RealClock = @import("server_store.zig").RealClock;
 const store_verified = @import("store_verified.zig");
 
 const Allocator = std.mem.Allocator;
@@ -46,6 +49,10 @@ pub const Server = struct {
     /// Wraps the backend's store: every call the server makes goes through it.
     verified: store_verified.VerifiedStore,
     remembered: ?Remembered,
+    /// The cluster CA (docs/peer.md): `ca.key` in the state directory, or in memory.
+    ca: peer_ca.Ca,
+    /// Unix milliseconds, for the credentials the CA signs.
+    wall: RealClock,
     listener: net.Server,
     group: std.Io.Group,
     accept_future: ?std.Io.Future(void),
@@ -73,6 +80,7 @@ pub const Server = struct {
         server.* = try init_value(gpa, io, backend, config, options);
         try server.guard(config, diag);
         errdefer server.unguard();
+        try server.open_ca(config, diag);
         server.first_check(diag);
         server.listener = try listen(io, config.listen, diag);
         errdefer server.listener.deinit(io);
@@ -130,6 +138,8 @@ pub const Server = struct {
             },
             .verified = undefined,
             .remembered = null,
+            .ca = undefined,
+            .wall = .{ .io = io },
             .listener = undefined,
             .group = .init,
             .accept_future = null,
@@ -179,6 +189,26 @@ pub const Server = struct {
         server.shared.api.pair_kept = remember != null;
         server.driver.store = guarded;
         server.driver.verified = &server.verified;
+    }
+
+    /// Loads or makes the cluster CA and hands it to the API. A state directory the server cannot
+    /// use for it is a start failure (`ZC-E0806`), not a server with no CA.
+    fn open_ca(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
+        const directory = state_path(config, diag);
+        if (diag.code != null) return error.StartFailed;
+        server_ca.open(
+            &server.ca,
+            server.gpa,
+            server.io,
+            directory,
+            server.wall.clock(),
+            diag,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            assert(diag.code != null);
+            return error.StartFailed;
+        };
+        server.shared.api.ca = &server.ca;
     }
 
     /// `file` as an absolute path (working directory plus name, lexically), for keying the
