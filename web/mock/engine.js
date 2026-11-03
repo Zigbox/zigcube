@@ -218,10 +218,10 @@ export class Engine {
     this.requireUp();
     const key = `/services/${spec.name}`;
     const existing = this.getKv(key);
-    const same = existing && ["image", "command", "env", "limits"].every(k => JSON.stringify(existing.value[k]) === JSON.stringify(spec[k] ?? (k === "env" ? [] : k === "limits" ? {} : undefined)));
+    const same = existing && ["image", "command", "env", "limits", "source"].every(k => JSON.stringify(existing.value[k]) === JSON.stringify(spec[k] ?? (k === "env" ? [] : k === "limits" ? {} : k === "source" ? "" : undefined)));
     const value = {
-      v: 2, name: spec.name, image: spec.image, replicas: spec.replicas, command: spec.command,
-      env: spec.env || [], limits: spec.limits || {},
+      v: 3, name: spec.name, image: spec.image, replicas: spec.replicas, command: spec.command,
+      env: spec.env || [], limits: spec.limits || {}, source: spec.source || "", // docs/keys.md: the OCI reference, "" if none
       // A change of the replica count alone does not bump the generation here; keys.md is silent on it.
       generation: existing ? existing.value.generation + (same ? 0 : 1) : 1,
       applied_by: actor, request_id: requestId, // proposed additions to /services/<name>, see docs/api.md
@@ -352,7 +352,7 @@ export class Engine {
           cause: { kind: "decision", id: sd.id },
         });
         const placed = this.place(svc, placing, create.id, id);
-        const replica = { v: 2, id, service: svc.name, generation: svc.generation, image: svc.image, command: svc.command, env: svc.env, limits: svc.limits };
+        const replica = { v: 3, id, service: svc.name, generation: svc.generation, image: svc.image, command: svc.command, env: svc.env, limits: svc.limits, source: svc.source || "" };
         ops.push(...create.ops, { put: [`/replicas/${svc.name}/${id}`, replica] });
         if (placed) {
           ops.push(...placed.ops);
