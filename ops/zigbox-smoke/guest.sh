@@ -159,6 +159,7 @@ stage_oom() {
     apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' '["tail","/dev/zero"]')"
     until_ok 120 "hog to end as oom" has_exit hog oom
     ok "a container past its memory limit ends as oom"
+    two_boxes || fail "box was disturbed by the oom stage: $(observed box | tr '\n' ';')"
     curl -sf -X DELETE "$API/v1/services/hog" >/dev/null || fail "delete hog"
 }
 
@@ -169,6 +170,7 @@ stage_refusals() {
     apply "$(service_json unknown $UNKNOWN_TREE 1 '{}' "$(loop_json unknown)")"
     until_ok 60 "unknown to be refused" has_code unknown ZBX-E0410
     ok "a digest the node cannot pull is held with ZBX-E0410"
+    two_boxes || fail "box was disturbed by the refusals: $(observed box | tr '\n' ';')"
     curl -sf -X DELETE "$API/v1/services/wrong" >/dev/null || fail "delete wrong"
     curl -sf -X DELETE "$API/v1/services/unknown" >/dev/null || fail "delete unknown"
 }
@@ -182,7 +184,10 @@ stage_scale0() {
     sleep 20
     agent_pid >/dev/null || fail "the agent died when a service was removed during a pull"
     two_boxes || fail "box was disturbed by removing big: $(count box) processes, observed:" \
-        "$(observed box | tr '\n' ';')" "processes:" "$(ps -eo pid,etime,args | grep -E 'zcube|# (box|big)' | grep -v grep)"
+        "$(observed box | tr '\n' ';')" "processes:" \
+        "$(ps -eo pid,etime,args | grep -E 'zcube|# (box|big)' | grep -v grep)" \
+        "launch box-5: $(ls -l "$STATE"/zigbox/box-5 | tr '\n' ';') supervisor.pid: $(cat "$STATE"/zigbox/box-5/supervisor.pid)" \
+        "zbx ps: $("$BIN/zbx" ps --all 2>&1 | tr '\n' ';')"
     ok "removing a service during its pull leaves the agent and box running"
 }
 
