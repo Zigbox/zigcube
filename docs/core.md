@@ -146,6 +146,12 @@ built with `-Doptimize=ReleaseSafe`).
   adapter is also correct for it. This is the one place the simulated runtime departs.
   `Runtime.signal` has no such departure: it acts at once (TERM is ignored by a `slow_stop`
   container, KILL ends any), and the fence uses it.
+  *Effect on sim-c0 fuzz reports (C2 slice 3).* The fence used to call `stop` with a grace, which
+  moved a `slow_stop` container to `.stopping`; `signal` TERM leaves it `.running`. Fuzz runs that
+  fence therefore differ in their counters (`sim_c0 99 fuzz 300`: agent failures 4491 became 4489;
+  `sim_c0 5 fuzz 300`: 4923 became 4922); plain scenarios and sim-cluster are unchanged. Cause
+  confirmed for seed 99 by making TERM on a slow container enter `.stopping`: 4491 came back. It
+  is an intended difference of the simulated runtime, not a change in the agent's decisions.
 - **The runtime does not report when a container started**, so the agent's `started_at_ms` is
   the time it started or first saw it (kept across re-adoption if a record exists). Zigbox's
   `Listing` could carry it.

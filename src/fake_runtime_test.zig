@@ -8,6 +8,10 @@
 const std = @import("std");
 const testing = std.testing;
 const agent_clock = @import("agent_clock.zig");
+const agent_mod = @import("agent.zig");
+const clock_mod = @import("clock.zig");
+const fencing = @import("fencing.zig");
+const store_memory = @import("store_memory.zig");
 const constants = @import("constants.zig");
 const codes = @import("diag/codes.zig");
 const diag_mod = @import("diag.zig");
@@ -401,6 +405,86 @@ test "sixteen containers that ignore TERM are signalled in well under one wait, 
     for (handles) |handle| {
         try testing.expectEqual(@as(u8, 9), (try rig.wait_stopped(handle)).signaled);
     }
+}
+
+test "a fence over sixteen real containers: polite ones go at once, the rest at the kill time" {
+    // Goal: P2 on real processes. Method: an `Agent` over `FakeRuntime` with sixteen containers,
+    // the odd ones trapping TERM; the fence is begun with a manual clock for the deadline. After
+    // the first step every polite container is gone and every trapping one still runs; just
+    // before the kill time that is still so; at it the rest are killed, and the next step ends
+    // the fence. The whole fence takes one `fence_stop_ms` of the manual clock plus one poll.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const count = 16;
+    var handles: [count]runtime.Handle = undefined;
+    for (&handles, 0..) |*handle, index| {
+        var name_buffer: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "fence-{d}", .{index});
+        handle.* = if (index % 2 == 0)
+            try rig.begin(name, &forever)
+        else
+            try begin_stubborn(rig, name);
+    }
+    var manual: clock_mod.ManualClock = .{ .ms = 1_000 };
+    var memory: store_memory.MemoryStore = undefined;
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    const agent = try testing.allocator.create(agent_mod.Agent);
+    defer testing.allocator.destroy(agent);
+    agent.init(.{ .node = "node1", .capacity = .{ .cpu_millis = 1000, .memory_bytes = 1 << 30 } });
+    const fence_at = manual.ms;
+    const kill_at = fencing.kill_at_ms(fence_at);
+    agent.fence = .{ .active = true, .asked = false, .kill_at_ms = kill_at };
+
+    try fence_step(rig, agent, &manual, &memory);
+    try testing.expect(agent.fence.asked);
+    for (handles, 0..) |handle, index| {
+        if (index % 2 == 0) {
+            try testing.expectEqual(@as(u8, 15), (try rig.wait_stopped(handle)).signaled);
+        } else {
+            try testing.expect(try rig.status(handle) == .running);
+        }
+    }
+    manual.ms = kill_at - 1;
+    try fence_step(rig, agent, &manual, &memory);
+    for (handles, 0..) |handle, index| {
+        if (index % 2 == 1) try testing.expect(try rig.status(handle) == .running);
+    }
+    try testing.expectEqual(@as(u32, 0), agent.fences);
+
+    manual.ms = kill_at;
+    try fence_step(rig, agent, &manual, &memory);
+    for (handles, 0..) |handle, index| {
+        if (index % 2 == 0) continue;
+        try testing.expectEqual(@as(u8, 9), (try rig.wait_stopped(handle)).signaled);
+    }
+    manual.ms = kill_at + constants.fence_poll_ms;
+    try fence_step(rig, agent, &manual, &memory);
+    try testing.expectEqual(@as(u32, 1), agent.fences);
+    try testing.expect(manual.ms - fence_at <= constants.fence_stop_ms + constants.fence_poll_ms);
+}
+
+fn fence_step(
+    rig: *Rig,
+    agent: *agent_mod.Agent,
+    manual: *clock_mod.ManualClock,
+    memory: *store_memory.MemoryStore,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: agent_mod.Context = .{
+        .store = memory.interface(),
+        .runtime = rig.fake.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    _ = agent.reconcile(&ctx) catch |err| {
+        if (diag.code) |code| std.debug.print("fence step: {s}\n", .{@tagName(code)});
+        return err;
+    };
 }
 
 test "a second agent on the same state directory is refused with ZC-E0506" {

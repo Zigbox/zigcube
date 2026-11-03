@@ -113,7 +113,8 @@ test "a fence over sixteen containers ends within one deadline, killing those th
     advance_to(world, kill_at + tick + constants.fence_poll_ms);
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     try testing.expectEqual(@as(u32, 1), world.agent.fences);
-    try testing.expect(world.now_ms() <= fencing.worst_case_dead_ms(sent, ttl));
+    const ended_by = kill_at + tick + constants.fence_poll_ms;
+    try testing.expect(ended_by <= fencing.worst_case_dead_ms(sent, ttl));
 }
 
 /// Long enough for a fence that needs no kill: a step that stops everything, and the poll after

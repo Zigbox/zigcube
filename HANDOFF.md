@@ -95,6 +95,7 @@ pub const Spec = struct {
 pub const Status = union(enum) { starting, running, stopped: ExitReason };
 
 // Runtime operations (vtable): start(Spec) -> Handle, stop(Handle, grace_ms),
+// signal(Handle, number) (TERM or KILL only; delivers and never waits),
 // inspect(Handle) -> Status, list() -> []Handle (with labels), and an event
 // stream of status changes. list() after an agent restart must return
 // containers started by the previous agent process.
