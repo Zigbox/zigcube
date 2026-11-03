@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0123 · Zigcube</title>
-<meta name="description" content="the local server did not come up">
+<meta name="description" content="the local server or agent did not come up">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0123.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,7 +73,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0123</h1>
-<p class="summary">the local server did not come up</p>
+<p class="summary">the local server or agent did not come up</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
 <p>zcube local up started zcube-server and zcube-agent, but the server did not answer, or the node did not register, within the time zcube waits. Both processes were stopped again. The cause line says which of the two steps failed, and the server's own log, which names the real reason (a port in use, a database it could not open), is in the local directory.</p>

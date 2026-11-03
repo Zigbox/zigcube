@@ -13,8 +13,10 @@
 //! The two processes are detached: their own process group, no input, output in their logs, so
 //! they outlive `zcube` and a Ctrl-C at the prompt. A pid file alone is never trusted. The pid may
 //! be dead, a zombie, or reused by a stranger, so a process counts as ours only if `/proc` shows
-//! it alive and its command line is the expected program working in this directory; anything else
-//! is a stale file, which is deleted and never signalled.
+//! it alive, started when the pid file says, and with exactly the arguments `up` gave it (see
+//! `is_ours`); anything else is a stale file, which is deleted and never signalled.
+//!
+//! `up` and `down` run one at a time: each holds a lock on `<dir>/lock` throughout.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -60,13 +62,33 @@ pub fn local_dir(env: *const Env, buffer: *[constants.state_path_bytes_max]u8) ?
     return std.fmt.bufPrint(buffer, "{s}/local", .{base}) catch null;
 }
 
-/// A pid file holds one decimal pid and a newline. Anything else is not a pid file of ours.
-pub fn parse_pid(text: []const u8) ?i32 {
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    const pid = std.fmt.parseInt(i32, trimmed, 10) catch return null;
+/// A pid file holds the pid and the process's start time (field 22 of `/proc/<pid>/stat`, in clock
+/// ticks since boot), each in decimal. The start time tells our process from a stranger that
+/// was given the same pid later.
+pub const PidFile = struct { pid: i32, start: u64 };
+
+/// Anything but exactly `<pid> <start>` is not a pid file of ours.
+pub fn parse_pid_file(text: []const u8) ?PidFile {
+    var fields = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const first = fields.next() orelse return null;
+    const second = fields.next() orelse return null;
+    if (fields.next() != null) return null;
+    const pid = std.fmt.parseInt(i32, first, 10) catch return null;
     if (pid <= 1) return null; // 0, 1 and negatives address groups or init, never our children.
-    return pid;
+    const start = std.fmt.parseInt(u64, second, 10) catch return null;
+    return .{ .pid = pid, .start = start };
+}
+
+/// Field 22 of `/proc/<pid>/stat`: when the process started. The fields after the last `)` begin
+/// with field 3, so it is the 20th of those.
+pub fn stat_start(stat: []const u8) ?u64 {
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    var fields = std.mem.tokenizeAny(u8, stat[close + 1 ..], " \n");
+    var index: u32 = 3;
+    while (fields.next()) |field| : (index += 1) {
+        if (index == 22) return std.fmt.parseInt(u64, field, 10) catch null;
+    }
+    return null;
 }
 
 /// `HOST:PORT` of the address file, as the CLI's `$ZCUBE_SERVER` wants it; the port alone.
@@ -86,15 +108,63 @@ pub fn is_zombie(stat: []const u8) bool {
     return state[0] == 'Z' or state[0] == 'X';
 }
 
-/// True if `cmdline` (NUL-separated, from `/proc`) is `exe_name` working in `dir`: the program's
-/// file name is `exe_name` and some argument names the directory. A reused pid fails one
-/// of the two.
-pub fn is_ours(cmdline: []const u8, exe_name: []const u8, dir: []const u8) bool {
-    assert(exe_name.len > 0);
+pub const Role = enum {
+    server,
+    agent,
+
+    fn exe_name(role: Role) []const u8 {
+        return switch (role) {
+            .server => server_exe,
+            .agent => agent_exe,
+        };
+    }
+};
+
+/// True if `cmdline` (NUL-separated, from `/proc`) is the program `zcube local up` starts for
+/// `role` in `dir`, and no other. Whole arguments are compared, never substrings: the program's
+/// file name is the role's; it is not a container's supervisor (`zcube-agent supervise <dir>/...`
+/// has the directory too); the server's `--store` is `sqlite:<dir>/zcube.db` and the agent's
+/// `--state-dir` is `<dir>/agent`, so a sibling directory with the same prefix is not ours.
+pub fn is_ours(cmdline: []const u8, role: Role, dir: []const u8) bool {
     assert(dir.len > 0);
-    const end = std.mem.indexOfScalar(u8, cmdline, 0) orelse cmdline.len;
-    if (!std.mem.eql(u8, std.fs.path.basename(cmdline[0..end]), exe_name)) return false;
-    return std.mem.find(u8, cmdline[end..], dir) != null;
+    assert(dir[dir.len - 1] != '/');
+    var args = std.mem.splitScalar(u8, cmdline, 0);
+    const program = args.next().?; // A split always yields a first element.
+    if (!std.mem.eql(u8, std.fs.path.basename(program), role.exe_name())) return false;
+    const flag = switch (role) {
+        .server => "--store",
+        .agent => "--state-dir",
+    };
+    var found = false;
+    var wanted = false;
+    while (args.next()) |arg| {
+        if (found) {
+            if (!value_is(role, arg, dir)) return false;
+            wanted = true;
+            found = false;
+        } else if (std.mem.eql(u8, arg, "supervise")) {
+            return false;
+        } else {
+            found = std.mem.eql(u8, arg, flag);
+        }
+    }
+    return wanted;
+}
+
+/// The value after `--store` or `--state-dir` that names `dir`'s own file or directory.
+fn value_is(role: Role, value: []const u8, dir: []const u8) bool {
+    const prefix = switch (role) {
+        .server => "sqlite:",
+        .agent => "",
+    };
+    const suffix = switch (role) {
+        .server => "/zcube.db",
+        .agent => "/agent",
+    };
+    if (!std.mem.startsWith(u8, value, prefix)) return false;
+    const path = value[prefix.len..];
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    return std.mem.eql(u8, path[dir.len..], suffix);
 }
 
 pub const Presence = enum { absent, running, stale };
@@ -107,15 +177,18 @@ pub fn decide(
     file: ?[]const u8,
     stat: ?[]const u8,
     cmdline: ?[]const u8,
-    exe_name: []const u8,
+    role: Role,
     dir: []const u8,
 ) Found {
     const text = file orelse return .{ .presence = .absent, .pid = 0 };
-    const pid = parse_pid(text) orelse return .{ .presence = .stale, .pid = 0 };
+    const recorded = parse_pid_file(text) orelse return .{ .presence = .stale, .pid = 0 };
+    const pid = recorded.pid;
     const alive = stat orelse return .{ .presence = .stale, .pid = pid };
     if (is_zombie(alive)) return .{ .presence = .stale, .pid = pid };
+    const start = stat_start(alive) orelse return .{ .presence = .stale, .pid = pid };
+    if (start != recorded.start) return .{ .presence = .stale, .pid = pid };
     const line = cmdline orelse return .{ .presence = .stale, .pid = pid };
-    if (!is_ours(line, exe_name, dir)) return .{ .presence = .stale, .pid = pid };
+    if (!is_ours(line, role, dir)) return .{ .presence = .stale, .pid = pid };
     return .{ .presence = .running, .pid = pid };
 }
 
@@ -167,12 +240,64 @@ fn raise_no_executable(report: *Report, name: []const u8, dir: []const u8, what:
 
 fn raise_not_up(report: *Report, step: []const u8, log: []const u8) void {
     report.diag.raise(.E0123);
-    report.diag.while_("waiting for the local server", .{});
+    report.diag.while_("waiting for the local server and agent", .{});
     report.diag.cause("{s}", .{step});
     report.diag.fix_with("read the log; the process says why it failed there:", "cat {s}", .{log});
 }
 
+fn raise_busy(report: *Report, lock_path: []const u8, wait_ms: u32) void {
+    report.diag.raise(.E0124);
+    report.diag.while_("waiting for another zcube local command to finish", .{});
+    report.diag.cause("{s} was still locked after {d} s", .{
+        lock_path, @divFloor(wait_ms, 1000),
+    });
+    report.diag.fix(.{ .sentence = "wait for the other zcube local command, then run this again" });
+}
+
+// ---- The lock --------------------------------------------------------------------------------
+
+/// Takes an exclusive lock on the file at `path`, creating it. `up` and `down` hold it from start
+/// to end, so two of them never run against the same processes at once. The kernel drops the lock
+/// when its holder ends, however it ends, and the descriptor is close-on-exec, so the server and
+/// the agent never inherit it. Waits at most `wait_ms` for the holder.
+pub fn lock_file(io: std.Io, path: []const u8, wait_ms: u32) error{ Busy, Unusable }!std.Io.File {
+    assert(path.len > 0);
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch
+        return error.Unusable;
+    var waited: u32 = 0;
+    while (true) {
+        const got = file.tryLock(io, .exclusive) catch {
+            file.close(io);
+            return error.Unusable;
+        };
+        if (got) return file;
+        if (waited >= wait_ms) {
+            file.close(io);
+            return error.Busy;
+        }
+        io.sleep(.fromMilliseconds(constants.local_poll_ms), .awake) catch {}; // Cancel.
+        waited += constants.local_poll_ms;
+    }
+}
+
+/// Marks every descriptor above stderr close-on-exec, so the server and the agent do not inherit
+/// what our caller left open (`exec 7>file; zcube local up`). Descriptors made later by std are
+/// close-on-exec already. A bounded scan: nobody keeps more than this many open across an exec.
+fn close_inherited_on_exec() void {
+    var fd: i32 = 3;
+    while (fd < constants.local_fd_scan_max) : (fd += 1) {
+        // EBADF for a descriptor that is not open is the common answer, and fine.
+        _ = std.os.linux.fcntl(fd, std.os.linux.F.SETFD, std.os.linux.FD_CLOEXEC);
+    }
+}
+
 // ---- The processes ---------------------------------------------------------------------------
+
+/// Why `up` gave up and which process to blame: the log to read is that process's.
+const NotUp = struct { culprit: Role, step: []const u8 };
+
+/// The pids `stop_all` stopped; 0 for a process that was not running (or would not stop).
+const Stopped = struct { server: i32 = 0, agent: i32 = 0 };
 
 const Local = struct {
     env: *const Env,
@@ -202,29 +327,26 @@ const Local = struct {
         std.Io.Dir.cwd().deleteFile(local.env.io, file) catch {}; // Already gone is the goal.
     }
 
-    /// What the pid file named `<which>.pid` and `/proc` say about that process.
-    fn find(local: *const Local, which: []const u8, exe_name: []const u8) Found {
-        const pid_name = std.fmt.allocPrint(local.arena, "{s}.pid", .{which}) catch
-            return .{ .presence = .stale, .pid = 0 };
-        const file = local.read(local.path(pid_name) catch return .{
-            .presence = .stale,
-            .pid = 0,
-        });
-        const pid = if (file) |text| parse_pid(text) else null;
-        if (pid == null) return decide(file, null, null, exe_name, local.dir);
-        const stat = local.proc(pid.?, "stat");
-        const line = local.proc(pid.?, "cmdline");
-        return decide(file, stat, line, exe_name, local.dir);
-    }
-
-    fn proc(local: *const Local, pid: i32, name: []const u8) ?[]const u8 {
-        const file = std.fmt.allocPrint(local.arena, "/proc/{d}/{s}", .{ pid, name }) catch
-            return null;
-        return local.read(file);
+    /// What the pid file of `role` and `/proc` say about that process.
+    fn find(local: *const Local, role: Role) Found {
+        const stale: Found = .{ .presence = .stale, .pid = 0 };
+        const pid_name = std.fmt.allocPrint(local.arena, "{s}.pid", .{@tagName(role)}) catch
+            return stale;
+        const file = local.read(local.path(pid_name) catch return stale);
+        const recorded = if (file) |text| parse_pid_file(text) else null;
+        if (recorded == null) return decide(file, null, null, role, local.dir);
+        // Stack buffers: this runs on every poll, and the arena would grow by 9 KB each time.
+        var stat_buffer: [1024]u8 = undefined;
+        var line_buffer: [constants.local_cmdline_bytes_max]u8 = undefined;
+        const pid = recorded.?.pid;
+        const stat = read_proc(local.env.io, pid, "stat", &stat_buffer);
+        const line = read_proc(local.env.io, pid, "cmdline", &line_buffer);
+        return decide(file, stat, line, role, local.dir);
     }
 
     fn alive(local: *const Local, pid: i32) bool {
-        const stat = local.proc(pid, "stat") orelse return false;
+        var buffer: [1024]u8 = undefined;
+        const stat = read_proc(local.env.io, pid, "stat", &buffer) orelse return false;
         return !is_zombie(stat);
     }
 
@@ -232,21 +354,23 @@ const Local = struct {
         local.env.io.sleep(.fromMilliseconds(constants.local_poll_ms), .awake) catch {}; // Cancel.
     }
 
-    /// SIGTERM, a wait, then SIGKILL. Only ever called with a pid `find` said is ours.
-    fn stop(local: *const Local, pid: i32) void {
+    /// SIGTERM, a wait, then SIGKILL. Only ever called with a pid `find` said is ours. True if
+    /// the process is gone at the end; a refused signal (EPERM) is not "gone".
+    fn stop(local: *const Local, pid: i32) bool {
         assert(pid > 1);
-        std.posix.kill(pid, .TERM) catch return; // Gone already.
+        std.posix.kill(pid, .TERM) catch |err| return err == error.ProcessNotFound;
+        if (local.wait_gone(pid)) return true;
+        std.posix.kill(pid, .KILL) catch |err| return err == error.ProcessNotFound;
+        return local.wait_gone(pid);
+    }
+
+    fn wait_gone(local: *const Local, pid: i32) bool {
         var waited: u32 = 0;
         while (waited < constants.local_stop_wait_ms) : (waited += constants.local_poll_ms) {
-            if (!local.alive(pid)) return;
+            if (!local.alive(pid)) return true;
             local.sleep();
         }
-        std.posix.kill(pid, .KILL) catch return;
-        waited = 0;
-        while (waited < constants.local_stop_wait_ms) : (waited += constants.local_poll_ms) {
-            if (!local.alive(pid)) return;
-            local.sleep();
-        }
+        return false;
     }
 
     fn out_of_memory(local: *const Local) error{Failed} {
@@ -271,21 +395,44 @@ const Local = struct {
         cli_commands.emit(local.env, .stdout, text, local.report) catch return error.Failed;
     }
 
-    /// Creates the directory, the agent's state directory and the image list, and finds the two
-    /// programs: nothing is started unless all of that is in place.
-    fn prepare(local: *const Local) Failed!void {
+    /// Finds the two programs (nothing is created unless they are there), creates the directory
+    /// (readable by this user only: the database may hold secrets), takes the lock, then writes
+    /// the agent's state directory and the image list. The caller closes the returned lock file.
+    fn prepare(local: *const Local) Failed!std.Io.File {
         const cwd = std.Io.Dir.cwd();
-        const agent_dir = try local.path("agent");
-        cwd.createDirPath(local.env.io, agent_dir) catch return local.cannot_write("the directory");
-        for ([_][]const u8{ server_exe, agent_exe }) |name| {
-            const exe = std.fmt.allocPrint(local.arena, "{s}/{s}", .{ local.bin_dir, name }) catch
-                return local.out_of_memory();
+        for ([_]Role{ .server, .agent }) |role| {
+            const exe = std.fmt.allocPrint(local.arena, "{s}/{s}", .{
+                local.bin_dir, role.exe_name(),
+            }) catch return local.out_of_memory();
             cwd.access(local.env.io, exe, .{ .execute = true }) catch {
-                raise_no_executable(local.report, name, local.bin_dir, "is not an executable file");
+                const what = "is not an executable file";
+                raise_no_executable(local.report, role.exe_name(), local.bin_dir, what);
                 return error.Failed;
             };
         }
+        const parent = std.fs.path.dirname(local.dir) orelse "/";
+        cwd.createDirPath(local.env.io, parent) catch return local.cannot_write("the directory");
+        const private: std.Io.File.Permissions = @enumFromInt(0o700);
+        cwd.createDir(local.env.io, local.dir, private) catch |err| {
+            if (err != error.PathAlreadyExists) return local.cannot_write("the directory");
+        };
+        const held = try local.lock();
+        errdefer held.close(local.env.io);
+        const agent_dir = try local.path("agent");
+        cwd.createDirPath(local.env.io, agent_dir) catch return local.cannot_write("agent");
         local.write("images.zon", images_text) catch return local.cannot_write("images.zon");
+        return held;
+    }
+
+    fn lock(local: *const Local) Failed!std.Io.File {
+        const file = try local.path("lock");
+        return lock_file(local.env.io, file, local.env.local_lock_wait_ms) catch |err| {
+            switch (err) {
+                error.Busy => raise_busy(local.report, file, local.env.local_lock_wait_ms),
+                error.Unusable => raise_cannot_use_dir(local.report, "can't lock the directory"),
+            }
+            return error.Failed;
+        };
     }
 
     /// The port the server used last time if it is free (so `$ZCUBE_SERVER` stays valid), else
@@ -310,7 +457,7 @@ const Local = struct {
     fn start_server(local: *const Local, address: []const u8) Failed!i32 {
         const database = std.fmt.allocPrint(local.arena, "sqlite:{s}/zcube.db", .{local.dir}) catch
             return local.out_of_memory();
-        return local.spawn(server_exe, "server", &.{
+        return local.spawn(.server, &.{
             "--listen", address, "--store", database, "--create-store", "--quiet",
         });
     }
@@ -325,7 +472,7 @@ const Local = struct {
             unreachable;
         const memory_text = std.fmt.bufPrint(&memory, "{d}", .{constants.local_memory_bytes}) catch
             unreachable;
-        return local.spawn(agent_exe, "agent", &.{
+        return local.spawn(.agent, &.{
             "--node",         constants.local_node_name,
             "--server",       address,
             "--state-dir",    agent_dir,
@@ -335,26 +482,27 @@ const Local = struct {
         });
     }
 
-    /// Starts `exe` detached (a process group of its own, no input, output in `<which>.log`) and
-    /// records its pid. Returns the pid.
-    fn spawn(
-        local: *const Local,
-        exe: []const u8,
-        which: []const u8,
-        args: []const []const u8,
-    ) Failed!i32 {
+    /// Starts the program of `role` detached (a process group of its own, no input, output in
+    /// `<role>.log`; the last run's log is kept as `<role>.log.1`) and records its pid and start
+    /// time. Returns the pid.
+    fn spawn(local: *const Local, role: Role, args: []const []const u8) Failed!i32 {
         const arena = local.arena;
         const io = local.env.io;
-        const log_name = std.fmt.allocPrint(arena, "{s}.log", .{which}) catch
+        const cwd = std.Io.Dir.cwd();
+        const log_name = std.fmt.allocPrint(arena, "{s}.log", .{@tagName(role)}) catch
             return local.out_of_memory();
-        const log = std.Io.Dir.cwd().createFile(io, try local.path(log_name), .{}) catch
-            return local.cannot_write(log_name);
+        const log_path = try local.path(log_name);
+        const older = std.fmt.allocPrint(arena, "{s}.1", .{log_path}) catch
+            return local.out_of_memory();
+        cwd.rename(log_path, cwd, older, io) catch {}; // No earlier log is fine.
+        const log = cwd.createFile(io, log_path, .{}) catch return local.cannot_write(log_name);
         defer log.close(io);
+        const exe = role.exe_name();
         const argv = arena.alloc([]const u8, args.len + 1) catch return local.out_of_memory();
         argv[0] = std.fmt.allocPrint(arena, "{s}/{s}", .{ local.bin_dir, exe }) catch
             return local.out_of_memory();
         @memcpy(argv[1..], args);
-        const child = std.process.spawn(io, .{
+        var child = std.process.spawn(io, .{
             .argv = argv,
             .stdin = .ignore,
             .stdout = .{ .file = log },
@@ -365,10 +513,21 @@ const Local = struct {
             return error.Failed;
         };
         const pid: i32 = child.id.?; // A spawned child has an id.
-        const text = std.fmt.allocPrint(arena, "{d}\n", .{pid}) catch return local.out_of_memory();
-        const pid_name = std.fmt.allocPrint(arena, "{s}.pid", .{which}) catch
+        var buffer: [1024]u8 = undefined;
+        const stat = read_proc(io, pid, "stat", &buffer);
+        const start = if (stat) |text| stat_start(text) orelse 0 else 0; // 0 never matches.
+        const text = std.fmt.allocPrint(arena, "{d} {d}\n", .{ pid, start }) catch {
+            child.kill(io);
             return local.out_of_memory();
-        local.write(pid_name, text) catch return local.cannot_write(pid_name);
+        };
+        const pid_name = std.fmt.allocPrint(arena, "{s}.pid", .{@tagName(role)}) catch {
+            child.kill(io);
+            return local.out_of_memory();
+        };
+        local.write(pid_name, text) catch {
+            child.kill(io); // Untracked, so it must not keep running.
+            return local.cannot_write(pid_name);
+        };
         return pid;
     }
 
@@ -388,30 +547,66 @@ const Local = struct {
         return reply.body;
     }
 
-    /// Waits until the server answers `/v1/status` and `/nodes/local` is registered. Null when it
-    /// is; otherwise the sentence for ZC-E0123 saying which step failed.
-    fn wait_ready(local: *const Local, port: u16, server: i32, agent: i32) ?[]const u8 {
-        const node_key = "\"/nodes/" ++ constants.local_node_name ++ "\"";
-        var answered = false;
+    /// The `mod_revision` of the node's registration, 0 if it has none. A registration outlives
+    /// `down`, so "registered" means a revision newer than the one seen before the agent started.
+    fn node_revision(local: *const Local, port: u16) u64 {
+        const body = local.get(port, "/v1/list?prefix=/nodes/") orelse return 0;
+        const Json = std.json.Value;
+        const root = std.json.parseFromSliceLeaky(Json, local.arena, body, .{}) catch return 0;
+        if (root != .object) return 0;
+        const kvs = root.object.get("kvs") orelse return 0;
+        if (kvs != .array) return 0;
+        for (kvs.array.items) |kv| {
+            if (kv != .object) continue;
+            const key = kv.object.get("key") orelse continue;
+            if (key != .string) continue;
+            if (!std.mem.eql(u8, key.string, "/nodes/" ++ constants.local_node_name)) continue;
+            const revision = kv.object.get("mod_revision") orelse return 0;
+            if (revision != .integer) return 0;
+            return std.math.cast(u64, revision.integer) orelse 0;
+        }
+        return 0;
+    }
+
+    /// Waits until the server answers `/v1/status`. Null when it does.
+    fn wait_server(local: *const Local, port: u16, server: i32) ?NotUp {
         var waited: u32 = 0;
         while (waited < constants.local_up_wait_ms) : (waited += constants.local_poll_ms) {
-            if (!local.alive(server)) return "the server stopped before it answered";
-            if (!local.alive(agent)) return "the agent stopped before its node registered";
-            if (local.get(port, "/v1/status") != null) answered = true;
-            if (answered) {
-                const listed = local.get(port, "/v1/list?prefix=/nodes/");
-                if (listed) |body| {
-                    if (std.mem.find(u8, body, node_key) != null) return null;
-                }
+            if (!local.alive(server)) {
+                return .{ .culprit = .server, .step = "the server stopped before it answered" };
             }
+            if (local.get(port, "/v1/status") != null) return null;
             local.sleep();
         }
+        return local.timed_out(.server, "answer");
+    }
+
+    /// Waits until the agent has registered its node afresh: `/nodes/local` has a revision after
+    /// `after`. Null when it has.
+    fn wait_node(local: *const Local, port: u16, pids: [2]i32, after: u64) ?NotUp {
+        var waited: u32 = 0;
+        while (waited < constants.local_up_wait_ms) : (waited += constants.local_poll_ms) {
+            if (!local.alive(pids[0])) {
+                const step = "the server stopped before the node registered";
+                return .{ .culprit = .server, .step = step };
+            }
+            if (!local.alive(pids[1])) {
+                const step = "the agent stopped before its node registered";
+                return .{ .culprit = .agent, .step = step };
+            }
+            if (local.node_revision(port) > after) return null;
+            local.sleep();
+        }
+        return local.timed_out(.agent, "register its node");
+    }
+
+    fn timed_out(local: *const Local, culprit: Role, what: []const u8) NotUp {
         const format = "the {s} did not {s} within {d} s";
         const seconds = @divFloor(constants.local_up_wait_ms, 1000);
-        const who: []const u8 = if (answered) "agent" else "server";
-        const what: []const u8 = if (answered) "register its node" else "answer";
-        return std.fmt.allocPrint(local.arena, format, .{ who, what, seconds }) catch
-            "the local process did not come up";
+        const step = std.fmt.allocPrint(local.arena, format, .{
+            @tagName(culprit), what, seconds,
+        }) catch "the local server or agent did not come up";
+        return .{ .culprit = culprit, .step = step };
     }
 
     fn say_up(
@@ -437,23 +632,59 @@ const Local = struct {
     }
 
     /// Stops what is running (the agent first, so it does not report a server that went away) and
-    /// deletes every pid file. Returns how many processes it stopped.
-    fn stop_all(local: *const Local, said: ?*[2]Found) u32 {
-        var stopped: u32 = 0;
-        const names = [_][2][]const u8{ .{ "agent", agent_exe }, .{ "server", server_exe } };
-        for (names, 0..) |pair, index| {
-            const found = local.find(pair[0], pair[1]);
-            if (said) |slot| slot[index] = found;
-            if (found.presence == .running) {
-                local.stop(found.pid);
-                stopped += 1;
-            }
-            const pid_name = std.fmt.allocPrint(local.arena, "{s}.pid", .{pair[0]}) catch continue;
+    /// deletes the pid files of what is gone. A process that would not stop keeps its pid file.
+    fn stop_all(local: *const Local) Stopped {
+        var stopped: Stopped = .{};
+        for ([_]Role{ .agent, .server }) |role| {
+            const found = local.find(role);
+            const gone = found.presence != .running or local.stop(found.pid);
+            if (found.presence == .running and gone) switch (role) {
+                .agent => stopped.agent = found.pid,
+                .server => stopped.server = found.pid,
+            };
+            if (!gone) continue;
+            const pid_name = std.fmt.allocPrint(local.arena, "{s}.pid", .{@tagName(role)}) catch
+                continue;
             local.remove(pid_name);
         }
         return stopped;
     }
+
+    /// Stops everything, then reports which log explains the failure.
+    fn give_up(local: *const Local, bad: NotUp) Failed {
+        _ = local.stop_all();
+        const log = if (bad.culprit == .agent) "agent.log" else "server.log";
+        raise_not_up(local.report, bad.step, local.path(log) catch local.dir);
+        return error.Failed;
+    }
+
+    /// What `down` says: only the processes it stopped.
+    fn stopped_text(local: *const Local, stopped: Stopped) Failed![]const u8 {
+        const kept = "; state kept in {s}\n" ++
+            "the agent's containers keep running; zcube local up adopts them\n";
+        const both = "local: stopped server (pid {d}) and agent (pid {d})" ++ kept;
+        const text = if (stopped.server > 0 and stopped.agent > 0)
+            std.fmt.allocPrint(local.arena, both, .{ stopped.server, stopped.agent, local.dir })
+        else if (stopped.server > 0)
+            std.fmt.allocPrint(local.arena, "local: stopped server (pid {d})" ++ kept, .{
+                stopped.server, local.dir,
+            })
+        else if (stopped.agent > 0)
+            std.fmt.allocPrint(local.arena, "local: stopped agent (pid {d})" ++ kept, .{
+                stopped.agent, local.dir,
+            })
+        else
+            std.fmt.allocPrint(local.arena, "local: not running\n", .{});
+        return text catch return local.out_of_memory();
+    }
 };
+
+/// The contents of `/proc/<pid>/<name>`, or null if there is no such process or file.
+fn read_proc(io: std.Io, pid: i32, name: []const u8, buffer: []u8) ?[]const u8 {
+    var file: [48]u8 = undefined;
+    const path = std.fmt.bufPrint(&file, "/proc/{d}/{s}", .{ pid, name }) catch return null;
+    return std.Io.Dir.cwd().readFile(io, path, buffer) catch null;
+}
 
 /// Is `port` free? A connection that is refused says yes; anything that answers, or is not
 /// refused, says no. (Binding to test would need SO_REUSEADDR, which hides a listener.)
@@ -477,9 +708,10 @@ const Failed = error{Failed};
 
 /// The failure is in `local.report`; a step that has no diagnostic of its own is a bug.
 fn up(local: *const Local) Failed!void {
-    try local.prepare();
-    const server = local.find("server", server_exe);
-    const agent = local.find("agent", agent_exe);
+    const held = try local.prepare();
+    defer held.close(local.env.io);
+    const server = local.find(.server);
+    const agent = local.find(.agent);
     if (server.presence == .running and agent.presence == .running) {
         if (local.read(try local.path("address"))) |address| {
             const where = std.mem.trim(u8, address, " \t\r\n");
@@ -488,38 +720,34 @@ fn up(local: *const Local) Failed!void {
     }
     // Anything half-running is stopped, so the two always start together on one address. The
     // agent's containers are not touched by that: it adopts them again.
-    _ = local.stop_all(null);
+    _ = local.stop_all();
     const port = local.choose_port();
     const address = std.fmt.allocPrint(local.arena, "127.0.0.1:{d}", .{port}) catch
         return local.out_of_memory();
     local.write("address", address) catch return local.cannot_write("address");
     const started_server = try local.start_server(address);
+    if (local.wait_server(port, started_server)) |bad| return local.give_up(bad);
+    // The registration of an earlier run is still in the store; only a newer one is this agent's.
+    const before = local.node_revision(port);
     const started_agent = local.start_agent(address) catch |err| {
-        _ = local.stop_all(null);
+        _ = local.stop_all();
         return err;
     };
-    if (local.wait_ready(port, started_server, started_agent)) |step| {
-        _ = local.stop_all(null);
-        const log = if (std.mem.find(u8, step, "agent") != null) "agent.log" else "server.log";
-        raise_not_up(local.report, step, local.path(log) catch local.dir);
-        return error.Failed;
-    }
+    const pids = [2]i32{ started_server, started_agent };
+    if (local.wait_node(port, pids, before)) |bad| return local.give_up(bad);
     const found_server: Found = .{ .presence = .running, .pid = started_server };
     const found_agent: Found = .{ .presence = .running, .pid = started_agent };
     return local.say_up("up", address, found_server, found_agent);
 }
 
 fn down(local: *const Local) Failed!void {
-    var found: [2]Found = undefined;
-    const stopped = local.stop_all(&found);
-    var text: []const u8 = "local: not running\n";
-    if (stopped > 0) {
-        const format = "local: stopped server (pid {d}) and agent (pid {d}); state kept in {s}\n" ++
-            "the agent's containers keep running; zcube local up adopts them\n";
-        const args = .{ found[1].pid, found[0].pid, local.dir };
-        text = std.fmt.allocPrint(local.arena, format, args) catch return local.out_of_memory();
-    }
-    try local.emit(text);
+    // Nothing to stop, and nothing to lock, if the directory was never made.
+    const exists = if (std.Io.Dir.cwd().access(local.env.io, local.dir, .{})) true else |_| false;
+    if (!exists) return local.emit("local: not running\n");
+    const held = try local.lock();
+    defer held.close(local.env.io);
+    const stopped = local.stop_all();
+    try local.emit(try local.stopped_text(stopped));
 }
 
 pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
@@ -544,7 +772,10 @@ pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
         .bin_dir = bin_dir,
     };
     const result = switch (action) {
-        .up => up(&local),
+        .up => blk: {
+            close_inherited_on_exec();
+            break :blk up(&local);
+        },
         .down => down(&local),
     };
     result catch return constants.exit_environment;
@@ -589,38 +820,108 @@ test "the local directory follows ZCUBE_LOCAL_DIR, then XDG_STATE_HOME, then HOM
 
 test "pid and port files parse only what we wrote" {
     // Goal: a damaged or foreign file is never mistaken for a process or a port.
-    try testing.expectEqual(@as(?i32, 4242), parse_pid("4242\n"));
-    try testing.expectEqual(@as(?i32, null), parse_pid(""));
-    try testing.expectEqual(@as(?i32, null), parse_pid("abc"));
-    try testing.expectEqual(@as(?i32, null), parse_pid("-1"));
-    try testing.expectEqual(@as(?i32, null), parse_pid("0"));
-    try testing.expectEqual(@as(?i32, null), parse_pid("1"));
+    const ok = parse_pid_file("4242 99\n").?;
+    try testing.expectEqual(@as(i32, 4242), ok.pid);
+    try testing.expectEqual(@as(u64, 99), ok.start);
+    try testing.expect(parse_pid_file("") == null);
+    try testing.expect(parse_pid_file("abc 1") == null);
+    try testing.expect(parse_pid_file("4242\n") == null); // No start time: not ours.
+    try testing.expect(parse_pid_file("4242 99 7") == null);
+    try testing.expect(parse_pid_file("-1 5") == null);
+    try testing.expect(parse_pid_file("0 5") == null);
+    try testing.expect(parse_pid_file("1 5") == null);
+    try testing.expect(parse_pid_file("4242 -3") == null);
     try testing.expectEqual(@as(?u16, 7071), parse_port("127.0.0.1:7071\n"));
     try testing.expectEqual(@as(?u16, null), parse_port("127.0.0.1"));
     try testing.expectEqual(@as(?u16, null), parse_port("127.0.0.1:0"));
     try testing.expectEqual(@as(?u16, null), parse_port("127.0.0.1:70000"));
 }
 
+test "the start time is field 22 of the stat line" {
+    // Goal: the number we compare is the process's start. Method: a real stat line, and a name
+    // with spaces and parentheses that would shift a naive split.
+    const real = "2935 (zcube-server) S 1 2935 2935 0 -1 4194560 1000 0 0 0 5 3 0 0 20 0 4 0 " ++
+        "123456 100000000 2000 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0";
+    try testing.expectEqual(@as(?u64, 123456), stat_start(real));
+    const odd = "9 (a b) c) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 777 20";
+    try testing.expectEqual(@as(?u64, 777), stat_start(odd));
+    try testing.expectEqual(@as(?u64, null), stat_start("9 (a) S 1 2"));
+    try testing.expectEqual(@as(?u64, null), stat_start("garbage"));
+}
+
 test "a stale pid file is told from a running process of ours" {
     // Goal: never signal a stranger. Method: every way a pid file can lie, then the one truth.
     const dir = "/tmp/zl";
     const mine = "/usr/bin/zcube-server\x00--store\x00sqlite:/tmp/zl/zcube.db\x00";
-    const alive = "123 (zcube-server) S 1 2 3";
-    try expect_presence(.absent, decide(null, null, null, "zcube-server", dir));
-    try expect_presence(.stale, decide("junk", alive, mine, "zcube-server", dir));
-    try expect_presence(.stale, decide("123\n", null, null, "zcube-server", dir));
-    const zombie = "123 (zcube-server) Z 1 2 3";
-    try expect_presence(.stale, decide("123\n", zombie, mine, "zcube-server", dir));
+    const alive = "123 (zcube-server) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 500 20";
+    const file = "123 500\n";
+    try expect_presence(.absent, decide(null, null, null, .server, dir));
+    try expect_presence(.stale, decide("junk", alive, mine, .server, dir));
+    try expect_presence(.stale, decide("123 500\n", null, null, .server, dir));
+    const zombie = "123 (zcube-server) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 500 20";
+    try expect_presence(.stale, decide(file, zombie, mine, .server, dir));
+    // The same pid, started later: a reused pid.
+    try expect_presence(.stale, decide("123 499\n", alive, mine, .server, dir));
     const stranger = "/usr/bin/vim\x00/tmp/zl/notes\x00";
-    try expect_presence(.stale, decide("123\n", alive, stranger, "zcube-server", dir));
+    try expect_presence(.stale, decide(file, alive, stranger, .server, dir));
     const elsewhere = "/usr/bin/zcube-server\x00--store\x00sqlite:/other/zcube.db\x00";
-    try expect_presence(.stale, decide("123\n", alive, elsewhere, "zcube-server", dir));
-    const found = decide("123\n", alive, mine, "zcube-server", dir);
+    try expect_presence(.stale, decide(file, alive, elsewhere, .server, dir));
+    // A sibling directory that shares our prefix is not ours.
+    const sibling = "/usr/bin/zcube-server\x00--store\x00sqlite:/tmp/zl2/zcube.db\x00";
+    try expect_presence(.stale, decide(file, alive, sibling, .server, dir));
+    const found = decide(file, alive, mine, .server, dir);
     try testing.expectEqual(Presence.running, found.presence);
     try testing.expectEqual(@as(i32, 123), found.pid);
     // A process name with spaces and parentheses must not fool the zombie check.
     try testing.expect(!is_zombie("9 (a) Z) S 1"));
     try testing.expect(is_zombie("9 (a) Z 1"));
+}
+
+test "only the agent and the server of this directory are ours" {
+    // Goal: the two command lines the review found being taken for the agent. Method: each
+    // against both roles, with the real argument lists `start_agent` and `start_server` use.
+    const dir = "/tmp/zl";
+    const agent = "/b/zcube-agent\x00--node\x00local\x00--server\x00127.0.0.1:7070\x00" ++
+        "--state-dir\x00/tmp/zl/agent\x00--images\x00/tmp/zl/images.zon\x00";
+    const server = "/b/zcube-server\x00--listen\x00127.0.0.1:7070\x00--store\x00" ++
+        "sqlite:/tmp/zl/zcube.db\x00--create-store\x00--quiet\x00";
+    try testing.expect(is_ours(agent, .agent, dir));
+    try testing.expect(is_ours(server, .server, dir));
+    try testing.expect(!is_ours(agent, .server, dir));
+    try testing.expect(!is_ours(server, .agent, dir));
+    // Our own container supervisor has the directory in its arguments and the agent's name.
+    const supervisor = "/b/zcube-agent\x00supervise\x00/tmp/zl/agent/containers/hello-1\x00";
+    try testing.expect(!is_ours(supervisor, .agent, dir));
+    try testing.expect(!is_ours(supervisor, .server, dir));
+    // A prefix directory (`zl2`) is another instance's, in both roles, and so is a longer path.
+    try testing.expect(!is_ours(agent, .agent, "/tmp/z"));
+    try testing.expect(!is_ours(server, .server, "/tmp/z"));
+    try testing.expect(!is_ours(agent, .agent, "/tmp/zl/agent"));
+    const nested = "/b/zcube-agent\x00--state-dir\x00/tmp/zl/agent/x\x00";
+    try testing.expect(!is_ours(nested, .agent, dir));
+    // No flag at all, an empty command line, and a flag without its value.
+    try testing.expect(!is_ours("/b/zcube-agent\x00", .agent, dir));
+    try testing.expect(!is_ours("", .agent, dir));
+    try testing.expect(!is_ours("/b/zcube-agent\x00--state-dir", .agent, dir));
+}
+
+test "the lock is exclusive, then free once its holder lets go" {
+    // Goal: two `zcube local` commands never run at once. Method: two descriptors on one file
+    // (the kernel treats each as a holder, as it would two processes), a short wait for the
+    // second, then the first closing.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const file = try std.fmt.allocPrint(testing.allocator, "{s}/.zig-cache/tmp/{s}/lock", .{
+        cwd, tmp.sub_path,
+    });
+    defer testing.allocator.free(file);
+    const first = try lock_file(testing.io, file, 0);
+    try testing.expectError(error.Busy, lock_file(testing.io, file, 3 * constants.local_poll_ms));
+    first.close(testing.io);
+    const second = try lock_file(testing.io, file, 0);
+    second.close(testing.io);
 }
 
 fn expect_presence(want: Presence, found: Found) !void {

@@ -20,6 +20,7 @@ const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
+const cli_local = @import("cli_local.zig");
 const cli_report = @import("cli_report.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
@@ -397,6 +398,7 @@ const cases = [_]Case{
     relayed(.E0121, bad_lease),
     with_flags(raised(.E0122, &.{ "local", "up" }), .{ .local = .no_executables }),
     with_flags(raised(.E0123, &.{ "local", "up" }), .{ .local = .dying_executables }),
+    with_flags(raised(.E0124, &.{ "local", "up" }), .{ .local = .busy }),
     relayed(.E0201, store_down),
     relayed(.E0202, store_failed),
     relayed(.E0203, compacted),
@@ -451,7 +453,7 @@ const Flags = struct {
     warning: bool = false,
     /// `zcube local up` runs in a directory of its own, with the executables it needs either
     /// missing or dying at once.
-    local: enum { off, no_executables, dying_executables } = .off,
+    local: enum { off, no_executables, dying_executables, busy } = .off,
 };
 
 fn with_flags(base: Case, flags: Flags) Case {
@@ -594,6 +596,9 @@ fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []con
         try environ.put("XDG_STATE_HOME", state_root);
     }
     const bin_dir = try prepare_local(arena, case, &environ, state_root);
+    // Another `zcube local` holds the lock for the whole run, and this one does not wait for it.
+    const held = if (case.flags.local == .busy) try hold_local_lock(arena, state_root) else null;
+    defer if (held) |file| file.close(testing.io);
     var stdout: Writer.Allocating = .init(arena);
     var stderr: Writer.Allocating = .init(arena);
     var failing: Writer = .{ .vtable = &.{ .drain = drain_fails }, .buffer = &.{} };
@@ -612,6 +617,7 @@ fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []con
         .deterministic_ids = true,
         .fixed_now_ms = 0,
         .bin_dir = bin_dir,
+        .local_lock_wait_ms = 0,
         .transport = if (case.script == .closed_port) null else .{
             .context = &fixture,
             .exchange = exchange,
@@ -622,6 +628,13 @@ fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []con
     else
         cli.run(&env, args.items);
     return .{ .exit = exit, .stdout = stdout.written(), .stderr = stderr.written() };
+}
+
+fn hold_local_lock(arena: Allocator, state_root: []const u8) !std.Io.File {
+    const dir = try std.fmt.allocPrint(arena, "{s}/local", .{state_root});
+    try std.Io.Dir.cwd().createDirPath(testing.io, dir);
+    const file = try std.fmt.allocPrint(arena, "{s}/lock", .{dir});
+    return cli_local.lock_file(testing.io, file, 0);
 }
 
 /// For a `zcube local` case: names the run's directory and returns where the executables are.
