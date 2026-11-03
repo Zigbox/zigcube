@@ -1,7 +1,8 @@
 # The `zcube` command line
 
 `zcube` talks to `zcube-server` over the HTTP API ([api.md](api.md)) and nothing else: it opens no
-store and starts no process. Every command below was run against a real `zcube-server` on SQLite
+store and starts no process, with one exception: [`zcube local`](#local-up-and-down) starts the
+server and the agent on this machine. Every command below was run against a real `zcube-server` on SQLite
 to write this page; the end-to-end test (`src/cli_test.zig`) runs them again on every `zig build
 test`. It is C0 slice 6b, which also holds the diagnostics machinery ([DIAGNOSTICS.md](../DIAGNOSTICS.md)).
 It is not `demo-c0`: that needs the real agent.
@@ -291,8 +292,41 @@ repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 | `ZC-W0119` | (warning) | `--no-redact` keeps secrets in the bundle |
 | `ZC-E0120` | environment | zcube ran out of memory |
 | `ZC-E0121` | user | the lease ttl is one an agent cannot fence in time |
+| `ZC-E0122` | environment | `zcube local` can't find or start the server or agent |
+| `ZC-E0123` | environment | the local server or agent did not come up |
 | `ZC-E0404` | user | a node's accounting disagrees with its assignments (`check allocations`, exit 1) |
 | `ZC-B0002` | internal | zcube failed in a way it should not (a command failed and said nothing) |
+
+## local up and down
+
+`zcube local up` runs a whole control plane on this machine, detached, so `zcube apply` has
+something to talk to. This is the one command that is not an HTTP client: it lives in
+`src/cli_local.zig`, outside the wasm core, and starts `zcube-server` (SQLite) and `zcube-agent`
+(`FakeRuntime`, node `local`), which it finds beside the `zcube` executable (E0122 if they are not
+there). It waits for `GET /v1/status` and for the node to be registered (E0123 if either does not
+happen within 20 s; the fix names the log), then prints the address, `export ZCUBE_SERVER=...` and
+`zcube apply hello.zon`.
+
+```
+$ zcube local up
+local: up
+  server  127.0.0.1:7070 (pid 1027), log /tmp/zl1/server.log
+  agent   node local (pid 1028), log /tmp/zl1/agent.log
+  state   /tmp/zl1
+next:
+  export ZCUBE_SERVER=127.0.0.1:7070
+  zcube apply hello.zon
+```
+
+- State is in `$ZCUBE_LOCAL_DIR`, else `$XDG_STATE_HOME/zcube/local`, else
+  `~/.local/state/zcube/local`: pid files, logs, the SQLite file, the agent's state directory.
+- The port is 7070, or the next free one; a later `up` prefers the port the last one used.
+- `up` when both run says `local: already running` and changes nothing. If only one runs, `up`
+  stops it and starts both together.
+- `zcube local down` sends SIGTERM, waits, then SIGKILL, agent first. The containers are not
+  stopped: the next `up` adopts them, with no duplicates. `down` with nothing running says so.
+- A pid file whose process is gone, a zombie, or another program (checked in `/proc/<pid>/cmdline`)
+  is deleted, never signalled.
 
 ## How it is tested
 
