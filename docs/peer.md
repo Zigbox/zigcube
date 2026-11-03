@@ -214,11 +214,12 @@ The ephemeral seed comes from the shell's randomness; `now_ms` from its wall clo
 
 ## Tests
 
-`src/peer.zig` (and `src/peer_test.zig`): a round trip; every refusal; a flip of every bit of
-every byte of M1, M2 and M3 is refused or harmless (only M1 payload bits that are not checked
-by the responder, which change the derived keys and are caught at M2's open); counter reuse,
-exhaustion, reordering and replay of records; a seeded fuzzer of the decoders; a teeth test
-(`peer_teeth`: a test-only fault that skips the credential signature check must make a test
-fail). `src/server_ca.zig`, `src/peer_files.zig`, the endpoint (`src/agent_api_test.zig`) and
-the agent's join have tests for issuance, persistence across a restart, renewal and refusal
-after removal.
+`src/peer_test.zig` (also run under WASI): a round trip; every refusal; one bit flipped at every
+byte position of M1, M2 and M3, each making the handshake fail (a flip in M1's ephemeral key
+changes the transcript, so the client fails when it opens M2); replay, reordering, reflection
+and tampering of records, and counter exhaustion; a teeth test (`set_test_fault`: a test-only
+fault that skips the credential signature check must let a forged credential in, which proves
+the refusal tests would fail). `src/peer_fuzz.zig` is the seeded decoder fuzzer
+(`ZCUBE_FUZZ_SEED`). **Not yet written (rest of 6a):** `src/server_ca.zig`, the agent's key
+files, the join endpoint and their tests for issuance, persistence across a restart, renewal and
+refusal after removal.
