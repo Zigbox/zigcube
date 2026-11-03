@@ -2259,7 +2259,8 @@ fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
         try check(c, rate >= ok_steps_per_minute_min, "too few agent steps while faults were " ++
             "on");
     }
-    try check(c, request_floor_met(during.delivered, operations, cluster_up_ms(c)), "too few requests reached the server while faults were on");
+    const met = request_floor_met(during.delivered, operations, cluster_up_ms(c));
+    try check(c, met, "too few requests reached the server while faults were on");
 }
 
 fn print_summary(c: *Cluster) void {
