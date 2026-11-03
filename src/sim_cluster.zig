@@ -721,9 +721,11 @@ pub const Cluster = struct {
         );
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.agent.init(node.config());
+        // Its own generator: the store's contents must not move the cluster's stream.
+        var store_prng = std.Random.DefaultPrng.init(c.seed ^ (0x5f5f0000 + index));
         var held: usize = 0;
         for (images) |digest| {
-            if (!random.boolean()) continue;
+            if (!store_prng.random().boolean()) continue;
             node.store_digests[held] = digest;
             held += 1;
         }

@@ -1254,9 +1254,10 @@ fn indexed_decision(
 
 // ---- L1 as a check ---------------------------------------------------------------------------
 
-/// L1 (the simulations'): the placement `request` is about to commit is no worse on fit or spread
-/// than an order of fit and spread alone would choose. Locality may pick among nodes tied on
-/// spread; it never costs a node that fits fewer of the service's replicas. Judged over the head
+/// L1 (the simulations'): the placement `request` is about to commit is no worse on spread, among
+/// the nodes that fit, than an order of fit and spread alone would choose. Locality may pick among
+/// nodes tied on spread; it never costs a node that fits fewer of the service's replicas. Fit
+/// itself is I6's (capacity) and I7's (readiness). Judged over the head
 /// the transaction commits over. A put of `/assigned/` for a replica that already has an
 /// assignment is a move, which has no locality step, and is not judged. `judged` counts the
 /// placements judged. Returns null, or the sentence that names what broke.
@@ -1284,9 +1285,9 @@ pub fn placement_problem(
         const need = requests_of(&world.replicas[index].rec);
         var counts: [views_max]u32 = undefined;
         service_counts(&world, world.replicas[index].rec.service, counts[0..world.nodes.len]);
-        if (judge(&world.nodes[at], need).reason != .fits) {
-            return "L1: a placement onto a node that does not fit";
-        }
+        // Whether the node still fits at the head is I6's and I7's to say (a placement whose
+        // compare was skipped lands on a node that changed): L1 judges only a placement that does.
+        if (judge(&world.nodes[at], need).reason != .fits) continue;
         for (world.nodes, 0..) |*view, other| {
             if (judge(view, need).reason != .fits) continue;
             if (counts[other] < counts[at]) {
