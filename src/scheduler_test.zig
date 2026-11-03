@@ -62,6 +62,14 @@ const Fixture = struct {
         try testing.expect(done.succeeded);
     }
 
+    /// Writes `bytes` as they are, for a record this release could not have written.
+    fn put_raw(self: *Fixture, role: writers.Role, key: []const u8, bytes: []const u8) !void {
+        const ctx = self.context();
+        const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+        const done = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &self.diag);
+        try testing.expect(done.succeeded);
+    }
+
     fn revision_of(self: *Fixture, key: []const u8) !store.Revision {
         const ctx = self.context();
         const got = try ctx.store.get(ctx.arena, key, null, &self.diag);
@@ -383,6 +391,10 @@ test "one hold_pending per change in the reason, not per pass" {
     try fixture.settle();
     try fixture.expect_on("big-1", "n3");
     try testing.expectEqual(@as(usize, 2), try fixture.count("hold_pending"));
+    // A decision with no locality members is still written at version 2, which a C1 build reads.
+    const holds = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(holds);
+    for (holds) |hold| try testing.expectEqual(records.decision_version_plain, hold.v);
 }
 
 test "a released assignment frees its allocation, and a gone replica is released once" {
@@ -766,6 +778,7 @@ test "locality breaks a tie, and the decision records what it read" {
     const placed = try fixture.decisions("place_replica");
     defer testing.allocator.free(placed);
     try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expectEqual(records.decision_version_locality, placed[0].v);
     try testing.expect(placed[0].locality_bytes.? > 0);
     try testing.expect(placed[0].node_store_revision.? > 0);
     try testing.expect(std.mem.indexOf(u8, placed[0].reason, "already there") != null);
@@ -836,4 +849,106 @@ test "a damaged summary entry is ignored, not an error" {
     try fixture.replica("web", "web-1", 100, gib);
     try fixture.settle();
     try fixture.expect_on("web-1", "a");
+}
+
+test "a summary that is newer or malformed is skipped, and placement goes on" {
+    // Goal: one node's bad advisory record must not stop every placement (finding 1 of the slice 5
+    // review). Method: a holds a record of version 2, b a truncated one, c a good one that holds
+    // the image; before the fix every pass failed with ZC-E0303 and nothing was placed. The two
+    // bad nodes score 0, so c still wins on locality.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.put_raw(.{ .agent = "a" }, records.node_store_key("a").slice(),
+        \\{"v":2,"node":"a","trees":[],"new_member":1}
+    );
+    const torn = "{\"v\":1,\"node\":";
+    try fixture.put_raw(.{ .agent = "b" }, records.node_store_key("b").slice(), torn);
+    try fixture.summary("c", &.{image});
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "c");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expect(placed[0].locality_bytes.? > 0);
+}
+
+test "a locality under 1 MiB is said in KiB, not as 0 MiB" {
+    // Goal: finding 13. Method: the summary advertises a tree of a few chunks of 256 KiB, so the
+    // node holds under 1 MiB of the image; the reason names KiB.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    try fixture.put(.{ .agent = "c" }, records.node_store_key("c").slice(), small_tree);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, " 0 MiB of the image") == null);
+    try testing.expect(std.mem.indexOf(u8, placed[0].reason, " KiB of the image") != null);
+}
+
+const small_tree: records.NodeStore = .{
+    .node = "c",
+    .trees = &.{.{
+        .tree = image,
+        .bytes = 100 * 1024,
+        .chunks = 1,
+        // One chunk of 100 KiB: key 1, size 102400 (little endian, 12 bytes).
+        .sample = "010000000000000000900100",
+    }},
+};
+
+test "L1 does not fail a placement that lost a race to a change after its read" {
+    // Goal: L1 judges a placement by what the scheduler could have seen. Method: web-1 sits on
+    // `a`; a placement of web-2 onto `a` is a wrong one while `b` (no web) is unchanged since the
+    // decision's read revision, and a lost race once `b` has changed after it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("b", 4000, 8 * gib, true);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    try fixture.replica("web", "web-2", 100, gib);
+    const read_at = (try fixture.context().store.status(&fixture.diag)).revision;
+
+    const ctx = fixture.context();
+    const decision: records.Decision = .{
+        .id = "1761350000999-sc01-0099",
+        .at_ms = fixture.manual.ms,
+        .actor = "scheduler",
+        .action = "place_replica",
+        .subject = .{ .kind = .replica, .name = "web-2" },
+        .reason = "test",
+        .cause = .{ .kind = .desired, .key = "/replicas/web/web-2", .revision = read_at },
+        .locality_bytes = 0,
+        .node_store_revision = 0,
+        .read_revision = read_at,
+    };
+    const decision_bytes = try records.encode(fixture.keep.allocator(), decision, &fixture.diag);
+    const ops = [_]store.Op{
+        .{ .put = .{ .key = "/assigned/a/web-2", .value = "{}" } },
+        .{ .put = .{ .key = "/decisions/1761350000999-sc01-0099", .value = decision_bytes } },
+    };
+    var judged: u64 = 0;
+    const wrong = scheduler.placement_problem(&ctx, .{ .on_success = &ops }, &judged);
+    try testing.expect(wrong != null);
+    try testing.expect(std.mem.startsWith(u8, wrong.?, "L1:"));
+
+    // `b` changes after the read: the scheduler could not have seen it.
+    try fixture.status("b", .ready, 0);
+    const ctx_after = fixture.context();
+    judged = 0;
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        scheduler.placement_problem(&ctx_after, .{ .on_success = &ops }, &judged),
+    );
 }

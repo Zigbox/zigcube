@@ -35,6 +35,8 @@ const Rig = struct {
     parsed: std.heap.ArenaAllocator,
     /// The tenure `join` made; reports to `/observed` carry it (see `call`).
     tenure: i64 = 0,
+    /// The lease `join` registered on.
+    lease: i64 = 0,
     patched: [4096]u8 = undefined,
 
     fn start(seed: u64) !Rig {
@@ -90,6 +92,7 @@ const Rig = struct {
         const target = try std.fmt.bufPrint(&path, "/v1/agent/nodes/{s}", .{node});
         const registered = try rig.ok("PUT", target, "", try register_text(&buffer, lease));
         rig.tenure = field(registered, "revision").integer;
+        rig.lease = lease;
         std.debug.assert(rig.tenure > 0);
     }
 
@@ -704,4 +707,164 @@ test "a store with no hash at the agent's revision: no known_hash, and the agent
     );
     try testing.expectEqualStrings(expected, diag.causes.slice()[0].slice());
     try testing.expectEqual(head, remote.known.?.revision);
+}
+
+// ---- PUT /v1/agent/nodes/{node}/store ---------------------------------------------------------
+
+const store_path = "/v1/agent/nodes/node2/store";
+
+/// A summary request body: `summary` is the record's JSON.
+fn summary_text(rig: *const Rig, lease: i64, summary: []const u8) ![]u8 {
+    const format = "{{\"tenure\":{d},\"lease\":{d},\"summary\":{s}}}";
+    return std.fmt.allocPrint(testing.allocator, format, .{ rig.tenure, lease, summary });
+}
+
+const small_summary =
+    \\{"v":1,"node":"node2","trees":[{"tree":"b3:51aa9c03","bytes":10,"chunks":1,
+    \\"sample":"010000000000000000900100"}],"filter":"ab","filter_chunks":1}
+;
+
+fn refuse_summary(rig: *Rig, body: []const u8, status: u16, code: []const u8) !void {
+    const before = try rig.revision();
+    try rig.refused(rig.call("PUT", store_path, "", body), status, code);
+    try testing.expectEqual(before, try rig.revision());
+}
+
+test "a summary is stored on the node's registration lease, and unknown fields are ignored" {
+    // Goal: the happy path and the tolerance of finding 2 (a newer agent's extra members must not
+    // be a 400). Method: join, put a summary with unknown members at both levels, read the key.
+    var rig = try Rig.start(21);
+    defer rig.stop();
+    try rig.join("node2");
+    const body = try summary_text(&rig, rig.lease, small_summary);
+    defer testing.allocator.free(body);
+    const gpa = testing.allocator;
+    const extra = try std.mem.replaceOwned(
+        u8,
+        gpa,
+        body,
+        "\"filter_chunks\":1",
+        "\"filter_chunks\":1,\"later\":[1]",
+    );
+    defer testing.allocator.free(extra);
+    _ = try rig.ok("PUT", store_path, "", extra);
+    const ctx = rig.world.controller_context();
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const got = try ctx.store.get(ctx.arena, records.node_store_key("node2").slice(), null, &diag);
+    try testing.expectEqual(@as(store.LeaseId, @intCast(rig.lease)), got.kv.?.lease);
+}
+
+test "a summary of a newer version, for another node, or with a bad lease is ZC-E0104" {
+    // Goal: finding 1's endpoint rule, 4 and 5. Method: each wrong body is refused with a coded
+    // 400 and writes nothing; lease 0 and another node's lease are both refused.
+    var rig = try Rig.start(22);
+    defer rig.stop();
+    try rig.join("node2");
+    const other = try rig.grant("node3");
+    const newer = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
+        small_summary,
+        "\"v\":1",
+        "\"v\":2",
+    );
+    defer testing.allocator.free(newer);
+    const elsewhere = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
+        small_summary,
+        "node2",
+        "node9",
+    );
+    defer testing.allocator.free(elsewhere);
+    const cases = [_]struct { lease: i64, text: []const u8 }{
+        .{ .lease = rig.lease, .text = newer },
+        .{ .lease = rig.lease, .text = elsewhere },
+        .{ .lease = 0, .text = small_summary },
+        .{ .lease = other, .text = small_summary },
+    };
+    for (cases) |case| {
+        const body = try summary_text(&rig, case.lease, case.text);
+        defer testing.allocator.free(body);
+        try refuse_summary(&rig, body, 400, "ZC-E0104");
+    }
+}
+
+test "a summary under an ended tenure is ZC-E0510, and one with too many trees is ZC-E0104" {
+    // Goal: finding 5. Method: join twice and write under the first tenure; then 33 trees.
+    var rig = try Rig.start(23);
+    defer rig.stop();
+    try rig.join("node2");
+    const old = rig.tenure;
+    const old_lease = rig.lease;
+    try rig.join("node2");
+    rig.tenure = old;
+    const stale = try summary_text(&rig, old_lease, small_summary);
+    defer testing.allocator.free(stale);
+    try refuse_summary(&rig, stale, 503, "ZC-E0510");
+    try rig.join("node2");
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "{\"v\":1,\"node\":\"node2\",\"trees\":[");
+    for (0..constants.summary_trees_max + 1) |index| {
+        if (index > 0) try text.append(testing.allocator, ',');
+        try text.print(
+            testing.allocator,
+            "{{\"tree\":\"t{d}\",\"bytes\":1,\"chunks\":0}}",
+            .{index},
+        );
+    }
+    try text.appendSlice(testing.allocator, "]}");
+    const many = try summary_text(&rig, rig.lease, text.items);
+    defer testing.allocator.free(many);
+    try refuse_summary(&rig, many, 400, "ZC-E0104");
+}
+
+test "the largest summary fits the endpoint, and a body past its cap is refused" {
+    // Goal: finding 3, the bound can be reached. Method: a full Bloom filter and 32 full trees
+    // as hex make a body over the 64 KiB of any other agent request and under the store's value
+    // limit; it is stored. A body one byte past the cap is a 400 that writes nothing.
+    var rig = try Rig.start(24);
+    defer rig.stop();
+    try rig.join("node2");
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "{\"v\":1,\"node\":\"node2\",\"filter\":\"");
+    try text.appendNTimes(testing.allocator, 'a', constants.summary_filter_bytes_max * 2);
+    try text.appendSlice(testing.allocator, "\",\"filter_chunks\":65536,\"trees\":[");
+    const sample_digits = constants.summary_sketch_keys * constants.summary_sketch_entry_bytes * 2;
+    for (0..constants.summary_trees_max) |index| {
+        if (index > 0) try text.append(testing.allocator, ',');
+        try text.print(
+            testing.allocator,
+            "{{\"tree\":\"sha256:{x:0>64}\",\"bytes\":99,\"chunks\":64,\"sample\":\"",
+            .{index},
+        );
+        try text.appendNTimes(testing.allocator, 'b', sample_digits);
+        try text.appendSlice(testing.allocator, "\"}");
+    }
+    try text.appendSlice(testing.allocator, "]}");
+    const full = try summary_text(&rig, rig.lease, text.items);
+    defer testing.allocator.free(full);
+    try testing.expect(full.len > constants.agent_request_bytes_max);
+    try testing.expect(full.len <= constants.summary_request_bytes_max);
+    _ = try rig.ok("PUT", store_path, "", full);
+    const ctx = rig.world.controller_context();
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const got = try ctx.store.get(ctx.arena, records.node_store_key("node2").slice(), null, &diag);
+    try testing.expect(got.kv.?.value.len <= constants.store_value_bytes_max);
+    const huge = try testing.allocator.alloc(u8, constants.summary_request_bytes_max + 1);
+    defer testing.allocator.free(huge);
+    @memset(huge, ' ');
+    try refuse_summary(&rig, huge, 400, "ZC-E0104");
+    try testing.expectEqual(
+        constants.summary_request_bytes_max,
+        agent_api.body_bytes_max(store_path),
+    );
+    try testing.expectEqual(
+        constants.agent_request_bytes_max,
+        agent_api.body_bytes_max("/v1/agent/nodes/node2/observed"),
+    );
 }

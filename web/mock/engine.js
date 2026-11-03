@@ -423,8 +423,8 @@ export class Engine {
     state.replicas.push({ id: "pending-" + id, service: svc.name, node: pick.name, limits: svc.limits, image: svc.image });
     const reason = state.nodes.length === 1
       ? `${pick.name} is the only node, and it fits ${need.cpu}m CPU and ${Math.round(need.mem / 1048576)} MiB`
-      : `${pick.name} has the fewest ${svc.name} replicas of the ${fits.length} nodes that fit (${counts}), then ${Math.round(locality / 1048576)} MiB of the image already there`;
-    const d = this.decision({ actor: "scheduler", action: "place_replica", subject: { kind: "replica", name: replicaId }, reason, cause: { kind: "decision", id: causeId }, locality: { bytes: locality, revision: 0 } });
+      : `${pick.name} has the fewest ${svc.name} replicas of the ${fits.length} nodes that fit (${counts}), then ${locality >= 1048576 ? Math.round(locality / 1048576) + " MiB" : "under 1 MiB"} of the image already there`;
+    const d = this.decision({ actor: "scheduler", action: "place_replica", subject: { kind: "replica", name: replicaId }, reason, cause: { kind: "decision", id: causeId }, locality: { bytes: locality, revision: locality ? this.rev : 0 } });
     return { node: pick.name, ops: d.ops, reason, requests: { cpu_millis: need.cpu, memory_bytes: need.mem } };
   }
 

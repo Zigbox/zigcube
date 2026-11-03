@@ -446,7 +446,15 @@ pub const Decision = struct {
     /// (0: the node had none). Absent on any other decision and on those written before C2.
     locality_bytes: ?u64 = null,
     node_store_revision: ?u64 = null,
+    /// The revision the scheduler read the world at when it chose (version 3, placements only):
+    /// the simulations' L1 judges the choice by what had not changed since.
+    read_revision: ?u64 = null,
 };
+
+/// Decisions are written at the oldest version that holds their members: version 3 only when the
+/// locality members are present, so a decision with none stays readable by a C1 build.
+pub const decision_version_locality: u32 = 3;
+pub const decision_version_plain: u32 = 2;
 
 pub const IndexEntry = struct {
     v: u32 = 1,

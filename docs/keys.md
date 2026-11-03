@@ -169,6 +169,11 @@ per entry (an 8-byte key and a 4-byte size, little endian); `filter` is hex. At 
 record of each candidate node and ranks by `locality_bytes` (after fit and spread, before least
 allocated); the decision records the number and the record's `mod_revision`.
 
+The scheduler does **not** watch `/node-store/`: it reads the prefix fresh each pass, at the
+revision its other reads use, so a summary refresh never wakes it. It reads tolerantly: a record
+that is malformed or of a version newer than 1 is skipped (and counted), and that node scores 0
+locality; one bad record never stops placement. The endpoint refuses any `v` but 1 (`ZC-E0104`).
+
 ## `/observed/<node>/<replica>`: what the agent reports
 
 ```json
@@ -221,10 +226,14 @@ replaced or fenced agent cannot overwrite what its successor observed.
   "cause_evidence": { "status": "stopped", "exit": {"kind": "signaled", "signal": 9} } }
 ```
 
-`Decision` v3 (C2 slice 5) adds two optional members to a placement: `locality_bytes`, the bytes
-of the replica's image tree the chosen node already held by the node's summary, and
-`node_store_revision`, the `mod_revision` of the `/node-store/<node>` the scheduler read (0 when
-the node had none).
+`Decision` v3 (C2 slice 5) adds three optional members to a placement: `locality_bytes`, the bytes
+of the replica's image tree the chosen node already held by the node's summary,
+`node_store_revision`, the `mod_revision` of the `/node-store/<node>` the scheduler read (non-zero
+whenever `locality_bytes` is; 0 when the node had none), and `read_revision`, the revision of the
+world the scheduler decided over (the simulators' L1 check judges only rivals no newer than it).
+A decision is written `v: 3` only when it carries `locality_bytes` (every placement of C2) and
+`v: 2` otherwise, so C2 only breaks a C1 reader for placements. **Rolling a store back from C2 to
+C1 is unsupported**: a C1 reader refuses a v3 decision as too new.
 
 `cause_evidence` (C1, optional, at most `decision_evidence_bytes_max` = 1024 bytes) holds the
 fields of the cited key's value that the decision acted on, as the controller read them, so

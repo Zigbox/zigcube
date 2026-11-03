@@ -113,9 +113,9 @@ export function why(ctx, params, query) {
       body.append(
         h("div", { class: "step-h" }, h("span", { class: "chip" }, d.actor), h("span", { class: "step-act" }, d.action), h("span", { class: "grow" }), timeEl(d.at_ms)),
         h("p", { class: "step-t" }, step.text),
-        h("p", { class: "step-m" }, "about ", h("a", { href: whyHref(d.subject.kind, d.subject.name) }, `${d.subject.kind} ${d.subject.name}`), " · decision ", h("code", { title: d.id }, d.id.slice(-9))),
+        h("p", { class: "step-m" }, "about ", h("a", { href: whyHref(d.subject.kind, d.subject.name) }, `${d.subject.kind} ${d.subject.name}`), " · decision ", h("code", { title: d.id }, d.id.slice(-9)), " ", copyButton(d.id, "Copy decision id")),
         d.locality_bytes == null ? null
-          : h("p", { class: "step-m" }, `locality ${Math.round(d.locality_bytes / 1048576)} MiB held`, d.node_store_revision ? ` · node summary at revision ${d.node_store_revision}` : " · no node summary"));
+          : h("p", { class: "step-m" }, `locality ${d.locality_bytes >= 1048576 ? Math.round(d.locality_bytes / 1048576) + " MiB" : d.locality_bytes >= 1024 ? Math.round(d.locality_bytes / 1024) + " KiB" : d.locality_bytes + " B"} held`, d.node_store_revision ? ` · node summary at revision ${d.node_store_revision}` : " · no node summary"));
     } else if (step.type === "observed") {
       body.append(
         h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "observed"), h("span", { class: "step-act" }, step.text)),

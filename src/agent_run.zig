@@ -104,7 +104,9 @@ const Shell = struct {
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
+        const refusals = shell.agent.store_refusals;
         const result = shell.agent.reconcile(&ctx);
+        if (shell.agent.store_refusals != refusals) shell.notice_refused_summary();
         shell.save_pair(false);
         shell.notice_pair();
         // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
@@ -234,6 +236,16 @@ const Shell = struct {
             std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {};
             return;
         }
+    }
+
+    /// The server refused the node's image summary (ZC-E0504, whose cause follows). It is
+    /// advisory: the agent goes on with its replicas and writes the summary again later.
+    fn notice_refused_summary(shell: *Shell) void {
+        var buffer: [256]u8 = undefined;
+        const text = "zcube-agent: zcube-server refused the node's image summary (ZC-E0504): " ++
+            "{s}; replicas go on, and it will be sent again\n";
+        const line = std.fmt.bufPrint(&buffer, text, .{shell.agent.store_refusal()}) catch return;
+        std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
     }
 
     /// The agent fenced itself (ZC-W0501): its containers were stopped, and it registers again.

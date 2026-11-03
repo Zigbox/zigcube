@@ -173,6 +173,21 @@ pub const Agent = struct {
     /// again only when it changes or the lease does (a new lease deleted the old key).
     store_lease: store.LeaseId,
     store_hash: u64,
+    /// Summary writes the server refused (not a failed tenure compare): counted once per run of
+    /// refusals, and cleared by the next write that is accepted. The summary is advisory, so a
+    /// refusal never stops replica work; the next step tries again.
+    store_refusals: u32,
+    store_refused: bool,
+    /// The first cause of the last counted refusal, for the shell to say.
+    store_refusal_text: [store_refusal_text_bytes]u8,
+    store_refusal_len: u8,
+
+    const store_refusal_text_bytes = 160;
+
+    /// What the last counted summary refusal said (empty if none).
+    pub fn store_refusal(agent: *const Agent) []const u8 {
+        return agent.store_refusal_text[0..agent.store_refusal_len];
+    }
 
     /// Initialises in place: the stop table is large.
     pub fn init(agent: *Agent, config: Config) void {
@@ -185,6 +200,9 @@ pub const Agent = struct {
         agent.renew_at_ms = 0;
         agent.fence = .{};
         agent.fences = 0;
+        agent.store_refusals = 0;
+        agent.store_refused = false;
+        agent.store_refusal_len = 0;
         agent.restored = false;
         agent.stops_count = 0;
         agent.store_lease = store.lease_none;
@@ -306,10 +324,33 @@ pub const Agent = struct {
         const op: store.Op = .{ .put = put };
         const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
         const role: writers.Role = .{ .agent = agent.config.node };
-        const done = try writers.txn(ctx.store, role, request, ctx.diag);
+        const done = writers.txn(ctx.store, role, request, ctx.diag) catch |err| {
+            return agent.store_refused_by(ctx, err);
+        };
         if (!done.succeeded) return agent.begin_fence(ctx, ctx.mono_ms());
         agent.store_lease = agent.lease;
         agent.store_hash = hash;
+        agent.store_refused = false;
+    }
+
+    /// A summary write that failed for any reason but a failed tenure compare. A server that
+    /// cannot be reached ends the step as any call does; a refusal (a C1 server with no such
+    /// endpoint, a body it will not take) is noted once and the step goes on, because the summary
+    /// is advisory and replica work must not wait for it.
+    fn store_refused_by(agent: *Agent, ctx: *const Context, err: Error) Error!void {
+        // ZC-E0504 is a server that answered and was not understood or refused; ZC-E0503 is one
+        // that did not answer, which the fence and the step's retry handle as for any call.
+        const code = ctx.diag.code orelse return err;
+        if (code != .E0504) return err;
+        if (!agent.store_refused) {
+            agent.store_refused = true;
+            agent.store_refusals += 1;
+            const text = ctx.diag.last_cause() orelse @tagName(code);
+            const len = @min(text.len, agent.store_refusal_text.len);
+            @memcpy(agent.store_refusal_text[0..len], text[0..len]);
+            agent.store_refusal_len = @intCast(len);
+        }
+        ctx.diag.reset();
     }
 
     /// Keeps the node's lease alive, or grants one and registers.

@@ -115,6 +115,8 @@ const NodeView = struct {
     status: ?records.NodeStatus,
     status_revision: Revision,
     audit_open: bool,
+    /// The revision of the node's `/audit-allocations` record (0: none), for L1.
+    audit_revision: Revision,
     /// 0 for a node with no allocation record yet.
     alloc_revision: Revision,
     alloc_node_revision: u64,
@@ -123,8 +125,12 @@ const NodeView = struct {
     /// The `/node-store/<node>` the pass read: its revision (0 if the node has none) and the
     /// trees it advertises. Advisory evidence; never compared (authority.md section 2).
     store_revision: Revision,
-    held: []const records.HeldTree,
+    held: []const HeldSketch,
 };
+
+/// A tree of a node's summary, decoded once when the world is read. A tree whose sample does not
+/// decode is left out: it scores 0.
+const HeldSketch = struct { digest: []const u8, sketch: chunk_summary.Sketch };
 
 const no_node: u32 = std.math.maxInt(u32);
 
@@ -152,6 +158,8 @@ pub const World = struct {
     assigned_by: std.StringHashMapUnmanaged(u32),
     /// Replica id -> index in `replicas`.
     desired: std.StringHashMapUnmanaged(u32),
+    /// `/node-store/` records the read left out because they did not decode or were newer.
+    summaries_skipped: u32 = 0,
 
     fn node_index(world: *const World, name: []const u8) ?u32 {
         for (world.nodes, 0..) |view, index| {
@@ -170,55 +178,26 @@ fn find_by_key(comptime T: type, items: []const Entry(T), key: []const u8) ?*con
 
 /// Reads `/replicas`, then everything else at that revision.
 pub fn read_world(ctx: *const Context) Error!World {
-    const replicas = try controller.list_all(
-        records.Replica,
-        ctx,
-        records.prefix_replicas,
-        null,
-        constants.replicas_max,
-    );
+    const rec = records;
+    const con = constants;
+    const list = controller.list_all;
+    const replicas = try list(rec.Replica, ctx, rec.prefix_replicas, null, con.replicas_max);
     const at = replicas.revision;
-    const assigned = try controller.list_all(
-        records.Assigned,
-        ctx,
-        records.prefix_assigned,
-        at,
-        constants.replicas_max,
-    );
-    const nodes = try controller.list_all(
-        records.Node,
-        ctx,
-        records.prefix_nodes,
-        at,
-        constants.nodes_max,
-    );
-    const statuses = try controller.list_all(
-        records.NodeStatus,
-        ctx,
-        records.prefix_node_status,
-        at,
-        constants.nodes_max,
-    );
-    const allocations = try controller.list_all(
-        records.Allocation,
-        ctx,
-        records.prefix_allocations,
-        at,
-        constants.nodes_max,
-    );
-    const audits = try controller.list_all(
-        records.Audit,
-        ctx,
-        records.prefix_audit_allocations,
-        at,
-        constants.nodes_max,
-    );
-    const summaries = try controller.list_all(
+    const assigned = try list(rec.Assigned, ctx, rec.prefix_assigned, at, con.replicas_max);
+    const nodes = try list(rec.Node, ctx, rec.prefix_nodes, at, con.nodes_max);
+    const statuses = try list(rec.NodeStatus, ctx, rec.prefix_node_status, at, con.nodes_max);
+    const allocations = try list(rec.Allocation, ctx, rec.prefix_allocations, at, con.nodes_max);
+    const audits = try list(rec.Audit, ctx, rec.prefix_audit_allocations, at, con.nodes_max);
+    // Summaries are advisory: one that is malformed, or newer than this release reads, must not
+    // stop every placement. It is skipped, counted, and its node scores 0 (authority.md section 2).
+    var summaries_skipped: u32 = 0;
+    const summaries = try controller.list_all_tolerant(
         records.NodeStore,
         ctx,
         records.prefix_node_store,
         at,
         constants.nodes_max,
+        &summaries_skipped,
     );
     var world: World = .{
         .revision = at,
@@ -232,6 +211,7 @@ pub fn read_world(ctx: *const Context) Error!World {
         .assigns = .empty,
         .assigned_by = .empty,
         .desired = .empty,
+        .summaries_skipped = summaries_skipped,
     };
     try index_replicas(ctx, &world);
     try index_assigned(ctx, &world, assigned.items);
@@ -254,7 +234,7 @@ fn views_of(
     const views = ctx.arena.alloc(NodeView, views_max) catch return failures.no_memory(ctx.diag);
     var count: u32 = 0;
     for (nodes) |*node| {
-        views[count] = view_of(node, sources);
+        views[count] = try view_of(ctx, node, sources);
         count += 1;
     }
     // A node with no `/nodes` record is named by its status or allocation record. Its view has
@@ -295,11 +275,15 @@ fn add_ghost(
         },
         .rec = .{ .name = name, .capacity = .{ .cpu_millis = 0, .memory_bytes = 0 } },
     };
-    views[count.*] = view_of(ghost, sources);
+    views[count.*] = try view_of(ctx, ghost, sources);
     count.* += 1;
 }
 
-fn view_of(node: *const Entry(records.Node), sources: Sources) NodeView {
+fn view_of(
+    ctx: *const Context,
+    node: *const Entry(records.Node),
+    sources: Sources,
+) Error!NodeView {
     const name = node.rec.name;
     const statuses = sources.statuses;
     const allocations = sources.allocations;
@@ -316,6 +300,7 @@ fn view_of(node: *const Entry(records.Node), sources: Sources) NodeView {
         .status = if (status) |found| found.rec else null,
         .status_revision = if (status) |found| found.kv.mod_revision else 0,
         .audit_open = audit != null,
+        .audit_revision = if (audit) |found| found.kv.mod_revision else 0,
         .alloc_revision = if (alloc) |found| found.kv.mod_revision else 0,
         .alloc_node_revision = if (alloc) |found| found.rec.node_revision else 0,
         .allocated = if (alloc) |found| found.rec.allocated else .{
@@ -324,8 +309,23 @@ fn view_of(node: *const Entry(records.Node), sources: Sources) NodeView {
         },
         .count = if (alloc) |found| found.rec.count else 0,
         .store_revision = if (summary) |found| found.kv.mod_revision else 0,
-        .held = if (summary) |found| found.rec.trees else &.{},
+        .held = if (summary) |found| try decode_held(ctx, found.rec.trees) else &.{},
     };
+}
+
+/// The sketches of a summary's trees, decoded once per pass; a tree that does not decode is
+/// skipped.
+fn decode_held(ctx: *const Context, trees: []const records.HeldTree) Error![]const HeldSketch {
+    const held = ctx.arena.alloc(HeldSketch, @min(trees.len, constants.summary_trees_max)) catch
+        return failures.no_memory(ctx.diag);
+    var count: usize = 0;
+    for (trees) |tree| {
+        if (count == held.len) break;
+        const sketch = node_store.sketch_of(tree) orelse continue;
+        held[count] = .{ .digest = tree.tree, .sketch = sketch };
+        count += 1;
+    }
+    return held[0..count];
 }
 
 fn index_replicas(ctx: *const Context, world: *World) Error!void {
@@ -445,11 +445,11 @@ const Rank = struct {
 fn locality_of(world: *const World, image: []const u8, out: []u64) void {
     assert(out.len == world.nodes.len);
     @memset(out, 0);
-    var target: ?chunk_summary.Sketch = null;
+    var target: ?*const chunk_summary.Sketch = null;
     for (world.nodes) |*view| {
-        for (view.held) |tree| {
-            if (!std.mem.eql(u8, tree.tree, image)) continue;
-            target = node_store.sketch_of(tree);
+        for (view.held) |*tree| {
+            if (!std.mem.eql(u8, tree.digest, image)) continue;
+            target = &tree.sketch;
             break;
         }
         if (target != null) break;
@@ -457,13 +457,8 @@ fn locality_of(world: *const World, image: []const u8, out: []u64) void {
     const wanted = target orelse return;
     for (world.nodes, out) |*view, *slot| {
         var held: [constants.summary_trees_max]chunk_summary.Sketch = undefined;
-        var count: u32 = 0;
-        for (view.held) |tree| {
-            if (count == held.len) break;
-            held[count] = node_store.sketch_of(tree) orelse continue;
-            count += 1;
-        }
-        slot.* = chunk_summary.locality_bytes(&wanted, held[0..count]);
+        for (view.held, 0..) |tree, index| held[index] = tree.sketch;
+        slot.* = chunk_summary.locality_bytes(wanted, held[0..view.held.len]);
     }
 }
 
@@ -475,7 +470,7 @@ fn fraction_order(used_a: u64, cap_a: u64, used_b: u64, cap_b: u64) std.math.Ord
 }
 
 /// What a placement decision records of the locality step (Decision v3).
-const Placed = struct { locality_bytes: u64, store_revision: Revision };
+const Placed = struct { locality_bytes: u64, store_revision: Revision, read_revision: Revision };
 
 const Chosen = struct {
     index: u32,
@@ -686,6 +681,7 @@ pub const Scheduler = struct {
         const evidence: Placed = .{
             .locality_bytes = chosen.locality_bytes,
             .store_revision = chosen.store_revision,
+            .read_revision = world.revision,
         };
         try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null, evidence);
         const key = try assign_key(ctx, name, replica.rec.id);
@@ -735,6 +731,7 @@ pub const Scheduler = struct {
             .cause = cause,
             .locality_bytes = if (placed) |found| found.locality_bytes else null,
             .node_store_revision = if (placed) |found| found.store_revision else null,
+            .read_revision = if (placed) |found| found.read_revision else null,
         }, batch);
     }
 
@@ -1047,6 +1044,13 @@ fn mib_of(bytes: u64) u64 {
     return @divFloor(bytes, 1024 * 1024);
 }
 
+/// A size for a sentence: whole MiB from 1 MiB up, whole KiB below, so a small share is not
+/// "0 MiB".
+fn size_words(ctx: *const Context, bytes: u64) Error![]const u8 {
+    if (bytes >= 1024 * 1024) return controller.format(ctx, "{d} MiB", .{mib_of(bytes)});
+    return controller.format(ctx, "{d} KiB", .{@divFloor(bytes, 1024)});
+}
+
 // ---- Words -----------------------------------------------------------------------------------
 
 fn place_reason(
@@ -1066,7 +1070,7 @@ fn place_reason(
             "MiB{s}", .{ name, need.cpu_millis, mib_of(need.memory_bytes), note });
     }
     return controller.format(ctx, "{s} is the best of the {d} of {d} nodes that fit {d}m CPU " ++
-        "and {d} MiB{s}: {d} replicas of this service there, then {d} MiB of the image already " ++
+        "and {d} MiB{s}: {d} replicas of this service there, then {s} of the image already " ++
         "there ({s}), then least allocated, then name", .{
         name,
         chosen.candidates,
@@ -1075,7 +1079,7 @@ fn place_reason(
         mib_of(need.memory_bytes),
         note,
         chosen.service_count,
-        mib_of(chosen.locality_bytes),
+        try size_words(ctx, chosen.locality_bytes),
         if (chosen.store_revision == 0) "no summary" else "by its summary",
     });
 }
@@ -1257,8 +1261,10 @@ fn indexed_decision(
 /// L1 (the simulations'): the placement `request` is about to commit is no worse on spread, among
 /// the nodes that fit, than an order of fit and spread alone would choose. Locality may pick among
 /// nodes tied on spread; it never costs a node that fits fewer of the service's replicas. Fit
-/// itself is I6's (capacity) and I7's (readiness). Judged over the head
-/// the transaction commits over. A put of `/assigned/` for a replica that already has an
+/// itself is I6's (capacity) and I7's (readiness). Judged over the head the transaction commits
+/// over, but a rival whose node, status, allocation or audit record is newer than the decision's
+/// `read_revision` is skipped: the scheduler could not have seen it, and a placement that lost
+/// that race is not a wrong one. A put of `/assigned/` for a replica that already has an
 /// assignment is a move, which has no locality step, and is not judged. `judged` counts the
 /// placements judged. Returns null, or the sentence that names what broke.
 pub fn placement_problem(
@@ -1274,6 +1280,7 @@ pub fn placement_problem(
         if (!std.mem.startsWith(u8, put.key, records.prefix_assigned)) continue;
         const rest = put.key[records.prefix_assigned.len..];
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "L1: a malformed key";
+        const read_revision = decision_read_revision(ctx, request) orelse continue;
         const world = read_world(ctx) catch {
             ctx.diag.reset();
             return "L1: the world cannot be read";
@@ -1290,11 +1297,46 @@ pub fn placement_problem(
         if (judge(&world.nodes[at], need).reason != .fits) continue;
         for (world.nodes, 0..) |*view, other| {
             if (judge(view, need).reason != .fits) continue;
+            // A rival that changed after the scheduler read the world was judged on what the
+            // scheduler saw, not on this: a lost race is not a wrong choice.
+            if (changed_since(view, read_revision)) continue;
             if (counts[other] < counts[at]) {
                 return "L1: a placement onto a node with more of the service than one that fits";
             }
         }
         judged.* += 1;
+    }
+    return null;
+}
+
+/// Whether any record that decides a node's fit or its replica count is newer than `revision`.
+fn changed_since(view: *const NodeView, revision: Revision) bool {
+    if (view.node.kv.mod_revision > revision) return true;
+    if (view.status_revision > revision) return true;
+    if (view.alloc_revision > revision) return true;
+    return view.audit_revision > revision;
+}
+
+/// The revision the placement in `request` says its world was read at, from its decision; null
+/// if the transaction carries none (it is not judged).
+fn decision_read_revision(ctx: *const Context, request: store.TxnRequest) ?Revision {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
+        const kv: store.KeyValue = .{
+            .key = put.key,
+            .value = put.value,
+            .create_revision = 0,
+            .mod_revision = 0,
+        };
+        const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch {
+            ctx.diag.reset();
+            continue;
+        };
+        if (decision.read_revision) |found| return found;
     }
     return null;
 }
