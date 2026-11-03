@@ -1164,6 +1164,7 @@ test "why never shows the current value as the reason for a compacted record" {
     try testing.expectEqual(.complete, result.completeness.verdict);
     try expect_contains(last.text, "/services/hello at revision");
     try expect_contains(last.text, "\"replicas\":3");
+    try testing.expect(std.mem.indexOf(u8, last.text, "\"replicas\":4") == null);
     for (result.steps) |step| {
         try testing.expect(std.mem.indexOf(u8, step.text, "was applied by") == null);
     }

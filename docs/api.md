@@ -180,9 +180,10 @@ terminal.
   with `R` one of `retention` (a decision was removed: decisions are kept 200 per subject, 7 days, or 24 hours once the subject is gone), `subject_deleted`
   (the same, and the subject no longer exists) or `compacted` (a key the chain cites has changed since, the store no longer keeps its value at the cited revision, and no decision kept evidence of it; a cited key that never changed is read now and is complete). A `gone` step carries the same `reason`, and for `compacted`
   the `key`. The current value of a compacted key is never shown as the reason for it. The field is
-  always present (an empty chain is `complete`); a client reading an older server may find it absent. Only the scheduler and the node
-  controller write `cause_evidence`; the replica controller writes none, so its `observed` and
-  `desired` terminals past compaction end `truncated`/`compacted` (a gap, reported with slice 7).
+  always present (an empty chain is `complete`); a client reading an older server may find it absent. Every actor that cites a key keeps
+  its evidence: the scheduler, the node controller, the auditor, `apply`, `delete_service` and the
+  replica controller write `cause_evidence`, so a terminal past compaction is `complete` and says
+  the evidence, and `truncated`/`compacted` only for a decision written without any.
 - `state.health` is `healthy`, `degraded`, `failing` or `gone`.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
   survive (24 h, keys.md) answers `200` with `state.exists: false`.

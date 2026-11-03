@@ -779,14 +779,19 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
 const c1_teeth_roots = [_]struct { name: []const u8, root: []const u8, symptom: []const u8 }{
     .{ .name = "allocation", .root = "src/sim_c1_teeth_allocation_main.zig", .symptom = "I6" },
     .{ .name = "readiness", .root = "src/sim_c1_teeth_readiness_main.zig", .symptom = "I7" },
+    .{ .name = "stale", .root = "src/sim_c1_teeth_stale_main.zig", .symptom = "I3" },
     .{ .name = "skew", .root = "src/sim_c1_teeth_skew_main.zig", .symptom = "I1b" },
-    .{ .name = "wedge", .root = "src/sim_c1_teeth_wedge_main.zig", .symptom = "I1b" },
+    .{
+        .name = "wedge",
+        .root = "src/sim_c1_teeth_wedge_main.zig",
+        .symptom = "I1b: a replaced replica kept executing longer",
+    },
 };
 
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the four negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the five negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",

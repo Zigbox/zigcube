@@ -533,7 +533,7 @@ pub const PhaseTotals = struct {
 
 /// One replica executing on two or more nodes at once (I1b): since when, and whether a wedged
 /// node was among them at any time.
-const Overlap = struct { name_hash: u64, since_ms: u64, wedged: bool, seen: bool };
+const Overlap = struct { name_hash: u64, since_ms: u64, wedged_at_ms: ?u64, seen: bool };
 
 pub const Cluster = struct {
     gpa: Allocator,
@@ -593,6 +593,11 @@ pub const Cluster = struct {
     c1: bool,
     /// The first per-revision check that failed, and the revision it failed at.
     c1_violation: ?[]const u8,
+    /// I2's and I3's verdict on the transaction about to commit; it counts if that one commits.
+    c1_pending: ?[]const u8,
+    /// Replaced replicas whose overlap was not watched because the table was full.
+    overlaps_unwatched: u32,
+    c1_tally: sim_c1.Tally,
     c1_violation_revision: store.Revision,
     c1_revisions: u64,
     /// Scratch for the per-revision checks, which run inside a store call.
@@ -628,10 +633,7 @@ pub const Cluster = struct {
             .inner = memory.interface(),
             .context = c,
             .after = tapped,
-            .before = if (c1_teeth.skip_allocation_compare or c1_teeth.skip_readiness_compare)
-                inject
-            else
-                null,
+            .before = before_commit,
         };
         c.ack_loss = .init(c.tap.interface(), seed ^ 0xac4, c.swarm.ack_loss_per_mille);
         c.switched = .{ .inner = c.ack_loss.interface() };
@@ -679,6 +681,9 @@ pub const Cluster = struct {
     fn init_c1(c: *Cluster, gpa: Allocator) void {
         c.c1 = false;
         c.c1_violation = null;
+        c.c1_pending = null;
+        c.overlaps_unwatched = 0;
+        c.c1_tally = .{};
         c.c1_violation_revision = 0;
         c.c1_revisions = 0;
         c.tap_arena = .init(gpa);
@@ -878,7 +883,12 @@ pub const Cluster = struct {
             c.second_ms += slice;
             if (c.second_ms >= 1000) {
                 c.second_ms -= 1000;
-                c.stats.duplicate_seconds += c.duplicates();
+                const twice = c.duplicates();
+                c.stats.duplicate_seconds += twice;
+                // A replica id is placed on one node, and a replacement gets a new id: the same
+                // replica executing on two nodes is a bug whatever wedged (sim-c1).
+                if (c.c1) check(c, twice == 0, "I1b: one replica executes on two nodes at " ++
+                    "once") catch return;
             }
             c.check_ms += slice;
             if (c.check_ms >= check_interval_ms) {
@@ -996,13 +1006,19 @@ pub const Cluster = struct {
                 c.tap_arena.allocator(),
                 put.value,
                 options,
-            ) catch continue;
+            ) catch {
+                c.overlaps_unwatched += 1;
+                continue;
+            };
             if (!std.mem.eql(u8, decision.action, "mark_replica_lost")) continue;
-            if (c.overlap_count == overlaps_max) return;
+            if (c.overlap_count == overlaps_max) {
+                c.overlaps_unwatched += 1; // Counted in the report: never judged.
+                continue;
+            }
             c.overlaps[c.overlap_count] = .{
                 .name_hash = std.hash.Wyhash.hash(0, decision.subject.name),
                 .since_ms = c.manual.ms,
-                .wedged = false,
+                .wedged_at_ms = null,
                 .seen = true,
             };
             c.overlap_count += 1;
@@ -1150,13 +1166,41 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
     };
     if (request) |txn| c.recorder.record_request(&ctx, txn);
     if (c.c1_violation != null) return;
+    if (request != null) {
+        if (c.c1_pending) |found| {
+            c.c1_violation = found;
+            c.c1_violation_revision = revision;
+            return;
+        }
+    }
     if (sim_c1.at_revision(&ctx, request)) |found| {
         c.c1_violation = found;
         c.c1_violation_revision = revision;
     }
 }
 
-/// The tap's `before`, only in the two negative tests' builds: just ahead of the scheduler's
+/// The tap's `before`: the negative tests' injection, then I2 and I3 over the head the
+/// transaction is about to commit over (`sim_c1.before_commit`); `tapped` acts on the verdict if
+/// the transaction commits.
+fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
+    const c: *Cluster = @ptrCast(@alignCast(context));
+    if (!c.c1) return;
+    if (c1_teeth.skip_allocation_compare or c1_teeth.skip_readiness_compare) {
+        inject(context, request);
+    }
+    if (c1_teeth.stale_observation) inject_reregistration(c, request);
+    _ = c.tap_arena.reset(.retain_capacity);
+    c.tap_diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.tap.inner,
+        .clock = c.manual.clock(),
+        .arena = c.tap_arena.allocator(),
+        .diag = &c.tap_diag,
+    };
+    c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally);
+}
+
+/// The injection of the two negative tests (compare skipped): just ahead of the scheduler's
 /// first placement it commits the competing write that the missing compare would have caught.
 fn inject(context: *anyopaque, request: store.TxnRequest) void {
     const c: *Cluster = @ptrCast(@alignCast(context));
@@ -1176,6 +1220,41 @@ fn inject(context: *anyopaque, request: store.TxnRequest) void {
             rest[0..slash],
             allocation_node_revision(c, request, rest[0..slash]),
         );
+    }
+}
+
+/// The node a decision cites a report of registers again (a new tenure), once, just before that
+/// decision commits: the report was admissible when the controller read it, and is not now.
+fn inject_reregistration(c: *Cluster, request: store.TxnRequest) void {
+    if (c.injected) return;
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
+        const arena = c.tap_arena.allocator();
+        const decision = std.json.parseFromSliceLeaky(records.Decision, arena, put.value, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        const cited = decision.cause.key orelse continue;
+        if (decision.cause.kind != .observed) continue;
+        if (!std.mem.startsWith(u8, cited, records.prefix_observed)) continue;
+        const rest = cited[records.prefix_observed.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+        const key = records.node_key(rest[0..slash]);
+        var scratch: Diag = undefined;
+        scratch.reset();
+        const got = c.tap.inner.get(c.tap_arena.allocator(), key.slice(), null, &scratch) catch {
+            scratch.reset();
+            continue;
+        };
+        const kv = got.kv orelse continue;
+        c.injected = true;
+        const same: store.Put = .{ .key = kv.key, .value = kv.value, .lease = kv.lease };
+        const ops = [_]store.Op{.{ .put = same }};
+        _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
+        return;
     }
 }
 
@@ -1269,20 +1348,24 @@ fn track_overlap(c: *Cluster) Failure!void {
                 if (container.phase == .stopped) continue;
                 if (std.hash.Wyhash.hash(0, container.name) != entry.name_hash) continue;
                 running = true;
-                if (c.wedged_lately(node)) entry.wedged = true;
+                if (c.wedged_lately(node)) entry.wedged_at_ms = c.manual.ms;
             }
         }
         if (!running) continue; // Stopped: the overlap is over.
         c.overlaps[kept] = entry.*;
         kept += 1;
         const length = c.manual.ms - entry.since_ms;
-        if (entry.wedged) {
+        // The excuse lasts while a node running the replica is wedged, and for the bound after
+        // it last was: a wedge long past does not excuse an overlap that goes on.
+        const excused_from = entry.wedged_at_ms orelse entry.since_ms;
+        const from = if (c1_teeth.wedge) entry.since_ms else excused_from;
+        if (entry.wedged_at_ms != null) {
             c.overlap_wedged_worst_ms = @max(c.overlap_wedged_worst_ms, length);
-            if (!c1_teeth.wedge) continue;
         } else {
             c.overlap_worst_ms = @max(c.overlap_worst_ms, length);
         }
-        try check(c, length <= overlap_ms_max, "I1b: a replaced replica kept executing longer " ++
+        const counted = c.manual.ms - from;
+        try check(c, counted <= overlap_ms_max, "I1b: a replaced replica kept executing longer " ++
             "than the lost grace plus the kill latency");
     }
     c.overlap_count = kept;
@@ -1370,7 +1453,16 @@ fn operation(c: *Cluster) void {
         },
         .freeze => {
             const span = freeze_ms_min + random.uintLessThan(u32, freeze_ms_spread);
-            c.pick_node().frozen_until_ms = c.manual.ms + span;
+            // Never the last unfrozen node: a cluster with every agent frozen does no work, which
+            // `enough_work_under_faults` would then rightly call a failure of the world.
+            const node = c.pick_node();
+            var unfrozen: u32 = 0;
+            for (c.nodes) |other| {
+                if (other.frozen_until_ms == null) unfrozen += 1;
+            }
+            if (unfrozen > 1 or node.frozen_until_ms != null) {
+                node.frozen_until_ms = c.manual.ms + span;
+            }
         },
     }
     c.advance(100);
@@ -2009,7 +2101,7 @@ pub fn simulate(
     c.c1 = options.c1;
     if (c.c1) {
         c.swarm.add_c1_faults(seed);
-        report.print("sim-c1: every revision checked (I1a I3 I4 I6 I7), overlaps bounded " ++
+        report.print("sim-c1: every revision checked (I1a I2 I3 I4 I6 I7), overlaps bounded " ++
             "(I1b), then every decision re-explained after its cited keys changed (I5, §5)\n", .{});
     }
     const heal_at = if (!options.liveness)
@@ -2180,14 +2272,22 @@ fn print_summary(c: *Cluster) void {
     var fences: u32 = 0;
     for (c.nodes) |node| fences += node.fences;
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
-    report.print("duplicates: {d} replica-seconds on two nodes (counted, NOT a pass: a " ++
-        "replacement waits for the lease, so a duplicate is a bug the invariant misses)\n", .{
+    report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
+        "counted otherwise)\n", .{
         s.duplicate_seconds,
     });
     if (c.c1) {
         report.print("sim-c1: revisions checked={d} overlap worst " ++
             "{d} ms (bound {d} ms), wedged worst {d} ms (excused)\n", .{
             c.c1_revisions, c.overlap_worst_ms, overlap_ms_max, c.overlap_wedged_worst_ms,
+        });
+        report.print("sim-c1 overlaps not watched (table full): {d}\n", .{c.overlaps_unwatched});
+        report.print("sim-c1 I2/I3: guarded writes={d} observations judged={d} unjudged={d} " ++
+            "other facts cited={d}\n", .{
+            c.c1_tally.guarded_writes,
+            c.c1_tally.observations_judged,
+            c.c1_tally.observations_unjudged,
+            c.c1_tally.facts_other,
         });
         const n = c.recorder.counts;
         report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++
