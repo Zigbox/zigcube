@@ -341,6 +341,50 @@ pub const fleet_find_page_size: u32 = 100;
 pub const fleet_hold_seconds_default: u32 = 3600;
 pub const fleet_hold_seconds_max: u32 = 24 * 3600;
 
+// ---- Swarm: the store summary and the fetch plan (docs/swarm.md, C2 slice 4) -------------------
+
+/// One chunk of Zigbox's store (`store_chunk_bytes`, 1 MiB): the unit a peer serves and a fetch
+/// verifies.
+pub const swarm_chunk_bytes: u32 = 1024 * 1024;
+/// The chunks a node's filter is sized for: 64 Ki of them, 64 GiB of distinct 1 MiB chunks.
+pub const summary_chunks_capacity: u32 = 64 * 1024;
+/// Filter bits per chunk of capacity. With `summary_filter_hashes` = 7 hash functions the
+/// false-positive rate is (1 - e^(-7/10))^7 = 0.82 %, under the 1 % c2.md asks for.
+pub const summary_filter_bits_per_chunk: u32 = 10;
+pub const summary_filter_hashes: u32 = 7;
+/// The filter's size at capacity: 64 Ki * 10 bits = 80 KiB, under `store_value_bytes_max`
+/// (256 KiB) together with the sketches below.
+pub const summary_filter_bytes_max: u32 =
+    summary_chunks_capacity * summary_filter_bits_per_chunk / 8;
+/// A sketch keeps the K smallest keys of a tree's distinct chunks. The estimate of the share a node
+/// holds is a ratio over about K samples, so its standard deviation is at most
+/// sqrt(0.25 / 64) = 6.25 % of the tree's size.
+pub const summary_sketch_keys: u32 = 64;
+/// A key is 8 bytes and its chunk's size 4: 64 * 12 = 768 bytes a tree, with its digest and
+/// totals about 820. At most 32 held trees: 26 KiB, so filter and sketches stay under
+/// `store_value_bytes_max`.
+pub const summary_trees_max: u32 = 32;
+pub const summary_sketch_entry_bytes: u32 = 12;
+
+/// Peers one fetch considers (a filter each), and chunks one fetch plans (a tree of 64 GiB).
+pub const fetch_peers_max: u32 = 16;
+pub const fetch_chunks_max: u32 = summary_chunks_capacity;
+/// With no peer holding a chunk, the plan waits this long from its start for a filter to show it
+/// (another node may be fetching it, c2.md O5), then goes to the registry.
+pub const fetch_peer_wait_ms: u32 = 30_000;
+/// A request not answered by then is a timeout.
+pub const fetch_request_timeout_ms: u32 = 10_000;
+/// Requests in flight in all, and to one peer.
+pub const fetch_in_flight_max: u32 = 8;
+pub const fetch_in_flight_per_peer_max: u32 = 2;
+/// A peer that times out this many times in a row is given up for this fetch.
+pub const fetch_peer_timeouts_max: u32 = 3;
+/// Tries of one chunk at the registry before the fetch fails.
+pub const fetch_registry_attempts_max: u32 = 4;
+/// Byte-rate caps: one peer's, and the node's (peers and registry together).
+pub const fetch_peer_rate_bytes_per_s: u32 = 32 * 1024 * 1024;
+pub const fetch_node_rate_bytes_per_s: u32 = 64 * 1024 * 1024;
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
@@ -421,4 +465,10 @@ comptime {
     assert(last_failure_bytes_max <= bundle_file_bytes_max);
     assert(timestamp_bytes == "2026-10-23T22-41-07Z".len);
     assert(6 * 1024 + 6 * diag_explanation_bytes_max + 2048 <= errors_page_bytes_max);
+    assert(summary_filter_bytes_max + summary_trees_max * (summary_sketch_keys *
+        summary_sketch_entry_bytes + 64) < store_value_bytes_max);
+    assert(fetch_in_flight_per_peer_max <= fetch_in_flight_max);
+    assert(fetch_peer_rate_bytes_per_s <= fetch_node_rate_bytes_per_s);
+    assert(fetch_request_timeout_ms < fetch_peer_wait_ms);
+    assert(fetch_peers_max <= 16); // A chunk's tried-peers set is a u16.
 }
