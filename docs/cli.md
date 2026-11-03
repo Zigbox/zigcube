@@ -294,6 +294,7 @@ repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 | `ZC-E0121` | user | the lease ttl is one an agent cannot fence in time |
 | `ZC-E0122` | environment | `zcube local` can't find or start the server or agent |
 | `ZC-E0123` | environment | the local server or agent did not come up |
+| `ZC-E0124` | environment | another `zcube local` command held the lock for 60 s |
 | `ZC-E0404` | user | a node's accounting disagrees with its assignments (`check allocations`, exit 1) |
 | `ZC-B0002` | internal | zcube failed in a way it should not (a command failed and said nothing) |
 
@@ -318,6 +319,9 @@ next:
   zcube apply hello.zon
 ```
 
+- The directory (mode `0700`) is also the scope of a lock: `up` and `down` hold an exclusive
+  `flock` on `<dir>/lock` for their whole run, so two at once take turns; one that waits 60 s
+  gives up with E0124. Logs are kept: the previous `server.log` and `agent.log` become `.log.1`.
 - State is in `$ZCUBE_LOCAL_DIR`, else `$XDG_STATE_HOME/zcube/local`, else
   `~/.local/state/zcube/local`: pid files, logs, the SQLite file, the agent's state directory.
 - The port is 7070, or the next free one; a later `up` prefers the port the last one used.
@@ -325,9 +329,17 @@ next:
   stops it and starts both together.
 - `zcube local down` sends SIGTERM, waits, then SIGKILL, agent first. The containers are not
   stopped: the next `up` adopts them, with no duplicates. `down` with nothing running says so.
-- A pid file whose process is gone, a zombie, or another program (checked in `/proc/<pid>/cmdline`)
-  is deleted, never signalled.
-- `zig build local-smoke` runs the whole sequence on the installed executables.
+- A pid file is `<pid> <start time>`. It counts only if the process exists, is not a zombie, has
+  that start time (`/proc/<pid>/stat`, field 22: a recycled pid has another) and its command line
+  is exactly ours: the server with `--store sqlite:<dir>/zcube.db`, the agent with
+  `--state-dir <dir>/agent`, and not a `supervise` process. Otherwise it is stale and deleted,
+  never signalled. A process that will not stop (EPERM) keeps its pid file.
+- `down` names only the processes it stopped.
+- `up` is ready when the server answers, the new agent's log says it registered, and the node is
+  in the store: an earlier run's registration proves nothing. The server and agent start with no
+  inherited descriptors above 2.
+- `zig build local-smoke` (`src/local_smoke.zig`) runs the sequence, two concurrent `up`s and a
+  `down` after the agent died, on copies of the executables the build made.
 
 ## How it is tested
 
