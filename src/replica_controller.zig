@@ -454,6 +454,7 @@ const Run = struct {
                 .command = service.rec.command,
                 .env = service.rec.env,
                 .limits = service.rec.limits,
+                .source = service.rec.source,
             };
             const key = records.replica_key(service.rec.name, id);
             const value = try records.encode(run.ctx.arena, replica, run.ctx.diag);

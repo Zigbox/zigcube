@@ -26,6 +26,8 @@ pub const Input = struct {
     command: []const []const u8,
     env: []const records.Pair = &.{},
     limits: records.Limits = .{},
+    /// The OCI reference `image` is pulled from, or empty (docs/keys.md).
+    source: []const u8 = "",
     /// Who applied it and the request that did (docs/api.md item 4).
     applied_by: []const u8,
     request_id: []const u8,
@@ -99,6 +101,7 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         .command = input.command,
         .env = input.env,
         .limits = input.limits,
+        .source = input.source,
         .generation = planned.generation,
         .next_replica = try legacy_counter(ctx, planned.existing),
         .applied_by = input.applied_by,
@@ -186,6 +189,7 @@ fn next_generation(existing: ?records.Service, input: Input) u64 {
 
 fn runs_differently(old: records.Service, input: Input) bool {
     if (!std.mem.eql(u8, old.image, input.image)) return true;
+    if (!std.mem.eql(u8, old.source, input.source)) return true;
     if (!strings_equal(old.command, input.command)) return true;
     if (!pairs_equal(old.env, input.env)) return true;
     return !limits_equal(old.limits, input.limits);
@@ -229,6 +233,12 @@ fn change_summary(ctx: *const Context, existing: ?records.Service, input: Input)
         });
         try append_part(ctx, &text, piece);
     }
+    if (!std.mem.eql(u8, old.source, input.source)) {
+        const piece = try controller.format(ctx, "source {s} → {s}", .{
+            shorten_source(old.source), shorten_source(input.source),
+        });
+        try append_part(ctx, &text, piece);
+    }
     if (!strings_equal(old.command, input.command)) try append_part(ctx, &text, "command changed");
     if (!pairs_equal(old.env, input.env)) try append_part(ctx, &text, "env changed");
     if (!limits_equal(old.limits, input.limits)) try append_part(ctx, &text, "limits changed");
@@ -250,9 +260,57 @@ fn shorten(digest: []const u8) []const u8 {
     return digest[0..keep];
 }
 
+/// A reference as a line shows it: "none" for no reference, else "…@sha256:" and the first 12
+/// digits of the digest it ends in; a text that does not end in one is cut to 24 bytes.
+fn shorten_source(reference: []const u8) []const u8 {
+    if (reference.len == 0) return "none";
+    const tail = source_digest_prefix.len + source_digest_hex;
+    if (reference.len < tail) return reference[0..@min(reference.len, 24)];
+    const at = reference.len - tail;
+    const shown = at + source_digest_prefix.len + 12;
+    if (!std.mem.eql(u8, reference[at..][0..source_digest_prefix.len], source_digest_prefix)) {
+        return reference[0..@min(reference.len, 24)];
+    }
+    return reference[at..shown];
+}
+
 // ---- Validation ------------------------------------------------------------------------------
 
+const source_digest_prefix = "@sha256:";
+const source_digest_hex = 64;
+
+/// Why `reference` is not a digest-pinned OCI reference `apply` takes, as a sentence; null if it
+/// is one (or empty). A prefilter: the supervisor parses with Zigbox's `parse_reference`, which
+/// the core cannot link, and may still refuse a reference this accepts.
+pub fn source_problem(reference: []const u8) ?[]const u8 {
+    if (reference.len == 0) return null;
+    if (reference.len > constants.source_bytes_max) {
+        return "the source must be at most 1024 bytes";
+    }
+    for (reference) |byte| {
+        if (byte <= ' ' or byte == 0x7f) {
+            return "the source must not hold whitespace or control characters";
+        }
+    }
+    const tail = source_digest_prefix.len + source_digest_hex;
+    if (reference.len <= tail) {
+        return "the source must end in @sha256: and 64 lowercase hex digits (a tag can move)";
+    }
+    const prefix_at = reference.len - tail;
+    const found = reference[prefix_at..][0..source_digest_prefix.len];
+    const ends_pinned = std.mem.eql(u8, found, source_digest_prefix);
+    if (!ends_pinned) {
+        return "the source must end in @sha256: and 64 lowercase hex digits (a tag can move)";
+    }
+    for (reference[reference.len - source_digest_hex ..]) |byte| {
+        const hex = (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
+        if (!hex) return "the source's digest must be 64 lowercase hex digits";
+    }
+    return null;
+}
+
 fn validate(ctx: *const Context, input: Input) Error!void {
+    if (source_problem(input.source)) |problem| return invalid_text(ctx, problem);
     if (records.name_problem(input.name, constants.service_name_bytes_max) != null) {
         return invalid(ctx, "the service name must be 1 to 48 lowercase letters, digits or '-'");
     }
@@ -278,6 +336,14 @@ fn invalid(ctx: *const Context, comptime problem: []const u8) error{Invalid} {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0104);
     ctx.diag.cause(problem, .{});
+    ctx.diag.fix(.{ .sentence = "correct the service file and apply it again" });
+    return error.Invalid;
+}
+
+fn invalid_text(ctx: *const Context, problem: []const u8) error{Invalid} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0104);
+    ctx.diag.cause("{s}", .{problem});
     ctx.diag.fix(.{ .sentence = "correct the service file and apply it again" });
     return error.Invalid;
 }
@@ -415,4 +481,111 @@ test "apply refuses more environment variables than Zigbox runs" {
     many.env = pairs[0..17];
     try testing.expectError(error.Invalid, apply(&ctx, &source, many));
     try testing.expectEqual(@import("diag/codes.zig").Code.E0104, diag.code.?);
+}
+
+fn repeated(comptime byte: u8, comptime count: usize) *const [count]u8 {
+    const bytes: [count]u8 = @splat(byte);
+    return &bytes;
+}
+
+const pinned_source = "registry.example/team/hello@sha256:" ++
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+const cut_pinned = pinned_source[0 .. pinned_source.len - 1];
+
+test "apply accepts no source or a digest-pinned one, and refuses everything else" {
+    // Goal: P1 of docs/briefs/c2-2.md. A tag can move, so only `@sha256:` and 64 lowercase hex
+    // digits is taken; every refusal is ZC-E0104 with a sentence naming the rule, and nothing is
+    // written. Method: one table of references, each applied to an empty store.
+    const long = repeated('a', 952) ++ "@sha256:" ++ repeated('0', 64);
+    const Case = struct { source: []const u8, ok: bool, rule: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .source = "", .ok = true },
+        .{ .source = pinned_source, .ok = true },
+        .{ .source = long, .ok = true },
+        .{ .source = "registry.example:5000/a/b@sha256:" ++ repeated('f', 64), .ok = true },
+        .{ .source = "registry.example/hello:latest", .ok = false, .rule = "must end in @sha256:" },
+        .{ .source = cut_pinned ++ "F", .ok = false, .rule = "lowercase hex" },
+        .{ .source = cut_pinned, .ok = false, .rule = "must end in @sha256:" },
+        .{ .source = "a b@sha256:" ++ repeated('0', 64), .ok = false, .rule = "whitespace" },
+        .{ .source = "a\nb@sha256:" ++ repeated('0', 64), .ok = false, .rule = "whitespace" },
+        .{ .source = "a\x00b@sha256:" ++ repeated('0', 64), .ok = false, .rule = "control" },
+        .{ .source = "a" ++ long, .ok = false, .rule = "at most 1024 bytes" },
+    };
+    try testing.expectEqual(@as(usize, 1024), long.len);
+    for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var manual: ManualClock = .{ .ms = 1 };
+        const memory = try testing.allocator.create(MemoryStore);
+        defer testing.allocator.destroy(memory);
+        memory.init(testing.allocator, manual.clock());
+        defer memory.deinit();
+        var diag: Diag = undefined;
+        diag.reset();
+        const ctx: Context = .{
+            .store = memory.interface(),
+            .clock = manual.clock(),
+            .arena = arena_state.allocator(),
+            .diag = &diag,
+        };
+        var source: controller.DecisionSource = .{ .instance = 0 };
+        var input = hello;
+        input.source = case.source;
+        if (case.ok) {
+            _ = try apply(&ctx, &source, input);
+            continue;
+        }
+        try testing.expectError(error.Invalid, apply(&ctx, &source, input));
+        try testing.expectEqual(@import("diag/codes.zig").Code.E0104, diag.code.?);
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, case.rule) != null);
+        diag.reset();
+        try testing.expectEqual(@as(store.Revision, 0), (try ctx.store.status(&diag)).revision);
+    }
+}
+
+test "a change of source bumps the generation and the summary says source" {
+    // Goal: a replica held for a bad reference is replaced only on a generation bump, so fixing
+    // `source` must move it (docs/keys.md). Method: create with none, set it, change it, clear
+    // it, and repeat the same apply.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    const created = try apply(&ctx, &source, hello);
+    try testing.expectEqual(@as(u64, 1), created.written.generation);
+    var with = hello;
+    with.source = pinned_source;
+    const second = try apply(&ctx, &source, with);
+    try testing.expectEqual(@as(u64, 2), second.written.generation);
+    try testing.expectEqualStrings(
+        "source none → @sha256:0123456789ab",
+        second.written.change,
+    );
+    try testing.expect((try apply(&ctx, &source, with)) == .unchanged);
+    var other = hello;
+    other.source = "registry.example/team/hello@sha256:" ++ repeated('f', 64);
+    const third = try apply(&ctx, &source, other);
+    try testing.expectEqual(@as(u64, 3), third.written.generation);
+    try testing.expectEqualStrings(
+        "source @sha256:0123456789ab → @sha256:ffffffffffff",
+        third.written.change,
+    );
+    const cleared = try apply(&ctx, &source, hello);
+    try testing.expectEqual(@as(u64, 4), cleared.written.generation);
+    const got = try ctx.store.get(ctx.arena, records.service_key("hello").slice(), null, &diag);
+    const stored = try records.read(records.Service, ctx.arena, got.kv.?, &diag);
+    try testing.expectEqualStrings("", stored.source);
 }

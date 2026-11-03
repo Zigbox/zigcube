@@ -100,6 +100,9 @@ pub const label_key_bytes_max: u32 = 32;
 pub const label_value_bytes_max: u32 = 128;
 /// "b3:" and 64 hex digits; shorter forms are fixture names in the fake runtime.
 pub const image_digest_bytes_max: u32 = 67;
+/// The longest OCI reference a service's `source` may hold: Zigbox's `reference_bytes_max`
+/// (`constants.zig` in the pinned package), the length its `pull.parse_reference` accepts.
+pub const source_bytes_max: u32 = 1024;
 
 // ---- Controllers, the agent step, the API (core) -------------------------------------------
 
