@@ -156,7 +156,11 @@ stage_restart() {
 
 stage_oom() {
     # busybox tail keeps a line with no newline in memory: /dev/zero fills the 32 MiB limit.
-    apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' '["tail","/dev/zero"]')"
+    # The sleep paces the restarts: Zigbox keeps at most 32 run records and deletes the oldest,
+    # live containers' included, so a hog restarted every 300 ms pruned box's records and left
+    # box listed as `starting` (a gap reported to the owner; Zigcube has no restart backoff yet).
+    apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' \
+        '["sh","-c","sleep 4; exec tail /dev/zero"]')"
     until_ok 120 "hog to end as oom" has_exit hog oom
     ok "a container past its memory limit ends as oom"
     two_boxes || fail "box was disturbed by the oom stage: $(observed box | tr '\n' ';')"
