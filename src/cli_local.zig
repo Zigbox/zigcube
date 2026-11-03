@@ -248,8 +248,10 @@ fn raise_not_up(report: *Report, step: []const u8, log: []const u8) void {
 fn raise_busy(report: *Report, lock_path: []const u8, wait_ms: u32) void {
     report.diag.raise(.E0124);
     report.diag.while_("waiting for another zcube local command to finish", .{});
-    report.diag.cause("{s} was still locked after {d} s", .{
-        lock_path, @divFloor(wait_ms, 1000),
+    // The text before the path is long enough that the path always wraps to a line of its own,
+    // so the report does not depend on how long the path is.
+    report.diag.cause("another zcube local command still held the lock after {d} s: {s}", .{
+        @divFloor(wait_ms, 1000), lock_path,
     });
     report.diag.fix(.{ .sentence = "wait for the other zcube local command, then run this again" });
 }
