@@ -23,6 +23,8 @@ pub const Service = struct {
     command: []const []const u8,
     env: []const records.Pair = &.{},
     limits: records.Limits = .{},
+    /// The OCI reference `image` is pulled from, digest-pinned (docs/cli.md); apply checks it.
+    source: []const u8 = "",
 };
 
 /// Reads and parses `path`. The strings of the result live in `env.arena`.
@@ -155,6 +157,7 @@ pub fn body_json(
         .command = service.command,
         .env = service.env,
         .limits = service.limits,
+        .source = if (service.source.len > 0) service.source else null,
         .applied_by = applied_by,
     };
     return std.json.Stringify.valueAlloc(arena, body, .{ .emit_null_optional_fields = false });
@@ -188,6 +191,27 @@ test "HANDOFF's example is a service, and becomes the body the API takes" {
             "\"command\":[\"sh\",\"-c\",\"while true; do sleep 1; done\"]," ++
             "\"env\":[[\"GREETING\",\"hi\"]],\"limits\":{\"memory_bytes\":268435456}," ++
             "\"applied_by\":\"alex@laptop\"}",
+        body,
+    );
+}
+
+test "a service file's source goes into the body, and is left out when there is none" {
+    // Goal: P1 of docs/briefs/c2-2.md at the CLI. Method: parse a file with `.source`, check the
+    // JSON member; the test above covers a file without one.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var report: Report = undefined;
+    report.reset();
+    const file =
+        \\.{ .name = "a", .image = "b3:1", .replicas = 1, .command = .{"x"},
+        \\   .source = "ghcr.io/o/r@sha256:00" }
+    ;
+    const service = try parse(arena, file, "a.zon", &report);
+    const body = try body_json(arena, service, "me");
+    try testing.expectEqualStrings(
+        "{\"name\":\"a\",\"image\":\"b3:1\",\"replicas\":1,\"command\":[\"x\"],\"env\":[]," ++
+            "\"limits\":{},\"source\":\"ghcr.io/o/r@sha256:00\",\"applied_by\":\"me\"}",
         body,
     );
 }

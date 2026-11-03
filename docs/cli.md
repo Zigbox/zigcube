@@ -54,7 +54,12 @@ applied service hello: replicas 3 → 5
   with `ZC-E0113`; it never waits and never guesses.** An answer that is not `y` or `yes` (or the end
   of the input) is `ZC-E0114`. `--dry-run` shows the change and stops.
 - The service file is HANDOFF's example: `.name`, `.image`, `.replicas`, `.command`, and optionally
-  `.env` (pairs of strings) and `.limits` (`.cpu_millis`, `.memory_bytes`). An unknown field is an
+  `.env` (pairs of strings), `.limits` (`.cpu_millis`, `.memory_bytes`) and `.source` (C2 slice 2:
+  the OCI reference the image is pulled from when the node does not have it, pinned by digest, as
+  `registry.example/hello@sha256:<64 hex digits>`; `zbx pull` prints the reference and the digest.
+  `apply` refuses a tag, with `ZC-E0104`). Leave `.source` out and the tree must already be on the
+  node. `get service -o wide` and `get replicas -o wide` gain a `SOURCE` column, and `-o json`
+  a `source` member, only for a service that has one. An unknown field is an
   error, so a typo is not silently ignored. Every problem is `ZC-E0110` with the file, line and
   column and the line itself (`--verbose`); a file that can't be read is `ZC-E0109`. Nothing is
   sent before the file is valid.
