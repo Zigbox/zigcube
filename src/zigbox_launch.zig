@@ -82,6 +82,7 @@ pub fn write_spec(io: std.Io, root: Dir, spec: *const Spec) files.WriteError!voi
     defer dir.close(io);
     dir.deleteFile(io, file_spec) catch {}; // Absent is fine; a new one follows.
     dir.deleteFile(io, file_failed) catch {};
+    dir.deleteFile(io, file_supervisor) catch {}; // The last launch's; this one writes its own.
     const lock = dir.createFile(io, file_lock, .{ .truncate = false }) catch
         return error.WriteFailed;
     lock.close(io);
@@ -139,14 +140,18 @@ pub fn parse_failed(out: *Diagnostic, line: []const u8) bool {
 
 const testing = std.testing;
 
+/// The label pair outlives the call: `sample` returns a spec that points at it.
+var sample_labels: [1]Pair = undefined;
+
 fn sample(name: []const u8) Spec {
+    sample_labels[0] = .{ "zcube.replica", name };
     return .{
         .name = name,
         .tree = "b3:51aa9c03",
         .reference = "ghcr.io/o/r@sha256:00",
         .command = &.{ "sh", "-c", "true" },
         .env = &.{.{ "K", "v" }},
-        .labels = &.{.{ "zcube.replica", name }},
+        .labels = &sample_labels,
         .memory_bytes = 1 << 26,
         .launched = 100,
     };

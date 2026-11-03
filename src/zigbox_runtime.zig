@@ -280,6 +280,9 @@ pub const ZigboxRuntime = struct {
         lifecycle.adopt(self.host, handle.name(), &ref, &state) catch
             return runtime_failed(diag, "find the container's run record");
         if (state != .running) return;
+        // Zigbox saves the record with pid 0 before the container exists: it is still starting,
+        // and the only thing to stop is the supervisor. Nothing is ever signalled with pid 0.
+        if (ref.pid == 0) return self.kill_supervisor(handle.name());
         // `lifecycle.signal` forwards only the terminating signals zbx catches (TERM among them,
         // and SIGKILL in its place for a PID 1 with no handler); a hard kill goes to the host.
         const sent = if (grace_ms > 0)
@@ -290,8 +293,8 @@ pub const ZigboxRuntime = struct {
             if (err == error.NotFound) return; // It ended between the look and the signal.
             return runtime_failed(diag, "signal the container");
         };
-        if (self.wait_gone(&ref, stop_wait_ms)) return;
-        if (grace_ms > 0) return; // The caller asks again, with no grace, to kill.
+        // One bounded wait either way; a grace that is not over is the caller's to ask again,
+        // with none, to kill.
         _ = self.wait_gone(&ref, stop_wait_ms);
     }
 
@@ -312,7 +315,8 @@ pub const ZigboxRuntime = struct {
         defer dir.close(self.io);
         if (!launch.supervisor_alive(self.io, dir)) return;
         const pid = files.read_pid(self.io, dir, launch.file_supervisor) catch return;
-        std.posix.kill(pid, .KILL) catch {}; // Gone already.
+        if (pid <= 0) return; // Never signal a process group, or ourselves by a zero.
+        self.host.signal(@intCast(pid), map.bounds.signal_kill) catch {}; // Gone already.
     }
 
     // ---- inspect, list ----
@@ -358,7 +362,7 @@ pub const ZigboxRuntime = struct {
                 if (!std.mem.eql(u8, entry.name(), name)) continue;
             }
             if (launch_of(launches, entry.name())) |one| {
-                if (entry.record.started < one.spec.launched) continue; // An earlier container.
+                if (!one.owns(&entry.record)) continue; // An earlier container.
                 one.matched = true;
             }
             const listing = try listing_of(arena, entry, diag);
@@ -404,8 +408,13 @@ pub const ZigboxRuntime = struct {
             const spec = launch.read_spec(self.io, dir, arena) catch continue;
             if (!std.mem.eql(u8, spec.name, name)) continue; // Not what the agent wrote.
             const phase = launch.phase(self.io, dir, arena);
-            result.append(arena, .{ .spec = spec, .phase = phase, .matched = false }) catch
-                return no_memory(diag);
+            const supervisor = files.read_pid(self.io, dir, launch.file_supervisor) catch null;
+            result.append(arena, .{
+                .spec = spec,
+                .phase = phase,
+                .supervisor = supervisor,
+                .matched = false,
+            }) catch return no_memory(diag);
         }
         return result.items;
     }
@@ -484,7 +493,20 @@ pub const ZigboxRuntime = struct {
     }
 };
 
-const Launch = struct { spec: launch.Spec, phase: launch.Phase, matched: bool };
+const Launch = struct {
+    spec: launch.Spec,
+    phase: launch.Phase,
+    /// The pid the launch's supervisor wrote; null until it has. A record of this launch has it
+    /// as `supervisor`, so a record of an earlier launch of the same name never matches, even
+    /// within the same second.
+    supervisor: ?i32,
+    matched: bool,
+
+    fn owns(one: *const Launch, record: *const zigbox.records.Parsed) bool {
+        const pid = one.supervisor orelse return false;
+        return record.supervisor == pid and record.started >= one.spec.launched;
+    }
+};
 
 fn launch_of(launches: []Launch, name: []const u8) ?*Launch {
     for (launches) |*one| {
@@ -572,8 +594,17 @@ fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic
         .env_value_too_long => collector.cause("an environment variable value is too long", .{}),
         .name_too_long => collector.cause("the container name is too long", .{}),
         .command_too_long => collector.cause("the command is too long", .{}),
+        .image_not_full => collector.cause(
+            "the image digest is not b3: and 64 hex digits, which Zigbox's pull yields",
+            .{},
+        ),
     }
-    collector.fix(.{ .sentence = "shorten it in the service file, then apply it again" });
+    if (reason == .image_not_full) {
+        collector.fix(.{ .sentence = "put the full tree digest that zbx pull prints in the " ++
+            "service file, then apply it again" });
+    } else {
+        collector.fix(.{ .sentence = "shorten it in the service file, then apply it again" });
+    }
     collector.while_("starting container {s}", .{spec.name});
     var out: Diagnostic = undefined;
     diag_mod.to_diagnostic(&out, &collector);
@@ -873,4 +904,148 @@ test "events report a container once when it appears and once when it stops" {
     const last = try rt.events(arena, 0, &diag);
     try testing.expectEqual(@as(usize, 1), last.len);
     try testing.expect(last[0].status == .stopped);
+}
+
+/// Rewrites the `.pid` and `.supervisor` numbers of a container's record in the sim, and returns
+/// the pid it had. Zigbox's start window, where the record says pid 0, lasts only a moment of
+/// simulated time, so the tests make one.
+fn rewrite_record(rig: *Rig, name: []const u8, pid: u32, supervisor: u32) !u32 {
+    const host = rig.sim.interface();
+    var dir: zigbox.records.Dir = undefined;
+    try testing.expect(zigbox.records.locate(host, &dir));
+    var path_buffer: [512 + 80]u8 = undefined;
+    const path = zigbox.records.record_path(&dir, name, &path_buffer);
+    var text: [64 * 1024]u8 = undefined;
+    const old = try host.read_file(path, &text);
+    var out: [64 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out);
+    var was: u32 = 0;
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " ");
+        if (std.mem.startsWith(u8, trimmed, ".pid = ")) {
+            was = try std.fmt.parseInt(u32, trimmed[".pid = ".len .. trimmed.len - 1], 10);
+            try writer.print("    .pid = {d},\n", .{pid});
+        } else if (std.mem.startsWith(u8, trimmed, ".supervisor = ")) {
+            try writer.print("    .supervisor = {d},\n", .{supervisor});
+        } else if (lines.peek() != null) {
+            try writer.print("{s}\n", .{line});
+        } else {
+            try writer.writeAll(line);
+        }
+    }
+    try host.write_file(path, writer.buffered());
+    return was;
+}
+
+fn write_supervisor_pid(rig: *Rig, name: []const u8, pid: i32) !void {
+    const dir = launch.container_dir(rig.rt.io, rig.rt.root, name).?;
+    defer dir.close(rig.rt.io);
+    try files.write_pid(rig.rt.io, dir, launch.file_supervisor, pid);
+}
+
+test "stopping a container in Zigbox's start window kills its supervisor, never pid 0" {
+    // Goal: the record says pid 0 until the container exists. Such a record is `starting`, and
+    // `stop` signals the supervisor named in the launch directory (the lock held, so it is
+    // live) and nothing else; with no supervisor file nothing is signalled at all.
+    var rig: Rig = undefined;
+    try rig.up(7);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    const own: u32 = rig.sim.interface().own_pid();
+    const container = try rewrite_record(&rig, "web-1", 0, own);
+    try rig.launch_spec("web-1", 0);
+    const rt = rig.rt.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const handle = runtime.Handle.init("web-1");
+    try write_supervisor_pid(&rig, "web-1", @intCast(own));
+    try testing.expect((try rt.inspect(handle, &diag)) == .starting);
+    const dir = launch.container_dir(rig.rt.io, rig.rt.root, "web-1").?;
+    defer dir.close(rig.rt.io);
+    const holder = try dir.createFile(rig.rt.io, launch.file_lock, .{
+        .truncate = false,
+        .lock = .exclusive,
+    });
+    defer holder.close(rig.rt.io);
+    // The supervisor file names the container's pid here, so a SIGKILL is visible in the sim.
+    try write_supervisor_pid(&rig, "web-1", @intCast(container));
+    try rt.stop(handle, 30_000, &diag);
+    try testing.expectEqual(@as(u32, 1), rig.sim.world.received_count);
+    try testing.expectEqual(@as(u8, 9), rig.sim.world.received[0]);
+}
+
+test "stopping a start-window container with no supervisor file signals nothing" {
+    var rig: Rig = undefined;
+    try rig.up(8);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    _ = try rewrite_record(&rig, "web-1", 0, rig.sim.interface().own_pid());
+    try rig.launch_spec("web-1", 0);
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = rig.rt.interface();
+    const handle = runtime.Handle.init("web-1");
+    try rt.stop(handle, 0, &diag);
+    try rt.stop(handle, 30_000, &diag);
+    try testing.expectEqual(@as(u32, 0), rig.sim.world.received_count);
+}
+
+test "a supervisor killed mid-start leaves a pid-0 record that is lost, not running" {
+    // Goal: Zigbox's own rule (`state_of`) trusts a pid-0 record while its supervisor exists;
+    // once the supervisor is gone the record is `lost`, and nothing adopts it as running.
+    var rig: Rig = undefined;
+    try rig.up(9);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    const gone_supervisor: u32 = 54321;
+    _ = try rewrite_record(&rig, "web-1", 0, gone_supervisor);
+    try rig.launch_spec("web-1", 0);
+    try write_supervisor_pid(&rig, "web-1", @intCast(gone_supervisor));
+    const rt = rig.rt.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const status = try rt.inspect(runtime.Handle.init("web-1"), &diag);
+    try testing.expect(status.stopped == .lost);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (try rt.list(arena_state.allocator(), &diag)) |item| {
+        try testing.expect(item.status != .running);
+    }
+}
+
+test "a grace of zero waits once for a container that will not die" {
+    // Goal: the bound docs/agent.md gives: one `stop_wait_ms`, not two. The sim's container
+    // ignores SIGKILL, so the wait runs out.
+    var rig: Rig = undefined;
+    try rig.up(10);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    rig.sim.world.immortal = true;
+    var diag: Diag = undefined;
+    diag.reset();
+    const began = rig.sim.world.now_ms;
+    try rig.rt.interface().stop(runtime.Handle.init("web-1"), 0, &diag);
+    const spent = rig.sim.world.now_ms - began;
+    try testing.expect(spent >= stop_wait_ms);
+    try testing.expect(spent < stop_wait_ms + 2 * lifecycle.poll_step_ms);
+}
+
+test "a record of an earlier launch within the same second is not this launch's" {
+    // Goal: `started >= launched` is a one-second comparison. A relaunch in the same second
+    // reads as the old container's record unless the record's supervisor is this launch's.
+    var rig: Rig = undefined;
+    try rig.up(11);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    const own: u32 = rig.sim.interface().own_pid();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = rig.rt.interface();
+    const handle = runtime.Handle.init("web-1");
+    try rig.launch_spec("web-1", 0);
+    try write_supervisor_pid(&rig, "web-1", @intCast(own + 1000));
+    try testing.expect((try rt.inspect(handle, &diag)) != .running);
+    try write_supervisor_pid(&rig, "web-1", @intCast(own));
+    try testing.expect((try rt.inspect(handle, &diag)) == .running);
 }
