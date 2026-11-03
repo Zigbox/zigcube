@@ -1074,7 +1074,7 @@ pub const registry = [_]Entry{
     .{
         .code = .W0601,
         .severity = .warning,
-        .blame = .environment,
+        .blame = .external,
         .summary = "a peer sent a chunk that does not match its hash",
         .explanation =
         \\A node that was asked for a chunk of an image sent bytes whose hash is not

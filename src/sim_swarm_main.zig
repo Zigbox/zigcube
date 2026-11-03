@@ -85,6 +85,9 @@ fn write(io: std.Io, text: []const u8) !void {
 }
 
 /// The FAILED line of a report, without its newline.
+/// What the plan's test-only fault makes the simulation report.
+const teeth_failure = "a chunk with wrong bytes was accepted";
+
 fn failure_line(report: *const sim_swarm.Report) []const u8 {
     const text = report.text();
     const start = std.mem.indexOf(u8, text, "FAILED: ") orelse return "";
@@ -107,7 +110,16 @@ fn run_range(io: std.Io, parsed: *const Args, report: *sim_swarm.Report) u8 {
                 seed, failure_line(report), seed, parsed.operations,
             }) catch return constants.exit_environment;
             out.flush() catch return constants.exit_environment;
-            if (parsed.expect_fail) break; // Caught: that is all the teeth test asks.
+            if (parsed.expect_fail) {
+                // Only the failure the teeth fault provokes counts: any other is a real bug.
+                if (std.mem.indexOf(u8, failure_line(report), teeth_failure) == null) {
+                    out.print("sim-swarm: seed {d} failed otherwise than the teeth fault\n", .{
+                        seed,
+                    }) catch return constants.exit_environment;
+                    return constants.exit_user;
+                }
+                break; // Caught: that is all the teeth test asks.
+            }
         }
         if (seed == parsed.last_seed) break;
     }
