@@ -134,7 +134,9 @@ fn run_guest(session: *vm.Session, out: *std.Io.Writer) !bool {
         const result = try session.run(line, stage.timeout_s);
         try out.print("{s}\n", .{result.output});
         if (result.status != 0) {
-            try out.print("zigbox-smoke: FAILED: stage {s} exited {d}\n", .{ stage.name, result.status });
+            try out.print("zigbox-smoke: FAILED: stage {s} exited {d}\n", .{
+                stage.name, result.status,
+            });
             return false;
         }
     }
