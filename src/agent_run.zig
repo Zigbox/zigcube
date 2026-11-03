@@ -435,6 +435,13 @@ const Backend = struct {
         const box = gpa.create(ZigboxBackend) catch return error.StartFailed;
         errdefer gpa.destroy(box);
         box.host_real = .{ .environ = init.minimal.environ };
+        if (config.pulls.len > 0) {
+            std.Io.File.stderr().writeStreamingAll(
+                init.io,
+                "zcube-agent: --images is deprecated for zigbox: name the reference in the " ++
+                    "service (`source`); the file is used only for a service without one\n",
+            ) catch {}; // Nowhere else to report it.
+        }
         for (config.pulls, 0..) |pull, index| {
             box.images[index] = .{ .digest = pull.digest, .reference = pull.reference };
         }

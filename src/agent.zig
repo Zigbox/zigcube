@@ -738,6 +738,7 @@ const Pass = struct {
         const spec: runtime.Spec = .{
             .name = replica.id,
             .image = replica.image,
+            .source = replica.source,
             .command = replica.command,
             .env = env,
             .limits = .{

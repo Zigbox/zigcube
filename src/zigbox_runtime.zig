@@ -182,7 +182,7 @@ pub const ZigboxRuntime = struct {
         return .{
             .name = spec.name,
             .tree = spec.image,
-            .reference = self.reference_of(spec.image),
+            .reference = if (spec.source.len > 0) spec.source else self.reference_of(spec.image),
             .command = spec.command,
             .env = Pairs.env[0..spec.env.len],
             .labels = Pairs.labels[0..spec.labels.len],
@@ -1048,4 +1048,31 @@ test "a record of an earlier launch within the same second is not this launch's"
     try testing.expect((try rt.inspect(handle, &diag)) != .running);
     try write_supervisor_pid(&rig, "web-1", @intCast(own));
     try testing.expect((try rt.inspect(handle, &diag)) == .running);
+}
+
+test "a spec's source is the launch reference; the images file fills in only where it is empty" {
+    // Goal: the service's reference wins over the node's `--images`, which stays the fallback.
+    // Method: build launch records for the same tree with and without a source, with and
+    // without an images entry.
+    var rig: Rig = undefined;
+    try rig.up(2);
+    defer rig.down();
+    const tree = "b3:51aa9c03";
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const own = "registry.example/a@sha256:" ++ digest;
+    const node = "registry.example/b@sha256:" ++ digest;
+    rig.rt.options.images = &.{.{ .digest = tree, .reference = node }};
+    var spec: runtime.Spec = .{
+        .name = "web-1",
+        .image = tree,
+        .command = &.{"true"},
+        .labels = &.{.{ .key = runtime.label_replica, .value = "web-1" }},
+    };
+    try testing.expectEqualStrings(node, rig.rt.launch_spec(&spec).reference);
+    spec.source = own;
+    try testing.expectEqualStrings(own, rig.rt.launch_spec(&spec).reference);
+    rig.rt.options.images = &.{};
+    try testing.expectEqualStrings(own, rig.rt.launch_spec(&spec).reference);
+    spec.source = "";
+    try testing.expectEqualStrings("", rig.rt.launch_spec(&spec).reference);
 }

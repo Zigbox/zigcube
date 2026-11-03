@@ -228,7 +228,10 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   `std.Io` and checks `Threads: 1` in `/proc/self/status` before start or pull (Zigbox makes
   namespaces, which the kernel allows a single-threaded process only); otherwise ZC-B0002. `--images FILE` for this
   runtime is `.{ .images = .{ .{ .digest = "b3:...", .reference = "ghcr.io/o/r@sha256:..." } } }`;
-  the digest-only form is the fake runtime's. Without it nothing is pulled.
+  the digest-only form is the fake runtime's. **Deprecated** for this runtime: a service names the
+  reference it is pulled from in `source` (docs/keys.md), which travels in the replica and the
+  `Spec`, and wins over this file; the file is the fallback for a service without one (the agent
+  says so on stderr at start). With neither, nothing is pulled.
 - **Stop**: SIGTERM and a wait of at most 500 ms when there is a grace, SIGKILL and the same
   single wait of at most 500 ms when there is none; the caller asks again as with the fake runtime. A fence over N containers costs up to
   N times 500 ms until the non-blocking `signal` (proposal P2) lands.

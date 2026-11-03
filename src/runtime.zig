@@ -90,6 +90,10 @@ pub const Spec = struct {
     command: []const []const u8,
     env: []const EnvVar = &.{},
     limits: Limits = .{},
+    /// The OCI reference `image` is pulled from when the node does not have the tree; empty if
+    /// the service names none. A runtime that has no registry (the fake and the simulated one)
+    /// ignores it.
+    source: []const u8 = "",
     /// Must include `label_replica`.
     labels: []const Label,
 };
@@ -247,6 +251,7 @@ pub const SpecProblem = enum {
     bad_name,
     bad_image,
     bad_command,
+    bad_source,
     too_many_env,
     too_many_labels,
     bad_label,
@@ -262,6 +267,7 @@ pub fn spec_problem(spec: *const Spec) ?SpecProblem {
     if (spec.command.len == 0) return .bad_command;
     if (spec.command.len > constants.runtime_command_words_max) return .bad_command;
     if (spec.command[0].len == 0) return .bad_command;
+    if (spec.source.len > constants.source_bytes_max) return .bad_source;
     if (spec.env.len > constants.runtime_env_count_max) return .too_many_env;
     if (spec.labels.len > constants.runtime_labels_max) return .too_many_labels;
     var has_replica = false;
@@ -312,6 +318,11 @@ test "a spec needs a name, an image, a command and the replica label" {
     bad = good;
     bad.command = &.{};
     try testing.expectEqual(SpecProblem.bad_command, spec_problem(&bad).?);
+    bad = good;
+    bad.source = repeat('a', constants.source_bytes_max);
+    try testing.expect(spec_problem(&bad) == null);
+    bad.source = repeat('a', constants.source_bytes_max + 1);
+    try testing.expectEqual(SpecProblem.bad_source, spec_problem(&bad).?);
     bad = good;
     bad.labels = &.{.{ .key = "other", .value = "x" }};
     try testing.expectEqual(SpecProblem.missing_replica_label, spec_problem(&bad).?);
