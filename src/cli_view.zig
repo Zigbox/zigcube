@@ -262,8 +262,20 @@ fn with_source_cell(
     const extra: usize = if (with_source) 1 else 0;
     const copy = try arena.alloc([]const u8, line.len + extra);
     @memcpy(copy[0..line.len], line);
-    if (with_source) copy[line.len] = if (source.len == 0) "-" else cut(source, 60);
+    if (with_source) copy[line.len] = try source_cell(arena, source);
     return copy;
+}
+
+/// "-" for none; a reference that is short enough as it is; else the end that matters, the digest:
+/// "…@sha256:" and its first 12 hex digits (a reference apply took always ends in one).
+fn source_cell(arena: Allocator, source: []const u8) Allocator.Error![]const u8 {
+    if (source.len == 0) return "-";
+    if (source.len <= 60) return source;
+    const marker = std.mem.lastIndexOf(u8, source, "@sha256:") orelse {
+        return std.fmt.allocPrint(arena, "{s}…", .{source[0..59]});
+    };
+    const digest = source[marker + "@sha256:".len ..];
+    return std.fmt.allocPrint(arena, "…@sha256:{s}", .{digest[0..@min(digest.len, 12)]});
 }
 
 fn cut(text: []const u8, length: usize) []const u8 {

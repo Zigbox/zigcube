@@ -114,7 +114,8 @@ the new one. The id is also the container name and the `zcube.replica` label.
 ```
 
 Version 2 (C1 slice 3) has no `node` and no `requests`; a version 1 record still reads, with
-both ignored. Version 3 (C2 slice 2) adds `source`, copied from the service (empty when absent). The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
+both ignored. Version 3 (C2 slice 2) adds `source`, copied from the service (empty when
+absent). The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
 for the replicas in `/assigned/<node>/` only; an assignment whose replica is gone is not served.
 
 The replica copies what it needs from the service at creation, so editing the service does not
