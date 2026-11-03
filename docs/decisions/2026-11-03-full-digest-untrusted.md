@@ -1,6 +1,6 @@
 # Untrusted paths need the full tree digest
 
-Date: 2026-11-03. Status: supervisor decision, pending owner confirmation.
+Date: 2026-11-03. Status: Decided (owner, 2026-11-03).
 
 `node_store.list_matches` accepts a digest that is a prefix of the list's BLAKE3 digest as short as
 8 hex digits (the short digests of images and fixtures). That is 32 bits: a CA-signed but rogue peer

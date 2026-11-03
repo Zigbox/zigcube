@@ -7,7 +7,7 @@ Built, all with unit tests (`zig build test` and `tidy` pass): `peer_stream`, `p
   (stat when the buffer fills; tests through DirImages and through `peer_server`); `write_whole`
   uses a random temporary name with exclusive create; DirImages is documented as one thread's;
   `fetch_worker.fetch` never asks a peer when the digest is not the full 67 characters
-  (decisions/2026-11-03-full-digest-untrusted.md, owner confirmation pending).
+  (decided by the owner, 2026-11-03).
 - Agent wiring: `--images-dir` makes `DirImages` the agent's `ctx.images`; `--peer-listen` starts
   the peer server (`agent_run.Swarm`); config test.
 - `zcube-agent fetch` (`fetch_cli.zig`): the worker over the registry (plain HTTP) and peers named
