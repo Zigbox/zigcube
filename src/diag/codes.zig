@@ -82,6 +82,10 @@ pub const Code = enum(u8) {
     E0508,
     E0509,
     E0510,
+    E0511,
+    E0512,
+    E0513,
+    E0514,
     W0501,
     B0001,
     B0002,
@@ -356,7 +360,7 @@ pub const registry = [_]Entry{
         .explanation =
         \\zcube explain was given a code that is not in the registry of Zigcube
         \\(ZC-) or of Zigbox (ZBX-). A code is a letter and four digits, with or
-        \\without its prefix: E0201, ZC-E0201, ZBX-E0501.
+        \\without its prefix: E0201, ZC-E0201, ZBX-E0410.
         \\
         \\The index of every code is at https://zigbox.github.io/zigcube/errors/
         ,
@@ -989,6 +993,66 @@ pub const registry = [_]Entry{
         \\new tenure. Nothing needs doing unless this repeats: then two agents
         \\may be using one node name, or the agent is cut off for longer than
         \\the lease time to live.
+        ,
+    },
+    .{
+        .code = .E0511,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the image does not give the tree the service names",
+        .explanation =
+        \\The node pulled the image from the reference it has for this tree, and
+        \\the files it unpacked to are not the tree the service's image digest
+        \\names. Nothing was started.
+        \\
+        \\Either the reference points at another image than the one the digest
+        \\was made from, or the digest was made for another platform (the node's
+        \\architecture decides which image of a multi-platform reference it gets).
+        \\Pull the reference again with Zigbox, take the tree digest it prints and
+        \\put that in the service file.
+        ,
+    },
+    .{
+        .code = .E0512,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the node can't apply limits: no user systemd bus",
+        .explanation =
+        \\The service sets a CPU, memory or process limit. Zigbox applies limits
+        \\through a cgroup scope that the user's systemd creates, and the agent's
+        \\user has no systemd user bus (no login session, or lingering is off).
+        \\The container was not started: running it without its limits would
+        \\not be what the service asked for.
+        \\
+        \\Enable lingering for the agent's user (loginctl enable-linger) and make
+        \\sure XDG_RUNTIME_DIR names its runtime directory, or remove the limits.
+        ,
+    },
+    .{
+        .code = .E0513,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "this host can't run Zigbox containers",
+        .explanation =
+        \\The agent was started with --runtime zigbox on a host that can't run
+        \\rootless containers: Zigbox needs cgroup v2, user namespaces, uidmap
+        \\and the other things its doctor checks. The agent did not start.
+        \\
+        \\Run zbx doctor as the agent's user; it names each missing piece and how
+        \\to fix it. Use --runtime fake for a node that only runs test workloads.
+        ,
+    },
+    .{
+        .code = .E0514,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the service does not fit Zigbox's limits",
+        .explanation =
+        \\The replica's name, command or environment is longer than Zigbox keeps
+        \\in a run record. The container was not started.
+        \\
+        \\The cause line says which. Shorten it in the service file and apply the
+        \\file again; the replica is held, not retried.
         ,
     },
     .{

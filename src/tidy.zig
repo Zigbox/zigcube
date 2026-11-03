@@ -50,6 +50,11 @@ const shell_allowlist = [_][]const u8{
     "demo/up.sh",
     "demo/down.sh",
     "demo/kill-node.sh",
+    // The guest half of `zig build zigbox-smoke` (docs/demos/c2.md): it runs inside the QEMU
+    // guest as an ordinary user, where the checks are `pgrep`, `kill -9`, `/sys/fs/cgroup` and
+    // `curl` against the server, a few lines each; a Zig program would be one more binary to copy
+    // in and would shell out to the same tools. Deviation recorded in the slice's report.
+    "ops/zigbox-smoke/guest.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
@@ -64,6 +69,7 @@ const module_allowlist = [_][]const u8{
     "libpq_c",
     "conformance_options",
     "zigbox",
+    "zigbox_vm",
     "web_files",
 };
 

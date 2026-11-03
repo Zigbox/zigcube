@@ -296,7 +296,7 @@ pub fn write_failed(report: *Report, stream: []const u8) Error {
 // ---- explain -----------------------------------------------------------------------------------
 
 /// `zcube explain <code>`: offline, from the registries. `E0201` and `ZC-E0201` are Zigcube's;
-/// `ZBX-E0501` is Zigbox's, from the linked module.
+/// `ZBX-E0410` is Zigbox's, from the linked module.
 pub fn explain(
     arena: Allocator,
     options: Options,
@@ -400,7 +400,7 @@ fn unknown(report: *Report, text: []const u8) Error {
     );
     report.diag.fix(
         .{
-            .sentence = "codes look like E0201, ZC-E0201 or ZBX-E0501; every ZC- code is at " ++
+            .sentence = "codes look like E0201, ZC-E0201 or ZBX-E0410; every ZC- code is at " ++
                 "https://zigbox.github.io/zigcube/errors/",
         },
     );

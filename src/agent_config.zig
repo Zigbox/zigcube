@@ -33,17 +33,19 @@ pub const images_default = "fixtures/images.zon";
 pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
-    \\                   [--verbose]
+    \\                   [--runtime fake|zigbox] [--verbose]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
-    \\                     .images and .address
+    \\                     .runtime, .images and .address
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
     \\  --cpu-millis N     the CPU this node offers, in millicores
     \\  --memory-bytes N   the memory this node offers, in bytes
-    \\  --images FILE      the image digests the fake runtime has (default fixtures/images.zon)
+    \\  --runtime NAME     fake (the default) or zigbox, real containers (docs/agent.md)
+    \\  --images FILE      fake: the image digests it has (default fixtures/images.zon);
+    \\                     zigbox: each digest with the reference to pull it from
     \\  --address TEXT     recorded with the node for people to read
     \\  --verbose          show the internal message of a bug
     \\
@@ -52,7 +54,16 @@ pub const usage =
     \\
 ;
 
+/// Which `Runtime` the agent runs containers with.
+pub const Kind = enum { fake, zigbox };
+
+/// An image the Zigbox runtime can pull: the tree digest a service names, and where it is.
+pub const Pull = struct { digest: []const u8, reference: []const u8 };
+
 pub const Config = struct {
+    runtime: Kind,
+    /// For `zigbox`: where each image can be pulled from (`--images`, the reference form).
+    pulls: []const Pull,
     node: []const u8,
     server: IpAddress,
     /// An absolute path, created if it was missing.
@@ -67,6 +78,8 @@ pub const Command = union(enum) {
     run: Config,
     /// `zcube-agent supervise <directory>`.
     supervise: []const u8,
+    /// `zcube-agent supervise-zigbox <launch directory>` (`zigbox_supervisor.zig`).
+    supervise_zigbox: []const u8,
     version,
     help,
 };
@@ -75,6 +88,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What a ZON file may set. Unknown fields are refused.
 const File = struct {
+    runtime: ?Kind = null,
     node: ?[]const u8 = null,
     server: ?[]const u8 = null,
     state_dir: ?[]const u8 = null,
@@ -86,9 +100,12 @@ const File = struct {
 
 /// The fixtures file: the digests the fake runtime has.
 const Fixtures = struct { images: []const []const u8 };
+/// The same file for the Zigbox runtime: each digest with the reference to pull it from.
+const PullFile = struct { images: []const Pull };
 
 /// The flags as typed, before they are merged over the file.
 const Flags = struct {
+    runtime: ?Kind = null,
     config: ?[]const u8 = null,
     node: ?[]const u8 = null,
     server: ?[]const u8 = null,
@@ -106,13 +123,15 @@ const Flags = struct {
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     if (args.len >= 1) {
-        if (std.mem.eql(u8, args[0], "supervise")) {
+        const zigbox_mode = std.mem.eql(u8, args[0], "supervise-zigbox");
+        if (zigbox_mode or std.mem.eql(u8, args[0], "supervise")) {
             if (args.len != 2) return bad(
                 diag,
                 "supervise takes one directory",
                 .{},
                 "it is run by the agent itself",
             );
+            if (zigbox_mode) return .{ .supervise_zigbox = args[1] };
             return .{ .supervise = args[1] };
         }
     }
@@ -158,12 +177,17 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     if (address.len > constants.listen_bytes_max) {
         return bad(diag, "the address text is longer than 128 bytes", .{}, "shorten it");
     }
-    const images_path = flags.images orelse file.images orelse images_default;
+    const kind = flags.runtime orelse file.runtime orelse .fake;
+    const images_given = flags.images orelse file.images;
+    const images_path = images_given orelse images_default;
+    const pulls_wanted = kind == .zigbox and images_given != null;
     return .{
+        .runtime = kind,
+        .pulls = if (pulls_wanted) try read_pulls(arena, io, images_path, diag) else &.{},
         .node = node,
         .server = try parse_server(server_text, diag),
         .state_dir = try absolute_state_dir(arena, io, state_text, diag),
-        .images = try read_images(arena, io, images_path, diag),
+        .images = if (kind == .fake) try read_images(arena, io, images_path, diag) else &.{},
         .capacity = .{ .cpu_millis = cpu, .memory_bytes = memory },
         .address = address,
         .verbose = flags.verbose,
@@ -185,6 +209,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.help = true;
         } else if (std.mem.eql(u8, arg, "--config")) {
             flags.config = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--runtime")) {
+            flags.runtime = try kind_of(try value_of(args, &index, diag), diag);
         } else if (std.mem.eql(u8, arg, "--node")) {
             flags.node = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--server")) {
@@ -227,6 +253,11 @@ fn value_of(args: []const []const u8, index: *usize, diag: *Diag) Error![]const 
         return bad(diag, "the value of {s} is longer than 4096 bytes", .{flag}, "shorten it");
     }
     return value;
+}
+
+fn kind_of(text: []const u8, diag: *Diag) Error!Kind {
+    return std.meta.stringToEnum(Kind, text) orelse
+        bad(diag, "the runtime {s} is not one the agent has", .{text}, "use fake or zigbox");
 }
 
 fn number_of(comptime T: type, args: []const []const u8, index: *usize, diag: *Diag) Error!T {
@@ -350,6 +381,45 @@ pub fn parse_images(
         }
     }
     return fixtures.images;
+}
+
+/// The images file in the reference form, for the Zigbox runtime.
+fn read_pulls(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error![]const Pull {
+    const source = try read_zon(arena, io, path, diag);
+    return parse_pulls(arena, source, path, diag);
+}
+
+pub fn parse_pulls(
+    arena: Allocator,
+    source: [:0]const u8,
+    path: []const u8,
+    diag: *Diag,
+) Error![]const Pull {
+    var zon_diag: std.zon.parse.Diagnostics = undefined;
+    const file = std.zon.parse.fromSlice(PullFile, .{
+        .gpa = arena,
+        .arena = arena,
+        .source = source,
+        .diagnostics = &zon_diag,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => return bad(
+            diag,
+            "{s} is not a list of .{{ .digest, .reference }} images",
+            .{path},
+            "give each image its digest and the reference to pull it from",
+        ),
+    };
+    if (file.images.len > constants.fixture_images_max) {
+        return bad(diag, "{s} lists more than 64 images", .{path}, "trim it");
+    }
+    const problem = "{s} has an image whose digest or reference is empty or too long";
+    for (file.images) |pull| {
+        const empty = pull.digest.len == 0 or pull.reference.len == 0;
+        const long = pull.digest.len > constants.image_digest_bytes_max;
+        if (empty or long) return bad(diag, problem, .{path}, "fix it");
+    }
+    return file.images;
 }
 
 // ---- Settings ----------------------------------------------------------------------------------
@@ -506,4 +576,35 @@ test "supervise mode is recognised before any flag, and needs exactly one direct
     try testing.expectEqualStrings("/tmp/x", command.supervise);
     diag.reset();
     try expect_bad(load(arena_state.allocator(), testing.io, &.{"supervise"}, &diag), &diag);
+}
+
+test "the runtime is fake unless asked, and the zigbox images carry their references" {
+    // Goal: a node that says nothing runs the fake runtime (the default is pinned); --runtime
+    // zigbox is read, a stranger refused; the reference form lists digest and reference.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    try testing.expectEqual(@as(?Kind, null), (try parse_flags(&.{}, &diag)).runtime);
+    const flags = try parse_flags(&.{ "--runtime", "zigbox" }, &diag);
+    try testing.expectEqual(Kind.zigbox, flags.runtime.?);
+    const file = try parse_file(arena, ".{ .runtime = .zigbox }", "agent.zon", &diag);
+    try testing.expectEqual(Kind.zigbox, file.runtime.?);
+    diag.reset();
+    try expect_bad(parse_flags(&.{ "--runtime", "docker" }, &diag), &diag);
+
+    const pulls = try parse_pulls(
+        arena,
+        ".{ .images = .{ .{ .digest = \"b3:aa\", .reference = \"ghcr.io/o/r@sha256:00\" } } }",
+        "images.zon",
+        &diag,
+    );
+    try testing.expectEqual(@as(usize, 1), pulls.len);
+    try testing.expectEqualStrings("ghcr.io/o/r@sha256:00", pulls[0].reference);
+    diag.reset();
+    try expect_bad(parse_pulls(arena, ".{ .images = .{ \"b3:aa\" } }", "i.zon", &diag), &diag);
+    diag.reset();
+    const empty = ".{ .images = .{ .{ .digest = \"b3:aa\", .reference = \"\" } } }";
+    try expect_bad(parse_pulls(arena, empty, "i.zon", &diag), &diag);
 }

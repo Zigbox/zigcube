@@ -154,7 +154,7 @@ terminal.
       "decision": { "id": "…-0025", "at_ms": 1761350000123, "actor": "replica-controller", "action": "hold_failed_replica",
                     "subject": {"kind": "service", "name": "broken"}, "reason": "…", "cause": {"kind": "observed", "key": "/observed/node1/broken-1", "revision": 28} } },
     { "type": "observed", "text": "broken-1 on node1: stopped (failed to start)",
-      "key": "/observed/node1/broken-1", "revision": 28, "diagnostic": { "code": "ZBX-E0501", "…": "…" } } ] }
+      "key": "/observed/node1/broken-1", "revision": 28, "diagnostic": { "code": "ZBX-E0410", "…": "…" } } ] }
 ```
 
 - `step.type` is `decision`, or a terminal: `observed`, `desired`, `resync`, `lease_expired`
@@ -173,7 +173,7 @@ terminal.
   replicas already running elsewhere are not moved back, because the scheduler does not rebalance.
 - **`state.text` and every `step.text` are the sentences the CLI prints.** The CLI renders
   `state.text`, then `← <text>` per step, and a step with a `diagnostic` as the full diagnostic
-  block instead (HANDOFF's `← error[ZBX-E0501]: image not found …` form). The console may add
+  block instead (HANDOFF's `← error[ZBX-E0410]: no tree with that digest …` form). The console may add
   structure around the text (who, when, links, the revision) but never different claims.
 - `completeness` (C1 slice 7, authority.md §5) says whether the chain reaches its cause:
   `{"verdict": "complete"}`, or `{"verdict": "truncated", "at": "<decision id or key>", "reason": R}`
@@ -223,7 +223,9 @@ are refused (`ZC-E0104`), so a typo cannot be silently ignored.
 
 `name`, `image`, `replicas` and `command` are required; `env`, `limits` and `applied_by` are
 optional (`applied_by` defaults to `anonymous`). The rules are `apply.zig`'s: a count change alone
-does not bump `generation`; a change to the image, command, env or limits does.
+does not bump `generation`; a change to the image, command, env or limits does. `env` holds at
+most 16 variables (Zigbox's `run_env_count_max`; it was 64 before C2 slice 1, which tightened it so
+a service the real runtime would refuse is refused at apply).
 
 The answer is the decision id and the one-line summary (api.md item 5), whether or not it wrote:
 
@@ -376,7 +378,7 @@ controller or API handler writes them yet.
 
 **Owner's answers.** Item 10: a change of the replica count alone does **not** bump
 `generation`. Item 11: a replica whose start failed through the user's fault (for example
-`ZBX-E0501`) is **held**, with a `hold_failed_replica` decision, and not retried or replaced.
+`ZBX-E0410`) is **held**, with a `hold_failed_replica` decision, and not retried or replaced.
 
 ## Agent endpoints (slice 6a)
 
@@ -503,7 +505,7 @@ transaction compares the registration's `mod_revision` with it: a node whose reg
 replaced or deleted is refused with `503` and `ZC-E0510` and nothing is written (I2).
 
 Answer `{"revision": 431}`. The `value` is the observed record, **including `diagnostic`**: the
-runtime's own diagnostic (`ZBX-E0501` for an image that is not in the node's store) reaches the
+runtime's own diagnostic (`ZBX-E0410` for an image that is not in the node's store) reaches the
 store as the agent built it, and `zcube why` renders it. The server refuses (`400`, `ZC-E0104`,
 nothing written) a put whose record is for another node, whose key is not the observed key of its
 record, a delete outside `/observed/<node>/`, a key named twice, and more than 16 operations.

@@ -80,11 +80,11 @@ if (mode === "sim") {
   });
   await check("sim: the why chain for broken comes from the real core", async () => {
     await page.evaluate(() => { location.hash = "#/why/service/broken"; });
-    await page.waitForFunction(() => document.querySelector("main")?.innerText.includes("ZBX-E0501"), null, { timeout: 10000 });
+    await page.waitForFunction(() => document.querySelector("main")?.innerText.includes("ZBX-E0410"), null, { timeout: 10000 });
     const text = await page.innerText("main");
     must(text.includes("service broken: 0/1 running"), "headline missing");
     must(text.includes("hold_failed_replica") || /not replaced/.test(text), "the hold sentence is missing");
-    must(await page.locator('article.diag a.code:text-is("ZBX-E0501")').count() > 0, "no ZBX-E0501 diagnostic block");
+    must(await page.locator('article.diag a.code:text-is("ZBX-E0410")').count() > 0, "no ZBX-E0410 diagnostic block");
     await shot(page, "sim-why-broken");
   });
   await check("sim: a forced panic shows a bug diagnostic with Reload, and the page stays up", async () => {

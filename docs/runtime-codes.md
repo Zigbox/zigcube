@@ -5,23 +5,18 @@ pinned Zigbox commit (`90b6f1c`) the registry has no code for a start that fails
 digest is not in the node's store, so Zigcube keeps one itself, in `src/runtime_codes.zig`, and
 the simulated runtime raises it. `/v1/codes` and `/v1/explain` serve it beside Zigbox's own.
 
-| Code | Blame | Summary | Raised by |
-| --- | --- | --- | --- |
-| `ZBX-E0501` | user | image not found | a start whose digest is not in the fixtures list |
-
-**Not agreed yet:** the number (Zigbox's `05xx` is "registry and pull"; that is why this one is
-`E0501`), the wording of the cause and fix, and a code for `lost` (the supervisor died, or the
-process vanished). The simulated runtime reports `lost` with no diagnostic, which the contract
-allows ("null means it truly does not know"), because there is nothing registered to say.
-
-The code leaves `runtime_codes.zig` the day Zigbox registers it; the diagnostic's shape (a
-`Diagnostic` with a `ZBX-` code, built from the JSON of DIAGNOSTICS.md) does not change.
+None at present. `ZBX-E0501` ("image not found"), which this file used to hold, became Zigbox's
+`ZBX-E0410` ("no tree with that digest") when the pin moved to Zigbox 600939c, which registers it;
+Zigcube's registry entry is gone and the codes API serves Zigbox's page. The mechanism stays in
+`src/runtime_codes.zig` for the next code Zigbox lacks. Still unregistered: a code for `lost`
+(the supervisor died, or the process vanished); the simulated runtime reports `lost` with no
+diagnostic, which the contract allows.
 
 ## Codes `FakeRuntime` raises of its own (slice 6a)
 
 `lost` has no `ZBX-` code yet, and neither does a command that cannot be run, so the real-process
 `FakeRuntime` uses `ZC-` codes of the agent's range (`src/diag/codes.zig`). They travel in the same
-diagnostic shape; when Zigbox registers the equivalents they move, as `ZBX-E0501` will.
+diagnostic shape; when Zigbox registers the equivalents they move, as `ZBX-E0501` (now `ZBX-E0410`) did.
 
 | Code | Blame | Summary | Raised for |
 | --- | --- | --- | --- |

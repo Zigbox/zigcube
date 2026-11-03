@@ -9,7 +9,7 @@
 //!   3. restart the agent: the same processes run, no duplicate was started;
 //!   4. restart the server: nothing changes;
 //!   5. apply a digest that is not in the fixtures: the replica is held, and the observed state
-//!      carries the `ZBX-E0501` diagnostic.
+//!      carries the `ZBX-E0410` diagnostic.
 //!
 //! Every process it starts is killed at the end, whatever happened (`Smoke.cleanup`). It prints
 //! to stdout only, one line per step, because the build runner counts any stderr as a failure; a
@@ -500,7 +500,7 @@ fn step_restart_server(smoke: *Smoke) !void {
     smoke.say("server restarted: the same replicas, the same processes", .{});
 }
 
-/// A digest that is not in the fixtures: held, with ZBX-E0501 in the observed state.
+/// A digest that is not in the fixtures: held, with ZBX-E0410 in the observed state.
 fn step_unknown_digest(smoke: *Smoke) !void {
     try smoke.apply("broken", "b3:00ff00ff", 1);
     const failed = struct {
@@ -518,8 +518,8 @@ fn step_unknown_digest(smoke: *Smoke) !void {
         if (std.mem.startsWith(u8, item.replica, "broken-")) code = item.diagnostic_code;
     }
     try smoke.expect(
-        std.mem.eql(u8, code, "ZBX-E0501"),
-        "the diagnostic is '{s}', expected ZBX-E0501",
+        std.mem.eql(u8, code, "ZBX-E0410"),
+        "the diagnostic is '{s}', expected ZBX-E0410",
         .{code},
     );
     const ids = try smoke.replica_ids("broken");
@@ -539,8 +539,8 @@ fn step_unknown_digest(smoke: *Smoke) !void {
     const why = try smoke.call("GET", "/v1/why/service/broken", "");
     try smoke.expect(why.status == 200, "why answered {d}", .{why.status});
     try smoke.expect(
-        std.mem.find(u8, why.body, "ZBX-E0501") != null,
-        "why does not mention ZBX-E0501",
+        std.mem.find(u8, why.body, "ZBX-E0410") != null,
+        "why does not mention ZBX-E0410",
         .{},
     );
     try smoke.expect(
@@ -548,7 +548,7 @@ fn step_unknown_digest(smoke: *Smoke) !void {
         "hello changed while broken failed",
         .{},
     );
-    smoke.say("unknown digest: {s} held with ZBX-E0501 in its observed state", .{later[0]});
+    smoke.say("unknown digest: {s} held with ZBX-E0410 in its observed state", .{later[0]});
 }
 
 /// A port the system is not using now: bind port 0, read it, let go.

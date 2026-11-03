@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     add_agent_smoke_step(b, built, zigbox_module);
     add_local_smoke_step(b, built);
     add_bench_watch_step(b, shared_options);
+    add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
@@ -330,6 +331,42 @@ fn add_bench_watch_step(b: *std.Build, options: ExecutablesOptions) void {
     run.setCwd(b.path("."));
     b.step("bench-watch", "Run the watch fan-out benchmark (50 agents, 2,000 assignments)")
         .dependOn(&run.step);
+}
+
+/// `zig build zigbox-smoke`: the Zigbox runtime on a real host, in a QEMU guest booted through
+/// Zigbox's exported `zigbox_vm` module (src/zigbox_smoke.zig). Skips unless `ZCUBE_REAL_HOST=1`.
+fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
+    const vm = b.dependency("zigbox", .{}).module("zigbox_vm");
+    // The guest runs the host's architecture; Zigbox's zbx is static and libc-free, and the guest
+    // gets it only to run `zbx doctor` for the log of a failure.
+    const zbx = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe })
+        .artifact("zbx");
+    const exe = b.addExecutable(.{
+        .name = "zigbox_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zigbox_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox_vm", .module = vm }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addFileArg(stripped(b, built.agent));
+    run.addFileArg(stripped(b, built.server));
+    run.addFileArg(stripped(b, zbx));
+    run.addFileArg(b.path("ops/zigbox-smoke/guest.sh"));
+    run.has_side_effects = true;
+    const help = "Run the Zigbox runtime on a real host in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
+    b.step("zigbox-smoke", help).dependOn(&run.step);
+}
+
+/// A copy of `exe` without symbols: the guest harness serves files of at most 8 MiB, which a
+/// ReleaseSafe build with debug information exceeds (binutils' `strip`; `zig objcopy` cannot).
+fn stripped(b: *std.Build, exe: *std.Build.Step.Compile) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ "strip", "-o" });
+    const output = run.addOutputFileArg(exe.name);
+    run.addArtifactArg(exe);
+    return output;
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it;

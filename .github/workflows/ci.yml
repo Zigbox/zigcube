@@ -320,3 +320,80 @@ jobs:
         run: |
           echo "seed ${{ github.run_id }}"
           zig build sim-c0 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
+
+  # The Zigbox runtime on a real host (C2 slice 1, docs/demos/c2.md): zcube-server, zcube-agent
+  # --runtime zigbox and real containers from a pulled Alpine image, in the Ubuntu 24.04 guest of
+  # Zigbox's `zigbox_vm` module under QEMU/KVM. The runner setup is Zigbox's (its demo jobs): QEMU,
+  # the udev rule that lets the runner user open /dev/kvm, the guest image cached by its pin.
+  # docker.io is reached through mirror.gcr.io, as in Zigbox's CI. A pass is a check, not
+  # `demo-c2`. It runs on a pull request only when the files it depends on changed, and on main.
+  zigbox-smoke:
+    name: zigbox-smoke (Ubuntu 24.04 VM, KVM, real containers)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Does this change touch the smoke?
+        id: touched
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          run=true
+          if [ "${EVENT}" = pull_request ]; then
+            run=false
+            files="$(git diff --no-renames --name-only "${BASE}...${HEAD}")" || files=build.zig
+            # An empty diff cannot be told from a failed one: run (fail safe).
+            [ -n "${files}" ] || files=build.zig
+            while IFS= read -r f; do
+              case "$f" in
+                src/zigbox_* | src/agent* | src/fake_* | src/runtime* | src/host_* | src/diag* | \
+                  build.zig | build.zig.zon | ops/zigbox-smoke/* | .github/workflows/ci.yml)
+                  run=true ;;
+              esac
+            done <<< "${files}"
+          fi
+          echo "Smoke runs: ${run}"
+          echo "run=${run}" >> "${GITHUB_OUTPUT}"
+      - uses: ./.github/actions/setup-zig
+        if: steps.touched.outputs.run == 'true'
+      - name: SQLite and libpq development files, QEMU
+        if: steps.touched.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        if: steps.touched.outputs.run == 'true'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        if: steps.touched.outputs.run == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: Zigbox smoke
+        if: steps.touched.outputs.run == 'true'
+        shell: bash
+        run: zig build zigbox-smoke -Doptimize=ReleaseSafe --summary all 2>&1 | tee zigbox-smoke.txt
+      - name: Keep the output
+        if: ${{ !cancelled() && steps.touched.outputs.run == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zigbox-smoke-output
+          path: zigbox-smoke.txt
+          if-no-files-found: warn

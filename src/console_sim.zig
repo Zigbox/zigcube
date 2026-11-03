@@ -326,7 +326,7 @@ test "the scenario runs to the end and explains why broken is not running" {
     const last = steps[steps.len - 1];
     try testing.expectEqualStrings("observed", last.object.get("type").?.string);
     const diagnostic = last.object.get("diagnostic").?;
-    try testing.expectEqualStrings("ZBX-E0501", diagnostic.object.get("code").?.string);
+    try testing.expectEqualStrings("ZBX-E0410", diagnostic.object.get("code").?.string);
 
     try testing.expectEqual(@as(i32, 5), try console.control(.step, 0));
     try testing.expectEqual(@as(i32, 1), try console.control(.is_store_down, 0));
