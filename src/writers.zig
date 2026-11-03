@@ -87,6 +87,40 @@ pub fn allowed(role: Role, request: store.TxnRequest) Verdict {
     return .allowed;
 }
 
+/// I4 as the simulator sees it, without knowing who wrote: a transaction is one role's, so its
+/// puts and deletes may not span the keys of two exclusive owners (every-role prefixes are
+/// anyone's), may not touch a key under no prefix, and an agent's keys name one node. Returns the
+/// first key that breaks this, or null.
+pub fn foreign_key(request: store.TxnRequest) ?[]const u8 {
+    var owner: ?Owner = null;
+    var node: ?[]const u8 = null;
+    for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
+        for (ops) |op| {
+            const key = switch (op) {
+                .put => |put| put.key,
+                .delete => |key| key,
+            };
+            const rule = rule_for(key) orelse return key;
+            if (rule.owner == .anyone) continue;
+            // The node controller may delete an agent's observed records (`agent_may_write`).
+            if (owner) |first| {
+                const pair_ok = first == .node_controller and rule.owner == .agent or
+                    first == .agent and rule.owner == .node_controller;
+                if (first != rule.owner and !pair_ok) return key;
+            }
+            owner = rule.owner;
+            if (rule.owner != .agent) continue;
+            const rest = key[rule.prefix.len..];
+            const end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+            if (node) |first| {
+                if (!std.mem.eql(u8, first, rest[0..end])) return key;
+            }
+            node = rest[0..end];
+        }
+    }
+    return null;
+}
+
 fn rule_for(key: []const u8) ?Rule {
     for (rules) |rule| {
         if (std.mem.startsWith(u8, key, rule.prefix)) return rule;
@@ -282,4 +316,17 @@ test "the node controller removes observed records and writes none" {
     const key = "/observed/n1/hello-1";
     try testing.expect(allowed(.node_controller, request_of(&.{.{ .delete = key }})) == .allowed);
     try testing.expect(allowed(.node_controller, request_of(&.{put_op(key)})) == .refused);
+}
+
+test "foreign_key finds a transaction that no single role could have written" {
+    const ok = [_]store.Op{ put_op("/services/hello"), put_op("/decisions/d1") };
+    try testing.expect(foreign_key(request_of(&ok)) == null);
+    const mixed = [_]store.Op{ put_op("/services/hello"), put_op("/assigned/n1/hello-1") };
+    try testing.expectEqualStrings("/assigned/n1/hello-1", foreign_key(request_of(&mixed)).?);
+    const nowhere = [_]store.Op{put_op("/nowhere/x")};
+    try testing.expectEqualStrings("/nowhere/x", foreign_key(request_of(&nowhere)).?);
+    const two_nodes = [_]store.Op{ put_op("/nodes/n1"), put_op("/observed/n2/c1") };
+    try testing.expectEqualStrings("/observed/n2/c1", foreign_key(request_of(&two_nodes)).?);
+    const own = [_]store.Op{ put_op("/nodes/n1"), put_op("/observed/n1/c1") };
+    try testing.expect(foreign_key(request_of(&own)) == null);
 }

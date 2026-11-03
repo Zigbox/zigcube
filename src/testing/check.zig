@@ -12,6 +12,9 @@
 //!     `sim-teeth`: the same simulator with the agent's test-only fault on, which must fail
 //!     (docs/core.md, "The cluster simulation"). A failure prints the seed in the
 //!     `sim-cluster: seed N` line above it.
+//!   - `sim-c1` (docs/authority.md §4 and §5) with a fresh seed, native against WASM, and
+//!     `sim-c1-teeth`, the four negative tests, each of which must fire. A failure prints the
+//!     seed in the `sim-c1: seed N` line above it.
 //!   - The one gate a root build container cannot see: CI runs `zig build test` as an ordinary
 //!     user. When this runs as root and <user> is not "-", the committed tree is checked out into
 //!     a scratch worktree owned by <user> and tested as that user, with its own cache.
@@ -19,7 +22,8 @@
 //! Then it prints the line a report quotes:
 //!
 //!     check: PASS 1a2b3c4d5e6f (build test tidy errors-site wasm-check wasm-test console-wasm
-//!     store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-swarm sim-swarm-teeth, test as tester)
+//!     store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth,
+//!     test as tester)
 //!
 //! It also says when the build cache has grown past `cache_note_bytes`, with the command that
 //! empties it, because a full disk costs more than a rebuild.
@@ -113,6 +117,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     sim_cluster_gates(gpa, io, zig, label, err) catch return 1;
+    sim_c1_gates(gpa, io, zig, label, err) catch return 1;
     sim_swarm_gates(gpa, io, zig, label, err) catch return 1;
     if (as_user) {
         test_as(gpa, io, zig, user, err) catch {
@@ -126,7 +131,7 @@ pub fn main(init: std.process.Init) !u8 {
         "";
     note_cache(gpa, io, err);
     const stores = if (postgres) "store:memory,sqlite,postgres" else "store:memory,sqlite";
-    const sims = "sim-c0 sim-cluster sim-teeth sim-swarm sim-swarm-teeth";
+    const sims = "sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth";
     try err.print("check: PASS {s} ({s} {s} {s}{s})\n", .{ label, gates, stores, sims, tail });
     return 0;
 }
@@ -159,6 +164,33 @@ fn sim_cluster_gates(
     run(io, &.{ zig, "build", "sim-teeth" }, null) catch {
         try err.print("check: FAIL {s} (zig build sim-teeth: the simulator did not catch " ++
             "the agent's test-only fault)\n", .{label});
+        return error.CommandFailed;
+    };
+}
+
+/// `sim-c1` on a fresh seed (native against WASM), then its four negative tests.
+fn sim_c1_gates(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zig: []const u8,
+    label: []const u8,
+    err: *Io.Writer,
+) !void {
+    var seed_bytes: [8]u8 = undefined;
+    io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-c1: seed {d}\n", .{seed});
+    try err.flush();
+    const seed_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{seed});
+    run(io, &.{ zig, "build", "sim-c1", seed_option }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c1: its seed is the line above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    run(io, &.{ zig, "build", "sim-c1-teeth" }, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-c1-teeth: a negative test did not " ++
+            "fire its check)\n", .{label});
         return error.CommandFailed;
     };
 }

@@ -336,3 +336,61 @@ range of seeds, not one.
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations, native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and
 `sim-swarm-teeth` ([swarm.md](swarm.md)).
+
+## sim-c1
+
+`zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]` is the cluster simulation with `Options.c1` on
+(`sim_cluster --c1` natively): clock skew and wedged (frozen) agents are added to the swarm, a
+`TapStore` beneath the lost-acknowledgement layer (`src/sim_tap.zig`) lets `src/sim_c1.zig` check
+every committed revision, and native and WASM reports must agree byte for byte. It is a profile,
+not a new simulator, because the faults and the real controllers, agents and store are the same
+(docs/DECISIONS.md, 2026-11-03).
+
+What it checks (docs/authority.md §4). Two of the checks run after each commit, and two just ahead
+of one, over the head the transaction will commit over (the tap's `before`; the verdict counts only
+if the transaction then commits, because a failed compare is the store doing its job):
+
+- **I1a** one assignment per replica id. **I6** allocations equal the sum of assignments, none
+  above capacity. **I7** no placement onto a node that is not ready for its tenure.
+- **I1b** a replaced replica stops on its old node within the overlap bound (5 s), unless a node
+  running it was wedged now or within `wedge_memory_ms`; the bound then runs from the last moment
+  of the wedge (a wedge long past excuses nothing), and the report counts the excused overlaps
+  separately. A node whose agent is down counts as wedged: until slice 6's self-fencing nothing
+  stops its containers (docs/DECISIONS.md). The same replica executing on two nodes at once
+  (`duplicates`) fails the run. A full overlap table is counted in the report, never silent.
+- **I2** every put under `/observed/<node>/` carries a compare on `/nodes/<node>` (the tenure)
+  and every write to `/assigned/<node>/<id>` a compare on that key (the placement epoch), and
+  the compared revision is the key's current one. The store refuses a stale compare, so this
+  finds a transaction that left the compare out, or a store that did not enforce it.
+- **I3** (authority.md §3, at the head the decision commits over): each decision citing an agent's
+  report (`cause.kind` `observed`, a key under `/observed/`) cites one whose `tenure` is its
+  node's current registration, whose `assignment`, when it has one, is the current revision of
+  `/assigned/<node>/<id>`, and whose node's `/node-status/<node>` is `ready`. The report itself is
+  read at the cited revision: a missing one fails, one compaction took is counted as unjudged
+  (the report prints judged, unjudged and the citations of other keys, a node or an allocation,
+  that are not §3's). Until slice 6 the agent does not stamp `assignment` (keys.md), so that
+  condition is judged for reports that have it and waits for the rest.
+- **I4** no transaction's puts and deletes span the keys of two writer roles, touch a key under no
+  prefix, or name two nodes' agent keys (`writers.foreign_key`). The tap sees the transaction and
+  not who sent it, so "the actual role matches the table" would need the role passed through the
+  `Store` interface, which is an Ask-first change; this is the weaker, role-free form.
+- **I5** every `why` is complete or truncated with a reason; a decision `why` cannot explain when
+  it commits, or the recorder cannot hold, fails the run.
+
+The evidence acceptance test (§5, `src/why_acceptance.zig`): each decision's terminal evidence is
+recorded as `why` renders it right after commit; at the end of the run every cited key is deleted or
+changed and the store compacted past them; `why` is asked again for every decision and must be
+complete with the same evidence, or truncated with a reason and nothing it cannot back. The same
+test runs over the real core in `zig build test`.
+
+Negative tests (`zig build sim-c1-teeth`, one step per test, each passes only if its check fires):
+a wedged node, not excused, breaks I1b (the overlap tracker's own sentence); skew beyond the
+bound fires the older fencing check (a container running on a node whose lease ran out longer ago
+than the lost grace), which sim-c1 labels I1b, not the overlap tracker; skipping the allocation
+compare breaks I6; skipping the readiness compare with a node lost between planning and commit
+breaks I7; a node that registers again between a controller's read of a report and the decision's
+commit (as if the tenure were not compared) breaks I3. Their
+switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
+`zcube-agent` assert at compile time that none is on.
+
+`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

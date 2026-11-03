@@ -8,6 +8,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const build_options = @import("build_options");
 const config_mod = @import("server_config.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const server_mod = @import("server.zig");
@@ -45,6 +46,11 @@ var stop_requested: std.atomic.Value(bool) = .init(false);
 
 fn on_signal(_: std.posix.SIG) callconv(.c) void {
     stop_requested.store(true, .release);
+}
+
+// The sim-c1 negative tests (c1_teeth.zig) must be unreachable from the shipped program.
+comptime {
+    std.debug.assert(!c1_teeth.any);
 }
 
 pub fn main(init: std.process.Init) u8 {

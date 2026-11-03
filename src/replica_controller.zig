@@ -33,6 +33,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
+const evidence = @import("evidence.zig");
 const retention = @import("retention.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
@@ -292,6 +293,7 @@ const Run = struct {
                     .revision = observed.kv.mod_revision,
                 },
                 .cause_diagnostic = observed.rec.diagnostic,
+                .cause_evidence = try evidence.observed(run.ctx, &observed.rec),
             }, &batch);
         }
         if (batch.ops_count == 0) return true;
@@ -365,6 +367,10 @@ const Run = struct {
             .subject = .{ .kind = .service, .name = service.rec.name },
             .reason = why,
             .cause = cause,
+            .cause_evidence = if (first_dead == null)
+                try evidence.service(run.ctx, &service.rec)
+            else
+                null,
         }, &batch);
         for (removed[0..removed_count]) |item| {
             if (item.class == .stale) try run.remove_stale(&batch, item, &decision, service);
@@ -686,6 +692,7 @@ const Run = struct {
             .subject = .{ .kind = .service, .name = service.rec.name },
             .reason = reason,
             .cause = desired_cause(service),
+            .cause_evidence = try evidence.service(run.ctx, &service.rec),
         }, &batch);
         try run.create_replicas(&batch, service, &decision, creations);
         _ = try run.finish(&batch);
@@ -724,6 +731,7 @@ const Run = struct {
             .subject = .{ .kind = .service, .name = service.rec.name },
             .reason = reason,
             .cause = desired_cause(service),
+            .cause_evidence = try evidence.service(run.ctx, &service.rec),
         }, &batch);
         for (victims[0..taken]) |item| {
             const why = try controller.format(run.ctx, "removing {s} to get from {d} to {d} {s}", .{
@@ -775,6 +783,7 @@ const Run = struct {
                 .key = try controller.key_copy(run.ctx, &key),
                 .revision = run.snap.revision,
             },
+            .cause_evidence = try evidence.deleted_service(run.ctx, service),
         }, batch);
     }
 };
