@@ -1,0 +1,7 @@
+# C1 slice 5 review fixes
+
+*Decided 2026-11-03.*
+
+C1 slice 5 review fixes. I2 and I3 run in the tap's `before` hook, over the head the transaction will commit over, and count only if it commits (`sim_c1.before_commit`); I3 is §3's three conditions (tenure, `assignment` when stamped, node ready; a missing report fails), judged only for reports under `/observed/` (the node controller and auditor also cite `/nodes/` and `/allocations/` keys as `observed`, which are not agents' reports). The agent stamps `assignment` from slice 6, so until then that condition waits. I4 stays the role-free "no transaction spans two roles": passing the writer role to the tap changes `Store` (Ask first). **A dead or frozen agent counts as wedged for I1b** until slice 6's self-fencing, and the excuse lasts only while the wedge does plus the overlap bound. A freeze never takes the last unfrozen node (a cluster of frozen agents does no work, which the fault-phase work floor rightly rejects). The same replica on two nodes fails under `--c1`. Nothing is dropped silently: a full overlap table, an undecodable decision, a `why` that fails at commit are counted in the report or fail the run. The skew negative test fires the older fencing check, relabelled I1b. A fifth negative test (`stale`) breaks I3. `cause_evidence.exit` is the `Exit` object of keys.md.
+
+Where: `src/sim_c1.zig`, `src/sim_cluster.zig`, `docs/core.md`

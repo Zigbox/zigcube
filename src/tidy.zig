@@ -55,6 +55,10 @@ const shell_allowlist = [_][]const u8{
     // `curl` against the server, a few lines each; a Zig program would be one more binary to copy
     // in and would shell out to the same tools. Deviation recorded in the slice's report.
     "ops/zigbox-smoke/guest.sh",
+    // The owner's one-off recipe for demo-c2's two GHCR images (ops/demo-c2-images): it runs on
+    // the owner's machine with docker and a registry login, never in a build or test, and is a
+    // list of `docker buildx` calls; the build has no docker to drive from Zig.
+    "ops/demo-c2-images/push.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).

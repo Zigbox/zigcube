@@ -1,0 +1,7 @@
+# Slice 10c, second review fixes: whether a write may have applied is a flag on the collector (Diag.write_outcome_unknown, set where the COMMIT drop is classified in pq.zig, never rendered), not a comparison of cause text
+
+*Decided 2026-10-31.*
+
+Slice 10c, second review fixes: whether a write may have applied is a flag on the collector (`Diag.write_outcome_unknown`, set where the COMMIT drop is classified in `pq.zig`, never rendered), not a comparison of cause text. `--mutate all_unknown` records every failed write as unknown; a faulted Postgres run must record some writes as failed, or it fails (SQLite never errors, so that mutation can be shown only on Postgres). The runner's own test (`mutated_report`) uses fixed seeds (7 honest; 100-102 for the lies) on purpose: it must fail the same way on every run so that a red build is a broken checker, not a draw; the interleaving still varies, so `stale_read` gets three seeds. The per-run random seed is for the runner itself, not its can-it-fail test. The leftover schema is dropped over a plain connection before the store opens, and `say` keeps a file-scope `say_enabled` switch (set before threads start) because `say` has callers with no run in reach. The proxy holds back a tail that could begin a COMMIT reply, so a reply split across reads is still cut.
+
+Where: `src/pq.zig`, `src/diag.zig`, `src/store_mutant.zig`, `src/store_faults.zig`, `src/testing/fault_proxy.zig`

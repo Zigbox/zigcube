@@ -5,7 +5,7 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 - **Coding handoff (C0, C1):** [HANDOFF.md](HANDOFF.md).
 - **How the code is written and tested:** [docs/STYLE.md](docs/STYLE.md) (Zigbox's TigerStyle rules, with Zigcube's departures).
 - **Diagnostics standard, shared with Zigbox:** [DIAGNOSTICS.md](DIAGNOSTICS.md).
-- **Rules for contributors and agents:** [AGENTS.md](AGENTS.md), with the self-review checklist [REVIEW.md](REVIEW.md) and the decision log [docs/DECISIONS.md](docs/DECISIONS.md).
+- **Rules for contributors and agents:** [AGENTS.md](AGENTS.md), with the self-review checklist [REVIEW.md](REVIEW.md) and the decision log [docs/decisions/](docs/decisions/).
 - **Plan and supervisor handoff:** [docs/supervisor-handoff.md](docs/supervisor-handoff.md).
 - **Web console (design and clickable prototype):** [docs/console.md](docs/console.md), with the HTTP API it needs proposed in [docs/api.md](docs/api.md).
 
