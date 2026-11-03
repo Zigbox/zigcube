@@ -34,6 +34,9 @@
 //! still `running` until the grace period has passed on the clock. The agent never relies on a
 //! stop having completed, so both are fine for it; the shell's adapter may be either. This is the
 //! one place the simulated runtime is lazier than the contract (docs/core.md).
+//!
+//! `Runtime.signal` is exact: TERM ends a polite container at once and a `slow_stop` one not at
+//! all, KILL ends any; neither waits. The fence uses it to stop N containers against one deadline.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -112,6 +115,7 @@ pub const SimRuntime = struct {
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
         .stop = stop_impl,
+        .signal = signal_impl,
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
@@ -431,6 +435,28 @@ pub const SimRuntime = struct {
         }
     }
 
+    /// A signal acts at once and never waits: TERM ends a container that does not ignore it (a
+    /// `slow_stop` one does, and stays as it was), KILL ends any that has not stopped.
+    fn signal_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        number: u8,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const self = from(context);
+        self.tick();
+        const container = self.find(handle.name()) orelse return not_found(diag, handle);
+        switch (container.phase) {
+            .stopped => {},
+            .running, .stopping => {
+                if (number == runtime.signal_kill) return self.end(container, .{ .signaled = 9 });
+                assert(number == runtime.signal_term);
+                if (container.ignores_stop) return;
+                self.end(container, .{ .signaled = 15 });
+            },
+        }
+    }
+
     fn inspect_impl(
         context: *anyopaque,
         handle: runtime.Handle,
@@ -649,6 +675,39 @@ test "faults end a container the way a real one ends, and list says how" {
     const changes = try rt.events(arena_state.allocator(), 0, &diag);
     try testing.expectEqual(@as(usize, 5), changes.len);
     try testing.expectEqual(@as(usize, 0), (try rt.events(arena_state.allocator(), 0, &diag)).len);
+}
+
+test "a signal never waits: TERM is ignored by a slow container, KILL ends it" {
+    // Goal: the semantics of `Runtime.signal` in virtual time. Method: signal a polite, a slow
+    // and a stopped container; the clock never moves, so nothing is waited for.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 1, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    const one = labels_of.one("a-1");
+    const two = labels_of.one("a-2");
+    _ = try rt.start(&spec_for("a-1", "b3:51aa9c03", &one), &diag);
+    _ = try rt.start(&spec_for("a-2", "b3:51aa9c03", &two), &diag);
+    const first = runtime.Handle.init("a-1");
+    const second = runtime.Handle.init("a-2");
+    try sim.inject("a-2", .slow_stop);
+
+    try rt.signal(first, runtime.signal_term, &diag);
+    try testing.expectEqual(@as(u8, 15), (try rt.inspect(first, &diag)).stopped.signaled);
+    try rt.signal(second, runtime.signal_term, &diag);
+    try testing.expect((try rt.inspect(second, &diag)) == .running);
+    try rt.signal(second, runtime.signal_kill, &diag);
+    try testing.expectEqual(@as(u8, 9), (try rt.inspect(second, &diag)).stopped.signaled);
+    try rt.signal(second, runtime.signal_kill, &diag); // Stopped: nothing.
+    try rt.signal(first, runtime.signal_term, &diag);
+    try testing.expectEqual(@as(u8, 15), (try rt.inspect(first, &diag)).stopped.signaled);
+    try testing.expectError(
+        error.NotFound,
+        rt.signal(runtime.Handle.init("zzz"), runtime.signal_kill, &diag),
+    );
 }
 
 test "a normal stop is done at once; a slow stop takes the grace period, then the kill" {

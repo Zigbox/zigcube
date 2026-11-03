@@ -41,6 +41,7 @@ pub const SimNode = struct {
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
         .stop = stop_impl,
+        .signal = signal_impl,
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
@@ -247,6 +248,29 @@ pub const SimNode = struct {
         // A record whose container never started has nothing to stop; its record stays.
         if (node.containers.has(handle.name())) {
             try node.containers.interface().stop(handle, grace_ms, diag);
+        }
+        if (node.step()) return node.dead(diag);
+    }
+
+    /// As `stop_impl`: a dead agent signals nothing, and a record whose container never started
+    /// has nothing to signal.
+    fn signal_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        number: u8,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const node = from(context);
+        if (node.crashed) return node.dead(diag);
+        var arena_state = std.heap.ArenaAllocator.init(node.files.gpa);
+        defer arena_state.deinit();
+        const state = node.files.interface();
+        const read = agent_records.read_spec(state, arena_state.allocator(), handle.name());
+        const found = read catch |err|
+            return node.state_failed(diag, err, "read the container's record");
+        if (found == null) return agent_records.not_found(diag, handle.name());
+        if (node.containers.has(handle.name())) {
+            try node.containers.interface().signal(handle, number, diag);
         }
         if (node.step()) return node.dead(diag);
     }

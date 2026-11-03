@@ -64,6 +64,16 @@ pub const Handle = struct {
     }
 };
 
+/// The two signals `Runtime.signal` takes: the polite request and the one that cannot be
+/// ignored. They are the Linux numbers, and Zigbox's `signal_term` and `signal_kill`.
+pub const signal_term: u8 = 15;
+pub const signal_kill: u8 = 9;
+
+/// True for the only two numbers `Runtime.signal` takes.
+pub fn signal_known(number: u8) bool {
+    return number == signal_term or number == signal_kill;
+}
+
 pub const Label = struct { key: []const u8, value: []const u8 };
 pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
@@ -149,6 +159,12 @@ pub const Runtime = struct {
             grace_ms: u32,
             diag: *Diag,
         ) Error!void,
+        signal: *const fn (
+            context: *anyopaque,
+            handle: Handle,
+            number: u8,
+            diag: *Diag,
+        ) Error!void,
         inspect: *const fn (context: *anyopaque, handle: Handle, diag: *Diag) Error!Status,
         list: *const fn (
             context: *anyopaque,
@@ -182,6 +198,18 @@ pub const Runtime = struct {
     pub fn stop(runtime: Runtime, handle: Handle, grace_ms: u32, diag: *Diag) Error!void {
         assert(diag.code == null);
         try finish(diag, runtime.vtable.stop(runtime.context, handle, grace_ms, diag));
+    }
+
+    /// Sends `signal_term` or `signal_kill` to the container's main process and returns at
+    /// once: it never waits, and success says nothing about whether the container has stopped
+    /// (read `inspect` or `list`). This is how the fence stops N containers against one
+    /// deadline. Signalling a container that has stopped does nothing; one that has no process
+    /// yet (still starting) is treated as `stop` treats it. An unknown handle is `NotFound`.
+    /// Any other number is a bug in the caller.
+    pub fn signal(runtime: Runtime, handle: Handle, number: u8, diag: *Diag) Error!void {
+        assert(diag.code == null);
+        assert(signal_known(number));
+        try finish(diag, runtime.vtable.signal(runtime.context, handle, number, diag));
     }
 
     pub fn inspect(runtime: Runtime, handle: Handle, diag: *Diag) Error!Status {
@@ -340,6 +368,7 @@ const Refusing = struct {
     const vtable: Runtime.VTable = .{
         .start = start,
         .stop = stop,
+        .signal = signal,
         .inspect = inspect,
         .list = list,
         .events = events,
@@ -359,6 +388,15 @@ const Refusing = struct {
     fn stop(context: *anyopaque, handle: Handle, grace_ms: u32, diag: *Diag) Error!void {
         _ = context;
         _ = grace_ms;
+        _ = handle;
+        diag.raise(.E0501);
+        diag.cause("no container by that name", .{});
+        return error.NotFound;
+    }
+
+    fn signal(context: *anyopaque, handle: Handle, number: u8, diag: *Diag) Error!void {
+        _ = context;
+        _ = number;
         _ = handle;
         diag.raise(.E0501);
         diag.cause("no container by that name", .{});
@@ -412,6 +450,9 @@ test "a failed start is an outcome carrying a diagnostic; an unknown handle is a
 
     const handle = Handle.init("hello-1");
     try testing.expectError(error.NotFound, runtime.stop(handle, 1000, &diag));
+    try testing.expectEqual(@as(@TypeOf(diag.code.?), .E0501), diag.code.?);
+    diag.reset();
+    try testing.expectError(error.NotFound, runtime.signal(handle, signal_term, &diag));
     try testing.expectEqual(@as(@TypeOf(diag.code.?), .E0501), diag.code.?);
     diag.reset();
     try testing.expectError(error.NotFound, runtime.inspect(handle, &diag));
