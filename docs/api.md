@@ -218,12 +218,20 @@ are refused (`ZC-E0104`), so a typo cannot be silently ignored.
 { "name": "hello", "image": "b3:51aa9c03", "replicas": 3,
   "command": ["sh", "-c", "while true; do sleep 1; done"],
   "env": [["KEY", "value"]], "limits": {"cpu_millis": 500, "memory_bytes": 268435456},
+  "source": "registry.example/hello@sha256:<64 hex digits>",
   "applied_by": "alex@laptop" }
 ```
 
-`name`, `image`, `replicas` and `command` are required; `env`, `limits` and `applied_by` are
-optional (`applied_by` defaults to `anonymous`). The rules are `apply.zig`'s: a count change alone
-does not bump `generation`; a change to the image, command, env or limits does. `env` holds at
+`name`, `image`, `replicas` and `command` are required; `env`, `limits`, `source` and `applied_by`
+are optional (`applied_by` defaults to `anonymous`, `source` to empty). The rules are
+`apply.zig`'s: a count change alone does not bump `generation`; a change to the image, source,
+command, env or limits does. `source` (C2 slice 2) is the OCI reference the image is pulled from
+when the node does not have it. It is empty, or at most 1024 bytes with no whitespace or control
+character, ending in `@sha256:` and 64 lowercase hex digits (a tag can move, so a pin is
+required); anything else is `ZC-E0104` naming the rule that failed. It is a string (any other
+type is `ZC-E0104`), it is not a secret, and it appears as `source` on `/services/<name>` and
+`/replicas/<service>/<id>` in the read endpoints, empty when none was given. The supervisor parses
+it with Zigbox's `parse_reference`, which may refuse what apply took. `env` holds at
 most 16 variables (Zigbox's `run_env_count_max`; it was 64 before C2 slice 1, which tightened it so
 a service the real runtime would refuse is refused at apply).
 

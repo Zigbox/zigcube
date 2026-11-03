@@ -439,6 +439,32 @@ test "a body that is not a service is ZC-E0104 and writes nothing" {
     try testing.expectEqual(@as(store.Revision, 0), rig.world.revision().?);
 }
 
+test "POST /v1/apply takes a source, serves it back, and refuses one that is not a pin" {
+    // Goal: P1 of docs/briefs/c2-2.md at the API. Method: apply with a digest-pinned source and
+    // read the service and its replicas back; then a tag, a number and an unknown neighbour are
+    // ZC-E0104 and write nothing more.
+    var rig = try Rig.start(13);
+    defer rig.stop();
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const reference = "registry.example/hello@sha256:" ++ digest;
+    const head = "{\"name\":\"hello\",\"image\":\"b3:51aa9c03\",\"replicas\":1,\"command\":[\"c\"]";
+    const created = try rig.json(post(&rig, "", head ++ ",\"source\":\"" ++ reference ++ "\"}"));
+    try testing.expectEqualStrings("create", field(created, "action").string);
+    rig.world.advance(2000);
+    const listed = try rig.ok("/v1/list", "prefix=%2Fservices%2F");
+    const kv = field(listed, "kvs").array.items[0];
+    try testing.expectEqualStrings(reference, field(field(kv, "value"), "source").string);
+    const replicas = try rig.ok("/v1/list", "prefix=%2Freplicas%2F");
+    const replica_kv = field(replicas, "kvs").array.items[0];
+    try testing.expectEqualStrings(reference, field(field(replica_kv, "value"), "source").string);
+    const before = rig.world.revision().?;
+    const tag = head ++ ",\"source\":\"registry.example/hello:v1\"}";
+    try rig.refused(post(&rig, "", tag), 400, "ZC-E0104");
+    try rig.refused(post(&rig, "", head ++ ",\"source\":7}"), 400, "ZC-E0104");
+    try rig.refused(post(&rig, "", head ++ ",\"sources\":\"x\"}"), 400, "ZC-E0104");
+    try testing.expectEqual(before, rig.world.revision().?);
+}
+
 test "DELETE /v1/services/{name} deletes, and a missing service is ZC-E0101" {
     // Goal: the second proposed write endpoint. Method: apply, delete, delete again; the replicas
     // are stopped by the controller afterwards, and a wrong path or method is a refusal.

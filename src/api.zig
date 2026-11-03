@@ -213,6 +213,7 @@ const ApplyBody = struct {
     command: []const []const u8,
     env: []const records.Pair = &.{},
     limits: records.Limits = .{},
+    source: []const u8 = "",
     applied_by: []const u8 = anonymous,
 };
 
@@ -331,6 +332,7 @@ fn apply_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!ap
         .command = parsed.command,
         .env = parsed.env,
         .limits = parsed.limits,
+        .source = parsed.source,
         .applied_by = parsed.applied_by,
         .request_id = id,
     };
