@@ -1,0 +1,5 @@
+error[ZC-E0123]: the local server did not come up
+  cause  the server stopped before it answered
+  fix    read the log; the process says why it failed there:   cat <state>/local/server.log
+  more   zcube explain E0123 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0123.html

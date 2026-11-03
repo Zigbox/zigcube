@@ -395,6 +395,8 @@ const cases = [_]Case{
     with_flags(routed(.W0119, bundle_unredacted, route_empty), .{ .warning = true }),
     with_flags(raised(.E0120, &.{ "explain", "E0102" }), .{ .no_memory = true }),
     relayed(.E0121, bad_lease),
+    with_flags(raised(.E0122, &.{ "local", "up" }), .{ .local = .no_executables }),
+    with_flags(raised(.E0123, &.{ "local", "up" }), .{ .local = .dying_executables }),
     relayed(.E0201, store_down),
     relayed(.E0202, store_failed),
     relayed(.E0203, compacted),
@@ -447,6 +449,9 @@ const Flags = struct {
     silent_failure: bool = false,
     /// The case succeeds with a warning: the exit code is the command's, not the blame's.
     warning: bool = false,
+    /// `zcube local up` runs in a directory of its own, with the executables it needs either
+    /// missing or dying at once.
+    local: enum { off, no_executables, dying_executables } = .off,
 };
 
 fn with_flags(base: Case, flags: Flags) Case {
@@ -588,6 +593,7 @@ fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []con
     } else if (!case.flags.no_state) {
         try environ.put("XDG_STATE_HOME", state_root);
     }
+    const bin_dir = try prepare_local(arena, case, &environ, state_root);
     var stdout: Writer.Allocating = .init(arena);
     var stderr: Writer.Allocating = .init(arena);
     var failing: Writer = .{ .vtable = &.{ .drain = drain_fails }, .buffer = &.{} };
@@ -605,6 +611,7 @@ fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []con
         .version = "0.0.0-test",
         .deterministic_ids = true,
         .fixed_now_ms = 0,
+        .bin_dir = bin_dir,
         .transport = if (case.script == .closed_port) null else .{
             .context = &fixture,
             .exchange = exchange,
@@ -615,6 +622,31 @@ fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []con
     else
         cli.run(&env, args.items);
     return .{ .exit = exit, .stdout = stdout.written(), .stderr = stderr.written() };
+}
+
+/// For a `zcube local` case: names the run's directory and returns where the executables are.
+/// Dying executables are shell scripts that exit at once, as a server that cannot start does.
+fn prepare_local(
+    arena: Allocator,
+    case: *const Case,
+    environ: *std.process.Environ.Map,
+    state_root: []const u8,
+) !?[]const u8 {
+    if (case.flags.local == .off) return null;
+    try environ.put("ZCUBE_LOCAL_DIR", try std.fmt.allocPrint(arena, "{s}/local", .{state_root}));
+    const bins = try std.fmt.allocPrint(arena, "{s}/bin", .{state_root});
+    if (case.flags.local == .no_executables) return bins;
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(testing.io, bins);
+    for ([_][]const u8{ "zcube-server", "zcube-agent" }) |name| {
+        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ bins, name });
+        try cwd.writeFile(testing.io, .{
+            .sub_path = path,
+            .data = "#!/bin/sh\nexit 1\n",
+            .flags = .{ .permissions = .executable_file },
+        });
+    }
+    return bins;
 }
 
 /// The state directory of a run: absolute, because the command line wants an absolute one.

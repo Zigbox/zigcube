@@ -1,0 +1,6 @@
+error[ZC-E0122]: zcube local can't find or start the server or agent
+  cause  zcube-server is not an executable file in
+         <state>/bin
+  fix    build them and run zcube from the directory they are in:   zig build && zig-out/bin/zcube local up
+  more   zcube explain E0122 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0122.html
