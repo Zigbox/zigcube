@@ -299,6 +299,26 @@ pub const bundles_dir_name = "bundles";
 pub const state_dir_name = "zcube";
 pub const last_failure_file_name = "last-failure.json";
 
+// ---- `zcube local up|down` (src/cli_local.zig) ------------------------------------------------
+
+/// The node the local agent registers as.
+pub const local_node_name = "local";
+/// The first port `local up` tries, then the next ones: 7070 is the CLI's own default.
+pub const local_port_first: u16 = 7070;
+pub const local_port_tries_max: u16 = 32;
+/// How long `local up` waits for the server to answer and the node to register.
+pub const local_up_wait_ms: u32 = 20 * 1000;
+/// How long `local down` waits after SIGTERM before SIGKILL.
+pub const local_stop_wait_ms: u32 = 10 * 1000;
+pub const local_poll_ms: u32 = 50;
+/// The capacity the local agent declares; the fake runtime isolates nothing, so these are only
+/// what the scheduler may place.
+pub const local_cpu_millis: u32 = 4000;
+pub const local_memory_bytes: u64 = 8 * 1024 * 1024 * 1024;
+/// A pid file, a command line from /proc and an address file are each read into a buffer of
+/// this size; longer content is not ours.
+pub const local_file_bytes_max: u32 = state_path_bytes_max + 256;
+
 /// A bundle (DIAGNOSTICS.md, "Bundles"): files are staged in one fixed workspace, cut at
 /// `bundle_file_bytes_max`, and written through the tar and gzip writers into a second buffer.
 pub const bundle_file_bytes_max: u32 = 128 * 1024;

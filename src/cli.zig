@@ -16,6 +16,7 @@ const cli_commands = @import("cli_commands.zig");
 const cli_env = @import("cli_env.zig");
 const cli_get = @import("cli_get.zig");
 const cli_http = @import("cli_http.zig");
+const cli_local = @import("cli_local.zig");
 const cli_report = @import("cli_report.zig");
 const constants = @import("constants.zig");
 
@@ -87,6 +88,7 @@ pub fn run_with(env: *const Env, args: []const []const u8, executor: Executor) u
 /// reason in `report` when it is not 0.
 fn run_offline(env: *const Env, parsed: *const Parsed, report: *Report) ?u8 {
     const options = parsed.options;
+    if (parsed.command == .local) return cli_local.run(env, parsed.command.local, report);
     const text = switch (parsed.command) {
         .help => cli_args.help_text,
         .version => std.fmt.allocPrint(env.arena, "zcube {s}\n", .{env.version}) catch {
@@ -134,7 +136,7 @@ pub fn execute(
         .repair_allocations => |node| {
             try cli_allocations.repair(env, client, options, node, report);
         },
-        .help, .version, .explain => unreachable, // Handled before a client exists.
+        .help, .version, .explain, .local => unreachable, // Handled before a client exists.
     }
 }
 
