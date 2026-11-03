@@ -23,6 +23,8 @@ pub const modules = .{
     @import("api.zig"),
     @import("auditor.zig"),
     @import("apply.zig"),
+    @import("chunk_summary.zig"),
+    @import("fetch_plan.zig"),
     @import("clock.zig"),
     @import("compare_sets.zig"),
     @import("control_plane.zig"),
