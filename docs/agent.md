@@ -240,8 +240,10 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
 - **Tests**: the lifecycle calls run over Zigbox's `HostSim` (`zigbox_runtime.zig`); the image
   decisions are table tests (`zigbox_image.zig`). `start` and the supervisor need a real host:
   `ZCUBE_REAL_HOST=1 zig build zigbox-smoke` (QEMU guest through Zigbox's `zigbox_vm` module).
-  Today it checks the agent starts and stays up under `--runtime zigbox`; a container from a
-  pulled image is not covered.
+  It runs `ops/zigbox-smoke/guest.sh` stage by stage (setup, replicas with cgroup limits and
+  no network but `lo`, `kill -9`, agent restart, `oom`, ZC-E0511 and ZBX-E0410 refusals, a
+  service removed during its pull); `docs/demos/c2.md` lists the assertions and the cuts
+  (`pid_limit`: a service cannot set `pids`). It is a check, never `demo-c2`.
 
 ## Known limits
 
