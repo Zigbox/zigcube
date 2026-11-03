@@ -66,6 +66,7 @@ the layout.
 | `/replicas/<svc>/<id>` | replica controller | desired replica: spec and generation; **no placement** | until the replica is retired |
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |
+| `/node-store/<node>` | that node's agent | **advisory** (C2 slice 5, owner decision O1): a summary of the image trees the node holds, for the scheduler's locality step only; never in a compare set; bound to the node's lease | **bound to the node's lease** |
 | `/allocations/<node>` | scheduler | authoritative accounting: the sum of the `requests` of every assignment on the node, their count, and the `/nodes/<node>` revision whose capacity it was checked against | while the node exists |
 | `/audit/allocations/<node>` | allocation auditor | an open finding: the recorded and the reconstructed totals, and the revision they were read at | until a later audit finds the node consistent |
 | `/node-status/<node>` | node controller (new) | `ready`, `lost` or `fenced`, the tenure it judged (§3), when, and the decision that set it | until the node is removed |

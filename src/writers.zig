@@ -50,6 +50,7 @@ pub const rules = [_]Rule{
     .{ .prefix = records.prefix_replicas, .owner = .replica_controller },
     .{ .prefix = records.prefix_assigned, .owner = .scheduler },
     .{ .prefix = records.prefix_nodes, .owner = .agent },
+    .{ .prefix = records.prefix_node_store, .owner = .agent },
     .{ .prefix = records.prefix_allocations, .owner = .scheduler },
     .{ .prefix = records.prefix_audit_allocations, .owner = .auditor },
     .{ .prefix = records.prefix_node_status, .owner = .node_controller },
@@ -141,7 +142,8 @@ fn may_write(role: Role, key: []const u8, op: store.Op) bool {
     }
 }
 
-/// An agent writes `/nodes/<its node>` and `/observed/<its node>/…`. The node controller also
+/// An agent writes `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
+/// The node controller also
 /// removes a lost node's observed records (authority.md §3), and only removes them.
 fn agent_may_write(role: Role, prefix: []const u8, key: []const u8, op: store.Op) bool {
     const rest = key[prefix.len..];
@@ -153,6 +155,7 @@ fn agent_may_write(role: Role, prefix: []const u8, key: []const u8, op: store.Op
         else => return false,
     };
     if (std.mem.eql(u8, prefix, records.prefix_nodes)) return std.mem.eql(u8, rest, node);
+    if (std.mem.eql(u8, prefix, records.prefix_node_store)) return std.mem.eql(u8, rest, node);
     assert(std.mem.eql(u8, prefix, records.prefix_observed));
     if (!std.mem.startsWith(u8, rest, node)) return false;
     return rest.len > node.len and rest[node.len] == '/';
@@ -212,6 +215,7 @@ const samples = [_]struct { key: []const u8, role: Role }{
     .{ .key = "/audit/allocations/n1", .role = .auditor },
     .{ .key = "/node-status/n1", .role = .node_controller },
     .{ .key = "/nodes/n1", .role = .{ .agent = "n1" } },
+    .{ .key = "/node-store/n1", .role = .{ .agent = "n1" } },
     .{ .key = "/observed/n1/hello-1", .role = .{ .agent = "n1" } },
 };
 
@@ -275,11 +279,14 @@ test "an agent writes only its own node and its own observed records" {
     // Goal: an agent cannot write another node's keys, nor a key that merely starts with its
     // node's name. Method: node n1 against n2's keys, and against "n10".
     const role: Role = .{ .agent = "n1" };
-    const own = [_][]const u8{ "/nodes/n1", "/observed/n1/hello-1" };
+    const own = [_][]const u8{ "/nodes/n1", "/node-store/n1", "/observed/n1/hello-1" };
     for (own) |key| try testing.expect(allowed(role, request_of(&.{put_op(key)})) == .allowed);
     const other = [_][]const u8{
         "/nodes/n2",
         "/nodes/n10",
+        "/node-store/n2",
+        "/node-store/n10",
+        "/node-store/n1/x",
         "/observed/n2/hello-1",
         "/observed/n10/hello-1",
         "/observed/n1",

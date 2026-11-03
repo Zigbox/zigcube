@@ -13,6 +13,7 @@ import {
 const STEP_MS = 250;
 const START_DELAY_MS = 700;
 const DEFAULT_REQUEST = { cpu_millis: 250, memory_bytes: 134217728 };
+const MOCK_IMAGE_BYTES = 48 * 1048576; // the mock's stand-in for a held image tree
 
 export class StoreDown extends Error {}
 
@@ -198,10 +199,11 @@ export class Engine {
   // ---- Decisions ---------------------------------------------------------------------------
 
   /** Builds a decision plus the index op that must be committed with it. */
-  decision({ actor, action, subject, reason, cause, causeDiagnostic }) {
+  decision({ actor, action, subject, reason, cause, causeDiagnostic, locality }) {
     const at = this.now();
     const id = `${String(at).padStart(13, "0")}-rc01-${String(++this.decisionCounter).padStart(4, "0")}`;
-    const value = { v: 1, id, at_ms: at, actor, action, subject, reason, cause };
+    const value = { v: locality ? 3 : 1, id, at_ms: at, actor, action, subject, reason, cause };
+    if (locality) { value.locality_bytes = locality.bytes; value.node_store_revision = locality.revision; }
     if (causeDiagnostic) value.cause_diagnostic = causeDiagnostic;
     return {
       id,
@@ -410,15 +412,19 @@ export class Engine {
     const fits = state.nodes.filter(n => { const u = used(n.name); return u.cpu + need.cpu <= n.capacity.cpu_millis && u.mem + need.mem <= n.capacity.memory_bytes; });
     if (!fits.length) return null;
     const count = name => state.replicas.filter(r => r.node === name && r.service === svc.name).length;
-    fits.sort((a, b) => count(a.name) - count(b.name) || (a.name < b.name ? -1 : 1));
+    // Locality (C2 slice 5): the mock stands in for a node's summary with "a replica of this image
+    // already runs there", worth MOCK_IMAGE_BYTES. Real values come from /node-store/<node>.
+    const held = name => state.replicas.some(r => r.node === name && r.image && r.image === svc.image) ? MOCK_IMAGE_BYTES : 0;
+    fits.sort((a, b) => count(a.name) - count(b.name) || held(b.name) - held(a.name) || (a.name < b.name ? -1 : 1));
     const pick = fits[0];
+    const locality = held(pick.name);
     const counts = fits.map(n => `${n.name} ${count(n.name)}`).join(", ");
     const id = state.nextId = (state.nextId || 0) + 1;
-    state.replicas.push({ id: "pending-" + id, service: svc.name, node: pick.name, limits: svc.limits });
+    state.replicas.push({ id: "pending-" + id, service: svc.name, node: pick.name, limits: svc.limits, image: svc.image });
     const reason = state.nodes.length === 1
       ? `${pick.name} is the only node, and it fits ${need.cpu}m CPU and ${Math.round(need.mem / 1048576)} MiB`
-      : `${pick.name} has the fewest ${svc.name} replicas of the ${fits.length} nodes that fit (${counts})`;
-    const d = this.decision({ actor: "scheduler", action: "place_replica", subject: { kind: "replica", name: replicaId }, reason, cause: { kind: "decision", id: causeId } });
+      : `${pick.name} has the fewest ${svc.name} replicas of the ${fits.length} nodes that fit (${counts}), then ${locality >= 1048576 ? Math.round(locality / 1048576) + " MiB" : "under 1 MiB"} of the image already there`;
+    const d = this.decision({ actor: "scheduler", action: "place_replica", subject: { kind: "replica", name: replicaId }, reason, cause: { kind: "decision", id: causeId }, locality: { bytes: locality, revision: locality ? this.rev : 0 } });
     return { node: pick.name, ops: d.ops, reason, requests: { cpu_millis: need.cpu, memory_bytes: need.mem } };
   }
 

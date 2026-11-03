@@ -865,12 +865,13 @@ const c1_teeth_roots = [_]struct { name: []const u8, root: []const u8, symptom: 
         .root = "src/sim_c1_teeth_wedge_main.zig",
         .symptom = "I1b: a replaced replica kept executing longer",
     },
+    .{ .name = "locality", .root = "src/sim_c1_teeth_locality_main.zig", .symptom = "L1" },
 };
 
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the five negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the six negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",

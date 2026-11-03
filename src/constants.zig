@@ -407,6 +407,18 @@ pub const summary_sketch_keys: u32 = 64;
 /// `store_value_bytes_max`.
 pub const summary_trees_max: u32 = 32;
 pub const summary_sketch_entry_bytes: u32 = 12;
+/// The summary is JSON and its Bloom filter and samples are hex, so each byte is two digits. A
+/// tree's entry adds its digest (`sha256:` and 64 digits), the keys, two numbers and quotes; the
+/// record adds its own members. Both are rounded up.
+pub const summary_tree_json_overhead_bytes: u32 = 256;
+pub const summary_json_overhead_bytes: u32 = 256;
+/// The largest summary record as stored, in JSON.
+pub const summary_json_bytes_max: u32 = summary_filter_bytes_max * 2 +
+    summary_trees_max * (summary_sketch_keys * summary_sketch_entry_bytes * 2 +
+        summary_tree_json_overhead_bytes) + summary_json_overhead_bytes;
+/// The body of `PUT /v1/agent/nodes/{node}/store`: the record, the tenure and the lease (two
+/// numbers and their names). The one agent request that is larger than `agent_request_bytes_max`.
+pub const summary_request_bytes_max: u32 = summary_json_bytes_max + 128;
 
 /// Peers one fetch considers (a filter each), and chunks one fetch plans (a tree of 64 GiB).
 pub const fetch_peers_max: u32 = 16;
@@ -509,8 +521,9 @@ comptime {
     assert(last_failure_bytes_max <= bundle_file_bytes_max);
     assert(timestamp_bytes == "2026-10-23T22-41-07Z".len);
     assert(6 * 1024 + 6 * diag_explanation_bytes_max + 2048 <= errors_page_bytes_max);
-    assert(summary_filter_bytes_max + summary_trees_max * (summary_sketch_keys *
-        summary_sketch_entry_bytes + 64) < store_value_bytes_max);
+    assert(summary_json_bytes_max <= store_value_bytes_max);
+    assert(summary_request_bytes_max > agent_request_bytes_max);
+    assert(summary_request_bytes_max <= request_arena_bytes_max / 8);
     assert(fetch_in_flight_per_peer_max <= fetch_in_flight_max);
     assert(fetch_peer_rate_bytes_per_s <= fetch_node_rate_bytes_per_s);
     assert(fetch_request_timeout_ms < fetch_peer_wait_ms);
