@@ -389,7 +389,10 @@ bound fires the older fencing check (a container running on a node whose lease r
 than the lost grace), which sim-c1 labels I1b, not the overlap tracker; skipping the allocation
 compare breaks I6; skipping the readiness compare with a node lost between planning and commit
 breaks I7; a node that registers again between a controller's read of a report and the decision's
-commit (as if the tenure were not compared) breaks I3. Their
+commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of
+spread breaks L1 (C2 slice 5: each placement is no worse on fit or spread than an order of fit and
+spread alone would choose, `scheduler.placement_problem`; every node holds a seed-chosen subset of
+the images and advertises it as `/node-store/<node>`). Their
 switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 

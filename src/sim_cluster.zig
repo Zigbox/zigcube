@@ -39,6 +39,7 @@ const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
+const node_store = @import("node_store.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
@@ -263,6 +264,10 @@ const Node = struct {
     nclock: sim_clock.NodeClock,
     remote: agent_client.RemoteStore,
     agent: agent_mod.Agent,
+    /// The node's image store (it survives the agent): a seed-chosen subset of `images`, which
+    /// the agent advertises as `/node-store/<node>` (C2 slice 5).
+    store_images: node_store.FakeImages,
+    store_digests: [images.len][]const u8,
     loop: agent_loop.Loop,
     diag: Diag,
     arena: std.heap.ArenaAllocator,
@@ -391,6 +396,7 @@ const Node = struct {
                 .context = &node.remote,
                 .set_fn = agent_client.RemoteStore.deadline_fn,
             },
+            .images = node.store_images.images(),
         };
         node.remote.set_deadline(clock, std.math.maxInt(u64));
         c.stats.agent_steps += 1;
@@ -715,6 +721,13 @@ pub const Cluster = struct {
         );
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.agent.init(node.config());
+        var held: usize = 0;
+        for (images) |digest| {
+            if (!random.boolean()) continue;
+            node.store_digests[held] = digest;
+            held += 1;
+        }
+        node.store_images = .{ .digests = node.store_digests[0..held] };
         node.loop = agent_loop.Loop.init();
         node.remote = agent_client.RemoteStore.init(c.gpa, node.transport(), node.name());
         node.diag.reset();
@@ -2289,6 +2302,7 @@ fn print_summary(c: *Cluster) void {
             c.c1_tally.observations_unjudged,
             c.c1_tally.facts_other,
         });
+        report.print("sim-c1 L1: placements judged={d}\n", .{c.c1_tally.placements_judged});
         const n = c.recorder.counts;
         report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++
             "keys deleted={d} changed={d}\n", .{

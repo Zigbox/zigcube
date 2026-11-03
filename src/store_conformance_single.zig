@@ -1119,6 +1119,42 @@ test "compare set: each of the six compared keys, moved, refuses the placement a
     }
 }
 
+test "node-store: a leased summary is advisory, writer-bound and gone with its lease" {
+    // Goal: `/node-store/<node>` as docs/keys.md has it. Method: the node's agent writes its
+    // summary under a lease; a placement planned before that write still commits (the summary is
+    // in no compare set); another node's agent may not write it; and when the lease runs out the
+    // key is deleted with the node's registration.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+    const facts = try seed_facts(s, &diag);
+    const lease = try s.lease_grant(1000, &diag);
+    const mine: writers.Role = .{ .agent = "n1" };
+    const put: store.Op = .{ .put = .{
+        .key = "/node-store/n1",
+        .value = "{\"v\":1}",
+        .lease = lease.id,
+    } };
+    const written = try writers.txn(s, mine, .{ .on_success = &.{put} }, &diag);
+    try testing.expect(written.succeeded);
+    const other: writers.Role = .{ .agent = "n2" };
+    // A write by another role is a defect that asserts, so ask the rule instead.
+    const verdict = writers.allowed(other, .{ .on_success = &.{put} });
+    try testing.expect(verdict == .refused);
+    const result = try place(s, &diag, facts, "hello-1");
+    try testing.expect(result.succeeded);
+    harness.manual.advance(1500);
+    const reaper = (try harness.connect()).interface();
+    try testing.expectEqual(@as(u32, 1), try reaper.expire_leases(&diag));
+    try testing.expect((try s.get(arena, "/node-store/n1", null, &diag)).kv == null);
+}
+
 test "compare set: two placements planned on one allocation revision cannot both commit" {
     // Goal: the phantom case. Two replicas are placed on the same node from the same read of
     // `/allocations/n1`; their assignments are different keys, so only the allocation compare

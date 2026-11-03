@@ -1252,6 +1252,52 @@ fn indexed_decision(
     return found;
 }
 
+// ---- L1 as a check ---------------------------------------------------------------------------
+
+/// L1 (the simulations'): the placement `request` is about to commit is no worse on fit or spread
+/// than an order of fit and spread alone would choose. Locality may pick among nodes tied on
+/// spread; it never costs a node that fits fewer of the service's replicas. Judged over the head
+/// the transaction commits over. A put of `/assigned/` for a replica that already has an
+/// assignment is a move, which has no locality step, and is not judged. `judged` counts the
+/// placements judged. Returns null, or the sentence that names what broke.
+pub fn placement_problem(
+    ctx: *const Context,
+    request: store.TxnRequest,
+    judged: *u64,
+) ?[]const u8 {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_assigned)) continue;
+        const rest = put.key[records.prefix_assigned.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "L1: a malformed key";
+        const world = read_world(ctx) catch {
+            ctx.diag.reset();
+            return "L1: the world cannot be read";
+        };
+        const replica_id = rest[slash + 1 ..];
+        if (world.assigned_by.contains(replica_id)) continue;
+        const at = world.node_index(rest[0..slash]) orelse return "L1: a placement onto no node";
+        const index = world.desired.get(replica_id) orelse continue;
+        const need = requests_of(&world.replicas[index].rec);
+        var counts: [views_max]u32 = undefined;
+        service_counts(&world, world.replicas[index].rec.service, counts[0..world.nodes.len]);
+        if (judge(&world.nodes[at], need).reason != .fits) {
+            return "L1: a placement onto a node that does not fit";
+        }
+        for (world.nodes, 0..) |*view, other| {
+            if (judge(view, need).reason != .fits) continue;
+            if (counts[other] < counts[at]) {
+                return "L1: a placement onto a node with more of the service than one that fits";
+            }
+        }
+        judged.* += 1;
+    }
+    return null;
+}
+
 // ---- I6 as a check ---------------------------------------------------------------------------
 
 pub const Mismatch = struct {
