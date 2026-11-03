@@ -16,12 +16,14 @@ const config_mod = @import("agent_config.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fake_supervisor = @import("fake_supervisor.zig");
+const c1_teeth = @import("c1_teeth.zig");
 
 const Diag = diag_mod.Diag;
 
 // The agent's test-only fault (agent.zig) must be unreachable from the shipped program.
 comptime {
     assert(!agent.fault_ignore_stop);
+    assert(!c1_teeth.any);
 }
 
 /// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`

@@ -137,7 +137,8 @@ pub const Recorder = struct {
             const got = try ctx.store.get(ctx.arena, key, null, ctx.diag);
             head = @max(head, got.revision);
             const kv = got.kv orelse continue;
-            const changed = if (done.items.len % 2 == 0) try changed_value(ctx.arena, kv.value) else null;
+            const even = done.items.len % 2 == 0;
+            const changed = if (even) try changed_value(ctx.arena, kv.value) else null;
             const op: store.Op = if (changed) |value|
                 .{ .put = .{ .key = key, .value = value } }
             else
@@ -223,7 +224,9 @@ pub fn check_completeness(answer: *const why_mod.Result) Found {
         .truncated => {
             if (answer.completeness.reason == null) return "I5: a truncated chain names no reason";
             if (answer.completeness.at == null) return "I5: a truncated chain names no last step";
-            if (!last_is_gone) return "I5: a truncated chain does not end with the step that says so";
+            if (!last_is_gone) {
+                return "I5: a truncated chain does not end with the step that says so";
+            }
             const reason = steps[steps.len - 1].reason orelse
                 return "I5: the gone step of a truncated chain names no reason";
             if (reason != answer.completeness.reason.?) {
