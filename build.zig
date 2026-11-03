@@ -805,9 +805,11 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     sim.ops = b.option(u32, "ops", ops_help) orelse 100;
     add_sim_step(b, sim);
     add_sim_cluster_step(b, sim);
+    add_sim_swarm_step(b, sim);
     add_sim_fleet_step(b, sim);
     add_sim_teeth_step(b, sim);
     add_sim_c1_steps(b, sim);
+    add_sim_swarm_teeth_step(b, sim);
 }
 
 /// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]`: the cluster
@@ -925,6 +927,65 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
 }
 
 const c1_teeth_operations = 100;
+
+/// `zig build sim-swarm [-Dseed=N] [-Dops=N]`: the swarm simulation (src/sim_swarm.zig), run
+/// natively and as WebAssembly for the same seed, and the two reports compared byte for byte.
+fn add_sim_swarm_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_swarm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_swarm_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    const exe_help = "Install the native sim-swarm runner into zig-out/bin";
+    b.step("sim-swarm-exe", exe_help).dependOn(&install.step);
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = b.fmt("{d}", .{sim.ops});
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ seed_text, ops_text });
+    const native_report = run.captureStdOut(.{});
+    const help = "Run the swarm simulation natively and as WASM, and compare (-Dseed=N)";
+    const step = b.step("sim-swarm", help);
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-swarm");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text });
+        node.addFileArg(native_report);
+        step.dependOn(&node.step);
+    }
+}
+
+/// `zig build sim-swarm-teeth`: the swarm simulator built with the fetch plan accepting chunks
+/// without checking them (`src/sim_swarm_teeth_main.zig`, the only root that can switch it on),
+/// run over seeds 1 to `teeth_seeds_max`; it passes only if at least one seed fails.
+fn add_sim_swarm_teeth_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_swarm_teeth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_swarm_teeth_main.zig"),
+            .target = sim.target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("sim-swarm-teeth-exe", "Install the fault-on swarm runner (test-only)")
+        .dependOn(&install.step);
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                         b.fmt("1..{d}", .{teeth_seeds_max}),
+        b.fmt("{d}", .{teeth_operations}), "--expect-fail",
+    });
+    const help = b.fmt("Run the swarm simulator with the fetch plan's test-only fault on; it " ++
+        "must fail within {d} seeds", .{teeth_seeds_max});
+    b.step("sim-swarm-teeth", help).dependOn(&run.step);
+}
 
 /// `zig build sim-fleet-exe` installs `zig-out/bin/sim_fleet`, the reporter of the simulation fleet
 /// (ops/sim-fleet/README.md): it files the failures `sim_cluster` finds. A host tool with no

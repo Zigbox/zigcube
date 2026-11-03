@@ -463,7 +463,7 @@ const Run = struct {
                 .revision = observed.kv.mod_revision,
             },
             .cause_diagnostic = observed.rec.diagnostic,
-            .cause_evidence = try evidence.observed(run.ctx, &observed.rec),
+            .cause_evidence = .{ .text = try exit_evidence(run.ctx, exit) },
         }, batch);
         batch.expect(replica.kv.key, replica.kv.mod_revision);
         // The observed record was found through the assignment: if the replica moved, the
@@ -820,6 +820,28 @@ fn user_fault(observed: *const records.Observed) bool {
     var diagnostic: records.Diagnostic = undefined;
     if (!records.diagnostic_parse(&diagnostic, raw)) return false;
     return diagnostic.blame == .user;
+}
+
+/// What the decision acted on in the observed record, as docs/keys.md shows it:
+/// `{"status":"stopped","exit":{"kind":"oom"}}`, with `code` or `signal` when the exit has one.
+/// The observed record is deleted with the replica, so this is what is left of the exit.
+fn exit_evidence(ctx: *const Context, exit: records.Exit) Error![]const u8 {
+    const kind = @tagName(exit.kind);
+    if (exit.code) |code| return controller.format(
+        ctx,
+        "{{\"status\":\"stopped\",\"exit\":{{\"kind\":\"{s}\",\"code\":{d}}}}}",
+        .{ kind, code },
+    );
+    if (exit.signal) |signal| return controller.format(
+        ctx,
+        "{{\"status\":\"stopped\",\"exit\":{{\"kind\":\"{s}\",\"signal\":{d}}}}}",
+        .{ kind, signal },
+    );
+    return controller.format(
+        ctx,
+        "{{\"status\":\"stopped\",\"exit\":{{\"kind\":\"{s}\"}}}}",
+        .{kind},
+    );
 }
 
 fn desired_cause(service: *const Entry(records.Service)) records.Cause {
