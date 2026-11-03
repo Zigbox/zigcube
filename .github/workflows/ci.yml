@@ -128,6 +128,11 @@ jobs:
       - name: Agent smoke (real processes)
         run: zig build agent-smoke --summary all
 
+      # Not demo-c0: `zcube local up` and `down` on the installed executables, in a scratch
+      # directory, with real containers. It cleans up what it starts.
+      - name: Local smoke (zcube local up and down)
+        run: zig build local-smoke --summary all
+
   # The same conformance suite against a real Postgres 16, the server a deployment would run.
   # The image is pinned by digest (postgres:16.15, resolved from Docker Hub on 2026-10-26), so a
   # moving tag cannot change what CI tests. The suite makes its own schema per test in the

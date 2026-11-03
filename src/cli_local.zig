@@ -412,7 +412,7 @@ const Local = struct {
         }
         const parent = std.fs.path.dirname(local.dir) orelse "/";
         cwd.createDirPath(local.env.io, parent) catch return local.cannot_write("the directory");
-        const private: std.Io.File.Permissions = @enumFromInt(0o700);
+        const private: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
         cwd.createDir(local.env.io, local.dir, private) catch |err| {
             if (err != error.PathAlreadyExists) return local.cannot_write("the directory");
         };
@@ -547,25 +547,22 @@ const Local = struct {
         return reply.body;
     }
 
-    /// The `mod_revision` of the node's registration, 0 if it has none. A registration outlives
-    /// `down`, so "registered" means a revision newer than the one seen before the agent started.
-    fn node_revision(local: *const Local, port: u16) u64 {
-        const body = local.get(port, "/v1/list?prefix=/nodes/") orelse return 0;
+    /// Is the node's registration in the store?
+    fn node_present(local: *const Local, port: u16) bool {
+        const body = local.get(port, "/v1/list?prefix=/nodes/") orelse return false;
         const Json = std.json.Value;
-        const root = std.json.parseFromSliceLeaky(Json, local.arena, body, .{}) catch return 0;
-        if (root != .object) return 0;
-        const kvs = root.object.get("kvs") orelse return 0;
-        if (kvs != .array) return 0;
+        const root = std.json.parseFromSliceLeaky(Json, local.arena, body, .{}) catch return false;
+        if (root != .object) return false;
+        const kvs = root.object.get("kvs") orelse return false;
+        if (kvs != .array) return false;
         for (kvs.array.items) |kv| {
             if (kv != .object) continue;
             const key = kv.object.get("key") orelse continue;
             if (key != .string) continue;
             if (!std.mem.eql(u8, key.string, "/nodes/" ++ constants.local_node_name)) continue;
-            const revision = kv.object.get("mod_revision") orelse return 0;
-            if (revision != .integer) return 0;
-            return std.math.cast(u64, revision.integer) orelse 0;
+            return true;
         }
-        return 0;
+        return false;
     }
 
     /// Waits until the server answers `/v1/status`. Null when it does.
@@ -581,9 +578,12 @@ const Local = struct {
         return local.timed_out(.server, "answer");
     }
 
-    /// Waits until the agent has registered its node afresh: `/nodes/local` has a revision after
-    /// `after`. Null when it has.
-    fn wait_node(local: *const Local, port: u16, pids: [2]i32, after: u64) ?NotUp {
+    /// Waits until this agent has registered its node. `/nodes/local` alone proves nothing: an
+    /// earlier run left one in the store, and registering again writes the same value, so its
+    /// revision does not move. The agent's log is new for each start (`spawn` rotates the old
+    /// one) and says "registered" once it has; the node must be in the store as well. Null when
+    /// both hold.
+    fn wait_node(local: *const Local, port: u16, pids: [2]i32) ?NotUp {
         var waited: u32 = 0;
         while (waited < constants.local_up_wait_ms) : (waited += constants.local_poll_ms) {
             if (!local.alive(pids[0])) {
@@ -594,10 +594,18 @@ const Local = struct {
                 const step = "the agent stopped before its node registered";
                 return .{ .culprit = .agent, .step = step };
             }
-            if (local.node_revision(port) > after) return null;
+            if (local.registered_in_log() and local.node_present(port)) return null;
             local.sleep();
         }
         return local.timed_out(.agent, "register its node");
+    }
+
+    fn registered_in_log(local: *const Local) bool {
+        var log_path: [constants.state_path_bytes_max + 16]u8 = undefined;
+        const name = std.fmt.bufPrint(&log_path, "{s}/agent.log", .{local.dir}) catch return false;
+        var buffer: [constants.local_file_bytes_max]u8 = undefined;
+        const bytes = std.Io.Dir.cwd().readFile(local.env.io, name, &buffer) catch return false;
+        return std.mem.find(u8, bytes, " registered on lease ") != null;
     }
 
     fn timed_out(local: *const Local, culprit: Role, what: []const u8) NotUp {
@@ -727,14 +735,12 @@ fn up(local: *const Local) Failed!void {
     local.write("address", address) catch return local.cannot_write("address");
     const started_server = try local.start_server(address);
     if (local.wait_server(port, started_server)) |bad| return local.give_up(bad);
-    // The registration of an earlier run is still in the store; only a newer one is this agent's.
-    const before = local.node_revision(port);
     const started_agent = local.start_agent(address) catch |err| {
         _ = local.stop_all();
         return err;
     };
     const pids = [2]i32{ started_server, started_agent };
-    if (local.wait_node(port, pids, before)) |bad| return local.give_up(bad);
+    if (local.wait_node(port, pids)) |bad| return local.give_up(bad);
     const found_server: Found = .{ .presence = .running, .pid = started_server };
     const found_agent: Found = .{ .presence = .running, .pid = started_agent };
     return local.say_up("up", address, found_server, found_agent);
