@@ -33,12 +33,12 @@ pub const images_default = "fixtures/images.zon";
 pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
-    \\                   [--images-dir DIR] [--peer-listen HOST:PORT]
+    \\                   [--images-dir DIR] [--peer-listen HOST:PORT] [--registry HOST:PORT]
     \\                   [--runtime fake|zigbox] [--verbose]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
-    \\                     .runtime, .images, .address, .images_dir and .peer_listen
+    \\                     .runtime, .images, .address, .images_dir, .peer_listen and .registry
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -48,7 +48,12 @@ pub const usage =
     \\  --images FILE      fake: the image digests it has (default fixtures/images.zon);
     \\                     zigbox (deprecated): each digest with the reference to pull it
     \\                     from, for a service that names no `source`
-    \\  --address TEXT     recorded with the node for people to read
+    \\  --address TEXT     recorded with the node for people to read; with --peer-listen, the
+    \\                     address its peers connect to
+    \\  --images-dir DIR   the node's chunk store; an image the node lacks is fetched into it
+    \\  --peer-listen ADDR serve the chunk store to peers (needs --images-dir)
+    \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
+    \\                     peer has it (needs --images-dir)
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -78,6 +83,8 @@ pub const Config = struct {
     images_dir: ?[]const u8 = null,
     /// Where the peer server listens; null: none runs. Needs `images_dir`.
     peer_listen: ?IpAddress = null,
+    /// The registry an image the node lacks is fetched from (`zcube-agent fetch`), as typed.
+    registry: ?[]const u8 = null,
 };
 
 pub const Command = union(enum) {
@@ -106,6 +113,7 @@ const File = struct {
     address: ?[]const u8 = null,
     images_dir: ?[]const u8 = null,
     peer_listen: ?[]const u8 = null,
+    registry: ?[]const u8 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -126,6 +134,7 @@ const Flags = struct {
     address: ?[]const u8 = null,
     images_dir: ?[]const u8 = null,
     peer_listen: ?[]const u8 = null,
+    registry: ?[]const u8 = null,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -196,6 +205,14 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         return bad(diag, "--peer-listen has no chunk store to serve", .{}, "give --images-dir DIR");
     }
     const peer_listen = if (listen_text) |text| try parse_server(text, diag) else null;
+    const registry = flags.registry orelse file.registry;
+    if (registry) |text| {
+        if (images_dir == null) {
+            const what = "--registry has no chunk store to fetch into";
+            return bad(diag, what, .{}, "give --images-dir DIR");
+        }
+        _ = try parse_server(text, diag);
+    }
     const kind = flags.runtime orelse file.runtime orelse .fake;
     const images_given = flags.images orelse file.images;
     const images_path = images_given orelse images_default;
@@ -212,6 +229,7 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .verbose = flags.verbose,
         .images_dir = images_dir,
         .peer_listen = peer_listen,
+        .registry = registry,
     };
 }
 
@@ -246,6 +264,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.images_dir = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--peer-listen")) {
             flags.peer_listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--registry")) {
+            flags.registry = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--cpu-millis")) {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
@@ -652,6 +672,13 @@ test "the chunk store and the peer address are read, and a peer address needs a 
     const loaded = try load(arena, std.testing.io, &both, &diag);
     try testing.expectEqualStrings("/tmp/i", loaded.run.images_dir.?);
     try testing.expectEqual(@as(u16, 7171), loaded.run.peer_listen.?.getPort());
+    const with_registry = both ++ [_][]const u8{ "--registry", "127.0.0.1:9000" };
+    diag.reset();
+    const fetching = try load(arena, std.testing.io, &with_registry, &diag);
+    try testing.expectEqualStrings("127.0.0.1:9000", fetching.run.registry.?);
+    const no_store = base ++ [_][]const u8{ "--registry", "127.0.0.1:9000" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &no_store, &diag), &diag);
     const alone = base ++ [_][]const u8{ "--peer-listen", "127.0.0.1:7171" };
     diag.reset();
     try expect_bad(load(arena, std.testing.io, &alone, &diag), &diag);

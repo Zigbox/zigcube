@@ -30,6 +30,8 @@ pub const file_child = agent_records.file_child;
 pub const file_supervisor = agent_records.file_supervisor;
 pub const file_lock = agent_records.file_lock;
 pub const file_forced = agent_records.file_forced;
+pub const file_fetch = agent_records.file_fetch;
+pub const FetchFile = agent_records.FetchFile;
 
 pub const Pair = agent_records.Pair;
 pub const SpecFile = agent_records.SpecFile;

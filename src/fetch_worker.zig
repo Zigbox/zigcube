@@ -21,6 +21,7 @@ const constants = @import("constants.zig");
 const chunk_summary = @import("chunk_summary.zig");
 const dir_images = @import("dir_images.zig");
 const fetch_plan = @import("fetch_plan.zig");
+const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -44,7 +45,27 @@ pub const Transport = struct {
     sleep_fn: *const fn (*anyopaque, u32) void,
     /// A peer was struck for sending bytes that do not match their hash (ZC-W0601).
     blame_fn: *const fn (*anyopaque, u8, u32, u32) void,
+    /// A peer sent a chunk list that does not hash to the tree's digest (ZC-W0602); the argument
+    /// is the peer's index.
+    bad_list_fn: *const fn (*anyopaque, u8) void,
 };
+
+/// Raises ZC-W0602: `peer_name` sent a chunk list that is not the tree's.
+pub fn raise_bad_tree(diag: *diag_mod.Diag, peer_name: []const u8, digest: []const u8) void {
+    diag.raise(.W0602);
+    diag.cause("peer {s} sent a chunk list that does not hash to tree {s}", .{
+        peer_name, digest,
+    });
+    diag.fix(.{ .sentence = "no action needed for this fetch; if it repeats, check that peer node" });
+}
+
+/// Raises ZC-E0601: no source had `digest`. `tried` is the sentence naming the sources.
+pub fn raise_tree_missing(diag: *diag_mod.Diag, digest: []const u8, tried: []const u8) void {
+    diag.raise(.E0601);
+    diag.cause("tree {s} was tried at {s}", .{ digest, tried });
+    const sentence = "check the registry is reachable from this node and the digest was pushed";
+    diag.fix(.{ .sentence = sentence });
+}
 
 pub const Report = struct {
     chunks: u32 = 0,
@@ -106,6 +127,7 @@ fn find_list(
         const text = transport.tree_fn(transport.context, source, digest, out) orelse continue;
         if (node_store.list_matches(digest, text)) return text;
         report.bad_lists += 1;
+        if (index < peer_count) transport.bad_list_fn(transport.context, @intCast(index));
     }
     return error.TreeUnavailable;
 }
@@ -262,8 +284,11 @@ const Table = struct {
             .now_fn = now,
             .sleep_fn = sleep,
             .blame_fn = blame,
+            .bad_list_fn = bad_list,
         };
     }
+
+    fn bad_list(_: *anyopaque, _: u8) void {}
 };
 
 fn test_store(tmp: *std.testing.TmpDir) !dir_images.DirImages {

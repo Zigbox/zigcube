@@ -10,7 +10,8 @@
 //!
 //! What it does, in order: start a session, take the directory's lock (held until the process
 //! ends, however it ends: a lost supervisor is a lock that anyone can take), record its pid, run
-//! the command with the spec's environment and no terminal, record the command's pid, wait for
+//! the fetch `fetch.json` names if there is one (C2 slice 6b), run the command with the spec's
+//! environment and no terminal, record the command's pid, wait for
 //! it, record how it ended. A `SIGTERM` to the supervisor is passed to the command, so that an
 //! operator who stops the supervisor does not leave an orphan.
 //!
@@ -58,7 +59,41 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
         .flags = 0,
     };
     std.posix.sigaction(.TERM, &action, null);
+    if (files.exists(io, dir, files.file_fetch)) {
+        if (fetch_first(init, dir, arena)) |failure| return record(io, dir, failure);
+    }
     return supervise(init, dir, &spec);
+}
+
+/// Runs the fetch `fetch.json` names and waits for it; null if the image is now on the node,
+/// else the `run.json` that says it is not. The container reports `starting` meanwhile (the
+/// supervisor's pid exists, the command's does not). A `SIGTERM` reaches the fetch through
+/// `child_pid`, like the command.
+fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFile {
+    const io = init.io;
+    const plan = files.read_json(files.FetchFile, io, dir, files.file_fetch, arena) catch
+        return failed(.environment, "the fetch record could not be read");
+    var child = std.process.spawn(io, .{
+        .argv = plan.argv,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return failed(.environment, "the host refused to start the fetch");
+    child_pid.store(child.id.?, .release);
+    const term = child.wait(io) catch return .{ .kind = .lost };
+    child_pid.store(0, .release);
+    switch (term) {
+        .exited => |code| if (code == constants.exit_ok) return null,
+        // Stopped while fetching: the container ended by that signal, it did not fail to start.
+        .signal => |signal| return .{ .kind = .signaled, .signal = @intCast(@backingInt(signal)) },
+        else => {},
+    }
+    const text = std.fmt.allocPrint(
+        arena,
+        "tree {s} was tried at this node's peers and the registry",
+        .{plan.digest},
+    ) catch return failed(.environment, "the fetch failed");
+    return failed(.fetch, text);
 }
 
 fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {

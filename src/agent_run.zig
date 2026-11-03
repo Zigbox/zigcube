@@ -534,6 +534,7 @@ const Backend = struct {
                     .state_dir = config.state_dir,
                     .supervisor_exe = exe,
                     .fixtures = config.images,
+                    .fetch = try fetch_options(gpa, config),
                 }, diag) catch return error.StartFailed;
                 self.* = .{
                     .runtime = fake.interface(),
@@ -543,6 +544,22 @@ const Backend = struct {
             },
             .zigbox => try self.start_zigbox(init, config, exe, diag),
         }
+    }
+
+    /// How the fake runtime fetches an image it lacks, when `--registry` is given. Allocated once
+    /// at startup and kept for the life of the process.
+    fn fetch_options(gpa: std.mem.Allocator, config: config_mod.Config) error{StartFailed}!?fake_runtime.Fetch {
+        const registry = config.registry orelse return null;
+        var text: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&text);
+        writer.print("{f}", .{config.server}) catch return error.StartFailed;
+        const server = gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
+        return .{
+            .node = config.node,
+            .images_dir = config.images_dir.?,
+            .registry = registry,
+            .server = server,
+        };
     }
 
     fn start_zigbox(

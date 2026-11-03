@@ -26,6 +26,8 @@ const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const fetch_plan = @import("fetch_plan.zig");
+const fetch_worker = @import("fetch_worker.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -429,30 +431,16 @@ fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
 }
 
 fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
-    sample(
-        diag,
-        .W0601,
-        &.{"peer node2 sent chunk 5 of 24 with bytes that do not match its hash"},
-        "no action needed for this fetch; check that node's store and disk",
-    );
+    fetch_plan.raise_blame(diag, .{ .peer = 0, .chunk = 4 }, "node2", 24);
 }
 
 fn tree_missing(diag: *diag_mod.Diag) void { // fetch_worker.zig
-    sample(
-        diag,
-        .E0601,
-        &.{"tree b3:7f1c4e9a5d20 was tried at node2, node3 and the registry"},
-        "check the registry is reachable from this node and the digest was pushed",
-    );
+    const tried = "node2, node3 and the registry";
+    fetch_worker.raise_tree_missing(diag, "b3:7f1c4e9a5d20", tried);
 }
 
 fn peer_bad_tree(diag: *diag_mod.Diag) void { // fetch_worker.zig
-    sample(
-        diag,
-        .W0602,
-        &.{"peer node2 sent a chunk list that does not hash to tree b3:7f1c4e9a5d20"},
-        "no action needed for this fetch; if it repeats, check that peer node",
-    );
+    fetch_worker.raise_bad_tree(diag, "node2", "b3:7f1c4e9a5d20");
 }
 
 fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
