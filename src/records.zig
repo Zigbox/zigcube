@@ -60,6 +60,7 @@ pub const prefix_assigned = "/assigned/";
 pub const prefix_allocations = "/allocations/";
 pub const prefix_audit_allocations = "/audit/allocations/";
 pub const prefix_node_status = "/node-status/";
+pub const prefix_node_store = "/node-store/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
 
@@ -97,6 +98,11 @@ pub fn observed_key(node: []const u8, replica: []const u8) Key {
 pub fn node_key(name: []const u8) Key {
     assert(name_problem(name, constants.node_name_bytes_max) == null);
     return Key.build(&.{ prefix_nodes, name });
+}
+
+pub fn node_store_key(name: []const u8) Key {
+    assert(name_problem(name, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_node_store, name });
 }
 
 pub fn decision_key(id: []const u8) Key {
@@ -283,6 +289,34 @@ pub const Node = struct {
     labels: []const []const u8 = &.{},
 };
 
+/// One tree a node holds completely, as its summary advertises it (docs/swarm.md): the tree's
+/// digest, its size, and the bottom-K sketch of its chunks as hex (24 digits an entry: the key,
+/// 8 bytes little endian, then the chunk's size, 4 bytes).
+pub const HeldTree = struct {
+    tree: []const u8,
+    bytes: u64,
+    chunks: u32,
+    sample: []const u8 = "",
+};
+
+/// `/node-store/<node>`: what a node's store holds (docs/keys.md), written by the node's agent on
+/// its lease, so the summary of a lost node goes with its registration. Advisory: the scheduler
+/// reads it for locality and never compares it, because a stale summary costs speed, not
+/// correctness (authority.md §2, owner decision O1, 2026-11-03).
+pub const NodeStore = struct {
+    v: u32 = 1,
+    node: []const u8,
+    /// The complete trees, most recently used first.
+    trees: []const HeldTree = &.{},
+    /// The Bloom filter over every chunk the node holds, as hex, for the fetching agents of
+    /// slice 6. Empty when the node advertises none.
+    filter: []const u8 = "",
+    /// Chunks the filter was filled with.
+    filter_chunks: u32 = 0,
+    /// Trees the node holds but left out of `trees` (more than `summary_trees_max`).
+    omitted: u32 = 0,
+};
+
 pub const ObservedStatus = enum { starting, running, stopped };
 
 pub const ExitKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
@@ -394,7 +428,7 @@ pub const Cause = struct {
 };
 
 pub const Decision = struct {
-    v: u32 = 2,
+    v: u32 = 3,
     id: []const u8,
     at_ms: u64,
     actor: []const u8,
@@ -407,6 +441,11 @@ pub const Decision = struct {
     /// The fields of the cause's key that the decision used, as a JSON object of at most
     /// `decision_evidence_bytes_max` bytes. Absent in C0 records.
     cause_evidence: ?Raw = null,
+    /// A placement's locality (version 3): the bytes of the replica's tree the chosen node was
+    /// estimated to hold, and the revision of the `/node-store/<node>` record that estimate read
+    /// (0: the node had none). Absent on any other decision and on those written before C2.
+    locality_bytes: ?u64 = null,
+    node_store_revision: ?u64 = null,
 };
 
 pub const IndexEntry = struct {
@@ -818,7 +857,7 @@ test "an audit finding, a node status and a summary encode and read back" {
     try testing.expectEqual(@as(u64, 142), (try read(Summary, arena, summary_kv, &diag)).count);
 }
 
-test "observed and decision write version 2 with their new members, and read them back" {
+test "observed and decision write their versions with their new members, and read them back" {
     // Goal: the members C1 adds are optional, and the version moves with the shape.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -851,7 +890,7 @@ test "observed and decision write version 2 with their new members, and read the
         .cause_evidence = .{ .text = "{\"replicas\":3,\"generation\":1}" },
     };
     const decision_bytes = try encode(arena, decision, &diag);
-    try testing.expect(std.mem.startsWith(u8, decision_bytes, "{\"v\":2,"));
+    try testing.expect(std.mem.startsWith(u8, decision_bytes, "{\"v\":3,"));
     const decision_kv = kv_of("/decisions/1761350000123-0001-0007", decision_bytes);
     const decoded = try read(Decision, arena, decision_kv, &diag);
     const evidence = decoded.cause_evidence.?.text;
@@ -1049,7 +1088,7 @@ test "the version a record is written in is the version the reader accepts" {
     diag.reset();
     inline for (.{
         Service, Replica,       Node,     Observed,   Assigned, Allocation, Audit, NodeStatus,
-        Summary, ReplicaNumber, Decision, IndexEntry,
+        Summary, ReplicaNumber, Decision, IndexEntry, NodeStore,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);

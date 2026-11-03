@@ -23,6 +23,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/replica-numbers/<service>` | replica controller | C1 slice 3 |
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
 | `/nodes/<node>` | that node's agent | C0 |
+| `/node-store/<node>` | that node's agent | C2 slice 5 |
 | `/allocations/<node>` | scheduler | C1 slice 3 |
 | `/audit/allocations/<node>` | allocation auditor | C1 slice 4 |
 | `/node-status/<node>` | node controller | C1 slice 3 |
@@ -30,7 +31,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
 
-An agent writes only `/nodes/<its node>` and `/observed/<its node>/…`. One departure from
+An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`. One departure from
 `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
@@ -43,7 +44,7 @@ number of counters bounds nothing.
 
 Every value has `"v"`. A reader accepts every version up to the one its release writes and
 ignores members it does not know. `Service` and `Replica` write `"v": 3` (C2 slice 2 added
-`source`); `Observed` and `Decision` write `"v": 2` (they gained members in C1); every other record
+`source`); `Observed` writes `"v": 2` (it gained members in C1); `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); every other record
 writes `"v": 1`. Records C0 and C1 wrote still read: the fixtures in `src/testdata/c0_store.txt`
 and `c1_store.txt` were captured from real stores. A value with a **newer**
 version than the reader knows is refused with one line naming the key and both versions,
@@ -149,6 +150,25 @@ is deleted by the store, and that delete event is how lost nodes are detected (C
 `mod_revision` at registration is the node's **tenure revision** (`authority.md` section 3). Capacity is
 declared by the agent's configuration (see the open questions in `docs/contracts-review.md`).
 
+## `/node-store/<node>`: what the node holds of the image trees (C2 slice 5)
+
+```json
+{ "v": 1, "node": "node1",
+  "trees": [{"tree": "b3:51aa9c03", "bytes": 52428800, "chunks": 800, "sample": "<hex>"}],
+  "filter": "<hex Bloom filter of every chunk held>", "filter_chunks": 800, "omitted": 0 }
+```
+
+Written by the agent, bound to the same lease as `/nodes/<node>` (a separate key, so a summary
+refresh never rewrites the registration), through the lease-bound agent endpoint with the same
+tenure check as an observed write. It is **advisory** (owner decision O1, 2026-11-03): it
+is a summary (`src/chunk_summary.zig`, `docs/swarm.md`), not an accounting. It is never in a
+compare set, so a stale or missing record can only make a placement less local, never wrong
+on fit or spread. `sample` is the bottom-K sketch of the tree's chunk keys as hex, 24 digits
+per entry (an 8-byte key and a 4-byte size, little endian); `filter` is hex. At most
+`summary_trees_max` trees; trees that do not fit count in `omitted`. The scheduler reads the
+record of each candidate node and ranks by `locality_bytes` (after fit and spread, before least
+allocated); the decision records the number and the record's `mod_revision`.
+
 ## `/observed/<node>/<replica>`: what the agent reports
 
 ```json
@@ -200,6 +220,11 @@ replaced or fenced agent cannot overwrite what its successor observed.
   "cause_diagnostic": { "...": "copy of the diagnostic, if the cause carries one" },
   "cause_evidence": { "status": "stopped", "exit": {"kind": "signaled", "signal": 9} } }
 ```
+
+`Decision` v3 (C2 slice 5) adds two optional members to a placement: `locality_bytes`, the bytes
+of the replica's image tree the chosen node already held by the node's summary, and
+`node_store_revision`, the `mod_revision` of the `/node-store/<node>` the scheduler read (0 when
+the node had none).
 
 `cause_evidence` (C1, optional, at most `decision_evidence_bytes_max` = 1024 bytes) holds the
 fields of the cited key's value that the decision acted on, as the controller read them, so

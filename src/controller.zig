@@ -369,6 +369,9 @@ pub const DecisionSpec = struct {
     /// The fields of the cause's key that the decision used (at most
     /// `constants.decision_evidence_bytes_max` bytes of JSON).
     cause_evidence: ?records.Raw = null,
+    /// A placement's locality estimate and the `/node-store` revision it read (decision v3).
+    locality_bytes: ?u64 = null,
+    node_store_revision: ?u64 = null,
 };
 
 /// Adds a decision, its by-subject index entry and the update of its summary to `batch` (at most
@@ -402,6 +405,8 @@ pub fn put_decision(
         .cause = spec.cause,
         .cause_diagnostic = spec.cause_diagnostic,
         .cause_evidence = spec.cause_evidence,
+        .locality_bytes = spec.locality_bytes,
+        .node_store_revision = spec.node_store_revision,
     };
     const entry: records.IndexEntry = .{
         .id = id.slice(),
