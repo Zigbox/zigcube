@@ -92,7 +92,7 @@ const Shell = struct {
             .arena = shell.arena.allocator(),
             .diag = &shell.diag,
             .mono = shell.boot,
-            .state = shell.fake.state.interface(),
+            .state = shell.pair_state.interface(),
             .boot_id = shell.boot_id,
             // No exchange may run past the fence: the agent moves the cap as the lease moves,
             // before its first call and after a grant or keepalive.
