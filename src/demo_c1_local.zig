@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const cli_local = @import("cli_local.zig");
 const constants = @import("constants.zig");
 const host_procs = @import("host_procs.zig");
 const state = @import("demo_c1_state.zig");
@@ -52,6 +53,8 @@ fn three_run(_: void, host: *Host) !bool {
 
 pub fn run(demo: *Demo) !void {
     const host = demo.host;
+    assert(replicas == 3);
+    assert(live_count(host) == 0);
     host.section("6. local mode: zcube local up, apply hello.zon, see it run");
     const saved_environ = host.cli_environ;
     const saved_exe = host.config.cli_exe;
@@ -87,19 +90,43 @@ pub fn run(demo: *Demo) !void {
         "down stops the server and the agent", .{});
 }
 
-/// Kills what the step started, best effort: `down`, then every supervisor group of the local
-/// agent (containers outlive `down` on purpose).
+/// The pid of the local `role` ("server" or "agent") if its pid file names a process that still
+/// runs: alive, not a zombie, and started when the file says, so a stranger that was given the
+/// same pid later is never taken for ours (the rule of `cli_local.zig`).
+fn live_pid(host: *Host, role: []const u8) ?i32 {
+    const name = std.fmt.allocPrint(host.arena(), "{s}/{s}.pid", .{
+        local_dir(host) catch return null, role,
+    }) catch return null;
+    var buffer: [64]u8 = undefined;
+    const bytes = std.Io.Dir.cwd().readFile(host.io, name, &buffer) catch return null;
+    const recorded = cli_local.parse_pid_file(bytes) orelse return null;
+    const stat_path = std.fmt.allocPrint(host.arena(), "/proc/{d}/stat", .{recorded.pid}) catch {
+        return null;
+    };
+    var stat_buffer: [1024]u8 = undefined;
+    const stat = std.Io.Dir.cwd().readFile(host.io, stat_path, &stat_buffer) catch return null;
+    if (cli_local.is_zombie(stat)) return null;
+    const start = cli_local.stat_start(stat) orelse return null;
+    if (start != recorded.start) return null;
+    return recorded.pid;
+}
+
+/// How many of the local server and agent still run (after `stop_all`: none).
+pub fn live_count(host: *Host) u32 {
+    var count: u32 = 0;
+    for ([_][]const u8{ "server", "agent" }) |role| {
+        if (live_pid(host, role) != null) count += 1;
+    }
+    return count;
+}
+
+/// Kills what the step started, best effort: every supervisor group of the local agent
+/// (containers outlive `down` on purpose), and the server and agent if they still run.
 pub fn stop_all(demo: *Demo) void {
     const host = demo.host;
     _ = procs(host).kill_supervisor_groups();
     for ([_][]const u8{ "server", "agent" }) |role| {
-        const name = std.fmt.allocPrint(host.arena(), "{s}/{s}.pid", .{
-            local_dir(host) catch return, role,
-        }) catch return;
-        var buffer: [64]u8 = undefined;
-        const bytes = std.Io.Dir.cwd().readFile(host.io, name, &buffer) catch continue;
-        var tokens = std.mem.tokenizeAny(u8, bytes, " \n");
-        const pid = std.fmt.parseInt(i32, tokens.next() orelse continue, 10) catch continue;
+        const pid = live_pid(host, role) orelse continue;
         std.posix.kill(pid, .KILL) catch {}; // May be gone.
     }
 }
