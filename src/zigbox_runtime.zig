@@ -129,7 +129,7 @@ pub const ZigboxRuntime = struct {
             return state_dir_failed(diag, options.state_dir, "set aside memory for");
     }
 
-    /// Refuses a host that can't run Zigbox containers (ZC-E0512). Zigbox's doctor is not part
+    /// Refuses a host that can't run Zigbox containers (ZC-E0513). Zigbox's doctor is not part
     /// of the linked module, so this is the cheap test: Linux, and a run directory it can read.
     /// Whatever else is missing is named by Zigbox itself at the first start (ZBX-E04xx).
     pub fn preflight(self: *ZigboxRuntime, diag: *Diag) error{HostUnsupported}!void {
@@ -601,7 +601,7 @@ fn runtime_failed(diag: *Diag, operation: []const u8) error{RuntimeFailed} {
 
 fn host_unsupported(diag: *Diag, why: []const u8) error{HostUnsupported} {
     assert(diag.code == null);
-    diag.raise(.E0512);
+    diag.raise(.E0513);
     diag.cause("this host can't run Zigbox containers: {s}", .{why});
     diag.fix(.{ .sentence = "run zbx doctor as the agent's user and fix what it names, " ++
         "or use --runtime fake" });

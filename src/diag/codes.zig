@@ -75,6 +75,7 @@ pub const Code = enum(u8) {
     E0508,
     E0509,
     E0510,
+    E0511,
     E0512,
     E0513,
     E0514,
@@ -870,6 +871,11 @@ pub const registry = [_]Entry{
         \\new tenure. Nothing needs doing unless this repeats: then two agents
         \\may be using one node name, or the agent is cut off for longer than
         \\the lease time to live.
+        ,
+    },
+    .{
+        .code = .E0511,
+        .severity = .@"error",
         .blame = .user,
         .summary = "the image does not give the tree the service names",
         .explanation =

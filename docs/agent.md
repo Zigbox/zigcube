@@ -215,17 +215,17 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   earlier container of the same name and is ignored.
 - **Images** (`zigbox_image.zig`): the supervisor tries `zigbox.start` with the locked tree
   digest; on ZBX-E0410 (tree not in the store) and a known reference it pulls once, checks the
-  tree it got is the locked one (ZC-E0510 if not) and starts again. `--images FILE` for this
+  tree it got is the locked one (ZC-E0511 if not) and starts again. `--images FILE` for this
   runtime is `.{ .images = .{ .{ .digest = "b3:...", .reference = "ghcr.io/o/r@sha256:..." } } }`;
   the digest-only form is the fake runtime's. Without it nothing is pulled.
 - **Stop**: SIGTERM and a wait of at most 500 ms when there is a grace, SIGKILL when there is
   none; the caller asks again as with the fake runtime. A fence over N containers costs up to
   N times 500 ms until the non-blocking `signal` (proposal P2) lands.
-- **Limits** are Zigbox's (`zigbox_map.zig` mirrors its bounds; apply refuses more, ZC-E0513).
-  CPU, memory and pids limits need the user's systemd bus; ZC-E0511 is registered for the case
+- **Limits** are Zigbox's (`zigbox_map.zig` mirrors its bounds; apply refuses more, ZC-E0514).
+  CPU, memory and pids limits need the user's systemd bus; ZC-E0512 is registered for the case
   of none.
 - **Preflight**: the agent refuses a host that is not Linux or cannot read Zigbox's run records
-  (ZC-E0512). Zigbox's doctor is not exported, so the rest is named by Zigbox at the first start.
+  (ZC-E0513). Zigbox's doctor is not exported, so the rest is named by Zigbox at the first start.
 - **Tests**: the lifecycle calls run over Zigbox's `HostSim` (`zigbox_runtime.zig`); the image
   decisions are table tests (`zigbox_image.zig`). `start` and the supervisor need a real host:
   `ZCUBE_REAL_HOST=1 zig build zigbox-smoke` (QEMU guest through Zigbox's `zigbox_vm` module).

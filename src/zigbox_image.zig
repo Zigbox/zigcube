@@ -5,7 +5,7 @@
 //! Zigbox's `start` with an image looks the tree up in the store and refuses with ZBX-E0410 when
 //! it is not there, before it creates anything. So the order is: try to start; on E0410, and only
 //! if the node has a reference for the tree, pull it, check that the pull produced the tree the
-//! service names (ZC-E0510 if not), and start again. A tree that is already in the store costs
+//! service names (ZC-E0511 if not), and start again. A tree that is already in the store costs
 //! one attempt and no network.
 
 const std = @import("std");
@@ -73,7 +73,7 @@ fn foreign_failure(collector: *const zigbox.diag.Diag) Outcome {
 fn mismatch(reference: []const u8, produced: []const u8, tree: []const u8) Diagnostic {
     var collector: diag_mod.Diag = undefined;
     collector.reset();
-    collector.raise(.E0510);
+    collector.raise(.E0511);
     collector.cause("the image at {s} unpacks to {s}, not {s}", .{ reference, produced, tree });
     collector.fix(.{ .sentence = "pull the reference with zbx, and put the tree digest it " ++
         "prints in the service file" });
@@ -175,7 +175,7 @@ test "a missing tree with no reference stays ZBX-E0410 and pulls nothing" {
     try testing.expectEqual(@as(u32, 0), script.pulls);
 }
 
-test "a pull that gives another tree is ZC-E0510 and nothing is started" {
+test "a pull that gives another tree is ZC-E0511 and nothing is started" {
     var script: Script = .{
         .first_start = .E0410,
         .later_start = null,
@@ -183,7 +183,7 @@ test "a pull that gives another tree is ZC-E0510 and nothing is started" {
         .produces = "b3:aa11",
     };
     const outcome, const trace = run(&script, true);
-    try testing.expectEqualStrings("ZC-E0510", outcome.failed.code.slice());
+    try testing.expectEqualStrings("ZC-E0511", outcome.failed.code.slice());
     try testing.expect(trace.pulled);
     try testing.expectEqual(@as(u32, 1), script.starts);
 }

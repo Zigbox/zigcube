@@ -4,7 +4,7 @@
 //! with `--runtime zigbox`.
 //!
 //! **What it checks today:** the agent's own build runs on the guest's glibc, `--runtime zigbox`
-//! passes its host preflight (no ZC-E0512) and the agent stays up until `timeout` ends it. **What
+//! passes its host preflight (no ZC-E0513) and the agent stays up until `timeout` ends it. **What
 //! it does not check:** a container started from a pulled image. That needs a registry the
 //! guest can reach and a service whose digest is locked against it; slice 1 leaves it to the
 //! supervisor's manual run (docs/agent.md). The result says so rather than passing silently.
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (version.status != 0) return failed(out, "zcube-agent --version failed in the guest");
 
     // The agent has no server to reach: it must still pass its preflight and keep trying, so
-    // `timeout` (exit 124) ends it. ZC-E0512 would end it at once with another status.
+    // `timeout` (exit 124) ends it. ZC-E0513 would end it at once with another status.
     const run_agent = "runuser -u cube -- sh -c 'mkdir -p /home/cube/state && timeout 5 " ++
         "/home/cube/zcube-agent --runtime zigbox --node smoke --server 10.0.2.2:1 " ++
         "--state-dir /home/cube/state --cpu-millis 1000 --memory-bytes 1073741824'";
