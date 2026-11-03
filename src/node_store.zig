@@ -17,13 +17,24 @@ const records = @import("records.zig");
 
 const Allocator = std.mem.Allocator;
 const Sketch = chunk_summary.Sketch;
+const Hash = chunk_summary.Hash;
+const ChunkRef = @import("fetch_plan.zig").ChunkRef;
 
 pub const Error = error{OutOfMemory};
 
-/// The agent's view of its image store. Only `summary` so far; slice 6 adds the rest.
+/// What the chunk calls of the seam can say.
+pub const ChunkError = error{ OutOfMemory, NotFound, BadHash, StoreFailed };
+
+/// The agent's view of its image store (C2 slice 6b). `summary` says what is held; the rest move
+/// chunks. A tree is named by its digest text, a chunk by its BLAKE3 hash. The fake that only
+/// makes summaries up (`FakeImages`) holds no bytes and answers every chunk call `NotFound`.
 pub const Images = struct {
     context: *anyopaque,
     summary_fn: *const fn (*anyopaque, Allocator, []const []const u8) Error!Summary,
+    has_fn: *const fn (*anyopaque, []const u8) bool = no_has,
+    chunk_list_fn: *const fn (*anyopaque, []const u8, []ChunkRef) ChunkError!u32 = no_list,
+    read_chunk_fn: *const fn (*anyopaque, *const Hash, []u8) ChunkError![]u8 = no_read,
+    put_chunk_fn: *const fn (*anyopaque, *const Hash, []const u8) ChunkError!void = no_put,
 
     /// The complete trees now in the store. `started` is the digests of the images the agent has
     /// started containers from (a store holds what it has run).
@@ -32,12 +43,105 @@ pub const Images = struct {
         assert(result.trees.len <= constants.summary_trees_max);
         return result;
     }
+
+    /// Whether the store holds every chunk of `tree`.
+    pub fn has(images: Images, tree: []const u8) bool {
+        return images.has_fn(images.context, tree);
+    }
+
+    /// The chunks of `tree` in order into `out`; the count, or `NotFound` for a tree the store
+    /// has no list for. A list longer than `out` is `StoreFailed`.
+    pub fn chunk_list(images: Images, tree: []const u8, out: []ChunkRef) ChunkError!u32 {
+        const count = try images.chunk_list_fn(images.context, tree, out);
+        assert(count <= out.len);
+        return count;
+    }
+
+    /// The bytes of chunk `hash` in `out` (which holds a chunk). The store checks BLAKE3 of what
+    /// it read against `hash` before it returns: a chunk that fails is `BadHash`, never served.
+    pub fn read_chunk(images: Images, hash: *const Hash, out: []u8) ChunkError![]u8 {
+        assert(out.len >= constants.swarm_chunk_bytes);
+        const bytes = try images.read_chunk_fn(images.context, hash, out);
+        assert(bytes.len <= out.len);
+        return bytes;
+    }
+
+    /// Stores `bytes` as chunk `hash`, after checking BLAKE3 of them against it: a mismatch is
+    /// `BadHash` and nothing is written. The check is the store's, not the caller's.
+    pub fn put_chunk(images: Images, hash: *const Hash, bytes: []const u8) ChunkError!void {
+        assert(bytes.len <= constants.swarm_chunk_bytes);
+        return images.put_chunk_fn(images.context, hash, bytes);
+    }
 };
+
+/// The digest a chunk list stands for: `b3:` and the lowercase hex of BLAKE3 of the list's text.
+pub fn list_digest(list: []const u8, out: *[67]u8) []const u8 {
+    var hash: Hash = undefined;
+    std.crypto.hash.Blake3.hash(list, &hash, .{});
+    out[0..3].* = "b3:".*;
+    for (hash, 0..) |byte, at| {
+        out[3 + at * 2] = hex_digits[byte >> 4];
+        out[4 + at * 2] = hex_digits[byte & 15];
+    }
+    return out;
+}
+
+/// Whether `digest` names `list`: it is `list_digest` or a prefix of it at least 8 hex digits long
+/// (the short digests of images and fixtures). A peer or registry that sends a list is held to it.
+pub fn list_matches(digest: []const u8, list: []const u8) bool {
+    var full: [67]u8 = undefined;
+    const want = list_digest(list, &full);
+    if (digest.len < 3 + 8 or digest.len > want.len) return false;
+    return std.mem.eql(u8, digest, want[0..digest.len]);
+}
+
+/// The chunks a list's text names, into `out`; the count, or null if a line is malformed, a size
+/// is 0 or over a chunk, or there are more lines than `out` holds (or none).
+pub fn list_parse(list: []const u8, out: []ChunkRef) ?u32 {
+    var count: u32 = 0;
+    var lines = std.mem.splitScalar(u8, list, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 and lines.peek() == null) break; // The text ends in a newline.
+        if (line.len < 66 or line[64] != ' ' or count == out.len) return null;
+        _ = std.fmt.hexToBytes(&out[count].hash, line[0..64]) catch return null;
+        out[count].bytes = std.fmt.parseInt(u32, line[65..], 10) catch return null;
+        if (out[count].bytes == 0 or out[count].bytes > constants.swarm_chunk_bytes) return null;
+        count += 1;
+    }
+    return if (count == 0) null else count;
+}
+
+/// BLAKE3 of `bytes` is `hash`: the check every store makes.
+pub fn chunk_verifies(hash: *const Hash, bytes: []const u8) bool {
+    var actual: Hash = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &actual, .{});
+    return std.crypto.timing_safe.eql(Hash, actual, hash.*);
+}
+
+fn no_has(_: *anyopaque, _: []const u8) bool {
+    return false;
+}
+
+fn no_list(_: *anyopaque, _: []const u8, _: []ChunkRef) ChunkError!u32 {
+    return error.NotFound;
+}
+
+fn no_read(_: *anyopaque, _: *const Hash, _: []u8) ChunkError![]u8 {
+    return error.NotFound;
+}
+
+fn no_put(_: *anyopaque, _: *const Hash, _: []const u8) ChunkError!void {
+    return error.NotFound;
+}
 
 pub const Summary = struct {
     /// Digest and sketch of each held tree, most recently used first.
     trees: []const Held = &.{},
     omitted: u32 = 0,
+    /// The Bloom filter over every chunk held (raw bytes), and the chunks it was filled with;
+    /// empty when the store has none (`filter_chunks` 0).
+    filter: []const u8 = "",
+    filter_chunks: u32 = 0,
 };
 
 pub const Held = struct { digest: []const u8, sketch: Sketch };
@@ -110,7 +214,30 @@ pub fn sketch_of(tree: records.HeldTree) ?Sketch {
 pub fn record_of(arena: Allocator, node: []const u8, summary: Summary) Error!records.NodeStore {
     const trees = try arena.alloc(records.HeldTree, summary.trees.len);
     for (summary.trees, trees) |held, *slot| slot.* = try held_of(arena, held);
-    return .{ .node = node, .trees = trees, .omitted = summary.omitted };
+    const filter = try arena.alloc(u8, summary.filter.len * 2);
+    for (summary.filter, 0..) |byte, at| {
+        filter[at * 2] = hex_digits[byte >> 4];
+        filter[at * 2 + 1] = hex_digits[byte & 15];
+    }
+    return .{
+        .node = node,
+        .trees = trees,
+        .omitted = summary.omitted,
+        .filter = filter,
+        .filter_chunks = summary.filter_chunks,
+    };
+}
+
+/// The filter bytes a record carries, into `out`, or null if the hex is damaged, the size is not
+/// one `Filter` takes, or `out` is too small. Empty is a valid answer: a node with no filter.
+pub fn filter_of(record: records.NodeStore, out: []u8) ?[]u8 {
+    const digits = record.filter;
+    if (digits.len == 0) return out[0..0];
+    if (digits.len % 2 != 0 or digits.len / 2 > out.len) return null;
+    const size = digits.len / 2;
+    if (size < 8 or size > constants.summary_filter_bytes_max) return null;
+    _ = std.fmt.hexToBytes(out[0..size], digits) catch return null;
+    return out[0..size];
 }
 
 // ---- The fake -----------------------------------------------------------------------------
@@ -215,4 +342,39 @@ test "a held tree scores its whole size against itself" {
     const both = chunk_summary.locality_bytes(&mine, &.{ other, mine });
     try std.testing.expectEqual(mine.total_bytes, both);
     try std.testing.expectEqual(@as(u64, 0), chunk_summary.locality_bytes(&mine, &.{other}));
+}
+
+test "a chunk list is held to its digest, and parses only whole" {
+    // Goal: a list from a peer or a registry is accepted only if it is what the digest names.
+    // Method: build a list, check the full digest and a short prefix, flip one digit of the list,
+    // then malformed lines.
+    var list_bytes: [200]u8 = undefined;
+    const hash_a: [32]u8 = @splat(0xab);
+    const hash_b: [32]u8 = @splat(0x01);
+    const list = std.fmt.bufPrint(&list_bytes, "{x} 1048576\n{x} 77\n", .{ &hash_a, &hash_b }) catch
+        unreachable; // Sized.
+    var full: [67]u8 = undefined;
+    const digest = list_digest(list, &full);
+    try std.testing.expect(list_matches(digest, list));
+    try std.testing.expect(list_matches(digest[0..11], list));
+    try std.testing.expect(!list_matches(digest[0..10], list)); // Too short to mean anything.
+    var other: [200]u8 = undefined;
+    @memcpy(other[0..list.len], list);
+    other[70] = '9';
+    try std.testing.expect(!list_matches(digest, other[0..list.len]));
+    var out: [4]ChunkRef = undefined;
+    try std.testing.expectEqual(@as(?u32, 2), list_parse(list, &out));
+    try std.testing.expectEqual(@as(u32, 77), out[1].bytes);
+    try std.testing.expectEqual(@as(?u32, null), list_parse("", &out));
+    try std.testing.expectEqual(@as(?u32, null), list_parse(list[0 .. list.len - 3], &out));
+    var one: [1]ChunkRef = undefined;
+    try std.testing.expectEqual(@as(?u32, null), list_parse(list, &one)); // More than fit.
+}
+
+test "a store refuses a chunk whose bytes are not its hash" {
+    // Goal: chunk_verifies is the check; the store's calls use it.
+    var hash: Hash = undefined;
+    std.crypto.hash.Blake3.hash("abc", &hash, .{});
+    try std.testing.expect(chunk_verifies(&hash, "abc"));
+    try std.testing.expect(!chunk_verifies(&hash, "abd"));
 }

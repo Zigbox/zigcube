@@ -423,6 +423,8 @@ pub const summary_request_bytes_max: u32 = summary_json_bytes_max + 128;
 /// Peers one fetch considers (a filter each), and chunks one fetch plans (a tree of 64 GiB).
 pub const fetch_peers_max: u32 = 16;
 pub const fetch_chunks_max: u32 = summary_chunks_capacity;
+/// A tree's chunk list as text: `<64 hex> <bytes>` and a newline per chunk, at most 80 bytes each.
+pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
 /// With no peer holding a chunk, the plan waits this long from its start for a filter to show it
 /// (another node may be fetching it, c2.md O5), then goes to the registry.
 pub const fetch_peer_wait_ms: u32 = 30_000;

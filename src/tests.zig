@@ -29,6 +29,7 @@ test {
     _ = @import("sim_fleet_state.zig");
     _ = @import("sim_fleet_github.zig");
     _ = @import("fake_files.zig");
+    _ = @import("dir_images.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_runtime_test.zig");
     _ = @import("zigbox_map.zig");
