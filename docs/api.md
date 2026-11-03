@@ -296,8 +296,8 @@ controller or API handler writes them yet.
    `lease_expired` with `{key, lease, ttl_ms, revision}`. The mock and `/v1/why` already use it.
 4. **[Approved]** **Who applied, and from which file.** `zcube why` ends at `desired` ("an apply"); SPEC's
    audit log wants an actor and request ID, and "config in git" wants the file's commit.
-   Proposed: `applied_by` and `request_id` on `/services/<name>` now, `source` (git commit, file
-   digest) later. The mock writes the first two.
+   Proposed: `applied_by` and `request_id` on `/services/<name>` now, `provenance` (git commit, file
+   digest) later (named `source` before C2 slice 2, which took that name for the OCI reference). The mock writes the first two.
 5. **[Approved]** **Spec history for diffs.** The previous generation's spec is gone after compaction, so
    neither a "what changed" view nor `zcube apply`'s diff of an old apply can be shown. Cheap
    option: the `apply` decision records a one-line change summary ("replicas 3 → 5").

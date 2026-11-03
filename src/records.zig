@@ -229,7 +229,7 @@ pub const Requests = struct {
 pub const Pair = [2][]const u8;
 
 pub const Service = struct {
-    v: u32 = 2,
+    v: u32 = 3,
     name: []const u8,
     image: []const u8,
     replicas: u32,
@@ -242,6 +242,9 @@ pub const Service = struct {
     next_replica: ?u64 = null,
     applied_by: []const u8 = "",
     request_id: []const u8 = "",
+    /// The OCI reference `image` is pulled from, pinned by digest (docs/keys.md); empty when the
+    /// tree must already be on the node. Absent in records before version 3.
+    source: []const u8 = "",
 };
 
 /// The counter that keeps replica ids unique forever: the number the next replica takes.
@@ -253,7 +256,7 @@ pub const ReplicaNumber = struct {
 /// What a service asks for, once per replica. Where it runs is `/assigned`'s (the scheduler's);
 /// a v1 record's `node` and `requests` are ignored on read.
 pub const Replica = struct {
-    v: u32 = 2,
+    v: u32 = 3,
     id: []const u8,
     service: []const u8,
     generation: u64,
@@ -261,6 +264,8 @@ pub const Replica = struct {
     command: []const []const u8,
     env: []const Pair = &.{},
     limits: Limits = .{},
+    /// The service's `source`, copied (absent before version 3).
+    source: []const u8 = "",
 };
 
 pub const Node = struct {
@@ -868,10 +873,12 @@ test "records a C0 build wrote still read" {
         if (std.mem.startsWith(u8, kv.key, prefix_services)) {
             const record = try read(Service, arena, kv, &diag);
             try testing.expectEqual(@as(u32, 1), record.v);
+            try testing.expectEqualStrings("", record.source);
             seen[0] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
             const record = try read(Replica, arena, kv, &diag);
             try testing.expectEqual(@as(u32, 1), record.v);
+            try testing.expectEqualStrings("", record.source);
             seen[1] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_observed)) {
             const record = try read(Observed, arena, kv, &diag);
@@ -898,7 +905,7 @@ const c1_store = @embedFile("testdata/c1_store.txt");
 test "records a C1 build wrote still read" {
     // Goal: a stored value is read by the next release. Method: read every record of a store a C1
     // build produced (services with env and limits, a replaced replica, a held one) as the type
-    // its key says; they are all version 2.
+    // its key says; they are all version 2 and have no `source`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -913,10 +920,12 @@ test "records a C1 build wrote still read" {
         if (std.mem.startsWith(u8, kv.key, prefix_services)) {
             const record = try read(Service, arena, kv, &diag);
             try testing.expectEqual(@as(u32, 2), record.v);
+            try testing.expectEqualStrings("", record.source);
             seen[0] += 1;
         } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
             const record = try read(Replica, arena, kv, &diag);
             try testing.expectEqual(@as(u32, 2), record.v);
+            try testing.expectEqualStrings("", record.source);
             seen[1] += 1;
         }
     }
@@ -946,6 +955,54 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
         "\"memory_bytes\":1}}");
     try testing.expectError(error.Malformed, read(Node, arena, node_kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
+}
+
+test "source round-trips at version 3 and a version 4 service is refused" {
+    // Goal: `source` is stored and read back, absent means empty, and a newer service is named.
+    // Method: encode a service with and without it, read both back, then read a v4 value.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const reference = "registry.example/hello@sha256:" ++
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const base: Service = .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 1,
+        .command = &.{"run"},
+        .generation = 1,
+    };
+    var with = base;
+    with.source = reference;
+    const with_bytes = try encode(arena, with, &diag);
+    const with_back = try read(Service, arena, kv_of("/services/hello", with_bytes), &diag);
+    try testing.expectEqual(@as(u32, 3), with_back.v);
+    try testing.expectEqualStrings(reference, with_back.source);
+    const without_bytes = try encode(arena, base, &diag);
+    const without_back = try read(Service, arena, kv_of("/services/hello", without_bytes), &diag);
+    try testing.expectEqualStrings("", without_back.source);
+    const replica: Replica = .{
+        .id = "hello-1",
+        .service = "hello",
+        .generation = 1,
+        .image = "b3:51aa9c03",
+        .command = &.{"run"},
+        .source = reference,
+    };
+    const replica_bytes = try encode(arena, replica, &diag);
+    const replica_kv = kv_of("/replicas/hello/hello-1", replica_bytes);
+    const replica_back = try read(Replica, arena, replica_kv, &diag);
+    try testing.expectEqualStrings(reference, replica_back.source);
+    const newer = "{\"v\":4,\"name\":\"hello\"}";
+    const newer_kv = kv_of("/services/hello", newer);
+    try testing.expectError(error.Malformed, read(Service, arena, newer_kv, &diag));
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
+    try testing.expectEqualStrings(
+        "the value at /services/hello is version 4; this release reads up to version 3",
+        diag.last_cause().?,
+    );
 }
 
 test "a newer version is refused before the shape is parsed" {
