@@ -367,7 +367,9 @@ test "a short fault phase is not judged by one request per operation (fleet issu
     // Goal: regression for the simulation fleet's issue 56. Method: replay the two shrunk
     // failures (73 operations healing at 79, 38 operations healing at 50); each had 47 and 31
     // virtual seconds of faults and delivered one request fewer than it had operations, which is
-    // luck (a lost call costs 10 s), not a cluster that stopped working. Both must now pass.
+    // luck (a lost call costs 10 s), not a cluster that stopped working. Both must now pass. The
+    // seeds stop reproducing those short runs when the simulator's draw changes; the lasting
+    // check is the unit test of `request_floor_met` in sim_cluster.zig.
     const Replay = struct { seed: u64, operations: u32, heal_at: u32 };
     const report = try std.testing.allocator.create(sim_cluster.Report);
     defer std.testing.allocator.destroy(report);
@@ -388,7 +390,10 @@ test "a service deleted and applied again leaves no old replica running (fleet i
     // (78 operations healing at 98): alpha was deleted and applied again between two controller
     // steps, its old replica alpha-6 (generation 2) survived the new service (generation 1), and
     // an apply of a broken image brought the service to generation 2, so alpha-6 ran for ever.
-    // Unit test of the cause: replica_controller_test.zig.
+    // A pinned seed stops reproducing the race when the simulator's draw changes (a new
+    // operation or a changed weight moves every later draw), so this test can start passing for
+    // the wrong reason; the lasting regression is the controller unit test of the cause,
+    // replica_controller_test.zig.
     const report = try std.testing.allocator.create(sim_cluster.Report);
     defer std.testing.allocator.destroy(report);
     sim_cluster.simulate(std.testing.allocator, 2352517332, 78, .{ .heal_at = 98 }, report);
