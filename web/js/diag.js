@@ -76,6 +76,8 @@ export function cliWhy(chain, { verbose = false } = {}) {
     } else lines.push(`  ← ${step.text}`);
   }
   if (!chain.steps.length) lines.push("  (no decisions recorded for this subject)");
+  const c = chain.completeness;
+  if (verbose && c) lines.push(c.verdict === "complete" ? "completeness: complete" : `completeness: truncated (${c.reason}) at ${c.at}`);
   return lines;
 }
 

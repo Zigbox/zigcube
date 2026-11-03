@@ -120,7 +120,10 @@ Rules:
    copy button. The two can be compared at a glance, and a test could compare them byte for byte.
 2. **Newest first, each step is the cause of the one above it.** "Because ↓" reads the way the
    CLI's `←` does. The chain ends at a terminal: an observation, an apply, a resync, or an
-   expired lease.
+   expired lease. Under the headline sits one line, "complete" or "truncated: <reason>" (the
+   `completeness` field, api.md), and the verbose terminal block prints the CLI's
+   `completeness:` line. A chain that is truncated says so and never fills the gap with the
+   record's current value.
 3. **The console adds provenance, never claims.** Revision numbers, times, decision ids, links to
    the subject of each decision, who applied. Those sit in small type under the step.
 4. **Commands are runnable.** A fix with a command shows it in a terminal-style chip with a

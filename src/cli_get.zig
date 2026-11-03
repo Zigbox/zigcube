@@ -40,6 +40,33 @@ pub const ReplicaRow = struct {
     /// clean state.
     detail: []const u8,
     started_at_ms: ?u64,
+    /// What the scheduler resolved the replica to need (`/assigned/<node>/<id>`), null while
+    /// unassigned.
+    requests: ?Resources = null,
+};
+
+pub const Resources = struct { cpu_millis: u64, memory_bytes: u64 };
+
+pub const LeaseRow = struct { id: u64, ttl_ms: u64, remaining_ms: u64 };
+
+/// One node: the join of `/nodes/`, `/node-status/`, `/allocations/` and the lease listing.
+pub const NodeRow = struct {
+    name: []const u8,
+    /// `state` of `/node-status/<node>`; null before the node controller has judged it.
+    status: ?[]const u8,
+    /// The tenure that status was judged for.
+    status_tenure: ?u64,
+    /// The `/nodes/<node>` revision; null with no registration.
+    tenure: ?u64,
+    lease: ?LeaseRow,
+    capacity: ?Resources,
+    allocated: Resources,
+    count: u64,
+    /// `ttl_ms - remaining_ms` of the node's lease: a keepalive creates no revision, so the lease
+    /// is the only record of the last contact.
+    last_heard_ms_ago: ?u64,
+    address: []const u8,
+    agent_version: []const u8,
 };
 
 pub fn run(
@@ -50,11 +77,16 @@ pub fn run(
     name: ?[]const u8,
     report: *Report,
 ) Error![]const u8 {
+    if (listing == .nodes) {
+        const rows = try nodes(arena, client, name, report);
+        return cli_view.nodes_text(arena, rows, options.output);
+    }
     if (listing == .service) {
         const rows = try services(arena, client, name, report);
         return cli_view.services_text(arena, rows, options.output);
     }
     const found = try replicas(arena, client, name, report);
+    assert(listing == .replicas);
     return cli_view.replicas_text(arena, found.rows, found.now_ms, options.output);
 }
 
@@ -204,6 +236,7 @@ fn replica_row(
         .status = "pending",
         .detail = "",
         .started_at_ms = null,
+        .requests = requests_of(assigned, id),
     };
     for (observed) |seen| {
         if (!is_observed_of(seen.key, id)) continue;
@@ -285,4 +318,130 @@ fn bad_record(report: *Report, key: []const u8) Error {
     report.diag.cause("the record is not a service or replica this zcube knows", .{});
     report.diag.fix(.{ .sentence = "use the zcube that came with the server" });
     return error.Failed;
+}
+
+fn requests_of(assigned: []const cli_data.Kv, id: []const u8) ?Resources {
+    for (assigned) |kv| {
+        if (!is_observed_of(kv.key, id)) continue;
+        return resources(kv.value, "requests");
+    }
+    return null;
+}
+
+fn resources(parent: Value, name: []const u8) ?Resources {
+    const inner = cli_data.member(parent, name) orelse return null;
+    return .{
+        .cpu_millis = cli_data.number(inner, "cpu_millis") orelse return null,
+        .memory_bytes = cli_data.number(inner, "memory_bytes") orelse return null,
+    };
+}
+
+/// The nodes (one, if named) in name order: the names under `/nodes/` and `/node-status/`
+/// together, so a node whose registration is gone but whose judgement remains still shows.
+/// A name that is in neither is ZC-E0101.
+pub fn nodes(
+    arena: Allocator,
+    client: *Client,
+    name: ?[]const u8,
+    report: *Report,
+) Error![]const NodeRow {
+    const registered = try cli_data.list(arena, client, "/nodes/", report);
+    const judged = try cli_data.list(arena, client, "/node-status/", report);
+    const accounts = try cli_data.list(arena, client, "/allocations/", report);
+    const leases_reply = try client.get("/v1/leases", report);
+    const leases = try cli_data.parse(arena, leases_reply, report);
+    var names: std.ArrayList([]const u8) = .empty;
+    try add_names(arena, &names, registered.items, "/nodes/");
+    try add_names(arena, &names, judged.items, "/node-status/");
+    std.mem.sort([]const u8, names.items, {}, name_less);
+    var rows: std.ArrayList(NodeRow) = .empty;
+    for (names.items) |node| {
+        if (name != null and !std.mem.eql(u8, name.?, node)) continue;
+        const row = node_row(node, registered.items, judged.items, accounts.items, leases);
+        rows.append(arena, row) catch return error.OutOfMemory;
+    }
+    if (name != null and rows.items.len == 0) return missing(report, "node", name.?);
+    return rows.items;
+}
+
+fn name_less(_: void, first: []const u8, second: []const u8) bool {
+    return std.mem.lessThan(u8, first, second);
+}
+
+fn add_names(
+    arena: Allocator,
+    names: *std.ArrayList([]const u8),
+    items: []const cli_data.Kv,
+    base: []const u8,
+) Error!void {
+    for (items) |kv| {
+        assert(std.mem.startsWith(u8, kv.key, base));
+        const node = kv.key[base.len..];
+        for (names.items) |known| {
+            if (std.mem.eql(u8, known, node)) break;
+        } else names.append(arena, node) catch return error.OutOfMemory;
+    }
+}
+
+fn find(items: []const cli_data.Kv, base: []const u8, node: []const u8) ?cli_data.Kv {
+    for (items) |kv| {
+        if (std.mem.eql(u8, kv.key[base.len..], node)) return kv;
+    }
+    return null;
+}
+
+fn node_row(
+    node: []const u8,
+    registered: []const cli_data.Kv,
+    judged: []const cli_data.Kv,
+    accounts: []const cli_data.Kv,
+    leases: Value,
+) NodeRow {
+    var row: NodeRow = .{
+        .name = node,
+        .status = null,
+        .status_tenure = null,
+        .tenure = null,
+        .lease = null,
+        .capacity = null,
+        .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 },
+        .count = 0,
+        .last_heard_ms_ago = null,
+        .address = "",
+        .agent_version = "",
+    };
+    if (find(registered, "/nodes/", node)) |kv| {
+        row.tenure = kv.mod_revision;
+        row.capacity = resources(kv.value, "capacity");
+        row.address = cli_data.text(kv.value, "address") orelse "";
+        row.agent_version = cli_data.text(kv.value, "agent_version") orelse "";
+        row.lease = lease_of(leases, kv.key);
+        if (row.lease) |lease| row.last_heard_ms_ago = lease.ttl_ms -| lease.remaining_ms;
+    }
+    if (find(judged, "/node-status/", node)) |kv| {
+        row.status = cli_data.text(kv.value, "state");
+        row.status_tenure = cli_data.number(kv.value, "tenure");
+    }
+    if (find(accounts, "/allocations/", node)) |kv| {
+        row.allocated = resources(kv.value, "allocated") orelse row.allocated;
+        row.count = cli_data.number(kv.value, "count") orelse 0;
+    }
+    return row;
+}
+
+/// The lease whose `keys` include `key`, from `GET /v1/leases`.
+fn lease_of(leases: Value, key: []const u8) ?LeaseRow {
+    const all = cli_data.array(leases, "leases") orelse return null;
+    for (all) |lease| {
+        const keys = cli_data.array(lease, "keys") orelse continue;
+        for (keys) |held| {
+            if (held != .string or !std.mem.eql(u8, held.string, key)) continue;
+            return .{
+                .id = cli_data.number(lease, "id") orelse return null,
+                .ttl_ms = cli_data.number(lease, "ttl_ms") orelse return null,
+                .remaining_ms = cli_data.number(lease, "remaining_ms") orelse return null,
+            };
+        }
+    }
+    return null;
 }

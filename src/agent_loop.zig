@@ -136,12 +136,18 @@ pub const Loop = struct {
         return .failure;
     }
 
-    /// A slice of the wait ended. `ended` is true if a replica changed, a container event came, or
-    /// the watch itself failed (the next step reports and retries); false if the slice just ran
-    /// out.
+    /// A slice of the wait ended. `ended` is true if a replica changed or a container event came;
+    /// false if the slice just ran out.
     pub fn watch_done(loop: *Loop, ended: bool) void {
         assert(loop.state == .waiting);
         if (ended) loop.state = .stepping;
+    }
+
+    /// The watch itself failed (the server refused a hold, or could not be reached). Like a failed
+    /// step it backs off before the next step, so a refused agent does not list in a hot loop.
+    pub fn watch_failed(loop: *Loop) void {
+        assert(loop.state == .waiting);
+        loop.state = .pausing;
     }
 };
 
@@ -216,6 +222,23 @@ test "a step that acted runs again at once, and one that did not waits in slices
     try testing.expectEqual(Action.step, loop.next(950));
     _ = loop.step_done(950, .{ .ok = idle });
     try testing.expectEqual(Action.step, loop.next(1_000));
+}
+
+test "a failed watch pauses before the next step, doubling while it keeps failing" {
+    // Goal: a refused watch (503 ZC-E0108) is not a hot loop. Method: idle step -> waiting; the
+    // watch fails -> a pause of the minimum, then a step; again, the pause is the same because
+    // the step in between succeeded.
+    var loop = Loop.init();
+    _ = loop.next(0);
+    const idle: controller.Wakeup = .{ .at_ms = 10_000, .prefixes = &.{}, .acted = 0 };
+    _ = loop.step_done(0, .{ .ok = idle });
+    _ = loop.next(0);
+    loop.watch_failed();
+    try testing.expectEqual(
+        Action{ .pause_ms = constants.server_retry_ms_min },
+        loop.next(0),
+    );
+    try testing.expectEqual(Action.step, loop.next(constants.server_retry_ms_min));
 }
 
 test "a stop request ends the loop from every state, and a lease is news only when it changes" {

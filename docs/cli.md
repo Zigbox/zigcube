@@ -11,6 +11,7 @@ zcube [options] apply <file.zon>        show what the file would change, then ap
 zcube [options] delete service <name>   delete a service; its replicas are stopped
 zcube [options] get service [name]      services and how many replicas run
 zcube [options] get replicas [service]  replicas, where they run and how they are doing
+zcube [options] get nodes [name]        nodes, their status, lease, capacity and last contact
 zcube [options] why <kind> <name>       why a service, replica or node is as it is
 zcube [options] check allocations       every node's allocation record against its assignments
 zcube [options] repair allocations <node> [--confirm]
@@ -70,11 +71,34 @@ NAME   READY  IMAGE
 hello  3/3    b3:51aa9c03
 
 $ zcube get replicas hello -o wide
-REPLICA  SERVICE  NODE   STATUS   AGE  GEN  IMAGE        DETAIL
-hello-1  hello    node1  running  12s  1    b3:51aa9c03
-hello-2  hello    node1  running  12s  1    b3:51aa9c03
-hello-3  hello    node1  running  12s  1    b3:51aa9c03
+REPLICA  SERVICE  NODE   STATUS   AGE  GEN  CPU   MEMORY  IMAGE        DETAIL
+hello-1  hello    node1  running  8s   1    250m  128Mi   b3:51aa9c03
+hello-2  hello    node2  running  8s   1    250m  128Mi   b3:51aa9c03
+hello-3  hello    node3  running  8s   1    250m  128Mi   b3:51aa9c03
+
+$ zcube get nodes
+NODE   STATUS  TENURE  LEASE     CAPACITY       ALLOCATED     LAST-HEARD
+node1  ready   1       8.3s/10s  4000m / 8.0Gi  250m / 128Mi  1s ago
+node2  ready   2       8.3s/10s  4000m / 8.0Gi  250m / 128Mi  1s ago
+node3  ready   4       8.3s/10s  4000m / 8.0Gi  250m / 128Mi  1s ago
 ```
+
+(Both from one run of `demo/up.sh` and `zcube apply` of a 3-replica `hello`.)
+
+`CPU` and `MEMORY` (wide) are the `requests` of the replica's `/assigned/<node>/<id>`, what the
+scheduler resolved it to need; `-` while it is unassigned.
+
+`get nodes` joins `/nodes/`, `/node-status/`, `/allocations/` and `GET /v1/leases`; the rows are
+the names under `/nodes/` and `/node-status/` together. `STATUS` is the node controller's `state`
+as stored (`-` before it has judged the node); `ready*` means the status is for an earlier tenure
+than the registration, which the scheduler does not count. `TENURE` is the `/nodes/<node>`
+revision. `LEASE` is remaining over ttl. `LAST-HEARD` is `ttl - remaining` of the lease, against
+the server's clock: a keepalive creates no revision, so the lease is the only record of contact;
+`-` when the node has no lease. `-o wide` adds `ADDRESS`, `AGENT`, `REPLICAS` and `LEASE-ID`.
+`get nodes node2` shows one node; an unknown name is `ZC-E0101`.
+
+The output above is `demo/up.sh` (three nodes, one `hello` service of 3 replicas); `demo/kill-node.sh
+node2` kills a node's agent and containers with `kill -9`, and `demo/down.sh` stops everything.
 
 `READY` is running replicas over desired. `STATUS` is the agent's report: `running`, `starting`,
 `exited`, `killed`, `oom`, `pid-limit`, `start-failed`, `lost`, or `pending` (no report yet). `DETAIL`
@@ -107,7 +131,17 @@ service broken: 0/1 running
       docs   https://zigbox.github.io/zigbox/errors/E0501.html
 ```
 
-`--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step.
+`--verbose` adds each decision's id, actor and action, and the full cause chain of a diagnostic step,
+and a last line on whether the chain reaches its cause: `completeness: complete`, or
+`completeness: truncated (retention) at <decision id>`; the reason is `retention`,
+`subject_deleted` or `compacted` (api.md). Without the field (an older server) the line is left out.
+
+`zcube why node node3` starts from the state line, which names the judgement and the load
+(`node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
+8.0Gi memory in use`), then the node's newest decision. A `ready` node that holds fewer
+replicas than another gets one more line, a note and not a reading of the store: replicas already
+running elsewhere are not moved back, because the scheduler places a replica when it is created or
+its node is lost and does not rebalance.
 
 ## check and repair allocations
 
@@ -158,7 +192,8 @@ JSON on standard output, for `--output json`:
 | Command | Shape |
 | --- | --- |
 | `get service` | `{"kind":"service","items":[{"name","image","desired","running","generation","applied_by","command"}]}` |
-| `get replicas` | `{"kind":"replicas","items":[{"id","service","node","generation","image","status","detail","started_at_ms"}]}` |
+| `get replicas` | `{"kind":"replicas","items":[{"id","service","node","generation","image","status","detail","started_at_ms","requests"}]}` (`requests`: `{"cpu_millis","memory_bytes"}` or null) |
+| `get nodes` | `{"kind":"nodes","items":[{"name","status","status_tenure","tenure","lease":{"id","ttl_ms","remaining_ms"},"capacity":{"cpu_millis","memory_bytes"},"allocated":{"cpu_millis","memory_bytes"},"count","last_heard_ms_ago","address","agent_version"}]}` (`status`, `status_tenure`, `tenure`, `lease`, `capacity`, `last_heard_ms_ago` are null when unknown) |
 | `why` | the server's body of `GET /v1/why`, unchanged |
 | `apply`, `delete` | the server's answer (`action`, `change`, `revision`, `decision`, ...), unchanged |
 | `explain` | `{"code","severity","blame","summary","explanation","exit_code"}` |

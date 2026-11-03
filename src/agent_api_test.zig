@@ -381,23 +381,24 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     try testing.expectEqual(before, try rig.revision());
 }
 
-test "the watch says whether a replica changed since a revision, and holds when nothing did" {
+test "the watch says whether an assignment of the node changed, and holds when nothing did" {
     // Goal: the long poll's contract. Method: at the head, nothing changed and the reply may be
-    // held; after an apply it has changed at once; a change outside /replicas/ does not count;
-    // a revision too far ahead and a compacted one are refused.
+    // held; a change of the node's own /assigned/node2/ has changed it at once; an apply (new
+    // replicas) and another node's assignment do not count; a revision too far ahead and a
+    // compacted one are refused.
     var rig = try Rig.start(8);
     defer rig.stop();
     const base = "/v1/agent/nodes/node2/watch";
     const head = try rig.revision();
     var hold_buffer: [64]u8 = undefined;
     var now_buffer: [64]u8 = undefined;
-    var future_buffer: [64]u8 = undefined;
 
     const hold_query = try watch_query(&hold_buffer, head + 1, 3000);
     const quiet = rig.call("GET", base, hold_query, "");
     try testing.expectEqual(@as(u16, 200), quiet.status);
     try testing.expectEqual(@as(u32, 3000), quiet.hold_ms);
-    try testing.expectEqualStrings("/replicas/", quiet.hold_prefixes[0]);
+    try testing.expectEqual(@as(usize, 1), quiet.hold_prefixes.len);
+    try testing.expectEqualStrings("/assigned/node2/", quiet.hold_prefixes[0]);
     const idle = try rig.json(quiet);
     try testing.expect(!field(idle, "changed").bool);
     try testing.expectEqual(head, field(idle, "revision").integer);
@@ -424,9 +425,36 @@ test "the watch says whether a replica changed since a revision, and holds when 
 
     _ = try rig.world.apply(hello);
     rig.world.advance(1000); // The controller creates the replicas.
-    const changed = try rig.ok("GET", base, hold_query, "");
+    // The scheduler places the new replicas on node2, the one node: its assignments changed.
+    const placed = try rig.ok("GET", base, hold_query, "");
+    try testing.expect(field(placed, "changed").bool);
+    const placed_head = try rig.revision();
+    var quiet_buffer: [64]u8 = undefined;
+    const after_query = try watch_query(&quiet_buffer, placed_head + 1, 3000);
+    rig.world.diag.reset();
+    const other = records.assigned_key("node3", "hello-1");
+    const mine = records.assigned_key("node2", "hello-1");
+    const put = [_]store.Op{
+        .{ .put = .{ .key = other.slice(), .value = "{}" } },
+    };
+    _ = try rig.world.store_handle().txn(.{ .on_success = &put }, &rig.world.diag);
+    const elsewhere = try rig.ok("GET", base, after_query, "");
+    try testing.expect(!field(elsewhere, "changed").bool);
+    const put_mine = [_]store.Op{.{ .put = .{ .key = mine.slice(), .value = "{}" } }};
+    _ = try rig.world.store_handle().txn(.{ .on_success = &put_mine }, &rig.world.diag);
+    const changed = try rig.ok("GET", base, after_query, "");
     try testing.expect(field(changed, "changed").bool);
+}
 
+test "the watch refuses a revision too far ahead, a bad query and a compacted revision" {
+    // Goal: the long poll's refusals. Method: ask for a revision past the head, for malformed
+    // queries, and for a revision below the compaction point.
+    var rig = try Rig.start(8);
+    defer rig.stop();
+    const base = "/v1/agent/nodes/node2/watch";
+    var future_buffer: [64]u8 = undefined;
+    _ = try rig.world.apply(hello);
+    rig.world.advance(1000);
     const future = try std.fmt.bufPrint(&future_buffer, "from={d}", .{(try rig.revision()) + 5});
     try rig.refused(rig.call("GET", base, future, ""), 400, "ZC-E0204");
     try rig.refused(rig.call("GET", base, "", ""), 400, "ZC-E0104");

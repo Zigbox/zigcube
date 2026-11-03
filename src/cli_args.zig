@@ -6,7 +6,7 @@
 //! ```
 //! zcube [options] apply <file.zon>
 //! zcube [options] delete service <name>
-//! zcube [options] get service|replicas [name]
+//! zcube [options] get service|replicas|nodes [name]
 //! zcube [options] why service|replica|node <name>
 //! zcube [options] explain <code>
 //! zcube [options] bundle --last | <kind> <name>
@@ -29,7 +29,7 @@ pub const Kind = enum { service, replica, node };
 pub const Subject = struct { kind: Kind, name: []const u8 };
 
 /// What `get` lists. Nodes arrive with C1.
-pub const Listing = enum { service, replicas };
+pub const Listing = enum { service, replicas, nodes };
 
 pub const Options = struct {
     verbose: bool = false,
@@ -78,6 +78,7 @@ pub const help_text =
     \\  delete service <name>        delete a service; its replicas are stopped
     \\  get service [name]           services and how many replicas run
     \\  get replicas [service]       replicas, where they run and how they are doing
+    \\  get nodes [name]             nodes, their status, lease, capacity and last contact
     \\  why <kind> <name>            why a service, replica or node is as it is
     \\  explain <code>               explain a diagnostic code offline, for example E0201
     \\  bundle --last                collect the evidence for the last failure
@@ -265,7 +266,9 @@ fn one_argument(
 }
 
 fn get_of(diag: *Diag, rest: []const []const u8) Error!Command {
-    if (rest.len == 0) return refuse(diag, "get needs what to list: service or replicas", .{});
+    if (rest.len == 0) {
+        return refuse(diag, "get needs what to list: service, replicas or nodes", .{});
+    }
     if (rest.len > 2) return refuse(diag, "get takes a kind and at most one name", .{});
     const word = rest[0];
     const listing: Listing = if (std.mem.eql(u8, word, "service") or std.mem.eql(
@@ -276,8 +279,14 @@ fn get_of(diag: *Diag, rest: []const []const u8) Error!Command {
         .service
     else if (std.mem.eql(u8, word, "replicas") or std.mem.eql(u8, word, "replica"))
         .replicas
+    else if (std.mem.eql(u8, word, "nodes") or std.mem.eql(u8, word, "node"))
+        .nodes
     else
-        return refuse(diag, "{s} is not something get lists (service or replicas)", .{word});
+        return refuse(
+            diag,
+            "{s} is not something get lists (service, replicas or nodes)",
+            .{word},
+        );
     return .{ .get = .{ .listing = listing, .name = if (rest.len == 2) rest[1] else null } };
 }
 
@@ -408,7 +417,7 @@ test "the refusals: each names the part at fault" {
         .{ .line = &.{ "apply", "--bogus" }, .cause = "--bogus is not a flag zcube has" },
         .{ .line = &.{"apply"}, .cause = "apply needs a file" },
         .{ .line = &.{ "apply", "a", "b" }, .cause = "apply takes one argument, not 2" },
-        .{ .line = &.{ "get", "nodes" }, .cause = "nodes is not something get lists" },
+        .{ .line = &.{ "get", "pods" }, .cause = "pods is not something get lists" },
         .{ .line = &.{"get"}, .cause = "get needs what to list" },
         .{ .line = &.{ "why", "service" }, .cause = "why needs a kind and a name" },
         .{ .line = &.{ "why", "pod", "x" }, .cause = "pod is not a kind" },

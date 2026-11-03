@@ -395,14 +395,21 @@ const Node = struct {
         const clock = node.nclock.clock();
         node.cap_calls(clock);
         const held = node.agent.watch_hold_ms(clock.now_ms(), slice_ms);
-        var ended = node.remote.watch_once(held, &node.diag) catch true;
+        var failed = false;
+        var ended = node.remote.watch_once(held, &node.diag) catch blk: {
+            failed = true;
+            break :blk true;
+        };
         if (!ended) {
             _ = node.arena.reset(.retain_capacity);
             const events = node.sim.interface().events(node.arena.allocator(), 0, &node.diag);
-            ended = if (events) |list| list.len > 0 else |_| true;
+            ended = if (events) |list| list.len > 0 else |_| blk: {
+                failed = true;
+                break :blk true;
+            };
         }
         node.resume_ms = node.cluster.manual.ms + node.spent_ms;
-        node.loop.watch_done(ended);
+        if (failed) node.loop.watch_failed() else node.loop.watch_done(ended);
         return ended;
     }
 

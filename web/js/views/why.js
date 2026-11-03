@@ -97,6 +97,13 @@ export function why(ctx, params, query) {
     render();
   }
 
+  function completenessEl(c) {
+    if (!c) return null;
+    if (c.verdict === "complete") return h("p", { class: "why-complete ok" }, h("strong", {}, "complete"), " · the chain reaches its cause");
+    const why = ({ retention: "a decision was removed by retention", subject_deleted: "the subject was deleted and a decision was removed", compacted: "a record the chain cites was compacted" })[c.reason] || c.reason;
+    return h("p", { class: "why-complete cut" }, h("strong", {}, `truncated: ${c.reason}`), ` · ${why}`, c.at ? [" · at ", h("code", {}, c.at)] : "");
+  }
+
   function stepEl(step, i) {
     const li = h("li", { class: `step ${step.type}` });
     const mark = h("span", { class: "because", "aria-hidden": "true" }, "because");
@@ -118,6 +125,11 @@ export function why(ctx, params, query) {
         h("p", { class: "step-m" }, step.applied_by ? ["by ", h("strong", {}, step.applied_by), step.request_id ? [" · request ", h("code", {}, step.request_id)] : ""] : "No author recorded for this apply."));
     } else if (step.type === "lease_expired") {
       body.append(h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "lease"), h("span", { class: "step-act" }, step.text)), h("p", { class: "step-m" }, h("code", {}, step.key), ` deleted at revision ${step.revision}`));
+    } else if (step.type === "note") {
+      // A statement of a rule, not a cause: no "because", its own chip.
+      body.append(h("div", { class: "step-h" }, h("span", { class: "chip" }, "note"), h("span", { class: "step-act" }, step.text)));
+      li.append(body);
+      return li;
     } else {
       body.append(h("div", { class: "step-h" }, h("span", { class: "chip" }, step.type === "resync" ? "resync" : "history"), h("span", { class: "step-act" }, step.text)));
     }
@@ -159,8 +171,9 @@ export function why(ctx, params, query) {
     banner.hidden = !chain.at_decision;
     if (chain.at_decision) rebuild(banner, chain.at_decision, () => [`Showing the chain as of decision `, h("code", {}, chain.at_decision.slice(-9)), ". ", h("a", { href: whyHref(kind, name) }, "Show the latest")]);
     const st = chain.state;
-    rebuild(headline, JSON.stringify([st, chain.steps.length]), () => [
+    rebuild(headline, JSON.stringify([st, chain.steps.length, chain.completeness]), () => [
       h("div", { class: "why-state" }, pill(st.health === "gone" ? "gone" : st.health), h("p", { class: "why-text" }, st.text)),
+      completenessEl(chain.completeness),
       chain.steps.length ? null : h("p", { class: "muted" }, "No decisions are recorded for this subject. Decisions are kept for a limited time (docs/keys.md, retention)."),
     ]);
     rebuild(chainEl, JSON.stringify(chain.steps), () => chain.steps.map(stepEl));

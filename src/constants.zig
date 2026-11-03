@@ -183,10 +183,11 @@ pub const why_text_bytes_max: u32 = 480;
 // ---- Server shell (zcube-server) -----------------------------------------------------------
 
 /// Connections the HTTP server serves at once; the next one is answered 503 and closed.
-pub const http_connections_max: u32 = 64;
+pub const http_connections_max: u32 = 96;
 /// Long-poll watches held open at once. Each holds one store watch (and, on Postgres, one
-/// connection), so this stays well under `store_postgres_watches_max`.
-pub const http_holds_max: u32 = 24;
+/// connection), so this stays well under `store_postgres_watches_max`. 50 agents hold one each
+/// (owner, 2026-11-02); Postgres then needs `max_connections` of at least 80.
+pub const http_holds_max: u32 = 50;
 /// Refusals being delivered at once to connections the server will not serve. Each has a task
 /// and a slot of its own, so a flood of refused clients cannot starve the served ones; one past
 /// this is closed without a reply.
