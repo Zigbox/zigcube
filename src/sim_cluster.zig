@@ -42,6 +42,7 @@ const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
+const why_acceptance = @import("why_acceptance.zig");
 const sim_checks = @import("sim_checks.zig");
 const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
@@ -596,6 +597,8 @@ pub const Cluster = struct {
     c1_revisions: u64,
     /// Scratch for the per-revision checks, which run inside a store call.
     tap_arena: std.heap.ArenaAllocator,
+    /// sim-c1: every decision as `why` rendered it when it committed (docs/authority.md §5).
+    recorder: why_acceptance.Recorder,
     tap_diag: Diag,
     /// A negative test's competing write has been made (once per run).
     injected: bool,
@@ -679,6 +682,7 @@ pub const Cluster = struct {
         c.c1_violation_revision = 0;
         c.c1_revisions = 0;
         c.tap_arena = .init(gpa);
+        c.recorder = .init(gpa);
         c.tap_diag.reset();
         c.injected = false;
         c.overlap_count = 0;
@@ -748,6 +752,7 @@ pub const Cluster = struct {
         gpa.free(c.nodes);
         c.net.deinit();
         c.tap_arena.deinit();
+        c.recorder.deinit();
         c.arena_state.deinit();
         c.memory.deinit();
         gpa.destroy(c.memory);
@@ -1135,7 +1140,6 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
     if (!c.c1) return;
     c.c1_revisions += 1;
     if (request) |txn| c.note_replaced(txn);
-    if (c.c1_violation != null) return;
     _ = c.tap_arena.reset(.retain_capacity);
     c.tap_diag.reset();
     const ctx: controller.Context = .{
@@ -1144,6 +1148,8 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         .arena = c.tap_arena.allocator(),
         .diag = &c.tap_diag,
     };
+    if (request) |txn| c.recorder.record_request(&ctx, txn);
+    if (c.c1_violation != null) return;
     if (sim_c1.at_revision(&ctx, request)) |found| {
         c.c1_violation = found;
         c.c1_violation_revision = revision;
@@ -2003,8 +2009,8 @@ pub fn simulate(
     c.c1 = options.c1;
     if (c.c1) {
         c.swarm.add_c1_faults(seed);
-        report.print("sim-c1: every revision checked (I1a I4 I6 I7), overlaps bounded " ++
-            "(I1b)\n", .{});
+        report.print("sim-c1: every revision checked (I1a I3 I4 I6 I7), overlaps bounded " ++
+            "(I1b), then every decision re-explained after its cited keys changed (I5, §5)\n", .{});
     }
     const heal_at = if (!options.liveness)
         operations
@@ -2050,6 +2056,26 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     try safety(c);
     try enough_work_under_faults(c, @min(heal_at, operations));
     try work_under_ceiling(c);
+    try acceptance(c);
+}
+
+/// sim-c1, docs/authority.md §5: every cited key is changed or deleted and the history compacted
+/// past them, and `why` must still explain every decision with the evidence it recorded.
+fn acceptance(c: *Cluster) Failure!void {
+    if (!c.c1) return;
+    _ = c.tap_arena.reset(.retain_capacity);
+    c.tap_diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.tap.inner,
+        .clock = c.manual.clock(),
+        .arena = c.tap_arena.allocator(),
+        .diag = &c.tap_diag,
+    };
+    c.recorder.disturb(&ctx) catch {
+        try check(c, false, "§5: the cited keys could not be changed and compacted");
+    };
+    const found = c.recorder.verify(&ctx);
+    try check(c, found == null, found orelse "");
 }
 
 /// The highest rate of agent steps (per minute of agent uptime, over the whole run) among the
@@ -2162,6 +2188,11 @@ fn print_summary(c: *Cluster) void {
         report.print("sim-c1: revisions checked={d} overlap worst " ++
             "{d} ms (bound {d} ms), wedged worst {d} ms (excused)\n", .{
             c.c1_revisions, c.overlap_worst_ms, overlap_ms_max, c.overlap_wedged_worst_ms,
+        });
+        const n = c.recorder.counts;
+        report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++
+            "keys deleted={d} changed={d}\n", .{
+            n.recorded, n.complete, n.truncated, n.dropped, n.keys_deleted, n.keys_changed,
         });
     }
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});

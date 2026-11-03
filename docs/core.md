@@ -334,3 +334,33 @@ range of seeds, not one.
 
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations, native against WASM, and `sim-teeth`.
+
+## sim-c1
+
+`zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]` is the cluster simulation with `Options.c1` on
+(`sim_cluster --c1` natively): clock skew and wedged (frozen) agents are added to the swarm, a
+`TapStore` beneath the lost-acknowledgement layer (`src/sim_tap.zig`) lets `src/sim_c1.zig` check
+every committed revision, and native and WASM reports must agree byte for byte. It is a profile,
+not a new simulator, because the faults and the real controllers, agents and store are the same
+(docs/DECISIONS.md, 2026-11-03).
+
+What it checks (docs/authority.md §4): **I1a** one assignment per replica id; **I1b** a replaced
+replica stops on its old node within the overlap bound (5 s), unless that node was wedged, which
+the report counts separately; **I3** each decision's cited observation was admissible (its tenure
+was its node's registration) at the cited revision; **I4** no transaction writes keys of two
+roles; **I5** every `why` is complete or truncated with a reason; **I6** allocations equal the sum of
+assignments; **I7** no placement onto a node that is not ready for its tenure.
+
+The evidence acceptance test (§5, `src/why_acceptance.zig`): each decision's terminal evidence is
+recorded as `why` renders it right after commit; at the end of the run every cited key is deleted or
+changed and the store compacted past them; `why` is asked again for every decision and must be
+complete with the same evidence, or truncated with a reason and nothing it cannot back. The same
+test runs over the real core in `zig build test`.
+
+Negative tests (`zig build sim-c1-teeth`, one step per test, each passes only if its check fires):
+skew beyond the bound or a wedged node breaks I1b; skipping the allocation compare breaks I6;
+skipping the readiness compare with a node lost between planning and commit breaks I7. Their
+switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
+`zcube-agent` assert at compile time that none is on.
+
+`zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.
