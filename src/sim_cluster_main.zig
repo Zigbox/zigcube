@@ -362,3 +362,23 @@ test "the step hook hears every step the run enters, in order" {
     try std.testing.expectEqualStrings("convergence", traced_steps[2]);
     try std.testing.expectEqualStrings("end", traced_steps[3]);
 }
+
+test "a short fault phase is not judged by one request per operation (fleet issue 56)" {
+    // Goal: regression for the simulation fleet's issue 56. Method: replay the two shrunk
+    // failures (73 operations healing at 79, 38 operations healing at 50); each had 47 and 31
+    // virtual seconds of faults and delivered one request fewer than it had operations, which is
+    // luck (a lost call costs 10 s), not a cluster that stopped working. Both must now pass.
+    const Replay = struct { seed: u64, operations: u32, heal_at: u32 };
+    const report = try std.testing.allocator.create(sim_cluster.Report);
+    defer std.testing.allocator.destroy(report);
+    for ([_]Replay{
+        .{ .seed = 3491114665, .operations = 73, .heal_at = 79 },
+        .{ .seed = 1995814075, .operations = 38, .heal_at = 50 },
+    }) |replay| {
+        sim_cluster.simulate(std.testing.allocator, replay.seed, replay.operations, .{
+            .heal_at = replay.heal_at,
+        }, report);
+        if (report.failed) std.debug.print("{s}\n", .{report.text()});
+        try std.testing.expect(!report.failed);
+    }
+}

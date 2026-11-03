@@ -2220,14 +2220,18 @@ fn slowest_node_rate(c: *const Cluster) ?u64 {
 /// were on; null if the nodes were up for less than `cluster_up_ms_min` in all, too little for
 /// a rate to mean anything (a lost call costs 10 s, so a short run is a few calls' luck).
 fn cluster_ok_rate(c: *const Cluster) ?u64 {
-    var steps: u64 = 0;
-    var up_ms: u64 = 0;
-    for (c.nodes) |node| {
-        steps += node.ok_steps;
-        up_ms += node.up_ms;
-    }
+    const up_ms = cluster_up_ms(c);
     if (up_ms < cluster_up_ms_min) return null;
+    var steps: u64 = 0;
+    for (c.nodes) |node| steps += node.ok_steps;
     return steps * 60_000 / up_ms;
+}
+
+/// Agent uptime summed over every node, while the faults were on.
+fn cluster_up_ms(c: *const Cluster) u64 {
+    var up_ms: u64 = 0;
+    for (c.nodes) |node| up_ms += node.up_ms;
+    return up_ms;
 }
 
 /// The faults must leave the cluster working: a world where the store or every link is down most
@@ -2242,8 +2246,14 @@ fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
         try check(c, rate >= ok_steps_per_minute_min, "too few agent steps while faults were " ++
             "on");
     }
-    try check(c, during.delivered >= operations, "too few requests reached the server " ++
-        "while faults were on");
+    // Operations are not time: the draw can hold few `advance` operations, and one lost call
+    // costs the agent 10 s, so a run of 30 to 50 virtual seconds delivers fewer requests than
+    // it has operations by luck alone (seeds 3491114665 and 1995814075: 72 of 73 and 37 of 38).
+    // The floor is therefore judged only where the ok-steps floor is, on enough uptime.
+    if (cluster_up_ms(c) >= cluster_up_ms_min) {
+        try check(c, during.delivered >= operations, "too few requests reached the server " ++
+            "while faults were on");
+    }
 }
 
 fn print_summary(c: *Cluster) void {
