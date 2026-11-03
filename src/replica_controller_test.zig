@@ -208,6 +208,27 @@ const Fixture = struct {
         return error.NoSuchDecision;
     }
 
+    /// The `reason` of the first decision of `kind`/`name` whose action is `action`.
+    fn reason_of(
+        self: *Fixture,
+        kind: records.SubjectKind,
+        name: []const u8,
+        action: []const u8,
+    ) ![]const u8 {
+        const ctx = self.context();
+        const prefix = records.index_prefix(kind, name);
+        const query: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+        const page = try ctx.store.list(ctx.arena, query, &self.diag);
+        for (page.kvs) |kv| {
+            const entry = try records.read(records.IndexEntry, ctx.arena, kv, &self.diag);
+            const at = records.decision_key(entry.id);
+            const got = try ctx.store.get(ctx.arena, at.slice(), null, &self.diag);
+            const decision = try records.read(records.Decision, ctx.arena, got.kv.?, &self.diag);
+            if (std.mem.eql(u8, decision.action, action)) return decision.reason;
+        }
+        return error.NoSuchDecision;
+    }
+
     fn user_diagnostic(self: *Fixture, blame_user: bool) !records.Raw {
         const ctx = self.context();
         var collector: Diag = undefined;
@@ -488,6 +509,27 @@ test "a service deleted and applied again between two steps loses its old replic
     defer Fixture.free_ids(last);
     try expect_ids(&.{ "hello-7", "hello-8" }, last);
     try fixture.expect_replica_image("hello-7", second.image);
+}
+
+test "a rolled service says its replicas run an older generation" {
+    // Goal: the reason of a replacement names what is true of the replicas. Method: apply a new
+    // image to a running service (generation 2), so its replicas are behind in generation.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var first = hello;
+    first.replicas = 2;
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    var second = first;
+    second.image = "b3:9d20c4f1";
+    try fixture.apply(second);
+    _ = try fixture.settle();
+    const reason = try fixture.reason_of(.service, "hello", "replace_replica");
+    const expected = "service hello is at generation 2 and 2 replicas run an older one; " ++
+        "replacing hello-1; hello-2";
+    try testing.expectEqualStrings(expected, reason);
 }
 
 test "a pass stops after one batch and says it has more to do" {

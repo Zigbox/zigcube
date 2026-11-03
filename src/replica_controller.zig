@@ -408,9 +408,20 @@ const Run = struct {
         const name = service.rec.name;
         const wanted = service.rec.replicas;
         if (plan.dead == 0) {
+            // A stale replica is behind in generation, or ahead of or equal to it and running
+            // another spec (a service applied again starts over at generation 1): say only
+            // what holds for every one of them.
+            const what = if (stale_behind(plan, service) == plan.stale)
+                "run an older one"
+            else
+                "do not run what it asks for";
             const head = try controller.format(run.ctx, "service {s} is at generation {d} and " ++
-                "{d} {s} run an older one; replacing ", .{
-                name, service.rec.generation, plan.stale, plural(plan.stale, "replica", "replicas"),
+                "{d} {s} {s}; replacing ", .{
+                name,
+                service.rec.generation,
+                plan.stale,
+                plural(plan.stale, "replica", "replicas"),
+                what,
             });
             text.appendSlice(run.ctx.arena, head) catch return nomem(run.ctx);
         } else {
@@ -862,6 +873,17 @@ fn exit_evidence(ctx: *const Context, exit: records.Exit) Error![]const u8 {
 
 fn desired_cause(service: *const Entry(records.Service)) records.Cause {
     return .{ .kind = .desired, .key = service.kv.key, .revision = service.kv.mod_revision };
+}
+
+/// How many of the plan's stale replicas are behind the service in generation.
+fn stale_behind(plan: *const ServicePlan, service: *const Entry(records.Service)) u32 {
+    var behind: u32 = 0;
+    for (plan.slice()) |item| {
+        if (item.class != .stale) continue;
+        if (item.replica.rec.generation < service.rec.generation) behind += 1;
+    }
+    assert(behind <= plan.stale);
+    return behind;
 }
 
 fn plural(count: u32, one: []const u8, many: []const u8) []const u8 {
