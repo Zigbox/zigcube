@@ -11,6 +11,7 @@ const std = @import("std");
 const testing = std.testing;
 const net = std.Io.net;
 const agent_mod = @import("agent.zig");
+const agent_peer = @import("agent_peer.zig");
 const clock_mod = @import("agent_clock.zig");
 const codes = @import("diag/codes.zig");
 const config_mod = @import("server_config.zig");
@@ -505,4 +506,175 @@ fn running_names(rig: *Rig, out: *[2]runtime_name) !void {
         found += 1;
     }
     try testing.expectEqual(@as(usize, 2), found);
+}
+
+/// A node is issued a credential only while registered under a live lease (finding 3): refused
+/// unregistered and under another lease; then registers and returns the lease.
+fn register_after_refusals(
+    rig: *Rig,
+    identity: *agent_peer.Peer,
+    arena: std.mem.Allocator,
+    wall: u64,
+    diag: *Diag,
+) !store.Lease {
+    try testing.expectError(
+        error.Failed,
+        identity.step(rig.http_transport.transport(), arena, 1, wall, 3000, diag),
+    );
+    // The agent reports the server's refusal, which carries E0205 in its cause.
+    try testing.expectEqual(@as(?codes.Code, .E0504), diag.code);
+    try testing.expect(identity.credential == null);
+    diag.reset();
+    const remote = rig.remote.interface();
+    const lease = try remote.lease_grant(10_000, diag);
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, diag);
+    identity.retry_at_ms = 0; // The refusal above set a pause.
+    try testing.expectError(
+        error.Failed,
+        identity.step(rig.http_transport.transport(), arena, lease.id + 1, wall, 3000, diag),
+    );
+    diag.reset();
+    identity.retry_at_ms = 0;
+    return lease;
+}
+
+test "a node joins the CA, keeps its pair, renews at half life, is refused once removed" {
+    // Goal: docs/peer.md's issuance, persistence, renewal and removal through real HTTP and the
+    // real files. Method: join; restart the server (the CA key is the same) and the peer (the
+    // stored pair is reused, nothing is due); step at the renewal time; then list the node as
+    // removed (the server's `revoked` file, read at start) and see ZC-E0807, the old pair kept.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var base: [constants.state_path_bytes_max]u8 = undefined;
+    const base_length = try rig.tmp.dir.realPath(rig.io, &base);
+    const state_dir = try std.fmt.allocPrint(arena, "{s}/agent", .{base[0..base_length]});
+
+    var identity = try agent_peer.Peer.open(rig.io, state_dir, "node1", &diag);
+    defer identity.close();
+    try testing.expect(identity.credential == null);
+    const wall = rig.clock_source.clock().now_ms();
+    const lease = try register_after_refusals(rig, &identity, arena, wall, &diag);
+    try identity.step(rig.http_transport.transport(), arena, lease.id, wall, 3000, &diag);
+    const first = identity.credential.?;
+    try testing.expect(identity.ca_public != null);
+    const life_ms = first.not_after_ms - first.not_before_ms;
+    try testing.expectEqual(@as(u64, constants.peer_credential_ttl_ms), life_ms);
+    for ([_][]const u8{ "peer.key", "peer.cred", "ca.pub" }) |name| {
+        var dir = try std.Io.Dir.cwd().openDir(rig.io, state_dir, .{});
+        defer dir.close(rig.io);
+        const file = try dir.openFile(rig.io, name, .{});
+        defer file.close(rig.io);
+        const stat = try file.stat(rig.io);
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    }
+    try testing.expect(!identity.due(wall + 1000));
+
+    // The server restarts over the same state directory: the same CA, so the stored pair holds.
+    try rig.restart_server();
+    var again = try agent_peer.Peer.open(rig.io, state_dir, "node1", &diag);
+    defer again.close();
+    try testing.expectEqualSlices(u8, &first.node_key, &again.credential.?.node_key);
+    try testing.expectEqual(identity.ca_public.?, again.ca_public.?);
+    try testing.expect(!again.due(wall + 1000));
+
+    // Renewal at half the life: a new credential, signed by the same CA.
+    const renew_at = again.renew_at_ms;
+    try testing.expect(again.due(renew_at));
+    try again.step(rig.http_transport.transport(), arena, lease.id, renew_at, 3000, &diag);
+    try testing.expect(again.credential.?.not_before_ms >= first.not_before_ms);
+    try testing.expect(!std.mem.eql(u8, &first.signature, &again.credential.?.signature));
+    try testing.expect(again.renew_at_ms > renew_at);
+    try testing.expectEqual(identity.ca_public.?, again.ca_public.?);
+
+    // Removal: the file is read at start, and then the node is refused, not stopped.
+    var dir = try std.Io.Dir.cwd().openDir(rig.io, base[0..base_length], .{});
+    defer dir.close(rig.io);
+    try dir.writeFile(rig.io, .{ .sub_path = "revoked", .data = "# gone\nnode1\n" });
+    try rig.restart_server();
+    const kept = again.credential.?;
+    try testing.expectError(
+        error.Failed,
+        again.step(rig.http_transport.transport(), arena, lease.id, again.renew_at_ms, 3000, &diag),
+    );
+    try testing.expectEqual(@as(?codes.Code, .E0807), diag.code);
+    try testing.expectEqualSlices(u8, &kept.signature, &again.credential.?.signature);
+    try testing.expect(!again.due(again.retry_at_ms - 1));
+}
+
+test "the credential endpoint refuses what it should: a bad key, a big body, a wrong method" {
+    // Goal: docs/api.md's refusals for the credential call. Method: send each wrong request to a
+    // live server and read the status; none may issue anything.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const path = "/v1/agent/nodes/node1/credential";
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, "{\"node_key\":\"zz\"}"));
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, "{\"node_key\":\"00\"}"));
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, "{}"));
+    const all_f = "ffffffffffffffffffffffffffffffffffffffffffffffff";
+    const off_curve = "{\"node_key\":\"" ++ all_f ++ all_f[0..16] ++ "\"}";
+    try testing.expectEqual(@as(u16, 400), try rig.post(path, off_curve));
+    var big: [constants.peer_join_request_bytes_max + 8]u8 = @splat(' ');
+    // A body over the cap is refused before it is read: a status, or the connection closed.
+    const refused = rig.post(path, &big) catch 400;
+    try testing.expect(refused >= 400);
+    const bad_name = "/v1/agent/nodes/Bad%20Name/credential";
+    try testing.expectEqual(@as(u16, 400), try rig.post(bad_name, off_curve));
+}
+
+test "a memory-store server that restarts has a new CA, and the agent joins it within one retry" {
+    // Goal: finding 1. Method: join a memory-store server, restart it (a new CA, an empty
+    // store), let the agent read one answer, and see its credential dropped and ZC-E0801 shown
+    // once; then it registers again and holds a credential from the new CA.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var server = try start_server_on(io, .memory, true);
+    defer server.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var http_transport: remote_mod.HttpTransport = .{
+        .client = .{ .io = io, .address = server.address() },
+    };
+    var remote_store = remote_mod.RemoteStore.init(
+        testing.allocator,
+        http_transport.transport(),
+        "node1",
+    );
+    const remote = remote_store.interface();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var base: [constants.state_path_bytes_max]u8 = undefined;
+    const base_length = try tmp.dir.realPath(io, &base);
+    const state_dir = try std.fmt.allocPrint(arena, "{s}/agent", .{base[0..base_length]});
+    var clock_source: clock_mod.RealClock = .{ .io = io };
+    const wall = clock_source.clock().now_ms();
+
+    var identity = try agent_peer.Peer.open(io, state_dir, "node1", &diag);
+    defer identity.close();
+    var lease = try remote.lease_grant(10_000, &diag);
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    try identity.step(http_transport.transport(), arena, lease.id, wall, 3000, &diag);
+    const old_ca = identity.ca_public.?;
+    try testing.expect(remote_store.ca_key_id != null);
+    try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
+
+    server.stop();
+    server = try start_server_on(io, .memory, true);
+    http_transport.client.address = server.address();
+    lease = try remote.lease_grant(10_000, &diag);
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    try testing.expect(identity.observe_ca(remote_store.ca_key_id.?));
+    try testing.expect(identity.credential == null);
+    try testing.expect(identity.due(wall));
+    try identity.step(http_transport.transport(), arena, lease.id, wall, 3000, &diag);
+    try testing.expect(!std.mem.eql(u8, &old_ca, &identity.ca_public.?));
+    try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
 }

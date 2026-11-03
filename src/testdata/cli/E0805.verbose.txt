@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0805]: a peer record was refused
+  cause  a record from node2 failed authentication
+  reqid  r-0000001
+  fix    check that both agents joined this cluster (docs/peer.md)   zcube get nodes
+  more   zcube explain E0805
+  docs   https://zigbox.github.io/zigcube/errors/E0805.html

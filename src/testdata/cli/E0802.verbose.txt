@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0802]: a peer's credential is expired or not yet valid
+  cause  node2's credential has expired
+  reqid  r-0000001
+  fix    check the clocks, then restart the agent so it renews   timedatectl
+  more   zcube explain E0802
+  docs   https://zigbox.github.io/zigcube/errors/E0802.html

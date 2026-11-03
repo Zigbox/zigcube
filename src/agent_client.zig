@@ -155,6 +155,8 @@ pub const RemoteStore = struct {
     notice: ?Notice = null,
     /// `Notice.unverified` is raised once per process.
     unverified_noted: bool = false,
+    /// The cluster CA's key id the last answer carried (null: none did, or no CA).
+    ca_key_id: ?[8]u8 = null,
     /// The address the file named, for `Notice.server_changed`.
     previous_server: [remembered_server_bytes_max]u8 = undefined,
     previous_server_len: u32 = 0,
@@ -675,12 +677,22 @@ pub const RemoteStore = struct {
             known_hash: ?[]const u8 = null,
             // Absent from the first 10b servers, which kept a pair for every store.
             verified: bool = true,
+            ca_key_id: ?[]const u8 = null,
         };
         const Answer = struct { chain: ?ChainJson = null };
         const answer = try parse(Answer, arena, body, diag);
         const chain = answer.chain orelse
             return bad(diag, "the reply carries no chain pair: the server is older than the agent");
         const now: Pair = .{ .revision = chain.revision, .hash = try parse_hash(chain.hash, diag) };
+        remote.ca_key_id = null;
+        if (chain.ca_key_id) |text| {
+            var id: [8]u8 = undefined;
+            const decoded = std.fmt.hexToBytes(&id, text) catch &[0]u8{};
+            if (decoded.len != id.len) {
+                return bad(diag, "the reply's CA key id is not 16 hex digits");
+            }
+            remote.ca_key_id = id;
+        }
         if (!chain.verified) return remote.forget_unverified();
         const known = remote.known orelse {
             remote.known = now;
@@ -910,7 +922,7 @@ const Refusal = struct {
 };
 
 /// The code of the first diagnostic in an error body, if it has one.
-fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
+pub fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
     const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return null;
     if (parsed.diagnostics.len == 0) return null;
@@ -918,7 +930,7 @@ fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
 }
 
 /// ZC-E0504 carrying the server's own diagnostic: its code and summary, and its innermost cause.
-fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
+pub fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
     assert(diag.code == null);
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
     const parsed = std.json.parseFromSliceLeaky(Refusal, arena, reply.body, options) catch

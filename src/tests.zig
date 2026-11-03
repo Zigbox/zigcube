@@ -69,3 +69,16 @@ test {
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }
+
+test "the peer handshake's seeded fuzzer is in this root" {
+    // Goal: the fuzzer reads ZCUBE_FUZZ_SEED, an environment the WASI core root does not have, so
+    // it is native only. Method: import it; the handshake's own tests come with the core.
+    _ = @import("peer_fuzz.zig");
+}
+
+test "the peer files and the CA's shell are in this root" {
+    // Goal: the shell halves of docs/peer.md (key files, CA, agent identity) are tested natively.
+    _ = @import("agent_peer.zig");
+    _ = @import("peer_files.zig");
+    _ = @import("server_ca.zig");
+}
