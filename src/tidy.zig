@@ -537,8 +537,12 @@ fn check_imports(
 }
 
 fn import_allowed(importing_path: []const u8, target: []const u8) bool {
-    // The one reader of the root file: the agent's test-only fault switch (src/agent.zig).
-    if (std.mem.eql(u8, target, "root")) return std.mem.eql(u8, importing_path, "src/agent.zig");
+    // The readers of the root file: the test-only fault switches (src/agent.zig, and the fetch
+    // plan's for `sim-swarm-teeth`).
+    if (std.mem.eql(u8, target, "root")) {
+        return std.mem.eql(u8, importing_path, "src/agent.zig") or
+            std.mem.eql(u8, importing_path, "src/fetch_plan.zig");
+    }
     for (module_allowlist) |name| {
         if (std.mem.eql(u8, name, target)) return true;
     }

@@ -371,6 +371,15 @@ fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
     );
 }
 
+fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
+    sample(
+        diag,
+        .W0601,
+        &.{"peer node2 sent chunk 5 of 24 with bytes that do not match its hash"},
+        "no action needed for this fetch; check that node's store and disk",
+    );
+}
+
 fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
     const cause = "lease time to live 30000 ms needs a fence margin of 4000 ms; it is 3000 ms";
     sample(diag, .E0121, &.{cause}, "shorten --lease-ttl-ms, or leave the fencing constants alone");
@@ -519,6 +528,7 @@ const cases = [_]Case{
     relayed(.E0513, agent_host),
     relayed(.E0514, agent_too_long),
     relayed(.W0501, agent_lease),
+    relayed(.W0601, peer_bad_chunk),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
 };
