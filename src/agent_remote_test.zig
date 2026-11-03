@@ -582,11 +582,13 @@ test "the credential endpoint refuses what it should: a bad key, a big body, a w
     try testing.expectEqual(@as(u16, 400), try rig.post(path, "{\"node_key\":\"zz\"}"));
     try testing.expectEqual(@as(u16, 400), try rig.post(path, "{\"node_key\":\"00\"}"));
     try testing.expectEqual(@as(u16, 400), try rig.post(path, "{}"));
-    const off_curve = "{\"node_key\":\"" ++ "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" ++ "\"}";
+    const all_f = "ffffffffffffffffffffffffffffffffffffffffffffffff";
+    const off_curve = "{\"node_key\":\"" ++ all_f ++ all_f[0..16] ++ "\"}";
     try testing.expectEqual(@as(u16, 400), try rig.post(path, off_curve));
     var big: [constants.peer_join_request_bytes_max + 8]u8 = @splat(' ');
     // A body over the cap is refused before it is read: a status, or the connection closed.
     const refused = rig.post(path, &big) catch 400;
     try testing.expect(refused >= 400);
-    try testing.expectEqual(@as(u16, 400), try rig.post("/v1/agent/nodes/Bad%20Name/credential", off_curve));
+    const bad_name = "/v1/agent/nodes/Bad%20Name/credential";
+    try testing.expectEqual(@as(u16, 400), try rig.post(bad_name, off_curve));
 }
