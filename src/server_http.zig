@@ -316,6 +316,14 @@ fn read_body(
         refuse_request(work, ctx, request, 413, .E0108, cause);
         return error.Refused;
     }
+    // An empty body is not read: for a method without a body `readerExpectContinue` returns
+    // `Reader.ending`, a constant in read-only memory that reading (even zero bytes) writes to.
+    // The agent sends `Content-Length: 0` on its GETs.
+    if (length == 0) return "";
+    if (!parsed.has_body_method) {
+        refuse_request(work, ctx, request, 400, .E0104, "this method has no request body");
+        return error.Refused;
+    }
     const reader = request.readerExpectContinue(&.{}) catch return error.Closed;
     const buffer = ctx.arena.alloc(u8, @intCast(length)) catch return error.Closed;
     reader.readSliceAll(buffer) catch return error.Closed;

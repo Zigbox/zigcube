@@ -261,6 +261,25 @@ test "the limits of constants.zig are enforced with a coded reply" {
     try expect_diagnostic(full, 503, "ZC-E0108");
 }
 
+test "a GET that announces Content-Length: 0, as the agent sends, is answered" {
+    // Goal: regression for the zigbox-smoke crash: the server segfaulted (a write to the constant
+    // `Reader.ending`) on every request of a method without a body that carried a Content-Length.
+    // Method: GET with 0 bytes announced is answered 200; GET with a body is refused, coded.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+
+    const empty = try send(io, address, "GET", "/v1/status", "");
+    defer empty.free();
+    try testing.expectEqual(@as(u16, 200), empty.status);
+    const body = try send(io, address, "GET", "/v1/status", "{}");
+    defer body.free();
+    try expect_diagnostic(body, 400, "ZC-E0104");
+}
+
 test "a client that goes quiet is closed by the watchdog, not kept for ever" {
     // Goal: a slow client cannot hold a slot for ever. Method: connect, send half a head, wait for
     // the idle timeout, and see the server close the connection and free the slot. Takes about
