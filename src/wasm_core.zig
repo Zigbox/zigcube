@@ -21,6 +21,7 @@ const core = @import("core.zig");
 const core_smoke = @import("core_smoke.zig");
 const sim_c0 = @import("sim_c0.zig");
 const sim_cluster = @import("sim_cluster.zig");
+const sim_swarm = @import("sim_swarm.zig");
 
 comptime {
     // Zig analyses only what is referenced; this makes the whole of every core module count.
@@ -47,6 +48,24 @@ export fn zcube_sim_c0(seed: u64) u32 {
 export fn zcube_sim_fuzz(seed: u64, operations: u32) u32 {
     sim_c0.fuzz(std.heap.wasm_allocator, seed, operations, &sim_report);
     return @backingInt(sim_report.failed);
+}
+
+var swarm_report: sim_swarm.Report = .{};
+
+/// Runs the swarm simulation (`sim_swarm.zig`): 0 if every check held, else 1. The report is read
+/// with `zcube_swarm_report_ptr` and `zcube_swarm_report_len`, and is byte for byte what the
+/// native `sim-swarm` prints.
+export fn zcube_sim_swarm(seed: u64, operations: u32) u32 {
+    sim_swarm.simulate(seed, operations, &swarm_report);
+    return @intFromBool(swarm_report.failed);
+}
+
+export fn zcube_swarm_report_ptr() [*]const u8 {
+    return &swarm_report.bytes;
+}
+
+export fn zcube_swarm_report_len() u32 {
+    return swarm_report.len;
 }
 
 var cluster_report: sim_cluster.Report = .{};
