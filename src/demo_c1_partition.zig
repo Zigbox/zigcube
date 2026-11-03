@@ -3,9 +3,9 @@
 //! local TCP proxy that the demo makes drop traffic in both directions. Asserted from process
 //! facts on the host, polled every `poll_ms`:
 //!
-//!   * every command of `node1` is dead by `P + ttl - fence_margin + fence_stop + kill latency`,
-//!     where `P` is the moment the proxy dropped traffic (`s`, the send time of the last
-//!     acknowledged keepalive, is at or before `P`, so the bound is sound, if weaker);
+//!   * every command of `node1` is dead by `E - fence_margin + fence_stop + kill latency` and
+//!     before `E`, where `E` is the server's expiry of the lease (at or after `s + ttl`, `s` the
+//!     send time of the last acknowledged keepalive; the agent fences at `s + ttl - margin`);
 //!   * no replacement starts before the server's expiry of the lease plus `lost_grace_ms`
 //!     (the expiry is read from the lease after the partition took hold, when no keepalive can
 //!     land any more);
@@ -46,6 +46,8 @@ const Watch = struct {
 };
 
 fn look(watch: *Watch, demo: *Demo, now_ms: u64) !void {
+    assert(watch.old.len <= old_max);
+    assert(watch.new_count <= old_max);
     const procs = demo.fleet.procs(index);
     var old_alive: usize = 0;
     for (watch.old, 0..) |pids, at| {
@@ -66,7 +68,11 @@ fn look(watch: *Watch, demo: *Demo, now_ms: u64) !void {
         for (watch.new_names[0..watch.new_count]) |seen| {
             known = known or std.mem.eql(u8, seen, name);
         }
-        if (known or watch.new_count == old_max) continue;
+        if (known) continue;
+        // More than the old ones had is a failure the check reports, not one to drop.
+        if (watch.new_count == old_max) return demo.host.fail("more than {d} replacements ran", .{
+            old_max,
+        });
         watch.new_names[watch.new_count] = try demo.host.arena().dupe(u8, name);
         watch.new_ms[watch.new_count] = now_ms;
         watch.new_count += 1;
@@ -89,6 +95,7 @@ pub fn run(demo: *Demo) !void {
     assert(fleet.proxy != null);
     const before = try state.running_everywhere(fleet, host.arena());
     const old = try fleet.procs(index).running_containers();
+    assert(old.len <= old_max);
     const alive = old.len == 3 and fleet.agent_alive(index);
     try host.check(alive, "{s}'s agent is alive and runs {d} replicas before the partition", .{
         node, old.len,
@@ -114,9 +121,9 @@ pub fn run(demo: *Demo) !void {
 /// `zcube get nodes` reads it, added to the moment of the read.
 fn lease_expiry(demo: *Demo) !u64 {
     const host = demo.host;
-    const rows = (try state.node_rows(host)).?;
-    const row = state.find_node(rows, node).?;
+    const row = try state.need_node(host, node);
     const remaining = row.remaining_ms orelse return host.fail("{s} has no lease", .{node});
+    assert(remaining >= 0);
     const expiry = host.now_ms() + @as(u64, @intCast(remaining));
     host.say("  the server's lease of {s} runs out in {d} ms (ttl {d} ms)", .{
         node, remaining, state.ttl_ms,
@@ -125,19 +132,23 @@ fn lease_expiry(demo: *Demo) !u64 {
 }
 
 fn expect_timing(host: *Host, watch: *const Watch, cut_ms: u64, expiry_ms: u64) !void {
+    assert(watch.old.len <= old_max);
     var last_death: u64 = 0;
     for (watch.died_ms[0..watch.old.len]) |died| {
         try host.check_quiet(died != 0, "a command of {s} still runs", .{node});
         last_death = @max(last_death, died);
     }
-    const stopped_after = last_death - cut_ms;
-    const in_time = stopped_after <= state.stop_bound_ms + state.tolerance_ms;
-    try host.check(in_time, "the agent stopped " ++
-        "all {d} containers {d} ms after the cut (bound: ttl {d} - margin {d} + stop {d} + kill " ++
-        "{d} = {d} ms)", .{
-        watch.old.len,             stopped_after,           state.ttl_ms,
-        constants.fence_margin_ms, constants.fence_stop_ms, constants.fence_kill_latency_ms,
-        state.stop_bound_ms,
+    // Signed: a failure must be reported, not panic on a difference below zero.
+    const expiry: i64 = @intCast(expiry_ms);
+    const death_vs_expiry: i64 = @as(i64, @intCast(last_death)) - expiry;
+    const bound = state.stop_after_expiry_ms + @as(i64, @intCast(state.tolerance_ms));
+    const in_time = death_vs_expiry <= bound and death_vs_expiry < 0;
+    try host.check(in_time, "the agent stopped all {d} containers {d} ms after the cut, {d} ms " ++
+        "relative to the server's expiry (bound: expiry - margin {d} + stop {d} + kill {d} " ++
+        "= {d} ms, +{d} ms for the poll; and before the expiry)", .{
+        watch.old.len,              last_death -| cut_ms,    death_vs_expiry,
+        constants.fence_margin_ms,  constants.fence_stop_ms, constants.fence_kill_latency_ms,
+        state.stop_after_expiry_ms, state.tolerance_ms,
     });
     try host.check_quiet(watch.new_count == watch.old.len, "only {d} replacements ran", .{
         watch.new_count,
@@ -146,12 +157,14 @@ fn expect_timing(host: *Host, watch: *const Watch, cut_ms: u64, expiry_ms: u64) 
     for (watch.new_ms[0..watch.new_count]) |started| first_new = @min(first_new, started);
     const grace_ms: u64 = constants.lost_grace_ms;
     const floor = expiry_ms + grace_ms;
+    const after_expiry: i64 = @as(i64, @intCast(first_new)) - expiry;
     try host.check(first_new + state.tolerance_ms >= floor, "the first replacement ran {d} ms " ++
         "after the server's expiry (no earlier than lost_grace_ms = {d} ms)", .{
-        @as(i64, @intCast(first_new)) - @as(i64, @intCast(expiry_ms)), grace_ms,
+        after_expiry, grace_ms,
     });
-    try host.check(last_death <= first_new, "the old instance was dead {d} ms before the first " ++
-        "replacement ran", .{first_new - last_death});
+    const gap: i64 = @as(i64, @intCast(first_new)) - @as(i64, @intCast(last_death));
+    try host.check(gap >= 0, "the old instance was dead {d} ms before the first " ++
+        "replacement ran", .{gap});
     try host.check(watch.overlaps == 0, "no overlap: in {d} polls, no old command and " ++
         "replacement ran together", .{watch.polls});
 }
@@ -159,9 +172,8 @@ fn expect_timing(host: *Host, watch: *const Watch, cut_ms: u64, expiry_ms: u64) 
 /// The replicas were replaced under new ids on the other nodes, and `zcube get` says so.
 fn expect_replaced(demo: *Demo, old: []const host_procs.Pids) !void {
     const host = demo.host;
-    const rows = (try state.replica_rows(host, "hello")) orelse {
-        return host.fail("no replicas", .{});
-    };
+    assert(old.len <= old_max);
+    const rows = try state.need_replicas(host, "hello");
     const moved = state.all_running(rows, 6) and state.on_node(rows, node, "running") == 0;
     try host.check(moved, "zcube get replicas: 6 running, none on {s}", .{node});
     for (old) |pids| {
@@ -169,8 +181,7 @@ fn expect_replaced(demo: *Demo, old: []const host_procs.Pids) !void {
         try host.check_quiet(!listed, "{s} is still listed", .{pids.name()});
     }
     try state.expect_placement(demo, "after the partition", .{ 0, 3, 3 });
-    const nodes = (try state.node_rows(host)).?;
-    const row = state.find_node(nodes, node).?;
+    const row = try state.need_node(host, node);
     try host.check(row.is_lost(), "zcube get nodes: {s} is lost", .{node});
 }
 
@@ -190,11 +201,12 @@ fn heal(demo: *Demo, old: []const host_procs.Pids) !void {
     demo.fleet.proxy.?.heal();
     const what = "node1 to register again under a new tenure";
     try host.wait_for(demo, rejoined, what, state.start_wait_ms);
-    const row = state.find_node((try state.node_rows(host)).?, node).?;
-    try host.check(row.tenure.? > old_tenure, "{s} registered again under tenure {d} (was {d})", .{
-        node, row.tenure.?, old_tenure,
+    const row = try state.need_node(host, node);
+    const tenure = try state.need_tenure(host, row);
+    try host.check(tenure > old_tenure, "{s} registered again under tenure {d} (was {d})", .{
+        node, tenure, old_tenure,
     });
-    demo.tenures[index] = row.tenure.?;
+    demo.tenures[index] = tenure;
     const log = try demo.fleet.agent_log(index);
     const warning = "warning[ZC-W0501]: the agent fenced itself and registered again";
     try host.check(state.contains(log, warning), "the agent printed {s}", .{warning});

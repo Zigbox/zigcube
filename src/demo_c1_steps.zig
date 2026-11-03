@@ -33,15 +33,16 @@ pub fn join(demo: *Demo) !void {
     try host.wait_for(demo, all_ready, "three nodes to be ready", state.start_wait_ms);
     const get = try host.zcube(&.{ "get", "nodes" });
     try host.check(get.code == 0, "zcube get nodes exits 0", .{});
-    const rows = (try state.node_rows(host)).?;
+    const rows = try state.need_nodes(host);
+    assert(rows.len == fleet_mod.count);
     for (fleet_mod.names, 0..) |name, index| {
-        const row = state.find_node(rows, name).?;
+        const row = state.find_node(rows, name) orelse return host.fail("{s} not listed", .{name});
         const capacity = row.cpu_millis == 4000 and row.memory_bytes == 8 * 1024 * 1024 * 1024;
         try host.check(capacity, "{s} is ready with capacity 4000m / 8.0Gi", .{name});
         try host.check(row.ttl_ms == state.ttl_ms, "{s}'s lease has a ttl of {d} ms", .{
             name, state.ttl_ms,
         });
-        demo.tenures[index] = row.tenure.?;
+        demo.tenures[index] = try state.need_tenure(host, row);
     }
     try host.check(state.contains(get.out, "4000m / 8.0Gi"), "the table shows 4000m / 8.0Gi", .{});
     try host.check(state.contains(get.out, "s/8s"), "the table shows leases of 8s", .{});
@@ -106,6 +107,8 @@ pub fn power_off(demo: *Demo) !void {
     host.section("3. power off node3: its replicas are replaced on the survivors");
     const before = try state.running_everywhere(demo.fleet, host.arena());
     const doomed = try names_on(host, before, lost_index);
+    assert(before.len == 6);
+    assert(doomed.len == 2);
     host.say("$ kill -9 the agent of {s} and its {d} supervisors' groups   # demo/kill-node.sh", .{
         lost_name, doomed.len,
     });
@@ -123,10 +126,14 @@ pub fn power_off(demo: *Demo) !void {
     });
     try host.wait_for({}, node_is_lost, "node3 to read lost", state.failover_ms);
     const lost_after = host.now_ms() - started;
-    const lost_in_time = lost_after <= state.ttl_ms + state.tolerance_ms + 2_000;
-    try host.check(lost_in_time, "{s} read lost {d} ms " ++
-        "after the power-off, within the lease timeout of {d} ms (+ the controllers' pass)", .{
-        lost_name, lost_after, state.ttl_ms,
+    // The last keepalive was sent at most ttl/3 (+ the agent's 1 s pass) before the kill, and the
+    // server declares the loss at the expiry, so it cannot come much sooner than ttl - that.
+    const early_ms: u64 = state.ttl_ms - state.ttl_ms / 3 - 1_000 - state.tolerance_ms;
+    const late_ms: u64 = state.ttl_ms + state.tolerance_ms + 2_000;
+    const lost_in_time = lost_after >= early_ms and lost_after <= late_ms;
+    try host.check(lost_in_time, "{s} read lost {d} ms after the power-off (the lease timeout " ++
+        "is {d} ms: expected {d}..{d} ms, the controllers' pass included)", .{
+        lost_name, lost_after, state.ttl_ms, early_ms, late_ms,
     });
     const swapped: Replaced = .{ .demo = demo, .gone = doomed };
     try host.wait_for(swapped, replaced, "the replicas to be replaced", state.failover_ms);
@@ -153,7 +160,9 @@ fn names_on(host: *Host, list: []const state.Placed, index: usize) ![]const []co
 /// nothing runs on the lost node; `zcube get` shows the same.
 fn expect_survivors(demo: *Demo, before: []const state.Placed, doomed: []const []const u8) !void {
     const host = demo.host;
+    assert(doomed.len == 2);
     const now = try state.running_everywhere(demo.fleet, host.arena());
+    assert(now.len <= 6);
     for (before) |placed| {
         if (placed.node == lost_index) continue;
         const name = placed.pids.name();
@@ -179,7 +188,8 @@ fn expect_survivors(demo: *Demo, before: []const state.Placed, doomed: []const [
     });
 }
 
-/// "Lease timeout is configurable and printed at failover": `zcube why node` says it.
+/// "Lease timeout is configurable and printed at failover": `zcube why node` says it, and the
+/// `mark_lost` decision in the store carries it (`ttl_ms`) with when the server last heard.
 fn expect_printed(demo: *Demo) !void {
     const host = demo.host;
     const why = try host.zcube(&.{ "why", "node", lost_name });
@@ -187,11 +197,60 @@ fn expect_printed(demo: *Demo) !void {
     const ttl = "(ttl 8000 ms) ran out";
     const timeout_shown = state.contains(why.out, ttl);
     try host.check(timeout_shown, "it prints the lease timeout: \"" ++ ttl ++ "\"", .{});
-    const heard = "the server last heard from it";
-    try host.check(state.contains(why.out, heard), "it prints when the server last heard", .{});
+    const heard = "the server last heard from it ";
+    const at = std.mem.find(u8, why.out, heard) orelse {
+        return host.fail("zcube why node {s} does not say when it last heard", .{lost_name});
+    };
+    const ago = leading_number(why.out[at + heard.len ..]) orelse {
+        return host.fail("the time last heard is not a number: {s}", .{why.out[at..]});
+    };
+    const lower: u64 = state.ttl_ms;
+    const upper: u64 = state.ttl_ms + state.tolerance_ms + 2_000;
+    try host.check(ago >= lower and ago <= upper, "it prints that the server last heard from " ++
+        "it {d} ms ago (the lease ran out, so at least {d}; at most {d})", .{ ago, lower, upper });
     const decision = "node node3 is lost: its lease";
     try host.check(state.contains(why.out, decision), "...in the node controller's decision", .{});
+    try expect_mark_lost(host);
     _ = try host.zcube(&.{ "get", "nodes" });
+}
+
+/// The digits at the start of `text`, or null.
+fn leading_number(text: []const u8) ?u64 {
+    var end: usize = 0;
+    while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u64, text[0..end], 10) catch null;
+}
+
+/// The store holds one `mark_lost` decision for the lost node: cause `lease_expired`, evidence
+/// with the ttl the server was started with and when it last heard (`last_heard_ms`, present).
+fn expect_mark_lost(host: *Host) !void {
+    const listed = try host.json("/v1/list?prefix=/decisions/&limit=500");
+    const kvs = listed.object.get("kvs") orelse return host.fail("no decisions listed", .{});
+    var found: u32 = 0;
+    for (kvs.array.items) |kv| {
+        const value = (kv.object.get("value") orelse continue).object;
+        const action = value.get("action") orelse continue;
+        const subject = (value.get("subject") orelse continue).object;
+        const name = subject.get("name") orelse continue;
+        if (!std.mem.eql(u8, action.string, "mark_lost")) continue;
+        if (!std.mem.eql(u8, name.string, lost_name)) continue;
+        found += 1;
+        const cause = (value.get("cause") orelse continue).object;
+        const kind = (cause.get("kind") orelse continue).string;
+        try host.check(std.mem.eql(u8, kind, "lease_expired"), "mark_lost's cause is {s}", .{kind});
+        const evidence = (value.get("cause_evidence") orelse {
+            return host.fail("mark_lost carries no evidence", .{});
+        }).object;
+        const ttl = evidence.get("ttl_ms") orelse return host.fail("no ttl_ms in evidence", .{});
+        const heard = evidence.get("last_heard_ms") orelse {
+            return host.fail("no last_heard_ms in evidence", .{});
+        };
+        try host.check(ttl == .integer and ttl.integer == state.ttl_ms, "mark_lost's evidence " ++
+            "has ttl_ms {d}", .{state.ttl_ms});
+        try host.check(heard == .integer, "mark_lost's evidence has last_heard_ms", .{});
+    }
+    try host.check(found == 1, "one mark_lost decision for {s} ({d})", .{ lost_name, found });
 }
 
 // ---- 4 ----
@@ -205,23 +264,24 @@ fn rejoined(demo: *Demo, host: *Host) !bool {
 pub fn restart(demo: *Demo) !void {
     const host = demo.host;
     host.section("4. restart node3: it rejoins empty, and nothing moves back");
-    const before = (try state.replica_rows(host, "hello")).?;
+    const before = try state.need_replicas(host, "hello");
+    assert(before.len == 6);
     try demo.fleet.start_agent(lost_index);
     try host.wait_for(demo, rejoined, "node3 to rejoin under a new tenure", state.start_wait_ms);
-    const rows = (try state.node_rows(host)).?;
-    const row = state.find_node(rows, lost_name).?;
-    try host.check(row.tenure.? > demo.tenures[lost_index], "{s} registered under a new tenure " ++
-        "({d}, was {d})", .{ lost_name, row.tenure.?, demo.tenures[lost_index] });
-    demo.tenures[lost_index] = row.tenure.?;
+    const row = try state.need_node(host, lost_name);
+    const tenure = try state.need_tenure(host, row);
+    try host.check(tenure > demo.tenures[lost_index], "{s} registered under a new tenure " ++
+        "({d}, was {d})", .{ lost_name, tenure, demo.tenures[lost_index] });
+    demo.tenures[lost_index] = tenure;
     try host.settle("nothing may move back", state.settle_ms);
-    const after = (try state.replica_rows(host, "hello")).?;
+    const after = try state.need_replicas(host, "hello");
     const same = rows_equal(before, after);
     try host.check(same, "no replica moved: the same 6 ids on the same nodes", .{});
     const now = try state.running_everywhere(demo.fleet, host.arena());
     try host.check(state.running_on(now, lost_index) == 0, "{s} runs nothing: it rejoined empty", .{
         lost_name,
     });
-    const node_row = state.find_node((try state.node_rows(host)).?, lost_name).?;
+    const node_row = try state.need_node(host, lost_name);
     try host.check(node_row.count == 0, "zcube get nodes: {s} has 0 assigned", .{lost_name});
     try expect_explained(demo);
 }
