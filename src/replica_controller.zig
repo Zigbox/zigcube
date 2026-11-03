@@ -21,8 +21,10 @@
 //!   - a replica whose start failed through the user's fault (the diagnostic's blame is `user`):
 //!     it is **held**, with a `hold_failed_replica` decision on the service, and neither retried
 //!     nor replaced; a new `generation` of the service replaces it;
-//!   - a replica behind its service's `generation`: replaced (a change of the replica count alone
-//!     does not bump `generation`, so scaling never replaces what runs);
+//!   - a replica behind its service's `generation`, or whose image, source, command, env or
+//!     limits are not the service's: replaced (a change of the replica count alone does not bump
+//!     `generation`, so scaling never replaces what runs; the spec is compared as well because a
+//!     service deleted and applied again between two steps restarts at generation 1);
 //!   - replicas of a service that no longer exists: `scale_down` on the (gone) service and
 //!     `stop_replica` for each;
 //!
@@ -229,7 +231,7 @@ const Run = struct {
                 .running = false,
                 .number = number,
             };
-            item.class = classify_one(replica.rec.generation, service.rec.generation, observed);
+            item.class = classify_one(&replica.rec, &service.rec, observed);
             if (item.class == .live) {
                 item.lost = run.lost_placement(replica.rec.id);
                 if (item.lost != null) item.class = .dead;
@@ -406,9 +408,20 @@ const Run = struct {
         const name = service.rec.name;
         const wanted = service.rec.replicas;
         if (plan.dead == 0) {
+            // A stale replica is behind in generation, or ahead of or equal to it and running
+            // another spec (a service applied again starts over at generation 1): say only
+            // what holds for every one of them.
+            const what = if (stale_behind(plan, service) == plan.stale)
+                "run an older one"
+            else
+                "do not run what it asks for";
             const head = try controller.format(run.ctx, "service {s} is at generation {d} and " ++
-                "{d} {s} run an older one; replacing ", .{
-                name, service.rec.generation, plan.stale, plural(plan.stale, "replica", "replicas"),
+                "{d} {s} {s}; replacing ", .{
+                name,
+                service.rec.generation,
+                plan.stale,
+                plural(plan.stale, "replica", "replicas"),
+                what,
             });
             text.appendSlice(run.ctx.arena, head) catch return nomem(run.ctx);
         } else {
@@ -533,10 +546,18 @@ const Run = struct {
         service: *const Entry(records.Service),
     ) Error!void {
         const replica = item.replica;
-        const reason = try controller.format(run.ctx, "{s} is at generation {d}, and service " ++
-            "{s} is at {d}", .{
-            replica.rec.id, replica.rec.generation, service.rec.name, service.rec.generation,
-        });
+        const behind = replica.rec.generation < service.rec.generation;
+        const reason = if (behind)
+            try controller.format(run.ctx, "{s} is at generation {d}, and service " ++
+                "{s} is at {d}", .{
+                replica.rec.id, replica.rec.generation, service.rec.name, service.rec.generation,
+            })
+        else
+            try controller.format(run.ctx, "{s} (generation {d}) does not run what service " ++
+                "{s} (generation {d}) asks for: it is left from before the service was " ++
+                "applied again", .{
+                replica.rec.id, replica.rec.generation, service.rec.name, service.rec.generation,
+            });
         try run.stop_replica(batch, replica, reason, because);
     }
 
@@ -802,10 +823,16 @@ fn by_victim_order(context: void, first: Item, second: Item) bool {
     return first.number > second.number;
 }
 
-fn classify_one(replica_generation: u64, service_generation: u64, observed: ?*const Entry(
-    records.Observed,
-)) Class {
-    if (replica_generation < service_generation) return .stale;
+fn classify_one(
+    replica: *const records.Replica,
+    service: *const records.Service,
+    observed: ?*const Entry(records.Observed),
+) Class {
+    if (replica.generation < service.generation) return .stale;
+    // A service deleted and applied again between two steps starts over at generation 1, so a
+    // replica of the old one can be ahead of the new service or equal to it (docs/keys.md): only
+    // what it runs says whether it is current.
+    if (!records.replica_runs_service(replica, service)) return .stale;
     const found = observed orelse return .live;
     if (found.rec.status != .stopped) return .live;
     if (user_fault(&found.rec)) return .held;
@@ -846,6 +873,17 @@ fn exit_evidence(ctx: *const Context, exit: records.Exit) Error![]const u8 {
 
 fn desired_cause(service: *const Entry(records.Service)) records.Cause {
     return .{ .kind = .desired, .key = service.kv.key, .revision = service.kv.mod_revision };
+}
+
+/// How many of the plan's stale replicas are behind the service in generation.
+fn stale_behind(plan: *const ServicePlan, service: *const Entry(records.Service)) u32 {
+    var behind: u32 = 0;
+    for (plan.slice()) |item| {
+        if (item.class != .stale) continue;
+        if (item.replica.rec.generation < service.rec.generation) behind += 1;
+    }
+    assert(behind <= plan.stale);
+    return behind;
 }
 
 fn plural(count: u32, one: []const u8, many: []const u8) []const u8 {

@@ -145,6 +145,22 @@ const Fixture = struct {
         return out.toOwnedSlice(testing.allocator);
     }
 
+    fn expect_replica_image(self: *Fixture, id: []const u8, image: []const u8) !void {
+        const ctx = self.context();
+        const list = try controller.list_all(
+            records.Replica,
+            &ctx,
+            records.replicas_prefix("hello").slice(),
+            null,
+            constants.replicas_max,
+        );
+        for (list.items) |item| {
+            if (!std.mem.eql(u8, item.rec.id, id)) continue;
+            return testing.expectEqualStrings(image, item.rec.image);
+        }
+        return error.TestUnexpectedResult;
+    }
+
     fn free_ids(list: []const []const u8) void {
         for (list) |item| testing.allocator.free(item);
         testing.allocator.free(list);
@@ -188,6 +204,27 @@ const Fixture = struct {
             const decision = try records.read(records.Decision, ctx.arena, got.kv.?, &self.diag);
             if (!std.mem.eql(u8, decision.action, action)) continue;
             return (decision.cause_evidence orelse return error.NoEvidence).text;
+        }
+        return error.NoSuchDecision;
+    }
+
+    /// The `reason` of the first decision of `kind`/`name` whose action is `action`.
+    fn reason_of(
+        self: *Fixture,
+        kind: records.SubjectKind,
+        name: []const u8,
+        action: []const u8,
+    ) ![]const u8 {
+        const ctx = self.context();
+        const prefix = records.index_prefix(kind, name);
+        const query: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+        const page = try ctx.store.list(ctx.arena, query, &self.diag);
+        for (page.kvs) |kv| {
+            const entry = try records.read(records.IndexEntry, ctx.arena, kv, &self.diag);
+            const at = records.decision_key(entry.id);
+            const got = try ctx.store.get(ctx.arena, at.slice(), null, &self.diag);
+            const decision = try records.read(records.Decision, ctx.arena, got.kv.?, &self.diag);
+            if (std.mem.eql(u8, decision.action, action)) return decision.reason;
         }
         return error.NoSuchDecision;
     }
@@ -426,6 +463,89 @@ test "a spec change replaces every replica; deleting the service stops them all"
     defer chain.deinit(testing.allocator);
     const tail = "delete_service<desired;scale_down<desired;";
     try testing.expect(std.mem.endsWith(u8, chain.items, tail));
+}
+
+test "a service deleted and applied again between two steps loses its old replicas (issue 55)" {
+    // Goal: regression for the simulation fleet's issue 55. Generation restarts at 1 when a
+    // service is deleted and applied again, and the controller never saw the service gone, so
+    // the old replicas look like the new service's. Method: the replicas are ahead (generation 2,
+    // image B) of the new service (generation 1, image A), which is how the simulation kept
+    // them until the service's next apply reached generation 2.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var first = hello;
+    first.replicas = 2;
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    var second = first;
+    second.image = "b3:9d20c4f1";
+    try fixture.apply(second);
+    _ = try fixture.settle();
+    const rolled = try fixture.ids("hello");
+    defer Fixture.free_ids(rolled);
+    try expect_ids(&.{ "hello-3", "hello-4" }, rolled);
+
+    const ctx = fixture.context();
+    const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000003");
+    try testing.expect(done == .written);
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    const renewed = try fixture.ids("hello");
+    defer Fixture.free_ids(renewed);
+    try expect_ids(&.{ "hello-5", "hello-6" }, renewed);
+    try fixture.expect_replica_image("hello-5", first.image);
+}
+
+test "a service applied again with the same generation and another image loses its replicas" {
+    // Goal: the second way to be wrong in issue 55, alone: the old replicas are equal in
+    // generation (1) to the new service and differ only in image, so only the spec comparison
+    // finds them. Method: apply, settle, delete and apply another image with no step between.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var first = hello;
+    first.replicas = 2;
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    const ctx = fixture.context();
+    const gone = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000004");
+    try testing.expect(gone == .written);
+    var second = first;
+    second.image = "b3:9d20c4f1";
+    try fixture.apply(second);
+    _ = try fixture.settle();
+    const last = try fixture.ids("hello");
+    defer Fixture.free_ids(last);
+    try expect_ids(&.{ "hello-3", "hello-4" }, last);
+    try fixture.expect_replica_image("hello-3", second.image);
+    const reason = try fixture.reason_of(.service, "hello", "replace_replica");
+    const expected = "service hello is at generation 1 and 2 replicas do not run what it asks " ++
+        "for; replacing hello-1; hello-2";
+    try testing.expectEqualStrings(expected, reason);
+}
+
+test "a rolled service says its replicas run an older generation" {
+    // Goal: the reason of a replacement names what is true of the replicas. Method: apply a new
+    // image to a running service (generation 2), so its replicas are behind in generation.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var first = hello;
+    first.replicas = 2;
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    var second = first;
+    second.image = "b3:9d20c4f1";
+    try fixture.apply(second);
+    _ = try fixture.settle();
+    const reason = try fixture.reason_of(.service, "hello", "replace_replica");
+    const expected = "service hello is at generation 2 and 2 replicas run an older one; " ++
+        "replacing hello-1; hello-2";
+    try testing.expectEqualStrings(expected, reason);
 }
 
 test "a pass stops after one batch and says it has more to do" {

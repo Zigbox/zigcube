@@ -193,31 +193,9 @@ fn next_generation(existing: ?records.Service, input: Input) u64 {
 fn runs_differently(old: records.Service, input: Input) bool {
     if (!std.mem.eql(u8, old.image, input.image)) return true;
     if (!std.mem.eql(u8, old.source, input.source)) return true;
-    if (!strings_equal(old.command, input.command)) return true;
-    if (!pairs_equal(old.env, input.env)) return true;
-    return !limits_equal(old.limits, input.limits);
-}
-
-fn strings_equal(first: []const []const u8, second: []const []const u8) bool {
-    if (first.len != second.len) return false;
-    for (first, second) |left, right| {
-        if (!std.mem.eql(u8, left, right)) return false;
-    }
-    return true;
-}
-
-fn pairs_equal(first: []const records.Pair, second: []const records.Pair) bool {
-    if (first.len != second.len) return false;
-    for (first, second) |left, right| {
-        if (!std.mem.eql(u8, left[0], right[0])) return false;
-        if (!std.mem.eql(u8, left[1], right[1])) return false;
-    }
-    return true;
-}
-
-fn limits_equal(first: records.Limits, second: records.Limits) bool {
-    if (first.cpu_millis != second.cpu_millis) return false;
-    return first.memory_bytes == second.memory_bytes;
+    if (!records.strings_equal(old.command, input.command)) return true;
+    if (!records.pairs_equal(old.env, input.env)) return true;
+    return !records.limits_equal(old.limits, input.limits);
 }
 
 /// One line saying what an apply changed; never an `env` value (docs/keys.md).
@@ -242,9 +220,13 @@ fn change_summary(ctx: *const Context, existing: ?records.Service, input: Input)
         });
         try append_part(ctx, &text, piece);
     }
-    if (!strings_equal(old.command, input.command)) try append_part(ctx, &text, "command changed");
-    if (!pairs_equal(old.env, input.env)) try append_part(ctx, &text, "env changed");
-    if (!limits_equal(old.limits, input.limits)) try append_part(ctx, &text, "limits changed");
+    if (!records.strings_equal(old.command, input.command)) {
+        try append_part(ctx, &text, "command changed");
+    }
+    if (!records.pairs_equal(old.env, input.env)) try append_part(ctx, &text, "env changed");
+    if (!records.limits_equal(old.limits, input.limits)) {
+        try append_part(ctx, &text, "limits changed");
+    }
     if (text.items.len == 0) return no_change;
     return text.items;
 }

@@ -280,6 +280,40 @@ pub const Replica = struct {
     source: []const u8 = "",
 };
 
+/// Whether `replica` runs what `service` asks for now: the image, `source`, command, `env` and
+/// `limits`, the inputs that bump a service's `generation`. The generation alone cannot say: it
+/// restarts at 1 when a service is deleted and applied again, so a replica of the previous
+/// incarnation can be ahead of the new service, or equal to it, and still run something else.
+pub fn replica_runs_service(replica: *const Replica, service: *const Service) bool {
+    if (!std.mem.eql(u8, replica.image, service.image)) return false;
+    if (!std.mem.eql(u8, replica.source, service.source)) return false;
+    if (!strings_equal(replica.command, service.command)) return false;
+    if (!pairs_equal(replica.env, service.env)) return false;
+    return limits_equal(replica.limits, service.limits);
+}
+
+pub fn strings_equal(first: []const []const u8, second: []const []const u8) bool {
+    if (first.len != second.len) return false;
+    for (first, second) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+pub fn pairs_equal(first: []const Pair, second: []const Pair) bool {
+    if (first.len != second.len) return false;
+    for (first, second) |left, right| {
+        if (!std.mem.eql(u8, left[0], right[0])) return false;
+        if (!std.mem.eql(u8, left[1], right[1])) return false;
+    }
+    return true;
+}
+
+pub fn limits_equal(first: Limits, second: Limits) bool {
+    if (first.cpu_millis != second.cpu_millis) return false;
+    return first.memory_bytes == second.memory_bytes;
+}
+
 pub const Node = struct {
     v: u32 = 1,
     name: []const u8,
