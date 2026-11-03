@@ -158,8 +158,11 @@ stage_restart() {
 
 # The exit kinds the controller acted on for a service's replicas, from `/decisions/`: the
 # durable witness. The replica controller deletes an ended replica's observed record at once and
-# replaces it, so `stopped oom` is observed for an instant that a poll can miss, but the decision
-# that replaces it keeps what justified it in `cause_evidence` (docs/keys.md).
+# replaces it, so `stopped oom` is observed for an instant that a poll can miss. The decision
+# that replaces it stays, and names the exit in its `reason` ("hog-3 ran out of memory on
+# smoke, so it is being removed": `records.exit_text`). The replica controller does not put the
+# exit in `cause_evidence` (docs/keys.md shows it there; `remove_dead` leaves it out), so the
+# reason is what is read; an exit that is not `oom` prints `-`.
 decided_exits() {
     api_get "/v1/list?prefix=/decisions/" | python3 -c '
 import json, sys
@@ -167,7 +170,10 @@ for kv in json.load(sys.stdin)["kvs"]:
     v = kv["value"]
     key = (v.get("cause") or {}).get("key", "")
     if "/observed/" + sys.argv[1] + "/" + sys.argv[2] + "-" in key:
-        print(v.get("action"), key, ((v.get("cause_evidence") or {}).get("exit") or {}).get("kind", "-"))
+        kind = ((v.get("cause_evidence") or {}).get("exit") or {}).get("kind", "-")
+        if kind == "-" and " ran out of memory on " in (v.get("reason") or ""):
+            kind = "oom"
+        print(v.get("action"), key, kind)
 ' "$NODE" "$1"
 }
 
