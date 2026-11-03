@@ -423,7 +423,8 @@ test "the commands of the handoff parse, with options before or after" {
     try testing.expectEqualStrings("ZC-E0201", explain.command.explain);
     _ = try parse_text(&.{"help"});
     try testing.expectEqual(LocalAction.up, (try parse_text(&.{ "local", "up" })).command.local);
-    try testing.expectEqual(LocalAction.down, (try parse_text(&.{ "-v", "local", "down" })).command.local);
+    const verbose_down = try parse_text(&.{ "-v", "local", "down" });
+    try testing.expectEqual(LocalAction.down, verbose_down.command.local);
 }
 
 test "the refusals: each names the part at fault" {

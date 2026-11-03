@@ -87,7 +87,8 @@ pub fn is_zombie(stat: []const u8) bool {
 }
 
 /// True if `cmdline` (NUL-separated, from `/proc`) is `exe_name` working in `dir`: the program's
-/// file name is `exe_name` and some argument names the directory. A reused pid fails one of the two.
+/// file name is `exe_name` and some argument names the directory. A reused pid fails one
+/// of the two.
 pub fn is_ours(cmdline: []const u8, exe_name: []const u8, dir: []const u8) bool {
     assert(exe_name.len > 0);
     assert(dir.len > 0);
@@ -140,7 +141,7 @@ pub fn pick_port(
 fn raise_no_dir(report: *Report) void {
     report.diag.raise(.E0116);
     report.diag.while_("finding the directory for zcube local", .{});
-    report.diag.cause("neither ZCUBE_LOCAL_DIR, XDG_STATE_HOME nor HOME names an absolute path", .{});
+    report.diag.cause("none of ZCUBE_LOCAL_DIR, XDG_STATE_HOME and HOME is absolute", .{});
     report.diag.fix(.{
         .sentence = "name a directory you can write, then run it again:",
         .command = "export ZCUBE_LOCAL_DIR=$HOME/.local/state/zcube/local",
@@ -253,7 +254,7 @@ const Local = struct {
             local.report.diag.raise(.E0120);
             local.report.diag.while_("running zcube local", .{});
             local.report.diag.cause("a request for memory was refused", .{});
-            local.report.diag.fix(.{ .sentence = "free memory on this machine, then run it again" });
+            local.report.diag.fix(.{ .sentence = "free memory, then run it again" });
         }
         return error.Failed;
     }
@@ -319,8 +320,11 @@ const Local = struct {
         const images = try local.path("images.zon");
         var cpu: [16]u8 = undefined;
         var memory: [24]u8 = undefined;
-        const cpu_text = std.fmt.bufPrint(&cpu, "{d}", .{constants.local_cpu_millis}) catch unreachable; // 10 digits at most.
-        const memory_text = std.fmt.bufPrint(&memory, "{d}", .{constants.local_memory_bytes}) catch unreachable; // 20 digits at most.
+        // A u32 has 10 digits and a u64 20, so neither buffer can run out.
+        const cpu_text = std.fmt.bufPrint(&cpu, "{d}", .{constants.local_cpu_millis}) catch
+            unreachable;
+        const memory_text = std.fmt.bufPrint(&memory, "{d}", .{constants.local_memory_bytes}) catch
+            unreachable;
         return local.spawn(agent_exe, "agent", &.{
             "--node",         constants.local_node_name,
             "--server",       address,
@@ -404,8 +408,10 @@ const Local = struct {
         }
         const format = "the {s} did not {s} within {d} s";
         const seconds = @divFloor(constants.local_up_wait_ms, 1000);
-        if (!answered) return std.fmt.allocPrint(local.arena, format, .{ "server", "answer", seconds }) catch "the server did not answer";
-        return std.fmt.allocPrint(local.arena, format, .{ "agent", "register its node", seconds }) catch "the agent did not register its node";
+        const who: []const u8 = if (answered) "agent" else "server";
+        const what: []const u8 = if (answered) "register its node" else "answer";
+        return std.fmt.allocPrint(local.arena, format, .{ who, what, seconds }) catch
+            "the local process did not come up";
     }
 
     fn say_up(
@@ -415,20 +421,18 @@ const Local = struct {
         server: Found,
         agent: Found,
     ) Failed!void {
-        const text = std.fmt.allocPrint(local.arena,
-            "local: {s}\n" ++
-                "  server  {s} (pid {d}), log {s}/server.log\n" ++
-                "  agent   node {s} (pid {d}), log {s}/agent.log\n" ++
-                "  state   {s}\n" ++
-                "next:\n" ++
-                "  export ZCUBE_SERVER={s}\n" ++
-                "  zcube apply hello.zon\n" ++
-                "stop it with: zcube local down\n",
-            .{
-                what,                      address,    server.pid, local.dir,
-                constants.local_node_name, agent.pid,  local.dir,  local.dir,
-                address,
-            }) catch return local.out_of_memory();
+        const text = std.fmt.allocPrint(local.arena, "local: {s}\n" ++
+            "  server  {s} (pid {d}), log {s}/server.log\n" ++
+            "  agent   node {s} (pid {d}), log {s}/agent.log\n" ++
+            "  state   {s}\n" ++
+            "next:\n" ++
+            "  export ZCUBE_SERVER={s}\n" ++
+            "  zcube apply hello.zon\n" ++
+            "stop it with: zcube local down\n", .{
+            what,                      address,   server.pid, local.dir,
+            constants.local_node_name, agent.pid, local.dir,  local.dir,
+            address,
+        }) catch return local.out_of_memory();
         try local.emit(text);
     }
 
@@ -478,7 +482,8 @@ fn up(local: *const Local) Failed!void {
     const agent = local.find("agent", agent_exe);
     if (server.presence == .running and agent.presence == .running) {
         if (local.read(try local.path("address"))) |address| {
-            return local.say_up("already running", std.mem.trim(u8, address, " \t\r\n"), server, agent);
+            const where = std.mem.trim(u8, address, " \t\r\n");
+            return local.say_up("already running", where, server, agent);
         }
     }
     // Anything half-running is stopped, so the two always start together on one address. The
@@ -509,10 +514,10 @@ fn down(local: *const Local) Failed!void {
     const stopped = local.stop_all(&found);
     var text: []const u8 = "local: not running\n";
     if (stopped > 0) {
-        text = std.fmt.allocPrint(local.arena,
-            "local: stopped server (pid {d}) and agent (pid {d}); state kept in {s}\n" ++
-                "the agent's containers keep running; zcube local up adopts them\n",
-            .{ found[1].pid, found[0].pid, local.dir }) catch return local.out_of_memory();
+        const format = "local: stopped server (pid {d}) and agent (pid {d}); state kept in {s}\n" ++
+            "the agent's containers keep running; zcube local up adopts them\n";
+        const args = .{ found[1].pid, found[0].pid, local.dir };
+        text = std.fmt.allocPrint(local.arena, format, args) catch return local.out_of_memory();
     }
     try local.emit(text);
 }
@@ -544,4 +549,122 @@ pub fn run(env: *const Env, action: cli_args.LocalAction, report: *Report) u8 {
     };
     result catch return constants.exit_environment;
     return constants.exit_ok;
+}
+
+// ---- Tests -----------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "the local directory follows ZCUBE_LOCAL_DIR, then XDG_STATE_HOME, then HOME" {
+    // Goal: where `zcube local` keeps its files. Method: each variable alone and together, a
+    // relative one refused, a trailing slash trimmed, none at all.
+    var map = std.process.Environ.Map.init(testing.allocator);
+    defer map.deinit();
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    const env: Env = .{
+        .io = testing.io,
+        .arena = testing.allocator,
+        .environ = &map,
+        .stdout = &sink.writer,
+        .stderr = &sink.writer,
+        .stdin = null,
+        .stdin_is_terminal = false,
+        .stderr_is_terminal = false,
+        .version = "0",
+    };
+    var buffer: [constants.state_path_bytes_max]u8 = undefined;
+    try testing.expect(local_dir(&env, &buffer) == null);
+    try map.put("HOME", "/home/alex");
+    const home_dir = local_dir(&env, &buffer).?;
+    try testing.expectEqualStrings("/home/alex/.local/state/zcube/local", home_dir);
+    try map.put("XDG_STATE_HOME", "/var/state");
+    try testing.expectEqualStrings("/var/state/zcube/local", local_dir(&env, &buffer).?);
+    try map.put("ZCUBE_LOCAL_DIR", "/work/z/");
+    try testing.expectEqualStrings("/work/z", local_dir(&env, &buffer).?);
+    try map.put("ZCUBE_LOCAL_DIR", "z");
+    try testing.expect(local_dir(&env, &buffer) == null);
+    try map.put("ZCUBE_LOCAL_DIR", "/");
+    try testing.expect(local_dir(&env, &buffer) == null);
+}
+
+test "pid and port files parse only what we wrote" {
+    // Goal: a damaged or foreign file is never mistaken for a process or a port.
+    try testing.expectEqual(@as(?i32, 4242), parse_pid("4242\n"));
+    try testing.expectEqual(@as(?i32, null), parse_pid(""));
+    try testing.expectEqual(@as(?i32, null), parse_pid("abc"));
+    try testing.expectEqual(@as(?i32, null), parse_pid("-1"));
+    try testing.expectEqual(@as(?i32, null), parse_pid("0"));
+    try testing.expectEqual(@as(?i32, null), parse_pid("1"));
+    try testing.expectEqual(@as(?u16, 7071), parse_port("127.0.0.1:7071\n"));
+    try testing.expectEqual(@as(?u16, null), parse_port("127.0.0.1"));
+    try testing.expectEqual(@as(?u16, null), parse_port("127.0.0.1:0"));
+    try testing.expectEqual(@as(?u16, null), parse_port("127.0.0.1:70000"));
+}
+
+test "a stale pid file is told from a running process of ours" {
+    // Goal: never signal a stranger. Method: every way a pid file can lie, then the one truth.
+    const dir = "/tmp/zl";
+    const mine = "/usr/bin/zcube-server\x00--store\x00sqlite:/tmp/zl/zcube.db\x00";
+    const alive = "123 (zcube-server) S 1 2 3";
+    try expect_presence(.absent, decide(null, null, null, "zcube-server", dir));
+    try expect_presence(.stale, decide("junk", alive, mine, "zcube-server", dir));
+    try expect_presence(.stale, decide("123\n", null, null, "zcube-server", dir));
+    const zombie = "123 (zcube-server) Z 1 2 3";
+    try expect_presence(.stale, decide("123\n", zombie, mine, "zcube-server", dir));
+    const stranger = "/usr/bin/vim\x00/tmp/zl/notes\x00";
+    try expect_presence(.stale, decide("123\n", alive, stranger, "zcube-server", dir));
+    const elsewhere = "/usr/bin/zcube-server\x00--store\x00sqlite:/other/zcube.db\x00";
+    try expect_presence(.stale, decide("123\n", alive, elsewhere, "zcube-server", dir));
+    const found = decide("123\n", alive, mine, "zcube-server", dir);
+    try testing.expectEqual(Presence.running, found.presence);
+    try testing.expectEqual(@as(i32, 123), found.pid);
+    // A process name with spaces and parentheses must not fool the zombie check.
+    try testing.expect(!is_zombie("9 (a) Z) S 1"));
+    try testing.expect(is_zombie("9 (a) Z 1"));
+}
+
+fn expect_presence(want: Presence, found: Found) !void {
+    try testing.expectEqual(want, found.presence);
+}
+
+const FreeSet = struct {
+    taken_below: u16,
+
+    fn is_free(context: *anyopaque, port: u16) bool {
+        const set: *FreeSet = @ptrCast(@alignCast(context));
+        return port >= set.taken_below;
+    }
+};
+
+test "the port is the first free one, or none" {
+    // Goal: 7070 or the next free port. Method: a fake probe with a boundary, and an exhausted run.
+    var set: FreeSet = .{ .taken_below = 7070 };
+    try testing.expectEqual(@as(?u16, 7070), pick_port(7070, 4, &set, FreeSet.is_free));
+    set.taken_below = 7073;
+    try testing.expectEqual(@as(?u16, 7073), pick_port(7070, 4, &set, FreeSet.is_free));
+    set.taken_below = 7074;
+    try testing.expectEqual(@as(?u16, null), pick_port(7070, 4, &set, FreeSet.is_free));
+    set.taken_below = 0;
+    try testing.expectEqual(@as(?u16, null), pick_port(65535, 2, &set, struct {
+        fn never(_: *anyopaque, _: u16) bool {
+            return false;
+        }
+    }.never));
+}
+
+test "the embedded image list is the fixture's" {
+    // Goal: an installed `zcube` writes the same images the repository's fixture lists.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const ours = try agent_config.parse_images(arena, images_text, "images.zon", &diag);
+    const buffer = try arena.allocSentinel(u8, 4096, 0);
+    const read = try std.Io.Dir.cwd().readFile(testing.io, "fixtures/images.zon", buffer);
+    buffer[read.len] = 0;
+    const source = buffer[0..read.len :0];
+    const theirs = try agent_config.parse_images(arena, source, "images.zon", &diag);
+    try testing.expectEqual(theirs.len, ours.len);
+    for (ours, theirs) |a, b| try testing.expectEqualStrings(a, b);
 }
