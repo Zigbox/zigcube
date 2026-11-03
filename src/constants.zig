@@ -461,8 +461,19 @@ pub const peer_join_request_bytes_max: u32 = 512;
 pub const peer_join_retry_ms: u32 = 5 * 1000;
 /// One join call waits this long at most (less near the lease's fence).
 pub const peer_join_timeout_ms: u32 = 3 * 1000;
+/// Handshakes the peer server starts for one source address in one window; the next is refused.
+/// An honest agent opens a handshake per fetch connection, a few per node per window.
+pub const peer_handshakes_per_source_max: u32 = 16;
+/// The window the per-source bound counts in.
+pub const peer_handshake_window_ms: u64 = 10 * 1000;
+/// Sources the limiter tracks at once. A table full of live windows refuses a new source: the
+/// cheapest answer to an address flood, and an agent retries.
+pub const peer_sources_max: u32 = 256;
 
 comptime {
+    assert(peer_handshakes_per_source_max > 0);
+    assert(peer_handshake_window_ms > 0);
+    assert(peer_sources_max >= peer_handshakes_per_source_max);
     assert(peer_credential_ttl_ms < peer_credential_ttl_ms_max);
     assert(peer_record_bytes_max + 16 <= std.math.maxInt(u16));
     assert(peer_clock_skew_ms < peer_credential_ttl_ms / 2);

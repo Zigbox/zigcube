@@ -1,0 +1,5 @@
+error[ZC-E0808]: a peer was refused: too many handshakes from one address
+  cause  10.0.0.7 started 16 handshakes in 10000 ms; the bound is 16
+  fix    nothing: it tries again after the window; check that node's agent for a retry loop
+  more   zcube explain E0808 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0808.html

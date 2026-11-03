@@ -95,6 +95,7 @@ pub const Code = enum(u8) {
     E0805,
     E0806,
     E0807,
+    E0808,
     B0001,
     B0002,
     B0003,
@@ -1214,6 +1215,24 @@ pub const registry = [_]Entry{
         \\file and restart zcube-server; the agent asks again by itself. The API is
         \\unauthenticated, so this binds an honest node only: until the API has auth,
         \\anyone who can reach it can register a name and ask for a credential.
+        ,
+    },
+    .{
+        .code = .E0808,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a peer was refused: too many handshakes from one address",
+        .explanation =
+        \\An agent's peer server starts at most a fixed number of handshakes per
+        \\source address in a short window (peer_handshakes_per_source_max in
+        \\peer_handshake_window_ms), and tracks a fixed number of sources. The
+        \\handshake costs the server public-key work, so a source that asks faster
+        \\is turned away before any of it.
+        \\
+        \\An honest fetch opens a handful of connections. If one node is refused
+        \\over and over, something there retries in a loop: look at its agent's
+        \\output. The refused node tries again by itself after the window, and a
+        \\fetch falls back to the registry meanwhile.
         ,
     },
     .{

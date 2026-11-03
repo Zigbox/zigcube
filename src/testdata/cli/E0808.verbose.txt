@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0808]: a peer was refused: too many handshakes from one address
+  cause  10.0.0.7 started 16 handshakes in 10000 ms; the bound is 16
+  reqid  r-0000001
+  fix    nothing: it tries again after the window; check that node's agent for a retry loop
+  more   zcube explain E0808
+  docs   https://zigbox.github.io/zigcube/errors/E0808.html

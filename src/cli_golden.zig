@@ -419,6 +419,15 @@ fn peer_removed(diag: *diag_mod.Diag) void { // agent_api.zig
     );
 }
 
+fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
+    sample(
+        diag,
+        .E0808,
+        &.{"10.0.0.7 started 16 handshakes in 10000 ms; the bound is 16"},
+        "nothing: it tries again after the window; check that node's agent for a retry loop",
+    );
+}
+
 fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
     sample(
         diag,
@@ -583,6 +592,7 @@ const cases = [_]Case{
     relayed(.E0805, peer_record),
     relayed(.E0806, peer_key_file),
     relayed(.E0807, peer_removed),
+    relayed(.E0808, peer_limited),
     relayed(.W0601, peer_bad_chunk),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
