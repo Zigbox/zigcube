@@ -20,7 +20,8 @@ import { join } from "node:path";
 
 const wasi = process.argv[2] === "--wasi";
 const sim = process.argv[2] === "--sim";
-const simCluster = process.argv[2] === "--sim-cluster";
+const simC1 = process.argv[2] === "--sim-c1";
+const simCluster = process.argv[2] === "--sim-cluster" || simC1;
 const path = process.argv[wasi || sim || simCluster ? 3 : 2];
 if (!path) {
   console.error("usage: node tools/wasm_check.mjs [--wasi | --sim ...] <module.wasm>");
@@ -52,18 +53,21 @@ if (simCluster) {
   const [wasmPath, seedText, operationsText, nodesText, livenessText, nativePath] = process.argv.slice(3);
   const exports = await instantiate(readFileSync(wasmPath));
   const started = Date.now();
-  const failed = exports.zcube_sim_cluster(BigInt(seedText), Number(operationsText), Number(nodesText), livenessText === "true" ? 1 : 0);
+  const failed = simC1
+    ? exports.zcube_sim_c1(BigInt(seedText), Number(operationsText), Number(nodesText))
+    : exports.zcube_sim_cluster(BigInt(seedText), Number(operationsText), Number(nodesText), livenessText === "true" ? 1 : 0);
+  const label = simC1 ? "sim-c1" : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_cluster_report_ptr(), exports.zcube_cluster_report_len());
   const wasmText = new TextDecoder().decode(rendered);
   const nativeText = readFileSync(nativePath, "utf8");
   if (failed !== 0 || wasmText !== nativeText) {
-    console.error(`sim-cluster (seed ${seedText}): wasm ${failed === 0 ? "held every check" : "failed"}; reports ${wasmText === nativeText ? "agree" : "differ"}`);
+    console.error(`${label} (seed ${seedText}): wasm ${failed === 0 ? "held every check" : "failed"}; reports ${wasmText === nativeText ? "agree" : "differ"}`);
     if (wasmText !== nativeText) console.error(firstDifference(nativeText, wasmText));
     console.error(wasmText);
     process.exit(1);
   }
-  console.log(`sim-cluster: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}; wasm ${seconds} s)`);
+  console.log(`${label}: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}; wasm ${seconds} s)`);
   process.exit(0);
 }
 

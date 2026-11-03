@@ -767,6 +767,7 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     add_sim_cluster_step(b, sim);
     add_sim_fleet_step(b, sim);
     add_sim_teeth_step(b, sim);
+    add_sim_c1_steps(b, sim);
 }
 
 /// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]`: the cluster
@@ -809,6 +810,76 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
 }
+
+/// The negative tests of sim-c1 (docs/authority.md §4, docs/core.md "sim-c1"): each root file
+/// declares one test-only switch (`src/c1_teeth.zig`), and the check it breaks.
+const c1_teeth_roots = [_]struct { name: []const u8, root: []const u8, symptom: []const u8 }{
+    .{ .name = "allocation", .root = "src/sim_c1_teeth_allocation_main.zig", .symptom = "I6" },
+    .{ .name = "readiness", .root = "src/sim_c1_teeth_readiness_main.zig", .symptom = "I7" },
+    .{ .name = "skew", .root = "src/sim_c1_teeth_skew_main.zig", .symptom = "I1b" },
+    .{ .name = "wedge", .root = "src/sim_c1_teeth_wedge_main.zig", .symptom = "I1b" },
+};
+
+/// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
+/// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
+/// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
+/// `sim-c1-teeth` runs the four negative tests, each of which passes only if its check fires.
+fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_cluster",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = sim.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    b.step("sim-c1-exe", "Install the native sim-c1 runner (sim_cluster --c1)")
+        .dependOn(&install.step);
+    const nodes = b.option(u32, "c1-nodes", "Nodes of sim-c1 (default: the seed picks)") orelse 0;
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = b.fmt("{d}", .{sim.ops});
+    const nodes_text = b.fmt("{d}", .{nodes});
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
+    const native_report = run.captureStdOut(.{});
+    const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-c1");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true" });
+        node.addFileArg(native_report);
+        step.dependOn(&node.step);
+    }
+    const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
+    for (c1_teeth_roots) |entry| {
+        const teeth_exe = b.addExecutable(.{
+            .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(entry.root),
+                .target = sim.target,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+            }),
+        });
+        const teeth_run = b.addRunArtifact(teeth_exe);
+        teeth_run.addArgs(&.{
+            "--seeds",                            b.fmt("1..{d}", .{teeth_seeds_max}),
+            b.fmt("{d}", .{c1_teeth_operations}), "--c1",
+            "--expect-fail",                      b.fmt("--expect-symptom={s}", .{entry.symptom}),
+        });
+        teeth.dependOn(&teeth_run.step);
+        const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
+        own.dependOn(&teeth_run.step);
+        const own_install = b.addInstallArtifact(teeth_exe, .{});
+        own.dependOn(&own_install.step);
+    }
+}
+
+const c1_teeth_operations = 100;
 
 /// `zig build sim-fleet-exe` installs `zig-out/bin/sim_fleet`, the reporter of the simulation fleet
 /// (ops/sim-fleet/README.md): it files the failures `sim_cluster` finds. A host tool with no
