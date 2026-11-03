@@ -18,6 +18,10 @@
 //! `--expect-fail` turns the range into the teeth test (`sim_teeth_main.zig`): it stops at the
 //! first seed that fails and exits 0 only if there was one.
 //!
+//! `--c1` runs sim-c1 (docs/core.md, "sim-c1"): the per-revision checks of docs/authority.md §4.
+//! `--expect-symptom=TEXT` with `--expect-fail` makes the failure count only if it starts with
+//! TEXT; the negative tests of sim-c1 use it (`sim_c1_teeth_main.zig`).
+//!
 //! `--trace-steps` writes `step: <name>` to stderr, unbuffered, as each run enters a step
 //! ("faults", "healed", "convergence", "end"), so a run that panics leaves where it was: the
 //! simulation fleet's runner files a crash under that step (ops/sim-fleet/run.sh). A range writes
@@ -45,6 +49,9 @@ const Args = struct {
     shrink: bool = false,
     expect_fail: bool = false,
     trace_steps: bool = false,
+    /// `--expect-symptom=TEXT` (with `--expect-fail`): the failure must start with TEXT ("I6"),
+    /// so a negative test passes only if the check it is about is the one that fired.
+    expect_symptom: ?[]const u8 = null,
 };
 
 /// Null if the arguments are not a valid command line.
@@ -72,6 +79,7 @@ fn parse(args: []const []const u8) ?Args {
     if (positional_count < skip + 1 or positional_count > skip + 2) return null;
     if (!parsed.range) {
         if (parsed.shrink or parsed.expect_fail) return null; // These need a range.
+        if (parsed.expect_symptom != null) return null;
         parsed.first_seed = std.fmt.parseInt(u64, positional[0], 0) catch return null;
         parsed.last_seed = parsed.first_seed;
     } else if (parsed.options.heal_at != null) {
@@ -103,6 +111,10 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.shrink = true;
     } else if (std.mem.eql(u8, arg, "--expect-fail")) {
         parsed.expect_fail = true;
+    } else if (std.mem.eql(u8, arg, "--c1")) {
+        parsed.options.c1 = true;
+    } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
+        parsed.expect_symptom = arg["--expect-symptom=".len..];
     } else if (std.mem.eql(u8, arg, "--trace-steps")) {
         parsed.trace_steps = true;
     } else if (std.mem.startsWith(u8, arg, "--heal-at=")) {
@@ -209,6 +221,7 @@ fn print_replay(
         seed, operations, options.nodes orelse 0,
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
+    if (options.c1) try out.writeAll(" --c1");
     if (heal_at) |point| try out.print(" --heal-at={d}", .{point});
     try out.writeAll("\n");
 }
@@ -227,7 +240,18 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
             report_failure(init, parsed, seed, report, out) catch return constants.exit_environment;
             // Out now: a crash on a later seed must not lose it.
             out.flush() catch return constants.exit_environment;
-            if (parsed.expect_fail) break; // Caught: that is all the teeth test asks.
+            if (parsed.expect_fail) {
+                // Caught, and that is all the teeth test asks, if it is the right check.
+                if (parsed.expect_symptom) |want| {
+                    if (!std.mem.startsWith(u8, symptom(report), want)) {
+                        out.print("sim-cluster: seed {d} failed, but not with \"{s}\"\n", .{
+                            seed, want,
+                        }) catch return constants.exit_environment;
+                        return constants.exit_user;
+                    }
+                }
+                break;
+            }
         }
         if (seed == parsed.last_seed) break;
     }

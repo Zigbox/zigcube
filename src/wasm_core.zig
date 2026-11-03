@@ -63,6 +63,17 @@ export fn zcube_sim_cluster(seed: u64, operations: u32, nodes: u32, liveness: u3
     return @intFromBool(cluster_report.failed);
 }
 
+/// Runs sim-c1 (`Options.c1`), the cluster simulation with the per-revision checks of
+/// docs/authority.md §4: 0 if every check held, else 1. The report is read as the cluster's.
+export fn zcube_sim_c1(seed: u64, operations: u32, nodes: u32) u32 {
+    const options: sim_cluster.Options = .{
+        .nodes = if (nodes == 0) null else nodes,
+        .c1 = true,
+    };
+    sim_cluster.simulate(std.heap.wasm_allocator, seed, operations, options, &cluster_report);
+    return @intFromBool(cluster_report.failed);
+}
+
 export fn zcube_cluster_report_ptr() [*]const u8 {
     return &cluster_report.bytes;
 }
