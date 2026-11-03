@@ -1,76 +1,156 @@
 # Supervisor handoff
 
-*Written 2026-10-30 by the supervisor session that shipped C0; updated the same day by the session that started C1 and merged its slices 1 and 2. Update it when you hand off in turn: replace what changed, keep it short.*
+*Updated 2026-11-03 by the supervisor session that shipped C1 and merged M7 slices 1 to 3b-i, for the session that runs C2 and the rest of M7. It covers both repos. Update it when you hand off in turn: replace what changed, keep it short.*
 
-## The role
+The owner decides; the supervisor runs the work. Zigbox (`Zigbox/zigbox`) is the sister project: its `AGENTS.md`, `REVIEW.md` and `DIAGNOSTICS.md` are where new rules show up first.
 
-The owner decides; the supervisor runs the work. You:
 
-- write each slice's brief and start a **fresh implementer session** for it (`create_session`, a Sonnet model; a Haiku one for purely mechanical jobs, which AGENTS.md now requires (owner, 2026-10-30), and each brief names its slice's mechanical parts for the implementer to hand to Haiku);
-- review every slice adversarially against `REVIEW.md`, `docs/STYLE.md`, `DIAGNOSTICS.md` and `docs/authority.md`, and start a fresh session for the fixes;
-- open the PRs, watch CI (`subscribe_pr_activity`), and tell the owner when a PR is ready;
-- merge your own green PRs that change only docs, the site or CI, when the owner has asked you to ship (they have, since C0); leave code PRs to the owner unless told otherwise;
-- keep `README.md`, `site/index.html` and `site/architecture.html` in step with the status, and update the pages with the CI run link when a milestone ships;
-- keep the live design doc (https://claude.ai/artifact/6D9js8mxSLYmfuZe3rQ26w, a Claude Doc) current when the owner decides something that changes it. Zigbox's `docs/SPEC.md` is a snapshot of it.
+## Role
 
-Zigbox (`Zigbox/zigbox`) is the sister project and ahead of us on process and diagnostics. Borrow from it ("borrow diags from Zigbox"); its `AGENTS.md`, `REVIEW.md` and `DIAGNOSTICS.md` are where new rules show up first. Check its `AGENTS.md` log when you start.
+You supervise Zigcube C2 and Zigbox M7, one slice at a time. Each slice runs through these steps:
 
-## Conventions that cost a round when missed
+1. A fresh **Sonnet** implementer session (`create_session`, model `claude-sonnet-5-5`, `extra_allowed_tools ["mcp__claude-code-remote__add_repo"]`, `source_url` and `source_revision` = main).
+2. An **Opus** review session, which inherits the model.
+3. A fresh Sonnet fix session for the review findings.
+4. A PR.
+5. A squash-merge.
 
-- Develop on the branch the session gives you; restart it from `origin/main` once its PR has merged. Never push to `main`, never force-push (fast-forward only).
-- Commits are signed off (`git commit -s`) and end with the session's attribution lines. No model names in commits, PRs or code.
-- CI runs on pull requests and `main` only. Documentation-only changes skip every job but `changes`; status-only commits carry `[skip ci]`, nothing else does.
-- `merge_pull_request` needs the full 40-character head SHA.
-- "Demonstrated" means `demo-cN` green in CI, with the run linked. `sim-cN` and `agent-smoke` are never called demos.
-- Playwright here: the default headless shell is missing; launch Chromium with `executablePath` set to the binary under `/opt/pw-browsers/`.
-- Implementer reports must carry the gates on the reported commit and a handoff note (`AGENTS.md`). A report without them goes back.
-- Sessions you start are yours to archive, but only with the owner's OK. Scheduled tasks on this account that you did not create belong to other sessions; leave them alone.
+You may merge to main once the review findings are fixed and CI is green. Zigbox also needs its `vm.yml` run green on a `vm/*` branch.
 
-## Where things stand
+After each merge:
 
-- **C0 · Loop: demonstrated** 2026-10-27 (run 40556942364), nine slices, PRs #4–#15.
-- **Authority model, revision 3** (`docs/authority.md`) is approved and is what C1 is built to. The architecture page shows it; `docs/keys.md` points at it.
-- **Process reset, 2026-10-30:** Zigbox's context discipline adopted (`AGENTS.md`), `REVIEW.md` and `docs/DECISIONS.md` added. `zig build check` exists since C1 slice 1.
-- **The CI skip for documentation-only PRs works live:** on PR #22 (run 41071276402) only `changes` ran, and every code job was skipped.
-- **C1 started 2026-10-30.** `docs/briefs/c1.md` is written; the fencing constants are the owner's (DECISIONS.md).
-  - Slice 1 (`zig build check`) merged in Zigbox/zigcube#23.
-  - Slice 2 (keys, versioned records, writer table, compare sets) merged in Zigbox/zigcube#24 after review and a fix session. The review fixes were one version source, the version read before the shape, and authority.md's move count (8) and `retention` role.
-  - **Next: slice 3 (scheduler).** Its brief, `docs/briefs/c1-3.md`, is on `main`; no implementer session has been started. It includes the owner's decision (2026-10-30) that `next_replica` moves to `/replica-numbers/<service>`, and a supervisor call the owner may overrule: no in-place upgrade from a C0 store (a v1 replica's `node` is ignored and it is placed again).
-  - README and site still say slice 2 is in review: update them to 2 of 8 merged in the next PR.
-  - Zigbox: SPEC.md resync to rev 86 merged in Zigbox/zigbox#23, and the Haiku rule in Zigbox/zigbox#25.
-- **Traps from slice 2.**
-  - The fix session was refused `add_repo` for Zigbox/zigbox, so it could not fetch the pinned package and pushed code it never compiled; its new test failed. The slice 3 brief now makes the implementer prove it can build before it writes code. If it still cannot, hand it the tarball or ask the owner to allow `add_repo`.
-  - Always run `zig build check` yourself on a fix branch before opening the PR; tidy (`zig fmt`) caught a line the fix session never formatted.
-  - Do not push to an open PR's branch for docs-only follow-ups: each push restarts its CI. Batch them.
-  - The slice 2 fix session (`session_01RfMZXLxkmaRen5xudyGXBU`) and the slice 2 implementer session are finished; archive them with the owner's OK.
-- **Local mode settled (owner, 2026-10-30):** C1 builds `zcube local up` only; names and grants moved to C4; the demo keeps agents on one machine. The live doc and Zigbox's `docs/SPEC.md` are both at rev 86.
+- Update README.md and site/index.html in a commit marked `[skip ci]`.
+- Dispatch `pages.yml` by hand (`actions_run_trigger run_workflow`, ref `main`), because `[skip ci]` also skips Pages.
 
-## The plan: C1 · Fleet
+Rules:
 
-Slices are cut small so that each fits one implementer session under the context ceiling. Each has its own brief in `docs/briefs/c1-<n>.md`, written by the supervisor from `docs/briefs/c1.md`.
+- **No tags or releases.**
+- Do not subscribe to PR activity.
+- Report briefly, with costs.
+- Leave owner-only decisions to the owner.
 
-0. **Brief.** Done: `docs/briefs/c1.md`, which settled:
-   - a replica that fits no node: held pending, with the shortfall in its decision;
-   - the fencing constants (proposed: ttl 10 s, fence_stop 2 s, skew 1 %, fence_margin 3 s, `lost_grace_ms` 1 s) — **owner**;
-   - a random part in server-assigned request IDs;
-   - a watch fan-out benchmark and its bar;
-   - the demo environment script in `demo/`, and the partition test HANDOFF asks for.
-1. **Faster loop.** `zig build check`: every gate (build, test, tidy, errors-site-check, wasm-check, wasm-test, console-wasm, test-store on memory and SQLite, and Postgres when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` with a fresh seed, and, as root, `zig build test` again as an ordinary user, as CI runs it. One last line: `check: PASS <commit>` or `check: FAIL ...`. Port it from Zigbox's `src/testing/check.zig`. A Haiku or Sonnet session; AGENTS.md's gate list then shrinks to this command.
-2. **Keys and writers.** The C1 key layout (`/nodes` lease-bound, `/node-status`, `/assigned`, `/allocations`, `/audit/allocations`, `/observed` with tenure and assignment), the writer-role table enforced in the core (I4), the compare-set helpers. `docs/keys.md` rewritten from `authority.md`.
-2b. **Cluster simulator** (owner, 2026-10-30). The agent's loop, its endpoint client and its persisted state move into the core; a `Network` seam with partitions and lost responses; a clock per node; agent crashes; the store's lost acknowledgement; `sim_cluster.zig` with swarm testing, a liveness mode and a seed runner that shrinks. Brief: `docs/briefs/c1-2b.md`. Slices 3 to 6 wire into it; slice 5's invariants and slice 6's fencing are checked by it.
-3. **Scheduler.** Fit and spread, the placement transaction with its full compare set, allocation accounting, pending with the shortfall.
-4. **Node controller and auditor.** Lease expiry to `lost` after `lost_grace_ms`, rescheduling, the auditor's `ZC-B` findings blocking placement, `zcube repair allocations <node> --confirm` as a `repair_allocation` decision.
-5. **sim-c1.** Invariants I1a–I7, the negative tests that must find I1b, I6 and I7 violations, the evidence acceptance test, native against WASM.
-6. **Agent.** Registration with a lease, tenure-checked observed writes, self-fencing on `CLOCK_BOOTTIME` with `s` persisted, the partition test.
-7. **Surfaces.** `zcube get nodes`, `get replicas -o wide`, `why node`, `repair`, `local up`; `docs/api.md` (`completeness` on `why`), the console.
-8. **demo-c1.** The demo script from HANDOFF, three agents on one machine, as `zig build demo-c1` on SQLite and Postgres, in CI.
-9. **Simulation fleet** (owner, 2026-10-30). An always-on instance runs `sim-cluster` 24/7 at `main` and files a GitHub issue per new failure (shrunk, deduplicated, with the replay command). Can start as soon as 2b lands. Needs from the owner: the instance and a fine-grained token with issues:write on `Zigbox/zigcube` only.
-10. **Store fault proxy** (owner, 2026-10-30). Our own Toxiproxy-style proxy in Zig; the conformance suite through it against real Postgres with a history checker; primary-to-standby failover (synchronous loses nothing, asynchronous is refused by the chain hash). Also the two store rules in `c1.md`'s table: the supported Postgres setup, and the store never going backwards. Can start in parallel with slice 3. Brief: `docs/briefs/c1-10.md` (10a chain hash, 10b refusing rollback, 10c proxy and history checker, 10d failover).
+## Mechanics
 
-Then: README, site and architecture page updated with the run link; C1 marked demonstrated. **C1 ships only when demo-c1 and test-store-faults are green and the fleet has run 24 hours on the shipping commit with every issue it filed closed or recorded as a cut** (`docs/briefs/c1.md`, "Gate for shipping C1").
+**Commits**
 
-## Open with the owner
+- Sign off with `git commit -s`, and add these trailers:
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and
+  `Claude-Session: https://claude.ai/code/session_01RfMZXMyXBLPcsaPf5PCxtq`.
+- Never put a model name in a repo artifact.
+- PR bodies end with "🤖 Generated with [Claude Code](https://claude.com/claude-code)" and the session link.
 
-- C0's implementer sessions and the CI-skip session are archived (owner's OK, 2026-10-30), except slice 4 (`session_01Jc3KpBnbQjqTJsuVnLZ6uD`), whose archive the permission classifier refused; the owner archives it.
-- Zigbox items, low priority: a separate diagnostics module (zigbox issue #8), a real code for `ZBX-E0410` and one for `lost`, container start time in `Runtime`.
+**Child sessions**
+
+- To read a child's report, call `list_events` with `kinds ["result"]`.
+- When it is done, call `archive_session`; the response gives `cost_usd`.
+
+**GitHub**
+
+- Force-push is denied. Push fixes to a new branch name and close the superseded PR.
+- `merge_pull_request` needs the full 40-character SHA as `expectedHeadSha`. Use squash.
+- The GitHub MCP disconnects often. Reload it with ToolSearch `select:mcp__github__<tool>`.
+- On Zigbox PRs, the "check and demos on macOS" job stays queued with no runner. Merge past it: there is no Mac build this release.
+
+**CI**
+
+- Zigcube CI runs only on PRs and main.
+- Zigbox `vm.yml` runs on pushes to `vm/<demo>-<slug>`.
+
+**Local**
+
+- Clones are at /home/user/zigcube and /home/user/zigbox. Update them with `git pull -q --ff-only origin main`.
+- There is no zig locally; children build.
+- **Summary doc (Claude Docs):** https://claude.ai/artifact/SE5XBKq9fVWHmdhJLamENX. Update it with `mcp__Claude_Docs__update`, using ref `{"object":"node","id":"5751ad44-4a69"}`, engine `prose`, and container `{"kind":"project","id":"cc47ebd7-0b8b-47eb-8dfb-791ef09b0ac4"}`. The current rev is 8.
+- This file is the handoff. Update it, in Zigcube, when you hand off.
+
+## State at handoff
+
+**C1 is demonstrated.**
+
+- Main CI run [41605325965](https://github.com/Zigbox/zigcube/actions/runs/41605325965) on 48024d6 was green.
+- README and site were updated in 21cab3a, and Pages was dispatched.
+
+**M7 has slices 1, 2, 3a and 3b-i merged.**
+
+- Slice 3b-i is zigbox#34 (a126aee). It ran as VM run 41605919986.
+- The status commit is defd2c1, and Pages was dispatched.
+- The site still shows `green:2,total:5`, "not demonstrated".
+
+**Overnight:** 12 PRs merged (Zigcube #38 #39 #37 #42 #46 #48 #50 #51; Zigbox #31 #32 #33 #34), about $122 in child sessions.
+
+**In flight:** nothing. No sessions or check-ins are scheduled.
+
+## Owner decisions (2026-11-03), not yet written into the repos
+
+### M7: slice 3b-ii is split into two parts (approved)
+
+**3b-ii, "The result"**
+
+- Image assembly and its cache, `image.config`, E0807.
+- The build record and the result digest.
+- `zbx run <digest>` and `zbx inspect <digest>`.
+- `--output json` and `zbx schema build`.
+- Pull of a locked base by digest. This removes the E0804 stopgap.
+- The N8 fix: root step outputs come before the cache entry.
+- VM check: the full demo builds, `zbx run` prints "hello from zigbox", and the JSON shows `compile` and `notice` overlapping.
+
+**3b-iii, "Network, streaming, library"**
+
+- `network = true`, with `net` in the report, and W0801.
+- `--verbose` streaming (kept).
+- The `zigbox.build` library export, with a second-caller test.
+- Worker crashes in the simulation, with the result digest a function of the inputs only.
+- **The pasta VM check is cut (owner, 2026-11-03).** demo-m5 already checks pasta, and demo-m7 step 6 (slice 4) runs `wget` through it end to end. Record the cut in `docs/demos/m7.md`.
+
+Slice 4 (demo-m7, upgrade, CI) follows.
+
+Record the split in `docs/briefs/M7-build.md` (slice 3 is at about line 166) and in `docs/demos/m7.md`, on the 3b-ii branch.
+
+### C2 (`zigcube/docs/briefs/c2.md`; owner questions at about lines 312–354, Z table at about line 299)
+
+**Approved:**
+
+- O1: `/node-store/<node>`, advisory, with an authority.md amendment.
+- O2: placement order is fit, then spread, then locality, then least allocated, then name. Demo step 4 gets a new service on a shared image.
+- O4: hostfwd plus a guest nft rule.
+- O5: the node with the lowest `hash(node, tree)` pulls; the others wait up to 30 s for peers.
+- O6: the key is `/pulls/<node>/<tree>`.
+- O7: peers are not on `Runtime.Spec`.
+- O8: GHCR images the owner pushes, public and pinned by digest.
+- Z1–Z8: all approved.
+- `source` names the OCI reference, and the provenance reservation is renamed `provenance`. A change of `source` bumps generation.
+
+**Open:**
+
+**Decided after the list above:**
+
+- **O3: mTLS (owner, 2026-11-03).** The peer chunk protocol is authenticated with mutual TLS. The control plane is the cluster CA and issues each node a certificate at join (node name in the cert). Chunk servers accept only peers whose certificates chain to the cluster CA, and clients verify the serving node's name. Integrity still rests on BLAKE3, and TLS adds confidentiality.
+  - **Before slice 6, check:**
+    - **Std TLS server support.** Have a Haiku agent read the pinned std's `std.crypto.tls` and confirm whether it supports server-side TLS 1.3 and client certificates. If it doesn't, slice 6 needs its own minimal TLS 1.3 server with Ed25519 certs. That would be a large piece of work, and the owner should be told about it before the slice is briefed.
+    - **Docs to amend:**
+      - O3 in c2.md.
+      - A keys.md / authority.md item covering where the CA key lives (the server's state, never in the store in clear), certificate lifetime, renewal before lease expiry, rotation, and revocation when a node is removed.
+      - New diagnostics, e.g. peer refused: bad or expired certificate.
+- **Console:** the "full on hover" behaviour against docs/console.md is still unanswered.
+
+## Next steps
+
+1. Mark the decided owner questions in c2.md, either through a docs PR or inside slice 5's branch.
+2. Start the **M7 3b-ii** implementer: Sonnet, from Zigbox main, with a VM check on `vm/m7-slice3b2`. Include the brief/demo-doc split edits.
+3. Start the **C2 slice 5** implementer: locality in keys and the scheduler, per O1 and O2.
+4. Brief the Zigbox slices for Z1–Z8. C2 slices 8 and 9 depend on them.
+5. Check std TLS (see O3), amend c2.md for mTLS, then C2 slice 6 (peers, mTLS, O5). Slice 7 (`/pulls`) follows. Slice 6 may need splitting (CA and issuing; then the chunk protocol over mTLS).
+6. Afterwards, M7 3b-iii, then slice 4 (demo-m7).
+
+## Kept from earlier handoffs
+
+- Playwright here: the default headless shell is missing. Launch Chromium with `executablePath` set to the binary under `/opt/pw-browsers/`.
+- Implementer reports must carry `check: PASS <commit>` on the reported commit and a handoff note. A report without them goes back.
+- A fix session that cannot `add_repo` Zigbox/zigbox cannot build. Make every implementer prove it can build before it writes code.
+- Do not push docs-only follow-ups to an open PR's branch: each push restarts its CI. Batch them.
+- Scheduled tasks on this account that you did not create belong to other sessions. Leave them alone.
+- Open, low priority:
+  - Zigbox issue #8, a separate diagnostics module.
+  - A real code for `lost`.
+  - Container start time in `Runtime`.
 - Before C7: a TLA+ model of fencing. Before a second server: a leader lease on `/leader/controllers`.
