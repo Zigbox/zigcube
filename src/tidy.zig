@@ -532,7 +532,8 @@ fn check_imports(
 
 fn import_allowed(importing_path: []const u8, target: []const u8) bool {
     // The one reader of the root file: the agent's test-only fault switch (src/agent.zig).
-    if (std.mem.eql(u8, target, "root")) return std.mem.eql(u8, importing_path, "src/agent.zig");
+    if (std.mem.eql(u8, target, "root")) return std.mem.eql(u8, importing_path, "src/agent.zig") or
+        std.mem.eql(u8, importing_path, "src/c1_teeth.zig");
     for (module_allowlist) |name| {
         if (std.mem.eql(u8, name, target)) return true;
     }
@@ -793,7 +794,7 @@ test "imports: std and in-repo files pass; escapes, absolute paths and packages 
     try testing.expect(report.contains(.import_not_allowed, 10));
     var root_report: Report = undefined;
     check_text(&root_report, "const r = @import(\"root\");\n");
-    try testing.expect(root_report.contains(.import_not_allowed, 1)); // Only agent.zig may.
+    try testing.expect(root_report.contains(.import_not_allowed, 1)); // Not other files.
     try testing.expect(!report.contains(.import_not_allowed, 11));
     try testing.expect(!report.contains(.import_not_allowed, 12));
     try testing.expectEqual(@as(u32, 4), report.total());

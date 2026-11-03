@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const compare_sets = @import("compare_sets.zig");
 const accounting = @import("allocations.zig");
 const constants = @import("constants.zig");
@@ -584,7 +585,7 @@ pub const Scheduler = struct {
         var batch: Batch = .{};
         var set: compare_sets.Set = .{};
         compare_sets.placement(&set, replica_read(replica), node_read(view));
-        expect_all(&batch, &set);
+        expect_placement(&batch, &set);
         const reason = try place_reason(ctx, world, replica, chosen, need);
         try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null);
         const key = try assign_key(ctx, name, replica.rec.id);
@@ -896,6 +897,23 @@ fn node_read(view: *const NodeView) compare_sets.NodeRead {
 
 fn expect_all(batch: *Batch, set: *compare_sets.Set) void {
     for (set.compares()) |compare| batch.expect(compare.key, compare.mod_revision);
+}
+
+/// `expect_all` for a placement, and the one place the sim-c1 negative tests weaken the scheduler:
+/// in a build whose root switched on `c1_teeth.skip_allocation_compare`, `/allocations/<node>` is
+/// left out; with `skip_readiness_compare`, `/node-status/<node>` and `/nodes/<node>` are.
+/// Both constants are false in every other build, so this is `expect_all`.
+fn expect_placement(batch: *Batch, set: *compare_sets.Set) void {
+    if (!c1_teeth.any) return expect_all(batch, set);
+    for (set.compares()) |compare| {
+        const skip_allocation = c1_teeth.skip_allocation_compare and
+            std.mem.startsWith(u8, compare.key, records.prefix_allocations);
+        const skip_readiness = c1_teeth.skip_readiness_compare and
+            (std.mem.startsWith(u8, compare.key, records.prefix_node_status) or
+                std.mem.startsWith(u8, compare.key, records.prefix_nodes));
+        if (skip_allocation or skip_readiness) continue;
+        batch.expect(compare.key, compare.mod_revision);
+    }
 }
 
 fn assign_key(ctx: *const Context, node: []const u8, replica: []const u8) Error![]const u8 {

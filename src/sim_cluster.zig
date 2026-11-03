@@ -35,16 +35,19 @@ const agent_loop = @import("agent_loop.zig");
 const agent_mod = @import("agent.zig");
 const api_mod = @import("api.zig");
 const apply_mod = @import("apply.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
+const sim_c1 = @import("sim_c1.zig");
 const sim_checks = @import("sim_checks.zig");
 const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
 const sim_store = @import("sim_store.zig");
+const sim_tap = @import("sim_tap.zig");
 const sim_world = @import("sim_world.zig");
 const store = @import("store.zig");
 const why_mod = @import("why.zig");
@@ -97,6 +100,21 @@ const check_interval_ms: u64 = 1000;
 /// it (docs/DECISIONS.md, "sim-cluster liveness mode").
 pub const liveness_bound_ms: u64 = 240_000;
 
+/// sim-c1: a clock beyond the skew bound (the negative test), the longest a frozen agent stays
+/// frozen, and the overlap table's size.
+const skew_beyond_ppm: u32 = 700_000;
+const freeze_ms_min: u32 = 5000;
+const freeze_ms_spread: u32 = 20_000;
+const overlaps_max: u32 = 64;
+
+/// I1b: how long one replica may execute on two nodes at once when no node is wedged: the lost
+/// grace, the kill latency, and the simulator's own granularity (a tick, and the check interval).
+const overlap_ms_max: u64 = constants.lost_grace_ms + constants.fence_kill_latency_ms +
+    constants.fence_stop_ms + tick_ms + check_interval_ms;
+/// A node counts as wedged for this long after its agent was last down, frozen or unable to kill:
+/// its fence deadline passed with nobody to act on it.
+const wedge_memory_ms: u64 = constants.node_lease_ttl_ms + constants.fence_stop_ms;
+
 const hello_digest = "b3:51aa9c03";
 const next_digest = "b3:9d20c4f1";
 const broken_digest = "b3:00ff" ++ repeat('0', 55).* ++ "e1";
@@ -146,6 +164,8 @@ pub const Swarm = struct {
     w_outage: u32,
     w_server: u32,
     w_suspend: u32,
+    /// sim-c1 only: an agent freezes, with its containers still running.
+    w_freeze: u32 = 0,
 
     /// Zero a quarter of the time, else 1 to `max`.
     fn rate(random: std.Random, max: u32) u32 {
@@ -193,6 +213,21 @@ pub const Swarm = struct {
             .w_server = rate(r, 4),
             .w_suspend = rate(r, 4),
         };
+    }
+
+    /// The faults sim-c1 adds to the seed's world, drawn apart from the base draw so that a
+    /// sim-cluster run of the same seed is unchanged. The negative tests turn them up.
+    fn add_c1_faults(swarm: *Swarm, seed: u64) void {
+        var prng = std.Random.DefaultPrng.init(seed ^ 0xc1fa_17e5);
+        const r = prng.random();
+        swarm.w_freeze = rate(r, 6);
+        if (c1_teeth.skew_beyond_bound) {
+            if (swarm.nodes > 1) swarm.w_partition = 25;
+        }
+        if (c1_teeth.wedge) {
+            swarm.w_freeze = 30;
+            swarm.w_runtime = 20;
+        }
     }
 
     fn print(swarm: *const Swarm, report: *Report) void {
@@ -248,6 +283,10 @@ const Node = struct {
     /// Since when the server has had no registration of this node (its lease ran out), while
     /// the agent was up; null while it has one. The fencing invariant's clock.
     unregistered_since_ms: ?u64,
+    /// sim-c1: the agent does nothing until this true time (frozen, its containers running).
+    frozen_until_ms: ?u64,
+    /// sim-c1: the last true time the agent was down, frozen, or a container ignored its stop.
+    last_wedged_ms: ?u64,
     /// Times the agent fenced itself, over the whole run (all agent lives).
     fences: u32,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
@@ -416,6 +455,10 @@ const Node = struct {
     /// Does what the loop says until it must wait for time to pass. Returns transactions made.
     fn drive(node: *Node) u32 {
         const c = node.cluster;
+        if (node.frozen_until_ms) |until| {
+            if (c.manual.ms < until) return 0;
+            node.frozen_until_ms = null;
+        }
         if (node.down) {
             if (c.manual.ms < node.restart_at_ms) return 0;
             node.restart();
@@ -487,12 +530,18 @@ pub const PhaseTotals = struct {
     }
 };
 
+/// One replica executing on two or more nodes at once (I1b): since when, and whether a wedged
+/// node was among them at any time.
+const Overlap = struct { name_hash: u64, since_ms: u64, wedged: bool, seen: bool };
+
 pub const Cluster = struct {
     gpa: Allocator,
     seed: u64,
     swarm: Swarm,
     manual: ManualClock,
     memory: *MemoryStore,
+    /// Beneath `ack_loss`: sees every revision as it commits (sim-c1's per-revision checks).
+    tap: sim_tap.TapStore,
     ack_loss: sim_store.AckLossStore,
     switched: sim_world.SwitchedStore,
     net: sim_net.SimNet,
@@ -539,6 +588,22 @@ pub const Cluster = struct {
     /// `liveness_bound_ms`; else faults stay on and only the safety checks run.
     liveness: bool,
     report: *Report,
+    /// sim-c1 (`Options.c1`): the per-revision checks run, and duplicates fail.
+    c1: bool,
+    /// The first per-revision check that failed, and the revision it failed at.
+    c1_violation: ?[]const u8,
+    c1_violation_revision: store.Revision,
+    c1_revisions: u64,
+    /// Scratch for the per-revision checks, which run inside a store call.
+    tap_arena: std.heap.ArenaAllocator,
+    tap_diag: Diag,
+    /// A negative test's competing write has been made (once per run).
+    injected: bool,
+    /// Replicas executing on two nodes right now, and since when.
+    overlaps: [overlaps_max]Overlap,
+    overlap_count: u32,
+    overlap_worst_ms: u64,
+    overlap_wedged_worst_ms: u64,
 
     pub fn create(
         gpa: Allocator,
@@ -556,7 +621,16 @@ pub const Cluster = struct {
         c.manual = .{ .ms = epoch_ms };
         memory.init(gpa, c.manual.clock());
         c.memory = memory;
-        c.ack_loss = .init(memory.interface(), seed ^ 0xac4, c.swarm.ack_loss_per_mille);
+        c.tap = .{
+            .inner = memory.interface(),
+            .context = c,
+            .after = tapped,
+            .before = if (c1_teeth.skip_allocation_compare or c1_teeth.skip_readiness_compare)
+                inject
+            else
+                null,
+        };
+        c.ack_loss = .init(c.tap.interface(), seed ^ 0xac4, c.swarm.ack_loss_per_mille);
         c.switched = .{ .inner = c.ack_loss.interface() };
         c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
         c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
@@ -590,6 +664,7 @@ pub const Cluster = struct {
         c.on_step = null;
         c.liveness = true;
         c.report = report;
+        c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
@@ -597,21 +672,37 @@ pub const Cluster = struct {
         return c;
     }
 
+    /// The state sim-c1 keeps (`Options.c1` turns the checks on).
+    fn init_c1(c: *Cluster, gpa: Allocator) void {
+        c.c1 = false;
+        c.c1_violation = null;
+        c.c1_violation_revision = 0;
+        c.c1_revisions = 0;
+        c.tap_arena = .init(gpa);
+        c.tap_diag.reset();
+        c.injected = false;
+        c.overlap_count = 0;
+        c.overlap_worst_ms = 0;
+        c.overlap_wedged_worst_ms = 0;
+    }
+
     fn create_node(c: *Cluster, index: u32) Allocator.Error!*Node {
         const node = try c.gpa.create(Node);
         const random = c.prng.random();
         const ppm_max: i32 = @intCast(c.swarm.clock_ppm);
+        const skew_ppm: i32 = @intCast(skew_beyond_ppm);
         const ppm = if (ppm_max == 0) 0 else random.intRangeAtMost(i32, -ppm_max, ppm_max);
         node.cluster = c;
         node.index = index;
+        const skewed = c1_teeth.skew_beyond_bound;
         // "node" and at most two digits fit the buffer, since `nodes_max` is 16.
         const name = std.fmt.bufPrint(&node.name_buf, "node{d}", .{index + 1}) catch unreachable;
         node.name_len = @intCast(name.len);
         node.nclock = sim_clock.NodeClock.init(
             c.manual.clock(),
             random.uintLessThan(u64, 1_000_000),
-            ppm,
-            @max(c.swarm.clock_ppm, 1),
+            if (skewed) -skew_ppm else ppm,
+            if (skewed) skew_beyond_ppm else @max(c.swarm.clock_ppm, 1),
         );
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.agent.init(node.config());
@@ -629,6 +720,8 @@ pub const Cluster = struct {
         node.ok_steps = 0;
         node.last_ok = true;
         node.unregistered_since_ms = null;
+        node.frozen_until_ms = null;
+        node.last_wedged_ms = null;
         node.fences = 0;
         node.up_ms = 0;
         node.all_steps = 0;
@@ -654,6 +747,7 @@ pub const Cluster = struct {
         }
         gpa.free(c.nodes);
         c.net.deinit();
+        c.tap_arena.deinit();
         c.arena_state.deinit();
         c.memory.deinit();
         gpa.destroy(c.memory);
@@ -771,6 +865,11 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
+            if (c.c1) {
+                c.note_wedged();
+                track_overlap(c) catch return;
+                c1_check(c) catch return;
+            }
             c.second_ms += slice;
             if (c.second_ms >= 1000) {
                 c.second_ms -= 1000;
@@ -877,6 +976,58 @@ pub const Cluster = struct {
         return false;
     }
 
+    /// Starts the clock of I1b for each replica this transaction marks lost (its decision).
+    fn note_replaced(c: *Cluster, request: store.TxnRequest) void {
+        for (request.on_success) |op| {
+            const put = switch (op) {
+                .put => |put| put,
+                .delete => continue,
+            };
+            if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
+            _ = c.tap_arena.reset(.retain_capacity);
+            const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+            const decision = std.json.parseFromSliceLeaky(
+                records.Decision,
+                c.tap_arena.allocator(),
+                put.value,
+                options,
+            ) catch continue;
+            if (!std.mem.eql(u8, decision.action, "mark_replica_lost")) continue;
+            if (c.overlap_count == overlaps_max) return;
+            c.overlaps[c.overlap_count] = .{
+                .name_hash = std.hash.Wyhash.hash(0, decision.subject.name),
+                .since_ms = c.manual.ms,
+                .wedged = false,
+                .seen = true,
+            };
+            c.overlap_count += 1;
+        }
+    }
+
+    /// Whether `node` cannot stop its containers right now: its agent is down or frozen, or a
+    /// container ignores a stop (`slow_stop`).
+    fn wedged_now(node: *const Node) bool {
+        if (node.down or node.frozen_until_ms != null) return true;
+        for (node.sim.containers.containers.items) |container| {
+            if (container.ignores_stop and container.phase != .stopped) return true;
+        }
+        return false;
+    }
+
+    /// Whether `node` was wedged now or within `wedge_memory_ms`: a stop the node missed while
+    /// wedged is still being made up for.
+    fn wedged_lately(c: *const Cluster, node: *const Node) bool {
+        if (wedged_now(node)) return true;
+        const last = node.last_wedged_ms orelse return false;
+        return c.manual.ms - last <= wedge_memory_ms;
+    }
+
+    fn note_wedged(c: *Cluster) void {
+        for (c.nodes) |node| {
+            if (wedged_now(node)) node.last_wedged_ms = c.manual.ms;
+        }
+    }
+
     // ---- What a person or a fault does ----
 
     fn request_id(c: *Cluster, buffer: []u8) []const u8 {
@@ -978,6 +1129,167 @@ pub const Cluster = struct {
     }
 };
 
+/// The tap's `after`: checks the revision a call just made (`sim_c1.at_revision`).
+fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revision) void {
+    const c: *Cluster = @ptrCast(@alignCast(context));
+    if (!c.c1) return;
+    c.c1_revisions += 1;
+    if (request) |txn| c.note_replaced(txn);
+    if (c.c1_violation != null) return;
+    _ = c.tap_arena.reset(.retain_capacity);
+    c.tap_diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.tap.inner,
+        .clock = c.manual.clock(),
+        .arena = c.tap_arena.allocator(),
+        .diag = &c.tap_diag,
+    };
+    if (sim_c1.at_revision(&ctx, request)) |found| {
+        c.c1_violation = found;
+        c.c1_violation_revision = revision;
+    }
+}
+
+/// The tap's `before`, only in the two negative tests' builds: just ahead of the scheduler's
+/// first placement it commits the competing write that the missing compare would have caught.
+fn inject(context: *anyopaque, request: store.TxnRequest) void {
+    const c: *Cluster = @ptrCast(@alignCast(context));
+    if (c.injected) return;
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_assigned)) continue;
+        const rest = put.key[records.prefix_assigned.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return;
+        c.injected = true;
+        if (c1_teeth.skip_readiness_compare) return inject_node_lost(c, rest[0..slash]);
+        return inject_competing_placement(
+            c,
+            rest[0..slash],
+            allocation_node_revision(c, request, rest[0..slash]),
+        );
+    }
+}
+
+/// The `node_revision` the scheduler's own allocation put carries, which a competing put copies.
+fn allocation_node_revision(c: *Cluster, request: store.TxnRequest, node: []const u8) u64 {
+    const key = records.allocation_key(node);
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.eql(u8, put.key, key.slice())) continue;
+        const arena = c.tap_arena.allocator();
+        const parsed = std.json.parseFromSliceLeaky(records.Allocation, arena, put.value, .{
+            .ignore_unknown_fields = true,
+        }) catch return 0;
+        return parsed.node_revision;
+    }
+    return 0;
+}
+
+/// The node is lost between the scheduler's read and its commit.
+fn inject_node_lost(c: *Cluster, node: []const u8) void {
+    var scratch: Diag = undefined;
+    scratch.reset();
+    const key = records.node_key(node);
+    const ops = [_]store.Op{.{ .delete = key.slice() }};
+    _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
+}
+
+/// Another writer places a replica on the node and raises its allocation by it, after the
+/// scheduler read the allocation: the scheduler's allocation put is then built from a stale sum.
+fn inject_competing_placement(c: *Cluster, node: []const u8, node_revision: u64) void {
+    var arena = std.heap.ArenaAllocator.init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var scratch: Diag = undefined;
+    scratch.reset();
+    const allocation_key = records.allocation_key(node);
+    const got = c.tap.inner.get(a, allocation_key.slice(), null, &scratch) catch return;
+    const before: records.Allocation = if (got.kv) |kv|
+        records.read(records.Allocation, a, kv, &scratch) catch return
+    else
+        .{
+            .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 },
+            .count = 0,
+            .node_revision = node_revision,
+        };
+    const extra: records.Requests = .{ .cpu_millis = 1, .memory_bytes = 1 };
+    const assigned: records.Assigned = .{
+        .replica = "c1-injected",
+        .service = "c1-injected",
+        .requests = extra,
+        .reason = "a competing placement (negative test)",
+    };
+    const after: records.Allocation = .{
+        .allocated = .{
+            .cpu_millis = before.allocated.cpu_millis + extra.cpu_millis,
+            .memory_bytes = before.allocated.memory_bytes + extra.memory_bytes,
+        },
+        .count = before.count + 1,
+        .node_revision = before.node_revision,
+    };
+    const assigned_key = records.assigned_key(node, "c1-injected");
+    const assigned_bytes = records.encode(a, assigned, &scratch) catch return;
+    const allocation_bytes = records.encode(a, after, &scratch) catch return;
+    const ops = [_]store.Op{
+        .{ .put = .{ .key = assigned_key.slice(), .value = assigned_bytes } },
+        .{ .put = .{ .key = allocation_key.slice(), .value = allocation_bytes } },
+    };
+    _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
+}
+
+fn c1_check(c: *Cluster) Failure!void {
+    if (!c.c1) return;
+    try check(c, c.c1_violation == null, c.c1_violation orelse "");
+}
+
+/// I1b (docs/authority.md §4): a replica the server replaced (`mark_replica_lost`, which lets the
+/// scheduler place a successor under a new id) is not still executing on its old node for longer
+/// than the lost grace plus the kill latency, unless that node was wedged (its agent down or
+/// frozen, or a kill that fails) now or lately, which the run records without failing. With the
+/// wedge negative test on, nothing is excused. A replica's two instances have different container
+/// names, so the pair is found through the replacement, not through a shared name.
+fn track_overlap(c: *Cluster) Failure!void {
+    var kept: u32 = 0;
+    for (c.overlaps[0..c.overlap_count]) |*entry| {
+        var running = false;
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                if (container.phase == .stopped) continue;
+                if (std.hash.Wyhash.hash(0, container.name) != entry.name_hash) continue;
+                running = true;
+                if (c.wedged_lately(node)) entry.wedged = true;
+            }
+        }
+        if (!running) continue; // Stopped: the overlap is over.
+        c.overlaps[kept] = entry.*;
+        kept += 1;
+        const length = c.manual.ms - entry.since_ms;
+        if (entry.wedged) {
+            c.overlap_wedged_worst_ms = @max(c.overlap_wedged_worst_ms, length);
+            if (!c1_teeth.wedge) continue;
+        } else {
+            c.overlap_worst_ms = @max(c.overlap_worst_ms, length);
+        }
+        try check(c, length <= overlap_ms_max, "I1b: a replaced replica kept executing longer " ++
+            "than the lost grace plus the kill latency");
+    }
+    c.overlap_count = kept;
+}
+
+fn executes(node: *const Node, name: []const u8) bool {
+    for (node.sim.containers.containers.items) |container| {
+        if (container.phase == .stopped) continue;
+        if (std.mem.eql(u8, container.name, name)) return true;
+    }
+    return false;
+}
+
 fn runs(node: *const Node, name: []const u8) bool {
     for (node.sim.containers.containers.items) |container| {
         if (container.phase != .running) continue;
@@ -1000,6 +1312,8 @@ const Op = enum {
     outage,
     server_restart,
     suspend_node,
+    /// sim-c1 only: an agent stops taking steps for a while, its containers keep running.
+    freeze,
 };
 
 /// With `faults_on` false (after the heal) the fault operations get no weight.
@@ -1009,7 +1323,7 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
         swarm.w_advance,    swarm.w_apply,         swarm.w_scale,
         swarm.w_delete,     swarm.w_broken,        swarm.w_runtime * f,
         swarm.w_crash * f,  swarm.w_partition * f, swarm.w_outage * f,
-        swarm.w_server * f, swarm.w_suspend * f,
+        swarm.w_server * f, swarm.w_suspend * f,   swarm.w_freeze * f,
     };
     comptime assert(weights.len == @typeInfo(Op).@"enum".field_names.len);
     var total: u32 = 0;
@@ -1047,6 +1361,10 @@ fn operation(c: *Cluster) void {
         .suspend_node => {
             c.stats.suspends += 1;
             c.pick_node().nclock.jump_forward(1000 + random.uintLessThan(u32, 20_000));
+        },
+        .freeze => {
+            const span = freeze_ms_min + random.uintLessThan(u32, freeze_ms_spread);
+            c.pick_node().frozen_until_ms = c.manual.ms + span;
         },
     }
     c.advance(100);
@@ -1212,6 +1530,7 @@ const Excess = struct { node: u32, name_hash: u64, accrued_ms: u64 };
 
 /// What is checked every `check_interval_ms` and after every operation.
 fn safety(c: *Cluster) Failure!void {
+    try c1_check(c);
     try invariants(c);
     try track_excess(c);
     try track_fencing(c);
@@ -1226,7 +1545,7 @@ fn track_fencing(c: *Cluster) Failure!void {
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
     for (c.nodes) |node| {
-        if (node.down) {
+        if (node.down or node.frozen_until_ms != null) {
             node.unregistered_since_ms = null;
             continue;
         }
@@ -1244,8 +1563,9 @@ fn track_fencing(c: *Cluster) Failure!void {
         node.unregistered_since_ms = since;
         if (c.manual.ms - since <= fencing_ms_max) continue;
         for (node.sim.containers.containers.items) |container| {
-            try check(c, container.phase == .stopped, "a container runs on a node whose lease " ++
-                "ran out longer ago than the lost grace (self-fencing failed)");
+            const message = "a container runs on a node whose lease ran out longer ago than " ++
+                "the lost grace (self-fencing failed)";
+            try check(c, container.phase == .stopped, if (c.c1) "I1b: " ++ message else message);
         }
     }
 }
@@ -1418,7 +1738,10 @@ fn heal(c: *Cluster) void {
     c.ack_loss.loss_per_mille = 0;
     c.swarm.net = .{};
     c.net.heal();
-    for (c.nodes) |node| node.partitioned_until_ms = null;
+    for (c.nodes) |node| {
+        node.partitioned_until_ms = null;
+        node.frozen_until_ms = null;
+    }
 }
 
 /// Null if `node` has no container of `name` that is not stopped; else whether it is `running`
@@ -1635,6 +1958,8 @@ pub const Options = struct {
     /// so a runner can say where a run that panics was (`sim_cluster --trace-steps`). It must
     /// not touch the run.
     on_step: ?*const fn (step: []const u8) void = null,
+    /// sim-c1 (docs/core.md): the per-revision checks, the overlap bound, the extra faults.
+    c1: bool = false,
 };
 
 /// The operation before which the faults end in a liveness run of `operations` operations from
@@ -1675,6 +2000,12 @@ pub fn simulate(
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
     c.liveness = options.liveness;
+    c.c1 = options.c1;
+    if (c.c1) {
+        c.swarm.add_c1_faults(seed);
+        report.print("sim-c1: every revision checked (I1a I4 I6 I7), overlaps bounded " ++
+            "(I1b)\n", .{});
+    }
     const heal_at = if (!options.liveness)
         operations
     else
@@ -1827,6 +2158,12 @@ fn print_summary(c: *Cluster) void {
         "replacement waits for the lease, so a duplicate is a bug the invariant misses)\n", .{
         s.duplicate_seconds,
     });
+    if (c.c1) {
+        report.print("sim-c1: revisions checked={d} overlap worst " ++
+            "{d} ms (bound {d} ms), wedged worst {d} ms (excused)\n", .{
+            c.c1_revisions, c.overlap_worst_ms, overlap_ms_max, c.overlap_wedged_worst_ms,
+        });
+    }
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
 }
 
