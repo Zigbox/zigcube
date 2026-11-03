@@ -10,6 +10,7 @@
 //! zcube [options] why service|replica|node <name>
 //! zcube [options] explain <code>
 //! zcube [options] bundle --last | <kind> <name>
+//! zcube [options] local up|down
 //! ```
 
 const std = @import("std");
@@ -42,6 +43,9 @@ pub const Options = struct {
     confirm: bool = false,
 };
 
+/// `zcube local`: the one command that starts processes (src/cli_local.zig).
+pub const LocalAction = enum { up, down };
+
 pub const BundleTarget = union(enum) { last, subject: Subject };
 
 pub const Command = union(enum) {
@@ -54,6 +58,7 @@ pub const Command = union(enum) {
     bundle: BundleTarget,
     /// `store accept-rollback --confirm`.
     accept_rollback,
+    local: LocalAction,
     help,
     version,
 };
@@ -77,6 +82,8 @@ pub const help_text =
     \\  explain <code>               explain a diagnostic code offline, for example E0201
     \\  bundle --last                collect the evidence for the last failure
     \\  bundle <kind> <name>         collect the evidence for a service, replica or node
+    \\  local up                     start a server and an agent on this machine (SQLite)
+    \\  local down                   stop them; the state and the containers are kept
     \\  help                         show this text
     \\  version                      print the version
     \\
@@ -217,6 +224,7 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     if (std.mem.eql(u8, name, "delete")) return delete_of(diag, rest);
     if (std.mem.eql(u8, name, "why")) return .{ .why = try subject_of(diag, name, rest) };
     if (std.mem.eql(u8, name, "bundle")) return bundle_of(diag, rest);
+    if (std.mem.eql(u8, name, "local")) return local_of(diag, rest);
     if (std.mem.eql(u8, name, "store")) {
         if (rest.len == 1 and std.mem.eql(u8, rest[0], "accept-rollback")) return .accept_rollback;
         return refuse(diag, "store takes accept-rollback", .{});
@@ -243,6 +251,14 @@ fn one_argument(
     if (rest.len == 0) return refuse(diag, "{s} needs {s}", .{ name, what });
     if (rest.len > 1) return refuse(diag, "{s} takes one argument, not {d}", .{ name, rest.len });
     return rest[0];
+}
+
+fn local_of(diag: *Diag, rest: []const []const u8) Error!Command {
+    if (rest.len == 1) {
+        if (std.mem.eql(u8, rest[0], "up")) return .{ .local = .up };
+        if (std.mem.eql(u8, rest[0], "down")) return .{ .local = .down };
+    }
+    return refuse(diag, "local takes up or down", .{});
 }
 
 fn get_of(diag: *Diag, rest: []const []const u8) Error!Command {
@@ -386,6 +402,8 @@ test "the commands of the handoff parse, with options before or after" {
     const explain = try parse_text(&.{ "explain", "ZC-E0201" });
     try testing.expectEqualStrings("ZC-E0201", explain.command.explain);
     _ = try parse_text(&.{"help"});
+    try testing.expectEqual(LocalAction.up, (try parse_text(&.{ "local", "up" })).command.local);
+    try testing.expectEqual(LocalAction.down, (try parse_text(&.{ "-v", "local", "down" })).command.local);
 }
 
 test "the refusals: each names the part at fault" {
@@ -420,6 +438,9 @@ test "the refusals: each names the part at fault" {
             .cause = "--output wide is for zcube get",
         },
         .{ .line = &.{ "help", "me" }, .cause = "help takes no arguments" },
+        .{ .line = &.{"local"}, .cause = "local takes up or down" },
+        .{ .line = &.{ "local", "restart" }, .cause = "local takes up or down" },
+        .{ .line = &.{ "local", "up", "down" }, .cause = "local takes up or down" },
         .{
             .line = &.{ "delete", "replica", "x" },
             .cause = "replica is not something delete removes",

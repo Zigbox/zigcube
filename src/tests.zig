@@ -54,6 +54,7 @@ test {
     _ = @import("cli_env.zig");
     _ = @import("cli_get.zig");
     _ = @import("cli_http.zig");
+    _ = @import("cli_local.zig");
     _ = @import("cli_report.zig");
     _ = @import("cli_service.zig");
     _ = @import("cli_view.zig");

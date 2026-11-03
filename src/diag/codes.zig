@@ -46,6 +46,8 @@ pub const Code = enum(u8) {
     W0119,
     E0120,
     E0121,
+    E0122,
+    E0123,
     E0201,
     E0202,
     E0203,
@@ -392,6 +394,37 @@ pub const registry = [_]Entry{
         \\
         \\The cause line names the numbers. Shorten the lease time to live, or
         \\leave the fencing constants as they are.
+        ,
+    },
+    .{
+        .code = .E0122,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "zcube local can't find or start the server or agent",
+        .explanation =
+        \\zcube local up starts zcube-server and zcube-agent, and looks for them in
+        \\the directory that holds the zcube command itself. One of them is not
+        \\there, is not an executable file, or the system refused to start it, so
+        \\nothing was left running.
+        \\
+        \\Build all three with zig build and run zcube from zig-out/bin, or keep the
+        \\three files together when you install them.
+        ,
+    },
+    .{
+        .code = .E0123,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the local server did not come up",
+        .explanation =
+        \\zcube local up started zcube-server and zcube-agent, but the server did
+        \\not answer, or the node did not register, within the time zcube waits.
+        \\Both processes were stopped again. The cause line says which of the two
+        \\steps failed, and the server's own log, which names the real reason (a
+        \\port in use, a database it could not open), is in the local directory.
+        \\
+        \\Read server.log and agent.log there. Your data is kept: zcube local up
+        \\tries again with the same files.
         ,
     },
     .{
