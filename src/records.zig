@@ -892,6 +892,37 @@ test "records a C0 build wrote still read" {
     for (seen) |count| try testing.expect(count > 0);
 }
 
+/// Records captured from a real C1 server and agent, the same way (src/testdata/README.md).
+const c1_store = @embedFile("testdata/c1_store.txt");
+
+test "records a C1 build wrote still read" {
+    // Goal: a stored value is read by the next release. Method: read every record of a store a C1
+    // build produced (services with env and limits, a replaced replica, a held one) as the type
+    // its key says; they are all version 2.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var seen: [2]u32 = @splat(0);
+    var lines = std.mem.splitScalar(u8, c1_store, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t').?;
+        const kv = kv_of(line[0..tab], line[tab + 1 ..]);
+        if (std.mem.startsWith(u8, kv.key, prefix_services)) {
+            const record = try read(Service, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 2), record.v);
+            seen[0] += 1;
+        } else if (std.mem.startsWith(u8, kv.key, prefix_replicas)) {
+            const record = try read(Replica, arena, kv, &diag);
+            try testing.expectEqual(@as(u32, 2), record.v);
+            seen[1] += 1;
+        }
+    }
+    for (seen) |count| try testing.expect(count > 0);
+}
+
 test "a newer version is refused with ZC-E0303, not as malformed" {
     // Goal: a value from a newer release is named and left alone. Method: bump the version of a
     // real record, and of a kind that is still at 1.
