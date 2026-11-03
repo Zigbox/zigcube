@@ -24,6 +24,7 @@ pub fn at_revision(ctx: *const Context, request: ?store.TxnRequest) Found {
     if (writers.foreign_key(txn)) |_| {
         return "I4: a transaction wrote keys that no single writer role owns";
     }
+    if (admissible_observations(ctx, txn)) |found| return found;
     if (!touches(txn, records.prefix_assigned) and !touches(txn, records.prefix_allocations)) {
         return null;
     }
@@ -133,6 +134,51 @@ fn ready(ctx: *const Context, node: []const u8) Found {
     if (judged.state != .ready) return "I7: a placement onto a node that is not ready";
     if (judged.tenure != node_kv.mod_revision) {
         return "I7: a placement onto a node whose status judged another tenure";
+    }
+    return null;
+}
+
+/// I3: each decision in `request` that cites an observation cites one that was admissible at its
+/// revision: the report named the tenure of its node, and that node's registration, read at the
+/// same revision, was that tenure. A revision compaction took is not judged.
+fn admissible_observations(ctx: *const Context, request: store.TxnRequest) Found {
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
+        const decision = std.json.parseFromSliceLeaky(records.Decision, ctx.arena, put.value, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        if (decision.cause.kind != .observed) continue;
+        const key = decision.cause.key orelse continue;
+        const revision = decision.cause.revision orelse continue;
+        if (admissible_at(ctx, key, revision)) |found| return found;
+    }
+    return null;
+}
+
+fn admissible_at(ctx: *const Context, key: []const u8, revision: store.Revision) Found {
+    const got = ctx.store.get(ctx.arena, key, revision, ctx.diag) catch {
+        ctx.diag.reset();
+        return null; // Compacted (or unreadable): not judged.
+    };
+    const kv = got.kv orelse return null;
+    const observed = records.read(records.Observed, ctx.arena, kv, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
+    const tenure = observed.tenure orelse return null;
+    const node_key = records.node_key(observed.node);
+    const node = ctx.store.get(ctx.arena, node_key.slice(), revision, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
+    const node_kv = node.kv orelse return "I3: a decision cites an observation of a node that " ++
+        "was not registered at that revision";
+    if (node_kv.mod_revision != tenure) {
+        return "I3: a decision cites an observation from another tenure of its node";
     }
     return null;
 }
