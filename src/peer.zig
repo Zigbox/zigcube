@@ -213,6 +213,11 @@ pub const Identity = struct {
     key: Ed25519.KeyPair,
     credential: Credential,
     ca_public: [32]u8,
+
+    /// Zeroes the node's secret key. The identity can not sign afterwards.
+    pub fn deinit(identity: *Identity) void {
+        std.crypto.secureZero(u8, &identity.key.secret_key.bytes);
+    }
 };
 
 fn hash_pair(first: []const u8, second: []const u8) [32]u8 {
@@ -224,8 +229,14 @@ fn hash_pair(first: []const u8, second: []const u8) [32]u8 {
 
 const HandshakeKeys = struct { server: [32]u8, client: [32]u8 };
 
+fn wipe_keys(keys: *HandshakeKeys) void {
+    std.crypto.secureZero(u8, &keys.server);
+    std.crypto.secureZero(u8, &keys.client);
+}
+
 fn handshake_keys(shared: [32]u8, h2: [32]u8) HandshakeKeys {
-    const prk = Hkdf.extract(&h2, &shared);
+    var prk = Hkdf.extract(&h2, &shared);
+    defer std.crypto.secureZero(u8, &prk);
     var keys: HandshakeKeys = undefined;
     Hkdf.expand(&keys.server, label ++ " hs server", prk);
     Hkdf.expand(&keys.client, label ++ " hs client", prk);
@@ -233,7 +244,8 @@ fn handshake_keys(shared: [32]u8, h2: [32]u8) HandshakeKeys {
 }
 
 fn transport_keys(shared: [32]u8, h4: [32]u8) HandshakeKeys {
-    const prk = Hkdf.extract(&h4, &shared);
+    var prk = Hkdf.extract(&h4, &shared);
+    defer std.crypto.secureZero(u8, &prk);
     var keys: HandshakeKeys = undefined;
     Hkdf.expand(&keys.client, label ++ " c2s", prk); // Client to server.
     Hkdf.expand(&keys.server, label ++ " s2c", prk); // Server to client.
@@ -320,12 +332,15 @@ fn check_proof(
     Aead.decrypt(&plain, sealed[0..proof_bytes], tag, transcript, nonce_of(0), key) catch
         return error.HandshakeFailed;
     const credential = try decode(plain[0..credential_bytes]);
-    try verify(&credential, identity.ca_public, options.now_ms, options.expected_node);
+    // The transcript signature first: it proves the sender holds the key in the credential for
+    // this connection, so a credential replayed from another connection (even an expired one)
+    // is a failed handshake, and only a live sender's credential is judged on CA, window, name.
     const message = proof_message(role, transcript, plain[0..credential_bytes]);
     const public = Ed25519.PublicKey.fromBytes(credential.node_key) catch
         return error.HandshakeFailed;
     const signature = Ed25519.Signature.fromBytes(plain[credential_bytes..][0..64].*);
     signature.verify(&message, public) catch return error.HandshakeFailed;
+    try verify(&credential, identity.ca_public, options.now_ms, options.expected_node);
     return credential;
 }
 
@@ -354,6 +369,12 @@ pub const Initiator = struct {
         };
     }
 
+    /// Zeroes the ephemeral secret. `second` does it on every path; call this when the
+    /// handshake is abandoned before that.
+    pub fn deinit(initiator: *Initiator) void {
+        std.crypto.secureZero(u8, &initiator.ephemeral.secret_key);
+    }
+
     pub fn first(initiator: *Initiator) [m1_bytes]u8 {
         assert(initiator.stage == .new);
         var m1: [m1_bytes]u8 = undefined;
@@ -371,12 +392,15 @@ pub const Initiator = struct {
     pub fn second(initiator: *Initiator, m2: *const [m2_bytes]u8) Error!Done {
         assert(initiator.stage == .sent_m1);
         initiator.stage = .done;
+        defer initiator.deinit();
         if (!header_ok(m2, type_m2)) return error.HandshakeFailed;
         const server_public = m2[2..][0..32].*;
-        const shared = X25519.scalarmult(initiator.ephemeral.secret_key, server_public) catch
+        var shared = X25519.scalarmult(initiator.ephemeral.secret_key, server_public) catch
             return error.HandshakeFailed;
+        defer std.crypto.secureZero(u8, &shared);
         const h2 = hash_pair(&initiator.h1, &server_public);
-        const keys = handshake_keys(shared, h2);
+        var keys = handshake_keys(shared, h2);
+        defer wipe_keys(&keys);
         const sealed = m2[2 + 32 ..][0..sealed_proof_bytes];
         const server = try check_proof(initiator.identity, "server", &h2, keys.server, sealed, .{
             .now_ms = initiator.now_ms,
@@ -388,7 +412,8 @@ pub const Initiator = struct {
         m3[1] = type_m3;
         m3[2..].* = make_proof(initiator.identity, "client", &h3, keys.client);
         const h4 = hash_pair(&h3, m3[2..]);
-        const transport = transport_keys(shared, h4);
+        var transport = transport_keys(shared, h4);
+        defer wipe_keys(&transport);
         return .{
             .m3 = m3,
             .session = Session.init(transport.client, transport.server, server),
@@ -413,10 +438,19 @@ pub const Responder = struct {
         };
     }
 
+    /// Zeroes the ephemeral secret, the shared secret and the handshake keys. `second` does it on
+    /// every path and `first` on a refusal; call this when the handshake is abandoned between.
+    pub fn deinit(responder: *Responder) void {
+        std.crypto.secureZero(u8, &responder.ephemeral.secret_key);
+        std.crypto.secureZero(u8, &responder.shared);
+        wipe_keys(&responder.keys);
+    }
+
     /// Reads M1 (any 32 bytes of key are accepted but a weak one) and answers with M2.
     pub fn first(responder: *Responder, m1: *const [m1_bytes]u8) Error![m2_bytes]u8 {
         assert(responder.stage == .new);
         responder.stage = .done; // Until M2 is out; a failure ends it.
+        errdefer responder.deinit();
         if (!header_ok(m1, type_m1)) return error.HandshakeFailed;
         responder.shared = X25519.scalarmult(responder.ephemeral.secret_key, m1[2..][0..32].*) catch
             return error.HandshakeFailed;
@@ -438,6 +472,7 @@ pub const Responder = struct {
     pub fn second(responder: *Responder, m3: *const [m3_bytes]u8) Error!Session {
         assert(responder.stage == .sent_m2);
         responder.stage = .done;
+        defer responder.deinit();
         if (!header_ok(m3, type_m3)) return error.HandshakeFailed;
         const sealed = m3[2..][0..sealed_proof_bytes];
         const client = try check_proof(
@@ -449,8 +484,8 @@ pub const Responder = struct {
             .{ .now_ms = responder.now_ms, .expected_node = null },
         );
         const h4 = hash_pair(&responder.h3, m3[2..]);
-        const transport = transport_keys(responder.shared, h4);
-        std.crypto.secureZero(u8, &responder.shared);
+        var transport = transport_keys(responder.shared, h4);
+        defer wipe_keys(&transport);
         return Session.init(transport.server, transport.client, client);
     }
 };

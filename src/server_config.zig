@@ -24,7 +24,7 @@ pub const listen_default = "127.0.0.1:7070";
 
 pub const usage =
     \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
-    \\                    [--verbose] [--quiet]
+    \\                    [--new-ca] [--verbose] [--quiet]
     \\       zcube-server --version | --help
     \\
     \\  --config FILE     a ZON file with .listen, .store and .create_store
@@ -36,6 +36,8 @@ pub const usage =
     \\  --state-dir DIR   where to remember the highest store revision seen (SQLite: default is
     \\                    the SQLite file's directory; Postgres: required). Keep outside the store
     \\  --create-store    create the store's file or schema if it is not there
+    \\  --new-ca          make a new peer CA key although the store has run before (every agent
+    \\                    then joins again); the key file is in the state directory
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
     \\
@@ -62,6 +64,8 @@ pub const Config = struct {
     state_dir: ?[]const u8 = null,
     verbose: bool,
     quiet: bool,
+    /// Make a new CA key although the store has run here before (`--new-ca`).
+    new_ca: bool = false,
     /// The ttl of the leases the server grants to agents.
     lease_ttl_ms: u32 = constants.lease_ttl_ms,
     /// How long after a node is marked lost its replicas are moved (docs/authority.md §3).
@@ -91,6 +95,7 @@ const Flags = struct {
     state_dir: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
+    new_ca: bool = false,
     version: bool = false,
     help: bool = false,
 };
@@ -118,6 +123,7 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .state_dir = flags.state_dir orelse file.state_dir,
         .verbose = flags.verbose,
         .quiet = flags.quiet,
+        .new_ca = flags.new_ca,
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
         .lost_grace_ms = try lost_grace_of(flags.lost_grace_ms orelse file.lost_grace_ms, diag),
     };
@@ -167,6 +173,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--create-store")) {
             flags.create_store = true;
+        } else if (std.mem.eql(u8, arg, "--new-ca")) {
+            flags.new_ca = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             flags.verbose = true;
         } else if (std.mem.eql(u8, arg, "-v")) {

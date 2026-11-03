@@ -1179,18 +1179,23 @@ pub const registry = [_]Entry{
     .{
         .code = .E0806,
         .severity = .@"error",
-        .blame = .environment,
-        .summary = "a peer key file can't be used",
+        .blame = .user,
+        .summary = "a peer key or trust file can't be used",
         .explanation =
-        \\The server's CA key (ca.key in its state directory) or an agent's node key
-        \\(peer.key) or credential (peer.cred) could not be read, created, written or
-        \\parsed, or has permissions that let other users read it. Key files must be
-        \\owned by the process, mode 0600, and hold one line of 64 hex digits.
+        \\The server's CA key (ca*.key in its state directory), the list of removed
+        \\nodes (revoked), or an agent's node key (peer.key), credential (peer.cred)
+        \\or trusted CA key (ca.pub) could not be read, created, written or parsed,
+        \\or its file or directory has permissions that let other users read a secret
+        \\or write a trust file. Key files must be owned by the process, mode 0600,
+        \\and hold one line of 64 hex digits; the state directory must not be
+        \\writable by group or others. A revoked line must be a node name.
         \\
-        \\The secret is never printed. If the file is damaged and there is a
-        \\backup, put it back. Otherwise delete it: a server then creates a new CA
-        \\(every agent then re-joins by itself), and an agent creates a new key and
-        \\joins again.
+        \\The secret is never printed. If the file is damaged and there is a backup,
+        \\put it back. An agent's files are caches: it ignores a damaged peer.cred
+        \\or ca.pub and joins again by itself; delete peer.key to get a new node key.
+        \\A server whose CA key is missing although its store has run refuses to
+        \\start: put the key back, or start once with --new-ca to make a new CA on
+        \\purpose (every agent then joins again by itself).
         ,
     },
     .{

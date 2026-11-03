@@ -51,6 +51,10 @@ pub const Server = struct {
     remembered: ?Remembered,
     /// The cluster CA (docs/peer.md): `ca.key` in the state directory, or in memory.
     ca: peer_ca.Ca,
+    /// The CA key's file for this store and whether the store has run here before (`guard`).
+    ca_name_buffer: [server_ca.key_name_bytes_max]u8 = undefined,
+    ca_name_length: u8 = 0,
+    has_history: bool = false,
     /// Unix milliseconds, for the credentials the CA signs.
     wall: RealClock,
     listener: net.Server,
@@ -172,6 +176,9 @@ pub const Server = struct {
                 return error.StartFailed;
             errdefer server.unguard();
             known = server.remembered.?.load(diag) catch return error.StartFailed;
+            server.has_history = known != null;
+            const ca_name = server_ca.key_name_for(database, &server.ca_name_buffer);
+            server.ca_name_length = @intCast(ca_name.len);
             remember = server.remembered.?.interface();
         } else if (diag.code != null) {
             return error.StartFailed;
@@ -202,6 +209,12 @@ pub const Server = struct {
             server.io,
             directory,
             server.wall.clock(),
+            .{
+                .key_name = server.ca_name_buffer[0..server.ca_name_length],
+                .first_start = !server.has_history,
+                .accept_new = config.new_ca,
+                .quiet = config.quiet,
+            },
             diag,
         ) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;

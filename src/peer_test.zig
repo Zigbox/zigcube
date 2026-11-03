@@ -195,9 +195,7 @@ test "a handshake is refused for each reason a peer can be wrong" {
     try testing.expectError(error.HandshakeFailed, connect(&f.client, &thief, "node2"));
 
     // The same three on the other side: the server refuses a bad client at M3.
-    var wrong_ca = f.client;
-    wrong_ca.credential = strange.credential;
-    wrong_ca.credential.name_buffer = f.client.credential.name_buffer;
+    const wrong_ca = try identity_of(other_ca, "node1", 1, now - hour, now + hour);
     try testing.expectError(error.UnknownCa, connect(&wrong_ca, &f.server, "node2"));
     const client_old = try identity_of(f.ca, "node1", 1, now - 3 * hour, now - 2 * hour);
     try testing.expectError(error.Expired, connect(&client_old, &f.server, "node2"));

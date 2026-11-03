@@ -42,9 +42,15 @@ pub const Peer = struct {
     retry_at_ms: u64 = 0,
     /// The last failure was shown; cleared by a success, so a streak is one report.
     reported: bool = false,
+    /// `peer.cred` or `ca.pub` was there and could not be used. They are caches, so `open` went
+    /// on without them; the problem is in the `diag` it was given, for the caller to show once.
+    stored_problem: bool = false,
 
     /// Opens the state directory, loads `peer.key` (making it on a first run) and the stored
-    /// credential and CA key. A file that cannot be used is ZC-E0806.
+    /// credential and CA key. `peer.key` that cannot be used is ZC-E0806 and an error. A stored
+    /// credential or CA key that cannot be used is a cache that went bad: it is ignored (the
+    /// agent joins again), `stored_problem` is set and `diag` holds ZC-E0806 for the caller to
+    /// show and reset.
     pub fn open(io: std.Io, state_dir: []const u8, node: []const u8, diag: *Diag) Error!Peer {
         assert(diag.code == null);
         const cwd = std.Io.Dir.cwd();
@@ -64,12 +70,31 @@ pub const Peer = struct {
             .node = node,
             .key = try load_or_make_key(io, dir, state_dir, diag),
         };
-        try opened.load_stored(diag);
+        opened.load_stored(diag) catch {
+            assert(diag.code != null);
+            opened.stored_problem = true;
+            opened.credential = null;
+            opened.ca_public = null;
+            opened.renew_at_ms = 0;
+        };
         return opened;
     }
 
     pub fn close(self: *Peer) void {
+        std.crypto.secureZero(u8, &self.key.secret_key.bytes);
         self.dir.close(self.io);
+    }
+
+    /// The CA key id the server says it has now (every answer carries it). A credential from
+    /// another CA is dropped so that `due` is true at once: true means the CA changed.
+    pub fn observe_ca(self: *Peer, id: [8]u8) bool {
+        const credential = self.credential orelse return false;
+        if (std.mem.eql(u8, &credential.ca_key_id, &id)) return false;
+        self.credential = null;
+        self.ca_public = null;
+        self.renew_at_ms = 0;
+        self.retry_at_ms = 0;
+        return true;
     }
 
     /// Whether `step` would call the server at wall time `now_ms`.
@@ -84,13 +109,15 @@ pub const Peer = struct {
         self: *Peer,
         transport: client_mod.Transport,
         arena: Allocator,
+        lease: u64,
         now_ms: u64,
         timeout_ms: u32,
         diag: *Diag,
     ) Error!void {
         assert(diag.code == null);
+        assert(lease != 0);
         if (!self.due(now_ms)) return;
-        self.join(transport, arena, now_ms, timeout_ms, diag) catch |err| {
+        self.join(transport, arena, lease, now_ms, timeout_ms, diag) catch |err| {
             assert(diag.code != null);
             self.retry_at_ms = now_ms + constants.peer_join_retry_ms;
             return err;
@@ -102,14 +129,16 @@ pub const Peer = struct {
         self: *Peer,
         transport: client_mod.Transport,
         arena: Allocator,
+        lease: u64,
         now_ms: u64,
         timeout_ms: u32,
         diag: *Diag,
     ) Error!void {
         const public = self.key.public_key.toBytes();
         var body_buffer: [constants.peer_join_request_bytes_max]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buffer, "{{\"node_key\":\"{x}\"}}", .{&public}) catch
-            unreachable; // 64 digits and the braces fit the request bound (a comptime constant).
+        const text = "{{\"node_key\":\"{x}\",\"lease\":{d}}}";
+        const body = std.fmt.bufPrint(&body_buffer, text, .{ &public, lease }) catch
+            unreachable; // 64 digits and a u64 fit the request bound (a comptime constant).
         var target_buffer: [128]u8 = undefined;
         const target = std.fmt.bufPrint(&target_buffer, "/v1/agent/nodes/{s}/credential", .{
             self.node,
@@ -181,14 +210,14 @@ pub const Peer = struct {
         var ca_buffer: [128]u8 = undefined;
         var credential_buffer: [512]u8 = undefined;
         const io, const dir, const where = .{ self.io, self.dir, self.where };
-        const ca_bytes = try files.read(io, dir, where, ca_file, false, &ca_buffer, diag) orelse
+        const ca_bytes = try files.read(io, dir, where, ca_file, .anchor, &ca_buffer, diag) orelse
             return;
         const credential_bytes = try files.read(
             io,
             dir,
             where,
             credential_file,
-            false,
+            .plain,
             &credential_buffer,
             diag,
         ) orelse return;
@@ -217,6 +246,15 @@ pub const Peer = struct {
         self.renew_at_ms = renew_time(&credential);
     }
 };
+
+/// ZC-E0801 for the agent's own credential: the server's CA is not the one that signed it. Said
+/// once per change; the agent joins again by itself.
+pub fn raise_ca_changed(diag: *Diag, node: []const u8) void {
+    assert(diag.code == null);
+    diag.raise(.E0801);
+    diag.cause("the cluster's CA changed: node {s}'s credential is from another", .{node});
+    diag.fix(.{ .sentence = "nothing: the agent joins again by itself, within seconds" });
+}
 
 /// Half the credential's life from its start.
 pub fn renew_time(credential: *const peer.Credential) u64 {

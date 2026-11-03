@@ -8,6 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Ed25519 = std.crypto.sign.Ed25519;
+const Edwards25519 = std.crypto.ecc.Edwards25519;
 const Clock = @import("clock.zig").Clock;
 const constants = @import("constants.zig");
 const peer = @import("peer.zig");
@@ -81,7 +82,10 @@ pub const Ca = struct {
     pub fn issue(ca: *const Ca, node: []const u8, node_key: [32]u8) IssueError!peer.Credential {
         assert(records.name_problem(node, peer.name_bytes_max) == null);
         if (ca.revoked.contains(node)) return error.Removed;
-        _ = Ed25519.PublicKey.fromBytes(node_key) catch return error.BadKey;
+        // On the curve and in the prime-order subgroup: a small-order or mixed-order point is
+        // refused, so no credential vouches for a key no honest node holds.
+        const point = Edwards25519.fromBytes(node_key) catch return error.BadKey;
+        point.rejectUnexpectedSubgroup() catch return error.BadKey;
         const now_ms = ca.wall.now_ms();
         const credential = peer.issue(
             ca.key,

@@ -92,6 +92,17 @@ const Shell = struct {
     /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
     fn peer_step(shell: *Shell) void {
         const now_ms = shell.clock.now_ms();
+        if (shell.remote.ca_key_id) |id| {
+            if (shell.peer.observe_ca(id)) {
+                shell.diag.reset();
+                agent_peer.raise_ca_changed(&shell.diag, shell.agent.config.node);
+                shell.show("\n", &shell.diag, "zcube-agent: joining the new CA\n");
+                shell.diag.reset();
+            }
+        }
+        // The server issues a credential only to a registered node (docs/api.md).
+        const lease = shell.agent.lease;
+        if (lease == store.lease_none or shell.agent.tenure == 0) return;
         if (!shell.peer.due(now_ms)) return;
         const timeout_ms = shell.before_fence(constants.peer_join_timeout_ms);
         if (timeout_ms == 0) return;
@@ -99,7 +110,7 @@ const Shell = struct {
         shell.diag.reset();
         const had = shell.peer.credential != null;
         const arena = shell.arena.allocator();
-        shell.peer.step(shell.peer_transport, arena, now_ms, timeout_ms, &shell.diag) catch {
+        shell.peer.step(shell.peer_transport, arena, lease, now_ms, timeout_ms, &shell.diag) catch {
             if (!shell.peer.reported) {
                 shell.peer.reported = true;
                 shell.show("\n", &shell.diag, "zcube-agent: running on; it will try again\n");
@@ -365,6 +376,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     };
     defer shell.arena.deinit();
     announce(io, config);
+    if (peer_identity.stored_problem) {
+        shell.show("\n", &diag, "zcube-agent: ignoring it; the node joins the cluster CA again\n");
+        diag.reset();
+    }
     shell.notice_pair();
     install_signals();
     loop(&shell);

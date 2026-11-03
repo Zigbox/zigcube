@@ -16,6 +16,10 @@ const Dir = std.Io.Dir;
 
 pub const Error = error{Failed};
 
+/// Who may touch a file we read: `secret` is ours alone (no group or other access); `anchor`
+/// is public but a trust anchor, so nobody else may write it; `plain` is not checked.
+pub const Guard = enum { plain, anchor, secret };
+
 /// ZC-E0806 for `name` in the directory `where`: `verb` is "read", "write", "parse" and so on.
 pub fn unusable(
     diag: *Diag,
@@ -24,22 +28,52 @@ pub fn unusable(
     verb: []const u8,
     why: []const u8,
 ) Error {
+    const sentence = "fix the file's owner or mode (0600), or delete it so it is made again";
+    return unusable_fix(diag, where, name, verb, why, sentence);
+}
+
+/// `unusable` with a fix of its own, for a file that is not a secret (a list of names).
+pub fn unusable_fix(
+    diag: *Diag,
+    where: []const u8,
+    name: []const u8,
+    verb: []const u8,
+    why: []const u8,
+    fix: []const u8,
+) Error {
     assert(diag.code == null);
     diag.raise(.E0806);
     diag.cause("can't {s} {s} in {s}: {s}", .{ verb, name, where, why });
-    const sentence = "fix the file's owner or mode (0600), or delete it so it is made again";
-    diag.fix(.{ .sentence = sentence });
+    diag.fix(.{ .sentence = fix });
     return error.Failed;
 }
 
+/// Refuses a directory that group or others can write into: they could replace a trust anchor or
+/// a secret's temporary file. ZC-E0806.
+pub fn check_dir(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    name: []const u8,
+    diag: *Diag,
+) Error!void {
+    const stat = dir.stat(io) catch |err| {
+        return unusable(diag, where, name, "use the directory of", @errorName(err));
+    };
+    if (stat.permissions.toMode() & 0o022 != 0) {
+        const why = "other users can write into the directory";
+        return unusable(diag, where, name, "use the directory of", why);
+    }
+}
+
 /// The file's bytes in `buffer`, null if there is no such file. A file that does not fit is
-/// refused (it is not ours). When `secret`, a file readable by group or others is refused too.
+/// refused (it is not ours). `guard` says which owner and mode checks apply.
 pub fn read(
     io: std.Io,
     dir: Dir,
     where: []const u8,
     name: []const u8,
-    secret: bool,
+    guard: Guard,
     buffer: []u8,
     diag: *Diag,
 ) Error!?[]u8 {
@@ -50,12 +84,16 @@ pub fn read(
         return unusable(diag, where, name, "read", @errorName(err));
     };
     defer file.close(io);
-    if (secret) {
+    if (guard != .plain) {
         const stat = file.stat(io) catch |err| {
             return unusable(diag, where, name, "read", @errorName(err));
         };
-        if (stat.permissions.toMode() & 0o077 != 0) {
+        const mode = stat.permissions.toMode();
+        if (guard == .secret and mode & 0o077 != 0) {
             return unusable(diag, where, name, "use", "other users can read it");
+        }
+        if (guard == .anchor and mode & 0o022 != 0) {
+            return unusable(diag, where, name, "use", "other users can write it");
         }
     }
     const length = file.readPositionalAll(io, buffer, 0) catch |err| {
@@ -74,9 +112,11 @@ pub fn read_seed(
     diag: *Diag,
 ) Error!?[32]u8 {
     var buffer: [128]u8 = undefined;
-    const bytes = try read(io, dir, where, name, true, &buffer, diag) orelse return null;
+    defer std.crypto.secureZero(u8, &buffer);
+    const bytes = try read(io, dir, where, name, .secret, &buffer, diag) orelse return null;
     const text = std.mem.trim(u8, bytes, " \t\r\n");
     var seed: [32]u8 = undefined;
+    errdefer std.crypto.secureZero(u8, &seed);
     const decoded = std.fmt.hexToBytes(&seed, text) catch
         return unusable(diag, where, name, "parse", "it is not 64 hex digits");
     if (decoded.len != seed.len) {
@@ -98,9 +138,14 @@ pub fn write(
     assert(name.len + ".tmp".len <= 64);
     var temp: [64]u8 = undefined;
     const temp_name = std.fmt.bufPrint(&temp, "{s}.tmp", .{name}) catch unreachable; // Sized.
+    // A temporary file left by a killed run, or planted, keeps its own mode and owner and would
+    // receive the secret: remove it and make ours exclusively. Every failure removes ours again.
+    dir.deleteFile(io, temp_name) catch {}; // Absent is the usual case.
+    errdefer dir.deleteFile(io, temp_name) catch {}; // Nothing more to do if this fails too.
     {
         const file = dir.createFile(io, temp_name, .{
             .permissions = .fromMode(0o600),
+            .exclusive = true,
         }) catch |err| return unusable(diag, where, name, "write", @errorName(err));
         defer file.close(io);
         file.writeStreamingAll(io, text) catch |err| {
@@ -129,6 +174,7 @@ pub fn write_seed(
     diag: *Diag,
 ) Error!void {
     var line: [65]u8 = undefined;
+    defer std.crypto.secureZero(u8, &line);
     const text = std.fmt.bufPrint(&line, "{x}\n", .{&seed}) catch
         unreachable; // 64 digits and "\n".
     return write(io, dir, where, name, text, diag);

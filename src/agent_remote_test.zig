@@ -508,6 +508,36 @@ fn running_names(rig: *Rig, out: *[2]runtime_name) !void {
     try testing.expectEqual(@as(usize, 2), found);
 }
 
+/// A node is issued a credential only while registered under a live lease (finding 3): refused
+/// unregistered and under another lease; then registers and returns the lease.
+fn register_after_refusals(
+    rig: *Rig,
+    identity: *agent_peer.Peer,
+    arena: std.mem.Allocator,
+    wall: u64,
+    diag: *Diag,
+) !store.Lease {
+    try testing.expectError(
+        error.Failed,
+        identity.step(rig.http_transport.transport(), arena, 1, wall, 3000, diag),
+    );
+    // The agent reports the server's refusal, which carries E0205 in its cause.
+    try testing.expectEqual(@as(?codes.Code, .E0504), diag.code);
+    try testing.expect(identity.credential == null);
+    diag.reset();
+    const remote = rig.remote.interface();
+    const lease = try remote.lease_grant(10_000, diag);
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, diag);
+    identity.retry_at_ms = 0; // The refusal above set a pause.
+    try testing.expectError(
+        error.Failed,
+        identity.step(rig.http_transport.transport(), arena, lease.id + 1, wall, 3000, diag),
+    );
+    diag.reset();
+    identity.retry_at_ms = 0;
+    return lease;
+}
+
 test "a node joins the CA, keeps its pair, renews at half life, is refused once removed" {
     // Goal: docs/peer.md's issuance, persistence, renewal and removal through real HTTP and the
     // real files. Method: join; restart the server (the CA key is the same) and the peer (the
@@ -528,7 +558,8 @@ test "a node joins the CA, keeps its pair, renews at half life, is refused once 
     defer identity.close();
     try testing.expect(identity.credential == null);
     const wall = rig.clock_source.clock().now_ms();
-    try identity.step(rig.http_transport.transport(), arena, wall, 3000, &diag);
+    const lease = try register_after_refusals(rig, &identity, arena, wall, &diag);
+    try identity.step(rig.http_transport.transport(), arena, lease.id, wall, 3000, &diag);
     const first = identity.credential.?;
     try testing.expect(identity.ca_public != null);
     const life_ms = first.not_after_ms - first.not_before_ms;
@@ -554,8 +585,10 @@ test "a node joins the CA, keeps its pair, renews at half life, is refused once 
     // Renewal at half the life: a new credential, signed by the same CA.
     const renew_at = again.renew_at_ms;
     try testing.expect(again.due(renew_at));
-    try again.step(rig.http_transport.transport(), arena, renew_at, 3000, &diag);
+    try again.step(rig.http_transport.transport(), arena, lease.id, renew_at, 3000, &diag);
     try testing.expect(again.credential.?.not_before_ms >= first.not_before_ms);
+    try testing.expect(!std.mem.eql(u8, &first.signature, &again.credential.?.signature));
+    try testing.expect(again.renew_at_ms > renew_at);
     try testing.expectEqual(identity.ca_public.?, again.ca_public.?);
 
     // Removal: the file is read at start, and then the node is refused, not stopped.
@@ -566,7 +599,7 @@ test "a node joins the CA, keeps its pair, renews at half life, is refused once 
     const kept = again.credential.?;
     try testing.expectError(
         error.Failed,
-        again.step(rig.http_transport.transport(), arena, again.renew_at_ms, 3000, &diag),
+        again.step(rig.http_transport.transport(), arena, lease.id, again.renew_at_ms, 3000, &diag),
     );
     try testing.expectEqual(@as(?codes.Code, .E0807), diag.code);
     try testing.expectEqualSlices(u8, &kept.signature, &again.credential.?.signature);
