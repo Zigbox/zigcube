@@ -854,7 +854,8 @@ pub const Scheduler = struct {
         };
         compare_sets.move(&set, replica_read(replica), read, node_read(target));
         expect_all(&batch, &set);
-        try sc.put_place_decision(ctx, &batch, replica, spec.reason, "place_replica", spec.cause, null);
+        const action = "place_replica";
+        try sc.put_place_decision(ctx, &batch, replica, spec.reason, action, spec.cause, null);
         batch.delete(from.key);
         const name = target.node.rec.name;
         const key = try assign_key(ctx, name, spec.replica);

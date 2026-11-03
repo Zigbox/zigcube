@@ -23,7 +23,7 @@ pub const Error = error{OutOfMemory};
 /// The agent's view of its image store. Only `summary` so far; slice 6 adds the rest.
 pub const Images = struct {
     context: *anyopaque,
-    summary_fn: *const fn (context: *anyopaque, arena: Allocator, started: []const []const u8) Error!Summary,
+    summary_fn: *const fn (*anyopaque, Allocator, []const []const u8) Error!Summary,
 
     /// The complete trees now in the store. `started` is the digests of the images the agent has
     /// started containers from (a store holds what it has run).
@@ -113,7 +113,7 @@ pub fn record_of(arena: Allocator, node: []const u8, summary: Summary) Error!rec
     return .{ .node = node, .trees = trees, .omitted = summary.omitted };
 }
 
-// ---- The fake ------------------------------------------------------------------------------------
+// ---- The fake -----------------------------------------------------------------------------
 
 /// Chunks of a fake tree: 4 to 11, of `fake_chunk_bytes` each, derived from the digest text.
 const fake_chunk_bytes: u32 = 256 * 1024;
@@ -147,7 +147,11 @@ pub const FakeImages = struct {
         return result;
     }
 
-    fn summary_impl(context: *anyopaque, arena: Allocator, started: []const []const u8) Error!Summary {
+    fn summary_impl(
+        context: *anyopaque,
+        arena: Allocator,
+        started: []const []const u8,
+    ) Error!Summary {
         const fake: *FakeImages = @ptrCast(@alignCast(context));
         var held: std.ArrayList(Held) = .empty;
         var omitted: u32 = 0;
@@ -173,7 +177,7 @@ pub const FakeImages = struct {
     }
 };
 
-// ---- Tests ---------------------------------------------------------------------------------------
+// ---- Tests --------------------------------------------------------------------------------
 
 test "a fake summary becomes a record and decodes back to the same sketch" {
     // Goal: the record round-trips what the scheduler will read. Method: two digests, one held
@@ -208,6 +212,7 @@ test "a held tree scores its whole size against itself" {
     // Goal: locality_bytes over decoded sketches finds a tree by digest.
     const mine = FakeImages.sketch("b3:51aa9c03");
     const other = FakeImages.sketch("b3:9d20c4f1");
-    try std.testing.expectEqual(mine.total_bytes, chunk_summary.locality_bytes(&mine, &.{ other, mine }));
+    const both = chunk_summary.locality_bytes(&mine, &.{ other, mine });
+    try std.testing.expectEqual(mine.total_bytes, both);
     try std.testing.expectEqual(@as(u64, 0), chunk_summary.locality_bytes(&mine, &.{other}));
 }

@@ -280,7 +280,11 @@ pub const Agent = struct {
 
     /// Writes the image summary (`/node-store/<node>`, advisory, bound to the node's lease) when
     /// it changed. A failed tenure compare fences, as for an observed write.
-    fn publish_store(agent: *Agent, ctx: *const Context, listings: []const runtime.Listing) Error!void {
+    fn publish_store(
+        agent: *Agent,
+        ctx: *const Context,
+        listings: []const runtime.Listing,
+    ) Error!void {
         const images = ctx.images orelse return;
         assert(agent.lease != store.lease_none);
         var started: std.ArrayList([]const u8) = .empty;
@@ -298,7 +302,8 @@ pub const Agent = struct {
         const key = records.node_store_key(agent.config.node);
         var tenure: compare_sets.Set = .{};
         compare_sets.observed_write(&tenure, agent.config.node, agent.tenure);
-        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = agent.lease } };
+        const put: store.Put = .{ .key = key.slice(), .value = value, .lease = agent.lease };
+        const op: store.Op = .{ .put = put };
         const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
         const role: writers.Role = .{ .agent = agent.config.node };
         const done = try writers.txn(ctx.store, role, request, ctx.diag);

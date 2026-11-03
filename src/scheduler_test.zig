@@ -778,11 +778,11 @@ test "spread outranks locality, and locality outranks least allocated" {
     try fixture.node("a", 4000, 8 * gib, true);
     try fixture.node("c", 4000, 8 * gib, true);
     try fixture.summary("c", &.{image});
-    try fixture.replica("load", "load-1", 2000, gib); // Another image's service: loads a or c by name.
+    try fixture.replica("load", "load-1", 2000, gib); // Loads a or c by name.
     try fixture.settle();
     try fixture.replica("web", "web-1", 100, gib);
     try fixture.settle();
-    try fixture.expect_on("web-1", "c"); // Locality ahead of least allocated (c is loaded or equal).
+    try fixture.expect_on("web-1", "c"); // Locality ahead of least allocated.
     try fixture.replica("web", "web-2", 100, gib);
     try fixture.settle();
     try fixture.expect_on("web-2", "a"); // Spread ahead of locality.

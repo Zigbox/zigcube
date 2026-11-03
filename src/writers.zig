@@ -142,7 +142,8 @@ fn may_write(role: Role, key: []const u8, op: store.Op) bool {
     }
 }
 
-/// An agent writes `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`. The node controller also
+/// An agent writes `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
+/// The node controller also
 /// removes a lost node's observed records (authority.md §3), and only removes them.
 fn agent_may_write(role: Role, prefix: []const u8, key: []const u8, op: store.Op) bool {
     const rest = key[prefix.len..];

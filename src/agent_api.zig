@@ -395,7 +395,8 @@ const Call = struct {
         const value = records.encode(ctx.arena, input.summary, ctx.diag) catch
             return propagate(ctx);
         const key = records.node_store_key(call.node);
-        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = input.lease } };
+        const put: store.Put = .{ .key = key.slice(), .value = value, .lease = input.lease };
+        const op: store.Op = .{ .put = put };
         var tenure: compare_sets.Set = .{};
         compare_sets.observed_write(&tenure, call.node, input.tenure);
         const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };

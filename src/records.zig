@@ -1087,7 +1087,7 @@ test "the version a record is written in is the version the reader accepts" {
     var diag: Diag = undefined;
     diag.reset();
     inline for (.{
-        Service, Replica,       Node,     Observed,   Assigned, Allocation, Audit, NodeStatus,
+        Service, Replica,       Node,     Observed,   Assigned,  Allocation, Audit, NodeStatus,
         Summary, ReplicaNumber, Decision, IndexEntry, NodeStore,
     }) |T| {
         var value = std.mem.zeroes(T);
