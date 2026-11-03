@@ -4,6 +4,8 @@
 //   node tools/wasm_check.mjs --wasi <core_tests.wasm>   the core's unit tests under WASI (zig build wasm-test)
 //   node tools/wasm_check.mjs --sim <zcube_core.wasm> <seed> <operations> <native scenario> <native fuzz>
 //                                                        the C0 simulation, compared with the native run (zig build sim-c0)
+//   node tools/wasm_check.mjs --sim-swarm <zcube_core.wasm> <seed> <operations> <native report>
+//                                                        the swarm simulation, compared with the native run (zig build sim-swarm)
 //   node tools/wasm_check.mjs --sim-cluster <zcube_core.wasm> <seed> <operations> <nodes> <liveness> <native report>
 //                                                        the cluster simulation, compared with the native run (zig build sim-cluster)
 //
@@ -21,7 +23,8 @@ import { join } from "node:path";
 const wasi = process.argv[2] === "--wasi";
 const sim = process.argv[2] === "--sim";
 const simCluster = process.argv[2] === "--sim-cluster";
-const path = process.argv[wasi || sim || simCluster ? 3 : 2];
+const simSwarm = process.argv[2] === "--sim-swarm";
+const path = process.argv[wasi || sim || simCluster || simSwarm ? 3 : 2];
 if (!path) {
   console.error("usage: node tools/wasm_check.mjs [--wasi | --sim ...] <module.wasm>");
   process.exit(2);
@@ -45,6 +48,26 @@ function firstDifference(left, right) {
     if (a[i] !== b[i]) return `line ${i + 1}:\n  native: ${a[i]}\n  wasm:   ${b[i]}`;
   }
   return "(no difference found)";
+}
+
+if (simSwarm) {
+  // Same contract as --sim-cluster: the native report arrives as a file and must be equal byte for byte.
+  const [wasmPath, seedText, operationsText, nativePath] = process.argv.slice(3);
+  const exports = await instantiate(readFileSync(wasmPath));
+  const started = Date.now();
+  const failed = exports.zcube_sim_swarm(BigInt(seedText), Number(operationsText));
+  const seconds = ((Date.now() - started) / 1000).toFixed(1);
+  const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_swarm_report_ptr(), exports.zcube_swarm_report_len());
+  const wasmText = new TextDecoder().decode(rendered);
+  const nativeText = readFileSync(nativePath, "utf8");
+  if (failed !== 0 || wasmText !== nativeText) {
+    console.error(`sim-swarm (seed ${seedText}): wasm ${failed === 0 ? "held every check" : "failed"}; reports ${wasmText === nativeText ? "agree" : "differ"}`);
+    if (wasmText !== nativeText) console.error(firstDifference(nativeText, wasmText));
+    console.error(wasmText);
+    process.exit(1);
+  }
+  console.log(`sim-swarm: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations; wasm ${seconds} s)`);
+  process.exit(0);
 }
 
 if (simCluster) {
