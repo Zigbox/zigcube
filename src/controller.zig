@@ -513,7 +513,7 @@ test "a decision and its index entry are written together, with a unique sortabl
         .reason = "creating hello-1",
         .cause = cause_decision(&first),
     }, &batch);
-    // Each decision: the record, the index entry and (these two share a key? no) the summary.
+    // Each decision: the record, the index entry and its summary (here two different summaries).
     try testing.expectEqual(@as(u32, 6), batch.ops_count);
     try testing.expect(std.mem.order(u8, first.slice(), second.slice()) == .lt);
     try testing.expectEqualStrings("1761350000123-0001-0000", first.slice());
@@ -550,4 +550,84 @@ test "a commit whose compare fails reports a conflict and writes nothing" {
     try testing.expect((try commit(&ctx, .api, &batch)) == .conflict);
     const status = try ctx.store.status(&diag);
     try testing.expectEqual(@as(Revision, 0), status.revision);
+}
+
+test "two decisions for one summary in a batch make one put and one compare, counted twice" {
+    // Goal: put_decision's merge. Method: two decisions with one subject, action and kind of
+    // cause in one batch: 2 x (record, index) + one summary put, one compare; after the commit
+    // the summary counts 2 and names the newer decision.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: DecisionSource = .{ .instance = 1 };
+    var batch: Batch = .{};
+    const spec: DecisionSpec = .{
+        .actor = "replica-controller",
+        .action = "create_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "creating hello-1",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 1 },
+    };
+    _ = try put_decision(&ctx, &source, spec, &batch);
+    manual.ms += 5;
+    const newer = try put_decision(&ctx, &source, spec, &batch);
+    try testing.expectEqual(@as(u32, 5), batch.ops_count);
+    try testing.expectEqual(@as(u32, 1), batch.compares_count);
+    try testing.expectEqual(@as(u32, 1), batch.summaries_count);
+    try testing.expect((try commit(&ctx, .replica_controller, &batch)) == .applied);
+    const key = records.summary_key(.replica, "hello-1", "create_replica", .desired);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &diag);
+    const summary = try records.read(records.Summary, ctx.arena, got.kv.?, &diag);
+    try testing.expectEqual(@as(u64, 2), summary.count);
+    try testing.expectEqualStrings(newer.slice(), summary.newest);
+    try testing.expectEqual(@as(u64, 1761350000128), summary.last_at_ms);
+}
+
+test "a summary written by another controller between plan and commit is a conflict" {
+    // Goal: the summary's compare is exact. Method: plan a decision (the summary is absent, so
+    // the compare expects revision 0), let another writer create that summary, then commit:
+    // a conflict, and the decision is not written.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: DecisionSource = .{ .instance = 1 };
+    var batch: Batch = .{};
+    const id = try put_decision(&ctx, &source, .{
+        .actor = "replica-controller",
+        .action = "create_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "creating hello-1",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 1 },
+    }, &batch);
+    const key = records.summary_key(.replica, "hello-1", "create_replica", .desired);
+    const other: store.Op = .{ .put = .{ .key = key.slice(), .value = "{}" } };
+    _ = try ctx.store.txn(.{ .on_success = &.{other} }, &diag);
+    try testing.expect((try commit(&ctx, .replica_controller, &batch)) == .conflict);
+    const decision_at = records.decision_key(id.slice());
+    const got = try ctx.store.get(ctx.arena, decision_at.slice(), null, &diag);
+    try testing.expect(got.kv == null);
 }

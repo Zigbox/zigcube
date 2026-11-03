@@ -31,8 +31,8 @@ pub const usage =
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
-    \\  --lost-grace-ms N how long a lost node's replicas stay before they are moved (default
-    \\                    1000)
+    \\  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
+    \\                    new ids (default 1000)
     \\  --state-dir DIR   where to remember the highest store revision seen (SQLite: default is
     \\                    the SQLite file's directory; Postgres: required). Keep outside the store
     \\  --create-store    create the store's file or schema if it is not there
@@ -417,6 +417,8 @@ test "the lost grace is a flag, a file setting, and refused over an hour" {
     const flags = try parse_flags(&.{ "--lost-grace-ms", "30000" }, &diag);
     const both = try merge(flags, .{ .lost_grace_ms = 5 }, &diag);
     try testing.expectEqual(@as(u32, 30000), both.lost_grace_ms);
+    const at_limit = try merge(.{ .lost_grace_ms = constants.lost_grace_ms_max }, .{}, &diag);
+    try testing.expectEqual(constants.lost_grace_ms_max, at_limit.lost_grace_ms); // Exactly 1 h.
     const over = constants.lost_grace_ms_max + 1;
     try expect_bad(merge(.{ .lost_grace_ms = over }, .{}, &diag), &diag);
 }

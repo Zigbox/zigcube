@@ -40,6 +40,12 @@ pub const watch_prefixes = [_][]const u8{ records.prefix_nodes, records.prefix_n
 const batch_nodes_max: u32 = 2;
 /// Observed records one transaction removes: the rest of the transaction is its one decision.
 pub const observed_removals_per_txn: u32 = constants.store_txn_ops_max - controller.decision_ops;
+/// Stale observed records one transaction removes from a ready node: each is compared at the
+/// revision read, beside the node, its status and the decision's summary.
+pub const observed_stale_per_txn: u32 = @min(
+    observed_removals_per_txn,
+    constants.store_txn_compares_max - 2 - controller.decision_compares,
+);
 /// The soonest the controller samples the leases again, so a lease whose time is up but which the
 /// store has not yet revoked does not make it spin.
 pub const lease_sample_min_ms: u64 = 200;
@@ -49,6 +55,10 @@ comptime {
     const compares_per_node = 2 + 2 * controller.decision_compares;
     assert(batch_nodes_max * compares_per_node <= constants.store_txn_compares_max);
     assert(observed_removals_per_txn > 0);
+    assert(observed_stale_per_txn > 0);
+    assert(observed_stale_per_txn + 2 + controller.decision_compares <=
+        constants.store_txn_compares_max);
+    assert(observed_stale_per_txn + controller.decision_ops <= constants.store_txn_ops_max);
     assert(2 + controller.decision_compares <= constants.store_txn_compares_max);
 }
 
@@ -63,9 +73,19 @@ const LeaseMemo = struct {
     heard_ms: u64 = 0,
 };
 
+/// A tenure whose stale observed records have all been removed: nothing older can appear again,
+/// because the store refuses an old tenure's writes (authority.md, "Tenure"). A cache; after a
+/// restart each ready node is scanned once.
+const Cleaned = struct {
+    node: records.Key = .{},
+    tenure: u64 = 0,
+};
+
 pub const NodeController = struct {
     source: controller.DecisionSource,
     memos: [constants.nodes_max]LeaseMemo = @splat(.{}),
+    cleaned: [constants.nodes_max]Cleaned = @splat(.{}),
+    cleaned_next: u32 = 0,
     /// A lost node's observed records stay this long after `mark_lost` (the scheduler's grace
     /// before it moves the node's replicas), so a node that comes back keeps them.
     lost_grace_ms: u64 = constants.lost_grace_ms,
@@ -232,10 +252,14 @@ pub const NodeController = struct {
         leases: []const store.LeaseInfo,
     ) Error!void {
         assert(status.rec.state == .ready);
+        // A lease that cannot be named (no memo, and the tenure's revision is compacted) is not in
+        // `leases` either: that is how an ended lease looks, and deciding otherwise would make
+        // the decision depend on when compaction ran. It is cited as lease 0.
         const lease = try nc.lease_of(ctx, name, status);
-        if (lease == store.lease_none) return; // Compacted away: nothing to say it ended.
-        if (lease_info(leases, lease)) |info| {
-            if (info.remaining_ms > 0) return;
+        if (lease != store.lease_none) {
+            if (lease_info(leases, lease)) |info| {
+                if (info.remaining_ms > 0) return;
+            }
         }
         _ = try nc.lost_decision(ctx, batch, name, status, lease);
     }
@@ -271,6 +295,9 @@ pub const NodeController = struct {
                 "the server last heard from it {d} ms ago", .{
                 name, lease, ttl_ms, now -| found.heard_ms,
             })
+        else if (lease == store.lease_none)
+            try controller.format(ctx, "node {s} is lost: its lease is unknown (the server " ++
+                "restarted and the record of its tenure is compacted) and is not running", .{name})
         else
             try controller.format(ctx, "node {s} is lost: its lease {d} ran out; when the " ++
                 "server last heard from it is unknown (the server restarted)", .{ name, lease });
@@ -403,9 +430,112 @@ pub const NodeController = struct {
             }
             return true;
         }
+        return nc.remove_stale_observed(ctx, nodes, statuses, acted);
+    }
+
+    /// Removes a page of the observed records of earlier tenures (or with no tenure) from a
+    /// ready node, with one `remove_observed` decision caused by the node's `mark_ready`. Each
+    /// record is compared at the revision read, so one the new tenure's agent has since
+    /// rewritten stays, and so are the node's record and status. Returns whether there may be
+    /// more; a ready node is scanned once per tenure.
+    fn remove_stale_observed(
+        nc: *NodeController,
+        ctx: *const Context,
+        nodes: []const Entry(records.Node),
+        statuses: []const Entry(records.NodeStatus),
+        acted: *u32,
+    ) Error!bool {
+        for (nodes) |*node| {
+            const status = status_of(statuses, node.rec.name) orelse continue;
+            if (status.rec.state != .ready) continue;
+            const tenure = node.kv.mod_revision;
+            if (status.rec.tenure != tenure) continue;
+            if (nc.is_cleaned(node.rec.name, tenure)) continue;
+            var stale: [observed_stale_per_txn]store.KeyValue = undefined;
+            const found = try stale_observed(ctx, node.rec.name, tenure, &stale);
+            if (found == 0) {
+                nc.mark_cleaned(node.rec.name, tenure);
+                continue;
+            }
+            var batch: Batch = .{};
+            batch.expect(node.kv.key, node.kv.mod_revision);
+            batch.expect(status.kv.key, status.kv.mod_revision);
+            const first = stale[0].key[records.observed_prefix(node.rec.name).len..];
+            const reason = try controller.format(ctx, "node {s} runs tenure {d}; {d} observed " ++
+                "records of earlier tenures are removed, the first {s}", .{
+                node.rec.name, tenure, found, first,
+            });
+            const cause: records.Cause = .{ .kind = .decision, .id = status.rec.decision };
+            _ = try controller.put_decision(ctx, &nc.source, .{
+                .actor = actor,
+                .action = "remove_observed",
+                .subject = .{ .kind = .node, .name = node.rec.name },
+                .reason = reason,
+                .cause = cause,
+            }, &batch);
+            for (stale[0..found]) |kv| {
+                batch.expect(kv.key, kv.mod_revision);
+                batch.delete(kv.key);
+            }
+            switch (try controller.commit(ctx, .node_controller, &batch)) {
+                .applied => acted.* += 1,
+                .conflict => {},
+            }
+            return true;
+        }
         return false;
     }
+
+    fn is_cleaned(nc: *const NodeController, name: []const u8, tenure: u64) bool {
+        for (&nc.cleaned) |*entry| {
+            if (entry.node.len == 0 or entry.tenure != tenure) continue;
+            if (std.mem.eql(u8, entry.node.slice(), name)) return true;
+        }
+        return false;
+    }
+
+    /// Remembers a scanned tenure, replacing the oldest entry when full (round robin: an entry
+    /// forgotten costs one more scan).
+    fn mark_cleaned(nc: *NodeController, name: []const u8, tenure: u64) void {
+        assert(tenure > 0);
+        nc.cleaned[nc.cleaned_next] = .{ .node = name_key(name), .tenure = tenure };
+        nc.cleaned_next = (nc.cleaned_next + 1) % constants.nodes_max;
+    }
 };
+
+/// Fills `out` with the node's observed records whose tenure is not `tenure` (or is absent), in
+/// key order, and returns how many. Reads the prefix a page at a time, at most the bound a node
+/// can hold (`agent_node_replicas_max`).
+fn stale_observed(
+    ctx: *const Context,
+    name: []const u8,
+    tenure: u64,
+    out: []store.KeyValue,
+) Error!u32 {
+    assert(out.len > 0);
+    const prefix = records.observed_prefix(name);
+    var found: u32 = 0;
+    var after: ?[]const u8 = null;
+    const pages_max = @divFloor(constants.agent_node_replicas_max, constants.store_list_limit_max);
+    for (0..pages_max + 1) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = prefix.slice(),
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, ctx.diag);
+        for (page.kvs) |kv| {
+            const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
+            if (observed.tenure) |held| {
+                if (held == tenure) continue;
+            }
+            out[found] = kv;
+            found += 1;
+            if (found == out.len) return found;
+        }
+        after = page.continue_after orelse return found;
+    }
+    return found;
+}
 
 /// A key-sized buffer holding a node's name.
 fn name_key(name: []const u8) records.Key {
@@ -540,7 +670,17 @@ const Fixture = struct {
         return lease.id;
     }
 
+    /// A record the agent wrote under the node's current tenure.
     fn observe(self: *Fixture, node: []const u8, replica: []const u8) !void {
+        return self.observe_at(node, replica, try self.node_revision(node));
+    }
+
+    fn observe_at(
+        self: *Fixture,
+        node: []const u8,
+        replica: []const u8,
+        tenure: store.Revision,
+    ) !void {
         const ctx = self.context();
         const value: records.Observed = .{
             .replica = replica,
@@ -548,11 +688,31 @@ const Fixture = struct {
             .generation = 1,
             .status = .running,
             .reported_at_ms = self.manual.ms,
+            .tenure = tenure,
         };
         const bytes = try records.encode(ctx.arena, value, &self.diag);
         const key = records.observed_key(node, replica);
         const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
         _ = try writers.txn(ctx.store, .{ .agent = node }, .{ .on_success = &.{op} }, &self.diag);
+    }
+
+    fn compact_all(self: *Fixture) !void {
+        const ctx = self.context();
+        const now = try ctx.store.status(&self.diag);
+        try ctx.store.compact(now.revision, &self.diag);
+    }
+
+    /// The `mark_lost` decision recorded for `node`.
+    fn lost_decision_of(self: *Fixture, node: []const u8) !records.Decision {
+        const ctx = self.context();
+        const prefix = records.index_prefix(.node, node);
+        const options: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+        const page = try ctx.store.list(ctx.arena, options, &self.diag);
+        for (page.kvs) |kv| {
+            const entry = try records.read(records.IndexEntry, ctx.arena, kv, &self.diag);
+            if (std.mem.eql(u8, entry.action, "mark_lost")) return self.decision(entry.id);
+        }
+        return error.TestUnexpectedResult;
     }
 
     fn count(self: *Fixture, prefix: []const u8) !usize {
@@ -794,4 +954,51 @@ test "a node that registers again on a new lease while its old one runs is not l
     try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
     try testing.expectEqual(records.NodeState.ready, (try fixture.status("n1")).?.rec.state);
     try testing.expectEqual(@as(usize, 2), try fixture.count("/decisions-by-subject/node/n1/"));
+}
+
+test "a record of an older tenure on a ready node is removed; the new tenure's is kept" {
+    // Goal: authority.md §3, records of a tenure that was lost are removed even when the node is
+    // back. Method: n1 is ready, writes two records; its lease runs out and it registers again
+    // before the grace ends; one record is rewritten under the new tenure. The pass marks the
+    // old tenure lost and the new one ready, and removes only the record of the old tenure.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    _ = try fixture.register_leased("n1", 1000);
+    _ = try fixture.step();
+    try fixture.observe("n1", "old-1");
+    try fixture.observe("n1", "kept-1");
+    fixture.manual.ms += 1001;
+    _ = try fixture.memory.interface().expire_leases(&fixture.diag);
+    _ = try fixture.register_leased("n1", 10_000);
+    try fixture.observe("n1", "kept-1");
+    _ = try fixture.step(); // lost for the old tenure, ready for the new.
+    try testing.expectEqual(@as(usize, 2), try fixture.count("/observed/n1/"));
+    _ = try fixture.step(); // Removes the stale record.
+    try testing.expectEqual(@as(usize, 1), try fixture.count("/observed/n1/"));
+    const ctx = fixture.context();
+    const key = records.observed_key("n1", "kept-1");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    try testing.expect(got.kv != null);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a lost tenure whose lease cannot be named is still marked lost, citing lease 0" {
+    // Goal: the decision does not depend on when compaction ran. Method: the controller has no
+    // memo and the tenure's revision is compacted; the node's record is gone and the lease is
+    // unknown; the pass still writes `mark_lost` with lease 0.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    _ = try fixture.register_leased("n1", 1000);
+    _ = try fixture.step();
+    fixture.nc = NodeController.init(3);
+    fixture.manual.ms += 1001;
+    _ = try fixture.memory.interface().expire_leases(&fixture.diag);
+    try fixture.compact_all();
+    _ = try fixture.register_leased("n1", 1000);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    const lost_id = try fixture.lost_decision_of("n1");
+    try testing.expectEqualStrings("mark_lost", lost_id.action);
+    try testing.expectEqual(@as(store.LeaseId, store.lease_none), lost_id.cause.lease.?);
 }

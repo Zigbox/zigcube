@@ -187,6 +187,9 @@ before an auditor ever has to find it in a cluster.
 - **Accounting is released when the assignment is removed**, which is before the old process has
   necessarily stopped. Physical use can therefore exceed the accounting for up to the stop grace
   (`stop_grace_ms`). Allocation is a promise about placement, not a measurement.
+- **A record deflated below an assignment's requests is not released until repair.** The node's
+  allocation record can hold less than its assignments request; the difference is not released
+  by the scheduler's ordinary passes, only by repair (`POST /v1/repair/allocations/{node}`).
 
 ## 3. Tenure, leases and fencing
 
