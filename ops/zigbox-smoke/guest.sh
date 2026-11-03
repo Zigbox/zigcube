@@ -191,9 +191,12 @@ oom_diagnostics() {
 }
 
 stage_oom() {
-    # busybox tail keeps a line with no newline in memory: /dev/zero fills the 32 MiB limit. It
-    # is the container's PID 1 itself (no `sh -c`), so it is what the OOM killer picks.
-    apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' '["tail","/dev/zero"]')"
+    # busybox tail keeps a line with no newline in memory: /dev/zero fills the 32 MiB limit.
+    # The sleep paces the restarts (Zigcube has no backoff): unpaced, CI's run of ac94f8a made 47
+    # hog replicas in 14 s and Zigbox, which keeps at most 32 run records and prunes the oldest,
+    # live ones included, pruned box's, so box showed `starting`. `exec` makes tail PID 1.
+    apply "$(service_json hog $ALPINE_TREE 1 '{"memory_bytes":33554432}' \
+        '["sh","-c","sleep 4; exec tail /dev/zero"]')"
     n=0
     until hog_oom; do
         n=$((n + 1))
