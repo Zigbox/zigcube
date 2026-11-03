@@ -1,0 +1,5 @@
+warning[ZC-W0601]: a peer sent a chunk that does not match its hash
+  cause  peer node2 sent chunk 5 of 24 with bytes that do not match its hash
+  fix    no action needed for this fetch; check that node's store and disk
+  more   zcube explain W0601 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0601.html
