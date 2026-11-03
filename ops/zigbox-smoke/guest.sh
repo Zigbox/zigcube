@@ -181,7 +181,8 @@ stage_scale0() {
     curl -sf -X DELETE "$API/v1/services/big" >/dev/null || fail "delete big"
     sleep 20
     agent_pid >/dev/null || fail "the agent died when a service was removed during a pull"
-    two_boxes || fail "box was disturbed by removing big"
+    two_boxes || fail "box was disturbed by removing big: $(count box) processes, observed:" \
+        "$(observed box | tr '\n' ';')" "processes:" "$(ps -eo pid,etime,args | grep -E 'zcube|# (box|big)' | grep -v grep)"
     ok "removing a service during its pull leaves the agent and box running"
 }
 
