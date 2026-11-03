@@ -74,7 +74,11 @@ pub const DirImages = struct {
     ) node_store.ChunkError!void {
         if (!node_store.list_matches(digest, list)) return error.BadHash;
         if (list.len > self.list.len) return error.BadHash;
-        if (node_store.list_parse(list, self.refs) == null) return error.BadHash;
+        const count = node_store.list_parse(list, self.refs) orelse return error.BadHash;
+        // Only the canonical text: it is what a peer will be sent, and what the digest names.
+        const canon = node_store.list_format(self.refs[0..count], self.list) orelse
+            return error.BadHash;
+        if (!std.mem.eql(u8, canon, list)) return error.BadHash;
         var name_buffer: [80]u8 = undefined;
         const name = tree_name(&name_buffer, digest) orelse return error.BadHash;
         const trees = self.root.openDir(self.io, dir_trees, .{}) catch return error.StoreFailed;

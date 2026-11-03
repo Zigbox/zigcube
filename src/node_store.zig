@@ -111,6 +111,16 @@ pub fn list_parse(list: []const u8, out: []ChunkRef) ?u32 {
     return if (count == 0) null else count;
 }
 
+/// The canonical text of a chunk list (lowercase hex, one decimal size, a newline per chunk), the
+/// text a digest names; null if `out` is too small.
+pub fn list_format(chunks: []const ChunkRef, out: []u8) ?[]u8 {
+    var writer: std.Io.Writer = .fixed(out);
+    for (chunks) |chunk| {
+        writer.print("{x} {d}\n", .{ &chunk.hash, chunk.bytes }) catch return null;
+    }
+    return writer.buffered();
+}
+
 /// BLAKE3 of `bytes` is `hash`: the check every store makes.
 pub fn chunk_verifies(hash: *const Hash, bytes: []const u8) bool {
     var actual: Hash = undefined;

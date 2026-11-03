@@ -41,6 +41,7 @@ pub const modules = .{
     @import("peer.zig"),
     @import("peer_ca.zig"),
     @import("peer_limit.zig"),
+    @import("peer_serve.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
     @import("runtime_codes.zig"),
