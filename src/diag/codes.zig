@@ -87,6 +87,7 @@ pub const Code = enum(u8) {
     E0513,
     E0514,
     W0501,
+    W0601,
     B0001,
     B0002,
     B0003,
@@ -1068,6 +1069,21 @@ pub const registry = [_]Entry{
         \\
         \\This happens when the agent was paused or cut off from the server for
         \\longer than the lease time to live less the fencing margin.
+        ,
+    },
+    .{
+        .code = .W0601,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a peer sent a chunk that does not match its hash",
+        .explanation =
+        \\A node that was asked for a chunk of an image sent bytes whose hash is not
+        \\the chunk's. The chunk was dropped and the node asked for no more from
+        \\that peer during this fetch; it came from another peer or the registry.
+        \\
+        \\The image is not affected: nothing is stored or run before every chunk
+        \\matches. The peer's disk or store may be damaged, or it may be running a
+        \\different build; check that node.
         ,
     },
     .{
