@@ -8,7 +8,9 @@
 //! `read_chunk` check BLAKE3 against the name, so a bad chunk is never stored and never served;
 //! `put_tree` holds a list to its digest (`node_store.list_matches`). Writes are a temporary file
 //! renamed into place, so a reader sees a whole file or none, and a crash leaves no half chunk
-//! under its name. Shell code: files. The fake registry and the demo seed it with `put_tree`.
+//! under its name. A `DirImages` belongs to one thread (its buffers are shared by its calls);
+//! each thread opens its own, and the directory itself may be shared (writes are renames of
+//! uniquely named temporary files). Shell code: files. The fake registry and the demo seed it with `put_tree`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -171,7 +173,11 @@ pub const DirImages = struct {
             error.FileNotFound => return error.NotFound,
             else => return error.StoreFailed,
         };
-        if (bytes.len == out.len) return error.BadHash; // A chunk file never fills the buffer.
+        if (bytes.len == out.len) {
+            // Exactly full: a whole chunk of the largest size, or a longer file cut short.
+            const stat = chunks.statFile(self.io, name, .{}) catch return error.StoreFailed;
+            if (stat.size != out.len) return error.BadHash;
+        }
         if (!node_store.chunk_verifies(hash, bytes)) return error.BadHash;
         return bytes;
     }
@@ -241,10 +247,13 @@ pub const DirImages = struct {
 
 /// `data` as `name` in `dir`, whole or not at all: a temporary file, synced, then renamed.
 fn write_whole(io: std.Io, dir: Dir, name: []const u8, data: []const u8) !void {
+    // A name of its own per write: two writers of one chunk must not share a temporary file.
+    var random: [8]u8 = undefined;
+    io.random(&random);
     var temp_buffer: [96]u8 = undefined;
-    const temp = try std.fmt.bufPrint(&temp_buffer, "{s}.tmp", .{name});
+    const temp = try std.fmt.bufPrint(&temp_buffer, "{s}.{x}.tmp", .{ name, &random });
     {
-        const file = try dir.createFile(io, temp, .{});
+        const file = try dir.createFile(io, temp, .{ .exclusive = true });
         defer file.close(io);
         try file.writeStreamingAll(io, data);
         try file.sync(io);
@@ -338,4 +347,30 @@ test "a chunk file that was damaged on disk is not served" {
     const out = try std.testing.allocator.alloc(u8, constants.swarm_chunk_bytes);
     defer std.testing.allocator.free(out);
     try std.testing.expectError(error.BadHash, images.read_chunk(&sample.hashes[0], out));
+}
+
+test "a chunk of exactly the largest size is stored, read and served" {
+    // Goal: a full-size chunk (every chunk but a file's last) is not mistaken for an overlong
+    // file. Method: store swarm_chunk_bytes of data, read it into a buffer of that size; then a
+    // file one byte longer under the same name is refused.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try test_store(&tmp);
+    defer store.close(std.testing.allocator);
+    const images = store.images();
+    const big = try std.testing.allocator.alloc(u8, constants.swarm_chunk_bytes + 1);
+    defer std.testing.allocator.free(big);
+    for (big, 0..) |*byte, at| byte.* = @truncate(at *% 7);
+    var hash: Hash = undefined;
+    std.crypto.hash.Blake3.hash(big[0..constants.swarm_chunk_bytes], &hash, .{});
+    try images.put_chunk(&hash, big[0..constants.swarm_chunk_bytes]);
+    const out = try std.testing.allocator.alloc(u8, constants.swarm_chunk_bytes);
+    defer std.testing.allocator.free(out);
+    const read = try images.read_chunk(&hash, out);
+    try std.testing.expectEqualSlices(u8, big[0..constants.swarm_chunk_bytes], read);
+    const chunks = try store.root.openDir(std.testing.io, dir_chunks, .{});
+    defer chunks.close(std.testing.io);
+    var name: [64]u8 = undefined;
+    try write_whole(std.testing.io, chunks, DirImages.chunk_name(&name, &hash), big);
+    try std.testing.expectError(error.BadHash, images.read_chunk(&hash, out));
 }

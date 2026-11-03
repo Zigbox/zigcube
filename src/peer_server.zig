@@ -373,3 +373,45 @@ test "a peer of the cluster is served a chunk and a tree, and a stranger is not"
         return error.TestUnexpectedResult;
     } else |_| {}
 }
+
+test "a chunk of the largest size is served whole" {
+    // Goal: every chunk but a file's last is swarm_chunk_bytes; the server must answer it 200.
+    // Method: store such a chunk next to the rig's tree, ask for it through a real connection.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const big = try gpa.alloc(u8, constants.swarm_chunk_bytes);
+    defer gpa.free(big);
+    for (big, 0..) |*byte, at| byte.* = @truncate(at *% 13);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(big, &hash, .{});
+    {
+        var store = try dir_images.DirImages.open(io, gpa, rig.images_buffer[0..rig.images_len]);
+        defer store.close(gpa);
+        try store.images().put_chunk(&hash, big);
+    }
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    var identity: peer.Identity = .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+    const end = peer_stream.boot_ms(io) + 10_000;
+    const fd = try peer_stream.connect(io, address, end);
+    defer _ = std.os.linux.close(fd);
+    var stream = try peer_stream.open_client(io, fd, &identity, "node2", end);
+    defer stream.deinit();
+    var target: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&target, "GET {s}{x}\n", .{ chunk_path, &hash });
+    try stream.send(path, end);
+    const reply = try gpa.alloc(u8, constants.swarm_chunk_bytes + 64);
+    defer gpa.free(reply);
+    const head = try stream.recv(reply, end);
+    try std.testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, head[0..2], .big));
+    const body = try stream.recv(reply, end);
+    try std.testing.expectEqualSlices(u8, big, body);
+}

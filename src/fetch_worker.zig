@@ -61,12 +61,17 @@ pub fn fetch(
     transport: Transport,
     store: *dir_images.DirImages,
     digest: []const u8,
-    peers: []const PeerInfo,
+    all_peers: []const PeerInfo,
     config: fetch_plan.Config,
     report: *Report,
 ) Error!void {
-    assert(peers.len <= constants.fetch_peers_max);
+    assert(all_peers.len <= constants.fetch_peers_max);
     report.* = .{};
+    // A peer is not trusted: only the whole digest (`b3:` and 64 hex) holds its list to the
+    // tree. A shorter one (8 hex is 32 bits) could be matched by a forged list, so such a tree
+    // comes from the registry alone.
+    const full_digest_len = 3 + 64;
+    const peers = if (digest.len == full_digest_len) all_peers else all_peers[0..0];
     const list_buffer = try allocator.alloc(u8, constants.tree_list_bytes_max);
     defer allocator.free(list_buffer);
     const refs = try allocator.alloc(ChunkRef, constants.fetch_chunks_max);
@@ -328,4 +333,30 @@ test "a second fetch asks for nothing, and a tree no source has fails" {
     const gpa = std.testing.allocator;
     const failed = fetch(gpa, transport, &other, &table.digest, &.{}, config, &report);
     try std.testing.expectError(error.TreeUnavailable, failed);
+}
+
+test "a tree named by a short digest is never fetched from a peer" {
+    // Goal: an 8-hex prefix proves too little to trust a peer's list. Method: fetch with a
+    // digest cut to 11 characters and a peer that holds everything: the peer is not asked for
+    // anything, the registry serves the lot; with the full digest the peer serves.
+    var table: Table = .{};
+    table.make();
+    var filter: [64]u8 = undefined;
+    full_filter(&table, &filter);
+    const peers = [_]PeerInfo{.{ .name = "node2", .filter = &filter }};
+    var report: Report = .{};
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try test_store(&tmp);
+    defer store.close(gpa);
+    try fetch(gpa, table.transport(), &store, table.digest[0..11], &peers, .{}, &report);
+    try std.testing.expectEqual(@as(u32, 0), table.peer_asked);
+    try std.testing.expectEqual(@as(u32, tree_chunks), table.registry_asked);
+    var again = std.testing.tmpDir(.{});
+    defer again.cleanup();
+    var second = try test_store(&again);
+    defer second.close(gpa);
+    try fetch(gpa, table.transport(), &second, &table.digest, &peers, .{}, &report);
+    try std.testing.expect(table.peer_asked > 0);
 }
