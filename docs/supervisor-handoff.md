@@ -124,7 +124,14 @@ Record the split in `docs/briefs/M7-build.md` (slice 3 is at about line 166) and
 
 **Decided after the list above:**
 
-- **O3: mTLS (owner, 2026-11-03).** The peer chunk protocol is authenticated with mutual TLS. The control plane is the cluster CA and issues each node a certificate at join (node name in the cert). Chunk servers accept only peers whose certificates chain to the cluster CA, and clients verify the serving node's name. Integrity still rests on BLAKE3, and TLS adds confidentiality.
+- **O3 revised (owner, 2026-11-03, later the same day): a Noise-style handshake, not TLS.** The pinned std has a TLS 1.3 client only: no server, and no client certificates. C2 peers therefore use a small fixed handshake (X25519, Ed25519, ChaCha20-Poly1305). It keeps the trust model below: the control plane signs each node's Ed25519 key at join. Real mTLS remains the target, and the release docs must say the handshake is interim.
+  - **Server-side TLS: open-source it, and when (owner, 2026-11-03).**
+    - When we have our own server-side TLS 1.3/mTLS implementation, we open-source it.
+    - It must land before Zigcube is offered for self-hosting on EC2. The owner placed that at C5.
+    - SPEC's C5 is "Edge: public HTTPS", which needs a TLS server for ACME certificates anyway. C4 ("Mesh") already lists mutual TLS between workloads as one option.
+    - So the latest point is C5, and C4 if C4 picks mTLS over WireGuard identity.
+    - Put this into c2.md's follow-ups and the C4/C5 briefs when they are written.
+- *Original O3 text, superseded:* **O3: mTLS (owner, 2026-11-03).** The peer chunk protocol is authenticated with mutual TLS. The control plane is the cluster CA and issues each node a certificate at join (node name in the cert). Chunk servers accept only peers whose certificates chain to the cluster CA, and clients verify the serving node's name. Integrity still rests on BLAKE3, and TLS adds confidentiality.
   - **Before slice 6, check:**
     - **Std TLS server support.** Have a Haiku agent read the pinned std's `std.crypto.tls` and confirm whether it supports server-side TLS 1.3 and client certificates. If it doesn't, slice 6 needs its own minimal TLS 1.3 server with Ed25519 certs. That would be a large piece of work, and the owner should be told about it before the slice is briefed.
     - **Docs to amend:**
