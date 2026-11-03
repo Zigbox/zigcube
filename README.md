@@ -16,7 +16,7 @@ An orchestrator for Zigbox workloads: store-aware scheduling, peer chunk distrib
 | Milestone | What it adds | Status |
 | --- | --- | --- |
 | C0 · Loop | One node keeps a promise: apply, get, why | **Demonstrated** 2026-10-27, [CI run](https://github.com/Zigbox/zigcube/actions/runs/40556942364) |
-| C1 · Fleet | Placement across nodes, failover on lease expiry | In progress: slices 1, 2, 3 (scheduler), 4 (node controller, lost nodes, replacement), 6 (agent leases), 7 (surfaces, `zcube local up\|down` included), 5 (sim-c1, PR #51), 8 (demo-c1, green in PR CI on SQLite and Postgres), 9 (the simulation fleet) and 10 (the store under faults): all 10 of 10 merged; not demonstrated until demo-c1 is green on main; plan in [docs/briefs/c1.md](docs/briefs/c1.md) |
+| C1 · Fleet | Placement across nodes, failover on lease expiry | **Demonstrated** 2026-11-03: demo-c1 green on main on SQLite and Postgres ([run](https://github.com/Zigbox/zigcube/actions/runs/41605325965)); all 10 slices reviewed and merged (scheduler, node controller and replacement, sim-c1, agent leases, surfaces and `zcube local up\|down`, demo-c1, the simulation fleet, the store under faults); plan in [docs/briefs/c1.md](docs/briefs/c1.md) |
 | C2 · Swarm | Images reach nodes fast: peer chunks, warm-node scheduling | In progress: slices 1 (the real Zigbox runtime, `zigbox-smoke` green on a KVM VM), 2 (`source`), 3 (`Runtime.signal`) and 4 (the swarm core, PR #50) of 9 merged; slices 5–9 wait on owner decisions (O1–O8) and Zigbox changes (Z1–Z7). Not demonstrated |
 | C3–C8 | Rollout, Mesh, Edge, Trust, State, Jobs | Not started |
 
