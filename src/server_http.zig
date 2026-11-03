@@ -270,7 +270,8 @@ const Parsed = struct {
     query: []const u8,
     request_id: ?[]const u8,
     content_length: ?u64,
-    chunked: bool,
+    /// Any Transfer-Encoding header, whatever its value (RFC 9112 6.3).
+    transfer_encoded: bool,
     has_body_method: bool,
 };
 
@@ -279,8 +280,12 @@ fn copy_head(ctx: *const controller.Context, request: *http.Server.Request) ?Par
     const target = ctx.arena.dupe(u8, head.target) catch return null;
     const question = std.mem.findScalar(u8, target, '?');
     var request_id: ?[]const u8 = null;
+    var transfer_encoded = false;
     var headers = request.iterateHeaders();
     while (headers.next()) |header| {
+        // std puts `gzip` or `deflate` in `transfer_compression` and leaves the encoding
+        // `.none`, so the head's field cannot say whether the header was there.
+        if (std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) transfer_encoded = true;
         if (!std.ascii.eqlIgnoreCase(header.name, "x-request-id")) continue;
         request_id = ctx.arena.dupe(u8, header.value) catch return null;
     }
@@ -290,7 +295,7 @@ fn copy_head(ctx: *const controller.Context, request: *http.Server.Request) ?Par
         .query = if (question) |at| target[at + 1 ..] else "",
         .request_id = request_id,
         .content_length = head.content_length,
-        .chunked = head.transfer_encoding != .none,
+        .transfer_encoded = transfer_encoded,
         .has_body_method = head.method.requestHasBody(),
     };
 }
@@ -305,12 +310,21 @@ fn read_body(
     request: *http.Server.Request,
     parsed: Parsed,
 ) BodyError![]const u8 {
-    if (parsed.chunked) {
-        const cause = "send a Content-Length: chunked bodies are not accepted";
+    // A Transfer-Encoding without a final `chunked` is a framing the server cannot read, and
+    // reading the body as empty would parse it as the next request (RFC 9112 6.3): refuse and
+    // close, whatever the value.
+    if (parsed.transfer_encoded) {
+        const cause = "send a Content-Length: bodies with a Transfer-Encoding are not accepted";
         refuse_request(work, ctx, request, 411, .E0104, cause);
         return error.Refused;
     }
-    const length = parsed.content_length orelse return "";
+    // RFC 9112 6.3: a request with neither Content-Length nor Transfer-Encoding has no body. A
+    // POST without either (`curl -X POST`) is told so, or std.http asserts when it responds.
+    if (parsed.content_length == null) {
+        if (!parsed.has_body_method) return "";
+        request.head.content_length = 0;
+    }
+    const length = request.head.content_length.?;
     if (length > constants.http_body_bytes_max) {
         const cause = "the request body is larger than 65536 bytes";
         refuse_request(work, ctx, request, 413, .E0108, cause);

@@ -134,6 +134,8 @@ pub const fence_margin_ms: u32 = 3000;
 /// How often a fencing agent looks at its containers while it waits for them to stop.
 pub const fence_poll_ms: u32 = 100;
 pub const lost_grace_ms: u32 = 1000;
+/// The longest `zcube-server --lost-grace-ms` accepts: an hour.
+pub const lost_grace_ms_max: u32 = 60 * 60 * 1000;
 /// What the margin leaves for the kernel to deliver SIGKILL and the process to exit.
 pub const fence_kill_latency_ms: u32 = 900;
 /// Bytes a decision's `cause_evidence` may take.
@@ -154,6 +156,14 @@ pub const decision_gone_age_ms_max: u64 = 24 * 60 * 60 * 1000;
 pub const retention_interval_ms: u32 = 60 * 1000;
 pub const retention_batch_pairs: u32 = store_txn_ops_max / 2;
 pub const retention_batches_max: u32 = 32;
+/// Reachability (authority.md §5): the decisions one pass pins, at most. A pass that would pin
+/// more drops nothing from live subjects (fail safe) and tries again at the next interval.
+pub const retention_pinned_max: u32 = 8192;
+/// The distinct actions of one live subject, each with a root: more is the same fail safe.
+pub const retention_actions_per_subject_max: u32 = 16;
+/// Memory one pass reads index pages and decisions through, reused for each: a page that does
+/// not fit is the same fail safe.
+pub const retention_scratch_bytes: u32 = 1024 * 1024;
 /// Decisions that may be written by one step, so a decision id's counter cannot wrap inside one.
 pub const decision_counter_modulus: u32 = 10_000;
 /// The widest `at_ms` a decision id holds: 13 digits.
@@ -376,6 +386,8 @@ comptime {
     assert(replicas_per_service_max <= replicas_max);
     assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
     assert(retention_batch_pairs * 2 <= store_txn_ops_max);
+    assert(why_steps_max <= retention_pinned_max);
+    assert(retention_scratch_bytes <= request_arena_bytes_max / 4);
     assert(decisions_scan_max <= store_list_limit_max);
     assert(request_id_bytes_min < request_id_bytes_max);
     assert(api_list_limit_max <= store_list_limit_max);

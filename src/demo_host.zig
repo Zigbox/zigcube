@@ -34,6 +34,8 @@ pub const Config = struct {
     /// The server's `--store` setting; the demo makes the store's file or schema new before it.
     store: []const u8,
     transcript_path: ?[]const u8,
+    /// The server's `--lost-grace-ms`, as text; null leaves the server's default.
+    lost_grace_ms: ?[]const u8 = null,
 };
 
 /// What a `zcube` command did: its exit code (255 if a signal ended it) and both streams.
@@ -143,13 +145,16 @@ pub const Host = struct {
         // A Postgres store has no directory beside it, so the server needs one to remember the
         // highest revision it saw (ZC-E0106 without it); the same one serves every restart.
         const state_dir = try host.path_in_work("server-state");
+        const grace = host.config.lost_grace_ms orelse "";
         const args = [_][]const u8{
-            "--listen",       listen,
-            "--store",        host.config.store,
-            "--state-dir",    state_dir,
-            "--create-store", "--quiet",
+            "--listen",        listen,
+            "--store",         host.config.store,
+            "--state-dir",     state_dir,
+            "--create-store",  "--quiet",
+            "--lost-grace-ms", grace,
         };
-        host.server = try host.spawn(host.config.server_exe, &args, log);
+        const count = if (host.config.lost_grace_ms == null) args.len - 2 else args.len;
+        host.server = try host.spawn(host.config.server_exe, args[0..count], log);
         const ready = struct {
             fn check(_: void, h: *Host) !bool {
                 const reply = h.call("GET", "/v1/status", "") catch return false;

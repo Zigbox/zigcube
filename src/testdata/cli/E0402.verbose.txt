@@ -1,0 +1,7 @@
+request  r-0000001  POST /v1/repair/allocations/node1?confirm=true  400
+error[ZC-E0402]: the node has no open allocation finding
+  cause  the allocation auditor has no open finding on node node1
+  reqid  r-0000001
+  fix    see every node's accounting   zcube check allocations
+  more   zcube explain E0402
+  docs   https://zigbox.github.io/zigcube/errors/E0402.html

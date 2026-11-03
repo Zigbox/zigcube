@@ -562,3 +562,175 @@ test "a move is refused, not asserted, for a caller's bad input" {
     try fixture.expect_on("hello-1", "n1");
     try fixture.accounting_holds();
 }
+
+/// The node controller's view of a lease that ran out: `/nodes/<name>` deleted (by its agent,
+/// as the lease's expiry would) and the status `lost` for the tenure it had, by "mark-lost-1".
+fn lose(fixture: *Fixture, name: []const u8) !void {
+    const key = records.node_key(name);
+    const tenure = try fixture.revision_of(key.slice());
+    const ctx = fixture.context();
+    const op: store.Op = .{ .delete = key.slice() };
+    const role: writers.Role = .{ .agent = name };
+    _ = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+    const value: records.NodeStatus = .{
+        .state = .lost,
+        .tenure = tenure,
+        .at_ms = fixture.manual.ms,
+        .decision = "mark-lost-1",
+    };
+    try fixture.put(.node_controller, records.node_status_key(name).slice(), value);
+}
+
+test "a lost node's replica stays put for the scheduler, past any grace" {
+    // Goal: the scheduler does not move a lost node's replica (the replica controller replaces it
+    // under a new id, authority.md §3), and places nothing more on the lost node.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    try fixture.node("n2", 4000, 8 * gib, true);
+    try lose(&fixture, "n1");
+    fixture.manual.ms += constants.lost_grace_ms_max;
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("hello-1", "n1");
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    try fixture.expect_on("hello-2", "n2");
+}
+
+test "a replica retired off a lost node has its assignment released there" {
+    // Goal: the reaction to the replica controller's replacement: n1 has no `/nodes` record, and
+    // its allocation still comes down with the release, caused by the `mark_replica_lost`.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    try lose(&fixture, "n1");
+    const ctx = fixture.context();
+    const key = records.replica_key("hello", "hello-1");
+    const op: store.Op = .{ .delete = key.slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{op} }, &fixture.diag);
+    try fixture.settle();
+    try fixture.expect_on("hello-1", null);
+    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_replica"));
+    try fixture.accounting_holds();
+}
+
+// ---- The allocation auditor and repair (C1 slice 4c, 4d) -------------------------------------
+
+const allocations = @import("allocations.zig");
+const auditor_mod = @import("auditor.zig");
+
+fn audit_pass(fixture: *Fixture, auditor: *auditor_mod.Auditor) !u32 {
+    const ctx = fixture.context();
+    return (try auditor.reconcile(&ctx)).acted;
+}
+
+fn finding_of(fixture: *Fixture, name: []const u8) !?records.Audit {
+    const ctx = fixture.context();
+    const got = try ctx.store.get(ctx.arena, records.audit_key(name).slice(), null, &fixture.diag);
+    const kv = got.kv orelse return null;
+    const keep = fixture.keep.allocator();
+    var audit = try records.read(records.Audit, keep, kv, &fixture.diag);
+    audit.decision = try keep.dupe(u8, audit.decision); // The context's arena is reset.
+    return audit;
+}
+
+/// Overwrites n1's allocation record with one more assignment and 250 more cpu millis than it
+/// holds, as a defect would.
+fn corrupt(fixture: *Fixture, name: []const u8) !void {
+    var wrong = try fixture.allocation(name);
+    wrong.count += 1;
+    wrong.allocated.cpu_millis += 250;
+    try fixture.put(.scheduler, records.allocation_key(name).slice(), wrong);
+}
+
+test "the auditor opens one finding on a corrupted record, and the scheduler only releases" {
+    // Goal: ZC-B0003 once, not once per pass; placement stops and release goes on. Method: two
+    // replicas on n1, corrupt the record, audit twice; a new replica is held, a retired one is
+    // released.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var auditor = auditor_mod.Auditor.init(7);
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.replica("hello", "hello-2", 500, gib);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
+    try corrupt(&fixture, "n1");
+    try testing.expectEqual(@as(u32, 1), try audit_pass(&fixture, &auditor));
+    try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
+    const found = try fixture.decisions(auditor_mod.action_mismatch);
+    defer testing.allocator.free(found);
+    try testing.expectEqual(@as(usize, 1), found.len);
+    const decision = found[0];
+    try testing.expectEqualStrings("n1", decision.subject.name);
+    try testing.expectEqual(records.CauseKind.observed, decision.cause.kind);
+    try testing.expectEqualStrings("/allocations/n1", decision.cause.key.?);
+    const diagnostic = decision.cause_diagnostic.?.text;
+    try testing.expect(std.mem.indexOf(u8, diagnostic, "ZC-B0003") != null);
+    const evidence = decision.cause_evidence.?.text;
+    const want = "\"recorded\":{\"cpu_millis\":1250,\"memory_bytes\":2147483648,\"count\":3}";
+    try testing.expect(std.mem.indexOf(u8, evidence, want) != null);
+    const finding = (try finding_of(&fixture, "n1")).?;
+    try testing.expectEqual(@as(u32, 3), finding.recorded.count);
+    try testing.expectEqual(@as(u32, 2), finding.reconstructed.count);
+    try testing.expectEqualStrings(decision.id, finding.decision);
+    // Placement stops on n1; release goes on.
+    try fixture.replica("hello", "hello-3", 500, gib);
+    _ = try fixture.sc_step_unchecked();
+    try fixture.expect_on("hello-3", null);
+    const ctx = fixture.context();
+    const gone: store.Op = .{ .delete = records.replica_key("hello", "hello-1").slice() };
+    _ = try writers.txn(ctx.store, .replica_controller, .{ .on_success = &.{gone} }, &fixture.diag);
+    _ = try fixture.sc_step_unchecked();
+    try fixture.expect_on("hello-1", null);
+    try testing.expectEqual(@as(u32, 2), (try fixture.allocation("n1")).count);
+}
+
+test "repair writes the reconstruction, cites the finding, and the next audit clears it" {
+    // Goal: the operator's way out. Method: corrupt n1, audit, repair as request r-1; the record
+    // equals the assignments' sum, the decision's cause is the finding's decision, the next audit
+    // deletes the finding with `audit_clear`, and a second repair finds nothing to do.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var auditor = auditor_mod.Auditor.init(7);
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.replica("hello", "hello-1", 500, gib);
+    try fixture.settle();
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    {
+        const ctx = fixture.context();
+        try testing.expect(try allocations.repair(&ctx, &source, "n1", "r-1") == .no_finding);
+    }
+    try corrupt(&fixture, "n1");
+    try testing.expectEqual(@as(u32, 1), try audit_pass(&fixture, &auditor));
+    const finding = (try finding_of(&fixture, "n1")).?;
+    const ctx = fixture.context();
+    const result = try allocations.repair(&ctx, &source, "n1", "r-1");
+    try testing.expectEqual(@as(u32, 2), result.repaired.recorded.count);
+    try testing.expectEqual(@as(u32, 1), result.repaired.reconstructed.count);
+    const repaired = try fixture.allocation("n1");
+    try testing.expectEqual(@as(u32, 1), repaired.count);
+    try testing.expectEqual(@as(u32, 500), repaired.allocated.cpu_millis);
+    const found = try fixture.decisions(allocations.repair_action);
+    defer testing.allocator.free(found);
+    try testing.expectEqual(@as(usize, 1), found.len);
+    try testing.expectEqualStrings(finding.decision, found[0].cause.id.?);
+    try testing.expect(std.mem.indexOf(u8, found[0].reason, "r-1") != null);
+    try testing.expect((try finding_of(&fixture, "n1")) != null); // The auditor clears it.
+    try fixture.accounting_holds();
+    try testing.expectEqual(@as(u32, 1), try audit_pass(&fixture, &auditor));
+    try testing.expect((try finding_of(&fixture, "n1")) == null);
+    try testing.expectEqual(@as(usize, 1), try fixture.count(auditor_mod.action_clear));
+    try testing.expectEqual(@as(u32, 0), try audit_pass(&fixture, &auditor));
+    const later = fixture.context();
+    try testing.expect(try allocations.repair(&later, &source, "n1", "r-2") == .no_finding);
+}

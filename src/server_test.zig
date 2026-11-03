@@ -212,6 +212,38 @@ test "the server routes the API and the console, and every reply has a request i
     try testing.expect(!std.mem.eql(u8, "no good", refused.header("x-request-id").?));
 }
 
+test "a POST without Content-Length has no body, and the connection carries the next request" {
+    // Goal: RFC 9112 6.3 and `zcube repair allocations`, which POSTs no body on a kept-alive
+    // connection (std.http asserted when it answered one). Method: a repair of a node with no
+    // finding (E0402 comes before the confirmation is asked for) with neither
+    // Content-Length nor Transfer-Encoding, unconfirmed then confirmed, each followed on the same
+    // connection by a status request; both replies must arrive.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+    const cases = [_]struct { query: []const u8, status: []const u8, code: []const u8 }{
+        .{ .query = "", .status = "409", .code = "ZC-E0402" },
+        .{ .query = "?confirm=true", .status = "409", .code = "ZC-E0402" },
+    };
+    for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(&buffer, "POST /v1/repair/allocations/node1{s} " ++
+            "HTTP/1.1\r\nHost: test\r\n\r\nGET /v1/status HTTP/1.1\r\nHost: test\r\n" ++
+            "Connection: close\r\n\r\n", .{case.query});
+        const reply = try exchange(io, address, request);
+        defer reply.free();
+        if (!std.mem.startsWith(u8, reply.raw[9..], case.status)) {
+            std.debug.print("{s}\n", .{reply.raw});
+        }
+        try testing.expect(std.mem.startsWith(u8, reply.raw[9..], case.status));
+        try testing.expect(std.mem.indexOf(u8, reply.body, case.code) != null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "HTTP/1.1 200") != null);
+    }
+}
+
 test "the limits of constants.zig are enforced with a coded reply" {
     // Goal: body, head and connection limits each end in a registered diagnostic, not a hang or a
     // bare status. Method: a body over the limit, a head over the limit, a chunked body, then
@@ -233,6 +265,16 @@ test "the limits of constants.zig are enforced with a coded reply" {
     const unsized = try exchange(io, address, chunked);
     defer unsized.free();
     try expect_diagnostic(unsized, 411, "ZC-E0104");
+
+    // Request smuggling: `gzip` leaves std's `transfer_encoding` at `.none`, so the body once
+    // parsed as a second request. It must be refused, and the second request never served.
+    const smuggle = "POST /v1/apply HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n" ++
+        "GET /v1/smuggled HTTP/1.1\r\nConnection: close\r\n\r\n";
+    const smuggled = try exchange(io, address, smuggle);
+    defer smuggled.free();
+    try expect_diagnostic(smuggled, 411, "ZC-E0104");
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, smuggled.raw, "smuggled"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, smuggled.raw, "HTTP/1.1 "));
 
     const padding = try testing.allocator.alloc(u8, constants.http_head_bytes_max);
     defer testing.allocator.free(padding);

@@ -1,0 +1,1 @@
+{"revision":9,"nodes":[{"node":"node1","recorded":{"allocated":{"cpu_millis":500,"memory_bytes":268435456},"count":3},"reconstructed":{"allocated":{"cpu_millis":500,"memory_bytes":268435456},"count":2},"consistent":false,"finding":{"decision":"1761350002000-0007-0000","revision":8}}],"inconsistent":1}

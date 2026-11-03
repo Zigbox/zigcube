@@ -1,0 +1,6 @@
+error[ZC-E0404]: a node's accounting disagrees with its assignments
+  cause  1 of 1 nodes disagree; the first, node1, records 3 assignments and 500
+         cpu millis, its assignments sum to 2 and 500
+  fix    see what a repair would write   zcube repair allocations node1
+  more   zcube explain E0404 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0404.html

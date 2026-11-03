@@ -32,16 +32,21 @@ const Demo = state.Demo;
 const Host = state.Host;
 const Json = state.Json;
 
-/// How long the store refuses writes, at least, from the moment it stops (`stopped_ms`): 9 s
-/// (owner, 2026-11-02). The agent renews every `ttl / 3`, so its last renewal `s` was at most
-/// `ttl / 3` before the store stopped; it fences at `s + ttl - fence_margin` and its containers
-/// are dead by `s + ttl`. So the outage outlasts the fence's start by 2 s or more.
-const outage_ms: u64 = 9000;
+/// How long the store refuses writes, at least, from the moment it stops (`stopped_ms`): 11 s.
+/// The owner's 9 s (2026-11-02) outlasts the fence: the agent renews every `ttl / 3`, so its
+/// last renewal `s` was at most `ttl / 3` before the store stopped; it fences at
+/// `s + ttl - fence_margin` and its containers are dead by `s + ttl`. C1 slice 4 makes it longer
+/// than the ttl as well, so the node's lease has always ended when the store is back
+/// (supervisor, 2026-11-02: an outage longer than the ttl ends the lease, and the node is lost),
+/// and the node controller records `mark_lost` whatever it sees first, the record gone or the
+/// node registered again.
+const outage_ms: u64 = constants.lease_ttl_ms + 1000;
 
 comptime {
     const fence_latest_ms = constants.lease_ttl_ms / 3 + constants.lease_ttl_ms -
         constants.fence_margin_ms - constants.lease_ttl_ms;
     assert(outage_ms >= fence_latest_ms + 2000);
+    assert(outage_ms > constants.lease_ttl_ms);
 }
 
 pub fn run(demo: *Demo) !void {
@@ -426,18 +431,58 @@ fn recovered(
         "the replicas run as new processes: no command or supervisor from before the fence",
         .{},
     );
-    // The agent reports its fenced replicas as stopped (SIGTERM) under its new tenure, in one
-    // write, and the controllers replace them as they would any replica that stopped.
-    const stopped: u32 = @intCast(before.len);
+    try expect_outage_decisions(demo, @intCast(before.len), tenure);
+    try apply_again(demo);
+}
+
+/// The agent reports its fenced replicas as stopped (SIGTERM) under its new tenure, in one
+/// write, and the controllers replace them as they would any replica that stopped.
+fn expect_outage_decisions(demo: *Demo, stopped: u32, tenure: u64) !void {
+    // The lease ended in the outage, so the old tenure is lost (C1 slice 4) and the new one
+    // ready. A transaction holds three replicas' changes with their decisions and summaries, so
+    // the replacement deletes both and creates one, and the next pass creates the other as a
+    // scale-up. The node controller then removes the records the old tenure left (three: hello's
+    // two replicas and the failed broken-1), and the agent reports broken-1 again under the new
+    // tenure, so the replica controller holds it once more.
     try decisions.expect_new(demo, "outage", &.{
+        .{ .actor = "node-controller", .action = "mark_lost", .count = 1 },
         .{ .actor = "node-controller", .action = "mark_ready", .count = 1 },
+        .{ .actor = "node-controller", .action = "remove_observed", .count = 1 },
+        .{ .actor = "replica-controller", .action = "hold_failed_replica", .count = 1 },
         .{ .actor = "replica-controller", .action = "delete_replica", .count = stopped },
         .{ .actor = "replica-controller", .action = "replace_replica", .count = 1 },
+        .{ .actor = "replica-controller", .action = "scale_up", .count = 1 },
         .{ .actor = "replica-controller", .action = "create_replica", .count = stopped },
         .{ .actor = "scheduler", .action = "release_replica", .count = stopped },
         .{ .actor = "scheduler", .action = "place_replica", .count = stopped },
     });
-    try apply_again(demo);
+    try expect_lost(demo, tenure);
+}
+
+/// The step's `mark_lost` names the tenure before the outage and the lease's ttl.
+fn expect_lost(demo: *Demo, tenure: u64) !void {
+    const host = demo.host;
+    const all = try decisions.read_all(demo);
+    var found: ?decisions.Decision = null;
+    for (all) |decision| {
+        if (std.mem.eql(u8, decision.action, "mark_lost")) found = decision;
+    }
+    const lost = found.?;
+    try host.check(
+        std.mem.eql(u8, lost.cause_kind, "lease_expired"),
+        "mark_lost's cause is lease_expired ({s})",
+        .{lost.cause_kind},
+    );
+    const evidence = lost.evidence.?.object;
+    const lost_tenure = evidence.get("tenure").?.integer;
+    try host.check(
+        lost_tenure == tenure,
+        "mark_lost is for tenure {d}, the one before the outage ({d})",
+        .{ lost_tenure, tenure },
+    );
+    const ttl = evidence.get("ttl_ms").?.integer;
+    const cites = ttl == constants.lease_ttl_ms;
+    try host.check(cites, "mark_lost cites the lease's ttl, {d} ms", .{ttl});
 }
 
 /// The start command may return before Postgres accepts connections: `pg_ctl start -w` waits

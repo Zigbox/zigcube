@@ -133,6 +133,10 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
             .images = "",
             .store = "",
             .transcript_path = options.transcript,
+            // Step 5's outage ends the node's lease, so the node is lost until it registers
+            // again; a grace longer than the agent's reconnect (its backoff reaches 5 s) keeps
+            // its replicas where they are, so the step's decisions do not depend on the race.
+            .lost_grace_ms = "30000",
         },
         .work = "",
         .state = "",

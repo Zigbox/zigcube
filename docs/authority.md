@@ -79,15 +79,21 @@ A seventh role, `retention`, deletes expired decisions (§5). It may write only 
 - **`/assigned/<node>/` replaces the `node` field.** An agent's long-poll watches its own prefix,
   so fan-out is O(replicas on the node), not O(all replicas). The agent endpoint joins each
   assignment with its `/replicas` record, so the agent sees the same shape as today.
-- **The scheduler moves a replica in one transaction.** It deletes `/assigned/<old>/<id>`, puts
+- **The scheduler can move a replica in one transaction.** It deletes `/assigned/<old>/<id>`, puts
   `/assigned/<new>/<id>`, updates both nodes' `/allocations` records and writes the
-  `place_replica` decision, with the compare set below for each node it touches.
+  `place_replica` decision, with the compare set below for each node it touches. Nothing in C1
+  moves a replica: a lost node's replicas are replaced under new ids (§3), not moved.
 - **Only the scheduler removes an assignment**, and it releases the allocation in the same
   transaction. A replica retired by the replica controller, or a node marked lost by the node
   controller, is a fact the scheduler reacts to; neither of them touches `/assigned` or
   `/allocations`.
-- **The replica controller never reads `/assigned` to decide anything about the desired set.** It
-  reads only to report (`get replicas` shows where each replica runs).
+- **The replica controller reads `/assigned` and `/node-status/` for two purposes only.** It
+  finds a replica's observed record through its assignment, and it replaces a replica whose
+  assigned node is `lost` past `lost_grace_ms` under a new id (§3). It is the only writer of
+  `/replicas/`, so a replacement under a new id is its job. Its compare set covers what it read:
+  the replica, its assignment and `/node-status/<node>`. Otherwise it reads `/assigned` only to
+  report (`get replicas` shows where each replica runs), never to decide the desired set.
+  (Owner, 2026-11-02.)
 
 ### The read-set rule
 
@@ -181,6 +187,9 @@ before an auditor ever has to find it in a cluster.
 - **Accounting is released when the assignment is removed**, which is before the old process has
   necessarily stopped. Physical use can therefore exceed the accounting for up to the stop grace
   (`stop_grace_ms`). Allocation is a promise about placement, not a measurement.
+- **A record deflated below an assignment's requests is not released until repair.** The node's
+  allocation record can hold less than its assignments request; the difference is not released
+  by the scheduler's ordinary passes, only by repair (`POST /v1/repair/allocations/{node}`).
 
 ## 3. Tenure, leases and fencing
 

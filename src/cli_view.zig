@@ -26,7 +26,7 @@ const arrow = "\u{2190}";
 // ---- Tables ------------------------------------------------------------------------------------
 
 /// Left-aligned columns, two spaces apart, the last one unpadded.
-fn write_table(
+pub fn write_table(
     writer: *Writer,
     header: []const []const u8,
     rows: []const []const []const u8,

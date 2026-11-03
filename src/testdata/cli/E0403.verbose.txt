@@ -1,0 +1,7 @@
+request  r-0000001  POST /v1/repair/allocations/node1?confirm=true  400
+error[ZC-E0403]: the node's accounting changed during the repair
+  cause  the accounting of node1 kept changing during the request
+  reqid  r-0000001
+  fix    run it again   zcube repair allocations node1 --confirm
+  more   zcube explain E0403
+  docs   https://zigbox.github.io/zigcube/errors/E0403.html

@@ -13,6 +13,11 @@
 //!   - a replica whose container ended (exit, signal, `oom`, `pid_limit`, `lost`, or a start that
 //!     failed through no fault of the user): `delete_replica` or `mark_replica_lost` on the
 //!     replica, then `replace_replica` on the service and a new replica;
+//!   - a replica placed on a node that is `lost` (and not registered again since), once
+//!     `lost_grace_ms` has passed since the node controller's `mark_lost`: `mark_replica_lost`
+//!     caused by that `mark_lost`, then `replace_replica` and a new replica under a **new id**
+//!     (authority.md §3: ids are never reused, so the old instance on a partitioned node is never
+//!     taken for the new one); the scheduler then releases the old assignment;
 //!   - a replica whose start failed through the user's fault (the diagnostic's blame is `user`):
 //!     it is **held**, with a `hold_failed_replica` decision on the service, and neither retried
 //!     nor replaced; a new `generation` of the service replaces it;
@@ -47,9 +52,15 @@ const NumberEntry = Entry(records.ReplicaNumber);
 
 pub const actor = "replica-controller";
 
-/// Replicas one transaction creates or removes: 2 operations for the service decision, 3 for each
-/// replica (a decision with its index entry, and the replica), and 1 for the service itself.
-const batch_replicas_max: u32 = 4;
+/// Replicas one transaction creates or removes: `decision_ops` operations for the service
+/// decision, `decision_ops + 1` for each replica (its decision, and the replica record or its
+/// delete), and 1 for the counter.
+const batch_replicas_max: u32 = 3;
+/// Distinct lost nodes one transaction removes replicas from: each costs two compares (its
+/// status and its `/nodes` record), which a batch of `batch_replicas_max` replicas on three
+/// nodes would push past `store_txn_compares_max`. A replica on a further node waits for the
+/// next pass.
+const lost_nodes_batch_max: u32 = 2;
 const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{
@@ -58,17 +69,34 @@ pub const watch_prefixes = [_][]const u8{
     records.prefix_observed,
     records.prefix_assigned,
     records.prefix_replica_numbers,
+    records.prefix_node_status,
 };
 
 comptime {
-    assert(2 + batch_replicas_max * 3 + 1 <= constants.store_txn_ops_max);
-    // The service, the counter, and per replica its key and (when it is dead) its assignment.
-    assert(2 + batch_replicas_max * 2 <= constants.store_txn_compares_max);
+    const decision = controller.decision_ops;
+    assert(decision + batch_replicas_max * (decision + 1) + 1 <= constants.store_txn_ops_max);
+    // A batch of one more replica would not fit: the bound moved with the summaries.
+    assert(decision + (batch_replicas_max + 1) * (decision + 1) + 1 > constants.store_txn_ops_max);
+    // The service, the counter and the service decision's summary; per replica its key, its
+    // assignment and its decision's summary; and per lost node, once however many of its
+    // replicas the batch removes, the node's status and its `/nodes` record.
+    const fixed = 2 + controller.decision_compares;
+    const per_replica = 2 + controller.decision_compares;
+    const per_lost_node = 2;
+    assert(fixed + batch_replicas_max * per_replica + lost_nodes_batch_max * per_lost_node <=
+        constants.store_txn_compares_max);
+    // One more lost node would not fit, so the limit is what the store allows, not slack.
+    assert(fixed + batch_replicas_max * per_replica +
+        (lost_nodes_batch_max + 1) * per_lost_node > constants.store_txn_compares_max);
+    assert(lost_nodes_batch_max <= batch_replicas_max);
 }
 
 pub const ReplicaController = struct {
     source: controller.DecisionSource,
     retention: retention.Cursor = .{},
+    /// How long after a node is marked lost its replicas are replaced (authority.md §2, §3). A
+    /// parameter so the server (`--lost-grace-ms`), the simulations and the tests can set it.
+    lost_grace_ms: u64 = constants.lost_grace_ms,
 
     /// `instance` is this controller's number, from the shell: it keeps decision ids unique
     /// when two servers run, and a restarted server takes a new one.
@@ -94,7 +122,7 @@ pub const ReplicaController = struct {
             rc.retention.due_ms = try retention.prune(ctx, &rc.retention, &snapshot, now);
         }
         const again = run.more or run.acted > 0;
-        var wake_at = now + resync_ms;
+        var wake_at = @min(now + resync_ms, run.wake_at_ms);
         if (again) wake_at = now;
         if (rc.retention.due_ms < wake_at) wake_at = @max(rc.retention.due_ms, now);
         return .{ .at_ms = wake_at, .prefixes = &watch_prefixes, .acted = run.acted };
@@ -111,6 +139,8 @@ const Item = struct {
     class: Class,
     running: bool,
     number: u32,
+    /// The status of the lost node the replica is placed on, once its grace has passed.
+    lost: ?*const Entry(records.NodeStatus) = null,
 };
 
 const ServicePlan = struct {
@@ -134,6 +164,8 @@ const Run = struct {
     acted: u32 = 0,
     /// Work is left for the next step (a conflict, a spent budget, a partial change).
     more: bool = false,
+    /// The earliest end of a lost node's grace, for a replica still placed on it.
+    wake_at_ms: u64 = std.math.maxInt(u64),
 
     /// True if one more transaction may be committed in this step.
     fn budget(run: *Run) bool {
@@ -197,6 +229,10 @@ const Run = struct {
                 .number = number,
             };
             item.class = classify_one(replica.rec.generation, service.rec.generation, observed);
+            if (item.class == .live) {
+                item.lost = run.lost_placement(replica.rec.id);
+                if (item.lost != null) item.class = .dead;
+            }
             item.running = if (observed) |found| found.rec.status == .running else false;
             plan.items[plan.count] = item;
             plan.count += 1;
@@ -210,6 +246,25 @@ const Run = struct {
         };
     }
 
+    /// The status of the node `replica` is placed on, if that node is lost for the tenure the
+    /// status judged (no newer `/nodes` record) and the grace has passed; before then, the step
+    /// wakes at the grace's end.
+    fn lost_placement(run: *Run, replica: []const u8) ?*const Entry(records.NodeStatus) {
+        const node = run.snap.node_of(replica) orelse return null;
+        const status = run.snap.status_of(node) orelse return null;
+        if (status.rec.state != .lost) return null;
+        if (run.snap.node_entry(node)) |entry| {
+            // Registered again: the node controller judges the new tenure first.
+            if (entry.kv.mod_revision > status.rec.tenure) return null;
+        }
+        const due = status.rec.at_ms +| run.rc.lost_grace_ms;
+        if (run.ctx.clock.now_ms() < due) {
+            run.wake_at_ms = @min(run.wake_at_ms, due);
+            return null;
+        }
+        return status;
+    }
+
     // ---- Holding a failed start ----
 
     /// Writes a `hold_failed_replica` decision for each held replica that has none for its current
@@ -220,7 +275,7 @@ const Run = struct {
             if (item.class != .held) continue;
             const observed = item.observed.?;
             if (try run.already_held(service.rec.name, observed)) continue;
-            if (!batch.has_room(2)) break;
+            if (!batch.has_room(controller.decision_ops)) break;
             batch.expect(observed.kv.key, observed.kv.mod_revision);
             const reason = try controller.format(run.ctx, "replica {s} failed to start on {s}; " ++
                 "it was not replaced because a new one would fail the same way", .{
@@ -273,9 +328,15 @@ const Run = struct {
     fn replace(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
         var removed: [batch_replicas_max]*const Item = undefined;
         var removed_count: u32 = 0;
+        var lost_nodes: [lost_nodes_batch_max][]const u8 = undefined;
+        var lost_nodes_count: u32 = 0;
         for (plan.slice()) |*item| {
             if (item.class != .dead and item.class != .stale) continue;
             if (removed_count == batch_replicas_max) break;
+            if (item.lost) |status| {
+                const node = status.kv.key[records.prefix_node_status.len..];
+                if (!note_lost_node(&lost_nodes, &lost_nodes_count, node)) continue;
+            }
             removed[removed_count] = item;
             removed_count += 1;
         }
@@ -312,6 +373,22 @@ const Run = struct {
         _ = try run.finish(&batch);
     }
 
+    /// Counts `node` among the lost nodes the batch touches. False if it is a new one and the
+    /// batch already has `lost_nodes_batch_max` (the compare budget).
+    fn note_lost_node(
+        nodes: *[lost_nodes_batch_max][]const u8,
+        count: *u32,
+        node: []const u8,
+    ) bool {
+        for (nodes[0..count.*]) |known| {
+            if (std.mem.eql(u8, known, node)) return true;
+        }
+        if (count.* == lost_nodes_batch_max) return false;
+        nodes[count.*] = node;
+        count.* += 1;
+        return true;
+    }
+
     fn replace_reason(
         run: *Run,
         service: *const Entry(records.Service),
@@ -345,6 +422,10 @@ const Run = struct {
     fn removal_phrase(run: *Run, item: *const Item) Error![]const u8 {
         const id = item.replica.rec.id;
         if (item.class == .stale) return controller.format(run.ctx, "{s}", .{id});
+        if (item.lost) |status| {
+            const node = status.kv.key[records.prefix_node_status.len..];
+            return controller.format(run.ctx, "{s} lost with node {s}", .{ id, node });
+        }
         const exit = item.observed.?.rec.exit orelse records.Exit{ .kind = .lost };
         var buffer: [64]u8 = undefined;
         return controller.format(run.ctx, "{s} {s}", .{ id, records.exit_text(exit, &buffer) });
@@ -352,6 +433,7 @@ const Run = struct {
 
     /// The decision and the delete for a replica whose container ended.
     fn remove_dead(run: *Run, batch: *Batch, item: *const Item) Error!DecisionId {
+        if (item.lost) |status| return run.remove_lost(batch, item.replica, status);
         const observed = item.observed.?;
         const replica = item.replica;
         const exit = observed.rec.exit orelse records.Exit{ .kind = .lost };
@@ -383,6 +465,56 @@ const Run = struct {
         batch.expect(placed.kv.key, placed.kv.mod_revision);
         batch.delete(replica.kv.key);
         return id;
+    }
+
+    /// The decision and the delete for a replica on a node lost past its grace, caused by the
+    /// node's `mark_lost`. Compared: the replica, its assignment (the placement judged) and the
+    /// node's status (still the `lost` that was read).
+    fn remove_lost(
+        run: *Run,
+        batch: *Batch,
+        replica: *const ReplicaEntry,
+        status: *const Entry(records.NodeStatus),
+    ) Error!DecisionId {
+        const node = status.kv.key[records.prefix_node_status.len..];
+        const reason = try controller.format(run.ctx, "{s} was on node {s}, lost {d} ms ago; " ++
+            "it is being removed and replaced under a new id", .{
+            replica.rec.id, node, run.ctx.clock.now_ms() -| status.rec.at_ms,
+        });
+        const id = try controller.put_decision(run.ctx, &run.rc.source, .{
+            .actor = actor,
+            .action = "mark_replica_lost",
+            .subject = .{ .kind = .replica, .name = replica.rec.id },
+            .reason = reason,
+            .cause = .{ .kind = .decision, .id = status.rec.decision },
+        }, batch);
+        batch.expect(replica.kv.key, replica.kv.mod_revision);
+        const placed = run.snap.assigned_of(replica.rec.id).?;
+        batch.expect(placed.kv.key, placed.kv.mod_revision);
+        try run.expect_node_lost(batch, node, status);
+        batch.delete(replica.kv.key);
+        return id;
+    }
+
+    /// Compares what "the node is lost and has not registered again" was judged from: its
+    /// status at the revision read and its `/nodes` record as read (absent is revision 0). Once
+    /// per node per batch: a second replica of the node adds nothing.
+    fn expect_node_lost(
+        run: *Run,
+        batch: *Batch,
+        node: []const u8,
+        status: *const Entry(records.NodeStatus),
+    ) Error!void {
+        for (batch.compares[0..batch.compares_count]) |compare| {
+            if (std.mem.eql(u8, compare.key, status.kv.key)) return;
+        }
+        batch.expect(status.kv.key, status.kv.mod_revision);
+        const registered = run.snap.node_entry(node);
+        const key = records.node_key(node);
+        batch.expect(
+            try controller.key_copy(run.ctx, &key),
+            if (registered) |entry| entry.kv.mod_revision else 0,
+        );
     }
 
     /// The decision and the delete for a replica that is to stop for a reason the service gave.

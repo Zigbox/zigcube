@@ -83,6 +83,13 @@ empty object before the first status), and, only while saving that pair fails,
 `remembered_save_failed`: a `ZC-E0216` diagnostic. `time_ms` is the server's clock: the console shows ages ("3 s ago")
 against it, so a skewed laptop clock does not make "just now" read "in 4 minutes".
 
+While the store answers, `findings` (C1 slice 4) lists the allocation auditor's open findings,
+one per node whose allocation record disagrees with its assignments (`/audit/allocations/<node>`,
+[keys.md](keys.md)): `[{"node", "recorded", "reconstructed", "revision", "decision"}]`, with each
+tally as `{"allocated": {"cpu_millis", "memory_bytes"}, "count"}` and `decision` the
+`allocation_mismatch` decision that opened it. An empty array is a healthy cluster; a listing that
+fails leaves the member out.
+
 ### `GET /v1/list?prefix=&at=&limit=&continue=&reverse=`
 
 `Store.list`, one to one. `kvs` is ascending by key unless `reverse=true`.
@@ -154,6 +161,9 @@ terminal.
   (new, below), or `gone` when a decision in the chain has been removed by retention. A `why node`
   chain may end in one more step of type `note` (C1 slice 7): a statement of the scheduler's rule,
   not a reading of the store. A client that does not know a step type prints its `text`.
+- `summaries` (additive) is `[{action, cause, count, first_at_ms, last_at_ms}]`, the subject's
+  `/decision-summaries` counts. A summary is a projection, never a step. The CLI prints one line
+  each after the chain: `replace_replica (observed): 142 times since 2025-10-24 23:13:20Z`.
 - `why node`'s `state.text` names the judgement and the load:
   `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
   8.0Gi memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
@@ -238,10 +248,55 @@ Deletes the service key and records a `delete_service` decision in one transacti
 controller then stops its replicas. The answer has the shape above with `"action": "delete"`.
 No such service is `404` and `ZC-E0101`.
 
+### `GET /v1/check/allocations` and `POST /v1/repair/allocations/{node}[?confirm=true]` (C1 slice 4)
+
+The allocation accounting, for `zcube check allocations` and `zcube repair allocations`
+([cli.md](cli.md)). `src/allocations.zig` rebuilds every node's tally from its assignments at one
+revision; both endpoints run it in the request.
+
+The check writes nothing:
+
+```json
+{ "revision": 431,
+  "nodes": [{"node": "node1",
+             "recorded": {"allocated": {"cpu_millis": 300, "memory_bytes": 3072}, "count": 3},
+             "reconstructed": {"allocated": {"cpu_millis": 200, "memory_bytes": 2048}, "count": 2},
+             "consistent": false,
+             "finding": {"decision": "0001761350123456-0003-0001", "revision": 428}}],
+  "inconsistent": 1 }
+```
+
+A node is listed when it holds an assignment or has an allocation record. `recorded` is `null`
+for a node without a record; `finding` is the auditor's open finding on the node, or `null`.
+
+The repair rewrites one node's record with the rebuilt total, in one transaction that compares
+the record and the finding at the revision it rebuilt from, and records a `repair_allocation` decision
+(actor `scheduler`) that cites the finding. The auditor clears the finding on its next pass.
+
+- The node has no open finding: `409` and **`ZC-E0402`**. Nothing is written.
+- Without `?confirm=true`: `400` and **`ZC-E0401`**, whose cause says what it would write.
+- The accounting moved during every attempt (three, as for apply): `409` and **`ZC-E0403`**.
+- Done: `200` and the same shape as an apply, with what was written:
+
+```json
+{ "request_id": "r-5f3a91c2-0001a4f", "node": "node1", "action": "repair_allocation",
+  "recorded": {"allocated": {"cpu_millis": 300, "memory_bytes": 3072}, "count": 3},
+  "reconstructed": {"allocated": {"cpu_millis": 200, "memory_bytes": 2048}, "count": 2},
+  "revision": 432, "decision": "0001761350123999-0002-0001" }
+```
+
+A `POST` with neither `Content-Length` nor `Transfer-Encoding` has no body (RFC 9112 6.3), which is
+how `zcube repair` sends one.
+
 ### New diagnostic codes
 
 | Code | Blame | Summary | Raised by |
 | --- | --- | --- | --- |
+| `ZC-E0401` | user | a repair needs confirming | `POST /v1/repair/...` without `confirm`, `400` |
+| `ZC-E0402` | user | the node has no open allocation finding | the repair, `409` |
+| `ZC-E0403` | user | the node's accounting changed during the repair | the repair, `409` |
+| `ZC-E0404` | user | a node's accounting disagrees with its assignments | `zcube check allocations` (the CLI, exit 1) |
+| `ZC-B0003` | bug | allocation accounting disagrees with assignments | the allocation auditor, in its finding's decision |
 | `ZC-E0105` | user | the service changed while it was being applied | the write endpoints, `409` |
 | `ZC-E0106` | user | the server's configuration can't be used | `zcube-server` at start-up |
 | `ZC-E0107` | environment | can't listen on the server's address | `zcube-server` at start-up |

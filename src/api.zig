@@ -30,6 +30,7 @@ const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
 const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
+const accounting = @import("allocations.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
@@ -178,6 +179,7 @@ pub const Api = struct {
         if (std.mem.eql(u8, first, "leases")) return call.leases();
         if (std.mem.eql(u8, first, "why")) return call.why();
         if (std.mem.eql(u8, first, "codes")) return call.codes_list();
+        if (std.mem.eql(u8, first, "check")) return call.check_allocations();
         if (std.mem.eql(u8, first, "explain")) return call.explain();
         return no_such(ctx, request.path);
     }
@@ -212,6 +214,81 @@ const ApplyBody = struct {
     env: []const records.Pair = &.{},
     limits: records.Limits = .{},
     applied_by: []const u8 = anonymous,
+};
+
+const CheckFinding = struct { decision: []const u8, revision: u64 };
+
+/// One node in `GET /v1/check/allocations`; `recorded` is null when there is no record.
+const CheckNode = struct {
+    node: []const u8,
+    recorded: ?records.Tally,
+    reconstructed: records.Tally,
+    consistent: bool,
+    finding: ?CheckFinding,
+};
+
+const RepairReply = struct {
+    request_id: []const u8,
+    node: []const u8,
+    action: []const u8,
+    recorded: records.Tally,
+    reconstructed: records.Tally,
+    revision: store.Revision,
+    decision: []const u8,
+};
+
+const NodeTally = accounting.NodeTally;
+
+fn open_finding(nodes: []const NodeTally, node: []const u8) ?*const NodeTally {
+    for (nodes) |*tally| {
+        if (!std.mem.eql(u8, tally.node, node)) continue;
+        if (tally.finding == null) return null;
+        return tally;
+    }
+    return null;
+}
+
+fn no_finding(ctx: *const Context, node: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0402);
+    ctx.diag.cause("the allocation auditor has no open finding on node {s}", .{node});
+    ctx.diag.fix(.{
+        .sentence = "see every node's accounting",
+        .command = "zcube check allocations",
+    });
+    return error.Failed;
+}
+
+fn unconfirmed(ctx: *const Context, tally: *const accounting.NodeTally) Failure {
+    assert(ctx.diag.code == null);
+    const recorded = tally.recorded orelse accounting.zero;
+    const now = tally.reconstructed;
+    ctx.diag.raise(.E0401);
+    ctx.diag.cause(
+        "would write {d} assignments, {d} cpu millis and {d} memory bytes to /allocations/{s}, " ++
+            "which records {d}, {d} and {d}",
+        .{
+            now.count,                       now.allocated.cpu_millis,
+            now.allocated.memory_bytes,      tally.node,
+            recorded.count,                  recorded.allocated.cpu_millis,
+            recorded.allocated.memory_bytes,
+        },
+    );
+    ctx.diag.fix_with(
+        "if that is right, confirm it",
+        "zcube repair allocations {s} --confirm",
+        .{tally.node},
+    );
+    return error.Failed;
+}
+
+/// One open finding in `GET /v1/status`.
+const Finding = struct {
+    node: []const u8,
+    recorded: records.Tally,
+    reconstructed: records.Tally,
+    revision: u64,
+    decision: []const u8,
 };
 
 const WriteReply = struct {
@@ -370,7 +447,8 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
         .user => {
             if (code == .E0101) return 404;
             if (code == .E0203) return 410;
-            if (code == .E0105) return 409;
+            // The state the request rested on is not (or no longer) there.
+            if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
             return 400;
         },
         .environment => return 503,
@@ -626,10 +704,38 @@ const Call = struct {
         try out.member("started_at_ms", call.api.started_at_ms);
         try out.end_object();
         try out.field("store");
-        try call.store_state(out);
+        const store_ok = try call.store_state(out);
+        if (store_ok) try findings(ctx, out);
         try out.member("time_ms", ctx.clock.now_ms());
         try out.end_object();
         return out.finish();
+    }
+
+    /// The allocation auditor's open findings (`/audit/allocations/`), present while the store
+    /// answers. A listing that fails leaves the member out; the store's state says why.
+    fn findings(ctx: *const Context, out: *Out) Failure!void {
+        const open = controller.list_all(
+            records.Audit,
+            ctx,
+            records.prefix_audit_allocations,
+            null,
+            constants.nodes_max,
+        ) catch {
+            ctx.diag.reset();
+            return;
+        };
+        try out.field("findings");
+        try out.begin_array();
+        for (open.items) |entry| {
+            try out.value(Finding{
+                .node = entry.kv.key[records.prefix_audit_allocations.len..],
+                .recorded = entry.rec.recorded,
+                .reconstructed = entry.rec.reconstructed,
+                .revision = entry.rec.revision,
+                .decision = entry.rec.decision,
+            });
+        }
+        try out.end_array();
     }
 
     /// The guard's pair and whether it could be saved. Members are added only when there is a
@@ -648,7 +754,8 @@ const Call = struct {
         try out.diagnostic(&diagnostic);
     }
 
-    fn store_state(call: Call, out: *Out) Failure!void {
+    /// Writes the store's state; returns whether the store answered.
+    fn store_state(call: Call, out: *Out) Failure!bool {
         const ctx = call.ctx;
         try out.begin_object();
         try out.member("backend", call.api.backend);
@@ -657,6 +764,8 @@ const Call = struct {
             try out.member("revision", state.revision);
             try out.member("compacted_revision", state.compacted_revision);
             try call.remembered_state(out);
+            try out.end_object();
+            return true;
         } else |_| {
             try out.member("ok", false);
             try out.field("diagnostic");
@@ -666,6 +775,7 @@ const Call = struct {
             ctx.diag.reset();
         }
         try out.end_object();
+        return false;
     }
 
     // ---- /v1/list ----
@@ -883,11 +993,93 @@ const Call = struct {
         return out.finish();
     }
 
+    // ---- GET /v1/check/allocations and POST /v1/repair/allocations/{node} ----
+
+    /// Every node's accounting reconstructed at one revision (`allocations.zig`). Writes nothing.
+    fn check_allocations(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const what = call.parts.next() orelse return no_such(ctx, "/v1/check");
+        if (!std.mem.eql(u8, what, "allocations")) return no_such(ctx, "/v1/check/<name>");
+        try call.query.allow(ctx, &.{});
+        try call.no_more();
+        const reconstruction = accounting.reconstruct(ctx) catch return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        out.json.options.emit_null_optional_fields = true;
+        try out.begin_object();
+        try out.member("revision", reconstruction.revision);
+        var inconsistent: u32 = 0;
+        try out.field("nodes");
+        try out.begin_array();
+        for (reconstruction.nodes) |*tally| {
+            if (!tally.consistent()) inconsistent += 1;
+            try out.value(CheckNode{
+                .node = tally.node,
+                .recorded = tally.recorded,
+                .reconstructed = tally.reconstructed,
+                .consistent = tally.consistent(),
+                .finding = if (tally.finding) |finding| .{
+                    .decision = finding.rec.decision,
+                    .revision = finding.rec.revision,
+                } else null,
+            });
+        }
+        try out.end_array();
+        try out.member("inconsistent", inconsistent);
+        try out.end_object();
+        return out.finish();
+    }
+
+    /// POST /v1/repair/allocations/{node}?confirm=true: the scheduler's `repair_allocation`, run
+    /// in the request. Refused with ZC-E0402 when the node has no open finding, and with
+    /// ZC-E0401, saying what it would write, without `confirm`.
+    fn repair_allocation(call: Call, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        const what = call.parts.next() orelse return no_such(ctx, "/v1/repair");
+        if (!std.mem.eql(u8, what, "allocations")) return no_such(ctx, "/v1/repair/<name>");
+        const node = call.parts.next() orelse return no_such(ctx, "/v1/repair/allocations");
+        try call.no_more();
+        try call.query.allow(ctx, &.{"confirm"});
+        if (records.name_problem(node, constants.node_name_bytes_max) != null) {
+            return bad_request(ctx, "node", "is not a node name");
+        }
+        const confirmed = try call.query.flag(ctx, "confirm");
+        for (0..apply_attempts_max) |_| {
+            const plan = accounting.reconstruct(ctx) catch return propagate(ctx);
+            const tally = open_finding(plan.nodes, node) orelse return no_finding(ctx, node);
+            if (!confirmed) return unconfirmed(ctx, tally);
+            const result = accounting.repair(ctx, &call.api.source, node, id) catch
+                return propagate(ctx);
+            switch (result) {
+                .repaired => |done| {
+                    const out = Out.create(ctx) catch return no_memory(ctx);
+                    try out.value(RepairReply{
+                        .request_id = id,
+                        .node = node,
+                        .action = accounting.repair_action,
+                        .recorded = done.recorded,
+                        .reconstructed = done.reconstructed,
+                        .revision = done.revision,
+                        .decision = done.decision,
+                    });
+                    return out.finish();
+                },
+                .no_finding => return no_finding(ctx, node),
+                .conflict => {},
+            }
+        }
+        ctx.diag.raise(.E0403);
+        ctx.diag.cause("the accounting of {s} kept changing during the request", .{node});
+        ctx.diag.fix_with("run it again", "zcube repair allocations {s} --confirm", .{node});
+        return error.Failed;
+    }
+
     fn write_post(call: Call, first: []const u8, body: []const u8, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
         if (std.mem.eql(u8, first, "store")) return call.accept_rollback();
+        if (std.mem.eql(u8, first, "repair")) return call.repair_allocation(id);
         if (!std.mem.eql(u8, first, "apply")) {
-            return bad_request(ctx, "method", "POST is accepted at /v1/apply only");
+            const where = "POST is accepted at /v1/apply, /v1/store and /v1/repair";
+            return bad_request(ctx, "method", where);
         }
         try call.query.allow(ctx, &.{"dry_run"});
         try call.no_more();

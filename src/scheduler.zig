@@ -14,12 +14,16 @@
 //! `controller_txns_per_step_max` transactions. Level-triggered like every controller: on a
 //! converged cluster a pass writes nothing.
 //!
-//! Not here yet: nothing calls `move_replica` until a node is lost (slice 4), and `/services/` is
-//! not read, so the replica of a deleted service is placed and then released.
+//! A lost node's replicas are not moved: the replica controller replaces each under a new id once
+//! `lost_grace_ms` has passed (authority.md §3), and this scheduler releases the old assignment
+//! like any retired replica's. `move_replica` is built and tested for the moves that keep an id
+//! (rebalancing, C7's fenced stateful replicas); nothing calls it yet. `/services/` is not read,
+//! so the replica of a deleted service is placed and then released.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const compare_sets = @import("compare_sets.zig");
+const accounting = @import("allocations.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const failures = @import("store_failures.zig");
@@ -46,6 +50,10 @@ pub const hold_memory_max: u32 = constants.replicas_max;
 
 comptime {
     assert(hold_memory_max >= constants.replicas_max);
+    // The largest compare set and the summary compare of the one decision in the transaction.
+    const compares = compare_sets.set_max + controller.decision_compares;
+    assert(compares <= constants.store_txn_compares_max);
+    assert(controller.decision_ops + 4 <= constants.store_txn_ops_max); // A move's writes.
 }
 
 pub const watch_prefixes = [_][]const u8{
@@ -112,6 +120,10 @@ const NodeView = struct {
 };
 
 const no_node: u32 = std.math.maxInt(u32);
+
+/// The most nodes a world holds: every registered node, and the nodes that have a status or an
+/// allocation record but no `/nodes` record (a lost node, whose assignments are released).
+pub const views_max: u32 = 2 * constants.nodes_max;
 
 const Assign = struct {
     key: []const u8,
@@ -214,29 +226,81 @@ fn views_of(
     allocations: []const Entry(records.Allocation),
     audits: []const Entry(records.Audit),
 ) Error![]NodeView {
-    const views = ctx.arena.alloc(NodeView, nodes.len) catch return failures.no_memory(ctx.diag);
-    for (nodes, views) |*node, *view| {
-        const name = node.rec.name;
-        const status_key = records.node_status_key(name);
-        const status = find_by_key(records.NodeStatus, statuses, status_key.slice());
-        const alloc_key = records.allocation_key(name);
-        const alloc = find_by_key(records.Allocation, allocations, alloc_key.slice());
-        const audit = find_by_key(records.Audit, audits, records.audit_key(name).slice());
-        view.* = .{
-            .node = node,
-            .status = if (status) |found| found.rec else null,
-            .status_revision = if (status) |found| found.kv.mod_revision else 0,
-            .audit_open = audit != null,
-            .alloc_revision = if (alloc) |found| found.kv.mod_revision else 0,
-            .alloc_node_revision = if (alloc) |found| found.rec.node_revision else 0,
-            .allocated = if (alloc) |found| found.rec.allocated else .{
-                .cpu_millis = 0,
-                .memory_bytes = 0,
-            },
-            .count = if (alloc) |found| found.rec.count else 0,
-        };
+    const views = ctx.arena.alloc(NodeView, views_max) catch return failures.no_memory(ctx.diag);
+    var count: u32 = 0;
+    for (nodes) |*node| {
+        views[count] = view_of(node, statuses, allocations, audits);
+        count += 1;
     }
-    return views;
+    // A node with no `/nodes` record is named by its status or allocation record. Its view has
+    // no capacity and tenure 0, so nothing fits on it, and the compare on `/nodes/<node>` at
+    // revision 0 says "still absent".
+    for (statuses) |entry| {
+        const name = entry.kv.key[records.prefix_node_status.len..];
+        try add_ghost(ctx, views, &count, name, statuses, allocations, audits);
+    }
+    for (allocations) |entry| {
+        const name = entry.kv.key[records.prefix_allocations.len..];
+        try add_ghost(ctx, views, &count, name, statuses, allocations, audits);
+    }
+    return views[0..count];
+}
+
+fn add_ghost(
+    ctx: *const Context,
+    views: []NodeView,
+    count: *u32,
+    name: []const u8,
+    statuses: []const Entry(records.NodeStatus),
+    allocations: []const Entry(records.Allocation),
+    audits: []const Entry(records.Audit),
+) Error!void {
+    for (views[0..count.*]) |view| {
+        if (std.mem.eql(u8, view.node.rec.name, name)) return;
+    }
+    // Bounded: statuses and allocations are written only for registered nodes, at most
+    // `nodes_max` of each.
+    if (count.* == views_max) return failures.no_memory(ctx.diag);
+    const ghost = ctx.arena.create(Entry(records.Node)) catch return failures.no_memory(ctx.diag);
+    const key = records.node_key(name);
+    ghost.* = .{
+        .kv = .{
+            .key = try controller.key_copy(ctx, &key),
+            .value = "",
+            .create_revision = 0,
+            .mod_revision = 0,
+        },
+        .rec = .{ .name = name, .capacity = .{ .cpu_millis = 0, .memory_bytes = 0 } },
+    };
+    views[count.*] = view_of(ghost, statuses, allocations, audits);
+    count.* += 1;
+}
+
+fn view_of(
+    node: *const Entry(records.Node),
+    statuses: []const Entry(records.NodeStatus),
+    allocations: []const Entry(records.Allocation),
+    audits: []const Entry(records.Audit),
+) NodeView {
+    const name = node.rec.name;
+    const status_key = records.node_status_key(name);
+    const status = find_by_key(records.NodeStatus, statuses, status_key.slice());
+    const alloc_key = records.allocation_key(name);
+    const alloc = find_by_key(records.Allocation, allocations, alloc_key.slice());
+    const audit = find_by_key(records.Audit, audits, records.audit_key(name).slice());
+    return .{
+        .node = node,
+        .status = if (status) |found| found.rec else null,
+        .status_revision = if (status) |found| found.kv.mod_revision else 0,
+        .audit_open = audit != null,
+        .alloc_revision = if (alloc) |found| found.kv.mod_revision else 0,
+        .alloc_node_revision = if (alloc) |found| found.rec.node_revision else 0,
+        .allocated = if (alloc) |found| found.rec.allocated else .{
+            .cpu_millis = 0,
+            .memory_bytes = 0,
+        },
+        .count = if (alloc) |found| found.rec.count else 0,
+    };
 }
 
 fn index_replicas(ctx: *const Context, world: *World) Error!void {
@@ -345,7 +409,7 @@ const Chosen = struct { index: u32, candidates: u32, service_count: u32 };
 
 fn choose(world: *const World, service: []const u8, verdicts: []const Verdict) ?Chosen {
     assert(verdicts.len == world.nodes.len);
-    var counts: [constants.nodes_max]u32 = undefined;
+    var counts: [views_max]u32 = undefined;
     service_counts(world, service, counts[0..world.nodes.len]);
     var best: ?u32 = null;
     var candidates: u32 = 0;
@@ -368,7 +432,6 @@ const Pass = struct {
     acted: u32 = 0,
     more: bool = false,
     stopped: bool = false,
-
     fn budget(pass: *Pass) bool {
         if (pass.txns_left == 0) {
             pass.more = true;
@@ -439,22 +502,19 @@ pub const Scheduler = struct {
     ) Error!void {
         const assign = world.assigns.items[index];
         if (!assign.live or world.desired.contains(assign.replica)) return;
-        if (assign.node == no_node) return; // The node is gone: slice 4's removal of its records.
+        if (assign.node == no_node) return; // No record names the node: nothing to release from.
         const view = &world.nodes[assign.node];
         if (view.alloc_revision == 0) return; // Unaccounted: the auditor's finding, not ours.
-        const after = subtract(view, assign.requests) orelse return;
+        if (subtract(view, assign.requests) == null) return;
         if (!pass.budget()) return;
-        const name = view.node.rec.name;
-        var batch: Batch = .{};
-        var set: compare_sets.Set = .{};
-        compare_sets.release(&set, name, assign.replica, assign.revision, view.alloc_revision);
-        expect_all(&batch, &set);
-        // The replica controller's `stop_replica` (scale down) or `delete_replica` (a replacement)
-        // retired it, if its decision is still indexed; else only a pass found it gone, and the
-        // store does not say at which revision.
+        // The replica controller's `stop_replica` (scale down), `delete_replica` or
+        // `mark_replica_lost` (a replacement) retired it, if its decision is still indexed; else
+        // only a pass found it gone, and the store does not say at which revision.
         const stopped = try indexed_decision(ctx, assign.replica, "stop_replica", .last);
-        const retired = stopped orelse
+        const deleted = stopped orelse
             try indexed_decision(ctx, assign.replica, "delete_replica", .last);
+        const retired = deleted orelse
+            try indexed_decision(ctx, assign.replica, "mark_replica_lost", .last);
         const cause: records.Cause = if (retired) |*id| controller.cause_decision(id) else .{
             .kind = .resync,
         };
@@ -463,8 +523,30 @@ pub const Scheduler = struct {
             assign.replica,
             assign.requests.cpu_millis,
             mib_of(assign.requests.memory_bytes),
-            name,
+            view.node.rec.name,
         });
+        try sc.commit_release(ctx, world, pass, index, cause, reason);
+    }
+
+    /// Releases assignment `index`: its decision, the assignment deleted and the allocation
+    /// lowered, under the release compares.
+    fn commit_release(
+        sc: *Scheduler,
+        ctx: *const Context,
+        world: *World,
+        pass: *Pass,
+        index: u32,
+        cause: records.Cause,
+        reason: []const u8,
+    ) Error!void {
+        const assign = world.assigns.items[index];
+        const view = &world.nodes[assign.node];
+        const after = subtract(view, assign.requests).?;
+        const name = view.node.rec.name;
+        var batch: Batch = .{};
+        var set: compare_sets.Set = .{};
+        compare_sets.release(&set, name, assign.replica, assign.revision, view.alloc_revision);
+        expect_all(&batch, &set);
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
             .action = "release_replica",
@@ -490,7 +572,7 @@ pub const Scheduler = struct {
         const replica = &world.replicas[replica_index];
         if (world.assigned_by.contains(replica.rec.id)) return;
         const need = requests_of(&replica.rec);
-        var verdicts: [constants.nodes_max]Verdict = undefined;
+        var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];
         for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need);
         const chosen = choose(world, replica.rec.service, judged) orelse {
@@ -504,7 +586,7 @@ pub const Scheduler = struct {
         compare_sets.placement(&set, replica_read(replica), node_read(view));
         expect_all(&batch, &set);
         const reason = try place_reason(ctx, world, replica, chosen, need);
-        try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica");
+        try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null);
         const key = try assign_key(ctx, name, replica.rec.id);
         const value: records.Assigned = .{
             .replica = replica.rec.id,
@@ -529,13 +611,20 @@ pub const Scheduler = struct {
         replica: *const Entry(records.Replica),
         reason: []const u8,
         action: []const u8,
+        given: ?records.Cause,
     ) Error!void {
-        const created = try indexed_decision(ctx, replica.rec.id, "create_replica", .first);
-        const cause: records.Cause = if (created) |*id| controller.cause_decision(id) else .{
-            .kind = .desired,
-            .key = replica.kv.key,
-            .revision = replica.kv.mod_revision,
-        };
+        const created = if (given == null)
+            try indexed_decision(ctx, replica.rec.id, "create_replica", .first)
+        else
+            null;
+        const cause: records.Cause = if (given) |found| found else if (created) |*id|
+            controller.cause_decision(id)
+        else
+            .{
+                .kind = .desired,
+                .key = replica.kv.key,
+                .revision = replica.kv.mod_revision,
+            };
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
             .action = action,
@@ -622,7 +711,8 @@ pub const Scheduler = struct {
 
     /// Moves an assigned replica to `spec.to` in one transaction: releases it on the old node and
     /// places it on the new, under the eight compares of `compare_sets.move`. Nothing in C1 asks
-    /// for a move until slice 4 (a lost node); the transaction is built and tested here.
+    /// for a move (a lost node's replicas are replaced under new ids); the transaction is built
+    /// and tested here.
     pub fn move_replica(
         sc: *Scheduler,
         ctx: *const Context,
@@ -660,7 +750,7 @@ pub const Scheduler = struct {
         };
         compare_sets.move(&set, replica_read(replica), read, node_read(target));
         expect_all(&batch, &set);
-        try sc.put_place_decision(ctx, &batch, replica, spec.reason, "place_replica");
+        try sc.put_place_decision(ctx, &batch, replica, spec.reason, "place_replica", spec.cause);
         batch.delete(from.key);
         const name = target.node.rec.name;
         const key = try assign_key(ctx, name, spec.replica);
@@ -706,7 +796,15 @@ pub const MoveSpec = struct {
     replica: []const u8,
     to: []const u8,
     reason: []const u8,
+    /// The decision's cause; null for the replica's creation.
+    cause: ?records.Cause = null,
 };
+
+comptime {
+    const compares = compare_sets.placement_count + compare_sets.release_count;
+    assert(compares + controller.decision_compares <= constants.store_txn_compares_max);
+    assert(controller.decision_ops + 4 <= constants.store_txn_ops_max);
+}
 
 pub const MoveResult = union(enum) {
     moved,
@@ -1038,81 +1136,14 @@ pub const Mismatch = struct {
 };
 
 /// Reconstructs every node's allocation from its assignments and compares it with the record
-/// (authority.md I6), both read at one revision. Returns the first node that disagrees, or null.
-/// The auditor and the simulations run the same reconstruction.
+/// (authority.md I6), both read at one revision. Returns the first node, by name, that disagrees,
+/// or null. The auditor and the simulations run the same reconstruction (`allocations.zig`).
 pub fn find_mismatch(ctx: *const Context) Error!?Mismatch {
-    const assigned = try controller.list_all(
-        records.Assigned,
-        ctx,
-        records.prefix_assigned,
-        null,
-        constants.replicas_max,
-    );
-    const allocations = try controller.list_all(
-        records.Allocation,
-        ctx,
-        records.prefix_allocations,
-        assigned.revision,
-        constants.nodes_max,
-    );
-    var sums: [constants.nodes_max]records.Tally = undefined;
-    var names: [constants.nodes_max][]const u8 = undefined;
-    var seen: u32 = 0;
-    for (assigned.items) |entry| {
-        const rest = entry.kv.key[records.prefix_assigned.len..];
-        const node = rest[0..std.mem.indexOfScalar(u8, rest, '/').?];
-        const slot = for (names[0..seen], 0..) |name, index| {
-            if (std.mem.eql(u8, name, node)) break index;
-        } else blk: {
-            if (seen == constants.nodes_max) return failures.no_memory(ctx.diag);
-            names[seen] = node;
-            sums[seen] = .{ .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 }, .count = 0 };
-            seen += 1;
-            break :blk seen - 1;
-        };
-        sums[slot] = .{
-            .allocated = add(sums[slot].allocated, entry.rec.requests),
-            .count = sums[slot].count + 1,
-        };
-    }
-    return mismatch_in(names[0..seen], sums[0..seen], allocations.items);
-}
-
-fn mismatch_in(
-    names: []const []const u8,
-    sums: []const records.Tally,
-    allocations: []const Entry(records.Allocation),
-) ?Mismatch {
-    const zero: records.Tally = .{
-        .allocated = .{ .cpu_millis = 0, .memory_bytes = 0 },
-        .count = 0,
+    const reconstruction = try accounting.reconstruct(ctx);
+    const tally = reconstruction.first_mismatch() orelse return null;
+    return .{
+        .node = tally.node,
+        .recorded = tally.recorded orelse accounting.zero,
+        .reconstructed = tally.reconstructed,
     };
-    for (allocations) |entry| {
-        const node = entry.kv.key[records.prefix_allocations.len..];
-        var rebuilt = zero;
-        for (names, sums) |name, sum| {
-            if (std.mem.eql(u8, name, node)) rebuilt = sum;
-        }
-        const recorded: records.Tally = .{
-            .allocated = entry.rec.allocated,
-            .count = entry.rec.count,
-        };
-        if (!tally_equal(recorded, rebuilt)) return .{
-            .node = node,
-            .recorded = recorded,
-            .reconstructed = rebuilt,
-        };
-    }
-    for (names, sums) |name, sum| {
-        const key = records.allocation_key(name);
-        if (find_by_key(records.Allocation, allocations, key.slice()) != null) continue;
-        return .{ .node = name, .recorded = zero, .reconstructed = sum };
-    }
-    return null;
-}
-
-fn tally_equal(first: records.Tally, second: records.Tally) bool {
-    if (first.count != second.count) return false;
-    if (first.allocated.cpu_millis != second.allocated.cpu_millis) return false;
-    return first.allocated.memory_bytes == second.allocated.memory_bytes;
 }

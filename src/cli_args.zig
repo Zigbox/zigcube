@@ -10,6 +10,8 @@
 //! zcube [options] why service|replica|node <name>
 //! zcube [options] explain <code>
 //! zcube [options] bundle --last | <kind> <name>
+//! zcube [options] check allocations
+//! zcube [options] repair allocations <node> [--confirm]
 //! ```
 
 const std = @import("std");
@@ -38,7 +40,7 @@ pub const Options = struct {
     /// apply: show the change and stop.
     dry_run: bool = false,
     no_redact: bool = false,
-    /// store accept-rollback: the operator has looked at the store.
+    /// store accept-rollback, repair allocations: the operator has looked and means it.
     confirm: bool = false,
 };
 
@@ -54,6 +56,10 @@ pub const Command = union(enum) {
     bundle: BundleTarget,
     /// `store accept-rollback --confirm`.
     accept_rollback,
+    /// `check allocations`.
+    check_allocations,
+    /// `repair allocations <node>`: the node. Without `--confirm` it shows what it would write.
+    repair_allocations: []const u8,
     help,
     version,
 };
@@ -77,6 +83,8 @@ pub const help_text =
     \\  explain <code>               explain a diagnostic code offline, for example E0201
     \\  bundle --last                collect the evidence for the last failure
     \\  bundle <kind> <name>         collect the evidence for a service, replica or node
+    \\  check allocations            compare each node's accounting with its assignments
+    \\  repair allocations <node>    show the repair of a node's accounting; --confirm writes it
     \\  help                         show this text
     \\  version                      print the version
     \\
@@ -217,11 +225,23 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     if (std.mem.eql(u8, name, "delete")) return delete_of(diag, rest);
     if (std.mem.eql(u8, name, "why")) return .{ .why = try subject_of(diag, name, rest) };
     if (std.mem.eql(u8, name, "bundle")) return bundle_of(diag, rest);
+    if (std.mem.eql(u8, name, "check")) {
+        if (rest.len == 1 and std.mem.eql(u8, rest[0], "allocations")) return .check_allocations;
+        return refuse(diag, "check takes allocations", .{});
+    }
+    if (std.mem.eql(u8, name, "repair")) return repair_of(diag, rest);
     if (std.mem.eql(u8, name, "store")) {
         if (rest.len == 1 and std.mem.eql(u8, rest[0], "accept-rollback")) return .accept_rollback;
         return refuse(diag, "store takes accept-rollback", .{});
     }
     return refuse(diag, "{s} is not a zcube command", .{name});
+}
+
+fn repair_of(diag: *Diag, rest: []const []const u8) Error!Command {
+    if (rest.len != 2 or !std.mem.eql(u8, rest[0], "allocations")) {
+        return refuse(diag, "repair needs allocations and a node: repair allocations node1", .{});
+    }
+    return .{ .repair_allocations = rest[1] };
 }
 
 fn no_arguments(
@@ -316,8 +336,8 @@ fn check_options(options: *const Options, command: Command, diag: *Diag) Error!v
     if (command == .accept_rollback and !options.confirm) {
         return refuse(diag, "accepting a store that went backwards needs --confirm", .{});
     }
-    if (options.confirm and command != .accept_rollback) {
-        return refuse(diag, "--confirm is for zcube store accept-rollback", .{});
+    if (options.confirm and command != .accept_rollback and command != .repair_allocations) {
+        return refuse(diag, "--confirm is for zcube store accept-rollback and repair", .{});
     }
     if (options.dry_run and command != .apply) {
         return refuse(diag, "--dry-run is for zcube apply", .{});
@@ -448,4 +468,36 @@ test "a lone dash and words after -- are positional" {
     // Goal: a file called -x.zon is reachable. Method: after `--` everything is a word.
     const parsed = try parse_text(&.{ "apply", "--", "-x.zon" });
     try testing.expectEqualStrings("-x.zon", parsed.command.apply);
+}
+
+test "check and repair allocations, and --confirm for repair only" {
+    // Goal: the slice 4d surface. Method: the accepted lines, then one refusal per rule.
+    const check = try parse_text(&.{ "check", "allocations", "-o", "json" });
+    try testing.expect(check.command == .check_allocations);
+    const shown = try parse_text(&.{ "repair", "allocations", "node1" });
+    try testing.expectEqualStrings("node1", shown.command.repair_allocations);
+    try testing.expect(!shown.options.confirm);
+    const confirmed = try parse_text(&.{ "repair", "allocations", "node1", "--confirm" });
+    try testing.expect(confirmed.options.confirm);
+    const cases = [_]struct { line: []const []const u8, cause: []const u8 }{
+        .{ .line = &.{"check"}, .cause = "check takes allocations" },
+        .{ .line = &.{ "check", "nodes" }, .cause = "check takes allocations" },
+        .{ .line = &.{ "repair", "allocations" }, .cause = "repair needs allocations and a node" },
+        .{ .line = &.{ "repair", "node1" }, .cause = "repair needs allocations and a node" },
+        .{
+            .line = &.{ "check", "allocations", "--confirm" },
+            .cause = "--confirm is for zcube store accept-rollback and repair",
+        },
+        .{
+            .line = &.{ "check", "allocations", "-o", "wide" },
+            .cause = "--output wide is for zcube get",
+        },
+    };
+    for (cases) |case| {
+        var diag: Diag = undefined;
+        diag.reset();
+        var parsed: Parsed = undefined;
+        try testing.expectError(error.Failed, parse(case.line, &parsed, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, case.cause) != null);
+    }
 }

@@ -21,6 +21,8 @@ pub const Decision = struct {
     cause_kind: []const u8,
     /// The cause's key (desired, observed) or decision id (decision).
     cause_ref: []const u8,
+    /// The cause's evidence, a JSON object, when the decision has one.
+    evidence: ?std.json.Value = null,
 };
 
 /// What a step should have decided: exactly `count` decisions of this actor and action.
@@ -61,6 +63,7 @@ pub fn read_all(demo: *Demo) ![]const Decision {
             .reason = text_of(value, "reason"),
             .cause_kind = kind,
             .cause_ref = reference,
+            .evidence = value.get("cause_evidence"),
         });
     }
     return found.items;

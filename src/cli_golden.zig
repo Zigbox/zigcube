@@ -344,6 +344,52 @@ fn tenure_ended(diag: *diag_mod.Diag) void { // agent_api.zig
     sample(diag, .E0510, &.{cause}, "nothing: the agent registers again and reports anew");
 }
 
+fn repair_unconfirmed(diag: *diag_mod.Diag) void { // api.zig
+    diag.raise(.E0401);
+    diag.cause(
+        "would write 2 assignments, 200 cpu millis and 2048 memory bytes to " ++
+            "/allocations/node1, which records 3, 300 and 3072",
+        .{},
+    );
+    diag.fix_with("if that is right, confirm it", "zcube repair allocations {s} --confirm", .{
+        "node1",
+    });
+}
+
+fn repair_no_finding(diag: *diag_mod.Diag) void { // api.zig
+    diag.raise(.E0402);
+    diag.cause("the allocation auditor has no open finding on node {s}", .{"node1"});
+    diag.fix(.{ .sentence = "see every node's accounting", .command = "zcube check allocations" });
+}
+
+fn repair_moving(diag: *diag_mod.Diag) void { // api.zig
+    diag.raise(.E0403);
+    diag.cause("the accounting of {s} kept changing during the request", .{"node1"});
+    diag.fix_with("run it again", "zcube repair allocations {s} --confirm", .{"node1"});
+}
+
+/// What the auditor embeds in its `allocation_mismatch` decision, relayed as a bug.
+fn accounting_bug(diag: *diag_mod.Diag) void { // auditor.zig
+    diag.raise(.B0003);
+    diag.cause(
+        "/allocations/node1 records 3 assignments, 300 cpu millis and 3072 memory bytes; " ++
+            "its assignments sum to 2, 200 and 2048",
+        .{},
+    );
+    diag.fix_with("check the accounting, then repair it", "zcube repair allocations {s} " ++
+        "--confirm", .{"node1"});
+}
+
+/// A check that finds node1's record one assignment ahead of its assignments.
+fn route_disagreeing(path: []const u8) ?Canned {
+    if (!std.mem.startsWith(u8, path, "/v1/check/allocations")) return null;
+    return .{
+        .status = 200,
+        // Captured from api_test.zig's "check shows it" test (a corrupted node1), verbatim.
+        .body = @embedFile("testdata/cli/check_allocations.json"),
+    };
+}
+
 /// A bug the server reports (it has written its own bundle, on its own machine).
 fn server_bug(diag: *diag_mod.Diag) void { // store_postgres.zig
     diag.raise(.B0001);
@@ -414,6 +460,10 @@ const cases = [_]Case{
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),
+    .{ .code = .E0401, .args = repair_node1, .script = .{ .diagnostic = repair_unconfirmed } },
+    .{ .code = .E0402, .args = repair_confirmed, .script = .{ .diagnostic = repair_no_finding } },
+    .{ .code = .E0403, .args = repair_confirmed, .script = .{ .diagnostic = repair_moving } },
+    disagreeing(),
     relayed(.E0501, unknown_container),
     relayed(.E0502, runtime_failed),
     relayed(.E0503, agent_unreachable),
@@ -426,7 +476,18 @@ const cases = [_]Case{
     relayed(.E0510, tenure_ended),
     relayed(.W0501, agent_lease),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
+    relayed(.B0003, accounting_bug),
 };
+
+const repair_node1: []const []const u8 = &.{ "repair", "allocations", "node1" };
+const repair_confirmed: []const []const u8 = &.{ "repair", "allocations", "node1", "--confirm" };
+
+/// `check allocations` prints its table, then fails with ZC-E0404.
+fn disagreeing() Case {
+    var case = routed(.E0404, &.{ "check", "allocations" }, route_disagreeing);
+    case.prints = true;
+    return case;
+}
 
 const bundle_hello: []const []const u8 = &.{ "bundle", "service", "hello" };
 const bundle_unredacted: []const []const u8 = &.{ "bundle", "service", "hello", "--no-redact" };

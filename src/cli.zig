@@ -11,6 +11,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const bundle_collect = @import("bundle_collect.zig");
 const cli_args = @import("cli_args.zig");
+const cli_allocations = @import("cli_allocations.zig");
 const cli_commands = @import("cli_commands.zig");
 const cli_env = @import("cli_env.zig");
 const cli_get = @import("cli_get.zig");
@@ -129,6 +130,10 @@ pub fn execute(
             try cli_commands.emit(env, .stdout, out, report);
         },
         .accept_rollback => try cli_commands.accept_rollback(env, client, options, report),
+        .check_allocations => try cli_allocations.check(env, client, options, report),
+        .repair_allocations => |node| {
+            try cli_allocations.repair(env, client, options, node, report);
+        },
         .help, .version, .explain => unreachable, // Handled before a client exists.
     }
 }

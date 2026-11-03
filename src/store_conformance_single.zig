@@ -18,6 +18,8 @@ const writers = @import("writers.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const scheduler = @import("scheduler.zig");
+const allocations = @import("allocations.zig");
+const auditor = @import("auditor.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 
 const Allocator = std.mem.Allocator;
@@ -1421,6 +1423,53 @@ test "scheduler: two schedulers planning on one allocation revision cannot both 
     try testing.expect(!try rig.assigned("n1", "hello-2"));
     try rig.settle(&second);
     try testing.expect(try rig.assigned("n1", "hello-2"));
+}
+
+// ---- The allocation auditor and repair (docs/authority.md, "Auditing the accounting") ----------
+
+test "auditor and repair: one finding on a corrupted record, the repair, and the clear" {
+    // Goal: the auditor's two transactions and the scheduler's repair on this backend. Method:
+    // hello-1 on n1; the record is corrupted as a defect would; one audit pass opens the finding
+    // and a second writes nothing; the repair writes the reconstruction; the next pass clears it.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000000 };
+    const rig: Rig = .{
+        .s = (try harness.connect()).interface(),
+        .diag = &diag,
+        .arena = arena_state.allocator(),
+        .clock = manual.clock(),
+    };
+    var sc = scheduler.Scheduler.init(1);
+    var audit = auditor.Auditor.init(3);
+    try rig.node("n1");
+    try rig.replica("hello-1");
+    try rig.settle(&sc);
+    const ctx = rig.context();
+    try testing.expectEqual(@as(u32, 0), (try audit.reconcile(&ctx)).acted);
+    const at = records.allocation_key("n1");
+    const got = try rig.s.get(rig.arena, at.slice(), null, rig.diag);
+    var wrong = try records.read(records.Allocation, rig.arena, got.kv.?, rig.diag);
+    wrong.count += 1;
+    try rig.put(.scheduler, at.slice(), wrong);
+    try testing.expectEqual(@as(u32, 1), (try audit.reconcile(&ctx)).acted);
+    const opened = try rig.revision();
+    try testing.expectEqual(@as(u32, 0), (try audit.reconcile(&ctx)).acted);
+    try testing.expectEqual(opened, try rig.revision());
+    const finding = records.audit_key("n1");
+    try testing.expect((try rig.s.get(rig.arena, finding.slice(), null, rig.diag)).kv != null);
+    var source: controller.DecisionSource = .{ .instance = 9 };
+    const result = try allocations.repair(&ctx, &source, "n1", "r-1");
+    try testing.expectEqual(@as(u32, 2), result.repaired.recorded.count);
+    try rig.accounting_holds();
+    try testing.expectEqual(@as(u32, 1), (try audit.reconcile(&ctx)).acted);
+    try testing.expect((try rig.s.get(rig.arena, finding.slice(), null, rig.diag)).kv == null);
+    try testing.expect(try allocations.repair(&ctx, &source, "n1", "r-2") == .no_finding);
 }
 
 // ---- The chain hash ----------------------------------------------------------------------------

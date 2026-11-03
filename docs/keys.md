@@ -254,8 +254,10 @@ controller records its choices about a service's replica set with the service as
 `scale_up`, `scale_down`, `replace_replica` and `hold_failed_replica`, each linking by `cause` to
 the observed record or decision that provoked it. A decision about one replica (`create_replica`,
 `stop_replica`, `mark_replica_lost`) keeps that replica as its subject, with a `cause` that points
-at the service-level decision above it, so the two chains join. A decision with a service as
-subject is indexed under `/decisions-by-subject/service/<name>/<id>` like any other.
+at the service-level decision above it, so the two chains join. (`mark_replica_lost` for a
+replica whose node was lost points at the node's `mark_lost` instead, and the `replace_replica`
+it provokes at it, so `why` on the replacement, a new id, reaches the lease.) A decision with a
+service as subject is indexed under `/decisions-by-subject/service/<name>/<id>` like any other.
 
 ## `/decisions-by-subject/<kind>/<name>/<id>`: the index for `zcube why`
 
@@ -281,6 +283,10 @@ C1 changes this rule: decisions on a live subject's current chain are never evic
 (`authority.md` section 5): for each live subject its newest decision of each action is a root,
 retention walks each root's chain and pins every decision on it, and only an unpinned decision
 beyond the budget is evicted. A deleted subject's decisions are no longer roots and stay 24 hours.
+Implemented in `src/retention.zig`. A pass computes the pinned set only when it has candidates,
+reading through a 1 MiB scratch region and bounded by `retention_pinned_max`; if a walk exceeds
+that bound or meets a malformed record, the pass drops nothing for live subjects (fail safe).
+A deleted subject's summaries go with its last decisions.
 A chain that needed an evicted decision is reported `truncated` by `zcube why`, with its reason.
 
 ## `/assigned/<node>/<replica>`: the placement (C1 slice 3)
@@ -319,7 +325,14 @@ both commit (no phantoms). Lifetime: while the node exists.
 Written by the allocation auditor when the sum it reconstructs from `/assigned/<node>/` differs
 from `/allocations/<node>`, both read at `revision`. While it exists the scheduler places nothing
 on the node (its absence is in the placement compare set). It never repairs. Lifetime: until a
-later audit finds the node consistent.
+later audit finds the node consistent, when the auditor deletes it with an `audit_clear` decision.
+
+**The repair** (`zcube repair allocations <node> --confirm`, `POST /v1/repair/allocations/<node>`)
+is the scheduler's, run in the request (role `scheduler`, actor `scheduler`): one transaction
+compares `/allocations/<node>` and this finding at the revision the tally was rebuilt at (every
+placement and release rewrites `/allocations/<node>`, so that compare also catches an assignment
+the scheduler changed meanwhile), puts the rebuilt tally into `/allocations/<node>` and writes a
+`repair_allocation` decision that cites the finding's `decision`. It leaves the finding in place; the auditor's next pass clears it.
 
 ## `/node-status/<node>`: the node controller's judgement (C1 slice 3)
 

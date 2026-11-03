@@ -58,12 +58,38 @@ pub fn key_copy(ctx: *const Context, key: *const records.Key) Error![]const u8 {
 
 // ---- Transactions of bounded size ------------------------------------------------------------
 
+/// What one `put_decision` adds to a batch, at most: the decision, its index entry and its
+/// summary (`/decision-summaries/`), and the summary's compare. A second decision for the same
+/// summary in one batch adds two operations and no compare. Every batch bound that holds
+/// decisions is derived from these.
+pub const decision_ops: u32 = 3;
+pub const decision_compares: u32 = 1;
+
+/// Summaries one batch can hold: every one has a decision, which takes `decision_ops`.
+const summaries_max = constants.store_txn_ops_max / decision_ops;
+
+/// A summary put already in a batch: where it is, and the record it holds.
+const SummarySlot = struct {
+    key: []const u8,
+    op_index: u32,
+    record: records.Summary,
+};
+
+comptime {
+    assert(summaries_max > 0);
+    assert(decision_ops >= 3);
+    assert(decision_compares == 1);
+    assert(decision_compares * summaries_max <= constants.store_txn_compares_max);
+}
+
 /// The operations and compares of one transaction, within the store's bounds.
 pub const Batch = struct {
     ops: [constants.store_txn_ops_max]store.Op = undefined,
     ops_count: u32 = 0,
     compares: [constants.store_txn_compares_max]store.Compare = undefined,
     compares_count: u32 = 0,
+    summaries: [summaries_max]SummarySlot = undefined,
+    summaries_count: u32 = 0,
 
     pub fn put(batch: *Batch, key: []const u8, value: []const u8) void {
         assert(batch.ops_count < constants.store_txn_ops_max);
@@ -86,6 +112,13 @@ pub const Batch = struct {
 
     pub fn has_room(batch: *const Batch, ops: u32) bool {
         return batch.ops_count + ops <= constants.store_txn_ops_max;
+    }
+
+    fn summary_slot(batch: *Batch, key: []const u8) ?*SummarySlot {
+        for (batch.summaries[0..batch.summaries_count]) |*slot| {
+            if (std.mem.eql(u8, slot.key, key)) return slot;
+        }
+        return null;
     }
 };
 
@@ -170,6 +203,8 @@ pub const Snapshot = struct {
     nodes: []const Entry(records.Node),
     /// The scheduler's assignments (`/assigned/`), at the same revision.
     assigned: []const Entry(records.Assigned) = &.{},
+    /// The node controller's judgements (`/node-status/`), at the same revision.
+    statuses: []const Entry(records.NodeStatus) = &.{},
     /// Replica id to the node it is assigned to.
     node_by_replica: std.StringHashMapUnmanaged([]const u8) = .empty,
 
@@ -220,6 +255,25 @@ pub const Snapshot = struct {
         return &snapshot.observed[index];
     }
 
+    /// A node's status, or null if the node controller has not judged it.
+    pub fn status_of(snapshot: *const Snapshot, node: []const u8) ?*const Entry(
+        records.NodeStatus,
+    ) {
+        const key = records.node_status_key(node);
+        for (snapshot.statuses) |*entry| {
+            if (std.mem.eql(u8, entry.kv.key, key.slice())) return entry;
+        }
+        return null;
+    }
+
+    /// A node's `/nodes` record, or null if it has none (its lease ended).
+    pub fn node_entry(snapshot: *const Snapshot, node: []const u8) ?*const Entry(records.Node) {
+        for (snapshot.nodes) |*entry| {
+            if (std.mem.eql(u8, entry.rec.name, node)) return entry;
+        }
+        return null;
+    }
+
     pub fn service_of(snapshot: *const Snapshot, name: []const u8) ?*const Entry(
         records.Service,
     ) {
@@ -261,6 +315,13 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         at,
         constants.replicas_max,
     );
+    const statuses = try list_all(
+        records.NodeStatus,
+        ctx,
+        records.prefix_node_status,
+        at,
+        constants.nodes_max,
+    );
     var by_replica: std.StringHashMapUnmanaged([]const u8) = .empty;
     for (assigned.items) |entry| {
         const rest = entry.kv.key[records.prefix_assigned.len..];
@@ -276,6 +337,7 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         .observed = observed.items,
         .nodes = nodes.items,
         .assigned = assigned.items,
+        .statuses = statuses.items,
         .node_by_replica = by_replica,
     };
 }
@@ -309,8 +371,12 @@ pub const DecisionSpec = struct {
     cause_evidence: ?records.Raw = null,
 };
 
-/// Adds a decision and its by-subject index entry to `batch` (two operations) and returns its id.
-/// The decision is committed with the action it records, or not at all.
+/// Adds a decision, its by-subject index entry and the update of its summary to `batch` (at most
+/// `decision_ops` operations and `decision_compares` compare) and returns its id. The decision
+/// is committed with the action it records, or not at all. The summary is read here and compared
+/// at the revision read (0: absent), so its count is exact: a concurrent writer of the same
+/// summary makes the transaction a conflict. A second decision for the same summary in one batch
+/// updates the put already there. A summary is never a cause.
 pub fn put_decision(
     ctx: *const Context,
     source: *DecisionSource,
@@ -318,7 +384,7 @@ pub fn put_decision(
     batch: *Batch,
 ) Error!records.DecisionId {
     assert(spec.reason.len > 0);
-    assert(batch.has_room(2));
+    assert(batch.has_room(decision_ops));
     if (spec.cause_evidence) |evidence| {
         assert(evidence.text.len <= constants.decision_evidence_bytes_max);
     }
@@ -347,7 +413,58 @@ pub fn put_decision(
     const index_at = records.index_key(spec.subject.kind, spec.subject.name, id.slice());
     batch.put(try key_copy(ctx, &decision_at), try records.encode(ctx.arena, decision, ctx.diag));
     batch.put(try key_copy(ctx, &index_at), try records.encode(ctx.arena, entry, ctx.diag));
+    try count_decision(ctx, batch, spec, &decision);
     return id;
+}
+
+/// Adds one to the summary of the decision's subject, action and kind of cause.
+fn count_decision(
+    ctx: *const Context,
+    batch: *Batch,
+    spec: DecisionSpec,
+    decision: *const records.Decision,
+) Error!void {
+    const summary_at = records.summary_key(
+        spec.subject.kind,
+        spec.subject.name,
+        spec.action,
+        spec.cause.kind,
+    );
+    const key = try key_copy(ctx, &summary_at);
+    const newest = ctx.arena.dupe(u8, decision.id) catch return failures.no_memory(ctx.diag);
+    if (batch.summary_slot(key)) |slot| {
+        assert(slot.record.count > 0);
+        slot.record.count += 1;
+        slot.record.last_at_ms = @max(slot.record.last_at_ms, decision.at_ms);
+        slot.record.newest = newest;
+        const bytes = try records.encode(ctx.arena, slot.record, ctx.diag);
+        batch.ops[slot.op_index] = .{ .put = .{ .key = key, .value = bytes } };
+        return;
+    }
+    assert(batch.summaries_count < summaries_max);
+    const got = try ctx.store.get(ctx.arena, key, null, ctx.diag);
+    var record: records.Summary = .{
+        .count = 1,
+        .first_at_ms = decision.at_ms,
+        .last_at_ms = decision.at_ms,
+        .newest = newest,
+    };
+    var revision: Revision = 0;
+    if (got.kv) |kv| {
+        const old = try records.read(records.Summary, ctx.arena, kv, ctx.diag);
+        record.count = old.count + 1;
+        record.first_at_ms = @min(old.first_at_ms, decision.at_ms);
+        record.last_at_ms = @max(old.last_at_ms, decision.at_ms);
+        revision = kv.mod_revision;
+    }
+    batch.expect(key, revision);
+    batch.summaries[batch.summaries_count] = .{
+        .key = key,
+        .op_index = batch.ops_count,
+        .record = record,
+    };
+    batch.summaries_count += 1;
+    batch.put(key, try records.encode(ctx.arena, record, ctx.diag));
 }
 
 /// A cause that points at another decision.
@@ -396,7 +513,8 @@ test "a decision and its index entry are written together, with a unique sortabl
         .reason = "creating hello-1",
         .cause = cause_decision(&first),
     }, &batch);
-    try testing.expectEqual(@as(u32, 4), batch.ops_count);
+    // Each decision: the record, the index entry and its summary (here two different summaries).
+    try testing.expectEqual(@as(u32, 6), batch.ops_count);
     try testing.expect(std.mem.order(u8, first.slice(), second.slice()) == .lt);
     try testing.expectEqualStrings("1761350000123-0001-0000", first.slice());
     const done = try commit(&ctx, .replica_controller, &batch);
@@ -432,4 +550,84 @@ test "a commit whose compare fails reports a conflict and writes nothing" {
     try testing.expect((try commit(&ctx, .api, &batch)) == .conflict);
     const status = try ctx.store.status(&diag);
     try testing.expectEqual(@as(Revision, 0), status.revision);
+}
+
+test "two decisions for one summary in a batch make one put and one compare, counted twice" {
+    // Goal: put_decision's merge. Method: two decisions with one subject, action and kind of
+    // cause in one batch: 2 x (record, index) + one summary put, one compare; after the commit
+    // the summary counts 2 and names the newer decision.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: DecisionSource = .{ .instance = 1 };
+    var batch: Batch = .{};
+    const spec: DecisionSpec = .{
+        .actor = "replica-controller",
+        .action = "create_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "creating hello-1",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 1 },
+    };
+    _ = try put_decision(&ctx, &source, spec, &batch);
+    manual.ms += 5;
+    const newer = try put_decision(&ctx, &source, spec, &batch);
+    try testing.expectEqual(@as(u32, 5), batch.ops_count);
+    try testing.expectEqual(@as(u32, 1), batch.compares_count);
+    try testing.expectEqual(@as(u32, 1), batch.summaries_count);
+    try testing.expect((try commit(&ctx, .replica_controller, &batch)) == .applied);
+    const key = records.summary_key(.replica, "hello-1", "create_replica", .desired);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &diag);
+    const summary = try records.read(records.Summary, ctx.arena, got.kv.?, &diag);
+    try testing.expectEqual(@as(u64, 2), summary.count);
+    try testing.expectEqualStrings(newer.slice(), summary.newest);
+    try testing.expectEqual(@as(u64, 1761350000128), summary.last_at_ms);
+}
+
+test "a summary written by another controller between plan and commit is a conflict" {
+    // Goal: the summary's compare is exact. Method: plan a decision (the summary is absent, so
+    // the compare expects revision 0), let another writer create that summary, then commit:
+    // a conflict, and the decision is not written.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: DecisionSource = .{ .instance = 1 };
+    var batch: Batch = .{};
+    const id = try put_decision(&ctx, &source, .{
+        .actor = "replica-controller",
+        .action = "create_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "creating hello-1",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 1 },
+    }, &batch);
+    const key = records.summary_key(.replica, "hello-1", "create_replica", .desired);
+    const other: store.Op = .{ .put = .{ .key = key.slice(), .value = "{}" } };
+    _ = try ctx.store.txn(.{ .on_success = &.{other} }, &diag);
+    try testing.expect((try commit(&ctx, .replica_controller, &batch)) == .conflict);
+    const decision_at = records.decision_key(id.slice());
+    const got = try ctx.store.get(ctx.arena, decision_at.slice(), null, &diag);
+    try testing.expect(got.kv == null);
 }

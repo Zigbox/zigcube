@@ -31,6 +31,8 @@ pub const usage =
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
+    \\  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
+    \\                    new ids (default 1000)
     \\  --state-dir DIR   where to remember the highest store revision seen (SQLite: default is
     \\                    the SQLite file's directory; Postgres: required). Keep outside the store
     \\  --create-store    create the store's file or schema if it is not there
@@ -62,6 +64,8 @@ pub const Config = struct {
     quiet: bool,
     /// The ttl of the leases the server grants to agents.
     lease_ttl_ms: u32 = constants.lease_ttl_ms,
+    /// How long after a node is marked lost its replicas are moved (docs/authority.md §3).
+    lost_grace_ms: u32 = constants.lost_grace_ms,
 };
 
 pub const Command = union(enum) { run: Config, version, help };
@@ -72,6 +76,7 @@ const File = struct {
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
+    lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
 };
 
@@ -82,6 +87,7 @@ const Flags = struct {
     store: ?[]const u8 = null,
     create_store: bool = false,
     lease_ttl_ms: ?u32 = null,
+    lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
     verbose: bool = false,
     quiet: bool = false,
@@ -113,7 +119,19 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .verbose = flags.verbose,
         .quiet = flags.quiet,
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
+        .lost_grace_ms = try lost_grace_of(flags.lost_grace_ms orelse file.lost_grace_ms, diag),
     };
+}
+
+/// ZC-E0106 for a grace outside its range: at most `lost_grace_ms_max`.
+fn lost_grace_of(given: ?u32, diag: *Diag) Error!u32 {
+    const grace = given orelse constants.lost_grace_ms;
+    if (grace > constants.lost_grace_ms_max) {
+        return bad(diag, "a lost grace of {d} ms is over {d} ms", .{
+            grace, constants.lost_grace_ms_max,
+        }, "choose a grace of at most an hour");
+    }
+    return grace;
 }
 
 /// ZC-E0121 for a ttl an agent cannot fence in time (docs/authority.md §3).
@@ -169,6 +187,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
             flags.lease_ttl_ms = try number_of(u32, args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--lost-grace-ms")) {
+            flags.lost_grace_ms = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--state-dir")) {
             flags.state_dir = try value_of(args, &index, diag);
         } else {
@@ -386,4 +406,19 @@ test "a lease ttl an agent cannot fence in time is ZC-E0121" {
         try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = ttl }, .{}, &diag));
         try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0121), diag.code);
     }
+}
+
+test "the lost grace is a flag, a file setting, and refused over an hour" {
+    // Goal: `--lost-grace-ms` reaches the config. Method: the default, a flag over a file, and
+    // one over `lost_grace_ms_max` refused with ZC-E0106.
+    var diag: Diag = undefined;
+    diag.reset();
+    try testing.expectEqual(constants.lost_grace_ms, (try merge(.{}, .{}, &diag)).lost_grace_ms);
+    const flags = try parse_flags(&.{ "--lost-grace-ms", "30000" }, &diag);
+    const both = try merge(flags, .{ .lost_grace_ms = 5 }, &diag);
+    try testing.expectEqual(@as(u32, 30000), both.lost_grace_ms);
+    const at_limit = try merge(.{ .lost_grace_ms = constants.lost_grace_ms_max }, .{}, &diag);
+    try testing.expectEqual(constants.lost_grace_ms_max, at_limit.lost_grace_ms); // Exactly 1 h.
+    const over = constants.lost_grace_ms_max + 1;
+    try expect_bad(merge(.{ .lost_grace_ms = over }, .{}, &diag), &diag);
 }

@@ -459,3 +459,73 @@ test "DELETE /v1/services/{name} deletes, and a missing service is ZC-E0101" {
     const odd = rig.call(.{ .method = "PUT", .path = "/v1/apply", .body = hello_json });
     try rig.refused(odd, 400, "ZC-E0104");
 }
+
+// ---- The allocation accounting (C1 slice 4c, 4d) -----------------------------------------------
+
+const writers = @import("writers.zig");
+
+/// Puts node1's allocation record back with one assignment more than it holds, as a defect would.
+fn corrupt_node1(rig: *Rig) !void {
+    const ctx = rig.world.controller_context();
+    const at = records.allocation_key(sim_world.node_name);
+    const got = try ctx.store.get(ctx.arena, at.slice(), null, ctx.diag);
+    var wrong = try records.read(records.Allocation, ctx.arena, got.kv.?, ctx.diag);
+    wrong.count += 1;
+    const bytes = try records.encode(ctx.arena, wrong, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = at.slice(), .value = bytes } };
+    _ = try writers.txn(ctx.store, .scheduler, .{ .on_success = &.{op} }, ctx.diag);
+}
+
+fn repair(rig: *Rig, query: []const u8) api_mod.Response {
+    const path = "/v1/repair/allocations/" ++ sim_world.node_name;
+    return rig.call(.{ .method = "POST", .path = path, .query = query });
+}
+
+test "status lists the auditor's finding; check shows it; repair asks, then writes and cites it" {
+    // Goal: docs/api.md, the check and repair endpoints and status `findings`. Method: hello on
+    // node1, its record corrupted; the auditor's pass opens the finding; check and status show
+    // it; a repair without confirm writes nothing; with it the record is the reconstruction and
+    // the next pass clears the finding.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const healthy = try rig.ok("/v1/check/allocations", "");
+    try testing.expectEqual(@as(i64, 0), field(healthy, "inconsistent").integer);
+    const statuses = field(try rig.ok("/v1/status", ""), "findings").array.items;
+    try testing.expectEqual(@as(usize, 0), statuses.len);
+    try rig.refused(repair(&rig, "confirm=true"), 409, "ZC-E0402");
+
+    try corrupt_node1(&rig);
+    _ = rig.world.settle();
+    const check = try rig.ok("/v1/check/allocations", "");
+    try testing.expectEqual(@as(i64, 1), field(check, "inconsistent").integer);
+    const node = field(check, "nodes").array.items[0];
+    try testing.expectEqualStrings(sim_world.node_name, field(node, "node").string);
+    try testing.expect(!field(node, "consistent").bool);
+    try testing.expectEqual(@as(i64, 3), field(field(node, "recorded"), "count").integer);
+    try testing.expectEqual(@as(i64, 2), field(field(node, "reconstructed"), "count").integer);
+    const decision = field(field(node, "finding"), "decision").string;
+    const findings = field(try rig.ok("/v1/status", ""), "findings").array.items;
+    try testing.expectEqual(@as(usize, 1), findings.len);
+    try testing.expectEqualStrings(decision, field(findings[0], "decision").string);
+
+    const before = (try rig.ok("/v1/status", "")).object.get("store").?;
+    try rig.refused(repair(&rig, ""), 400, "ZC-E0401");
+    const after = (try rig.ok("/v1/status", "")).object.get("store").?;
+    try testing.expectEqual(field(before, "revision").integer, field(after, "revision").integer);
+    try rig.refused(repair(&rig, "confirm=maybe"), 400, "ZC-E0104");
+
+    const done = repair(&rig, "confirm=true");
+    try testing.expectEqual(@as(u16, 200), done.status);
+    const body = try rig.json(done);
+    try testing.expectEqualStrings(done.request_id, field(body, "request_id").string);
+    try testing.expectEqualStrings("repair_allocation", field(body, "action").string);
+    try testing.expectEqual(@as(i64, 2), field(field(body, "reconstructed"), "count").integer);
+    _ = rig.world.settle();
+    const repaired = try rig.ok("/v1/check/allocations", "");
+    try testing.expectEqual(@as(i64, 0), field(repaired, "inconsistent").integer);
+    const cleared = field(repaired, "nodes").array.items[0];
+    try testing.expect(field(cleared, "finding") == .null);
+    try rig.refused(repair(&rig, "confirm=true"), 409, "ZC-E0402");
+}
