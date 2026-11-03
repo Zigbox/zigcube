@@ -46,7 +46,8 @@ pub fn exit_reason(out: *runtime.ExitReason, reason: *const zigbox.ExitReason) v
 pub fn status(out: *runtime.Status, entry: *const zigbox.Entry) void {
     assert(entry.record.name_len > 0);
     switch (entry.state) {
-        .running => out.* = .running,
+        // Zigbox saves the record with pid 0 before it starts the container.
+        .running => out.* = if (entry.record.pid == 0) .starting else .running,
         .lost => out.* = .{ .stopped = .{ .lost = null } },
         .stopped => {
             out.* = .{ .stopped = undefined };
@@ -97,6 +98,9 @@ pub const Refusal = enum {
     env_value_too_long,
     name_too_long,
     command_too_long,
+    /// The image is not `b3:` and 64 hex digits: a pull yields the full text, and the supervisor
+    /// compares the two exactly, so an abbreviated lock would be refused after a good pull.
+    image_not_full,
 };
 
 /// Zigbox's bounds (its `constants.zig`, which the `zigbox` module does not export: a gap to
@@ -113,9 +117,21 @@ pub const bounds = struct {
     pub const signal_kill: u8 = 9;
 };
 
+/// `b3:` and 64 lowercase hex digits: the text of a tree digest as Zigbox writes it.
+pub fn full_digest(text: []const u8) bool {
+    const prefix = "b3:";
+    if (text.len != prefix.len + 64) return false;
+    if (!std.mem.startsWith(u8, text, prefix)) return false;
+    for (text[prefix.len..]) |digit| {
+        if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return false;
+    }
+    return true;
+}
+
 pub fn refusal(spec: *const runtime.Spec) ?Refusal {
     const constants = bounds;
     if (spec.name.len > constants.container_name_bytes_max) return .name_too_long;
+    if (!full_digest(spec.image)) return .image_not_full;
     for (spec.env) |pair| {
         if (pair.name.len == 0) return .env_name_empty;
         if (pair.name.len > constants.env_name_bytes_max) return .env_name_too_long;
@@ -267,16 +283,27 @@ test "limits keep their fields and units" {
     try testing.expect(!none.any());
 }
 
+const hex64 = "51aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c03";
+const full_tree = "b3:" ++ hex64;
+
 test "refusal names what Zigbox bounds and Zigcube's spec check does not" {
     const base: runtime.Spec = .{
         .name = "hello-1",
-        .image = "b3:51aa9c03",
+        .image = full_tree,
         .command = &.{ "sh", "-c", "true" },
         .labels = &.{.{ .key = runtime.label_replica, .value = "hello-1" }},
     };
     try testing.expect(refusal(&base) == null);
 
     var spec = base;
+    const abbreviated = "b3:" ++ hex64[0..63]; // One digit short.
+    for ([_][]const u8{ "b3:51aa9c03", abbreviated, hex64, "" }) |short| {
+        spec.image = short;
+        try testing.expectEqual(Refusal.image_not_full, refusal(&spec).?);
+    }
+    spec.image = "b3:A" ++ hex64[1..]; // Zigbox writes lowercase.
+    try testing.expectEqual(Refusal.image_not_full, refusal(&spec).?);
+    spec = base;
     spec.env = &.{.{ .name = "", .value = "x" }};
     try testing.expectEqual(Refusal.env_name_empty, refusal(&spec).?);
     const long_name = repeat('A', bounds.env_name_bytes_max + 1);

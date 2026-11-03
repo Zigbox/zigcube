@@ -46,6 +46,10 @@ const Storage = struct {
     network_memory: NetworkMemory,
 };
 
+/// How much of `ZBX_REGISTRY_MIRRORS` is read: more than Zigbox's 1024 (not exported), so that a
+/// list that is too long reaches `pull` and is refused there, by Zigbox, not quietly ignored.
+const mirrors_bytes_max: u32 = 4096;
+
 /// The start and pull steps over real Zigbox, for `zigbox_image.start_with_image`.
 const Real = struct {
     host: zigbox.host.Host,
@@ -78,7 +82,11 @@ const Real = struct {
         const request: zigbox.pull.Request = .{
             .reference = reference,
             .platform = .{},
-            .mirrors = "",
+            // Docker Hub mirrors, from the environment the agent gave this process.
+            .mirrors = self.host.environment(
+                "ZBX_REGISTRY_MIRRORS",
+                mirrors_bytes_max,
+            ) orelse "",
         };
         try zigbox.pull.pull(
             self.host,
@@ -98,7 +106,10 @@ const Real = struct {
 
 pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     assert(dir_path.len > 0);
-    const io = init.io;
+    // Not `init.io`: that is a threaded Io. Zigbox's start and pull make namespaces, which
+    // needs a process with one thread, and this Io never starts another.
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
     const dir = Dir.openDirAbsolute(io, dir_path, .{}) catch return constants.exit_environment;
     defer dir.close(io);
     // A new session and process group: signals aimed at the agent do not reach it.
@@ -129,6 +140,12 @@ fn supervise(
     arena: Allocator,
 ) u8 {
     const container = container_spec(arena, spec) orelse return constants.exit_environment;
+    var status: [4096]u8 = undefined;
+    const count = if (host.read_file("/proc/self/status", &status)) |text|
+        image.threads_in(text)
+    else |_|
+        null;
+    if (count != 1) return record_failure(io, dir, &image.not_single_threaded(count));
     var real: Real = .{ .host = host, .storage = storage, .spec = &container };
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {
