@@ -147,8 +147,6 @@ const PendingStop = struct {
     deadline_ms: u64,
 };
 
-pub const watch_prefixes = [_][]const u8{ records.prefix_replicas, records.prefix_assigned };
-
 pub const Agent = struct {
     config: Config,
     lease: store.LeaseId,
@@ -248,7 +246,7 @@ pub const Agent = struct {
         agent.forget_finished_stops(listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
         const at_ms = agent.next_wake(now, mono);
-        return .{ .at_ms = at_ms, .prefixes = &watch_prefixes, .acted = acted };
+        return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = acted };
     }
 
     /// The soonest the agent needs to run again: its lease renewal, the fence, a stop's deadline,
@@ -416,7 +414,7 @@ pub const Agent = struct {
         if (running == 0) try agent.fenced(ctx);
         const poll = now + constants.fence_poll_ms;
         const at_ms = if (running == 0) now else poll;
-        return .{ .at_ms = at_ms, .prefixes = &watch_prefixes, .acted = 0 };
+        return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = 0 };
     }
 
     /// Every container has stopped: the lease and the tenure are over.

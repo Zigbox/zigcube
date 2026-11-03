@@ -151,11 +151,28 @@ terminal.
 ```
 
 - `step.type` is `decision`, or a terminal: `observed`, `desired`, `resync`, `lease_expired`
-  (new, below), or `gone` when a decision in the chain has been removed by retention.
+  (new, below), or `gone` when a decision in the chain has been removed by retention. A `why node`
+  chain may end in one more step of type `note` (C1 slice 7): a statement of the scheduler's rule,
+  not a reading of the store. A client that does not know a step type prints its `text`.
+- `why node`'s `state.text` names the judgement and the load:
+  `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
+  8.0Gi memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
+  status is for an earlier tenure says so, and one that is not registered says `not registered`
+  and, if a status remains, `last judged <state> (tenure N)`. The `note` step is added when the
+  node is `ready` for its current tenure and holds fewer replicas than another registered node:
+  replicas already running elsewhere are not moved back, because the scheduler does not rebalance.
 - **`state.text` and every `step.text` are the sentences the CLI prints.** The CLI renders
   `state.text`, then `← <text>` per step, and a step with a `diagnostic` as the full diagnostic
   block instead (HANDOFF's `← error[ZBX-E0501]: image not found …` form). The console may add
   structure around the text (who, when, links, the revision) but never different claims.
+- `completeness` (C1 slice 7, authority.md §5) says whether the chain reaches its cause:
+  `{"verdict": "complete"}`, or `{"verdict": "truncated", "at": "<decision id or key>", "reason": R}`
+  with `R` one of `retention` (a decision was removed: decisions are kept 200 per subject, 7 days, or 24 hours once the subject is gone), `subject_deleted`
+  (the same, and the subject no longer exists) or `compacted` (a key the chain cites has changed since, the store no longer keeps its value at the cited revision, and no decision kept evidence of it; a cited key that never changed is read now and is complete). A `gone` step carries the same `reason`, and for `compacted`
+  the `key`. The current value of a compacted key is never shown as the reason for it. The field is
+  always present (an empty chain is `complete`); a client reading an older server may find it absent. Only the scheduler and the node
+  controller write `cause_evidence`; the replica controller writes none, so its `observed` and
+  `desired` terminals past compaction end `truncated`/`compacted` (a gap, reported with slice 7).
 - `state.health` is `healthy`, `degraded`, `failing` or `gone`.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
   survive (24 h, keys.md) answers `200` with `state.exists: false`.
@@ -445,10 +462,13 @@ The long poll, the provisional transport of HANDOFF. `from` is a revision (at le
 { "revision": 415, "changed": true }
 ```
 
-`changed` is true if any key under the watched prefixes, `/replicas/` and (from C1 slice 3)
-`/assigned/`, was written or deleted at a revision `>= from`. Each prefix is scanned in turn;
-with nothing changed, `revision` is the smaller of the two scans' bookmarks, so watching from
-`revision + 1` skips no change under either. If nothing has changed the
+`changed` is true if any key under `/assigned/<node>/` was written or deleted at a revision `>= from`
+(C1 slice 7; before it the watch also woke on every `/replicas/` change and on any node's
+assignment, so every agent woke for every placement). The agent lists its assignments and joins each
+replica record, and every change it must act on is a change of its own assignments: a replica
+record is written once and removed, never edited, and the scheduler deletes the assignment of a
+replica that is gone. With nothing changed, `revision` is the scan's bookmark, so watching from
+`revision + 1` skips no change. If nothing has changed the
 server holds the reply up to `timeout`, as for `GET /v1/watch`, and answers with `changed: false`
 and the bookmark when the time is up. **The reply carries no events**, because the agent
 reconciles by level: it reads the list again and lets the core decide, so a lost or compacted
