@@ -74,7 +74,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-W0601</h1>
 <p class="summary">a peer sent a chunk that does not match its hash</p>
-<dl class="facts"><div><dt>Kind</dt><dd>warning</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
+<dl class="facts"><div><dt>Kind</dt><dd>warning</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>A node that was asked for a chunk of an image sent bytes whose hash is not the chunk's. The chunk was dropped and the node asked for no more from that peer during this fetch; it came from another peer or the registry.</p>
 <p>The image is not affected: nothing is stored or run before every chunk matches. The peer's disk or store may be damaged, or it may be running a different build; check that node.</p>

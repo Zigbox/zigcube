@@ -104,7 +104,6 @@ const Fetch = struct {
     peer_node: [images.nodes_max]u32 = undefined,
     peer_requested: [images.nodes_max]u64 = @splat(0),
     node_requested: u64 = 0,
-    struck_seen: [images.nodes_max]bool = @splat(false),
     pending: [constants.fetch_in_flight_max]Pending = @splat(.{}),
 };
 
@@ -360,7 +359,7 @@ fn check_peer_request(sim: *Sim, request: fetch_plan.Request, peer: u8, waited: 
     if (!f.filters[peer].maybe_has(&sim.world.hashes[id])) {
         return sim.fail("a peer was asked for a chunk its filter does not claim", .{});
     }
-    if (f.struck_seen[peer]) return sim.fail("a struck peer was asked again", .{});
+    if (f.plan.is_struck(peer)) return sim.fail("a struck peer was asked again", .{});
     const bit = @as(u16, 1) << @intCast(peer);
     if (f.asked[request.chunk] & bit != 0) {
         return sim.fail("a peer was asked twice for the same chunk", .{});

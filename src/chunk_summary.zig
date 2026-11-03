@@ -61,7 +61,8 @@ pub const Filter = struct {
         const count = filter.bit_count();
         const first = std.mem.readInt(u64, hash[0..8], .little);
         const second = std.mem.readInt(u64, hash[8..16], .little);
-        // A step in 1..count-1 never repeats a probe within count steps (a step of 0 would).
+        // A step of 0 would repeat one probe; a step in 1..count-1 spreads them (probes may still
+        // coincide when the step shares a factor with count, which only costs a little accuracy).
         const step = second % (count - 1) + 1;
         return (first % count + @as(u64, index) * step) % count;
     }
@@ -200,24 +201,14 @@ fn lower_bound(entries: []const Entry, key: u64) u32 {
     return low;
 }
 
-/// The bottom-K of the union of several trees' chunks, which the bottom-K sketches of the trees
-/// determine: the K smallest keys among theirs.
-const Union = struct {
-    sketch: Sketch,
-    /// Every chunk of every tree is in the sample.
-    complete: bool,
-};
-
-fn union_of(held: []const Sketch) Union {
+/// The bottom-K of the union of several trees' chunks: the K smallest keys among theirs. It is
+/// exact only below the smallest limit of the trees it merges.
+fn union_of(held: []const Sketch) Sketch {
     var merged: Sketch = .{};
-    var complete = true;
     for (held) |*tree| {
-        if (!tree.exact()) complete = false;
         for (tree.slice()) |entry| merged.add_entry(entry);
     }
-    // `chunks` counted the keys seen: the union is complete only if none was dropped.
-    if (merged.chunks > sketch_keys_max) complete = false;
-    return .{ .sketch = merged, .complete = complete };
+    return merged;
 }
 
 /// What the node's summary says it holds, for `locality_bytes`: the sketches of the complete
@@ -231,11 +222,13 @@ pub fn locality_bytes(target: *const Sketch, held: []const Sketch) u64 {
         }
     }
     const node = union_of(held);
-    // Both samples are complete up to their limits; compare in the range both cover.
+    // Each sketch is exact below its own limit, so the union of the held ones is exact below the
+    // smallest held limit (not below the union's own limit, which can be far lower), and the
+    // target is exact below its own: compare in the range all of them cover.
     var cutoff: ?u64 = target.limit();
-    if (!node.complete) {
-        const node_limit = node.sketch.entries[node.sketch.count - 1].key;
-        cutoff = if (cutoff) |own| @min(own, node_limit) else node_limit;
+    for (held) |*tree| {
+        const tree_limit = tree.limit() orelse continue;
+        cutoff = if (cutoff) |own| @min(own, tree_limit) else tree_limit;
     }
     var sampled: u64 = 0;
     var hit: u64 = 0;
@@ -244,8 +237,8 @@ pub fn locality_bytes(target: *const Sketch, held: []const Sketch) u64 {
             if (entry.key > limit) break;
         }
         sampled += entry.bytes;
-        const found = lower_bound(node.sketch.slice(), entry.key);
-        if (found < node.sketch.count and node.sketch.entries[found].key == entry.key) {
+        const found = lower_bound(node.slice(), entry.key);
+        if (found < node.count and node.entries[found].key == entry.key) {
             hit += entry.bytes;
         }
     }
@@ -473,4 +466,47 @@ test "several held trees together cover the target" {
     const half = locality_bytes(&target, &.{left});
     try std.testing.expect(half > target.total_bytes / 4);
     try std.testing.expect(half < target.total_bytes * 3 / 4);
+}
+
+test "many held versions at about 20 per cent churn estimate the target within bound" {
+    // Goal: the estimate stays accurate when the union of the held trees is far larger than the
+    // target (the cutoff is the smallest limit, not the union's). Method: a chain of versions of
+    // 1000 chunks, each replacing 20 % of the previous one's chunks; the first 16 are held, the
+    // 17th is the target; the truth is the target bytes not new in it. 20 seeded trials at 16
+    // and 32 held versions (the 32 only if the tree table allows), mean error within 10 %.
+    var prng = std.Random.DefaultPrng.init(0xc3);
+    const random = prng.random();
+    const chunks = 1000;
+    const Chunk = struct { hash: Hash, size: u32 };
+    for ([_]u32{ 16, 32 }) |versions| {
+        if (versions > constants.summary_trees_max) continue;
+        var error_sum: u64 = 0;
+        for (0..20) |_| {
+            var current: [chunks]Chunk = undefined;
+            for (&current) |*chunk| chunk.* = .{
+                .hash = random_hash(random),
+                .size = random.intRangeAtMost(u32, 1000, constants.swarm_chunk_bytes),
+            };
+            var held: [32]Sketch = undefined;
+            var target: Sketch = undefined;
+            var truth: u64 = 0;
+            for (0..versions + 1) |version| {
+                var sketch = Sketch.init(random_hash(random));
+                truth = 0;
+                for (&current) |*chunk| {
+                    if (version > 0 and random.uintLessThan(u32, 5) == 0) {
+                        chunk.* = .{
+                            .hash = random_hash(random),
+                            .size = random.intRangeAtMost(u32, 1000, constants.swarm_chunk_bytes),
+                        };
+                    } else truth += chunk.size;
+                    sketch.add(&chunk.hash, chunk.size);
+                }
+                if (version < versions) held[version] = sketch else target = sketch;
+            }
+            const estimate = locality_bytes(&target, held[0..versions]);
+            error_sum += if (estimate > truth) estimate - truth else truth - estimate;
+        }
+        try std.testing.expect(error_sum / 20 * 10 < 1000 * constants.swarm_chunk_bytes / 2);
+    }
 }
