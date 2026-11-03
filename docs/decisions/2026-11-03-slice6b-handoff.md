@@ -17,23 +17,29 @@ Built, all with unit tests (`zig build test` and `tidy` pass): `peer_stream`, `p
   `fetch_cli` prints ZC-E0601 as text; the full diagnostic raise (Diag) is not wired. ZC-W0602 has
   no raise site yet (the worker counts `bad_lists` only).
 
-Cut (from the bottom of the brief's list; NOT done):
-- The supervisor running `fetch` before the command, with `fetch.json`, `starting` while it runs,
-  `Blame.fetch` -> ZC-E0601 (design below).
-- Peer and filter discovery from the server (`/v1/list?prefix=/node-store/`, `/nodes/`).
-- D: fake registry (fault-proxied for node 3), the teeth fault, `zig build swarm-smoke` with a
-  1 MiB chunk. E: `--help` is done; `peer.md`, `api.md`, `keys.md` tables are not.
-- No revert-check was run for the three part-A fixes (tests pass; they were not shown to fail
-  without the fix).
+Part 4 (the cut items, now done):
+- Supervisor integration as designed below: `fetch.json`, `fetch.log` (the fetch's stderr),
+  `Blame.fetch` -> ZC-E0601; `zcube-agent --registry HOST:PORT` (needs `--images-dir`).
+- Peer discovery: `zcube-agent fetch --server HOST:PORT` reads `/nodes/` and `/node-store/`.
+- Raise sites for ZC-E0601 and ZC-W0602 with goldens.
+- D: `src/swarm_smoke.zig` (`zig build swarm-smoke`, three agents, fake registry, one 1 MiB chunk,
+  node 3's registry black-holed) and `swarm-smoke-teeth` (agent built with verification skipped;
+  passes only if the smoke fails). Test fault `<state-dir>/faults/peer-corrupt` makes a peer flip
+  the first body byte of every chunk reply (read at agent start).
+- Supervisor review fixes M1 and S2: `fetch_cli.Net` keeps one stream per peer (reopened after an
+  error or `peer_connection_requests_max` requests); a non-200 head is `.refused`. Test in
+  `peer_server.zig` (more requests than `peer_handshakes_per_source_max`).
+- Revert checks: chunk read, peers list and `write_whole` temp name each fail a test without the
+  fix (a test was added for `write_whole`: `a write never touches another writer's temporary
+  file`; the later fix session may still harden it).
+- Docs: `agent.md`, `api.md`, `keys.md`, `peer.md`; AGENTS.md lists the smoke.
 
-Design for the supervisor integration: FakeRuntime writes `fetch.json` into the container
-directory when the image is not in `DirImages` and a registry is configured;
-`fake_supervisor.supervise` runs the fetch after writing `supervisor.pid` and before spawning the
-command, so `agent_records.classify` already reports `starting`. `await_start` returns `started`
-once `supervisor.pid` exists when `fetch.json` does. A failure is `start_failed` with a new
-`Blame.fetch` that `start_failure` turns into ZC-E0601. The plan strikes a peer for the rest of a
-fetch after one bad chunk, so the smoke's "registry exactly once" needs node 1 to fetch first.
+Observations: in a teeth run a later replacement replica on node 3 still reached `running` with an
+empty `fetch.log` (probably chunk 0 from node 2 on a retry); not explained. `-Dtest-filter` ran
+nothing for new tests here; use the full `zig build test`. tidy bans `**` formatting oddities and
+`@import("root")` outside the allowlist (`zcube_agent.zig` added).
 
 Traps: `zig build test` (not `-Dtest-filter`) is the only true revert-check; zig-pkg must be
 populated by hand (AGENTS.md); `pkill -f` with a pattern in your own command line kills your shell;
-a concurrent `zig build` while a subagent edits `src/diag/codes.zig` fails on its comptime asserts.
+a concurrent `zig build` while a subagent edits `src/diag/codes.zig` fails on its comptime asserts;
+`say()` in the smokes truncates at 512 bytes; a worktree under `.claude/worktrees/` breaks tidy.

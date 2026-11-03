@@ -53,7 +53,7 @@ const Registry = struct {
     /// "/trees/" and the digest.
     tree_path: [74]u8 = undefined,
     list: [3 * 80]u8 = undefined,
-    list_len: usize = 0,
+    list_len: u32 = 0,
     hashes: [3][64]u8 = undefined,
     bodies: [3][]u8 = undefined,
     trees_asked: std.atomic.Value(u32) = .init(0),
@@ -69,7 +69,8 @@ const Registry = struct {
             prng.random().bytes(body.*);
             std.crypto.hash.Blake3.hash(body.*, &refs[at].hash, .{});
             refs[at].bytes = size;
-            _ = std.fmt.bufPrint(&registry.hashes[at], "{x}", .{&refs[at].hash}) catch unreachable; // 64 hex digits fit.
+            const hex = std.fmt.bufPrint(&registry.hashes[at], "{x}", .{&refs[at].hash});
+            _ = hex catch unreachable; // 64 hex digits fit.
         }
         const text = node_store.list_format(&refs, &registry.list) orelse return error.ListTooBig;
         registry.list_len = text.len;
@@ -185,10 +186,16 @@ const Smoke = struct {
 
     /// `node`'s `rest` (a directory or file of its own) under the work directory.
     fn node_path(smoke: *Smoke, node: []const u8, rest: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(smoke.arena.allocator(), "{s}/{s}/{s}", .{ smoke.work, node, rest });
+        const arena = smoke.arena.allocator();
+        return std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ smoke.work, node, rest });
     }
 
-    fn spawn(smoke: *Smoke, exe: []const u8, args: []const []const u8, log: []const u8) !std.process.Child {
+    fn spawn(
+        smoke: *Smoke,
+        exe: []const u8,
+        args: []const []const u8,
+        log: []const u8,
+    ) !std.process.Child {
         const name = try smoke.path(log);
         const file = try std.Io.Dir.cwd().createFile(smoke.io, name, .{});
         defer file.close(smoke.io);
@@ -282,7 +289,8 @@ const Smoke = struct {
             .{ &smoke.registry.digest, replicas, service_command },
         );
         const reply = try smoke.call("POST", "/v1/apply", body);
-        try smoke.expect(reply.status == 200, "apply answered {d}: {s}", .{ reply.status, reply.body });
+        const said = "apply answered {d}: {s}";
+        try smoke.expect(reply.status == 200, said, .{ reply.status, reply.body });
     }
 
     /// How many replicas node `at` reports `running`.
@@ -370,15 +378,18 @@ const Smoke = struct {
     fn dump_logs(smoke: *Smoke) void {
         const arena = smoke.arena.allocator();
         for ([_][]const u8{ "server", "agent-node1", "agent-node2", "agent-node3" }) |name| {
-            const file = std.fmt.allocPrint(arena, "{s}/{s}.log", .{ smoke.work, name }) catch continue;
+            const form = "{s}/{s}.log";
+            const file = std.fmt.allocPrint(arena, form, .{ smoke.work, name }) catch continue;
             const text = std.Io.Dir.cwd().readFileAlloc(smoke.io, file, arena, .limited(8192)) catch
                 continue;
             smoke.say("---- {s} ----", .{name});
-            std.Io.File.stdout().writeStreamingAll(smoke.io, text) catch {}; // Nowhere else to say it.
+            const out = std.Io.File.stdout();
+            out.writeStreamingAll(smoke.io, text) catch {}; // Nowhere else to say it.
         }
         if (smoke.call("GET", "/v1/list?prefix=/observed/node3/", "")) |reply| {
             smoke.say("---- node3 observed ----", .{});
-            std.Io.File.stdout().writeStreamingAll(smoke.io, reply.body) catch {}; // Nowhere else to say it.
+            const out = std.Io.File.stdout();
+            out.writeStreamingAll(smoke.io, reply.body) catch {}; // Nowhere else to say it.
         } else |_| {}
         const log = smoke.fetch_log(nodes[2]) catch return;
         smoke.say("---- node3 fetch.log ----", .{});
@@ -464,7 +475,8 @@ fn step_third_without_registry(smoke: *Smoke) !void {
     while (waited < wait_ms and try smoke.summaries() < 2) : (waited += 100) {
         try smoke.io.sleep(.fromMilliseconds(100), .awake);
     }
-    try smoke.expect(try smoke.summaries() >= 2, "node1 and node2 never published their chunks", .{});
+    const published = try smoke.summaries();
+    try smoke.expect(published >= 2, "node1 and node2 never published their chunks", .{});
     try smoke.start_agent(2);
     try wait_registered(smoke, 3);
     try smoke.apply(3);
@@ -472,7 +484,8 @@ fn step_third_without_registry(smoke: *Smoke) !void {
     try expect_registry(smoke, 1, 3, "node3");
     const reached = smoke.proxy.stats().upstream_connects;
     try smoke.expect(reached == 0, "node3 reached the registry {d} times", .{reached});
-    try smoke.expect(try fetch_log_has(smoke, "ZC-W0601"), "node3's fetch.log has no ZC-W0601", .{});
+    const struck = try fetch_log_has(smoke, "ZC-W0601");
+    try smoke.expect(struck, "node3's fetch.log has no ZC-W0601", .{});
     smoke.say("node3 ran its replica with the registry cut off: node1's bad chunk was struck " ++
         "(ZC-W0601), the rest came from node2", .{});
 }
@@ -486,7 +499,8 @@ pub fn main(init: std.process.Init) u8 {
     const io = init.io;
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return 2;
     if (args.len != 3) {
-        std.Io.File.stderr().writeStreamingAll(io, "usage: swarm_smoke <zcube-server> <zcube-agent>\n") catch {};
+        const usage = "usage: swarm_smoke <zcube-server> <zcube-agent>\n";
+        std.Io.File.stderr().writeStreamingAll(io, usage) catch {}; // Nowhere else to say it.
         return 2;
     }
     const registry = init.gpa.create(Registry) catch return 2;

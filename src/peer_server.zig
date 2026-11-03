@@ -422,3 +422,49 @@ test "a chunk of the largest size is served whole" {
     const body = try stream.recv(reply, end);
     try std.testing.expectEqualSlices(u8, big, body);
 }
+
+test "more requests than the handshake limit are served over one stream, a missing one refused" {
+    // Goal: the fetch client keeps one stream per peer, so an image of many chunks does not hit
+    // `peer_handshakes_per_source_max`, and a non-200 reply is `.refused`, not `.timeout`.
+    // Method: ask one peer server for the same chunk 3 * peer_connection_requests_max times (the
+    // stream is reopened twice, far under the limit) and then for a chunk it does not hold.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const fetch_cli = @import("fetch_cli.zig");
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    const peers = [_]fetch_cli.Peer{.{
+        .name = "node2",
+        .address = try net.IpAddress.parse("127.0.0.1", rig.server.port()),
+    }};
+    var reply: [1024]u8 = undefined;
+    var net_state: fetch_cli.Net = .{
+        .io = io,
+        .registry = peers[0].address,
+        .peers = &peers,
+        .identity = .{
+            .key = key,
+            .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+            .ca_public = rig.ca.public_key.toBytes(),
+        },
+        .reply = &reply,
+    };
+    defer net_state.close_peers();
+    var target: [128]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&target, "{s}{x}", .{ chunk_path, &rig.hash });
+    const requests = 3 * constants.peer_connection_requests_max;
+    comptime assert(requests > 2 * constants.peer_handshakes_per_source_max);
+    for (0..requests) |_| {
+        const got = net_state.peer_get(0, path, &out);
+        try std.testing.expectEqualSlices(u8, &rig.body, got.bytes);
+    }
+    const zeros: [64]u8 = @splat('0');
+    const absent = try std.fmt.bufPrint(&target, "{s}{s}", .{ chunk_path, &zeros });
+    try std.testing.expectEqual(
+        fetch_cli.PeerReply.refused,
+        net_state.peer_get(0, absent, &out),
+    );
+}

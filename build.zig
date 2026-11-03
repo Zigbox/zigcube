@@ -314,7 +314,8 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
     run.addArtifactArg(built.server);
     run.addArtifactArg(built.agent);
     run.has_side_effects = true;
-    const help = "Run three agents, a fake registry and a corrupt peer as real processes (not demo-c0)";
+    const help = "Run three agents, a fake registry and a corrupt peer as real processes " ++
+        "(not demo-c0)";
     b.step("swarm-smoke", help).dependOn(&run.step);
     const teeth = b.addRunArtifact(exe);
     teeth.addArtifactArg(built.server);

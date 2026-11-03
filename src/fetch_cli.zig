@@ -43,6 +43,8 @@ pub const Net = struct {
     digest: []const u8 = "",
     /// Counts for the log line.
     bad_lists: u32 = 0,
+    /// The open stream to each peer, by index.
+    conns: [constants.fetch_peers_max]Conn = @splat(.{}),
 
     fn from(context: *anyopaque) *Net {
         return @ptrCast(@alignCast(context));
@@ -72,7 +74,10 @@ pub const Net = struct {
                 const prefix = peer_serve.path_trees;
                 const path = std.fmt.bufPrint(&target, "{s}{s}", .{ prefix, digest }) catch
                     return null;
-                return net.peer_get(net.peers[index], path, out);
+                return switch (net.peer_get(index, path, out)) {
+                    .bytes => |bytes| bytes,
+                    .refused, .timeout => null,
+                };
             },
         }
     }
@@ -86,11 +91,15 @@ pub const Net = struct {
                     return .refused;
                 break :blk net.registry_get(path, out);
             },
-            .peer => |index| blk: {
+            .peer => |index| {
                 const prefix = peer_serve.path_chunk;
                 const path = std.fmt.bufPrint(&target, "{s}{x}", .{ prefix, &ref.hash }) catch
                     return .refused;
-                break :blk net.peer_get(net.peers[index], path, out);
+                return switch (net.peer_get(index, path, out)) {
+                    .bytes => |bytes| .{ .bytes = bytes },
+                    .refused => .refused,
+                    .timeout => .timeout,
+                };
             },
         };
         return if (got) |bytes| .{ .bytes = bytes } else .timeout;
@@ -142,23 +151,79 @@ pub const Net = struct {
         return out[0..body.len];
     }
 
-    /// The body of `GET path` from `who`, over an authenticated stream, or null.
-    fn peer_get(net: *Net, who: Peer, path: []const u8, out: []u8) ?[]const u8 {
-        const identity = net.identity orelse return null;
+    /// The answer to `GET path` from peer `index`, over that peer's one authenticated stream.
+    /// The stream is kept for the whole fetch (the server limits handshakes per source) and
+    /// reopened after an error or `peer_connection_requests_max` requests. A non-200 head is
+    /// `.refused` (the peer lacks it); a connect, handshake or stream failure is `.timeout`.
+    pub fn peer_get(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
+        const conn = &net.conns[index];
+        const reused = conn.open;
+        if (conn.open and conn.requests >= constants.peer_connection_requests_max) {
+            conn.close();
+        }
+        const first = net.peer_try(index, path, out);
+        if (first == .timeout and reused) return net.peer_try(index, path, out); // Idle-closed.
+        return first;
+    }
+
+    fn peer_try(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
+        const identity = net.identity orelse return .timeout;
+        const conn = &net.conns[index];
         const end = peer_stream.boot_ms(net.io) + constants.fetch_request_timeout_ms;
-        const fd = peer_stream.connect(net.io, who.address, end) catch return null;
-        defer _ = std.os.linux.close(fd);
-        var stream = peer_stream.open_client(net.io, fd, &identity, who.name, end) catch
-            return null;
-        defer stream.deinit();
+        if (!conn.open) {
+            const who = net.peers[index];
+            const fd = peer_stream.connect(net.io, who.address, end) catch return .timeout;
+            conn.stream = peer_stream.open_client(net.io, fd, &identity, who.name, end) catch {
+                _ = std.os.linux.close(fd);
+                return .timeout;
+            };
+            conn.fd = fd;
+            conn.open = true;
+            conn.requests = 0;
+        }
+        conn.requests += 1;
         var request: [160]u8 = undefined;
-        const text = std.fmt.bufPrint(&request, "GET {s}\n", .{path}) catch return null;
-        stream.send(text, end) catch return null;
-        const head = stream.recv(net.reply[0..reply_head_bytes], end) catch return null;
-        if (head.len != reply_head_bytes) return null;
-        if (std.mem.readInt(u16, head[0..2], .big) != 200) return null;
-        const body = stream.recv(out, end) catch return null;
-        return body;
+        const text = std.fmt.bufPrint(&request, "GET {s}\n", .{path}) catch return .timeout;
+        const reply = net.peer_exchange(&conn.stream, text, out, end);
+        if (reply == .timeout) conn.close();
+        return reply;
+    }
+
+    fn peer_exchange(
+        net: *Net,
+        stream: *peer_stream.Stream,
+        text: []const u8,
+        out: []u8,
+        end: u64,
+    ) PeerReply {
+        stream.send(text, end) catch return .timeout;
+        const head = stream.recv(net.reply[0..reply_head_bytes], end) catch return .timeout;
+        if (head.len != reply_head_bytes) return .timeout;
+        const body = stream.recv(out, end) catch return .timeout;
+        if (std.mem.readInt(u16, head[0..2], .big) != 200) return .refused;
+        return .{ .bytes = body };
+    }
+
+    /// Closes every open peer stream.
+    pub fn close_peers(net: *Net) void {
+        for (&net.conns) |*conn| conn.close();
+    }
+};
+
+pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout };
+
+/// One peer's open stream and how many requests it has carried.
+const Conn = struct {
+    open: bool = false,
+    fd: std.posix.fd_t = -1,
+    requests: u32 = 0,
+    stream: peer_stream.Stream = undefined,
+
+    fn close(conn: *Conn) void {
+        if (!conn.open) return;
+        conn.stream.deinit();
+        _ = std.os.linux.close(conn.fd);
+        conn.* = .{};
     }
 };
 
@@ -389,6 +454,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};
     const peers = infos[0..found];
+    defer net.close_peers();
     const transport = net.transport();
     fetch_worker.fetch(gpa, transport, &store, parsed.digest, peers, .{}, &report) catch |err| {
         var tried_buffer: [256]u8 = undefined;
@@ -463,7 +529,10 @@ test "a peer's filter is read from /node-store/ and a malformed one is ignored" 
 test "the sources a failed fetch names are its peers and the registry" {
     var buffer: [128]u8 = undefined;
     const address = try IpAddress.parse("127.0.0.1", 1);
-    const peers = [_]Peer{ .{ .name = "node2", .address = address }, .{ .name = "node3", .address = address } };
+    const peers = [_]Peer{
+        .{ .name = "node2", .address = address },
+        .{ .name = "node3", .address = address },
+    };
     try std.testing.expectEqualStrings(
         "node2, node3, and the registry",
         tried_sources(&buffer, &peers),

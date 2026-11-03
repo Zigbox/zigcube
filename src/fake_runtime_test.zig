@@ -287,7 +287,8 @@ test "an image that is not a fixture is fetched first, and a failed fetch is ZC-
     try testing.expectEqualStrings("ZC-E0601", now.stopped.start_failed.code.slice());
     const dir = try rig.fake.containers.openDir(testing.io, "fetch-1", .{});
     defer dir.close(testing.io);
-    const log = try dir.readFileAlloc(testing.io, fake_files.file_fetch_log, rig.arena.allocator(), .limited(8192));
+    const arena = rig.arena.allocator();
+    const log = try dir.readFileAlloc(testing.io, fake_files.file_fetch_log, arena, .limited(8192));
     try testing.expect(std.mem.find(u8, log, "ZC-E0601") != null);
     try testing.expectError(error.FileNotFound, dir.access(testing.io, fake_files.file_child, .{}));
 }

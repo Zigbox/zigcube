@@ -128,7 +128,10 @@ pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
 pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!void {
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
-    for ([_][]const u8{ file_run, file_child, file_supervisor, file_forced, file_fetch, file_fetch_log }) |stale| {
+    const files = [_][]const u8{
+        file_run, file_child, file_supervisor, file_forced, file_fetch, file_fetch_log,
+    };
+    for (files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {
             error.Absent => {}, // The usual case.
             else => |other| return other,
