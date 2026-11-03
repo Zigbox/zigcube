@@ -73,11 +73,15 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
     const io = init.io;
     const plan = files.read_json(files.FetchFile, io, dir, files.file_fetch, arena) catch
         return failed(.environment, "the fetch record could not be read");
+    // The fetch's diagnostics (ZC-W0601, ZC-E0601) are kept beside the container's other files.
+    const log = dir.createFile(io, files.file_fetch_log, .{}) catch
+        return failed(.environment, "the fetch log could not be created");
+    defer log.close(io);
     var child = std.process.spawn(io, .{
         .argv = plan.argv,
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .ignore,
+        .stderr = .{ .file = log },
     }) catch return failed(.environment, "the host refused to start the fetch");
     child_pid.store(child.id.?, .release);
     const term = child.wait(io) catch return .{ .kind = .lost };

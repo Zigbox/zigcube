@@ -39,6 +39,9 @@ pub const Config = struct {
     node: []const u8,
     images_path: []const u8,
     verbose: bool = false,
+    /// Test fault (`<state dir>/faults/peer-corrupt`, docs/agent.md): the first byte of every chunk
+    /// sent is flipped, so a peer that lies reaches its clients' hash check.
+    corrupt_chunks: bool = false,
 };
 
 /// What one connection task owns.
@@ -216,12 +219,12 @@ fn serve(server: *Server, slot: *Slot) void {
     var count: u32 = 0;
     while (count < constants.peer_connection_requests_max) : (count += 1) {
         if (server.stopping.load(.acquire)) return;
-        if (!one_request(&stream, slot)) return;
+        if (!one_request(&stream, slot, server.config.corrupt_chunks)) return;
     }
 }
 
 /// Reads one request and answers it. False when the connection should end.
-fn one_request(stream: *peer_stream.Stream, slot: *Slot) bool {
+fn one_request(stream: *peer_stream.Stream, slot: *Slot, corrupt_chunks: bool) bool {
     var request: [1024]u8 = undefined;
     const io = stream.io;
     const text = stream.recv(&request, peer_stream.boot_ms(io) + constants.peer_idle_ms) catch
@@ -242,6 +245,10 @@ fn one_request(stream: *peer_stream.Stream, slot: *Slot) bool {
         slot.scratch,
         slot.refs,
     );
+    const is_chunk = std.mem.startsWith(u8, first[space + 1 ..], peer_serve.path_chunk);
+    if (corrupt_chunks and is_chunk and reply.status == 200 and reply.body.len > 0) {
+        @constCast(reply.body)[0] ^= 0xff; // The body is the slot's own scratch (`chunk`).
+    }
     var head: [reply_head_bytes]u8 = @splat(0);
     std.mem.writeInt(u16, head[0..2], reply.status, .big);
     if (reply.range) |span| {

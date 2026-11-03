@@ -265,6 +265,6 @@ identity from the state directory at each handshake (`agent_peer.load_identity`)
 `peer_connections_max` connections, each with its own buffers. `src/fetch_worker.zig` drives
 `fetch_plan` over a `Transport` and a `DirImages`.
 
-Not built yet: the `zcube-agent fetch` command, the agent's `--peer-listen` flag, the registry
-client and peer discovery over `/v1/list`, the supervisor running the worker before the command,
-ZC-E0601 and ZC-W0602, and `swarm-smoke`. See `docs/decisions/2026-11-03-slice6b-handoff.md`.
+The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor running the worker before
+the command (ZC-E0601) and the fake registry are described in `docs/agent.md`; `zig build swarm-smoke`
+runs them end to end. See `docs/decisions/2026-11-03-slice6b-handoff.md`.

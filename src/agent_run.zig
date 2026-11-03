@@ -468,6 +468,7 @@ const Swarm = struct {
             .node = config.node,
             .images_path = path,
             .verbose = config.verbose,
+            .corrupt_chunks = test_fault(io, config.state_dir, "peer-corrupt"),
         }) catch {
             gpa.destroy(server);
             swarm.server = null;
@@ -483,6 +484,15 @@ const Swarm = struct {
         if (swarm.has_store) swarm.store.close(gpa);
     }
 };
+
+/// Whether the test fault `faults/<name>` is set in the state directory (docs/agent.md).
+fn test_fault(io: std.Io, state_dir: []const u8, name: []const u8) bool {
+    var buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const path = std.fmt.bufPrint(&buffer, "{s}/faults/{s}", .{ state_dir, name }) catch
+        return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
 
 fn fail_start(io: std.Io, diag: *Diag, verbose: bool, what: []const u8) u8 {
     diag.reset();

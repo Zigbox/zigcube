@@ -79,6 +79,7 @@ These arrive with the scaffold; keep this list current as they land.
   fault proxy), the `zcube` command; join, 6 replicas two per node, power off node3 and replacement,
   restart and `zcube why node`, the partition test, local mode. About 35 s; uses the Postgres like
   `test-store`. `docs/demos/c1.md` says what it asserts. Not `sim-cluster`.
+- `zig build swarm-smoke` (`src/swarm_smoke.zig`) runs `zcube-server` and three `zcube-agent`s with `FakeRuntime` and a fake registry (one chunk of at least 1 MiB; node 3's registry link is black-holed): the first image is fetched from the registry, the second from a peer, a corrupting peer is struck (ZC-W0601), and the third replica starts with the registry unreachable. `swarm-smoke-teeth` runs it against `zcube-agent` built with verification skipped and passes only if the smoke fails. About 30 s; not in `check`; not a demo. A fetch's stderr is `<container dir>/fetch.log`; `zcube-agent --registry HOST:PORT` (needs `--images-dir`) enables it. `docs/agent.md`.
 - `zig build demo-cN` runs milestone N's demo.
 
 ## Working as the implementer

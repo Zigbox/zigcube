@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, zigbox_module);
+    add_swarm_smoke_steps(b, shared_options, built);
     add_local_smoke_step(b, built);
     add_bench_watch_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
@@ -281,6 +282,47 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     run.has_side_effects = true;
     const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
     b.step("agent-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build swarm-smoke` and `swarm-smoke-teeth` (src/swarm_smoke.zig): three agents, a fake
+/// registry and a corrupt peer on real processes. The teeth step runs the same program with an
+/// agent whose fetch plan skips the hash check (src/zcube_agent_teeth.zig) and passes only if the
+/// smoke fails. Never cached, not in `check`, not demo-c0.
+fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Built) void {
+    const exe = b.addExecutable(.{
+        .name = "swarm_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/swarm_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = options.zigbox }},
+        }),
+    });
+    const teeth_agent = b.addExecutable(.{
+        .name = "zcube-agent-teeth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zcube_agent_teeth.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{
+                .{ .name = "build_options", .module = options.options.createModule() },
+                .{ .name = "zigbox", .module = options.zigbox },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArtifactArg(built.server);
+    run.addArtifactArg(built.agent);
+    run.has_side_effects = true;
+    const help = "Run three agents, a fake registry and a corrupt peer as real processes (not demo-c0)";
+    b.step("swarm-smoke", help).dependOn(&run.step);
+    const teeth = b.addRunArtifact(exe);
+    teeth.addArtifactArg(built.server);
+    teeth.addArtifactArg(teeth_agent);
+    teeth.has_side_effects = true;
+    teeth.expectExitCode(1);
+    const teeth_help = "swarm-smoke with the fetch plan's test-only fault on; it must fail";
+    b.step("swarm-smoke-teeth", teeth_help).dependOn(&teeth.step);
 }
 
 /// `zig build local-smoke`: `zcube local up` and `down` as a person would use them

@@ -19,6 +19,7 @@ const fake_supervisor = @import("fake_supervisor.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const zigbox_supervisor = @import("zigbox_supervisor.zig");
 const fetch_cli = @import("fetch_cli.zig");
+const fetch_plan = @import("fetch_plan.zig");
 
 const Diag = diag_mod.Diag;
 
@@ -26,6 +27,8 @@ const Diag = diag_mod.Diag;
 comptime {
     assert(!agent.fault_ignore_stop);
     assert(!c1_teeth.any);
+    // `zcube_agent_teeth.zig` is the one root that switches the fetch plan's fault on.
+    if (@import("root") == @This()) assert(!fetch_plan.fault_skip_verify);
 }
 
 /// A panic is a `bug` diagnostic. The internal message is shown only with `--verbose`

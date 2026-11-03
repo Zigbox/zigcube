@@ -255,6 +255,43 @@ test "a command that is not there fails with ZC-E0508 and is a stopped container
     try testing.expectEqualStrings("ZC-E0508", now.stopped.start_failed.code.slice());
 }
 
+test "an image that is not a fixture is fetched first, and a failed fetch is ZC-E0601" {
+    // Goal: the supervisor runs the fetch before the command, and a fetch that fails is a start
+    // failure blamed on the fetch, with the fetch's own text kept in `fetch.log`. Method: a
+    // runtime with a registry nobody listens on; the command must never start.
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.fake.deinit();
+    const images = try std.fmt.allocPrint(rig.arena.allocator(), "{s}/images", .{rig.path});
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.init(testing.io, rig.clock_source.clock(), .{
+        .gpa = testing.allocator,
+        .state_dir = rig.path,
+        .supervisor_exe = rig.exe,
+        .fixtures = &fixtures,
+        .fetch = .{ .node = "node1", .images_dir = images, .registry = "127.0.0.1:1" },
+    }, &local);
+    const digest = "b3:" ++ "0000000000000000000000000000000000000000000000000000000000000000";
+    const outcome = try rig.launch("fetch-1", digest, &forever, &.{});
+    const handle = switch (outcome) {
+        .started => |started| started,
+        .failed => |diagnostic| {
+            // The fetch failed before `start` returned; the outcome says so.
+            try testing.expectEqualStrings("ZC-E0601", diagnostic.code.slice());
+            return;
+        },
+    };
+    _ = try rig.wait_stopped(handle);
+    const now = try rig.status(handle);
+    try testing.expectEqualStrings("ZC-E0601", now.stopped.start_failed.code.slice());
+    const dir = try rig.fake.containers.openDir(testing.io, "fetch-1", .{});
+    defer dir.close(testing.io);
+    const log = try dir.readFileAlloc(testing.io, fake_files.file_fetch_log, rig.arena.allocator(), .limited(8192));
+    try testing.expect(std.mem.find(u8, log, "ZC-E0601") != null);
+    try testing.expectError(error.FileNotFound, dir.access(testing.io, fake_files.file_child, .{}));
+}
+
 test "a supervisor that dies leaves a lost container, and nothing of it runs on" {
     // Goal: HANDOFF's `lost`. Method: kill the supervisor with SIGKILL while its command runs;
     // the container is stopped as lost with ZC-E0509, and the command is killed with it.

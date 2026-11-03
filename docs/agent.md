@@ -45,7 +45,8 @@ zcube-agent --node node1 --server 127.0.0.1:7070 --state-dir /var/lib/zcube-agen
 
 Everything can also be set in a ZON file (`--config FILE`); flags win. `--help` lists the rest.
 The images the fake runtime "has" are read from `fixtures/images.zon` (`--images FILE`); any other
-digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)).
+digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)),
+unless `--registry` gives it a registry to fetch from (below).
 Capacity is declared, as HANDOFF's provisional answer says.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
@@ -64,6 +65,8 @@ Each container is a directory `<state>/containers/<replica id>/`:
 | `supervisor.pid` | the supervisor | its pid, which is also its process group and session |
 | `child.pid` | the supervisor | the command's pid, once it runs |
 | `forced` | a test fault | `oom` or `pid_limit`, before the kill |
+| `fetch.json` | the runtime, when the image must be fetched first | `{digest, argv}`: the `zcube-agent fetch` command the supervisor runs before the command |
+| `fetch.log` | the fetch's stderr, while and after it runs | the text of ZC-W0601 and ZC-E0601, when they are raised |
 | `run.json` | the supervisor, last | how the command ended; the truth for `list` and `inspect` |
 
 `start` writes the spec and starts `zcube-agent supervise <dir>`, then waits (at most
@@ -162,6 +165,12 @@ slice 6b's chunk server does.
 
 ## The chunk store, the peer server and `fetch` (C2 slice 6b)
 
+With `--registry HOST:PORT` (needs `--images-dir`; `.registry` in the ZON file) the fake runtime
+fetches an image that is not in its fixtures, rather than refusing it. Before it runs the command,
+the container's supervisor runs `zcube-agent fetch` for the image (`fetch.json`, above), and the
+replica reports `starting` while that runs. A failed fetch is a start failure with ZC-E0601, the
+text in `fetch.log`.
+
 `--images-dir DIR` gives the node a chunk store (`dir_images.zig`: `trees/<digest>` lists and
 `chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
 checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
@@ -170,15 +179,22 @@ thread; a `DirImages` belongs to one thread, and the peer server gives each conn
 CA-authenticated peers only, rate limited (ZC-E0808).
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
-[--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the registry (plain HTTP,
-`/trees/<digest>`, `/chunks/<hex>`) and the named peers. It exits 0 when the tree is whole in the
-store and 1 with ZC-E0601 when it is not. A peer is only ever asked when the digest is the full
-`b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
+[--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
+registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
+whole in the store and 1 with ZC-E0601 when it is not. A peer is only ever asked when the digest is
+the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
-**Not built yet (6b part 3 cut):** peers and their chunk filters discovered from the server
-(`/node-store/`, `/nodes/`) instead of `--peer`; the supervisor running `fetch` before the
-command so a replica reports `starting` while it runs; the fake registry, `swarm-smoke` and its
-teeth fault; `keys.md` and `api.md` tables.
+- `--server HOST:PORT` gives the peers without naming them. The fetch reads
+  `/v1/list?prefix=/nodes/` for each node's name and `address`, and `/v1/list?prefix=/node-store/`
+  for each node's hex `filter` (keys.md, api.md), and skips its own node.
+- `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
+  the plan strikes it if it lies.
+
+**Not built yet (6b part 3 cut):** the fake registry, `swarm-smoke` and its teeth fault.
+
+Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the first byte of every
+chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer
+server, so restart the agent after creating or removing the file.
 
 ## What survives what
 

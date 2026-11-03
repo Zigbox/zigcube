@@ -435,3 +435,38 @@ test "the fetch arguments need a node, directories, a digest and a registry" {
     try std.testing.expect(parse(good[0..8]) == null);
     try std.testing.expect(parse(&.{ "--node", "n", "--bogus", "x" }) == null);
 }
+
+test "a peer's filter is read from /node-store/ and a malformed one is ignored" {
+    // Goal: discovery adds only sources it can use. Method: the stores of a good node, a node
+    // whose filter has an odd number of digits, a filter too short for `Filter`, and one that is
+    // not hex; each is asked for by name, and an unknown node has none.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text =
+        \\[{"key":"/node-store/good","value":{"filter":"00ff00ff00ff00ff"}},
+        \\ {"key":"/node-store/odd","value":{"filter":"00ff00ff00ff00f"}},
+        \\ {"key":"/node-store/short","value":{"filter":"00ff"}},
+        \\ {"key":"/node-store/hex","value":{"filter":"zzzzzzzzzzzzzzzz"}},
+        \\ {"key":"/other/good","value":{"filter":"00ff00ff00ff00ff"}}]
+    ;
+    const stores = try std.json.parseFromSliceLeaky([]const Kv, arena, text, .{});
+    const good = filter_of(arena, stores, "good").?;
+    try std.testing.expectEqual(@as(usize, 8), good.len);
+    try std.testing.expectEqual(@as(u8, 0xff), good[1]);
+    try std.testing.expect(filter_of(arena, stores, "odd") == null);
+    try std.testing.expect(filter_of(arena, stores, "short") == null);
+    try std.testing.expect(filter_of(arena, stores, "hex") == null);
+    try std.testing.expect(filter_of(arena, stores, "absent") == null);
+}
+
+test "the sources a failed fetch names are its peers and the registry" {
+    var buffer: [128]u8 = undefined;
+    const address = try IpAddress.parse("127.0.0.1", 1);
+    const peers = [_]Peer{ .{ .name = "node2", .address = address }, .{ .name = "node3", .address = address } };
+    try std.testing.expectEqualStrings(
+        "node2, node3, and the registry",
+        tried_sources(&buffer, &peers),
+    );
+    try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}));
+}

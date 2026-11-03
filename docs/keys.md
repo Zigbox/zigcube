@@ -36,6 +36,8 @@ Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer
 `ca.pub`, live in the state directories, not in the store.
 
 An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
+The `zcube-agent fetch` process reads `/nodes/<node>` (`address`) and `/node-store/<node>` (`filter`)
+to find peers, and writes neither.
 One departure from `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
