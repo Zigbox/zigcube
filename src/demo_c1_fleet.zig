@@ -75,6 +75,7 @@ pub const Fleet = struct {
     /// Power off: SIGKILL of the agent, so it cannot revoke its lease, then of every supervisor's
     /// group (the supervisor, its container's command, what that started).
     pub fn power_off(fleet: *Fleet, index: usize) !void {
+        assert(index < count);
         var child = fleet.agents[index] orelse return;
         std.posix.kill(child.id.?, .KILL) catch {}; // Already gone is fine; wait says how.
         _ = try child.wait(fleet.host.io);

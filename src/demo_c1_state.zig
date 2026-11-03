@@ -24,10 +24,14 @@ pub const hello_image = c0.hello_image;
 /// holds for it: `fence_margin` 3000 >= `fence_stop` 2000 + ttl * 1% + kill latency 900.
 pub const ttl_ms: u32 = 8_000;
 pub const ttl_text = "8000";
-/// How long the agent may take to stop its containers after the fence, at the latest: the bound
-/// of the partition test is `s + ttl - fence_margin + fence_stop + kill latency`.
-pub const stop_bound_ms: u32 = ttl_ms - constants.fence_margin_ms + constants.fence_stop_ms +
-    constants.fence_kill_latency_ms;
+/// Where the agent's last container is dead, at the latest, relative to the server's expiry of
+/// its lease. The agent fences at `s + ttl - fence_margin`, `s` the send time of the last
+/// keepalive the server acknowledged, and the server's expiry is that receipt plus `ttl`, so the
+/// expiry is at or after `s + ttl`; the agent then takes `fence_stop` and the kill latency.
+/// Negative: the agent is done before the lease runs out, which keeps the replacements from
+/// overlapping it.
+pub const stop_after_expiry_ms: i64 = @as(i64, constants.fence_stop_ms) +
+    constants.fence_kill_latency_ms - constants.fence_margin_ms;
 
 // ---- Every wait of the demo is bounded by one of these ----
 
@@ -94,6 +98,14 @@ fn string_of(value: ?Json) ?[]const u8 {
     };
 }
 
+/// The `items` array of a list reply; null if the reply is not shaped so.
+fn items_of(parsed: Json) ?[]const Json {
+    if (parsed != .object) return null;
+    const found = parsed.object.get("items") orelse return null;
+    if (found != .array) return null;
+    return found.array.items;
+}
+
 /// One row of `zcube get nodes -o json`; a field is null when the command says null.
 pub const NodeRow = struct {
     name: []const u8,
@@ -125,8 +137,10 @@ pub fn node_rows(host: *Host) !?[]const NodeRow {
     const cli = try host.zcube_quiet(&.{ "get", "nodes", "-o", "json" });
     if (cli.code != 0) return null;
     const parsed = std.json.parseFromSliceLeaky(Json, host.arena(), cli.out, .{}) catch return null;
+    const items = items_of(parsed) orelse return null;
     var rows: std.ArrayList(NodeRow) = .empty;
-    for (parsed.object.get("items").?.array.items) |item| {
+    for (items) |item| {
+        if (item != .object) return null;
         const fields = item.object;
         const lease = if (fields.get("lease")) |value| switch (value) {
             .object => |object| object,
@@ -137,7 +151,7 @@ pub fn node_rows(host: *Host) !?[]const NodeRow {
             else => null,
         } else null;
         try rows.append(host.arena(), .{
-            .name = string_of(fields.get("name")).?,
+            .name = string_of(fields.get("name")) orelse return null,
             .status = string_of(fields.get("status")),
             .status_tenure = number(fields.get("status_tenure")),
             .tenure = number(fields.get("tenure")),
@@ -149,6 +163,29 @@ pub fn node_rows(host: *Host) !?[]const NodeRow {
         });
     }
     return rows.items;
+}
+
+/// `node_rows`, or the demo fails: for the places where the command must work, so that a
+/// transient failure ends the run through `run`'s cleanup instead of a panic that skips it.
+pub fn need_nodes(host: *Host) ![]const NodeRow {
+    return (try node_rows(host)) orelse host.fail("zcube get nodes failed or was unreadable", .{});
+}
+
+/// The row of `name` in a fresh `zcube get nodes`, or the demo fails.
+pub fn need_node(host: *Host, name: []const u8) !NodeRow {
+    const rows = try need_nodes(host);
+    return find_node(rows, name) orelse host.fail("zcube get nodes does not list {s}", .{name});
+}
+
+/// The tenure of a registered node, or the demo fails.
+pub fn need_tenure(host: *Host, row: NodeRow) !i64 {
+    return row.tenure orelse host.fail("{s} has no tenure", .{row.name});
+}
+
+/// `replica_rows`, or the demo fails.
+pub fn need_replicas(host: *Host, service: []const u8) ![]const Row {
+    return (try replica_rows(host, service)) orelse
+        host.fail("zcube get replicas {s} failed or was unreadable", .{service});
 }
 
 pub fn find_node(rows: []const NodeRow, name: []const u8) ?NodeRow {
@@ -163,11 +200,13 @@ pub fn replica_rows(host: *Host, service: []const u8) !?[]const Row {
     const cli = try host.zcube_quiet(&.{ "get", "replicas", service, "-o", "json" });
     if (cli.code != 0) return null;
     const parsed = std.json.parseFromSliceLeaky(Json, host.arena(), cli.out, .{}) catch return null;
+    const items = items_of(parsed) orelse return null;
     var rows: std.ArrayList(Row) = .empty;
-    for (parsed.object.get("items").?.array.items) |item| {
+    for (items) |item| {
+        if (item != .object) return null;
         try rows.append(host.arena(), .{
-            .id = string_of(item.object.get("id")).?,
-            .status = string_of(item.object.get("status")).?,
+            .id = string_of(item.object.get("id")) orelse return null,
+            .status = string_of(item.object.get("status")) orelse return null,
             .node = string_of(item.object.get("node")) orelse "",
         });
     }
@@ -236,7 +275,9 @@ pub fn expect_placement(demo: *Demo, comptime what: []const u8, expected: [3]u32
         );
         const agent_pid = demo.fleet.agent_pid(index) orelse continue;
         for (alive) |pids| {
-            const supervisor = procs.proc(pids.supervisor).?;
+            const supervisor = procs.proc(pids.supervisor) orelse {
+                return host.fail("{s}: supervisor {d} is gone", .{ pids.name(), pids.supervisor });
+            };
             const own = pids.supervisor;
             const led = supervisor.session == own and supervisor.group == own;
             try host.check_quiet(led, "{s}: no session of its own", .{pids.name()});

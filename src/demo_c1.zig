@@ -151,11 +151,13 @@ fn run(demo: *Demo) u8 {
         demo.fleet.dump_logs();
         ok = false;
     };
+    const started = pids_started(demo);
     host.cleanup();
     demo.fleet.cleanup();
     local.stop_all(demo);
     host.section("Cleanup");
-    const left = (demo.fleet.survivors() catch 1) + (local.procs(host).supervisors() catch 1);
+    const left = (demo.fleet.survivors() catch 1) + (local.procs(host).supervisors() catch 1) +
+        local.live_count(host) + still_running(demo, started);
     if (left == 0) {
         host.say("  ok: every process the demo started is gone (agents, supervisors, ...)", .{});
     } else {
@@ -166,6 +168,28 @@ fn run(demo: *Demo) u8 {
     std.Io.Dir.cwd().deleteTree(host.io, host.work) catch {}; // Best effort: it is in /tmp.
     host.say("\n{s}", .{if (ok) "demo-c1 PASSED" else "demo-c1 FAILED"});
     return if (ok) 0 else 1;
+}
+
+/// The server and the agents the demo started, as they are before the cleanup kills them.
+const Started = struct { pids: [1 + fleet_mod.count]i32 = @splat(0) };
+
+fn pids_started(demo: *Demo) Started {
+    var started: Started = .{};
+    if (demo.host.server) |child| started.pids[0] = child.id orelse 0;
+    for (demo.fleet.agents, 0..) |agent, index| {
+        if (agent) |child| started.pids[1 + index] = child.id orelse 0;
+    }
+    return started;
+}
+
+/// How many of those processes still run: `kill` reaps its child, so none may.
+fn still_running(demo: *Demo, started: Started) u32 {
+    const procs = demo.host.procs();
+    var count: u32 = 0;
+    for (started.pids) |pid| {
+        if (pid > 1 and procs.alive(pid)) count += 1;
+    }
+    return count;
 }
 
 // ---- The store of a Postgres run: the demo starts from an empty one ----

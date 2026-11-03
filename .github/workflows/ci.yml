@@ -297,6 +297,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
@@ -318,6 +319,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
