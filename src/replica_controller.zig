@@ -56,6 +56,11 @@ pub const actor = "replica-controller";
 /// decision, `decision_ops + 1` for each replica (its decision, and the replica record or its
 /// delete), and 1 for the counter.
 const batch_replicas_max: u32 = 3;
+/// Distinct lost nodes one transaction removes replicas from: each costs two compares (its
+/// status and its `/nodes` record), which a batch of `batch_replicas_max` replicas on three
+/// nodes would push past `store_txn_compares_max`. A replica on a further node waits for the
+/// next pass.
+const lost_nodes_batch_max: u32 = 2;
 const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{
@@ -72,12 +77,18 @@ comptime {
     assert(decision + batch_replicas_max * (decision + 1) + 1 <= constants.store_txn_ops_max);
     // A batch of one more replica would not fit: the bound moved with the summaries.
     assert(decision + (batch_replicas_max + 1) * (decision + 1) + 1 > constants.store_txn_ops_max);
-    // The service, the counter and the service decision's summary, and per replica its key,
-    // (when it is dead) its assignment, (when its node is lost) the node's status, and its
-    // decision's summary.
+    // The service, the counter and the service decision's summary; per replica its key, its
+    // assignment and its decision's summary; and per lost node, once however many of its
+    // replicas the batch removes, the node's status and its `/nodes` record.
     const fixed = 2 + controller.decision_compares;
-    const per_replica = 3 + controller.decision_compares;
-    assert(fixed + batch_replicas_max * per_replica <= constants.store_txn_compares_max);
+    const per_replica = 2 + controller.decision_compares;
+    const per_lost_node = 2;
+    assert(fixed + batch_replicas_max * per_replica + lost_nodes_batch_max * per_lost_node <=
+        constants.store_txn_compares_max);
+    // One more lost node would not fit, so the limit is what the store allows, not slack.
+    assert(fixed + batch_replicas_max * per_replica +
+        (lost_nodes_batch_max + 1) * per_lost_node > constants.store_txn_compares_max);
+    assert(lost_nodes_batch_max <= batch_replicas_max);
 }
 
 pub const ReplicaController = struct {
@@ -317,9 +328,15 @@ const Run = struct {
     fn replace(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
         var removed: [batch_replicas_max]*const Item = undefined;
         var removed_count: u32 = 0;
+        var lost_nodes: [lost_nodes_batch_max][]const u8 = undefined;
+        var lost_nodes_count: u32 = 0;
         for (plan.slice()) |*item| {
             if (item.class != .dead and item.class != .stale) continue;
             if (removed_count == batch_replicas_max) break;
+            if (item.lost) |status| {
+                const node = status.kv.key[records.prefix_node_status.len..];
+                if (!note_lost_node(&lost_nodes, &lost_nodes_count, node)) continue;
+            }
             removed[removed_count] = item;
             removed_count += 1;
         }
@@ -354,6 +371,22 @@ const Run = struct {
         }
         try run.create_replicas(&batch, service, &decision, creations);
         _ = try run.finish(&batch);
+    }
+
+    /// Counts `node` among the lost nodes the batch touches. False if it is a new one and the
+    /// batch already has `lost_nodes_batch_max` (the compare budget).
+    fn note_lost_node(
+        nodes: *[lost_nodes_batch_max][]const u8,
+        count: *u32,
+        node: []const u8,
+    ) bool {
+        for (nodes[0..count.*]) |known| {
+            if (std.mem.eql(u8, known, node)) return true;
+        }
+        if (count.* == lost_nodes_batch_max) return false;
+        nodes[count.*] = node;
+        count.* += 1;
+        return true;
     }
 
     fn replace_reason(
@@ -458,9 +491,30 @@ const Run = struct {
         batch.expect(replica.kv.key, replica.kv.mod_revision);
         const placed = run.snap.assigned_of(replica.rec.id).?;
         batch.expect(placed.kv.key, placed.kv.mod_revision);
-        batch.expect(status.kv.key, status.kv.mod_revision);
+        try run.expect_node_lost(batch, node, status);
         batch.delete(replica.kv.key);
         return id;
+    }
+
+    /// Compares what "the node is lost and has not registered again" was judged from: its
+    /// status at the revision read and its `/nodes` record as read (absent is revision 0). Once
+    /// per node per batch: a second replica of the node adds nothing.
+    fn expect_node_lost(
+        run: *Run,
+        batch: *Batch,
+        node: []const u8,
+        status: *const Entry(records.NodeStatus),
+    ) Error!void {
+        for (batch.compares[0..batch.compares_count]) |compare| {
+            if (std.mem.eql(u8, compare.key, status.kv.key)) return;
+        }
+        batch.expect(status.kv.key, status.kv.mod_revision);
+        const registered = run.snap.node_entry(node);
+        const key = records.node_key(node);
+        batch.expect(
+            try controller.key_copy(run.ctx, &key),
+            if (registered) |entry| entry.kv.mod_revision else 0,
+        );
     }
 
     /// The decision and the delete for a replica that is to stop for a reason the service gave.

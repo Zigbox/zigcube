@@ -951,3 +951,47 @@ test "the replacement off a lost node fails when the node's status moved" {
     defer Fixture.free_ids(now);
     try expect_ids(&.{ "hello-4", "hello-5", "hello-6" }, now);
 }
+
+test "the replacement off a lost node fails when the node registers again before the commit" {
+    // Goal: `/nodes/<node>` (absent) is in the read set of the replacement (review M1).
+    // Method: the agent's record is put back just before the commit, after the plan saw the
+    // node unregistered; the transaction fails its compare and nothing is replaced.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try fixture.register_node("node2");
+    var ctx = fixture.context();
+    const key = records.node_key("node1");
+    const registered = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    try lose(&fixture, "node1");
+    fixture.manual.ms += constants.lost_grace_ms;
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = registered.kv.?.value,
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, now);
+    try testing.expectEqual(@as(u64, 0), try count_decisions(&fixture, "hello-1", "mark_replica_lost"));
+}
+
+fn count_decisions(fixture: *Fixture, name: []const u8, action: []const u8) !u64 {
+    const ctx = fixture.context();
+    const prefix = records.index_prefix(.replica, name);
+    const options: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+    const page = try ctx.store.list(ctx.arena, options, &fixture.diag);
+    var count: u64 = 0;
+    for (page.kvs) |kv| {
+        const entry = try records.read(records.IndexEntry, ctx.arena, kv, &fixture.diag);
+        if (std.mem.eql(u8, entry.action, action)) count += 1;
+    }
+    return count;
+}
