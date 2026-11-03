@@ -38,6 +38,7 @@ const runtime_mod = @import("runtime.zig");
 const zigbox = @import("zigbox");
 const zigbox_runtime = @import("zigbox_runtime.zig");
 const loop_mod = @import("agent_loop.zig");
+const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const failures = @import("store_failures.zig");
@@ -78,6 +79,8 @@ const Shell = struct {
     policy: loop_mod.Loop,
     /// This boot's id, kept with the lease (`agent.Context.boot_id`).
     boot_id: []const u8,
+    /// The image store whose summary the agent publishes; null for a runtime with none yet.
+    images: ?node_store.Images = null,
     /// The last save of the remembered pair failed; shown once, cleared by one that works.
     save_failed: bool = false,
 
@@ -94,13 +97,16 @@ const Shell = struct {
             .mono = shell.boot,
             .state = shell.pair_state.interface(),
             .boot_id = shell.boot_id,
+            .images = shell.images,
             // No exchange may run past the fence: the agent moves the cap as the lease moves,
             // before its first call and after a grant or keepalive.
             .deadline = .{ .context = shell.remote, .set_fn = remote_mod.RemoteStore.deadline_fn },
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
+        const refusals = shell.agent.store_refusals;
         const result = shell.agent.reconcile(&ctx);
+        if (shell.agent.store_refusals != refusals) shell.notice_refused_summary();
         shell.save_pair(false);
         shell.notice_pair();
         // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
@@ -232,6 +238,16 @@ const Shell = struct {
         }
     }
 
+    /// The server refused the node's image summary (ZC-E0504, whose cause follows). It is
+    /// advisory: the agent goes on with its replicas and writes the summary again later.
+    fn notice_refused_summary(shell: *Shell) void {
+        var buffer: [256]u8 = undefined;
+        const text = "zcube-agent: zcube-server refused the node's image summary (ZC-E0504): " ++
+            "{s}; replicas go on, and it will be sent again\n";
+        const line = std.fmt.bufPrint(&buffer, text, .{shell.agent.store_refusal()}) catch return;
+        std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
+    }
+
     /// The agent fenced itself (ZC-W0501): its containers were stopped, and it registers again.
     fn notice_fence(shell: *Shell, before: store.LeaseId) void {
         var warning: Diag = undefined;
@@ -294,7 +310,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .address = config.address,
         .agent_version = build_options.version,
     });
+    var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var shell: Shell = .{
+        .images = if (config.runtime == .fake) fake_images.images() else null,
         .io = io,
         .clock = real.clock(),
         .boot = boot.clock(),

@@ -162,6 +162,32 @@ pub fn list_all(
     at_revision: ?Revision,
     count_max: u32,
 ) Error!List(T) {
+    return list_pages(T, ctx, prefix, at_revision, count_max, null);
+}
+
+/// As `list_all`, for advisory records: one that does not decode, or was written in a newer
+/// version, is left out and counted in `skipped` (its diagnostic is dropped) instead of failing
+/// the read. The records it returns are still ascending by key.
+pub fn list_all_tolerant(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    at_revision: ?Revision,
+    count_max: u32,
+    skipped: *u32,
+) Error!List(T) {
+    skipped.* = 0;
+    return list_pages(T, ctx, prefix, at_revision, count_max, skipped);
+}
+
+fn list_pages(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    at_revision: ?Revision,
+    count_max: u32,
+    skipped: ?*u32,
+) Error!List(T) {
     var items: std.ArrayList(Entry(T)) = .empty;
     var revision = at_revision;
     var after: ?[]const u8 = null;
@@ -176,7 +202,13 @@ pub fn list_all(
         revision = page.revision;
         for (page.kvs) |kv| {
             if (items.items.len >= count_max) return too_many(ctx, prefix, count_max);
-            const rec = try records.read(T, ctx.arena, kv, ctx.diag);
+            const rec = records.read(T, ctx.arena, kv, ctx.diag) catch |err| {
+                const count = skipped orelse return err;
+                if (err != error.Malformed) return err;
+                ctx.diag.reset();
+                count.* += 1;
+                continue;
+            };
             items.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
                 return failures.no_memory(ctx.diag);
         }
@@ -369,6 +401,11 @@ pub const DecisionSpec = struct {
     /// The fields of the cause's key that the decision used (at most
     /// `constants.decision_evidence_bytes_max` bytes of JSON).
     cause_evidence: ?records.Raw = null,
+    /// A placement's locality estimate and the `/node-store` revision it read (decision v3).
+    locality_bytes: ?u64 = null,
+    node_store_revision: ?u64 = null,
+    /// The revision the placement's world was read at.
+    read_revision: ?u64 = null,
 };
 
 /// Adds a decision, its by-subject index entry and the update of its summary to `batch` (at most
@@ -391,7 +428,9 @@ pub fn put_decision(
     const at_ms = ctx.clock.now_ms();
     assert(at_ms <= constants.decision_time_ms_max);
     const id = source.next(at_ms);
+    const locality = spec.locality_bytes != null;
     const decision: records.Decision = .{
+        .v = if (locality) records.decision_version_locality else records.decision_version_plain,
         .id = id.slice(),
         .at_ms = at_ms,
         .actor = spec.actor,
@@ -402,6 +441,9 @@ pub fn put_decision(
         .cause = spec.cause,
         .cause_diagnostic = spec.cause_diagnostic,
         .cause_evidence = spec.cause_evidence,
+        .locality_bytes = spec.locality_bytes,
+        .node_store_revision = spec.node_store_revision,
+        .read_revision = spec.read_revision,
     };
     const entry: records.IndexEntry = .{
         .id = id.slice(),

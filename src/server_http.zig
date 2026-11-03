@@ -22,6 +22,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const http = std.http;
 const net = std.Io.net;
+const agent_api = @import("agent_api.zig");
 const api_mod = @import("api.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
@@ -325,8 +326,17 @@ fn read_body(
         request.head.content_length = 0;
     }
     const length = request.head.content_length.?;
-    if (length > constants.http_body_bytes_max) {
-        const cause = "the request body is larger than 65536 bytes";
+    // The agent's summary is the one body larger than the rest (hex of a Bloom filter).
+    const agent_path = std.mem.startsWith(u8, parsed.path, "/v1/agent/");
+    const limit = if (agent_path)
+        agent_api.body_bytes_max(parsed.path)
+    else
+        constants.http_body_bytes_max;
+    if (length > limit) {
+        const cause = if (limit == constants.http_body_bytes_max)
+            "the request body is larger than 65536 bytes"
+        else
+            "the request body is larger than a node summary can be";
         refuse_request(work, ctx, request, 413, .E0108, cause);
         return error.Refused;
     }

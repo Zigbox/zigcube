@@ -14,6 +14,7 @@
 //!   GET  /v1/agent/nodes/{node}/assigned               the node's assignments, as stored
 //!   GET  /v1/agent/nodes/{node}/observed               what the node has reported
 //!   POST /v1/agent/nodes/{node}/observed               one transaction of puts and deletes
+//!   PUT  /v1/agent/nodes/{node}/store                  the node's image summary (advisory)
 //!   GET  /v1/agent/nodes/{node}/watch?from=&timeout=   "something changed", a long poll
 //!
 //! **Every answer carries `chain`**: `{"revision": R, "hash": "<hex>"}`, the store's `status`
@@ -79,6 +80,18 @@ pub fn watch_prefixes(ctx: *const Context, node: []const u8) Failure![]const []c
 const Parts = std.mem.SplitIterator(u8, .scalar);
 
 /// Routes one request under `/v1/agent/`. `parts` is positioned after "agent".
+/// The largest request body the agent endpoint at `path` takes: the summary's is the hex of the
+/// largest summary, every other agent request is `agent_request_bytes_max`.
+pub fn body_bytes_max(path: []const u8) u32 {
+    const prefix = "/v1/agent/nodes/";
+    if (!std.mem.startsWith(u8, path, prefix)) return constants.agent_request_bytes_max;
+    const rest = path[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
+        return constants.agent_request_bytes_max;
+    if (!std.mem.eql(u8, rest[slash..], "/store")) return constants.agent_request_bytes_max;
+    return constants.summary_request_bytes_max;
+}
+
 pub fn route(
     ctx: *const Context,
     method: []const u8,
@@ -113,6 +126,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "replicas")) return call.replicas();
     if (std.mem.eql(u8, what, "assigned")) return call.assigned();
     if (std.mem.eql(u8, what, "observed")) return call.observed();
+    if (std.mem.eql(u8, what, "store")) return call.summary();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
@@ -373,6 +387,66 @@ const Call = struct {
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
+    // ---- PUT /v1/agent/nodes/{node}/store ----
+
+    /// The node's image summary, on the lease the agent names, under its tenure. Advisory, so
+    /// the checks are on shape and size, not on content.
+    fn summary(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("PUT");
+        try call.only_known();
+        try call.no_more();
+        if (call.body.len > constants.summary_request_bytes_max) {
+            return bad_request(ctx, "body", "is larger than a summary can be");
+        }
+        const input = try parse_body_up_to(SummaryBody, ctx, call.body, .{
+            .bytes_max = constants.summary_request_bytes_max,
+            .ignore_unknown_fields = true,
+        });
+        if (input.summary.v != 1) return bad_request(ctx, "summary.v", "must be 1");
+        if (input.tenure == 0) return bad_request(ctx, "tenure", "is needed: it must not be 0");
+        if (input.lease == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        if (!std.mem.eql(u8, input.summary.node, call.node)) {
+            return bad_request(ctx, "summary", "is for another node");
+        }
+        if (input.summary.trees.len > constants.summary_trees_max) {
+            return bad_request(ctx, "summary", "holds more trees than a summary may");
+        }
+        const value = records.encode(ctx.arena, input.summary, ctx.diag) catch
+            return propagate(ctx);
+        if (value.len > constants.store_value_bytes_max) {
+            return bad_request(ctx, "summary", "is larger than a stored value may be");
+        }
+        try call.lease_matches(input.tenure, input.lease);
+        const key = records.node_store_key(call.node);
+        const put: store.Put = .{ .key = key.slice(), .value = value, .lease = input.lease };
+        const op: store.Op = .{ .put = put };
+        var tenure: compare_sets.Set = .{};
+        compare_sets.observed_write(&tenure, call.node, input.tenure);
+        const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = call.node };
+        const result = writers.txn(ctx.store, role, request, ctx.diag) catch
+            return propagate(ctx);
+        if (!result.succeeded) return tenure_ended(ctx, call.node);
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
+    }
+
+    /// The summary rides the lease of the node's registration, which the tenure compare pins: a
+    /// body that names another lease (or none) is refused, so it cannot attach the record to a
+    /// lease that ends at another time.
+    fn lease_matches(call: Call, tenure: u64, named: u64) Failure!void {
+        const ctx = call.ctx;
+        const key = records.node_key(call.node);
+        const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch
+            return propagate(ctx);
+        const registered = got.kv orelse return tenure_ended(ctx, call.node);
+        if (registered.mod_revision != tenure) return tenure_ended(ctx, call.node);
+        if (registered.lease != named) {
+            return bad_request(ctx, "lease", "is not the lease of this node's registration");
+        }
+    }
+
     /// The key is this node's observed key for the replica the record names, and the record says
     /// it is this node's: an agent can write its own node's reports and no other key.
     fn check_put(call: Call, put: *const ObservedPut) Failure!void {
@@ -502,6 +576,12 @@ fn hex(ctx: *const Context, hash: store.Hash) Failure![]const u8 {
     return std.fmt.allocPrint(ctx.arena, "{x}", .{&hash}) catch no_memory(ctx);
 }
 
+const SummaryBody = struct {
+    tenure: u64 = 0,
+    lease: u64 = 0,
+    summary: records.NodeStore,
+};
+
 const ObservedBody = struct {
     /// The revision of the registration the agent writes under (its tenure).
     tenure: u64 = 0,
@@ -540,11 +620,28 @@ fn reply(ctx: *const Context, value: anytype) Failure!Reply {
 }
 
 fn parse_body(comptime T: type, ctx: *const Context, body: []const u8) Failure!T {
+    return parse_body_up_to(T, ctx, body, .{
+        .bytes_max = constants.api_request_bytes_max,
+        .ignore_unknown_fields = false,
+    });
+}
+
+const BodyLimits = struct { bytes_max: u32, ignore_unknown_fields: bool };
+
+fn parse_body_up_to(
+    comptime T: type,
+    ctx: *const Context,
+    body: []const u8,
+    limits: BodyLimits,
+) Failure!T {
     if (body.len == 0) return bad_request(ctx, "body", "is required: a JSON object");
-    if (body.len > constants.api_request_bytes_max) {
-        return bad_request(ctx, "body", "is larger than 65536 bytes");
+    if (body.len > limits.bytes_max) {
+        return bad_request(ctx, "body", "is larger than this endpoint takes");
     }
-    return std.json.parseFromSliceLeaky(T, ctx.arena, body, .{}) catch |err| {
+    const options: std.json.ParseOptions = .{
+        .ignore_unknown_fields = limits.ignore_unknown_fields,
+    };
+    return std.json.parseFromSliceLeaky(T, ctx.arena, body, options) catch |err| {
         if (err == error.OutOfMemory) return no_memory(ctx);
         return bad_request(ctx, "body", "is not what this endpoint takes: see docs/api.md");
     };

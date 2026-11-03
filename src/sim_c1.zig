@@ -13,6 +13,7 @@ const accounting = @import("allocations.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
+const scheduler = @import("scheduler.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
 
@@ -151,12 +152,15 @@ pub const Tally = struct {
     observations_unjudged: u64 = 0,
     /// Citations of a key that is not an agent's report (a node, an allocation): not §3's.
     facts_other: u64 = 0,
+    /// Placements checked for fit and spread (L1, `scheduler.placement_problem`).
+    placements_judged: u64 = 0,
 };
 
 /// Checks one transaction about to commit against the head it will commit over (I2 and I3). The
 /// caller keeps the verdict and acts on it only if the transaction commits: a transaction whose
 /// compare fails writes nothing, which is the store doing its job.
 pub fn before_commit(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
+    if (scheduler.placement_problem(ctx, request, &tally.placements_judged)) |found| return found;
     if (superseded(ctx, request, tally)) |found| return found;
     return admissible_observations(ctx, request, tally);
 }

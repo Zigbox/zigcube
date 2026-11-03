@@ -51,6 +51,9 @@ pub const SwitchedStore = struct {
     inner: store.Store,
     down: bool = false,
     fail_after: ?u32 = null,
+    /// A transaction that puts a key under this prefix is answered, and refused (ZC-E0504), as a
+    /// server that has no such endpoint does; test-only, null in every simulation.
+    refuse_put_prefix: ?[]const u8 = null,
     calls: u32 = 0,
 
     const vtable: store.Store.VTable = .{
@@ -132,6 +135,14 @@ pub const SwitchedStore = struct {
     ) store.Error!store.TxnResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.refuse_put_prefix) |prefix| {
+            for (request.on_success) |op| {
+                if (op != .put) continue;
+                if (!std.mem.startsWith(u8, op.put.key, prefix)) continue;
+                @import("agent_client.zig").raise_bad_reply(diag, "the server refused the write");
+                return error.BackendFailed;
+            }
+        }
         return self.inner.txn(request, diag);
     }
 
@@ -230,6 +241,8 @@ pub const World = struct {
     /// A runtime the agent uses instead of `sim` (a test's wrapper that watches the specs it is
     /// given and passes them on to `sim.interface()`); null in every simulation.
     runtime_override: ?runtime_mod.Runtime = null,
+    /// The agent's image store, for the summary it writes; null in every simulation but a test's.
+    images: ?@import("node_store.zig").Images = null,
     server: control_plane.ControlPlane,
     agent: *agent_mod.Agent,
     /// The agent's files (the kept lease), which a restart of the agent finds again.
@@ -286,6 +299,7 @@ pub const World = struct {
         world.last_failure = null;
         world.boot_id = "";
         world.runtime_override = null;
+        world.images = null;
         return world;
     }
 
@@ -359,6 +373,7 @@ pub const World = struct {
             .clock = world.manual.clock(),
             .arena = world.fresh_arena(),
             .diag = &world.diag,
+            .images = world.images,
             .state = world.files.interface(),
             .boot_id = world.boot_id,
         };

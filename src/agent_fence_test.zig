@@ -354,3 +354,26 @@ test "the agent hands a replica's source to the runtime in the Spec it starts" {
     }
     try testing.expectEqual(@as(u32, 2), with_pin);
 }
+
+test "a server that refuses the image summary does not stop the replicas" {
+    // Goal: the summary is advisory, so a refused write (a C1 server with no such endpoint)
+    // is noted once and replica work goes on. Method: refuse every put under /node-store/, give
+    // the agent an image store, apply a service, and count what runs and what the agent noted.
+    const node_store = @import("node_store.zig");
+    const world = try sim_world.World.create(testing.allocator, 5, &sim_runtime.default_fixtures);
+    defer world.destroy();
+    var fake: node_store.FakeImages = .{ .digests = &.{hello.image} };
+    world.images = fake.images();
+    world.switched.refuse_put_prefix = "/node-store/";
+    _ = try world.apply(hello);
+    world.advance(5_000);
+    try testing.expectEqual(@as(u32, 2), world.running_count("hello"));
+    try testing.expectEqual(@as(u32, 1), world.agent.store_refusals);
+    try testing.expect(world.agent.store_refusal().len > 0);
+    try testing.expect(world.agent.store_hash == 0 or world.agent.store_lease != world.agent.lease);
+    // Once the server takes the write, the next step publishes and the note clears.
+    world.switched.refuse_put_prefix = null;
+    world.advance(5_000);
+    try testing.expectEqual(world.agent.lease, world.agent.store_lease);
+    try testing.expectEqual(@as(u32, 2), world.running_count("hello"));
+}

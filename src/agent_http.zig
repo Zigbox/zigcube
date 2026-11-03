@@ -16,6 +16,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const net = std.Io.net;
+const agent_api = @import("agent_api.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 
@@ -45,7 +46,7 @@ pub const Client = struct {
         assert(diag.code == null);
         assert(request.target.len > 0);
         assert(request.target[0] == '/');
-        if (request.body.len > constants.agent_request_bytes_max) {
+        if (request.body.len > agent_api.body_bytes_max(request.target)) {
             return bad_reply(diag, "the request the agent built is larger than the server accepts");
         }
         const io_ms = request.timeout_ms orelse client.io_timeout_ms;

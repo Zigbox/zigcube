@@ -422,6 +422,7 @@ runs unchanged on the far side of HTTP:
 | `lease_grant(ttl)` | `POST /v1/agent/nodes/{node}/lease` |
 | `lease_keepalive(id)` | `POST /v1/agent/nodes/{node}/lease/{id}/keepalive` |
 | `txn` with one put of `/nodes/<node>` on a lease | `PUT /v1/agent/nodes/{node}` |
+| `txn` with one put of `/node-store/<node>` on the same lease (C2 slice 5) | `PUT /v1/agent/nodes/{node}/store` |
 | `list(/replicas/)`, filtered to the node | `GET /v1/agent/nodes/{node}/replicas` |
 | `list(/observed/<node>/)` | `GET /v1/agent/nodes/{node}/observed` |
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
@@ -458,6 +459,27 @@ Registers the node: the server writes `/nodes/<node>` on the lease, in the recor
 
 `lease` and `capacity` are required, and both capacity numbers must be above 0. Answer
 `{"revision": 431}`. A lease that is not the store's is `ZC-E0205`.
+
+### `PUT /v1/agent/nodes/{node}/store` (C2 slice 5)
+
+Writes the node's image summary, `/node-store/<node>` of keys.md, bound to the node's lease. The body
+is the record itself plus the lease:
+
+```json
+{ "lease": 43, "v": 1, "node": "node1", "trees": [ { "tree": "b3:51aa9c03", "bytes": 52428800,
+  "chunks": 800, "sample": "<hex>" } ], "filter": "<hex>", "filter_chunks": 800, "omitted": 0 }
+```
+
+Answer `{"revision": 433}`. The write is one transaction under the node's tenure compare, as an
+observed write is. Refusals: `v` other than 1, `node` other than `{node}`, a lease of 0, a lease
+that is not the one `/nodes/<node>` was registered on, or more than `summary_trees_max` (32) trees
+are `400` and `ZC-E0104`; a tenure that has ended (no registration, or one newer than the agent's)
+is `503` and `ZC-E0510`. Fields the server does not know are **ignored** (the record is advisory
+and may grow). The endpoint has its own body cap, `summary_request_bytes_max` (about 217 KiB: the
+filter and the samples are hex, so the largest record is twice its binary size, plus JSON
+overhead); every other agent body stays at 64 KiB. A stored value over `store_value_bytes_max`
+(256 KiB) is `400`. A server older than C2 has no such route: the agent gets a `404` (`ZC-E0504`),
+notes it once on stderr and goes on, because replica work never waits for a summary.
 
 ### `GET /v1/agent/nodes/{node}/replicas`
 
