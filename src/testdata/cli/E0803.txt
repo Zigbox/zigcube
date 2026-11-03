@@ -1,0 +1,5 @@
+error[ZC-E0803]: the peer is not the node that was asked for
+  cause  10.0.0.7:7071 answered with another node's credential
+  fix    check that both agents joined this cluster (docs/peer.md)   zcube get nodes
+  more   zcube explain E0803 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0803.html

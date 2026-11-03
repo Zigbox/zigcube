@@ -1,0 +1,5 @@
+error[ZC-E0802]: a peer's credential is expired or not yet valid
+  cause  node2's credential has expired
+  fix    check the clocks, then restart the agent so it renews   timedatectl
+  more   zcube explain E0802 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0802.html

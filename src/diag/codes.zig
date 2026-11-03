@@ -88,6 +88,13 @@ pub const Code = enum(u8) {
     E0514,
     W0501,
     W0601,
+    E0801,
+    E0802,
+    E0803,
+    E0804,
+    E0805,
+    E0806,
+    E0807,
     B0001,
     B0002,
     B0003,
@@ -1084,6 +1091,121 @@ pub const registry = [_]Entry{
         \\The image is not affected: nothing is stored or run before every chunk
         \\matches. The peer's disk or store may be damaged, or it may be running a
         \\different build; check that node.
+        ,
+    },
+    .{
+        .code = .E0801,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer's credential is not signed by this cluster",
+        .explanation =
+        \\A node presented a credential that the cluster's certificate authority
+        \\did not sign: its key id is not this cluster's, or its signature does not
+        \\verify. The connection was closed before anything was exchanged.
+        \\
+        \\The control plane is the authority. A node gets its credential when its
+        \\agent joins (POST /v1/agent/nodes/<node>/credential). A node that never
+        \\joined, or joined a different cluster, is refused by every peer.
+        \\
+        \\Check that the node's agent talks to this cluster's server, and that its
+        \\ca.pub in the agent state directory is the one this server serves. Deleting
+        \\the agent's peer.cred makes it join again.
+        ,
+    },
+    .{
+        .code = .E0802,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer's credential is expired or not yet valid",
+        .explanation =
+        \\A node presented a credential outside its validity window, judged on this
+        \\machine's wall clock with a skew allowance of 60 seconds. A credential lives
+        \\24 hours and the agent renews it after half that.
+        \\
+        \\The usual causes are a node whose clock is far off, or an agent that
+        \\could not reach the server for a day. Check the clock on both machines
+        \\(timedatectl), then restart the agent: it renews on start.
+        ,
+    },
+    .{
+        .code = .E0803,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the peer is not the node that was asked for",
+        .explanation =
+        \\A client connected to a node's peer address and the credential the server
+        \\presented names a different node. The client closed the connection before it
+        \\sent its own credential.
+        \\
+        \\This happens when a node's address in /nodes/<node> is stale and another
+        \\node now answers there. It resolves itself when the agent re-registers;
+        \\check zcube get nodes for the address.
+        ,
+    },
+    .{
+        .code = .E0804,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer handshake failed",
+        .explanation =
+        \\The handshake between two nodes ended before it finished: a message was
+        \\malformed, cut short or altered, a signature over the exchange did not
+        \\verify, the peer spoke another protocol version, or a key was unusable. A
+        \\server that refuses a client closes the connection without a reply, so a
+        \\refusal and a network cut look alike from the client's side.
+        \\
+        \\Nothing was transferred. If it repeats between two particular nodes, compare
+        \\their clocks and their credentials (the agent's peer.cred), and look for the
+        \\server's own line naming the refusal. The handshake is interim; see
+        \\docs/peer.md.
+        ,
+    },
+    .{
+        .code = .E0805,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer record was refused",
+        .explanation =
+        \\A record on an established peer connection failed authentication: it was
+        \\altered, repeated, dropped or reordered, or it was longer than allowed,
+        \\or the connection reached its record limit. The connection was closed.
+        \\
+        \\Whatever was in flight is discarded and fetched again, from this peer or
+        \\another. Image data is checked by its hash regardless. A single
+        \\occurrence on a flaky network is harmless; a pattern between two nodes
+        \\points at the path between them.
+        ,
+    },
+    .{
+        .code = .E0806,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a peer key file can't be used",
+        .explanation =
+        \\The server's CA key (ca.key in its state directory) or an agent's node key
+        \\(peer.key) or credential (peer.cred) could not be read, created, written or
+        \\parsed, or has permissions that let other users read it. Key files must be
+        \\owned by the process, mode 0600, and hold one line of 64 hex digits.
+        \\
+        \\The secret is never printed. If the file is damaged and there is a
+        \\backup, put it back. Otherwise delete it: a server then creates a new CA
+        \\(every agent then re-joins by itself), and an agent creates a new key and
+        \\joins again.
+        ,
+    },
+    .{
+        .code = .E0807,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a node was refused a credential: it was removed",
+        .explanation =
+        \\The server will not issue or renew a peer credential for this node,
+        \\because its name is on the server's list of removed nodes (the revoked
+        \\file in its state directory). The node's current credential stays valid
+        \\until it expires, within a day, and then its peers refuse it.
+        \\
+        \\If the node should be in the cluster, remove its name from the revoked
+        \\file and restart zcube-server, then restart the agent.
         ,
     },
     .{

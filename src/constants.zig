@@ -439,6 +439,31 @@ pub const fetch_registry_attempts_max: u32 = 4;
 pub const fetch_peer_rate_bytes_per_s: u32 = 32 * 1024 * 1024;
 pub const fetch_node_rate_bytes_per_s: u32 = 64 * 1024 * 1024;
 
+// ---- Peer identity and the handshake (docs/peer.md, C2 slice 6a) -----------------------------
+
+/// A node credential lives this long from its issuer's wall clock; the agent renews at half.
+pub const peer_credential_ttl_ms: u64 = 24 * 60 * 60 * 1000;
+/// The longest life a verifier accepts, so a CA bug or a bad clock cannot mint a forever key.
+pub const peer_credential_ttl_ms_max: u64 = 7 * peer_credential_ttl_ms;
+/// Wall-clock disagreement tolerated between two nodes, and between a node and the CA.
+pub const peer_clock_skew_ms: u64 = 60 * 1000;
+/// Plaintext of one record. A 1 MiB chunk is sent as 64 of them.
+pub const peer_record_bytes_max: u32 = 16 * 1024;
+/// Records a direction may carry before the connection must be replaced (2^32).
+pub const peer_record_counter_max: u64 = 1 << 32;
+/// The `revoked` file and the key files are small; this bounds the read.
+pub const peer_file_bytes_max: u32 = 16 * 1024;
+/// Names on the server's `revoked` list.
+pub const peer_revoked_max: u32 = 256;
+/// A credential request body: `{"public_key": "<64 hex>"}` with room to spare.
+pub const peer_join_request_bytes_max: u32 = 512;
+
+comptime {
+    assert(peer_credential_ttl_ms < peer_credential_ttl_ms_max);
+    assert(peer_record_bytes_max + 16 <= std.math.maxInt(u16));
+    assert(peer_clock_skew_ms < peer_credential_ttl_ms / 2);
+}
+
 comptime {
     assert(exit_ok == 0);
     assert(exit_internal == 70);
