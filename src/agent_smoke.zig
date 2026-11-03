@@ -370,13 +370,22 @@ fn step_kill_one(smoke: *Smoke) ![]const Pids {
     const first = (try smoke.running_containers())[0];
     const killed = try smoke.arena.allocator().dupe(u8, first.name());
     try std.posix.kill(first.command, .KILL);
+    // `kill -9` is asynchronous: until the kernel has ended the command, it still counts as
+    // running, and the server still reports 3 running replicas. Waiting for 3 alone passes
+    // before the kill has landed, so first wait for the killed container to be gone.
     const replaced = struct {
+        var gone: []const u8 = "";
+
         fn check(s: *Smoke) !bool {
-            if (try s.running_count("hello-") != 3) return false;
             const alive = try s.running_containers();
-            return alive.len == 3;
+            for (alive) |pids| {
+                if (std.mem.eql(u8, pids.name(), gone)) return false;
+            }
+            if (alive.len != 3) return false;
+            return try s.running_count("hello-") == 3;
         }
     };
+    replaced.gone = killed;
     try smoke.wait_until("the killed replica to be replaced", replaced.check, wait_ms_default);
     const alive = try smoke.running_containers();
     for (alive) |pids| {
