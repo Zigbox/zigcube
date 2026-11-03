@@ -296,6 +296,7 @@ next:
   stopped: the next `up` adopts them, with no duplicates. `down` with nothing running says so.
 - A pid file whose process is gone, a zombie, or another program (checked in `/proc/<pid>/cmdline`)
   is deleted, never signalled.
+- `zig build local-smoke` runs the whole sequence on the installed executables.
 
 ## How it is tested
 
