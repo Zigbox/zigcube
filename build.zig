@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, zigbox_module);
+    add_local_smoke_step(b);
     add_bench_watch_step(b, shared_options);
     add_tidy_step(b);
     add_errors_site_steps(b);
@@ -279,6 +280,17 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     run.has_side_effects = true;
     const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
     b.step("agent-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build local-smoke`: `zcube local up` and `down` as a person would use them
+/// (tools/local_smoke.sh), on the installed executables. Never cached, not in `check`, not demo-c0.
+fn add_local_smoke_step(b: *std.Build) void {
+    // The default prefix; `-p` elsewhere would need the script's argument changed.
+    const run = b.addSystemCommand(&.{ "sh", "tools/local_smoke.sh", "zig-out/bin" });
+    run.step.dependOn(b.getInstallStep());
+    run.has_side_effects = true;
+    const help = "Run zcube local up and down against real processes (not demo-c0)";
+    b.step("local-smoke", help).dependOn(&run.step);
 }
 
 /// `zig build bench-watch`: the watch fan-out row of docs/c1.md (src/bench_watch.zig), a real
