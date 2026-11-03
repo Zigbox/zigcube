@@ -42,6 +42,8 @@ const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
+const dir_images = @import("dir_images.zig");
+const peer_server_mod = @import("peer_server.zig");
 const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 
@@ -357,8 +359,33 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .agent_version = build_options.version,
     });
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
+    // The chunk store, when the node has one: the summary pass reads it on this thread, and the
+    // peer server opens its own `DirImages` per connection (a `DirImages` is one thread's).
+    var chunk_store: dir_images.DirImages = undefined;
+    const has_store = config.images_dir != null;
+    if (config.images_dir) |path| {
+        chunk_store = dir_images.DirImages.open(io, gpa, path) catch
+            return fail_start(io, &diag, config.verbose, "open the chunk store (--images-dir)");
+    }
+    defer if (has_store) chunk_store.close(gpa);
+    const peer_server = gpa.create(peer_server_mod.Server) catch return constants.exit_environment;
+    defer gpa.destroy(peer_server);
+    var peer_serving = false;
+    if (config.peer_listen) |listen| {
+        peer_server.start(io, .{
+            .listen = listen,
+            .state_dir = config.state_dir,
+            .node = config.node,
+            .images_path = config.images_dir.?, // Config checked that --images-dir is given.
+            .verbose = config.verbose,
+        }) catch return fail_start(io, &diag, config.verbose, "start the peer server");
+        peer_serving = true;
+    }
+    defer if (peer_serving) peer_server.stop();
     var shell: Shell = .{
-        .images = if (config.runtime == .fake) fake_images.images() else null,
+        .images = if (has_store)
+            chunk_store.images()
+        else if (config.runtime == .fake) fake_images.images() else null,
         .io = io,
         .clock = real.clock(),
         .boot = boot.clock(),
