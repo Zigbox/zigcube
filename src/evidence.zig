@@ -4,12 +4,25 @@
 //! Each function renders one kind of record into the step's arena. Core code.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 
 const Context = controller.Context;
+
+comptime {
+    // The longest evidence is a service's (name, replicas, applied_by, request id and the keys
+    // around them, 128 bytes of JSON syntax in all) or an observed record's (replica id, node,
+    // status and exit, 160): both fit `decision_evidence_bytes_max`, which `render` asserts.
+    const service_max = 128 + constants.service_name_bytes_max + 64 +
+        constants.request_id_bytes_max;
+    const replica_id_max = constants.service_name_bytes_max + 1 + 9;
+    const observed_max = 160 + replica_id_max + constants.node_name_bytes_max;
+    assert(service_max <= constants.decision_evidence_bytes_max);
+    assert(observed_max <= constants.decision_evidence_bytes_max);
+}
 
 fn render(ctx: *const Context, value: anytype) controller.Error!records.Raw {
     const text = std.json.Stringify.valueAlloc(ctx.arena, value, .{
@@ -38,12 +51,11 @@ pub fn deleted_service(ctx: *const Context, name: []const u8) controller.Error!r
 /// An observed record as the decision read it: its status and exit, not the diagnostic, which the
 /// decision copies on its own (`cause_diagnostic`).
 pub fn observed(ctx: *const Context, record: *const records.Observed) controller.Error!records.Raw {
-    var buffer: [64]u8 = undefined;
     return render(ctx, .{
         .replica = record.replica,
         .node = record.node,
         .generation = record.generation,
         .status = @tagName(record.status),
-        .exit = if (record.exit) |exit| records.exit_text(exit, &buffer) else null,
+        .exit = record.exit, // The object keys.md documents: {"kind":"signaled","signal":9}.
     });
 }

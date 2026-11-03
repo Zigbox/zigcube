@@ -49,6 +49,10 @@ pub const Counts = struct {
     truncated: u32 = 0,
     /// A decision retention dropped before the check: nothing to ask.
     dropped: u32 = 0,
+    /// A decision `why` could not explain the moment it committed, or that did not fit in the
+    /// recorder: `verify` fails on either, so nothing is skipped without a word.
+    unexplained: u32 = 0,
+    unrecorded: u32 = 0,
     keys_deleted: u32 = 0,
     keys_changed: u32 = 0,
 };
@@ -77,7 +81,10 @@ pub const Recorder = struct {
             if (!std.mem.startsWith(u8, put.key, records.prefix_decisions)) continue;
             const decision = std.json.parseFromSliceLeaky(records.Decision, ctx.arena, put.value, .{
                 .ignore_unknown_fields = true,
-            }) catch continue;
+            }) catch {
+                r.counts.unexplained += 1;
+                continue;
+            };
             r.record(ctx, decision);
         }
     }
@@ -109,18 +116,22 @@ pub const Recorder = struct {
         const kept = r.arena.allocator();
         const answer = why_mod.why(ctx, decision.subject, decision.id) catch {
             ctx.diag.reset();
-            return; // The decision cannot be explained now: verify says so for the ones it finds.
+            r.counts.unexplained += 1;
+            return;
         };
+        const id = kept.dupe(u8, decision.id) catch return r.fail_to_record();
+        const name = kept.dupe(u8, decision.subject.name) catch return r.fail_to_record();
         const entry: Entry = .{
-            .id = kept.dupe(u8, decision.id) catch return,
-            .subject = .{
-                .kind = decision.subject.kind,
-                .name = kept.dupe(u8, decision.subject.name) catch return,
-            },
+            .id = id,
+            .subject = .{ .kind = decision.subject.kind, .name = name },
             .terminal = terminal_of(kept, answer.steps),
         };
-        r.entries.append(kept, entry) catch return;
+        r.entries.append(kept, entry) catch return r.fail_to_record();
         r.counts.recorded += 1;
+    }
+
+    fn fail_to_record(r: *Recorder) void {
+        r.counts.unrecorded += 1;
     }
 
     /// Step 2: every key a recorded decision cites is deleted or changed (alternately), then the
@@ -153,6 +164,10 @@ pub const Recorder = struct {
 
     /// Step 3: null when every recorded decision passes, else the first sentence that fails.
     pub fn verify(r: *Recorder, ctx: *const Context) Found {
+        if (r.counts.unexplained > 0) {
+            return "I5: why failed on a decision at the moment it committed";
+        }
+        if (r.counts.unrecorded > 0) return "I5: the recorder could not hold a decision";
         for (r.entries.items) |entry| {
             if (r.verify_one(ctx, entry)) |found| return found;
         }

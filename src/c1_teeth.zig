@@ -21,4 +21,9 @@ pub const skew_beyond_bound = declared("c1_teeth_skew_beyond_bound");
 /// Agents freeze and containers ignore stops, and a wedged node is not excused (must break I1b).
 pub const wedge = declared("c1_teeth_wedge");
 
-pub const any = skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge;
+/// A node registers again between a controller's read of its report and the decision's commit, as
+/// if the controller did not compare the report's tenure (must break I3).
+pub const stale_observation = declared("c1_teeth_stale_observation");
+
+pub const any = skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge or
+    stale_observation;
