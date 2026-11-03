@@ -31,9 +31,9 @@ the sample is a uniform sample of the tree's chunks, and a tree of at most 64 ch
 sketches of the complete trees on the node:
 
 1. A held tree with the target's digest is worth the whole target.
-2. Else the target's sample is compared with the union of the held samples (the 64 smallest keys of
-   their union), over the key range both cover exactly. The share of the target's sampled bytes in
-   that range that the union holds, applied to the target's size, is the estimate. It is exact when
+2. Else the target's sample is compared with the held samples (a key is held if any
+   of them has it), over the key range both cover exactly. The share of the target's sampled bytes in
+   that range that the held trees hold, applied to the target's size, is the estimate. It is exact when
    both are exact. Otherwise the range is below the smallest limit among the target's and the held
    samples (each sketch is exact below its own limit, the union only below the smallest of them),
    and the estimate is a ratio over the target's samples in that range: about 64 of them when the
