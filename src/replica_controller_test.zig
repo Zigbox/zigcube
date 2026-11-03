@@ -980,7 +980,8 @@ test "the replacement off a lost node fails when the node registers again before
     const now = try fixture.ids("hello");
     defer Fixture.free_ids(now);
     try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, now);
-    try testing.expectEqual(@as(u64, 0), try count_decisions(&fixture, "hello-1", "mark_replica_lost"));
+    const lost = try count_decisions(&fixture, "hello-1", "mark_replica_lost");
+    try testing.expectEqual(@as(u64, 0), lost);
 }
 
 fn count_decisions(fixture: *Fixture, name: []const u8, action: []const u8) !u64 {

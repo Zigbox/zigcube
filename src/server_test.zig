@@ -266,6 +266,16 @@ test "the limits of constants.zig are enforced with a coded reply" {
     defer unsized.free();
     try expect_diagnostic(unsized, 411, "ZC-E0104");
 
+    // Request smuggling: `gzip` leaves std's `transfer_encoding` at `.none`, so the body once
+    // parsed as a second request. It must be refused, and the second request never served.
+    const smuggle = "POST /v1/apply HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n" ++
+        "GET /v1/smuggled HTTP/1.1\r\nConnection: close\r\n\r\n";
+    const smuggled = try exchange(io, address, smuggle);
+    defer smuggled.free();
+    try expect_diagnostic(smuggled, 411, "ZC-E0104");
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, smuggled.raw, "smuggled"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, smuggled.raw, "HTTP/1.1 "));
+
     const padding = try testing.allocator.alloc(u8, constants.http_head_bytes_max);
     defer testing.allocator.free(padding);
     @memset(padding, 'a');
