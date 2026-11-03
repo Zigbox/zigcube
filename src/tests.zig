@@ -23,6 +23,7 @@ test {
     _ = @import("agent_remote.zig");
     _ = @import("agent_remote_test.zig");
     _ = @import("sim_cluster_main.zig");
+    _ = @import("sim_swarm_main.zig");
     _ = @import("sim_fleet.zig");
     _ = @import("sim_fleet_issue.zig");
     _ = @import("sim_fleet_state.zig");

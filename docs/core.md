@@ -33,6 +33,7 @@ thread, socket, file, libc, `std.Io` value, real clock, source of randomness or 
 | `sim_world.zig` | The smallest honest shell: server, agent, store, runtime on virtual time |
 | `sim_c0.zig` | The C0 simulation and its fuzz variant |
 | `sim_cluster.zig` | The cluster simulation: N agents, a network, a store, the controllers, one seed ([below](#the-cluster-simulation)) |
+| `chunk_summary.zig`, `fetch_plan.zig`, `sim_images.zig`, `sim_swarm.zig` | C2's summary, locality estimate and fetch plan, and their simulation ([swarm.md](swarm.md)) |
 
 ## The step model
 
@@ -317,4 +318,5 @@ crashed seed was in is the last such line; the fleet replays a crashed range see
 A seed whose world cannot be built (out of memory) reports `step: setup`.
 
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
-operations, native against WASM, and `sim-teeth`.
+operations, native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and
+`sim-swarm-teeth` ([swarm.md](swarm.md)).
