@@ -326,13 +326,22 @@ fn add_zigbox_smoke_step(b: *std.Build, built: Built) void {
         }),
     });
     const run = b.addRunArtifact(exe);
-    run.addArtifactArg(built.agent);
-    run.addArtifactArg(built.server);
-    run.addArtifactArg(zbx);
+    run.addFileArg(stripped(b, built.agent));
+    run.addFileArg(stripped(b, built.server));
+    run.addFileArg(stripped(b, zbx));
     run.addFileArg(b.path("ops/zigbox-smoke/guest.sh"));
     run.has_side_effects = true;
     const help = "Run the Zigbox runtime on a real host in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
     b.step("zigbox-smoke", help).dependOn(&run.step);
+}
+
+/// A copy of `exe` without symbols: the guest harness serves files of at most 8 MiB, which a
+/// ReleaseSafe build with debug information exceeds (binutils' `strip`; `zig objcopy` cannot).
+fn stripped(b: *std.Build, exe: *std.Build.Step.Compile) std.Build.LazyPath {
+    const run = b.addSystemCommand(&.{ "strip", "-o" });
+    const output = run.addOutputFileArg(exe.name);
+    run.addArtifactArg(exe);
+    return output;
 }
 
 /// `zig build pg-up` starts a throwaway Postgres for the conformance suite; `pg-down` removes it;
