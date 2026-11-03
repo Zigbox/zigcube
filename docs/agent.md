@@ -212,18 +212,29 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   start). A pull can take minutes before Zigbox has any record, so the replica is `starting`
   while the lock is held and no record of this launch exists; `lost` if the supervisor is gone and
   left nothing; `start_failed` with `failed.json`. A Zigbox record older than the launch is an
-  earlier container of the same name and is ignored.
+  earlier container of the same name and is ignored: a record belongs to a launch only if it was
+  begun at or after the launch *and* its `supervisor` is the pid in the launch directory's
+  `supervisor.pid` (the time has one-second resolution, so a relaunch within the second would
+  otherwise adopt the old record). A record with pid 0 is Zigbox's start window, before the
+  container exists: it is `starting`, never `running`, and `stop` kills the supervisor, never
+  pid 0; if the supervisor dies there the record reads `lost`.
 - **Images** (`zigbox_image.zig`): the supervisor tries `zigbox.start` with the locked tree
   digest; on ZBX-E0410 (tree not in the store) and a known reference it pulls once, checks the
-  tree it got is the locked one (ZC-E0511 if not) and starts again. `--images FILE` for this
+  tree it got is the locked one (ZC-E0511 if not) and starts again. The locked digest must be
+  the full `b3:` plus 64 lowercase hex digits (an abbreviated or unprefixed one is refused at
+  apply, naming the form), since the check is an exact compare. The pull passes the mirrors in
+  `ZBX_REGISTRY_MIRRORS` of the *agent's* environment (Zigbox's own variable, same format; at most
+  4096 bytes) to Zigbox's `pull`; unset means none. The supervisor runs on a single-threaded
+  `std.Io` and checks `Threads: 1` in `/proc/self/status` before start or pull (Zigbox makes
+  namespaces, which the kernel allows a single-threaded process only); otherwise ZC-B0002. `--images FILE` for this
   runtime is `.{ .images = .{ .{ .digest = "b3:...", .reference = "ghcr.io/o/r@sha256:..." } } }`;
   the digest-only form is the fake runtime's. Without it nothing is pulled.
-- **Stop**: SIGTERM and a wait of at most 500 ms when there is a grace, SIGKILL when there is
-  none; the caller asks again as with the fake runtime. A fence over N containers costs up to
+- **Stop**: SIGTERM and a wait of at most 500 ms when there is a grace, SIGKILL and the same
+  single wait of at most 500 ms when there is none; the caller asks again as with the fake runtime. A fence over N containers costs up to
   N times 500 ms until the non-blocking `signal` (proposal P2) lands.
 - **Limits** are Zigbox's (`zigbox_map.zig` mirrors its bounds; apply refuses more, ZC-E0514).
-  CPU, memory and pids limits need the user's systemd bus; ZC-E0512 is registered for the case
-  of none.
+  CPU, memory and pids limits need the user's systemd bus; Zigbox's ZBX-E0307 (no bus) is
+  reported as ZC-E0512 with the fix.
 - **Preflight**: the agent refuses a host that is not Linux or cannot read Zigbox's run records
   (ZC-E0513). Zigbox's doctor is not exported, so the rest is named by Zigbox at the first start.
 - **Tests**: the lifecycle calls run over Zigbox's `HostSim` (`zigbox_runtime.zig`); the image
