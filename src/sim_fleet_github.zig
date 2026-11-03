@@ -296,7 +296,8 @@ pub const Http = struct {
     /// From the last rate-limited reply.
     wait_seconds: u32 = 0,
 
-    const api = "https://api.github.com";
+    /// The REST root; tests point it at a loopback server.
+    api: []const u8 = "https://api.github.com",
 
     pub fn github(http: *Http) Github {
         return .{ .ptr = http, .vtable = &http_vtable };
@@ -325,14 +326,19 @@ pub const Http = struct {
     ) Error![]const u8 {
         assert(path.len > 0);
         assert(path[0] == '/');
-        const url = try std.fmt.allocPrint(arena, "{s}/repos/{s}{s}", .{ api, http.repo, path });
+        const url = try std.fmt.allocPrint(arena, "{s}/repos/{s}{s}", .{
+            http.api, http.repo, path,
+        });
         const uri = std.Uri.parse(url) catch return error.GitHubRefused;
         const bearer = try std.fmt.allocPrint(arena, "Bearer {s}", .{http.token});
+        // Not `privileged_headers`: the pinned std keeps those for redirects and never writes
+        // them into the request head, so GitHub saw no token and answered 401. Redirects are
+        // `.not_allowed`, so the token cannot follow one to another host.
         const extra = [_]std.http.Header{
+            .{ .name = "Authorization", .value = bearer },
             .{ .name = "Accept", .value = "application/vnd.github+json" },
             .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
         };
-        const privileged = [_]std.http.Header{.{ .name = "Authorization", .value = bearer }};
         var req = http.client.request(method, uri, .{
             .redirect_behavior = .not_allowed,
             .headers = .{
@@ -345,7 +351,6 @@ pub const Http = struct {
                     .omit,
             },
             .extra_headers = &extra,
-            .privileged_headers = &privileged,
         }) catch |err| return http.unreachable_error(method, path, @errorName(err));
         defer req.deinit();
         send(&req, payload) catch |err|
@@ -524,4 +529,99 @@ test "the fake finds an issue by the marker in its body" {
     try std.testing.expectEqual(@as(?u32, null), try github.find(arena, "fedcba9876543210"));
     try github.comment(arena, 1, "again");
     try std.testing.expectEqual(@as(usize, 1), fake.comments.items.len);
+}
+
+const Recorded = struct {
+    heads: [3][1024]u8 = undefined,
+    lens: [3]u32 = .{ 0, 0, 0 },
+    count: u32 = 0,
+
+    fn head(recorded: *const Recorded, index: u32) []const u8 {
+        return recorded.heads[index][0..recorded.lens[index]];
+    }
+};
+
+/// Serves three requests (over however many connections) and records each request head.
+fn serve_three(io: std.Io, listener: *std.Io.net.Server, recorded: *Recorded) void {
+    const replies = [3][]const u8{ "[]", "{\"number\":7}", "{}" };
+    while (recorded.count < 3) {
+        const stream = listener.accept(io) catch return;
+        defer stream.close(io);
+        var in_buffer: [2048]u8 = undefined;
+        var out_buffer: [512]u8 = undefined;
+        var reader = stream.reader(io, &in_buffer);
+        var writer = stream.writer(io, &out_buffer);
+        while (recorded.count < 3) {
+            var length: usize = 0;
+            var content_length: usize = 0;
+            while (true) {
+                const line = reader.interface.takeDelimiterInclusive('\n') catch break;
+                const slot = &recorded.heads[recorded.count];
+                if (length + line.len > slot.len) return;
+                @memcpy(slot[length..][0..line.len], line);
+                length += line.len;
+                const lower = "content-length: ";
+                if (line.len > lower.len and std.ascii.startsWithIgnoreCase(line, lower)) {
+                    content_length = std.fmt.parseInt(
+                        usize,
+                        std.mem.trim(u8, line[lower.len..], " \r\n"),
+                        10,
+                    ) catch return;
+                }
+                if (line.len == 2) break; // The empty line ends the head.
+            } else unreachable;
+            if (length == 0) break; // Connection closed between requests.
+            reader.interface.discardAll(content_length) catch return;
+            recorded.lens[recorded.count] = @intCast(length);
+            const body = replies[recorded.count];
+            recorded.count += 1;
+            writer.interface.print(
+                "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\n\r\n{s}",
+                .{ body.len, body },
+            ) catch return;
+            writer.interface.flush() catch return;
+        }
+    }
+}
+
+test "every request carries the Authorization header, on a reused connection too" {
+    // Goal: GitHub answered 401 to a valid token in production (fleet, 2026-11-03) because the
+    // pinned std never writes `privileged_headers` into the request head. Method: a loopback
+    // server records the head of find, open and comment, which share one client.
+    const io = std.testing.io;
+    const any = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try any.listen(io, .{});
+    defer listener.deinit(io);
+    var recorded: Recorded = .{};
+    const thread = try std.Thread.spawn(.{}, serve_three, .{ io, &listener, &recorded });
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sink: [256]u8 = undefined;
+    var log: std.Io.Writer = .fixed(&sink);
+    var url_buffer: [64]u8 = undefined;
+    const api = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}", .{
+        listener.socket.address.getPort(),
+    });
+    var http: Http = .{
+        .client = .{ .allocator = std.testing.allocator, .io = io },
+        .repo = "o/r",
+        .token = "tok-123",
+        .log = &log,
+        .api = api,
+    };
+    defer http.client.deinit();
+    const github = http.github();
+    try std.testing.expectEqual(@as(?u32, null), try github.find(arena, "fp"));
+    try std.testing.expectEqual(@as(u32, 7), try github.open(arena, "t", "b"));
+    try github.comment(arena, 7, "c");
+    thread.join();
+    try std.testing.expectEqual(@as(u32, 3), recorded.count);
+    for (0..3) |index| {
+        const head = recorded.head(@intCast(index));
+        try std.testing.expect(std.ascii.findIgnoreCase(
+            head,
+            "\r\nauthorization: Bearer tok-123\r\n",
+        ) != null);
+    }
 }
