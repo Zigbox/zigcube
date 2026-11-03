@@ -22,6 +22,7 @@ const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const control_plane = @import("control_plane.zig");
 const runtime = @import("runtime.zig");
+const runtime_mod = runtime;
 const sim_runtime = @import("sim_runtime.zig");
 const store = @import("store.zig");
 const ManualClock = @import("clock.zig").ManualClock;
@@ -226,6 +227,9 @@ pub const World = struct {
     memory: *MemoryStore,
     switched: SwitchedStore,
     sim: sim_runtime.SimRuntime,
+    /// A runtime the agent uses instead of `sim` (a test's wrapper that watches the specs it is
+    /// given and passes them on to `sim.interface()`); null in every simulation.
+    runtime_override: ?runtime_mod.Runtime = null,
     server: control_plane.ControlPlane,
     agent: *agent_mod.Agent,
     /// The agent's files (the kept lease), which a restart of the agent finds again.
@@ -281,6 +285,7 @@ pub const World = struct {
         world.dropped_before_restart = 0;
         world.last_failure = null;
         world.boot_id = "";
+        world.runtime_override = null;
         return world;
     }
 
@@ -350,7 +355,7 @@ pub const World = struct {
         world.diag.reset();
         const ctx: agent_mod.Context = .{
             .store = world.store_handle(),
-            .runtime = world.sim.interface(),
+            .runtime = world.runtime_override orelse world.sim.interface(),
             .clock = world.manual.clock(),
             .arena = world.fresh_arena(),
             .diag = &world.diag,

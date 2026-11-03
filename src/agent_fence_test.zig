@@ -195,3 +195,112 @@ test "the shipped constants satisfy the inequality" {
         fencing.inequality_problem(constants.lease_ttl_ms),
     );
 }
+
+/// Passes every call to the simulated runtime and keeps the `source` of each spec it is asked
+/// to start.
+const SourceSpy = struct {
+    inner: @import("runtime.zig").Runtime,
+    /// Copies: the spec's slices live in the agent's step arena, which is gone after the step.
+    buffers: [4][160]u8 = undefined,
+    lengths: [4]u32 = @splat(0),
+    count: u32 = 0,
+
+    const rt = @import("runtime.zig");
+    const Diag = @import("diag.zig").Diag;
+
+    fn runtime(self: *SourceSpy) rt.Runtime {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable: rt.Runtime.VTable = .{
+        .start = on_start,
+        .stop = on_stop,
+        .inspect = on_inspect,
+        .list = on_list,
+        .events = on_events,
+    };
+
+    fn me(context: *anyopaque) *SourceSpy {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn on_start(
+        context: *anyopaque,
+        spec: *const rt.Spec,
+        diag: *Diag,
+    ) rt.Error!rt.StartOutcome {
+        const self = me(context);
+        if (self.count < self.lengths.len) {
+            @memcpy(self.buffers[self.count][0..spec.source.len], spec.source);
+            self.lengths[self.count] = @intCast(spec.source.len);
+        }
+        self.count += 1;
+        return self.inner.vtable.start(self.inner.context, spec, diag);
+    }
+
+    fn on_stop(
+        context: *anyopaque,
+        handle: rt.Handle,
+        grace_ms: u32,
+        diag: *Diag,
+    ) rt.Error!void {
+        const self = me(context);
+        return self.inner.vtable.stop(self.inner.context, handle, grace_ms, diag);
+    }
+
+    fn on_inspect(context: *anyopaque, handle: rt.Handle, diag: *Diag) rt.Error!rt.Status {
+        const self = me(context);
+        return self.inner.vtable.inspect(self.inner.context, handle, diag);
+    }
+
+    fn on_list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        diag: *Diag,
+    ) rt.Error![]const rt.Listing {
+        const self = me(context);
+        return self.inner.vtable.list(self.inner.context, arena, diag);
+    }
+
+    fn on_events(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) rt.Error![]const rt.StatusChange {
+        const self = me(context);
+        return self.inner.vtable.events(self.inner.context, arena, timeout_ms, diag);
+    }
+};
+
+test "the agent hands a replica's source to the runtime in the Spec it starts" {
+    // Goal: the reference a service names reaches `Runtime.start` (and is empty without one).
+    // Method: wrap the simulated runtime in a spy; apply one service with a pin and one without;
+    // read what the spy was given for each.
+    const world = try sim_world.World.create(testing.allocator, 21, &sim_runtime.default_fixtures);
+    defer world.destroy();
+    var spy: SourceSpy = .{ .inner = world.sim.interface() };
+    world.runtime_override = spy.runtime();
+    const pin = "registry.example/hello@sha256:" ++
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var pinned = hello;
+    pinned.source = pin;
+    _ = try world.apply(pinned);
+    var plain = hello;
+    plain.name = "plain";
+    plain.replicas = 1;
+    plain.request_id = "r-0000002";
+    _ = try world.apply(plain);
+    world.advance(5_000);
+    try testing.expectEqual(@as(u32, 3), spy.count);
+    var with_pin: u32 = 0;
+    for (0..3) |index| {
+        const source = spy.buffers[index][0..spy.lengths[index]];
+        if (std.mem.eql(u8, source, pin)) {
+            with_pin += 1;
+        } else {
+            try testing.expectEqualStrings("", source);
+        }
+    }
+    try testing.expectEqual(@as(u32, 2), with_pin);
+}
