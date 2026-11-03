@@ -19,8 +19,8 @@
 //! `stop` does not wait out a grace period (`lifecycle.stop` would block the agent's lease for
 //! up to `grace_ms` + 5 s): with a grace it sends SIGTERM and waits at most `stop_wait_ms`; with
 //! none it sends SIGKILL and waits as long. The caller checks `inspect` and asks again, as with
-//! `FakeRuntime`. For N containers a fence costs up to N times `stop_wait_ms`: docs/briefs/c2-1.md
-//! (c).4 proposes the non-blocking `signal` that removes it.
+//! `FakeRuntime`. `signal` is the same delivery without the wait: the fence signals every
+//! container and then looks at `list` against one deadline, so N containers cost one.
 //!
 //! `host` is a parameter, so the tests run the lifecycle calls over Zigbox's simulated kernel.
 //! `start` and the supervisor need real processes and are covered by `zigbox-smoke`.
@@ -97,6 +97,7 @@ pub const ZigboxRuntime = struct {
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
         .stop = stop_impl,
+        .signal = signal_impl,
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
@@ -265,7 +266,30 @@ pub const ZigboxRuntime = struct {
         grace_ms: u32,
         diag: *Diag,
     ) runtime.Error!void {
-        const self = from(context);
+        const number = if (grace_ms > 0) runtime.signal_term else runtime.signal_kill;
+        return from(context).deliver(handle, number, .wait, diag);
+    }
+
+    fn signal_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        number: u8,
+        diag: *Diag,
+    ) runtime.Error!void {
+        return from(context).deliver(handle, number, .no_wait, diag);
+    }
+
+    const Wait = enum { wait, no_wait };
+
+    /// TERM or KILL to a container, and with `.wait` one bounded wait for it to go.
+    fn deliver(
+        self: *ZigboxRuntime,
+        handle: runtime.Handle,
+        number: u8,
+        wait: Wait,
+        diag: *Diag,
+    ) runtime.Error!void {
+        assert(runtime.signal_known(number));
         var arena_state = std.heap.ArenaAllocator.init(self.options.gpa);
         defer arena_state.deinit();
         const found = try self.resolve(arena_state.allocator(), handle.name(), diag);
@@ -285,7 +309,7 @@ pub const ZigboxRuntime = struct {
         if (ref.pid == 0) return self.kill_supervisor(handle.name());
         // `lifecycle.signal` forwards only the terminating signals zbx catches (TERM among them,
         // and SIGKILL in its place for a PID 1 with no handler); a hard kill goes to the host.
-        const sent = if (grace_ms > 0)
+        const sent = if (number == runtime.signal_term)
             lifecycle.signal(&ref, map.bounds.signal_term)
         else
             self.host.signal(ref.pid, map.bounds.signal_kill);
@@ -293,9 +317,9 @@ pub const ZigboxRuntime = struct {
             if (err == error.NotFound) return; // It ended between the look and the signal.
             return runtime_failed(diag, "signal the container");
         };
-        // One bounded wait either way; a grace that is not over is the caller's to ask again,
-        // with none, to kill.
-        _ = self.wait_gone(&ref, stop_wait_ms);
+        // One bounded wait for `stop`; a grace that is not over is the caller's to ask again,
+        // with none, to kill. A signal does not wait: the caller reads `list`.
+        if (wait == .wait) _ = self.wait_gone(&ref, stop_wait_ms);
     }
 
     fn wait_gone(self: *ZigboxRuntime, ref: *const lifecycle.Ref, limit_ms: u32) bool {
@@ -832,6 +856,60 @@ test "stop with no grace kills; the record then says stopped" {
     try rt.stop(handle, 0, &diag);
     diag.reset();
     try testing.expectError(error.NotFound, rt.stop(runtime.Handle.init("nope"), 0, &diag));
+}
+
+test "a signal reaches the container and never waits" {
+    // Goal: `signal` is `stop`'s delivery without the wait. Method: TERM, then KILL, to a running
+    // container over Zigbox's simulated kernel; each lands in the kernel's received list, the
+    // simulated clock does not move (a wait would have moved it), and an unknown name is NotFound.
+    var rig: Rig = undefined;
+    try rig.up(21);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    rig.sim.world.immortal = true;
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = rig.rt.interface();
+    const handle = runtime.Handle.init("web-1");
+    const began = rig.sim.world.now_ms;
+    try rt.signal(handle, runtime.signal_term, &diag);
+    try testing.expectEqual(@as(u32, 1), rig.sim.world.received_count);
+    try rt.signal(handle, runtime.signal_kill, &diag);
+    try testing.expectEqual(@as(u32, 2), rig.sim.world.received_count);
+    try testing.expectEqual(@as(u8, 9), rig.sim.world.received[1]);
+    try testing.expectEqual(began, rig.sim.world.now_ms);
+    try testing.expect((try rt.inspect(handle, &diag)) == .running); // Immortal: still there.
+    try testing.expectError(
+        error.NotFound,
+        rt.signal(runtime.Handle.init("nope"), runtime.signal_term, &diag),
+    );
+}
+
+test "a signal to a stopped container, or one still starting with no supervisor, does nothing" {
+    // Goal: the edges `stop` has, for `signal`. Method: kill and reap one container, then
+    // signal it again; a start-window container with no supervisor file is signalled nothing.
+    var rig: Rig = undefined;
+    try rig.up(22);
+    defer rig.down();
+    try sim_container(&rig.sim, "web-1", "web-1");
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = rig.rt.interface();
+    const handle = runtime.Handle.init("web-1");
+    try rt.signal(handle, runtime.signal_kill, &diag);
+    _ = zigbox.wait(&sim_handle);
+    const received = rig.sim.world.received_count;
+    try rt.signal(handle, runtime.signal_term, &diag);
+    try testing.expectEqual(received, rig.sim.world.received_count);
+
+    var other: Rig = undefined;
+    try other.up(23);
+    defer other.down();
+    try sim_container(&other.sim, "web-1", "web-1");
+    _ = try rewrite_record(&other, "web-1", 0, other.sim.interface().own_pid());
+    try other.launch_spec("web-1", 0);
+    try other.rt.interface().signal(handle, runtime.signal_kill, &diag);
+    try testing.expectEqual(@as(u32, 0), other.sim.world.received_count);
 }
 
 test "a launch with a live supervisor and no record is starting; without one, lost" {

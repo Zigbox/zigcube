@@ -33,7 +33,8 @@
 //! `stop` waits for a polite stop only `fake_stop_wait_ms` and then returns with the container
 //! still running if the grace period is longer; the agent asks again with a grace of 0 to kill
 //! it. The contract says it returns once the container has stopped. A single-threaded agent that
-//! waited out a long grace would starve its lease (docs/agent.md).
+//! waited out a long grace would starve its lease (docs/agent.md). `signal` never waits at all:
+//! the fence signals every container and then looks at `list` against one deadline.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -92,6 +93,7 @@ pub const FakeRuntime = struct {
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
         .stop = stop_impl,
+        .signal = signal_impl,
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
@@ -335,6 +337,29 @@ pub const FakeRuntime = struct {
         const waited = @min(grace_ms, stop_wait_ms);
         if (self.wait_ended(dir, waited)) return;
         if (grace_ms <= stop_wait_ms) self.kill_and_wait(dir, child);
+    }
+
+    /// TERM or KILL to the container's command, and no wait. A container whose command has not
+    /// started has no polite stop, as in `stop_impl`: its group is killed.
+    fn signal_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        number: u8,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const self = from(context);
+        const dir = self.containers.openDir(self.io, handle.name(), .{}) catch
+            return not_found(diag, handle);
+        defer dir.close(self.io);
+        var arena_state = std.heap.ArenaAllocator.init(self.options.gpa);
+        defer arena_state.deinit();
+        const status = try self.status_of(arena_state.allocator(), dir, handle.name(), diag);
+        if (status == .stopped) return;
+        const child = files.read_pid(self.io, dir, files.file_child) catch {
+            self.kill_group(dir);
+            return;
+        };
+        signal(child, if (number == runtime.signal_kill) .KILL else .TERM);
     }
 
     fn kill_and_wait(self: *FakeRuntime, dir: Dir, child: i32) void {

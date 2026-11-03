@@ -381,14 +381,17 @@ pub const Agent = struct {
         try agent.persist(ctx);
     }
 
-    /// One step of a fence: ask every running container of this node to stop, kill what is
-    /// left at the deadline, and when none runs any longer forget the lease, so the next step
-    /// registers the node again, empty. Needs no server. A stop may wait (`Runtime.stop`), so
-    /// the time is read again before each, and a wait never pushes a kill past its deadline; a
-    /// container that cannot be stopped does not keep the others running.
+    /// One step of a fence: the first step signals TERM to every running container of this node,
+    /// none of the calls waiting; later steps look at the runtime again (`list`) and, from the
+    /// deadline on, signal KILL to each one still running. When none runs any longer the lease
+    /// is forgotten, so the next step registers the node again, empty. Needs no server. N
+    /// containers cost one deadline, not N waits (`Runtime.signal`); a container that cannot be
+    /// signalled does not keep the others running.
     fn fence_step(agent: *Agent, ctx: *const Context, now: u64) Error!Wakeup {
         assert(agent.fence.active);
         const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
+        const kill = ctx.mono_ms() >= agent.fence.kill_at_ms;
+        const number = if (kill) runtime.signal_kill else runtime.signal_term;
         var running: u32 = 0;
         // The first failure is the step's; later ones are dropped (the next step retries).
         var spare: Diag = undefined;
@@ -398,13 +401,10 @@ pub const Agent = struct {
             if (!is_running(listing)) continue;
             running += 1;
             if (fault_ignore_stop) continue;
-            const mono = ctx.mono_ms();
-            const kill = mono >= agent.fence.kill_at_ms;
             if (!kill and agent.fence.asked) continue;
-            const grace: u32 = if (kill) 0 else @intCast(agent.fence.kill_at_ms - mono);
             const diag = if (failed == null) ctx.diag else &spare;
             spare.reset();
-            ctx.runtime.stop(listing.handle, grace, diag) catch |err| switch (err) {
+            ctx.runtime.signal(listing.handle, number, diag) catch |err| switch (err) {
                 error.NotFound => diag.reset(), // It has gone: what the fence wants.
                 error.RuntimeFailed => failed = failed orelse err,
             };
