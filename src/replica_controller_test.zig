@@ -468,10 +468,9 @@ test "a spec change replaces every replica; deleting the service stops them all"
 test "a service deleted and applied again between two steps loses its old replicas (issue 55)" {
     // Goal: regression for the simulation fleet's issue 55. Generation restarts at 1 when a
     // service is deleted and applied again, and the controller never saw the service gone, so
-    // the old replicas look like the new service's. Method, two ways to be wrong: (1) the
-    // replicas are ahead (generation 2, image B) of the new service (generation 1, image A),
-    // which is how the simulation kept them until the service's next apply reached generation 2;
-    // (2) the replicas are equal in generation (1) and differ in image.
+    // the old replicas look like the new service's. Method: the replicas are ahead (generation 2,
+    // image B) of the new service (generation 1, image A), which is how the simulation kept
+    // them until the service's next apply reached generation 2.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -488,7 +487,6 @@ test "a service deleted and applied again between two steps loses its old replic
     defer Fixture.free_ids(rolled);
     try expect_ids(&.{ "hello-3", "hello-4" }, rolled);
 
-    // (1) Deleted and applied again with no step between.
     const ctx = fixture.context();
     const done = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000003");
     try testing.expect(done == .written);
@@ -498,17 +496,35 @@ test "a service deleted and applied again between two steps loses its old replic
     defer Fixture.free_ids(renewed);
     try expect_ids(&.{ "hello-5", "hello-6" }, renewed);
     try fixture.expect_replica_image("hello-5", first.image);
+}
 
-    // (2) The same again, now with the replicas equal in generation and different in image.
-    const again = fixture.context();
-    const gone = try apply_mod.delete_service(&again, &fixture.api, "hello", "alex", "r-00000004");
+test "a service applied again with the same generation and another image loses its replicas" {
+    // Goal: the second way to be wrong in issue 55, alone: the old replicas are equal in
+    // generation (1) to the new service and differ only in image, so only the spec comparison
+    // finds them. Method: apply, settle, delete and apply another image with no step between.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    var first = hello;
+    first.replicas = 2;
+    try fixture.apply(first);
+    _ = try fixture.settle();
+    const ctx = fixture.context();
+    const gone = try apply_mod.delete_service(&ctx, &fixture.api, "hello", "alex", "r-00000004");
     try testing.expect(gone == .written);
+    var second = first;
+    second.image = "b3:9d20c4f1";
     try fixture.apply(second);
     _ = try fixture.settle();
     const last = try fixture.ids("hello");
     defer Fixture.free_ids(last);
-    try expect_ids(&.{ "hello-7", "hello-8" }, last);
-    try fixture.expect_replica_image("hello-7", second.image);
+    try expect_ids(&.{ "hello-3", "hello-4" }, last);
+    try fixture.expect_replica_image("hello-3", second.image);
+    const reason = try fixture.reason_of(.service, "hello", "replace_replica");
+    const expected = "service hello is at generation 1 and 2 replicas do not run what it asks " ++
+        "for; replacing hello-1; hello-2";
+    try testing.expectEqualStrings(expected, reason);
 }
 
 test "a rolled service says its replicas run an older generation" {
