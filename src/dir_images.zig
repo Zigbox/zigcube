@@ -10,7 +10,8 @@
 //! renamed into place, so a reader sees a whole file or none, and a crash leaves no half chunk
 //! under its name. A `DirImages` belongs to one thread (its buffers are shared by its calls);
 //! each thread opens its own, and the directory itself may be shared (writes are renames of
-//! uniquely named temporary files). Shell code: files. The fake registry and the demo seed it with `put_tree`.
+//! uniquely named temporary files). Shell code: files. The fake registry and the demo seed it
+//! with `put_tree`.
 
 const std = @import("std");
 const assert = std.debug.assert;

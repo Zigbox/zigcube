@@ -86,6 +86,8 @@ pub const Command = union(enum) {
     supervise: []const u8,
     /// `zcube-agent supervise-zigbox <launch directory>` (`zigbox_supervisor.zig`).
     supervise_zigbox: []const u8,
+    /// `zcube-agent fetch ...` (`fetch_cli.zig`): the arguments after `fetch`.
+    fetch: []const []const u8,
     version,
     help,
 };
@@ -132,6 +134,7 @@ const Flags = struct {
 /// Reads the flags and the files they name, merges them (flags win) and checks every setting.
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    if (args.len >= 1 and std.mem.eql(u8, args[0], "fetch")) return .{ .fetch = args[1..] };
     if (args.len >= 1) {
         const zigbox_mode = std.mem.eql(u8, args[0], "supervise-zigbox");
         if (zigbox_mode or std.mem.eql(u8, args[0], "supervise")) {
@@ -644,7 +647,8 @@ test "the chunk store and the peer address are read, and a peer address needs a 
         "--state-dir",    "/tmp",    "--cpu-millis", "1000",
         "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
     };
-    const both = base ++ [_][]const u8{ "--images-dir", "/tmp/i", "--peer-listen", "127.0.0.1:7171" };
+    const extra = [_][]const u8{ "--images-dir", "/tmp/i", "--peer-listen", "127.0.0.1:7171" };
+    const both = base ++ extra;
     const loaded = try load(arena, std.testing.io, &both, &diag);
     try testing.expectEqualStrings("/tmp/i", loaded.run.images_dir.?);
     try testing.expectEqual(@as(u16, 7171), loaded.run.peer_listen.?.getPort());

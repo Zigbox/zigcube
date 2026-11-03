@@ -87,7 +87,9 @@ pub const Code = enum(u8) {
     E0513,
     E0514,
     W0501,
+    E0601,
     W0601,
+    W0602,
     E0801,
     E0802,
     E0803,
@@ -1080,6 +1082,21 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0601,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a tree could not be fetched from any peer or the registry",
+        .explanation =
+        \\A node needed the chunk tree of an image and could not get it onto this
+        \\node: no peer sent it, and the registry did not serve it. The cause line
+        \\names the tree's digest and every source that was tried, in order.
+        \\
+        \\Check that the registry is reachable from this node, and that the digest
+        \\names an image that was pushed. A digest that was never pushed is held by
+        \\no source, so every fetch of it fails the same way.
+        ,
+    },
+    .{
         .code = .W0601,
         .severity = .warning,
         .blame = .external,
@@ -1092,6 +1109,21 @@ pub const registry = [_]Entry{
         \\The image is not affected: nothing is stored or run before every chunk
         \\matches. The peer's disk or store may be damaged, or it may be running a
         \\different build; check that node.
+        ,
+    },
+    .{
+        .code = .W0602,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "a peer's chunk list does not match its digest",
+        .explanation =
+        \\A node that was asked for an image's chunk tree got a list from a peer
+        \\whose BLAKE3 digest is not the tree's digest. The list was ignored and the
+        \\node tried the next source: another peer, then the registry.
+        \\
+        \\The image is not affected: a tree is used only when its digest matches.
+        \\No action is needed. If it repeats, check the peer node, whose store may
+        \\be damaged or running a different build.
         ,
     },
     .{

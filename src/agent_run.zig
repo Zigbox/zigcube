@@ -359,32 +359,13 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .agent_version = build_options.version,
     });
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
-    // The chunk store, when the node has one: the summary pass reads it on this thread, and the
-    // peer server opens its own `DirImages` per connection (a `DirImages` is one thread's).
-    var chunk_store: dir_images.DirImages = undefined;
-    const has_store = config.images_dir != null;
-    if (config.images_dir) |path| {
-        chunk_store = dir_images.DirImages.open(io, gpa, path) catch
-            return fail_start(io, &diag, config.verbose, "open the chunk store (--images-dir)");
-    }
-    defer if (has_store) chunk_store.close(gpa);
-    const peer_server = gpa.create(peer_server_mod.Server) catch return constants.exit_environment;
-    defer gpa.destroy(peer_server);
-    var peer_serving = false;
-    if (config.peer_listen) |listen| {
-        peer_server.start(io, .{
-            .listen = listen,
-            .state_dir = config.state_dir,
-            .node = config.node,
-            .images_path = config.images_dir.?, // Config checked that --images-dir is given.
-            .verbose = config.verbose,
-        }) catch return fail_start(io, &diag, config.verbose, "start the peer server");
-        peer_serving = true;
-    }
-    defer if (peer_serving) peer_server.stop();
+    var swarm: Swarm = .{};
+    swarm.start(io, gpa, config) catch |what|
+        return fail_start(io, &diag, config.verbose, @errorName(what));
+    defer swarm.stop(gpa);
     var shell: Shell = .{
-        .images = if (has_store)
-            chunk_store.images()
+        .images = if (swarm.has_store)
+            swarm.store.images()
         else if (config.runtime == .fake) fake_images.images() else null,
         .io = io,
         .clock = real.clock(),
@@ -403,13 +384,18 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     };
     defer shell.arena.deinit();
     announce(io, config);
-    if (peer_identity.stored_problem) {
-        shell.show("\n", &diag, "zcube-agent: ignoring it; the node joins the cluster CA again\n");
+    return serve(&shell, &diag, peer_identity.stored_problem);
+}
+
+/// Runs the agent's loop until it is told to stop, then saves the pair.
+fn serve(shell: *Shell, diag: *Diag, stored_problem: bool) u8 {
+    if (stored_problem) {
+        shell.show("\n", diag, "zcube-agent: ignoring it; the node joins the cluster CA again\n");
         diag.reset();
     }
     shell.notice_pair();
     install_signals();
-    loop(&shell);
+    loop(shell);
     shell.save_pair(true);
     return constants.exit_ok;
 }
@@ -459,6 +445,44 @@ fn announce(io: std.Io, config: config_mod.Config) void {
     }) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {}; // Nowhere else to report it.
 }
+
+/// The node's chunk store and peer server, when it has them (`--images-dir`, `--peer-listen`).
+/// The summary pass reads the store on the agent's thread; the peer server opens its own
+/// `DirImages` per connection (a `DirImages` is one thread's).
+const Swarm = struct {
+    store: dir_images.DirImages = undefined,
+    has_store: bool = false,
+    server: ?*peer_server_mod.Server = null,
+
+    fn start(swarm: *Swarm, io: std.Io, gpa: std.mem.Allocator, config: config_mod.Config) !void {
+        const path = config.images_dir orelse return;
+        swarm.store = dir_images.DirImages.open(io, gpa, path) catch
+            return error.@"open the chunk store (--images-dir)";
+        swarm.has_store = true;
+        const listen = config.peer_listen orelse return;
+        const server = gpa.create(peer_server_mod.Server) catch return error.OutOfMemory;
+        swarm.server = server;
+        server.start(io, .{
+            .listen = listen,
+            .state_dir = config.state_dir,
+            .node = config.node,
+            .images_path = path,
+            .verbose = config.verbose,
+        }) catch {
+            gpa.destroy(server);
+            swarm.server = null;
+            return error.@"start the peer server";
+        };
+    }
+
+    fn stop(swarm: *Swarm, gpa: std.mem.Allocator) void {
+        if (swarm.server) |server| {
+            server.stop();
+            gpa.destroy(server);
+        }
+        if (swarm.has_store) swarm.store.close(gpa);
+    }
+};
 
 fn fail_start(io: std.Io, diag: *Diag, verbose: bool, what: []const u8) u8 {
     diag.reset();

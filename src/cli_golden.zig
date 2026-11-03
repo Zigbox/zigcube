@@ -437,6 +437,24 @@ fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
     );
 }
 
+fn tree_missing(diag: *diag_mod.Diag) void { // fetch_worker.zig
+    sample(
+        diag,
+        .E0601,
+        &.{"tree b3:7f1c4e9a5d20 was tried at node2, node3 and the registry"},
+        "check the registry is reachable from this node and the digest was pushed",
+    );
+}
+
+fn peer_bad_tree(diag: *diag_mod.Diag) void { // fetch_worker.zig
+    sample(
+        diag,
+        .W0602,
+        &.{"peer node2 sent a chunk list that does not hash to tree b3:7f1c4e9a5d20"},
+        "no action needed for this fetch; if it repeats, check that peer node",
+    );
+}
+
 fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
     const cause = "lease time to live 30000 ms needs a fence margin of 4000 ms; it is 3000 ms";
     sample(diag, .E0121, &.{cause}, "shorten --lease-ttl-ms, or leave the fencing constants alone");
@@ -594,6 +612,8 @@ const cases = [_]Case{
     relayed(.E0807, peer_removed),
     relayed(.E0808, peer_limited),
     relayed(.W0601, peer_bad_chunk),
+    relayed(.E0601, tree_missing),
+    relayed(.W0602, peer_bad_tree),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
 };

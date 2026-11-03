@@ -18,6 +18,7 @@ const diag_mod = @import("diag.zig");
 const fake_supervisor = @import("fake_supervisor.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const zigbox_supervisor = @import("zigbox_supervisor.zig");
+const fetch_cli = @import("fetch_cli.zig");
 
 const Diag = diag_mod.Diag;
 
@@ -68,6 +69,7 @@ pub fn main(init: std.process.Init) u8 {
         .help => return say(init.io, config_mod.usage),
         .supervise => |directory| return fake_supervisor.run(init, directory),
         .supervise_zigbox => |directory| return zigbox_supervisor.run(init, directory),
+        .fetch => |rest| return fetch_cli.run(init, rest),
         .run => |config| {
             verbose_panics = config.verbose;
             return agent_run.run(init, config);

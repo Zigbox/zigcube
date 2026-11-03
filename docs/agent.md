@@ -160,6 +160,26 @@ unreachable server, `ZC-E0807` for a removed node) is shown once and retried eve
 `peer_join_retry_ms`; it never stops the agent or its containers. Nothing yet uses the credential:
 slice 6b's chunk server does.
 
+## The chunk store, the peer server and `fetch` (C2 slice 6b)
+
+`--images-dir DIR` gives the node a chunk store (`dir_images.zig`: `trees/<digest>` lists and
+`chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
+checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
+thread; a `DirImages` belongs to one thread, and the peer server gives each connection its own.
+`--peer-listen HOST:PORT` (needs `--images-dir`) starts the peer server (`peer_server.zig`): read-only,
+CA-authenticated peers only, rate limited (ZC-E0808).
+
+`zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
+[--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the registry (plain HTTP,
+`/trees/<digest>`, `/chunks/<hex>`) and the named peers. It exits 0 when the tree is whole in the
+store and 1 with ZC-E0601 when it is not. A peer is only ever asked when the digest is the full
+`b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
+
+**Not built yet (6b part 3 cut):** peers and their chunk filters discovered from the server
+(`/node-store/`, `/nodes/`) instead of `--peer`; the supervisor running `fetch` before the
+command so a replica reports `starting` while it runs; the fake registry, `swarm-smoke` and its
+teeth fault; `keys.md` and `api.md` tables.
+
 ## What survives what
 
 | Event | Containers | The agent's work |
