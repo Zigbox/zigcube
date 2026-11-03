@@ -56,7 +56,9 @@ pub fn raise_bad_tree(diag: *diag_mod.Diag, peer_name: []const u8, digest: []con
     diag.cause("peer {s} sent a chunk list that does not hash to tree {s}", .{
         peer_name, digest,
     });
-    diag.fix(.{ .sentence = "no action needed for this fetch; if it repeats, check that peer node" });
+    diag.fix(.{
+        .sentence = "no action needed for this fetch; if it repeats, check that peer node",
+    });
 }
 
 /// Raises ZC-E0601: no source had `digest`. `tried` is the sentence naming the sources.

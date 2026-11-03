@@ -375,3 +375,19 @@ test "a chunk of exactly the largest size is stored, read and served" {
     try write_whole(std.testing.io, chunks, DirImages.chunk_name(&name, &hash), big);
     try std.testing.expectError(error.BadHash, images.read_chunk(&hash, out));
 }
+
+test "a write never touches another writer's temporary file" {
+    // Goal: two writers of one file must not share a temporary name (one would truncate or
+    // rename away the other's half-written file). Method: leave a file under the plain
+    // `<name>.tmp` as a stand-in for a concurrent writer's, write the name, and check the
+    // write landed whole and the stand-in is untouched.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "other.tmp", .data = "half-written" });
+    try write_whole(std.testing.io, tmp.dir, "other", "whole");
+    var buffer: [32]u8 = undefined;
+    const whole = try tmp.dir.readFile(std.testing.io, "other", &buffer);
+    try std.testing.expectEqualStrings("whole", whole);
+    const stand_in = try tmp.dir.readFile(std.testing.io, "other.tmp", &buffer);
+    try std.testing.expectEqualStrings("half-written", stand_in);
+}

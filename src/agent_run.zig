@@ -558,7 +558,10 @@ const Backend = struct {
 
     /// How the fake runtime fetches an image it lacks, when `--registry` is given. Allocated once
     /// at startup and kept for the life of the process.
-    fn fetch_options(gpa: std.mem.Allocator, config: config_mod.Config) error{StartFailed}!?fake_runtime.Fetch {
+    fn fetch_options(
+        gpa: std.mem.Allocator,
+        config: config_mod.Config,
+    ) error{StartFailed}!?fake_runtime.Fetch {
         const registry = config.registry orelse return null;
         var text: [64]u8 = undefined;
         var writer = std.Io.Writer.fixed(&text);
