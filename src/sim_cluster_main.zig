@@ -382,3 +382,16 @@ test "a short fault phase is not judged by one request per operation (fleet issu
         try std.testing.expect(!report.failed);
     }
 }
+
+test "a service deleted and applied again leaves no old replica running (fleet issue 55)" {
+    // Goal: regression for the simulation fleet's issue 55. Method: replay the shrunk failure
+    // (78 operations healing at 98): alpha was deleted and applied again between two controller
+    // steps, its old replica alpha-6 (generation 2) survived the new service (generation 1), and
+    // an apply of a broken image brought the service to generation 2, so alpha-6 ran for ever.
+    // Unit test of the cause: replica_controller_test.zig.
+    const report = try std.testing.allocator.create(sim_cluster.Report);
+    defer std.testing.allocator.destroy(report);
+    sim_cluster.simulate(std.testing.allocator, 2352517332, 78, .{ .heal_at = 98 }, report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try std.testing.expect(!report.failed);
+}

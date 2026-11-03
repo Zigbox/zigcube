@@ -74,7 +74,10 @@ so a decision can say which version it acted on: the image, `source`, the comman
 `limits`.
 **A change of `replicas` alone does not bump it** (owner, 2026-10-26): scaling from 3 to 5 must
 not replace the three that run. The replica controller replaces replicas whose `generation` is
-behind, and only a change of the replica's own inputs puts one behind. `next_replica` is the
+behind, and only a change of the replica's own inputs puts one behind. It also replaces a replica
+whose image, `source`, command, `env` or `limits` differ from the service's whatever its
+`generation` says: `generation` starts again at 1 when a service is deleted and applied again, so a
+replica of the old service can be ahead of the new one or equal to it. `next_replica` is the
 counter that makes replica ids unique forever (below). From slice 3 it lives in
 `/replica-numbers/<service>` (`{"next": N}`), which only the replica controller writes, in the
 same transaction that creates the replica. It is **never deleted**: the key outlives the service
