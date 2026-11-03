@@ -27,7 +27,27 @@ pub const ServiceRow = struct {
     generation: u64,
     applied_by: []const u8,
     command: []const u8,
+    /// The OCI reference the image is pulled from; empty when the service has none, and then
+    /// absent from `-o json` (a service without one prints as it did before C2 slice 2).
+    source: []const u8 = "",
+
+    pub fn jsonStringify(row: ServiceRow, jw: anytype) !void {
+        try stringify_without_empty_source(row, jw);
+    }
 };
+
+/// Writes `row` as the default JSON would, except that an empty `source` is left out.
+fn stringify_without_empty_source(row: anytype, jw: anytype) !void {
+    try jw.beginObject();
+    inline for (@typeInfo(@TypeOf(row)).@"struct".field_names) |name| {
+        const skip = comptime std.mem.eql(u8, name, "source");
+        if (!skip or @field(row, name).len > 0) {
+            try jw.objectField(name);
+            try jw.write(@field(row, name));
+        }
+    }
+    try jw.endObject();
+}
 
 pub const ReplicaRow = struct {
     id: []const u8,
@@ -43,6 +63,12 @@ pub const ReplicaRow = struct {
     /// What the scheduler resolved the replica to need (`/assigned/<node>/<id>`), null while
     /// unassigned.
     requests: ?Resources = null,
+    /// The replica's `source`; empty when it has none, and then absent from `-o json`.
+    source: []const u8 = "",
+
+    pub fn jsonStringify(row: ReplicaRow, jw: anytype) !void {
+        try stringify_without_empty_source(row, jw);
+    }
 };
 
 pub const Resources = struct { cpu_millis: u64, memory_bytes: u64 };
@@ -167,6 +193,7 @@ fn service_row(
         .generation = cli_data.number(kv.value, "generation") orelse 0,
         .applied_by = cli_data.text(kv.value, "applied_by") orelse "",
         .command = try command_text(arena, kv.value),
+        .source = cli_data.text(kv.value, "source") orelse "",
     };
 }
 
@@ -237,6 +264,7 @@ fn replica_row(
         .detail = "",
         .started_at_ms = null,
         .requests = requests_of(assigned, id),
+        .source = cli_data.text(kv.value, "source") orelse "",
     };
     for (observed) |seen| {
         if (!is_observed_of(seen.key, id)) continue;
