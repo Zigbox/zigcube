@@ -170,6 +170,28 @@ const Fixture = struct {
         return out;
     }
 
+    /// The `cause_evidence` text of the first decision of `kind`/`name` whose action is `action`.
+    fn evidence_of(
+        self: *Fixture,
+        kind: records.SubjectKind,
+        name: []const u8,
+        action: []const u8,
+    ) ![]const u8 {
+        const ctx = self.context();
+        const prefix = records.index_prefix(kind, name);
+        const query: store.ListOptions = .{ .prefix = prefix.slice(), .limit = 100 };
+        const page = try ctx.store.list(ctx.arena, query, &self.diag);
+        for (page.kvs) |kv| {
+            const entry = try records.read(records.IndexEntry, ctx.arena, kv, &self.diag);
+            const at = records.decision_key(entry.id);
+            const got = try ctx.store.get(ctx.arena, at.slice(), null, &self.diag);
+            const decision = try records.read(records.Decision, ctx.arena, got.kv.?, &self.diag);
+            if (!std.mem.eql(u8, decision.action, action)) continue;
+            return (decision.cause_evidence orelse return error.NoEvidence).text;
+        }
+        return error.NoSuchDecision;
+    }
+
     fn user_diagnostic(self: *Fixture, blame_user: bool) !records.Raw {
         const ctx = self.context();
         var collector: Diag = undefined;
@@ -258,6 +280,35 @@ test "a replica whose container was killed is replaced, and the decisions say wh
     defer service.deinit(testing.allocator);
     const service_chain = "apply<desired;scale_up<desired;replace_replica<decision;";
     try testing.expectEqualStrings(service_chain, service.items);
+}
+
+test "delete_replica keeps the exit as cause_evidence once the observed record is gone" {
+    // Goal: docs/keys.md's cause_evidence for a dead replica; zigbox-smoke's oom stage reads it,
+    // because `stopped oom` is observed only for an instant. Method: three replicas end three
+    // ways (oom, signal 9, code 3); each delete_replica decision carries that exit, and the
+    // observed records are gone by then.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    for ([_][]const u8{ "hello-1", "hello-2", "hello-3" }) |id| {
+        try fixture.observe(id, .running, null, null);
+    }
+    try fixture.observe("hello-1", .stopped, .{ .kind = .oom }, null);
+    try fixture.observe("hello-2", .stopped, .{ .kind = .signaled, .signal = 9 }, null);
+    try fixture.observe("hello-3", .stopped, .{ .kind = .exited, .code = 3 }, null);
+    _ = try fixture.settle();
+    const expected = [_][]const u8{
+        "{\"status\":\"stopped\",\"exit\":{\"kind\":\"oom\"}}",
+        "{\"status\":\"stopped\",\"exit\":{\"kind\":\"signaled\",\"signal\":9}}",
+        "{\"status\":\"stopped\",\"exit\":{\"kind\":\"exited\",\"code\":3}}",
+    };
+    for ([_][]const u8{ "hello-1", "hello-2", "hello-3" }, expected) |id, want| {
+        const got = try fixture.evidence_of(.replica, id, "delete_replica");
+        try testing.expectEqualStrings(want, got);
+    }
 }
 
 test "scaling up keeps the replicas that run; scaling down stops idle ones, then the newest" {
