@@ -129,10 +129,11 @@ const Bucket = struct {
 
     fn refill(bucket: *Bucket, now_ms: u64) void {
         assert(now_ms >= bucket.last_ms);
-        // A second fills it, so a longer gap adds no more (and cannot overflow).
-        const elapsed: i64 = @intCast(@min(now_ms - bucket.last_ms, 1000));
-        const filled = bucket.milli + elapsed * bucket.rate_bytes_per_s;
-        bucket.milli = @min(filled, burst(bucket.rate_bytes_per_s));
+        // The filled amount is capped, not the time: a bucket in debt for more than a second's
+        // worth must still earn all the elapsed time. i128 cannot overflow here.
+        const elapsed: i128 = now_ms - bucket.last_ms;
+        const filled = @as(i128, bucket.milli) + elapsed * bucket.rate_bytes_per_s;
+        bucket.milli = @intCast(@min(filled, burst(bucket.rate_bytes_per_s)));
         bucket.last_ms = now_ms;
     }
 
@@ -264,7 +265,10 @@ pub const Plan = struct {
             return .done;
         }
         var wake: ?u64 = null;
-        if (plan.in_flight < constants.fetch_in_flight_max) {
+        // Every request, to a peer or the registry, spends the node's bucket: with it empty or
+        // the in-flight limit reached nothing can be issued, so skip the scan.
+        if (!plan.node.ready()) wake = plan.node.ready_at();
+        if (plan.in_flight < constants.fetch_in_flight_max and plan.node.ready()) {
             var index = plan.first_pending;
             while (index < plan.chunks.len) : (index += 1) {
                 if (plan.states[index].status != .pending) {
@@ -293,11 +297,16 @@ pub const Plan = struct {
         const chunk = &plan.chunks[index];
         const tried = plan.states[index].tried;
         var claimers: u32 = 0;
+        // Struck or gone peers whose filters claim the chunk: tried, and never to be asked.
+        var lost_claimers: u32 = 0;
         var open: u32 = 0;
         var live: u32 = 0;
         var best: ?u8 = null;
         for (plan.peers[0..plan.peer_count], 0..) |*peer, peer_index| {
-            if (peer.struck or peer.gone) continue;
+            if (peer.struck or peer.gone) {
+                if (peer.filter.maybe_has(&chunk.hash)) lost_claimers += 1;
+                continue;
+            }
             live += 1;
             if (!peer.filter.maybe_has(&chunk.hash)) continue;
             claimers += 1;
@@ -323,7 +332,7 @@ pub const Plan = struct {
             return .hold; // Open peers are all busy or in debt; a result or the bucket wakes us.
         }
         // No peer is open for this chunk. Wait for one to claim it only if none ever did.
-        if (claimers == 0 and live > 0) {
+        if (claimers + lost_claimers == 0 and live > 0) {
             const deadline = plan.started_ms + plan.config.peer_wait_ms;
             if (plan.now_ms < deadline) {
                 wake.* = earliest(wake.*, deadline);
@@ -670,6 +679,24 @@ test "no peer at all means the registry at once; peers that claim nothing mean a
         try std.testing.expectEqual(@as(u32, 0), log.to_peer[0]);
         try std.testing.expectEqual(@as(?u64, 6000), log.first_registry_ms);
     }
+}
+
+test "a chunk only a struck peer claimed goes to the registry at once, not after the wait" {
+    // Goal: the liar's chunks do not wait peer_wait_ms for a peer that claims nothing. Method: one
+    // corrupt peer that claims everything, one honest peer that claims nothing.
+    var fixture: Fixture = .{};
+    fixture.setup();
+    var plan = fixture.plan(.{ .peer_wait_ms = 30_000 });
+    _ = plan.add_peer(.view(&fixture.full));
+    _ = plan.add_peer(.view(&fixture.empty));
+    var log: Log = .{};
+    try std.testing.expectEqual(
+        Action.done,
+        drive(&plan, &.{ .corrupt, .honest }, .honest, &log),
+    );
+    try std.testing.expectEqual(@as(u32, 0), log.after_strike);
+    try std.testing.expect(log.first_registry_ms.? < 1000 + 30_000);
+    try std.testing.expect(log.end_ms < 1000 + 30_000);
 }
 
 test "a filter that comes to show a chunk during the wait wins over the registry" {

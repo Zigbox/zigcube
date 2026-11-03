@@ -34,7 +34,11 @@ sketches of the complete trees on the node:
 2. Else the target's sample is compared with the union of the held samples (the 64 smallest keys of
    their union), over the key range both cover exactly. The share of the target's sampled bytes in
    that range that the union holds, applied to the target's size, is the estimate. It is exact when
-   both are exact; otherwise its standard deviation is at most 6.25 % of the tree.
+   both are exact. Otherwise the range is below the smallest limit among the target's and the held
+   samples (each sketch is exact below its own limit, the union only below the smallest of them),
+   and the estimate is a ratio over the target's samples in that range: about 64 of them when the
+   held trees are no larger than the target (standard deviation about 6 % of the tree), and fewer
+   as the held trees' limits drop, as with many versions of a churning image.
 
 The target's sketch is an input. Where the scheduler gets it is slice 5's question.
 

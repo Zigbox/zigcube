@@ -395,8 +395,9 @@ pub const summary_filter_hashes: u32 = 7;
 pub const summary_filter_bytes_max: u32 =
     summary_chunks_capacity * summary_filter_bits_per_chunk / 8;
 /// A sketch keeps the K smallest keys of a tree's distinct chunks. The estimate of the share a node
-/// holds is a ratio over about K samples, so its standard deviation is at most
-/// sqrt(0.25 / 64) = 6.25 % of the tree's size.
+/// holds is a ratio over the target's samples below the smallest sketch limit, at most K of them:
+/// about sqrt(0.25 / 64) = 6.25 % of the tree's size when the held trees are no larger than the
+/// target, and worse as many held trees push their limits down (docs/swarm.md).
 pub const summary_sketch_keys: u32 = 64;
 /// A key is 8 bytes and its chunk's size 4: 64 * 12 = 768 bytes a tree, with its digest and
 /// totals about 820. At most 32 held trees: 26 KiB, so filter and sketches stay under
