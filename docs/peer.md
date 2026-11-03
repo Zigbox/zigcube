@@ -253,3 +253,18 @@ file, and in `src/agent_remote_test.zig` a live server and agent files for issua
 across a server restart, renewal and the refusal of a removed node (ZC-E0807). With a memory
 store the CA is made again at each start, which says so on stderr, and every agent rejoins.
 The handshake is interim: see `docs/decisions/2026-11-03-peer-handshake-interim.md`.
+
+## The peer server and the fetch worker (slice 6b, part 2)
+
+`src/peer_stream.zig` runs the handshake and sealed messages over a socket (a message is a u32
+length and its body in records; every wait is a `poll` against one deadline). `src/peer_server.zig`
+listens, asks `peer_limit.Limiter` before each handshake (ZC-E0808 once per streak), loads the
+identity from the state directory at each handshake (`agent_peer.load_identity`) and answers
+`GET /v1/peer/trees/<digest>` and `GET /v1/peer/chunk/<hash>` with `peer_serve.answer`. A reply is a
+14-byte head message (status u16, first, last, total u32 big endian) and a body message. At most
+`peer_connections_max` connections, each with its own buffers. `src/fetch_worker.zig` drives
+`fetch_plan` over a `Transport` and a `DirImages`.
+
+Not built yet: the `zcube-agent fetch` command, the agent's `--peer-listen` flag, the registry
+client and peer discovery over `/v1/list`, the supervisor running the worker before the command,
+ZC-E0601 and ZC-W0602, and `swarm-smoke`. See `docs/decisions/2026-11-03-slice6b-handoff.md`.
