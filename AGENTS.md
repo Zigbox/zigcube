@@ -73,6 +73,11 @@ These arrive with the scaffold; keep this list current as they land.
   `sim-cluster` (40 operations) each with a fresh seed (printed as `sim-c0: seed N`, `sim-cluster: seed N` first), `sim-teeth` and, as root, `zig build test` as `tester` in a scratch
   worktree of HEAD (`-Dcheck-user=-` skips it; `useradd -m tester` creates the user). `+dirty` after the commit
   means uncommitted changes the user run did not see. It leaves out `agent-smoke` and `demo-c0`.
+- `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]` runs HANDOFF's C1 demo for real:
+  `zcube-server` with `--lease-ttl-ms 8000`, three `zcube-agent`s with `FakeRuntime` (node1 behind a
+  fault proxy), the `zcube` command; join, 6 replicas two per node, power off node3 and replacement,
+  restart and `zcube why node`, the partition test, local mode. About 35 s; uses the Postgres like
+  `test-store`. `docs/demos/c1.md` says what it asserts. Not `sim-cluster`.
 - `zig build demo-cN` runs milestone N's demo.
 
 ## Working as the implementer

@@ -288,6 +288,69 @@ jobs:
           path: demo-c0-postgres.txt
           if-no-files-found: warn
 
+  # HANDOFF's C1 demo, run for real (docs/demos/c1.md): zcube-server, three zcube-agents with
+  # FakeRuntime and the zcube command as real processes, on each backend, with the partition test
+  # and local mode. Each prints a transcript (also kept as an artifact); it fails on the first
+  # assertion that does not hold and kills everything it started.
+  demo-c1-sqlite:
+    name: demo-c1 (sqlite)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: demo-c1 on SQLite
+        run: zig build demo-c1 -Dbackend=sqlite -Dtranscript=demo-c1-sqlite.txt --summary all
+      - name: Keep the transcript
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c1-sqlite-transcript
+          path: demo-c1-sqlite.txt
+          if-no-files-found: warn
+
+  # The same image as demo-c0-postgres. demo-c1 does not stop the database.
+  demo-c1-postgres:
+    name: demo-c1 (postgres)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: demo-c1 on Postgres
+        run: zig build demo-c1 -Dbackend=postgres -Dtranscript=demo-c1-postgres.txt --summary all
+      - name: Keep the transcript
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c1-postgres-transcript
+          path: demo-c1-postgres.txt
+          if-no-files-found: warn
+
   # The control-plane core must compile for wasm32-freestanding (docs/wasm.md): no libc, no OS,
   # no threads, no std.Io. Node is the one WebAssembly runtime on the runner (its version is
   # printed below); tools/wasm_check.mjs says why a JavaScript runner is acceptable. The core is

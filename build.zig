@@ -455,6 +455,46 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c0", help).dependOn(&run.step);
+    add_demo_c1_step(b, step_options, transcript);
+}
+
+/// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
+/// real (src/demo_c1.zig): the server, three agents and the `zcube` command as real processes.
+/// It does not stop the database, so it needs no `pg-up` control.
+fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const exe = b.addExecutable(.{
+        .name = "demo_c1",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_c1.zig"),
+            .target = step_options.target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--backend");
+    switch (step_options.backend) {
+        .sqlite => run.addArg("sqlite"),
+        .postgres => run.addArgs(&.{ "postgres", "--postgres", step_options.postgres }),
+        .memory => unreachable, // `add_store_and_demo_steps` never passes it.
+    }
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addArtifactArg(built.agent);
+    run.addArg("--images");
+    run.addFileArg(b.path("fixtures/images.zon"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run HANDOFF's C1 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
+    b.step("demo-c1", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.
