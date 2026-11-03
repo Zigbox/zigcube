@@ -10,6 +10,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
+const evidence = @import("evidence.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 
@@ -121,6 +122,7 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         // A transaction cannot know the revision it will take; a reader takes it from the
         // decision key's own `mod_revision` (docs/keys.md).
         .cause = .{ .kind = .desired, .key = service_key_copy },
+        .cause_evidence = try evidence.service(ctx, &service),
     }, &batch);
     return switch (try controller.commit(ctx, .api, &batch)) {
         .applied => |revision| .{ .written = .{
@@ -161,6 +163,7 @@ pub fn delete_service(
         .reason = reason,
         .change = "deleted",
         .cause = .{ .kind = .desired, .key = kv.key },
+        .cause_evidence = try evidence.deleted_service(ctx, name),
     }, &batch);
     return switch (try controller.commit(ctx, .api, &batch)) {
         .applied => |revision| .{ .written = .{
