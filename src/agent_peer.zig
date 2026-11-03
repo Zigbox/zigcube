@@ -170,7 +170,8 @@ pub const Peer = struct {
         self.ca_public = issued.ca_public;
         self.renew_at_ms = renew_time(&issued.credential);
         self.store(diag) catch |err| {
-            // The pair is in memory and works; not being kept means joining again next start.
+            // The pair is in memory and works; the failed write is retried at the agent's next
+            // pass (renew_at_ms is 0), and a restart before it succeeds joins again.
             self.renew_at_ms = 0;
             return err;
         };
@@ -310,4 +311,99 @@ fn load_or_make_key(
         try files.write_seed(io, dir, where, key_file, seed, diag);
         return key;
     }
+}
+
+const TestState = struct {
+    tmp: std.testing.TmpDir,
+    path_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    path_length: u32 = 0,
+
+    fn make(state: *TestState, io: std.Io) !void {
+        state.tmp = std.testing.tmpDir(.{});
+        state.path_length = @intCast(try state.tmp.dir.realPath(io, &state.path_buffer));
+    }
+
+    fn path(state: *const TestState) []const u8 {
+        return state.path_buffer[0..state.path_length];
+    }
+};
+
+/// Opens a Peer in `state`, gives it a pair from the CA made of `ca_seed`, and closes it.
+fn store_pair(state: *const TestState, node: []const u8, ca_seed: u8) !void {
+    const io = std.testing.io;
+    var diag: Diag = undefined;
+    diag.reset();
+    var opened = try Peer.open(io, state.path(), "node1", &diag);
+    defer opened.close();
+    const ca = try Ed25519.KeyPair.generateDeterministic(@splat(ca_seed));
+    opened.credential = peer.issue(ca, node, opened.key.public_key.toBytes(), 1000, 100_000);
+    opened.ca_public = ca.public_key.toBytes();
+    try opened.store(&diag);
+}
+
+test "a stored pair is kept for its own node, key and CA, and ignored for any other" {
+    // Goal: finding 7 and 6. Method: store a pair; open again as the same node (kept), as another
+    // node, with a replaced key, and with another CA's ca.pub (each ignored, with no problem
+    // reported: a cache that does not fit is not a fault).
+    const io = std.testing.io;
+    var state: TestState = undefined;
+    try state.make(io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    try store_pair(&state, "node1", 5);
+    var kept = try Peer.open(io, state.path(), "node1", &diag);
+    defer kept.close();
+    try std.testing.expect(kept.credential != null);
+    try std.testing.expect(!kept.stored_problem);
+    try std.testing.expect(kept.renew_at_ms > 1000);
+
+    var other = try Peer.open(io, state.path(), "node2", &diag);
+    defer other.close();
+    try std.testing.expect(other.credential == null);
+    try std.testing.expect(!other.stored_problem);
+
+    const foreign = try Ed25519.KeyPair.generateDeterministic(@splat(6));
+    const foreign_hex = std.fmt.bytesToHex(foreign.public_key.toBytes(), .lower);
+    try state.tmp.dir.writeFile(io, .{
+        .sub_path = ca_file,
+        .data = &foreign_hex ++ "\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+    var other_ca = try Peer.open(io, state.path(), "node1", &diag);
+    defer other_ca.close();
+    try std.testing.expect(other_ca.credential == null);
+    try std.testing.expect(!other_ca.stored_problem);
+
+    try store_pair(&state, "node1", 5);
+    try state.tmp.dir.deleteFile(io, key_file);
+    var new_key = try Peer.open(io, state.path(), "node1", &diag);
+    defer new_key.close();
+    try std.testing.expect(new_key.credential == null);
+}
+
+test "a corrupt or loose cache file is ignored with one problem, never an error" {
+    // Goal: finding 6. Method: damage peer.cred, then ca.pub's text and mode; each time `open`
+    // succeeds with no pair and `stored_problem` set, ZC-E0806 in diag.
+    const io = std.testing.io;
+    var state: TestState = undefined;
+    try state.make(io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
+    try store_pair(&state, "node1", 5);
+    try state.tmp.dir.writeFile(io, .{ .sub_path = credential_file, .data = "zz\n" });
+    diag.reset();
+    var corrupt = try Peer.open(io, state.path(), "node1", &diag);
+    defer corrupt.close();
+    try std.testing.expect(corrupt.stored_problem);
+    try std.testing.expect(corrupt.credential == null);
+    try std.testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0806), diag.code);
+
+    try store_pair(&state, "node1", 5);
+    try state.tmp.dir.setFilePermissions(io, ca_file, .fromMode(0o666), .{});
+    diag.reset();
+    var loose = try Peer.open(io, state.path(), "node1", &diag);
+    defer loose.close();
+    try std.testing.expect(loose.stored_problem);
+    try std.testing.expect(loose.ca_public == null);
 }

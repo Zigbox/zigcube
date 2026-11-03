@@ -1124,7 +1124,8 @@ pub const registry = [_]Entry{
         \\
         \\The usual causes are a node whose clock is far off, or an agent that
         \\could not reach the server for a day. Check the clock on both machines
-        \\(timedatectl), then restart the agent: it renews on start.
+        \\(timedatectl). The agent renews by itself, on start and at half the life,
+        \\and retries every few seconds when the server refuses.
         ,
     },
     .{
@@ -1210,7 +1211,9 @@ pub const registry = [_]Entry{
         \\until it expires, within a day, and then its peers refuse it.
         \\
         \\If the node should be in the cluster, remove its name from the revoked
-        \\file and restart zcube-server, then restart the agent.
+        \\file and restart zcube-server; the agent asks again by itself. The API is
+        \\unauthenticated, so this binds an honest node only: until the API has auth,
+        \\anyone who can reach it can register a name and ask for a credential.
         ,
     },
     .{

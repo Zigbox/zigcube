@@ -16,7 +16,9 @@ Gives:
 
 - **Mutual authentication.** Each side proves it holds the private key of a credential the
   cluster CA signed, and a client checks that the server's credential names the node it meant to
-  reach. A peer with no CA-signed credential is refused before it is told anything.
+  reach. A peer with no CA-signed credential is refused before it is sent application data. It is
+  not refused before it is told anything: any 34-byte M1 gets the server's credential in M2, at
+  the cost of one X25519 and one Ed25519 signature. Rate limiting M1 is 6b's work.
 - **Confidentiality and integrity of the stream** (ChaCha20-Poly1305 records) and **forward
   secrecy** (fresh X25519 keys for every connection; a stolen node key does not open a recorded
   session).
@@ -125,6 +127,16 @@ client                                                          server
   "zcube-peer-v1 hs server")` and `k_hs_c` likewise with `client`. After M3,
   `prk2 = HKDF-Extract(salt = h4, ikm = dh)`; `k_c2s = Expand(prk2, "zcube-peer-v1 c2s")` and
   `k_s2c = Expand(prk2, "... s2c")`. Each handshake key seals exactly one message, nonce 0.
+- **The signed bytes.** `sign_X(label, role, h, cred)` signs `SHA-256(label || " " || role ||
+  h || cred)`, where `label` is the ASCII string `zcube-peer-v1`, `role` is `server` or `client`,
+  and `h` is `h2` or `h3`.
+- **What kind of exchange this is.** SIGMA-I-style, not Noise: there is no static DH and no
+  chaining key. The server reveals its identity to an active attacker; the client reveals its
+  own only to a server it has verified. The signatures are transferable (unlike XX's), and
+  authentication holds because each proof is sealed under the DH-derived key. See
+  docs/decisions/2026-11-03-peer-handshake-and-ca.md.
+- **Order of checks.** The transcript signature is verified before the credential's CA, window
+  and name, so a replayed old credential fails as ZC-E0804, not ZC-E0802.
 - **Why the signatures cover the credential bytes** (`|| cred`): so that a signature cannot be
   paired with a different credential for the same key (an identity misbinding). They cover
   `h2` / `h3`, which hash both ephemeral keys, so a signature is good for one connection only and
@@ -190,9 +202,22 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
   command to drive a store-backed list. When one exists it writes this list. A listed node whose
   credential has not yet expired is still accepted by peers until it does: **a day is the bound
   on revocation**, and a shorter ttl is the dial.
-- A server that has no state directory (memory store) cannot keep a CA key across a restart.
-  It generates a fresh in-memory CA each start and says so on stderr; agents re-join (their
-  stored `ca.pub` no longer matches, so they fetch the new one and a new credential).
+- **The CA key file is per store.** `ca-<16 hex of a hash of the store's identity>.key`, so two
+  clusters sharing a state directory get two CAs. The directory and the file must not be
+  writable by group or others (ZC-E0806). The key is never written to the store.
+- **A lost key is refused, not remade.** A new CA is made silently only at a store's first
+  start. If the key is missing for a store that has history, the server stops with ZC-E0806;
+  `zcube-server --new-ca` accepts a new CA, and every node then joins again.
+- **A CA that changed reaches the agents.** Every agent answer carries `chain.ca_key_id`. An
+  agent whose credential names another CA drops it and its `ca.pub`, reports ZC-E0801 once and
+  joins again at its next pass (seconds). A server without a state directory (memory store)
+  makes a new CA each start and says so in its startup line; its agents do the same.
+- **Issuance names a lease.** `POST .../credential` carries `{"node_key", "lease"}` and the
+  server issues only when the node's record is registered under that live lease (a store read;
+  ZC-E0205 otherwise). The CA reads node and lease records and writes none.
+- **The API is unauthenticated.** Revocation (`revoked`, the lease check) binds an honest node
+  only until API auth lands: anyone who can reach the API can register a name and ask for a
+  credential.
 
 ## What 6b calls
 

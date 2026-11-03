@@ -208,3 +208,28 @@ test "a seed is written 0600, read back, and a loose file is refused" {
     try std.testing.expectError(error.Failed, read_seed(io, tmp.dir, "tmp", "k", &diag));
     try std.testing.expectEqual(codes.Code.E0806, diag.code.?);
 }
+
+test "a planted temporary file with a loose mode never receives the secret" {
+    // Goal: finding 4. Method: plant `k.tmp` at 0644 holding text of its own, write a seed, and
+    // find the result at 0600, the temporary gone, the planted text not kept.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "k.tmp",
+        .data = "planted\n",
+        .flags = .{ .permissions = .fromMode(0o644) },
+    });
+    try tmp.dir.setFilePermissions(io, "k.tmp", .fromMode(0o644), .{});
+    const seed: [32]u8 = @splat(0xcd);
+    try write_seed(io, tmp.dir, "tmp", "k", seed, &diag);
+    const file = try tmp.dir.openFile(io, "k", .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "k.tmp", .{}));
+    const back = try read_seed(io, tmp.dir, "tmp", "k", &diag);
+    try std.testing.expectEqualSlices(u8, &seed, &back.?);
+}

@@ -55,8 +55,8 @@ byte for class 1 and with process ids for class 2.
 ## 2. One writer role per key
 
 **The cluster CA is not a writer.** The control plane signs peer credentials (docs/peer.md) with
-a key of its own, held in the server's state directory; issuing one writes no store key and reads
-none, so it has no chain pair and no place in any compare set. Which nodes are removed is a file
+a key of its own, held in the server's state directory; issuing one writes no store key. It reads the
+node and lease records (the node is registered under a live lease) and writes none, so it has no chain pair and no place in any compare set. Which nodes are removed is a file
 the server reads at start, not a key.
 
 Every key prefix has exactly one writer role, so two controllers never contend for one key, and a

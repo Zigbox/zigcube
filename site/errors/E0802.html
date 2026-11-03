@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>A node presented a credential outside its validity window, judged on this machine's wall clock with a skew allowance of 60 seconds. A credential lives 24 hours and the agent renews it after half that.</p>
-<p>The usual causes are a node whose clock is far off, or an agent that could not reach the server for a day. Check the clock on both machines (timedatectl), then restart the agent: it renews on start.</p>
+<p>The usual causes are a node whose clock is far off, or an agent that could not reach the server for a day. Check the clock on both machines (timedatectl). The agent renews by itself, on start and at half the life, and retries every few seconds when the server refuses.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0802</pre>

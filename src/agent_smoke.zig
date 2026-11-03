@@ -314,6 +314,7 @@ fn script(smoke: *Smoke) !void {
 
     try step_apply_three(smoke);
     const before = try step_kill_one(smoke);
+    try step_peer_files(smoke);
     try step_restart_agent(smoke, before);
     try step_restart_server(smoke);
     try step_unknown_digest(smoke);
@@ -420,6 +421,35 @@ fn same_containers(smoke: *Smoke, before: []const Pids) !bool {
         if (left.command != right.command) return false;
     }
     return true;
+}
+
+/// The first agent joined the cluster CA and keeps three files, mode 0600, in its state dir.
+fn step_peer_files(smoke: *Smoke) !void {
+    const joined = struct {
+        fn check(s: *Smoke) !bool {
+            const text = std.Io.Dir.cwd().readFileAlloc(
+                s.io,
+                try s.work_file("agent-1.log"),
+                s.arena.allocator(),
+                .limited(65536),
+            ) catch return false;
+            return std.mem.find(u8, text, "joined the cluster CA") != null;
+        }
+    };
+    try smoke.wait_until("the agent to join the cluster CA", joined.check, wait_ms_default);
+    var dir = try std.Io.Dir.cwd().openDir(smoke.io, smoke.state, .{});
+    defer dir.close(smoke.io);
+    for ([_][]const u8{ "peer.key", "peer.cred", "ca.pub" }) |name| {
+        const file = dir.openFile(smoke.io, name, .{}) catch |err| {
+            const why = "{s} is missing from the state dir: {s}";
+            try smoke.expect(false, why, .{ name, @errorName(err) });
+            return;
+        };
+        defer file.close(smoke.io);
+        const mode = (try file.stat(smoke.io)).permissions.toMode() & 0o777;
+        try smoke.expect(mode == 0o600, "{s} has mode {o}, expected 600", .{ name, mode });
+    }
+    smoke.say("the agent joined the cluster CA; peer.key, peer.cred and ca.pub are 0600", .{});
 }
 
 /// A restarted agent adopts what runs and starts nothing.

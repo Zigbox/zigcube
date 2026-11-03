@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
 <p>The server will not issue or renew a peer credential for this node, because its name is on the server's list of removed nodes (the revoked file in its state directory). The node's current credential stays valid until it expires, within a day, and then its peers refuse it.</p>
-<p>If the node should be in the cluster, remove its name from the revoked file and restart zcube-server, then restart the agent.</p>
+<p>If the node should be in the cluster, remove its name from the revoked file and restart zcube-server; the agent asks again by itself. The API is unauthenticated, so this binds an honest node only: until the API has auth, anyone who can reach it can register a name and ask for a credential.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0807</pre>

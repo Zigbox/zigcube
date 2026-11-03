@@ -193,6 +193,11 @@ test "a handshake is refused for each reason a peer can be wrong" {
     var thief = f.server;
     thief.key = try Ed25519.KeyPair.generateDeterministic(seed(77));
     try testing.expectError(error.HandshakeFailed, connect(&f.client, &thief, "node2"));
+    // A replayed old credential is shown by a node without its key: the signature fails first
+    // (E0804), not the credential's window (E0803) or CA (E0802).
+    var replayer = old;
+    replayer.key = try Ed25519.KeyPair.generateDeterministic(seed(79));
+    try testing.expectError(error.HandshakeFailed, connect(&f.client, &replayer, "node2"));
 
     // The same three on the other side: the server refuses a bad client at M3.
     const wrong_ca = try identity_of(other_ca, "node1", 1, now - hour, now + hour);

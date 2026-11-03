@@ -167,3 +167,21 @@ test "the CA signs for a live node, refuses a removed one and a bad key" {
     const off_curve: [32]u8 = @splat(0xff);
     try std.testing.expectError(error.BadKey, ca.issue("node1", off_curve));
 }
+
+test "the CA refuses a small-order key and the identity point" {
+    // Goal: finding 8b. Method: the identity (order 1) and the point (0, -1) (order 2) are on
+    // the curve and decode, but are in a small subgroup: both are refused as BadKey.
+    var clock: TestClock = .{ .ms = 1_000_000 };
+    var ca: Ca = .{
+        .key = try Ed25519.KeyPair.generateDeterministic(@splat(7)),
+        .revoked = .{},
+        .wall = clock.clock(),
+    };
+    var identity: [32]u8 = @splat(0);
+    identity[0] = 1; // y = 1, x = 0.
+    try std.testing.expectError(error.BadKey, ca.issue("node1", identity));
+    var order_two: [32]u8 = @splat(0xff);
+    order_two[0] = 0xec; // y = p - 1 = -1, x = 0.
+    order_two[31] = 0x7f;
+    try std.testing.expectError(error.BadKey, ca.issue("node1", order_two));
+}

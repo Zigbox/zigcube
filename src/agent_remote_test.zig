@@ -625,3 +625,56 @@ test "the credential endpoint refuses what it should: a bad key, a big body, a w
     const bad_name = "/v1/agent/nodes/Bad%20Name/credential";
     try testing.expectEqual(@as(u16, 400), try rig.post(bad_name, off_curve));
 }
+
+test "a memory-store server that restarts has a new CA, and the agent joins it within one retry" {
+    // Goal: finding 1. Method: join a memory-store server, restart it (a new CA, an empty
+    // store), let the agent read one answer, and see its credential dropped and ZC-E0801 shown
+    // once; then it registers again and holds a credential from the new CA.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var server = try start_server_on(io, .memory, true);
+    defer server.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var http_transport: remote_mod.HttpTransport = .{
+        .client = .{ .io = io, .address = server.address() },
+    };
+    var remote_store = remote_mod.RemoteStore.init(
+        testing.allocator,
+        http_transport.transport(),
+        "node1",
+    );
+    const remote = remote_store.interface();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var base: [constants.state_path_bytes_max]u8 = undefined;
+    const base_length = try tmp.dir.realPath(io, &base);
+    const state_dir = try std.fmt.allocPrint(arena, "{s}/agent", .{base[0..base_length]});
+    var clock_source: clock_mod.RealClock = .{ .io = io };
+    const wall = clock_source.clock().now_ms();
+
+    var identity = try agent_peer.Peer.open(io, state_dir, "node1", &diag);
+    defer identity.close();
+    var lease = try remote.lease_grant(10_000, &diag);
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    try identity.step(http_transport.transport(), arena, lease.id, wall, 3000, &diag);
+    const old_ca = identity.ca_public.?;
+    try testing.expect(remote_store.ca_key_id != null);
+    try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
+
+    server.stop();
+    server = try start_server_on(io, .memory, true);
+    http_transport.client.address = server.address();
+    lease = try remote.lease_grant(10_000, &diag);
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    try testing.expect(identity.observe_ca(remote_store.ca_key_id.?));
+    try testing.expect(identity.credential == null);
+    try testing.expect(identity.due(wall));
+    try identity.step(http_transport.transport(), arena, lease.id, wall, 3000, &diag);
+    try testing.expect(!std.mem.eql(u8, &old_ca, &identity.ca_public.?));
+    try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
+}

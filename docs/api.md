@@ -443,7 +443,8 @@ registered on it.
 
 ### `POST /v1/agent/nodes/{node}/credential` (C2 slice 6a)
 
-The join of docs/peer.md. Body `{"node_key": "<64 hex digits>"}` (the node's Ed25519 public key;
+The join of docs/peer.md. Body `{"node_key": "<64 hex digits>", "lease": N}` (the node's Ed25519 public key and the
+lease its record is registered under; 
 at most `peer_join_request_bytes_max` bytes, no unknown fields). The server's CA signs a
 credential binding that key to `{node}` for `peer_credential_ttl_ms` from its wall clock, and
 answers
@@ -456,8 +457,9 @@ answers
 The agent calls it again at half the credential's life. Refusals: `400` for a key that is not 64
 hex digits or not a point on the curve, or a node name that is not a node name; `ZC-E0807` for a
 node on the server's `revoked` file (read at start); `404` where the server has no CA (the
-simulation's `Api`). The reply carries **no chain pair**: the call reads and writes no store
-key, and the CA is not a store writer (authority.md, section 2). Like every agent endpoint it is
+simulation's `Api`); `400` for a `lease` of 0; `ZC-E0205` for a node whose record is not on that
+lease (a store read of `/nodes/{node}`). The reply carries **no chain pair**: the call writes
+no store key, and the CA is not a store writer (authority.md, section 2). Like every agent endpoint it is
 unauthenticated until the API has auth (docs/peer.md, "Trust model").
 
 ### `POST /v1/agent/nodes/{node}/lease/{id}/keepalive`
@@ -589,7 +591,9 @@ compaction point is `410` and `ZC-E0203`, and the agent treats that as "changed"
 ### The chain pair (C1 slice 10b)
 
 Every `200` answer of these endpoints carries
-`"chain": {"revision": R, "hash": "<64 hex>", "verified": V}`: for a write (registration, report),
+`"chain": {"revision": R, "hash": "<64 hex>", "verified": V, "ca_key_id": "<16 hex>"}`
+(`ca_key_id`, C2 slice 6a: the first 8 bytes of SHA-256 of the cluster CA's public key, when the
+server has a CA; an agent whose credential names another CA joins again): for a write (registration, report),
 the revision and hash of the transaction itself; otherwise the store's `status` taken after the
 endpoint did its work (for the watch, the head it answered at), so it is at least as new as
 anything in the answer. `verified` is `false` when the server keeps no pair for its store across
@@ -636,5 +640,5 @@ rest are about the agent's own host.
 | `ZC-E0508` | user | the container's command can't be run | the supervisor, as `start_failed` |
 | `ZC-E0509` | environment | the container's supervisor is gone | `FakeRuntime`, as `lost` |
 | `ZC-W0501` | environment | the agent's lease ended and it registered again | the agent, a warning |
-| `ZC-E0806` | environment | the CA key, a node key or a credential file can't be used | `zcube-server` and the agent at start |
+| `ZC-E0806` | user | a peer key or trust file can't be used | `zcube-server` and the agent at start |
 | `ZC-E0807` | user | the node was removed from the cluster and is refused a credential | the credential endpoint |
