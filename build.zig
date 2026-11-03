@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .libpq = libpq_module,
     });
     add_agent_smoke_step(b, built, zigbox_module);
+    add_local_smoke_step(b, built);
     add_bench_watch_step(b, shared_options);
     add_tidy_step(b);
     add_errors_site_steps(b);
@@ -279,6 +280,30 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     run.has_side_effects = true;
     const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
     b.step("agent-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build local-smoke`: `zcube local up` and `down` as a person would use them
+/// (src/local_smoke.zig), on copies of the executables the build made. Never cached, not in
+/// `check`, not demo-c0.
+fn add_local_smoke_step(b: *std.Build, built: Built) void {
+    const exe = b.addExecutable(.{
+        .name = "local_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/local_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    // The smoke copies the three executables into a directory of its own: the 0.17 build system
+    // does not tell a build script the install prefix, and `zcube local` finds the server and
+    // the agent beside itself.
+    run.addArtifactArg(built.cli);
+    run.addArtifactArg(built.server);
+    run.addArtifactArg(built.agent);
+    run.has_side_effects = true;
+    const help = "Run zcube local up and down against real processes (not demo-c0)";
+    b.step("local-smoke", help).dependOn(&run.step);
 }
 
 /// `zig build bench-watch`: the watch fan-out row of docs/c1.md (src/bench_watch.zig), a real

@@ -46,6 +46,9 @@ pub const Code = enum(u8) {
     W0119,
     E0120,
     E0121,
+    E0122,
+    E0123,
+    E0124,
     E0201,
     E0202,
     E0203,
@@ -323,6 +326,12 @@ pub const registry = [_]Entry{
         \\
         \\Name a directory you can write, for example
         \\export XDG_STATE_HOME=$HOME/.local/state
+        \\
+        \\zcube local keeps its database, logs and containers in a directory of its
+        \\own, $ZCUBE_LOCAL_DIR if that is set, else the local directory under the
+        \\state directory above. The same applies: it must be absolute, and zcube
+        \\must be able to create and write it. If ZCUBE_LOCAL_DIR is set, change or
+        \\unset that one instead; XDG_STATE_HOME does not affect it.
         ,
     },
     .{
@@ -397,6 +406,52 @@ pub const registry = [_]Entry{
         \\
         \\The cause line names the numbers. Shorten the lease time to live, or
         \\leave the fencing constants as they are.
+        ,
+    },
+    .{
+        .code = .E0122,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "zcube local can't find or start the server or agent",
+        .explanation =
+        \\zcube local up starts zcube-server and zcube-agent, and looks for them in
+        \\the directory that holds the zcube command itself. One of them is not
+        \\there, is not an executable file, or the system refused to start it, so
+        \\nothing was left running.
+        \\
+        \\Build all three with zig build and run zcube from zig-out/bin, or keep the
+        \\three files together when you install them.
+        ,
+    },
+    .{
+        .code = .E0123,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the local server or agent did not come up",
+        .explanation =
+        \\zcube local up started zcube-server and zcube-agent, but the server did
+        \\not answer, or the node did not register, within the time zcube waits.
+        \\Both processes were stopped again. The cause line says which of the two
+        \\steps failed, and the server's own log, which names the real reason (a
+        \\port in use, a database it could not open), is in the local directory.
+        \\
+        \\Read server.log and agent.log there. Your data is kept: zcube local up
+        \\tries again with the same files.
+        ,
+    },
+    .{
+        .code = .E0124,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "another zcube local command is running",
+        .explanation =
+        \\zcube local up and zcube local down take turns: each holds a lock on the
+        \\file lock in the local directory while it starts or stops the server and
+        \\the agent, so two of them never fight over the same processes. Another one
+        \\held the lock for longer than this one was willing to wait.
+        \\
+        \\Wait for the other command to finish and run this one again. The lock is
+        \\released when its holder ends, however it ends, so it is never stale.
         ,
     },
     .{
