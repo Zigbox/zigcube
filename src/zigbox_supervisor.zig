@@ -20,6 +20,7 @@ const zigbox = @import("zigbox");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("fake_files.zig");
+const agent_records = @import("agent_records.zig");
 const image = @import("zigbox_image.zig");
 const launch = @import("zigbox_launch.zig");
 
@@ -118,23 +119,29 @@ const Real = struct {
 /// What the swarm fetch needs beyond the launch's `Fetch`: the tree, the manifest, the IO.
 const Swarm = struct {
     io: std.Io,
+    /// The container's name: its pull record is `<state dir>/containers/<name>/pull.json`.
+    name: []const u8,
     fetch: launch.Fetch,
     tree: []const u8,
     manifest: []const u8,
 };
 
-fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
-    var store: zigbox.store.Store = undefined;
-    if (!zigbox.store.Store.locate(&store, host)) return false;
-    var argv: [20][]const u8 = undefined;
+/// The words of the fetch: `argv` holds them, `report` is where the pull's record goes.
+fn fetch_argv(
+    swarm: Swarm,
+    store_root: []const u8,
+    report: []const u8,
+    argv: *[fetch_argv_max][]const u8,
+) []const []const u8 {
     var count: usize = 0;
     const head = [_][]const u8{
         swarm.fetch.exe,  "fetch",
         "--node",         swarm.fetch.node,
         "--state-dir",    swarm.fetch.state_dir,
-        "--zigbox-store", store.root_text(),
+        "--zigbox-store", store_root,
         "--manifest",     swarm.manifest,
         "--digest",       swarm.tree,
+        "--report",       report,
     };
     for (head) |word| {
         argv[count] = word;
@@ -150,8 +157,26 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
         argv[count + 1] = swarm.fetch.server;
         count += 2;
     }
+    return argv[0..count];
+}
+
+const fetch_argv_max = 20;
+
+fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
+    var store: zigbox.store.Store = undefined;
+    if (!zigbox.store.Store.locate(&store, host)) return false;
+    // The agent publishes `containers/<name>/pull.json` (agent.zig); the directory may not exist
+    // in this runtime, and a report that cannot be written only loses the statistics.
+    var report_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const report = std.fmt.bufPrint(&report_buffer, "{s}/{s}{s}/{s}", .{
+        swarm.fetch.state_dir, agent_records.dir_containers, swarm.name, agent_records.file_pull,
+    }) catch return false;
+    const parent = std.fs.path.dirname(report).?;
+    std.Io.Dir.cwd().createDirPath(swarm.io, parent) catch {}; // Said by the fetch if it matters.
+    var words: [fetch_argv_max][]const u8 = undefined;
+    const argv = fetch_argv(swarm, store.root_text(), report, &words);
     var child = std.process.spawn(swarm.io, .{
-        .argv = argv[0..count],
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -208,7 +233,7 @@ fn supervise(
     var real: Real = .{ .host = host, .storage = storage, .spec = &container };
     if (spec.fetch) |fetch| {
         if (launch.manifest_of(spec.reference)) |manifest| {
-            real.swarm = .{ .io = io, .fetch = fetch, .tree = spec.tree, .manifest = manifest };
+            real.swarm = .{ .io = io, .name = spec.name, .fetch = fetch, .tree = spec.tree, .manifest = manifest };
         }
     }
     var trace: image.Trace = .{};
@@ -250,4 +275,24 @@ fn container_spec(arena: Allocator, spec: *const launch.Spec) ?zigbox.Spec {
             .cpu_millis = spec.cpu_millis,
         },
     };
+}
+
+test "the fetch is told where to put its pull record, and the registry and server only if known" {
+    var swarm: Swarm = .{
+        .io = std.testing.io,
+        .name = "web-0",
+        .fetch = .{ .exe = "/bin/zcube-agent", .node = "n1", .state_dir = "/state" },
+        .tree = "b3:aa",
+        .manifest = "sha256:bb",
+    };
+    var words: [fetch_argv_max][]const u8 = undefined;
+    var argv = fetch_argv(swarm, "/store", "/state/containers/web-0/pull.json", &words);
+    try std.testing.expectEqual(@as(usize, 14), argv.len);
+    try std.testing.expectEqualStrings("--report", argv[12]);
+    try std.testing.expectEqualStrings("/state/containers/web-0/pull.json", argv[13]);
+    swarm.fetch.registry = "r:1";
+    swarm.fetch.server = "s:2";
+    argv = fetch_argv(swarm, "/store", "x", &words);
+    try std.testing.expectEqual(@as(usize, 18), argv.len);
+    try std.testing.expectEqualStrings("--server", argv[16]);
 }

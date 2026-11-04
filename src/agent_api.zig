@@ -134,6 +134,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "assigned")) return call.assigned();
     if (std.mem.eql(u8, what, "observed")) return call.observed();
     if (std.mem.eql(u8, what, "store")) return call.summary();
+    if (std.mem.eql(u8, what, "pulls")) return call.pull();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     if (std.mem.eql(u8, what, "credential")) return call.credential();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
@@ -503,6 +504,64 @@ const Call = struct {
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
 
+    // ---- POST /v1/agent/nodes/{node}/pulls ----
+
+    /// One pull record (`/pulls/<node>/<tree>`, statistics) under the agent's tenure. The key is
+    /// built from the record, so an agent can write its own node's pulls and no other key.
+    fn pull(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("POST");
+        try call.only_known();
+        try call.no_more();
+        if (call.body.len > constants.pull_request_bytes_max) {
+            return bad_request(ctx, "body", "is larger than a pull record can be");
+        }
+        const input = try parse_body_up_to(PullBody, ctx, call.body, .{
+            .bytes_max = constants.pull_request_bytes_max,
+            .ignore_unknown_fields = true,
+        });
+        const record = input.pull;
+        if (record.v != 1) return bad_request(ctx, "pull.v", "must be 1");
+        if (input.tenure == 0) return bad_request(ctx, "tenure", "is needed: it must not be 0");
+        if (!std.mem.eql(u8, record.node, call.node)) {
+            return bad_request(ctx, "pull", "is for another node");
+        }
+        if (record.tree.len == 0 or record.tree.len > constants.tree_digest_bytes) {
+            return bad_request(ctx, "pull.tree", "is not a tree digest");
+        }
+        if (!key_safe(record.tree)) return bad_request(ctx, "pull.tree", "is not printable text");
+        if (record.peer_bytes.len > constants.pull_peers_max) {
+            return bad_request(ctx, "pull.peer_bytes", "names more peers than a pull may");
+        }
+        if (record.bad_peers.len > constants.pull_peers_max) {
+            return bad_request(ctx, "pull.bad_peers", "names more peers than a pull may");
+        }
+        for (record.peer_bytes) |sent| try pull_peer_name(ctx, "pull.peer_bytes", sent.peer);
+        for (record.bad_peers) |named| try pull_peer_name(ctx, "pull.bad_peers", named);
+        const value = records.encode(ctx.arena, record, ctx.diag) catch return propagate(ctx);
+        if (value.len > constants.pull_record_bytes_max) {
+            return bad_request(ctx, "pull", "is larger than a pull record can be");
+        }
+        const key = records.pull_key(call.node, record.tree);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+        var tenure: compare_sets.Set = .{};
+        compare_sets.observed_write(&tenure, call.node, input.tenure);
+        const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = call.node };
+        const result = writers.txn(ctx.store, role, request, ctx.diag) catch
+            return propagate(ctx);
+        if (!result.succeeded) return tenure_ended(ctx, call.node);
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .chain = pair });
+    }
+
+    /// A peer is named by a node name: the statistics reach a terminal, and a name that is not
+    /// one could carry control bytes there.
+    fn pull_peer_name(ctx: *const Context, field: []const u8, name: []const u8) Failure!void {
+        if (records.name_problem(name, constants.node_name_bytes_max) == null) return;
+        return bad_request(ctx, field, "names a peer that is not a valid node name");
+    }
+
     /// The summary rides the lease of the node's registration, which the tenure compare pins: a
     /// body that names another lease (or none) is refused, so it cannot attach the record to a
     /// lease that ends at another time.
@@ -657,6 +716,19 @@ const SummaryBody = struct {
     lease: u64 = 0,
     summary: records.NodeStore,
 };
+
+const PullBody = struct {
+    tenure: u64 = 0,
+    pull: records.Pull,
+};
+
+/// Whether every byte is printable ASCII and not a slash: it can be a part of a key.
+fn key_safe(text: []const u8) bool {
+    for (text) |byte| {
+        if (byte <= 0x20 or byte >= 0x7f or byte == '/') return false;
+    }
+    return true;
+}
 
 const ObservedBody = struct {
     /// The revision of the registration the agent writes under (its tenure).

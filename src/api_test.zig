@@ -7,6 +7,7 @@ const testing = std.testing;
 const api_mod = @import("api.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
+const constants = @import("constants.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -554,4 +555,244 @@ test "status lists the auditor's finding; check shows it; repair asks, then writ
     const cleared = field(repaired, "nodes").array.items[0];
     try testing.expect(field(cleared, "finding") == .null);
     try rig.refused(repair(&rig, "confirm=true"), 409, "ZC-E0402");
+}
+
+/// Puts a pull record of `node` for `tree` into the store as the agent would, finished at `at_ms`.
+fn put_pull(rig: *Rig, node: []const u8, tree: []const u8, at_ms: u64, version: u32) !void {
+    const ctx = rig.world.controller_context();
+    const record: records.Pull = .{
+        .v = version,
+        .node = node,
+        .tree = tree,
+        .registry_bytes = 1000,
+        .peer_bytes = &.{.{ .peer = "node2", .bytes = 500 }},
+        .cached_bytes = 20,
+        .finished_at_ms = at_ms,
+    };
+    const bytes = try records.encode(ctx.arena, record, ctx.diag);
+    const key = records.pull_key(node, tree);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+    _ = try writers.txn(ctx.store, .{ .agent = node }, .{ .on_success = &.{op} }, ctx.diag);
+}
+
+test "stats pull lists the pulls newest first, by node, with a limit, and counts what it skips" {
+    // Goal: docs/api.md, "GET /v1/stats/pull". Method: three pulls on two nodes, one record from
+    // a version that does not exist yet, one that is not JSON; then ask all, one node, a limit.
+    var rig = try Rig.start(3);
+    defer rig.stop();
+    try put_pull(&rig, "node1", "b3:00000001", 100, 1);
+    try put_pull(&rig, "node2", "b3:00000002", 300, 1);
+    try put_pull(&rig, "node1", "b3:00000003", 200, 1);
+    try put_pull(&rig, "node1", "b3:00000004", 400, 99);
+    const ctx = rig.world.controller_context();
+    const junk: store.Op = .{ .put = .{ .key = "/pulls/node3/b3:00000005", .value = "{" } };
+    _ = try writers.txn(ctx.store, .{ .agent = "node3" }, .{ .on_success = &.{junk} }, ctx.diag);
+
+    const all = try rig.ok("/v1/stats/pull", "");
+    const pulls = field(all, "pulls").array.items;
+    try testing.expectEqual(@as(usize, 3), pulls.len);
+    try testing.expectEqualStrings("b3:00000002", field(pulls[0], "tree").string);
+    try testing.expectEqualStrings("b3:00000003", field(pulls[1], "tree").string);
+    try testing.expectEqualStrings("b3:00000001", field(pulls[2], "tree").string);
+    try testing.expectEqual(@as(i64, 1000), field(pulls[0], "registry_bytes").integer);
+    const peer = field(pulls[0], "peer_bytes").array.items[0];
+    try testing.expectEqualStrings("node2", field(peer, "peer").string);
+    try testing.expectEqual(@as(i64, 2), field(all, "skipped").integer);
+    try testing.expectEqual(false, field(all, "truncated").bool);
+    try testing.expectEqual(@as(i64, 3), field(all, "matched").integer);
+
+    const mine = try rig.ok("/v1/stats/pull", "node=node1");
+    try testing.expectEqual(@as(usize, 2), field(mine, "pulls").array.items.len);
+    const one = try rig.ok("/v1/stats/pull", "limit=1");
+    try testing.expectEqual(@as(usize, 1), field(one, "pulls").array.items.len);
+    const none = try rig.ok("/v1/stats/pull", "node=node9");
+    try testing.expectEqual(@as(usize, 0), field(none, "pulls").array.items.len);
+}
+
+test "stats pull counts a stored row that names a peer that is not a node name as skipped" {
+    // Goal: the read side of the agent endpoint's peer-name check. Method: one good pull and one
+    // row stored with a bad peer name (written straight to the store, as a bug or another
+    // writer could); the bad one is skipped, not served.
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    try put_pull(&rig, "node1", "b3:00000001", 100, 1);
+    const ctx = rig.world.controller_context();
+    const value =
+        \\{"v":1,"node":"node1","tree":"b3:00000002","peer_bytes":[{"peer":"a b","bytes":1}]}
+    ;
+    const key = records.pull_key("node1", "b3:00000002");
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+    _ = try writers.txn(ctx.store, .{ .agent = "node1" }, .{ .on_success = &.{op} }, ctx.diag);
+    const reply = try rig.ok("/v1/stats/pull", "");
+    try testing.expectEqual(@as(usize, 1), field(reply, "pulls").array.items.len);
+    try testing.expectEqual(@as(i64, 1), field(reply, "skipped").integer);
+    try testing.expectEqual(@as(i64, 1), field(reply, "matched").integer);
+}
+
+test "stats pull stops at its read cap and says truncated instead of failing" {
+    // Goal: more records than the cap (retention is eventual, so a cluster can hold them) is a
+    // partial answer, not ZC-E0302. Method: cap + 5 pulls on two nodes; ask for 500; the reply
+    // lists 500, matched is the cap, truncated is true, and a node-limited read is complete.
+    var rig = try Rig.start(8);
+    defer rig.stop();
+    const total = constants.pulls_read_max + 5;
+    for (0..total) |at| {
+        var tree: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at});
+        try put_pull(&rig, if (at < 10) "node2" else "node1", name, 1000 + at, 1);
+    }
+    const reply = try rig.ok("/v1/stats/pull", "limit=500");
+    try testing.expectEqual(@as(usize, 500), field(reply, "pulls").array.items.len);
+    try testing.expectEqual(@as(i64, constants.pulls_read_max), field(reply, "matched").integer);
+    try testing.expectEqual(true, field(reply, "truncated").bool);
+    const small = try rig.ok("/v1/stats/pull", "node=node2");
+    try testing.expectEqual(false, field(small, "truncated").bool);
+    try testing.expectEqual(@as(usize, 10), field(small, "pulls").array.items.len);
+}
+
+test "stats pull at its read cap with the largest records fits the request arena" {
+    // Goal: constants.zig's claim that the cap's worst case fits `request_arena_bytes_max`, which
+    // an arena that frees nothing makes easy to get wrong. Method: `pulls_read_max` + 5 records
+    // each with the most peers, bad peers and longest names the agent endpoint accepts; one
+    // request with limit 500; the arena's whole capacity must stay within the real limit.
+    var rig = try Rig.start(9);
+    defer rig.stop();
+    const node: [constants.node_name_bytes_max]u8 = @splat('n');
+    const peer: [constants.node_name_bytes_max]u8 = @splat('p');
+    var peers: [constants.pull_peers_max]records.PullPeer = undefined;
+    for (&peers) |*slot| slot.* = .{ .peer = &peer, .bytes = std.math.maxInt(u64) };
+    var bad: [constants.pull_peers_max][]const u8 = undefined;
+    for (&bad) |*slot| slot.* = &peer;
+    var longest: usize = 0;
+    for (0..constants.pulls_read_max + 5) |at| {
+        const ctx = rig.world.controller_context();
+        var tree: [64]u8 = @splat('t');
+        _ = std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at}) catch unreachable; // 11 bytes fit in 64.
+        const record: records.Pull = .{
+            .node = &node,
+            .tree = &tree,
+            .registry_bytes = std.math.maxInt(u64),
+            .peer_bytes = &peers,
+            .cached_bytes = std.math.maxInt(u64),
+            .started_at_ms = std.math.maxInt(u64),
+            .finished_at_ms = 1000 + at,
+            .bad_peers = &bad,
+        };
+        const bytes = try records.encode(ctx.arena, record, ctx.diag);
+        try testing.expect(bytes.len <= constants.pull_record_bytes_max);
+        longest = @max(longest, bytes.len);
+        const key = records.pull_key(&node, &tree);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+        _ = try writers.txn(ctx.store, .{ .agent = &node }, .{ .on_success = &.{op} }, ctx.diag);
+    }
+    try testing.expect(longest > constants.pull_record_bytes_max / 2); // Really near the worst.
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = rig.world.controller_context();
+    ctx.arena = arena.allocator();
+    const response = rig.api.handle(&ctx, .{
+        .method = "GET",
+        .path = "/v1/stats/pull",
+        .query = "limit=500",
+    });
+    try testing.expectEqual(@as(u16, 200), response.status);
+    // Every byte the arena took, chunk overhead included, is at most what the real one allows.
+    try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
+    try testing.expect(response.body.len > 400 * constants.pull_record_bytes_max / 2);
+    try testing.expect(std.mem.indexOf(u8, response.body, "\"truncated\":true") != null);
+}
+
+test "stats pull with malformed rows near the cap says truncated, never ZC-E0302" {
+    // Goal: docs/api.md's "never a failure" when rows that do not parse use up the pages. Method:
+    // the cap's worth minus 10 valid pulls on node1, then three pages of rows on node2 that are
+    // not JSON; the reply is 200 with truncated, and the skipped rows count toward the cap.
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    const valid = constants.pulls_read_max - 10;
+    for (0..valid) |at| {
+        var tree: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at});
+        try put_pull(&rig, "node1", name, 1000 + at, 1);
+    }
+    const ctx = rig.world.controller_context();
+    for (0..3 * constants.store_list_limit_max) |at| {
+        var key: [40]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "/pulls/node2/b3:{x:0>8}", .{at});
+        const op: store.Op = .{ .put = .{ .key = name, .value = "not json" } };
+        _ = try writers.txn(ctx.store, .{ .agent = "node2" }, .{ .on_success = &.{op} }, ctx.diag);
+    }
+    const reply = try rig.ok("/v1/stats/pull", "limit=500");
+    try testing.expectEqual(true, field(reply, "truncated").bool);
+    try testing.expectEqual(@as(usize, valid), field(reply, "pulls").array.items.len);
+    try testing.expectEqual(@as(i64, 10), field(reply, "skipped").integer);
+}
+
+test "stats pull refuses a bad node, a bad limit, an unknown parameter and an unknown kind" {
+    // Goal: the handler's parameter checks. Method: one request each; every answer is a 400/404
+    // with a code and the request's id.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    try rig.refused(rig.get("/v1/stats/pull", "node=A%20B"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/pull", "limit=0"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/pull", "limit=501"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/pull", "bogus=1"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/other", ""), 404, "ZC-E0101");
+    try rig.refused(rig.get("/v1/stats", ""), 404, "ZC-E0101");
+}
+
+test "the agent publishes the pull records its fetches left, and removes every file it read" {
+    // Goal: slice 7's data path, agent side. Method: leave `pull.json` in three container
+    // directories (a good record, one for another node, one that is not JSON) in the state
+    // directory; one agent step stores the good one under /pulls/node1/ and removes all three.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const files = rig.world.files.interface();
+    const good =
+        \\{"v":1,"node":"node1","tree":"b3:51aa9c03","registry_bytes":7,"finished_at_ms":9}
+    ;
+    const foreign = "{\"v\":1,\"node\":\"node2\",\"tree\":\"b3:51aa9c03\"}";
+    try files.put_atomic("containers/hello-1/pull.json", good);
+    try files.put_atomic("containers/hello-2/pull.json", foreign);
+    try files.put_atomic("containers/hello-3/pull.json", "{");
+    const stepped = rig.world.agent_step();
+    try testing.expect(stepped.failed == null);
+
+    const ctx = rig.world.controller_context();
+    const options: store.ListOptions = .{ .prefix = records.prefix_pulls, .limit = 10 };
+    const listed = try ctx.store.list(ctx.arena, options, ctx.diag);
+    try testing.expectEqual(@as(usize, 1), listed.kvs.len);
+    try testing.expectEqualStrings("/pulls/node1/b3:51aa9c03", listed.kvs[0].key);
+    const names = [_][]const u8{
+        "containers/hello-1/pull.json",
+        "containers/hello-2/pull.json",
+        "containers/hello-3/pull.json",
+    };
+    for (names) |name| {
+        try testing.expectError(error.Absent, files.read(ctx.arena, name));
+    }
+}
+
+test "a pull retention pass that fails is recorded and does not fail the controller step" {
+    // Goal: statistics never hold replica work back. Method: an old pull record, every delete under
+    // /pulls/ failing as an unreachable server does; the server steps without error, the replicas
+    // of an applied service are placed, and the cursor says what failed and backs off; once the
+    // store answers, the record is dropped and the failure is cleared.
+    var rig = try Rig.start(7);
+    defer rig.stop();
+    try put_pull(&rig, "node1", "b3:00000001", 100, 1);
+    rig.world.switched.down_write_prefix = "/pulls/";
+    _ = try rig.world.apply(hello);
+    rig.world.advance(3000);
+    const cursor = &rig.world.server.replicas.pulls;
+    try testing.expect(cursor.failing);
+    try testing.expect(cursor.failures > 0);
+    try testing.expectEqual(codes.Code.E0201, cursor.failure.code.?);
+    try testing.expectEqual(@as(u32, 2), rig.world.running_count("hello"));
+    rig.world.switched.down_write_prefix = null;
+    rig.world.advance(constants.pulls_retry_ms + 3000);
+    try testing.expect(!cursor.failing);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
 }

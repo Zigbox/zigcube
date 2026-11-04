@@ -5,6 +5,7 @@ test {
     _ = @import("text.zig");
     _ = @import("test_util.zig");
     _ = @import("clock.zig");
+    _ = @import("agent_run.zig");
     _ = @import("diag/codes.zig");
     _ = @import("diag.zig");
     _ = @import("errors_site.zig");
@@ -49,6 +50,7 @@ test {
     _ = @import("server_static.zig");
     _ = @import("server.zig");
     _ = @import("server_test.zig");
+    _ = @import("pull_arena_test.zig");
     _ = @import("bundle.zig");
     _ = @import("bundle_collect.zig");
     _ = @import("bundle_redact.zig");

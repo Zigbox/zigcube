@@ -491,7 +491,7 @@ pub const Swarm = struct {
     ) !void {
         var zigbox_root: ?[]const u8 = null;
         if (config.runtime == .zigbox) {
-            zigbox_root = try swarm.zigbox_store(init);
+            zigbox_root = try swarm.zigbox_store(init.minimal.environ);
         }
         try swarm.start_with(init.io, gpa, config, zigbox_root);
     }
@@ -553,8 +553,8 @@ pub const Swarm = struct {
 
     /// The Zigbox store this node pulls into, made if absent (what `pull` would make), so the
     /// peer server can serve it from the first start.
-    fn zigbox_store(swarm: *Swarm, init: std.process.Init) ![]const u8 {
-        var host: zigbox.host_real.HostReal = .{ .environ = init.minimal.environ };
+    fn zigbox_store(swarm: *Swarm, environ: std.process.Environ) ![]const u8 {
+        var host: zigbox.host_real.HostReal = .{ .environ = environ };
         var zstore: zigbox.store.Store = undefined;
         var diag: zigbox.diag.Diag = undefined;
         diag.reset();
@@ -731,3 +731,61 @@ const Backend = struct {
         }
     }
 };
+
+// ---- Tests ------------------------------------------------------------------------------------
+
+test "the store the agent reports from: the chunk directory, else Zigbox's, else the fake's" {
+    // Goal: `Shell.images` is the store the node really holds (slice 8). Method: `node_images`
+    // is that choice; each source is told apart by the summary it gives.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: @import("zigbox_images.zig").Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    var opened: zigbox_fetch.Opened = .{};
+    try opened.open(std.testing.allocator, pair.a.root_text());
+    defer opened.close();
+    var fake: node_store.FakeImages = .{ .digests = &.{} };
+    var swarm: Swarm = .{};
+    var config: config_mod.Config = .{
+        .runtime = .fake,
+        .pulls = &.{},
+        .node = "n1",
+        .server = try std.Io.net.IpAddress.parse("127.0.0.1", 1),
+        .state_dir = "/tmp",
+        .images = &.{},
+        .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+        .address = "",
+        .verbose = false,
+    };
+    // Nothing to read from: a node on the zigbox runtime with no store yet reports none.
+    config.runtime = .zigbox;
+    try std.testing.expect(node_images(&swarm, config, &fake) == null);
+    config.runtime = .fake;
+    try std.testing.expectEqual(@as(*anyopaque, &fake), node_images(&swarm, config, &fake).?.context);
+    // The Zigbox store wins over the fake's, and is the one opened.
+    swarm.zigbox = &opened;
+    const got = node_images(&swarm, config, &fake).?;
+    try std.testing.expectEqual(@as(*anyopaque, &opened.images), got.context);
+}
+
+test "Swarm finds the Zigbox store from the environment, making it if absent" {
+    // Goal: the real `Swarm.start` lookup (two lines over `start_with`). Method: an environment
+    // whose XDG_DATA_HOME is a scratch directory; the store lands at `$XDG_DATA_HOME/zbx/store`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buffer)];
+    var entry_buffer: [std.fs.max_path_bytes + 32:0]u8 = undefined;
+    const entry = try std.fmt.bufPrint(&entry_buffer, "XDG_DATA_HOME={s}", .{base});
+    entry_buffer[entry.len] = 0;
+    const entries = [_:null]?[*:0]const u8{@ptrCast(&entry_buffer)};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &entries } };
+    var swarm: Swarm = .{};
+    const root = try swarm.zigbox_store(environ);
+    try std.testing.expect(std.mem.startsWith(u8, root, base));
+    try std.testing.expect(std.mem.endsWith(u8, root, "zbx/store"));
+    var opened: zigbox_fetch.Opened = .{};
+    try opened.open(std.testing.allocator, root); // It is a store that opens as existing.
+    opened.close();
+}

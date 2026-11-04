@@ -551,6 +551,8 @@ pub const Args = struct {
     /// `--peer` values left out because the name is not a node name, and the first of them.
     peers_skipped: u32 = 0,
     first_skipped: []const u8 = "",
+    /// Where a successful fetch writes its `records.Pull` (the agent publishes it); empty: none.
+    report: []const u8 = "",
 };
 
 pub fn parse(args: []const []const u8) ?Args {
@@ -576,6 +578,8 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.digest = value;
         } else if (std.mem.eql(u8, flag, "--registry")) {
             parsed.registry = parse_address(value) orelse return null;
+        } else if (std.mem.eql(u8, flag, "--report")) {
+            parsed.report = value;
         } else if (std.mem.eql(u8, flag, "--server")) {
             parsed.server = parse_address(value) orelse return null;
         } else if (std.mem.eql(u8, flag, "--peer")) {
@@ -651,7 +655,8 @@ fn parse_address(text: []const u8) ?IpAddress {
 
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
     "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX [--source OCI-REF]) " ++
-    "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
+    "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--report FILE] " ++
+    "[--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
 /// memory), 3 is that no source had the tree (the supervisor records that as ZC-E0601).
@@ -785,6 +790,7 @@ fn fetch_from(
     note(io, describe_skipped(&line, skipped));
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};
+    const started_ms = real_ms(io);
     const transport = net.transport();
     const asked = infos[0..found];
     switch (target) {
@@ -800,6 +806,7 @@ fn fetch_from(
             };
         },
     }
+    if (parsed.report.len > 0) write_report(gpa, net, parsed, &report, started_ms);
     var buffer: [256]u8 = undefined;
     const said = "zcube-agent fetch: {s} chunks {d} held {d} peers {d} registry {d} " ++
         "bad lists {d}\n";
@@ -844,7 +851,31 @@ fn fetch_zigbox(
         .already_held = done.already_held,
         .peer_chunks = done.peer_chunks,
         .bad_lists = done.bad_bundles,
+        .peer_bytes = done.peer_bytes,
+        .cached_bytes = done.cached_bytes,
+        .struck_peers = done.struck_peers,
     };
+}
+
+/// Counts what `pull` did with each blob: a downloaded or resumed blob is the registry's bytes
+/// (a resumed one counts whole, the size Zigbox reports), a cached one the store's own.
+fn add_blob_bytes(report: *fetch_worker.Report, blobs: []const zigbox_pull.Blob) void {
+    for (blobs) |blob| switch (blob.outcome) {
+        .downloaded, .resumed => report.registry_bytes += blob.bytes,
+        .cached => report.cached_bytes += blob.bytes,
+    };
+}
+
+test "add_blob_bytes sorts a pull's blobs into registry and cached bytes" {
+    var report: fetch_worker.Report = .{ .cached_bytes = 5 };
+    const blobs = [_]zigbox_pull.Blob{
+        .{ .digest = undefined, .bytes = 100, .outcome = .downloaded },
+        .{ .digest = undefined, .bytes = 7, .outcome = .cached },
+        .{ .digest = undefined, .bytes = 30, .outcome = .resumed },
+    };
+    add_blob_bytes(&report, &blobs);
+    try std.testing.expectEqual(@as(u64, 130), report.registry_bytes);
+    try std.testing.expectEqual(@as(u64, 12), report.cached_bytes);
 }
 
 /// No peer had the tree: Zigbox's `pull` of the assignment's reference, checked against the
@@ -878,12 +909,88 @@ fn pull_fallback(
         return error.TreeUnavailable;
     };
     note(net.io, "zcube-agent fetch: pulled from the registry\n");
-    return .{
+    var report: fetch_worker.Report = .{
         .chunks = pulled.blob_count,
         .already_held = done.already_held,
         .registry_chunks = pulled.blob_count,
+        .peer_bytes = done.peer_bytes,
+        .cached_bytes = done.cached_bytes,
+        .struck_peers = done.struck_peers,
     };
+    add_blob_bytes(&report, pulled.blobs[0..pulled.blob_count]);
+    return report;
 }
+
+
+fn real_ms(io: std.Io) u64 {
+    return @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+}
+
+/// The peers a pull's record names, as (with bytes, struck): a peer whose name is not a node
+/// name is left out, because the server refuses the record for it (ZC-E0104) and the name is
+/// printed on a terminal.
+fn report_peers(
+    named: []const Peer,
+    report: *const fetch_worker.Report,
+    peers: []records.PullPeer,
+    bad: [][]const u8,
+) [2]usize {
+    var peer_count: usize = 0;
+    var bad_count: usize = 0;
+    for (named, 0..) |who, at| {
+        if (records.name_problem(who.name, constants.node_name_bytes_max) != null) continue;
+        if (peer_count < peers.len and report.peer_bytes[at] > 0) {
+            peers[peer_count] = .{ .peer = who.name, .bytes = report.peer_bytes[at] };
+            peer_count += 1;
+        }
+        const struck = (report.struck_peers >> @intCast(at)) & 1 != 0;
+        if (struck and bad_count < bad.len) {
+            bad[bad_count] = who.name;
+            bad_count += 1;
+        }
+    }
+    return .{ peer_count, bad_count };
+}
+
+/// Writes `report` as a `records.Pull` to `parsed.report`, through a temporary file and a rename,
+/// so the agent never reads half of it. A failure is said on stderr and changes nothing else: the
+/// fetch worked, and only its statistics are lost.
+fn write_report(
+    gpa: std.mem.Allocator,
+    net: *const Net,
+    parsed: *const Args,
+    report: *const fetch_worker.Report,
+    started_ms: u64,
+) void {
+    const io = net.io;
+    var peers: [constants.fetch_peers_max]records.PullPeer = undefined;
+    var bad: [constants.fetch_peers_max][]const u8 = undefined;
+    const counts = report_peers(net.peers, report, &peers, &bad);
+    const peer_count = counts[0];
+    const bad_count = counts[1];
+    const record: records.Pull = .{
+        .node = parsed.node,
+        .tree = parsed.digest,
+        .registry_bytes = report.registry_bytes,
+        .peer_bytes = peers[0..peer_count],
+        .cached_bytes = report.cached_bytes,
+        .started_at_ms = started_ms,
+        .finished_at_ms = real_ms(io),
+        .bad_peers = bad[0..bad_count],
+    };
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    std.json.Stringify.value(record, .{}, &text.writer) catch return note(io, report_failed);
+    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const temporary = std.fmt.bufPrint(&name_buffer, "{s}.tmp", .{parsed.report}) catch
+        return note(io, report_failed);
+    const dir = std.Io.Dir.cwd();
+    dir.writeFile(io, .{ .sub_path = temporary, .data = text.written() }) catch
+        return note(io, report_failed);
+    dir.rename(temporary, dir, parsed.report, io) catch return note(io, report_failed);
+}
+
+const report_failed = "zcube-agent fetch: the pull report could not be written\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.
@@ -1241,6 +1348,26 @@ test "a --peer with a name that is not a node name is left out, the rest are kep
     const said = describe_skipped(&line, .{ .bad_name = parsed.peers_skipped });
     try std.testing.expect(std.mem.find(u8, said, "2 with a name") != null);
     try std.testing.expectEqualStrings("", describe_skipped(&line, .{}));
+}
+
+test "a pull report leaves out a peer whose name is not a node name" {
+    // Goal: no control byte or bad name reaches the record. Method: three peers all gave bytes
+    // and were struck; the one named with an escape sequence is dropped from both lists.
+    const unused = try IpAddress.parse("127.0.0.1", 1);
+    const named = [_]Peer{
+        .{ .name = "node1", .address = unused },
+        .{ .name = "node2\x1b[2J", .address = unused },
+        .{ .name = "node3", .address = unused },
+    };
+    var report: fetch_worker.Report = .{ .struck_peers = 0b111 };
+    @memset(report.peer_bytes[0..3], 7);
+    var peers: [3]records.PullPeer = undefined;
+    var bad: [3][]const u8 = undefined;
+    const counts = report_peers(&named, &report, &peers, &bad);
+    try std.testing.expectEqual(@as(usize, 2), counts[0]);
+    try std.testing.expectEqual(@as(usize, 2), counts[1]);
+    try std.testing.expectEqualStrings("node3", peers[1].peer);
+    try std.testing.expectEqualStrings("node3", bad[1]);
 }
 
 test "a reply's status is read from a complete status line" {

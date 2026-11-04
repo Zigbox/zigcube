@@ -14,6 +14,7 @@ zcube [options] get service [name]      services and how many replicas run
 zcube [options] get replicas [service]  replicas, where they run and how they are doing
 zcube [options] get nodes [name]        nodes, their status, lease, capacity and last contact
 zcube [options] why <kind> <name>       why a service, replica or node is as it is
+zcube [options] stats pull [node]       what pulls moved, by source (registry, peers, cache)
 zcube [options] check allocations       every node's allocation record against its assignments
 zcube [options] repair allocations <node> [--confirm]
                                         rewrite a node's record from its assignments
@@ -26,7 +27,7 @@ zcube help | version
 | Option | Meaning |
 | --- | --- |
 | `-v`, `--verbose` | the full cause chain and context of a failure; every request made, with its id |
-| `-o`, `--output text\|wide\|json` | `wide` adds columns to `get`; `json` is for scripts (below) |
+| `-o`, `--output text\|wide\|json` | `wide` adds columns to `get` and `stats pull`; `json` is for scripts (below) |
 | `--server HOST:PORT` | where `zcube-server` listens: this flag, else `$ZCUBE_SERVER`, else `127.0.0.1:7070`. An IP address (or `localhost`) and a port |
 | `-y`, `--yes` | `apply`, `delete`: do not ask first |
 | `--dry-run` | `apply`: show the change and stop |
@@ -173,6 +174,25 @@ says what it would write and stops (`ZC-E0401`); with `--confirm` it writes, rec
 no open finding is `ZC-E0402`; one whose accounting kept moving during the request is `ZC-E0403`
 (run it again). The texts above are the CLI's unit and golden tests (`src/cli_allocations.zig`,
 `src/testdata/cli/E040*.txt`).
+
+## stats pull (C2 slice 7)
+
+`zcube stats pull [node]` reads `GET /v1/stats/pull` (docs/api.md) and prints one row per
+recorded pull, newest first, at most 50:
+
+```
+NODE   TREE             REGISTRY  PEERS  CACHED  TOOK  BAD PEERS
+node1  b3:51aa9c03...   1Mi       2Mi    0B      4s    node3
+```
+
+The digest is cut to 15 bytes and "..." (the table pads by bytes, so the ellipsis is ASCII);
+`-o wide` prints it whole and adds `FROM PEERS` (`node2=2Mi,...`). `-o json` is the reply.
+No pulls prints `no pulls have been recorded` and is not an error. Under the table, one line each
+for records that could not be read (`1 record could not be read`), pulls the server read but the
+50-row limit left out (`3 more not shown`), and a server that stopped at its own cap (`the server
+read only part of the records`). A node name is percent-encoded in the request. Code:
+`src/cli_stats.zig`; tests there and in
+`src/cli_test.zig` (against a live server).
 
 ## explain
 

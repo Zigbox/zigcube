@@ -223,8 +223,12 @@ pub const FakeRuntime = struct {
         diag: *Diag,
     ) runtime.Error!void {
         const fetch = self.options.fetch.?;
-        var argv: [12 + 2 + 2 * constants.fetch_peers_max][]const u8 = undefined;
+        var argv: [12 + 2 + 2 + 2 * constants.fetch_peers_max][]const u8 = undefined;
         var count: usize = 0;
+        var report_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const report = std.fmt.bufPrint(&report_buffer, "{s}/containers/{s}/{s}", .{
+            self.options.state_dir, spec.name, files.file_pull,
+        }) catch return runtime_failed(diag, "build the pull report's path");
         const head = [_][]const u8{
             self.options.supervisor_exe, "fetch",                "--node",       fetch.node,
             "--state-dir",               self.options.state_dir, "--images-dir", fetch.images_dir,
@@ -234,6 +238,9 @@ pub const FakeRuntime = struct {
             argv[count] = word;
             count += 1;
         }
+        argv[count] = "--report";
+        argv[count + 1] = report;
+        count += 2;
         if (fetch.server.len > 0) {
             argv[count] = "--server";
             argv[count + 1] = fetch.server;

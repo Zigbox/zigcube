@@ -32,6 +32,7 @@ pub const file_lock = agent_records.file_lock;
 pub const file_forced = agent_records.file_forced;
 pub const file_fetch = agent_records.file_fetch;
 pub const file_fetch_log = agent_records.file_fetch_log;
+pub const file_pull = agent_records.file_pull;
 pub const FetchFile = agent_records.FetchFile;
 
 pub const Pair = agent_records.Pair;

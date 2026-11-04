@@ -11,6 +11,7 @@
 //! zcube [options] explain <code>
 //! zcube [options] bundle --last | <kind> <name>
 //! zcube [options] check allocations
+//! zcube [options] stats pull [node]
 //! zcube [options] repair allocations <node> [--confirm]
 //! zcube [options] local up|down
 //! ```
@@ -62,6 +63,8 @@ pub const Command = union(enum) {
     accept_rollback,
     /// `check allocations`.
     check_allocations,
+    /// `stats pull [node]`: the recorded pulls, of one node when it is named.
+    stats_pull: ?[]const u8,
     /// `repair allocations <node>`: the node. Without `--confirm` it shows what it would write.
     repair_allocations: []const u8,
     local: LocalAction,
@@ -89,6 +92,7 @@ pub const help_text =
     \\  bundle --last                collect the evidence for the last failure
     \\  bundle <kind> <name>         collect the evidence for a service, replica or node
     \\  check allocations            compare each node's accounting with its assignments
+    \\  stats pull [node]            the recorded image pulls: bytes by source, time, struck peers
     \\  repair allocations <node>    show the repair of a node's accounting; --confirm writes it
     \\  local up                     start a server and an agent on this machine (SQLite)
     \\  local down                   stop them; the state and the containers are kept
@@ -237,12 +241,19 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
         return refuse(diag, "check takes allocations", .{});
     }
     if (std.mem.eql(u8, name, "repair")) return repair_of(diag, rest);
+    if (std.mem.eql(u8, name, "stats")) return stats_of(diag, rest);
     if (std.mem.eql(u8, name, "local")) return local_of(diag, rest);
     if (std.mem.eql(u8, name, "store")) {
         if (rest.len == 1 and std.mem.eql(u8, rest[0], "accept-rollback")) return .accept_rollback;
         return refuse(diag, "store takes accept-rollback", .{});
     }
     return refuse(diag, "{s} is not a zcube command", .{name});
+}
+
+fn stats_of(diag: *Diag, rest: []const []const u8) Error!Command {
+    const ok = rest.len >= 1 and rest.len <= 2 and std.mem.eql(u8, rest[0], "pull");
+    if (!ok) return refuse(diag, "stats takes pull and, optionally, a node: stats pull node1", .{});
+    return .{ .stats_pull = if (rest.len == 2) rest[1] else null };
 }
 
 fn repair_of(diag: *Diag, rest: []const []const u8) Error!Command {
@@ -361,8 +372,8 @@ fn check_options(options: *const Options, command: Command, diag: *Diag) Error!v
     if (options.no_redact and command != .bundle) {
         return refuse(diag, "--no-redact is for zcube bundle", .{});
     }
-    if (options.output == .wide and command != .get) {
-        return refuse(diag, "--output wide is for zcube get", .{});
+    if (options.output == .wide and command != .get and command != .stats_pull) {
+        return refuse(diag, "--output wide is for zcube get and stats pull", .{});
     }
 }
 
@@ -484,6 +495,24 @@ test "scan finds the output mode before a bad argument is reached" {
     try testing.expectEqual(Output.json, options.output);
     try testing.expect(options.verbose);
     try testing.expectEqual(Output.text, scan(&.{ "--", "-o", "json" }).output);
+}
+
+test "stats pull takes an optional node, and nothing else" {
+    // Goal: the slice 7 surface. Method: the accepted lines, then one refusal per rule.
+    const all = try parse_text(&.{ "stats", "pull" });
+    try testing.expect(all.command.stats_pull == null);
+    const one = try parse_text(&.{ "stats", "pull", "node2", "-o", "wide" });
+    try testing.expectEqualStrings("node2", one.command.stats_pull.?);
+    const lines = [_][]const []const u8{
+        &.{"stats"}, &.{ "stats", "push" }, &.{ "stats", "pull", "a", "b" },
+    };
+    for (lines) |line| {
+        var diag: Diag = undefined;
+        diag.reset();
+        var parsed: Parsed = undefined;
+        try testing.expectError(error.Failed, parse(line, &parsed, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "stats takes pull") != null);
+    }
 }
 
 test "a lone dash and words after -- are positional" {

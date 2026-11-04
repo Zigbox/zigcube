@@ -180,6 +180,21 @@ pub fn list_all_tolerant(
     return list_pages(T, ctx, prefix, at_revision, count_max, skipped);
 }
 
+/// As `list_all_tolerant`, but a read that reaches `count_max` records stops there, with
+/// `truncated` set, instead of failing with ZC-E0302: for a screen that shows what fits.
+pub fn list_capped_tolerant(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    count_max: u32,
+    skipped: *u32,
+    truncated: *bool,
+) Error!List(T) {
+    skipped.* = 0;
+    truncated.* = false;
+    return list_pages_capped(T, ctx, prefix, null, count_max, skipped, truncated);
+}
+
 fn list_pages(
     comptime T: type,
     ctx: *const Context,
@@ -188,20 +203,45 @@ fn list_pages(
     count_max: u32,
     skipped: ?*u32,
 ) Error!List(T) {
+    return list_pages_capped(T, ctx, prefix, at_revision, count_max, skipped, null);
+}
+
+fn list_pages_capped(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    at_revision: ?Revision,
+    count_max: u32,
+    skipped: ?*u32,
+    truncated: ?*bool,
+) Error!List(T) {
     var items: std.ArrayList(Entry(T)) = .empty;
     var revision = at_revision;
     var after: ?[]const u8 = null;
+    // Rows read, kept or skipped. A caller that asked for `truncated` has the cap on these, so
+    // rows that do not parse cannot make the read cost the arena more than the cap's worth.
+    var examined: u32 = 0;
     const pages_max = @divFloor(count_max, constants.store_list_limit_max) + 1;
     for (0..pages_max + 1) |_| {
+        // Ask for no more than the cap still allows, plus one to see that there is more: at the
+        // cap a full third page would cost the arena records that are then thrown away.
+        const counted = if (truncated != null) examined else @as(u32, @intCast(items.items.len));
+        const wanted = count_max -| counted +| 1;
         const page = try ctx.store.list(ctx.arena, .{
             .prefix = prefix,
             .at_revision = revision,
-            .limit = constants.store_list_limit_max,
+            .limit = @min(constants.store_list_limit_max, wanted),
             .continue_after = after,
         }, ctx.diag);
         revision = page.revision;
         for (page.kvs) |kv| {
-            if (items.items.len >= count_max) return too_many(ctx, prefix, count_max);
+            const seen = if (truncated != null) examined else @as(u32, @intCast(items.items.len));
+            if (seen >= count_max) {
+                const flag = truncated orelse return too_many(ctx, prefix, count_max);
+                flag.* = true;
+                return .{ .items = items.items, .revision = revision.? };
+            }
+            examined += 1;
             const rec = records.read(T, ctx.arena, kv, ctx.diag) catch |err| {
                 const count = skipped orelse return err;
                 if (err != error.Malformed) return err;
@@ -215,7 +255,12 @@ fn list_pages(
         after = page.continue_after;
         if (after == null) return .{ .items = items.items, .revision = revision.? };
     }
-    return too_many(ctx, prefix, count_max);
+    // Pages came back short and the iterations ran out before the end (so `truncated` can mean
+    // "page budget exhausted" with fewer rows than the cap): a read that asked for
+    // `truncated` gets what it has, as the docs promise ("never a failure").
+    const flag = truncated orelse return too_many(ctx, prefix, count_max);
+    flag.* = true;
+    return .{ .items = items.items, .revision = revision.? };
 }
 
 fn too_many(ctx: *const Context, prefix: []const u8, count_max: u32) error{NoCapacity} {

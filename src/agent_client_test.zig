@@ -17,6 +17,8 @@ const Diag = diag_mod.Diag;
 /// A server that answers every request with the next scripted body, and keeps the targets.
 const Script = struct {
     bodies: []const []const u8,
+    /// The status every reply carries.
+    status: u16 = 200,
     next: u32 = 0,
     targets: [8][]const u8 = undefined,
     target_bytes: [8][128]u8 = undefined,
@@ -40,7 +42,7 @@ const Script = struct {
         script.targets[script.next] = slot[0..request.target.len];
         const body = script.bodies[script.next];
         script.next += 1;
-        return .{ .status = 200, .body = body };
+        return .{ .status = script.status, .body = body };
     }
 };
 
@@ -430,4 +432,41 @@ test "a clean stop saves the pair whatever the time since the last save" {
     try rig.remote.save_final(files.interface(), 1002);
     const final = try read_file(&files, rig.arena.allocator());
     try testing.expect(std.mem.indexOf(u8, final, "\"revision\":11,") != null);
+}
+
+const pull_json = "{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:aa\",\"finished_at_ms\":5}";
+
+test "a pull record a server refuses is ZC-E0504, and a foreign one is never sent" {
+    // Goal: RemoteStore.pull sends only a put of a pull record under its own key, and a 404 from
+    // a server without the endpoint is a coded refusal. Method: a scripted 404, then a delete, a
+    // record under another key and a second operation, none of which reach the transport.
+    const bodies = [_][]const u8{"{}"};
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    rig.script.status = 404;
+    const remote = rig.remote.interface();
+    const tenure = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = 4 }};
+    const put: store.Op = .{ .put = .{ .key = "/pulls/node1/b3:aa", .value = pull_json } };
+    try testing.expectError(
+        error.BackendFailed,
+        remote.txn(.{ .compares = &tenure, .on_success = &.{put} }, &rig.diag),
+    );
+    try testing.expectEqual(.E0504, rig.diag.code.?);
+    try testing.expectEqual(@as(u32, 1), rig.script.next);
+
+    const refusals = [_][]const store.Op{
+        &.{.{ .delete = "/pulls/node1/b3:aa" }},
+        &.{.{ .put = .{ .key = "/pulls/node1/b3:bb", .value = pull_json } }},
+        &.{ put, .{ .put = .{ .key = "/pulls/node1/b3:cc", .value = pull_json } } },
+    };
+    for (refusals) |ops| {
+        rig.diag.reset();
+        try testing.expectError(
+            error.BackendFailed,
+            remote.txn(.{ .compares = &tenure, .on_success = ops }, &rig.diag),
+        );
+        try testing.expectEqual(.B0001, rig.diag.code.?);
+    }
+    try testing.expectEqual(@as(u32, 1), rig.script.next);
 }

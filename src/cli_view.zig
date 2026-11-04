@@ -165,7 +165,7 @@ pub fn bytes_text(arena: Allocator, bytes: u64) Error![]const u8 {
 }
 
 /// `10s` for a whole number of seconds, else `7.9s`.
-fn seconds_text(arena: Allocator, ms: u64) Error![]const u8 {
+pub fn seconds_text(arena: Allocator, ms: u64) Error![]const u8 {
     const oom = error.OutOfMemory;
     if (ms % 1000 == 0) return std.fmt.allocPrint(arena, "{d}s", .{ms / 1000}) catch oom;
     return std.fmt.allocPrint(arena, "{d}.{d}s", .{ ms / 1000, ms % 1000 / 100 }) catch oom;

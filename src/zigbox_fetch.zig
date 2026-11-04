@@ -237,6 +237,13 @@ pub const Report = struct {
     peer_chunks: u32 = 0,
     bad_bundles: u32 = 0,
     blamed: u32 = 0,
+    /// Bytes by source, for `/pulls` (C2 slice 8, Z5): what each peer gave (by the place in the
+    /// caller's list), what the store already held. A tree held whole is left alone, so its
+    /// bytes are not counted.
+    peer_bytes: [constants.fetch_candidates_max]u64 = @splat(0),
+    cached_bytes: u64 = 0,
+    /// Bit `i` is set for a peer that sent a bundle or a chunk that failed its hash.
+    struck_peers: u64 = 0,
 };
 
 /// Gets `tree` into `images` from `peers`, importing its image record only for
@@ -295,6 +302,7 @@ fn find_bundle(
             if (err == error.OutOfMemory) return error.OutOfMemory;
             if (err == error.Store) return error.Store;
             report.bad_bundles += 1;
+            report.struck_peers |= @as(u64, 1) << @intCast(index);
             transport.bad_list_fn(transport.context, @intCast(index));
         }
     }
@@ -318,6 +326,7 @@ fn fetch_chunks(
     const needed = fetch_worker.lacking(seam, chunks, scratch, &inner) catch
         return error.OutOfMemory;
     report.already_held = inner.already_held;
+    report.cached_bytes = inner.cached_bytes;
     if (needed == 0) return;
     const states = try allocator.alloc(fetch_plan.ChunkState, needed);
     defer allocator.free(states);
@@ -335,6 +344,8 @@ fn fetch_chunks(
     );
     report.peer_chunks = inner.peer_chunks;
     report.blamed = inner.blamed;
+    report.peer_bytes = inner.peer_bytes;
+    report.struck_peers |= inner.struck_peers;
     done catch |err| return switch (err) {
         error.Deadline => error.Deadline,
         error.Store => error.Store,
@@ -510,6 +521,9 @@ test "zigbox fetch: a tree comes from a peer by bundle and chunks, and is rooted
     try testing.expect(to_b.images().has(&name));
     try testing.expect(report.peer_chunks > 0);
     try testing.expectEqual(report.chunks, report.peer_chunks);
+    try testing.expect(report.peer_bytes[0] > 0);
+    try testing.expectEqual(@as(u64, 0), report.cached_bytes);
+    try testing.expectEqual(@as(u64, 0), report.struck_peers);
     var listing: [8]zigbox.store.roots.Root = undefined;
     var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
     const rooted = try zigbox.store.roots.list(&pair.b, &names, &listing);
@@ -560,6 +574,8 @@ test "zigbox fetch: a peer that corrupts chunks fails the fetch and nothing is r
     const name = pair.tree.text();
     try testing.expect(!to_b.images().has(&name));
     try testing.expect(report.blamed > 0);
+    try testing.expectEqual(@as(u64, 1), report.struck_peers);
+    try testing.expectEqual(@as(u64, 0), report.peer_bytes[0]);
 }
 
 test "zigbox fetch: a bundle whose first tree is not the tree asked for is a bad bundle" {
@@ -578,6 +594,7 @@ test "zigbox fetch: a bundle whose first tree is not the tree asked for is a bad
     const got = run_rig(&rig, &to_b, pair.tree, expected, &report);
     try testing.expectError(error.TreeUnavailable, got);
     try testing.expectEqual(@as(u32, 1), rig.bad);
+    try testing.expectEqual(@as(u64, 1), report.struck_peers);
     try testing.expectEqual(@as(usize, 0), to_b.claims.items.len);
 }
 
