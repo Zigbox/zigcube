@@ -588,7 +588,11 @@ fn fetch_from(rig: *Rig, registry: []const u8, base_ms: u32, cap_ms: u32) !void 
 /// The pids of the processes the supervisor `supervisor` has started (its fetch, while it fetches).
 fn children_of(supervisor: i32, out: *[8]i32) !usize {
     var path: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&path, "/proc/{d}/task/{d}/children", .{ supervisor, supervisor });
+    const name = try std.fmt.bufPrint(
+        &path,
+        "/proc/{d}/task/{d}/children",
+        .{ supervisor, supervisor },
+    );
     var buffer: [128]u8 = undefined;
     const line = try std.Io.Dir.cwd().readFile(testing.io, name, &buffer);
     var count: usize = 0;
@@ -624,7 +628,8 @@ test "an agent that restarts in the middle of a fetch adopts it, and the fetch g
     var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
     defer listener.deinit(testing.io);
     var address: [32]u8 = undefined;
-    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    const port = listener.socket.address.getPort();
+    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{port});
     try fetch_from(rig, try rig.arena.allocator().dupe(u8, registry), 50, 100);
     const outcome = try rig.launch("mid-1", unfetched, &forever, &.{});
     const handle = outcome.started;
@@ -652,7 +657,8 @@ test "a fetch that is killed with SIGKILL is a failed start blamed on the fetch"
     var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
     defer listener.deinit(testing.io);
     var address: [32]u8 = undefined;
-    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    const port = listener.socket.address.getPort();
+    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{port});
     try fetch_from(rig, try rig.arena.allocator().dupe(u8, registry), 50, 100);
     const handle = (try rig.launch("kill-1", unfetched, &forever, &.{})).started;
     const supervisor = try rig.pid_of("kill-1", fake_files.file_supervisor);
@@ -676,7 +682,8 @@ test "a replica stopped while it fetches ends as stopped, not as a failed start"
     var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
     defer listener.deinit(testing.io);
     var address: [32]u8 = undefined;
-    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    const port = listener.socket.address.getPort();
+    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{port});
     try fetch_from(rig, try rig.arena.allocator().dupe(u8, registry), 50, 100);
     const handle = (try rig.launch("stop-1", unfetched, &forever, &.{})).started;
     const supervisor = try rig.pid_of("stop-1", fake_files.file_supervisor);

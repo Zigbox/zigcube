@@ -151,7 +151,8 @@ fn source_of(storage: *const std.os.linux.sockaddr.storage) u64 {
 /// because one host holds a whole /64 and each of its addresses would otherwise be a new source;
 /// an IPv4-mapped address (`::ffff:a.b.c.d`) is the IPv4 address it carries.
 pub fn source_key(address: []const u8) u64 {
-    assert(address.len == 4 or address.len == 16);
+    const sized = address.len == 4 or address.len == 16;
+    assert(sized);
     if (address.len == 4) return std.hash.Wyhash.hash(0, address);
     const zeros: [10]u8 = @splat(0);
     if (std.mem.eql(u8, address[0..10], &zeros)) {
@@ -173,7 +174,7 @@ fn admit(server: *Server, fd: std.posix.fd_t, source: u64, io: std.Io) void {
     }
     const verdict = server.limiter.admit(source, peer_stream.boot_ms(io));
     if (verdict != .admitted) {
-        refuse(server, io, "a peer address started more than the handshakes it is allowed in a window");
+        refuse(server, io, "a peer address started more handshakes than a window allows");
         _ = std.os.linux.close(fd);
         return;
     }
