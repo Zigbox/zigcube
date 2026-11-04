@@ -37,6 +37,9 @@ pub const report_bytes_max: u32 = 4 * 1024;
 
 pub const Report = struct {
     failed: bool = false,
+    /// What the run was doing when it failed: "fetch" or "locality" (the operations that check
+    /// anything). Empty while no check has failed. The simulation fleet files failures by it.
+    step: []const u8 = "",
     bytes: [report_bytes_max]u8 = undefined,
     len: u32 = 0,
 
@@ -117,6 +120,8 @@ const Sim = struct {
     node_rate: u32,
     totals: Totals = .{},
     fetch: Fetch = undefined,
+    /// The operation being run, for `Report.step`.
+    step: []const u8 = "fetch",
 
     fn random(sim: *Sim) std.Random {
         return sim.prng.random();
@@ -126,6 +131,7 @@ const Sim = struct {
     fn fail(sim: *Sim, comptime format: []const u8, args: anytype) void {
         if (sim.report.failed) return;
         sim.report.failed = true;
+        sim.report.step = sim.step;
         sim.report.print("FAILED: " ++ format ++ " (seed {d}, at {d} ms)\n", args ++ .{
             sim.seed, sim.now_ms,
         });
@@ -184,9 +190,18 @@ fn run_operation(sim: *Sim) void {
     const node = random.uintLessThan(u32, sim.world.node_count);
     const tree = random.uintLessThan(u32, sim.world.tree_count);
     switch (random.uintLessThan(u32, 10)) {
-        0...6 => run_fetch(sim, node, tree),
-        7, 8 => check_locality(sim, node, tree),
-        else => drop_chunks(sim, node),
+        0...6 => {
+            sim.step = "fetch";
+            run_fetch(sim, node, tree);
+        },
+        7, 8 => {
+            sim.step = "locality";
+            check_locality(sim, node, tree);
+        },
+        else => {
+            sim.step = "drop";
+            drop_chunks(sim, node);
+        },
     }
 }
 

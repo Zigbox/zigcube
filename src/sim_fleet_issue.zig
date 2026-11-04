@@ -6,7 +6,33 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 
+/// The producers a round runs (ops/sim-fleet/README.md): `sim_cluster --seeds A..B <ops> --shrink`,
+/// the same with `--c1`, and `sim_swarm --seeds A..B <ops> --shrink`. The kind is part of a
+/// failure's fingerprint, so one check failing in two kinds is two issues.
 pub const kind_sim_cluster = "sim-cluster";
+pub const kind_sim_c1 = "sim-c1";
+pub const kind_sim_swarm = "sim-swarm";
+pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm };
+
+pub fn kind_known(kind: []const u8) bool {
+    for (kinds) |known| {
+        if (std.mem.eql(u8, known, kind)) return true;
+    }
+    return false;
+}
+
+/// The `zig build` step that installs the runner of `kind` (and so the replay's binary).
+fn exe_step(kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm-exe";
+    return "sim-cluster-exe";
+}
+
+/// The word before ": seeds A..B, N operations: F of T failed", the summary line of the runner.
+/// `sim_cluster` prints it for plain and `--c1` runs alike.
+fn summary_prefix(kind: []const u8) []const u8 {
+    if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm: seeds ";
+    return "sim-cluster: seeds ";
+}
 
 /// Hex digits of a fingerprint: 8 bytes of SHA-256, enough that two failures never meet by chance.
 pub const fingerprint_bytes = 16;
@@ -90,9 +116,10 @@ fn parse_seed_line(line: []const u8) ?SeedLine {
 
 const SummaryLine = struct { seeds: u64, operations: u32 };
 
-/// "sim-cluster: seeds A..B, N operations: F of T failed" gives (T, N).
-fn parse_summary(line: []const u8) ?SummaryLine {
-    const rest = after_prefix(line, "sim-cluster: seeds ") orelse return null;
+/// "sim-cluster: seeds A..B, N operations: F of T failed" (`sim-swarm:` for that kind) gives
+/// (T, N).
+fn parse_summary(kind: []const u8, line: []const u8) ?SummaryLine {
+    const rest = after_prefix(line, summary_prefix(kind)) orelse return null;
     const comma = std.mem.indexOf(u8, rest, ", ") orelse return null;
     const dots = std.mem.indexOf(u8, rest[0..comma], "..") orelse return null;
     const first = std.fmt.parseInt(u64, rest[0..dots], 10) catch return null;
@@ -126,7 +153,8 @@ fn normalize_crash(arena: std.mem.Allocator, message: []const u8) error{OutOfMem
 /// Parses the output of one round: the outputs of its batches one after another, each ending in
 /// the runner's summary line. A failure after the last summary is a batch that was cut short,
 /// and counting its seeds would be a guess, so the whole round is refused.
-pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Batch {
+pub fn parse(arena: std.mem.Allocator, kind: []const u8, text: []const u8) ParseError!Batch {
+    assert(kind_known(kind));
     var failures: std.ArrayList(Failure) = .empty;
     var seeds: u64 = 0;
     var operations: ?u32 = null;
@@ -147,7 +175,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Batch {
                 .replay = "",
             });
             open = true;
-        } else if (parse_summary(line)) |found| {
+        } else if (parse_summary(kind, line)) |found| {
             // Batches of one round run the same operation count.
             if (operations) |known| if (known != found.operations) return error.BadLine;
             operations = found.operations;
@@ -188,6 +216,7 @@ fn parse_detail(failure: *Failure, line: []const u8) ParseError!void {
 /// The line that rebuilds and replays a failure on the commit that found it.
 pub fn replay_line(
     arena: std.mem.Allocator,
+    kind: []const u8,
     commit: []const u8,
     failure: Failure,
 ) std.mem.Allocator.Error![]const u8 {
@@ -196,8 +225,8 @@ pub fn replay_line(
     assert(replay.len > 0);
     return std.fmt.allocPrint(
         arena,
-        "git checkout {s} && zig build -Doptimize=ReleaseSafe sim-cluster-exe && {s}",
-        .{ commit, replay },
+        "git checkout {s} && zig build -Doptimize=ReleaseSafe {s} && {s}",
+        .{ commit, exe_step(kind), replay },
     );
 }
 
@@ -241,7 +270,9 @@ fn write_failure(
     replay: []const u8,
 ) std.Io.Writer.Error!void {
     const failure = report.failure;
-    try out.print("- commit: `{s}`\n- seed: {d}\n", .{ report.commit, failure.seed });
+    try out.print("- run: {s}\n- commit: `{s}`\n- seed: {d}\n", .{
+        report.kind, report.commit, failure.seed,
+    });
     if (failure.crash) {
         try out.writeAll("- operations: not shrunk (the simulator crashed)\n");
     } else if (failure.shrunk_operations) |shrunk| {
@@ -259,7 +290,7 @@ fn write_failure(
 
 /// The body of a new issue, with the marker that finds it again.
 pub fn issue_body(arena: std.mem.Allocator, report: *const Report) error{OutOfMemory}![]const u8 {
-    const replay = try replay_line(arena, report.commit, report.failure);
+    const replay = try replay_line(arena, report.kind, report.commit, report.failure);
     var out: std.Io.Writer.Allocating = .init(arena);
     write_body(&out.writer, report, replay) catch return error.OutOfMemory;
     const body = try out.toOwnedSlice();
@@ -294,7 +325,7 @@ pub fn comment_body(
     arena: std.mem.Allocator,
     report: *const Report,
 ) error{OutOfMemory}![]const u8 {
-    const replay = try replay_line(arena, report.commit, report.failure);
+    const replay = try replay_line(arena, report.kind, report.commit, report.failure);
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
     w.writeAll("The fleet saw this failure again.\n\n") catch return error.OutOfMemory;
@@ -334,7 +365,7 @@ const sample =
 test "parse reads failures, their shrinks and the seed count" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const batch = try parse(arena_state.allocator(), sample);
+    const batch = try parse(arena_state.allocator(), kind_sim_cluster, sample);
     try std.testing.expectEqual(@as(u64, 10), batch.seeds);
     try std.testing.expectEqual(@as(u32, 100), batch.operations);
     try std.testing.expectEqual(@as(usize, 3), batch.failures.len);
@@ -349,15 +380,15 @@ test "parse refuses output cut short or without a step" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const cut = sample[0 .. sample.len - 50];
-    try std.testing.expectError(error.NoSummary, parse(arena, cut));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, cut));
     const no_step =
         \\seed 1: FAILED: x
         \\  replay: zig-out/bin/sim_cluster 1 100 0
         \\sim-cluster: seeds 1..1, 100 operations: 1 of 1 failed
     ;
-    try std.testing.expectError(error.BadLine, parse(arena, no_step));
+    try std.testing.expectError(error.BadLine, parse(arena, kind_sim_cluster, no_step));
     const clean = "sim-cluster: seeds 5..9, 60 operations: 0 of 5 failed\n";
-    const batch = try parse(arena, clean);
+    const batch = try parse(arena, kind_sim_cluster, clean);
     try std.testing.expectEqual(@as(u64, 5), batch.seeds);
     try std.testing.expectEqual(@as(usize, 0), batch.failures.len);
 }
@@ -365,7 +396,7 @@ test "parse refuses output cut short or without a step" {
 test "the fingerprint ignores the seed, the commit and the shrink; the step changes it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const batch = try parse(arena_state.allocator(), sample);
+    const batch = try parse(arena_state.allocator(), kind_sim_cluster, sample);
     const a = fingerprint(kind_sim_cluster, batch.failures[0]);
     const b = fingerprint(kind_sim_cluster, batch.failures[1]);
     try std.testing.expectEqualStrings(&a, &b);
@@ -383,7 +414,7 @@ test "the issue body names commit, seed, shrunk operations, replay and the marke
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const batch = try parse(arena, sample);
+    const batch = try parse(arena, kind_sim_cluster, sample);
     const report: Report = .{
         .kind = kind_sim_cluster,
         .commit = "abc123",
@@ -411,7 +442,7 @@ test "a failure that was not shrunk replays the full run" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const batch = try parse(arena, sample);
+    const batch = try parse(arena, kind_sim_cluster, sample);
     const report: Report = .{
         .kind = kind_sim_cluster,
         .commit = "def456",
@@ -432,14 +463,14 @@ test "a round of several batches sums their seeds; a batch cut short refuses the
     const arena = arena_state.allocator();
     const clean = "sim-cluster: seeds 50..59, 100 operations: 0 of 10 failed\n";
     const round = sample ++ clean ++ sample;
-    const batch = try parse(arena, round);
+    const batch = try parse(arena, kind_sim_cluster, round);
     try std.testing.expectEqual(@as(u64, 30), batch.seeds);
     try std.testing.expectEqual(@as(usize, 6), batch.failures.len);
     const cut = sample ++ "seed 3: FAILED: x\n  step: end\n  replay: r\n";
-    try std.testing.expectError(error.NoSummary, parse(arena, cut));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, cut));
     const other_operations = sample ++ "sim-cluster: seeds 1..2, 60 operations: 0 of 2 failed\n";
-    try std.testing.expectError(error.BadLine, parse(arena, other_operations));
-    try std.testing.expectError(error.NoSummary, parse(arena, ""));
+    try std.testing.expectError(error.BadLine, parse(arena, kind_sim_cluster, other_operations));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, ""));
 }
 
 /// What run.sh writes for a seed whose replay crashed (ops/sim-fleet/run.sh, `record_crash`).
@@ -457,15 +488,15 @@ test "a crash is its own failure: digits elided, a crash title, and never a chec
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const batch = try parse(arena, crash_record);
+    const batch = try parse(arena, kind_sim_cluster, crash_record);
     try std.testing.expectEqual(@as(usize, 1), batch.failures.len);
     const crash = batch.failures[0];
     try std.testing.expect(crash.crash);
     try std.testing.expect(!crash.infra());
     try std.testing.expectEqualStrings("index out of bounds: index N, len N", crash.check);
-    const other_index = try parse(arena, "seed 9: CRASHED: index out of bounds: " ++
-        "index 40, len 7\n" ++
-        "  step: healed\n  replay: r\nsim-cluster: seeds 9..9, 100 operations: 1 of 1 failed\n");
+    const other_text = "seed 9: CRASHED: index out of bounds: index 40, len 7\n" ++
+        "  step: healed\n  replay: r\nsim-cluster: seeds 9..9, 100 operations: 1 of 1 failed\n";
+    const other_index = try parse(arena, kind_sim_cluster, other_text);
     const a = fingerprint(kind_sim_cluster, crash);
     try std.testing.expectEqualStrings(&a, &fingerprint(kind_sim_cluster, other_index.failures[0]));
     var as_check = crash;
@@ -479,7 +510,7 @@ test "a crash is its own failure: digits elided, a crash title, and never a chec
     const xs: [400]u8 = @splat('x');
     const long = try std.fmt.allocPrint(arena, "seed 1: CRASHED: {s}\n  step: end\n" ++
         "  replay: r\nsim-cluster: seeds 1..1, 1 operations: 1 of 1 failed\n", .{&xs});
-    const cut = try parse(arena, long);
+    const cut = try parse(arena, kind_sim_cluster, long);
     const check_max: usize = constants.fleet_check_bytes_max;
     try std.testing.expectEqual(check_max, cut.failures[0].check.len);
 }
@@ -492,12 +523,13 @@ test "a run that could not allocate its world is infrastructure, and its step pa
     const text = "seed 5: FAILED: out of memory\n  step: setup\n" ++
         "  replay: zig-out/bin/sim_cluster 5 100 0 --heal-at=70\n" ++
         "sim-cluster: seeds 1..9, 100 operations: 1 of 9 failed\n";
-    const batch = try parse(arena_state.allocator(), text);
+    const batch = try parse(arena_state.allocator(), kind_sim_cluster, text);
     try std.testing.expect(batch.failures[0].infra());
     try std.testing.expect(!batch.failures[0].crash);
     const empty_step = "seed 5: FAILED: out of memory\n  step: \n  replay: r\n" ++
         "sim-cluster: seeds 1..9, 100 operations: 1 of 9 failed\n";
-    try std.testing.expectError(error.BadLine, parse(arena_state.allocator(), empty_step));
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.BadLine, parse(arena, kind_sim_cluster, empty_step));
 }
 
 test "the marker hashes the kind of the run it reports" {
@@ -506,7 +538,7 @@ test "the marker hashes the kind of the run it reports" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const batch = try parse(arena, sample);
+    const batch = try parse(arena, kind_sim_cluster, sample);
     const report: Report = .{
         .kind = "store-faults",
         .commit = "c",
@@ -518,4 +550,138 @@ test "the marker hashes the kind of the run it reports" {
     try std.testing.expectEqualStrings(&expected, marker_of(body).?);
     const other = fingerprint(kind_sim_cluster, batch.failures[0]);
     try std.testing.expect(!std.mem.eql(u8, &other, marker_of(body).?));
+}
+
+// Real outputs, captured from the teeth runners (`sim_c1_teeth_allocation --seeds 1..3 100 --c1
+// --shrink`, `sim_swarm_teeth --seeds 1..6 100 --shrink`), and the crash records `run.sh` writes.
+const c1_failing =
+    \\seed 1: FAILED: I6: an allocation disagrees with the sum of its node's assignments
+    \\  step: faults
+    \\  replay: zig-out/bin/sim_cluster 1 100 0 --c1 --heal-at=60
+    \\  shrunk to 3 operations
+    \\  replay: zig-out/bin/sim_cluster 1 3 0 --c1 --heal-at=60
+    \\seed 2: FAILED: I6: an allocation disagrees with the sum of its node's assignments
+    \\  step: faults
+    \\  replay: zig-out/bin/sim_cluster 2 100 0 --c1 --heal-at=60
+    \\  shrunk to 7 operations
+    \\  replay: zig-out/bin/sim_cluster 2 7 0 --c1 --heal-at=60
+    \\sim-cluster: seeds 1..3, 100 operations: 2 of 3 failed
+    \\
+;
+
+const swarm_failing =
+    \\seed 1: FAILED: a chunk with wrong bytes was accepted
+    \\  step: fetch
+    \\  replay: zig-out/bin/sim_swarm 1 100
+    \\  shrunk to 1 operations
+    \\  replay: zig-out/bin/sim_swarm 1 1
+    \\seed 2: FAILED: a chunk with wrong bytes was accepted
+    \\  step: fetch
+    \\  replay: zig-out/bin/sim_swarm 2 100
+    \\  shrunk to 1 operations
+    \\  replay: zig-out/bin/sim_swarm 2 1
+    \\seed 4: FAILED: a chunk with wrong bytes was accepted
+    \\  step: locality
+    \\  replay: zig-out/bin/sim_swarm 4 100
+    \\sim-swarm: seeds 1..6, 100 operations: 3 of 6 failed
+    \\
+;
+
+const swarm_clean = "sim-swarm: seeds 1..20, 60 operations: 0 of 20 failed\n";
+const c1_clean = "sim-cluster: seeds 1..8, 60 operations: 0 of 8 failed\n";
+
+const swarm_crash =
+    \\seed 7: CRASHED: reached unreachable code
+    \\  step: run
+    \\  replay: zig-out/bin/sim_swarm 7 100
+    \\sim-swarm: seeds 7..7, 100 operations: 1 of 1 failed
+    \\
+;
+
+const c1_crash =
+    \\seed 7: CRASHED: index out of bounds: index 40, len 7
+    \\  step: healed
+    \\  replay: zig-out/bin/sim_cluster 7 100 0 --c1
+    \\sim-cluster: seeds 7..7, 100 operations: 1 of 1 failed
+    \\
+;
+
+test "each kind's real output parses: failures, shrinks, clean runs and crashes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const c1 = try parse(arena, kind_sim_c1, c1_failing);
+    try std.testing.expectEqual(@as(u64, 3), c1.seeds);
+    try std.testing.expectEqual(@as(usize, 2), c1.failures.len);
+    try std.testing.expectEqualStrings("faults", c1.failures[1].step);
+    try std.testing.expectEqual(@as(?u32, 7), c1.failures[1].shrunk_operations);
+    const swarm = try parse(arena, kind_sim_swarm, swarm_failing);
+    try std.testing.expectEqual(@as(u64, 6), swarm.seeds);
+    try std.testing.expectEqual(@as(usize, 3), swarm.failures.len);
+    try std.testing.expectEqualStrings("locality", swarm.failures[2].step);
+    try std.testing.expect(swarm.failures[2].shrunk_replay == null);
+    try std.testing.expectEqual(@as(?u32, 1), swarm.failures[0].shrunk_operations);
+    const clean = try parse(arena, kind_sim_swarm, swarm_clean);
+    try std.testing.expectEqual(@as(u64, 20), clean.seeds);
+    const c1_ok = try parse(arena, kind_sim_c1, c1_clean);
+    try std.testing.expectEqual(@as(u64, 8), c1_ok.seeds);
+    const swarm_crashed = try parse(arena, kind_sim_swarm, swarm_crash);
+    try std.testing.expect(swarm_crashed.failures[0].crash);
+    try std.testing.expectEqualStrings("run", swarm_crashed.failures[0].step);
+    const c1_crashed = try parse(arena, kind_sim_c1, c1_crash);
+    const crash_check = c1_crashed.failures[0].check;
+    try std.testing.expectEqualStrings("index out of bounds: index N, len N", crash_check);
+    // A kind reads only its own summary line: swarm text is no sim-cluster batch and back.
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, swarm_clean));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_swarm, c1_clean));
+}
+
+test "one check failing in two kinds is two fingerprints, and one kind keeps one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cluster = try parse(arena, kind_sim_cluster, c1_failing);
+    const c1 = try parse(arena, kind_sim_c1, c1_failing);
+    const a = fingerprint(kind_sim_cluster, cluster.failures[0]);
+    const b = fingerprint(kind_sim_c1, c1.failures[0]);
+    try std.testing.expect(!std.mem.eql(u8, &a, &b));
+    // Seeds 1 and 2 failed alike in the same kind.
+    try std.testing.expectEqualStrings(&b, &fingerprint(kind_sim_c1, c1.failures[1]));
+    const swarm_crashed = try parse(arena, kind_sim_swarm, swarm_crash);
+    var as_cluster = swarm_crashed.failures[0];
+    as_cluster.step = "run";
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &fingerprint(kind_sim_swarm, as_cluster),
+        &fingerprint(kind_sim_cluster, as_cluster),
+    ));
+    const other = try parse(arena, kind_sim_c1, c1_crash);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &fingerprint(kind_sim_c1, other.failures[0]),
+        &fingerprint(kind_sim_c1, c1.failures[0]),
+    ));
+}
+
+test "the replay line builds the kind's own runner and replays the shrunk run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const swarm = try parse(arena, kind_sim_swarm, swarm_failing);
+    try std.testing.expectEqualStrings(
+        "git checkout abc123 && zig build -Doptimize=ReleaseSafe sim-swarm-exe && " ++
+            "zig-out/bin/sim_swarm 1 1",
+        try replay_line(arena, kind_sim_swarm, "abc123", swarm.failures[0]),
+    );
+    try std.testing.expectEqualStrings(
+        "git checkout abc123 && zig build -Doptimize=ReleaseSafe sim-swarm-exe && " ++
+            "zig-out/bin/sim_swarm 4 100",
+        try replay_line(arena, kind_sim_swarm, "abc123", swarm.failures[2]),
+    );
+    const c1 = try parse(arena, kind_sim_c1, c1_failing);
+    try std.testing.expectEqualStrings(
+        "git checkout abc123 && zig build -Doptimize=ReleaseSafe sim-cluster-exe && " ++
+            "zig-out/bin/sim_cluster 2 7 0 --c1 --heal-at=60",
+        try replay_line(arena, kind_sim_c1, "abc123", c1.failures[1]),
+    );
 }

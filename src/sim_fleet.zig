@@ -1,13 +1,17 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster] [--dry-run]  < one round's output
+//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
+//!                      < one run kind's output of a round
 //!
-//! Reads one round of the runner on stdin: what each `sim_cluster --seeds A..B <operations>
-//! --shrink` printed, concatenated, plus `run.sh`'s records of crashed seeds. It counts the seeds
-//! per UTC day in the state file and, on the first round of a new day, first posts the finished
-//! days' totals on the tracking issue. Then each distinct failure (fingerprint = kind, failing
-//! check, step) that no issue carries yet becomes an issue; one that has an issue gets a comment,
+//! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
+//! `sim_cluster --seeds A..B <operations> --shrink`; for `sim-c1`, the same with `--c1`; for
+//! `sim-swarm`, each `sim_swarm --seeds A..B <operations> --shrink`; concatenated, plus
+//! `run.sh`'s records of crashed seeds. `run.sh` calls it once per kind per round. It counts
+//! the seeds per UTC day in the state file and, on the first round of a new day, first posts the
+//! finished days' totals on the tracking issue. Then each distinct failure (fingerprint = kind,
+//! failing check, step) that no issue carries yet becomes an issue; one that has an issue gets
+//! a comment,
 //! at most once per commit and a few times a day. A seed that failed to start (`step: setup`)
 //! is the host's trouble: counted, never filed. A deleted or transferred issue is forgotten and
 //! filed again; a locked one is skipped. A rate limit stops every write and holds them until
@@ -25,8 +29,10 @@ const github_api = @import("sim_fleet_github.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
-    "                        [--tracker N] [--kind sim-cluster] [--dry-run]\n" ++
-    "reads one round of `sim_cluster --seeds A..B <operations> --shrink` output on stdin\n";
+    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]\n" ++
+    "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
+    "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
+    "--shrink` (sim-swarm), concatenated\n";
 
 pub const Options = struct {
     kind: []const u8 = issue.kind_sim_cluster,
@@ -118,7 +124,7 @@ pub fn ingest(
     };
     const today = state_file.ymd_of(options.now_seconds);
     // Counted first: the seeds ran whether or not GitHub answers.
-    try state.count(arena, today, counts, options.commit);
+    try state.count(arena, today, options.kind, counts, options.commit);
     const groups = try group_failures(arena, options.kind, batch.failures);
     for (groups) |*group| {
         const fp = try arena.dupe(u8, &group.fingerprint);
@@ -307,10 +313,15 @@ fn write_totals(
     seen: []const state_file.Seen,
 ) std.Io.Writer.Error!void {
     try w.print("{s} (UTC): {d} seeds run, {d} failed ({d} crashed, {d} could not start), " ++
-        "in {d} rounds; the last round ran at commit `{s}`. A day with no comment here means " ++
+        "in {d} batches; the last batch ran at commit `{s}`. A day with no comment here means " ++
         "the fleet did not run.\n", .{
         &day.ymd, day.seeds, day.failed, day.crashes, day.infra, day.batches, day.commit,
     });
+    try w.writeAll("\nSeeds by run:\n");
+    for (issue.kinds) |kind| {
+        const totals = state_file.kind_totals(state, day, kind, issue.kind_sim_cluster);
+        try w.print("- {s}: {d} seeds, {d} failed\n", .{ kind, totals.seeds, totals.failed });
+    }
     if (seen.len == 0) return;
     try w.writeAll("\nFailures by issue:\n");
     for (seen) |item| {
@@ -368,7 +379,7 @@ fn parse_args(args: []const []const u8) ?Args {
     if (parsed.commit.len == 0 or parsed.state.len == 0) return null;
     // The commit and kind are words in the state file.
     if (std.mem.indexOfAny(u8, parsed.commit, " \t\r\n") != null) return null;
-    if (!std.mem.eql(u8, parsed.kind, issue.kind_sim_cluster)) return null;
+    if (!issue.kind_known(parsed.kind)) return null;
     if (!parsed.dry_run and (parsed.repo.len == 0 or parsed.token_file == null)) return null;
     return parsed;
 }
@@ -479,7 +490,7 @@ fn run(
     const input_limit: std.Io.Limit = .limited(constants.fleet_input_bytes_max);
     const input = stdin.interface.allocRemaining(arena, input_limit) catch
         return error.InputUnreadable;
-    const batch = try issue.parse(arena, input);
+    const batch = try issue.parse(arena, args.kind, input);
     // A dry run keeps its own state file: it must not mark anything filed in the real one.
     const state_path = if (args.dry_run)
         try std.fmt.allocPrint(arena, "{s}.dry", .{args.state})
@@ -610,7 +621,7 @@ test "one issue per fingerprint, one comment per commit, then the day's totals" 
     var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
     defer fake.deinit();
     var state: state_file.State = .{};
-    const batch = try issue.parse(arena, teeth_output);
+    const batch = try issue.parse(arena, issue.kind_sim_cluster, teeth_output);
 
     const first = try ingest(arena, fake.github(), &state, batch, test_options("aaa", day_one));
     try std.testing.expectEqual(@as(u32, 2), first.filed); // Two fingerprints, three seeds.
@@ -653,8 +664,12 @@ test "comments on one failure are capped per day, whatever the commits" {
     var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
     defer fake.deinit();
     var state: state_file.State = .{};
-    const one = try issue.parse(arena, "seed 1: FAILED: x\n  step: end\n  replay: r1\n" ++
-        "sim-cluster: seeds 1..2, 5 operations: 1 of 2 failed\n");
+    const one = try issue.parse(
+        arena,
+        issue.kind_sim_cluster,
+        "seed 1: FAILED: x\n  step: end\n  replay: r1\n" ++
+            "sim-cluster: seeds 1..2, 5 operations: 1 of 2 failed\n",
+    );
     const rounds = constants.fleet_comments_per_failure_per_day_max + 3;
     var commit_buffer: [16]u8 = undefined;
     for (0..rounds) |round| {
@@ -677,7 +692,7 @@ test "the totals go out despite a locked and a deleted issue, and the deleted on
     var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
     defer fake.deinit();
     var state: state_file.State = .{};
-    const batch = try issue.parse(arena, teeth_output);
+    const batch = try issue.parse(arena, issue.kind_sim_cluster, teeth_output);
     _ = try ingest(arena, fake.github(), &state, batch, test_options("aaa", day_one));
     fake.locked = 1;
     fake.gone = 2;
@@ -712,7 +727,7 @@ test "a rate limit stops the round and holds every write until GitHub's wait is 
     };
     defer fake.deinit();
     var state: state_file.State = .{};
-    const batch = try issue.parse(arena, teeth_output);
+    const batch = try issue.parse(arena, issue.kind_sim_cluster, teeth_output);
     const first = try ingest(arena, fake.github(), &state, batch, test_options("aaa", day_one));
     try std.testing.expectEqual(@as(?github_api.Error, error.GitHubRateLimited), first.stopped);
     try std.testing.expectEqual(@as(u32, 1), first.filed);
@@ -743,7 +758,7 @@ test "a crash is filed under its own fingerprint and a seed that never started i
     var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
     defer fake.deinit();
     var state: state_file.State = .{};
-    const round = try issue.parse(arena,
+    const round = try issue.parse(arena, issue.kind_sim_cluster,
         \\seed 5: FAILED: out of memory
         \\  step: setup
         \\  replay: zig-out/bin/sim_cluster 5 100 0
@@ -772,7 +787,7 @@ test "a lost state file is rebuilt from the markers on the issues" {
     const arena = arena_state.allocator();
     var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
     defer fake.deinit();
-    const batch = try issue.parse(arena, teeth_output);
+    const batch = try issue.parse(arena, issue.kind_sim_cluster, teeth_output);
     var old: state_file.State = .{};
     _ = try ingest(arena, fake.github(), &old, batch, test_options("aaa", day_one));
     var fresh: state_file.State = .{};
@@ -792,6 +807,7 @@ test "a clean batch files nothing and still counts its seeds" {
     var state: state_file.State = .{};
     const clean = try issue.parse(
         arena,
+        issue.kind_sim_cluster,
         "sim-cluster: seeds 1..40, 100 operations: 0 of 40 failed\n",
     );
     const summary = try ingest(arena, fake.github(), &state, clean, test_options("aaa", day_one));
@@ -809,8 +825,12 @@ test "the dry run prints one would-be issue, then would-be comments, and asks Gi
     var out: std.Io.Writer.Allocating = .init(arena);
     var printer: github_api.Printer = .{ .out = &out.writer };
     var state: state_file.State = .{};
-    const one = try issue.parse(arena, "seed 1: FAILED: x\n  step: end\n  replay: r1\n" ++
-        "sim-cluster: seeds 1..2, 5 operations: 1 of 2 failed\n");
+    const one = try issue.parse(
+        arena,
+        issue.kind_sim_cluster,
+        "seed 1: FAILED: x\n  step: end\n  replay: r1\n" ++
+            "sim-cluster: seeds 1..2, 5 operations: 1 of 2 failed\n",
+    );
     _ = try ingest(arena, printer.github(), &state, one, test_options("aaa", day_one));
     _ = try ingest(arena, printer.github(), &state, one, test_options("bbb", day_one));
     _ = try ingest(arena, printer.github(), &state, one, test_options("bbb", day_one));
@@ -867,4 +887,63 @@ test "parse_args wants a commit and a state, and a repo and token unless dry" {
     try std.testing.expect(parse_args(&.{ "f", "ingest", "--bogus", "1" }) == null);
     const spaced = parse_args(&.{ "f", "ingest", "--commit", "a b", "--state", "s", "--dry-run" });
     try std.testing.expect(spaced == null);
+}
+
+test "three kinds on one day: separate issues, separate counts, and the totals break them down" {
+    // Goal: the same check failing in sim-cluster and sim-c1 is two issues, and the daily post
+    // says how many seeds each kind ran. Method: ingest one failure per kind, then the next day.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
+    defer fake.deinit();
+    var state: state_file.State = .{};
+    const failing = "seed 3: FAILED: I6: an allocation disagrees\n  step: faults\n" ++
+        "  replay: zig-out/bin/sim_cluster 3 100 0 --c1\n";
+    const swarm_text = "seed 5: FAILED: a chunk with wrong bytes was accepted\n  step: fetch\n" ++
+        "  replay: zig-out/bin/sim_swarm 5 100\n  shrunk to 1 operations\n" ++
+        "  replay: zig-out/bin/sim_swarm 5 1\n";
+    const cluster_tail = "sim-cluster: seeds 1..100, 100 operations: 1 of 100 failed\n";
+    const swarm_tail = "sim-swarm: seeds 1..50, 100 operations: 1 of 50 failed\n";
+    const Input = struct { kind: []const u8, text: []const u8, seeds: u32, tail: []const u8 };
+    const inputs = [_]Input{
+        .{ .kind = issue.kind_sim_cluster, .text = failing, .seeds = 100, .tail = cluster_tail },
+        .{ .kind = issue.kind_sim_c1, .text = failing, .seeds = 100, .tail = cluster_tail },
+        .{ .kind = issue.kind_sim_swarm, .text = swarm_text, .seeds = 50, .tail = swarm_tail },
+    };
+    for (inputs) |input| {
+        const text = try std.mem.concat(arena, u8, &.{ input.text, input.tail });
+        const batch = try issue.parse(arena, input.kind, text);
+        var options = test_options("aaa", day_one);
+        options.kind = input.kind;
+        const summary = try ingest(arena, fake.github(), &state, batch, options);
+        try std.testing.expectEqual(@as(u32, 1), summary.filed);
+        try std.testing.expectEqual(@as(u64, input.seeds), summary.seeds);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fake.issues.items.len);
+    const swarm_body = fake.issues.items[2].body;
+    try std.testing.expect(std.mem.indexOf(u8, swarm_body, "sim-swarm-exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, swarm_body, "- run: sim-swarm") != null);
+    const day = &state.days.items[0];
+    try std.testing.expectEqual(@as(u64, 250), day.seeds);
+    const default = issue.kind_sim_cluster;
+    const swarm = state_file.kind_totals(&state, day, issue.kind_sim_swarm, default);
+    try std.testing.expectEqual(@as(u64, 50), swarm.seeds);
+    const cluster = state_file.kind_totals(&state, day, issue.kind_sim_cluster, default);
+    try std.testing.expectEqual(@as(u64, 100), cluster.seeds);
+    const before = fake.comments.items.len;
+    const next = try issue.parse(
+        arena,
+        issue.kind_sim_swarm,
+        "sim-swarm: seeds 1..9, 100 operations: 0 of 9 failed\n",
+    );
+    var next_options = test_options("bbb", day_two);
+    next_options.kind = issue.kind_sim_swarm;
+    _ = try ingest(arena, fake.github(), &state, next, next_options);
+    const posted = fake.comments.items[before].body;
+    for ([_][]const u8{
+        "- sim-cluster: 100 seeds, 1 failed",
+        "- sim-c1: 100 seeds, 1 failed",
+        "- sim-swarm: 50 seeds, 1 failed",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, posted, line) != null);
 }
