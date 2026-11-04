@@ -42,7 +42,9 @@ package may carry the `zbx` command where it helps.
 - Maintainer scripts are the minimum: create the system user, `systemctl daemon-reload`. Upgrades
   restart nothing on their own; the release notes say "upgrade the server, then the agents"
   (mixed versions are parked).
-- Signing on the owner's machine, with Zigbox's key and tool.
+- Signed with `gpg` on the owner's machine with Zigbox's archive key; hosted with Zigbox's
+  repository on GitHub Pages; tested on Ubuntu 24.04, Debian 12, current Fedora and a RHEL 9
+  compatible (owner, 2026-11-04; Zigbox `docs/decisions/2026-11-04-package-signing-hosting.md`).
 
 ## Unknowns to settle first
 
