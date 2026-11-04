@@ -44,7 +44,7 @@ A writer and a matching parser, both bounded, for three certificate kinds:
   one `dNSName` instead (exact match, no wildcard).
 - **Private extension** (non-critical, so a stock stack that does not know it still accepts the
   certificate; JDK and OpenSSL both refuse unknown *critical* extensions). OID under the
-  UUID-derived arc `2.25.<uuid as integer>` (Q4). Value is a DER SEQUENCE:
+  UUID-derived arc `2.25.192541954756406065736426278304158759968` (Q4). Value is a DER SEQUENCE:
   `{ version INTEGER (1), image_digest OCTET STRING (32, the BLAKE3 tree digest), placement_epoch
   INTEGER (0..2^63-1), labels SEQUENCE OF SEQUENCE { key UTF8String, value UTF8String } }`.
   Labels are sorted by key, keys unique. This is C4's identity: service or job, image digest,
@@ -76,9 +76,7 @@ A writer and a matching parser, both bounded, for three certificate kinds:
 
 - **Versions and algorithms.** TLS 1.3 only. One group, x25519. One signature scheme,
   `ed25519` (0x0807), for `signature_algorithms` and `signature_algorithms_cert`. Cipher suite
-  `TLS_AES_128_GCM_SHA256` (0x1301) **only** (Q2 asks whether to add
-  `TLS_CHACHA20_POLY1305_SHA256`; recommended no: JDK 15+ and OpenSSL both do AES-128-GCM, and a
-  second suite doubles the schedule and record tests for nothing B3 needs).
+  `TLS_AES_128_GCM_SHA256` (0x1301) **only** (Q2: no ChaCha20-Poly1305; JDK 15+ and OpenSSL both do AES-128-GCM).
 - **Never offered, never accepted:** TLS 1.2 or older, session resumption (no `pre_shared_key`,
   no `psk_key_exchange_modes`; a `NewSessionTicket` is read and discarded), 0-RTT (no
   `early_data`), compression, renegotiation, other groups. A `HelloRetryRequest` is refused: the
@@ -306,33 +304,26 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
 - Replacing the peer handshake with this TLS (the "eventual target" in `docs/peer.md` is a later
   decision).
 
-## Open questions for the supervisor
+## Answers (supervisor, 2026-11-04)
 
-- **Q1. Which server chains must the client accept?** As written: an Ed25519 server leaf signed
-  directly by the one pinned cluster CA, as B3's acceptance says ("a stock TLS server configured
-  with the CA certificate"). If Botpike's real upstream presents a certificate from a public CA or
-  with an ECDSA or RSA key, this client refuses it until a later slice adds those algorithms,
-  which is far larger (`std.crypto.Certificate` does verify them, but then the client parses
-  untrusted chains of many shapes). Recommended: Ed25519 only, and Botpike's upstream gets a
-  certificate from the cluster CA. Needs the owner's confirmation.
-- **Q2. ChaCha20-Poly1305?** Recommended no (above). Adding it later is an S slice.
-- **Q3. External programs.** STYLE allows external programs "only where the spec names them". The
-  interop harness runs `openssl` and `java`, and the JVM server is a Java source file. Both are
-  test-only, never in a shipped binary, and the B3 acceptance requires a stock JVM. Needs the
-  owner's written approval, as does the CI job installing a JDK (the container has one).
-- **Q4. The private extension's OID.** Recommended the `2.25.<UUID>` arc (needs no registration).
-  A registered Private Enterprise Number is the alternative; either is a one-line change before
-  anyone issues a certificate, an incompatible one after.
-- **Q5. Server name form.** The client checks the server leaf's `dNSName` (exact) or its SPIFFE
-  URI SAN, whichever the caller names. Does Botpike's upstream have a SPIFFE ID, or only a DNS
-  name? The brief supports both.
-- **Q6. Core or shell for the state machine.** Recommended core (pure, fuzzable, wasm-clean,
-  simulation-ready), at the cost of passing randomness and the clock in. The alternative, a shell
-  module over `std.Io`, is simpler to use and cannot be fuzzed from a seed.
-- **Q7. Who holds the leaf key.** The interface takes a public key to certify and a sign callback
-  for the client; it does not say whether the node agent or the relay generates the key. That is
-  B3's design, and nothing here forces an answer. The relay holding the key and the workload
-  never seeing it (B3 acceptance) is compatible with both.
-- **Q8. Live design doc not read.** AGENTS.md says the live design doc wins over repository files.
-  This session read the repository only. If SPEC Part II says anything about the certificate
-  fields or TLS that this brief contradicts, the supervisor should say so before slice 1.
+- **Q1. Server chains.** The client takes ONE pinned trust anchor: an Ed25519 CA public key
+  chosen by the caller. It is the cluster CA by default, and a relay's upstream may pin its own
+  anchor in cluster configuration. Only Ed25519 server leaves signed directly by that anchor are
+  accepted; there is no public-CA, RSA or ECDSA support. Botpike's broker will present an Ed25519
+  certificate on the relay port; JDK 21 can serve one. The owner is told that this is the
+  contract. The client API names the parameter `anchor`, not "cluster CA".
+- **Q2. ChaCha20-Poly1305.** No.
+- **Q3. External programs.** Approved, test-only. The owner's B3 acceptance requires a stock JVM
+  server, which is the spec naming the programs. Slice 7 records this in a decision file:
+  `openssl` and `java` run in the interop harness and its CI job only, never in a shipped binary.
+- **Q4. The private extension's OID.** The `2.25.<UUID>` arc. The UUID was generated once, in
+  slice 1: `90da3b4b-8df9-4f57-9af3-d569aaf6bc20`, so the OID is
+  `2.25.192541954756406065736426278304158759968`.
+  `docs/decisions/2026-11-04-mtls-identity-extension-oid.md` records it.
+- **Q5. Server name form.** Support both forms, as written. Botpike's broker has a DNS name
+  (`broker.botpike.com`).
+- **Q6. Core or shell for the state machine.** Core, as recommended.
+- **Q7. Who holds the leaf key.** B3's to decide; out of scope here. The interface stays as
+  written: a public key to certify, and a sign callback.
+- **Q8. Live design doc.** Slice 1 read Zigbox `docs/SPEC.md` Part II C4 and the identity and
+  trust lines of C6 (snapshot `a2ff703`); what it found is in the slice 1 report.
