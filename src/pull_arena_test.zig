@@ -91,7 +91,8 @@ fn ask(s: store.Store) !u64 {
 test "stats pull at its read cap with the largest records fits the request arena (memory)" {
     // Goal: the worst case at the cap uses at most half the real limit (2x arena bound; the cap
     // itself is enforced by the comptime assert in constants.zig, not by this test).
-    // Method: cap + 500 maximum records, one request under a BoundedArena of exactly `request_arena_bytes_max`.
+    // Method: cap + 500 maximum records, one request under a
+    // BoundedArena of exactly `request_arena_bytes_max`.
     var manual: clock_mod.ManualClock = .{};
     var memory: MemoryStore = undefined;
     memory.init(testing.allocator, manual.clock());
