@@ -1,6 +1,6 @@
 //! `zig build demo-c2`: SPEC's C2 demo, run for real (docs/demos/c2.md, "demo-c2"). The server
 //! runs on the host over SQLite; four QEMU guests (src/demo_c2_vms.zig) each run one
-//! `zcube-agent --runtime zigbox` as the ordinary user `cube`, which reaches the server at
+//! `zcube-agent --runtime zigbox` as root, which reaches the server at
 //! 10.0.2.2 and advertises its peer server as `10.0.2.2:H_i`, a host port forwarded to it. The
 //! `zcube` command runs on the host. The script is src/demo_c2_script.zig.
 //!
@@ -185,7 +185,7 @@ fn boot_and_run(demo: *steps.Demo, init: std.process.Init, options: Options) !vo
 fn guest_logs(demo: *steps.Demo) void {
     for (0..vms.count) |index| {
         if (!demo.guests.started[index]) continue;
-        const result = demo.guests.cube(@intCast(index), "logs", 60) catch continue;
+        const result = demo.guests.root(@intCast(index), "logs", 60) catch continue;
         demo.host.say("---- {s}: guest.sh logs ----", .{vms.names[index]});
         demo.host.out(result.output);
         demo.host.out("\n");

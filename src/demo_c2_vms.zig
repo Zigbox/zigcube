@@ -18,10 +18,6 @@ pub const peer_port_guest: u16 = 7071;
 
 const cache_dir = ".zig-cache/vm";
 
-/// What a login session of `cube` would set (as src/zigbox_smoke.zig does).
-pub const as_cube = "runuser -u cube -- env HOME=/home/cube XDG_RUNTIME_DIR=/run/user/1000 " ++
-    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus ";
-
 pub const script = "/home/cube/guest.sh";
 
 const configs = configs: {
@@ -37,8 +33,9 @@ const configs = configs: {
                 .subid_count = 65536,
                 .linger = true,
             },
-            // nftables for step 3's rule on guest 3; uidmap and passt as zigbox-smoke, for
-            // the rootless containers of Zigbox.
+            // nftables for step 3's rule on guest 3; uidmap and passt as zigbox-smoke. The
+            // agents run as root (gap 2 of slice 8's M3); `guest.sh setup-root` gives root its
+            // subordinate range and its user bus. `cube` only owns the uploaded files.
             .packages = &.{ "uidmap", "passt", "nftables" },
             .sysctls = &.{.{
                 .key = "kernel.apparmor_restrict_unprivileged_userns",
@@ -151,20 +148,6 @@ pub const Guests = struct {
         for (&guests.sessions, guests.started) |*session, started| {
             if (started) try session.pump(ms);
         }
-    }
-
-    /// Runs `guest.sh <arguments>` as `cube` on guest `index`.
-    pub fn cube(
-        guests: *Guests,
-        index: u32,
-        arguments: []const u8,
-        timeout_s: u32,
-    ) !vm.Session.Result {
-        var line: [vm.limits.command_bytes_max]u8 = undefined;
-        const command = try std.fmt.bufPrint(&line, as_cube ++ "sh " ++ script ++ " {s}", .{
-            arguments,
-        });
-        return guests.sessions[index].run(command, timeout_s);
     }
 
     /// Runs `guest.sh <arguments>` as root on guest `index`.

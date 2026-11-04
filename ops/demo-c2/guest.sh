@@ -1,26 +1,30 @@
 #!/bin/sh
 # The guest half of `zig build demo-c2` (src/demo_c2.zig, docs/demos/c2.md, "demo-c2"). The host
-# half boots four guests, copies the binaries and this script in, and calls it with one command at
-# a time. The server runs on the host; this guest runs one `zcube-agent --runtime zigbox` as the
-# ordinary user `cube`, which reaches the server at 10.0.2.2 (QEMU user-mode networking) and serves
-# its peers on port 7071, which the host forwards from a port of its own.
+# half boots four guests, copies the binaries and this script in, and calls it as root with one
+# command at a time. The server runs on the host; this guest runs one `zcube-agent --runtime
+# zigbox` as root (slice 8's M3: a peer server that is not root cannot read objects its range
+# owns), which reaches the server at 10.0.2.2 (QEMU user-mode networking) and serves its peers on
+# port 7071, which the host forwards from a port of its own.
 #
-# Run as cube:  guest.sh agent <node> <server host:port> <advertised host:port>
-#               guest.sh restart | fault-on | fault-off | learn <reference> | store-empty
-#               guest.sh fetch-logs <pattern> | logs
-# Run as root:  guest.sh block-registry
+# Commands:  guest.sh setup-root | agent <node> <server host:port> <advertised host:port>
+#            guest.sh restart | fault-on | fault-off | learn <reference> | store-empty
+#            guest.sh fetch-logs <pattern> | logs | one-chunk-owners <tree> | block-registry
 #
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1.
 
 BIN=/home/cube/bin
-STATE=/home/cube/state
-LOG=/home/cube/log
-ARGS=/home/cube/agent.args
+STATE=/root/state
+LOG=/root/log
+ARGS=/root/agent.args
 PEER_PORT=7071
+# Root's id range for Zigbox's full map; cube's is 100000:65536 (src/demo_c2_vms.zig).
+ROOT_RANGE=200000:65536
 
-# Zigbox asks the user's systemd for a scope per container: it needs this session's variables.
-export XDG_RUNTIME_DIR=/run/user/1000
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+export HOME=/root
+# Zigbox asks the caller's systemd user manager for a scope per container; root's is
+# user@0.service, which `setup-root` starts by lingering root.
+export XDG_RUNTIME_DIR=/run/user/0
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
 # Docker Hub images (step 3's Alpine) come through Google's mirror, as in Zigbox's CI.
 export ZBX_REGISTRY_MIRRORS=mirror.gcr.io
 
@@ -68,6 +72,22 @@ cmd_restart() {
     ok "the agent restarted (pid $pid, now $(agent_pid))"
 }
 
+# Root gets a subordinate range (the full id map) and a systemd user manager with its bus.
+cmd_setup_root() {
+    [ "$(id -u)" -eq 0 ] || fail "setup-root runs as root"
+    for file in /etc/subuid /etc/subgid; do
+        grep -q "^root:" "$file" || echo "root:$ROOT_RANGE" >>"$file" || fail "append to $file"
+    done
+    loginctl enable-linger root || fail "loginctl enable-linger root"
+    tries=0
+    while [ ! -S "$XDG_RUNTIME_DIR/bus" ]; do
+        tries=$((tries + 1))
+        [ $tries -le 300 ] || fail "no bus at $XDG_RUNTIME_DIR/bus within 30 s"
+        sleep 0.1
+    done
+    ok "root has $(grep '^root:' /etc/subuid) in /etc/subuid and a bus at $XDG_RUNTIME_DIR/bus"
+}
+
 cmd_fault_on() {
     mkdir -p "$STATE/faults"
     : >"$STATE/faults/peer-corrupt"
@@ -83,7 +103,7 @@ cmd_fault_off() {
 # deleted after: the node's own store stays as it was.
 cmd_learn() {
     [ $# -eq 1 ] || fail "usage: guest.sh learn <reference>"
-    scratch=/home/cube/learn
+    scratch=/root/learn
     rm -rf "$scratch"
     mkdir -p "$scratch/data" "$scratch/cache" "$scratch/state"
     out=$(XDG_DATA_HOME="$scratch/data" XDG_CACHE_HOME="$scratch/cache" \
@@ -98,7 +118,7 @@ cmd_learn() {
 
 # The node's own Zigbox store holds no tree (before its agent first starts).
 cmd_store_empty() {
-    store=/home/cube/.local/share/zbx
+    store=/root/.local/share/zbx
     if [ -d "$store" ] && [ -n "$(find "$store" -type f | head -1)" ]; then
         fail "the store $store is not empty"
     fi
@@ -113,6 +133,7 @@ cmd_fetch_logs() {
         name=$(basename "$(dirname "$log")")
         grep -e "$1" "$log" | sed "s|^|$name: |"
     done
+    [ -f "$LOG/agent.log" ] && grep -e "$1" "$LOG/agent.log" | tail -40 | sed "s|^|agent.log: |"
     true
 }
 
@@ -128,7 +149,19 @@ cmd_logs() {
     ps -eo pid,etime,args | grep -E 'zcube|zbx' | grep -v grep
 }
 
-# As root: drop every outbound TCP connection except to the host (10.0.2.2: the server and the
+# Zigbox gap 1 (slice 8's M3, Z9): a peer server reads a one-chunk object (at most 1 MiB) as
+# Damaged when its container owner is not 0:0. Lists the files of <tree>, from this node's own
+# store, that are such objects: owner, octal mode, size, path.
+cmd_one_chunk_owners() {
+    [ $# -eq 1 ] || fail "usage: guest.sh one-chunk-owners <tree>"
+    "$BIN/zbx" run "$1" -- find / -xdev -type f -size -1025k -exec stat -c '%u:%g %a %s %n' {} + \
+        >/root/owners.txt 2>/root/owners.err || fail "zbx run $1: $(tail -5 /root/owners.err)"
+    awk '$1 != "0:0" && $3 > 0' /root/owners.txt
+    ok "$(awk '$1 != "0:0" && $3 > 0' /root/owners.txt | wc -l) of" \
+        "$(wc -l </root/owners.txt) files of at most 1 MiB have a container owner other than 0:0"
+}
+
+# Drop every outbound TCP connection except to the host (10.0.2.2: the server and the
 # peers) and loopback, so neither GHCR nor the Docker Hub mirror can be reached, then show it.
 cmd_block_registry() {
     [ "$(id -u)" -eq 0 ] || fail "block-registry runs as root"
@@ -153,6 +186,7 @@ main() {
     command=$1
     shift
     case "$command" in
+        setup-root) cmd_setup_root ;;
         agent) cmd_agent "$@" ;;
         restart) cmd_restart ;;
         fault-on) cmd_fault_on ;;
@@ -161,6 +195,7 @@ main() {
         store-empty) cmd_store_empty ;;
         fetch-logs) cmd_fetch_logs "$@" ;;
         logs) cmd_logs ;;
+        one-chunk-owners) cmd_one_chunk_owners "$@" ;;
         block-registry) cmd_block_registry ;;
         *) fail "unknown command $command" ;;
     esac

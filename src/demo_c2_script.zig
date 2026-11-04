@@ -55,8 +55,10 @@ fn deploy_v1(demo: *Demo) !void {
     }, steps.pulls_recorded, "v1's pull records of node1-3", steps.record_ms);
     const pulls = try demo.pulls(demo.v1_tree);
     for (pulls) |pull| steps.say_pull(demo, pull);
-    demo.expect(check.registry_once(pulls), "v1 came from the registry on one node only; the " ++
-        "other two fetched it from peers", .{});
+    const once = check.registry_once(pulls);
+    demo.expect(once, "v1 came from the registry on one node only; the other two fetched it " ++
+        "from peers", .{});
+    if (!once) try steps.gap_evidence(demo, demo.v1_tree, 0, &.{ 0, 1, 2 });
 }
 
 // ---- 2. Roll to v2: only the changed layer moves ----
@@ -117,9 +119,9 @@ fn peers_only(demo: *Demo) !void {
         .tree = steps.alpine_tree,
         .nodes = &.{ "node1", "node2" },
     }, steps.pulls_recorded, "alpine's pull records of node1 and node2", steps.record_ms);
-    _ = try demo.guest(0, false, "fault-on", .{});
-    _ = try demo.guest(0, false, "restart", .{});
-    _ = try demo.guest(2, true, "block-registry", .{});
+    _ = try demo.guest(0, "fault-on", .{});
+    _ = try demo.guest(0, "restart", .{});
+    _ = try demo.guest(2, "block-registry", .{});
     try demo.apply(alpine(3));
     const started = try demo.wait(steps.Expect{
         .service = alpine_box,
@@ -128,27 +130,31 @@ fn peers_only(demo: *Demo) !void {
     }, steps.replicas_running, "alpine-box's third replica, on node3", steps.start_ms);
     demo.expect(started, "node3 started alpine-box with no registry reachable", .{});
     _ = try host.zcube(&.{ "get", "replicas", alpine_box });
-    if (started) try peers_only_record(demo);
-    _ = try demo.guest(0, false, "fault-off", .{});
-    _ = try demo.guest(0, false, "restart", .{});
+    const peers_alone = if (started) try peers_only_record(demo) else false;
+    const warned = try demo.guest(2, "fetch-logs ZC-W0601", .{});
+    demo.expect(std.mem.indexOf(u8, warned, "ZC-W0601") != null, "node3's fetch log says " ++
+        "ZC-W0601", .{});
+    if (!peers_alone) try steps.gap_evidence(demo, steps.alpine_tree, 0, &.{2});
+    _ = try demo.guest(0, "fault-off", .{});
+    _ = try demo.guest(0, "restart", .{});
 }
 
-fn peers_only_record(demo: *Demo) !void {
+/// node3's pull record of alpine: from peers alone, with node1 struck. True if it was from peers
+/// alone.
+fn peers_only_record(demo: *Demo) !bool {
     const found = try demo.wait(steps.Records{
         .tree = steps.alpine_tree,
         .nodes = &.{"node3"},
     }, steps.pulls_recorded, "node3's pull record of alpine", steps.record_ms);
     demo.expect(found, "node3 recorded its pull of alpine", .{});
-    if (!found) return;
+    if (!found) return false;
     const pull = check.pull_on(try demo.pulls(steps.alpine_tree), "node3").?;
     steps.say_pull(demo, pull);
-    demo.expect(check.from_peers_only(pull), "node3 took every byte from peers, none from " ++
-        "a registry", .{});
+    const alone = check.from_peers_only(pull);
+    demo.expect(alone, "node3 took every byte from peers, none from a registry", .{});
     demo.expect(pull.has_bad_peer("node1"), "node3 struck node1 for a chunk that did not " ++
         "verify", .{});
-    const warned = try demo.guest(2, false, "fetch-logs ZC-W0601", .{});
-    demo.expect(std.mem.indexOf(u8, warned, "ZC-W0601") != null, "node3's fetch log says " ++
-        "ZC-W0601", .{});
+    return alone;
 }
 
 // ---- 4. A fourth, empty node ----
@@ -203,7 +209,9 @@ fn spread_wins(demo: *Demo) !void {
     if (!found) return;
     const pull = check.pull_on(try demo.pulls(demo.v2_tree), "node4").?;
     steps.say_pull(demo, pull);
-    demo.expect(check.from_peers_only(pull), "node4 fetched v2 from peers alone", .{});
+    const alone = check.from_peers_only(pull);
+    demo.expect(alone, "node4 fetched v2 from peers alone", .{});
+    if (!alone) try steps.gap_evidence(demo, demo.v2_tree, 0, &.{3});
 }
 
 fn summary(demo: *Demo) !void {

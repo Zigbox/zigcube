@@ -95,32 +95,28 @@ pub const Demo = struct {
         return demo.host.fail("timed out waiting for " ++ what, .{});
     }
 
-    /// `guest.sh <arguments>` as `cube` (or root) on guest `index`, shown in the transcript.
-    /// A non-zero exit ends the demo.
-    pub fn guest(
-        demo: *Demo,
-        index: u32,
-        as_root: bool,
-        comptime format: []const u8,
-        args: anytype,
-    ) ![]const u8 {
+    /// `guest.sh <arguments>` as root on guest `index`, shown in the transcript. A non-zero
+    /// exit ends the demo.
+    pub fn guest(demo: *Demo, index: u32, comptime format: []const u8, args: anytype) ![]const u8 {
         const arguments = try std.fmt.allocPrint(demo.arena(), format, args);
-        const timeout_s: u32 = 300;
-        const result = if (as_root)
-            try demo.guests.root(index, arguments, timeout_s)
-        else
-            try demo.guests.cube(index, arguments, timeout_s);
-        const output = try demo.arena().dupe(u8, result.output);
-        const prompt = if (as_root) "#" else "$";
-        demo.host.say("{s}{s} guest.sh {s}", .{ vms.names[index], prompt, arguments });
-        demo.host.out(output);
-        demo.host.out("\n");
-        if (result.status != 0) {
+        const ran = try demo.guest_run(index, arguments);
+        if (ran.status != 0) {
             return demo.host.fail("guest.sh {s} on {s} exited {d}", .{
-                arguments, vms.names[index], result.status,
+                arguments, vms.names[index], ran.status,
             });
         }
-        return output;
+        return ran.output;
+    }
+
+    /// As `guest`, but a non-zero exit is the caller's to judge.
+    pub fn guest_run(demo: *Demo, index: u32, arguments: []const u8) !Ran {
+        const timeout_s: u32 = 300;
+        const result = try demo.guests.root(index, arguments, timeout_s);
+        const output = try demo.arena().dupe(u8, result.output);
+        demo.host.say("{s}# guest.sh {s}", .{ vms.names[index], arguments });
+        demo.host.out(output);
+        demo.host.out("\n");
+        return .{ .output = output, .status = result.status };
     }
 
     /// `zcube -o json <args>`, parsed; not shown.
@@ -166,6 +162,8 @@ pub const Demo = struct {
     }
 };
 
+pub const Ran = struct { output: []const u8, status: u8 };
+
 pub const Service = struct {
     name: []const u8,
     image: []const u8,
@@ -188,18 +186,21 @@ pub fn start(demo: *Demo) !void {
     host.say("  zcube-server is up on 127.0.0.1:{d} (SQLite); the guests reach it at {s}", .{
         host.port, demo.server,
     });
+    // The agents run as root (slice 8's M3, gap 2): root gets a subordinate range for the full
+    // id map and a user bus (linger) for its scopes.
+    for (0..vms.count) |index| _ = try demo.guest(@intCast(index), "setup-root", .{});
     // The tree digest Zigbox computes for an image depends on the host it is pulled on, so the
     // demo learns v1's and v2's on guest 4, in a scratch store it deletes; node4 stays empty.
     demo.v1_tree = try learn(demo, v1_ref);
     demo.v2_tree = try learn(demo, v2_ref);
-    _ = try demo.guest(3, false, "store-empty", .{});
+    _ = try demo.guest(3, "store-empty", .{});
     for (0..3) |index| try start_agent(demo, @intCast(index));
     try demo.wait_hard(@as(u32, 3), peers_known, "3 nodes with peer addresses", join_ms);
     _ = try host.zcube(&.{ "get", "nodes" });
 }
 
 fn learn(demo: *Demo, reference: []const u8) ![]const u8 {
-    const output = try demo.guest(3, false, "learn {s}", .{reference});
+    const output = try demo.guest(3, "learn {s}", .{reference});
     const at = std.mem.indexOf(u8, output, "tree b3:") orelse
         return demo.host.fail("no tree learned for {s}", .{reference});
     const tree = output[at + "tree ".len ..];
@@ -209,7 +210,7 @@ fn learn(demo: *Demo, reference: []const u8) ![]const u8 {
 }
 
 pub fn start_agent(demo: *Demo, index: u32) !void {
-    _ = try demo.guest(index, false, "agent {s} {s} 10.0.2.2:{d}", .{
+    _ = try demo.guest(index, "agent {s} {s} 10.0.2.2:{d}", .{
         vms.names[index], demo.server, demo.guests.peer_ports[index],
     });
 }
@@ -225,6 +226,24 @@ pub fn peers_known(nodes: u32, demo: *Demo) !bool {
         .array => |list| list.items.len >= nodes,
         else => false,
     };
+}
+
+// ---- Zigbox gap 1 (slice 8's M3; Zigbox Z9) ----
+
+/// Says what stands behind a miss of step 1 or 3 while the pinned Zigbox has gap 1: a node
+/// that holds `tree` cannot serve a one-chunk object whose container owner is not 0:0 (it reads
+/// as Damaged, the peer server answers 500 and the fetch falls back or fails, ZC-E0601). Lists
+/// those objects as `holder` sees them inside the image, then the fetch logs of `fetchers`.
+pub fn gap_evidence(demo: *Demo, tree: []const u8, holder: u32, fetchers: []const u32) !void {
+    demo.host.say("  evidence for Zigbox gap 1 (Z9): one-chunk objects not owned by 0:0 in {s}", .{
+        tree,
+    });
+    const owners = try std.fmt.allocPrint(demo.arena(), "one-chunk-owners {s}", .{tree});
+    _ = try demo.guest_run(holder, owners);
+    _ = try demo.guest_run(holder, "fetch-logs 'does not match\\|Damaged'");
+    for (fetchers) |index| {
+        _ = try demo.guest_run(index, "fetch-logs 'ZC-[EW]06\\|does not match'");
+    }
 }
 
 // ---- Waits on replicas and records ----
