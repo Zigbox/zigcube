@@ -27,7 +27,7 @@ const node_store = @import("node_store.zig");
 const Allocator = std.mem.Allocator;
 const ChunkRef = fetch_plan.ChunkRef;
 
-pub const Error = error{ TreeUnavailable, ChunkFailed, Store, OutOfMemory, TooMany };
+pub const Error = error{ TreeUnavailable, ChunkFailed, Deadline, Store, OutOfMemory, TooMany };
 
 /// A peer the worker may ask: its name for reports and the bytes of its chunk filter.
 pub const PeerInfo = struct {
@@ -88,8 +88,10 @@ pub fn fetch(
     config: fetch_plan.Config,
     report: *Report,
 ) Error!void {
-    assert(all_peers.len <= constants.fetch_peers_max);
+    assert(all_peers.len <= constants.fetch_candidates_max);
     report.* = .{};
+    assert(config.total_ms > 0);
+    const deadline = transport.now_fn(transport.context) + config.total_ms;
     // A peer is not trusted: only the whole digest (`b3:` and 64 hex) holds its list to the
     // tree. A shorter one (8 hex is 32 bits) could be matched by a forged list, so such a tree
     // comes from the registry alone.
@@ -99,7 +101,8 @@ pub fn fetch(
     defer allocator.free(list_buffer);
     const refs = try allocator.alloc(ChunkRef, constants.fetch_chunks_max);
     defer allocator.free(refs);
-    const list = try find_list(transport, digest, peers.len, list_buffer, report);
+    const asked = @min(peers.len, constants.fetch_list_peers_max);
+    const list = try find_list(transport, digest, asked, list_buffer, deadline, report);
     const count = node_store.list_parse(list, refs) orelse return error.TreeUnavailable;
     store.put_tree(digest, list) catch return error.Store;
     const chunk_buffer = try allocator.alloc(u8, constants.swarm_chunk_bytes);
@@ -109,7 +112,49 @@ pub fn fetch(
     if (needed == 0) return;
     const states = try allocator.alloc(fetch_plan.ChunkState, needed);
     defer allocator.free(states);
-    try run_plan(transport, store, refs[0..needed], states, peers, config, chunk_buffer, report);
+    const ranked = rank_peers(peers, refs[0..needed]);
+    const run: Run = .{ .deadline = deadline, .config = config, .ranked = ranked };
+    try run_plan(transport, store, refs[0..needed], states, peers, &run, chunk_buffer, report);
+}
+
+/// The peers a plan uses, best first: `order[i]` is the index in the caller's `peers` of the
+/// plan's peer `i`.
+const Ranked = struct {
+    order: [constants.fetch_peers_max]u8 = undefined,
+    count: u8 = 0,
+};
+
+/// What `run_plan` needs besides its buffers.
+const Run = struct {
+    deadline: u64,
+    config: fetch_plan.Config,
+    ranked: Ranked,
+};
+
+/// Picks the `fetch_peers_max` peers whose filters claim the most of `chunks`, most first (ties
+/// keep the caller's order). A peer that claims none is left out: the plan would never ask it.
+fn rank_peers(peers: []const PeerInfo, chunks: []const ChunkRef) Ranked {
+    assert(peers.len <= constants.fetch_candidates_max);
+    var claims: [constants.fetch_candidates_max]u32 = @splat(0);
+    for (peers, 0..) |peer, at| {
+        const filter = chunk_summary.Filter.view(peer.filter);
+        for (chunks) |ref| {
+            if (filter.maybe_has(&ref.hash)) claims[at] += 1;
+        }
+    }
+    var ranked: Ranked = .{};
+    while (ranked.count < constants.fetch_peers_max) {
+        var best: ?usize = null;
+        for (claims[0..peers.len], 0..) |claimed, at| {
+            if (claimed == 0) continue;
+            if (best == null or claimed > claims[best.?]) best = at;
+        }
+        const at = best orelse break;
+        ranked.order[ranked.count] = @intCast(at);
+        ranked.count += 1;
+        claims[at] = 0;
+    }
+    return ranked;
 }
 
 /// The first list a source gives that is the tree's own. Peers first.
@@ -118,10 +163,12 @@ fn find_list(
     digest: []const u8,
     peer_count: usize,
     out: []u8,
+    deadline: u64,
     report: *Report,
 ) Error![]const u8 {
     var index: usize = 0;
     while (index <= peer_count) : (index += 1) {
+        if (transport.now_fn(transport.context) >= deadline) return error.Deadline;
         const source: fetch_plan.Source = if (index < peer_count)
             .{ .peer = @intCast(index) }
         else
@@ -159,14 +206,17 @@ fn run_plan(
     chunks: []const ChunkRef,
     states: []fetch_plan.ChunkState,
     peers: []const PeerInfo,
-    config: fetch_plan.Config,
+    run: *const Run,
     buffer: []u8,
     report: *Report,
 ) Error!void {
-    var plan = fetch_plan.Plan.init(config, chunks, states, transport.now_fn(transport.context));
-    for (peers) |peer| _ = plan.add_peer(chunk_summary.Filter.view(peer.filter));
+    const start = transport.now_fn(transport.context);
+    var plan = fetch_plan.Plan.init(run.config, chunks, states, start);
+    const order = run.ranked.order[0..run.ranked.count];
+    for (order) |original| _ = plan.add_peer(chunk_summary.Filter.view(peers[original].filter));
     while (true) {
         const now = transport.now_fn(transport.context);
+        if (now >= run.deadline) return error.Deadline;
         switch (plan.next(now)) {
             .done => return,
             .failed => return error.ChunkFailed,
@@ -176,7 +226,12 @@ fn run_plan(
             },
             .request => |request| {
                 const ref = chunks[request.chunk];
-                const result = transport.chunk_fn(transport.context, request.source, ref, buffer);
+                // The transport knows peers by their place in the caller's list.
+                const source: fetch_plan.Source = switch (request.source) {
+                    .registry => .registry,
+                    .peer => |ranked| .{ .peer = order[ranked] },
+                };
+                const result = transport.chunk_fn(transport.context, source, ref, buffer);
                 const after = transport.now_fn(transport.context);
                 const outcome = plan.receive(request.id, result, after);
                 if (outcome == .verified) {
@@ -190,7 +245,7 @@ fn run_plan(
                 while (plan.take_blame()) |blame| {
                     report.blamed += 1;
                     const total: u32 = @intCast(chunks.len);
-                    transport.blame_fn(transport.context, blame.peer, blame.chunk, total);
+                    transport.blame_fn(transport.context, order[blame.peer], blame.chunk, total);
                 }
             },
         }
@@ -217,6 +272,8 @@ const Table = struct {
     peer_asked: u32 = 0,
     blames: u32 = 0,
     clock: u64 = 1000,
+    /// What each reading of the clock adds, to make time pass while nothing sleeps.
+    tick: u64 = 0,
     garbage: [chunk_len]u8 = @splat(0xee),
 
     fn make(table: *Table) void {
@@ -267,7 +324,9 @@ const Table = struct {
     }
 
     fn now(context: *anyopaque) u64 {
-        return from(context).clock;
+        const table = from(context);
+        table.clock += table.tick;
+        return table.clock;
     }
 
     fn sleep(context: *anyopaque, ms: u32) void {
@@ -386,4 +445,56 @@ test "a tree named by a short digest is never fetched from a peer" {
     defer second.close(gpa);
     try fetch(gpa, table.transport(), &second, &table.digest, &peers, .{}, &report);
     try std.testing.expect(table.peer_asked > 0);
+}
+
+test "the fetch ends in an error when its total time is spent" {
+    // Goal: one deadline covers the whole fetch. Method: a clock that moves 1000 ms at each
+    // reading and a total of 1 ms; the list step must give up with Deadline and nothing may be
+    // stored. A fetch with the default total, on the same table, succeeds.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try test_store(&tmp);
+    defer store.close(gpa);
+    var table: Table = .{};
+    table.make();
+    table.tick = 1000;
+    var report: Report = .{};
+    const hurried: fetch_plan.Config = .{ .total_ms = 1 };
+    const failed = fetch(gpa, table.transport(), &store, &table.digest, &.{}, hurried, &report);
+    try std.testing.expectError(error.Deadline, failed);
+    try std.testing.expect(!store.images().has(&table.digest));
+    try fetch(gpa, table.transport(), &store, &table.digest, &.{}, .{}, &report);
+    try std.testing.expect(store.images().has(&table.digest));
+}
+
+test "peers are ranked by the chunks their filters claim and the ones with none are left out" {
+    // Goal: the sixteen peers a plan uses are the best of up to sixty-four. Method: three peers
+    // claiming 6, 2 and 0 of the tree's chunks, then 20 peers each claiming one more chunk than
+    // the last (up to all): only 16 are kept, the biggest claim first.
+    var table: Table = .{};
+    table.make();
+    var full: [64]u8 = undefined;
+    full_filter(&table, &full);
+    var some: [64]u8 = undefined;
+    var filter = chunk_summary.Filter.init(&some);
+    filter.add(&table.refs[0].hash);
+    filter.add(&table.refs[1].hash);
+    var none: [64]u8 = undefined;
+    _ = chunk_summary.Filter.init(&none);
+    const three = [_]PeerInfo{
+        .{ .name = "a", .filter = &none },
+        .{ .name = "b", .filter = &some },
+        .{ .name = "c", .filter = &full },
+    };
+    const ranked = rank_peers(&three, &table.refs);
+    try std.testing.expectEqualSlices(u8, &.{ 2, 1 }, ranked.order[0..ranked.count]);
+    var many: [constants.fetch_candidates_max]PeerInfo = undefined;
+    for (&many, 0..) |*slot, at| {
+        slot.* = .{ .name = "n", .filter = if (at < 40) &some else &full };
+    }
+    const kept = rank_peers(&many, &table.refs);
+    try std.testing.expectEqual(@as(u8, constants.fetch_peers_max), kept.count);
+    try std.testing.expectEqual(@as(u8, 40), kept.order[0]);
+    try std.testing.expectEqual(@as(u8, 41), kept.order[1]);
 }

@@ -23,6 +23,8 @@ const fetch_worker = @import("fetch_worker.zig");
 const peer = @import("peer.zig");
 const peer_serve = @import("peer_serve.zig");
 const peer_stream = @import("peer_stream.zig");
+const records = @import("records.zig");
+const store_failures = @import("store_failures.zig");
 
 const IpAddress = std.Io.net.IpAddress;
 const ChunkRef = fetch_plan.ChunkRef;
@@ -43,8 +45,8 @@ pub const Net = struct {
     digest: []const u8 = "",
     /// Counts for the log line.
     bad_lists: u32 = 0,
-    /// The open stream to each peer, by index.
-    conns: [constants.fetch_peers_max]Conn = @splat(.{}),
+    /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
+    conns: []Conn = &.{},
 
     fn from(context: *anyopaque) *Net {
         return @ptrCast(@alignCast(context));
@@ -68,7 +70,10 @@ pub const Net = struct {
         switch (source) {
             .registry => {
                 const path = std.fmt.bufPrint(&target, "/trees/{s}", .{digest}) catch return null;
-                return net.registry_get(path, out);
+                return switch (net.http_get(net.registry, path, out)) {
+                    .bytes => |bytes| bytes,
+                    .refused, .timeout => null,
+                };
             },
             .peer => |index| {
                 const prefix = peer_serve.path_trees;
@@ -85,11 +90,15 @@ pub const Net = struct {
     fn chunk(context: *anyopaque, source: Source, ref: ChunkRef, out: []u8) fetch_plan.Result {
         const net = from(context);
         var target: [128]u8 = undefined;
-        const got = switch (source) {
-            .registry => blk: {
+        switch (source) {
+            .registry => {
                 const path = std.fmt.bufPrint(&target, "/chunks/{x}", .{&ref.hash}) catch
                     return .refused;
-                break :blk net.registry_get(path, out);
+                return switch (net.http_get(net.registry, path, out)) {
+                    .bytes => |bytes| .{ .bytes = bytes },
+                    .refused => .refused,
+                    .timeout => .timeout,
+                };
             },
             .peer => |index| {
                 const prefix = peer_serve.path_chunk;
@@ -101,8 +110,7 @@ pub const Net = struct {
                     .timeout => .timeout,
                 };
             },
-        };
-        return if (got) |bytes| .{ .bytes = bytes } else .timeout;
+        }
     }
 
     fn now(context: *anyopaque) u64 {
@@ -130,46 +138,46 @@ pub const Net = struct {
         emit(net.io, &diag);
     }
 
-    /// The body of `GET path` from the registry, or null on any failure.
-    fn registry_get(net: *Net, path: []const u8, out: []u8) ?[]const u8 {
-        return net.http_get(net.registry, path, out);
-    }
-
-    /// The body of a plain-HTTP `GET path` from `address`, or null on any failure.
-    fn http_get(net: *Net, address: IpAddress, path: []const u8, out: []u8) ?[]const u8 {
+    /// The answer to a plain-HTTP `GET path` from `address`, copied into `out`: the body of a
+    /// 200, `.refused` for any other status (the source lacks it), `.timeout` for a connection,
+    /// a read, a deadline or a body that fails.
+    fn http_get(net: *Net, address: IpAddress, path: []const u8, out: []u8) PeerReply {
         const end = peer_stream.boot_ms(net.io) + constants.fetch_request_timeout_ms;
-        const fd = peer_stream.connect(net.io, address, end) catch return null;
+        const fd = peer_stream.connect(net.io, address, end) catch return .timeout;
         defer _ = std.os.linux.close(fd);
         var request: [192]u8 = undefined;
         const form = "GET {s} HTTP/1.0\r\nHost: registry\r\n\r\n";
-        const text = std.fmt.bufPrint(&request, form, .{path}) catch return null;
-        write_all(fd, text) catch return null;
-        const got = read_until_close(net.io, fd, net.reply, end) orelse return null;
-        const body = http_body(got) orelse return null;
-        if (body.len > out.len) return null;
+        const text = std.fmt.bufPrint(&request, form, .{path}) catch return .timeout;
+        write_all(fd, text) catch return .timeout;
+        const got = read_until_close(net.io, fd, net.reply, end) orelse return .timeout;
+        const body = http_body(got) orelse {
+            return if (http_status(got) == null) .timeout else .refused;
+        };
+        if (body.len > out.len) return .timeout;
         @memcpy(out[0..body.len], body);
-        return out[0..body.len];
+        return .{ .bytes = out[0..body.len] };
     }
 
     /// The answer to `GET path` from peer `index`, over that peer's one authenticated stream.
     /// The stream is kept for the whole fetch (the server limits handshakes per source) and
     /// reopened after an error or `peer_connection_requests_max` requests. A non-200 head is
     /// `.refused` (the peer lacks it); a connect, handshake or stream failure is `.timeout`.
+    /// One deadline covers both tries of a request.
     pub fn peer_get(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
         const conn = &net.conns[index];
         const reused = conn.open;
         if (conn.open and conn.requests >= constants.peer_connection_requests_max) {
             conn.close();
         }
-        const first = net.peer_try(index, path, out);
-        if (first == .timeout and reused) return net.peer_try(index, path, out); // Idle-closed.
-        return first;
+        const end = peer_stream.boot_ms(net.io) + constants.fetch_request_timeout_ms;
+        const first = net.peer_try(index, path, out, end);
+        if (first != .timeout or !reused) return first;
+        return net.peer_try(index, path, out, end); // The stream was idle-closed.
     }
 
-    fn peer_try(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
+    fn peer_try(net: *Net, index: u8, path: []const u8, out: []u8, end: u64) PeerReply {
         const identity = net.identity orelse return .timeout;
         const conn = &net.conns[index];
-        const end = peer_stream.boot_ms(net.io) + constants.fetch_request_timeout_ms;
         if (!conn.open) {
             const who = net.peers[index];
             const fd = peer_stream.connect(net.io, who.address, end) catch return .timeout;
@@ -206,14 +214,14 @@ pub const Net = struct {
 
     /// Closes every open peer stream.
     pub fn close_peers(net: *Net) void {
-        for (&net.conns) |*conn| conn.close();
+        for (net.conns) |*conn| conn.close();
     }
 };
 
 pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout };
 
 /// One peer's open stream and how many requests it has carried.
-const Conn = struct {
+pub const Conn = struct {
     open: bool = false,
     fd: std.posix.fd_t = -1,
     requests: u32 = 0,
@@ -263,30 +271,92 @@ pub fn http_body(reply: []const u8) ?[]const u8 {
     return reply[split + 4 ..];
 }
 
-/// The peers the control plane knows (`/nodes/<n>` with an address, `/node-store/<n>` with a
-/// chunk filter), other than `self`, written to `peers` and `infos`; their count. Anything
-/// malformed or incomplete is skipped: discovery only ever adds sources, and the registry
-/// remains. Strings live in `arena`.
-fn discover(
+/// The status of a reply whose status line is complete, or null.
+fn http_status(reply: []const u8) ?u16 {
+    if (!std.mem.startsWith(u8, reply, "HTTP/1.")) return null;
+    const line_end = std.mem.findScalar(u8, reply, '\r') orelse return null;
+    if (line_end < 12) return null;
+    return std.fmt.parseInt(u16, reply[9..12], 10) catch null;
+}
+
+/// Why discovery or the command line left a node out, as counts, for the one log line.
+pub const Skipped = struct {
+    self_node: u32 = 0,
+    bad_name: u32 = 0,
+    no_address: u32 = 0,
+    no_filter: u32 = 0,
+    over_limit: u32 = 0,
+
+    fn total(skipped: Skipped) u32 {
+        return skipped.self_node + skipped.bad_name + skipped.no_address + skipped.no_filter +
+            skipped.over_limit;
+    }
+};
+
+/// "left out 3 nodes (2 with no usable peer address, 1 with a bad name)", or empty.
+fn describe_skipped(buffer: []u8, skipped: Skipped) []const u8 {
+    if (skipped.total() == 0) return "";
+    var writer = std.Io.Writer.fixed(buffer);
+    writer.print("zcube-agent fetch: left out {d} nodes (", .{skipped.total()}) catch return "";
+    const reasons = [_]struct { count: u32, text: []const u8 }{
+        .{ .count = skipped.self_node, .text = "this node" },
+        .{ .count = skipped.bad_name, .text = "a name that is not a node name" },
+        .{ .count = skipped.no_address, .text = "no usable peer address" },
+        .{ .count = skipped.no_filter, .text = "no usable chunk filter" },
+        .{ .count = skipped.over_limit, .text = "past the limit of candidates" },
+    };
+    var first = true;
+    for (reasons) |reason| {
+        if (reason.count == 0) continue;
+        const separator = if (first) "" else ", ";
+        writer.print("{s}{d} with {s}", .{ separator, reason.count, reason.text }) catch return "";
+        first = false;
+    }
+    writer.writeAll(")\n") catch return "";
+    return writer.buffered();
+}
+
+/// The peers the control plane knows from `/node-store/` (`peer` is the address the node's peer
+/// server answers on, `filter` its chunk filter), other than `self`, written to `peers` and
+/// `infos`; their count. A node with a bad name, no usable address or no usable filter is
+/// counted in `skipped` and left out: discovery only ever adds sources, and the registry
+/// remains. Strings live in `arena`. The worker ranks the candidates by what they claim.
+fn select_candidates(
     arena: std.mem.Allocator,
-    net: *Net,
-    server: IpAddress,
+    stores: []const Kv,
     self: []const u8,
     peers: []Peer,
     infos: []fetch_worker.PeerInfo,
+    skipped: *Skipped,
 ) u32 {
-    const body = arena.alloc(u8, constants.swarm_chunk_bytes) catch return 0;
-    const nodes = list_prefix(arena, net, server, "/nodes/", body) orelse return 0;
-    const stores = list_prefix(arena, net, server, "/node-store/", body) orelse return 0;
+    assert(peers.len == infos.len);
+    const prefix = "/node-store/";
     var count: u32 = 0;
-    for (nodes) |kv| {
-        if (count == peers.len) break;
-        const name = string_field(kv.value, "name") orelse continue;
-        const address_text = string_field(kv.value, "address") orelse continue;
-        if (name.len == 0 or std.mem.eql(u8, name, self)) continue;
-        const address = parse_address(address_text) orelse continue;
-        const filter = filter_of(arena, stores, name) orelse continue;
-        peers[count] = .{ .name = name, .address = address };
+    for (stores) |kv| {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) continue;
+        const name = kv.key[prefix.len..];
+        if (records.name_problem(name, constants.node_name_bytes_max) != null) {
+            skipped.bad_name += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, name, self)) {
+            skipped.self_node += 1;
+            continue;
+        }
+        const address = (string_field(kv.value, "peer") orelse "");
+        const parsed = parse_address(address) orelse {
+            skipped.no_address += 1;
+            continue;
+        };
+        const filter = decode_filter(arena, kv.value) orelse {
+            skipped.no_filter += 1;
+            continue;
+        };
+        if (count == peers.len) {
+            skipped.over_limit += 1;
+            continue;
+        }
+        peers[count] = .{ .name = name, .address = parsed };
         infos[count] = .{ .name = name, .filter = filter };
         count += 1;
     }
@@ -295,23 +365,19 @@ fn discover(
 
 const Kv = struct { key: []const u8, value: std.json.Value };
 
-fn list_prefix(
-    arena: std.mem.Allocator,
-    net: *Net,
-    server: IpAddress,
-    prefix: []const u8,
-    scratch: []u8,
-) ?[]const Kv {
-    var target: [96]u8 = undefined;
-    const path = std.fmt.bufPrint(&target, "/v1/list?prefix={s}&limit=500", .{prefix}) catch
-        return null;
-    const body = net.http_get(server, path, scratch) orelse return null;
+/// The `kvs` of a `/v1/list` reply, or null if the text is over `discover_body_bytes_max` or is
+/// not one.
+fn parse_kvs(arena: std.mem.Allocator, text: []const u8) ?[]const Kv {
+    if (text.len > discover_body_bytes_max) return null;
     const Listed = struct { kvs: []const Kv };
-    const parsed = std.json.parseFromSliceLeaky(Listed, arena, body, .{
+    const parsed = std.json.parseFromSliceLeaky(Listed, arena, text, .{
         .ignore_unknown_fields = true,
     }) catch return null;
     return parsed.kvs;
 }
+
+/// The reply to the server's list of `/node-store/` is at most this long (a filter is hex).
+const discover_body_bytes_max = constants.swarm_chunk_bytes;
 
 fn string_field(value: std.json.Value, name: []const u8) ?[]const u8 {
     if (value != .object) return null;
@@ -319,29 +385,25 @@ fn string_field(value: std.json.Value, name: []const u8) ?[]const u8 {
     return if (field == .string) field.string else null;
 }
 
-/// The decoded chunk filter of `/node-store/<node>` among `stores`, or null if it has none that
-/// fits `chunk_summary.Filter`.
-fn filter_of(arena: std.mem.Allocator, stores: []const Kv, node: []const u8) ?[]u8 {
-    for (stores) |kv| {
-        const prefix = "/node-store/";
-        if (!std.mem.startsWith(u8, kv.key, prefix)) continue;
-        if (!std.mem.eql(u8, kv.key[prefix.len..], node)) continue;
-        const hex = string_field(kv.value, "filter") orelse return null;
-        const size = hex.len / 2;
-        const fits = hex.len % 2 == 0 and size >= 8 and size <= constants.summary_filter_bytes_max;
-        if (!fits) return null;
-        const bytes = arena.alloc(u8, size) catch return null;
-        _ = std.fmt.hexToBytes(bytes, hex) catch return null;
-        return bytes;
-    }
-    return null;
+/// The decoded chunk filter in a `/node-store/<node>` value, or null if it has none that fits
+/// `chunk_summary.Filter`.
+fn decode_filter(arena: std.mem.Allocator, value: std.json.Value) ?[]u8 {
+    const hex = string_field(value, "filter") orelse return null;
+    const size = hex.len / 2;
+    const fits = hex.len % 2 == 0 and size >= 8 and size <= constants.summary_filter_bytes_max;
+    if (!fits) return null;
+    const bytes = arena.alloc(u8, size) catch return null;
+    _ = std.fmt.hexToBytes(bytes, hex) catch return null;
+    return bytes;
 }
 
 /// "node2, node3 and the registry", or "the registry" when there are no peers.
 fn tried_sources(buffer: []u8, peers: []const Peer) []const u8 {
     var writer = std.Io.Writer.fixed(buffer);
-    for (peers) |who| writer.print("{s}, ", .{who.name}) catch break;
-    writer.writeAll(if (peers.len > 0) "and the registry" else "the registry") catch {};
+    for (peers, 0..) |who, at| {
+        writer.print("{s}{s}", .{ if (at == 0) "" else ", ", who.name }) catch break;
+    }
+    writer.writeAll(if (peers.len > 0) " and the registry" else "the registry") catch {};
     return writer.buffered();
 }
 
@@ -362,10 +424,13 @@ pub const Args = struct {
     images_dir: []const u8 = "",
     digest: []const u8 = "",
     registry: ?IpAddress = null,
-    /// zcube-server: where the peers and their chunk filters are read (`/nodes/`, `/node-store/`).
+    /// zcube-server: where the peers and their chunk filters are read (`/node-store/`).
     server: ?IpAddress = null,
     peers: [constants.fetch_peers_max]Peer = undefined,
     peer_count: u32 = 0,
+    /// `--peer` values left out because the name is not a node name, and the first of them.
+    peers_skipped: u32 = 0,
+    first_skipped: []const u8 = "",
 };
 
 pub fn parse(args: []const []const u8) ?Args {
@@ -388,11 +453,7 @@ pub fn parse(args: []const []const u8) ?Args {
         } else if (std.mem.eql(u8, flag, "--server")) {
             parsed.server = parse_address(value) orelse return null;
         } else if (std.mem.eql(u8, flag, "--peer")) {
-            const equals = std.mem.findScalar(u8, value, '=') orelse return null;
-            if (parsed.peer_count == parsed.peers.len) return null;
-            const address = parse_address(value[equals + 1 ..]) orelse return null;
-            parsed.peers[parsed.peer_count] = .{ .name = value[0..equals], .address = address };
-            parsed.peer_count += 1;
+            if (!parse_peer(&parsed, value)) return null;
         } else return null;
     }
     const complete = parsed.node.len > 0 and parsed.state_dir.len > 0 and
@@ -400,80 +461,203 @@ pub fn parse(args: []const []const u8) ?Args {
     return if (complete) parsed else null;
 }
 
+/// Adds `NAME=HOST:PORT` to `parsed.peers`. False if the value is not of that form or there are
+/// too many; a name that is not a node name is counted and left out (the handshake asserts a
+/// valid name, and a bad one can only come from a typo or an attacker).
+fn parse_peer(parsed: *Args, value: []const u8) bool {
+    const equals = std.mem.findScalar(u8, value, '=') orelse return false;
+    const address = parse_address(value[equals + 1 ..]) orelse return false;
+    const name = value[0..equals];
+    if (records.name_problem(name, constants.node_name_bytes_max) != null) {
+        if (parsed.peers_skipped == 0) parsed.first_skipped = name;
+        parsed.peers_skipped += 1;
+        return true;
+    }
+    if (parsed.peer_count == parsed.peers.len) return false;
+    parsed.peers[parsed.peer_count] = .{ .name = name, .address = address };
+    parsed.peer_count += 1;
+    return true;
+}
+
+/// `HOST:PORT`, or `[IPV6]:PORT`.
 fn parse_address(text: []const u8) ?IpAddress {
     const colon = std.mem.findScalarLast(u8, text, ':') orelse return null;
     const port = std.fmt.parseInt(u16, text[colon + 1 ..], 10) catch return null;
-    return IpAddress.parse(text[0..colon], port) catch null;
+    var host = text[0..colon];
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
+        host = host[1 .. host.len - 1];
+    }
+    return IpAddress.parse(host, port) catch null;
 }
 
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR --images-dir DIR " ++
-    "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--peer NAME=HOST:PORT]...\n";
+    "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
+
+/// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
+/// memory), 3 is that no source had the tree (the supervisor records that as ZC-E0601).
+fn finish(io: std.Io, diag: *const diag_mod.Diag, code: u8) u8 {
+    assert(code != constants.exit_ok);
+    emit(io, diag);
+    return code;
+}
+
+fn no_memory(io: std.Io, diag: *diag_mod.Diag) u8 {
+    diag.reset();
+    store_failures.no_memory(diag) catch {}; // It only raises the diagnostic.
+    return finish(io, diag, constants.exit_environment);
+}
+
+fn note(io: std.Io, text: []const u8) void {
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
 
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const io = init.io;
-    const stderr = std.Io.File.stderr();
-    const parsed = parse(args) orelse {
-        stderr.writeStreamingAll(io, usage) catch {}; // Nowhere else to say it.
-        return constants.exit_user;
-    };
-    const gpa = init.gpa;
     var diag: diag_mod.Diag = undefined;
     diag.reset();
+    const parsed = parse(args) orelse {
+        diag.raise(.E0505);
+        diag.cause("the arguments of zcube-agent fetch are not complete or not valid", .{});
+        diag.fix(.{ .sentence = usage });
+        return finish(io, &diag, constants.exit_user);
+    };
+    const gpa = init.gpa;
     const identity = agent_peer.load_identity(io, parsed.state_dir, parsed.node, &diag) catch null;
+    if (diag.code != null) {
+        emit(io, &diag); // The peers will not be asked; the registry may still answer.
+        diag.reset();
+    }
     const reply = gpa.alloc(u8, constants.swarm_chunk_bytes + 4096) catch
-        return constants.exit_environment;
+        return no_memory(io, &diag);
     defer gpa.free(reply);
-    var store = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch
-        return constants.exit_environment;
+    var store = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
+        diag.raise(.E0506);
+        diag.cause("the images directory {s} can't be used", .{parsed.images_dir});
+        diag.fix(.{ .sentence = "check the path and its permissions, and the free disk space" });
+        return finish(io, &diag, constants.exit_environment);
+    };
     defer store.close(gpa);
+    const conns = gpa.alloc(Conn, constants.fetch_candidates_max) catch
+        return no_memory(io, &diag);
+    defer gpa.free(conns);
+    @memset(conns, .{});
     var net: Net = .{
         .io = io,
         .registry = parsed.registry.?,
-        .peers = parsed.peers[0..parsed.peer_count],
+        .peers = &.{},
         .identity = identity,
         .reply = reply,
         .digest = parsed.digest,
+        .conns = conns,
     };
-    var infos: [constants.fetch_peers_max]fetch_worker.PeerInfo = undefined;
+    defer net.close_peers();
+    return fetch_from(gpa, &net, &store, &parsed, &diag);
+}
+
+/// Finds the peers (the server's, then the named ones) and runs the worker over them.
+fn fetch_from(
+    gpa: std.mem.Allocator,
+    net: *Net,
+    store: *dir_images.DirImages,
+    parsed: *const Args,
+    diag: *diag_mod.Diag,
+) u8 {
+    const io = net.io;
+    var infos: [constants.fetch_candidates_max]fetch_worker.PeerInfo = undefined;
+    var all: [constants.fetch_candidates_max]Peer = undefined;
     var filter: [64]u8 = undefined;
     _ = chunk_summary.Filter.init(&filter);
     @memset(&filter, 0xff); // A named peer is assumed to hold everything: the plan strikes liars.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var all: [constants.fetch_peers_max]Peer = undefined;
+    var skipped: Skipped = .{ .bad_name = parsed.peers_skipped };
     var found: u32 = 0;
-    if (parsed.server) |server| {
-        const room = all.len - parsed.peer_count;
-        found = discover(arena_state.allocator(), &net, server, parsed.node, all[0..room], &infos);
-    }
     for (parsed.peers[0..parsed.peer_count]) |named| {
         all[found] = named;
         infos[found] = .{ .name = named.name, .filter = &filter };
         found += 1;
     }
+    if (parsed.server) |server| {
+        const arena = arena_state.allocator();
+        const room: Slots = .{ all[found..], infos[found..] };
+        found += discover(arena, net, server, parsed.node, room, &skipped);
+    }
+    var line: [320]u8 = undefined;
+    note(io, describe_skipped(&line, skipped));
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};
-    const peers = infos[0..found];
-    defer net.close_peers();
     const transport = net.transport();
-    fetch_worker.fetch(gpa, transport, &store, parsed.digest, peers, .{}, &report) catch |err| {
-        var tried_buffer: [256]u8 = undefined;
-        const tried = tried_sources(&tried_buffer, net.peers);
-        diag.reset();
-        fetch_worker.raise_tree_missing(&diag, parsed.digest, tried);
-        diag.cause("the last failure was {t}", .{err});
-        emit(io, &diag);
-        return 1;
+    const asked = infos[0..found];
+    fetch_worker.fetch(gpa, transport, store, parsed.digest, asked, .{}, &report) catch |err| {
+        return fetch_failed(net, diag, err);
     };
     var buffer: [256]u8 = undefined;
     const said = "zcube-agent fetch: {s} chunks {d} held {d} peers {d} registry {d} " ++
         "bad lists {d}\n";
-    const line = std.fmt.bufPrint(&buffer, said, .{
+    const text = std.fmt.bufPrint(&buffer, said, .{
         parsed.digest,      report.chunks,          report.already_held,
         report.peer_chunks, report.registry_chunks, report.bad_lists,
-    }) catch return 0;
-    std.Io.File.stdout().writeStreamingAll(io, line) catch {}; // Nowhere else to say it.
-    return 0;
+    }) catch return constants.exit_ok;
+    std.Io.File.stdout().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    return constants.exit_ok;
+}
+
+/// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
+/// or disk failing is exit 2, with the code of the one that ran out.
+fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) u8 {
+    diag.reset();
+    switch (err) {
+        error.OutOfMemory, error.TooMany => {
+            return no_memory(net.io, diag);
+        },
+        error.Store => {
+            diag.raise(.E0506);
+            diag.cause("the chunks could not be written to this node's images directory", .{});
+            diag.fix(.{ .sentence = "check the directory's permissions and the free disk space" });
+            return finish(net.io, diag, constants.exit_environment);
+        },
+        error.TreeUnavailable, error.ChunkFailed, error.Deadline => {},
+    }
+    var tried_buffer: [256]u8 = undefined;
+    const tried = tried_sources(&tried_buffer, net.peers);
+    fetch_worker.raise_tree_missing(diag, net.digest, tried);
+    switch (err) {
+        error.TreeUnavailable => diag.cause("no source sent a list that hashes to the digest", .{}),
+        error.ChunkFailed => diag.cause("a chunk could not be had from any source asked", .{}),
+        else => diag.cause("the fetch ran past its limit of {d} minutes", .{
+            @divExact(constants.fetch_total_ms, 60_000),
+        }),
+    }
+    return finish(net.io, diag, constants.exit_external);
+}
+
+/// What `select_candidates` fills: the peers and, beside them, their filters.
+const Slots = struct { []Peer, []fetch_worker.PeerInfo };
+
+/// Asks the server for the nodes' summaries and picks the candidates among them.
+fn discover(
+    arena: std.mem.Allocator,
+    net: *Net,
+    server: IpAddress,
+    self: []const u8,
+    slots: Slots,
+    skipped: *Skipped,
+) u32 {
+    const scratch = arena.alloc(u8, discover_body_bytes_max) catch return 0;
+    var target: [96]u8 = undefined;
+    const form = "/v1/list?prefix=/node-store/&limit={d}";
+    const path = std.fmt.bufPrint(&target, form, .{constants.fetch_candidates_max + 1}) catch
+        return 0;
+    const stores = switch (net.http_get(server, path, scratch)) {
+        .bytes => |body| parse_kvs(arena, body),
+        .refused, .timeout => null,
+    } orelse {
+        note(net.io, "zcube-agent fetch: the server's node list could not be read; peers: " ++
+            "only those named\n");
+        return 0;
+    };
+    const room = @min(slots[0].len, slots[1].len);
+    return select_candidates(arena, stores, self, slots[0][0..room], slots[1][0..room], skipped);
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
@@ -502,28 +686,132 @@ test "the fetch arguments need a node, directories, a digest and a registry" {
     try std.testing.expect(parse(&.{ "--node", "n", "--bogus", "x" }) == null);
 }
 
-test "a peer's filter is read from /node-store/ and a malformed one is ignored" {
-    // Goal: discovery adds only sources it can use. Method: the stores of a good node, a node
-    // whose filter has an odd number of digits, a filter too short for `Filter`, and one that is
-    // not hex; each is asked for by name, and an unknown node has none.
+const test_filter = "00ff00ff00ff00ff";
+
+/// A `/v1/list` reply for the tests: one `/node-store/<name>` per `(name, peer, filter)`.
+fn stores_text(arena: std.mem.Allocator, entries: []const [3][]const u8) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    try writer.writer.writeAll("{\"kvs\":[");
+    for (entries, 0..) |entry, at| {
+        if (at > 0) try writer.writer.writeAll(",");
+        try writer.writer.print("{{\"key\":\"/node-store/{s}\",\"value\":{{", .{entry[0]});
+        try writer.writer.print("\"peer\":\"{s}\",\"filter\":\"{s}\"}}}}", .{ entry[1], entry[2] });
+    }
+    try writer.writer.writeAll("]}");
+    return writer.written();
+}
+
+fn select_from(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    slots: Slots,
+    skipped: *Skipped,
+) u32 {
+    const stores = parse_kvs(arena, text) orelse return 0;
+    return select_candidates(arena, stores, "node1", slots[0], slots[1], skipped);
+}
+
+test "discovery keeps the nodes it can use and counts the rest" {
+    // Goal: only usable sources are added, and every node left out is counted. Method: node-store
+    // entries for this node itself, a good node, a bad name (upper case, and one that is too
+    // long), an IPv6 peer, a node with no peer address, a bad address, a filter that is not hex
+    // and one that is too short, and a node whose entry has no filter at all.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const text =
-        \\[{"key":"/node-store/good","value":{"filter":"00ff00ff00ff00ff"}},
-        \\ {"key":"/node-store/odd","value":{"filter":"00ff00ff00ff00f"}},
-        \\ {"key":"/node-store/short","value":{"filter":"00ff"}},
-        \\ {"key":"/node-store/hex","value":{"filter":"zzzzzzzzzzzzzzzz"}},
-        \\ {"key":"/other/good","value":{"filter":"00ff00ff00ff00ff"}}]
-    ;
-    const stores = try std.json.parseFromSliceLeaky([]const Kv, arena, text, .{});
-    const good = filter_of(arena, stores, "good").?;
-    try std.testing.expectEqual(@as(usize, 8), good.len);
-    try std.testing.expectEqual(@as(u8, 0xff), good[1]);
-    try std.testing.expect(filter_of(arena, stores, "odd") == null);
-    try std.testing.expect(filter_of(arena, stores, "short") == null);
-    try std.testing.expect(filter_of(arena, stores, "hex") == null);
-    try std.testing.expect(filter_of(arena, stores, "absent") == null);
+    const long_name: [64]u8 = @splat('a');
+    const text = try stores_text(arena, &.{
+        .{ "node1", "127.0.0.1:1", test_filter },
+        .{ "node2", "127.0.0.1:2", test_filter },
+        .{ "Node3", "127.0.0.1:3", test_filter },
+        .{ &long_name, "127.0.0.1:3", test_filter },
+        .{ "node4", "[::1]:4", test_filter },
+        .{ "node5", "", test_filter },
+        .{ "node6", "not-an-address", test_filter },
+        .{ "node7", "127.0.0.1:7", "zzzzzzzzzzzzzzzz" },
+        .{ "node8", "127.0.0.1:8", "00ff" },
+    });
+    var peers: [constants.fetch_candidates_max]Peer = undefined;
+    var infos: [constants.fetch_candidates_max]fetch_worker.PeerInfo = undefined;
+    var skipped: Skipped = .{};
+    const count = select_from(arena, text, .{ &peers, &infos }, &skipped);
+    try std.testing.expectEqual(@as(u32, 2), count);
+    try std.testing.expectEqualStrings("node2", peers[0].name);
+    try std.testing.expectEqualStrings("node4", peers[1].name);
+    try std.testing.expect(peers[1].address == .ip6);
+    try std.testing.expectEqualStrings("node4", infos[1].name);
+    try std.testing.expectEqual(@as(usize, 8), infos[0].filter.len);
+    try std.testing.expectEqual(@as(u32, 1), skipped.self_node);
+    try std.testing.expectEqual(@as(u32, 2), skipped.bad_name);
+    try std.testing.expectEqual(@as(u32, 2), skipped.no_address);
+    try std.testing.expectEqual(@as(u32, 2), skipped.no_filter);
+    var line: [320]u8 = undefined;
+    const said = describe_skipped(&line, skipped);
+    try std.testing.expect(std.mem.startsWith(u8, said, "zcube-agent fetch: left out 7 nodes ("));
+    try std.testing.expect(std.mem.find(u8, said, "2 with a name that is not a node name") != null);
+}
+
+test "discovery keeps at most the room it is given and a malformed body gives nothing" {
+    // Goal: more nodes than candidates are counted, not dropped silently; a body that is cut,
+    // not JSON or longer than the bound is no discovery at all. Method: 70 good nodes into 64
+    // slots, then into 16; then a truncated body, text, and a body one byte over the bound.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var names: [70][8]u8 = undefined;
+    var entries: [70][3][]const u8 = undefined;
+    for (&names, &entries, 0..) |*name, *entry, at| {
+        entry.* = .{
+            std.fmt.bufPrint(name, "peer-{d:0>2}", .{at}) catch unreachable, // Fits.
+            "127.0.0.1:9",
+            test_filter,
+        };
+    }
+    const text = try stores_text(arena, &entries);
+    var peers: [constants.fetch_candidates_max]Peer = undefined;
+    var infos: [constants.fetch_candidates_max]fetch_worker.PeerInfo = undefined;
+    var skipped: Skipped = .{};
+    const all = select_from(arena, text, .{ &peers, &infos }, &skipped);
+    try std.testing.expectEqual(constants.fetch_candidates_max, all);
+    try std.testing.expectEqual(@as(u32, 6), skipped.over_limit);
+    skipped = .{};
+    const few = select_from(arena, text, .{ peers[0..16], infos[0..16] }, &skipped);
+    try std.testing.expectEqual(@as(u32, 16), few);
+    try std.testing.expectEqual(@as(u32, 54), skipped.over_limit);
+    try std.testing.expect(parse_kvs(arena, text[0 .. text.len - 5]) == null);
+    try std.testing.expect(parse_kvs(arena, "no") == null);
+    const over = try arena.alloc(u8, discover_body_bytes_max + 1);
+    @memset(over, ' ');
+    try std.testing.expect(parse_kvs(arena, over) == null);
+}
+
+test "a --peer with a name that is not a node name is left out, the rest are kept" {
+    // Goal: the handshake asserts a valid name, so a bad one must never reach it. Method: three
+    // --peer flags (good, upper case, empty name) and an IPv6 one; two are kept, two counted.
+    const base = [_][]const u8{
+        "--node",       "node1",              "--state-dir", "/s",
+        "--images-dir", "/i",                 "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000",     "--peer",      "node2=127.0.0.1:9001",
+        "--peer",       "Bad=127.0.0.1:9002", "--peer",      "=127.0.0.1:9003",
+        "--peer",       "node4=[::1]:9004",
+    };
+    const parsed = parse(&base).?;
+    try std.testing.expectEqual(@as(u32, 2), parsed.peer_count);
+    try std.testing.expectEqual(@as(u32, 2), parsed.peers_skipped);
+    try std.testing.expectEqualStrings("Bad", parsed.first_skipped);
+    try std.testing.expectEqualStrings("node4", parsed.peers[1].name);
+    var line: [320]u8 = undefined;
+    const said = describe_skipped(&line, .{ .bad_name = parsed.peers_skipped });
+    try std.testing.expect(std.mem.find(u8, said, "2 with a name") != null);
+    try std.testing.expectEqualStrings("", describe_skipped(&line, .{}));
+}
+
+test "a reply's status is read from a complete status line" {
+    // Goal: a 404 from the registry is `refused`, garbage is a timeout. Method: statuses.
+    try std.testing.expectEqual(@as(?u16, 404), http_status("HTTP/1.0 404 Not Found\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, 200), http_status("HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(http_status("HTTP/1.0 20") == null);
+    try std.testing.expect(http_status("nonsense\r\n") == null);
 }
 
 test "the sources a failed fetch names are its peers and the registry" {
@@ -534,7 +822,7 @@ test "the sources a failed fetch names are its peers and the registry" {
         .{ .name = "node3", .address = address },
     };
     try std.testing.expectEqualStrings(
-        "node2, node3, and the registry",
+        "node2, node3 and the registry",
         tried_sources(&buffer, &peers),
     );
     try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}));

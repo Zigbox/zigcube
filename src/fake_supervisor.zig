@@ -29,7 +29,12 @@ const Dir = std.Io.Dir;
 /// The command's pid, for the signal handler, which has nowhere else to look.
 var child_pid: std.atomic.Value(i32) = .init(0);
 
+/// Set once this supervisor itself got `SIGTERM`: a fetch that ends by a signal after that was
+/// stopped; before it, the fetch crashed.
+var term_received: std.atomic.Value(bool) = .init(false);
+
 fn on_term(_: std.posix.SIG) callconv(.c) void {
+    term_received.store(true, .release);
     const pid = child_pid.load(.acquire);
     if (pid > 1) _ = std.os.linux.kill(pid, .TERM);
 }
@@ -80,24 +85,44 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
     var child = std.process.spawn(io, .{
         .argv = plan.argv,
         .stdin = .ignore,
-        .stdout = .ignore,
+        .stdout = .{ .file = log },
         .stderr = .{ .file = log },
     }) catch return failed(.environment, "the host refused to start the fetch");
     child_pid.store(child.id.?, .release);
     const term = child.wait(io) catch return .{ .kind = .lost };
     child_pid.store(0, .release);
     switch (term) {
-        .exited => |code| if (code == constants.exit_ok) return null,
+        .exited => |code| {
+            if (code == constants.exit_ok) return null;
+            return fetch_exit(arena, plan.digest, code);
+        },
         // Stopped while fetching: the container ended by that signal, it did not fail to start.
-        .signal => |signal| return .{ .kind = .signaled, .signal = @intCast(@backingInt(signal)) },
-        else => {},
+        // A signal this supervisor was not sent is the fetch crashing or being killed.
+        .signal => |signal| {
+            if (term_received.load(.acquire)) {
+                return .{ .kind = .signaled, .signal = @intCast(@backingInt(signal)) };
+            }
+            return failed(.fetch, "the fetch ended by a signal before it finished the tree");
+        },
+        else => return failed(.environment, "the fetch ended in a way the host did not report"),
     }
-    const text = std.fmt.allocPrint(
-        arena,
-        "tree {s} was tried at this node's peers and the registry",
-        .{plan.digest},
-    ) catch return failed(.environment, "the fetch failed");
-    return failed(.fetch, text);
+}
+
+/// What a fetch's exit code says (`fetch_cli.zig`): 3 is the tree not fetched (`ZC-E0601`, the
+/// registry or the peers), 1 and 2 are this node's own setup, anything else is a crash.
+fn fetch_exit(arena: Allocator, digest: []const u8, code: u8) files.RunFile {
+    if (code == constants.exit_external) {
+        const text = std.fmt.allocPrint(
+            arena,
+            "tree {s} was tried at this node's peers and the registry",
+            .{digest},
+        ) catch return failed(.environment, "the fetch failed");
+        return failed(.fetch, text);
+    }
+    if (code == constants.exit_user or code == constants.exit_environment) {
+        return failed(.environment, "the fetch could not run on this node; see fetch.log");
+    }
+    return failed(.fetch, "the fetch crashed; see fetch.log");
 }
 
 fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {

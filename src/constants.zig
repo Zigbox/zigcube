@@ -422,6 +422,15 @@ pub const summary_request_bytes_max: u32 = summary_json_bytes_max + 128;
 
 /// Peers one fetch considers (a filter each), and chunks one fetch plans (a tree of 64 GiB).
 pub const fetch_peers_max: u32 = 16;
+/// Peers discovery may offer a fetch; the worker ranks them by the chunks their filters claim
+/// and keeps `fetch_peers_max` of them.
+pub const fetch_candidates_max: u32 = 64;
+/// Peers asked for the tree's chunk list before the registry is (each may take a request
+/// timeout, so this bounds how long the list can take).
+pub const fetch_list_peers_max: u32 = 4;
+/// One fetch ends in an error after this long, whatever it is doing (a 64 GiB tree at the
+/// node's rate cap takes about 17 minutes).
+pub const fetch_total_ms: u32 = 30 * 60 * 1000;
 pub const fetch_chunks_max: u32 = summary_chunks_capacity;
 /// A tree's chunk list as text: `<64 hex> <bytes>` and a newline per chunk, at most 80 bytes each.
 pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
@@ -583,4 +592,8 @@ comptime {
     assert(fetch_peer_rate_bytes_per_s <= fetch_node_rate_bytes_per_s);
     assert(fetch_request_timeout_ms < fetch_peer_wait_ms);
     assert(fetch_peers_max <= 16); // A chunk's tried-peers set is a u16.
+    assert(fetch_candidates_max >= fetch_peers_max);
+    assert(fetch_candidates_max <= 255); // A peer's index is a u8.
+    assert(fetch_list_peers_max <= fetch_peers_max);
+    assert(fetch_total_ms > fetch_peer_wait_ms);
 }

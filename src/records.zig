@@ -313,6 +313,9 @@ pub const NodeStore = struct {
     filter: []const u8 = "",
     /// Chunks the filter was filled with.
     filter_chunks: u32 = 0,
+    /// `HOST:PORT` the node's peer server answers on, for the fetching agents of other nodes;
+    /// empty when the node serves no peers. (`/nodes/<node>`'s `address` is text for people.)
+    peer: []const u8 = "",
     /// Trees the node holds but left out of `trees` (more than `summary_trees_max`).
     omitted: u32 = 0,
 };

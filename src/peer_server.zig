@@ -440,8 +440,10 @@ test "more requests than the handshake limit are served over one stream, a missi
         .address = try net.IpAddress.parse("127.0.0.1", rig.server.port()),
     }};
     var reply: [1024]u8 = undefined;
+    var conns: [1]fetch_cli.Conn = .{.{}};
     var net_state: fetch_cli.Net = .{
         .io = io,
+        .conns = &conns,
         .registry = peers[0].address,
         .peers = &peers,
         .identity = .{
