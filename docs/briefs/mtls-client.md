@@ -326,4 +326,29 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
 - **Q7. Who holds the leaf key.** B3's to decide; out of scope here. The interface stays as
   written: a public key to certify, and a sign callback.
 - **Q8. Live design doc.** Slice 1 read Zigbox `docs/SPEC.md` Part II C4 and the identity and
-  trust lines of C6 (snapshot `a2ff703`); what it found is in the slice 1 report.
+  trust lines of C6 (snapshot `a2ff703`). Nothing is resolved here or in code; the owner decides.
+  The first list was lost with the slice 1 session's context, so this one was re-derived on
+  2026-11-04 by re-reading the snapshot against this brief and the slice 1 code. It may miss
+  something the first list had.
+  1. **mTLS or WireGuard identity.** SPEC C4 scope: "mutual TLS between workloads (or
+     WireGuard-level identity, decided at C4 start)", and the Open question "Workload identity at
+     C4: mTLS per connection, or identity carried at the WireGuard layer?" is unchecked. The
+     brief and `x509_identity.zig` fix X.509 with a private extension as the identity format now.
+     Building it before C4 starts settles a decision the SPEC leaves open.
+  2. **Reuse proven libraries.** SPEC risk table, "Identity and mTLS design is easy to get subtly
+     wrong" (C4, C6): "Reuse proven libraries and an existing identity format such as SPIFFE IDs;
+     external review before C6". SPEC also says "Lean on the standard library first" (std covers
+     "a TLS client") and to add a dependency only with a written reason. The brief writes the
+     X.509 writer, strict parser and TLS client in-house, on std only, because std's TLS client
+     cannot answer `certificate_request` (first section of this brief). It does use SPIFFE IDs,
+     but the digest, epoch and labels are a private extension, not a SPIFFE feature. The brief
+     schedules no external review.
+  3. **Service or job.** SPEC C4: identity is "bound to service name, image digest and placement
+     epoch". The brief's SPIFFE ID is `spiffe://<cluster>/job/<name>`, with `<name>` the job
+     name under B1's charset, and the extension comment says "service or job". Whether C4's
+     service name maps onto `/job/<name>`, or needs another path form, is not settled. The
+     label charset in code is provisional for the same reason.
+  4. **Identity bound to a signed digest.** SPEC C4 acceptance: "A workload's identity changes
+     when its digest changes, so a grant can be scoped to signed versions". The extension holds
+     a 32-byte BLAKE3 tree digest only. Nothing in the format says whether it is a signed
+     version, and the SPEC's C6 signing (ed25519 `zbx sign`) is not referenced by this work.
