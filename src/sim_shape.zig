@@ -92,7 +92,7 @@ pub const Shape = struct {
     lease_ttl_ms: u32,
     /// The workload's replica counts, as a percentage of the ones sim_cluster always drew.
     replicas_pct: u32,
-    /// One run in `long_share_denominator`, drawn at 1,000 to 1,500 operations.
+    /// One run in `long_share_denominator`, drawn at 400 to 1,000 operations.
     long: bool,
 };
 
@@ -100,14 +100,14 @@ pub const operations_min: u32 = 40;
 /// The brief asked for 5,000; a run costs about operations^1.8 (measured: 800 operations on 3
 /// nodes take 24 s, 100 take 1.3 s), so 5,000 would take 25 minutes and a range of 100 seeds has
 /// an hour. The decision record has the measurements.
-pub const operations_max: u32 = 1500;
+pub const operations_max: u32 = 1000;
 /// Runs of this many operations or more are "long".
-pub const operations_long_min: u32 = 1000;
+pub const operations_long_min: u32 = 400;
 /// One run in this many is long.
 pub const long_share_denominator: u32 = 10;
 /// Operations times nodes, at most: keeps a long run on many nodes inside the fleet's per-range
 /// deadline (measured, docs/decisions/2026-11-04-fleet-profiles-and-shapes.md).
-pub const cost_max: u32 = 16_000;
+pub const cost_max: u32 = 12_000;
 
 /// The shortest ttl a shape draws. The agent fences `fence_margin_ms` (3 s) before the lease ends,
 /// and the simulation measured that a ttl below 5 s (4,500 and under) makes a healed one-node
@@ -140,16 +140,16 @@ pub fn fixed_shape(operations: u32) Shape {
     };
 }
 
-/// Operations: one run in ten is long, uniform in 1,000 to 1,500; the rest are 40 to 99 (40 %),
-/// 100 to 299 (35 %) or 300 to 999 (25 %), so short runs dominate and every size shows up.
+/// Operations: one run in ten is long, uniform in 400 to 1,000; the rest are 40 to 99 (45 %),
+/// 100 to 199 (35 %) or 200 to 399 (20 %), so short runs dominate and every size shows up.
 fn draw_operations(r: std.Random) u32 {
     if (r.uintLessThan(u32, long_share_denominator) == 0) {
         return operations_long_min + r.uintLessThan(u32, operations_max - operations_long_min + 1);
     }
     return switch (r.uintLessThan(u32, 100)) {
-        0...39 => 40 + r.uintLessThan(u32, 60),
-        40...74 => 100 + r.uintLessThan(u32, 200),
-        else => 300 + r.uintLessThan(u32, 700),
+        0...44 => 40 + r.uintLessThan(u32, 60),
+        45...79 => 100 + r.uintLessThan(u32, 100),
+        else => 200 + r.uintLessThan(u32, 200),
     };
 }
 
