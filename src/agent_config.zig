@@ -252,7 +252,18 @@ fn peer_advertised(listen: ?IpAddress, text: ?[]const u8, diag: *Diag) Error!?Ip
         const why = "--peer-advertise has no peer server to advertise";
         return bad(diag, why, .{}, "give --peer-listen");
     };
-    if (text) |given| return try parse_server(given, diag);
+    if (text) |given| {
+        const advertised = try parse_server(given, diag);
+        if (is_unspecified(advertised)) {
+            return bad(
+                diag,
+                "--peer-advertise is {f}, an address no peer can connect to",
+                .{advertised},
+                "give the address peers reach this node on, HOST:PORT",
+            );
+        }
+        return advertised;
+    }
     if (is_unspecified(listening)) {
         return bad(
             diag,
@@ -264,10 +275,16 @@ fn peer_advertised(listen: ?IpAddress, text: ?[]const u8, diag: *Diag) Error!?Ip
     return listening;
 }
 
-fn is_unspecified(address: IpAddress) bool {
+/// Whether no peer can connect to `address`: 0.0.0.0, ::, or `::ffff:0.0.0.0`, which is 0.0.0.0.
+pub fn is_unspecified(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |ip4| std.mem.allEqual(u8, &ip4.bytes, 0),
-        .ip6 => |ip6| std.mem.allEqual(u8, &ip6.bytes, 0),
+        .ip6 => |ip6| {
+            if (std.mem.allEqual(u8, &ip6.bytes, 0)) return true;
+            const mapped_prefix: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (!std.mem.eql(u8, ip6.bytes[0..12], &mapped_prefix)) return false;
+            return std.mem.allEqual(u8, ip6.bytes[12..16], 0);
+        },
     };
 }
 
@@ -759,4 +776,42 @@ test "the published peer address is the advertised one, or a specified listen ad
     const junk = host ++ [_][]const u8{ "--peer-advertise", "node1:7701" };
     diag.reset();
     try expect_bad(load(arena, std.testing.io, &junk, &diag), &diag);
+    const any4 = host ++ [_][]const u8{ "--peer-advertise", "0.0.0.0:7700" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &any4, &diag), &diag);
+    const any6 = host ++ [_][]const u8{ "--peer-advertise", "[::]:7700" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &any6, &diag), &diag);
+}
+
+test "peer_advertise from a configuration file is checked like the flag" {
+    // Goal: review nit, the ZON path. Method: a file that listens on 0.0.0.0 and advertises a
+    // host (published as is), one that advertises 0.0.0.0, and one that advertises the mapped
+    // `::ffff:0.0.0.0`, which is 0.0.0.0 (refused); and `is_unspecified` on each form.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    const head =
+        \\.{ .node = "node1", .server = "127.0.0.1:7070", .state_dir = "/tmp", .cpu_millis = 1000,
+        \\    .memory_bytes = 1000000, .images = "fixtures/images.zon", .images_dir = "/tmp/i",
+        \\    .peer_listen = "0.0.0.0:7700",
+    ;
+    const good_text = head ++ " .peer_advertise = \"10.0.2.2:7701\" }";
+    const good = try parse_file(arena, good_text, "a.zon", &diag);
+    const config = try merge(arena, std.testing.io, .{}, good, &diag);
+    try testing.expectEqual(@as(u16, 7701), config.peer_advertise.?.getPort());
+    for ([_][]const u8{ "0.0.0.0:7701", "[::]:7701", "[::ffff:0.0.0.0]:7701" }) |text| {
+        const source = try std.fmt.allocPrintSentinel(
+            arena,
+            "{s} .peer_advertise = \"{s}\" }}",
+            .{ head, text },
+            0,
+        );
+        const bad_file = try parse_file(arena, source, "b.zon", &diag);
+        diag.reset();
+        try expect_bad(merge(arena, std.testing.io, .{}, bad_file, &diag), &diag);
+    }
+    try testing.expect(is_unspecified(try IpAddress.parse("::ffff:0.0.0.0", 1)));
+    try testing.expect(!is_unspecified(try IpAddress.parse("::ffff:10.0.0.1", 1)));
 }

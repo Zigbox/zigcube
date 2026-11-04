@@ -503,6 +503,10 @@ pub const peer_connections_max: u32 = 4;
 /// words each, no buffers. A silent stranger holds one for at most `peer_handshake_ms`; the
 /// buffers of a serving slot go to a connection only once it has authenticated.
 pub const peer_handshakes_max: u32 = 32;
+/// A stranger younger than this is never evicted for a newcomer (the newcomer is closed
+/// instead): under a flood, oldest-first eviction would otherwise give every honest handshake a
+/// lifetime shorter than a slow link's round trips.
+pub const peer_handshake_evict_min_ms: u64 = 750;
 /// Time between two times ZC-E0808 is shown, whatever the sources: a flood must not flood a log.
 pub const peer_refusal_log_ms: u64 = 10 * 1000;
 /// Times a fetch asks a peer again after its server said it is busy, and the pause before each.
@@ -521,6 +525,7 @@ pub const peer_connection_requests_max: u32 = 64;
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
     assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
+    assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);
     assert(peer_sources_max >= peer_handshakes_per_source_max);

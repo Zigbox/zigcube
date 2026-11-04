@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const agent_config = @import("agent_config.zig");
 const agent_peer = @import("agent_peer.zig");
 const constants = @import("constants.zig");
 const chunk_summary = @import("chunk_summary.zig");
@@ -395,7 +396,7 @@ fn select_candidates(
             continue;
         }
         const address = (string_field(kv.value, "peer") orelse "");
-        const parsed = parse_address(address) orelse {
+        const parsed = usable_address(address) orelse {
             skipped.no_address += 1;
             continue;
         };
@@ -570,6 +571,15 @@ fn parse_peer(parsed: *Args, value: []const u8) bool {
     parsed.peers[parsed.peer_count] = .{ .name = name, .address = address };
     parsed.peer_count += 1;
     return true;
+}
+
+/// A peer address another node published: null when it is not an address or when no peer can
+/// connect to it (port 0, 0.0.0.0, ::).
+fn usable_address(text: []const u8) ?IpAddress {
+    const address = parse_address(text) orelse return null;
+    if (address.getPort() == 0) return null;
+    if (agent_config.is_unspecified(address)) return null;
+    return address;
 }
 
 /// `HOST:PORT`, or `[IPV6]:PORT`.
@@ -766,8 +776,23 @@ fn collect_pages(arena: std.mem.Allocator, getter: anytype, out: []u8) ?[]const 
         all.appendSlice(arena, page.kvs) catch break;
         if (at == 0) first_revision = page.revision;
         after = page.@"continue" orelse return all.items;
+        // The key goes into a request line: a server's reply must not shape it.
+        if (!continue_key_valid(after.?)) break;
     }
     return if (all.items.len == 0) null else all.items;
+}
+
+/// A `continue` key is accepted only as a `/node-store/` key made of `[a-z0-9./-]`.
+fn continue_key_valid(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, "/node-store/")) return false;
+    for (key) |byte| {
+        const ok = switch (byte) {
+            'a'...'z', '0'...'9', '.', '/', '-' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// `collect_pages` over the control plane's HTTP.
@@ -890,6 +915,10 @@ test "discovery keeps the nodes it can use and counts the rest" {
         .{ "node6", "not-an-address", test_filter },
         .{ "node7", "127.0.0.1:7", "zzzzzzzzzzzzzzzz" },
         .{ "node8", "127.0.0.1:8", "00ff" },
+        .{ "node9", "0.0.0.0:9", test_filter },
+        .{ "node10", "[::]:10", test_filter },
+        .{ "node11", "127.0.0.1:0", test_filter },
+        .{ "node12", "[::ffff:0.0.0.0]:12", test_filter },
     });
     var peers: [constants.fetch_candidates_max]Peer = undefined;
     var infos: [constants.fetch_candidates_max]fetch_worker.PeerInfo = undefined;
@@ -903,11 +932,11 @@ test "discovery keeps the nodes it can use and counts the rest" {
     try std.testing.expectEqual(@as(usize, 8), infos[0].filter.len);
     try std.testing.expectEqual(@as(u32, 1), skipped.self_node);
     try std.testing.expectEqual(@as(u32, 2), skipped.bad_name);
-    try std.testing.expectEqual(@as(u32, 2), skipped.no_address);
+    try std.testing.expectEqual(@as(u32, 6), skipped.no_address);
     try std.testing.expectEqual(@as(u32, 2), skipped.no_filter);
     var line: [320]u8 = undefined;
     const said = describe_skipped(&line, skipped);
-    try std.testing.expect(std.mem.startsWith(u8, said, "zcube-agent fetch: left out 7 nodes ("));
+    try std.testing.expect(std.mem.startsWith(u8, said, "zcube-agent fetch: left out 11 nodes ("));
     try std.testing.expect(std.mem.find(u8, said, "2 with a name that is not a node name") != null);
 }
 
@@ -1000,6 +1029,27 @@ test "discovery reads more nodes than one reply holds, with full-size filters, p
     try std.testing.expectEqual(@as(u32, 3), calls);
     const asked = std.mem.sliceTo(&second, 0);
     try std.testing.expect(std.mem.find(u8, asked, "&at=7&continue=/node-store/n015") != null);
+}
+
+test "a continue key that could shape the request line stops paging, keeping what was read" {
+    // Goal: review follow-up 3. Method: a first page whose `continue` holds a space and a line
+    // break; only one request is made and the page's nodes are kept.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const evil = "{\"revision\":7,\"kvs\":[{\"key\":\"/node-store/n000\",\"value\":{}}]," ++
+        "\"continue\":\"/node-store/n000 HTTP/1.1\\r\\nX: y\"}";
+    const pages = [_][]const u8{ evil, evil };
+    var calls: u32 = 0;
+    var last: [160]u8 = @splat(0);
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last };
+    const out = try arena.alloc(u8, discover_page_bytes_max);
+    const kvs = collect_pages(arena, getter, out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), kvs.len);
+    try std.testing.expectEqual(@as(u32, 1), calls);
+    try std.testing.expect(continue_key_valid("/node-store/n015"));
+    try std.testing.expect(!continue_key_valid("/v1/list"));
+    try std.testing.expect(!continue_key_valid("/node-store/A"));
 }
 
 test "a --peer with a name that is not a node name is left out, the rest are kept" {
