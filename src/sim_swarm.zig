@@ -28,6 +28,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const images = @import("sim_images.zig");
+const sim_shape = @import("sim_shape.zig");
 
 const Blake3 = std.crypto.hash.Blake3;
 const Hash = chunk_summary.Hash;
@@ -110,6 +111,7 @@ const Fetch = struct {
 const Sim = struct {
     report: *Report,
     seed: u64,
+    profile: sim_shape.SwarmProfile = .mixed,
     prng: std.Random.DefaultPrng,
     world: World = undefined,
     now_ms: u64 = 0,
@@ -132,18 +134,71 @@ const Sim = struct {
     }
 };
 
-/// Runs `operations` operations of the world `seed` draws, into `report`.
+/// Runs `operations` operations of the world `seed` draws, into `report`: the `mixed` profile,
+/// the world every earlier build drew.
 pub fn simulate(seed: u64, operations: u32, report: *Report) void {
+    simulate_profile(seed, operations, .mixed, report);
+}
+
+/// What the profile does to the peers the seed drew: `mixed` leaves them; `honest` makes every
+/// peer honest; each other makes every peer that misbehaved misbehave in the profile's one way,
+/// and one peer if the seed drew none (so the profile's fault is always there). Its own
+/// generator, so no other draw of the run moves.
+fn apply_profile(world: *images.World, seed: u64, profile: sim_shape.SwarmProfile) void {
+    const way: images.Behavior = switch (profile) {
+        .mixed => return,
+        .honest => .honest,
+        .liars => .liar,
+        .silent => .silent,
+        .refusers => .refuser,
+    };
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x9f0f_11e5_5a01_0001);
+    const nodes = world.nodes[0..world.node_count];
+    var misbehaving: u32 = 0;
+    for (nodes) |*node| {
+        if (node.behavior == .honest) continue;
+        node.behavior = way;
+        misbehaving += 1;
+    }
+    if (way != .honest and misbehaving == 0) {
+        nodes[prng.random().uintLessThan(u32, world.node_count)].behavior = way;
+    }
+}
+
+pub const Plan = struct {
+    operations: u32,
+    profile: sim_shape.SwarmProfile,
+};
+
+/// Resolves what a command line left open: null operations are drawn from the seed
+/// (`sim_shape.draw_swarm_operations`), a null profile likewise. A drawn value is a pure
+/// function of the seed, so the replay line names the concrete ones.
+pub fn resolve(seed: u64, operations: ?u32, profile: ?sim_shape.SwarmProfile) Plan {
+    return .{
+        .operations = operations orelse sim_shape.draw_swarm_operations(seed),
+        .profile = profile orelse sim_shape.draw_swarm_profile(seed),
+    };
+}
+
+/// `simulate` in the given profile.
+pub fn simulate_profile(
+    seed: u64,
+    operations: u32,
+    profile: sim_shape.SwarmProfile,
+    report: *Report,
+) void {
     assert(operations > 0);
     report.* = .{};
     var sim: Sim = .{
         .report = report,
         .seed = seed,
+        .profile = profile,
         .prng = std.Random.DefaultPrng.init(seed),
         .peer_rate = 0,
         .node_rate = 0,
     };
     sim.world.generate(sim.random());
+    apply_profile(&sim.world, seed, profile);
     // Slow enough that the caps bind in some worlds, fast enough to finish.
     sim.peer_rate = 1_000 + sim.random().uintLessThan(u32, 40_000);
     sim.node_rate = sim.peer_rate + sim.random().uintLessThan(u32, 2 * sim.peer_rate);
@@ -162,7 +217,8 @@ fn print_world(sim: *Sim) void {
     for (sim.world.nodes[0..sim.world.node_count]) |node| counts[@backingInt(node.behavior)] += 1;
     sim.report.print(
         "sim-swarm: seed {d}\nworld: {d} chunks, {d} trees of {d} chunks, {d} nodes " ++
-            "(honest {d} liar {d} silent {d} refuser {d})\ncaps: peer {d} B/s, node {d} B/s\n",
+            "(honest {d} liar {d} silent {d} refuser {d})\nprofile: {s}\n" ++
+            "caps: peer {d} B/s, node {d} B/s\n",
         .{
             sim.seed,
             sim.world.universe,
@@ -173,6 +229,7 @@ fn print_world(sim: *Sim) void {
             counts[1],
             counts[2],
             counts[3],
+            sim.profile.name(),
             sim.peer_rate,
             sim.node_rate,
         },

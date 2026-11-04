@@ -34,6 +34,8 @@ const agent_client = @import("agent_client.zig");
 const agent_loop = @import("agent_loop.zig");
 const agent_mod = @import("agent.zig");
 const api_mod = @import("api.zig");
+const fencing = @import("fencing.zig");
+const sim_shape = @import("sim_shape.zig");
 const apply_mod = @import("apply.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
@@ -151,6 +153,10 @@ pub const Report = struct {
 /// The world a seed chose: how big, which faults at what rate, what the workload does.
 pub const Swarm = struct {
     nodes: u32,
+    /// Which fault classes are on (`sim_shape.zig`).
+    profile: sim_shape.ClusterProfile = .mixed,
+    /// The workload's replica counts as a percentage of the base ones.
+    replicas_pct: u32 = sim_shape.replicas_pct_default,
     net: sim_net.Faults,
     ack_loss_per_mille: u32,
     clock_ppm: u32,
@@ -188,7 +194,16 @@ pub const Swarm = struct {
         return 1 + random.uintLessThan(u32, 8);
     }
 
-    pub fn draw(seed: u64, nodes_wanted: ?u32) Swarm {
+    /// The seed's world; `profile` then switches whole fault classes off (and its own on). The
+    /// base draw is the same whatever the profile, so `mixed` is the world of every earlier build.
+    pub fn draw(seed: u64, nodes_wanted: ?u32, profile: sim_shape.ClusterProfile) Swarm {
+        var swarm = draw_base(seed, nodes_wanted);
+        swarm.profile = profile;
+        swarm.apply_profile(seed);
+        return swarm;
+    }
+
+    fn draw_base(seed: u64, nodes_wanted: ?u32) Swarm {
         var prng = std.Random.DefaultPrng.init(seed ^ 0x5a3a_17c1);
         const r = prng.random();
         const nodes = nodes_wanted orelse 1 + r.uintLessThan(u32, 5);
@@ -217,12 +232,73 @@ pub const Swarm = struct {
         };
     }
 
+    /// A value forced on: `value` if it is, else 1 to `max`.
+    fn nonzero(random: std.Random, value: u32, max: u32) u32 {
+        if (value != 0) return value;
+        return 1 + random.uintLessThan(u32, max);
+    }
+
+    /// Switches every fault class off but the profile's own, which it forces on. The workload
+    /// (apply, scale, delete, broken, the passage of time) is the profile's in every case. A
+    /// generator of its own draws the forced rates, so no profile moves another draw.
+    fn apply_profile(swarm: *Swarm, seed: u64) void {
+        if (swarm.profile == .mixed) return;
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x9f0f_11e5_c10a_0001);
+        const r = prng.random();
+        const base = swarm.*;
+        swarm.net = .{};
+        swarm.ack_loss_per_mille = 0;
+        swarm.clock_ppm = 0;
+        swarm.w_runtime = 0;
+        swarm.w_crash = 0;
+        swarm.w_partition = 0;
+        swarm.w_outage = 0;
+        swarm.w_server = 0;
+        swarm.w_suspend = 0;
+        swarm.w_freeze = 0;
+        switch (swarm.profile) {
+            .mixed => unreachable, // Returned above.
+            .partitions => {
+                swarm.net = .{
+                    .request = .{
+                        .drop_per_mille = nonzero(r, base.net.request.drop_per_mille, 5),
+                        .delay_ms_max = base.net.request.delay_ms_max,
+                    },
+                    .reply = .{
+                        .drop_per_mille = nonzero(r, base.net.reply.drop_per_mille, 8),
+                        .delay_ms_max = base.net.reply.delay_ms_max,
+                    },
+                    .duplicate_per_mille = nonzero(r, base.net.duplicate_per_mille, 100),
+                    .reorder_per_mille = nonzero(r, base.net.reorder_per_mille, 10),
+                };
+                if (base.nodes > 1) swarm.w_partition = 4 + r.uintLessThan(u32, 10);
+            },
+            .skew => {
+                swarm.clock_ppm = 1000 + r.uintLessThan(u32, 9001);
+                swarm.w_suspend = 2 + r.uintLessThan(u32, 6);
+            },
+            .crash_heavy => {
+                swarm.w_crash = 10 + r.uintLessThan(u32, 20);
+                swarm.w_server = 2 + r.uintLessThan(u32, 4);
+                swarm.w_runtime = 8 + r.uintLessThan(u32, 16);
+            },
+            .slow_store => {
+                swarm.ack_loss_per_mille = 20 + r.uintLessThan(u32, 80);
+                swarm.w_outage = 4 + r.uintLessThan(u32, 6);
+                swarm.net.request.delay_ms_max = 200 + r.uintLessThan(u32, 400);
+                swarm.net.reply.delay_ms_max = 200 + r.uintLessThan(u32, 400);
+            },
+        }
+    }
+
     /// The faults sim-c1 adds to the seed's world, drawn apart from the base draw so that a
     /// sim-cluster run of the same seed is unchanged. The negative tests turn them up.
     fn add_c1_faults(swarm: *Swarm, seed: u64) void {
         var prng = std.Random.DefaultPrng.init(seed ^ 0xc1fa_17e5);
         const r = prng.random();
-        swarm.w_freeze = rate(r, 6);
+        const freeze = rate(r, 6);
+        swarm.w_freeze = if (swarm.profile.freezes()) freeze else 0;
+        if (swarm.profile == .crash_heavy) swarm.w_freeze = nonzero(r, freeze, 6);
         if (c1_teeth.skew_beyond_bound) {
             if (swarm.nodes > 1) swarm.w_partition = 25;
         }
@@ -622,7 +698,7 @@ pub const Cluster = struct {
     pub fn create(
         gpa: Allocator,
         seed: u64,
-        nodes_wanted: ?u32,
+        options: Options,
         report: *Report,
     ) Allocator.Error!*Cluster {
         const c = try gpa.create(Cluster);
@@ -631,7 +707,10 @@ pub const Cluster = struct {
         errdefer gpa.destroy(memory);
         c.gpa = gpa;
         c.seed = seed;
-        c.swarm = Swarm.draw(seed, nodes_wanted);
+        assert(!options.profile_auto); // `plan` resolves it.
+        c.swarm = Swarm.draw(seed, options.nodes, options.profile);
+        c.swarm.replicas_pct = options.replicas_pct orelse sim_shape.replicas_pct_default;
+        assert(c.swarm.replicas_pct > 0);
         c.manual = .{ .ms = epoch_ms };
         memory.init(gpa, c.manual.clock());
         c.memory = memory;
@@ -645,6 +724,10 @@ pub const Cluster = struct {
         c.switched = .{ .inner = c.ack_loss.interface() };
         c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
         c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
+        if (options.lease_ttl_ms) |ttl_ms| {
+            assert(fencing.inequality_problem(ttl_ms) == null);
+            c.api.lease_ttl_ms = ttl_ms;
+        }
         c.api_source = .{ .instance = 0 };
         c.prng = .init(seed ^ 0xc15e_7e12);
         c.diag.reset();
@@ -943,7 +1026,8 @@ pub const Cluster = struct {
     /// nodes' CPU (16 replicas of 250 millis on each 4000): an unplaceable replica is not a bug.
     fn replicas_for(c: *Cluster, random: std.Random, most: u32) u32 {
         const fit: u32 = @intCast(c.nodes.len * 4);
-        return random.uintLessThan(u32, @min(most, fit - 1) + 1);
+        const scaled = @divFloor(most * c.swarm.replicas_pct, 100);
+        return random.uintLessThan(u32, @min(scaled, fit - 1) + 1);
     }
 
     fn phase_totals(c: *Cluster) PhaseTotals {
@@ -2073,7 +2157,43 @@ pub const Options = struct {
     on_step: ?*const fn (step: []const u8) void = null,
     /// sim-c1 (docs/core.md): the per-revision checks, the overlap bound, the extra faults.
     c1: bool = false,
+    /// Which fault classes are on (`sim_shape.zig`). `mixed` is the seed's own mix, as every
+    /// build before profiles drew it.
+    profile: sim_shape.ClusterProfile = .mixed,
+    /// True: `plan` draws the profile from the seed (and clears this). `simulate` refuses it.
+    profile_auto: bool = false,
+    /// The ttl of the leases the server grants. Null: the shipped one.
+    lease_ttl_ms: ?u32 = null,
+    /// The workload's replica counts as a percentage of the base ones. Null: 100.
+    replicas_pct: ?u32 = null,
 };
+
+/// What a command line asked for, resolved: the operations and the options every unset knob of
+/// which the seed drew (`sim_shape.draw_shape`, `draw_cluster_profile`). A pure function of the
+/// seed and the request, so a seed alone replays a run, and what it returns is concrete, so its
+/// replay line needs no draw.
+pub const Plan = struct {
+    operations: u32,
+    options: Options,
+};
+
+/// `operations` null draws the whole shape from the seed (operations, nodes, lease ttl, replica
+/// counts); each knob the request set is kept. `options.profile_auto` draws the profile.
+pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
+    var options = requested;
+    var shape = sim_shape.fixed_shape(1);
+    if (operations == null) shape = sim_shape.draw_shape(seed);
+    if (options.profile_auto) {
+        options.profile = sim_shape.draw_cluster_profile(seed);
+        options.profile_auto = false;
+    }
+    if (operations == null) {
+        if (options.nodes == null) options.nodes = shape.nodes;
+        if (options.lease_ttl_ms == null) options.lease_ttl_ms = shape.lease_ttl_ms;
+        if (options.replicas_pct == null) options.replicas_pct = shape.replicas_pct;
+    }
+    return .{ .operations = operations orelse shape.operations, .options = options };
+}
 
 /// The operation before which the faults end in a liveness run of `operations` operations from
 /// `seed`, as the run prints it; what `Options.heal_at` overrides.
@@ -2100,7 +2220,7 @@ pub fn simulate(
     report: *Report,
 ) void {
     report.* = .{};
-    const c = Cluster.create(gpa, seed, options.nodes, report) catch {
+    const c = Cluster.create(gpa, seed, options, report) catch {
         report.failed = true;
         report.print("FAILED: out of memory\n", .{});
         // The run never started: the host's trouble, which the fleet counts and never files.
@@ -2112,6 +2232,12 @@ pub fn simulate(
     c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
+    report.print("profile: {s}\nshape: operations={d} nodes={d} lease_ttl_ms={d} " ++
+        "replicas_pct={d}\n", .{
+        c.swarm.profile.name(), operations,
+        c.swarm.nodes,          options.lease_ttl_ms orelse constants.lease_ttl_ms,
+        c.swarm.replicas_pct,
+    });
     c.liveness = options.liveness;
     c.c1 = options.c1;
     if (c.c1) {
@@ -2406,7 +2532,7 @@ test "the fencing check fires on a node that runs containers long after it lost 
     // Goal: track_fencing has teeth. Method: run replicas, delete the node's registration, then
     // move the clock past the bound without letting any node step: the containers still run.
     var report: Report = .{};
-    const c = try Cluster.create(testing.allocator, 7, 1, &report);
+    const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
     defer c.destroy();
     c.apply("hello", hello_digest, 2);
     c.advance(5_000);

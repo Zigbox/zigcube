@@ -1,13 +1,22 @@
 //! `sim-cluster`: runs the deterministic cluster simulation natively and prints its report, for
 //! one seed or for a range of them.
 //!
-//!     sim-cluster <seed> <operations> [<nodes>] [--liveness=true|false] [--heal-at=N]
-//!                 [--trace-steps]
-//!     sim-cluster --seeds A..B <operations> [<nodes>] [--liveness=true|false] [--shrink]
+//!     sim-cluster <seed> <operations|auto> [<nodes>] [--liveness=true|false] [--heal-at=N]
+//!                 [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N] [--trace-steps]
+//!     sim-cluster --seeds A..B <operations|auto> [<nodes>] [--liveness=true|false] [--shrink]
+//!                 [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
 //!                 [--expect-fail] [--trace-steps]
 //!
 //! `<nodes>` 0 lets the seed pick. Liveness is on by default (src/sim_cluster.zig says what it
 //! is). `--heal-at=N` makes the faults end before operation N instead of where the seed chose.
+//!
+//! **Variety** (src/sim_shape.zig). `auto` for `<operations>` draws the run's shape from the
+//! seed: operations (40 to 5,000), nodes (unless given), lease ttl, replica counts.
+//! `--profile=auto` draws which fault classes are on (`mixed` is today's mix and the default,
+//! so a command line without these flags runs what it always ran; `partitions`, `skew`,
+//! `crash_heavy` and `slow_store` switch the other classes off). A flag given beats the draw.
+//! The report and each failure say what ran, and the replay line is concrete: it names the
+//! drawn values, so it needs no draw to reproduce.
 //!
 //! A single seed prints its whole report. A range (`A..B` is inclusive of both) prints one line
 //! per failing seed, `seed N: FAILED: <what>`, `  step: <faults|healed|convergence|end>` (where the
@@ -33,18 +42,23 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const fencing = @import("fencing.zig");
 const sim_cluster = @import("sim_cluster.zig");
+const sim_shape = @import("sim_shape.zig");
 
-const usage_text = "usage: sim-cluster <seed> <operations> [<nodes>] [--liveness=true|false] " ++
-    "[--heal-at=N] [--trace-steps]\n       sim-cluster --seeds A..B <operations> [<nodes>] " ++
-    "[--liveness=true|false] [--shrink] [--expect-fail] [--trace-steps]\n";
+const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
+    "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
+    "[--replicas-pct=N] [--trace-steps]\n       sim-cluster --seeds A..B <operations|auto> " ++
+    "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
+    "[--replicas-pct=N] [--expect-fail] [--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
     first_seed: u64 = 0,
     last_seed: u64 = 0,
     range: bool = false,
-    operations: u32 = 0,
+    /// Null: `auto`, the seed draws the shape.
+    operations: ?u32 = null,
     options: sim_cluster.Options = .{},
     shrink: bool = false,
     expect_fail: bool = false,
@@ -85,13 +99,27 @@ fn parse(args: []const []const u8) ?Args {
     } else if (parsed.options.heal_at != null) {
         return null; // Each seed in a range draws its own.
     }
-    parsed.operations = std.fmt.parseInt(u32, positional[skip], 10) catch return null;
+    if (!std.mem.eql(u8, positional[skip], "auto")) {
+        const operations = std.fmt.parseInt(u32, positional[skip], 10) catch return null;
+        if (operations == 0) return null;
+        parsed.operations = operations;
+    }
     if (positional_count == skip + 2) {
         const count = std.fmt.parseInt(u32, positional[skip + 1], 10) catch return null;
         if (count > sim_cluster.nodes_max) return null;
         parsed.options.nodes = if (count == 0) null else count;
     }
     return parsed;
+}
+
+fn parse_profile(parsed: *Args, text: []const u8) bool {
+    if (std.mem.eql(u8, text, "auto")) {
+        parsed.options.profile_auto = true;
+        return true;
+    }
+    parsed.options.profile = sim_shape.ClusterProfile.parse(text) orelse return false;
+    parsed.options.profile_auto = false;
+    return true;
 }
 
 fn parse_range(parsed: *Args, text: []const u8) bool {
@@ -115,6 +143,16 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.c1 = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
         parsed.expect_symptom = arg["--expect-symptom=".len..];
+    } else if (std.mem.startsWith(u8, arg, "--profile=")) {
+        return parse_profile(parsed, arg["--profile=".len..]);
+    } else if (std.mem.startsWith(u8, arg, "--lease-ttl-ms=")) {
+        const ttl = std.fmt.parseInt(u32, arg["--lease-ttl-ms=".len..], 10) catch return false;
+        if (fencing.inequality_problem(ttl) != null) return false;
+        parsed.options.lease_ttl_ms = ttl;
+    } else if (std.mem.startsWith(u8, arg, "--replicas-pct=")) {
+        const pct = std.fmt.parseInt(u32, arg["--replicas-pct=".len..], 10) catch return false;
+        if (pct == 0 or pct > 1600) return false;
+        parsed.options.replicas_pct = pct;
     } else if (std.mem.eql(u8, arg, "--trace-steps")) {
         parsed.trace_steps = true;
     } else if (std.mem.startsWith(u8, arg, "--heal-at=")) {
@@ -129,7 +167,6 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
 pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return constants.exit_user;
     var parsed = parse(args) orelse return usage(init.io);
-    if (parsed.operations == 0) return usage(init.io);
     if (parsed.trace_steps) {
         trace_io = init.io;
         parsed.options.on_step = trace_step;
@@ -137,7 +174,9 @@ pub fn main(init: std.process.Init) u8 {
     const report = init.gpa.create(sim_cluster.Report) catch return constants.exit_environment;
     defer init.gpa.destroy(report);
     if (parsed.range) return run_range(init, &parsed, report);
-    sim_cluster.simulate(init.gpa, parsed.first_seed, parsed.operations, parsed.options, report);
+    const resolved = sim_cluster.plan(parsed.first_seed, parsed.operations, parsed.options);
+    const seed = parsed.first_seed;
+    sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
     write(init.io, report.text()) catch return constants.exit_environment;
     if (report.failed) return constants.exit_user;
     return constants.exit_ok;
@@ -222,6 +261,10 @@ fn print_replay(
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c1) try out.writeAll(" --c1");
+    // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
+    if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
+    if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});
+    if (options.replicas_pct) |pct| try out.print(" --replicas-pct={d}", .{pct});
     if (heal_at) |point| try out.print(" --heal-at={d}", .{point});
     try out.writeAll("\n");
 }
@@ -234,10 +277,12 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     var failures: u64 = 0;
     var seed = parsed.first_seed;
     while (true) : (seed += 1) {
-        sim_cluster.simulate(init.gpa, seed, parsed.operations, parsed.options, report);
+        const resolved = sim_cluster.plan(seed, parsed.operations, parsed.options);
+        sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
         if (report.failed) {
             failures += 1;
-            report_failure(init, parsed, seed, report, out) catch return constants.exit_environment;
+            report_failure(init, parsed, seed, resolved, report, out) catch
+                return constants.exit_environment;
             // Out now: a crash on a later seed must not lose it.
             out.flush() catch return constants.exit_environment;
             if (parsed.expect_fail) {
@@ -262,9 +307,16 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         return constants.exit_ok;
     }
     const total = parsed.last_seed - parsed.first_seed + 1;
-    out.print("sim-cluster: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
-        parsed.first_seed, parsed.last_seed, parsed.operations, failures, total,
-    }) catch return constants.exit_environment;
+    if (parsed.operations) |operations| {
+        out.print("sim-cluster: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
+            parsed.first_seed, parsed.last_seed, operations, failures, total,
+        }) catch return constants.exit_environment;
+    } else {
+        // Not the fixed form above: the fleet's parser reads only that one.
+        out.print("sim-cluster: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
+            parsed.first_seed, parsed.last_seed, failures, total,
+        }) catch return constants.exit_environment;
+    }
     if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
     return if (failures == 0) constants.exit_ok else constants.exit_user;
 }
@@ -273,6 +325,7 @@ fn report_failure(
     init: std.process.Init,
     parsed: *const Args,
     seed: u64,
+    resolved: sim_cluster.Plan,
     report: *sim_cluster.Report,
     out: *std.Io.Writer,
 ) !void {
@@ -282,17 +335,25 @@ fn report_failure(
     @memcpy(what, what_text[0..what.len]);
     try out.print("seed {d}: FAILED: {s}\n", .{ seed, what });
     try out.print("  step: {s}\n", .{step_of(report)});
-    const heal_at: ?u32 = if (parsed.options.liveness)
-        sim_cluster.heal_point(seed, parsed.operations)
+    const options = resolved.options;
+    try out.print("  profile: {s}\n", .{options.profile.name()});
+    try out.print("  shape: operations={d} nodes={d} lease_ttl_ms={d} replicas_pct={d}\n", .{
+        resolved.operations,
+        options.nodes orelse 0,
+        options.lease_ttl_ms orelse constants.lease_ttl_ms,
+        options.replicas_pct orelse sim_shape.replicas_pct_default,
+    });
+    const heal_at: ?u32 = if (options.liveness)
+        sim_cluster.heal_point(seed, resolved.operations)
     else
         null;
-    try print_replay(out, seed, parsed.operations, parsed.options, heal_at);
+    try print_replay(out, seed, resolved.operations, options, heal_at);
     if (!parsed.shrink) return;
-    var pinned = parsed.options;
-    pinned.heal_at = heal_at orelse parsed.operations;
-    const smallest = shrink(init, seed, parsed.operations, pinned, what, report);
+    var pinned = options;
+    pinned.heal_at = heal_at orelse resolved.operations;
+    const smallest = shrink(init, seed, resolved.operations, pinned, what, report);
     try out.print("  shrunk to {d} operations\n", .{smallest});
-    try print_replay(out, seed, smallest, parsed.options, heal_at);
+    try print_replay(out, seed, smallest, options, heal_at);
 }
 
 fn usage(io: std.Io) u8 {
@@ -304,7 +365,7 @@ test "the command lines: one seed, a range, and what is refused" {
     const single = parse(&.{ "sim", "7", "100", "3", "--liveness=false", "--heal-at=40" }).?;
     try std.testing.expect(!single.range);
     try std.testing.expectEqual(@as(u64, 7), single.first_seed);
-    try std.testing.expectEqual(@as(u32, 100), single.operations);
+    try std.testing.expectEqual(@as(?u32, 100), single.operations);
     try std.testing.expectEqual(@as(?u32, 3), single.options.nodes);
     try std.testing.expectEqual(@as(?u32, 40), single.options.heal_at);
     try std.testing.expect(!single.options.liveness);
@@ -313,7 +374,19 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expect(range.range and range.shrink);
     try std.testing.expectEqual(@as(u64, 5), range.first_seed);
     try std.testing.expectEqual(@as(u64, 9), range.last_seed);
-    try std.testing.expectEqual(@as(u32, 60), range.operations);
+    try std.testing.expectEqual(@as(?u32, 60), range.operations);
+    const drawn = parse(&.{
+        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=5000",
+    }).?;
+    try std.testing.expectEqual(@as(?u32, null), drawn.operations);
+    try std.testing.expect(drawn.options.profile_auto);
+    try std.testing.expectEqual(@as(?u32, 5000), drawn.options.lease_ttl_ms);
+    const named = parse(&.{ "sim", "7", "60", "--profile=skew", "--replicas-pct=200" }).?;
+    try std.testing.expect(named.options.profile == .skew and !named.options.profile_auto);
+    try std.testing.expectEqual(@as(?u32, 200), named.options.replicas_pct);
+    try std.testing.expect(parse(&.{ "sim", "7", "60", "--profile=nope" }) == null);
+    try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=2000" }) == null);
+    try std.testing.expect(parse(&.{ "sim", "7", "0" }) == null);
     try std.testing.expectEqual(@as(?u32, null), range.options.nodes);
 
     try std.testing.expect(parse(&.{ "sim", "--seeds", "9..5", "60" }) == null);
