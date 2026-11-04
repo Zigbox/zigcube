@@ -9,8 +9,9 @@ n=0
 
 check() {
   local event=$1 ref=$2 labels=$3 paths=$4 want=$5 got out
-  out=$(printf '%s\n' ${paths} | EVENT="$event" HEAD_REF="$ref" LABELS="$labels" \
-    "$dir/ci-changes.sh" | tr '\n' ' ')
+  # GITHUB_OUTPUT is set on a runner; unset, the script writes to stdout.
+  out=$(printf '%s\n' ${paths} | env -u GITHUB_OUTPUT EVENT="$event" HEAD_REF="$ref" \
+    LABELS="$labels" "$dir/ci-changes.sh" | tr '\n' ' ')
   got=$(echo "$out" | sed -E 's/code=true/T/; s/code=false/F/; s/store=true/T/; s/store=false/F/;
     s/demo_c0=true/T/; s/demo_c0=false/F/; s/demo_c1=true/T/; s/demo_c1=false/F/;
     s/zigbox_smoke=true/T/; s/zigbox_smoke=false/F/; s/ //g')
