@@ -29,6 +29,7 @@ const records = @import("records.zig");
 const store_failures = @import("store_failures.zig");
 const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
+const zigbox_pull = @import("zigbox_pull.zig");
 
 const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
@@ -65,6 +66,8 @@ pub const Net = struct {
     oversize: bool = false,
     /// Zigbox mode: the image record named a manifest other than the assignment's.
     refused_record: bool = false,
+    /// The process environment, which locates the Zigbox store `pull` writes to.
+    environ: std.process.Environ = .empty,
     /// Times a peer answered that it was busy (counts for tests and the log line).
     busy_seen: u32 = 0,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
@@ -530,6 +533,8 @@ pub const Args = struct {
     /// the manifest of the assignment's digest-pinned image, `sha256:HEX`.
     zigbox_store: []const u8 = "",
     manifest: []const u8 = "",
+    /// Zigbox mode: the OCI reference, pinned by digest, pulled when no peer has the tree.
+    source: []const u8 = "",
     registry: ?IpAddress = null,
     /// zcube-server: where the peers and their chunk filters are read (`/node-store/`).
     server: ?IpAddress = null,
@@ -555,6 +560,8 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.images_dir = value;
         } else if (std.mem.eql(u8, flag, "--zigbox-store")) {
             parsed.zigbox_store = value;
+        } else if (std.mem.eql(u8, flag, "--source")) {
+            parsed.source = value;
         } else if (std.mem.eql(u8, flag, "--manifest")) {
             parsed.manifest = value;
         } else if (std.mem.eql(u8, flag, "--digest")) {
@@ -578,7 +585,9 @@ pub fn parse(args: []const []const u8) ?Args {
         if (Zsha256.parse(parsed.manifest) == null) return null;
         return parsed;
     }
-    if (parsed.images_dir.len == 0 or parsed.manifest.len > 0) return null;
+    if (parsed.images_dir.len == 0 or parsed.manifest.len > 0 or parsed.source.len > 0) {
+        return null;
+    }
     return parsed;
 }
 
@@ -633,7 +642,7 @@ fn parse_address(text: []const u8) ?IpAddress {
 }
 
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
-    "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX) " ++
+    "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX [--source OCI-REF]) " ++
     "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
@@ -717,6 +726,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         .reply = reply,
         .digest = parsed.digest,
         .conns = conns,
+        .environ = init.minimal.environ,
     };
     defer net.close_peers();
     return fetch_from(gpa, &net, target, &parsed, &diag);
@@ -808,6 +818,10 @@ fn fetch_zigbox(
     var done: zigbox_fetch.Report = .{};
     const images = &opened.images;
     zigbox_fetch.fetch(gpa, transport, images, tree, manifest, infos, .{}, &done) catch |err| {
+        const from_registry = err == error.TreeUnavailable or err == error.ChunkFailed;
+        if (from_registry and parsed.source.len > 0) {
+            return pull_fallback(gpa, net, parsed, tree, manifest, done);
+        }
         return switch (err) {
             error.TreeUnavailable, error.ChunkFailed, error.Deadline, error.Store => |same| same,
             error.OutOfMemory => error.OutOfMemory,
@@ -822,6 +836,44 @@ fn fetch_zigbox(
         .already_held = done.already_held,
         .peer_chunks = done.peer_chunks,
         .bad_lists = done.bad_bundles,
+    };
+}
+
+/// No peer had the tree: Zigbox's `pull` of the assignment's reference, checked against the
+/// tree and the manifest asked for. The registry's bytes are not chunks of ours, so the report
+/// counts them as the blobs `pull` saw.
+fn pull_fallback(
+    gpa: std.mem.Allocator,
+    net: *Net,
+    parsed: *const Args,
+    tree: zigbox.store.Digest,
+    manifest: Zsha256,
+    done: zigbox_fetch.Report,
+) fetch_worker.Error!fetch_worker.Report {
+    var zdiag: zigbox.diag.Diag = undefined;
+    zdiag.reset();
+    const environ = net.environ;
+    const reference = parsed.source;
+    const pulled = zigbox_pull.pull_image(
+        gpa,
+        environ,
+        reference,
+        tree,
+        manifest,
+        &zdiag,
+    ) catch |err| {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Mismatch => net.refused_record = true,
+            error.Failed => {},
+        }
+        return error.TreeUnavailable;
+    };
+    note(net.io, "zcube-agent fetch: pulled from the registry\n");
+    return .{
+        .chunks = pulled.blob_count,
+        .already_held = done.already_held,
+        .registry_chunks = pulled.blob_count,
     };
 }
 
