@@ -51,7 +51,8 @@ pub const usage =
     \\                     from, for a service that names no `source`
     \\  --address TEXT     recorded with the node for people to read; it is not used to connect
     \\  --images-dir DIR   the node's chunk store; an image the node lacks is fetched into it
-    \\  --peer-listen ADDR serve the chunk store to peers (needs --images-dir)
+    \\  --peer-listen ADDR serve the chunk store to peers (needs --images-dir, or --runtime zigbox:
+    \\                     the Zigbox store is served)
     \\  --peer-advertise ADDR  the address peers connect to, published with the node; needed when
     \\                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
@@ -83,7 +84,8 @@ pub const Config = struct {
     verbose: bool,
     /// The chunk store (`dir_images.zig`); null: the agent keeps no chunks of its own.
     images_dir: ?[]const u8 = null,
-    /// Where the peer server listens; null: none runs. Needs `images_dir`.
+    /// Where the peer server listens; null: none runs. Needs `images_dir` (the fake runtime), or
+    /// serves the Zigbox store (`runtime = .zigbox`).
     peer_listen: ?IpAddress = null,
     /// The address published for peers (`/node-store/<node>.peer`): `--peer-advertise`, else the
     /// listen address when that names one host. Set exactly when `peer_listen` is.
@@ -208,7 +210,9 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     }
     const images_dir = flags.images_dir orelse file.images_dir;
     const listen_text = flags.peer_listen orelse file.peer_listen;
-    if (listen_text != null and images_dir == null) {
+    const kind = flags.runtime orelse file.runtime orelse .fake;
+    // A Zigbox node serves its Zigbox store; only the fake runtime needs a chunk directory.
+    if (listen_text != null and images_dir == null and kind != .zigbox) {
         return bad(diag, "--peer-listen has no chunk store to serve", .{}, "give --images-dir DIR");
     }
     const peer_listen = if (listen_text) |text| try parse_server(text, diag) else null;
@@ -222,7 +226,6 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         }
         _ = try parse_server(text, diag);
     }
-    const kind = flags.runtime orelse file.runtime orelse .fake;
     const images_given = flags.images orelse file.images;
     const images_path = images_given orelse images_default;
     const pulls_wanted = kind == .zigbox and images_given != null;
@@ -739,6 +742,17 @@ test "the chunk store and the peer address are read, and a peer address needs a 
     const alone = base ++ [_][]const u8{ "--peer-listen", "127.0.0.1:7171" };
     diag.reset();
     try expect_bad(load(arena, std.testing.io, &alone, &diag), &diag);
+    // A Zigbox node serves its Zigbox store, so it needs no chunk directory.
+    const zigbox_node = [_][]const u8{
+        "--node",         "node1",          "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",           "--cpu-millis", "1000",
+        "--memory-bytes", "1000000",        "--runtime",    "zigbox",
+        "--peer-listen",  "127.0.0.1:7171",
+    };
+    diag.reset();
+    const serving = try load(arena, std.testing.io, &zigbox_node, &diag);
+    try testing.expect(serving.run.images_dir == null);
+    try testing.expectEqual(@as(u16, 7171), serving.run.peer_listen.?.getPort());
 }
 
 test "the published peer address is the advertised one, or a specified listen address" {

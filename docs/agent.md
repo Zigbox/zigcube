@@ -175,7 +175,7 @@ text in `fetch.log`.
 `chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
 checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
 thread; a `DirImages` belongs to one thread, and the peer server gives each connection its own.
-`--peer-listen HOST:PORT` (needs `--images-dir`) starts the peer server (`peer_server.zig`): read-only,
+`--peer-listen HOST:PORT` (needs `--images-dir`, except with `--runtime zigbox`, where it serves the node's Zigbox store; see below) starts the peer server (`peer_server.zig`): read-only,
 CA-authenticated peers only, rate limited (ZC-E0808). The address the node publishes for peers
 (`/node-store/<node>.peer`) is `--peer-advertise HOST:PORT` (`.peer_advertise` in the ZON file);
 without it, the `--peer-listen` address if that names a host. `--peer-listen 0.0.0.0:P` or `[::]:P`
@@ -186,6 +186,8 @@ slots, which hold the big buffers and go only to a peer that authenticated: sile
 cannot lock honest peers out, and a client that finds every serving slot taken gets status 503
 (busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
 without a strike against the peer.
+
+**Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. `Shell.images` is still null in Zigbox mode, so the node's chunk summary (the filter peers see) is not yet reported from the Zigbox store: peers ask it and fall back to the registry or the next peer.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the

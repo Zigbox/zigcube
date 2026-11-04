@@ -550,6 +550,10 @@ const Rig = struct {
     /// corrupted on the way out.
     zigbox_root: ?[]const u8 = null,
     corrupt: bool = false,
+    /// Serve through the agent's own wiring (`agent_run.Swarm`), configured for Zigbox only: no
+    /// `images_dir`, the store named by `zigbox_root`.
+    via_agent: bool = false,
+    swarm: agent_run.Swarm = .{},
 
     fn state(rig: *const Rig) []const u8 {
         return rig.state_buffer[0..rig.state_len];
@@ -581,6 +585,24 @@ const Rig = struct {
         _ = @import("node_store.zig").list_digest(text, &rig.digest);
         try store.put_tree(&rig.digest, text);
         try store.images().put_chunk(&rig.hash, &rig.body);
+        if (rig.via_agent) {
+            const config: agent_config.Config = .{
+                .runtime = .zigbox,
+                .pulls = &.{},
+                .node = "node2",
+                .server = try net.IpAddress.parse("127.0.0.1", 1),
+                .state_dir = rig.state(),
+                .images = &.{},
+                .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+                .address = "",
+                .verbose = false,
+                .peer_listen = try net.IpAddress.parse("127.0.0.1", 0),
+                .peer_advertise = try net.IpAddress.parse("127.0.0.1", 1),
+            };
+            rig.swarm.chunk_bytes_test = 8;
+            try rig.swarm.start_with(io, std.testing.allocator, config, rig.zigbox_root);
+            return;
+        }
         try rig.server.start(io, .{
             .listen = try net.IpAddress.parse("127.0.0.1", 0),
             .state_dir = rig.state(),
@@ -593,8 +615,12 @@ const Rig = struct {
         });
     }
 
+    fn port(rig: *const Rig) u16 {
+        return if (rig.via_agent) rig.swarm.server.?.port() else rig.server.port();
+    }
+
     fn deinit(rig: *Rig) void {
-        rig.server.stop();
+        if (rig.via_agent) rig.swarm.stop(std.testing.allocator) else rig.server.stop();
         rig.tmp.cleanup();
     }
 };
@@ -1131,6 +1157,8 @@ const images_mod = @import("zigbox_images.zig");
 const fetch_client = @import("fetch_cli.zig");
 const fetch_worker = @import("fetch_worker.zig");
 const zigbox = @import("zigbox");
+const agent_run = @import("agent_run.zig");
+const agent_config = @import("agent_config.zig");
 
 const Digest = zigbox.store.Digest;
 const Manifest = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
@@ -1159,7 +1187,7 @@ fn fetch_from_rig(
     @memset(conns, .{});
     const peers = [_]fetch_client.Peer{.{
         .name = "node2",
-        .address = try net.IpAddress.parse("127.0.0.1", rig.server.port()),
+        .address = try net.IpAddress.parse("127.0.0.1", rig.port()),
     }};
     var text = tree.text();
     var client: fetch_client.Net = .{
@@ -1228,4 +1256,35 @@ fn rooted_count(store: *zigbox.store.Store) usize {
     var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
     const rooted = zigbox.store.roots.list(store, &names, &listing) catch return 999;
     return rooted.count;
+}
+
+test "an agent configured for Zigbox only serves its store's tree to a peer fetch" {
+    // Goal: demo-c2 needs a node with no --images-dir to serve what it pulled. Method: the agent's
+    // own wiring (`Swarm`) with `runtime = .zigbox`, `peer_listen` and no `images_dir` serves
+    // store A; a peer fetches the tree into an empty store B, checked against the full digest.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    const manifest = Manifest.parse(images_mod.manifest_text).?;
+    {
+        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
+        defer from_a.close();
+        var buffer: [2048]u8 = undefined;
+        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
+        _ = try from_a.import_image(record, pair.tree, manifest);
+    }
+    var to_b = try images_mod.ZigboxImages.open(gpa, &pair.b);
+    defer to_b.close();
+    var agent: Rig = .{ .tmp = undefined, .ca = undefined, .via_agent = true };
+    agent.zigbox_root = pair.a.root_text();
+    try agent.init();
+    defer agent.deinit();
+    try std.testing.expect(!agent.swarm.has_store);
+    try fetch_from_rig(&agent, &to_b, pair.tree, manifest);
+    const name = pair.tree.text();
+    try std.testing.expect(to_b.images().has(&name));
+    try std.testing.expectEqual(@as(usize, 1), rooted_count(&pair.b));
 }

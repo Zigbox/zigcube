@@ -38,12 +38,15 @@ Status: done on `claude/c2-slice8` (ea4bea9, 7043838, 58d46c8).
 
 ## Not done / traps
 
-- **The agent does not serve its Zigbox store to peers yet.** `Config.zigbox_store` exists in
-  `peer_server`, but `agent_run`'s `Swarm.start` opens a chunk directory (`--images-dir`) and the
-  peer server needs one; no agent flag names the Zigbox store. So the supervisor's fetch finds
-  peers (from the server's `/node-store/`) that cannot yet answer a bundle: it falls back to the
-  pull. Wiring this (a `--zigbox-store`-less `peer_listen` in zigbox mode, using
-  `zigbox.store.Store.locate`) is the next item.
+- **The agent serves its Zigbox store (added after the first report).** With `--runtime zigbox
+  --peer-listen` and no `--images-dir`, `Swarm.start` finds the store (`store.open.open` with
+  `.create`, so a node that has not pulled yet already serves an empty store), passes its root to
+  the peer server as `zigbox_store`, and gives the server an unused chunk directory
+  `<state-dir>/peer-chunks`. Test: `peer_server.zig`, "an agent configured for Zigbox only
+  serves its store's tree to a peer fetch" runs `Swarm.start_with`. Still open: `Shell.images` is
+  null in Zigbox mode, so the node's chunk summary (filter) is not reported from the Zigbox store;
+  `ZigboxImages.summary_impl` exists but is not wired. A process-level test of the real `Swarm.start`
+  (store location from the environment) is missing: `start` is two lines over `start_with`.
 - The supervisor's fetch and the new `launch.Fetch` spec field have unit tests only
   (`image.start_with_image` with a scripted fetch; `manifest_of`); no process-level test, and
   `zigbox-smoke` was not extended (no KVM here).
