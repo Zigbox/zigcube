@@ -50,8 +50,6 @@ pub const Error = error{
     Refused,
 };
 
-const room_attrs: usize = 1 << 16;
-
 /// Builds the bundle of `tree` into `out`; null if the tree is not whole here, has no image record
 /// (a tree no image rooted is not worth fetching: it would be collected) or does not fit.
 pub fn encode(
@@ -73,7 +71,7 @@ pub fn encode(
         writer.writeInt(u32, @intCast(bytes.len), .little) catch return null;
         writer.writeAll(bytes) catch return null;
     }
-    write_objects(allocator, images, tree, &writer) orelse return null;
+    write_objects(images, tree, &writer) orelse return null;
     const image = allocator.create([constants.zigbox_record_bytes_max]u8) catch return null;
     defer allocator.destroy(image);
     const text = images.export_image(tree, image) orelse return null;
@@ -83,18 +81,15 @@ pub fn encode(
 }
 
 fn write_objects(
-    allocator: Allocator,
     images: *ZigboxImages,
     tree: Digest,
     writer: *std.Io.Writer,
 ) ?void {
-    var found = images.collect(tree) orelse return null;
+    var found = images.describe(tree) orelse return null;
     defer found.deinit();
-    const room = allocator.alloc(u8, room_attrs) catch return null;
-    defer allocator.free(room);
-    writer.writeInt(u32, @intCast(found.list.items.len), .little) catch return null;
-    for (found.list.items) |ref| {
-        const meta = images.object_meta(ref, room) orelse return null;
+    writer.writeInt(u32, @intCast(found.items.items.len), .little) catch return null;
+    for (found.items.items) |*item| {
+        const meta = images.object_meta(item) orelse return null;
         writer.writeAll(&meta.id.bytes) catch return null;
         writer.writeInt(u16, meta.mode, .little) catch return null;
         writer.writeInt(u32, meta.uid, .little) catch return null;

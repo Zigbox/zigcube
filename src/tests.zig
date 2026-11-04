@@ -81,6 +81,7 @@ comptime {
     _ = @import("dir_images.zig");
     _ = @import("zigbox_images.zig");
     _ = @import("zigbox_fetch.zig");
+    _ = @import("zigbox_fetch_owner_test.zig");
     _ = @import("pull_report.zig");
     _ = @import("fetch_backoff.zig");
     _ = @import("peer_stream.zig");

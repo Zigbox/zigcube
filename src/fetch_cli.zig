@@ -11,6 +11,11 @@
 //! are named on the command line; each is assumed to hold every chunk, and the plan strikes
 //! one that lies (a hash mismatch) or does not answer. Exit codes: 0 fetched, 1 bad arguments
 //! (ZC-E0505), 2 this node failed (disk, memory), 3 no source had the tree (ZC-E0601).
+//!
+//! With `--zigbox-store` the whole fetch runs in Zigbox's store namespace (`fetch_in_namespace`,
+//! C2 slice 8 M3): the process has one thread (a single-threaded Io, checked), and the child
+//! `namespace.run` makes does the network and every store write, so the files get the owners
+//! Zigbox's own pull gives them. The child's exit code is the command's.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -29,6 +34,7 @@ const records = @import("records.zig");
 const store_failures = @import("store_failures.zig");
 const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
+const zigbox_image = @import("zigbox_image.zig");
 const pull_report = @import("pull_report.zig");
 
 const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
@@ -686,7 +692,10 @@ fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.
 }
 
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
-    const io = init.io;
+    // Not `init.io`: that is a threaded Io. A Zigbox store is written in Zigbox's store
+    // namespace, which only a process of one thread may make, and this Io never starts another.
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
     var diag: diag_mod.Diag = undefined;
     diag.reset();
     const parsed = parse(args) orelse {
@@ -704,25 +713,6 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const reply = gpa.alloc(u8, reply_bytes) catch
         return no_memory(io, &diag);
     defer gpa.free(reply);
-    var dir: dir_images.DirImages = undefined;
-    var opened: zigbox_fetch.Opened = undefined;
-    var target: Target = undefined;
-    if (parsed.zigbox_store.len > 0) {
-        opened.open(gpa, parsed.zigbox_store) catch |err| switch (err) {
-            error.OutOfMemory => return no_memory(io, &diag),
-            error.NoStore => return unusable_images(io, &diag, parsed.zigbox_store),
-        };
-        target = .{ .zigbox = &opened };
-    } else {
-        dir = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
-            return unusable_images(io, &diag, parsed.images_dir);
-        };
-        target = .{ .dir = &dir };
-    }
-    defer switch (target) {
-        .dir => dir.close(gpa),
-        .zigbox => opened.close(),
-    };
     const conns = gpa.alloc(Conn, constants.fetch_candidates_max) catch
         return no_memory(io, &diag);
     defer gpa.free(conns);
@@ -738,7 +728,117 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         .environ = init.minimal.environ,
     };
     defer net.close_peers();
-    return fetch_from(gpa, &net, target, &parsed, &diag);
+    if (parsed.zigbox_store.len > 0) return fetch_in_namespace(gpa, &net, &parsed, &diag);
+    var dir = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
+        return unusable_images(io, &diag, parsed.images_dir);
+    };
+    defer dir.close(gpa);
+    return fetch_from(gpa, &net, .{ .dir = &dir }, &parsed, &diag);
+}
+
+/// Zigbox mode. The whole fetch (the store opened, the peers asked, every write, the report)
+/// runs in Zigbox's store namespace (`zigbox.store.namespace.run`, Z6): a child of one thread
+/// with the id map Zigbox's own pull uses, so an object's owner lands as the id a container
+/// sees and the store is the one `zbx pull` of the same image would leave. The child inherits
+/// stdout and stderr, and its exit code is the command's. What it set in memory is lost with
+/// it, which is why nothing runs after it here.
+fn fetch_in_namespace(
+    gpa: std.mem.Allocator,
+    net: *Net,
+    parsed: *const Args,
+    diag: *diag_mod.Diag,
+) u8 {
+    assert(parsed.zigbox_store.len > 0);
+    assert(diag.code == null);
+    const io = net.io;
+    var real: zigbox.host_real.HostReal = .{ .environ = net.environ };
+    const host = real.interface();
+    var status: [4096]u8 = undefined;
+    const threads = if (host.read_file("/proc/self/status", &status)) |text|
+        zigbox_image.threads_in(text)
+    else |_|
+        null;
+    if (threads != 1) return not_single_threaded(io, diag, threads);
+    const facts = gpa.create(Facts) catch return no_memory(io, diag);
+    defer gpa.destroy(facts);
+    var job: NamespaceJob = .{ .gpa = gpa, .net = net, .parsed = parsed, .diag = diag };
+    const work: zigbox.store.namespace.Work = .{ .context = &job, .call = NamespaceJob.call };
+    const warn: zigbox.store.namespace.Warn = .{ .context = net, .call = say_warning };
+    var failure: zigbox.diag.Diag = undefined;
+    failure.reset();
+    return zigbox.store.namespace.run(host, facts, work, warn, &failure) catch {
+        say_foreign(io, &failure); // ZBX-E0419: the child could not be made or was killed.
+        return constants.exit_environment;
+    };
+}
+
+/// Zigbox's doctor facts, which `namespace.run` fills to choose the id map (not exported).
+const Facts = @FieldType(zigbox.Handle, "facts");
+
+/// What the namespace child does: everything `run` would do with the store, in the child.
+const NamespaceJob = struct {
+    gpa: std.mem.Allocator,
+    net: *Net,
+    parsed: *const Args,
+    diag: *diag_mod.Diag,
+
+    fn call(context: *anyopaque, squash_owner: bool) u8 {
+        const job: *NamespaceJob = @ptrCast(@alignCast(context));
+        // Only Zigbox's tree import takes an owner; a peer's objects carry theirs in their ids,
+        // and `put_chunk`, `put_tree` and `import_image` store what the namespace's file system
+        // gives (namespace.zig, "For Zigcube"). On a one-id map an owner that is not 0 cannot
+        // be stored: that object fails, and the supervisor's pull is the fallback.
+        _ = squash_owner;
+        const io = job.net.io;
+        var opened: zigbox_fetch.Opened = .{};
+        opened.open(job.gpa, job.parsed.zigbox_store) catch |err| switch (err) {
+            error.OutOfMemory => return no_memory(io, job.diag),
+            error.NoStore => return unusable_images(io, job.diag, job.parsed.zigbox_store),
+        };
+        defer opened.close();
+        const code = fetch_from(job.gpa, job.net, .{ .zigbox = &opened }, job.parsed, job.diag);
+        assert(code != zigbox_setup_failed);
+        return code;
+    }
+};
+
+/// Zigbox's exit code for a namespace child that could not be set up (not exported); the
+/// fetch's own codes never collide with it.
+const zigbox_setup_failed: u8 = 125;
+
+comptime {
+    for ([_]u8{
+        constants.exit_ok,       constants.exit_user,     constants.exit_environment,
+        constants.exit_external, constants.exit_internal,
+    }) |code| assert(code != zigbox_setup_failed);
+}
+
+fn say_warning(context: *anyopaque, warning: *const zigbox.diag.Diag) void {
+    const net: *Net = @ptrCast(@alignCast(context));
+    say_foreign(net.io, warning); // ZBX-W0201: the one-id map.
+}
+
+/// Prints a diagnostic of Zigbox's (ZBX-) on stderr, as Zigbox wrote it.
+fn say_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
+    assert(collector.code != null);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    zigbox.diagnostic.from_diag(&diagnostic, collector);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
+
+fn not_single_threaded(io: std.Io, diag: *diag_mod.Diag, count: ?u32) u8 {
+    diag.raise(.B0002);
+    if (count) |threads| {
+        diag.cause("zcube-agent fetch has {d} threads; Zigbox's store namespace needs one", .{
+            threads,
+        });
+    } else {
+        diag.cause("zcube-agent fetch can't tell how many threads it has", .{});
+    }
+    diag.fix(.{ .sentence = "report this: the fetch must start no thread before its store work" });
+    return finish(io, diag, constants.exit_internal);
 }
 
 /// Where the tree goes: a chunk directory, or a Zigbox store (`--zigbox-store`).

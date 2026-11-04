@@ -73,6 +73,61 @@ pub const Collected = struct {
     }
 };
 
+/// The distinct file objects of a tree with the attributes their tree entries record (C2 slice
+/// 8, M3). Those are the ids Zigbox recorded inside its store namespace, the container's view,
+/// and the object id commits to them; the file's owner as the host sees it (`lstat` outside the
+/// namespace, which is where a peer server runs) is not, so it is never what a peer is sent.
+pub const Described = struct {
+    pub const Item = struct {
+        ref: store_api.walk.ObjectRef,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+        /// The canonical attribute section; owned by `arena`.
+        xattrs: []const u8,
+    };
+
+    items: std.ArrayList(Item) = .empty,
+    seen: std.AutoHashMapUnmanaged(Hash, void) = .empty,
+    arena: std.heap.ArenaAllocator,
+    allocator: Allocator,
+    chunk_bytes: u32,
+    failed: bool = false,
+
+    pub fn entry(self: *Described, found: *const store_api.tree.Entry) void {
+        if (self.failed or found.kind != .file) return;
+        const slot = self.seen.getOrPut(self.allocator, found.object.bytes) catch {
+            self.failed = true;
+            return;
+        };
+        if (slot.found_existing) return;
+        const xattrs = self.arena.allocator().dupe(u8, found.xattrs) catch {
+            self.failed = true;
+            return;
+        };
+        self.items.append(self.allocator, .{
+            .ref = .{
+                .id = found.object,
+                .size = found.size,
+                .content = found.content,
+                .chunk_count = store_api.object.chunk_count(found.size, self.chunk_bytes),
+            },
+            .mode = found.mode,
+            .uid = found.uid,
+            .gid = found.gid,
+            .xattrs = xattrs,
+        }) catch {
+            self.failed = true;
+        };
+    }
+
+    pub fn deinit(self: *Described) void {
+        self.items.deinit(self.allocator);
+        self.seen.deinit(self.allocator);
+        self.arena.deinit();
+    }
+};
+
 /// The directory trees of a tree, the root first, each once: the records a peer needs besides
 /// the objects, for a directory is a tree record of its own.
 const Subtrees = struct {
@@ -207,6 +262,37 @@ pub const ZigboxImages = struct {
             tree,
             &found,
             entries_max,
+            &failure,
+        ) catch {
+            found.deinit();
+            return null;
+        };
+        if (found.failed) {
+            found.deinit();
+            return null;
+        }
+        return found;
+    }
+
+    /// The distinct file objects below `tree` with their tree entries' attributes, walk order.
+    /// Null if the walk could not finish. `collect` runs first: it stops at `entries_max`
+    /// entries, so the unbounded walk here only revisits trees already read whole.
+    pub fn describe(self: *ZigboxImages, tree: Digest) ?Described {
+        var bounded = self.collect(tree) orelse return null;
+        bounded.deinit();
+        var found: Described = .{
+            .arena = .init(self.allocator),
+            .allocator = self.allocator,
+            .chunk_bytes = self.store.chunk_bytes,
+        };
+        var failure: store_api.walk.Failure = undefined;
+        store_api.walk.walk(
+            self.store,
+            self.tree_buffer,
+            self.stack,
+            null,
+            tree,
+            &found,
             &failure,
         ) catch {
             found.deinit();
@@ -396,29 +482,30 @@ pub const ZigboxImages = struct {
         return store_api.get_tree(self.store, digest, out, &errno) catch null;
     }
 
-    /// What `begin_object` takes, for object `ref.id`: the attributes go into `buffer`, the
-    /// hashes (one per chunk) into the adapter's own room, valid until the next call. Null if the
-    /// store lacks the object or it cannot be read.
-    pub fn object_meta(
-        self: *ZigboxImages,
-        ref: store_api.walk.ObjectRef,
-        buffer: []u8,
-    ) ?ObjectMeta {
-        var path: store_api.fs.PathBuf = undefined;
-        const text = self.store.object_path(&path, ref.id);
-        const stat = self.store.fs.lstat(text) catch return null;
-        const section = self.scratch.gather(self.store.fs, text) catch return null;
-        if (section.len > buffer.len) return null;
-        @memcpy(buffer[0..section.len], section);
-        const listed = store_api.chunks(self.store, ref.id, self.io, self.hashes) catch return null;
+    /// What `begin_object` takes, for object `item.ref.id`: the attributes are its tree
+    /// entry's (`Described`), the hashes (one per chunk) go into the adapter's own room, valid
+    /// until the next call. Null if the store lacks the object or it cannot be read, or the
+    /// entry's attributes do not make its id (a tree the store holds damaged).
+    pub fn object_meta(self: *ZigboxImages, item: *const Described.Item) ?ObjectMeta {
+        const attrs: store_api.object.Attrs = .{
+            .mode = item.mode,
+            .uid = item.uid,
+            .gid = item.gid,
+            .xattrs = item.xattrs,
+        };
+        if (item.mode > 0o7777) return null;
+        if (store_api.xattrs.validate(item.xattrs) != .none) return null;
+        if (!store_api.object.object_id(item.ref.content, attrs).eql(item.ref.id)) return null;
+        const listed = store_api.chunks(self.store, item.ref.id, self.io, self.hashes) catch
+            return null;
         return .{
-            .id = ref.id,
-            .mode = stat.mode,
-            .uid = stat.uid,
-            .gid = stat.gid,
-            .xattrs = buffer[0..section.len],
-            .size = ref.size,
-            .content = ref.content,
+            .id = item.ref.id,
+            .mode = item.mode,
+            .uid = item.uid,
+            .gid = item.gid,
+            .xattrs = item.xattrs,
+            .size = item.ref.size,
+            .content = item.ref.content,
             .hashes = listed,
         };
     }
@@ -714,14 +801,9 @@ fn replicate(source: *ZigboxImages, target: *ZigboxImages, tree: Digest) !void {
     const digests = source.tree_digests(tree).?;
     defer testing.allocator.free(digests);
     for (digests) |digest| try target.put_tree_record(digest, source.tree_record(digest, record).?);
-    var found = source.collect(tree).?;
+    var found = source.describe(tree).?;
     defer found.deinit();
-    const attr_room = try testing.allocator.alloc(u8, 1 << 16);
-    defer testing.allocator.free(attr_room);
-    for (found.list.items) |ref| {
-        const meta = source.object_meta(ref, attr_room).?;
-        try target.begin_object(meta);
-    }
+    for (found.items.items) |*item| try target.begin_object(source.object_meta(item).?);
     const seam = target.images();
     const chunk = try testing.allocator.alloc(u8, constants.swarm_chunk_bytes);
     defer testing.allocator.free(chunk);
@@ -779,10 +861,9 @@ test "a chunk with the wrong bytes under its hash is refused and nothing lands" 
     const record = try testing.allocator.alloc(u8, constants.zigbox_tree_buffer_bytes);
     defer testing.allocator.free(record);
     try to_b.put_tree_record(pair.tree, from_a.tree_record(pair.tree, record).?);
-    var found = from_a.collect(pair.tree).?;
+    var found = from_a.describe(pair.tree).?;
     defer found.deinit();
-    var room: [1 << 12]u8 = undefined;
-    for (found.list.items) |ref| try to_b.begin_object(from_a.object_meta(ref, &room).?);
+    for (found.items.items) |*item| try to_b.begin_object(from_a.object_meta(item).?);
     var text: [67]u8 = undefined;
     _ = try std.fmt.bufPrint(&text, "{s}", .{&pair.tree.text()});
     var refs: [64]ChunkRef = undefined;
@@ -790,6 +871,34 @@ test "a chunk with the wrong bytes under its hash is refused and nothing lands" 
     try testing.expectError(error.BadHash, to_b.images().put_chunk(&refs[0].hash, "rotten!!"));
     try testing.expect(!to_b.claims_complete());
     try testing.expect(!to_b.images().has(&text));
+}
+
+test "an object is described by its tree entry, not by the file's owner on the host" {
+    // Goal: M3. A peer server runs outside Zigbox's store namespace, where an object a mapped
+    // write left owned by container id 1000 reads as a host id of the subordinate range; what it
+    // sends must still make the object's id. Method: change the owner of every object file in A
+    // (as root; skipped otherwise) and replicate A into B: every claim must still be accepted.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    var from_a = try ZigboxImages.open(testing.allocator, &pair.a);
+    defer from_a.close();
+    var to_b = try ZigboxImages.open(testing.allocator, &pair.b);
+    defer to_b.close();
+    var found = from_a.describe(pair.tree).?;
+    defer found.deinit();
+    try testing.expect(found.items.items.len >= 2);
+    for (found.items.items) |*item| {
+        var path: store_api.fs.PathBuf = undefined;
+        const text = pair.a.object_path(&path, item.ref.id);
+        const rc = std.os.linux.fchownat(std.os.linux.AT.FDCWD, text, 200999, 200999, 0);
+        if (std.os.linux.errno(rc) == .PERM) return error.SkipZigTest; // Not root.
+        try testing.expectEqual(.SUCCESS, std.os.linux.errno(rc));
+    }
+    try replicate(&from_a, &to_b, pair.tree);
+    try testing.expect(to_b.claims_complete());
 }
 
 test "an object claim whose id its attributes do not make is refused" {
@@ -802,10 +911,9 @@ test "an object claim whose id its attributes do not make is refused" {
     defer from_a.close();
     var to_b = try ZigboxImages.open(testing.allocator, &pair.b);
     defer to_b.close();
-    var found = from_a.collect(pair.tree).?;
+    var found = from_a.describe(pair.tree).?;
     defer found.deinit();
-    var room: [1 << 12]u8 = undefined;
-    var meta = from_a.object_meta(found.list.items[0], &room).?;
+    var meta = from_a.object_meta(&found.items.items[0]).?;
     meta.mode ^= 0o111; // A peer that changes the mode of an object it cannot prove.
     try testing.expectError(error.BadHash, to_b.begin_object(meta));
     try testing.expectEqual(@as(usize, 0), to_b.claims.items.len);

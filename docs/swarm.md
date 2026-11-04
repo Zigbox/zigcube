@@ -93,7 +93,23 @@ counts whole); `cached_bytes` is store chunk bytes for a peer fetch (what the st
 held) and compressed blob bytes for a pull (blobs it already had).
 
 `--registry` is optional in this mode (it is still required with `--images-dir`).
-The fetch does not yet run inside the container's `store.namespace`.
+
+**The store namespace (M3).** In this mode every store write of the fetch (tree records,
+objects, chunks, the image record) and its network work run in Zigbox's store namespace
+(`zigbox.store.namespace.run`), in its child of one thread, as Zigbox's own `pull` does. So an
+object of container id 1000 lands as the host id the subordinate range gives it, and the store
+is file for file what a pull leaves (`zigbox_fetch_owner_test.zig`). The child's exit code is the
+fetch's; a child that cannot be made is ZBX-E0419 and exit 2. `fetch` checks that it has one
+thread first (ZC-B0002 otherwise). On a host with only the one-id map (ZBX-W0201) every owner is 0
+inside, so an object whose id commits to another owner cannot be written: the fetch fails and the
+supervisor's pull (which squashes owners) runs.
+
+The serving side (`peer_server`, threads, outside the namespace) sends each object's attributes
+from its tree entry (`ZigboxImages.describe`), never from `lstat`, which outside the namespace
+gives the host's ids. Zigbox's `read_chunk` still checks an object of one chunk against an id
+made from the file's own `lstat`: outside the namespace, on a host with the full map, such an
+object owned by any container id but 0 reads as damaged and is not served. That is a gap in the
+pinned Zigbox, reported in `docs/decisions/2026-11-04-c2-slice8-review-fixes.md`.
 
 ## sim-swarm
 
