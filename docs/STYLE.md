@@ -86,6 +86,7 @@ Design goals, in order: **safety, performance, developer experience.**
 #### Dependencies and tooling
 
 - **No dependencies** beyond the Zig toolchain. External programs are allowed only where the spec names them as part of the system: `newuidmap`/`newgidmap`, `pasta`, and QEMU for the test VM.
+- **The Linux package release** (C3) runs `gpg` on the owner's machine to sign the apt and dnf repositories and the rpm headers, as Zigbox's does (owner, 2026-11-04). Release time only; CI and the product never run it.
 - Build, tidy, fuzz and VM tooling are written in Zig, not shell. A `.sh` file needs a written reason.
 
 ### Testing
