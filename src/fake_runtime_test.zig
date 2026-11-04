@@ -20,6 +20,7 @@ const fake_runtime = @import("fake_runtime.zig");
 const runtime = @import("runtime.zig");
 
 const Diag = diag_mod.Diag;
+const net = std.Io.net;
 
 const fixtures = [_][]const u8{ "b3:51aa9c03", "b3:9d20c4f1" };
 const forever = [_][]const u8{ "sh", "-c", "while true; do sleep 1; done" };
@@ -32,6 +33,8 @@ const Rig = struct {
     exe: []const u8,
     exe_buffer: [constants.state_path_bytes_max]u8,
     arena: std.heap.ArenaAllocator,
+    /// How the runtime fetches an image it lacks; null: it does not (`ZBX-E0410`).
+    fetch: ?fake_runtime.Fetch,
 
     /// Skips the test when the supervisor's executable cannot be found.
     fn start() !*Rig {
@@ -47,6 +50,7 @@ const Rig = struct {
         errdefer testing.allocator.free(rig.path);
         rig.clock_source = .{ .io = testing.io };
         rig.exe = exe;
+        rig.fetch = null;
         rig.arena = .init(testing.allocator);
         rig.fake = try testing.allocator.create(fake_runtime.FakeRuntime);
         errdefer testing.allocator.destroy(rig.fake);
@@ -62,6 +66,7 @@ const Rig = struct {
             .state_dir = rig.path,
             .supervisor_exe = rig.exe,
             .fixtures = &fixtures,
+            .fetch = rig.fetch,
         }, &diag) catch |err| {
             if (diag.code) |code| std.debug.print("init: {s}\n", .{@tagName(code)});
             return err;
@@ -563,4 +568,150 @@ test "events report a container when it starts and when it ends" {
     const ended = try interface.events(arena, 1000, &local);
     try testing.expectEqual(@as(usize, 1), ended.len);
     try testing.expect(ended[0].status == .stopped);
+}
+
+const unfetched = "b3:" ++ "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The runtime fetches from `registry`, with a back-off of `base_ms` doubling to `cap_ms`.
+fn fetch_from(rig: *Rig, registry: []const u8, base_ms: u32, cap_ms: u32) !void {
+    const images = try std.fmt.allocPrint(rig.arena.allocator(), "{s}/images", .{rig.path});
+    rig.fetch = .{
+        .node = "node1",
+        .images_dir = images,
+        .registry = registry,
+        .backoff_base_ms = base_ms,
+        .backoff_cap_ms = cap_ms,
+    };
+    try rig.restart();
+}
+
+/// The pids of the processes the supervisor `supervisor` has started (its fetch, while it fetches).
+fn children_of(supervisor: i32, out: *[8]i32) !usize {
+    var path: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&path, "/proc/{d}/task/{d}/children", .{ supervisor, supervisor });
+    var buffer: [128]u8 = undefined;
+    const line = try std.Io.Dir.cwd().readFile(testing.io, name, &buffer);
+    var count: usize = 0;
+    var words = std.mem.tokenizeScalar(u8, line, ' ');
+    while (words.next()) |word| {
+        const trimmed = std.mem.trim(u8, word, "\n");
+        if (trimmed.len == 0) continue;
+        if (count == out.len) break;
+        out[count] = try std.fmt.parseInt(i32, trimmed, 10);
+        count += 1;
+    }
+    return count;
+}
+
+/// Waits until the supervisor has a fetch running, and returns its pid.
+fn fetch_pid(supervisor: i32) !i32 {
+    for (0..500) |_| {
+        var found: [8]i32 = undefined;
+        const count = children_of(supervisor, &found) catch 0;
+        if (count > 0) return found[0];
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.NoFetch;
+}
+
+test "an agent that restarts in the middle of a fetch adopts it, and the fetch goes on" {
+    // Goal: the review's S3, restart case. A fetch is the supervisor's child, so the agent
+    // going away must neither end it nor start a second one. Method: a registry that accepts and
+    // says nothing holds the fetch; restart the runtime; the same supervisor and the same fetch
+    // are there, the replica is still starting, and stopping it ends both.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
+    defer listener.deinit(testing.io);
+    var address: [32]u8 = undefined;
+    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    try fetch_from(rig, try rig.arena.allocator().dupe(u8, registry), 50, 100);
+    const outcome = try rig.launch("mid-1", unfetched, &forever, &.{});
+    const handle = outcome.started;
+    const supervisor = try rig.pid_of("mid-1", fake_files.file_supervisor);
+    const fetching = try fetch_pid(supervisor);
+    try rig.restart();
+    try testing.expect(alive(supervisor));
+    try testing.expect(alive(fetching));
+    try testing.expectEqual(supervisor, try rig.pid_of("mid-1", fake_files.file_supervisor));
+    try testing.expect((try rig.status(handle)) == .starting);
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.interface().stop(handle, 1000, &local);
+    _ = try rig.wait_stopped(handle);
+    try expect_dead(fetching);
+    try expect_dead(supervisor);
+}
+
+test "a fetch that is killed with SIGKILL is a failed start blamed on the fetch" {
+    // Goal: the review's S3, SIGKILL case. The fetch ending by a signal the supervisor did not
+    // send is a crash, not a stop. Method: hold a fetch as above, kill it, and expect ZC-E0601
+    // with the fetch's blame and no command ever started.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
+    defer listener.deinit(testing.io);
+    var address: [32]u8 = undefined;
+    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    try fetch_from(rig, try rig.arena.allocator().dupe(u8, registry), 50, 100);
+    const handle = (try rig.launch("kill-1", unfetched, &forever, &.{})).started;
+    const supervisor = try rig.pid_of("kill-1", fake_files.file_supervisor);
+    std.posix.kill(try fetch_pid(supervisor), .KILL) catch unreachable; // It is running.
+    const reason = try rig.wait_stopped(handle);
+    try testing.expectEqualStrings("ZC-E0601", reason.start_failed.code.slice());
+    try testing.expectEqual(codes.Blame.external, reason.start_failed.blame);
+    try testing.expectError(error.FileNotFound, (try rig.fake.containers.openDir(
+        testing.io,
+        "kill-1",
+        .{},
+    )).access(testing.io, fake_files.file_child, .{}));
+}
+
+test "a replica stopped while it fetches ends as stopped, not as a failed start" {
+    // Goal: the review's S3, stop case. Stopping is not the fetch's fault, so the controller must
+    // not read it as one, and the streak must not grow. Method: stop a held fetch with the
+    // streak file absent; expect a signal exit and no streak afterwards.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var listener = try (try net.IpAddress.parse("127.0.0.1", 0)).listen(testing.io, .{});
+    defer listener.deinit(testing.io);
+    var address: [32]u8 = undefined;
+    const registry = try std.fmt.bufPrint(&address, "127.0.0.1:{d}", .{listener.socket.address.getPort()});
+    try fetch_from(rig, try rig.arena.allocator().dupe(u8, registry), 50, 100);
+    const handle = (try rig.launch("stop-1", unfetched, &forever, &.{})).started;
+    const supervisor = try rig.pid_of("stop-1", fake_files.file_supervisor);
+    const fetching = try fetch_pid(supervisor);
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.interface().stop(handle, 1000, &local);
+    const reason = try rig.wait_stopped(handle);
+    try testing.expect(reason == .signaled);
+    try expect_dead(fetching);
+    try testing.expectError(
+        error.FileNotFound,
+        rig.tmp.dir.access(testing.io, "fetch-streak.json", .{}),
+    );
+}
+
+test "after a failed fetch the next one on the node waits, longer each time, up to the cap" {
+    // Goal: the back-off of fetch_backoff.zig as the supervisors apply it (review S6). Method: a
+    // registry nobody listens on; the first failure comes at once, the second replica waits the
+    // base (200 ms), the third twice that, the fourth the cap (400 ms). Lower bounds only: a
+    // loaded machine may be slower, never faster.
+    var rig = try Rig.start();
+    defer rig.stop();
+    try fetch_from(rig, "127.0.0.1:1", 200, 400);
+    const names = [_][]const u8{ "back-1", "back-2", "back-3", "back-4" };
+    const waits_ms = [_]i64{ 0, 200, 400, 400 };
+    for (names, waits_ms) |name, wait_ms| {
+        const began = std.Io.Clock.boot.now(testing.io).toMilliseconds();
+        const outcome = try rig.launch(name, unfetched, &forever, &.{});
+        const reason = switch (outcome) {
+            .started => |handle| try rig.wait_stopped(handle),
+            .failed => |diagnostic| runtime.ExitReason{ .start_failed = diagnostic },
+        };
+        const took = std.Io.Clock.boot.now(testing.io).toMilliseconds() - began;
+        try testing.expectEqualStrings("ZC-E0601", reason.start_failed.code.slice());
+        try testing.expect(took >= wait_ms - 20);
+    }
 }

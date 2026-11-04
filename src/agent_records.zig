@@ -58,6 +58,11 @@ pub const FetchFile = struct {
     /// The tree being fetched, for the failure's cause.
     digest: []const u8,
     argv: []const []const u8,
+    /// The node's state dir, where the fetch back-off streak is kept (`fetch_backoff.zig`);
+    /// empty: no back-off.
+    state_dir: []const u8 = "",
+    backoff_base_ms: u32 = constants.fetch_backoff_base_ms,
+    backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
 };
 
 comptime {

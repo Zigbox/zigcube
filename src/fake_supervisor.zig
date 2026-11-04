@@ -22,6 +22,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const files = @import("fake_files.zig");
+const backoff = @import("fetch_backoff.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -82,6 +83,11 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
     const log = dir.createFile(io, files.file_fetch_log, .{}) catch
         return failed(.environment, "the fetch log could not be created");
     defer log.close(io);
+    const state = std.Io.Dir.openDirAbsolute(io, plan.state_dir, .{}) catch null;
+    defer if (state) |opened| opened.close(io);
+    if (state) |opened| {
+        if (wait_for_backoff(io, opened, arena, &plan)) |stopped| return stopped;
+    }
     var child = std.process.spawn(io, .{
         .argv = plan.argv,
         .stdin = .ignore,
@@ -91,10 +97,59 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
     child_pid.store(child.id.?, .release);
     const term = child.wait(io) catch return .{ .kind = .lost };
     child_pid.store(0, .release);
+    const result = fetch_ended(arena, plan.digest, term);
+    if (state) |opened| settle_streak(io, opened, arena, result);
+    return result;
+}
+
+/// What the fetch's end means for the next fetch on this node: a tree fetched ends the streak,
+/// a failure of the fetch extends it, and anything else (a stop, this node's own setup) leaves
+/// it as it was.
+fn settle_streak(io: std.Io, state: Dir, arena: Allocator, result: ?files.RunFile) void {
+    const failure = result orelse return backoff.clear(io, state);
+    if (failure.kind != .start_failed) return;
+    if (failure.blame != .fetch) return;
+    backoff.record_failure(io, state, arena, boot_ms(io));
+}
+
+fn boot_ms(io: std.Io) u64 {
+    const ms = std.Io.Clock.boot.now(io).toMilliseconds();
+    assert(ms >= 0);
+    return @intCast(ms);
+}
+
+/// Waits out the back-off a failed fetch on this node left (`fetch_backoff.zig`), in short
+/// sleeps so a `SIGTERM` ends the wait. Returns the container's end if it was stopped meanwhile.
+fn wait_for_backoff(
+    io: std.Io,
+    state: Dir,
+    arena: Allocator,
+    plan: *const files.FetchFile,
+) ?files.RunFile {
+    assert(plan.backoff_base_ms > 0);
+    assert(plan.backoff_cap_ms >= plan.backoff_base_ms);
+    const streak = backoff.read(io, state, arena);
+    while (true) {
+        if (term_received.load(.acquire)) {
+            return .{ .kind = .signaled, .signal = @intCast(@backingInt(std.posix.SIG.TERM)) };
+        }
+        const left = backoff.wait_remaining_ms(
+            streak,
+            boot_ms(io),
+            plan.backoff_base_ms,
+            plan.backoff_cap_ms,
+        );
+        if (left == 0) return null;
+        const slice_ms: i64 = @min(left, constants.fetch_backoff_slice_ms);
+        io.sleep(.fromMilliseconds(slice_ms), .boot) catch return null;
+    }
+}
+
+fn fetch_ended(arena: Allocator, digest: []const u8, term: std.process.Child.Term) ?files.RunFile {
     switch (term) {
         .exited => |code| {
             if (code == constants.exit_ok) return null;
-            return fetch_exit(arena, plan.digest, code);
+            return fetch_exit(arena, digest, code);
         },
         // Stopped while fetching: the container ended by that signal, it did not fail to start.
         // A signal this supervisor was not sent is the fetch crashing or being killed.

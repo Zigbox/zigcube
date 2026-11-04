@@ -32,6 +32,7 @@ test {
     _ = @import("dir_images.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_runtime_test.zig");
+    _ = @import("fetch_backoff.zig");
     _ = @import("zigbox_map.zig");
     _ = @import("zigbox_image.zig");
     _ = @import("zigbox_launch.zig");

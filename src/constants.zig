@@ -431,6 +431,18 @@ pub const fetch_list_peers_max: u32 = 4;
 /// One fetch ends in an error after this long, whatever it is doing (a 64 GiB tree at the
 /// node's rate cap takes about 17 minutes).
 pub const fetch_total_ms: u32 = 30 * 60 * 1000;
+/// The wait before a fetch on a node whose last fetch failed, doubling from the base to the cap
+/// (`fetch_backoff.zig`), so an unreachable tree does not make replicas churn at the speed of the
+/// refusals.
+pub const fetch_backoff_base_ms: u32 = 1000;
+pub const fetch_backoff_cap_ms: u32 = 5 * 60 * 1000;
+/// A temporary file of the chunk store older than this was left by a writer that died
+/// (`dir_images.zig`); the fetch deadline is far shorter.
+pub const dir_temp_stale_ms: u64 = 2 * @as(u64, fetch_total_ms);
+/// Entries one sweep of a store directory looks at.
+pub const dir_sweep_entries_max: u32 = 1 << 20;
+/// A wait for the back-off sleeps in slices of this size, so a stop is noticed.
+pub const fetch_backoff_slice_ms: u32 = 100;
 pub const fetch_chunks_max: u32 = summary_chunks_capacity;
 /// A tree's chunk list as text: `<64 hex> <bytes>` and a newline per chunk, at most 80 bytes each.
 pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
@@ -596,4 +608,6 @@ comptime {
     assert(fetch_candidates_max <= 255); // A peer's index is a u8.
     assert(fetch_list_peers_max <= fetch_peers_max);
     assert(fetch_total_ms > fetch_peer_wait_ms);
+    assert(fetch_backoff_base_ms > 0);
+    assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }

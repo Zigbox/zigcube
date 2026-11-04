@@ -52,6 +52,11 @@ const Slot = struct {
     scratch: []u8 = &.{},
     refs: []fetch_plan.ChunkRef = &.{},
     fd: std.posix.fd_t = -1,
+    /// The source key of the connection (`source_key`), valid while `busy`.
+    source: u64 = 0,
+    /// True once the handshake succeeded: until then the connection is a stranger's, and one
+    /// source may hold only one such slot (`admit`).
+    authenticated: std.atomic.Value(bool) = .init(false),
 };
 
 pub const Server = struct {
@@ -138,24 +143,37 @@ fn accept_loop(server: *Server) void {
 fn source_of(storage: *const std.os.linux.sockaddr.storage) u64 {
     const bytes = std.mem.asBytes(storage);
     const family = std.mem.readInt(u16, bytes[0..2], .little);
-    const part = if (family == std.os.linux.AF.INET) bytes[4..8] else bytes[8..24];
-    return std.hash.Wyhash.hash(0, part);
+    if (family == std.os.linux.AF.INET) return source_key(bytes[4..8]);
+    return source_key(bytes[8..24]);
+}
+
+/// The key of an address of 4 bytes (IPv4) or 16 (IPv6). An IPv6 address is keyed by its /64,
+/// because one host holds a whole /64 and each of its addresses would otherwise be a new source;
+/// an IPv4-mapped address (`::ffff:a.b.c.d`) is the IPv4 address it carries.
+pub fn source_key(address: []const u8) u64 {
+    assert(address.len == 4 or address.len == 16);
+    if (address.len == 4) return std.hash.Wyhash.hash(0, address);
+    const zeros: [10]u8 = @splat(0);
+    if (std.mem.eql(u8, address[0..10], &zeros)) {
+        if (address[10] == 0xff) {
+            if (address[11] == 0xff) return source_key(address[12..16]);
+        }
+    }
+    return std.hash.Wyhash.hash(1, address[0..8]);
 }
 
 fn admit(server: *Server, fd: std.posix.fd_t, source: u64, io: std.Io) void {
+    if (handshake_pending(server, source)) {
+        // One unauthenticated connection per source: a stranger that sends nothing cannot take
+        // the slots one by one. The refused peer connects again by itself (its handshake, at the
+        // longest `peer_handshake_ms` from now, has ended by then). Not counted by the limiter.
+        refuse(server, io, "a peer address already has a handshake that has not finished");
+        _ = std.os.linux.close(fd);
+        return;
+    }
     const verdict = server.limiter.admit(source, peer_stream.boot_ms(io));
     if (verdict != .admitted) {
-        if (!server.refusal_shown) {
-            server.refusal_shown = true;
-            var diag: Diag = undefined;
-            diag.reset();
-            diag.raise(.E0808);
-            diag.cause("a peer address started more than {d} handshakes in {d} ms", .{
-                constants.peer_handshakes_per_source_max, constants.peer_handshake_window_ms,
-            });
-            diag.fix(.{ .sentence = "no action needed; it is tried again by itself" });
-            show(io, &diag, server.config.verbose);
-        }
+        refuse(server, io, "a peer address started more than the handshakes it is allowed in a window");
         _ = std.os.linux.close(fd);
         return;
     }
@@ -165,6 +183,8 @@ fn admit(server: *Server, fd: std.posix.fd_t, source: u64, io: std.Io) void {
         if (slot.future) |*future| future.await(io);
         slot.future = null;
         slot.fd = fd;
+        slot.source = source;
+        slot.authenticated.store(false, .release);
         slot.busy.store(true, .release);
         slot.future = io.concurrent(serve, .{ server, slot }) catch {
             slot.busy.store(false, .release);
@@ -174,6 +194,28 @@ fn admit(server: *Server, fd: std.posix.fd_t, source: u64, io: std.Io) void {
         return;
     }
     _ = std.os.linux.close(fd); // Every slot is busy: the peer tries another source.
+}
+
+/// Whether a connection of `source` is still in its handshake in some slot.
+fn handshake_pending(server: *Server, source: u64) bool {
+    for (&server.slots) |*slot| {
+        if (!slot.busy.load(.acquire)) continue;
+        if (slot.source != source) continue;
+        if (!slot.authenticated.load(.acquire)) return true;
+    }
+    return false;
+}
+
+/// Shows ZC-E0808 once per streak of refusals: a flood must not flood the log.
+fn refuse(server: *Server, io: std.Io, why: []const u8) void {
+    if (server.refusal_shown) return;
+    server.refusal_shown = true;
+    var diag: Diag = undefined;
+    diag.reset();
+    diag.raise(.E0808);
+    diag.cause("{s}", .{why});
+    diag.fix(.{ .sentence = "no action needed; it is tried again by itself" });
+    show(io, &diag, server.config.verbose);
 }
 
 fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
@@ -216,6 +258,7 @@ fn serve(server: *Server, slot: *Slot) void {
         return;
     };
     defer stream.deinit();
+    slot.authenticated.store(true, .release);
     var count: u32 = 0;
     while (count < constants.peer_connection_requests_max) : (count += 1) {
         if (server.stopping.load(.acquire)) return;
@@ -469,4 +512,76 @@ test "more requests than the handshake limit are served over one stream, a missi
         fetch_cli.PeerReply.refused,
         net_state.peer_get(0, absent, &out),
     );
+}
+
+test "four silent connections from one source hold one slot, and an honest peer is served" {
+    // Goal: a source that connects and sends nothing cannot take the connection slots from
+    // everyone (review M2). Method: four raw connections that never send; only one is admitted
+    // (the rest are closed at accept, so the slots are not all taken); an honest client of the
+    // same source, which on loopback is every client, is served once the silent handshake has
+    // timed out, retrying meanwhile.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    var silent: [4]std.posix.fd_t = undefined;
+    for (&silent) |*fd| fd.* = try peer_stream.connect(io, address, peer_stream.boot_ms(io) + 5000);
+    defer for (silent) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    try io.sleep(.fromMilliseconds(200), .awake);
+    var busy: u32 = 0;
+    for (&rig.server.slots) |*slot| {
+        if (slot.busy.load(.acquire)) busy += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), busy);
+
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    var identity: peer.Identity = .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+    const give_up = peer_stream.boot_ms(io) + constants.peer_handshake_ms + 3000;
+    while (peer_stream.boot_ms(io) < give_up) {
+        const end = peer_stream.boot_ms(io) + 2000;
+        const fd = peer_stream.connect(io, address, end) catch continue;
+        defer _ = std.os.linux.close(fd);
+        var stream = peer_stream.open_client(io, fd, &identity, "node2", end) catch {
+            try io.sleep(.fromMilliseconds(100), .awake);
+            continue;
+        };
+        defer stream.deinit();
+        var target: [128]u8 = undefined;
+        var reply: [1024]u8 = undefined;
+        const path = try std.fmt.bufPrint(&target, "GET {s}{x}\n", .{ chunk_path, &rig.hash });
+        try stream.send(path, end);
+        const head = try stream.recv(&reply, end);
+        try std.testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, head[0..2], .big));
+        return;
+    }
+    return error.NeverServed;
+}
+
+test "an IPv6 address is a source by its /64, and a mapped IPv4 address by its IPv4 address" {
+    // Goal: one host with a /64 is one source (review M2), and mapped addresses are not all one.
+    // Method: addresses that differ in the low 64 bits, the high 64 bits, and mapped forms.
+    var first: [16]u8 = @splat(0);
+    first[0] = 0x20;
+    first[1] = 0x01;
+    var second = first;
+    second[15] = 9;
+    try std.testing.expectEqual(source_key(&first), source_key(&second));
+    second[7] = 1;
+    try std.testing.expect(source_key(&first) != source_key(&second));
+    var mapped_one: [16]u8 = @splat(0);
+    mapped_one[10] = 0xff;
+    mapped_one[11] = 0xff;
+    var mapped_two = mapped_one;
+    mapped_one[12..16].* = .{ 10, 0, 0, 1 };
+    mapped_two[12..16].* = .{ 10, 0, 0, 2 };
+    try std.testing.expect(source_key(&mapped_one) != source_key(&mapped_two));
+    try std.testing.expectEqual(source_key(&.{ 10, 0, 0, 1 }), source_key(&mapped_one));
 }

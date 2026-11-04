@@ -45,6 +45,9 @@ pub const DirImages = struct {
         errdefer root.close(io);
         root.createDirPath(io, dir_trees) catch return error.Unusable;
         root.createDirPath(io, dir_chunks) catch return error.Unusable;
+        for ([_][]const u8{ dir_trees, dir_chunks }) |name| {
+            sweep_temps(io, root, name, constants.dir_temp_stale_ms);
+        }
         const list = try allocator.alloc(u8, constants.tree_list_bytes_max);
         errdefer allocator.free(list);
         const refs = try allocator.alloc(ChunkRef, constants.fetch_chunks_max);
@@ -100,7 +103,9 @@ pub const DirImages = struct {
         const hex = digest[3..];
         if (hex.len < 8 or hex.len > 64 or 3 + hex.len > buffer.len) return null;
         for (hex) |c| {
-            if (!std.ascii.isHex(c)) return null;
+            if (!std.ascii.isDigit(c)) {
+                if (c < 'a' or c > 'f') return null; // Lower case only: one name per tree.
+            }
         }
         @memcpy(buffer[0..3], "b3-");
         @memcpy(buffer[3..][0..hex.len], hex);
@@ -256,11 +261,37 @@ fn write_whole(io: std.Io, dir: Dir, name: []const u8, data: []const u8) !void {
     {
         const file = try dir.createFile(io, temp, .{ .exclusive = true });
         defer file.close(io);
+        // A write that fails leaves nothing behind: the name is random, so nothing else would
+        // ever remove it.
+        errdefer dir.deleteFile(io, temp) catch {}; // Already failing; the sweep at open is next.
         try file.writeStreamingAll(io, data);
         try file.sync(io);
     }
+    errdefer dir.deleteFile(io, temp) catch {}; // The rename failed: same.
     try dir.rename(temp, dir, name, io);
     try fake_files.sync_dir(io, dir);
+}
+
+/// Removes the temporary files (`*.tmp`) of `sub` under `root` that were last written more than
+/// `stale_ms` ago: a writer that was killed between create and rename leaves one, and its random
+/// name means no later write reuses it. Younger ones may belong to a live writer (the agent, a
+/// fetch and the peer server share the directory), so they stay. Best effort.
+fn sweep_temps(io: std.Io, root: Dir, sub: []const u8, stale_ms: u64) void {
+    const iterating: Dir.OpenOptions = .{ .iterate = true };
+    const dir = root.openDir(io, sub, iterating) catch return;
+    defer dir.close(io);
+    const now = std.Io.Clock.real.now(io).toNanoseconds();
+    var iterator = dir.iterate();
+    for (0..constants.dir_sweep_entries_max) |_| {
+        const entry = iterator.next(io) catch return;
+        const found = entry orelse return;
+        if (found.kind != .file) continue;
+        if (!std.mem.endsWith(u8, found.name, ".tmp")) continue;
+        const stat = dir.statFile(io, found.name, .{}) catch continue;
+        const age_ns = now - stat.mtime.toNanoseconds();
+        if (age_ns < @as(i96, stale_ms) * std.time.ns_per_ms) continue;
+        dir.deleteFile(io, found.name) catch {}; // Another sweeper was first, or it is not ours.
+    }
 }
 
 // ---- Tests --------------------------------------------------------------------------------
@@ -390,4 +421,65 @@ test "a write never touches another writer's temporary file" {
     try std.testing.expectEqualStrings("whole", whole);
     const stand_in = try tmp.dir.readFile(std.testing.io, "other.tmp", &buffer);
     try std.testing.expectEqualStrings("half-written", stand_in);
+}
+
+fn count_temps(dir: Dir) !u32 {
+    var count: u32 = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(std.testing.io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".tmp")) count += 1;
+    }
+    return count;
+}
+
+test "a write that fails leaves no temporary file, and open sweeps the stale ones" {
+    // Goal: review S1. Method: make the rename fail (the name is a directory), count the
+    // temporary files; then leave one by hand, and see open keep it while it is young and a
+    // sweep with no age remove it.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "blocked", .default_dir);
+    try std.testing.expect(std.meta.isError(write_whole(io, tmp.dir, "blocked", "data")));
+    try std.testing.expectEqual(@as(u32, 0), try count_temps(tmp.dir));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "left.1234.tmp", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "kept", .data = "x" });
+    sweep_temps(io, tmp.dir, ".", constants.dir_temp_stale_ms);
+    try std.testing.expectEqual(@as(u32, 1), try count_temps(tmp.dir));
+    sweep_temps(io, tmp.dir, ".", 0);
+    try std.testing.expectEqual(@as(u32, 0), try count_temps(tmp.dir));
+    try tmp.dir.access(io, "kept", .{});
+}
+
+const Writer = struct {
+    dir: Dir,
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn run(writer: *Writer, data: []const u8) void {
+        for (0..40) |_| {
+            write_whole(std.testing.io, writer.dir, "shared", data) catch {
+                _ = writer.failures.fetchAdd(1, .monotonic);
+            };
+        }
+    }
+};
+
+test "two writers of one name leave a whole file and no temporary file" {
+    // Goal: review S1, the two-writer case. Two threads write the same name with the same
+    // bytes (two fetches of one tree); every write succeeds, a reader sees all of it, and no
+    // temporary file is left.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var writer: Writer = .{ .dir = tmp.dir };
+    const data: [512]u8 = @splat(0x5a);
+    const first = try std.Thread.spawn(.{}, Writer.run, .{ &writer, &data });
+    const second = try std.Thread.spawn(.{}, Writer.run, .{ &writer, &data });
+    first.join();
+    second.join();
+    try std.testing.expectEqual(@as(u32, 0), writer.failures.load(.monotonic));
+    var back: [1024]u8 = undefined;
+    const read = try tmp.dir.readFile(std.testing.io, "shared", &back);
+    try std.testing.expectEqualSlices(u8, &data, read);
+    try std.testing.expectEqual(@as(u32, 0), try count_temps(tmp.dir));
 }

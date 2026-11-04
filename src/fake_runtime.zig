@@ -81,6 +81,9 @@ pub const Fetch = struct {
     server: []const u8 = "",
     /// `NAME=HOST:PORT`, fixed peers.
     peers: []const []const u8 = &.{},
+    /// The wait after one failed fetch on the node, doubling to the cap (`fetch_backoff.zig`).
+    backoff_base_ms: u32 = constants.fetch_backoff_base_ms,
+    backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
 };
 
 const Tag = enum(u8) { starting, running, stopped };
@@ -241,7 +244,13 @@ pub const FakeRuntime = struct {
             argv[count + 1] = peer;
             count += 2;
         }
-        const record: files.FetchFile = .{ .digest = spec.image, .argv = argv[0..count] };
+        const record: files.FetchFile = .{
+            .digest = spec.image,
+            .argv = argv[0..count],
+            .state_dir = self.options.state_dir,
+            .backoff_base_ms = fetch.backoff_base_ms,
+            .backoff_cap_ms = fetch.backoff_cap_ms,
+        };
         files.write_json(self.io, dir, files.file_fetch, record) catch
             return runtime_failed(diag, "write the container's fetch record");
     }
@@ -384,7 +393,16 @@ pub const FakeRuntime = struct {
         const status = try self.status_of(arena, dir, handle.name(), diag);
         if (status == .stopped) return;
         const child = files.read_pid(self.io, dir, files.file_child) catch {
-            // Not running yet: there is nothing polite to say to it.
+            // Not running yet. A supervisor that is fetching can be told politely, so it records
+            // the stop; anything else, or one that does not answer, loses its group.
+            if (grace_ms != 0 and files.exists(self.io, dir, files.file_fetch)) {
+                if (files.read_pid(self.io, dir, files.file_supervisor)) |supervisor| {
+                    if (self.is_our_supervisor(supervisor)) {
+                        signal(supervisor, .TERM);
+                        if (self.wait_ended(dir, @min(grace_ms, stop_wait_ms))) return;
+                    }
+                } else |_| {}
+            }
             self.kill_group(dir);
             return;
         };
