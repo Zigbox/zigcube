@@ -233,7 +233,13 @@ fn supervise(
     var real: Real = .{ .host = host, .storage = storage, .spec = &container };
     if (spec.fetch) |fetch| {
         if (launch.manifest_of(spec.reference)) |manifest| {
-            real.swarm = .{ .io = io, .name = spec.name, .fetch = fetch, .tree = spec.tree, .manifest = manifest };
+            real.swarm = .{
+                .io = io,
+                .name = spec.name,
+                .fetch = fetch,
+                .tree = spec.tree,
+                .manifest = manifest,
+            };
         }
     }
     var trace: image.Trace = .{};

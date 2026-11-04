@@ -921,7 +921,6 @@ fn pull_fallback(
     return report;
 }
 
-
 fn real_ms(io: std.Io) u64 {
     return @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
 }

@@ -762,7 +762,8 @@ test "the store the agent reports from: the chunk directory, else Zigbox's, else
     config.runtime = .zigbox;
     try std.testing.expect(node_images(&swarm, config, &fake) == null);
     config.runtime = .fake;
-    try std.testing.expectEqual(@as(*anyopaque, &fake), node_images(&swarm, config, &fake).?.context);
+    const faked = node_images(&swarm, config, &fake).?;
+    try std.testing.expectEqual(@as(*anyopaque, &fake), faked.context);
     // The Zigbox store wins over the fake's, and is the one opened.
     swarm.zigbox = &opened;
     const got = node_images(&swarm, config, &fake).?;

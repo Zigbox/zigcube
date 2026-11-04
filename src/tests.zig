@@ -5,7 +5,6 @@ test {
     _ = @import("text.zig");
     _ = @import("test_util.zig");
     _ = @import("clock.zig");
-    _ = @import("agent_run.zig");
     _ = @import("diag/codes.zig");
     _ = @import("diag.zig");
     _ = @import("errors_site.zig");
@@ -92,4 +91,5 @@ test "the peer files and the CA's shell are in this root" {
     _ = @import("fetch_cli.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
+    _ = @import("agent_run.zig"); // The agent's store choice and Zigbox store lookup.
 }
