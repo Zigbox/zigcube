@@ -325,6 +325,14 @@ stage_peers_prep() {
     a_holds() { holds_tree $NODE "$PYTHON_TREE" && holds_tree $NODE "$PY13_TREE" &&
         holds_tree $NODE "$ALPINE_TREE"; }
     until_ok 90 "A's summary to list its trees and its peer address" a_holds
+    # The supervisor's pull wrote those chunks, not the agent: A's peer server indexes the store
+    # when it starts (or at its next write), so restart it to serve what it now holds
+    # (decisions/2026-11-04-c2-slice8-review-fixes.md, S3).
+    kill -TERM "$(agent_pid)"
+    gone_a() { ! agent_pid; }
+    until_ok 30 "agent A to stop" gone_a
+    start_agent
+    until_ok 90 "A's summary again after its restart" a_holds
     ok "agent A ($NODE) holds python:3.12-slim, python:3.13-slim and alpine and says so in /node-store"
 }
 
@@ -343,7 +351,8 @@ stage_peers_fetch() {
     until_ok 240 "pyone to run on $NODE_B" one_up
     await_pull "$PYTHON_TREE" "$since"
     echo "pull record of pyone: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
-    [ "$PEER" -gt 0 ] || fail "pyone: no bytes came from a peer (registry=$REG peers=$PEERS)"
+    [ "$PEER" -gt 0 ] || fail "pyone: no bytes came from a peer (registry=$REG peers=$PEERS)" \
+        "fetch.log: $(cat "$(fetch_log_of pyone)" 2>&1 | head -c 1500)"
     [ "$REG" -eq 0 ] || fail "pyone: $REG registry bytes, but A has the image"
     case "$PEERS" in "$NODE="*) ;; *) fail "pyone: peers are '$PEERS', not $NODE" ;; esac
     ok "B fetched python:3.12-slim from peer $NODE: $PEER peer bytes, 0 registry bytes"
