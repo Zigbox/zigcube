@@ -14,16 +14,40 @@ Status: done on `claude/c2-slice8` (ea4bea9, 7043838, 58d46c8).
 - **Fallback.** With no peer holding the tree, `fetch` calls Zigbox `pull` (`src/zigbox_pull.zig`,
   `pull_image`, `Pulled.blobs` carries digest, bytes, outcome).
 
+## Follow-ups from the supervisor (same slice)
+
+- **Supervisor launches the fetch.** `ZigboxRuntime.Options.fetch` (`launch.Fetch`: exe, node,
+  state dir, server, registry) goes into the launch spec when the tree is a full `b3:` digest and
+  the reference is pinned (`name@sha256:HEX`; `launch.manifest_of` reads the manifest from it: the
+  manifest is the assignment's). `zigbox_supervisor` runs `<exe> fetch --node .. --state-dir ..
+  --zigbox-store <located root> --manifest .. --digest .. [--registry ..] [--server ..]` when
+  Zigbox's start says ZBX-E0410 (`image.Steps.fetch`, before the pull), then starts again.
+- **Deviation:** `--source` is *not* passed. The supervisor keeps the pull itself, in its own
+  single-threaded process (Zigbox's pull may make namespaces; I could not check that the fetch
+  process stays single-threaded), and says its own ZBX diagnostics. `fetch --source` stays for
+  other callers. A failed fetch falls through to the pull.
+- **`--registry` is optional** with `--zigbox-store`; without it, a tree no peer has is ZC-E0601
+  naming the peers asked ("no peer, and no registry is given" when there are none).
+- **End-to-end test** (`peer_server.zig`, "a Zigbox store serves a tree..."): real peer stream,
+  two stores; a corrupting peer fails with `ChunkFailed`, a wrong manifest is `Refused` (data may
+  land, nothing is rooted), an absent tree is `TreeUnavailable`, then the honest fetch roots it.
+  `Opened.chunk_bytes` / `Config.zigbox_chunk_bytes` exist for the tests only: the store's chunk
+  size is not recorded in the store, and a store opened with another size than it was made with
+  trips `zigbox_images.chunk_length`'s assertion in `reindex` (a hard abort in a peer server).
+- Docs: `docs/peer.md` (the bundle route) and `docs/swarm.md` (the Zigbox store path).
+
 ## Not done / traps
 
-- The supervisor's `fetch` launch in `agent_run` does not yet pass `--zigbox-store`,
-  `--manifest`, `--source`. `--registry` is still required in Zigbox mode.
+- **The agent does not serve its Zigbox store to peers yet.** `Config.zigbox_store` exists in
+  `peer_server`, but `agent_run`'s `Swarm.start` opens a chunk directory (`--images-dir`) and the
+  peer server needs one; no agent flag names the Zigbox store. So the supervisor's fetch finds
+  peers (from the server's `/node-store/`) that cannot yet answer a bundle: it falls back to the
+  pull. Wiring this (a `--zigbox-store`-less `peer_listen` in zigbox mode, using
+  `zigbox.store.Store.locate`) is the next item.
+- The supervisor's fetch and the new `launch.Fetch` spec field have unit tests only
+  (`image.start_with_image` with a scripted fetch; `manifest_of`); no process-level test, and
+  `zigbox-smoke` was not extended (no KVM here).
 - The fetch does not run inside `store.namespace` (Z6).
-- `docs/peer.md` and `docs/swarm.md` are not updated.
 - `lacking`'s reindex trap remains.
-- The pull fallback has only host unit tests; it was never run against a registry.
-- No host end-to-end test of peer server plus client with two Zigbox stores yet (Rig in
-  `peer_server.zig` needs an optional `zigbox_store`).
-- `zigbox-smoke` with a second agent and store was not extended: it needs KVM and a QEMU guest,
-  absent here.
-- Z5 (per-blob pull bytes into `/pulls`) skipped: slice 7 ("pull stats") is not on main.
+- The pull fallback in `fetch --source` was never run against a registry.
+- Z5 (per-blob pull bytes into `/pulls`) skipped: #61 is still in review.

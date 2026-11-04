@@ -67,6 +67,26 @@ The target's sketch is an input. Where the scheduler gets it is slice 5's questi
   chunk`.
 * **Memory.** The caller gives the plan a `ChunkState` per chunk and the peers' filter bytes.
 
+## The Zigbox store path (slice 8)
+
+With `--zigbox-store ROOT --manifest sha256:HEX [--source OCI-REF]`, `zcube-agent fetch` fills a
+Zigbox store instead of a chunk directory (`zigbox_fetch.zig`, `fetch_cli.zig`):
+
+1. Each peer, in turn, is asked for the tree's bundle (`GET /v1/peer/bundle/<digest>`, docs/peer.md)
+   and the chunks the store lacks are fetched under the same plan as above (peers first, hashes
+   checked by the plan itself). The tree is then rooted for the manifest the assignment names.
+   A manifest in the bundle that is not the assignment's is refused.
+2. When no peer has the tree (`TreeUnavailable`, or `ChunkFailed`) and `--source` is given, the
+   fetch falls back to Zigbox's own `pull` of that reference (`zigbox_pull.pull_image`) and holds
+   the result to the same tree digest and manifest. The registry's blobs are not chunks of ours:
+   the report counts them as `registry_chunks` = the blobs `pull` saw.
+3. With no `--source` and no peer that has the tree, the fetch fails with ZC-E0601, which names
+   the peers asked (or "no peer, and no registry is given").
+
+`--registry` is optional in this mode (it is still required with `--images-dir`): the
+bundle route has only peers behind it, and `pull` goes to the registry named by the reference.
+The fetch does not yet run inside the container's `store.namespace`.
+
 ## sim-swarm
 
 `zig build sim-swarm [-Dseed=N] [-Dops=N]` runs the simulation natively and as WASM and compares

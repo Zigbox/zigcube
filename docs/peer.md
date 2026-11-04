@@ -271,6 +271,25 @@ The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor 
 the command (ZC-E0601) and the fake registry are described in `docs/agent.md`; `zig build swarm-smoke`
 runs them end to end. See `docs/decisions/2026-11-03-slice6b-handoff.md`.
 
+### The bundle route (slice 8)
+
+A node whose images live in a Zigbox store (`--zigbox-store`) also answers
+`GET /v1/peer/bundle/<full digest>` (`peer_serve.path_bundle`, `zigbox_fetch.encode`): the tree
+records, a description of every object and the image record in one message of 16 KiB records
+(wire format in `src/zigbox_fetch.zig`, magic `ZCB1`). The route takes the full `b3:` digest only
+(a short one is 400); a tree the store lacks, or a server with no Zigbox store, or a request with no
+buffer is 404. The core has no allocator: the shell (`peer_server.zig`) gives every request a
+bundle buffer and each serving slot its own `ZigboxImages`, so one thread's state is never shared.
+Chunks are the existing `chunk/<hash>` route, served from the same store.
+
+A receiver trusts the peer for nothing but speed. The expected manifest comes from its own
+assignment, never from the bundle; the tree is asked for by its full digest; each tree record is
+checked against its digest, each object against its id and each chunk against its hash. A bad
+bundle is ZC-W0602 and the next peer is tried. `src/peer_server.zig` has a test over a real stream
+and two stores: a peer that corrupts chunks fails the fetch (`ChunkFailed`), a record for another
+manifest is `Refused`, a tree the peer lacks is `TreeUnavailable`, and in each case nothing is
+rooted in the empty store.
+
 ## Rate limit
 
 M1 costs the responder public-key work, so `peer_server` decides before it starts a handshake,
