@@ -127,6 +127,12 @@ pub const ZigboxImages = struct {
     hashes: []Digest,
     memory: *store_api.image_peer.Memory,
     index: Index = .empty,
+    /// Whether `reindex` has walked every root since the store last changed. A chunk the index
+    /// lacks then cannot be found by walking again, so a peer asking for unknown hashes costs
+    /// one walk, not one per hash. Cleared by whatever writes to the store.
+    walked: bool = false,
+    /// How many walks `reindex` has made (the tests count them).
+    walks: u32 = 0,
     claims: std.ArrayList(Claim) = .empty,
     /// What the last refused `import_image` was refused for.
     refusal: ?store_api.image_peer.Refusal = null,
@@ -299,7 +305,7 @@ pub const ZigboxImages = struct {
         out: []u8,
     ) node_store.ChunkError![]u8 {
         const self = from(context);
-        if (self.index.get(hash.*) == null) self.reindex();
+        if (self.index.get(hash.*) == null and !self.walked) self.reindex();
         const place = self.index.get(hash.*) orelse return error.NotFound;
         const length = store_api.read_chunk(
             self.store,
@@ -324,6 +330,8 @@ pub const ZigboxImages = struct {
 
     /// Lists every root's tree, which puts its chunks in the index (best effort).
     fn reindex(self: *ZigboxImages) void {
+        self.walked = true;
+        self.walks += 1;
         var listing: [constants.summary_trees_max]store_api.roots.Root = undefined;
         var arena: [constants.zigbox_roots_arena_bytes]u8 = undefined;
         const found = store_api.roots.list(self.store, &arena, &listing) catch return;
@@ -433,6 +441,7 @@ pub const ZigboxImages = struct {
         digest: Digest,
         bytes: []const u8,
     ) ReceiveError!void {
+        self.walked = false;
         var failure: store_api.object.Failure = undefined;
         _ = store_api.put_tree(self.store, digest, bytes, &failure) catch |err| switch (err) {
             error.TooLarge, error.DigestMismatch, error.Malformed => return error.BadHash,
@@ -452,6 +461,7 @@ pub const ZigboxImages = struct {
             .gid = meta.gid,
             .xattrs = meta.xattrs,
         };
+        self.walked = false;
         if (meta.mode > 0o7777) return error.BadHash;
         if (store_api.xattrs.validate(meta.xattrs) != .none) return error.BadHash;
         if (!store_api.object.object_id(meta.content, attrs).eql(meta.id)) return error.BadHash;
@@ -550,6 +560,7 @@ pub const ZigboxImages = struct {
 
     /// Forgets the claims (a fetch's end).
     pub fn end_claims(self: *ZigboxImages) void {
+        self.walked = false;
         self.clear_claims();
     }
 
@@ -569,6 +580,7 @@ pub const ZigboxImages = struct {
             .entries_max = entries_max,
         };
         var failure: store_api.image_peer.Failure = undefined;
+        self.walked = false;
         self.refusal = null;
         const store = self.store;
         return store_api.import_image(store, self.memory, text, tree, options, &failure) catch {
@@ -856,4 +868,37 @@ test "the image record of a tree that is not whole is refused" {
     const text = try record_text(&buffer, pair.tree, manifest_text);
     const expected = Sha256.parse(manifest_text).?;
     try testing.expectError(error.Refused, to_b.import_image(text, pair.tree, expected));
+}
+
+test "unknown chunk hashes cost one walk of the roots, not one each" {
+    // Goal: a peer that asks for many hashes the store lacks cannot make the agent list every
+    // root once per hash. Method: a fresh adapter (empty index) over a store with an image;
+    // ask for 20 unknown hashes, count walks; the first known hash is then served from the
+    // index that walk built; a write to the store lets the next miss walk again.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    var adapter = try ZigboxImages.open(testing.allocator, &pair.a);
+    defer adapter.close();
+    const seam = adapter.images();
+    const chunk = try testing.allocator.alloc(u8, constants.swarm_chunk_bytes);
+    defer testing.allocator.free(chunk);
+    var unknown: Hash = @splat(0);
+    for (0..20) |n| {
+        unknown[0] = @intCast(n + 1);
+        try testing.expectError(error.NotFound, seam.read_chunk(&unknown, chunk));
+    }
+    try testing.expectEqual(@as(u32, 1), adapter.walks);
+    var text: [67]u8 = undefined;
+    _ = try std.fmt.bufPrint(&text, "{s}", .{&pair.tree.text()});
+    var refs: [64]ChunkRef = undefined;
+    const count = try seam.chunk_list(&text, &refs);
+    try testing.expect(count > 0);
+    _ = try seam.read_chunk(&refs[0].hash, chunk);
+    try testing.expectEqual(@as(u32, 1), adapter.walks);
+    adapter.end_claims(); // Something may have been written: the next miss may walk.
+    try testing.expectError(error.NotFound, seam.read_chunk(&unknown, chunk));
+    try testing.expectEqual(@as(u32, 2), adapter.walks);
 }
