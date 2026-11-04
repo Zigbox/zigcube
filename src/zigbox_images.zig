@@ -46,10 +46,10 @@ pub const entries_max: u32 = 1 << 16;
 /// Where a chunk is held, for reads: the object and the chunk's place in it.
 const Position = struct { object: Digest, index: u32 };
 
-const Index = std.AutoHashMapUnmanaged(Hash, Position);
+pub const Index = std.AutoHashMapUnmanaged(Hash, Position);
 
 /// What the objects of a tree are, as the walk saw them.
-const Collected = struct {
+pub const Collected = struct {
     list: std.ArrayList(store_api.walk.ObjectRef) = .empty,
     seen: std.AutoHashMapUnmanaged(Hash, void) = .empty,
     allocator: Allocator,
@@ -67,7 +67,7 @@ const Collected = struct {
         };
     }
 
-    fn deinit(self: *Collected) void {
+    pub fn deinit(self: *Collected) void {
         self.list.deinit(self.allocator);
         self.seen.deinit(self.allocator);
     }
@@ -190,7 +190,7 @@ pub const ZigboxImages = struct {
 
     /// The distinct file objects below `tree`, walk order. Null if the walk could not finish
     /// (a missing or damaged tree, too many entries, memory).
-    fn collect(self: *ZigboxImages, tree: Digest) ?Collected {
+    pub fn collect(self: *ZigboxImages, tree: Digest) ?Collected {
         var found: Collected = .{ .allocator = self.allocator };
         var failure: store_api.walk.Failure = undefined;
         store_api.walk_objects(
@@ -575,7 +575,7 @@ pub const ZigboxImages = struct {
 };
 
 /// The bytes of chunk `index` of an object of `size` bytes in chunks of `chunk_bytes`.
-fn chunk_length(size: u64, chunk_bytes: u32, index: u32) u32 {
+pub fn chunk_length(size: u64, chunk_bytes: u32, index: u32) u32 {
     const start = @as(u64, index) * chunk_bytes;
     assert(start < size);
     return @intCast(@min(@as(u64, chunk_bytes), size - start));
@@ -593,18 +593,18 @@ fn hex_of(comptime byte: *const [2]u8) [64]u8 {
     return text;
 }
 
-const manifest_text = "sha256:" ++ hex_of("ab");
-const other_manifest_text = "sha256:" ++ hex_of("cd");
+pub const manifest_text = "sha256:" ++ hex_of("ab");
+pub const other_manifest_text = "sha256:" ++ hex_of("cd");
 
 /// Two real stores in a scratch directory, `a` with a tree and `b` empty, chunks of 8 bytes.
-const Pair = struct {
+pub const Pair = struct {
     host: HostReal = .{},
     a: Store,
     b: Store,
     tree: Digest,
     workspace: *store_api.import.Workspace,
 
-    fn make(pair: *Pair, tmp: *testing.TmpDir) !void {
+    pub fn make(pair: *Pair, tmp: *testing.TmpDir) !void {
         var cwd_buffer: [512]u8 = undefined;
         const cwd_len = try std.process.currentPath(testing.io, &cwd_buffer);
         var root_buffer: [768]u8 = undefined;
@@ -649,7 +649,7 @@ const Pair = struct {
         // on this side after the import.
     }
 
-    fn deinit(pair: *Pair) void {
+    pub fn deinit(pair: *Pair) void {
         testing.allocator.destroy(pair.workspace);
     }
 };
@@ -759,7 +759,7 @@ test "an object claim whose id its attributes do not make is refused" {
     try testing.expectEqual(@as(usize, 0), to_b.claims.items.len);
 }
 
-fn record_text(buffer: []u8, tree: Digest, manifest: []const u8) ![]const u8 {
+pub fn record_text(buffer: []u8, tree: Digest, manifest: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buffer,
         \\.{{
         \\    .version = 2,

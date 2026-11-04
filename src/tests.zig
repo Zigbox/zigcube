@@ -82,6 +82,7 @@ test "the peer files and the CA's shell are in this root" {
     _ = @import("peer_files.zig");
     _ = @import("dir_images.zig");
     _ = @import("zigbox_images.zig");
+    _ = @import("zigbox_fetch.zig");
     _ = @import("fetch_backoff.zig");
     _ = @import("peer_stream.zig");
     _ = @import("peer_server.zig");

@@ -647,7 +647,7 @@ pub const zigbox_chunks_per_object_max: u32 = 4096;
 /// The bytes the root listing's names may take.
 pub const zigbox_roots_arena_bytes: u32 = 1 << 14;
 /// The bytes of one image record (a peer's record is held to this before it is parsed).
-pub const zigbox_record_bytes_max: u32 = 1 << 20;
+pub const zigbox_record_bytes_max: u32 = 80 * 1024;
 /// The objects an in-progress receive may hold claims on.
 pub const zigbox_claims_max: u32 = 1 << 14;
 /// The bytes a tree record is read into.
