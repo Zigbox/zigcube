@@ -59,9 +59,29 @@ allows these (ttl above the margin). Replay:
 `--trace-steps` shows it stopped in convergence). Either the inequality needs a margin for the
 renewal cadence or the agent's renewal is wrong near the margin; the shapes stay at 5,000+.
 
+## Limit found by the 2,000-seed sweep: the same failure reaches TTLs above 4,500 ms
+
+`sim_cluster --seeds 1..2000 auto --profile=auto` (ReleaseSafe, each seed run alone under a
+150 s cap): 1,951 pass, 7 fail, 42 are cut at the cap. All 7 failures are one check, "an agent
+took too many steps for the time it was up (a busy loop)", all under `crash_heavy`, with lease
+ttls 5,040 to 6,172 ms (nodes 1 to 6, replicas 100 or 300 %). Replays (the printed lines):
+
+| seed | replay | ttl 10,000 |
+|---|---|---|
+| 254 | `sim_cluster 254 378 3 --profile=crash_heavy --lease-ttl-ms=5181 --replicas-pct=300 --heal-at=347` | holds; also at 8,000, fails at 6,000 |
+| 343 | `sim_cluster 343 736 1 --profile=crash_heavy --lease-ttl-ms=5129 --replicas-pct=100 --heal-at=700` | holds; fails at 7,000 |
+| 478, 551, 1468, 1698, 1841 | `--seeds N..N auto --profile=auto` prints each line | not replayed at other ttls |
+
+That is the failure of #78 (a short ttl makes agents fence again and again) with a wider reach
+than #78 states: seed 343 fails at 7,000 ms. It is a core issue, not the shape code, and is not
+fixed here. **Until #78 is fixed, a `crash_heavy` run with a ttl below about 8,000 ms is likely to
+fail**; only seeds 254 and 343 were replayed at other ttls. The draw floor stays at 5,000 ms (the
+brief's lower bound and what the sweeps above ran with), so the fleet will report this failure at
+about 0.35 % of `auto` seeds; raising the floor to 8,000 ms is one line in `sim_shape.zig` and the
+owner's call (it would hide the failure from the fleet, not fix it).
+
 ## Fleet follow-ups (not done: `ops/sim-fleet/`, `src/sim_fleet*` are PR #71's)
 
-- `parse_summary` reads only `sim-cluster: seeds A..B, <N> operations: ...`. An `auto` range
-  prints `drawn operations` instead; the parser must learn it, or the fleet passes explicit
-  operations. A failure now also prints `  profile:` and `  shape:` detail lines, which the
-  current parser ignores.
+- `parse_summary` now reads the `auto` summary (`drawn operations`; done). A failure also prints
+  `  profile:` and `  shape:` detail lines, which the parser ignores. `ops/sim-fleet/run.sh` still
+  passes explicit operations; moving it to `auto` is the next step.
