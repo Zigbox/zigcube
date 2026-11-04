@@ -607,11 +607,23 @@ const Backend = struct {
         for (config.pulls, 0..) |pull, index| {
             box.images[index] = .{ .digest = pull.digest, .reference = pull.reference };
         }
+        // The peers are read from the server by the supervisor's `fetch`; a Zigbox node keeps no
+        // registry of its own (an image's reference is pulled by Zigbox).
+        var server_text: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&server_text);
+        writer.print("{f}", .{config.server}) catch return error.StartFailed;
+        const server = gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
         box.runtime.init(init.io, box.host_real.interface(), .{
             .gpa = gpa,
             .state_dir = config.state_dir,
             .supervisor_exe = exe,
             .images = box.images[0..config.pulls.len],
+            .fetch = .{
+                .exe = exe,
+                .node = config.node,
+                .state_dir = config.state_dir,
+                .server = server,
+            },
         }, diag) catch return error.StartFailed;
         errdefer box.runtime.deinit();
         box.runtime.preflight(diag) catch return error.StartFailed;

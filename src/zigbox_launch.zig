@@ -32,6 +32,18 @@ pub const file_supervisor = "supervisor.pid";
 
 pub const Pair = files.Pair;
 
+/// How the supervisor asks the swarm for a tree the node lacks, before it pulls: it runs
+/// `<exe> fetch ...` (`fetch_cli.zig`) against the node's Zigbox store. Borrowed.
+pub const Fetch = struct {
+    exe: []const u8,
+    node: []const u8,
+    state_dir: []const u8,
+    /// `HOST:PORT` of the server, from which the peers are read; empty: none.
+    server: []const u8 = "",
+    /// `HOST:PORT` of the registry; empty: peers only.
+    registry: []const u8 = "",
+};
+
 /// What the supervisor is to run. `tree` is the locked Zigbox tree digest (`b3:...`, the
 /// service's `image`); `reference` is the OCI reference to pull it from, empty if the node has
 /// none for it.
@@ -39,6 +51,9 @@ pub const Spec = struct {
     name: []const u8,
     tree: []const u8,
     reference: []const u8,
+    /// Null: no peers to ask. Set only with a digest-pinned reference (its manifest is the one
+    /// the fetched image record is held to).
+    fetch: ?Fetch = null,
     command: []const []const u8,
     env: []const Pair,
     labels: []const Pair,
@@ -220,4 +235,26 @@ test "a failure line that does not parse is not a diagnostic" {
     var parsed: Diagnostic = undefined;
     try testing.expect(!parse_failed(&parsed, "{{{"));
     try testing.expect(!parse_failed(&parsed, ""));
+}
+
+/// `sha256:HEX` of a reference pinned by digest (`name@sha256:HEX`), else null.
+pub fn manifest_of(reference: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, reference, '@') orelse return null;
+    const text = reference[at + 1 ..];
+    if (!std.mem.startsWith(u8, text, "sha256:") or text.len != "sha256:".len + 64) return null;
+    for (text["sha256:".len..]) |c| {
+        if (!std.ascii.isHex(c) or std.ascii.isUpper(c)) return null;
+    }
+    return text;
+}
+
+test "a manifest is read from a reference pinned by digest, and from nothing else" {
+    const hex: [64]u8 = @splat('a');
+    const upper: [64]u8 = @splat('A');
+    const pinned = "ghcr.io/o/r@sha256:" ++ hex;
+    try testing.expectEqualStrings("sha256:" ++ hex, manifest_of(pinned).?);
+    try testing.expect(manifest_of("ghcr.io/o/r:latest") == null);
+    try testing.expect(manifest_of("ghcr.io/o/r@sha256:00") == null);
+    try testing.expect(manifest_of("ghcr.io/o/r@sha256:" ++ upper) == null);
+    try testing.expect(manifest_of("") == null);
 }

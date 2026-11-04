@@ -55,11 +55,22 @@ const Real = struct {
     host: zigbox.host.Host,
     storage: *Storage,
     spec: *const zigbox.Spec,
+    /// The swarm fetch, and what it needs (null: none). `arena` is for its argv.
+    swarm: ?Swarm = null,
     /// "b3:" and 64 hex digits (Zigbox's store_digest_text_bytes, not exported).
     tree_text: [67]u8 = undefined,
 
     fn steps(self: *Real) image.Steps {
-        return .{ .context = self, .start = start, .pull = pull };
+        const asks: ?*const fn (context: *anyopaque) bool = if (self.swarm != null) fetch else null;
+        return .{ .context = self, .start = start, .pull = pull, .fetch = asks };
+    }
+
+    /// Runs `zcube-agent fetch` against the node's store: true if it finished (the tree is in
+    /// the store). Its own diagnostics go nowhere (stderr is ignored); a failure falls back to
+    /// the pull, which says its own.
+    fn fetch(context: *anyopaque) bool {
+        const self: *Real = @ptrCast(@alignCast(context));
+        return fetch_swarm(self.swarm.?, self.host);
     }
 
     fn start(context: *anyopaque, diag: *zigbox.diag.Diag) error{StartFailed}!void {
@@ -104,6 +115,54 @@ const Real = struct {
     }
 };
 
+/// What the swarm fetch needs beyond the launch's `Fetch`: the tree, the manifest, the IO.
+const Swarm = struct {
+    io: std.Io,
+    fetch: launch.Fetch,
+    tree: []const u8,
+    manifest: []const u8,
+};
+
+fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
+    var store: zigbox.store.Store = undefined;
+    if (!zigbox.store.Store.locate(&store, host)) return false;
+    var argv: [20][]const u8 = undefined;
+    var count: usize = 0;
+    const head = [_][]const u8{
+        swarm.fetch.exe,  "fetch",
+        "--node",         swarm.fetch.node,
+        "--state-dir",    swarm.fetch.state_dir,
+        "--zigbox-store", store.root_text(),
+        "--manifest",     swarm.manifest,
+        "--digest",       swarm.tree,
+    };
+    for (head) |word| {
+        argv[count] = word;
+        count += 1;
+    }
+    if (swarm.fetch.registry.len > 0) {
+        argv[count] = "--registry";
+        argv[count + 1] = swarm.fetch.registry;
+        count += 2;
+    }
+    if (swarm.fetch.server.len > 0) {
+        argv[count] = "--server";
+        argv[count + 1] = swarm.fetch.server;
+        count += 2;
+    }
+    var child = std.process.spawn(swarm.io, .{
+        .argv = argv[0..count],
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const term = child.wait(swarm.io) catch return false;
+    return switch (term) {
+        .exited => |code| code == constants.exit_ok,
+        else => false,
+    };
+}
+
 pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     assert(dir_path.len > 0);
     // Not `init.io`: that is a threaded Io. Zigbox's start and pull make namespaces, which
@@ -147,6 +206,11 @@ fn supervise(
         null;
     if (count != 1) return record_failure(io, dir, &image.not_single_threaded(count));
     var real: Real = .{ .host = host, .storage = storage, .spec = &container };
+    if (spec.fetch) |fetch| {
+        if (launch.manifest_of(spec.reference)) |manifest| {
+            real.swarm = .{ .io = io, .fetch = fetch, .tree = spec.tree, .manifest = manifest };
+        }
+    }
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {
         .started => {},
