@@ -421,7 +421,7 @@ const Rig = struct {
 const peer_infos = [_]fetch_worker.PeerInfo{.{ .name = "node1", .filter = &filter_all }};
 var filter_all: [64]u8 = @splat(0xff);
 
-fn run(rig: *Rig, to: *ZigboxImages, tree: Digest, manifest: Sha256, report: *Report) Error!void {
+fn run_rig(rig: *Rig, to: *ZigboxImages, tree: Digest, manifest: Sha256, report: *Report) Error!void {
     const transport = rig.transport();
     return fetch(testing.allocator, transport, to, tree, manifest, &peer_infos, .{}, report);
 }
@@ -451,7 +451,7 @@ test "zigbox fetch: a tree comes from a peer by bundle and chunks, and is rooted
     var rig: Rig = .{ .from = &from_a, .allocator = testing.allocator };
     var report: Report = undefined;
     const expected = Sha256.parse(images_mod.manifest_text).?;
-    try run(&rig, &to_b, pair.tree, expected, &report);
+    try run_rig(&rig, &to_b, pair.tree, expected, &report);
     const name = pair.tree.text();
     try testing.expect(to_b.images().has(&name));
     try testing.expect(report.peer_chunks > 0);
@@ -462,7 +462,7 @@ test "zigbox fetch: a tree comes from a peer by bundle and chunks, and is rooted
     try testing.expectEqual(@as(usize, 1), rooted.count);
     // A second fetch finds the tree whole and asks for nothing.
     const before = rig.chunks_served;
-    try run(&rig, &to_b, pair.tree, expected, &report);
+    try run_rig(&rig, &to_b, pair.tree, expected, &report);
     try testing.expectEqual(before, rig.chunks_served);
 }
 
@@ -480,7 +480,7 @@ test "zigbox fetch: a record for another manifest is refused and the tree is not
     var rig: Rig = .{ .from = &from_a, .allocator = testing.allocator };
     var report: Report = undefined;
     const other = Sha256.parse(images_mod.other_manifest_text).?;
-    const got = run(&rig, &to_b, pair.tree, other, &report);
+    const got = run_rig(&rig, &to_b, pair.tree, other, &report);
     try testing.expectError(error.Refused, got);
     var listing: [8]zigbox.store.roots.Root = undefined;
     var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
@@ -501,7 +501,7 @@ test "zigbox fetch: a peer that corrupts chunks fails the fetch and nothing is r
     var rig: Rig = .{ .from = &from_a, .allocator = testing.allocator, .mode = 1 };
     var report: Report = undefined;
     const expected = Sha256.parse(images_mod.manifest_text).?;
-    const got = run(&rig, &to_b, pair.tree, expected, &report);
+    const got = run_rig(&rig, &to_b, pair.tree, expected, &report);
     try testing.expect(std.meta.isError(got));
     const name = pair.tree.text();
     try testing.expect(!to_b.images().has(&name));
@@ -521,7 +521,7 @@ test "zigbox fetch: a bundle whose first tree is not the tree asked for is a bad
     var rig: Rig = .{ .from = &from_a, .allocator = testing.allocator, .mode = 2 };
     var report: Report = undefined;
     const expected = Sha256.parse(images_mod.manifest_text).?;
-    const got = run(&rig, &to_b, pair.tree, expected, &report);
+    const got = run_rig(&rig, &to_b, pair.tree, expected, &report);
     try testing.expectError(error.TreeUnavailable, got);
     try testing.expectEqual(@as(u32, 1), rig.bad);
     try testing.expectEqual(@as(usize, 0), to_b.claims.items.len);
