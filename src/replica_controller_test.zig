@@ -988,6 +988,134 @@ test "the replace transaction fails when the dead replica's assignment moved" {
     try expect_ids(&.{ "hello-1", "hello-3", "hello-4" }, now);
 }
 
+/// A report of `replica` stamped with `tenure`, as a C1 agent writes it.
+fn observe_stamped(
+    fixture: *Fixture,
+    replica: []const u8,
+    status: records.ObservedStatus,
+    exit: ?records.Exit,
+    tenure: u64,
+) !void {
+    const node = "node1";
+    const observed: records.Observed = .{
+        .replica = replica,
+        .node = node,
+        .generation = 1,
+        .status = status,
+        .exit = exit,
+        .reported_at_ms = fixture.manual.ms,
+        .tenure = tenure,
+    };
+    try fixture.put(.{ .agent = node }, records.observed_key(node, replica).slice(), observed);
+}
+
+fn tenure_of(fixture: *Fixture, name: []const u8) !u64 {
+    const ctx = fixture.context();
+    const key = records.node_key(name);
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    return got.kv.?.mod_revision;
+}
+
+/// Three replicas running on node1 and reported under its tenure, the node judged `ready`.
+fn start_stamped(fixture: *Fixture) !u64 {
+    try fixture.start();
+    try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const tenure = try tenure_of(fixture, "node1");
+    for ([_][]const u8{ "hello-1", "hello-2", "hello-3" }) |id| {
+        try observe_stamped(fixture, id, .running, null, tenure);
+    }
+    _ = try fixture.settle();
+    return tenure;
+}
+
+/// One pass of the replica controller alone, so the node controller cannot judge in between.
+fn replica_pass(fixture: *Fixture) !u32 {
+    const ctx = fixture.context();
+    var mutable = ctx;
+    const wake = try fixture.plane.replicas.reconcile(&mutable);
+    return wake.acted;
+}
+
+test "an exit report of a replaced tenure removes nothing (I3, seeds 300 of the C1 sweep)" {
+    // Goal: authority.md section 3, condition 1: no action on an observation whose tenure is not
+    // the node's current one. Method: hello-2's stop is reported under tenure t1, the agent then
+    // registers again (t2) before the replica controller looks; its pass writes nothing and the
+    // replica stays. Before the fix it wrote delete_replica citing the old report.
+    var fixture: Fixture = undefined;
+    const old = try start_stamped(&fixture);
+    defer fixture.stop();
+    try fixture.register_node("node1");
+    try testing.expect((try tenure_of(&fixture, "node1")) != old);
+    try observe_stamped(&fixture, "hello-2", .stopped, .{ .kind = .signaled, .signal = 15 }, old);
+    try testing.expectEqual(@as(u32, 0), try replica_pass(&fixture));
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+}
+
+test "an exit report from a node that is not ready removes nothing (I3, seeds 306 and 145)" {
+    // Goal: condition 3: no action on an observation of a node whose status is not `ready`.
+    // Method: the node is judged `fenced` after the agent stopped hello-2 (the report is still
+    // stamped with the current tenure); the pass writes nothing, and once the node is judged
+    // `ready` again the replica is replaced.
+    var fixture: Fixture = undefined;
+    const tenure = try start_stamped(&fixture);
+    defer fixture.stop();
+    const fenced: records.NodeStatus = .{
+        .state = .fenced,
+        .tenure = tenure,
+        .at_ms = fixture.manual.ms,
+        .decision = "fence-1",
+    };
+    try fixture.put(.node_controller, records.node_status_key("node1").slice(), fenced);
+    const signalled: records.Exit = .{ .kind = .signaled, .signal = 15 };
+    try observe_stamped(&fixture, "hello-2", .stopped, signalled, tenure);
+    try testing.expectEqual(@as(u32, 0), try replica_pass(&fixture));
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+
+    const ready: records.NodeStatus = .{
+        .state = .ready,
+        .tenure = tenure,
+        .at_ms = fixture.manual.ms,
+        .decision = "ready-1",
+    };
+    try fixture.put(.node_controller, records.node_status_key("node1").slice(), ready);
+    try testing.expect((try replica_pass(&fixture)) > 0);
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try testing.expect(now.len == 3);
+    try testing.expect(!std.mem.eql(u8, now[1], "hello-2"));
+}
+
+test "the replacement fails when the node's status moved after the exit report was read" {
+    // Goal: `/node-status/<node>` and `/nodes/<node>` are in the read set of a removal that cites
+    // an exit report (the read-set rule). Method: a store rewrites the status just before the
+    // commit; that pass writes nothing and hello-2 is still there.
+    var fixture: Fixture = undefined;
+    const tenure = try start_stamped(&fixture);
+    defer fixture.stop();
+    try observe_stamped(&fixture, "hello-2", .stopped, .{ .kind = .signaled, .signal = 9 }, tenure);
+    var ctx = fixture.context();
+    const key = records.node_status_key("node1");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = got.kv.?.value,
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+}
+
 /// What the node controller writes when `name`'s lease ends: `/nodes/<name>` gone and the status
 /// `lost` for the tenure it had, by decision "mark-lost-1", at the clock's time.
 fn lose(fixture: *Fixture, name: []const u8) !void {

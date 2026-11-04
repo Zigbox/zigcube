@@ -230,7 +230,7 @@ const Run = struct {
             }
             const number = records.replica_number(service.rec.name, replica.rec.id) orelse
                 return records.malformed(run.ctx.diag, replica.kv.key, "Replica");
-            const observed = run.snap.observed_of(&replica.rec);
+            const observed = run.admissible(run.snap.observed_of(&replica.rec));
             var item: Item = .{
                 .replica = replica,
                 .observed = observed,
@@ -259,6 +259,28 @@ const Run = struct {
     /// The status of the node `replica` is placed on, if that node is lost for the tenure the
     /// status judged (no newer `/nodes` record) and the grace has passed; before then, the step
     /// wakes at the grace's end.
+    /// `found` if the controller may act on it (authority.md section 3), else null: the replica is
+    /// then treated as not reported, and the node controller's judgement decides what happens to
+    /// it. A C1 report carries the tenure it was written under, the node's `/nodes` record must
+    /// still have that revision, the report's placement epoch (if it names one) must be the
+    /// assignment's revision, and the node's status must be `ready`. A C0 report carries no
+    /// tenure and is taken as it is.
+    fn admissible(run: *Run, found: ?*const Entry(records.Observed)) ?*const Entry(
+        records.Observed,
+    ) {
+        const entry = found orelse return null;
+        const tenure = entry.rec.tenure orelse return entry;
+        const node = run.snap.node_entry(entry.rec.node) orelse return null;
+        if (node.kv.mod_revision != tenure) return null;
+        if (entry.rec.assignment) |epoch| {
+            const placed = run.snap.assigned_of(entry.rec.replica) orelse return null;
+            if (placed.kv.mod_revision != epoch) return null;
+        }
+        const status = run.snap.status_of(entry.rec.node) orelse return null;
+        if (status.rec.state != .ready) return null;
+        return entry;
+    }
+
     fn lost_placement(run: *Run, replica: []const u8) ?*const Entry(records.NodeStatus) {
         const node = run.snap.node_of(replica) orelse return null;
         const status = run.snap.status_of(node) orelse return null;
@@ -281,12 +303,19 @@ const Run = struct {
     /// observed record. False if the transaction did not commit (the step stops for this service).
     fn hold_pass(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!bool {
         var batch: Batch = .{};
+        var nodes: [lost_nodes_batch_max][]const u8 = undefined;
+        var nodes_count: u32 = 0;
         for (plan.slice()) |item| {
             if (item.class != .held) continue;
             const observed = item.observed.?;
             if (try run.already_held(service.rec.name, observed)) continue;
             if (!batch.has_room(controller.decision_ops)) break;
+            // A node past the compare budget waits for the next pass.
+            if (judged_by_status(observed)) {
+                if (!note_node(&nodes, &nodes_count, observed.rec.node)) continue;
+            }
             batch.expect(observed.kv.key, observed.kv.mod_revision);
+            if (judged_by_status(observed)) try run.expect_node_judged(&batch, observed.rec.node);
             const reason = try controller.format(run.ctx, "replica {s} failed to start on {s}; " ++
                 "it was not replaced because a new one would fail the same way", .{
                 item.replica.rec.id, observed.rec.node,
@@ -344,9 +373,8 @@ const Run = struct {
         for (plan.slice()) |*item| {
             if (item.class != .dead and item.class != .stale) continue;
             if (removed_count == batch_replicas_max) break;
-            if (item.lost) |status| {
-                const node = status.kv.key[records.prefix_node_status.len..];
-                if (!note_lost_node(&lost_nodes, &lost_nodes_count, node)) continue;
+            if (judged_node(item)) |node| {
+                if (!note_node(&lost_nodes, &lost_nodes_count, node)) continue;
             }
             removed[removed_count] = item;
             removed_count += 1;
@@ -388,9 +416,9 @@ const Run = struct {
         _ = try run.finish(&batch);
     }
 
-    /// Counts `node` among the lost nodes the batch touches. False if it is a new one and the
-    /// batch already has `lost_nodes_batch_max` (the compare budget).
-    fn note_lost_node(
+    /// Counts `node` among the nodes whose status the batch compares. False if it is a new one and
+    /// the batch already has `lost_nodes_batch_max` (the compare budget).
+    fn note_node(
         nodes: *[lost_nodes_batch_max][]const u8,
         count: *u32,
         node: []const u8,
@@ -490,6 +518,8 @@ const Run = struct {
         // judgement was about another placement, so the assignment is in the read set.
         const placed = run.snap.assigned_of(replica.rec.id).?;
         batch.expect(placed.kv.key, placed.kv.mod_revision);
+        // The report was admissible because the node was ready under the tenure it names.
+        if (judged_by_status(observed)) try run.expect_node_judged(batch, observed.rec.node);
         batch.delete(replica.kv.key);
         return id;
     }
@@ -518,20 +548,17 @@ const Run = struct {
         batch.expect(replica.kv.key, replica.kv.mod_revision);
         const placed = run.snap.assigned_of(replica.rec.id).?;
         batch.expect(placed.kv.key, placed.kv.mod_revision);
-        try run.expect_node_lost(batch, node, status);
+        try run.expect_node_judged(batch, node);
         batch.delete(replica.kv.key);
         return id;
     }
 
-    /// Compares what "the node is lost and has not registered again" was judged from: its
-    /// status at the revision read and its `/nodes` record as read (absent is revision 0). Once
-    /// per node per batch: a second replica of the node adds nothing.
-    fn expect_node_lost(
-        run: *Run,
-        batch: *Batch,
-        node: []const u8,
-        status: *const Entry(records.NodeStatus),
-    ) Error!void {
+    /// Compares what the judgement of a node rests on: its status at the revision read (`lost`
+    /// for a removal off a lost node, `ready` for one that cites a report) and its `/nodes`
+    /// record as read (absent is revision 0). Once per node per batch: a second replica of the
+    /// node adds nothing.
+    fn expect_node_judged(run: *Run, batch: *Batch, node: []const u8) Error!void {
+        const status = run.snap.status_of(node).?;
         for (batch.compares[0..batch.compares_count]) |compare| {
             if (std.mem.eql(u8, compare.key, status.kv.key)) return;
         }
@@ -828,6 +855,22 @@ fn by_victim_order(context: void, first: Item, second: Item) bool {
     _ = context;
     if (first.running != second.running) return !first.running;
     return first.number > second.number;
+}
+
+/// Whether the controller judged `observed` admissible from the node's status and tenure (a C1
+/// report); a C0 report has no tenure and nothing to compare.
+fn judged_by_status(observed: *const Entry(records.Observed)) bool {
+    return observed.rec.tenure != null;
+}
+
+/// The node whose status and `/nodes` record the removal of `item` compares: the lost node, or the
+/// ready one an exit report came from.
+fn judged_node(item: *const Item) ?[]const u8 {
+    if (item.lost) |status| return status.kv.key[records.prefix_node_status.len..];
+    const observed = item.observed orelse return null;
+    if (item.class != .dead) return null;
+    if (!judged_by_status(observed)) return null;
+    return observed.rec.node;
 }
 
 fn classify_one(
