@@ -1,20 +1,32 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
 # installed from a verified tarball (.github/actions/setup-zig). The other shell lines are the
-# changes job's classifier (git diff over the changed paths, see that job), the apt-get line that
-# installs the SQLite and libpq development files the tests link, and the docker line of the
-# Postgres demo job that names its service container. The wasm job uses the Node that the runner
-# image carries.
+# changes job (.github/ci-changes.sh decides what runs), the apt-get line that installs the SQLite
+# and libpq development files the tests link, and the docker line of the Postgres demo job that
+# names its service container. The wasm and simulations jobs use the Node that the runner image
+# carries.
+#
+# What runs (docs/decisions/2026-11-04-ci-affected-demos.md):
+#   - A change that touches only documentation (ci-changes.sh says what counts) skips every other
+#     job: they report as skipped, which required checks count as passing.
+#   - Any other change runs format, build, test, wasm and the simulations, and of the rest only
+#     what its paths can affect on a pull request: the Postgres store suites, demo-c0, demo-c1
+#     and the Zigbox smoke. A path no rule names runs everything.
+#   - A push to main, a pull request from a claude/release-* branch and a pull request labelled
+#     full-ci run everything, so a break the filter missed shows on main.
+#   - The jobs whose time is compiling restore the Zig build cache (.github/actions/zig-cache);
+#     the jobs dominated by a real database, a VM or real processes do not.
 name: ci
 
 # CI runs on pull requests and on main only: a pushed branch without a PR runs nothing, so
 # Actions time is spent once per change. Open a PR when a change needs CI. A newer push to the
 # same PR cancels the run it supersedes; runs on main are never cancelled.
-# A change that touches only documentation (the changes job says what counts) skips every other
-# job: they report as skipped, which required checks count as passing. Anything else runs them all.
 on:
   push:
     branches: [main]
+  # `labeled` so that adding full-ci to a pull request starts the full run (any label starts a
+  # run, and the newer run cancels the older one).
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -24,75 +36,57 @@ permissions:
   contents: read
 
 jobs:
-  # Decides whether the jobs below run. A change is documentation only when every changed path is
-  # a file ending in `.md` (except under web/ or src/), or lies under site/ (except site/errors/,
-  # which CI generates and checks). An empty diff, a path that is neither, or a diff that cannot be
-  # listed means code, so everything runs. Renames are listed as a delete and an add (--no-renames),
-  # so the old path is judged too. A `.zig`, `.zon` or `.sh` file is code wherever it is, because
-  # `zig fmt --check .` and tidy read every one in the tree. The jobs below run when `code` is
-  # true. If this job itself fails, they still run (the output defaults to true), so a broken
-  # classifier cannot skip the checks; `!cancelled()` rather than `always()`, so a run superseded
-  # by a newer push is still cancelled.
+  # Decides which of the jobs below run (.github/ci-changes.sh, whose rules .github/ci-changes-test.sh
+  # tests first). Seconds. Renames are listed as a delete and an add (--no-renames), so the old
+  # path is judged too. If the changed paths cannot be listed, the script gets none and runs
+  # everything. If this job itself fails, the jobs below still run (each output defaults to
+  # true), so a broken classifier cannot skip the checks; `!cancelled()` rather than `always()`,
+  # so a run superseded by a newer push is still cancelled.
   changes:
     name: changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
-      code: ${{ steps.classify.outputs.code || 'true' }}
+      code: ${{ steps.pick.outputs.code || 'true' }}
+      store: ${{ steps.pick.outputs.store || 'true' }}
+      demo_c0: ${{ steps.pick.outputs.demo_c0 || 'true' }}
+      demo_c1: ${{ steps.pick.outputs.demo_c1 || 'true' }}
+      zigbox_smoke: ${{ steps.pick.outputs.zigbox_smoke || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Classify the change (documentation only or code)
-        id: classify
+      - name: Test the classifier
+        run: .github/ci-changes-test.sh
+      - name: Pick the jobs
+        id: pick
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
         run: |
-          is_doc() {
-            case "$1" in
-              web/* | src/* | site/errors/*) return 1 ;;
-              *.zig | *.zon | *.sh) return 1 ;;
-              site/*) return 0 ;;
-              *.md) return 0 ;;
-              *) return 1 ;;
-            esac
-          }
           files=""
-          listed=no
           if [ "${EVENT}" = pull_request ]; then
-            if files="$(git diff --no-renames --name-only "${BASE}...${HEAD}")"; then listed=yes; fi
-          elif [ "${EVENT}" = push ] && [ "${BEFORE}" != 0000000000000000000000000000000000000000 ]; then
-            if files="$(git diff --no-renames --name-only "${BEFORE}" "${AFTER}")"; then listed=yes; fi
-          fi
-          code=true
-          why="the changed files could not be listed"
-          if [ "${listed}" = yes ] && [ -z "${files}" ]; then
-            why="the diff is empty"
-          elif [ "${listed}" = yes ]; then
-            code=false
-            why="every changed path is documentation"
-            while IFS= read -r f; do
-              if ! is_doc "${f}"; then
-                code=true
-                why="${f} is not documentation"
-                break
-              fi
-            done <<< "${files}"
+            files="$(git diff --no-renames --name-only "${BASE}...${HEAD}")" || files=""
+          elif [ "${BEFORE}" != 0000000000000000000000000000000000000000 ]; then
+            files="$(git diff --no-renames --name-only "${BEFORE}" "${AFTER}")" || files=""
           fi
           echo "Changed files:"
           if [ -n "${files}" ]; then
             while IFS= read -r f; do echo "  ${f}"; done <<< "${files}"
           fi
-          if [ "${code}" = true ]; then
-            echo "Verdict: not documentation only (${why}); every job runs"
+          if [ -n "${files}" ]; then
+            .github/ci-changes.sh <<< "${files}"
           else
-            echo "Verdict: documentation only; the other jobs are skipped"
+            .github/ci-changes.sh < /dev/null
           fi
-          echo "code=${code}" >> "${GITHUB_OUTPUT}"
+          echo "Verdict:"
+          cat "${GITHUB_OUTPUT}"
 
   check:
     name: format, build, test
@@ -103,6 +97,9 @@ jobs:
       # The SHA is the one Zigbox's CI pins for actions/checkout v7.0.1.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: check
       - name: Formatting
         run: zig fmt --check .
       - name: Tidy (style rules)
@@ -141,7 +138,7 @@ jobs:
   store-postgres:
     name: store conformance (postgres)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.store == 'true' }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -180,7 +177,7 @@ jobs:
   store-faults:
     name: store faults (postgres, sqlite)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.store == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
@@ -225,7 +222,7 @@ jobs:
   demo-c0-sqlite:
     name: demo-c0 (sqlite)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c0 == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -248,7 +245,7 @@ jobs:
   demo-c0-postgres:
     name: demo-c0 (postgres)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c0 == 'true' }}
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -295,7 +292,7 @@ jobs:
   demo-c1-sqlite:
     name: demo-c1 (sqlite)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c1 == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -317,7 +314,7 @@ jobs:
   demo-c1-postgres:
     name: demo-c1 (postgres)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c1 == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
@@ -355,6 +352,8 @@ jobs:
   # no threads, no std.Io. Node is the one WebAssembly runtime on the runner (its version is
   # printed below); tools/wasm_check.mjs says why a JavaScript runner is acceptable. The core is
   # also built and run in ReleaseSafe, the mode Zigcube ships, where assertions stay on.
+  # The simulations are the next job, so the two run side by side (they were one job of 13 minutes,
+  # the longest of the run).
   wasm:
     name: core on wasm32
     needs: changes
@@ -363,6 +362,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: wasm
       - name: Node version
         run: node --version
       - name: Core library (wasm32-freestanding), run in Node
@@ -375,8 +377,20 @@ jobs:
       # exactly env.zc_panic, answer GET /v1/status and run the scenario, under each V8 compiler.
       - name: Console module (browser), checked in Node
         run: zig build console-wasm --summary all
-      # A simulation, not demo-c0 (docs/core.md). The same seed runs natively and in WASM and the
-      # reports must agree byte for byte. Seed 1 always, and one seed per CI run, printed here.
+
+  # Simulations, not demo-c0 (docs/core.md). The same seed runs natively and in WASM and the
+  # reports must agree byte for byte. Seed 1 always, and one seed per CI run, printed here.
+  sim:
+    name: simulations (sim-c0, sim-c1)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: sim
       - name: C0 simulation, native and WASM, seed 1
         run: zig build sim-c0 --summary all
       - name: C0 simulation, native and WASM, seed of this run
@@ -384,7 +398,7 @@ jobs:
           echo "seed ${{ github.run_id }}"
           zig build sim-c0 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
       # sim-c1 (docs/core.md, "sim-c1"): docs/authority.md §4's invariants after every revision, §5's
-      # evidence test over every decision, native against WASM. The four negative tests must fire.
+      # evidence test over every decision, native against WASM. The negative tests must fire.
       - name: sim-c1, native and WASM, seed 1
         run: zig build sim-c1 --summary all
       - name: sim-c1, native and WASM, seed of this run
@@ -399,11 +413,11 @@ jobs:
   # Zigbox's `zigbox_vm` module under QEMU/KVM. The runner setup is Zigbox's (its demo jobs): QEMU,
   # the udev rule that lets the runner user open /dev/kvm, the guest image cached by its pin.
   # docker.io is reached through mirror.gcr.io, as in Zigbox's CI. A pass is a check, not
-  # `demo-c2`. It runs on a pull request only when the files it depends on changed, and on main.
+  # `demo-c2`. It runs on a pull request only when ci-changes.sh says its paths changed, and on main.
   zigbox-smoke:
     name: zigbox-smoke (Ubuntu 24.04 VM, KVM, real containers)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.zigbox_smoke == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -411,41 +425,12 @@ jobs:
       ZCUBE_REAL_HOST: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Does this change touch the smoke?
-        id: touched
-        shell: bash
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          run=true
-          if [ "${EVENT}" = pull_request ]; then
-            run=false
-            files="$(git diff --no-renames --name-only "${BASE}...${HEAD}")" || files=build.zig
-            # An empty diff cannot be told from a failed one: run (fail safe).
-            [ -n "${files}" ] || files=build.zig
-            while IFS= read -r f; do
-              case "$f" in
-                src/zigbox_* | src/agent* | src/fake_* | src/runtime* | src/host_* | src/diag* | \
-                  build.zig | build.zig.zon | ops/zigbox-smoke/* | .github/workflows/ci.yml)
-                  run=true ;;
-              esac
-            done <<< "${files}"
-          fi
-          echo "Smoke runs: ${run}"
-          echo "run=${run}" >> "${GITHUB_OUTPUT}"
       - uses: ./.github/actions/setup-zig
-        if: steps.touched.outputs.run == 'true'
       - name: SQLite and libpq development files, QEMU
-        if: steps.touched.outputs.run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
       - name: Enable KVM
-        if: steps.touched.outputs.run == 'true'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
@@ -453,18 +438,16 @@ jobs:
       # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
       # key is the pinned package (build.zig.zon).
       - name: Cache the VM base image
-        if: steps.touched.outputs.run == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache/vm/*.img
           key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
       # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
       - name: Zigbox smoke
-        if: steps.touched.outputs.run == 'true'
         shell: bash
         run: zig build zigbox-smoke -Doptimize=ReleaseSafe --summary all 2>&1 | tee zigbox-smoke.txt
       - name: Keep the output
-        if: ${{ !cancelled() && steps.touched.outputs.run == 'true' }}
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: zigbox-smoke-output
