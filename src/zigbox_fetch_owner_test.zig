@@ -7,9 +7,9 @@
 //! running the test, the namespace maps the full range, and a file of container id 1000 lands as
 //! the host id the range gives it, not as host id 1000: a fetch outside the namespace fails the
 //! comparison. Without them (the one-id map) every owner is 0 inside, the user outside: run as
-//! root that is the same id either way and the test cannot tell; run as another user (`zig
-//! build check` runs the tests as `tester`), a fetch outside the namespace cannot `chown` to 0
-//! and fails.
+//! root that is the same id either way and the test cannot tell; run as another user, a fetch
+//! outside the namespace cannot `chown` to 0 and fails. `useradd` gives a new user a range where
+//! `/etc/subuid` is set up, so `zig build check`'s run as `tester` usually has the full map.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -226,9 +226,11 @@ fn run_fetch(io: std.Io, argv: []const []const u8, log: std.Io.File) !u8 {
 }
 
 /// The source tree: `hello`, `etc/plain` and `etc/owned`, which the reference gives container id
-/// 1000. Each is two chunks, so the peer server's read checks it against its chunk list: Zigbox
-/// checks a one-chunk object against an id made from the file's owner as the reader sees it,
-/// which outside the namespace is the host's (the gap in the decision file, M3).
+/// 1000 and mode 0604. Each is two chunks, so the peer server's read checks it against its chunk
+/// list: Zigbox checks a one-chunk object against an id made from the file's owner as the reader
+/// sees it, which outside the namespace is the host's (the gap in the decision file, M3). And
+/// `owned` can be read by others: a peer server that is not root reads, outside the namespace, a
+/// file whose host owner is an id of the user's range (the second gap there).
 fn write_source(io: std.Io, dir: std.Io.Dir) !void {
     const bytes = try testing.allocator.alloc(u8, constants.swarm_chunk_bytes + 100);
     defer testing.allocator.free(bytes);
@@ -301,7 +303,7 @@ test "a fetched tree's files have the owners and modes Zigbox's own write gives 
     var paths: [6][std.fs.max_path_bytes]u8 = undefined;
     const source = try std.fmt.bufPrintSentinel(&paths[0], "{s}/src", .{base}, 0);
     const owned = try std.fmt.bufPrintSentinel(&paths[1], "{s}/src/etc/owned", .{base}, 0);
-    try testing.expectEqual(@as(usize, 0), linux.chmod(owned, 0o640));
+    try testing.expectEqual(@as(usize, 0), linux.chmod(owned, 0o604));
     const root_a = try std.fmt.bufPrint(&paths[2], "{s}/a/store", .{base});
     const root_b = try std.fmt.bufPrint(&paths[3], "{s}/b/store", .{base});
     const state1 = try std.fmt.bufPrint(&paths[4], "{s}/state1", .{base});
