@@ -255,7 +255,8 @@ fn list_pages_capped(
         after = page.continue_after;
         if (after == null) return .{ .items = items.items, .revision = revision.? };
     }
-    // Pages came back short and the iterations ran out before the end: a read that asked for
+    // Pages came back short and the iterations ran out before the end (so `truncated` can mean
+    // "page budget exhausted" with fewer rows than the cap): a read that asked for
     // `truncated` gets what it has, as the docs promise ("never a failure").
     const flag = truncated orelse return too_many(ctx, prefix, count_max);
     flag.* = true;

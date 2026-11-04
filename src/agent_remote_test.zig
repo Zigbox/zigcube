@@ -338,8 +338,11 @@ test "a pull record goes in under the tenure; a stale tenure is refused" {
     diag.reset();
     const lease = try remote.lease_grant(10_000, &diag);
     const joined = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
-    const body = "{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:aa\",\"registry_bytes\":9," ++
-        "\"started_at_ms\":1,\"finished_at_ms\":5}";
+    // Stamped now: the server's pull retention would drop a record dated 1970.
+    const finished_ms = std.Io.Clock.real.now(rig.io).toMilliseconds();
+    var body_buffer: [160]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buffer, "{{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:aa\"," ++
+        "\"registry_bytes\":9,\"started_at_ms\":{d},\"finished_at_ms\":{d}}}", .{ finished_ms - 5, finished_ms });
     const put: store.Op = .{ .put = .{ .key = "/pulls/node1/b3:aa", .value = body } };
     const ended = joined.revision + 50;
     const stale = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = ended }};

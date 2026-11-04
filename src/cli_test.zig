@@ -742,8 +742,10 @@ test "stats pull shows the recorded pulls, one node's, as JSON and wide, and say
     try testing.expectEqualStrings("no pulls have been recorded\n", world.out());
 
     const long = "b3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    try put_pull(&world, "node1", "b3:51aa9c03", 2000, 0);
-    try put_pull(&world, "node2", long, 5000, 1536);
+    // Relative to the real clock: the server's pull retention (30 days) would drop tiny stamps.
+    const now_ms: u64 = @intCast(std.Io.Clock.real.now(world.io).toMilliseconds());
+    try put_pull(&world, "node1", "b3:51aa9c03", now_ms - 3000, 0);
+    try put_pull(&world, "node2", long, now_ms - 1000, 1536);
     try testing.expectEqual(@as(u8, 0), world.run(&.{ "stats", "pull" }));
     try testing.expectEqualStrings(
         "NODE   TREE                REGISTRY  PEERS  CACHED  TOOK  BAD PEERS\n" ++

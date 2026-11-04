@@ -8,10 +8,16 @@ cursor (`continue_after`) across passes and prunes the part of each node's run i
 named in each list at maximum-length names, one request under a `BoundedArena` of exactly
 `request_arena_bytes_max`, 16,777,216 bytes). `used_bytes` at the cap of 500: SQLite 4,644,368,
 memory 4,789,304 (under 30% of the arena). At the earlier cap of 1,000: SQLite 7,307,524 (2.3x
-headroom), memory 16,776,362 and a ZC-E0207. The memory store, not the parse, was the cost: each
+headroom), memory 16,776,362 and a ZC-E0207 (before the page-only copy; with it, 7,590,964). The memory store, not the parse, was the cost: each
 page copied every entry under the prefix, so a read of N records cost pages x N values; it now
 copies the page it returns (`store_memory.zig`). The earlier "11.9 KB parse per record" figure
 came from that and was wrong.
+
+**What guards what.** `src/pull_arena_test.zig` guards the 2x arena bound (used bytes at most
+half of the arena); it does not fail at the old cap of 1,000 (measured 7,590,964 bytes on memory,
+under the 2x check). The cap itself is guarded by the comptime assert in `src/constants.zig`.
+The memory store's `list` no longer lists every entry under the prefix for a current-state page:
+it keeps only the `limit` + 1 entries it returns (a historical `at_revision` page still does).
 
 **Derivation.** Per record: the value copy and the key copy the store makes (SQLite, Postgres),
 and the parse, which is at most the value again: measured about 5.0 KB for 3,036 bytes. The

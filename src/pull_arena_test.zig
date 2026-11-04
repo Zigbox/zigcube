@@ -1,5 +1,5 @@
 //! The worst case of `GET /v1/stats/pull` against the real request arena (`BoundedArena` of
-//! exactly `request_arena_bytes_max`), on the memory store (which borrows values) and on SQLite
+//! exactly `request_arena_bytes_max`), on the memory store (which copies only the page it returns) and on SQLite
 //! (which copies every key and value into the arena). Shell test: it needs SQLite and files.
 
 const std = @import("std");
@@ -81,13 +81,16 @@ fn ask(s: store.Store) !u64 {
     }
     try testing.expectEqual(@as(u16, 200), response.status);
     try testing.expect(std.mem.indexOf(u8, response.body, "\"truncated\":true") != null);
-    // At least twice the room it needs.
+    // At least twice the room it needs. This guards the arena bound; the cap itself is guarded
+    // by the comptime assert on `pulls_read_max` in constants.zig (at the old cap of 1,000 this
+    // test still passes).
     try testing.expect(bounded.used_bytes * 2 <= constants.request_arena_bytes_max);
     return bounded.used_bytes;
 }
 
 test "stats pull at its read cap with the largest records fits the request arena (memory)" {
-    // Goal: the cap's worst case fits the real limit with 2x headroom. Method: cap + 500 maximum
+    // Goal: the worst case at the cap uses at most half the real limit (2x arena bound; the cap
+    // itself is enforced by the comptime assert in constants.zig, not by this test). Method: cap + 500 maximum
     // records, one request under a BoundedArena of exactly `request_arena_bytes_max`.
     var manual: clock_mod.ManualClock = .{};
     var memory: MemoryStore = undefined;
