@@ -475,14 +475,22 @@ pub const ZigboxImages = struct {
             .complete = false,
         });
         const claim = &self.claims.items[self.claims.items.len - 1];
-        if (meta.size == 0) try self.finish_empty(claim); // No chunk will ever finish it.
+        try self.settle(claim);
     }
 
-    fn finish_empty(self: *ZigboxImages, claim: *Claim) ReceiveError!void {
+    /// Completes a claim no chunk will finish: an empty file, an object the store already holds
+    /// (two images share files; `lacking` then never asks for its chunks), or one whose chunks
+    /// an earlier fetch left in `partial/`.
+    fn settle(self: *ZigboxImages, claim: *Claim) ReceiveError!void {
         var failure: store_api.chunk_put.Failure = undefined;
-        _ = store_api.chunk_put.finish(self.store, self.io, &claim.wanted, &failure) catch
-            return error.StoreFailed;
-        claim.complete = true;
+        const progress = store_api.chunk_put.finish(
+            self.store,
+            self.io,
+            &claim.wanted,
+            &failure,
+        ) catch return error.StoreFailed;
+        claim.complete = progress.complete;
+        assert(claim.wanted.size != 0 or claim.complete);
     }
 
     fn put_chunk_impl(
@@ -494,11 +502,10 @@ pub const ZigboxImages = struct {
         if (!node_store.chunk_verifies(hash, bytes)) return error.BadHash;
         var used = false;
         for (self.claims.items) |*claim| {
-            if (claim.complete) continue;
             for (claim.hashes, 0..) |listed, at| {
                 if (!std.mem.eql(u8, &listed.bytes, hash)) continue;
-                try self.land(claim, @intCast(at), bytes);
-                used = true;
+                used = true; // A complete claim lists it too: the object is there already.
+                if (!claim.complete) try self.land(claim, @intCast(at), bytes);
             }
         }
         if (!used) return error.NotFound; // No object that was claimed lists this chunk.
@@ -604,13 +611,46 @@ pub const Pair = struct {
     tree: Digest,
     workspace: *store_api.import.Workspace,
 
-    pub fn make(pair: *Pair, tmp: *testing.TmpDir) !void {
+    fn base_of(tmp: *testing.TmpDir, out: []u8) ![]const u8 {
         var cwd_buffer: [512]u8 = undefined;
         const cwd_len = try std.process.currentPath(testing.io, &cwd_buffer);
-        var root_buffer: [768]u8 = undefined;
-        const base = try std.fmt.bufPrint(&root_buffer, "{s}/.zig-cache/tmp/{s}", .{
+        return std.fmt.bufPrint(out, "{s}/.zig-cache/tmp/{s}", .{
             cwd_buffer[0..cwd_len], tmp.sub_path,
         });
+    }
+
+    /// Imports into `a` a second tree: the first one's files plus `src2/etc/extra`, so the two
+    /// trees share every chunk but the new file's.
+    pub fn add_tree(pair: *Pair, tmp: *testing.TmpDir) !Digest {
+        var root_buffer: [768]u8 = undefined;
+        const base = try base_of(tmp, &root_buffer);
+        try tmp.dir.createDir(testing.io, "src2", .default_dir);
+        try tmp.dir.createDir(testing.io, "src2/etc", .default_dir);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "src2/hello", .data = "hello, world" });
+        try tmp.dir.writeFile(testing.io, .{
+            .sub_path = "src2/etc/long",
+            .data = "0123456789abcdefghijklmnopqrstuvwxyz",
+        });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "src2/etc/copy", .data = "hello, world" });
+        try tmp.dir.writeFile(testing.io, .{
+            .sub_path = "src2/etc/extra",
+            .data = "a file only the second image has",
+        });
+        var path: [800]u8 = undefined;
+        const source = try std.fmt.bufPrint(&path, "{s}/src2", .{base});
+        var result: store_api.import.Result = undefined;
+        var diag: zigbox.diag.Diag = undefined;
+        diag.reset();
+        store_api.import.import(&pair.a, pair.workspace, source, .{
+            .squash_owner = false,
+            .warn = null,
+        }, &result, &diag) catch return error.ImportFailed;
+        return result.digest;
+    }
+
+    pub fn make(pair: *Pair, tmp: *testing.TmpDir) !void {
+        var root_buffer: [768]u8 = undefined;
+        const base = try base_of(tmp, &root_buffer);
         try tmp.dir.createDir(testing.io, "src", .default_dir);
         try tmp.dir.createDir(testing.io, "src/etc", .default_dir);
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "src/hello", .data = "hello, world" });

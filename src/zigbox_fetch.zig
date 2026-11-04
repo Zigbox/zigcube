@@ -638,3 +638,37 @@ test "zigbox fetch: the serving seam gives the bundle encode makes, and none for
     try testing.expect(serving(&from_a).bundle("b3:nonsense", buffer) == null);
     try testing.expect(from_a.images().bundle("anything", buffer) == null);
 }
+
+test "zigbox fetch: a second image that shares files with a held one is fetched" {
+    // Goal: demo-c2's v1 to v2. Chunks the store holds are not fetched again, so the objects
+    // they belong to must not wait for them. Method: B fetches T1, then T2 (T1 plus one file)
+    // from A; B ends with both trees whole, and only the new file's chunks come from the peer.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try rigged(&pair, &tmp);
+    defer pair.deinit();
+    const second = try pair.add_tree(&tmp);
+    var from_a = try ZigboxImages.open(testing.allocator, &pair.a);
+    defer from_a.close();
+    var buffer: [2048]u8 = undefined;
+    const text = try images_mod.record_text(&buffer, second, images_mod.other_manifest_text);
+    const other = Sha256.parse(images_mod.other_manifest_text).?;
+    _ = try from_a.import_image(text, second, other);
+    var to_b = try ZigboxImages.open(testing.allocator, &pair.b);
+    defer to_b.close();
+    var rig: Rig = .{ .from = &from_a, .allocator = testing.allocator };
+    var report: Report = undefined;
+    const first = Sha256.parse(images_mod.manifest_text).?;
+    try run_rig(&rig, &to_b, pair.tree, first, &report);
+    try run_rig(&rig, &to_b, second, other, &report);
+    const name = second.text();
+    try testing.expect(to_b.images().has(&name));
+    try testing.expect(report.already_held > 0);
+    try testing.expect(report.peer_chunks > 0);
+    try testing.expect(report.peer_chunks < report.chunks);
+    var listing: [8]zigbox.store.roots.Root = undefined;
+    var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
+    const rooted = try zigbox.store.roots.list(&pair.b, &names, &listing);
+    try testing.expectEqual(@as(usize, 2), rooted.count);
+}
