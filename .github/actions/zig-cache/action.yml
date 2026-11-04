@@ -31,9 +31,9 @@ runs:
           !.zig-cache/bench-watch/**
           !.zig-cache/store-*/**
           !.zig-cache/zcube-check-tree/**
-        key: zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+        key: zig-v2-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
         restore-keys: |
-          zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-
+          zig-v2-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-
     # Zig never deletes from its cache, so a chain of restores that start from the previous entry
     # only grows. Past this size the restored entry is dropped and the job starts cold, which then
     # saves a fresh, small entry. GitHub keeps 10 GB for the repository; three jobs use this
