@@ -15,6 +15,8 @@ You supervise Zigcube C2 and Zigbox M7, one slice at a time. Each slice runs thr
 4. A PR.
 5. A squash-merge.
 
+Owner, 2026-11-04: when a task is complex enough that an **Opus** implementer would finish it sooner than a Sonnet (model `claude-opus-5-5`), use Opus. Up to two Sonnets at a time; Haikus without limit.
+
 You may merge to main once the review findings are fixed and CI is green. Zigbox also needs its `vm.yml` run green on a `vm/*` branch.
 
 After each merge:
@@ -157,6 +159,15 @@ Record the split in `docs/briefs/M7-build.md` (slice 3 is at about line 166) and
 - A fix session that cannot `add_repo` Zigbox/zigbox cannot build. Make every implementer prove it can build before it writes code.
 - Do not push docs-only follow-ups to an open PR's branch: each push restarts its CI. Batch them.
 - Scheduled tasks on this account that you did not create belong to other sessions. Leave them alone.
+- **Test-filter trap:** `-Dtest-filter` silently skips tests in files imported from `tests.zig`'s "the peer files and the CA's shell…" block unless the filter matches that block's name.
+- Known gaps (2026-11-04), unscheduled:
+  - the #60 swap race;
+  - a stray `pull.json.tmp` can be left behind;
+  - Postgres arena use is not measured;
+  - the memory store's `at_revision` paging lists the whole prefix;
+  - a stray `claude/release-retro` branch in Zigbox (the proxy refuses remote deletes; the owner can delete it);
+  - Zigbox `mac.yml` still queues a mac job on docs-only PRs;
+  - Zigbox branch protection may still name the old per-fuzzer check names after #44.
 - Open, low priority:
   - Zigbox issue #8, a separate diagnostics module.
   - A real code for `lost`.
