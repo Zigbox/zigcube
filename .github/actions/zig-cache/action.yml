@@ -1,0 +1,61 @@
+name: Cache the Zig build
+description: >
+  Restores and saves Zig's global cache (~/.cache/zig) and the project's .zig-cache, so a job
+  recompiles only what a change touched. The key is the OS, the pinned Zig (the setup-zig action
+  names the version and its checksum) and the hash of build.zig, build.zig.zon and src/**; a
+  restore without an exact hit starts from the newest entry of the same job. Zig's cache is
+  content-addressed, so a restored entry can only skip work that an identical input already did.
+  A Run step with side effects (tidy, errors-site-check, the Node checks, the store suites, every
+  smoke and demo) runs every time, and a test binary is skipped only when it is byte-identical to
+  one that passed. Used by the jobs whose time is compiling; the jobs dominated by a real
+  database, a VM or real processes do not use it.
+inputs:
+  name:
+    description: Which job's cache this is. One entry per job, so two jobs never race to save the same key.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache ~/.cache/zig and .zig-cache
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        # A negated path needs `/**` to exclude a directory's contents. What the tests and the
+        # smokes write under .zig-cache (scratch directories, pid files, VM images) is state of
+        # one run and never restored.
+        path: |
+          ~/.cache/zig
+          .zig-cache
+          !.zig-cache/tmp/**
+          !.zig-cache/vm/**
+          !.zig-cache/bench-watch/**
+          !.zig-cache/store-*/**
+          !.zig-cache/zcube-check-tree/**
+        key: zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**') }}
+        restore-keys: |
+          zig-v1-${{ inputs.name }}-${{ runner.os }}-${{ hashFiles('.github/actions/setup-zig/action.yml') }}-
+    # Zig never deletes from its cache, so a chain of restores that start from the previous entry
+    # only grows. Past this size the restored entry is dropped and the job starts cold, which then
+    # saves a fresh, small entry. GitHub keeps 10 GB for the repository; three jobs use this
+    # action, so the entries stay under about 3 GB together.
+    # No `if:` on the matched key: it is empty on a restore-key (prefix) hit, which is the normal
+    # warm path after a source change. The step looks at the directories instead, and does
+    # nothing when nothing was restored.
+    - name: Drop a restored cache that has grown too large
+      shell: bash
+      run: |
+        # Leftovers of a run that was not this one's: never restored, removed if they came back.
+        rm -rf .zig-cache/tmp .zig-cache/vm .zig-cache/bench-watch .zig-cache/store-* \
+          .zig-cache/zcube-check-tree
+        # A cold start restored nothing; du exits non-zero on a missing path, which pipefail turns
+        # into a failed step.
+        mkdir -p ~/.cache/zig .zig-cache
+        limit_mb=1000
+        size_mb=$(du -smc ~/.cache/zig .zig-cache 2>/dev/null | tail -1 | cut -f1)
+        echo "zig-cache: restored ${size_mb} MB (hit: ${{ steps.cache.outputs.cache-hit }}," \
+          "key: ${{ steps.cache.outputs.cache-matched-key }})"
+        if [ "${size_mb}" -gt "${limit_mb}" ]; then
+          echo "zig-cache: over ${limit_mb} MB, starting cold"
+          rm -rf ~/.cache/zig
+          find .zig-cache -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        fi

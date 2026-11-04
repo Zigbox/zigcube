@@ -59,6 +59,11 @@ const shell_allowlist = [_][]const u8{
     // the owner's machine with docker and a registry login, never in a build or test, and is a
     // list of `docker buildx` calls; the build has no docker to drive from Zig.
     "ops/demo-c2-images/push.sh",
+    // CI's changes job (docs/decisions/2026-11-04-ci-affected-demos.md): it runs before any Zig
+    // is installed, on a runner that only has git and bash, and decides which jobs install it.
+    // Its table test sits beside it and runs in the same job.
+    ".github/ci-changes.sh",
+    ".github/ci-changes-test.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).
