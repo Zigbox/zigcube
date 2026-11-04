@@ -380,6 +380,8 @@ pub const fleet_token_bytes_max: u32 = 4096;
 pub const fleet_filed_max: u32 = 1024;
 /// UTC days the state file keeps counts for; the oldest is dropped past this.
 pub const fleet_days_kept: u32 = 31;
+/// The run kinds a day is broken down by (sim-cluster, sim-c1, sim-swarm, and room for one more).
+pub const fleet_kinds_max: u32 = 4;
 /// Distinct failures counted per day for the tracker comment; more are in the day's total only.
 pub const fleet_seen_per_day_max: u32 = 256;
 /// Comments one failure gets per UTC day, and never two for the same commit.

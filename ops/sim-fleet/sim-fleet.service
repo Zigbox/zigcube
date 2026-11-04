@@ -1,5 +1,5 @@
 [Unit]
-Description=Zigcube simulation fleet (sim-cluster on fresh seeds at the tip of main)
+Description=Zigcube simulation fleet (sim-cluster, sim-c1 and sim-swarm on fresh seeds at the tip of main)
 Documentation=https://github.com/Zigbox/zigcube/blob/main/ops/sim-fleet/README.md
 After=network-online.target
 Wants=network-online.target
