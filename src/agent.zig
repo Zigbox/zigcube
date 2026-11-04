@@ -265,8 +265,6 @@ pub const Agent = struct {
         const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
         try agent.publish_store(ctx, listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
-        try agent.publish_pulls(ctx);
-        if (agent.fence.active) return agent.fence_step(ctx, now);
         var pass: Pass = .{
             .agent = agent,
             .ctx = ctx,
@@ -279,6 +277,10 @@ pub const Agent = struct {
         try pass.orphan_records();
         acted += try pass.flush();
         agent.forget_finished_stops(listings);
+        if (agent.fence.active) return agent.fence_step(ctx, now);
+        // After the replica pass: the records are statistics, so a failing publish (a server that
+        // cannot be reached, a state directory that cannot be read) never holds replica work back.
+        try agent.publish_pulls(ctx);
         if (agent.fence.active) return agent.fence_step(ctx, now);
         const at_ms = agent.next_wake(now, mono);
         return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = acted };
@@ -358,7 +360,12 @@ pub const Agent = struct {
             var buffer: [agent_state.name_bytes_max]u8 = undefined;
             const file = agent_records.path(&buffer, name, agent_records.file_pull);
             const text = state.read(ctx.arena, file) catch |err| switch (err) {
-                error.Absent, error.TooBig => continue,
+                error.Absent => continue,
+                // A file past the state limit can never be read: remove it, or it wedges here.
+                error.TooBig => {
+                    try agent.drop_pull(ctx, state, file);
+                    continue;
+                },
                 else => return state_failed(ctx, err, "read a pull record"),
             };
             published += 1;

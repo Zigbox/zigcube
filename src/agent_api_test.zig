@@ -910,7 +910,7 @@ test "a pull record is stored under the node's key, replaced by a later pull of 
     try testing.expectEqual(@as(u64, 99), second.registry_bytes);
 }
 
-test "a pull of another node, a newer version, a bad tree or too many peers is ZC-E0104" {
+test "a pull of another node, version, tree, peer name or too many peers is ZC-E0104" {
     // Goal: the endpoint's checks. Method: each wrong record is refused with a coded 400 and
     // writes nothing.
     var rig = try Rig.start(32);
@@ -922,6 +922,10 @@ test "a pull of another node, a newer version, a bad tree or too many peers is Z
         .{ "\"node\":\"node2\"", "\"node\":\"node9\"" },
         .{ "b3:51aa9c03", "" },
         .{ "b3:51aa9c03", "b3:51aa\\u0000" },
+        // A peer name that is not a node name could carry terminal control bytes (ESC, here).
+        .{ "\"peer\":\"node1\"", "\"peer\":\"node1\\u001b[2J\"" },
+        .{ "\"node3\"", "\"Node3\"" },
+        .{ "\"node3\"", "\"\\u001b]0;x\\u0007\"" },
     };
     for (swaps) |swap| {
         const record = try std.mem.replaceOwned(u8, gpa, small_pull, swap[0], swap[1]);

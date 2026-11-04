@@ -536,7 +536,12 @@ const Call = struct {
         if (record.bad_peers.len > constants.pull_peers_max) {
             return bad_request(ctx, "pull.bad_peers", "names more peers than a pull may");
         }
+        for (record.peer_bytes) |sent| try pull_peer_name(ctx, "pull.peer_bytes", sent.peer);
+        for (record.bad_peers) |named| try pull_peer_name(ctx, "pull.bad_peers", named);
         const value = records.encode(ctx.arena, record, ctx.diag) catch return propagate(ctx);
+        if (value.len > constants.pull_record_bytes_max) {
+            return bad_request(ctx, "pull", "is larger than a pull record can be");
+        }
         const key = records.pull_key(call.node, record.tree);
         const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
         var tenure: compare_sets.Set = .{};
@@ -548,6 +553,13 @@ const Call = struct {
         if (!result.succeeded) return tenure_ended(ctx, call.node);
         const pair = try call.chain_written(result);
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
+    }
+
+    /// A peer is named by a node name: the statistics reach a terminal, and a name that is not
+    /// one could carry control bytes there.
+    fn pull_peer_name(ctx: *const Context, field: []const u8, name: []const u8) Failure!void {
+        if (records.name_problem(name, constants.node_name_bytes_max) == null) return;
+        return bad_request(ctx, field, "names a peer that is not a valid node name");
     }
 
     /// The summary rides the lease of the node's registration, which the tenure compare pins: a

@@ -213,9 +213,14 @@ when the pull succeeds; the agent publishes it on its next step and removes the 
 
 Retention (`src/pull_retention.zig`): the newest `pulls_per_node_max` (100) per node, none older
 than `pull_age_ms_max` (30 days) by `finished_at_ms`. The replica controller runs a pass every
-`pulls_interval_ms` (5 minutes), reading at most `pulls_pages_per_pass_max` pages; the `retention`
-role deletes with a `mod_revision` compare and never puts. A malformed record is left alone and
-counted, never deleted by guess. `GET /v1/stats/pull` reads tolerantly (`skipped`).
+`pulls_interval_ms` (5 minutes) and, when a pass stopped at `pulls_pages_per_pass_max` pages, again
+at once from where it stopped, wrapping to the start when a page ends the prefix. A pass prunes the
+part of each node's run it read: a dropped record always has `pulls_per_node_max` newer ones in
+the whole set, so a partial run is safe and repeated passes converge. The `retention` role deletes
+with a `mod_revision` compare and never puts. A malformed record is left alone and counted, never
+deleted by guess. A pass that fails does not fail the step: it is retried after `pulls_retry_ms`
+and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) and at most
+`pulls_read_max` (1,000) records (`truncated`).
 
 ## `/observed/<node>/<replica>`: what the agent reports
 

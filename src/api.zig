@@ -791,7 +791,8 @@ const Call = struct {
 
     /// `GET /v1/stats/pull[?node=NAME][&limit=N]`: the recorded pulls (`/pulls/`), newest first.
     /// Advisory records: one that does not decode or is from a newer version is counted in
-    /// `skipped`, not an error.
+    /// `skipped`, not an error. A read stops at `pulls_read_max` records (ascending by node) and
+    /// says `truncated`, so a large cluster gets part of the picture, never a failure.
     fn stats(call: Call) Failure!Reply {
         const ctx = call.ctx;
         const kind = call.parts.next() orelse return no_such(ctx, "/v1/stats");
@@ -810,13 +811,14 @@ const Call = struct {
             prefix = records.pull_prefix(node).slice();
         }
         var skipped: u32 = 0;
-        const found = controller.list_all_tolerant(
+        var truncated = false;
+        const found = controller.list_capped_tolerant(
             records.Pull,
             ctx,
             prefix,
-            null,
             constants.pulls_read_max,
             &skipped,
+            &truncated,
         ) catch return propagate(ctx);
         const order = ctx.arena.alloc(u32, found.items.len) catch return no_memory(ctx);
         for (order, 0..) |*slot, at| slot.* = @intCast(at);
@@ -828,6 +830,8 @@ const Call = struct {
         for (order[0..@min(order.len, limit)]) |at| try out.value(found.items[at].rec);
         try out.end_array();
         try out.member("skipped", skipped);
+        try out.member("matched", found.items.len);
+        try out.member("truncated", truncated);
         try out.member("revision", found.revision);
         try out.end_object();
         return out.finish();

@@ -1072,6 +1072,42 @@ test "records a C1 build wrote still read" {
     for (seen) |count| try testing.expect(count > 0);
 }
 
+/// `/pulls/` rows captured from a real swarm-smoke run (src/testdata/README.md).
+const c2_pulls = @embedFile("testdata/c2_pulls.txt");
+
+test "pull records a real run wrote still read" {
+    // Goal: Pull v1 as stored reads under its own key. Method: read each captured row as a `Pull`,
+    // check the key is the one its node and tree give, and check the bytes by source.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var rows: u32 = 0;
+    var struck: u32 = 0;
+    var lines = std.mem.splitScalar(u8, c2_pulls, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t').?;
+        const kv = kv_of(line[0..tab], line[tab + 1 ..]);
+        const record = try read(Pull, arena, kv, &diag);
+        try testing.expectEqual(@as(u32, 1), record.v);
+        try testing.expectEqualStrings(pull_key(record.node, record.tree).slice(), kv.key);
+        try testing.expectEqual(@as(u64, 1353576), record.registry_bytes + sum_peers(record));
+        try testing.expect(record.finished_at_ms >= record.started_at_ms);
+        struck += @intCast(record.bad_peers.len);
+        rows += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), rows);
+    try testing.expectEqual(@as(u32, 1), struck);
+}
+
+fn sum_peers(record: Pull) u64 {
+    var total: u64 = 0;
+    for (record.peer_bytes) |peer| total += peer.bytes;
+    return total;
+}
+
 test "a newer version is refused with ZC-E0303, not as malformed" {
     // Goal: a value from a newer release is named and left alone. Method: bump the version of a
     // real record, and of a kind that is still at 1.

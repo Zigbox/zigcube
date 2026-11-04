@@ -180,6 +180,21 @@ pub fn list_all_tolerant(
     return list_pages(T, ctx, prefix, at_revision, count_max, skipped);
 }
 
+/// As `list_all_tolerant`, but a read that reaches `count_max` records stops there, with
+/// `truncated` set, instead of failing with ZC-E0302: for a screen that shows what fits.
+pub fn list_capped_tolerant(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    count_max: u32,
+    skipped: *u32,
+    truncated: *bool,
+) Error!List(T) {
+    skipped.* = 0;
+    truncated.* = false;
+    return list_pages_capped(T, ctx, prefix, null, count_max, skipped, truncated);
+}
+
 fn list_pages(
     comptime T: type,
     ctx: *const Context,
@@ -187,6 +202,18 @@ fn list_pages(
     at_revision: ?Revision,
     count_max: u32,
     skipped: ?*u32,
+) Error!List(T) {
+    return list_pages_capped(T, ctx, prefix, at_revision, count_max, skipped, null);
+}
+
+fn list_pages_capped(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    at_revision: ?Revision,
+    count_max: u32,
+    skipped: ?*u32,
+    truncated: ?*bool,
 ) Error!List(T) {
     var items: std.ArrayList(Entry(T)) = .empty;
     var revision = at_revision;
@@ -201,7 +228,11 @@ fn list_pages(
         }, ctx.diag);
         revision = page.revision;
         for (page.kvs) |kv| {
-            if (items.items.len >= count_max) return too_many(ctx, prefix, count_max);
+            if (items.items.len >= count_max) {
+                const flag = truncated orelse return too_many(ctx, prefix, count_max);
+                flag.* = true;
+                return .{ .items = items.items, .revision = revision.? };
+            }
             const rec = records.read(T, ctx.arena, kv, ctx.diag) catch |err| {
                 const count = skipped orelse return err;
                 if (err != error.Malformed) return err;

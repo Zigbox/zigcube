@@ -2,16 +2,22 @@
 //! its newest `pulls_per_node_max` records and none older than `pull_age_ms_max`.
 //!
 //! A pass reads at most `pulls_pages_per_pass_max` pages of the prefix, which ascends by node
-//! and then tree, and drops whole nodes' worth: when the read stopped short of the end, the last
-//! node seen is left for the next pass, because its records may continue on the next page. A
-//! delete compares the record's `mod_revision`, so a pull that rewrote the key after the read is
-//! never dropped. Fail safe: a record that does not parse is kept (and never counted as old),
-//! because dropping on a guess would lose statistics, while keeping one costs a row.
+//! and then tree, starting after the key the last pass stopped at (`Cursor.after`), and wraps to
+//! the start only when a read reaches the end. So every node is reached however many records
+//! the others hold, and one node with more records than a pass reads is pruned a pass at a time.
+//! A node's run that a pass sees only part of is pruned as the part: both rules are safe on a
+//! part, because a record beyond the newest `pulls_per_node_max` of a part has at least that many
+//! newer in the whole, and age does not depend on the others. What a part keeps, the next part
+//! may thin again, so a node of any size converges to its limit in a few wraps. A delete
+//! compares the record's `mod_revision`, so a pull that rewrote the key after the read is never
+//! dropped. Fail safe: a record that does not parse is kept (and never counted as old), because
+//! dropping on a guess would lose statistics, while keeping one costs a row.
 //!
 //! The role is `retention`, which may only delete under `/pulls/` (`writers.zig`). Core code.
 
 const std = @import("std");
 const assert = std.debug.assert;
+const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
@@ -25,16 +31,44 @@ const Error = controller.Error;
 /// Where a pass stopped and when the next is due, on the `Clock`'s scale; 0 is now.
 pub const Cursor = struct {
     due_ms: u64 = 0,
+    /// Resume after this key. Meaningful only if `resuming`.
+    after: records.Key = .{},
+    /// True while a read has not yet reached the end of the prefix.
+    resuming: bool = false,
     /// Pull records dropped (counted when the delete is attempted), for tests and the shell.
     dropped: u64 = 0,
+    /// Whether the last pass failed, how many have, and the code of the last failure: statistics
+    /// must not stop replica work, so a failure is kept here for the shell to say once.
+    failing: bool = false,
+    failures: u64 = 0,
+    failure_code: ?codes.Code = null,
 };
 
-/// One pass; returns when the next is due. `now_ms` is the controller's clock.
+/// `prune` for the replica controller: a failed pass is recorded in `cursor` and retried after
+/// `pulls_retry_ms`, and its diagnostic is cleared, so nothing else in the step is held back.
+pub fn prune_or_back_off(ctx: *const Context, cursor: *Cursor, now_ms: u64) u64 {
+    assert(ctx.diag.code == null);
+    if (prune(ctx, cursor, now_ms)) |due| {
+        cursor.failing = false;
+        return due;
+    } else |_| {
+        assert(ctx.diag.code != null); // Every failure of the store or a record is coded.
+        cursor.failing = true;
+        cursor.failures += 1;
+        cursor.failure_code = ctx.diag.code;
+        ctx.diag.reset();
+        return now_ms + constants.pulls_retry_ms;
+    }
+}
+
+/// One pass; returns when the next is due: now if the prefix was not finished, else a full
+/// interval on. `now_ms` is the controller's clock.
 pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
     assert(constants.pulls_per_node_max > 0);
+    assert(cursor.resuming == (cursor.after.len > 0));
     const revision = (try ctx.store.status(ctx.diag)).revision;
     var seen: std.ArrayList(store.KeyValue) = .empty;
-    var after: ?[]const u8 = null;
+    var after: ?[]const u8 = if (cursor.resuming) cursor.after.slice() else null;
     var complete = false;
     for (0..constants.pulls_pages_per_pass_max) |_| {
         const page = try ctx.store.list(ctx.arena, .{
@@ -50,17 +84,26 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
             break;
         }
     }
-    try prune_nodes(ctx, cursor, seen.items, complete, now_ms);
-    return now_ms + constants.pulls_interval_ms;
+    // The cursor moves only once the deletes are in: a failed pass reads the same pages again.
+    try prune_nodes(ctx, cursor, seen.items, now_ms);
+    if (complete) {
+        cursor.resuming = false;
+        cursor.after.len = 0;
+        return now_ms + constants.pulls_interval_ms;
+    }
+    const last = after.?;
+    assert(last.len <= constants.store_key_bytes_max);
+    @memcpy(cursor.after.bytes[0..last.len], last);
+    cursor.after.len = @intCast(last.len);
+    cursor.resuming = true;
+    return now_ms;
 }
 
-/// Drops from each node's run in `kvs` (ascending by key), leaving the last node's run alone
-/// unless `complete`.
+/// Drops from each node's run in `kvs` (ascending by key); a run may be only part of its node.
 fn prune_nodes(
     ctx: *const Context,
     cursor: *Cursor,
     kvs: []const store.KeyValue,
-    complete: bool,
     now_ms: u64,
 ) Error!void {
     var start: usize = 0;
@@ -68,7 +111,6 @@ fn prune_nodes(
         const node = node_of(kvs[start].key);
         var end = start + 1;
         while (end < kvs.len and std.mem.eql(u8, node_of(kvs[end].key), node)) end += 1;
-        if (end == kvs.len and !complete) return;
         try prune_node(ctx, cursor, kvs[start..end], now_ms);
         start = end;
     }
@@ -107,19 +149,20 @@ fn prune_node(
     for (run, drop) |kv, marked| {
         if (!marked) continue;
         if (!batch.has_room(1) or batch.compares_count == constants.store_txn_compares_max) {
-            try flush(ctx, &batch);
+            try flush(ctx, cursor, &batch);
         }
         batch.expect(kv.key, kv.mod_revision);
         batch.delete(kv.key);
-        cursor.dropped += 1;
     }
-    try flush(ctx, &batch);
+    try flush(ctx, cursor, &batch);
 }
 
-fn flush(ctx: *const Context, batch: *Batch) Error!void {
+/// Commits the batch; only deletes that went in count as dropped.
+fn flush(ctx: *const Context, cursor: *Cursor, batch: *Batch) Error!void {
     if (batch.ops_count == 0) return;
     // A conflict means a pull rewrote a key since the read: the next pass sees the new record.
-    _ = try controller.commit(ctx, .retention, batch);
+    const done = try controller.commit(ctx, .retention, batch);
+    if (done == .applied) cursor.dropped += batch.ops_count;
     batch.* = .{};
 }
 
@@ -238,10 +281,32 @@ const Fixture = struct {
         try testing.expect(done.succeeded);
     }
 
+    /// How many keys lie under `prefix`, read a page at a time.
     fn count(self: *Fixture, prefix: []const u8) !usize {
         const ctx = self.context();
-        const page = try ctx.store.list(ctx.arena, .{ .prefix = prefix, .limit = 500 }, ctx.diag);
-        return page.kvs.len;
+        var total: usize = 0;
+        var after: ?[]const u8 = null;
+        const revision = (try ctx.store.status(ctx.diag)).revision;
+        while (true) {
+            const options: store.ListOptions = .{
+                .prefix = prefix,
+                .at_revision = revision,
+                .limit = constants.store_list_limit_max,
+                .continue_after = after,
+            };
+            const page = try ctx.store.list(ctx.arena, options, ctx.diag);
+            total += page.kvs.len;
+            after = page.continue_after orelse return total;
+        }
+    }
+
+    /// Writes `total` pulls for `node`, trees `b3:<hex>`, a higher index finishing later.
+    fn pull_many(self: *Fixture, node: []const u8, total: u32) !void {
+        for (0..total) |at| {
+            var tree: [16]u8 = undefined;
+            const name = try std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at});
+            try self.pull(node, name, 100_000 - at);
+        }
     }
 };
 
@@ -288,4 +353,65 @@ test "a node past its count keeps its newest and another node is untouched" {
     const oldest = records.pull_key("n1", "b3:00000067"); // Index 103: the oldest.
     const got = try ctx.store.get(ctx.arena, oldest.slice(), null, ctx.diag);
     try testing.expect(got.kv == null);
+}
+
+test "a pass resumes where the last stopped, so every node is pruned and the cursor wraps" {
+    // Goal: no node is starved by the ones before it (the old pass restarted at the first key
+    // and never got past 2,000 records). Method: five nodes of 500 pulls, 2,500 in all, more than
+    // one pass reads; passes run until the cursor wraps, in at most three; each node is then at
+    // its limit and the cursor is back at the start.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const nodes = [_][]const u8{ "n1", "n2", "n3", "n4", "n5" };
+    for (nodes) |node| try fixture.pull_many(node, 500);
+    const ctx = fixture.context();
+    var cursor: Cursor = .{};
+    var passes: u32 = 0;
+    while (true) {
+        const due = try prune(&ctx, &cursor, fixture.manual.ms);
+        passes += 1;
+        if (!cursor.resuming) {
+            try testing.expectEqual(fixture.manual.ms + constants.pulls_interval_ms, due);
+            break;
+        }
+        try testing.expectEqual(fixture.manual.ms, due); // Not finished: due now.
+        try testing.expect(passes < 3);
+    }
+    try testing.expectEqual(@as(u32, 2), passes);
+    try testing.expectEqual(@as(usize, 0), cursor.after.len);
+    for (nodes) |node| {
+        var prefix: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&prefix, "/pulls/{s}/", .{node});
+        try testing.expectEqual(@as(usize, constants.pulls_per_node_max), try fixture.count(text));
+    }
+    try testing.expectEqual(@as(u64, 5 * (500 - constants.pulls_per_node_max)), cursor.dropped);
+}
+
+test "one node with more records than a pass reads converges to its limit" {
+    // Goal: a single large node does not stall retention. Method: 2,300 pulls of one node, the
+    // pass reads 2,000; each pass drops what is safe on the part it saw; within four passes the
+    // node is at its limit, and the newest records are the ones kept.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const total = constants.store_list_limit_max * constants.pulls_pages_per_pass_max + 300;
+    try fixture.pull_many("n1", total);
+    const ctx = fixture.context();
+    var cursor: Cursor = .{};
+    var passes: u32 = 0;
+    while (try fixture.count("/pulls/n1/") > constants.pulls_per_node_max) {
+        _ = try prune(&ctx, &cursor, fixture.manual.ms);
+        passes += 1;
+        try testing.expect(passes <= 4);
+    }
+    const kept = try fixture.count("/pulls/n1/");
+    try testing.expectEqual(@as(usize, constants.pulls_per_node_max), kept);
+    // A higher index finished later, so the newest hundred are the last hundred written.
+    const newest = records.pull_key("n1", "b3:000008fb"); // Index 2299.
+    const got = try ctx.store.get(ctx.arena, newest.slice(), null, ctx.diag);
+    try testing.expect(got.kv != null);
+    const oldest = records.pull_key("n1", "b3:00000000");
+    const gone = try ctx.store.get(ctx.arena, oldest.slice(), null, ctx.diag);
+    try testing.expect(gone.kv == null);
 }

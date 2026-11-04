@@ -3,7 +3,7 @@
 // (1) the text helpers agree with the CLI's golden text (src/cli_stats.zig), and (2) the mock
 // answers GET /v1/stats/pull as docs/api.md says: empty before any image starts, then one record
 // per (node, tree), the second node's pull coming from a peer and not the registry.
-import { bytesText, treeShort, tookText, peersText, sourcesText } from "../web/js/pulls_text.js";
+import { bytesText, treeShort, tookText, peersText, sourcesText, moreText } from "../web/js/pulls_text.js";
 import { startMock } from "../web/mock/index.js";
 
 function fail(message) { console.error(`pulls check: ${message}`); process.exit(1); }
@@ -14,8 +14,12 @@ equal(bytesText(0), "0B", "zero");
 equal(bytesText(48 * 1048576), "48Mi", "48 MiB");
 equal(treeShort("b3:51aa9c03"), "b3:51aa9c03", "a short digest stays whole");
 equal(treeShort("b3:" + "ab".repeat(32)), "b3:" + "ab".repeat(6) + "...", "a long digest is cut at 15 bytes");
-equal(tookText(0, 4000), "4.0s", "took");
+equal(tookText(0, 4000), "4s", "took, whole seconds");
 equal(tookText(0, 42000), "42s", "took, ten seconds or more");
+equal(tookText(1000, 3500), "2.5s", "took, one decimal as the CLI shows it");
+equal(tookText(0, 250), "0.2s", "took, the decimal is cut, not rounded");
+equal(moreText(2, { matched: 5, truncated: true }), "3 more not shown; the server read only part of the records", "more text");
+equal(moreText(2, { matched: 2, truncated: false }), "", "nothing more");
 const pull = { registry_bytes: 1048576, peer_bytes: [{ peer: "node2", bytes: 2097152 }], cached_bytes: 0, bad_peers: [] };
 equal(peersText(pull), "node2=2Mi", "peers text");
 equal(sourcesText(pull), "1Mi from the registry, 2Mi from node2, 0B already held", "sources text");

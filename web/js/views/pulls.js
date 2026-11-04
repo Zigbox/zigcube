@@ -4,7 +4,7 @@
 import { h, setText, rebuild, copyButton, emptyState, timeEl, plural } from "../ui.js";
 import { diagnosticBlock } from "../diag.js";
 import { pageHead } from "./parts.js";
-import { bytesText, treeShort, tookText, peersTotal, peersText, sourcesText } from "../pulls_text.js";
+import { bytesText, treeShort, tookText, peersTotal, peersText, sourcesText, moreText } from "../pulls_text.js";
 
 const REFRESH_MS = 10000;
 const filter = { node: "" };
@@ -55,7 +55,7 @@ export function pulls({ client, model }) {
     const list = all.filter(p => !q || p.node.toLowerCase().includes(q));
     const sig = JSON.stringify([list.map(p => [p.node, p.tree, p.finished_at_ms]), [...open]]);
     rebuild(body, sig, () => rows(list));
-    setText(count, data ? `${list.length} of ${plural(all.length, "pull")}${data.skipped ? `, ${data.skipped} unreadable` : ""}` : "Loading…", { flash: false });
+    setText(count, data ? `${list.length} of ${plural(all.length, "pull")}${data.skipped ? `, ${data.skipped} unreadable` : ""}${moreText(all.length, data) ? `; ${moreText(all.length, data)}` : ""}` : "Loading…", { flash: false });
     rebuild(slot, JSON.stringify([!!data, all.length, list.length, !!error]), () => {
       if (error) return error.diagnostics.map(d => diagnosticBlock(d, { origin: error.origin === "console" ? "raised by the console" : null, requestId: error.requestId }));
       if (!data) return [];

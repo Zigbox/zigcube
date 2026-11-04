@@ -54,6 +54,10 @@ pub const SwitchedStore = struct {
     /// A transaction that puts a key under this prefix is answered, and refused (ZC-E0504), as a
     /// server that has no such endpoint does; test-only, null in every simulation.
     refuse_put_prefix: ?[]const u8 = null,
+    /// A transaction that puts or deletes a key under this prefix fails as a server that cannot
+    /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
+    /// simulation.
+    down_write_prefix: ?[]const u8 = null,
     calls: u32 = 0,
 
     const vtable: store.Store.VTable = .{
@@ -140,6 +144,19 @@ pub const SwitchedStore = struct {
                 if (op != .put) continue;
                 if (!std.mem.startsWith(u8, op.put.key, prefix)) continue;
                 @import("agent_client.zig").raise_bad_reply(diag, "the server refused the write");
+                return error.BackendFailed;
+            }
+        }
+        if (self.down_write_prefix) |prefix| {
+            for (request.on_success) |op| {
+                const key = switch (op) {
+                    .put => |put| put.key,
+                    .delete => |deleted| deleted,
+                };
+                if (!std.mem.startsWith(u8, key, prefix)) continue;
+                diag.raise(.E0201);
+                diag.cause("connection refused", .{});
+                diag.fix(.{ .sentence = "switch it back on" });
                 return error.BackendFailed;
             }
         }

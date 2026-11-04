@@ -38,6 +38,8 @@ pub const Driver = struct {
     /// The guard, if the store is wrapped in one: a failed save of its pair is reported here.
     verified: ?*store_verified.VerifiedStore = null,
     saving_reported: bool = false,
+    /// Whether a failing pull-retention pass has been said (once, until it recovers).
+    pulls_reported: bool = false,
     /// Steps that ran, for tests and the status line.
     steps: std.atomic.Value(u64) = .init(0),
 
@@ -86,7 +88,28 @@ pub const Driver = struct {
     fn step(driver: *Driver, ctx: *const controller.Context) controller.Error!controller.Wakeup {
         _ = try driver.store.status(ctx.diag);
         driver.report_saving();
-        return driver.plane.reconcile(ctx);
+        const wake = try driver.plane.reconcile(ctx);
+        driver.report_pull_retention();
+        return wake;
+    }
+
+    /// Pull records are statistics: a retention pass that fails never fails the step, so it is
+    /// said once when it starts failing and once when it stops.
+    fn report_pull_retention(driver: *Driver) void {
+        const cursor = &driver.plane.replicas.pulls;
+        if (cursor.failing == driver.pulls_reported) return;
+        driver.pulls_reported = cursor.failing;
+        if (!driver.report_failures) return;
+        var buffer: [160]u8 = undefined;
+        const line = if (cursor.failing)
+            std.fmt.bufPrint(
+                &buffer,
+                "zcube-server: pull-record retention failed ({s}); retrying later, nothing waits\n",
+                .{@tagName(cursor.failure_code.?)},
+            ) catch return
+        else
+            "zcube-server: pull-record retention works again\n";
+        std.Io.File.stderr().writeStreamingAll(driver.io, line) catch {};
     }
 
     /// A pair that cannot be saved (`ZC-E0216`) is shown once when it starts, and once when it

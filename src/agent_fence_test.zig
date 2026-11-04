@@ -377,3 +377,28 @@ test "a server that refuses the image summary does not stop the replicas" {
     try testing.expectEqual(world.agent.lease, world.agent.store_lease);
     try testing.expectEqual(@as(u32, 2), world.running_count("hello"));
 }
+
+test "a pull record the server cannot take does not hold replica work back" {
+    // Goal: statistics never block replicas (the publish runs after the replica pass). Method:
+    // leave a good record, make every put under /pulls/ fail as an unreachable server does,
+    // apply a service: its replicas run anyway, and the record stays for a later step, which
+    // stores it once the server answers.
+    const world = try sim_world.World.create(testing.allocator, 6, &sim_runtime.default_fixtures);
+    defer world.destroy();
+    const files = world.files.interface();
+    const record =
+        \\{"v":1,"node":"node1","tree":"b3:51aa9c03","registry_bytes":7,"finished_at_ms":9}
+    ;
+    try files.put_atomic("containers/stray-1/pull.json", record);
+    world.switched.down_write_prefix = "/pulls/";
+    _ = try world.apply(hello);
+    world.advance(5_000);
+    try testing.expectEqual(@as(u32, 2), world.running_count("hello"));
+    try testing.expect(world.stats.agent_failures > 0);
+    const arena = world.fresh_arena();
+    _ = try files.read(arena, "containers/stray-1/pull.json");
+    world.switched.down_write_prefix = null;
+    world.advance(5_000);
+    try testing.expectError(error.Absent, files.read(arena, "containers/stray-1/pull.json"));
+    try testing.expectEqual(@as(u32, 2), world.running_count("hello"));
+}

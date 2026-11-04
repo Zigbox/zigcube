@@ -200,10 +200,13 @@ What pulls moved, by source: the `/pulls/` records of keys.md, newest `finished_
 { "pulls": [ { "v": 1, "node": "node1", "tree": "b3:51aa9c03…", "registry_bytes": 1048576,
   "peer_bytes": [{"peer": "node2", "bytes": 2097152}], "cached_bytes": 0,
   "started_at_ms": 1700000000000, "finished_at_ms": 1700000004000, "bad_peers": [] } ],
-  "skipped": 0, "revision": 512 }
+  "skipped": 0, "matched": 1, "truncated": false, "revision": 512 }
 ```
 
-`node` limits the answer to one node; `limit` defaults to 50 and is at most 500 (above it, or
+`matched` is how many records were read before `limit` cut the list, and `truncated` is `true`
+when the server stopped reading at `pulls_read_max` (1,000) records, which it reads in key order
+(by node): the answer is then part of the picture, never a failure (it was `ZC-E0302` before).
+Both are additive members of version 1. `node` limits the answer to one node; `limit` defaults to 50 and is at most 500 (above it, or
 0, is `400` `ZC-E0104`, as is a `node` that is not a node name). The read is tolerant: a record
 that is malformed or newer than the server's reader counts in `skipped` and is left out. Reads
 need no auth beyond the server's own.
@@ -535,10 +538,12 @@ the node. The body is the agent's tenure (the revision of its registration, as f
 ```
 
 Answer `{"revision": 434, "chain": …}`. One transaction under the node's tenure compare. Refusals:
-`v` other than 1, `node` other than `{node}`, an empty `tree`, more than `pull_peers_max` peers,
-or a body over `pull_request_bytes_max` (8 KiB) are `400` `ZC-E0104`; a tenure that has ended is
-`503` `ZC-E0510`. A server older than C2 slice 7 answers `404` (`ZC-E0504`): the agent notes it
-once, drops the file and goes on.
+`v` other than 1, `node` other than `{node}`, an empty `tree`, a peer name (in `peer_bytes` or `bad_peers`) that is not a node name, more than `pull_peers_max`
+peers, a record that encodes past `pull_record_bytes_max` (4 KiB), or a body over
+`pull_request_bytes_max` (8 KiB) are `400` `ZC-E0104`; a tenure that has ended is
+`503` `ZC-E0510`. A server older than C2 slice 7 answers `404` (`ZC-E0504`): the agent drops the
+file without saying so, and goes on (statistics are never worth holding replica work back; a
+server that cannot be reached leaves the file for the next step).
 
 ### `GET /v1/agent/nodes/{node}/replicas`
 

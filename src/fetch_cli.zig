@@ -719,6 +719,32 @@ fn real_ms(io: std.Io) u64 {
     return @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
 }
 
+/// The peers a pull's record names, as (with bytes, struck): a peer whose name is not a node
+/// name is left out, because the server refuses the record for it (ZC-E0104) and the name is
+/// printed on a terminal.
+fn report_peers(
+    named: []const Peer,
+    report: *const fetch_worker.Report,
+    peers: []records.PullPeer,
+    bad: [][]const u8,
+) [2]usize {
+    var peer_count: usize = 0;
+    var bad_count: usize = 0;
+    for (named, 0..) |who, at| {
+        if (records.name_problem(who.name, constants.node_name_bytes_max) != null) continue;
+        if (peer_count < peers.len and report.peer_bytes[at] > 0) {
+            peers[peer_count] = .{ .peer = who.name, .bytes = report.peer_bytes[at] };
+            peer_count += 1;
+        }
+        const struck = (report.struck_peers >> @intCast(at)) & 1 != 0;
+        if (struck and bad_count < bad.len) {
+            bad[bad_count] = who.name;
+            bad_count += 1;
+        }
+    }
+    return .{ peer_count, bad_count };
+}
+
 /// Writes `report` as a `records.Pull` to `parsed.report`, through a temporary file and a rename,
 /// so the agent never reads half of it. A failure is said on stderr and changes nothing else: the
 /// fetch worked, and only its statistics are lost.
@@ -732,19 +758,9 @@ fn write_report(
     const io = net.io;
     var peers: [constants.fetch_peers_max]records.PullPeer = undefined;
     var bad: [constants.fetch_peers_max][]const u8 = undefined;
-    var peer_count: usize = 0;
-    var bad_count: usize = 0;
-    for (net.peers, 0..) |who, at| {
-        if (peer_count < peers.len and report.peer_bytes[at] > 0) {
-            peers[peer_count] = .{ .peer = who.name, .bytes = report.peer_bytes[at] };
-            peer_count += 1;
-        }
-        const struck = (report.struck_peers >> @intCast(at)) & 1 != 0;
-        if (struck and bad_count < bad.len) {
-            bad[bad_count] = who.name;
-            bad_count += 1;
-        }
-    }
+    const counts = report_peers(net.peers, report, &peers, &bad);
+    const peer_count = counts[0];
+    const bad_count = counts[1];
     const record: records.Pull = .{
         .node = parsed.node,
         .tree = parsed.digest,
@@ -1082,6 +1098,26 @@ test "a --peer with a name that is not a node name is left out, the rest are kep
     const said = describe_skipped(&line, .{ .bad_name = parsed.peers_skipped });
     try std.testing.expect(std.mem.find(u8, said, "2 with a name") != null);
     try std.testing.expectEqualStrings("", describe_skipped(&line, .{}));
+}
+
+test "a pull report leaves out a peer whose name is not a node name" {
+    // Goal: no control byte or bad name reaches the record. Method: three peers all gave bytes
+    // and were struck; the one named with an escape sequence is dropped from both lists.
+    const unused = try IpAddress.parse("127.0.0.1", 1);
+    const named = [_]Peer{
+        .{ .name = "node1", .address = unused },
+        .{ .name = "node2\x1b[2J", .address = unused },
+        .{ .name = "node3", .address = unused },
+    };
+    var report: fetch_worker.Report = .{ .struck_peers = 0b111 };
+    @memset(report.peer_bytes[0..3], 7);
+    var peers: [3]records.PullPeer = undefined;
+    var bad: [3][]const u8 = undefined;
+    const counts = report_peers(&named, &report, &peers, &bad);
+    try std.testing.expectEqual(@as(usize, 2), counts[0]);
+    try std.testing.expectEqual(@as(usize, 2), counts[1]);
+    try std.testing.expectEqualStrings("node3", peers[1].peer);
+    try std.testing.expectEqualStrings("node3", bad[1]);
 }
 
 test "a reply's status is read from a complete status line" {

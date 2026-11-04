@@ -35,7 +35,17 @@ const Pull = struct {
     bad_peers: []const []const u8 = &.{},
 };
 
-const Reply = struct { pulls: []const Pull, skipped: u32 = 0, revision: u64 = 0 };
+const Reply = struct {
+    pulls: []const Pull,
+    skipped: u32 = 0,
+    /// How many records the server read before `limit`, and whether it stopped at its own cap.
+    matched: u32 = 0,
+    truncated: bool = false,
+    revision: u64 = 0,
+};
+
+/// How many pulls the table asks for (the server's default, said explicitly).
+const pulls_shown_max: u32 = 50;
 
 const parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
 
@@ -51,10 +61,13 @@ pub fn pull(
     report: *Report,
 ) Error!void {
     const arena = env.arena;
+    const limit = try std.fmt.allocPrint(arena, "limit={d}", .{pulls_shown_max});
     const path = if (node) |name|
-        try std.fmt.allocPrint(arena, "/v1/stats/pull?node={s}", .{name})
+        try std.fmt.allocPrint(arena, "/v1/stats/pull?node={s}&{s}", .{
+            try cli_data.percent_encode(arena, name), limit,
+        })
     else
-        "/v1/stats/pull";
+        try std.fmt.allocPrint(arena, "/v1/stats/pull?{s}", .{limit});
     const reply = try client.get(path, report);
     const body = std.json.parseFromSliceLeaky(Reply, arena, reply.body, parse_options) catch
         return cli_data.contract(report, reply.request_id, "is not a list of pulls");
@@ -81,11 +94,26 @@ pub fn text(arena: Allocator, body: *const Reply, wide: bool) Error![]const u8 {
     };
     cli_view.write_table(&out.writer, if (wide) wider else narrow, cells.items) catch
         return error.OutOfMemory;
+    try notes(&out.writer, body);
+    return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
+/// The lines under the table: what could not be read, and what is not shown.
+fn notes(writer: *Writer, body: *const Reply) Error!void {
     if (body.skipped > 0) {
-        out.writer.print("{d} records could not be read\n", .{body.skipped}) catch
+        const noun = if (body.skipped == 1) "record" else "records";
+        writer.print("{d} {s} could not be read\n", .{ body.skipped, noun }) catch
             return error.OutOfMemory;
     }
-    return out.toOwnedSlice() catch error.OutOfMemory;
+    const shown: u32 = @intCast(body.pulls.len);
+    if (body.matched > shown) {
+        writer.print("{d} more not shown\n", .{body.matched - shown}) catch
+            return error.OutOfMemory;
+    }
+    if (body.truncated) {
+        writer.writeAll("the server read only part of the records\n") catch
+            return error.OutOfMemory;
+    }
 }
 
 fn row(arena: Allocator, item: *const Pull, wide: bool) Error![]const []const u8 {
@@ -140,18 +168,25 @@ test "the table shortens a long digest, sums the peers, and wide says it all" {
         .finished_at_ms = 3500,
         .bad_peers = &.{"node3"},
     }};
-    const body: Reply = .{ .pulls = &pulls, .skipped = 1, .revision = 9 };
+    const body: Reply = .{
+        .pulls = &pulls,
+        .skipped = 1,
+        .matched = 4,
+        .truncated = true,
+        .revision = 9,
+    };
     const narrow = try text(arena, &body, false);
     try std.testing.expectEqualStrings(
         "NODE   TREE                REGISTRY  PEERS  CACHED  TOOK  BAD PEERS\n" ++
             "node2  b3:abababababab...  3Mi       3Ki    0B      2.5s  node3\n" ++
-            "1 records could not be read\n",
+            "1 record could not be read\n3 more not shown\n" ++
+            "the server read only part of the records\n",
         narrow,
     );
     const wide = try text(arena, &body, true);
     try std.testing.expect(std.mem.indexOf(u8, wide, long) != null);
-    const tail = "node1=1Ki,node3=2Ki\n1 records could not be read\n";
-    try std.testing.expect(std.mem.endsWith(u8, wide, tail));
+    const tail = "node1=1Ki,node3=2Ki\n1 record could not be read\n3 more not shown\n";
+    try std.testing.expect(std.mem.indexOf(u8, wide, tail) != null);
     const empty = try text(arena, &.{ .pulls = &.{} }, false);
     try std.testing.expectEqualStrings("no pulls have been recorded\n", empty);
 }

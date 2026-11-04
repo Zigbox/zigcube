@@ -32,7 +32,8 @@ export function createMockTransport(engine, faults) {
       if (path === "/v1/stats/pull") {
         const limit = Number(q.get("limit") ?? 50);
         if (!(limit >= 1 && limit <= 500)) return fail(400, [diagBadRequest("limit", "must be from 1 to 500")], requestId);
-        return reply(200, { pulls: engine.pullList(q.get("node"), limit), skipped: 0, revision: engine.rev }, requestId);
+        const pulls = engine.pullList(q.get("node"), limit);
+        return reply(200, { pulls, skipped: 0, matched: engine.pullList(q.get("node"), 500).length, truncated: false, revision: engine.rev }, requestId);
       }
       if (path === "/v1/leases") return reply(200, leases(), requestId);
       if (path === "/v1/watch") return await watch(q, signal, requestId);

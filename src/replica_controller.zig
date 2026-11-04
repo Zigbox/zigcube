@@ -127,7 +127,8 @@ pub const ReplicaController = struct {
             rc.retention.due_ms = try retention.prune(ctx, &rc.retention, &snapshot, now);
         }
         if (now >= rc.pulls.due_ms) {
-            rc.pulls.due_ms = try pull_retention.prune(ctx, &rc.pulls, now);
+            // Statistics: a failed pass is recorded and retried later, never the step's failure.
+            rc.pulls.due_ms = pull_retention.prune_or_back_off(ctx, &rc.pulls, now);
         }
         const again = run.more or run.acted > 0;
         var wake_at = @min(now + resync_ms, run.wake_at_ms);

@@ -169,6 +169,8 @@ pub const pull_request_bytes_max: u32 = 8 * 1024;
 pub const pulls_per_step_max: u32 = 8;
 /// How often the controller looks for pull records to drop.
 pub const pulls_interval_ms: u32 = 5 * 60 * 1000;
+/// How long retention of pull records waits after a pass failed, before the next try.
+pub const pulls_retry_ms: u32 = 60 * 1000;
 /// How often the controller looks for decisions to drop.
 pub const retention_interval_ms: u32 = 60 * 1000;
 pub const retention_batch_pairs: u32 = store_txn_ops_max / 2;
@@ -643,5 +645,28 @@ comptime {
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }
 
-/// `GET /v1/stats/pull` reads at most this many pull records (nodes_max nodes at their retention).
-pub const pulls_read_max: u32 = nodes_max * pulls_per_node_max;
+/// The most a validated pull record encodes to: the fixed fields (node, tree, four numbers, with
+/// escapes) under 512 bytes, and `pull_peers_max` peers each in `peer_bytes` (a node name and a
+/// byte count, about 110 bytes) and in `bad_peers` (a node name, 70). The agent endpoint refuses
+/// a record that would encode larger, so this bounds what `/pulls/` holds.
+pub const pull_record_bytes_max: u32 = 4 * 1024;
+
+/// What reading one pull record costs `GET /v1/stats/pull`'s arena at most: its key, its value,
+/// the parsed record's strings and slices, and the entry that holds them (an arena frees nothing,
+/// so the list's growth is counted in the slack).
+pub const pull_read_arena_bytes: u32 =
+    store_key_bytes_max + 2 * pull_record_bytes_max + 1024;
+
+/// `GET /v1/stats/pull` reads at most this many pull records, ascending by node, then says
+/// `truncated`. Retention keeps up to `nodes_max` x `pulls_per_node_max` (6,400) records, which
+/// the request arena cannot hold at the worst case; this is what it can (checked below).
+pub const pulls_read_max: u32 = 1000;
+
+comptime {
+    // The response is at most `api_list_limit_max` records, written into a buffer that doubles.
+    const response = 2 * api_list_limit_max * pull_record_bytes_max;
+    assert(pulls_read_max * pull_read_arena_bytes + response + 64 * 1024 <=
+        request_arena_bytes_max);
+    assert(pull_record_bytes_max > 512 + pull_peers_max * (110 + 70));
+    assert(pulls_read_max >= api_list_limit_max);
+}

@@ -7,6 +7,7 @@ const testing = std.testing;
 const api_mod = @import("api.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
+const constants = @import("constants.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -597,6 +598,8 @@ test "stats pull lists the pulls newest first, by node, with a limit, and counts
     const peer = field(pulls[0], "peer_bytes").array.items[0];
     try testing.expectEqualStrings("node2", field(peer, "peer").string);
     try testing.expectEqual(@as(i64, 2), field(all, "skipped").integer);
+    try testing.expectEqual(false, field(all, "truncated").bool);
+    try testing.expectEqual(@as(i64, 3), field(all, "matched").integer);
 
     const mine = try rig.ok("/v1/stats/pull", "node=node1");
     try testing.expectEqual(@as(usize, 2), field(mine, "pulls").array.items.len);
@@ -604,6 +607,27 @@ test "stats pull lists the pulls newest first, by node, with a limit, and counts
     try testing.expectEqual(@as(usize, 1), field(one, "pulls").array.items.len);
     const none = try rig.ok("/v1/stats/pull", "node=node9");
     try testing.expectEqual(@as(usize, 0), field(none, "pulls").array.items.len);
+}
+
+test "stats pull stops at its read cap and says truncated instead of failing" {
+    // Goal: more records than the cap (retention is eventual, so a cluster can hold them) is a
+    // partial answer, not ZC-E0302. Method: cap + 5 pulls on two nodes; ask for 500; the reply
+    // lists 500, matched is the cap, truncated is true, and a node-limited read is complete.
+    var rig = try Rig.start(8);
+    defer rig.stop();
+    const total = constants.pulls_read_max + 5;
+    for (0..total) |at| {
+        var tree: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at});
+        try put_pull(&rig, if (at < 10) "node2" else "node1", name, 1000 + at, 1);
+    }
+    const reply = try rig.ok("/v1/stats/pull", "limit=500");
+    try testing.expectEqual(@as(usize, 500), field(reply, "pulls").array.items.len);
+    try testing.expectEqual(@as(i64, constants.pulls_read_max), field(reply, "matched").integer);
+    try testing.expectEqual(true, field(reply, "truncated").bool);
+    const small = try rig.ok("/v1/stats/pull", "node=node2");
+    try testing.expectEqual(false, field(small, "truncated").bool);
+    try testing.expectEqual(@as(usize, 10), field(small, "pulls").array.items.len);
 }
 
 test "stats pull refuses a bad node, a bad limit, an unknown parameter and an unknown kind" {
@@ -651,4 +675,26 @@ test "the agent publishes the pull records its fetches left, and removes every f
     for (names) |name| {
         try testing.expectError(error.Absent, files.read(ctx.arena, name));
     }
+}
+
+test "a pull retention pass that fails is recorded and does not fail the controller step" {
+    // Goal: statistics never hold replica work back. Method: an old pull record, every delete under
+    // /pulls/ failing as an unreachable server does; the server steps without error, the replicas
+    // of an applied service are placed, and the cursor says what failed and backs off; once the
+    // store answers, the record is dropped and the failure is cleared.
+    var rig = try Rig.start(7);
+    defer rig.stop();
+    try put_pull(&rig, "node1", "b3:00000001", 100, 1);
+    rig.world.switched.down_write_prefix = "/pulls/";
+    _ = try rig.world.apply(hello);
+    rig.world.advance(3000);
+    const cursor = &rig.world.server.replicas.pulls;
+    try testing.expect(cursor.failing);
+    try testing.expect(cursor.failures > 0);
+    try testing.expectEqual(codes.Code.E0201, cursor.failure_code.?);
+    try testing.expectEqual(@as(u32, 2), rig.world.running_count("hello"));
+    rig.world.switched.down_write_prefix = null;
+    rig.world.advance(constants.pulls_retry_ms + 3000);
+    try testing.expect(!cursor.failing);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
 }

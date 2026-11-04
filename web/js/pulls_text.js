@@ -12,10 +12,20 @@ export function bytesText(n) {
 /** The digest cut to 15 bytes and "..." as the CLI does; the full value stays one click away. */
 export function treeShort(tree) { return tree.length > 15 ? `${tree.slice(0, 15)}...` : tree; }
 
-/** Seconds, one decimal under ten, as `took`. */
+/** Seconds as the CLI shows them: whole ("4s") or with one truncated decimal ("2.5s"). */
 export function tookText(startedMs, finishedMs) {
   const ms = Math.max(0, finishedMs - startedMs);
-  return ms < 10000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${Math.floor(ms / 1000)}.${Math.floor((ms % 1000) / 100)}s`;
+}
+
+/** The line under a list that shows part of what was read, as the CLI says it; "" if complete. */
+export function moreText(shown, data) {
+  const more = Math.max(0, (data.matched ?? shown) - shown);
+  const parts = [];
+  if (more > 0) parts.push(`${more} more not shown`);
+  if (data.truncated) parts.push("the server read only part of the records");
+  return parts.join("; ");
 }
 
 /** Total bytes the peers gave. */
