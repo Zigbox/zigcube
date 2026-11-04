@@ -1,0 +1,5 @@
+error[ZC-E0811]: a certificate is expired or not yet valid
+  cause  node2's certificate was refused: it has expired
+  fix    check the clocks on both sides, then ask for a new certificate   timedatectl
+  more   zcube explain E0811 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0811.html

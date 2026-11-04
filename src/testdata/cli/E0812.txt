@@ -1,0 +1,5 @@
+error[ZC-E0812]: a certificate names another server than the one asked for
+  cause  broker.botpike.com's certificate is for another server
+  fix    check that both sides use this cluster's CA (docs/peer.md)
+  more   zcube explain E0812 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0812.html

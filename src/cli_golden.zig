@@ -28,6 +28,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const x509 = @import("x509.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -430,6 +431,26 @@ fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
     );
 }
 
+fn x509_refused(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.BadSan, "node2");
+}
+
+fn x509_unsigned(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.BadSignature, "node2");
+}
+
+fn x509_expired(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.Expired, "node2");
+}
+
+fn x509_wrong_server(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.WrongName, "broker.botpike.com");
+}
+
+fn x509_not_issued(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.TooManyLabels, "broker-1");
+}
+
 fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
     fetch_plan.raise_blame(diag, .{ .peer = 0, .chunk = 4 }, "node2", 24);
 }
@@ -599,6 +620,11 @@ const cases = [_]Case{
     relayed(.E0806, peer_key_file),
     relayed(.E0807, peer_removed),
     relayed(.E0808, peer_limited),
+    relayed(.E0809, x509_refused),
+    relayed(.E0810, x509_unsigned),
+    relayed(.E0811, x509_expired),
+    relayed(.E0812, x509_wrong_server),
+    relayed(.E0817, x509_not_issued),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

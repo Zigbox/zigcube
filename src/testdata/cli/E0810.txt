@@ -1,0 +1,6 @@
+error[ZC-E0810]: a certificate is not signed by the pinned CA
+  cause  node2's certificate was refused: its signature does not verify under
+         the pinned CA key
+  fix    check that both sides use this cluster's CA (docs/peer.md)
+  more   zcube explain E0810 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0810.html

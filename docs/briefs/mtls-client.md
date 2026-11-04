@@ -310,8 +310,8 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
   chosen by the caller. It is the cluster CA by default, and a relay's upstream may pin its own
   anchor in cluster configuration. Only Ed25519 server leaves signed directly by that anchor are
   accepted; there is no public-CA, RSA or ECDSA support. Botpike's broker will present an Ed25519
-  certificate on the relay port; JDK 21 can serve one. The owner is told that this is the
-  contract. The client API names the parameter `anchor`, not "cluster CA".
+  certificate on the relay port; JDK 21 can serve one. Botpike confirmed this contract (owner,
+  2026-11-04). The client API names the parameter `anchor`, not "cluster CA".
 - **Q2. ChaCha20-Poly1305.** No.
 - **Q3. External programs.** Approved, test-only. The owner's B3 acceptance requires a stock JVM
   server, which is the spec naming the programs. Slice 7 records this in a decision file:
