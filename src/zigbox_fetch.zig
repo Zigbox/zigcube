@@ -145,6 +145,7 @@ pub fn receive(
     allocator: Allocator,
     images: *ZigboxImages,
     tree: Digest,
+    expected_manifest: Sha256,
     bytes: []const u8,
 ) ReceiveError!Received {
     var cursor: Cursor = .{ .bytes = bytes };
@@ -156,7 +157,20 @@ pub fn receive(
     const length = cursor.int(u32) orelse return error.BadBundle;
     const record = cursor.take(length) orelse return error.BadBundle;
     if (cursor.at != bytes.len or record.len == 0) return error.BadBundle;
+    // A peer's record for another image is a bad bundle now, not after every chunk is fetched:
+    // the next peer is tried and this one is struck. `import_image` still decides at the end.
+    if (!record_names(record, expected_manifest)) return error.BadBundle;
     return .{ .chunks = chunks, .record = record };
+}
+
+/// Whether the image record `record` names `manifest`: Zigbox writes the line
+/// `    .manifest = "sha256:HEX",` (`images.zig`), and a bundle's record comes from `export_image`.
+fn record_names(record: []const u8, manifest: Sha256) bool {
+    var needle: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&needle, "\n    .manifest = \"{s}\",\n", .{
+        &manifest.text(),
+    }) catch unreachable; // The line is 92 bytes.
+    return std.mem.indexOf(u8, record, line) != null;
 }
 
 fn receive_trees(images: *ZigboxImages, tree: Digest, cursor: *Cursor) ReceiveError!void {
@@ -268,7 +282,16 @@ pub fn fetch(
     const buffer = try allocator.alloc(u8, bundle_bytes_max);
     defer allocator.free(buffer);
     defer images.end_claims();
-    const got = try find_bundle(allocator, transport, images, tree, peers, buffer, report);
+    const got = try find_bundle(
+        allocator,
+        transport,
+        images,
+        tree,
+        expected_manifest,
+        peers,
+        buffer,
+        report,
+    );
     defer allocator.free(got.chunks);
     report.chunks = @intCast(got.chunks.len);
     try fetch_chunks(allocator, transport, images, got.chunks, peers, config, deadline, report);
@@ -286,6 +309,7 @@ fn find_bundle(
     transport: fetch_worker.Transport,
     images: *ZigboxImages,
     tree: Digest,
+    expected_manifest: Sha256,
     peers: []const fetch_worker.PeerInfo,
     buffer: []u8,
     report: *Report,
@@ -295,7 +319,7 @@ fn find_bundle(
     for (0..asked) |index| {
         const source: fetch_plan.Source = .{ .peer = @intCast(index) };
         const bytes = transport.bundle_fn(transport.context, source, &text, buffer) orelse continue;
-        if (receive(allocator, images, tree, bytes)) |got| {
+        if (receive(allocator, images, tree, expected_manifest, bytes)) |got| {
             return got;
         } else |err| {
             images.end_claims();
@@ -410,8 +434,11 @@ const Rig = struct {
     from: *ZigboxImages,
     allocator: Allocator,
     /// 0 serves honestly; 1 flips a bit in every chunk; 2 serves a bundle for another manifest's
-    /// tree record (the first tree record's digest changed).
+    /// tree record (the first tree record's digest changed); 3 spoils the image record of the
+    /// first bundle it serves.
     mode: u8 = 0,
+    /// Bundles asked for so far (mode 3 spoils the first only).
+    bundles: u32 = 0,
     clock: u64 = 1000,
     bad: u32 = 0,
     chunks_served: u32 = 0,
@@ -426,6 +453,12 @@ const Rig = struct {
         const wanted = Digest.parse(text) orelse return null;
         const made = encode(rig.allocator, rig.from, wanted, out) orelse return null;
         if (rig.mode == 2) out[magic.len + 4] ^= 1; // The first tree's digest, one bit off.
+        rig.bundles += 1;
+        if (rig.mode == 3 and rig.bundles == 1) {
+            // The image record names another manifest: one digit of it changed.
+            const at = std.mem.indexOf(u8, made, ".manifest = \"sha256:").?;
+            out[at + ".manifest = \"sha256:".len] ^= 1;
+        }
         return made;
     }
 
@@ -549,7 +582,9 @@ test "zigbox fetch: a record for another manifest is refused and the tree is not
     var report: Report = undefined;
     const other = Sha256.parse(images_mod.other_manifest_text).?;
     const got = run_rig(&rig, &to_b, pair.tree, other, &report);
-    try testing.expectError(error.Refused, got);
+    try testing.expectError(error.TreeUnavailable, got); // A bad bundle, whatever the chunks.
+    try testing.expectEqual(@as(u32, 1), rig.bad);
+    try testing.expectEqual(@as(u32, 0), rig.chunks_served);
     var listing: [8]zigbox.store.roots.Root = undefined;
     var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
     const rooted = try zigbox.store.roots.list(&pair.b, &names, &listing);
@@ -612,8 +647,9 @@ test "zigbox fetch: every cut of a bundle is refused, never read past" {
     const out = try testing.allocator.alloc(u8, 1 << 20);
     defer testing.allocator.free(out);
     const whole = encode(testing.allocator, &from_a, pair.tree, out).?;
+    const manifest = Sha256.parse(images_mod.manifest_text).?;
     for (0..whole.len) |cut| {
-        const got = receive(testing.allocator, &to_b, pair.tree, whole[0..cut]);
+        const got = receive(testing.allocator, &to_b, pair.tree, manifest, whole[0..cut]);
         try testing.expectError(error.BadBundle, got);
         to_b.end_claims();
     }
@@ -671,4 +707,32 @@ test "zigbox fetch: a second image that shares files with a held one is fetched"
     var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
     const rooted = try zigbox.store.roots.list(&pair.b, &names, &listing);
     try testing.expectEqual(@as(usize, 2), rooted.count);
+}
+
+test "zigbox fetch: a record naming another manifest strikes the peer, the next is asked" {
+    // Goal: S2. The record is checked when the bundle arrives: the chunks of a bundle that can
+    // never be rooted are not fetched, the peer is struck, and the next peer's bundle is taken.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try rigged(&pair, &tmp);
+    defer pair.deinit();
+    var from_a = try ZigboxImages.open(testing.allocator, &pair.a);
+    defer from_a.close();
+    var to_b = try ZigboxImages.open(testing.allocator, &pair.b);
+    defer to_b.close();
+    var rig: Rig = .{ .from = &from_a, .allocator = testing.allocator, .mode = 3 };
+    var report: Report = undefined;
+    const expected = Sha256.parse(images_mod.manifest_text).?;
+    const two = [_]fetch_worker.PeerInfo{
+        .{ .name = "node1", .filter = &filter_all },
+        .{ .name = "node2", .filter = &filter_all },
+    };
+    const transport = rig.transport();
+    try fetch(testing.allocator, transport, &to_b, pair.tree, expected, &two, .{}, &report);
+    try testing.expectEqual(@as(u32, 1), rig.bad);
+    try testing.expectEqual(@as(u64, 1), report.struck_peers); // Bit 0: the first peer.
+    try testing.expectEqual(@as(u32, 1), report.bad_bundles);
+    const name = pair.tree.text();
+    try testing.expect(to_b.images().has(&name));
 }
