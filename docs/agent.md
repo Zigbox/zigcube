@@ -187,7 +187,7 @@ cannot lock honest peers out, and a client that finds every serving slot taken g
 (busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
 without a strike against the peer.
 
-**Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. `Shell.images` is still null in Zigbox mode, so the node's chunk summary (the filter peers see) is not yet reported from the Zigbox store: peers ask it and fall back to the registry or the next peer.
+**Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. The agent's summary pass (the trees and chunk filter it reports, which the scheduler's locality uses) reads the same Zigbox store on the agent's thread (`ZigboxImages`), so a tree `pull` or a swarm fetch puts there is reported at the next summary; the store is opened in Zigbox mode whether or not `--peer-listen` is given.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the

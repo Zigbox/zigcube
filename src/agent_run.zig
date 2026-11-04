@@ -43,6 +43,7 @@ const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
 const dir_images = @import("dir_images.zig");
+const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
 const failures = @import("store_failures.zig");
 const store = @import("store.zig");
@@ -375,9 +376,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     swarm.start(init, gpa, config) catch |what|
         return fail_start(io, &diag, config.verbose, @errorName(what));
     var shell: Shell = .{
-        .images = if (swarm.has_store)
-            swarm.store.images()
-        else if (config.runtime == .fake) fake_images.images() else null,
+        .images = node_images(&swarm, config, &fake_images),
         .io = io,
         .clock = real.clock(),
         .boot = boot.clock(),
@@ -457,12 +456,27 @@ fn announce(io: std.Io, config: config_mod.Config) void {
     std.Io.File.stdout().writeStreamingAll(io, line) catch {}; // Nowhere else to report it.
 }
 
+/// The store the agent's summary pass reads: the chunk directory, else the Zigbox store, else
+/// the fixtures of the fake runtime.
+fn node_images(
+    swarm: *Swarm,
+    config: config_mod.Config,
+    fake_images: *node_store.FakeImages,
+) ?node_store.Images {
+    if (swarm.has_store) return swarm.store.images();
+    if (swarm.zigbox) |opened| return opened.images.images();
+    if (config.runtime == .fake) return fake_images.images();
+    return null;
+}
+
 /// The node's chunk store and peer server, when it has them (`--images-dir`, `--peer-listen`).
 /// The summary pass reads the store on the agent's thread; the peer server opens its own
 /// `DirImages` per connection (a `DirImages` is one thread's).
 pub const Swarm = struct {
     store: dir_images.DirImages = undefined,
     has_store: bool = false,
+    /// The node's Zigbox store (`--runtime zigbox`), opened on the agent's thread.
+    zigbox: ?*zigbox_fetch.Opened = null,
     server: ?*peer_server_mod.Server = null,
     zigbox_root: [constants.state_path_bytes_max]u8 = undefined,
     chunks_path: [constants.state_path_bytes_max + 16]u8 = undefined,
@@ -476,7 +490,7 @@ pub const Swarm = struct {
         config: config_mod.Config,
     ) !void {
         var zigbox_root: ?[]const u8 = null;
-        if (config.runtime == .zigbox and config.peer_listen != null) {
+        if (config.runtime == .zigbox) {
             zigbox_root = try swarm.zigbox_store(init);
         }
         try swarm.start_with(init.io, gpa, config, zigbox_root);
@@ -490,14 +504,28 @@ pub const Swarm = struct {
         config: config_mod.Config,
         zigbox_root: ?[]const u8,
     ) !void {
-        const path = config.images_dir orelse peer_chunks_path(swarm, config, zigbox_root) orelse
-            return;
-        if (config.images_dir != null) {
-            swarm.store = dir_images.DirImages.open(io, gpa, path) catch
+        if (zigbox_root) |root| {
+            // The summary pass reads the Zigbox store on the agent's thread; the peer server
+            // opens its own per connection.
+            const opened = gpa.create(zigbox_fetch.Opened) catch return error.OutOfMemory;
+            opened.* = .{ .chunk_bytes = swarm.chunk_bytes_test };
+            opened.open(gpa, root) catch |err| {
+                gpa.destroy(opened);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.NoStore => error.@"open the Zigbox store",
+                };
+            };
+            swarm.zigbox = opened;
+        }
+        if (config.images_dir) |dir| {
+            swarm.store = dir_images.DirImages.open(io, gpa, dir) catch
                 return error.@"open the chunk store (--images-dir)";
             swarm.has_store = true;
         }
         const listen = config.peer_listen orelse return;
+        const path = config.images_dir orelse peer_chunks_path(swarm, config, zigbox_root) orelse
+            return error.@"start the peer server";
         const server = gpa.create(peer_server_mod.Server) catch return error.OutOfMemory;
         swarm.server = server;
         server.start(io, .{
@@ -545,6 +573,10 @@ pub const Swarm = struct {
             gpa.destroy(server);
         }
         if (swarm.has_store) swarm.store.close(gpa);
+        if (swarm.zigbox) |opened| {
+            opened.close();
+            gpa.destroy(opened);
+        }
     }
 };
 

@@ -1269,13 +1269,6 @@ test "an agent configured for Zigbox only serves its store's tree to a peer fetc
     try pair.make(&tmp);
     defer pair.deinit();
     const manifest = Manifest.parse(images_mod.manifest_text).?;
-    {
-        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
-        defer from_a.close();
-        var buffer: [2048]u8 = undefined;
-        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
-        _ = try from_a.import_image(record, pair.tree, manifest);
-    }
     var to_b = try images_mod.ZigboxImages.open(gpa, &pair.b);
     defer to_b.close();
     var agent: Rig = .{ .tmp = undefined, .ca = undefined, .via_agent = true };
@@ -1283,6 +1276,22 @@ test "an agent configured for Zigbox only serves its store's tree to a peer fetc
     try agent.init();
     defer agent.deinit();
     try std.testing.expect(!agent.swarm.has_store);
+    // The node's summary comes from the Zigbox store the agent opened: it lists the tree.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const seam = agent.swarm.zigbox.?.images.images();
+    {
+        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
+        defer from_a.close();
+        var buffer: [2048]u8 = undefined;
+        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
+        _ = try from_a.import_image(record, pair.tree, manifest);
+    }
+    const held = try seam.summary(arena_state.allocator(), &.{});
+    try std.testing.expectEqual(@as(usize, 1), held.trees.len);
+    const text = pair.tree.text();
+    try std.testing.expectEqualStrings(&text, held.trees[0].digest);
+    try std.testing.expect(held.filter_chunks > 0);
     try fetch_from_rig(&agent, &to_b, pair.tree, manifest);
     const name = pair.tree.text();
     try std.testing.expect(to_b.images().has(&name));
