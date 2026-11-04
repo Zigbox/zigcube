@@ -703,6 +703,31 @@ test "stats pull at its read cap with the largest records fits the request arena
     try testing.expect(std.mem.indexOf(u8, response.body, "\"truncated\":true") != null);
 }
 
+test "stats pull with malformed rows near the cap says truncated, never ZC-E0302" {
+    // Goal: docs/api.md's "never a failure" when rows that do not parse use up the pages. Method:
+    // the cap's worth minus 10 valid pulls on node1, then three pages of rows on node2 that are
+    // not JSON; the reply is 200 with truncated, and the skipped rows count toward the cap.
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    const valid = constants.pulls_read_max - 10;
+    for (0..valid) |at| {
+        var tree: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at});
+        try put_pull(&rig, "node1", name, 1000 + at, 1);
+    }
+    const ctx = rig.world.controller_context();
+    for (0..3 * constants.store_list_limit_max) |at| {
+        var key: [40]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "/pulls/node2/b3:{x:0>8}", .{at});
+        const op: store.Op = .{ .put = .{ .key = name, .value = "not json" } };
+        _ = try writers.txn(ctx.store, .{ .agent = "node2" }, .{ .on_success = &.{op} }, ctx.diag);
+    }
+    const reply = try rig.ok("/v1/stats/pull", "limit=500");
+    try testing.expectEqual(true, field(reply, "truncated").bool);
+    try testing.expectEqual(@as(usize, valid), field(reply, "pulls").array.items.len);
+    try testing.expectEqual(@as(i64, 10), field(reply, "skipped").integer);
+}
+
 test "stats pull refuses a bad node, a bad limit, an unknown parameter and an unknown kind" {
     // Goal: the handler's parameter checks. Method: one request each; every answer is a 400/404
     // with a code and the request's id.

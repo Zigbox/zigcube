@@ -205,7 +205,7 @@ What pulls moved, by source: the `/pulls/` records of keys.md, newest `finished_
 
 `matched` is how many records were read and kept (those counted in `skipped` are not in it)
 before `limit` cut the list, and `truncated` is `true` when the server stopped reading at
-`pulls_read_max` (1,000) records, which it reads in key order (by node): the answer is then part
+`pulls_read_max` (500) records, which it reads in key order (by node): the answer is then part
 of the picture, never a failure (it was `ZC-E0302` before). Both are additive members of
 version 1. `node` limits the answer to one node; `limit` defaults to 50 and is at most 500
 (above it, or 0, is `400` `ZC-E0104`, as is a `node` that is not a node name). The read is

@@ -586,6 +586,11 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
 /// Parses the value of `kv` as a `T`. A value that is not one is ZC-E0301 naming the key.
 pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag) Error!T {
     assert(kv.key.len > 0);
+    // The agent endpoint refuses a larger pull record; a row that holds one was not written
+    // through it, and parsing it would cost the arena several times its size.
+    if (T == Pull and kv.value.len > constants.pull_record_bytes_max) {
+        return malformed(diag, kv.key, @typeName(T));
+    }
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
     if (@hasField(T, "v")) {
         // The version comes before the shape: a newer release may have changed the shape.
@@ -606,8 +611,11 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
     return record;
 }
 
-/// Whether every peer a pull record names (`peer_bytes`, `bad_peers`) is a node name.
+/// Whether a pull record names at most `pull_peers_max` peers in each list and every one is a
+/// node name.
 fn pull_peers_named(record: Pull) bool {
+    if (record.peer_bytes.len > constants.pull_peers_max) return false;
+    if (record.bad_peers.len > constants.pull_peers_max) return false;
     for (record.peer_bytes) |sent| {
         if (name_problem(sent.peer, constants.node_name_bytes_max) != null) return false;
     }
@@ -1110,6 +1118,44 @@ test "a pull record naming a peer that is not a node name does not read" {
     diag.reset();
     const record = try read(Pull, arena, kv_of(key, good), &diag);
     try testing.expectEqualStrings("node2", record.peer_bytes[0].peer);
+}
+
+test "a pull record over the size bound or naming too many peers does not read" {
+    // Goal: the read side of the agent endpoint's size and peer-count checks. Method: a valid row
+    // padded past `pull_record_bytes_max` (before parsing), one with `pull_peers_max` + 1 peers,
+    // and the same row at the bounds, which reads.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const key = "/pulls/node1/b3:1";
+    const head = "{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:1\",\"bad_peers\":[";
+    var rows: [3][]const u8 = undefined;
+    var at: usize = 0;
+    var many: std.ArrayList(u8) = .empty;
+    try many.appendSlice(arena, head);
+    for (0..constants.pull_peers_max + 1) |index| {
+        if (index > 0) try many.append(arena, ',');
+        try many.appendSlice(arena, "\"node2\"");
+        if (index == constants.pull_peers_max - 1) {
+            try many.appendSlice(arena, "]}");
+            rows[at] = try arena.dupe(u8, many.items); // Exactly the bound: reads.
+            at += 1;
+            many.shrinkRetainingCapacity(many.items.len - 2);
+            try many.append(arena, ',');
+        }
+    }
+    try many.appendSlice(arena, "]}");
+    rows[at] = many.items; // One past the bound.
+    const padded = try arena.alloc(u8, constants.pull_record_bytes_max + 1);
+    @memset(padded, ' ');
+    @memcpy(padded[0..rows[0].len], rows[0]); // A valid record followed by spaces: too long.
+    _ = try read(Pull, arena, kv_of(key, rows[0]), &diag);
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, rows[1]), &diag));
+    diag.reset();
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, padded), &diag));
+    try testing.expect(diag.code == .E0301);
 }
 
 test "pull records a real run wrote still read" {

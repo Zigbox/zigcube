@@ -220,7 +220,7 @@ the whole set, so a partial run is safe and repeated passes converge. The `reten
 with a `mod_revision` compare and never puts. A malformed record is left alone and counted, never
 deleted by guess. A pass that fails does not fail the step: it is retried after `pulls_retry_ms`
 and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) and at most
-`pulls_read_max` (1,000) records (`truncated`).
+`pulls_read_max` (500) records (`truncated`).
 
 ## `/observed/<node>/<replica>`: what the agent reports
 

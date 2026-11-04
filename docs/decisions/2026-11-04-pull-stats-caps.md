@@ -1,20 +1,29 @@
 # Pull statistics: a 1,000-record read cap and partial-run pruning
 
-**Decision.** `GET /v1/stats/pull` reads at most `pulls_read_max` = 1,000 records and says
-`truncated: true` when it stopped there. Retention keeps a cursor (`continue_after`) across
-passes and prunes the part of each node's run it has read.
+**Decision.** `GET /v1/stats/pull` reads at most `pulls_read_max` = 500 records (rows examined,
+kept or skipped) and says `truncated: true` when it stopped there, never ZC-E0302. Retention keeps a
+cursor (`continue_after`) across passes and prunes the part of each node's run it has read.
 
-**Why.** A worst-case record is about 9.7 KB in the arena (key, value and its parse), and the
-request arena is 16 MiB; the earlier 6,400 could not fit. `constants.zig` now asserts the whole
-worst case at compile time: `pulls_read_max` + 1 records (the list asks each page for no more
-than the cap still allows plus one, so no third page of 500 is read at the cap), the response
-buffer taken whole (`pulls_response_bytes`, about 2 MiB: an arena frees nothing, so a buffer that
-grew would leave about twice its final size behind), the sort order and 64 KiB of slack. That
-is about 11 MiB of the 16. A test (`api_test.zig`, "at its read cap with the largest records")
-stores 1,005 maximum-size records and checks the arena's whole capacity stays within the limit.
-Retention that restarted at the first page starved every node past the first
-2,000 records. Pruning a partial run is safe because a record's age does not depend on others,
-and a dropped record has at least `pulls_per_node_max` newer ones in the whole set.
+**Measured** (`src/pull_arena_test.zig`: 1,000 + 500 maximum records of 3,036 bytes, 11 peers
+named in each list at maximum-length names, one request under a `BoundedArena` of exactly
+`request_arena_bytes_max`, 16,777,216 bytes). `used_bytes` at the cap of 500: SQLite 4,644,368,
+memory 4,789,304 (under 30% of the arena). At the earlier cap of 1,000: SQLite 7,307,524 (2.3x
+headroom), memory 16,776,362 and a ZC-E0207. The memory store, not the parse, was the cost: each
+page copied every entry under the prefix, so a read of N records cost pages x N values; it now
+copies the page it returns (`store_memory.zig`). The earlier "11.9 KB parse per record" figure
+came from that and was wrong.
+
+**Derivation.** Per record: the value copy and the key copy the store makes (SQLite, Postgres),
+and the parse, which is at most the value again: measured about 5.0 KB for 3,036 bytes. The
+constant (`pull_read_arena_bytes`) takes the bound instead: key + 2 x 4 KiB + 1 KiB, about 9.7 KB,
+roughly 1.9x the measurement. `constants.zig` asserts at compile time that `pulls_read_max` + 1
+of those, the response buffer taken whole (`pulls_response_bytes`, about 2 MiB: an arena frees
+nothing), the sort order and 64 KiB of slack come to at most half the arena (about 7.1 MiB of 8).
+Rows that do not parse count toward the cap, so malformed rows cannot grow the read; a value over
+`pull_record_bytes_max` or more than `pull_peers_max` peers is Malformed (counted in `skipped`).
+Retention that restarted at the first page starved every node past the first 2,000 records.
+Pruning a partial run is safe because a record's age does not depend on others, and a dropped
+record has at least `pulls_per_node_max` newer ones in the whole set.
 
 **Not done.** A streaming top-K read would give exact newest-first statistics without a cap; the
 console and CLI show `truncated` instead. A retention failure is kept in the cursor and printed

@@ -216,7 +216,7 @@ pub const MemoryStore = struct {
         const revision = options.at_revision orelse self.revision;
         try self.check_readable(revision, diag);
         const entries = try self.snapshot(arena, revision, options.prefix, diag);
-        if (options.reverse) std.mem.reverse(store.KeyValue, entries);
+        if (options.reverse) std.mem.reverse(Entry, entries);
         var start: usize = 0;
         if (options.continue_after) |after| {
             const wanted: std.math.Order = if (options.reverse) .lt else .gt;
@@ -233,17 +233,23 @@ pub const MemoryStore = struct {
         }
         const more = end < entries.len;
         const last_key: ?[]const u8 = if (more) entries[end - 1].key else null;
-        return .{ .kvs = entries[start..end], .revision = revision, .continue_after = last_key };
+        // Only the page is copied: copying every entry under the prefix on each call would cost a
+        // paged read of N records N x pages x value size of the arena.
+        const kvs = arena.alloc(store.KeyValue, end - start) catch return no_memory(diag);
+        for (entries[start..end], kvs) |entry, *kv| kv.* = try copy_kv(arena, entry, diag);
+        const last_copy: ?[]const u8 = if (last_key != null) kvs[kvs.len - 1].key else null;
+        return .{ .kvs = kvs, .revision = revision, .continue_after = last_copy };
     }
 
-    /// The keys under `prefix` as they were at `revision`, ascending, copied into `arena`.
+    /// The entries under `prefix` as they were at `revision`, ascending, borrowed (only the list
+    /// itself is in `arena`).
     fn snapshot(
         self: *const MemoryStore,
         arena: Allocator,
         revision: Revision,
         prefix: []const u8,
         diag: *Diag,
-    ) Error![]store.KeyValue {
+    ) Error![]Entry {
         var state: std.ArrayList(Entry) = .empty; // Borrowed entries; only the list is arena.
         if (revision == self.revision) {
             // The current state is the live table: no need to replay the log, which is linear in
@@ -268,9 +274,7 @@ pub const MemoryStore = struct {
             }
         }
         std.mem.sort(Entry, state.items, {}, entry_key_less);
-        const kvs = arena.alloc(store.KeyValue, state.items.len) catch return no_memory(diag);
-        for (state.items, kvs) |entry, *kv| kv.* = try copy_kv(arena, entry, diag);
-        return kvs;
+        return state.items;
     }
 
     // ---- Transactions --------------------------------------------------------------------

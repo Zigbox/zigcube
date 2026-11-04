@@ -651,16 +651,18 @@ comptime {
 /// a record that would encode larger, so this bounds what `/pulls/` holds.
 pub const pull_record_bytes_max: u32 = 4 * 1024;
 
-/// What reading one pull record costs `GET /v1/stats/pull`'s arena at most: its key, its value,
-/// the parsed record's strings and slices, and the entry that holds them (an arena frees nothing,
-/// so the list's growth is counted in the slack).
+/// What reading one pull record costs `GET /v1/stats/pull`'s arena at most: its key and value
+/// as the store copies them (SQLite and Postgres copy both; memory copies the page only), the
+/// parsed record (strings and slices, never more than the value again) and the entry that holds
+/// them. Measured (docs/decisions/2026-11-04-pull-stats-caps.md): about 5.0 KB for a 3,036-byte
+/// record; this is for 4 KiB, and about twice that.
 pub const pull_read_arena_bytes: u32 =
     store_key_bytes_max + 2 * pull_record_bytes_max + 1024;
 
 /// `GET /v1/stats/pull` reads at most this many pull records, ascending by node, then says
 /// `truncated`. Retention keeps up to `nodes_max` x `pulls_per_node_max` (6,400) records, which
 /// the request arena cannot hold at the worst case; this is what it can (checked below).
-pub const pulls_read_max: u32 = 1000;
+pub const pulls_read_max: u32 = 500;
 
 /// What `GET /v1/stats/pull` writes its answer into, taken at once: `api_list_limit_max` records
 /// of at most `pull_record_bytes_max` each, and 4 KiB for the members around them. An arena frees
@@ -674,7 +676,7 @@ comptime {
     const records_held = pulls_read_max + 1;
     const sorted = 4 * pulls_read_max + 1024; // The order array and the pointers of the list.
     assert(records_held * pull_read_arena_bytes + pulls_response_bytes + sorted + 64 * 1024 <=
-        request_arena_bytes_max);
+        request_arena_bytes_max / 2);
     assert(pull_record_bytes_max > 512 + pull_peers_max * (110 + 70));
     assert(pulls_read_max >= api_list_limit_max);
 }
