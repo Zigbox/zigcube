@@ -3,9 +3,10 @@
 Owner, 2026-11-04: what we can think of to get more value out of the simulation fleet goes into
 C3. This is a list to fold into C3's brief when it is written, not a brief.
 
-**Already in C2, because C2's ship gate needs it** (branch `claude/sim-fleet-2`): the fleet runs
-`sim-swarm` and the `--c1` checks alongside plain `sim-cluster`, so the release rule's 24 hours
-covers every simulator C2 gates on.
+**First in C3** (owner, 2026-11-04, docs/decisions/2026-11-04-c2-ships-without-fleet-soak.md):
+C2 ships without a 24-hour fleet run, and C3 starts with the fleet. The work in flight on branch
+`claude/sim-fleet-2` (PR #71: the fleet runs `sim-swarm` and the `--c1` checks alongside plain
+`sim-cluster`) lands first; the items below follow.
 
 ## For C3
 

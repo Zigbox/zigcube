@@ -115,6 +115,7 @@ A release (a tag, and any milestone that ships) is cut only from a commit that i
 - **Sim-clean.** The simulation fleet has run on that commit for 24 hours, with every simulator the
   milestone gates on (today `sim-cluster`, its `--c1` checks and `sim-swarm`), and no `sim-fleet`
   issue is open against it; `zig build check` passes on it.
+  (C2 alone ships without the 24 hours: docs/decisions/2026-11-04-c2-ships-without-fleet-soak.md.)
 - **Jepsen-clean,** once the Jepsen battery exists (a C5 prerequisite,
   [docs/decisions/2026-11-03-jepsen-before-c5.md](docs/decisions/2026-11-03-jepsen-before-c5.md)):
   the battery passes on that commit.
