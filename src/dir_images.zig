@@ -228,6 +228,8 @@ pub const DirImages = struct {
         for (0..constants.fake_dir_entries_max) |_| {
             const entry = iterator.next(self.io) catch break orelse break;
             if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, "b3-")) continue;
+            // Full-digest trees only: a short name is this node's own (`peer_serve.tree`).
+            if (entry.name.len != constants.tree_digest_bytes) continue;
             const digest = try arena.dupe(u8, entry.name);
             digest[2] = ':';
             const count = self.load_list(digest) orelse continue;

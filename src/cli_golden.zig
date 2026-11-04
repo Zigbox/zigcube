@@ -425,7 +425,7 @@ fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
     sample(
         diag,
         .E0808,
-        &.{"a peer address started more handshakes than a window allows"},
+        &.{"peer address 10.0.0.7 started more handshakes than a window allows"},
         "no action needed; it is tried again by itself",
     );
 }

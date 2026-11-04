@@ -176,16 +176,26 @@ text in `fetch.log`.
 checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
 thread; a `DirImages` belongs to one thread, and the peer server gives each connection its own.
 `--peer-listen HOST:PORT` (needs `--images-dir`) starts the peer server (`peer_server.zig`): read-only,
-CA-authenticated peers only, rate limited (ZC-E0808).
+CA-authenticated peers only, rate limited (ZC-E0808). The address the node publishes for peers
+(`/node-store/<node>.peer`) is `--peer-advertise HOST:PORT` (`.peer_advertise` in the ZON file);
+without it, the `--peer-listen` address if that names a host. `--peer-listen 0.0.0.0:P` or `[::]:P`
+without `--peer-advertise` is refused at startup with ZC-E0505, because nobody can connect to
+`0.0.0.0`. `--address` is only recorded with the node for people to read; it is never connected to.
+The server has `peer_handshakes_max` cheap handshake slots and `peer_connections_max` serving
+slots, which hold the big buffers and go only to a peer that authenticated: silent strangers
+cannot lock honest peers out, and a client that finds every serving slot taken gets status 503
+(busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
+without a strike against the peer.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
 registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
-whole in the store and 1 with ZC-E0601 when it is not. A peer is only ever asked when the digest is
+whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
+setup. A peer is only ever asked when the digest is
 the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
 - `--server HOST:PORT` gives the peers without naming them. The fetch reads
-  `/v1/list?prefix=/node-store/` once, for each node's `peer` address and hex `filter` (keys.md,
+  `/v1/list?prefix=/node-store/` in pages of `discover_page_nodes` (following `continue`), for each node's `peer` address and hex `filter` (keys.md,
   api.md). It leaves out its own node and any node with a bad name, no `peer` or no filter, says
   how many on one line of stderr, and ranks the rest by the chunks their filters claim.
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and

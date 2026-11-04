@@ -66,9 +66,22 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     };
     std.posix.sigaction(.TERM, &action, null);
     if (files.exists(io, dir, files.file_fetch)) {
-        if (fetch_first(init, dir, arena)) |failure| return record(io, dir, failure);
+        const failure = after_fetch(fetch_first(init, dir, arena));
+        if (failure) |over| return record(io, dir, over);
     }
     return supervise(init, dir, &spec);
+}
+
+/// What ends the container after its fetch: the fetch's failure if it failed, a stop if this
+/// supervisor was sent `SIGTERM` meanwhile (the command must not start after it), else null.
+fn after_fetch(failure: ?files.RunFile) ?files.RunFile {
+    if (failure) |over| return over;
+    if (term_received.load(.acquire)) return stopped_run();
+    return null;
+}
+
+fn stopped_run() files.RunFile {
+    return .{ .kind = .signaled, .signal = @intCast(@backingInt(std.posix.SIG.TERM)) };
 }
 
 /// Runs the fetch `fetch.json` names and waits for it; null if the image is now on the node,
@@ -98,18 +111,24 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
     const term = child.wait(io) catch return .{ .kind = .lost };
     child_pid.store(0, .release);
     const result = fetch_ended(arena, plan.digest, term);
-    if (state) |opened| settle_streak(io, opened, arena, result);
+    if (state) |opened| settle_streak(io, opened, arena, plan.digest, result);
     return result;
 }
 
 /// What the fetch's end means for the next fetch on this node: a tree fetched ends the streak,
 /// a failure of the fetch extends it, and anything else (a stop, this node's own setup) leaves
 /// it as it was.
-fn settle_streak(io: std.Io, state: Dir, arena: Allocator, result: ?files.RunFile) void {
-    const failure = result orelse return backoff.clear(io, state);
+fn settle_streak(
+    io: std.Io,
+    state: Dir,
+    arena: Allocator,
+    digest: []const u8,
+    result: ?files.RunFile,
+) void {
+    const failure = result orelse return backoff.clear(io, state, arena, digest);
     if (failure.kind != .start_failed) return;
     if (failure.blame != .fetch) return;
-    backoff.record_failure(io, state, arena, boot_ms(io));
+    backoff.record_failure(io, state, arena, digest, boot_ms(io));
 }
 
 fn boot_ms(io: std.Io) u64 {
@@ -128,10 +147,10 @@ fn wait_for_backoff(
 ) ?files.RunFile {
     assert(plan.backoff_base_ms > 0);
     assert(plan.backoff_cap_ms >= plan.backoff_base_ms);
-    const streak = backoff.read(io, state, arena);
+    const streak = backoff.read(io, state, arena, plan.digest);
     while (true) {
         if (term_received.load(.acquire)) {
-            return .{ .kind = .signaled, .signal = @intCast(@backingInt(std.posix.SIG.TERM)) };
+            return stopped_run();
         }
         const left = backoff.wait_remaining_ms(
             streak,
@@ -246,4 +265,17 @@ fn spawn_failure(err: std.process.SpawnError) files.RunFile {
 fn record(io: std.Io, dir: Dir, run_file: files.RunFile) u8 {
     files.write_json(io, dir, files.file_run, run_file) catch return constants.exit_environment;
     return constants.exit_ok;
+}
+
+test "a SIGTERM during the fetch ends the container before its command; a failure is kept" {
+    // Goal: the command must not start after the supervisor was stopped (review nit). Method:
+    // `after_fetch` over no failure, a failure, and no failure with `term_received` set.
+    term_received.store(false, .release);
+    try std.testing.expect(after_fetch(null) == null);
+    const failure = after_fetch(failed(.fetch, "x")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(files.Blame.fetch, failure.blame);
+    term_received.store(true, .release);
+    defer term_received.store(false, .release);
+    const stopped = after_fetch(null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(files.RunKind.signaled, stopped.kind);
 }

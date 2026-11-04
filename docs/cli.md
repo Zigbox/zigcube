@@ -353,7 +353,8 @@ joins the swarm with two flags of `zcube-agent` itself (they are in `zcube-agent
 `docs/agent.md` says what they do): `--images-dir DIR` gives the node a chunk store, and
 `--peer-listen HOST:PORT` (needs `--images-dir`) serves it to peers over the authenticated
 handshake, rate limited (ZC-E0808, `docs/peer.md`, "Rate limit"). `--registry HOST:PORT` is where
-an image no peer has is fetched from (also needs `--images-dir`).
+an image no peer has is fetched from (also needs `--images-dir`). `--peer-advertise HOST:PORT` is
+the address published for peers; it is required when `--peer-listen` names `0.0.0.0` or `::`.
 
 ## How it is tested
 

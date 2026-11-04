@@ -74,10 +74,10 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0808</h1>
 <p class="summary">a peer's handshake was refused: its address is over a limit</p>
-<dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
+<dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>An agent's peer server limits what one source address may ask of it, because a handshake costs the server public-key work. A handshake is refused, and the connection closed without a byte, when the address already has a handshake that has not finished (one at a time per source), when it has started peer_handshakes_per_source_max handshakes in peer_handshake_window_ms, or when the server already tracks peer_sources_max addresses in the window. An IPv6 address counts by its /64, one host's whole range.</p>
-<p>The text is shown once for a run of refusals, not once per connection. An honest fetch opens a handful of connections and keeps them. If one node is refused over and over, something there retries in a loop: look at its agent's output. A refused node tries again by itself, and a fetch falls back to the registry meanwhile. A flood from many addresses can fill the table and turn honest nodes away for up to one window; no action is needed unless it repeats.</p>
+<p>The cause names the refused address (an IPv6 one by its /64). The text is shown once per peer_refusal_log_ms, not once per connection. An honest fetch opens a handful of connections and keeps them. If one node is refused over and over, something there retries in a loop: look at its agent's output. A refused node tries again by itself, and a fetch falls back to the registry meanwhile. A flood from many addresses can fill the table and turn honest nodes away for up to one window; no action is needed unless it repeats.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0808</pre>

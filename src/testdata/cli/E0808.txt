@@ -1,5 +1,5 @@
 error[ZC-E0808]: a peer's handshake was refused: its address is over a limit
-  cause  a peer address started more handshakes than a window allows
+  cause  peer address 10.0.0.7 started more handshakes than a window allows
   fix    no action needed; it is tried again by itself
   more   zcube explain E0808 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0808.html

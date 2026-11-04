@@ -320,14 +320,15 @@ const Shell = struct {
     }
 };
 
-/// Runs the agent until it is told to stop. Returns the process's exit code.
-/// The peer server's `host:port` for the node's record, empty when it serves none.
-fn peer_address(buffer: *[64]u8, listen: ?std.Io.net.IpAddress) []const u8 {
-    const address = listen orelse return "";
+/// The `host:port` published for peers in the node's record (`--peer-advertise`, else the listen
+/// address; `agent_config` has refused a configuration with neither), empty when it serves none.
+fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
+    const address = advertise orelse return "";
     // An IP address and a port always fit.
     return std.fmt.bufPrint(buffer, "{f}", .{address}) catch unreachable;
 }
 
+/// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
     const gpa = init.gpa;
@@ -360,7 +361,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     var peer_buffer: [64]u8 = undefined;
-    const peer_text = peer_address(&peer_buffer, config.peer_listen);
+    const peer_text = peer_address(&peer_buffer, config.peer_advertise);
     agent.init(.{
         .node = config.node,
         .capacity = config.capacity,

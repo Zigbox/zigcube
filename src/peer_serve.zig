@@ -26,6 +26,9 @@ const Hash = chunk_summary.Hash;
 pub const path_trees = "/v1/peer/trees/";
 pub const path_chunk = "/v1/peer/chunk/";
 
+/// The head status of a reply from a server whose serving slots are all taken (`peer_server`).
+pub const status_busy: u16 = 503;
+
 /// The scratch bytes `answer` needs: one chunk, or one tree list.
 pub const scratch_bytes: u32 = @max(constants.swarm_chunk_bytes, constants.tree_list_bytes_max);
 
@@ -86,7 +89,9 @@ fn fixed(status: u16, message: []const u8) Reply {
 }
 
 fn tree(images: node_store.Images, digest: []const u8, scratch: []u8, refs: []ChunkRef) Reply {
-    if (digest.len < 11 or digest.len > 3 + 64) return fixed(400, "not a tree digest");
+    // Full digests only: a short one (the images and fixtures of a fake runtime) names a tree
+    // of this node alone, and a prefix is not a name another node can rely on.
+    if (digest.len != constants.tree_digest_bytes) return fixed(400, "not a full tree digest");
     const count = images.chunk_list(digest, refs) catch |err| switch (err) {
         error.NotFound => return fixed(404, "no such tree"),
         else => return fixed(500, "the store failed"),
@@ -229,7 +234,10 @@ test "a tree is served as the list its digest names, and a missing tree is 404" 
     const reply = rig.get(held, null);
     try std.testing.expectEqual(@as(u16, 200), reply.status);
     try std.testing.expect(node_store.list_matches(&rig.mem.digest, reply.body));
-    try std.testing.expectEqual(@as(u16, 404), rig.get(path_trees ++ "b3:12345678", null).status);
+    try std.testing.expectEqual(@as(u16, 400), rig.get(path_trees ++ "b3:12345678", null).status);
+    const zeros64: [64]u8 = @splat('0');
+    const absent = path_trees ++ "b3:" ++ zeros64;
+    try std.testing.expectEqual(@as(u16, 404), rig.get(absent, null).status);
     try std.testing.expectEqual(@as(u16, 400), rig.get(path_trees ++ "../etc", null).status);
     try std.testing.expectEqual(@as(u16, 404), rig.get("/v1/peer/other", null).status);
     try std.testing.expectEqual(@as(u16, 404), rig.get("/v1/agent/nodes/node1/store", null).status);

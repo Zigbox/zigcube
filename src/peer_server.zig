@@ -5,10 +5,15 @@
 //!
 //! * **Rate limit.** `peer_limit.Limiter` is asked before a handshake starts (ZC-E0808 when a
 //!   source is turned away; the connection is closed without a byte).
-//! * **Connections.** At most `peer_connections_max` at once, each on a task of its own with its
-//!   own `DirImages` and buffers (pages the connection does not touch stay untouched); one more
-//!   is closed at once. A connection lives while requests keep coming (`peer_idle_ms` between
-//!   them) and for `peer_connection_requests_max` requests, then the client opens another.
+//! * **Connections.** Two kinds of slot. A *link* (`peer_handshakes_max` of them) is a task, a
+//!   descriptor and a few words: every accepted connection takes one for its handshake, which
+//!   ends at `peer_handshake_ms` at the latest, so strangers that send nothing cannot use up
+//!   the serving slots. A *slot* (`peer_connections_max`) owns a `DirImages` and buffers (pages
+//!   the connection does not touch stay untouched) and goes to a connection only once it has
+//!   authenticated; an authenticated peer that finds every slot taken is answered 503 (busy) to
+//!   its first request and closed. A connection lives while requests keep coming
+//!   (`peer_idle_ms` between them) and for `peer_connection_requests_max` requests, then the
+//!   client opens another.
 //! * **Identity.** Read from the state directory at each handshake (`agent_peer.load_identity`),
 //!   so a renewed credential is used and a node that has not joined yet refuses everyone.
 //! * **A request** is one message `GET <target>\n[Range: bytes=A-B\n]`; the reply is a head
@@ -46,19 +51,38 @@ pub const Config = struct {
     quiet: bool = false,
 };
 
-/// What one connection task owns.
-const Slot = struct {
+/// What a connection task owns from accept to its end; no buffers.
+const Link = struct {
     busy: std.atomic.Value(bool) = .init(false),
     future: ?std.Io.Future(void) = null,
-    images: dir_images.DirImages = undefined,
-    scratch: []u8 = &.{},
-    refs: []fetch_plan.ChunkRef = &.{},
     fd: std.posix.fd_t = -1,
     /// The source key of the connection (`source_key`), valid while `busy`.
     source: u64 = 0,
     /// True once the handshake succeeded: until then the connection is a stranger's, and one
-    /// source may hold only one such slot (`admit`).
+    /// source may hold only one such link (`admit`).
     authenticated: std.atomic.Value(bool) = .init(false),
+};
+
+/// The buffers of one served connection, lent to a connection once it has authenticated.
+const Slot = struct {
+    busy: std.atomic.Value(bool) = .init(false),
+    images: dir_images.DirImages = undefined,
+    scratch: []u8 = &.{},
+    refs: []fetch_plan.ChunkRef = &.{},
+};
+
+/// ZC-E0808 is shown at most once per `peer_refusal_log_ms`, whichever source is refused and
+/// whatever other handshakes are admitted meanwhile.
+pub const RefusalLog = struct {
+    last_ms: ?u64 = null,
+
+    pub fn due(log: *RefusalLog, now_ms: u64) bool {
+        if (log.last_ms) |last| {
+            if (now_ms -| last < constants.peer_refusal_log_ms) return false;
+        }
+        log.last_ms = now_ms;
+        return true;
+    }
 };
 
 pub const Server = struct {
@@ -67,11 +91,11 @@ pub const Server = struct {
     listener: net.Server,
     stopping: std.atomic.Value(bool) = .init(false),
     accept_future: ?std.Io.Future(void) = null,
+    links: [constants.peer_handshakes_max]Link = @splat(.{}),
     slots: [constants.peer_connections_max]Slot = @splat(.{}),
     limiter: peer_limit.Limiter = .{},
-    /// The last source refused with ZC-E0808 was shown; cleared by the next admitted one.
-    refusal_shown: bool = false,
-    /// How many times ZC-E0808 was shown (once per streak), for tests.
+    refusal_log: RefusalLog = .{},
+    /// How many times ZC-E0808 was shown, for tests.
     refusals_shown: u32 = 0,
 
     pub const StartError = error{ Listen, NoThreads, OutOfMemory, Store };
@@ -109,11 +133,11 @@ pub const Server = struct {
         server.stopping.store(true, .release);
         if (server.accept_future) |*future| future.cancel(server.io);
         server.accept_future = null;
-        for (&server.slots) |*slot| {
-            if (slot.future) |*future| future.await(server.io);
-            slot.future = null;
-            free_slot(slot, server.io, std.heap.page_allocator);
+        for (&server.links) |*link| {
+            if (link.future) |*future| future.await(server.io);
+            link.future = null;
         }
+        for (&server.slots) |*slot| free_slot(slot, server.io, std.heap.page_allocator);
         server.listener.deinit(server.io);
     }
 };
@@ -125,30 +149,68 @@ fn free_slot(slot: *Slot, io: std.Io, gpa: std.mem.Allocator) void {
     gpa.free(slot.refs);
 }
 
+const accept_poll_ms = 100;
+
 fn accept_loop(server: *Server) void {
     const io = server.io;
     const listen_fd = server.listener.socket.handle;
     while (!server.stopping.load(.acquire)) {
         const events = std.posix.POLL.IN;
         var wait = [_]std.posix.pollfd{.{ .fd = listen_fd, .events = events, .revents = 0 }};
-        const ready = std.posix.poll(&wait, 100) catch continue;
+        const ready = std.posix.poll(&wait, accept_poll_ms) catch continue;
         if (ready == 0) continue;
         var storage: std.os.linux.sockaddr.storage = undefined;
         var length: std.posix.socklen_t = @sizeOf(@TypeOf(storage));
         const linux = std.os.linux;
         const got = linux.accept4(listen_fd, @ptrCast(&storage), &length, linux.SOCK.CLOEXEC);
-        if (std.os.linux.errno(got) != .SUCCESS) continue;
+        switch (std.os.linux.errno(got)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => continue,
+            // EMFILE, ENFILE, ENOMEM...: the connection stays queued and the listener stays
+            // readable, so retrying at once would spin. Wait a poll period.
+            else => {
+                io.sleep(.fromMilliseconds(accept_poll_ms), .awake) catch {};
+                continue;
+            },
+        }
         const fd: std.posix.fd_t = @intCast(got);
-        admit(server, fd, source_of(&storage), io);
+        admit(server, fd, &storage, io);
     }
 }
 
-/// A key for the peer's address, the port left out.
-fn source_of(storage: *const std.os.linux.sockaddr.storage) u64 {
+const Storage = std.os.linux.sockaddr.storage;
+
+/// The address bytes of a peer: 4 (IPv4) or 16 (IPv6).
+fn address_bytes(storage: *const Storage) []const u8 {
     const bytes = std.mem.asBytes(storage);
     const family = std.mem.readInt(u16, bytes[0..2], .little);
-    if (family == std.os.linux.AF.INET) return source_key(bytes[4..8]);
-    return source_key(bytes[8..24]);
+    if (family == std.os.linux.AF.INET) return bytes[4..8];
+    return bytes[8..24];
+}
+
+/// A key for the peer's address, the port left out.
+fn source_of(storage: *const Storage) u64 {
+    return source_key(address_bytes(storage));
+}
+
+/// The address a refusal names: an IPv4 address (a mapped one as the IPv4 it carries) as
+/// dotted decimal, an IPv6 one as its /64, the unit it is counted in.
+pub fn source_text(buffer: *[64]u8, storage: *const Storage) []const u8 {
+    var bytes = address_bytes(storage);
+    const zeros: [10]u8 = @splat(0);
+    if (bytes.len == 16 and std.mem.eql(u8, bytes[0..10], &zeros) and
+        bytes[10] == 0xff and bytes[11] == 0xff) bytes = bytes[12..16];
+    // 64 bytes hold either form, so the prints cannot fail.
+    if (bytes.len == 4) {
+        const form = "{d}.{d}.{d}.{d}";
+        return std.fmt.bufPrint(buffer, form, .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch
+            unreachable;
+    }
+    var group: [4]u16 = undefined;
+    for (&group, 0..) |*each, at| each.* = std.mem.readInt(u16, bytes[at * 2 ..][0..2], .big);
+    return std.fmt.bufPrint(buffer, "{x}:{x}:{x}:{x}::/64", .{
+        group[0], group[1], group[2], group[3],
+    }) catch unreachable; // At most 4 groups of 4 digits and the suffix fit `buffer`.
 }
 
 /// The key of an address of 4 bytes (IPv4) or 16 (IPv6). An IPv6 address is keyed by its /64,
@@ -167,62 +229,70 @@ pub fn source_key(address: []const u8) u64 {
     return std.hash.Wyhash.hash(1, address[0..8]);
 }
 
-fn admit(server: *Server, fd: std.posix.fd_t, source: u64, io: std.Io) void {
+fn admit(server: *Server, fd: std.posix.fd_t, storage: *const Storage, io: std.Io) void {
+    const source = source_of(storage);
     if (handshake_pending(server, source)) {
         // One unauthenticated connection per source: a stranger that sends nothing cannot take
-        // the slots one by one. The refused peer connects again by itself (its handshake, at the
+        // the links one by one. The refused peer connects again by itself (its handshake, at the
         // longest `peer_handshake_ms` from now, has ended by then). Not counted by the limiter.
-        refuse(server, io, "a peer address already has a handshake that has not finished");
+        refuse(server, io, storage, "already has a handshake that has not finished");
         _ = std.os.linux.close(fd);
         return;
     }
     const verdict = server.limiter.admit(source, peer_stream.boot_ms(io));
     if (verdict != .admitted) {
-        refuse(server, io, switch (verdict) {
-            .table_full => "the server already tracks as many peer addresses as it keeps",
-            else => "a peer address started more handshakes than a window allows",
+        refuse(server, io, storage, switch (verdict) {
+            .table_full => "was turned away: the server tracks as many peer addresses as it keeps",
+            else => "started more handshakes than a window allows",
         });
         _ = std.os.linux.close(fd);
         return;
     }
-    server.refusal_shown = false;
-    for (&server.slots) |*slot| {
-        if (slot.busy.load(.acquire)) continue;
-        if (slot.future) |*future| future.await(io);
-        slot.future = null;
-        slot.fd = fd;
-        slot.source = source;
-        slot.authenticated.store(false, .release);
-        slot.busy.store(true, .release);
-        slot.future = io.concurrent(serve, .{ server, slot }) catch {
-            slot.busy.store(false, .release);
+    for (&server.links) |*link| {
+        if (link.busy.load(.acquire)) continue;
+        if (link.future) |*future| future.await(io);
+        link.future = null;
+        link.fd = fd;
+        link.source = source;
+        link.authenticated.store(false, .release);
+        link.busy.store(true, .release);
+        link.future = io.concurrent(serve, .{ server, link }) catch {
+            link.busy.store(false, .release);
             _ = std.os.linux.close(fd);
             return;
         };
         return;
     }
-    _ = std.os.linux.close(fd); // Every slot is busy: the peer tries another source.
+    _ = std.os.linux.close(fd); // Every link is busy: the peer tries again.
 }
 
-/// Whether a connection of `source` is still in its handshake in some slot.
+/// Whether a connection of `source` is still in its handshake in some link.
 fn handshake_pending(server: *Server, source: u64) bool {
-    for (&server.slots) |*slot| {
-        if (!slot.busy.load(.acquire)) continue;
-        if (slot.source != source) continue;
-        if (!slot.authenticated.load(.acquire)) return true;
+    for (&server.links) |*link| {
+        if (!link.busy.load(.acquire)) continue;
+        if (link.source != source) continue;
+        if (!link.authenticated.load(.acquire)) return true;
     }
     return false;
 }
 
-/// Shows ZC-E0808 once per streak of refusals: a flood must not flood the log.
-fn refuse(server: *Server, io: std.Io, why: []const u8) void {
-    if (server.refusal_shown) return;
-    server.refusal_shown = true;
+/// A slot for an authenticated connection, or null when every one is serving.
+fn claim_slot(server: *Server) ?*Slot {
+    for (&server.slots) |*slot| {
+        if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) return slot;
+    }
+    return null;
+}
+
+/// Shows ZC-E0808, naming the refused address, at most once per `peer_refusal_log_ms`.
+fn refuse(server: *Server, io: std.Io, storage: *const Storage, why: []const u8) void {
+    if (!server.refusal_log.due(peer_stream.boot_ms(io))) return;
     server.refusals_shown += 1;
+    var text_buffer: [64]u8 = undefined;
     var diag: Diag = undefined;
     diag.reset();
     diag.raise(.E0808);
-    diag.cause("{s}", .{why});
+    diag.cause("peer address {s} {s}", .{ source_text(&text_buffer, storage), why });
     diag.fix(.{ .sentence = "no action needed; it is tried again by itself" });
     if (!server.config.quiet) show(io, &diag, server.config.verbose);
 }
@@ -236,11 +306,11 @@ fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to report it.
 }
 
-fn serve(server: *Server, slot: *Slot) void {
+fn serve(server: *Server, link: *Link) void {
     const io = server.io;
     defer {
-        _ = std.os.linux.close(slot.fd);
-        slot.busy.store(false, .release);
+        _ = std.os.linux.close(link.fd);
+        link.busy.store(false, .release);
     }
     var diag: Diag = undefined;
     diag.reset();
@@ -256,7 +326,7 @@ fn serve(server: *Server, slot: *Slot) void {
     var identity = identity_found orelse return; // Not joined yet: nobody is served.
     defer identity.deinit();
     const handshake_end = peer_stream.boot_ms(io) + constants.peer_handshake_ms;
-    var stream = peer_stream.open_server(io, slot.fd, &identity, handshake_end) catch |err| {
+    var stream = peer_stream.open_server(io, link.fd, &identity, handshake_end) catch |err| {
         switch (err) {
             error.Closed, error.Timeout, error.Io, error.TooBig => {},
             else => |refusal| {
@@ -267,12 +337,27 @@ fn serve(server: *Server, slot: *Slot) void {
         return;
     };
     defer stream.deinit();
-    slot.authenticated.store(true, .release);
+    link.authenticated.store(true, .release);
+    const slot = claim_slot(server) orelse return tell_busy(&stream);
+    defer slot.busy.store(false, .release);
     var count: u32 = 0;
     while (count < constants.peer_connection_requests_max) : (count += 1) {
         if (server.stopping.load(.acquire)) return;
         if (!one_request(&stream, slot, server.config.corrupt_chunks)) return;
     }
+}
+
+/// Every serving slot is taken: answers the authenticated peer's first request with 503 (an
+/// empty body) so that it knows the server is busy rather than gone, and ends the connection.
+fn tell_busy(stream: *peer_stream.Stream) void {
+    var request: [1024]u8 = undefined;
+    const io = stream.io;
+    _ = stream.recv(&request, peer_stream.boot_ms(io) + constants.peer_idle_ms) catch return;
+    var head: [reply_head_bytes]u8 = @splat(0);
+    std.mem.writeInt(u16, head[0..2], peer_serve.status_busy, .big);
+    const end = peer_stream.boot_ms(io) + constants.peer_reply_ms;
+    stream.send(&head, end) catch return;
+    stream.send("", end) catch return;
 }
 
 /// Reads one request and answers it. False when the connection should end.
@@ -417,8 +502,15 @@ test "a peer of the cluster is served a chunk and a tree, and a stranger is not"
     try stream.send(tree, end);
     _ = try stream.recv(&reply, end);
     try std.testing.expectEqualSlices(u8, rig.list[0..rig.list_len], try stream.recv(&reply, end));
-    const missing = try std.fmt.bufPrint(&target, "GET {s}{s}\n", .{ trees_path, "b3:12345678" });
-    try stream.send(missing, end);
+    // A tree under its short name is not served (400); a full digest that is not held is 404.
+    const short = try std.fmt.bufPrint(&target, "GET {s}{s}\n", .{ trees_path, "b3:12345678" });
+    try stream.send(short, end);
+    const refused_short = try stream.recv(&reply, end);
+    try std.testing.expectEqual(@as(u16, 400), std.mem.readInt(u16, refused_short[0..2], .big));
+    _ = try stream.recv(&reply, end); // Its body.
+    const zeros: [64]u8 = @splat('0');
+    const absent = try std.fmt.bufPrint(&target, "GET {s}b3:{s}\n", .{ trees_path, &zeros });
+    try stream.send(absent, end);
     const gone = try stream.recv(&reply, end);
     try std.testing.expectEqual(@as(u16, 404), std.mem.readInt(u16, gone[0..2], .big));
 
@@ -542,8 +634,8 @@ test "four silent connections from one source hold one slot, and an honest peer 
     };
     try io.sleep(.fromMilliseconds(200), .awake);
     var busy: u32 = 0;
-    for (&rig.server.slots) |*slot| {
-        if (slot.busy.load(.acquire)) busy += 1;
+    for (&rig.server.links) |*link| {
+        if (link.busy.load(.acquire)) busy += 1;
     }
     try std.testing.expectEqual(@as(u32, 1), busy);
     // Three refused connections are one streak: ZC-E0808 was shown once, not three times.
@@ -575,6 +667,130 @@ test "four silent connections from one source hold one slot, and an honest peer 
         return;
     }
     return error.NeverServed;
+}
+
+test "a busy peer is asked again a few times, then refused, and is never a timeout" {
+    // Goal: review S3. Method: every serving slot taken; the client's `peer_get` sees 503 each
+    // time, retries `fetch_busy_retries_max` times and answers `.refused` (a timeout would be a
+    // strike), having seen busy once more than it retried.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    for (&rig.server.slots) |*slot| slot.busy.store(true, .release);
+    defer for (&rig.server.slots) |*slot| slot.busy.store(false, .release);
+    const fetch_cli = @import("fetch_cli.zig");
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    const peers = [_]fetch_cli.Peer{.{
+        .name = "node2",
+        .address = try net.IpAddress.parse("127.0.0.1", rig.server.port()),
+    }};
+    var reply: [1024]u8 = undefined;
+    var conns: [1]fetch_cli.Conn = .{.{}};
+    var net_state: fetch_cli.Net = .{
+        .io = io,
+        .conns = &conns,
+        .registry = peers[0].address,
+        .peers = &peers,
+        .identity = .{
+            .key = key,
+            .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+            .ca_public = rig.ca.public_key.toBytes(),
+        },
+        .reply = &reply,
+    };
+    defer net_state.close_peers();
+    var target: [128]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&target, "{s}{x}", .{ chunk_path, &rig.hash });
+    try std.testing.expectEqual(fetch_cli.PeerReply.refused, net_state.peer_get(0, path, &out));
+    try std.testing.expectEqual(constants.fetch_busy_retries_max + 1, net_state.busy_seen);
+}
+
+/// A connection to `address` from the loopback address 127.0.0.`octet`, a source of its own.
+fn connect_from(io: std.Io, octet: u8, address: net.IpAddress) !std.posix.fd_t {
+    const linux = std.os.linux;
+    const opened = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.Io;
+    const fd: std.posix.fd_t = @intCast(opened);
+    errdefer _ = linux.close(fd);
+    var text: [16]u8 = undefined;
+    const from = try net.IpAddress.parse(try std.fmt.bufPrint(&text, "127.0.0.{d}", .{octet}), 0);
+    var from_storage: std.Io.Threaded.PosixAddress = undefined;
+    const from_length = std.Io.Threaded.addressToPosix(&from, &from_storage);
+    if (linux.errno(linux.bind(fd, &from_storage.any, from_length)) != .SUCCESS) return error.Io;
+    var to_storage: std.Io.Threaded.PosixAddress = undefined;
+    const to_length = std.Io.Threaded.addressToPosix(&address, &to_storage);
+    if (linux.errno(linux.connect(fd, &to_storage.any, to_length)) != .SUCCESS) return error.Io;
+    _ = io;
+    return fd;
+}
+
+test "silent connections from more sources than there are serving slots do not lock out a peer" {
+    // Goal: review M1. Method: twice `peer_connections_max` silent connections, each from a
+    // source of its own (127.0.0.2 and up); an honest peer (127.0.0.1) is served at once.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    var silent: [2 * constants.peer_connections_max]std.posix.fd_t = undefined;
+    for (&silent, 0..) |*fd, at| fd.* = try connect_from(io, @intCast(2 + at), address);
+    defer for (silent) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    var identity: peer.Identity = .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+    const end = peer_stream.boot_ms(io) + 3000;
+    const fd = try peer_stream.connect(io, address, end);
+    defer _ = std.os.linux.close(fd);
+    var stream = try peer_stream.open_client(io, fd, &identity, "node2", end);
+    defer stream.deinit();
+    var target: [128]u8 = undefined;
+    var reply: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&target, "GET {s}{x}\n", .{ chunk_path, &rig.hash });
+    try stream.send(path, end);
+    const head = try stream.recv(&reply, end);
+    try std.testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, head[0..2], .big));
+}
+
+test "an authenticated peer finding every serving slot taken is told busy" {
+    // Goal: review M1, the explicit busy reply. Method: take every serving slot by hand.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    for (&rig.server.slots) |*slot| slot.busy.store(true, .release);
+    defer for (&rig.server.slots) |*slot| slot.busy.store(false, .release);
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    var identity: peer.Identity = .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+    const end = peer_stream.boot_ms(io) + 3000;
+    const fd = try peer_stream.connect(io, address, end);
+    defer _ = std.os.linux.close(fd);
+    var stream = try peer_stream.open_client(io, fd, &identity, "node2", end);
+    defer stream.deinit();
+    var target: [128]u8 = undefined;
+    var reply: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&target, "GET {s}{x}\n", .{ chunk_path, &rig.hash });
+    try stream.send(path, end);
+    const head = try stream.recv(&reply, end);
+    try std.testing.expectEqual(
+        @as(u16, peer_serve.status_busy),
+        std.mem.readInt(u16, head[0..2], .big),
+    );
 }
 
 test "an IPv6 address is a source by its /64, and a mapped IPv4 address by its IPv4 address" {

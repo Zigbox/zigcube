@@ -422,6 +422,8 @@ pub const summary_request_bytes_max: u32 = summary_json_bytes_max + 128;
 
 /// Peers one fetch considers (a filter each), and chunks one fetch plans (a tree of 64 GiB).
 pub const fetch_peers_max: u32 = 16;
+/// A full tree digest: `b3:` and 64 hex digits.
+pub const tree_digest_bytes: u32 = 3 + 64;
 /// Peers discovery may offer a fetch; the worker ranks them by the chunks their filters claim
 /// and keeps `fetch_peers_max` of them.
 pub const fetch_candidates_max: u32 = 64;
@@ -443,6 +445,8 @@ pub const dir_temp_stale_ms: u64 = 2 * @as(u64, fetch_total_ms);
 pub const dir_sweep_entries_max: u32 = 1 << 20;
 /// A wait for the back-off sleeps in slices of this size, so a stop is noticed.
 pub const fetch_backoff_slice_ms: u32 = 100;
+/// Digests whose fetch streak a node keeps (`fetch_backoff.zig`); a new one drops the oldest.
+pub const fetch_streak_digests_max: u32 = 16;
 pub const fetch_chunks_max: u32 = summary_chunks_capacity;
 /// A tree's chunk list as text: `<64 hex> <bytes>` and a newline per chunk, at most 80 bytes each.
 pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
@@ -492,8 +496,19 @@ pub const peer_handshake_window_ms: u64 = 10 * 1000;
 /// Sources the limiter tracks at once. A table full of live windows refuses a new source: the
 /// cheapest answer to an address flood, and an agent retries.
 pub const peer_sources_max: u32 = 256;
-/// Peer connections the server serves at once; one more is closed at once.
+/// Peer connections the server serves at once (each owns buffers of about 12 MiB). One more
+/// authenticated peer is told it is busy (status 503) and closed.
 pub const peer_connections_max: u32 = 4;
+/// Connections the server holds before they are authenticated: a descriptor, a task and a few
+/// words each, no buffers. A silent stranger holds one for at most `peer_handshake_ms`; the
+/// buffers of a serving slot go to a connection only once it has authenticated.
+pub const peer_handshakes_max: u32 = 32;
+/// Time between two times ZC-E0808 is shown, whatever the sources: a flood must not flood a log.
+pub const peer_refusal_log_ms: u64 = 10 * 1000;
+/// Times a fetch asks a peer again after its server said it is busy, and the pause before each.
+/// A busy peer is not a failed one: no timeout, no strike.
+pub const fetch_busy_retries_max: u32 = 4;
+pub const fetch_busy_sleep_ms: u32 = 250;
 /// Time a peer has to finish the handshake.
 pub const peer_handshake_ms: u32 = 3 * 1000;
 /// Time a served connection waits for its next request before it closes.
@@ -504,6 +519,8 @@ pub const peer_reply_ms: u32 = 5 * 1000;
 pub const peer_connection_requests_max: u32 = 64;
 
 comptime {
+    assert(peer_handshakes_max > peer_connections_max);
+    assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);
     assert(peer_sources_max >= peer_handshakes_per_source_max);

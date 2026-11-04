@@ -9,7 +9,8 @@
 //! sources: the registry, plain HTTP (`GET /trees/<digest>`, `GET /chunks/<64 hex>`), and the
 //! peers, over `peer_stream` (`GET /v1/peer/trees/<digest>`, `/v1/peer/chunk/<64 hex>`). Peers
 //! are named on the command line; each is assumed to hold every chunk, and the plan strikes
-//! one that lies (a hash mismatch) or does not answer. Exit codes: 0 fetched, 1 not fetched.
+//! one that lies (a hash mismatch) or does not answer. Exit codes: 0 fetched, 1 bad arguments
+//! (ZC-E0505), 2 this node failed (disk, memory), 3 no source had the tree (ZC-E0601).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -40,8 +41,10 @@ const reply_head_slack_bytes = 4096;
 /// The reply buffer's size: the largest legitimate reply, a tree's chunk list
 /// (`tree_list_bytes_max`, larger than a chunk) or a chunk, and a head. A reply past it is
 /// refused (`Net.oversize`).
-pub const reply_bytes: usize = @max(constants.swarm_chunk_bytes, constants.tree_list_bytes_max) +
-    reply_head_slack_bytes;
+pub const reply_bytes: usize = @max(
+    @max(constants.swarm_chunk_bytes, constants.tree_list_bytes_max),
+    discover_page_bytes_max,
+) + reply_head_slack_bytes;
 
 /// The network side of the worker. `list_scratch` holds one reply; `identity` is the node's.
 pub const Net = struct {
@@ -56,6 +59,8 @@ pub const Net = struct {
     bad_lists: u32 = 0,
     /// The registry sent a reply larger than `reply_bytes`: refused, and said in ZC-E0601.
     oversize: bool = false,
+    /// Times a peer answered that it was busy (counts for tests and the log line).
+    busy_seen: u32 = 0,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
     conns: []Conn = &.{},
 
@@ -83,7 +88,7 @@ pub const Net = struct {
                 const path = std.fmt.bufPrint(&target, "/trees/{s}", .{digest}) catch return null;
                 return switch (net.http_get(net.registry, path, out)) {
                     .bytes => |bytes| bytes,
-                    .refused, .timeout => null,
+                    .refused, .timeout, .busy => null,
                 };
             },
             .peer => |index| {
@@ -92,7 +97,7 @@ pub const Net = struct {
                     return null;
                 return switch (net.peer_get(index, path, out)) {
                     .bytes => |bytes| bytes,
-                    .refused, .timeout => null,
+                    .refused, .timeout, .busy => null,
                 };
             },
         }
@@ -108,7 +113,7 @@ pub const Net = struct {
                 return switch (net.http_get(net.registry, path, out)) {
                     .bytes => |bytes| .{ .bytes = bytes },
                     .refused => .refused,
-                    .timeout => .timeout,
+                    .timeout, .busy => .timeout,
                 };
             },
             .peer => |index| {
@@ -117,7 +122,7 @@ pub const Net = struct {
                     return .refused;
                 return switch (net.peer_get(index, path, out)) {
                     .bytes => |bytes| .{ .bytes = bytes },
-                    .refused => .refused,
+                    .refused, .busy => .refused, // `peer_get` has waited out a busy peer.
                     .timeout => .timeout,
                 };
             },
@@ -179,8 +184,23 @@ pub const Net = struct {
     /// The stream is kept for the whole fetch (the server limits handshakes per source) and
     /// reopened after an error or `peer_connection_requests_max` requests. A non-200 head is
     /// `.refused` (the peer lacks it); a connect, handshake or stream failure is `.timeout`.
-    /// One deadline covers both tries of a request.
+    /// One deadline covers both tries of a request. A peer whose server says it is busy (every
+    /// serving slot taken, status 503) is asked again after `fetch_busy_sleep_ms`, at most
+    /// `fetch_busy_retries_max` times: it is neither a timeout nor a strike. Still busy after
+    /// that, the answer is `.refused` and the plan takes the chunk from another source.
     pub fn peer_get(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
+        var retries: u32 = 0;
+        while (true) {
+            const reply = net.peer_get_once(index, path, out);
+            if (reply != .busy) return reply;
+            net.busy_seen += 1;
+            if (retries == constants.fetch_busy_retries_max) return .refused;
+            retries += 1;
+            sleep(net, constants.fetch_busy_sleep_ms);
+        }
+    }
+
+    fn peer_get_once(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
         const conn = &net.conns[index];
         const reused = conn.open;
         if (conn.open and conn.requests >= constants.peer_connection_requests_max) {
@@ -210,7 +230,7 @@ pub const Net = struct {
         var request: [160]u8 = undefined;
         const text = std.fmt.bufPrint(&request, "GET {s}\n", .{path}) catch return .timeout;
         const reply = net.peer_exchange(&conn.stream, text, out, end);
-        if (reply == .timeout) conn.close();
+        if (reply == .timeout or reply == .busy) conn.close();
         return reply;
     }
 
@@ -225,7 +245,9 @@ pub const Net = struct {
         const head = stream.recv(net.reply[0..reply_head_bytes], end) catch return .timeout;
         if (head.len != reply_head_bytes) return .timeout;
         const body = stream.recv(out, end) catch return .timeout;
-        if (std.mem.readInt(u16, head[0..2], .big) != 200) return .refused;
+        const status = std.mem.readInt(u16, head[0..2], .big);
+        if (status == peer_serve.status_busy) return .busy;
+        if (status != 200) return .refused;
         return .{ .bytes = body };
     }
 
@@ -235,7 +257,7 @@ pub const Net = struct {
     }
 };
 
-pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout };
+pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout, busy };
 
 /// One peer's open stream and how many requests it has carried.
 pub const Conn = struct {
@@ -394,19 +416,48 @@ fn select_candidates(
 
 const Kv = struct { key: []const u8, value: std.json.Value };
 
-/// The `kvs` of a `/v1/list` reply, or null if the text is over `discover_body_bytes_max` or is
+/// One page of a `/v1/list` reply: its `kvs`, the revision it was read at and, if the list was
+/// cut, the key to continue after.
+const Page = struct {
+    kvs: []const Kv,
+    revision: u64 = 0,
+    @"continue": ?[]const u8 = null,
+};
+
+/// The page a `/v1/list` reply holds, or null if the text is over `discover_page_bytes_max` or is
 /// not one.
-fn parse_kvs(arena: std.mem.Allocator, text: []const u8) ?[]const Kv {
-    if (text.len > discover_body_bytes_max) return null;
-    const Listed = struct { kvs: []const Kv };
-    const parsed = std.json.parseFromSliceLeaky(Listed, arena, text, .{
+fn parse_page(arena: std.mem.Allocator, text: []const u8) ?Page {
+    if (text.len > discover_page_bytes_max) return null;
+    return std.json.parseFromSliceLeaky(Page, arena, text, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
-    return parsed.kvs;
+    }) catch null;
 }
 
-/// The reply to the server's list of `/node-store/` is at most this long (a filter is hex).
-const discover_body_bytes_max = constants.swarm_chunk_bytes;
+/// The `kvs` of a `/v1/list` reply, or null (see `parse_page`).
+fn parse_kvs(arena: std.mem.Allocator, text: []const u8) ?[]const Kv {
+    const page = parse_page(arena, text) orelse return null;
+    return page.kvs;
+}
+
+/// Nodes asked for in one page of discovery. A node's record is at most
+/// `summary_json_bytes_max` (a full filter and sketches, about 216 KiB) and a listed key adds a
+/// few hundred bytes, so a page of this many fits one reply (`api_response_bytes_max`) and one
+/// `reply_bytes` buffer; the list is read page by page (`/v1/list`'s `continue`), so the number
+/// of nodes is not bound by the size of one reply.
+const discover_page_nodes: u32 = 16;
+const discover_kv_overhead_bytes = 512;
+/// The reply to one page is at most this long.
+const discover_page_bytes_max: usize = discover_page_nodes *
+    (constants.summary_json_bytes_max + discover_kv_overhead_bytes) + 256;
+/// Pages read at most: enough for `fetch_candidates_max` nodes and one more (to count the rest).
+const discover_pages_max = (constants.fetch_candidates_max + 1 + discover_page_nodes - 1) /
+    discover_page_nodes;
+
+comptime {
+    assert(discover_page_bytes_max <= constants.api_response_bytes_max);
+    assert(constants.summary_json_bytes_max <= constants.store_value_bytes_max);
+    assert(discover_pages_max * discover_page_nodes > constants.fetch_candidates_max);
+}
 
 fn string_field(value: std.json.Value, name: []const u8) ?[]const u8 {
     if (value != .object) return null;
@@ -486,8 +537,21 @@ pub fn parse(args: []const []const u8) ?Args {
         } else return null;
     }
     const complete = parsed.node.len > 0 and parsed.state_dir.len > 0 and
-        parsed.images_dir.len > 0 and parsed.digest.len > 0 and parsed.registry != null;
-    return if (complete) parsed else null;
+        parsed.images_dir.len > 0 and parsed.registry != null;
+    if (!complete or !digest_valid(parsed.digest)) return null;
+    return parsed;
+}
+
+/// `b3:` and 8 to 64 lower-case hex digits. The digest goes into request lines (the registry's
+/// HTTP and the peers'), so anything else, a CR or LF above all, is refused here.
+pub fn digest_valid(digest: []const u8) bool {
+    if (!std.mem.startsWith(u8, digest, "b3:")) return false;
+    const hex = digest[3..];
+    if (hex.len < 8 or hex.len > 64) return false;
+    for (hex) |c| {
+        if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
+    }
+    return true;
 }
 
 /// Adds `NAME=HOST:PORT` to `parsed.peers`. False if the value is not of that form or there are
@@ -681,6 +745,44 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
 /// What `select_candidates` fills: the peers and, beside them, their filters.
 const Slots = struct { []Peer, []fetch_worker.PeerInfo };
 
+/// Reads the server's `/node-store/` list, a page at a time (`discover_page_nodes` each, at most
+/// `discover_pages_max`); what was read when a later page fails is kept, and null if none was.
+/// `getter.get(path, out)` is the body of a 200 for `path`, copied into `out`, or null.
+fn collect_pages(arena: std.mem.Allocator, getter: anytype, out: []u8) ?[]const Kv {
+    var all: std.ArrayList(Kv) = .empty;
+    var first_revision: u64 = 0;
+    var after: ?[]const u8 = null;
+    for (0..discover_pages_max) |at| {
+        var target: [160]u8 = undefined;
+        const form = "/v1/list?prefix=/node-store/&limit={d}";
+        const path = if (after) |key|
+            std.fmt.bufPrint(&target, form ++ "&at={d}&continue={s}", .{
+                discover_page_nodes, first_revision, key,
+            })
+        else
+            std.fmt.bufPrint(&target, form, .{discover_page_nodes});
+        const body = getter.get(path catch break, out) orelse break;
+        const page = parse_page(arena, body) orelse break;
+        all.appendSlice(arena, page.kvs) catch break;
+        if (at == 0) first_revision = page.revision;
+        after = page.@"continue" orelse return all.items;
+    }
+    return if (all.items.len == 0) null else all.items;
+}
+
+/// `collect_pages` over the control plane's HTTP.
+const HttpGetter = struct {
+    net: *Net,
+    server: IpAddress,
+
+    fn get(getter: HttpGetter, path: []const u8, out: []u8) ?[]const u8 {
+        return switch (getter.net.http_get(getter.server, path, out)) {
+            .bytes => |body| body,
+            .refused, .timeout, .busy => null,
+        };
+    }
+};
+
 /// Asks the server for the nodes' summaries and picks the candidates among them.
 fn discover(
     arena: std.mem.Allocator,
@@ -690,15 +792,9 @@ fn discover(
     slots: Slots,
     skipped: *Skipped,
 ) u32 {
-    const scratch = arena.alloc(u8, discover_body_bytes_max) catch return 0;
-    var target: [96]u8 = undefined;
-    const form = "/v1/list?prefix=/node-store/&limit={d}";
-    const path = std.fmt.bufPrint(&target, form, .{constants.fetch_candidates_max + 1}) catch
-        return 0;
-    const stores = switch (net.http_get(server, path, scratch)) {
-        .bytes => |body| parse_kvs(arena, body),
-        .refused, .timeout => null,
-    } orelse {
+    const scratch = arena.alloc(u8, discover_page_bytes_max) catch return 0;
+    const getter: HttpGetter = .{ .net = net, .server = server };
+    const stores = collect_pages(arena, getter, scratch) orelse {
         note(net.io, "zcube-agent fetch: the server's node list could not be read; peers: " ++
             "only those named\n");
         return 0;
@@ -730,6 +826,23 @@ test "the fetch arguments need a node, directories, a digest and a registry" {
     try std.testing.expectEqual(@as(u32, 1), parsed.peer_count);
     try std.testing.expectEqualStrings("node2", parsed.peers[0].name);
     try std.testing.expect(parse(good[0..8]) == null);
+    const zeros65: [65]u8 = @splat('0');
+    const a64: [64]u8 = @splat('a');
+    // The digest ends up in request lines: CR/LF, a path, upper case, a wrong length are refused.
+    const bad_digests = [_][]const u8{
+        "b3:00000000\r\nX-Evil: 1", "b3:00000000\n",   "b3:0000000",
+        "b3:" ++ zeros65,           "b3:0000000G",     "b3:0000000A",
+        "B3:00000000",              "sha256:00000000", "b3:../../../x",
+        "b3:00000000 HTTP/1.1",     "",                "b3:",
+    };
+    for (bad_digests) |bad| {
+        var args = good;
+        args[7] = bad;
+        try std.testing.expect(parse(&args) == null);
+    }
+    var long = good;
+    long[7] = "b3:" ++ a64;
+    try std.testing.expect(parse(&long) != null);
     try std.testing.expect(parse(&.{ "--node", "n", "--bogus", "x" }) == null);
 }
 
@@ -827,9 +940,66 @@ test "discovery keeps at most the room it is given and a malformed body gives no
     try std.testing.expectEqual(@as(u32, 54), skipped.over_limit);
     try std.testing.expect(parse_kvs(arena, text[0 .. text.len - 5]) == null);
     try std.testing.expect(parse_kvs(arena, "no") == null);
-    const over = try arena.alloc(u8, discover_body_bytes_max + 1);
+    const over = try arena.alloc(u8, discover_page_bytes_max + 1);
     @memset(over, ' ');
     try std.testing.expect(parse_kvs(arena, over) == null);
+}
+
+/// A server that answers `collect_pages` from prepared pages, one per call.
+const PagedGetter = struct {
+    pages: []const []const u8,
+    calls: *u32,
+    last_path: *[160]u8,
+
+    fn get(getter: PagedGetter, path: []const u8, out: []u8) ?[]const u8 {
+        const at = getter.calls.*;
+        getter.calls.* += 1;
+        if (at == 1) @memcpy(getter.last_path[0..path.len], path);
+        if (at >= getter.pages.len) return null;
+        @memcpy(out[0..getter.pages[at].len], getter.pages[at]);
+        return out[0..getter.pages[at].len];
+    }
+};
+
+test "discovery reads more nodes than one reply holds, with full-size filters, page by page" {
+    // Goal: review S1. Method: 40 nodes whose records are as large as a node's summary may be
+    // (`summary_json_bytes_max`), served 16 to a page; all 40 arrive, the second request names
+    // the revision of the first page and the key to continue after.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filter = try arena.alloc(u8, constants.summary_json_bytes_max - 128);
+    @memset(filter, 'a');
+    var pages: [3][]const u8 = undefined;
+    for (&pages, 0..) |*page, number| {
+        const first = number * discover_page_nodes;
+        const last = @min(first + discover_page_nodes, 40);
+        var writer: std.Io.Writer.Allocating = .init(arena);
+        try writer.writer.writeAll("{\"revision\":7,\"kvs\":[");
+        for (first..last) |at| {
+            if (at > first) try writer.writer.writeAll(",");
+            try writer.writer.print(
+                "{{\"key\":\"/node-store/n{d:0>3}\",\"value\":{{\"filter\":\"{s}\"}}}}",
+                .{ at, filter },
+            );
+        }
+        try writer.writer.writeAll("]");
+        if (last < 40) {
+            const more = ",\"continue\":\"/node-store/n{d:0>3}\"";
+            try writer.writer.print(more, .{last - 1});
+        }
+        try writer.writer.writeAll("}");
+        page.* = writer.written();
+    }
+    var calls: u32 = 0;
+    var second: [160]u8 = @splat(0);
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &second };
+    const out = try arena.alloc(u8, discover_page_bytes_max);
+    const kvs = collect_pages(arena, getter, out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 40), kvs.len);
+    try std.testing.expectEqual(@as(u32, 3), calls);
+    const asked = std.mem.sliceTo(&second, 0);
+    try std.testing.expect(std.mem.find(u8, asked, "&at=7&continue=/node-store/n015") != null);
 }
 
 test "a --peer with a name that is not a node name is left out, the rest are kept" {

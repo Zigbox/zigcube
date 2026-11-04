@@ -262,8 +262,9 @@ length and its body in records; every wait is a `poll` against one deadline). `s
 listens, asks `peer_limit.Limiter` before each handshake (ZC-E0808 once per streak), loads the
 identity from the state directory at each handshake (`agent_peer.load_identity`) and answers
 `GET /v1/peer/trees/<digest>` and `GET /v1/peer/chunk/<hash>` with `peer_serve.answer`. A reply is a
-14-byte head message (status u16, first, last, total u32 big endian) and a body message. At most
-`peer_connections_max` connections, each with its own buffers. `src/fetch_worker.zig` drives
+14-byte head message (status u16, first, last, total u32 big endian) and a body message. Each connection first
+holds a cheap handshake slot (`peer_handshakes_max`); only after it authenticates does it take one of
+`peer_connections_max` serving slots (the big buffers), else it is told 503 (busy). `src/fetch_worker.zig` drives
 `fetch_plan` over a `Transport` and a `DirImages`.
 
 The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor running the worker before
@@ -291,8 +292,8 @@ address as the IPv4 address it carries (`peer_server.source_key`).
   addresses, at the cost that honest peers are refused too, for at most one window, until a
   slot frees. Their retry is the recovery. The clock is `CLOCK_BOOTTIME` milliseconds (monotonic).
 
-Refusals are shown as ZC-E0808 once per run of refusals (a flood does not flood the log); the
-next admitted handshake starts a new run.
+Refusals are shown as ZC-E0808, naming the address, at most once per `peer_refusal_log_ms`
+(a flood does not flood the log). Only full `b3:` + 64 hex trees are served or counted.
 
 ## Test fault: `peer-corrupt`
 

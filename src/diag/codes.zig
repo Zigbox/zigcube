@@ -1252,7 +1252,7 @@ pub const registry = [_]Entry{
     .{
         .code = .E0808,
         .severity = .@"error",
-        .blame = .user,
+        .blame = .external,
         .summary = "a peer's handshake was refused: its address is over a limit",
         .explanation =
         \\An agent's peer server limits what one source address may ask of it,
@@ -1264,8 +1264,9 @@ pub const registry = [_]Entry{
         \\tracks peer_sources_max addresses in the window. An IPv6 address
         \\counts by its /64, one host's whole range.
         \\
-        \\The text is shown once for a run of refusals, not once per
-        \\connection. An honest fetch opens a handful of connections and keeps
+        \\The cause names the refused address (an IPv6 one by its /64). The
+        \\text is shown once per peer_refusal_log_ms, not once per connection.
+        \\An honest fetch opens a handful of connections and keeps
         \\them. If one node is refused over and over, something there retries
         \\in a loop: look at its agent's output. A refused node tries again by
         \\itself, and a fetch falls back to the registry meanwhile. A flood
