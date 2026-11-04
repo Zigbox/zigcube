@@ -18,7 +18,7 @@ Gives:
   cluster CA signed, and a client checks that the server's credential names the node it meant to
   reach. A peer with no CA-signed credential is refused before it is sent application data. It is
   not refused before it is told anything: any 34-byte M1 gets the server's credential in M2, at
-  the cost of one X25519 and one Ed25519 signature. Rate limiting M1 is 6b's work.
+  the cost of one X25519 and one Ed25519 signature. The peer server limits handshakes per source ("Rate limit", below).
 - **Confidentiality and integrity of the stream** (ChaCha20-Poly1305 records) and **forward
   secrecy** (fresh X25519 keys for every connection; a stolen node key does not open a recorded
   session).
@@ -187,6 +187,7 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 | E0805 | a record failed authentication, or a direction reached its record counter limit |
 | E0806 | (environment) the CA key or the node key could not be read, written or parsed |
 | E0807 | (user) a node was refused a credential because it was removed from the cluster |
+| E0808 | (user) a peer's handshake was refused: its address already has one unfinished, started too many in a window, or the table of addresses is full |
 
 ## Lifetime, renewal and removal
 
@@ -268,6 +269,30 @@ identity from the state directory at each handshake (`agent_peer.load_identity`)
 The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor running the worker before
 the command (ZC-E0601) and the fake registry are described in `docs/agent.md`; `zig build swarm-smoke`
 runs them end to end. See `docs/decisions/2026-11-03-slice6b-handoff.md`.
+
+## Rate limit
+
+M1 costs the responder public-key work, so `peer_server` decides before it starts a handshake,
+and closes a refused connection without a byte. A source is the peer's address with the port left
+out; an IPv6 address counts by its /64 (one host holds the whole range) and an IPv4-mapped IPv6
+address as the IPv4 address it carries (`peer_server.source_key`).
+
+- **One unfinished handshake per source.** While a connection from a source is still in its
+  handshake, another from the same source is refused and not counted below. A stranger that
+  connects and sends nothing therefore holds one connection slot, not all
+  `peer_connections_max`. The refused peer tries again and is admitted once the first handshake
+  has finished or timed out (`peer_handshake_ms`).
+- **A cap per window.** `peer_handshakes_per_source_max` (16) starts per source in
+  `peer_handshake_window_ms` (10 s) counted from the source's first start (`peer_limit.Limiter`).
+  A fetch keeps one stream per peer for up to `peer_connection_requests_max` requests, so an
+  honest node stays far below it.
+- **A table of `peer_sources_max` (256) sources.** A source whose window ran out frees its slot.
+  A table of live windows refuses a new source: the cheapest answer to a flood from many
+  addresses, at the cost that honest peers are refused too, for at most one window, until a
+  slot frees. Their retry is the recovery. The clock is `CLOCK_BOOTTIME` milliseconds (monotonic).
+
+Refusals are shown as ZC-E0808 once per run of refusals (a flood does not flood the log); the
+next admitted handshake starts a new run.
 
 ## Test fault: `peer-corrupt`
 

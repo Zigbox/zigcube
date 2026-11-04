@@ -338,7 +338,8 @@ fn load_or_make_key(
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
         io.random(&seed);
-        const key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
+        var key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
+        errdefer std.crypto.secureZero(u8, &key.secret_key.bytes); // A key that was not stored.
         try files.write_seed(io, dir, where, key_file, seed, diag);
         return key;
     }

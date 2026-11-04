@@ -27,6 +27,9 @@ const node_store = @import("node_store.zig");
 const Allocator = std.mem.Allocator;
 const ChunkRef = fetch_plan.ChunkRef;
 
+/// A whole tree digest as text: `b3:` and 64 hex digits of BLAKE3.
+const full_digest_len = 3 + 64;
+
 pub const Error = error{ TreeUnavailable, ChunkFailed, Deadline, Store, OutOfMemory, TooMany };
 
 /// A peer the worker may ask: its name for reports and the bytes of its chunk filter.
@@ -95,7 +98,6 @@ pub fn fetch(
     // A peer is not trusted: only the whole digest (`b3:` and 64 hex) holds its list to the
     // tree. A shorter one (8 hex is 32 bits) could be matched by a forged list, so such a tree
     // comes from the registry alone.
-    const full_digest_len = 3 + 64;
     const peers = if (digest.len == full_digest_len) all_peers else all_peers[0..0];
     const list_buffer = try allocator.alloc(u8, constants.tree_list_bytes_max);
     defer allocator.free(list_buffer);
@@ -265,7 +267,7 @@ const Table = struct {
     refs: [tree_chunks]ChunkRef = undefined,
     list: [tree_chunks * 80]u8 = undefined,
     list_len: u32 = 0,
-    digest: [67]u8 = undefined,
+    digest: [full_digest_len]u8 = undefined,
     corrupt: ?u32 = null,
     registry_up: bool = true,
     registry_asked: u32 = 0,

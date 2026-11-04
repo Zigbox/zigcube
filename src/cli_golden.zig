@@ -425,8 +425,8 @@ fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
     sample(
         diag,
         .E0808,
-        &.{"10.0.0.7 started 16 handshakes in 10000 ms; the bound is 16"},
-        "nothing: it tries again after the window; check that node's agent for a retry loop",
+        &.{"a peer address started more handshakes than a window allows"},
+        "no action needed; it is tried again by itself",
     );
 }
 

@@ -34,6 +34,10 @@ pub const DirImages = struct {
     /// One tree list's text, read into here (startup allocation, `tree_list_bytes_max`).
     list: []u8,
     refs: []ChunkRef,
+    /// The most chunks a summary's filter is made for (`summary_chunks_capacity`; a test lowers
+    /// it). Trees past it are left out of the summary and counted in `omitted`, so the filter
+    /// never holds more than it was sized for and the hashes read stay under 2 MiB.
+    chunks_capacity: u32 = constants.summary_chunks_capacity,
 
     pub const OpenError = error{ OutOfMemory, Unusable };
 
@@ -131,16 +135,19 @@ pub const DirImages = struct {
         return node_store.list_parse(text, self.refs);
     }
 
-    fn has_chunk(self: *DirImages, chunks: Dir, hash: *const Hash) bool {
+    /// Whether the chunk is in `chunks` at the size the list gives (a cut-short file is not held;
+    /// its hash is checked only when it is read).
+    fn has_chunk(self: *DirImages, chunks: Dir, ref: ChunkRef) bool {
         var name_buffer: [64]u8 = undefined;
-        chunks.access(self.io, chunk_name(&name_buffer, hash), .{}) catch return false;
-        return true;
+        const stat = chunks.statFile(self.io, chunk_name(&name_buffer, &ref.hash), .{}) catch
+            return false;
+        return stat.size == ref.bytes;
     }
 
     /// Whether every chunk of the `count` in `self.refs` is in `chunks`.
     fn complete(self: *DirImages, chunks: Dir, count: u32) bool {
         for (self.refs[0..count]) |ref| {
-            if (!self.has_chunk(chunks, &ref.hash)) return false;
+            if (!self.has_chunk(chunks, ref)) return false;
         }
         return true;
     }
@@ -225,7 +232,8 @@ pub const DirImages = struct {
             digest[2] = ':';
             const count = self.load_list(digest) orelse continue;
             if (!self.complete(chunks, count)) continue;
-            if (held.items.len == constants.summary_trees_max) {
+            const over_trees = held.items.len == constants.summary_trees_max;
+            if (over_trees or hashes.items.len + count > self.chunks_capacity) {
                 omitted += 1;
                 continue;
             }
@@ -237,7 +245,8 @@ pub const DirImages = struct {
             try held.append(arena, .{ .digest = digest, .sketch = sketch });
         }
         if (hashes.items.len == 0) return .{ .omitted = omitted };
-        const capacity: u32 = @intCast(@min(hashes.items.len, constants.summary_chunks_capacity));
+        const capacity: u32 = @intCast(hashes.items.len);
+        assert(capacity <= self.chunks_capacity);
         const size = chunk_summary.Filter.bytes_for(@max(capacity, 64));
         const bits = try arena.alloc(u8, size);
         var filter = chunk_summary.Filter.init(bits);
@@ -379,6 +388,58 @@ test "a chunk file that was damaged on disk is not served" {
     const out = try std.testing.allocator.alloc(u8, constants.swarm_chunk_bytes);
     defer std.testing.allocator.free(out);
     try std.testing.expectError(error.BadHash, images.read_chunk(&sample.hashes[0], out));
+}
+
+test "a chunk file cut short is not held" {
+    // Goal: `has` checks the size the list gives, not only that the name exists. Method: a whole
+    // tree, then one chunk's file replaced by a shorter one.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try test_store(&tmp);
+    defer store.close(std.testing.allocator);
+    const images = store.images();
+    var sample: Sample = .{};
+    sample.make(50, 2);
+    const digest: []const u8 = &sample.digest;
+    try store.put_tree(digest, sample.list[0..sample.list_len]);
+    for (0..2) |index| try images.put_chunk(&sample.hashes[index], &sample.bodies[index]);
+    try std.testing.expect(images.has(digest));
+    var name: [64]u8 = undefined;
+    const chunks = try store.root.openDir(std.testing.io, dir_chunks, .{});
+    defer chunks.close(std.testing.io);
+    try write_whole(std.testing.io, chunks, DirImages.chunk_name(&name, &sample.hashes[1]), "cut");
+    try std.testing.expect(!images.has(digest));
+}
+
+test "a summary leaves out trees past the filter's capacity" {
+    // Goal: the filter is never over capacity (it would saturate and claim everything), and the
+    // memory a summary reads is bounded. Method: capacity 4 chunks, a tree of 3 and one of 2.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try test_store(&tmp);
+    defer store.close(std.testing.allocator);
+    store.chunks_capacity = 4;
+    const images = store.images();
+    var first: Sample = .{};
+    first.make(60, 3);
+    var second: Sample = .{};
+    second.make(90, 2);
+    for ([_]*Sample{ &first, &second }) |sample| {
+        try store.put_tree(&sample.digest, sample.list[0..sample.list_len]);
+        for (0..3) |index| {
+            if (std.mem.eql(u8, &sample.digest, &first.digest) or index < 2) {
+                try images.put_chunk(&sample.hashes[index], &sample.bodies[index]);
+            }
+        }
+    }
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const summary = try images.summary(arena_state.allocator(), &.{});
+    try std.testing.expectEqual(@as(usize, 1), summary.trees.len);
+    try std.testing.expectEqual(@as(u32, 1), summary.omitted);
+    // Directory order decides which tree came first; the other no longer fits.
+    const kept_first = std.mem.eql(u8, summary.trees[0].digest, &first.digest);
+    try std.testing.expectEqual(@as(u32, if (kept_first) 3 else 2), summary.filter_chunks);
 }
 
 test "a chunk of exactly the largest size is stored, read and served" {

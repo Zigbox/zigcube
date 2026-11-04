@@ -44,10 +44,19 @@ pub fn parse_range(value: []const u8) error{Bad}!struct { first: u32, last: u32 
     if (!std.mem.startsWith(u8, value, prefix)) return error.Bad;
     const spec = value[prefix.len..];
     const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.Bad;
-    const first = std.fmt.parseInt(u32, spec[0..dash], 10) catch return error.Bad;
-    const last = std.fmt.parseInt(u32, spec[dash + 1 ..], 10) catch return error.Bad;
+    const first = number(spec[0..dash]) orelse return error.Bad;
+    const last = number(spec[dash + 1 ..]) orelse return error.Bad;
     if (first > last) return error.Bad;
     return .{ .first = first, .last = last };
+}
+
+/// A range bound: ASCII digits only (`parseInt` also takes a leading `+`).
+fn number(text: []const u8) ?u32 {
+    if (text.len == 0) return null;
+    for (text) |character| {
+        if (character < '0' or character > '9') return null;
+    }
+    return std.fmt.parseInt(u32, text, 10) catch null;
 }
 
 /// The reply to `method target` with the `Range` header value `range_header` (null if none).
@@ -77,7 +86,7 @@ fn fixed(status: u16, message: []const u8) Reply {
 }
 
 fn tree(images: node_store.Images, digest: []const u8, scratch: []u8, refs: []ChunkRef) Reply {
-    if (digest.len < 11 or digest.len > 67) return fixed(400, "not a tree digest");
+    if (digest.len < 11 or digest.len > 3 + 64) return fixed(400, "not a tree digest");
     const count = images.chunk_list(digest, refs) catch |err| switch (err) {
         error.NotFound => return fixed(404, "no such tree"),
         else => return fixed(500, "the store failed"),
@@ -246,6 +255,13 @@ test "a range is served exactly, clamped at the end, and refused past it" {
     try std.testing.expectEqual(@as(u32, 99), clamped.range.?.last);
     try std.testing.expectEqual(@as(u16, 416), rig.get(path, "bytes=100-120").status);
     for ([_][]const u8{ "bytes=5-", "bytes=-5", "bytes=9-3", "items=0-1", "bytes=0-1,5-6" }) |bad| {
+        try std.testing.expectEqual(@as(u16, 400), rig.get(path, bad).status);
+    }
+    // Only digits are a bound: a sign or a space is not (`parseInt` takes a leading `+`).
+    const malformed = [_][]const u8{
+        "bytes=+1-5", "bytes=1-+5", "bytes= 1-5", "bytes=1- 5", "bytes=1-5 ",
+    };
+    for (malformed) |bad| {
         try std.testing.expectEqual(@as(u16, 400), rig.get(path, bad).status);
     }
 }

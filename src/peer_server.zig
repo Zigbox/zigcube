@@ -42,6 +42,8 @@ pub const Config = struct {
     /// Test fault (`<state dir>/faults/peer-corrupt`, docs/agent.md): the first byte of every chunk
     /// sent is flipped, so a peer that lies reaches its clients' hash check.
     corrupt_chunks: bool = false,
+    /// Tests: ZC-E0808 is counted (`Server.refusals_shown`) but not written to stderr.
+    quiet: bool = false,
 };
 
 /// What one connection task owns.
@@ -69,6 +71,8 @@ pub const Server = struct {
     limiter: peer_limit.Limiter = .{},
     /// The last source refused with ZC-E0808 was shown; cleared by the next admitted one.
     refusal_shown: bool = false,
+    /// How many times ZC-E0808 was shown (once per streak), for tests.
+    refusals_shown: u32 = 0,
 
     pub const StartError = error{ Listen, NoThreads, OutOfMemory, Store };
 
@@ -174,7 +178,10 @@ fn admit(server: *Server, fd: std.posix.fd_t, source: u64, io: std.Io) void {
     }
     const verdict = server.limiter.admit(source, peer_stream.boot_ms(io));
     if (verdict != .admitted) {
-        refuse(server, io, "a peer address started more handshakes than a window allows");
+        refuse(server, io, switch (verdict) {
+            .table_full => "the server already tracks as many peer addresses as it keeps",
+            else => "a peer address started more handshakes than a window allows",
+        });
         _ = std.os.linux.close(fd);
         return;
     }
@@ -211,12 +218,13 @@ fn handshake_pending(server: *Server, source: u64) bool {
 fn refuse(server: *Server, io: std.Io, why: []const u8) void {
     if (server.refusal_shown) return;
     server.refusal_shown = true;
+    server.refusals_shown += 1;
     var diag: Diag = undefined;
     diag.reset();
     diag.raise(.E0808);
     diag.cause("{s}", .{why});
     diag.fix(.{ .sentence = "no action needed; it is tried again by itself" });
-    show(io, &diag, server.config.verbose);
+    if (!server.config.quiet) show(io, &diag, server.config.verbose);
 }
 
 fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
@@ -365,6 +373,7 @@ const Rig = struct {
             .state_dir = rig.state(),
             .node = "node2",
             .images_path = images,
+            .quiet = true,
         });
     }
 
@@ -537,6 +546,8 @@ test "four silent connections from one source hold one slot, and an honest peer 
         if (slot.busy.load(.acquire)) busy += 1;
     }
     try std.testing.expectEqual(@as(u32, 1), busy);
+    // Three refused connections are one streak: ZC-E0808 was shown once, not three times.
+    try std.testing.expectEqual(@as(u32, 1), rig.server.refusals_shown);
 
     const now = peer_stream.wall_ms(io);
     const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));

@@ -1253,18 +1253,24 @@ pub const registry = [_]Entry{
         .code = .E0808,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a peer was refused: too many handshakes from one address",
+        .summary = "a peer's handshake was refused: its address is over a limit",
         .explanation =
-        \\An agent's peer server starts at most a fixed number of handshakes per
-        \\source address in a short window (peer_handshakes_per_source_max in
-        \\peer_handshake_window_ms), and tracks a fixed number of sources. The
-        \\handshake costs the server public-key work, so a source that asks faster
-        \\is turned away before any of it.
+        \\An agent's peer server limits what one source address may ask of it,
+        \\because a handshake costs the server public-key work. A handshake is
+        \\refused, and the connection closed without a byte, when the address
+        \\already has a handshake that has not finished (one at a time per
+        \\source), when it has started peer_handshakes_per_source_max
+        \\handshakes in peer_handshake_window_ms, or when the server already
+        \\tracks peer_sources_max addresses in the window. An IPv6 address
+        \\counts by its /64, one host's whole range.
         \\
-        \\An honest fetch opens a handful of connections. If one node is refused
-        \\over and over, something there retries in a loop: look at its agent's
-        \\output. The refused node tries again by itself after the window, and a
-        \\fetch falls back to the registry meanwhile.
+        \\The text is shown once for a run of refusals, not once per
+        \\connection. An honest fetch opens a handful of connections and keeps
+        \\them. If one node is refused over and over, something there retries
+        \\in a loop: look at its agent's output. A refused node tries again by
+        \\itself, and a fetch falls back to the registry meanwhile. A flood
+        \\from many addresses can fill the table and turn honest nodes away
+        \\for up to one window; no action is needed unless it repeats.
         ,
     },
     .{

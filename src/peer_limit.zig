@@ -6,7 +6,9 @@
 //! `peer_handshakes_per_source_max` starts in a window of `peer_handshake_window_ms`, counted from
 //! its first start. The table holds `peer_sources_max` sources; a source whose window has run out
 //! frees its slot, and a table of live windows refuses a new source, which is the answer to a flood
-//! from many addresses at once.
+//! from many addresses at once. That is a lockout of honest peers too, for up to one window, while
+//! about `peer_sources_max` sources per window keep the table full; their retry (the agent tries
+//! again by itself) is the cost accepted, and docs/peer.md, "Rate limit", says so.
 //!
 //! Core code: no clock of its own (the caller passes `now_ms`), no allocation.
 
@@ -18,11 +20,12 @@ pub const Verdict = enum { admitted, source_busy, table_full };
 
 pub const Limiter = struct {
     keys: [constants.peer_sources_max]u64 = undefined,
-    starts: [constants.peer_sources_max]u64 = undefined,
+    starts: [constants.peer_sources_max]u64 = @splat(0),
     counts: [constants.peer_sources_max]u32 = @splat(0),
 
-    /// Whether `source` may start a handshake at `now_ms` (which never goes backwards). An
-    /// admitted start is counted.
+    /// Whether `source` may start a handshake at `now_ms`, a monotonic clock (the peer server
+    /// passes `CLOCK_BOOTTIME` milliseconds; a clock that went back would only make windows look
+    /// young, since ages saturate at zero). An admitted start is counted.
     pub fn admit(limiter: *Limiter, source: u64, now_ms: u64) Verdict {
         var free: ?usize = null;
         for (&limiter.counts, 0..) |*count, slot| {

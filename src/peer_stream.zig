@@ -214,10 +214,11 @@ pub fn connect(io: std.Io, address: std.Io.net.IpAddress, end_ms: u64) Error!std
         else => return error.Closed,
     }
     const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return error.Io; // Its result is only a mode if it worked.
     var mode: linux.O = @bitCast(@as(u32, @truncate(flags)));
     mode.NONBLOCK = false;
     const set = linux.fcntl(fd, linux.F.SETFL, @as(u32, @bitCast(mode)));
-    if (linux.errno(flags) != .SUCCESS or linux.errno(set) != .SUCCESS) return error.Io;
+    if (linux.errno(set) != .SUCCESS) return error.Io;
     return fd;
 }
 

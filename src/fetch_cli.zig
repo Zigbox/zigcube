@@ -34,6 +34,15 @@ pub const Peer = struct { name: []const u8, address: IpAddress };
 
 const reply_head_bytes = 14;
 
+/// Room beside a body in the reply buffer for a registry's HTTP head.
+const reply_head_slack_bytes = 4096;
+
+/// The reply buffer's size: the largest legitimate reply, a tree's chunk list
+/// (`tree_list_bytes_max`, larger than a chunk) or a chunk, and a head. A reply past it is
+/// refused (`Net.oversize`).
+pub const reply_bytes: usize = @max(constants.swarm_chunk_bytes, constants.tree_list_bytes_max) +
+    reply_head_slack_bytes;
+
 /// The network side of the worker. `list_scratch` holds one reply; `identity` is the node's.
 pub const Net = struct {
     io: std.Io,
@@ -45,6 +54,8 @@ pub const Net = struct {
     digest: []const u8 = "",
     /// Counts for the log line.
     bad_lists: u32 = 0,
+    /// The registry sent a reply larger than `reply_bytes`: refused, and said in ZC-E0601.
+    oversize: bool = false,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
     conns: []Conn = &.{},
 
@@ -148,8 +159,14 @@ pub const Net = struct {
         var request: [192]u8 = undefined;
         const form = "GET {s} HTTP/1.0\r\nHost: registry\r\n\r\n";
         const text = std.fmt.bufPrint(&request, form, .{path}) catch return .timeout;
-        write_all(fd, text) catch return .timeout;
-        const got = read_until_close(net.io, fd, net.reply, end) orelse return .timeout;
+        write_all(net.io, fd, text, end) catch return .timeout;
+        const got = read_until_close(net.io, fd, net.reply, end) catch |err| switch (err) {
+            error.TooLarge => {
+                net.oversize = true;
+                return .refused;
+            },
+            error.Timeout => return .timeout,
+        };
         const body = http_body(got) orelse {
             return if (http_status(got) == null) .timeout else .refused;
         };
@@ -235,27 +252,39 @@ pub const Conn = struct {
     }
 };
 
-fn write_all(fd: std.posix.fd_t, bytes: []const u8) !void {
+/// Writes all of `bytes`, waiting for the socket to take them until `end_ms` (`error.Io` after).
+fn write_all(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, end_ms: u64) !void {
     var done: usize = 0;
     while (done < bytes.len) {
+        const now_ms = peer_stream.boot_ms(io);
+        if (now_ms >= end_ms) return error.Io;
+        var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const ready = std.posix.poll(&wait, @intCast(end_ms - now_ms)) catch return error.Io;
+        if (ready == 0) return error.Io;
         const wrote = std.os.linux.write(fd, bytes[done..].ptr, bytes.len - done);
         if (std.os.linux.errno(wrote) != .SUCCESS) return error.Io;
         done += wrote;
     }
 }
 
-/// Reads `fd` to its end into `buffer` (null if it does not fit or the deadline passes).
-fn read_until_close(io: std.Io, fd: std.posix.fd_t, buffer: []u8, end_ms: u64) ?[]u8 {
+/// Reads `fd` to its end into `buffer`: `error.TooLarge` if the reply does not fit,
+/// `error.Timeout` if the deadline passes or a read fails.
+fn read_until_close(
+    io: std.Io,
+    fd: std.posix.fd_t,
+    buffer: []u8,
+    end_ms: u64,
+) error{ TooLarge, Timeout }![]u8 {
     var filled: usize = 0;
     while (true) {
         const now_ms = peer_stream.boot_ms(io);
-        if (now_ms >= end_ms) return null;
+        if (now_ms >= end_ms) return error.Timeout;
         var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&wait, @intCast(end_ms - now_ms)) catch return null;
-        if (ready == 0) return null;
-        if (filled == buffer.len) return null;
+        const ready = std.posix.poll(&wait, @intCast(end_ms - now_ms)) catch return error.Timeout;
+        if (ready == 0) return error.Timeout;
+        if (filled == buffer.len) return error.TooLarge;
         const got = std.os.linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
-        if (std.os.linux.errno(got) != .SUCCESS) return null;
+        if (std.os.linux.errno(got) != .SUCCESS) return error.Timeout;
         if (got == 0) return buffer[0..filled];
         filled += got;
     }
@@ -511,6 +540,19 @@ fn note(io: std.Io, text: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
 }
 
+/// The node's identity, or null when it has none or its files cannot be used; the second case
+/// leaves ZC-E0806 in `diag` (never an error with no diagnostic).
+fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.Identity {
+    assert(diag.code == null);
+    const loaded = agent_peer.load_identity(io, parsed.state_dir, parsed.node, diag) catch |err| {
+        switch (err) {
+            error.Failed => assert(diag.code != null), // `Failed` always carries its diagnostic.
+        }
+        return null;
+    };
+    return loaded;
+}
+
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const io = init.io;
     var diag: diag_mod.Diag = undefined;
@@ -522,12 +564,12 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         return finish(io, &diag, constants.exit_user);
     };
     const gpa = init.gpa;
-    const identity = agent_peer.load_identity(io, parsed.state_dir, parsed.node, &diag) catch null;
+    const identity = identity_or_say(io, &parsed, &diag);
     if (diag.code != null) {
         emit(io, &diag); // The peers will not be asked; the registry may still answer.
         diag.reset();
     }
-    const reply = gpa.alloc(u8, constants.swarm_chunk_bytes + 4096) catch
+    const reply = gpa.alloc(u8, reply_bytes) catch
         return no_memory(io, &diag);
     defer gpa.free(reply);
     var store = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
@@ -621,6 +663,11 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
     var tried_buffer: [256]u8 = undefined;
     const tried = tried_sources(&tried_buffer, net.peers);
     fetch_worker.raise_tree_missing(diag, net.digest, tried);
+    if (net.oversize) {
+        diag.cause("the registry sent a reply larger than the {d} bytes a reply may have", .{
+            reply_bytes,
+        });
+    }
     switch (err) {
         error.TreeUnavailable => diag.cause("no source sent a list that hashes to the digest", .{}),
         error.ChunkFailed => diag.cause("a chunk could not be had from any source asked", .{}),
@@ -826,4 +873,62 @@ test "the sources a failed fetch names are its peers and the registry" {
         tried_sources(&buffer, &peers),
     );
     try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}));
+}
+
+test "a fetch with an unusable key file says ZC-E0806 and has no identity" {
+    // Goal: S4. Method: a peer.key readable by others; the identity is null and the diagnostic
+    // is E0806, which `run` prints before asking the registry alone.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = agent_peer.key_file, .data = "00\n" });
+    try tmp.dir.setFilePermissions(io, agent_peer.key_file, .fromMode(0o644), .{});
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    const parsed: Args = .{ .node = "node1", .state_dir = path };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    try std.testing.expect(identity_or_say(io, &parsed, &diag) == null);
+    try std.testing.expectEqual(@as(?@TypeOf(diag.code.?), .E0806), diag.code);
+}
+
+test "a reply past the buffer is TooLarge and a write that never drains times out" {
+    // Goal: S5 and the write deadline. Method: a pipe holding more than the buffer, closed, is
+    // read into a small buffer; a full pipe nobody reads fails `write_all` at its deadline.
+    const io = std.testing.io;
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(
+        std.os.linux.pipe2(&fds, .{ .NONBLOCK = true }),
+    ));
+    defer _ = std.os.linux.close(fds[0]);
+    var open_write = true;
+    defer if (open_write) {
+        _ = std.os.linux.close(fds[1]);
+    };
+    const data: [100]u8 = @splat(0xab);
+    try write_all(io, fds[1], &data, peer_stream.boot_ms(io) + 1000);
+    _ = std.os.linux.close(fds[1]);
+    open_write = false;
+    var small: [50]u8 = @splat(0);
+    const soon = peer_stream.boot_ms(io) + 1000;
+    try std.testing.expectError(error.TooLarge, read_until_close(io, fds[0], &small, soon));
+    var fits: [200]u8 = @splat(0);
+    const whole = try read_until_close(io, fds[0], &fits, peer_stream.boot_ms(io) + 1000);
+    try std.testing.expectEqual(@as(usize, 50), whole.len); // The 50 the small buffer left.
+
+    var full: [2]i32 = undefined;
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(
+        std.os.linux.pipe2(&full, .{ .NONBLOCK = true }),
+    ));
+    defer _ = std.os.linux.close(full[0]);
+    defer _ = std.os.linux.close(full[1]);
+    const huge: [4 * 65536]u8 = @splat(1); // More than a pipe holds.
+    const started = peer_stream.boot_ms(io);
+    try std.testing.expectError(error.Io, write_all(io, full[1], &huge, started + 200));
+    try std.testing.expect(peer_stream.boot_ms(io) - started < 5000);
+}
+
+test "the reply buffer holds the largest tree list and a head" {
+    try std.testing.expect(reply_bytes >= constants.tree_list_bytes_max + reply_head_slack_bytes);
+    try std.testing.expect(reply_bytes >= constants.swarm_chunk_bytes + reply_head_slack_bytes);
 }

@@ -370,9 +370,9 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     });
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};
+    defer swarm.stop(gpa); // Also after a start that failed with the store open.
     swarm.start(io, gpa, config) catch |what|
         return fail_start(io, &diag, config.verbose, @errorName(what));
-    defer swarm.stop(gpa);
     var shell: Shell = .{
         .images = if (swarm.has_store)
             swarm.store.images()

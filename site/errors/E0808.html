@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0808 · Zigcube</title>
-<meta name="description" content="a peer was refused: too many handshakes from one address">
+<meta name="description" content="a peer's handshake was refused: its address is over a limit">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0808.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,11 +73,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0808</h1>
-<p class="summary">a peer was refused: too many handshakes from one address</p>
+<p class="summary">a peer's handshake was refused: its address is over a limit</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>An agent's peer server starts at most a fixed number of handshakes per source address in a short window (peer_handshakes_per_source_max in peer_handshake_window_ms), and tracks a fixed number of sources. The handshake costs the server public-key work, so a source that asks faster is turned away before any of it.</p>
-<p>An honest fetch opens a handful of connections. If one node is refused over and over, something there retries in a loop: look at its agent's output. The refused node tries again by itself after the window, and a fetch falls back to the registry meanwhile.</p>
+<p>An agent's peer server limits what one source address may ask of it, because a handshake costs the server public-key work. A handshake is refused, and the connection closed without a byte, when the address already has a handshake that has not finished (one at a time per source), when it has started peer_handshakes_per_source_max handshakes in peer_handshake_window_ms, or when the server already tracks peer_sources_max addresses in the window. An IPv6 address counts by its /64, one host's whole range.</p>
+<p>The text is shown once for a run of refusals, not once per connection. An honest fetch opens a handful of connections and keeps them. If one node is refused over and over, something there retries in a loop: look at its agent's output. A refused node tries again by itself, and a fetch falls back to the registry meanwhile. A flood from many addresses can fill the table and turn honest nodes away for up to one window; no action is needed unless it repeats.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0808</pre>
