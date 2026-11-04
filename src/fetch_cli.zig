@@ -107,7 +107,9 @@ pub const Net = struct {
         var target: [128]u8 = undefined;
         const prefix = peer_serve.path_bundle;
         const path = std.fmt.bufPrint(&target, "{s}{s}", .{ prefix, digest }) catch return null;
-        return switch (net.peer_get(index, path, out)) {
+        const reply = net.peer_get(index, path, out);
+        if (reply != .bytes) say_bundle_failed(net.io, net.peers[index].name, reply);
+        return switch (reply) {
             .bytes => |bytes| bytes,
             .refused, .timeout, .busy => null,
         };
@@ -293,6 +295,25 @@ pub const Net = struct {
 };
 
 pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout, busy };
+
+/// The line `fetch.log` gets when a peer gave no bundle: who, and what it answered. Not a strike
+/// (docs/swarm.md strikes wrong bytes): the fetch asks the next peer.
+pub fn bundle_note(buffer: []u8, peer_name: []const u8, reply: PeerReply) []const u8 {
+    const what = switch (reply) {
+        .bytes => "a bundle",
+        .refused => "a status other than 200 (or a reply too large)",
+        .timeout => "no reply (connection, read or deadline failure)",
+        .busy => "busy until the retries ran out",
+    };
+    return std.fmt.bufPrint(buffer, "zcube-agent fetch: peer {s} answered the bundle request " ++
+        "with {s}; asking the next peer\n", .{ peer_name, what }) catch buffer[0..0];
+}
+
+fn say_bundle_failed(io: std.Io, peer_name: []const u8, reply: PeerReply) void {
+    var buffer: [256]u8 = undefined;
+    const text = bundle_note(&buffer, peer_name, reply);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
 
 /// One peer's open stream and how many requests it has carried.
 pub const Conn = struct {
@@ -1134,6 +1155,16 @@ fn discover(
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
+
+test "a peer that gave no bundle is named with what it answered" {
+    var buffer: [256]u8 = undefined;
+    const line = bundle_note(&buffer, "node2", .refused);
+    try std.testing.expect(std.mem.indexOf(u8, line, "peer node2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "status other than 200") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n"));
+    const timed_out = bundle_note(&buffer, "n", .timeout);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out, "no reply") != null);
+}
 
 test "an HTTP reply gives its body only for 200" {
     // Goal: the registry client takes the body of a 200 and nothing else. Method: a 200, a 404,

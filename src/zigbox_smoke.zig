@@ -43,10 +43,14 @@ const config: vm.Config = .{
 const cache_dir = ".zig-cache/vm";
 const overlay = cache_dir ++ "/overlay-zcube-smoke.qcow2";
 
-/// What a login session of `cube` would set; Zigbox asks that user's systemd bus for a scope per
-/// container (the same prefix Zigbox's demos use, src/testing/vm/harness.zig).
-const as_cube = "runuser -u cube -- env HOME=/home/cube XDG_RUNTIME_DIR=/run/user/1000 " ++
-    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus ";
+/// What a login session of root would set; Zigbox asks that user's systemd bus for a scope per
+/// container. The agents run as root, not `cube`: a peer server that is not root cannot open
+/// objects owned by a range id that others may not read (docs/demos/c2.md, slice 8). `cube` stays
+/// as the owner of the files.
+const as_root = "env HOME=/home/cube XDG_RUNTIME_DIR=/run/user/0 " ++
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus ";
+/// The stage that gives root its range and its bus, so it has neither yet.
+const before_bus = "env HOME=/home/cube ";
 
 /// A file for the guest: the route it is served at, where it goes and its mode.
 const Upload = struct { route: []const u8, guest_path: []const u8, mode: []const u8 };
@@ -62,6 +66,7 @@ const uploads = [_]Upload{
 const Stage = struct { name: []const u8, timeout_s: u32 };
 
 const stages = [_]Stage{
+    .{ .name = "setup_root", .timeout_s = 120 },
     .{ .name = "setup", .timeout_s = 120 },
     .{ .name = "replicas", .timeout_s = 420 },
     .{ .name = "kill", .timeout_s = 150 },
@@ -124,7 +129,7 @@ pub fn main(init: std.process.Init) !u8 {
 /// Copies the files in and runs the stages; false (after printing why) at the first failure.
 fn run_guest(session: *vm.Session, out: *std.Io.Writer) !bool {
     const timeout = vm.limits.command_timeout_kvm_s;
-    const made = try session.run("runuser -u cube -- mkdir -p /home/cube/bin", timeout);
+    const made = try session.run("mkdir -p /home/cube/bin", timeout);
     if (made.status != 0) return failed(out, "mkdir in the guest failed");
     for (uploads) |upload| {
         _ = try session.copy_in(.{
@@ -136,8 +141,9 @@ fn run_guest(session: *vm.Session, out: *std.Io.Writer) !bool {
     }
     var command: [vm.limits.command_bytes_max]u8 = undefined;
     for (stages) |stage| {
+        const prefix = if (std.mem.eql(u8, stage.name, "setup_root")) before_bus else as_root;
         const line = try std.fmt.bufPrint(&command, "{s}sh /home/cube/guest.sh {s}", .{
-            as_cube, stage.name,
+            prefix, stage.name,
         });
         try out.print("zigbox-smoke: stage {s}\n", .{stage.name});
         const result = try session.run(line, stage.timeout_s);
