@@ -362,6 +362,9 @@ pub const Opened = struct {
     host: zigbox.host_real.HostReal = .{},
     store: zigbox.store.Store = undefined,
     images: ZigboxImages = undefined,
+    /// Set before `open` to open a store made with another chunk size than Zigbox's own (tests
+    /// only: the size is not recorded in the store); 0 keeps Zigbox's.
+    chunk_bytes: u32 = 0,
 
     pub const OpenError = error{ NoStore, OutOfMemory };
 
@@ -370,6 +373,7 @@ pub const Opened = struct {
         if (root.len < 2 or root[0] != '/' or root.len >= self.store.root.len) return error.NoStore;
         self.host = .{};
         self.store.at(self.host.interface(), root);
+        if (self.chunk_bytes != 0) self.store.chunk_bytes = self.chunk_bytes;
         var diag: zigbox.diag.Diag = undefined;
         diag.reset();
         const present = zigbox.store.open.check(&self.store, .existing, &diag) catch
