@@ -205,6 +205,8 @@ fn run_operation(sim: *Sim) void {
     }
 }
 
+/// No check can fail here (only an assertion, which is a crash, step `run` in the fleet), so no
+/// failure is ever reported with step `drop`.
 fn drop_chunks(sim: *Sim, node: u32) void {
     const random = sim.random();
     const drops = random.uintLessThan(u32, 24);

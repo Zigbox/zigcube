@@ -313,8 +313,8 @@ fn write_totals(
     seen: []const state_file.Seen,
 ) std.Io.Writer.Error!void {
     try w.print("{s} (UTC): {d} seeds run, {d} failed ({d} crashed, {d} could not start), " ++
-        "in {d} batches; the last batch ran at commit `{s}`. A day with no comment here means " ++
-        "the fleet did not run.\n", .{
+        "in {d} ingests (one per kind per round); the last ran at commit `{s}`. A day with " ++
+        "no comment here means the fleet did not run.\n", .{
         &day.ymd, day.seeds, day.failed, day.crashes, day.infra, day.batches, day.commit,
     });
     try w.writeAll("\nSeeds by run:\n");
@@ -412,10 +412,12 @@ const RunError = issue.ParseError || state_file.ParseError || IngestError ||
 /// diagnostics yet: docs/briefs/c1-9.md, "Cuts".)
 fn explain(err: RunError) []const u8 {
     return switch (err) {
-        error.NoSummary => "stdin has no `sim-cluster: seeds A..B` summary line, or a failure " ++
-            "after the last one; feed it sim_cluster --seeds output (run.sh does)",
-        error.BadLine => "stdin has a line sim_fleet cannot read, or batches of different " ++
-            "operation counts; feed it unchanged sim_cluster --seeds output",
+        error.NoSummary => "stdin has no summary line of --kind (`sim-cluster: seeds A..B`, " ++
+            "`sim-cluster --c1: seeds A..B` or `sim-swarm: seeds A..B`), or a failure after " ++
+            "the last one; feed it that producer's --seeds output (run.sh does)",
+        error.BadLine => "stdin has a line sim_fleet cannot read, batches of different " ++
+            "operation counts, or a summary whose count of failed seeds is not the number of " ++
+            "`seed N:` records before it; feed it unchanged --seeds output",
         error.TooManyFailures => "stdin lists more failing seeds than a round may hold; " ++
             "run smaller batches",
         error.BadState => "the state file is not one sim_fleet wrote; move it aside " ++
@@ -524,22 +526,24 @@ fn run(
     // Saved whatever GitHub answered: what was filed stays filed, and a hold stays held.
     try save(arena, io, state_path, &state);
     const summary = try outcome;
-    try print_summary(out, &summary, &state, args.dry_run);
+    try print_summary(out, args.kind, &summary, &state, args.dry_run);
     if (summary.stopped != null) return error.GitHubStopped;
     return constants.exit_ok;
 }
 
 fn print_summary(
     out: *std.Io.Writer,
+    kind: []const u8,
     summary: *const Summary,
     state: *const state_file.State,
     dry_run: bool,
 ) std.Io.Writer.Error!void {
     try out.print(
-        "sim-fleet: {d} seeds, {d} failed ({d} crashed, {d} could not start): " ++
+        "sim-fleet: {s}: {d} seeds, {d} failed ({d} crashed, {d} could not start): " ++
             "{d} issues filed, {d} comments, {d} throttled, {d} refiled, {d} locked, " ++
             "{d} daily reports{s}\n",
         .{
+            kind,
             summary.seeds,
             summary.failed,
             summary.crashes,
@@ -904,11 +908,12 @@ test "three kinds on one day: separate issues, separate counts, and the totals b
         "  replay: zig-out/bin/sim_swarm 5 100\n  shrunk to 1 operations\n" ++
         "  replay: zig-out/bin/sim_swarm 5 1\n";
     const cluster_tail = "sim-cluster: seeds 1..100, 100 operations: 1 of 100 failed\n";
+    const c1_tail = "sim-cluster --c1: seeds 1..100, 100 operations: 1 of 100 failed\n";
     const swarm_tail = "sim-swarm: seeds 1..50, 100 operations: 1 of 50 failed\n";
     const Input = struct { kind: []const u8, text: []const u8, seeds: u32, tail: []const u8 };
     const inputs = [_]Input{
         .{ .kind = issue.kind_sim_cluster, .text = failing, .seeds = 100, .tail = cluster_tail },
-        .{ .kind = issue.kind_sim_c1, .text = failing, .seeds = 100, .tail = cluster_tail },
+        .{ .kind = issue.kind_sim_c1, .text = failing, .seeds = 100, .tail = c1_tail },
         .{ .kind = issue.kind_sim_swarm, .text = swarm_text, .seeds = 50, .tail = swarm_tail },
     };
     for (inputs) |input| {

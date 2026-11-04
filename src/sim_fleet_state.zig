@@ -24,6 +24,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const kinds = @import("sim_fleet_issue.zig");
 
 /// The state file's format; a file without a `version` line is version 1.
 const version = 3;
@@ -414,6 +415,8 @@ fn parse_kind(words: *Words) ParseError!KindDay {
         .failed = try parse_number(u64, words),
     };
     if (item.failed > item.seeds) return error.BadState;
+    // A kind this build does not run is a file from another program: refuse it, never count it.
+    if (!kinds.kind_known(item.kind)) return error.BadState;
     return item;
 }
 
@@ -524,6 +527,15 @@ test "state round trips through its text" {
     try std.testing.expectError(
         error.BadState,
         parse(arena, "version 3\nkind 2026-11-02 sim-swarm 5 6\n"),
+    );
+    // A kind that is not one of the fleet's is refused.
+    try std.testing.expectError(
+        error.BadState,
+        parse(arena, "version 3\nkind 2026-11-02 sim-bogus 5 1\n"),
+    );
+    try std.testing.expectError(
+        error.BadState,
+        parse(arena, "version 3\nkind 2026-11-02 store-faults 5 1\n"),
     );
 }
 

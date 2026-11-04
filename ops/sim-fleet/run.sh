@@ -23,6 +23,13 @@ main() {
     : "${SIM_FLEET_BRANCH:=main}"
     : "${SIM_FLEET_OPS:=100}"
     : "${SIM_FLEET_BATCH:=100}"
+    # Seeds per batch by kind; the cluster kinds fall back to SIM_FLEET_BATCH. The swarm's default
+    # is 50000 and ignores SIM_FLEET_BATCH, because an installed fleet.env already sets that to
+    # 100 (setup.sh never overwrites it) and the swarm worker would idle. A swarm seed takes ~1.5 ms to a cluster seed's ~1.1 s (measured 2026-11-04, ReleaseSafe, 100
+    # operations), so 50000 keep its core about as busy as 100 cluster seeds keep theirs.
+    : "${SIM_FLEET_BATCH_CLUSTER:=$SIM_FLEET_BATCH}"
+    : "${SIM_FLEET_BATCH_C1:=$SIM_FLEET_BATCH}"
+    : "${SIM_FLEET_BATCH_SWARM:=50000}"
     # Parallel workers per kind (one core each): 1 + 1 + 1 leaves a core of a 4 vCPU host for the
     # reporter, git and builds. A kind set to 0 is not run.
     : "${SIM_FLEET_WORKERS_CLUSTER:=1}"
@@ -153,7 +160,17 @@ kind_flags() {
 kind_prefix() {
     case "$1" in
     sim-swarm) echo sim-swarm ;;
+    sim-c1) echo "sim-cluster --c1" ;;
     *) echo sim-cluster ;;
+    esac
+}
+
+# Seeds per batch of kind $1 (defaults above).
+kind_batch() {
+    case "$1" in
+    sim-cluster) echo "$SIM_FLEET_BATCH_CLUSTER" ;;
+    sim-c1) echo "$SIM_FLEET_BATCH_C1" ;;
+    *) echo "$SIM_FLEET_BATCH_SWARM" ;;
     esac
 }
 
@@ -209,7 +226,7 @@ start_worker() {
         code=0
         # shellcheck disable=SC2086 # $flags is empty or one flag.
         timeout "$SIM_FLEET_BATCH_TIMEOUT" "$bin/$exe" \
-            --seeds "$base..$((base + SIM_FLEET_BATCH - 1))" "$SIM_FLEET_OPS" $flags --shrink \
+            --seeds "$base..$((base + $(kind_batch "$2") - 1))" "$SIM_FLEET_OPS" $flags --shrink \
             >"$round/out-$1" 2>"$round/err-$1" || code=$?
         echo "$code" >"$round/code-$1"
     ) &
@@ -220,7 +237,7 @@ start_worker() {
 # counted. $2 is the kind.
 collect() {
     base=$(cat "$round/base-$1")
-    last=$((base + SIM_FLEET_BATCH - 1))
+    last=$((base + $(kind_batch "$2") - 1))
     code=$(cat "$round/code-$1")
     case "$code" in
     0 | 1) cat "$round/out-$1" ;;
