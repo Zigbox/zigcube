@@ -29,7 +29,7 @@ const records = @import("records.zig");
 const store_failures = @import("store_failures.zig");
 const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
-const zigbox_pull = @import("zigbox_pull.zig");
+const pull_report = @import("pull_report.zig");
 
 const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
@@ -541,8 +541,6 @@ pub const Args = struct {
     /// the manifest of the assignment's digest-pinned image, `sha256:HEX`.
     zigbox_store: []const u8 = "",
     manifest: []const u8 = "",
-    /// Zigbox mode: the OCI reference, pinned by digest, pulled when no peer has the tree.
-    source: []const u8 = "",
     registry: ?IpAddress = null,
     /// zcube-server: where the peers and their chunk filters are read (`/node-store/`).
     server: ?IpAddress = null,
@@ -570,8 +568,6 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.images_dir = value;
         } else if (std.mem.eql(u8, flag, "--zigbox-store")) {
             parsed.zigbox_store = value;
-        } else if (std.mem.eql(u8, flag, "--source")) {
-            parsed.source = value;
         } else if (std.mem.eql(u8, flag, "--manifest")) {
             parsed.manifest = value;
         } else if (std.mem.eql(u8, flag, "--digest")) {
@@ -597,7 +593,7 @@ pub fn parse(args: []const []const u8) ?Args {
         return parsed;
     }
     if (parsed.registry == null) return null; // The chunk directory's registry is not optional.
-    if (parsed.images_dir.len == 0 or parsed.manifest.len > 0 or parsed.source.len > 0) {
+    if (parsed.images_dir.len == 0 or parsed.manifest.len > 0) {
         return null;
     }
     return parsed;
@@ -654,7 +650,7 @@ fn parse_address(text: []const u8) ?IpAddress {
 }
 
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
-    "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX [--source OCI-REF]) " ++
+    "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX) " ++
     "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--report FILE] " ++
     "[--peer NAME=HOST:PORT]...";
 
@@ -797,12 +793,12 @@ fn fetch_from(
         .dir => |store| {
             const digest = parsed.digest;
             fetch_worker.fetch(gpa, transport, store, digest, asked, .{}, &report) catch |err| {
-                return fetch_failed(net, diag, err);
+                return fetch_failed(net, diag, err, target);
             };
         },
         .zigbox => |opened| {
             report = fetch_zigbox(gpa, transport, opened, parsed, asked, net) catch |err| {
-                return fetch_failed(net, diag, err);
+                return fetch_failed(net, diag, err, target);
             };
         },
     }
@@ -832,11 +828,9 @@ fn fetch_zigbox(
     const manifest = Zsha256.parse(parsed.manifest) orelse return error.TreeUnavailable;
     var done: zigbox_fetch.Report = .{};
     const images = &opened.images;
+    // No peer had the tree: the supervisor's own pull is the registry fallback (it writes the
+    // pull record from Zigbox's blobs), so a failure here is the exit code it reacts to.
     zigbox_fetch.fetch(gpa, transport, images, tree, manifest, infos, .{}, &done) catch |err| {
-        const from_registry = err == error.TreeUnavailable or err == error.ChunkFailed;
-        if (from_registry and parsed.source.len > 0) {
-            return pull_fallback(gpa, net, parsed, tree, manifest, done);
-        }
         return switch (err) {
             error.TreeUnavailable, error.ChunkFailed, error.Deadline, error.Store => |same| same,
             error.OutOfMemory => error.OutOfMemory,
@@ -855,70 +849,6 @@ fn fetch_zigbox(
         .cached_bytes = done.cached_bytes,
         .struck_peers = done.struck_peers,
     };
-}
-
-/// Counts what `pull` did with each blob: a downloaded or resumed blob is the registry's bytes
-/// (a resumed one counts whole, the size Zigbox reports), a cached one the store's own.
-fn add_blob_bytes(report: *fetch_worker.Report, blobs: []const zigbox_pull.Blob) void {
-    for (blobs) |blob| switch (blob.outcome) {
-        .downloaded, .resumed => report.registry_bytes += blob.bytes,
-        .cached => report.cached_bytes += blob.bytes,
-    };
-}
-
-test "add_blob_bytes sorts a pull's blobs into registry and cached bytes" {
-    var report: fetch_worker.Report = .{ .cached_bytes = 5 };
-    const blobs = [_]zigbox_pull.Blob{
-        .{ .digest = undefined, .bytes = 100, .outcome = .downloaded },
-        .{ .digest = undefined, .bytes = 7, .outcome = .cached },
-        .{ .digest = undefined, .bytes = 30, .outcome = .resumed },
-    };
-    add_blob_bytes(&report, &blobs);
-    try std.testing.expectEqual(@as(u64, 130), report.registry_bytes);
-    try std.testing.expectEqual(@as(u64, 12), report.cached_bytes);
-}
-
-/// No peer had the tree: Zigbox's `pull` of the assignment's reference, checked against the
-/// tree and the manifest asked for. The registry's bytes are not chunks of ours, so the report
-/// counts them as the blobs `pull` saw.
-fn pull_fallback(
-    gpa: std.mem.Allocator,
-    net: *Net,
-    parsed: *const Args,
-    tree: zigbox.store.Digest,
-    manifest: Zsha256,
-    done: zigbox_fetch.Report,
-) fetch_worker.Error!fetch_worker.Report {
-    var zdiag: zigbox.diag.Diag = undefined;
-    zdiag.reset();
-    const environ = net.environ;
-    const reference = parsed.source;
-    const pulled = zigbox_pull.pull_image(
-        gpa,
-        environ,
-        reference,
-        tree,
-        manifest,
-        &zdiag,
-    ) catch |err| {
-        switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Mismatch => net.refused_record = true,
-            error.Failed => {},
-        }
-        return error.TreeUnavailable;
-    };
-    note(net.io, "zcube-agent fetch: pulled from the registry\n");
-    var report: fetch_worker.Report = .{
-        .chunks = pulled.blob_count,
-        .already_held = done.already_held,
-        .registry_chunks = pulled.blob_count,
-        .peer_bytes = done.peer_bytes,
-        .cached_bytes = done.cached_bytes,
-        .struck_peers = done.struck_peers,
-    };
-    add_blob_bytes(&report, pulled.blobs[0..pulled.blob_count]);
-    return report;
 }
 
 fn real_ms(io: std.Io) u64 {
@@ -977,23 +907,19 @@ fn write_report(
         .finished_at_ms = real_ms(io),
         .bad_peers = bad[0..bad_count],
     };
-    var text: std.Io.Writer.Allocating = .init(gpa);
-    defer text.deinit();
-    std.json.Stringify.value(record, .{}, &text.writer) catch return note(io, report_failed);
-    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const temporary = std.fmt.bufPrint(&name_buffer, "{s}.tmp", .{parsed.report}) catch
-        return note(io, report_failed);
-    const dir = std.Io.Dir.cwd();
-    dir.writeFile(io, .{ .sub_path = temporary, .data = text.written() }) catch
-        return note(io, report_failed);
-    dir.rename(temporary, dir, parsed.report, io) catch return note(io, report_failed);
+    if (!pull_report.write(gpa, io, parsed.report, record)) note(io, report_failed);
 }
 
 const report_failed = "zcube-agent fetch: the pull report could not be written\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.
-fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) u8 {
+fn fetch_failed(
+    net: *const Net,
+    diag: *diag_mod.Diag,
+    err: fetch_worker.Error,
+    target: Target,
+) u8 {
     diag.reset();
     switch (err) {
         error.OutOfMemory, error.TooMany => {
@@ -1001,8 +927,12 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
         },
         error.Store => {
             diag.raise(.E0506);
-            diag.cause("the chunks could not be written to this node's images directory", .{});
-            diag.fix(.{ .sentence = "check the directory's permissions and the free disk space" });
+            const place = switch (target) {
+                .dir => "images directory",
+                .zigbox => "Zigbox store",
+            };
+            diag.cause("the chunks could not be written to this node's {s}", .{place});
+            diag.fix(.{ .sentence = "check its permissions and the free disk space" });
             return finish(net.io, diag, constants.exit_environment);
         },
         error.TreeUnavailable, error.ChunkFailed, error.Deadline => {},
@@ -1015,11 +945,10 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
             reply_bytes,
         });
     }
-    if (net.refused_record) {
-        diag.cause("the image record is not for the manifest this assignment pins", .{});
-    }
     switch (err) {
-        error.TreeUnavailable => diag.cause("no source sent a list that hashes to the digest", .{}),
+        error.TreeUnavailable => if (net.refused_record) {
+            diag.cause("the image record is not for the manifest this assignment pins", .{});
+        } else diag.cause("no source sent a list that hashes to the digest", .{}),
         error.ChunkFailed => diag.cause("a chunk could not be had from any source asked", .{}),
         else => diag.cause("the fetch ran past its limit of {d} minutes", .{
             @divExact(constants.fetch_total_ms, 60_000),

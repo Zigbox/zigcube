@@ -449,6 +449,9 @@ pub const fetch_list_peers_max: u32 = 4;
 /// One fetch ends in an error after this long, whatever it is doing (a 64 GiB tree at the
 /// node's rate cap takes about 17 minutes).
 pub const fetch_total_ms: u32 = 30 * 60 * 1000;
+/// The Zigbox supervisor kills a `zcube-agent fetch` that is still running this long after it
+/// started: the fetch's own limit and a minute for it to say why it failed.
+pub const zigbox_fetch_deadline_ms: u32 = fetch_total_ms + 60 * 1000;
 /// The wait before a fetch on a node whose last fetch failed, doubling from the base to the cap
 /// (`fetch_backoff.zig`), so an unreachable tree does not make replicas churn at the speed of the
 /// refusals.

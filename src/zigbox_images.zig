@@ -490,7 +490,7 @@ pub const ZigboxImages = struct {
             &failure,
         ) catch return error.StoreFailed;
         claim.complete = progress.complete;
-        assert(claim.wanted.size != 0 or claim.complete);
+        if (claim.wanted.size == 0) assert(claim.complete);
     }
 
     fn put_chunk_impl(
