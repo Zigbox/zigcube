@@ -46,6 +46,7 @@ pub const modules = .{
     @import("replica_controller.zig"),
     @import("runtime_codes.zig"),
     @import("retention.zig"),
+    @import("pull_retention.zig"),
     @import("scheduler.zig"),
     @import("runtime.zig"),
     @import("sim_c0.zig"),

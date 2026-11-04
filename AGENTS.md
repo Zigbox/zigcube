@@ -54,7 +54,7 @@ These arrive with the scaffold; keep this list current as they land.
 - `zig build console-wasm` builds the console's browser module (`src/console_wasm.zig`, the real
   core over a memory store and the simulated runtime, ReleaseSafe) and checks it in Node under both
   V8 compilers: exactly one import (`env.zc_panic`), `GET /v1/status`, the C0 scenario, a reported
-  panic. `zig build console-site` also installs the whole console to `zig-out/console` for any
+  panic, then `tools/pulls_check.mjs` (the Pulls screen's text helpers and the mock's `GET /v1/stats/pull`). `zig build console-site` also installs the whole console to `zig-out/console` for any
   static file server. `node tools/browser_check.mjs <url> --mode sim|server` is the dev-time
   Playwright check. See `docs/console.md`.
 - `zig build agent-smoke` starts `zcube-server` (SQLite) and one `zcube-agent` with `FakeRuntime` as real processes and checks them on the host: 3 replicas as 3 commands under 3 supervisors, a `kill -9` replaced, an agent restart with no duplicates, a server restart that changes nothing, an unknown digest held with `ZBX-E0410`. It kills everything it started, even on failure. **It is not `demo-c0`.** About 15 seconds. `docs/agent.md` describes the agent.

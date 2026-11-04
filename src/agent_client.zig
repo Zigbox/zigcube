@@ -403,10 +403,13 @@ pub const RemoteStore = struct {
         if (registering and tenure != 0) return unsupported(diag, "a registration with a compare");
         const summary_key = records.node_store_key(remote.node);
         const publishing = std.mem.eql(u8, first, summary_key.slice());
+        const pulling = std.mem.startsWith(u8, first, records.prefix_pulls);
         const sent: Request = if (registering)
             try remote.registration(arena, request.on_success, diag)
         else if (publishing)
             try remote.summary(arena, request.on_success, tenure, diag)
+        else if (pulling)
+            try remote.pull(arena, request.on_success, tenure, diag)
         else
             try remote.report(arena, request.on_success, tenure, diag);
         const reply = try remote.exchange(arena, sent, diag);
@@ -497,6 +500,43 @@ pub const RemoteStore = struct {
         const body = out.toOwnedSlice() catch return failures.no_memory(diag);
         const target = try remote.path(arena, "/store", diag);
         return .{ .method = "PUT", .target = target, .body = body };
+    }
+
+    /// `POST /v1/agent/nodes/{node}/pulls`: the one put of a `/pulls/<node>/<tree>` record,
+    /// under the tenure. The server builds the key from the record, so the key is checked here.
+    fn pull(
+        remote: *RemoteStore,
+        arena: Allocator,
+        ops: []const store.Op,
+        tenure: u64,
+        diag: *Diag,
+    ) store.Error!Request {
+        if (tenure == 0) return unsupported(diag, "a pull record without a tenure");
+        if (ops.len != 1) return unsupported(diag, "a pull record with other operations");
+        const put = switch (ops[0]) {
+            .put => |value| value,
+            .delete => return unsupported(diag, "the delete of a pull record"),
+        };
+        const record = std.json.parseFromSliceLeaky(records.Pull, arena, put.value, .{
+            .ignore_unknown_fields = true,
+        }) catch return unsupported(diag, "a pull record that is not a pull record");
+        const wanted = records.pull_key(remote.node, record.tree);
+        if (!std.mem.eql(u8, put.key, wanted.slice())) {
+            return unsupported(diag, "a pull record under a key that is not its own");
+        }
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var json: std.json.Stringify = .{ .writer = &out.writer };
+        json.beginObject() catch return failures.no_memory(diag);
+        json.objectField("tenure") catch return failures.no_memory(diag);
+        json.write(tenure) catch return failures.no_memory(diag);
+        json.objectField("pull") catch return failures.no_memory(diag);
+        json.beginWriteRaw() catch return failures.no_memory(diag);
+        json.writer.writeAll(put.value) catch return failures.no_memory(diag);
+        json.endWriteRaw();
+        json.endObject() catch return failures.no_memory(diag);
+        const body = out.toOwnedSlice() catch return failures.no_memory(diag);
+        const target = try remote.path(arena, "/pulls", diag);
+        return .{ .method = "POST", .target = target, .body = body };
     }
 
     /// `POST /v1/agent/nodes/{node}/observed`: puts and deletes of the node's observed records.

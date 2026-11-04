@@ -555,3 +555,100 @@ test "status lists the auditor's finding; check shows it; repair asks, then writ
     try testing.expect(field(cleared, "finding") == .null);
     try rig.refused(repair(&rig, "confirm=true"), 409, "ZC-E0402");
 }
+
+/// Puts a pull record of `node` for `tree` into the store as the agent would, finished at `at_ms`.
+fn put_pull(rig: *Rig, node: []const u8, tree: []const u8, at_ms: u64, version: u32) !void {
+    const ctx = rig.world.controller_context();
+    const record: records.Pull = .{
+        .v = version,
+        .node = node,
+        .tree = tree,
+        .registry_bytes = 1000,
+        .peer_bytes = &.{.{ .peer = "node2", .bytes = 500 }},
+        .cached_bytes = 20,
+        .finished_at_ms = at_ms,
+    };
+    const bytes = try records.encode(ctx.arena, record, ctx.diag);
+    const key = records.pull_key(node, tree);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+    _ = try writers.txn(ctx.store, .{ .agent = node }, .{ .on_success = &.{op} }, ctx.diag);
+}
+
+test "stats pull lists the pulls newest first, by node, with a limit, and counts what it skips" {
+    // Goal: docs/api.md, "GET /v1/stats/pull". Method: three pulls on two nodes, one record from
+    // a version that does not exist yet, one that is not JSON; then ask all, one node, a limit.
+    var rig = try Rig.start(3);
+    defer rig.stop();
+    try put_pull(&rig, "node1", "b3:00000001", 100, 1);
+    try put_pull(&rig, "node2", "b3:00000002", 300, 1);
+    try put_pull(&rig, "node1", "b3:00000003", 200, 1);
+    try put_pull(&rig, "node1", "b3:00000004", 400, 99);
+    const ctx = rig.world.controller_context();
+    const junk: store.Op = .{ .put = .{ .key = "/pulls/node3/b3:00000005", .value = "{" } };
+    _ = try writers.txn(ctx.store, .{ .agent = "node3" }, .{ .on_success = &.{junk} }, ctx.diag);
+
+    const all = try rig.ok("/v1/stats/pull", "");
+    const pulls = field(all, "pulls").array.items;
+    try testing.expectEqual(@as(usize, 3), pulls.len);
+    try testing.expectEqualStrings("b3:00000002", field(pulls[0], "tree").string);
+    try testing.expectEqualStrings("b3:00000003", field(pulls[1], "tree").string);
+    try testing.expectEqualStrings("b3:00000001", field(pulls[2], "tree").string);
+    try testing.expectEqual(@as(i64, 1000), field(pulls[0], "registry_bytes").integer);
+    const peer = field(pulls[0], "peer_bytes").array.items[0];
+    try testing.expectEqualStrings("node2", field(peer, "peer").string);
+    try testing.expectEqual(@as(i64, 2), field(all, "skipped").integer);
+
+    const mine = try rig.ok("/v1/stats/pull", "node=node1");
+    try testing.expectEqual(@as(usize, 2), field(mine, "pulls").array.items.len);
+    const one = try rig.ok("/v1/stats/pull", "limit=1");
+    try testing.expectEqual(@as(usize, 1), field(one, "pulls").array.items.len);
+    const none = try rig.ok("/v1/stats/pull", "node=node9");
+    try testing.expectEqual(@as(usize, 0), field(none, "pulls").array.items.len);
+}
+
+test "stats pull refuses a bad node, a bad limit, an unknown parameter and an unknown kind" {
+    // Goal: the handler's parameter checks. Method: one request each; every answer is a 400/404
+    // with a code and the request's id.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    try rig.refused(rig.get("/v1/stats/pull", "node=A%20B"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/pull", "limit=0"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/pull", "limit=501"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/pull", "bogus=1"), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/stats/other", ""), 404, "ZC-E0101");
+    try rig.refused(rig.get("/v1/stats", ""), 404, "ZC-E0101");
+}
+
+test "the agent publishes the pull records its fetches left, and removes every file it read" {
+    // Goal: slice 7's data path, agent side. Method: leave `pull.json` in three container
+    // directories (a good record, one for another node, one that is not JSON) in the state
+    // directory; one agent step stores the good one under /pulls/node1/ and removes all three.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const files = rig.world.files.interface();
+    const good =
+        \\{"v":1,"node":"node1","tree":"b3:51aa9c03","registry_bytes":7,"finished_at_ms":9}
+    ;
+    const foreign = "{\"v\":1,\"node\":\"node2\",\"tree\":\"b3:51aa9c03\"}";
+    try files.put_atomic("containers/hello-1/pull.json", good);
+    try files.put_atomic("containers/hello-2/pull.json", foreign);
+    try files.put_atomic("containers/hello-3/pull.json", "{");
+    const stepped = rig.world.agent_step();
+    try testing.expect(stepped.failed == null);
+
+    const ctx = rig.world.controller_context();
+    const options: store.ListOptions = .{ .prefix = records.prefix_pulls, .limit = 10 };
+    const listed = try ctx.store.list(ctx.arena, options, ctx.diag);
+    try testing.expectEqual(@as(usize, 1), listed.kvs.len);
+    try testing.expectEqualStrings("/pulls/node1/b3:51aa9c03", listed.kvs[0].key);
+    const names = [_][]const u8{
+        "containers/hello-1/pull.json",
+        "containers/hello-2/pull.json",
+        "containers/hello-3/pull.json",
+    };
+    for (names) |name| {
+        try testing.expectError(error.Absent, files.read(ctx.arena, name));
+    }
+}

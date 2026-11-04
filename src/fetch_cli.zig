@@ -511,6 +511,8 @@ pub const Args = struct {
     /// `--peer` values left out because the name is not a node name, and the first of them.
     peers_skipped: u32 = 0,
     first_skipped: []const u8 = "",
+    /// Where a successful fetch writes its `records.Pull` (the agent publishes it); empty: none.
+    report: []const u8 = "",
 };
 
 pub fn parse(args: []const []const u8) ?Args {
@@ -530,6 +532,8 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.digest = value;
         } else if (std.mem.eql(u8, flag, "--registry")) {
             parsed.registry = parse_address(value) orelse return null;
+        } else if (std.mem.eql(u8, flag, "--report")) {
+            parsed.report = value;
         } else if (std.mem.eql(u8, flag, "--server")) {
             parsed.server = parse_address(value) orelse return null;
         } else if (std.mem.eql(u8, flag, "--peer")) {
@@ -584,7 +588,8 @@ fn parse_address(text: []const u8) ?IpAddress {
 }
 
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR --images-dir DIR " ++
-    "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
+    "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--report FILE] " ++
+    "[--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
 /// memory), 3 is that no source had the tree (the supervisor records that as ZC-E0601).
@@ -692,11 +697,13 @@ fn fetch_from(
     note(io, describe_skipped(&line, skipped));
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};
+    const started_ms = real_ms(io);
     const transport = net.transport();
     const asked = infos[0..found];
     fetch_worker.fetch(gpa, transport, store, parsed.digest, asked, .{}, &report) catch |err| {
         return fetch_failed(net, diag, err);
     };
+    if (parsed.report.len > 0) write_report(gpa, net, parsed, &report, started_ms);
     var buffer: [256]u8 = undefined;
     const said = "zcube-agent fetch: {s} chunks {d} held {d} peers {d} registry {d} " ++
         "bad lists {d}\n";
@@ -707,6 +714,60 @@ fn fetch_from(
     std.Io.File.stdout().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
     return constants.exit_ok;
 }
+
+fn real_ms(io: std.Io) u64 {
+    return @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+}
+
+/// Writes `report` as a `records.Pull` to `parsed.report`, through a temporary file and a rename,
+/// so the agent never reads half of it. A failure is said on stderr and changes nothing else: the
+/// fetch worked, and only its statistics are lost.
+fn write_report(
+    gpa: std.mem.Allocator,
+    net: *const Net,
+    parsed: *const Args,
+    report: *const fetch_worker.Report,
+    started_ms: u64,
+) void {
+    const io = net.io;
+    var peers: [constants.fetch_peers_max]records.PullPeer = undefined;
+    var bad: [constants.fetch_peers_max][]const u8 = undefined;
+    var peer_count: usize = 0;
+    var bad_count: usize = 0;
+    for (net.peers, 0..) |who, at| {
+        if (peer_count < peers.len and report.peer_bytes[at] > 0) {
+            peers[peer_count] = .{ .peer = who.name, .bytes = report.peer_bytes[at] };
+            peer_count += 1;
+        }
+        const struck = (report.struck_peers >> @intCast(at)) & 1 != 0;
+        if (struck and bad_count < bad.len) {
+            bad[bad_count] = who.name;
+            bad_count += 1;
+        }
+    }
+    const record: records.Pull = .{
+        .node = parsed.node,
+        .tree = parsed.digest,
+        .registry_bytes = report.registry_bytes,
+        .peer_bytes = peers[0..peer_count],
+        .cached_bytes = report.cached_bytes,
+        .started_at_ms = started_ms,
+        .finished_at_ms = real_ms(io),
+        .bad_peers = bad[0..bad_count],
+    };
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    std.json.Stringify.value(record, .{}, &text.writer) catch return note(io, report_failed);
+    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const temporary = std.fmt.bufPrint(&name_buffer, "{s}.tmp", .{parsed.report}) catch
+        return note(io, report_failed);
+    const dir = std.Io.Dir.cwd();
+    dir.writeFile(io, .{ .sub_path = temporary, .data = text.written() }) catch
+        return note(io, report_failed);
+    dir.rename(temporary, dir, parsed.report, io) catch return note(io, report_failed);
+}
+
+const report_failed = "zcube-agent fetch: the pull report could not be written\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.

@@ -52,6 +52,9 @@ pub const file_forced = "forced";
 /// `argv` (`zcube-agent fetch ...`) after recording its pid and before the command.
 pub const file_fetch = "fetch.json";
 pub const file_fetch_log = "fetch.log";
+/// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
+/// the agent publishes under `/pulls/` and then removes.
+pub const file_pull = "pull.json";
 
 /// `fetch.json`.
 pub const FetchFile = struct {

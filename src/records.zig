@@ -61,6 +61,7 @@ pub const prefix_allocations = "/allocations/";
 pub const prefix_audit_allocations = "/audit/allocations/";
 pub const prefix_node_status = "/node-status/";
 pub const prefix_node_store = "/node-store/";
+pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
 
@@ -103,6 +104,19 @@ pub fn node_key(name: []const u8) Key {
 pub fn node_store_key(name: []const u8) Key {
     assert(name_problem(name, constants.node_name_bytes_max) == null);
     return Key.build(&.{ prefix_node_store, name });
+}
+
+/// `/pulls/<node>/<tree>`: the record of the last pull of a tree on a node.
+pub fn pull_key(node: []const u8, tree: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    assert(tree.len > 0);
+    assert(tree.len <= constants.tree_digest_bytes);
+    return Key.build(&.{ prefix_pulls, node, "/", tree });
+}
+
+pub fn pull_prefix(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_pulls, node, "/" });
 }
 
 pub fn decision_key(id: []const u8) Key {
@@ -352,6 +366,30 @@ pub const NodeStore = struct {
     peer: []const u8 = "",
     /// Trees the node holds but left out of `trees` (more than `summary_trees_max`).
     omitted: u32 = 0,
+};
+
+/// Bytes one peer gave a pull.
+pub const PullPeer = struct { peer: []const u8, bytes: u64 };
+
+/// `/pulls/<node>/<tree>`: what the last pull of a tree on a node moved, by source (docs/keys.md,
+/// owner decision O6, C2 slice 7). Written by the node's agent from the fetch worker's report
+/// and never read by a controller: it is statistics, so a missing or stale record can change
+/// nothing but `zcube stats pull`. A later pull of the same tree replaces it.
+pub const Pull = struct {
+    v: u32 = 1,
+    node: []const u8,
+    /// The tree's digest as the pull was asked for it.
+    tree: []const u8,
+    /// Bytes the registry gave.
+    registry_bytes: u64 = 0,
+    /// Bytes each peer gave, by the peer's node name; a peer that gave none is left out.
+    peer_bytes: []const PullPeer = &.{},
+    /// Bytes the node already held, so nothing moved for them.
+    cached_bytes: u64 = 0,
+    started_at_ms: u64 = 0,
+    finished_at_ms: u64 = 0,
+    /// Peers the pull struck for a chunk that did not match its hash (ZC-W0601).
+    bad_peers: []const []const u8 = &.{},
 };
 
 pub const ObservedStatus = enum { starting, running, stopped };
@@ -1133,7 +1171,7 @@ test "the version a record is written in is the version the reader accepts" {
     diag.reset();
     inline for (.{
         Service, Replica,       Node,     Observed,   Assigned,  Allocation, Audit, NodeStatus,
-        Summary, ReplicaNumber, Decision, IndexEntry, NodeStore,
+        Summary, ReplicaNumber, Decision, IndexEntry, NodeStore, Pull,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);

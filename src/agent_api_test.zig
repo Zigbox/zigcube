@@ -868,3 +868,97 @@ test "the largest summary fits the endpoint, and a body past its cap is refused"
         agent_api.body_bytes_max("/v1/agent/nodes/node2/observed"),
     );
 }
+
+// ---- POST /v1/agent/nodes/{node}/pulls --------------------------------------------------------
+
+const pulls_path = "/v1/agent/nodes/node2/pulls";
+
+fn pull_text(rig: *const Rig, record: []const u8) ![]u8 {
+    const format = "{{\"tenure\":{d},\"pull\":{s}}}";
+    return std.fmt.allocPrint(testing.allocator, format, .{ rig.tenure, record });
+}
+
+const small_pull =
+    \\{"v":1,"node":"node2","tree":"b3:51aa9c03","registry_bytes":10,
+    \\"peer_bytes":[{"peer":"node1","bytes":5}],"cached_bytes":1,
+    \\"started_at_ms":100,"finished_at_ms":160,"bad_peers":["node3"],"later":true}
+;
+
+test "a pull record is stored under the node's key, replaced by a later pull of the tree" {
+    // Goal: the endpoint's happy path, unknown members ignored. Method: join, post a record,
+    // read the key; post the same tree again with other numbers and read the replacement.
+    var rig = try Rig.start(31);
+    defer rig.stop();
+    try rig.join("node2");
+    const body = try pull_text(&rig, small_pull);
+    defer testing.allocator.free(body);
+    _ = try rig.ok("POST", pulls_path, "", body);
+    const ctx = rig.world.controller_context();
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const key = records.pull_key("node2", "b3:51aa9c03");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &diag);
+    const first = try records.read(records.Pull, ctx.arena, got.kv.?, &diag);
+    try testing.expectEqual(@as(u64, 10), first.registry_bytes);
+    try testing.expectEqualStrings("node1", first.peer_bytes[0].peer);
+    try testing.expectEqualStrings("node3", first.bad_peers[0]);
+    const again = try std.mem.replaceOwned(u8, testing.allocator, body, ":10,", ":99,");
+    defer testing.allocator.free(again);
+    _ = try rig.ok("POST", pulls_path, "", again);
+    const replaced = try ctx.store.get(ctx.arena, key.slice(), null, &diag);
+    const second = try records.read(records.Pull, ctx.arena, replaced.kv.?, &diag);
+    try testing.expectEqual(@as(u64, 99), second.registry_bytes);
+}
+
+test "a pull of another node, a newer version, a bad tree or too many peers is ZC-E0104" {
+    // Goal: the endpoint's checks. Method: each wrong record is refused with a coded 400 and
+    // writes nothing.
+    var rig = try Rig.start(32);
+    defer rig.stop();
+    try rig.join("node2");
+    const gpa = testing.allocator;
+    const swaps = [_][2][]const u8{
+        .{ "\"v\":1", "\"v\":2" },
+        .{ "\"node\":\"node2\"", "\"node\":\"node9\"" },
+        .{ "b3:51aa9c03", "" },
+        .{ "b3:51aa9c03", "b3:51aa\\u0000" },
+    };
+    for (swaps) |swap| {
+        const record = try std.mem.replaceOwned(u8, gpa, small_pull, swap[0], swap[1]);
+        defer gpa.free(record);
+        const body = try pull_text(&rig, record);
+        defer gpa.free(body);
+        const before = try rig.revision();
+        try rig.refused(rig.call("POST", pulls_path, "", body), 400, "ZC-E0104");
+        try testing.expectEqual(before, try rig.revision());
+    }
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(gpa);
+    const head = "{\"v\":1,\"node\":\"node2\",\"tree\":\"b3:51aa9c03\",\"bad_peers\":[";
+    try many.appendSlice(gpa, head);
+    for (0..constants.pull_peers_max + 1) |index| {
+        if (index > 0) try many.append(gpa, ',');
+        try many.print(gpa, "\"n{d}\"", .{index});
+    }
+    try many.appendSlice(gpa, "]}");
+    const body = try pull_text(&rig, many.items);
+    defer gpa.free(body);
+    try rig.refused(rig.call("POST", pulls_path, "", body), 400, "ZC-E0104");
+    const wrong_method = rig.call("GET", pulls_path, "", "");
+    try testing.expect(wrong_method.status != 200);
+}
+
+test "a pull under a tenure that has been replaced is ZC-E0510 and writes nothing" {
+    // Goal: statistics are written by the node that holds the tenure, as every agent write.
+    var rig = try Rig.start(33);
+    defer rig.stop();
+    try rig.join("node2");
+    const old = rig.tenure;
+    try rig.join("node2");
+    rig.tenure = old;
+    const body = try pull_text(&rig, small_pull);
+    defer testing.allocator.free(body);
+    const before = try rig.revision();
+    try rig.refused(rig.call("POST", pulls_path, "", body), 503, "ZC-E0510");
+    try testing.expectEqual(before, try rig.revision());
+}

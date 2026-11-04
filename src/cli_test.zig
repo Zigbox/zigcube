@@ -731,3 +731,58 @@ test "a server can be restarted on its port right after zcube has used it" {
     world.node = try Node.start(world.io, world.server.backend.handle());
     try testing.expectEqual(@as(u8, 0), world.run(&.{ "get", "service" }));
 }
+
+test "stats pull shows the recorded pulls, one node's, as JSON and wide, and says when none" {
+    // Goal: docs/cli.md, `zcube stats pull`. Method: against a live server, ask with no records;
+    // write two (as the nodes' agents would) and ask for all, for one node, wide and as JSON.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "stats", "pull" }));
+    try testing.expectEqualStrings("no pulls have been recorded\n", world.out());
+
+    const long = "b3:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    try put_pull(&world, "node1", "b3:51aa9c03", 2000, 0);
+    try put_pull(&world, "node2", long, 5000, 1536);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "stats", "pull" }));
+    try testing.expectEqualStrings(
+        "NODE   TREE                REGISTRY  PEERS  CACHED  TOOK  BAD PEERS\n" ++
+            "node2  b3:001122334455...  1000B     1Ki    0B      1.5s  node9\n" ++
+            "node1  b3:51aa9c03         1000B     0B     0B      1.5s  node9\n",
+        world.out(),
+    );
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "stats", "pull", "node1", "-o", "wide" }));
+    try expect_contains(world.out(), "FROM PEERS\n");
+    try expect_contains(world.out(), "node1  b3:51aa9c03");
+    try testing.expect(std.mem.indexOf(u8, world.out(), "node2") == null);
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "stats", "pull", "-o", "json" }));
+    try expect_contains(world.out(), "\"registry_bytes\":1000");
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "stats", "pull", "bad name" }));
+    try expect_contains(world.err(), "ZC-E0104");
+}
+
+/// A pull record of `node` for `tree` that finished at `at_ms`, written as that node's agent would.
+fn put_pull(world: *World, node: []const u8, tree: []const u8, at_ms: u64, peer: u64) !void {
+    const records = @import("records.zig");
+    const writers = @import("writers.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const peers = [_]records.PullPeer{.{ .peer = "node1", .bytes = peer }};
+    const record: records.Pull = .{
+        .node = node,
+        .tree = tree,
+        .registry_bytes = 1000,
+        .peer_bytes = if (peer > 0) &peers else &.{},
+        .started_at_ms = at_ms - 1500,
+        .finished_at_ms = at_ms,
+        .bad_peers = &.{"node9"},
+    };
+    const key = records.pull_key(node, tree);
+    const value = try records.encode(arena, record, &diag);
+    const op: store_mod.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+    const handle = world.server.backend.handle();
+    _ = try writers.txn(handle, .{ .agent = node }, .{ .on_success = &.{op} }, &diag);
+}

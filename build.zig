@@ -1148,6 +1148,9 @@ fn add_console_steps(b: *std.Build) *std.Build.Step.Compile {
         node.addFileArg(module.getEmittedBin());
         step.dependOn(&node.step);
     }
+    const pulls = b.addSystemCommand(&.{ "node", "--no-warnings" });
+    pulls.addFileArg(b.path("tools/pulls_check.mjs"));
+    step.dependOn(&pulls.step);
     const site_help = "Install the whole console (web/ and its WASM) to zig-out/console";
     const site = b.step("console-site", site_help);
     site.dependOn(step);

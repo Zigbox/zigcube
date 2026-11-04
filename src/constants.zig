@@ -155,6 +155,20 @@ pub const request_default_memory_bytes: u64 = 128 * 1024 * 1024;
 pub const decisions_per_subject_max: u32 = 200;
 pub const decision_age_ms_max: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const decision_gone_age_ms_max: u64 = 24 * 60 * 60 * 1000;
+/// Pull records (`/pulls/<node>/<tree>`, docs/keys.md): the newest this many per node and at most
+/// 30 days; a pass reads at most `store_list_limit_max` x `pulls_pages_per_pass_max` records.
+pub const pulls_per_node_max: u32 = 100;
+pub const pull_age_ms_max: u64 = 30 * 24 * 60 * 60 * 1000;
+pub const pulls_pages_per_pass_max: u32 = 4;
+/// Peers one pull record names, each way (bytes given, struck); the rest are summed in none.
+pub const pull_peers_max: u32 = fetch_peers_max;
+/// The body of `POST /v1/agent/nodes/{node}/pulls`: a record of at most this many bytes and the
+/// tenure, with room for the names.
+pub const pull_request_bytes_max: u32 = 8 * 1024;
+/// Pull records an agent publishes in one step, so a burst of finished pulls cannot hold it.
+pub const pulls_per_step_max: u32 = 8;
+/// How often the controller looks for pull records to drop.
+pub const pulls_interval_ms: u32 = 5 * 60 * 1000;
 /// How often the controller looks for decisions to drop.
 pub const retention_interval_ms: u32 = 60 * 1000;
 pub const retention_batch_pairs: u32 = store_txn_ops_max / 2;
@@ -628,3 +642,6 @@ comptime {
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }
+
+/// `GET /v1/stats/pull` reads at most this many pull records (nodes_max nodes at their retention).
+pub const pulls_read_max: u32 = nodes_max * pulls_per_node_max;

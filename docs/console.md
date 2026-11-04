@@ -35,7 +35,7 @@ reserved for state, and every state also has a glyph and a word.
 
 ## Information architecture
 
-Seven screens, one sentence each. Deep links are hash routes, so they work from a static file.
+Eight screens, one sentence each. Deep links are hash routes, so they work from a static file.
 
 | Screen | URL | Answers |
 | --- | --- | --- |
@@ -46,11 +46,12 @@ Seven screens, one sentence each. Deep links are hash routes, so they work from 
 | Nodes | `#/nodes`, `#/nodes/<name>` | Capacity declared vs used, lease state, what runs there |
 | Why | `#/why/<service\|replica\|node>/<name>[?decision=<id>]`, `#/why` | The causal chain behind a state |
 | Decisions | `#/decisions` | Everything the controllers did, with causes |
+| Pulls | `#/pulls` | What each image pull moved, from the registry, from peers or already held (C2 slice 7) |
 | Codes | `#/codes`, `#/codes/<code>` | `zcube explain`, in the browser |
 
 Navigation is a left rail on desktop and a horizontally scrolling tab row on a phone. There is no
 hamburger menu: seven items fit in a scrolling row, and a menu would hide the thing a person
-reaches for first. Keyboard: `g` then `o s r n d w c` jumps between screens, `/` focuses the
+reaches for first. Keyboard: `g` then `o s r n d p w c` jumps between screens, `/` focuses the
 filter, `?` lists them.
 
 **Every object links to its Why view.** A service, replica or node name in a table goes to its
@@ -96,6 +97,19 @@ Declared capacity against used (CPU, memory), lease remaining against its TTL, r
 address. A node whose lease expired stays in the list as **lost** for as long as its decisions
 are retained, so the failure does not simply vanish from the screen. "Used" is the sum of its
 replicas' limits, which is not what the scheduler reserves; see api.md, item 6.
+
+### Pulls (C2 slice 7)
+
+`GET /v1/stats/pull` (api.md), one row per recorded pull, newest first: node, tree, bytes from the
+registry, from peers, already held, how long it took, struck peers, when it finished. The tree is
+shortened as in the CLI; a row's button (click, Enter or Space) expands the full digest with Copy,
+where each byte came from and why a peer was struck. Nothing is hover-only. It reads on opening
+and again when the store moves, at most every 10 s, and says "No pulls recorded yet" with the
+command `zcube stats pull` when there are none. The text helpers are `web/js/pulls_text.js`,
+checked in Node by `tools/pulls_check.mjs` against the CLI's wording. `?mock=c1` records a pull
+when a node first starts an image (the first from the registry, later ones from a peer). `?mock=c0`
+opens the simulation, whose real core answers the endpoint: empty until C2's fetch runs, which the
+simulated runtime does not.
 
 ### Why
 

@@ -37,6 +37,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
 const retention = @import("retention.zig");
+const pull_retention = @import("pull_retention.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 
@@ -97,6 +98,7 @@ comptime {
 pub const ReplicaController = struct {
     source: controller.DecisionSource,
     retention: retention.Cursor = .{},
+    pulls: pull_retention.Cursor = .{},
     /// How long after a node is marked lost its replicas are replaced (authority.md §2, §3). A
     /// parameter so the server (`--lost-grace-ms`), the simulations and the tests can set it.
     lost_grace_ms: u64 = constants.lost_grace_ms,
@@ -124,10 +126,14 @@ pub const ReplicaController = struct {
         if (now >= rc.retention.due_ms) {
             rc.retention.due_ms = try retention.prune(ctx, &rc.retention, &snapshot, now);
         }
+        if (now >= rc.pulls.due_ms) {
+            rc.pulls.due_ms = try pull_retention.prune(ctx, &rc.pulls, now);
+        }
         const again = run.more or run.acted > 0;
         var wake_at = @min(now + resync_ms, run.wake_at_ms);
         if (again) wake_at = now;
         if (rc.retention.due_ms < wake_at) wake_at = @max(rc.retention.due_ms, now);
+        if (rc.pulls.due_ms < wake_at) wake_at = @max(rc.pulls.due_ms, now);
         return .{ .at_ms = wake_at, .prefixes = &watch_prefixes, .acted = run.acted };
     }
 };

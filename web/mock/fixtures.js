@@ -72,6 +72,14 @@ export function diagFutureRevision(from, current) {
   };
 }
 
+export function diagBadRequest(name, rule) {
+  return {
+    code: "ZC-E0104", severity: "error", blame: "user", summary: "the request can't be understood",
+    causes: [`${name} ${rule}`], while: [], context: {},
+    fixes: [{ sentence: "correct the request and try again" }], omitted: { ...omitted },
+  };
+}
+
 export function diagNotFound(what) {
   return {
     code: "ZC-E0101", severity: "error", blame: "user", summary: "no such resource",

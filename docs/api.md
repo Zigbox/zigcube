@@ -192,6 +192,22 @@ terminal.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
   survive (24 h, keys.md) answers `200` with `state.exists: false`.
 
+### `GET /v1/stats/pull[?node=<name>][&limit=<n>]` (C2 slice 7)
+
+What pulls moved, by source: the `/pulls/` records of keys.md, newest `finished_at_ms` first.
+
+```json
+{ "pulls": [ { "v": 1, "node": "node1", "tree": "b3:51aa9c03…", "registry_bytes": 1048576,
+  "peer_bytes": [{"peer": "node2", "bytes": 2097152}], "cached_bytes": 0,
+  "started_at_ms": 1700000000000, "finished_at_ms": 1700000004000, "bad_peers": [] } ],
+  "skipped": 0, "revision": 512 }
+```
+
+`node` limits the answer to one node; `limit` defaults to 50 and is at most 500 (above it, or
+0, is `400` `ZC-E0104`, as is a `node` that is not a node name). The read is tolerant: a record
+that is malformed or newer than the server's reader counts in `skipped` and is left out. Reads
+need no auth beyond the server's own.
+
 ### `GET /v1/codes` and `GET /v1/explain/{code}`
 
 The registry, for the console's code reader. `codes` is `[{code, severity, blame, summary}]`;
@@ -427,6 +443,7 @@ runs unchanged on the far side of HTTP:
 | `lease_keepalive(id)` | `POST /v1/agent/nodes/{node}/lease/{id}/keepalive` |
 | `txn` with one put of `/nodes/<node>` on a lease | `PUT /v1/agent/nodes/{node}` |
 | `txn` with one put of `/node-store/<node>` on the same lease (C2 slice 5) | `PUT /v1/agent/nodes/{node}/store` |
+| `txn` with one put of `/pulls/<node>/<tree>` (C2 slice 7) | `POST /v1/agent/nodes/{node}/pulls` |
 | `list(/replicas/)`, filtered to the node | `GET /v1/agent/nodes/{node}/replicas` |
 | `list(/observed/<node>/)` | `GET /v1/agent/nodes/{node}/observed` |
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
@@ -505,6 +522,23 @@ filter and the samples are hex, so the largest record is twice its binary size, 
 overhead); every other agent body stays at 64 KiB. A stored value over `store_value_bytes_max`
 (256 KiB) is `400`. A server older than C2 has no such route: the agent gets a `404` (`ZC-E0504`),
 notes it once on stderr and goes on, because replica work never waits for a summary.
+
+### `POST /v1/agent/nodes/{node}/pulls` (C2 slice 7)
+
+Writes one pull record, `/pulls/<node>/<tree>` of keys.md. Not lease-bound: statistics outlive
+the node. The body is the agent's tenure (the revision of its registration, as for an observed write) and the record:
+
+```json
+{ "tenure": 430,
+  "pull": { "v": 1, "node": "node1", "tree": "b3:51aa9c03…", "registry_bytes": 1048576,
+  "peer_bytes": [], "cached_bytes": 0, "started_at_ms": 1, "finished_at_ms": 2, "bad_peers": [] } }
+```
+
+Answer `{"revision": 434, "chain": …}`. One transaction under the node's tenure compare. Refusals:
+`v` other than 1, `node` other than `{node}`, an empty `tree`, more than `pull_peers_max` peers,
+or a body over `pull_request_bytes_max` (8 KiB) are `400` `ZC-E0104`; a tenure that has ended is
+`503` `ZC-E0510`. A server older than C2 slice 7 answers `404` (`ZC-E0504`): the agent notes it
+once, drops the file and goes on.
 
 ### `GET /v1/agent/nodes/{node}/replicas`
 
