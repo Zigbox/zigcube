@@ -73,7 +73,8 @@ const Registry = struct {
             _ = hex catch unreachable; // 64 hex digits fit.
         }
         const text = node_store.list_format(&refs, &registry.list) orelse return error.ListTooBig;
-        registry.list_len = text.len;
+        assert(text.len <= registry.list.len);
+        registry.list_len = @intCast(text.len);
         _ = node_store.list_digest(text, &registry.digest);
         registry.tree_path[0..7].* = "/trees/".*;
         registry.tree_path[7..].* = registry.digest;

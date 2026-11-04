@@ -310,6 +310,9 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
             },
         }),
     });
+    // Both are built by plain `zig build`, so neither smoke can stop compiling unnoticed.
+    b.installArtifact(exe);
+    b.getInstallStep().dependOn(&teeth_agent.step);
     const run = b.addRunArtifact(exe);
     run.addArtifactArg(built.server);
     run.addArtifactArg(built.agent);
