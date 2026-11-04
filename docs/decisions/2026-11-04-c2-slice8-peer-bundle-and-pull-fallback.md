@@ -51,3 +51,21 @@ Status: done on `claude/c2-slice8` (ea4bea9, 7043838, 58d46c8).
 - `lacking`'s reindex trap remains.
 - The pull fallback in `fetch --source` was never run against a registry.
 - Z5 (per-blob pull bytes into `/pulls`) skipped: #61 is still in review.
+
+## What is left (final state, commit 65254d1)
+
+- **Z5** (bytes into `/pulls`) is not started; it waits for #61 to merge. A fresh session does it.
+- The chunk summary is reported from the Zigbox store (`Swarm.zigbox` is `Shell.images` in Zigbox
+  mode; `node_images` in `agent_run.zig`), tested through the seam in `peer_server.zig`'s
+  "an agent configured for Zigbox only serves ..." test. Not tested: the `Shell` wiring in `run`,
+  the real `Swarm.start` store lookup from the environment, and the scheduler's locality reading
+  the Zigbox-sourced summary end to end.
+- A summary taken before a tree is imported was expected to be empty, but the fixture's `import`
+  already roots the tree in a full test run (and not in a filtered one: unexplained), so the test
+  asserts only the after state.
+- `check` prints a `failed command: .../test` line with PASS: it is the stderr echo of the
+  ZC-W0601 warning that the lying-peer tests provoke; `zig build test --summary all` reports 14/14
+  steps succeeded.
+- REVIEW.md: covered interfaces (`--help`, docs, config test), start-failure diagnostics (ZC-E0506,
+  no ZC-B), test reachability and wasm cleanliness. Not covered: SIGKILL/exit-path tests of the new
+  Swarm start, the supervisor fetch spawn at process level, Postgres (store untouched).
