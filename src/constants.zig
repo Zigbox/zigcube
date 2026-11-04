@@ -667,8 +667,9 @@ pub const zigbox_chunks_per_object_max: u32 = 4096;
 pub const zigbox_roots_arena_bytes: u32 = 1 << 14;
 /// The bytes of one image record (a peer's record is held to this before it is parsed).
 pub const zigbox_record_bytes_max: u32 = 80 * 1024;
-/// The objects an in-progress receive may hold claims on.
-pub const zigbox_claims_max: u32 = 1 << 14;
+/// The objects an in-progress receive may hold claims on: as many as the walk's `entries_max`
+/// (`zigbox_images.zig` asserts it), so every tree the walk accepts can be claimed.
+pub const zigbox_claims_max: u32 = 1 << 16;
 /// The bytes a tree record is read into.
 pub const zigbox_tree_buffer_bytes: u32 = 4 << 20;
 

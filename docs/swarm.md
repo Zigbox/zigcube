@@ -72,13 +72,31 @@ The target's sketch is an input. Where the scheduler gets it is slice 5's questi
 With `--zigbox-store ROOT --manifest sha256:HEX`, `zcube-agent fetch` fills a Zigbox store
 instead of a chunk directory (`zigbox_fetch.zig`, `fetch_cli.zig`):
 
-1. Each peer, in turn, is asked for the tree's bundle (`GET /v1/peer/bundle/<digest>`, docs/peer.md)
+1. A tree already whole in the store, for which the store already holds this manifest's image
+   record, is imported again from that record and no peer is asked. A tree that is whole under
+   other manifests' records only is fetched like any other (its chunks are found held), so its
+   record for this manifest is imported too.
+2. Each peer, in turn, is asked for the tree's bundle (`GET /v1/peer/bundle/<digest>`, docs/peer.md)
    and the chunks the store lacks are fetched under the same plan as above (peers first, hashes
    checked by the plan itself). The tree is then rooted for the manifest the assignment names.
-   The bundle's image record is checked against that manifest as soon as the bundle arrives: a
-   record naming another manifest is a bad bundle, the peer is struck (ZC-W0601) and the next
-   one is asked. Tree records of a rejected bundle stay in the store, unrooted, until gc.
-2. With no peer that has the tree, the fetch fails with ZC-E0601, which names the peers asked.
+   A bundle is held to the tree it claims: its tree records to their digests (only those the
+   tree reaches are kept), and its objects must be exactly the distinct objects those records
+   name, each once, with the size and content the tree's entry gives. A bundle that adds an
+   object, leaves one out, sends one twice or gets one wrong is a bad bundle: the peer is
+   struck (ZC-W0602) and the next one is asked. Tree records of a rejected bundle stay in the
+   store, unrooted, until gc.
+3. The bundle's image record is checked against the assignment's manifest as soon as the bundle
+   arrives. A peer sends the newest image record of the tree (Zigbox's `export_record`), so an
+   honest peer that ran another image of the same tree sends that one's: it is counted, not
+   struck, and the next peer is asked. If no peer sends this manifest's record, ZC-E0601 says
+   so. A record Zigbox refuses at import is reported with Zigbox's reason (`images.refusal`);
+   the peer is struck only when the record is its own fault (too large, malformed, for another
+   tree or another manifest).
+4. A tree with more objects than one fetch claims (`zigbox_claims_max`, equal to the walk's
+   `entries_max`) or more chunks than it fetches (`fetch_chunks_max`) is too large for a peer
+   fetch on this node. That limit is this node's, and the counts come from the digest-checked
+   tree, so no peer is struck and no other peer is asked: ZC-E0601 says the tree is too large.
+5. With no peer that has the tree, the fetch fails with ZC-E0601, which names the peers asked.
    There is no registry fallback inside `fetch`.
 
 The registry fallback is the supervisor's own Zigbox `pull` (`zigbox_supervisor.zig`), which

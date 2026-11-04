@@ -276,10 +276,11 @@ fn finished_ok(io: std.Io, child: *std.process.Child, limit_ms: u32) bool {
     while (true) {
         var status: i32 = 0;
         const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-        if (rc != 0) { // Reaped, or not ours any more: either way it is over.
-            const ours = rc == @as(usize, @intCast(pid));
-            return ours and std.os.linux.W.IFEXITED(@bitCast(status)) and
-                std.os.linux.W.EXITSTATUS(@bitCast(status)) == constants.exit_ok;
+        switch (wait_verdict(rc, pid, status)) {
+            .running => {},
+            .again => continue,
+            .exited_ok => return true,
+            .over => return false,
         }
         if (awake_ms(io) -| started >= limit_ms) {
             child.kill(io);
@@ -287,6 +288,26 @@ fn finished_ok(io: std.Io, child: *std.process.Child, limit_ms: u32) bool {
         }
         io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation only ends the wait early.
     }
+}
+
+const Verdict = enum { running, again, exited_ok, over };
+
+/// What a `waitpid(pid, WNOHANG)` result `rc` (with `status`) says: an error is checked first
+/// (an interrupted wait is tried again; any other, such as ECHILD, means the child is not ours
+/// to wait for and is over, not a success), then 0 (still running), then the child's own exit.
+fn wait_verdict(rc: usize, pid: std.posix.pid_t, status: i32) Verdict {
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        .INTR => return .again,
+        else => return .over,
+    }
+    if (rc == 0) return .running;
+    if (rc != @as(usize, @intCast(pid))) return .over;
+    const exited = std.os.linux.W.IFEXITED(@bitCast(status));
+    if (exited and std.os.linux.W.EXITSTATUS(@bitCast(status)) == constants.exit_ok) {
+        return .exited_ok;
+    }
+    return .over;
 }
 
 pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
@@ -497,4 +518,19 @@ test "a fetch that outlives its deadline is killed, and only an exit 0 counts" {
         // Gone: reaped by the wait or by the kill. A live child would answer signal 0.
         try std.testing.expect(std.os.linux.kill(pid, @fromBackingInt(@intCast(0))) != 0);
     }
+}
+
+test "a wait's error is read before its pid: interrupted again, any other over, never ok" {
+    const errno_rc = struct {
+        fn of(code: std.os.linux.E) usize {
+            return @bitCast(-@as(isize, @backingInt(code)));
+        }
+    }.of;
+    const pid: std.posix.pid_t = 4242;
+    try std.testing.expectEqual(Verdict.again, wait_verdict(errno_rc(.INTR), pid, 0));
+    try std.testing.expectEqual(Verdict.over, wait_verdict(errno_rc(.CHILD), pid, 0));
+    try std.testing.expectEqual(Verdict.running, wait_verdict(0, pid, 0));
+    try std.testing.expectEqual(Verdict.exited_ok, wait_verdict(4242, pid, 0));
+    try std.testing.expectEqual(Verdict.over, wait_verdict(4242, pid, 3 << 8));
+    try std.testing.expectEqual(Verdict.over, wait_verdict(4243, pid, 0));
 }

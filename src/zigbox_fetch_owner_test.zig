@@ -429,3 +429,68 @@ test "a fetch killed while its namespace child works leaves no child behind" {
     }
     try testing.expectEqual(@as(u32, 0), seen);
 }
+
+test "a peer without the tree is named in the fetch's log, with ZC-E0601" {
+    // Goal: S3 of slice 8's review. What the supervisor's `fetch.log` gets when no peer has the
+    // tree: the line naming the peer that refused the bundle request, and ZC-E0601. Method: a
+    // real peer server over an empty store; a real `zcube-agent fetch`, its stderr into a file.
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var exe_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = try find_agent_exe(&exe_buffer);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = base_buffer[0..try tmp.dir.realPath(io, &base_buffer)];
+    for ([_][]const u8{ "a", "b", "images", "state1", "state2" }) |name| {
+        try tmp.dir.createDir(io, name, .default_dir);
+    }
+    var paths: [5][std.fs.max_path_bytes]u8 = undefined;
+    const root_a = try std.fmt.bufPrint(&paths[0], "{s}/a/store", .{base});
+    const root_b = try std.fmt.bufPrint(&paths[1], "{s}/b/store", .{base});
+    const state1 = try std.fmt.bufPrint(&paths[2], "{s}/state1", .{base});
+    const state2 = try std.fmt.bufPrint(&paths[3], "{s}/state2", .{base});
+    const images = try std.fmt.bufPrint(&paths[4], "{s}/images", .{base});
+    var host_real: zigbox.host_real.HostReal = .{};
+    const stores = try gpa.alloc(store_api.Store, 2);
+    defer gpa.free(stores);
+    try make_store(&stores[0], host_real.interface(), root_a);
+    try make_store(&stores[1], host_real.interface(), root_b);
+    const ca = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    try make_identity(io, state2, "node2", ca);
+    try make_identity(io, state1, "node1", ca);
+    var chunk_dir = try dir_images.DirImages.open(io, gpa, images);
+    chunk_dir.close(gpa);
+    const server = try gpa.create(peer_server.Server);
+    defer gpa.destroy(server);
+    try server.start(io, .{
+        .listen = try std.Io.net.IpAddress.parse("127.0.0.1", 0),
+        .state_dir = state2,
+        .node = "node2",
+        .images_path = images,
+        .zigbox_store = root_a,
+        .quiet = true,
+    });
+    defer server.stop();
+    const absent: store_api.Digest = .{ .bytes = @splat(7) };
+    const tree_text = absent.text();
+    var named_buffer: [64]u8 = undefined;
+    const named = try std.fmt.bufPrint(&named_buffer, "node2=127.0.0.1:{d}", .{server.port()});
+    const argv = [_][]const u8{
+        exe,              "fetch",
+        "--node",         "node1",
+        "--state-dir",    state1,
+        "--zigbox-store", root_b,
+        "--manifest",     images_mod.manifest_text,
+        "--digest",       &tree_text,
+        "--peer",         named,
+    };
+    const log = try tmp.dir.createFile(io, "fetch.log", .{ .read = true });
+    defer log.close(io);
+    try testing.expectEqual(constants.exit_external, try run_fetch(io, &argv, log));
+    var said: [8192]u8 = undefined;
+    const text = said[0..try log.readPositionalAll(io, &said, 0)];
+    const refused = "peer node2 answered the bundle request with a status other than 200";
+    try testing.expect(std.mem.indexOf(u8, text, refused) != null);
+    try testing.expect(std.mem.indexOf(u8, text, "ZC-E0601") != null);
+}

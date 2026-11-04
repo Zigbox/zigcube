@@ -415,6 +415,10 @@ stage_peers_fallback() {
     [ "$PEER" -eq 0 ] || fail "mcached: $PEER peer bytes, but no peer has the image"
     log=$(fetch_log_of mcached)
     [ -n "$log" ] && [ -s "$log" ] || fail "mcached: fetch.log is missing or empty ($log)"
+    grep -q 'ZC-E0601' "$log" || fail "mcached: fetch.log does not say ZC-E0601 ($log)"
+    # A holds no memcached, so it refuses the bundle request (404) and the fetch says so.
+    grep -q 'answered the bundle request' "$log" ||
+        fail "mcached: fetch.log does not name the peer that refused the bundle ($log)"
     ok "an image no peer has: pulled from the registry ($REG bytes); fetch.log says: $(head -c 200 "$log" | tr '\n' ' ')"
 
     # The deadline: with the fault the fetch of alpine, which A holds, is killed at once, so the

@@ -43,6 +43,11 @@ const Store = store_api.Store;
 /// The most distinct objects and entries one tree walk looks at (the bound of `walk_objects`).
 pub const entries_max: u32 = 1 << 16;
 
+comptime {
+    // A tree the walk accepts has no more objects than entries: all of them can be claimed.
+    assert(constants.zigbox_claims_max >= entries_max);
+}
+
 /// Where a chunk is held, for reads: the object and the chunk's place in it.
 const Position = struct { object: Digest, index: u32 };
 
@@ -189,6 +194,10 @@ pub const ZigboxImages = struct {
     /// How many walks `reindex` has made (the tests count them).
     walks: u32 = 0,
     claims: std.ArrayList(Claim) = .empty,
+    /// The most objects one fetch claims (`begin_object`); a bundle's receiver refuses a larger
+    /// tree before it claims anything, as a limit of this node's, not a peer's fault. Tests
+    /// lower it.
+    claims_max: u32 = constants.zigbox_claims_max,
     /// What the last refused `import_image` was refused for.
     refusal: ?store_api.image_peer.Refusal = null,
 
@@ -252,7 +261,18 @@ pub const ZigboxImages = struct {
     /// The distinct file objects below `tree`, walk order. Null if the walk could not finish
     /// (a missing or damaged tree, too many entries, memory).
     pub fn collect(self: *ZigboxImages, tree: Digest) ?Collected {
+        return self.collect_checked(tree) catch null;
+    }
+
+    /// Why `collect_checked` could not finish: a tree record below is not here or is damaged
+    /// (`Incomplete`), the tree is larger than a walk here takes (`TooLarge`, a local limit),
+    /// or the store or memory failed.
+    pub const CollectError = error{ Incomplete, TooLarge, StoreFailed, OutOfMemory };
+
+    /// `collect`, saying why it failed.
+    pub fn collect_checked(self: *ZigboxImages, tree: Digest) CollectError!Collected {
         var found: Collected = .{ .allocator = self.allocator };
+        errdefer found.deinit();
         var failure: store_api.walk.Failure = undefined;
         store_api.walk_objects(
             self.store,
@@ -263,14 +283,12 @@ pub const ZigboxImages = struct {
             &found,
             entries_max,
             &failure,
-        ) catch {
-            found.deinit();
-            return null;
+        ) catch return switch (failure.kind) {
+            .missing, .damaged => error.Incomplete,
+            .too_many_entries, .stack_full => error.TooLarge,
+            .unreadable => error.StoreFailed,
         };
-        if (found.failed) {
-            found.deinit();
-            return null;
-        }
+        if (found.failed) return error.OutOfMemory;
         return found;
     }
 
@@ -520,6 +538,24 @@ pub const ZigboxImages = struct {
         return store_api.export_image(self.store, self.memory, tree, out, &failure) catch null;
     }
 
+    /// This store's own image record for `manifest`, or null if it has none (or cannot read
+    /// it). `export_image` gives only a tree's newest record; this one is for one manifest. The
+    /// pinned Zigbox exports no reader of a record by manifest (`store/images.zig` is not
+    /// exported), so this reads the file `images.save` writes, `<store>/images/<hex>`;
+    /// `import_image` parses and checks whatever it returns.
+    pub fn own_record(
+        self: *ZigboxImages,
+        manifest: Sha256,
+        out: *[constants.zigbox_record_bytes_max]u8,
+    ) ?[]const u8 {
+        const root = self.store.root[0..self.store.root_len];
+        var path: [@sizeOf(@TypeOf(self.store.root)) + 80]u8 = undefined;
+        const hex = manifest.hex();
+        const text = std.fmt.bufPrintSentinel(&path, "{s}/images/{s}", .{ root, &hex }, 0) catch
+            unreachable; // The root fits its own array; the rest is 72 bytes.
+        return self.store.fs.read_whole(text, out) catch null;
+    }
+
     // ---- The receiving half --------------------------------------------------------------
 
     /// Stores a tree record from a peer: held to its digest and encoding, or refused.
@@ -554,7 +590,7 @@ pub const ZigboxImages = struct {
         if (!store_api.object.object_id(meta.content, attrs).eql(meta.id)) return error.BadHash;
         const wanted_count = store_api.object.chunk_count(meta.size, self.store.chunk_bytes);
         if (meta.hashes.len != wanted_count) return error.BadHash;
-        if (self.claims.items.len == constants.zigbox_claims_max) return error.TooMany;
+        if (self.claims.items.len >= self.claims_max) return error.TooMany;
         const xattrs = try self.allocator.dupe(u8, meta.xattrs);
         errdefer self.allocator.free(xattrs);
         const hashes = try self.allocator.dupe(Digest, meta.hashes);
