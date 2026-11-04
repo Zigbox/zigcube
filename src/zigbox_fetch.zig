@@ -421,7 +421,13 @@ const Rig = struct {
 const peer_infos = [_]fetch_worker.PeerInfo{.{ .name = "node1", .filter = &filter_all }};
 var filter_all: [64]u8 = @splat(0xff);
 
-fn run_rig(rig: *Rig, to: *ZigboxImages, tree: Digest, manifest: Sha256, report: *Report) Error!void {
+fn run_rig(
+    rig: *Rig,
+    to: *ZigboxImages,
+    tree: Digest,
+    manifest: Sha256,
+    report: *Report,
+) Error!void {
     const transport = rig.transport();
     return fetch(testing.allocator, transport, to, tree, manifest, &peer_infos, .{}, report);
 }
