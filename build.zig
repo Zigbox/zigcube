@@ -165,6 +165,16 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
     run.step.dependOn(&built.agent_install.step);
     run.addFileInput(built.agent.getEmittedBin());
     test_step.dependOn(&run.step);
+    // The gate's own tests (src/testing/check.zig): `check` must fail over a reported failure.
+    const check_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/testing/check.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const check_run = b.addRunArtifact(check_tests);
+    check_run.setCwd(b.path("."));
+    test_step.dependOn(&check_run.step);
 }
 
 const CModules = struct { sqlite: *std.Build.Module, libpq: *std.Build.Module };
