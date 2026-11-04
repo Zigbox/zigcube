@@ -12,12 +12,21 @@ BIN=$HOME/bin
 STATE=$HOME/state
 LOG=$HOME/log
 API="http://127.0.0.1:$PORT"
+# The peer stages (slice 8): agent A is $NODE above, agent B has a Zigbox store and state of its own.
+NODE_B=peerb
+PEER_A=127.0.0.1:7081
+PEER_B=127.0.0.1:7082
+B_DIR=$HOME/b
 
 # The locked trees come from Zigbox's own lock file (src/testing/vm/zbx.lock), which its CI checks.
 ALPINE_TREE=b3:2e478596e56b3c0f1748d14e505d5d289ead0bb0526cbd53b325baff01afe599
 ALPINE_REF=alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
 PYTHON_TREE=b3:2ef2776fb138a7b7010d46af46cb15b338dff81ce3c2d8927e8bbe3fb6db0897
 PYTHON_REF=python:3.12-slim@sha256:6d2b0577e6d1632f077331de8e4780535f54839d163ded7abb4b7dd37b5d37ac
+PY13_TREE=b3:2ec6b79d8d9fb965b5c2ae195d7e41754b4fe0c7b835831f12cfdb18800f1f81
+PY13_REF=python:3.13-slim@sha256:fea139ecc0ab98360ead50b38872df6d42cf3503bec83215461224cbef0c8269
+MEMCACHED_TREE=b3:6af1ea2d0c60bf995daf058a95ad4df25c3b43b2fac92f2cc8ffb46b4f4e2b08
+MEMCACHED_REF=memcached:alpine@sha256:9057793717e87e054636eaf06cf8ec2792a3ad164ad9e8bcae1e90241ea73fb0
 # Names an image the registry has, but not with this tree: the pull must be refused.
 WRONG_TREE=b3:00000000000000000000000000000000000000000000000000000000000000aa
 # Names no image at all.
@@ -74,7 +83,7 @@ count() { box_pids "$1" | wc -l; }
 
 # `replica status exit_kind diagnostic_code` for every observed replica of a service.
 observed() {
-    api_get "/v1/list?prefix=/observed/$NODE/" | python3 -c '
+    api_get "/v1/list?prefix=/observed/${ON:-$NODE}/" | python3 -c '
 import json, sys
 for kv in json.load(sys.stdin)["kvs"]:
     v = kv["value"]
@@ -92,7 +101,18 @@ two_boxes() { [ "$(count box)" -eq 2 ] && [ "$(running_count box)" -eq 2 ]; }
 start_agent() {
     setsid "$BIN/zcube-agent" --runtime zigbox --node $NODE --server 127.0.0.1:$PORT \
         --state-dir "$STATE" --cpu-millis 2000 --memory-bytes 1073741824 \
-        >>"$LOG/agent.log" 2>&1 </dev/null &
+        --peer-listen $PEER_A >>"$LOG/agent.log" 2>&1 </dev/null &
+}
+
+# Agent B: its own node, state directory and Zigbox store (XDG_DATA_HOME), so what it holds is
+# what it fetched. Capacity is large, and A's is not, so a service that asks for more than A has
+# left goes to B.
+start_agent_b() {
+    mkdir -p "$B_DIR/data" "$B_DIR/state" "$B_DIR/agent"
+    XDG_DATA_HOME=$B_DIR/data XDG_STATE_HOME=$B_DIR/state \
+        setsid "$BIN/zcube-agent" --runtime zigbox --node $NODE_B --server 127.0.0.1:$PORT \
+        --state-dir "$B_DIR/agent" --cpu-millis 8000 --memory-bytes 4294967296 \
+        --peer-listen $PEER_B >>"$LOG/agent-b.log" 2>&1 </dev/null &
 }
 
 agent_pid() { pgrep -f "^$BIN/zcube-agent --runtime"; }
@@ -245,6 +265,141 @@ stage_scale0() {
         "launch box-5: $(ls -l "$STATE"/zigbox/box-5 | tr '\n' ';') supervisor.pid: $(cat "$STATE"/zigbox/box-5/supervisor.pid)" \
         "zbx ps: $("$BIN/zbx" ps --all 2>&1 | tr '\n' ';')"
     ok "removing a service during its pull leaves the agent and box running"
+}
+
+# ---- Peer fetch (C2 slice 8, M4): agent B gets images from agent A --------------------------
+
+now_ms() { echo $(($(date +%s) * 1000)); }
+
+# `registry_bytes cached_bytes peer_bytes peers` of the newest /pulls record of $1 (node) for
+# tree $2 finished at or after $3 (ms), from /v1/stats/pull, which is what the agent published
+# from the container's pull.json (it removes the file once stored). Nothing if there is none.
+pull_record() {
+    api_get "/v1/stats/pull?node=$1&limit=100" | python3 -c '
+import json, sys
+tree, since = sys.argv[1], int(sys.argv[2])
+for p in json.load(sys.stdin)["pulls"]:
+    if tree.startswith(p["tree"]) and p["finished_at_ms"] >= since:
+        peers = ",".join("%s=%d" % (q["peer"], q["bytes"]) for q in p["peer_bytes"])
+        print(p["registry_bytes"], p["cached_bytes"], sum(q["bytes"] for q in p["peer_bytes"]),
+              peers or "-")
+        break
+' "$2" "$3"
+}
+
+# Waits for the record, then prints it to the log and the globals REG CACHED PEER and PEERS.
+await_pull() { # tree since
+    have_pull() { [ -n "$(pull_record $NODE_B "$1" "$2")" ]; }
+    until_ok 120 "the pull record of $1 on $NODE_B" have_pull "$1" "$2"
+    set -- "$(pull_record $NODE_B "$1" "$2")"
+    # shellcheck disable=SC2086
+    set -- $1
+    REG=$1 CACHED=$2 PEER=$3 PEERS=$4
+}
+
+# True when node $1's summary lists tree $2 and a peer address.
+holds_tree() {
+    short=$(echo "$2" | cut -c1-11)
+    api_get "/v1/list?prefix=/node-store/$1" | grep -q "$short" || return 1
+    api_get "/v1/list?prefix=/node-store/$1" | grep -q '127.0.0.1:70'
+}
+
+# The log of the newest container directory of service $1 on B.
+fetch_log_of() { ls -t "$B_DIR"/agent/containers/"$1"-*/fetch.log 2>/dev/null | head -n 1; }
+
+# A service only B can take: more CPU than A has left (2000 millicores less box's 1000).
+only_b() { service_json "$1" "$2" 1 '{"cpu_millis":1200,"memory_bytes":134217728}' "$(sleep_json)" "$3"; }
+sleep_json() { echo '["sleep","1000"]'; }
+
+stage_peers_prep() {
+    # A pulls both Python images from the registry (B is not up yet, so A is the only node), so
+    # that it holds them whole and says so in its summary.
+    for pair in "prepone $PYTHON_TREE $PYTHON_REF" "preptwo $PY13_TREE $PY13_REF"; do
+        set -- $pair
+        apply "$(service_json "$1" "$2" 1 '{"cpu_millis":100,"memory_bytes":134217728}' "$(sleep_json)" "$3")"
+    done
+    both_up() { [ "$(running_count prepone)" -eq 1 ] && [ "$(running_count preptwo)" -eq 1 ]; }
+    until_ok 400 "A to run both Python images" both_up
+    curl -sf -X DELETE "$API/v1/services/prepone" >/dev/null || fail "delete prepone"
+    curl -sf -X DELETE "$API/v1/services/preptwo" >/dev/null || fail "delete preptwo"
+    a_holds() { holds_tree $NODE "$PYTHON_TREE" && holds_tree $NODE "$PY13_TREE" &&
+        holds_tree $NODE "$ALPINE_TREE"; }
+    until_ok 90 "A's summary to list its trees and its peer address" a_holds
+    ok "agent A ($NODE) holds python:3.12-slim, python:3.13-slim and alpine and says so in /node-store"
+}
+
+stage_peers_up() {
+    start_agent_b
+    node_b_up() { api_get "/v1/list?prefix=/nodes/$NODE_B" | grep -q "$NODE_B"; }
+    until_ok 60 "agent B to register" node_b_up
+    ok "agent B ($NODE_B, its own Zigbox store under $B_DIR/data) is up beside A"
+}
+
+stage_peers_fetch() {
+    ON=$NODE_B
+    since=$(now_ms)
+    apply "$(only_b pyone $PYTHON_TREE $PYTHON_REF)"
+    one_up() { [ "$(running_count pyone)" -eq 1 ]; }
+    until_ok 240 "pyone to run on $NODE_B" one_up
+    await_pull "$PYTHON_TREE" "$since"
+    echo "pull record of pyone: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
+    [ "$PEER" -gt 0 ] || fail "pyone: no bytes came from a peer (registry=$REG peers=$PEERS)"
+    [ "$REG" -eq 0 ] || fail "pyone: $REG registry bytes, but A has the image"
+    case "$PEERS" in "$NODE="*) ;; *) fail "pyone: peers are '$PEERS', not $NODE" ;; esac
+    ok "B fetched python:3.12-slim from peer $NODE: $PEER peer bytes, 0 registry bytes"
+    first_peer=$PEER
+
+    # The second image shares most of its files with the first: B asks A only for the chunks it
+    # does not hold yet, and counts the rest as cached.
+    since=$(now_ms)
+    apply "$(only_b pytwo $PY13_TREE $PY13_REF)"
+    two_up() { [ "$(running_count pytwo)" -eq 1 ]; }
+    until_ok 240 "pytwo to run on $NODE_B" two_up
+    await_pull "$PY13_TREE" "$since"
+    echo "pull record of pytwo: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
+    [ "$REG" -eq 0 ] || fail "pytwo: $REG registry bytes, but A has the image"
+    [ "$PEER" -gt 0 ] || fail "pytwo: no bytes came from a peer"
+    [ "$CACHED" -gt 0 ] || fail "pytwo: nothing was already held; the images do not overlap"
+    ok "B fetched python:3.13-slim: $PEER peer bytes, $CACHED chunk bytes already held (only the rest moved)"
+    curl -sf -X DELETE "$API/v1/services/pyone" >/dev/null || fail "delete pyone"
+    curl -sf -X DELETE "$API/v1/services/pytwo" >/dev/null || fail "delete pytwo"
+    ON=
+}
+
+stage_peers_fallback() {
+    ON=$NODE_B
+    # An image no peer has: the fetch fails, says why in fetch.log, and the supervisor's own pull
+    # gets it from the registry.
+    since=$(now_ms)
+    apply "$(only_b mcached $MEMCACHED_TREE $MEMCACHED_REF)"
+    mc_up() { [ "$(running_count mcached)" -eq 1 ]; }
+    until_ok 240 "mcached to run on $NODE_B" mc_up
+    await_pull "$MEMCACHED_TREE" "$since"
+    echo "pull record of mcached: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
+    [ "$REG" -gt 0 ] || fail "mcached: no registry bytes"
+    [ "$PEER" -eq 0 ] || fail "mcached: $PEER peer bytes, but no peer has the image"
+    log=$(fetch_log_of mcached)
+    [ -n "$log" ] && [ -s "$log" ] || fail "mcached: fetch.log is missing or empty ($log)"
+    ok "an image no peer has: pulled from the registry ($REG bytes); fetch.log says: $(head -c 200 "$log" | tr '\n' ' ')"
+
+    # The deadline: with the fault the fetch of alpine, which A holds, is killed at once, so the
+    # tree must come from the registry. Without the kill the peer would have supplied it.
+    echo 50 >"$B_DIR/agent/faults/fetch-deadline-ms" 2>/dev/null ||
+        { mkdir -p "$B_DIR/agent/faults" && echo 50 >"$B_DIR/agent/faults/fetch-deadline-ms"; }
+    since=$(now_ms)
+    apply "$(only_b alp $ALPINE_TREE $ALPINE_REF)"
+    alp_up() { [ "$(running_count alp)" -eq 1 ]; }
+    until_ok 240 "alp to run on $NODE_B" alp_up
+    rm -f "$B_DIR/agent/faults/fetch-deadline-ms"
+    await_pull "$ALPINE_TREE" "$since"
+    echo "pull record of alp: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
+    [ "$REG" -gt 0 ] || fail "alp: no registry bytes after the fetch was killed"
+    [ "$PEER" -eq 0 ] || fail "alp: $PEER peer bytes; the fetch outlived its 50 ms deadline"
+    pgrep -f 'zcube-agent fetch' >/dev/null && fail "a fetch is still running"
+    ok "a fetch past its deadline (50 ms) is killed: alpine came from the registry ($REG bytes), not from $NODE"
+    curl -sf -X DELETE "$API/v1/services/mcached" >/dev/null || fail "delete mcached"
+    curl -sf -X DELETE "$API/v1/services/alp" >/dev/null || fail "delete alp"
+    ON=
 }
 
 main() {

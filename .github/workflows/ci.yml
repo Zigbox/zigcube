@@ -405,7 +405,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     env:
       ZBX_REGISTRY_MIRRORS: mirror.gcr.io
       ZCUBE_REAL_HOST: '1'

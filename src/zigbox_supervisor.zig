@@ -240,7 +240,31 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
         .stdout = sink,
         .stderr = sink,
     }) catch return false;
-    return finished_ok(swarm.io, &child, constants.zigbox_fetch_deadline_ms);
+    return finished_ok(swarm.io, &child, fetch_deadline(swarm));
+}
+
+/// The fetch's deadline: `constants.zigbox_fetch_deadline_ms`, unless the test fault
+/// `<state dir>/faults/fetch-deadline-ms` holds a shorter one (docs/agent.md). Without it a smoke
+/// would wait half an hour to see the kill.
+fn fetch_deadline(swarm: Swarm) u32 {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}/faults/fetch-deadline-ms", .{
+        swarm.fetch.state_dir,
+    }) catch return constants.zigbox_fetch_deadline_ms;
+    var text: [16]u8 = undefined;
+    const read = std.Io.Dir.cwd().readFile(swarm.io, path, &text) catch
+        return constants.zigbox_fetch_deadline_ms;
+    return deadline_from_fault(read);
+}
+
+/// The milliseconds a fault file holds (digits, then maybe a newline), 1 to the real deadline;
+/// anything else leaves the real deadline in force.
+fn deadline_from_fault(text: []const u8) u32 {
+    const trimmed = std.mem.trim(u8, text, " \n");
+    const value = std.fmt.parseInt(u32, trimmed, 10) catch
+        return constants.zigbox_fetch_deadline_ms;
+    if (value == 0) return constants.zigbox_fetch_deadline_ms;
+    return @min(value, constants.zigbox_fetch_deadline_ms);
 }
 
 /// Waits for `child` to exit, at most `limit_ms`; a child still running then is killed. True only
@@ -441,6 +465,15 @@ test "the fetch's diagnostics have a log in the container's directory" {
     );
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("ZC-W0601", text);
+}
+
+test "the fault file can only shorten the fetch's deadline" {
+    const real = constants.zigbox_fetch_deadline_ms;
+    try std.testing.expectEqual(@as(u32, 50), deadline_from_fault("50\n"));
+    try std.testing.expectEqual(real, deadline_from_fault(""));
+    try std.testing.expectEqual(real, deadline_from_fault("0"));
+    try std.testing.expectEqual(real, deadline_from_fault("soon"));
+    try std.testing.expectEqual(real, deadline_from_fault("4000000000"));
 }
 
 test "a fetch that outlives its deadline is killed, and only an exit 0 counts" {
