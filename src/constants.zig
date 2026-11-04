@@ -628,3 +628,22 @@ comptime {
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }
+
+// The Zigbox store adapter (`zigbox_images.zig`, C2 slice 8). All bounds, none a policy.
+
+/// The scratch one Zigbox call reads or writes through: exactly Zigbox's `store_io_buffer_bytes`
+/// (not exported), which `fs.read` asserts as a most and `chunk_hashes` as a least.
+pub const zigbox_io_bytes: u32 = 256 * 1024;
+/// The depth of the walk's explicit stack, in digests.
+pub const zigbox_walk_stack_max: u32 = 1 << 12;
+/// The chunks one object lists: exactly Zigbox's `store_chunks_max` (not exported), which
+/// `chunk_hashes` asserts of the room it is given.
+pub const zigbox_chunks_per_object_max: u32 = 4096;
+/// The bytes the root listing's names may take.
+pub const zigbox_roots_arena_bytes: u32 = 1 << 14;
+/// The bytes of one image record (a peer's record is held to this before it is parsed).
+pub const zigbox_record_bytes_max: u32 = 1 << 20;
+/// The objects an in-progress receive may hold claims on.
+pub const zigbox_claims_max: u32 = 1 << 14;
+/// The bytes a tree record is read into.
+pub const zigbox_tree_buffer_bytes: u32 = 4 << 20;
