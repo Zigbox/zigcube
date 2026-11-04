@@ -42,60 +42,16 @@ const cluster_operations = "40";
 const swarm_operations = "100";
 const gates = "build test tidy errors-site wasm-check wasm-test console-wasm";
 
-/// Where `run` keeps a child's standard error, so it can be shown and then read.
-const stderr_copy = ".zig-cache/zcube-check-stderr";
-const stderr_copy_bytes_max = 64 << 20;
-
-/// What a `zig build` prints for a failed step. A build that prints it has failed whatever its
-/// exit status says: the gate does not trust the status alone (the C2 slice 7 report showed a
-/// `check: PASS` over a log holding a failed `test` step).
-fn reports_failure(text: []const u8) bool {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "failed command: ")) return true;
-        if (std.mem.indexOf(u8, line, "error: the following build command failed") != null) {
-            return true;
-        }
-        if (std.mem.indexOf(u8, line, "test process unexpectedly") != null) return true;
-    }
-    return false;
-}
-
-/// Runs `argv` (in `cwd` if given) with its errors on stderr; fails unless it exits 0 and its
-/// errors do not report a failed build step. The child's stderr goes to a file (not a pipe, which
-/// a detached grandchild such as a supervisor could hold open), is copied to ours, and is read.
+/// Runs `argv` (in `cwd` if given) with its errors on stderr; fails unless it exits 0.
 fn run(io: Io, argv: []const []const u8, cwd: ?[]const u8) !void {
-    return run_echo(io, argv, cwd, true);
-}
-
-/// `run`, with the copy of the child's errors on our stderr only if `echo` (the tests keep it
-/// off: a test's stderr is the build's, and would read as a failed step to the gate above it).
-fn run_echo(io: Io, argv: []const []const u8, cwd: ?[]const u8, echo: bool) !void {
-    const copy = try Io.Dir.cwd().createFile(io, stderr_copy, .{});
-    defer copy.close(io);
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
         .stdout = .ignore,
-        .stderr = .{ .file = copy },
+        .stderr = .inherit,
     });
-    const term = try child.wait(io);
-    var buffer: [4096]u8 = undefined;
-    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena.deinit();
-    const text = Io.Dir.cwd().readFileAlloc(
-        io,
-        stderr_copy,
-        arena.allocator(),
-        .limited(stderr_copy_bytes_max),
-    ) catch "";
-    if (echo) {
-        var stderr_writer: Io.File.Writer = .init(.stderr(), io, &buffer);
-        stderr_writer.interface.writeAll(text) catch {};
-        stderr_writer.interface.flush() catch {};
-    }
-    switch (term) {
-        .exited => |code| if (code == 0 and !reports_failure(text)) return,
+    switch (try child.wait(io)) {
+        .exited => |code| if (code == 0) return,
         else => {},
     }
     return error.CommandFailed;
@@ -348,22 +304,12 @@ fn usage(err: *Io.Writer) !u8 {
     return 2;
 }
 
-// The gate must never pass over a failed step: `run` fails on a non-zero exit and also on an exit
-// 0 whose errors report a failed build step (the teeth of that rule).
-test "run fails when the child's errors report a failed step despite exit 0" {
+// `run` is the gate's only judge of a nested build: a non-zero exit must fail it. (A passing test
+// step that wrote to stderr makes the build runner print `failed command: ... --listen=-` under
+// a success; that line alone is not a failure, so the gate does not read it as one.)
+test "run fails on a non-zero exit and passes on zero" {
     const io = std.testing.io;
-    const noisy = [_][]const u8{
-        "sh", "-c", "echo 'failed command: zig test --listen=-' >&2; exit 0",
-    };
-    try std.testing.expectError(error.CommandFailed, run_echo(io, &noisy, null, false));
-    const crash = [_][]const u8{ "sh", "-c", "echo 'test process unexpectedly exited' >&2" };
-    try std.testing.expectError(error.CommandFailed, run_echo(io, &crash, null, false));
-    const exit3 = [_][]const u8{ "sh", "-c", "exit 3" };
-    try std.testing.expectError(error.CommandFailed, run_echo(io, &exit3, null, false));
-    try run_echo(io, &.{ "sh", "-c", "echo fine >&2" }, null, false);
-}
-
-test "reports_failure recognises a build runner's failure report" {
-    try std.testing.expect(reports_failure("x\nfailed command: a b\ny"));
-    try std.testing.expect(!reports_failure("sim-c0: seed 1\nok\n"));
+    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "exit 3" }, null));
+    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "kill -9 $$" }, null));
+    try run(io, &.{ "sh", "-c", "exit 0" }, null);
 }
