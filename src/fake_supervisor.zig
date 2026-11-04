@@ -10,7 +10,8 @@
 //!
 //! What it does, in order: start a session, take the directory's lock (held until the process
 //! ends, however it ends: a lost supervisor is a lock that anyone can take), record its pid, run
-//! the command with the spec's environment and no terminal, record the command's pid, wait for
+//! the fetch `fetch.json` names if there is one (C2 slice 6b), run the command with the spec's
+//! environment and no terminal, record the command's pid, wait for
 //! it, record how it ended. A `SIGTERM` to the supervisor is passed to the command, so that an
 //! operator who stops the supervisor does not leave an orphan.
 //!
@@ -21,6 +22,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const files = @import("fake_files.zig");
+const backoff = @import("fetch_backoff.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -28,7 +30,12 @@ const Dir = std.Io.Dir;
 /// The command's pid, for the signal handler, which has nowhere else to look.
 var child_pid: std.atomic.Value(i32) = .init(0);
 
+/// Set once this supervisor itself got `SIGTERM`: a fetch that ends by a signal after that was
+/// stopped; before it, the fetch crashed.
+var term_received: std.atomic.Value(bool) = .init(false);
+
 fn on_term(_: std.posix.SIG) callconv(.c) void {
+    term_received.store(true, .release);
     const pid = child_pid.load(.acquire);
     if (pid > 1) _ = std.os.linux.kill(pid, .TERM);
 }
@@ -58,7 +65,138 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
         .flags = 0,
     };
     std.posix.sigaction(.TERM, &action, null);
+    if (files.exists(io, dir, files.file_fetch)) {
+        const failure = after_fetch(fetch_first(init, dir, arena));
+        if (failure) |over| return record(io, dir, over);
+    }
     return supervise(init, dir, &spec);
+}
+
+/// What ends the container after its fetch: the fetch's failure if it failed, a stop if this
+/// supervisor was sent `SIGTERM` meanwhile (the command must not start after it), else null.
+fn after_fetch(failure: ?files.RunFile) ?files.RunFile {
+    if (failure) |over| return over;
+    if (term_received.load(.acquire)) return stopped_run();
+    return null;
+}
+
+fn stopped_run() files.RunFile {
+    return .{ .kind = .signaled, .signal = @intCast(@backingInt(std.posix.SIG.TERM)) };
+}
+
+/// Runs the fetch `fetch.json` names and waits for it; null if the image is now on the node,
+/// else the `run.json` that says it is not. The container reports `starting` meanwhile (the
+/// supervisor's pid exists, the command's does not). A `SIGTERM` reaches the fetch through
+/// `child_pid`, like the command.
+fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFile {
+    const io = init.io;
+    const plan = files.read_json(files.FetchFile, io, dir, files.file_fetch, arena) catch
+        return failed(.environment, "the fetch record could not be read");
+    // The fetch's diagnostics (ZC-W0601, ZC-E0601) are kept beside the container's other files.
+    const log = dir.createFile(io, files.file_fetch_log, .{}) catch
+        return failed(.environment, "the fetch log could not be created");
+    defer log.close(io);
+    const state = std.Io.Dir.openDirAbsolute(io, plan.state_dir, .{}) catch null;
+    defer if (state) |opened| opened.close(io);
+    if (state) |opened| {
+        if (wait_for_backoff(io, opened, arena, &plan)) |stopped| return stopped;
+    }
+    var child = std.process.spawn(io, .{
+        .argv = plan.argv,
+        .stdin = .ignore,
+        .stdout = .{ .file = log },
+        .stderr = .{ .file = log },
+    }) catch return failed(.environment, "the host refused to start the fetch");
+    child_pid.store(child.id.?, .release);
+    const term = child.wait(io) catch return .{ .kind = .lost };
+    child_pid.store(0, .release);
+    const result = fetch_ended(arena, plan.digest, term);
+    if (state) |opened| settle_streak(io, opened, arena, plan.digest, result);
+    return result;
+}
+
+/// What the fetch's end means for the next fetch on this node: a tree fetched ends the streak,
+/// a failure of the fetch extends it, and anything else (a stop, this node's own setup) leaves
+/// it as it was.
+fn settle_streak(
+    io: std.Io,
+    state: Dir,
+    arena: Allocator,
+    digest: []const u8,
+    result: ?files.RunFile,
+) void {
+    const failure = result orelse return backoff.clear(io, state, arena, digest);
+    if (failure.kind != .start_failed) return;
+    if (failure.blame != .fetch) return;
+    backoff.record_failure(io, state, arena, digest, boot_ms(io));
+}
+
+fn boot_ms(io: std.Io) u64 {
+    const ms = std.Io.Clock.boot.now(io).toMilliseconds();
+    assert(ms >= 0);
+    return @intCast(ms);
+}
+
+/// Waits out the back-off a failed fetch on this node left (`fetch_backoff.zig`), in short
+/// sleeps so a `SIGTERM` ends the wait. Returns the container's end if it was stopped meanwhile.
+fn wait_for_backoff(
+    io: std.Io,
+    state: Dir,
+    arena: Allocator,
+    plan: *const files.FetchFile,
+) ?files.RunFile {
+    assert(plan.backoff_base_ms > 0);
+    assert(plan.backoff_cap_ms >= plan.backoff_base_ms);
+    const streak = backoff.read(io, state, arena, plan.digest);
+    while (true) {
+        if (term_received.load(.acquire)) {
+            return stopped_run();
+        }
+        const left = backoff.wait_remaining_ms(
+            streak,
+            boot_ms(io),
+            plan.backoff_base_ms,
+            plan.backoff_cap_ms,
+        );
+        if (left == 0) return null;
+        const slice_ms: i64 = @min(left, constants.fetch_backoff_slice_ms);
+        io.sleep(.fromMilliseconds(slice_ms), .boot) catch return null;
+    }
+}
+
+fn fetch_ended(arena: Allocator, digest: []const u8, term: std.process.Child.Term) ?files.RunFile {
+    switch (term) {
+        .exited => |code| {
+            if (code == constants.exit_ok) return null;
+            return fetch_exit(arena, digest, code);
+        },
+        // Stopped while fetching: the container ended by that signal, it did not fail to start.
+        // A signal this supervisor was not sent is the fetch crashing or being killed.
+        .signal => |signal| {
+            if (term_received.load(.acquire)) {
+                return .{ .kind = .signaled, .signal = @intCast(@backingInt(signal)) };
+            }
+            return failed(.fetch, "the fetch ended by a signal before it finished the tree");
+        },
+        else => return failed(.environment, "the fetch ended in a way the host did not report"),
+    }
+}
+
+/// What a fetch's exit code says (`fetch_cli.zig`): 3 is the tree not fetched (`ZC-E0601`, the
+/// registry or the peers), 1 and 2 are this node's own setup, anything else is a crash.
+fn fetch_exit(arena: Allocator, digest: []const u8, code: u8) files.RunFile {
+    if (code == constants.exit_external) {
+        const text = std.fmt.allocPrint(
+            arena,
+            "tree {s} was tried at this node's peers and the registry",
+            .{digest},
+        ) catch return failed(.environment, "the fetch failed");
+        return failed(.fetch, text);
+    }
+    if (code == constants.exit_user or code == constants.exit_environment) {
+        return failed(.environment, "the fetch could not run on this node; see fetch.log");
+    }
+    return failed(.fetch, "the fetch crashed; see fetch.log");
 }
 
 fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {
@@ -127,4 +265,17 @@ fn spawn_failure(err: std.process.SpawnError) files.RunFile {
 fn record(io: std.Io, dir: Dir, run_file: files.RunFile) u8 {
     files.write_json(io, dir, files.file_run, run_file) catch return constants.exit_environment;
     return constants.exit_ok;
+}
+
+test "a SIGTERM during the fetch ends the container before its command; a failure is kept" {
+    // Goal: the command must not start after the supervisor was stopped (review nit). Method:
+    // `after_fetch` over no failure, a failure, and no failure with `term_received` set.
+    term_received.store(false, .release);
+    try std.testing.expect(after_fetch(null) == null);
+    const failure = after_fetch(failed(.fetch, "x")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(files.Blame.fetch, failure.blame);
+    term_received.store(true, .release);
+    defer term_received.store(false, .release);
+    const stopped = after_fetch(null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(files.RunKind.signaled, stopped.kind);
 }

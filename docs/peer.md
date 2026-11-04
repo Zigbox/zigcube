@@ -18,7 +18,7 @@ Gives:
   cluster CA signed, and a client checks that the server's credential names the node it meant to
   reach. A peer with no CA-signed credential is refused before it is sent application data. It is
   not refused before it is told anything: any 34-byte M1 gets the server's credential in M2, at
-  the cost of one X25519 and one Ed25519 signature. Rate limiting M1 is 6b's work.
+  the cost of one X25519 and one Ed25519 signature. The peer server limits handshakes per source ("Rate limit", below).
 - **Confidentiality and integrity of the stream** (ChaCha20-Poly1305 records) and **forward
   secrecy** (fresh X25519 keys for every connection; a stolen node key does not open a recorded
   session).
@@ -187,6 +187,7 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 | E0805 | a record failed authentication, or a direction reached its record counter limit |
 | E0806 | (environment) the CA key or the node key could not be read, written or parsed |
 | E0807 | (user) a node was refused a credential because it was removed from the cluster |
+| E0808 | (user) a peer's handshake was refused: its address already has one unfinished, started too many in a window, or the table of addresses is full |
 
 ## Lifetime, renewal and removal
 
@@ -253,3 +254,49 @@ file, and in `src/agent_remote_test.zig` a live server and agent files for issua
 across a server restart, renewal and the refusal of a removed node (ZC-E0807). With a memory
 store the CA is made again at each start, which says so on stderr, and every agent rejoins.
 The handshake is interim: see `docs/decisions/2026-11-03-peer-handshake-interim.md`.
+
+## The peer server and the fetch worker (slice 6b, part 2)
+
+`src/peer_stream.zig` runs the handshake and sealed messages over a socket (a message is a u32
+length and its body in records; every wait is a `poll` against one deadline). `src/peer_server.zig`
+listens, asks `peer_limit.Limiter` before each handshake (ZC-E0808 once per streak), loads the
+identity from the state directory at each handshake (`agent_peer.load_identity`) and answers
+`GET /v1/peer/trees/<digest>` and `GET /v1/peer/chunk/<hash>` with `peer_serve.answer`. A reply is a
+14-byte head message (status u16, first, last, total u32 big endian) and a body message. Each connection first
+holds a cheap handshake slot (`peer_handshakes_max`); only after it authenticates does it take one of
+`peer_connections_max` serving slots (the big buffers), else it is told 503 (busy). `src/fetch_worker.zig` drives
+`fetch_plan` over a `Transport` and a `DirImages`.
+
+The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor running the worker before
+the command (ZC-E0601) and the fake registry are described in `docs/agent.md`; `zig build swarm-smoke`
+runs them end to end. See `docs/decisions/2026-11-03-slice6b-handoff.md`.
+
+## Rate limit
+
+M1 costs the responder public-key work, so `peer_server` decides before it starts a handshake,
+and closes a refused connection without a byte. A source is the peer's address with the port left
+out; an IPv6 address counts by its /64 (one host holds the whole range) and an IPv4-mapped IPv6
+address as the IPv4 address it carries (`peer_server.source_key`).
+
+- **One unfinished handshake per source.** While a connection from a source is still in its
+  handshake, another from the same source is refused and not counted below. A stranger that
+  connects and sends nothing therefore holds one connection slot, not all
+  `peer_connections_max`. The refused peer tries again and is admitted once the first handshake
+  has finished or timed out (`peer_handshake_ms`).
+- **A cap per window.** `peer_handshakes_per_source_max` (16) starts per source in
+  `peer_handshake_window_ms` (10 s) counted from the source's first start (`peer_limit.Limiter`).
+  A fetch keeps one stream per peer for up to `peer_connection_requests_max` requests, so an
+  honest node stays far below it.
+- **A table of `peer_sources_max` (256) sources.** A source whose window ran out frees its slot.
+  A table of live windows refuses a new source: the cheapest answer to a flood from many
+  addresses, at the cost that honest peers are refused too, for at most one window, until a
+  slot frees. Their retry is the recovery. The clock is `CLOCK_BOOTTIME` milliseconds (monotonic).
+
+Refusals are shown as ZC-E0808, naming the address, at most once per `peer_refusal_log_ms`
+(a flood does not flood the log). Only full `b3:` + 64 hex trees are served or counted.
+
+## Test fault: `peer-corrupt`
+
+`<state-dir>/faults/peer-corrupt` makes that node's peer server flip the first byte of every chunk
+it serves. The fetching node must hash the chunk, strike the peer (`ZC-W0601`) and take the chunk
+elsewhere; `zig build swarm-smoke` runs node1 with it. Never set it outside a test.

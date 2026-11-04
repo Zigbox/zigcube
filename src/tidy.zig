@@ -546,7 +546,8 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
     if (std.mem.eql(u8, target, "root")) {
         return std.mem.eql(u8, importing_path, "src/agent.zig") or
             std.mem.eql(u8, importing_path, "src/c1_teeth.zig") or
-            std.mem.eql(u8, importing_path, "src/fetch_plan.zig");
+            std.mem.eql(u8, importing_path, "src/fetch_plan.zig") or
+            std.mem.eql(u8, importing_path, "src/zcube_agent.zig");
     }
     for (module_allowlist) |name| {
         if (std.mem.eql(u8, name, target)) return true;

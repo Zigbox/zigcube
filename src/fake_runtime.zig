@@ -67,6 +67,23 @@ pub const Options = struct {
     supervisor_exe: []const u8,
     /// The digests the node "has": anything else is `ZBX-E0410`. Borrowed.
     fixtures: []const []const u8,
+    /// Where an image the node lacks comes from (C2 slice 6b); null: such an image is `ZBX-E0410`.
+    fetch: ?Fetch = null,
+};
+
+/// How to run `zcube-agent fetch` for an image that is not in `fixtures`. Borrowed.
+pub const Fetch = struct {
+    node: []const u8,
+    images_dir: []const u8,
+    registry: []const u8,
+    /// `HOST:PORT` of the server, from which the worker reads the peers (`/nodes/`,
+    /// `/node-store/`); empty: only `peers`.
+    server: []const u8 = "",
+    /// `NAME=HOST:PORT`, fixed peers.
+    peers: []const []const u8 = &.{},
+    /// The wait after one failed fetch on the node, doubling to the cap (`fetch_backoff.zig`).
+    backoff_base_ms: u32 = constants.fetch_backoff_base_ms,
+    backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
 };
 
 const Tag = enum(u8) { starting, running, stopped };
@@ -158,7 +175,9 @@ pub const FakeRuntime = struct {
     ) runtime.Error!runtime.StartOutcome {
         const self = from(context);
         self.reap();
-        if (!agent_records.has_image(self.options.fixtures, spec.image)) {
+        const fetched = !agent_records.has_image(self.options.fixtures, spec.image) and
+            self.options.fetch != null;
+        if (!fetched and !agent_records.has_image(self.options.fixtures, spec.image)) {
             var failure: Diagnostic = undefined;
             sim_runtime.image_not_found(&failure, spec.name, spec.image);
             return .{ .failed = failure };
@@ -168,6 +187,7 @@ pub const FakeRuntime = struct {
         defer dir.close(self.io);
         var path_buffer: [constants.state_path_bytes_max]u8 = undefined;
         const path = try self.container_path(&path_buffer, spec.name, diag);
+        if (fetched) try self.write_fetch(dir, spec, diag);
         try self.spawn_supervisor(path, spec.name, diag);
         return self.await_start(dir, spec.name, diag);
     }
@@ -193,6 +213,46 @@ pub const FakeRuntime = struct {
             return runtime_failed(diag, "create the container's lock file");
         lock.close(io);
         return dir;
+    }
+
+    /// Writes `fetch.json`: the supervisor fetches `spec.image` before it runs the command.
+    fn write_fetch(
+        self: *FakeRuntime,
+        dir: Dir,
+        spec: *const runtime.Spec,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const fetch = self.options.fetch.?;
+        var argv: [12 + 2 + 2 * constants.fetch_peers_max][]const u8 = undefined;
+        var count: usize = 0;
+        const head = [_][]const u8{
+            self.options.supervisor_exe, "fetch",                "--node",       fetch.node,
+            "--state-dir",               self.options.state_dir, "--images-dir", fetch.images_dir,
+            "--digest",                  spec.image,             "--registry",   fetch.registry,
+        };
+        for (head) |word| {
+            argv[count] = word;
+            count += 1;
+        }
+        if (fetch.server.len > 0) {
+            argv[count] = "--server";
+            argv[count + 1] = fetch.server;
+            count += 2;
+        }
+        for (fetch.peers) |peer| {
+            argv[count] = "--peer";
+            argv[count + 1] = peer;
+            count += 2;
+        }
+        const record: files.FetchFile = .{
+            .digest = spec.image,
+            .argv = argv[0..count],
+            .state_dir = self.options.state_dir,
+            .backoff_base_ms = fetch.backoff_base_ms,
+            .backoff_cap_ms = fetch.backoff_cap_ms,
+        };
+        files.write_json(self.io, dir, files.file_fetch, record) catch
+            return runtime_failed(diag, "write the container's fetch record");
     }
 
     fn spec_file(self: *FakeRuntime, spec: *const runtime.Spec) files.SpecFile {
@@ -267,6 +327,11 @@ pub const FakeRuntime = struct {
             if (files.exists(self.io, dir, files.file_child)) {
                 return .{ .started = runtime.Handle.init(name) };
             }
+            // Fetching the image: the replica is `starting` until the command runs.
+            const fetching = files.exists(self.io, dir, files.file_fetch);
+            if (fetching and files.exists(self.io, dir, files.file_supervisor)) {
+                return .{ .started = runtime.Handle.init(name) };
+            }
             self.nap(constants.fake_poll_ms);
         }
         self.kill_group(dir);
@@ -328,7 +393,16 @@ pub const FakeRuntime = struct {
         const status = try self.status_of(arena, dir, handle.name(), diag);
         if (status == .stopped) return;
         const child = files.read_pid(self.io, dir, files.file_child) catch {
-            // Not running yet: there is nothing polite to say to it.
+            // Not running yet. A supervisor that is fetching can be told politely, so it records
+            // the stop; anything else, or one that does not answer, loses its group.
+            if (grace_ms != 0 and files.exists(self.io, dir, files.file_fetch)) {
+                if (files.read_pid(self.io, dir, files.file_supervisor)) |supervisor| {
+                    if (self.is_our_supervisor(supervisor)) {
+                        signal(supervisor, .TERM);
+                        if (self.wait_ended(dir, @min(grace_ms, stop_wait_ms))) return;
+                    }
+                } else |_| {}
+            }
             self.kill_group(dir);
             return;
         };

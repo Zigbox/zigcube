@@ -26,6 +26,8 @@ const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const fetch_plan = @import("fetch_plan.zig");
+const fetch_worker = @import("fetch_worker.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -419,13 +421,26 @@ fn peer_removed(diag: *diag_mod.Diag) void { // agent_api.zig
     );
 }
 
-fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
+fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
     sample(
         diag,
-        .W0601,
-        &.{"peer node2 sent chunk 5 of 24 with bytes that do not match its hash"},
-        "no action needed for this fetch; check that node's store and disk",
+        .E0808,
+        &.{"peer address 10.0.0.7 started more handshakes than a window allows"},
+        "no action needed; it is tried again by itself",
     );
+}
+
+fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
+    fetch_plan.raise_blame(diag, .{ .peer = 0, .chunk = 4 }, "node2", 24);
+}
+
+fn tree_missing(diag: *diag_mod.Diag) void { // fetch_worker.zig
+    const tried = "node2, node3 and the registry";
+    fetch_worker.raise_tree_missing(diag, "b3:7f1c4e9a5d20", tried);
+}
+
+fn peer_bad_tree(diag: *diag_mod.Diag) void { // fetch_worker.zig
+    fetch_worker.raise_bad_tree(diag, "node2", "b3:7f1c4e9a5d20");
 }
 
 fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
@@ -583,7 +598,10 @@ const cases = [_]Case{
     relayed(.E0805, peer_record),
     relayed(.E0806, peer_key_file),
     relayed(.E0807, peer_removed),
+    relayed(.E0808, peer_limited),
     relayed(.W0601, peer_bad_chunk),
+    relayed(.E0601, tree_missing),
+    relayed(.W0602, peer_bad_tree),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
 };

@@ -346,6 +346,16 @@ next:
 - `zig build local-smoke` (`src/local_smoke.zig`) runs the sequence, two concurrent `up`s and a
   `down` after the agent died, on copies of the executables the build made.
 
+## Chunk store flags of `zcube-agent`
+
+`zcube` does not start the peer swarm: `zcube local up` runs its agent with no chunk store. A node
+joins the swarm with two flags of `zcube-agent` itself (they are in `zcube-agent --help`, and
+`docs/agent.md` says what they do): `--images-dir DIR` gives the node a chunk store, and
+`--peer-listen HOST:PORT` (needs `--images-dir`) serves it to peers over the authenticated
+handshake, rate limited (ZC-E0808, `docs/peer.md`, "Rate limit"). `--registry HOST:PORT` is where
+an image no peer has is fetched from (also needs `--images-dir`). `--peer-advertise HOST:PORT` is
+the address published for peers; it is required when `--peer-listen` names `0.0.0.0` or `::`.
+
 ## How it is tested
 
 - **Golden tests** (`src/cli_golden.zig`, `src/testdata/cli/`): every registered `ZC-` code has its

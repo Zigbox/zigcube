@@ -80,5 +80,11 @@ test "the peer files and the CA's shell are in this root" {
     // Goal: the shell halves of docs/peer.md (key files, CA, agent identity) are tested natively.
     _ = @import("agent_peer.zig");
     _ = @import("peer_files.zig");
+    _ = @import("dir_images.zig");
+    _ = @import("fetch_backoff.zig");
+    _ = @import("peer_stream.zig");
+    _ = @import("peer_server.zig");
+    _ = @import("fetch_cli.zig");
+    _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
 }

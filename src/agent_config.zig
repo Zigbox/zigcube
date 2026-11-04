@@ -33,11 +33,13 @@ pub const images_default = "fixtures/images.zon";
 pub const usage =
     \\usage: zcube-agent [--config FILE] [--node NAME] [--server HOST:PORT] [--state-dir DIR]
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
-    \\                   [--runtime fake|zigbox] [--verbose]
+    \\                   [--images-dir DIR] [--peer-listen HOST:PORT] [--peer-advertise HOST:PORT]
+    \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--verbose]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
-    \\                     .runtime, .images and .address
+    \\                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise
+    \\                     and .registry
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -47,7 +49,13 @@ pub const usage =
     \\  --images FILE      fake: the image digests it has (default fixtures/images.zon);
     \\                     zigbox (deprecated): each digest with the reference to pull it
     \\                     from, for a service that names no `source`
-    \\  --address TEXT     recorded with the node for people to read
+    \\  --address TEXT     recorded with the node for people to read; it is not used to connect
+    \\  --images-dir DIR   the node's chunk store; an image the node lacks is fetched into it
+    \\  --peer-listen ADDR serve the chunk store to peers (needs --images-dir)
+    \\  --peer-advertise ADDR  the address peers connect to, published with the node; needed when
+    \\                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
+    \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
+    \\                     peer has it (needs --images-dir)
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -73,6 +81,15 @@ pub const Config = struct {
     capacity: records.Requests,
     address: []const u8,
     verbose: bool,
+    /// The chunk store (`dir_images.zig`); null: the agent keeps no chunks of its own.
+    images_dir: ?[]const u8 = null,
+    /// Where the peer server listens; null: none runs. Needs `images_dir`.
+    peer_listen: ?IpAddress = null,
+    /// The address published for peers (`/node-store/<node>.peer`): `--peer-advertise`, else the
+    /// listen address when that names one host. Set exactly when `peer_listen` is.
+    peer_advertise: ?IpAddress = null,
+    /// The registry an image the node lacks is fetched from (`zcube-agent fetch`), as typed.
+    registry: ?[]const u8 = null,
 };
 
 pub const Command = union(enum) {
@@ -81,6 +98,8 @@ pub const Command = union(enum) {
     supervise: []const u8,
     /// `zcube-agent supervise-zigbox <launch directory>` (`zigbox_supervisor.zig`).
     supervise_zigbox: []const u8,
+    /// `zcube-agent fetch ...` (`fetch_cli.zig`): the arguments after `fetch`.
+    fetch: []const []const u8,
     version,
     help,
 };
@@ -97,6 +116,10 @@ const File = struct {
     memory_bytes: ?u64 = null,
     images: ?[]const u8 = null,
     address: ?[]const u8 = null,
+    images_dir: ?[]const u8 = null,
+    peer_listen: ?[]const u8 = null,
+    peer_advertise: ?[]const u8 = null,
+    registry: ?[]const u8 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -115,6 +138,10 @@ const Flags = struct {
     memory_bytes: ?u64 = null,
     images: ?[]const u8 = null,
     address: ?[]const u8 = null,
+    images_dir: ?[]const u8 = null,
+    peer_listen: ?[]const u8 = null,
+    peer_advertise: ?[]const u8 = null,
+    registry: ?[]const u8 = null,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -123,6 +150,7 @@ const Flags = struct {
 /// Reads the flags and the files they name, merges them (flags win) and checks every setting.
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    if (args.len >= 1 and std.mem.eql(u8, args[0], "fetch")) return .{ .fetch = args[1..] };
     if (args.len >= 1) {
         const zigbox_mode = std.mem.eql(u8, args[0], "supervise-zigbox");
         if (zigbox_mode or std.mem.eql(u8, args[0], "supervise")) {
@@ -178,6 +206,22 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
     if (address.len > constants.listen_bytes_max) {
         return bad(diag, "the address text is longer than 128 bytes", .{}, "shorten it");
     }
+    const images_dir = flags.images_dir orelse file.images_dir;
+    const listen_text = flags.peer_listen orelse file.peer_listen;
+    if (listen_text != null and images_dir == null) {
+        return bad(diag, "--peer-listen has no chunk store to serve", .{}, "give --images-dir DIR");
+    }
+    const peer_listen = if (listen_text) |text| try parse_server(text, diag) else null;
+    const advertise_text = flags.peer_advertise orelse file.peer_advertise;
+    const peer_advertise = try peer_advertised(peer_listen, advertise_text, diag);
+    const registry = flags.registry orelse file.registry;
+    if (registry) |text| {
+        if (images_dir == null) {
+            const what = "--registry has no chunk store to fetch into";
+            return bad(diag, what, .{}, "give --images-dir DIR");
+        }
+        _ = try parse_server(text, diag);
+    }
     const kind = flags.runtime orelse file.runtime orelse .fake;
     const images_given = flags.images orelse file.images;
     const images_path = images_given orelse images_default;
@@ -192,6 +236,38 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .capacity = .{ .cpu_millis = cpu, .memory_bytes = memory },
         .address = address,
         .verbose = flags.verbose,
+        .images_dir = images_dir,
+        .peer_listen = peer_listen,
+        .peer_advertise = peer_advertise,
+        .registry = registry,
+    };
+}
+
+/// The address to publish for peers: the advertised one, else the listen address if it names a
+/// host. Listening on every address (0.0.0.0, ::) with nothing to advertise is refused: the
+/// published address would be one no peer can connect to.
+fn peer_advertised(listen: ?IpAddress, text: ?[]const u8, diag: *Diag) Error!?IpAddress {
+    const listening = listen orelse {
+        if (text == null) return null;
+        const why = "--peer-advertise has no peer server to advertise";
+        return bad(diag, why, .{}, "give --peer-listen");
+    };
+    if (text) |given| return try parse_server(given, diag);
+    if (is_unspecified(listening)) {
+        return bad(
+            diag,
+            "--peer-listen is {f}, an address no peer can connect to, and nothing is advertised",
+            .{listening},
+            "give --peer-advertise HOST:PORT, the address peers reach this node on",
+        );
+    }
+    return listening;
+}
+
+fn is_unspecified(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| std.mem.allEqual(u8, &ip4.bytes, 0),
+        .ip6 => |ip6| std.mem.allEqual(u8, &ip6.bytes, 0),
     };
 }
 
@@ -222,6 +298,14 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.images = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--address")) {
             flags.address = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--images-dir")) {
+            flags.images_dir = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--peer-listen")) {
+            flags.peer_listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--peer-advertise")) {
+            flags.peer_advertise = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--registry")) {
+            flags.registry = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--cpu-millis")) {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
@@ -608,4 +692,71 @@ test "the runtime is fake unless asked, and the zigbox images carry their refere
     diag.reset();
     const empty = ".{ .images = .{ .{ .digest = \"b3:aa\", .reference = \"\" } } }";
     try expect_bad(parse_pulls(arena, empty, "i.zon", &diag), &diag);
+}
+
+test "the chunk store and the peer address are read, and a peer address needs a store" {
+    // Goal: --images-dir and --peer-listen reach the Config; serving peers without a store to
+    // serve from is a bad configuration. Method: load with both, then with the address alone.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = [_][]const u8{
+        "--node",         "node1",   "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+    };
+    const extra = [_][]const u8{ "--images-dir", "/tmp/i", "--peer-listen", "127.0.0.1:7171" };
+    const both = base ++ extra;
+    const loaded = try load(arena, std.testing.io, &both, &diag);
+    try testing.expectEqualStrings("/tmp/i", loaded.run.images_dir.?);
+    try testing.expectEqual(@as(u16, 7171), loaded.run.peer_listen.?.getPort());
+    const with_registry = both ++ [_][]const u8{ "--registry", "127.0.0.1:9000" };
+    diag.reset();
+    const fetching = try load(arena, std.testing.io, &with_registry, &diag);
+    try testing.expectEqualStrings("127.0.0.1:9000", fetching.run.registry.?);
+    const no_store = base ++ [_][]const u8{ "--registry", "127.0.0.1:9000" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &no_store, &diag), &diag);
+    const alone = base ++ [_][]const u8{ "--peer-listen", "127.0.0.1:7171" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &alone, &diag), &diag);
+}
+
+test "the published peer address is the advertised one, or a specified listen address" {
+    // Goal: M2 of the final re-review. Method: listen on a host (published as is), on 0.0.0.0 and
+    // :: with and without --peer-advertise, and advertise without a server.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base = [_][]const u8{
+        "--node",         "node1",   "--server",     "127.0.0.1:7070",
+        "--state-dir",    "/tmp",    "--cpu-millis", "1000",
+        "--memory-bytes", "1000000", "--images",     "fixtures/images.zon",
+        "--images-dir",   "/tmp/i",
+    };
+    const host = base ++ [_][]const u8{ "--peer-listen", "127.0.0.1:7171" };
+    const plain = try load(arena, std.testing.io, &host, &diag);
+    try testing.expectEqual(@as(u16, 7171), plain.run.peer_advertise.?.getPort());
+    try testing.expect(plain.run.peer_advertise.?.eql(&plain.run.peer_listen.?));
+    const wild = base ++ [_][]const u8{ "--peer-listen", "0.0.0.0:7700" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &wild, &diag), &diag);
+    const wild6 = base ++ [_][]const u8{ "--peer-listen", "[::]:7700" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &wild6, &diag), &diag);
+    const told = wild ++ [_][]const u8{ "--peer-advertise", "10.0.2.2:7701" };
+    diag.reset();
+    const split = try load(arena, std.testing.io, &told, &diag);
+    try testing.expectEqual(@as(u16, 7700), split.run.peer_listen.?.getPort());
+    try testing.expectEqual(@as(u16, 7701), split.run.peer_advertise.?.getPort());
+    const lone = base ++ [_][]const u8{ "--peer-advertise", "10.0.2.2:7701" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &lone, &diag), &diag);
+    const junk = host ++ [_][]const u8{ "--peer-advertise", "node1:7701" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &junk, &diag), &diag);
 }

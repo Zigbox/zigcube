@@ -17,6 +17,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("peer_files.zig");
 const peer = @import("peer.zig");
+const codes = @import("diag/codes.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -193,7 +194,7 @@ pub const Peer = struct {
     }
 
     /// Writes `ca.pub` and then `peer.cred`: the credential's presence means the pair is whole.
-    fn store(self: *Peer, diag: *Diag) Error!void {
+    pub fn store(self: *Peer, diag: *Diag) Error!void {
         var ca_text: [65]u8 = undefined;
         const ca_line = std.fmt.bufPrint(&ca_text, "{x}\n", .{&self.ca_public.?}) catch
             unreachable; // Sized.
@@ -247,6 +248,36 @@ pub const Peer = struct {
         self.renew_at_ms = renew_time(&credential);
     }
 };
+
+/// The identity the agent has stored in `state_dir` (`peer.key`, `peer.cred`, `ca.pub`), read
+/// without making or changing anything: null if the agent has not joined yet (or its files do not
+/// fit one another). The peer server and the fetch worker call this per use, so a renewed
+/// credential is picked up. A file that cannot be used is ZC-E0806.
+pub fn load_identity(
+    io: std.Io,
+    state_dir: []const u8,
+    node: []const u8,
+    diag: *Diag,
+) Error!?peer.Identity {
+    assert(diag.code == null);
+    const dir = std.Io.Dir.cwd().openDir(io, state_dir, .{}) catch return null;
+    defer dir.close(io);
+    var seed = (try files.read_seed(io, dir, state_dir, key_file, diag)) orelse return null;
+    defer std.crypto.secureZero(u8, &seed);
+    var loaded: Peer = .{
+        .io = io,
+        .dir = dir,
+        .where = state_dir,
+        .node = node,
+        .key = Ed25519.KeyPair.generateDeterministic(seed) catch
+            return files.unusable(diag, state_dir, key_file, "use", "it is not a usable key seed"),
+    };
+    defer std.crypto.secureZero(u8, &loaded.key.secret_key.bytes);
+    try loaded.load_stored(diag);
+    const credential = loaded.credential orelse return null;
+    const ca_public = loaded.ca_public orelse return null;
+    return .{ .key = loaded.key, .credential = credential, .ca_public = ca_public };
+}
 
 /// ZC-E0801 for the agent's own credential: the server's CA is not the one that signed it. Said
 /// once per change; the agent joins again by itself.
@@ -307,7 +338,8 @@ fn load_or_make_key(
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
         io.random(&seed);
-        const key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
+        var key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
+        errdefer std.crypto.secureZero(u8, &key.secret_key.bytes); // A key that was not stored.
         try files.write_seed(io, dir, where, key_file, seed, diag);
         return key;
     }
@@ -406,4 +438,160 @@ test "a corrupt or loose cache file is ignored with one problem, never an error"
     defer loose.close();
     try std.testing.expect(loose.stored_problem);
     try std.testing.expect(loose.ca_public == null);
+}
+
+/// A server that answers every call the same way and counts them.
+const Canned = struct {
+    status: u16,
+    body: []const u8,
+    calls: u32 = 0,
+
+    fn transport(canned: *Canned) client_mod.Transport {
+        return .{ .context = canned, .call_fn = call };
+    }
+
+    fn call(
+        context: *anyopaque,
+        arena: Allocator,
+        request: client_mod.Request,
+        diag: *Diag,
+    ) client_mod.Error!client_mod.Reply {
+        _ = arena;
+        _ = diag;
+        const canned: *Canned = @ptrCast(@alignCast(context));
+        canned.calls += 1;
+        std.debug.assert(std.mem.endsWith(u8, request.target, "/credential"));
+        return .{ .status = canned.status, .body = canned.body };
+    }
+};
+
+/// The body the server sends for a credential of `ca` for `node` and `node_key`, shown to the
+/// agent as signed by `shown_ca`.
+fn issued_body(
+    arena: Allocator,
+    ca: Ed25519.KeyPair,
+    shown_ca: Ed25519.KeyPair,
+    node: []const u8,
+    node_key: [32]u8,
+) ![]const u8 {
+    const credential = peer.issue(ca, node, node_key, 1000, 1000 + 86_400_000);
+    const bytes = peer.encode(&credential);
+    const ca_public = shown_ca.public_key.toBytes();
+    const text = "{{\"credential\":\"{x}\",\"ca_public\":\"{x}\"}}";
+    return std.fmt.allocPrint(arena, text, .{ &bytes, &ca_public });
+}
+
+/// Runs one `step` against `canned`; true if it joined. Whatever failed is left in `diag`.
+fn try_step(peer_state: *Peer, canned: *Canned, now_ms: u64, diag: *Diag) bool {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    diag.reset();
+    peer_state.step(canned.transport(), arena_state.allocator(), 7, now_ms, 1000, diag) catch
+        return false;
+    return true;
+}
+
+test "a join reply that names another key, node or CA is refused and stores nothing" {
+    // Goal: carried over from the review of slice 6a: the agent keeps a credential only if it is
+    // for this node, for the key it sent and from the CA it is shown. Method: for each wrong
+    // reply, run a step; it must fail with a diagnostic, schedule the retry, leave the agent
+    // with no pair and write no file (a reopened Peer has none). Then a right reply joins.
+    const io = std.testing.io;
+    var state: TestState = undefined;
+    try state.make(io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var agent = try Peer.open(io, state.path(), "node1", &diag);
+    defer agent.close();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ca = try Ed25519.KeyPair.generateDeterministic(@splat(11));
+    const other_ca = try Ed25519.KeyPair.generateDeterministic(@splat(12));
+    const mine = agent.key.public_key.toBytes();
+    const stranger = (try Ed25519.KeyPair.generateDeterministic(@splat(13))).public_key.toBytes();
+    const wrong = [_]struct { body: []const u8, name: []const u8 }{
+        .{ .name = "another key", .body = try issued_body(arena, ca, ca, "node1", stranger) },
+        .{ .name = "another node", .body = try issued_body(arena, ca, ca, "node2", mine) },
+        // Signed by `ca`, but the reply says the CA is `other_ca`.
+        .{ .name = "another CA", .body = try issued_body(arena, ca, other_ca, "node1", mine) },
+        .{ .name = "not hex", .body = "{\"credential\":\"zz\",\"ca_public\":\"zz\"}" },
+        .{ .name = "not json", .body = "welcome" },
+    };
+    var now_ms: u64 = 2000;
+    for (wrong) |case| {
+        var canned: Canned = .{ .status = 200, .body = case.body };
+        try std.testing.expect(!try_step(&agent, &canned, now_ms, &diag));
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try std.testing.expect(diag.code != null);
+        try std.testing.expect(agent.credential == null);
+        try std.testing.expect(agent.ca_public == null);
+        try std.testing.expectEqual(now_ms + constants.peer_join_retry_ms, agent.retry_at_ms);
+        try std.testing.expect(!agent.due(now_ms));
+        now_ms += constants.peer_join_retry_ms;
+    }
+    diag.reset();
+    var reopened = try Peer.open(io, state.path(), "node1", &diag);
+    defer reopened.close();
+    try std.testing.expect(reopened.credential == null);
+    var good: Canned = .{ .status = 200, .body = try issued_body(arena, ca, ca, "node1", mine) };
+    try std.testing.expect(try_step(&agent, &good, now_ms, &diag));
+    try std.testing.expect(agent.credential != null);
+    try std.testing.expect(!agent.due(now_ms));
+}
+
+test "a renewal that fails keeps the pair the agent has" {
+    // Goal: a server that fails, refuses or lies at renewal time costs the agent nothing it
+    // already holds. Method: join, move to the renewal time, and answer with the server failing
+    // its store (500 with a diagnostic), removing the node (ZC-E0807) and a wrong key.
+    const io = std.testing.io;
+    var state: TestState = undefined;
+    try state.make(io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var agent = try Peer.open(io, state.path(), "node1", &diag);
+    defer agent.close();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ca = try Ed25519.KeyPair.generateDeterministic(@splat(11));
+    const mine = agent.key.public_key.toBytes();
+    var good: Canned = .{ .status = 200, .body = try issued_body(arena, ca, ca, "node1", mine) };
+    try std.testing.expect(try_step(&agent, &good, 2000, &diag));
+    const held = agent.credential.?;
+    const renew_at = agent.renew_at_ms;
+    try std.testing.expect(!agent.due(renew_at - 1));
+    const store_failed =
+        \\{"request_id":"r-1","diagnostics":[{"code":"ZC-B0002","summary":"zcube failed",
+        \\"causes":["the store refused the write"]}]}
+    ;
+    const removed =
+        \\{"request_id":"r-2","diagnostics":[{"code":"ZC-E0807","summary":"removed",
+        \\"causes":["node1 is on the list"]}]}
+    ;
+    const stranger = (try Ed25519.KeyPair.generateDeterministic(@splat(13))).public_key.toBytes();
+    const lying = try issued_body(arena, ca, ca, "node1", stranger);
+    const cases = [_]struct { status: u16, body: []const u8, code: codes.Code }{
+        .{ .status = 500, .body = store_failed, .code = .E0504 },
+        .{ .status = 403, .body = removed, .code = .E0807 },
+        .{ .status = 200, .body = lying, .code = .E0504 },
+        .{ .status = 503, .body = "", .code = .E0504 },
+    };
+    var now_ms = renew_at;
+    for (cases) |case| {
+        var canned: Canned = .{ .status = case.status, .body = case.body };
+        try std.testing.expect(!try_step(&agent, &canned, now_ms, &diag));
+        try std.testing.expectEqual(@as(?codes.Code, case.code), diag.code);
+        const kept = agent.credential.?;
+        try std.testing.expectEqualSlices(u8, &peer.encode(&held), &peer.encode(&kept));
+        try std.testing.expectEqual(now_ms + constants.peer_join_retry_ms, agent.retry_at_ms);
+        now_ms += constants.peer_join_retry_ms;
+    }
+    // The pair on disk is still the first one: a restart finds it.
+    diag.reset();
+    var reopened = try Peer.open(io, state.path(), "node1", &diag);
+    defer reopened.close();
+    try std.testing.expect(reopened.credential != null);
 }

@@ -87,7 +87,9 @@ pub const Code = enum(u8) {
     E0513,
     E0514,
     W0501,
+    E0601,
     W0601,
+    W0602,
     E0801,
     E0802,
     E0803,
@@ -95,6 +97,7 @@ pub const Code = enum(u8) {
     E0805,
     E0806,
     E0807,
+    E0808,
     B0001,
     B0002,
     B0003,
@@ -1079,6 +1082,21 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0601,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a tree could not be fetched from any peer or the registry",
+        .explanation =
+        \\A node needed the chunk tree of an image and could not get it onto this
+        \\node: no peer sent it, and the registry did not serve it. The cause line
+        \\names the tree's digest and every source that was tried, in order.
+        \\
+        \\Check that the registry is reachable from this node, and that the digest
+        \\names an image that was pushed. A digest that was never pushed is held by
+        \\no source, so every fetch of it fails the same way.
+        ,
+    },
+    .{
         .code = .W0601,
         .severity = .warning,
         .blame = .external,
@@ -1091,6 +1109,21 @@ pub const registry = [_]Entry{
         \\The image is not affected: nothing is stored or run before every chunk
         \\matches. The peer's disk or store may be damaged, or it may be running a
         \\different build; check that node.
+        ,
+    },
+    .{
+        .code = .W0602,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "a peer's chunk list does not match its digest",
+        .explanation =
+        \\A node that was asked for an image's chunk tree got a list from a peer
+        \\whose BLAKE3 digest is not the tree's digest. The list was ignored and the
+        \\node tried the next source: another peer, then the registry.
+        \\
+        \\The image is not affected: a tree is used only when its digest matches.
+        \\No action is needed. If it repeats, check the peer node, whose store may
+        \\be damaged or running a different build.
         ,
     },
     .{
@@ -1214,6 +1247,31 @@ pub const registry = [_]Entry{
         \\file and restart zcube-server; the agent asks again by itself. The API is
         \\unauthenticated, so this binds an honest node only: until the API has auth,
         \\anyone who can reach it can register a name and ask for a credential.
+        ,
+    },
+    .{
+        .code = .E0808,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer's handshake was refused: its address is over a limit",
+        .explanation =
+        \\An agent's peer server limits what one source address may ask of it,
+        \\because a handshake costs the server public-key work. A handshake is
+        \\refused, and the connection closed without a byte, when the address
+        \\already has a handshake that has not finished (one at a time per
+        \\source), when it has started peer_handshakes_per_source_max
+        \\handshakes in peer_handshake_window_ms, or when the server already
+        \\tracks peer_sources_max addresses in the window. An IPv6 address
+        \\counts by its /64, one host's whole range.
+        \\
+        \\The cause names the refused address (an IPv6 one by its /64). The
+        \\text is shown once per peer_refusal_log_ms, not once per connection.
+        \\An honest fetch opens a handful of connections and keeps
+        \\them. If one node is refused over and over, something there retries
+        \\in a loop: look at its agent's output. A refused node tries again by
+        \\itself, and a fetch falls back to the registry meanwhile. A flood
+        \\from many addresses can fill the table and turn honest nodes away
+        \\for up to one window; no action is needed unless it repeats.
         ,
     },
     .{
