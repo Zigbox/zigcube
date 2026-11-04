@@ -105,8 +105,8 @@ fails leaves the member out.
 current one `400` with `ZC-E0204`. `limit` is at most 500. `continue` is the last key of a
 truncated page; pass it back with the first page's `at`. **`reverse` is new** (see below).
 
-`zcube-agent fetch --server` uses this read, unchanged, for peer discovery: `prefix=/nodes/` and
-`prefix=/node-store/` with `limit=500` (agent.md, "The chunk store, the peer server and `fetch`").
+`zcube-agent fetch --server` uses this read, unchanged, for peer discovery: one call with
+`prefix=/node-store/` and `limit=65` (agent.md, "The chunk store, the peer server and `fetch`").
 It adds no endpoint.
 
 ### `GET /v1/watch?prefix=&prefix=&from=&timeout=`

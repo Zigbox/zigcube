@@ -470,8 +470,8 @@ test "the fetch ends in an error when its total time is spent" {
 
 test "peers are ranked by the chunks their filters claim and the ones with none are left out" {
     // Goal: the sixteen peers a plan uses are the best of up to sixty-four. Method: three peers
-    // claiming 6, 2 and 0 of the tree's chunks, then 20 peers each claiming one more chunk than
-    // the last (up to all): only 16 are kept, the biggest claim first.
+    // claiming 6, 2 and 0 of the tree's chunks, then 40 peers claiming two chunks and 24 claiming
+    // all: only 16 are kept, the biggest claim first.
     var table: Table = .{};
     table.make();
     var full: [64]u8 = undefined;

@@ -36,8 +36,8 @@ Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer
 `ca.pub`, live in the state directories, not in the store.
 
 An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
-The `zcube-agent fetch` process reads `/nodes/<node>` (`address`) and `/node-store/<node>` (`filter`)
-to find peers, and writes neither.
+The `zcube-agent fetch` process reads `/node-store/<node>` (`peer`, `filter`) to find peers, and
+writes nothing.
 One departure from `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
@@ -161,8 +161,12 @@ declared by the agent's configuration (see the open questions in `docs/contracts
 ```json
 { "v": 1, "node": "node1",
   "trees": [{"tree": "b3:51aa9c03", "bytes": 52428800, "chunks": 800, "sample": "<hex>"}],
-  "filter": "<hex Bloom filter of every chunk held>", "filter_chunks": 800, "omitted": 0 }
+  "filter": "<hex Bloom filter of every chunk held>", "filter_chunks": 800, "omitted": 0,
+  "peer": "10.0.0.7:7700" }
 ```
+
+`peer` is the `host:port` of the node's peer server (`--peer-listen`); empty when it serves
+none. A fetch reads it instead of guessing from `/nodes/<node>`, whose port is the agent's API.
 
 Written by the agent, bound to the same lease as `/nodes/<node>` (a separate key, so a summary
 refresh never rewrites the registration), through the lease-bound agent endpoint with the same

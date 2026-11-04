@@ -185,8 +185,9 @@ whole in the store and 1 with ZC-E0601 when it is not. A peer is only ever asked
 the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
 - `--server HOST:PORT` gives the peers without naming them. The fetch reads
-  `/v1/list?prefix=/nodes/` for each node's name and `address`, and `/v1/list?prefix=/node-store/`
-  for each node's hex `filter` (keys.md, api.md), and skips its own node.
+  `/v1/list?prefix=/node-store/` once, for each node's `peer` address and hex `filter` (keys.md,
+  api.md). It leaves out its own node and any node with a bad name, no `peer` or no filter, says
+  how many on one line of stderr, and ranks the rest by the chunks their filters claim.
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
   the plan strikes it if it lies.
 

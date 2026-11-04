@@ -268,3 +268,9 @@ identity from the state directory at each handshake (`agent_peer.load_identity`)
 The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor running the worker before
 the command (ZC-E0601) and the fake registry are described in `docs/agent.md`; `zig build swarm-smoke`
 runs them end to end. See `docs/decisions/2026-11-03-slice6b-handoff.md`.
+
+## Test fault: `peer-corrupt`
+
+`<state-dir>/faults/peer-corrupt` makes that node's peer server flip the first byte of every chunk
+it serves. The fetching node must hash the chunk, strike the peer (`ZC-W0601`) and take the chunk
+elsewhere; `zig build swarm-smoke` runs node1 with it. Never set it outside a test.
