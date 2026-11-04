@@ -35,6 +35,11 @@ fn expect_canonical(bytes: []const u8) !void {
 /// Applies one random damage to `buffer[0..length]`; returns the new length.
 fn damage(random: std.Random, buffer: *[buffer_bytes]u8, length: usize) usize {
     var size = length;
+    if (size <= 4) {
+        // Too short to damage in place: grow it, so every case below has bytes to work on.
+        random.bytes(buffer[size..][0..8]);
+        size += 8;
+    }
     switch (random.uintLessThan(u8, 7)) {
         0 => buffer[random.uintLessThan(usize, size)] = random.int(u8),
         1 => buffer[random.uintLessThan(usize, size)] ^= @as(u8, 1) << random.int(u3),
