@@ -358,7 +358,8 @@ test "run fails when the child's errors report a failed step despite exit 0" {
     try std.testing.expectError(error.CommandFailed, run_echo(io, &noisy, null, false));
     const crash = [_][]const u8{ "sh", "-c", "echo 'test process unexpectedly exited' >&2" };
     try std.testing.expectError(error.CommandFailed, run_echo(io, &crash, null, false));
-    try std.testing.expectError(error.CommandFailed, run_echo(io, &.{ "sh", "-c", "exit 3" }, null, false));
+    const exit3 = [_][]const u8{ "sh", "-c", "exit 3" };
+    try std.testing.expectError(error.CommandFailed, run_echo(io, &exit3, null, false));
     try run_echo(io, &.{ "sh", "-c", "echo fine >&2" }, null, false);
 }
 
