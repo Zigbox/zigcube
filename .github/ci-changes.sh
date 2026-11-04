@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Decides what ci.yml runs. Reads the changed paths, one per line, on stdin and writes
+# Decides which jobs ci.yml runs. Reads the changed paths, one per line, on stdin and writes
 # `name=true|false` lines (to $GITHUB_OUTPUT, or stdout when that is unset):
 #
 #   code          format, build, test, tidy, errors-site, the memory and SQLite store suites, the
