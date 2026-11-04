@@ -54,7 +54,8 @@ pub const reply_bytes: usize = @max(
 /// The network side of the worker. `list_scratch` holds one reply; `identity` is the node's.
 pub const Net = struct {
     io: std.Io,
-    registry: IpAddress,
+    /// Null in Zigbox mode with no `--registry`: the peers are the only source.
+    registry: ?IpAddress,
     peers: []const Peer,
     identity: ?peer.Identity,
     reply: []u8,
@@ -112,7 +113,8 @@ pub const Net = struct {
         switch (source) {
             .registry => {
                 const path = std.fmt.bufPrint(&target, "/trees/{s}", .{digest}) catch return null;
-                return switch (net.http_get(net.registry, path, out)) {
+                const address = net.registry orelse return null;
+                return switch (net.http_get(address, path, out)) {
                     .bytes => |bytes| bytes,
                     .refused, .timeout, .busy => null,
                 };
@@ -136,7 +138,8 @@ pub const Net = struct {
             .registry => {
                 const path = std.fmt.bufPrint(&target, "/chunks/{x}", .{&ref.hash}) catch
                     return .refused;
-                return switch (net.http_get(net.registry, path, out)) {
+                const address = net.registry orelse return .refused;
+                return switch (net.http_get(address, path, out)) {
                     .bytes => |bytes| .{ .bytes = bytes },
                     .refused => .refused,
                     .timeout, .busy => .timeout,
@@ -503,13 +506,18 @@ fn decode_filter(arena: std.mem.Allocator, value: std.json.Value) ?[]u8 {
     return bytes;
 }
 
-/// "node2, node3 and the registry", or "the registry" when there are no peers.
-fn tried_sources(buffer: []u8, peers: []const Peer) []const u8 {
+/// "node2, node3 and the registry", or "the registry" when there are no peers; without a
+/// registry, "node2 and node3" or "no peer".
+fn tried_sources(buffer: []u8, peers: []const Peer, registry: bool) []const u8 {
     var writer = std.Io.Writer.fixed(buffer);
     for (peers, 0..) |who, at| {
         writer.print("{s}{s}", .{ if (at == 0) "" else ", ", who.name }) catch break;
     }
-    writer.writeAll(if (peers.len > 0) " and the registry" else "the registry") catch {};
+    if (registry) {
+        writer.writeAll(if (peers.len > 0) " and the registry" else "the registry") catch {};
+    } else if (peers.len == 0) {
+        writer.writeAll("no peer, and no registry is given") catch {};
+    }
     return writer.buffered();
 }
 
@@ -574,8 +582,7 @@ pub fn parse(args: []const []const u8) ?Args {
             if (!parse_peer(&parsed, value)) return null;
         } else return null;
     }
-    const complete = parsed.node.len > 0 and parsed.state_dir.len > 0 and
-        parsed.registry != null;
+    const complete = parsed.node.len > 0 and parsed.state_dir.len > 0;
     if (!complete or !digest_valid(parsed.digest)) return null;
     if (parsed.zigbox_store.len > 0) {
         // Zigbox mode: the store and the manifest come together; the digest is a full one.
@@ -585,6 +592,7 @@ pub fn parse(args: []const []const u8) ?Args {
         if (Zsha256.parse(parsed.manifest) == null) return null;
         return parsed;
     }
+    if (parsed.registry == null) return null; // The chunk directory's registry is not optional.
     if (parsed.images_dir.len == 0 or parsed.manifest.len > 0 or parsed.source.len > 0) {
         return null;
     }
@@ -643,7 +651,7 @@ fn parse_address(text: []const u8) ?IpAddress {
 
 pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
     "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX [--source OCI-REF]) " ++
-    "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
+    "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
 /// memory), 3 is that no source had the tree (the supervisor records that as ZC-E0601).
@@ -720,7 +728,7 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     @memset(conns, .{});
     var net: Net = .{
         .io = io,
-        .registry = parsed.registry.?,
+        .registry = parsed.registry,
         .peers = &.{},
         .identity = identity,
         .reply = reply,
@@ -894,7 +902,7 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
         error.TreeUnavailable, error.ChunkFailed, error.Deadline => {},
     }
     var tried_buffer: [256]u8 = undefined;
-    const tried = tried_sources(&tried_buffer, net.peers);
+    const tried = tried_sources(&tried_buffer, net.peers, net.registry != null);
     fetch_worker.raise_tree_missing(diag, net.digest, tried);
     if (net.oversize) {
         diag.cause("the registry sent a reply larger than the {d} bytes a reply may have", .{
@@ -1252,9 +1260,9 @@ test "the sources a failed fetch names are its peers and the registry" {
     };
     try std.testing.expectEqualStrings(
         "node2, node3 and the registry",
-        tried_sources(&buffer, &peers),
+        tried_sources(&buffer, &peers, true),
     );
-    try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}));
+    try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}, true));
 }
 
 test "a fetch with an unusable key file says ZC-E0806 and has no identity" {
@@ -1334,4 +1342,24 @@ test "zigbox mode arguments: a store and a manifest together, a full digest, no 
     try std.testing.expect(parse(&short) == null);
     const dir_mode = base ++ [_][]const u8{ "--images-dir", "/i", "--manifest", manifest };
     try std.testing.expect(parse(&dir_mode) == null);
+    // Zigbox mode needs no registry (the peers are the only source); the directory mode does.
+    const bare = [_][]const u8{
+        "--node",         "node1",  "--state-dir", "/s",     "--digest", full,
+        "--zigbox-store", "/store", "--manifest",  manifest,
+    };
+    try std.testing.expect(parse(&bare).?.registry == null);
+    const dir_bare = [_][]const u8{
+        "--node", "node1", "--state-dir", "/s", "--digest", full, "--images-dir", "/i",
+    };
+    try std.testing.expect(parse(&dir_bare) == null);
+}
+
+test "without a registry the sources a failed fetch names are the peers alone" {
+    var buffer: [128]u8 = undefined;
+    const peers = [_]Peer{.{ .name = "node2", .address = undefined }};
+    try std.testing.expectEqualStrings("node2", tried_sources(&buffer, &peers, false));
+    try std.testing.expectEqualStrings(
+        "no peer, and no registry is given",
+        tried_sources(&buffer, &.{}, false),
+    );
 }
