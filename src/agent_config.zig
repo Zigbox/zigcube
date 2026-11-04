@@ -252,7 +252,18 @@ fn peer_advertised(listen: ?IpAddress, text: ?[]const u8, diag: *Diag) Error!?Ip
         const why = "--peer-advertise has no peer server to advertise";
         return bad(diag, why, .{}, "give --peer-listen");
     };
-    if (text) |given| return try parse_server(given, diag);
+    if (text) |given| {
+        const advertised = try parse_server(given, diag);
+        if (is_unspecified(advertised)) {
+            return bad(
+                diag,
+                "--peer-advertise is {f}, an address no peer can connect to",
+                .{advertised},
+                "give the address peers reach this node on, HOST:PORT",
+            );
+        }
+        return advertised;
+    }
     if (is_unspecified(listening)) {
         return bad(
             diag,
@@ -759,4 +770,10 @@ test "the published peer address is the advertised one, or a specified listen ad
     const junk = host ++ [_][]const u8{ "--peer-advertise", "node1:7701" };
     diag.reset();
     try expect_bad(load(arena, std.testing.io, &junk, &diag), &diag);
+    const any4 = host ++ [_][]const u8{ "--peer-advertise", "0.0.0.0:7700" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &any4, &diag), &diag);
+    const any6 = host ++ [_][]const u8{ "--peer-advertise", "[::]:7700" };
+    diag.reset();
+    try expect_bad(load(arena, std.testing.io, &any6, &diag), &diag);
 }

@@ -61,6 +61,11 @@ const Link = struct {
     /// True once the handshake succeeded: until then the connection is a stranger's, and one
     /// source may hold only one such link (`admit`).
     authenticated: std.atomic.Value(bool) = .init(false),
+    /// When the connection was admitted (`peer_stream.boot_ms`), for evicting the oldest stranger.
+    started_ms: u64 = 0,
+    /// Whether `fd` is open: 0 closed, 1 open, 2 being shut down by `evict_oldest`. The task that
+    /// serves the link closes the fd by moving 1 to 0, so an evictor never touches a reused fd.
+    fd_state: std.atomic.Value(u8) = .init(0),
 };
 
 /// The buffers of one served connection, lent to a connection once it has authenticated.
@@ -250,20 +255,69 @@ fn admit(server: *Server, fd: std.posix.fd_t, storage: *const Storage, io: std.I
     }
     for (&server.links) |*link| {
         if (link.busy.load(.acquire)) continue;
-        if (link.future) |*future| future.await(io);
-        link.future = null;
-        link.fd = fd;
-        link.source = source;
-        link.authenticated.store(false, .release);
-        link.busy.store(true, .release);
-        link.future = io.concurrent(serve, .{ server, link }) catch {
-            link.busy.store(false, .release);
-            _ = std.os.linux.close(fd);
-            return;
-        };
-        return;
+        return start_link(server, link, fd, source, io);
     }
-    _ = std.os.linux.close(fd); // Every link is busy: the peer tries again.
+    // Every link is taken. Silent strangers must not lock honest peers out: the oldest link that
+    // has not authenticated is shut down, its task ends and frees the link the usual way, and
+    // the newcomer takes it.
+    if (evict_oldest(server, io)) |link| return start_link(server, link, fd, source, io);
+    _ = std.os.linux.close(fd); // Every link is authenticated and serving: the peer tries again.
+}
+
+fn start_link(server: *Server, link: *Link, fd: std.posix.fd_t, source: u64, io: std.Io) void {
+    assert(!link.busy.load(.acquire));
+    if (link.future) |*future| future.await(io);
+    link.future = null;
+    link.fd = fd;
+    link.source = source;
+    link.started_ms = peer_stream.boot_ms(io);
+    link.authenticated.store(false, .release);
+    link.fd_state.store(1, .release);
+    link.busy.store(true, .release);
+    link.future = io.concurrent(serve, .{ server, link }) catch {
+        link.fd_state.store(0, .release);
+        link.busy.store(false, .release);
+        _ = std.os.linux.close(fd);
+        return;
+    };
+}
+
+/// How long `evict_oldest` waits for the shut-down task to free its link.
+const evict_wait_ms = 500;
+
+/// Shuts down the oldest unauthenticated connection and returns its link once free, or null if
+/// every link is authenticated (or the task did not end in time).
+fn evict_oldest(server: *Server, io: std.Io) ?*Link {
+    var oldest: ?*Link = null;
+    for (&server.links) |*link| {
+        if (!link.busy.load(.acquire)) return link; // Freed meanwhile.
+        if (link.authenticated.load(.acquire)) continue;
+        if (oldest) |best| {
+            if (link.started_ms >= best.started_ms) continue;
+        }
+        oldest = link;
+    }
+    const link = oldest orelse return null;
+    if (link.fd_state.cmpxchgStrong(1, 2, .acq_rel, .acquire) == null) {
+        _ = std.os.linux.shutdown(link.fd, std.os.linux.SHUT.RDWR);
+        link.fd_state.store(1, .release);
+    }
+    var waited: u32 = 0;
+    while (link.busy.load(.acquire)) : (waited += 1) {
+        if (waited >= evict_wait_ms) return null;
+        io.sleep(.fromMilliseconds(1), .awake) catch return null;
+    }
+    return link;
+}
+
+/// Closes the link's fd once, after any evictor has finished with it.
+fn close_link_fd(link: *Link) void {
+    while (true) {
+        if (link.fd_state.cmpxchgWeak(1, 0, .acq_rel, .acquire) == null) break;
+        if (link.fd_state.load(.acquire) == 0) return;
+        std.atomic.spinLoopHint();
+    }
+    _ = std.os.linux.close(link.fd);
 }
 
 /// Whether a connection of `source` is still in its handshake in some link.
@@ -309,7 +363,7 @@ fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
 fn serve(server: *Server, link: *Link) void {
     const io = server.io;
     defer {
-        _ = std.os.linux.close(link.fd);
+        close_link_fd(link);
         link.busy.store(false, .release);
     }
     var diag: Diag = undefined;
@@ -741,6 +795,21 @@ test "silent connections from more sources than there are serving slots do not l
         _ = std.os.linux.close(fd);
     };
     try io.sleep(.fromMilliseconds(200), .awake);
+    try std.testing.expectEqual(@as(u32, silent.len), busy_links(&rig.server));
+    try expect_served(&rig, address);
+}
+
+fn busy_links(server: *const Server) u32 {
+    var busy: u32 = 0;
+    for (&server.links) |*link| {
+        if (link.busy.load(.acquire)) busy += 1;
+    }
+    return busy;
+}
+
+/// An honest client (127.0.0.1) handshakes and fetches the rig's chunk.
+fn expect_served(rig: *Rig, address: net.IpAddress) !void {
+    const io = std.testing.io;
     const now = peer_stream.wall_ms(io);
     const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
     var identity: peer.Identity = .{
@@ -759,6 +828,24 @@ test "silent connections from more sources than there are serving slots do not l
     try stream.send(path, end);
     const head = try stream.recv(&reply, end);
     try std.testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, head[0..2], .big));
+}
+
+test "silent connections taking every link do not lock out an honest peer" {
+    // Goal: review follow-up 1. Method: `peer_handshakes_max` silent connections, one source
+    // each, hold every link; an honest handshake evicts the oldest stranger and is served.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    var silent: [constants.peer_handshakes_max]std.posix.fd_t = undefined;
+    for (&silent, 0..) |*fd, at| fd.* = try connect_from(io, @intCast(2 + at), address);
+    defer for (silent) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try std.testing.expectEqual(constants.peer_handshakes_max, busy_links(&rig.server));
+    try expect_served(&rig, address);
 }
 
 test "an authenticated peer finding every serving slot taken is told busy" {

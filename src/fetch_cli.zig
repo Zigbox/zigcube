@@ -766,8 +766,23 @@ fn collect_pages(arena: std.mem.Allocator, getter: anytype, out: []u8) ?[]const 
         all.appendSlice(arena, page.kvs) catch break;
         if (at == 0) first_revision = page.revision;
         after = page.@"continue" orelse return all.items;
+        // The key goes into a request line: a server's reply must not shape it.
+        if (!continue_key_valid(after.?)) break;
     }
     return if (all.items.len == 0) null else all.items;
+}
+
+/// A `continue` key is accepted only as a `/node-store/` key made of `[a-z0-9./-]`.
+fn continue_key_valid(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, "/node-store/")) return false;
+    for (key) |byte| {
+        const ok = switch (byte) {
+            'a'...'z', '0'...'9', '.', '/', '-' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// `collect_pages` over the control plane's HTTP.
@@ -1000,6 +1015,27 @@ test "discovery reads more nodes than one reply holds, with full-size filters, p
     try std.testing.expectEqual(@as(u32, 3), calls);
     const asked = std.mem.sliceTo(&second, 0);
     try std.testing.expect(std.mem.find(u8, asked, "&at=7&continue=/node-store/n015") != null);
+}
+
+test "a continue key that could shape the request line stops paging, keeping what was read" {
+    // Goal: review follow-up 3. Method: a first page whose `continue` holds a space and a line
+    // break; only one request is made and the page's nodes are kept.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const evil = "{\"revision\":7,\"kvs\":[{\"key\":\"/node-store/n000\",\"value\":{}}]," ++
+        "\"continue\":\"/node-store/n000 HTTP/1.1\\r\\nX: y\"}";
+    const pages = [_][]const u8{ evil, evil };
+    var calls: u32 = 0;
+    var last: [160]u8 = @splat(0);
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last };
+    const out = try arena.alloc(u8, discover_page_bytes_max);
+    const kvs = collect_pages(arena, getter, out) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), kvs.len);
+    try std.testing.expectEqual(@as(u32, 1), calls);
+    try std.testing.expect(continue_key_valid("/node-store/n015"));
+    try std.testing.expect(!continue_key_valid("/v1/list"));
+    try std.testing.expect(!continue_key_valid("/node-store/A"));
 }
 
 test "a --peer with a name that is not a node name is left out, the rest are kept" {
