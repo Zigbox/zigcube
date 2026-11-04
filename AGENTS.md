@@ -108,6 +108,24 @@ An agent re-reads its whole context on every turn, so cost grows with context si
 - [README.md](README.md) holds the status of every milestone and slice: what is built and reviewed, what is in review, and what is not started. The supervisor updates it in the same push that changes the status. Never mark anything "demonstrated" until its `demo-cN` job is green in CI.
 - The project site (`site/index.html`, the `SITE` and `MILESTONES` data at the top of its script) shows the same status. Update it in the same push as the README: the milestone's `status`, its `slices` count and, once a demo is green in CI, its `demo` lines taken from that run's recorded output, with `recorded` linking to the run (`{url, date}`), which renders the "recorded in CI" badge. Never show output that was not recorded as recorded. Pages deploys only from `main`.
 
+## Releases (owner, 2026-11-04)
+
+A release (a tag, and any milestone that ships) is cut only from a commit that is all of:
+
+- **Sim-clean.** The simulation fleet has run on that commit for 24 hours, with every simulator the
+  milestone gates on (today `sim-cluster`, its `--c1` checks and `sim-swarm`), and no `sim-fleet`
+  issue is open against it; `zig build check` passes on it.
+- **Jepsen-clean,** once the Jepsen battery exists (a C5 prerequisite,
+  [docs/decisions/2026-11-03-jepsen-before-c5.md](docs/decisions/2026-11-03-jepsen-before-c5.md)):
+  the battery passes on that commit.
+- **Reviewed adversarially by two independent Opus reviewers.** Each is a fresh session given the
+  diff since the last release and the briefs, not the other's findings nor the implementers'
+  conclusions. Every MUST from either is fixed, or the owner accepts it in writing in
+  `docs/decisions/`, before the release.
+
+The release PR (or the supervisor's report) quotes the fleet's tracker line, the Jepsen result
+when it applies, and both review verdicts.
+
 ## Git
 
 - Develop on the branch you were given and commit in small, meaningful steps, signed off (`git commit -s`, DCO). Licence is Apache 2.0; there is no CLA.
