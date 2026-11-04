@@ -59,3 +59,12 @@ runs:
           rm -rf ~/.cache/zig
           find .zig-cache -mindepth 1 -maxdepth 1 -exec rm -rf {} +
         fi
+        # A restored entry that cannot even configure the build (a save that was cut short leaves
+        # one: `configuration failed: FileNotFound`) is dropped, its error printed, and the job
+        # starts cold, so a bad entry costs time and never a red run.
+        if ! zig build --help > "${RUNNER_TEMP}/zig-cache-probe.log" 2>&1; then
+          echo "zig-cache: the restored entry cannot configure the build, starting cold:"
+          tail -n 20 "${RUNNER_TEMP}/zig-cache-probe.log"
+          rm -rf ~/.cache/zig
+          find .zig-cache -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        fi
