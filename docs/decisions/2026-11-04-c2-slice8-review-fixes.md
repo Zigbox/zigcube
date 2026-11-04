@@ -52,12 +52,14 @@ Status: decided 2026-11-04, on PR #66. Fixes the first review of slice 8.
   object of one chunk (no `.chunks` list) by recomputing its id from the file's own `lstat` and
   attributes (`chunk_read.zig`, `id_holds`). A peer server reads outside the namespace, so on a
   host with the full map every one-chunk object of a container id other than 0 is `Damaged`
-  and is not served. Zigbox's rule is that every store operation runs in the namespace, but a
+  and is not served; for an agent that is not root, every one-chunk object is (the one-id map
+  records owner 0, and `lstat` outside gives the user's id; seen in `zig build check`'s run as
+  `tester`). Zigbox's rule is that every store operation runs in the namespace, but a
   peer server with threads cannot. Zigbox could take the expected attributes from the caller
   (the tree entry), check the content hash against the tree's, or offer a serving read that
   does not depend on the view. Until then a peer fetch of such an image fails
   (ZC-E0601) and the supervisor's pull gets it from the registry. The test makes
-  its container-owned file two chunks long for this reason.
+  every file two chunks long for this reason.
 - **What was exercised (root, Postgres not involved).** With `uidmap` installed and
   `root:200000:65536` in `/etc/subuid` and `/etc/subgid` (full map):
   `zigbox_fetch_owner_test.zig` passes. With the fetch's `namespace.run` bypassed it fails:

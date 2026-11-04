@@ -225,20 +225,20 @@ fn run_fetch(io: std.Io, argv: []const []const u8, log: std.Io.File) !u8 {
     }
 }
 
-/// The source tree: two small files and `etc/owned`, which the reference gives container id 1000.
+/// The source tree: `hello`, `etc/plain` and `etc/owned`, which the reference gives container id
+/// 1000. Each is two chunks, so the peer server's read checks it against its chunk list: Zigbox
+/// checks a one-chunk object against an id made from the file's owner as the reader sees it,
+/// which outside the namespace is the host's (the gap in the decision file, M3).
 fn write_source(io: std.Io, dir: std.Io.Dir) !void {
-    try dir.writeFile(io, .{ .sub_path = "src/hello", .data = "hello, world" });
-    // Two chunks, so the peer server's read checks it against its chunk list: Zigbox checks a
-    // one-chunk object against an id made from the file's owner as the reader sees it, which
-    // outside the namespace is the host's (the gap in the decision file, M3).
-    const owned_bytes = try testing.allocator.alloc(u8, constants.swarm_chunk_bytes + 100);
-    defer testing.allocator.free(owned_bytes);
-    for (owned_bytes, 0..) |*byte, at| byte.* = @truncate(at *% 31);
-    try dir.writeFile(io, .{ .sub_path = "src/etc/owned", .data = owned_bytes });
-    try dir.writeFile(io, .{ .sub_path = "src/etc/plain", .data = "another file" });
+    const bytes = try testing.allocator.alloc(u8, constants.swarm_chunk_bytes + 100);
+    defer testing.allocator.free(bytes);
+    for ([_][]const u8{ "src/hello", "src/etc/plain", "src/etc/owned" }, 0..) |name, file| {
+        for (bytes, 0..) |*byte, at| byte.* = @truncate(at *% 31 +% file);
+        try dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    }
 }
 
-/// Runs `zcube-agent fetch` of `tree` from the peer server on `port` into the store at `root`.
+/// Runs `zcube-agent fetch` of `tree` from the peer server on `port` into the store at `root_b`.
 fn fetch_into(
     io: std.Io,
     dir: std.Io.Dir,

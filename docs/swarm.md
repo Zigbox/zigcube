@@ -108,7 +108,8 @@ The serving side (`peer_server`, threads, outside the namespace) sends each obje
 from its tree entry (`ZigboxImages.describe`), never from `lstat`, which outside the namespace
 gives the host's ids. Zigbox's `read_chunk` still checks an object of one chunk against an id
 made from the file's own `lstat`: outside the namespace, on a host with the full map, such an
-object owned by any container id but 0 reads as damaged and is not served. That is a gap in the
+object owned by any container id but 0 reads as damaged and is not served, and for an agent
+that is not root so does every one-chunk object. That is a gap in the
 pinned Zigbox, reported in `docs/decisions/2026-11-04-c2-slice8-review-fixes.md`.
 
 ## sim-swarm
