@@ -44,3 +44,22 @@ stale entry is `NotFound`, never a wrong chunk).
 * The Zigbox tests' `Store.at` wants the parent of the root to exist.
 * `zig build test -Dtest-filter=X` filters by test name only, and a filter that matches one test says
   `1/1 passed`; filter on a word in each test's name.
+
+## Handoff for the next implementer
+
+State: `claude/c2-slice8` = pin (96a2c85), adapter (215fbd9), merge of main with #60 (9a36470), `check: PASS 9a36470c4158`.
+Remaining slice 8, in order:
+
+1. Wire: decide how a peer sends tree records, per-object descriptions (`ObjectMeta`) and the image record
+   (suggested: one bundle endpoint beside the chunk endpoints in `peer_server.zig`), then the fetch worker
+   (`fetch_worker.zig`, run by `zcube-agent fetch` in the namespace child) on `ZigboxImages`: put every tree
+   record from `tree_digests`, `begin_object` per object, `put_chunk` per planned chunk, then `import_image`
+   with `expected_manifest` taken from the assignment's digest-pinned image (never the peer's text). Keep the
+   owner-rule test next to the worker's.
+2. Registry fallback becomes Zigbox's `pull`; its `Result.blob` bytes (Z5) go into `pull.json` written by
+   `zcube-agent fetch --report`, which `Agent.publish_pulls` (src/agent.zig) publishes to `/pulls`. Depends on
+   #61 (slice 7); merge main after it lands, and re-check `check`.
+3. zigbox-smoke: a second VM-less store, two agents on one host, one fetching from the other (needs 1).
+4. Run agent-smoke and swarm-smoke (not run in this session); zigbox-smoke needs KVM.
+
+Traps: see above; also `ZigboxImages` holds one thread's state and its hash index is in memory only.
