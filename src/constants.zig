@@ -422,7 +422,34 @@ pub const summary_request_bytes_max: u32 = summary_json_bytes_max + 128;
 
 /// Peers one fetch considers (a filter each), and chunks one fetch plans (a tree of 64 GiB).
 pub const fetch_peers_max: u32 = 16;
+/// A full tree digest: `b3:` and 64 hex digits.
+pub const tree_digest_bytes: u32 = 3 + 64;
+/// Peers discovery may offer a fetch; the worker ranks them by the chunks their filters claim
+/// and keeps `fetch_peers_max` of them.
+pub const fetch_candidates_max: u32 = 64;
+/// Peers asked for the tree's chunk list before the registry is (each may take a request
+/// timeout, so this bounds how long the list can take).
+pub const fetch_list_peers_max: u32 = 4;
+/// One fetch ends in an error after this long, whatever it is doing (a 64 GiB tree at the
+/// node's rate cap takes about 17 minutes).
+pub const fetch_total_ms: u32 = 30 * 60 * 1000;
+/// The wait before a fetch on a node whose last fetch failed, doubling from the base to the cap
+/// (`fetch_backoff.zig`), so an unreachable tree does not make replicas churn at the speed of the
+/// refusals.
+pub const fetch_backoff_base_ms: u32 = 1000;
+pub const fetch_backoff_cap_ms: u32 = 5 * 60 * 1000;
+/// A temporary file of the chunk store older than this was left by a writer that died
+/// (`dir_images.zig`); the fetch deadline is far shorter.
+pub const dir_temp_stale_ms: u64 = 2 * @as(u64, fetch_total_ms);
+/// Entries one sweep of a store directory looks at.
+pub const dir_sweep_entries_max: u32 = 1 << 20;
+/// A wait for the back-off sleeps in slices of this size, so a stop is noticed.
+pub const fetch_backoff_slice_ms: u32 = 100;
+/// Digests whose fetch streak a node keeps (`fetch_backoff.zig`); a new one drops the oldest.
+pub const fetch_streak_digests_max: u32 = 16;
 pub const fetch_chunks_max: u32 = summary_chunks_capacity;
+/// A tree's chunk list as text: `<64 hex> <bytes>` and a newline per chunk, at most 80 bytes each.
+pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
 /// With no peer holding a chunk, the plan waits this long from its start for a filter to show it
 /// (another node may be fetching it, c2.md O5), then goes to the registry.
 pub const fetch_peer_wait_ms: u32 = 30_000;
@@ -438,6 +465,77 @@ pub const fetch_registry_attempts_max: u32 = 4;
 /// Byte-rate caps: one peer's, and the node's (peers and registry together).
 pub const fetch_peer_rate_bytes_per_s: u32 = 32 * 1024 * 1024;
 pub const fetch_node_rate_bytes_per_s: u32 = 64 * 1024 * 1024;
+
+// ---- Peer identity and the handshake (docs/peer.md, C2 slice 6a) -----------------------------
+
+/// A node credential lives this long from its issuer's wall clock; the agent renews at half.
+pub const peer_credential_ttl_ms: u64 = 24 * 60 * 60 * 1000;
+/// The longest life a verifier accepts, so a CA bug or a bad clock cannot mint a forever key.
+pub const peer_credential_ttl_ms_max: u64 = 7 * peer_credential_ttl_ms;
+/// Wall-clock disagreement tolerated between two nodes, and between a node and the CA.
+pub const peer_clock_skew_ms: u64 = 60 * 1000;
+/// Plaintext of one record. A 1 MiB chunk is sent as 64 of them.
+pub const peer_record_bytes_max: u32 = 16 * 1024;
+/// Records a direction may carry before the connection must be replaced (2^32).
+pub const peer_record_counter_max: u64 = 1 << 32;
+/// The `revoked` file and the key files are small; this bounds the read.
+pub const peer_file_bytes_max: u32 = 32 * 1024;
+/// Names on the server's `revoked` list.
+pub const peer_revoked_max: u32 = 256;
+/// A credential request body: `{"node_key": "<64 hex>"}` with room to spare.
+pub const peer_join_request_bytes_max: u32 = 512;
+/// A failed join or renewal is tried again after this long.
+pub const peer_join_retry_ms: u32 = 5 * 1000;
+/// One join call waits this long at most (less near the lease's fence).
+pub const peer_join_timeout_ms: u32 = 3 * 1000;
+/// Handshakes the peer server starts for one source address in one window; the next is refused.
+/// An honest agent opens a handshake per fetch connection, a few per node per window.
+pub const peer_handshakes_per_source_max: u32 = 16;
+/// The window the per-source bound counts in.
+pub const peer_handshake_window_ms: u64 = 10 * 1000;
+/// Sources the limiter tracks at once. A table full of live windows refuses a new source: the
+/// cheapest answer to an address flood, and an agent retries.
+pub const peer_sources_max: u32 = 256;
+/// Peer connections the server serves at once (each owns buffers of about 12 MiB). One more
+/// authenticated peer is told it is busy (status 503) and closed.
+pub const peer_connections_max: u32 = 4;
+/// Connections the server holds before they are authenticated: a descriptor, a task and a few
+/// words each, no buffers. A silent stranger holds one for at most `peer_handshake_ms`; the
+/// buffers of a serving slot go to a connection only once it has authenticated.
+pub const peer_handshakes_max: u32 = 32;
+/// A stranger younger than this is never evicted for a newcomer (the newcomer is closed
+/// instead): under a flood, oldest-first eviction would otherwise give every honest handshake a
+/// lifetime shorter than a slow link's round trips.
+pub const peer_handshake_evict_min_ms: u64 = 750;
+/// Time between two times ZC-E0808 is shown, whatever the sources: a flood must not flood a log.
+pub const peer_refusal_log_ms: u64 = 10 * 1000;
+/// Times a fetch asks a peer again after its server said it is busy, and the pause before each.
+/// A busy peer is not a failed one: no timeout, no strike.
+pub const fetch_busy_retries_max: u32 = 4;
+pub const fetch_busy_sleep_ms: u32 = 250;
+/// Time a peer has to finish the handshake.
+pub const peer_handshake_ms: u32 = 3 * 1000;
+/// Time a served connection waits for its next request before it closes.
+pub const peer_idle_ms: u32 = 2 * 1000;
+/// Time to send one reply.
+pub const peer_reply_ms: u32 = 5 * 1000;
+/// Requests one connection serves before the client opens another.
+pub const peer_connection_requests_max: u32 = 64;
+
+comptime {
+    assert(peer_handshakes_max > peer_connections_max);
+    assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
+    assert(peer_handshake_evict_min_ms < peer_handshake_ms);
+    assert(peer_handshakes_per_source_max > 0);
+    assert(peer_handshake_window_ms > 0);
+    assert(peer_sources_max >= peer_handshakes_per_source_max);
+    assert(peer_credential_ttl_ms < peer_credential_ttl_ms_max);
+    assert(peer_record_bytes_max + 16 <= std.math.maxInt(u16));
+    assert(peer_clock_skew_ms < peer_credential_ttl_ms / 2);
+    // 256 names of the longest length, a newline each, fit the file bound.
+    assert(peer_revoked_max * (node_name_bytes_max + 1) <= peer_file_bytes_max);
+    assert(peer_join_timeout_ms < agent_io_timeout_ms);
+}
 
 comptime {
     assert(exit_ok == 0);
@@ -528,4 +626,10 @@ comptime {
     assert(fetch_peer_rate_bytes_per_s <= fetch_node_rate_bytes_per_s);
     assert(fetch_request_timeout_ms < fetch_peer_wait_ms);
     assert(fetch_peers_max <= 16); // A chunk's tried-peers set is a u16.
+    assert(fetch_candidates_max >= fetch_peers_max);
+    assert(fetch_candidates_max <= 255); // A peer's index is a u8.
+    assert(fetch_list_peers_max <= fetch_peers_max);
+    assert(fetch_total_ms > fetch_peer_wait_ms);
+    assert(fetch_backoff_base_ms > 0);
+    assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }

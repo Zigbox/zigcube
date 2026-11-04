@@ -1,0 +1,5 @@
+error[ZC-E0801]: a peer's credential is not signed by this cluster
+  cause  node2's credential is from another CA
+  fix    check that both agents joined this cluster (docs/peer.md)   zcube get nodes
+  more   zcube explain E0801 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0801.html

@@ -115,6 +115,8 @@ pub const Config = struct {
     node: []const u8,
     capacity: records.Requests,
     address: []const u8 = "",
+    /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
+    peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
 };
 
@@ -312,8 +314,9 @@ pub const Agent = struct {
         }
         const summary = images.summary(ctx.arena, started.items) catch
             return failures.no_memory(ctx.diag);
-        const record = node_store.record_of(ctx.arena, agent.config.node, summary) catch
+        var record = node_store.record_of(ctx.arena, agent.config.node, summary) catch
             return failures.no_memory(ctx.diag);
+        record.peer = agent.config.peer;
         const value = try records.encode(ctx.arena, record, ctx.diag);
         const hash = std.hash.Wyhash.hash(0, value);
         if (agent.store_lease == agent.lease and agent.store_hash == hash) return;

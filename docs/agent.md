@@ -45,7 +45,8 @@ zcube-agent --node node1 --server 127.0.0.1:7070 --state-dir /var/lib/zcube-agen
 
 Everything can also be set in a ZON file (`--config FILE`); flags win. `--help` lists the rest.
 The images the fake runtime "has" are read from `fixtures/images.zon` (`--images FILE`); any other
-digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)).
+digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)),
+unless `--registry` gives it a registry to fetch from (below).
 Capacity is declared, as HANDOFF's provisional answer says.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
@@ -64,6 +65,8 @@ Each container is a directory `<state>/containers/<replica id>/`:
 | `supervisor.pid` | the supervisor | its pid, which is also its process group and session |
 | `child.pid` | the supervisor | the command's pid, once it runs |
 | `forced` | a test fault | `oom` or `pid_limit`, before the kill |
+| `fetch.json` | the runtime, when the image must be fetched first | `{digest, argv}`: the `zcube-agent fetch` command the supervisor runs before the command |
+| `fetch.log` | the fetch's stderr, while and after it runs | the text of ZC-W0601 and ZC-E0601, when they are raised |
 | `run.json` | the supervisor, last | how the command ended; the truth for `list` and `inspect` |
 
 `start` writes the spec and starts `zcube-agent supervise <dir>`, then waits (at most
@@ -147,6 +150,62 @@ What the agent check guards is what the agent acts on. It does not gate writes t
 is the server's `VerifiedStore`, which refuses every store call once its store went backwards. An
 agent's refusal keeps it from starting or stopping containers on the strength of an answer from
 behind; the server's keeps the controllers and every write from building on one.
+
+## The peer identity (C2 slice 6a)
+
+At start the agent opens its state directory and loads `peer.key` (an Ed25519 seed, 64 hex
+digits, mode 0600; made on the first run), `peer.cred` and `ca.pub`. A file others can read, or
+one that does not parse, is `ZC-E0806` and the agent does not start. A stored pair that belongs to
+another key, node or CA is ignored and the agent joins again. Before each step the agent calls
+`POST /v1/agent/nodes/{node}/credential` if it has no credential or half of its life has passed
+(`agent_peer.zig`); the call's timeout stays short of the lease's fence. A failure (an
+unreachable server, `ZC-E0807` for a removed node) is shown once and retried every
+`peer_join_retry_ms`; it never stops the agent or its containers. Nothing yet uses the credential:
+slice 6b's chunk server does.
+
+## The chunk store, the peer server and `fetch` (C2 slice 6b)
+
+With `--registry HOST:PORT` (needs `--images-dir`; `.registry` in the ZON file) the fake runtime
+fetches an image that is not in its fixtures, rather than refusing it. Before it runs the command,
+the container's supervisor runs `zcube-agent fetch` for the image (`fetch.json`, above), and the
+replica reports `starting` while that runs. A failed fetch is a start failure with ZC-E0601, the
+text in `fetch.log`.
+
+`--images-dir DIR` gives the node a chunk store (`dir_images.zig`: `trees/<digest>` lists and
+`chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
+checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
+thread; a `DirImages` belongs to one thread, and the peer server gives each connection its own.
+`--peer-listen HOST:PORT` (needs `--images-dir`) starts the peer server (`peer_server.zig`): read-only,
+CA-authenticated peers only, rate limited (ZC-E0808). The address the node publishes for peers
+(`/node-store/<node>.peer`) is `--peer-advertise HOST:PORT` (`.peer_advertise` in the ZON file);
+without it, the `--peer-listen` address if that names a host. `--peer-listen 0.0.0.0:P` or `[::]:P`
+without `--peer-advertise` is refused at startup with ZC-E0505, because nobody can connect to
+`0.0.0.0`. `--address` is only recorded with the node for people to read; it is never connected to.
+The server has `peer_handshakes_max` cheap handshake slots and `peer_connections_max` serving
+slots, which hold the big buffers and go only to a peer that authenticated: silent strangers
+cannot lock honest peers out, and a client that finds every serving slot taken gets status 503
+(busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
+without a strike against the peer.
+
+`zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
+[--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
+registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
+whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
+setup. A peer is only ever asked when the digest is
+the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
+
+- `--server HOST:PORT` gives the peers without naming them. The fetch reads
+  `/v1/list?prefix=/node-store/` in pages of `discover_page_nodes` (following `continue`), for each node's `peer` address and hex `filter` (keys.md,
+  api.md). It leaves out its own node and any node with a bad name, no `peer` or no filter, says
+  how many on one line of stderr, and ranks the rest by the chunks their filters claim.
+- `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
+  the plan strikes it if it lies.
+
+**Not built yet (6b part 3 cut):** the fake registry, `swarm-smoke` and its teeth fault.
+
+Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the first byte of every
+chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer
+server, so restart the agent after creating or removing the file.
 
 ## What survives what
 

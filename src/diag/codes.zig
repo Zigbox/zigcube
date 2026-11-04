@@ -87,7 +87,17 @@ pub const Code = enum(u8) {
     E0513,
     E0514,
     W0501,
+    E0601,
     W0601,
+    W0602,
+    E0801,
+    E0802,
+    E0803,
+    E0804,
+    E0805,
+    E0806,
+    E0807,
+    E0808,
     B0001,
     B0002,
     B0003,
@@ -1072,6 +1082,21 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0601,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a tree could not be fetched from any peer or the registry",
+        .explanation =
+        \\A node needed the chunk tree of an image and could not get it onto this
+        \\node: no peer sent it, and the registry did not serve it. The cause line
+        \\names the tree's digest and every source that was tried, in order.
+        \\
+        \\Check that the registry is reachable from this node, and that the digest
+        \\names an image that was pushed. A digest that was never pushed is held by
+        \\no source, so every fetch of it fails the same way.
+        ,
+    },
+    .{
         .code = .W0601,
         .severity = .warning,
         .blame = .external,
@@ -1084,6 +1109,169 @@ pub const registry = [_]Entry{
         \\The image is not affected: nothing is stored or run before every chunk
         \\matches. The peer's disk or store may be damaged, or it may be running a
         \\different build; check that node.
+        ,
+    },
+    .{
+        .code = .W0602,
+        .severity = .warning,
+        .blame = .external,
+        .summary = "a peer's chunk list does not match its digest",
+        .explanation =
+        \\A node that was asked for an image's chunk tree got a list from a peer
+        \\whose BLAKE3 digest is not the tree's digest. The list was ignored and the
+        \\node tried the next source: another peer, then the registry.
+        \\
+        \\The image is not affected: a tree is used only when its digest matches.
+        \\No action is needed. If it repeats, check the peer node, whose store may
+        \\be damaged or running a different build.
+        ,
+    },
+    .{
+        .code = .E0801,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer's credential is not signed by this cluster",
+        .explanation =
+        \\A node presented a credential that the cluster's certificate authority
+        \\did not sign: its key id is not this cluster's, or its signature does not
+        \\verify. The connection was closed before anything was exchanged.
+        \\
+        \\The control plane is the authority. A node gets its credential when its
+        \\agent joins (POST /v1/agent/nodes/<node>/credential). A node that never
+        \\joined, or joined a different cluster, is refused by every peer.
+        \\
+        \\Check that the node's agent talks to this cluster's server, and that its
+        \\ca.pub in the agent state directory is the one this server serves. Deleting
+        \\the agent's peer.cred makes it join again.
+        ,
+    },
+    .{
+        .code = .E0802,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer's credential is expired or not yet valid",
+        .explanation =
+        \\A node presented a credential outside its validity window, judged on this
+        \\machine's wall clock with a skew allowance of 60 seconds. A credential lives
+        \\24 hours and the agent renews it after half that.
+        \\
+        \\The usual causes are a node whose clock is far off, or an agent that
+        \\could not reach the server for a day. Check the clock on both machines
+        \\(timedatectl). The agent renews by itself, on start and at half the life,
+        \\and retries every few seconds when the server refuses.
+        ,
+    },
+    .{
+        .code = .E0803,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the peer is not the node that was asked for",
+        .explanation =
+        \\A client connected to a node's peer address and the credential the server
+        \\presented names a different node. The client closed the connection before it
+        \\sent its own credential.
+        \\
+        \\This happens when a node's address in /nodes/<node> is stale and another
+        \\node now answers there. It resolves itself when the agent re-registers;
+        \\check zcube get nodes for the address.
+        ,
+    },
+    .{
+        .code = .E0804,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer handshake failed",
+        .explanation =
+        \\The handshake between two nodes ended before it finished: a message was
+        \\malformed, cut short or altered, a signature over the exchange did not
+        \\verify, the peer spoke another protocol version, or a key was unusable. A
+        \\server that refuses a client closes the connection without a reply, so a
+        \\refusal and a network cut look alike from the client's side.
+        \\
+        \\Nothing was transferred. If it repeats between two particular nodes, compare
+        \\their clocks and their credentials (the agent's peer.cred), and look for the
+        \\server's own line naming the refusal. The handshake is interim; see
+        \\docs/peer.md.
+        ,
+    },
+    .{
+        .code = .E0805,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer record was refused",
+        .explanation =
+        \\A record on an established peer connection failed authentication: it was
+        \\altered, repeated, dropped or reordered, or it was longer than allowed,
+        \\or the connection reached its record limit. The connection was closed.
+        \\
+        \\Whatever was in flight is discarded and fetched again, from this peer or
+        \\another. Image data is checked by its hash regardless. A single
+        \\occurrence on a flaky network is harmless; a pattern between two nodes
+        \\points at the path between them.
+        ,
+    },
+    .{
+        .code = .E0806,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a peer key or trust file can't be used",
+        .explanation =
+        \\The server's CA key (ca*.key in its state directory), the list of removed
+        \\nodes (revoked), or an agent's node key (peer.key), credential (peer.cred)
+        \\or trusted CA key (ca.pub) could not be read, created, written or parsed,
+        \\or its file or directory has permissions that let other users read a secret
+        \\or write a trust file. Key files must be owned by the process, mode 0600,
+        \\and hold one line of 64 hex digits; the state directory must not be
+        \\writable by group or others. A revoked line must be a node name.
+        \\
+        \\The secret is never printed. If the file is damaged and there is a backup,
+        \\put it back. An agent's files are caches: it ignores a damaged peer.cred
+        \\or ca.pub and joins again by itself; delete peer.key to get a new node key.
+        \\A server whose CA key is missing although its store has run refuses to
+        \\start: put the key back, or start once with --new-ca to make a new CA on
+        \\purpose (every agent then joins again by itself).
+        ,
+    },
+    .{
+        .code = .E0807,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a node was refused a credential: it was removed",
+        .explanation =
+        \\The server will not issue or renew a peer credential for this node,
+        \\because its name is on the server's list of removed nodes (the revoked
+        \\file in its state directory). The node's current credential stays valid
+        \\until it expires, within a day, and then its peers refuse it.
+        \\
+        \\If the node should be in the cluster, remove its name from the revoked
+        \\file and restart zcube-server; the agent asks again by itself. The API is
+        \\unauthenticated, so this binds an honest node only: until the API has auth,
+        \\anyone who can reach it can register a name and ask for a credential.
+        ,
+    },
+    .{
+        .code = .E0808,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a peer's handshake was refused: its address is over a limit",
+        .explanation =
+        \\An agent's peer server limits what one source address may ask of it,
+        \\because a handshake costs the server public-key work. A handshake is
+        \\refused, and the connection closed without a byte, when the address
+        \\already has a handshake that has not finished (one at a time per
+        \\source), when it has started peer_handshakes_per_source_max
+        \\handshakes in peer_handshake_window_ms, or when the server already
+        \\tracks peer_sources_max addresses in the window. An IPv6 address
+        \\counts by its /64, one host's whole range.
+        \\
+        \\The cause names the refused address (an IPv6 one by its /64). The
+        \\text is shown once per peer_refusal_log_ms, not once per connection.
+        \\An honest fetch opens a handful of connections and keeps
+        \\them. If one node is refused over and over, something there retries
+        \\in a loop: look at its agent's output. A refused node tries again by
+        \\itself, and a fetch falls back to the registry meanwhile. A flood
+        \\from many addresses can fill the table and turn honest nodes away
+        \\for up to one window; no action is needed unless it repeats.
         ,
     },
     .{

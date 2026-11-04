@@ -26,6 +26,8 @@ const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const fetch_plan = @import("fetch_plan.zig");
+const fetch_worker = @import("fetch_worker.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -371,13 +373,74 @@ fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
     );
 }
 
-fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
+fn peer_fix(diag: *diag_mod.Diag, code: codes.Code, cause: []const u8) void { // peer.zig
+    diag.raise(code);
+    diag.cause("{s}", .{cause});
+    const sentence = "check that both agents joined this cluster (docs/peer.md)";
+    diag.fix(.{ .sentence = sentence, .command = "zcube get nodes" });
+}
+
+fn peer_foreign_ca(diag: *diag_mod.Diag) void { // peer.zig
+    peer_fix(diag, .E0801, "node2's credential is from another CA");
+}
+
+fn peer_expired(diag: *diag_mod.Diag) void { // peer.zig
+    diag.raise(.E0802);
+    diag.cause("node2's credential has expired", .{});
+    const sentence = "check the clocks, then restart the agent so it renews";
+    diag.fix(.{ .sentence = sentence, .command = "timedatectl" });
+}
+
+fn peer_wrong_node(diag: *diag_mod.Diag) void { // peer.zig
+    peer_fix(diag, .E0803, "10.0.0.7:7071 answered with another node's credential");
+}
+
+fn peer_handshake(diag: *diag_mod.Diag) void { // peer.zig
+    peer_fix(diag, .E0804, "the handshake with node2 did not complete");
+}
+
+fn peer_record(diag: *diag_mod.Diag) void { // peer.zig
+    peer_fix(diag, .E0805, "a record from node2 failed authentication");
+}
+
+fn peer_key_file(diag: *diag_mod.Diag) void { // server_ca.zig
     sample(
         diag,
-        .W0601,
-        &.{"peer node2 sent chunk 5 of 24 with bytes that do not match its hash"},
-        "no action needed for this fetch; check that node's store and disk",
+        .E0806,
+        &.{"the CA key file <state>/ca.key is readable by other users (mode 0644)"},
+        "set its mode to 0600, or delete it so the server creates a new CA",
     );
+}
+
+fn peer_removed(diag: *diag_mod.Diag) void { // agent_api.zig
+    sample(
+        diag,
+        .E0807,
+        &.{"node node3 is on the server's list of removed nodes"},
+        "remove its name from the revoked file, then restart zcube-server",
+    );
+}
+
+fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
+    sample(
+        diag,
+        .E0808,
+        &.{"peer address 10.0.0.7 started more handshakes than a window allows"},
+        "no action needed; it is tried again by itself",
+    );
+}
+
+fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
+    fetch_plan.raise_blame(diag, .{ .peer = 0, .chunk = 4 }, "node2", 24);
+}
+
+fn tree_missing(diag: *diag_mod.Diag) void { // fetch_worker.zig
+    const tried = "node2, node3 and the registry";
+    fetch_worker.raise_tree_missing(diag, "b3:7f1c4e9a5d20", tried);
+}
+
+fn peer_bad_tree(diag: *diag_mod.Diag) void { // fetch_worker.zig
+    fetch_worker.raise_bad_tree(diag, "node2", "b3:7f1c4e9a5d20");
 }
 
 fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
@@ -528,7 +591,17 @@ const cases = [_]Case{
     relayed(.E0513, agent_host),
     relayed(.E0514, agent_too_long),
     relayed(.W0501, agent_lease),
+    relayed(.E0801, peer_foreign_ca),
+    relayed(.E0802, peer_expired),
+    relayed(.E0803, peer_wrong_node),
+    relayed(.E0804, peer_handshake),
+    relayed(.E0805, peer_record),
+    relayed(.E0806, peer_key_file),
+    relayed(.E0807, peer_removed),
+    relayed(.E0808, peer_limited),
     relayed(.W0601, peer_bad_chunk),
+    relayed(.E0601, tree_missing),
+    relayed(.W0602, peer_bad_tree),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
 };

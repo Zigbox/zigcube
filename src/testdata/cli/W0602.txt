@@ -1,0 +1,5 @@
+warning[ZC-W0602]: a peer's chunk list does not match its digest
+  cause  peer node2 sent a chunk list that does not hash to tree b3:7f1c4e9a5d20
+  fix    no action needed for this fetch; if it repeats, check that peer node
+  more   zcube explain W0602 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0602.html

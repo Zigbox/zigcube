@@ -1,0 +1,5 @@
+error[ZC-E0805]: a peer record was refused
+  cause  a record from node2 failed authentication
+  fix    check that both agents joined this cluster (docs/peer.md)   zcube get nodes
+  more   zcube explain E0805 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0805.html

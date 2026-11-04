@@ -38,6 +38,10 @@ pub const modules = .{
     @import("diag.zig"),
     @import("diag/codes.zig"),
     @import("node_controller.zig"),
+    @import("peer.zig"),
+    @import("peer_ca.zig"),
+    @import("peer_limit.zig"),
+    @import("peer_serve.zig"),
     @import("records.zig"),
     @import("replica_controller.zig"),
     @import("runtime_codes.zig"),
@@ -119,6 +123,12 @@ test "the single-threaded store conformance tests are in this root" {
     // (`conformance_options` names the memory backend in this build); importing it brings its
     // tests into this root, so `zig build wasm-test` runs them under WASI.
     _ = @import("store_conformance_single.zig");
+}
+
+test "the peer handshake's tests are in this root" {
+    // Goal: the handshake runs under WASI too (32-bit, single thread). Method: import its tests;
+    // they use no file, clock or environment.
+    _ = @import("peer_test.zig");
 }
 
 test "the controllers' tests are in this root" {

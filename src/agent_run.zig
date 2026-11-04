@@ -41,6 +41,9 @@ const loop_mod = @import("agent_loop.zig");
 const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
+const agent_peer = @import("agent_peer.zig");
+const dir_images = @import("dir_images.zig");
+const peer_server_mod = @import("peer_server.zig");
 const failures = @import("store_failures.zig");
 const store = @import("store.zig");
 
@@ -83,9 +86,51 @@ const Shell = struct {
     images: ?node_store.Images = null,
     /// The last save of the remembered pair failed; shown once, cleared by one that works.
     save_failed: bool = false,
+    /// The node's peer identity (docs/peer.md) and the transport its join calls use.
+    peer: *agent_peer.Peer,
+    peer_transport: remote_mod.client.Transport,
+
+    /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
+    /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
+    fn peer_step(shell: *Shell) void {
+        const now_ms = shell.clock.now_ms();
+        if (shell.remote.ca_key_id) |id| {
+            if (shell.peer.observe_ca(id)) {
+                shell.diag.reset();
+                agent_peer.raise_ca_changed(&shell.diag, shell.agent.config.node);
+                shell.show("\n", &shell.diag, "zcube-agent: joining the new CA\n");
+                shell.diag.reset();
+            }
+        }
+        // The server issues a credential only to a registered node (docs/api.md).
+        const lease = shell.agent.lease;
+        if (lease == store.lease_none or shell.agent.tenure == 0) return;
+        if (!shell.peer.due(now_ms)) return;
+        const timeout_ms = shell.before_fence(constants.peer_join_timeout_ms);
+        if (timeout_ms == 0) return;
+        shell.arena.reset();
+        shell.diag.reset();
+        const had = shell.peer.credential != null;
+        const arena = shell.arena.allocator();
+        shell.peer.step(shell.peer_transport, arena, lease, now_ms, timeout_ms, &shell.diag) catch {
+            if (!shell.peer.reported) {
+                shell.peer.reported = true;
+                shell.show("\n", &shell.diag, "zcube-agent: running on; it will try again\n");
+            }
+            shell.diag.reset();
+            return;
+        };
+        const verb = if (had) "renewed" else "joined";
+        var buffer: [128]u8 = undefined;
+        const text = "zcube-agent: node {s} {s} the cluster CA\n";
+        const line = std.fmt.bufPrint(&buffer, text, .{ shell.agent.config.node, verb }) catch
+            return;
+        std.Io.File.stdout().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
+    }
 
     /// One step of the core, with what the policy says to tell the person.
     fn pass(shell: *Shell) loop_mod.Outcome {
+        shell.peer_step();
         shell.arena.reset();
         shell.diag.reset();
         const ctx: agent_mod.Context = .{
@@ -275,6 +320,14 @@ const Shell = struct {
     }
 };
 
+/// The `host:port` published for peers in the node's record (`--peer-advertise`, else the listen
+/// address; `agent_config` has refused a configuration with neither), empty when it serves none.
+fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
+    const address = advertise orelse return "";
+    // An IP address and a port always fit.
+    return std.fmt.bufPrint(buffer, "{f}", .{address}) catch unreachable;
+}
+
 /// Runs the agent until it is told to stop. Returns the process's exit code.
 pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const io = init.io;
@@ -302,17 +355,29 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
     load_pair(gpa, &remote, backend.pair_state, config.state_dir, server, &diag) catch
         return fail(io, &diag, config.verbose);
+    var peer_identity = agent_peer.Peer.open(io, config.state_dir, config.node, &diag) catch
+        return fail(io, &diag, config.verbose);
+    defer peer_identity.close();
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
+    var peer_buffer: [64]u8 = undefined;
+    const peer_text = peer_address(&peer_buffer, config.peer_advertise);
     agent.init(.{
         .node = config.node,
         .capacity = config.capacity,
         .address = config.address,
+        .peer = peer_text,
         .agent_version = build_options.version,
     });
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
+    var swarm: Swarm = .{};
+    defer swarm.stop(gpa); // Also after a start that failed with the store open.
+    swarm.start(io, gpa, config) catch |what|
+        return fail_start(io, &diag, config.verbose, @errorName(what));
     var shell: Shell = .{
-        .images = if (config.runtime == .fake) fake_images.images() else null,
+        .images = if (swarm.has_store)
+            swarm.store.images()
+        else if (config.runtime == .fake) fake_images.images() else null,
         .io = io,
         .clock = real.clock(),
         .boot = boot.clock(),
@@ -325,12 +390,23 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
         .boot_id = boot_id,
+        .peer = &peer_identity,
+        .peer_transport = http_transport.transport(),
     };
     defer shell.arena.deinit();
     announce(io, config);
+    return serve(&shell, &diag, peer_identity.stored_problem);
+}
+
+/// Runs the agent's loop until it is told to stop, then saves the pair.
+fn serve(shell: *Shell, diag: *Diag, stored_problem: bool) u8 {
+    if (stored_problem) {
+        shell.show("\n", diag, "zcube-agent: ignoring it; the node joins the cluster CA again\n");
+        diag.reset();
+    }
     shell.notice_pair();
     install_signals();
-    loop(&shell);
+    loop(shell);
     shell.save_pair(true);
     return constants.exit_ok;
 }
@@ -379,6 +455,54 @@ fn announce(io: std.Io, config: config_mod.Config) void {
         build_options.version, config.node, config.server, config.state_dir,
     }) catch return;
     std.Io.File.stdout().writeStreamingAll(io, line) catch {}; // Nowhere else to report it.
+}
+
+/// The node's chunk store and peer server, when it has them (`--images-dir`, `--peer-listen`).
+/// The summary pass reads the store on the agent's thread; the peer server opens its own
+/// `DirImages` per connection (a `DirImages` is one thread's).
+const Swarm = struct {
+    store: dir_images.DirImages = undefined,
+    has_store: bool = false,
+    server: ?*peer_server_mod.Server = null,
+
+    fn start(swarm: *Swarm, io: std.Io, gpa: std.mem.Allocator, config: config_mod.Config) !void {
+        const path = config.images_dir orelse return;
+        swarm.store = dir_images.DirImages.open(io, gpa, path) catch
+            return error.@"open the chunk store (--images-dir)";
+        swarm.has_store = true;
+        const listen = config.peer_listen orelse return;
+        const server = gpa.create(peer_server_mod.Server) catch return error.OutOfMemory;
+        swarm.server = server;
+        server.start(io, .{
+            .listen = listen,
+            .state_dir = config.state_dir,
+            .node = config.node,
+            .images_path = path,
+            .verbose = config.verbose,
+            .corrupt_chunks = test_fault(io, config.state_dir, "peer-corrupt"),
+        }) catch {
+            gpa.destroy(server);
+            swarm.server = null;
+            return error.@"start the peer server";
+        };
+    }
+
+    fn stop(swarm: *Swarm, gpa: std.mem.Allocator) void {
+        if (swarm.server) |server| {
+            server.stop();
+            gpa.destroy(server);
+        }
+        if (swarm.has_store) swarm.store.close(gpa);
+    }
+};
+
+/// Whether the test fault `faults/<name>` is set in the state directory (docs/agent.md).
+fn test_fault(io: std.Io, state_dir: []const u8, name: []const u8) bool {
+    var buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const path = std.fmt.bufPrint(&buffer, "{s}/faults/{s}", .{ state_dir, name }) catch
+        return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
 }
 
 fn fail_start(io: std.Io, diag: *Diag, verbose: bool, what: []const u8) u8 {
@@ -431,6 +555,7 @@ const Backend = struct {
                     .state_dir = config.state_dir,
                     .supervisor_exe = exe,
                     .fixtures = config.images,
+                    .fetch = try fetch_options(gpa, config),
                 }, diag) catch return error.StartFailed;
                 self.* = .{
                     .runtime = fake.interface(),
@@ -440,6 +565,25 @@ const Backend = struct {
             },
             .zigbox => try self.start_zigbox(init, config, exe, diag),
         }
+    }
+
+    /// How the fake runtime fetches an image it lacks, when `--registry` is given. Allocated once
+    /// at startup and kept for the life of the process.
+    fn fetch_options(
+        gpa: std.mem.Allocator,
+        config: config_mod.Config,
+    ) error{StartFailed}!?fake_runtime.Fetch {
+        const registry = config.registry orelse return null;
+        var text: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&text);
+        writer.print("{f}", .{config.server}) catch return error.StartFailed;
+        const server = gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
+        return .{
+            .node = config.node,
+            .images_dir = config.images_dir.?,
+            .registry = registry,
+            .server = server,
+        };
     }
 
     fn start_zigbox(

@@ -33,6 +33,7 @@ const constants = @import("constants.zig");
 const accounting = @import("allocations.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
+const peer_ca = @import("peer_ca.zig");
 const records = @import("records.zig");
 const runtime_codes = @import("runtime_codes.zig");
 const store = @import("store.zig");
@@ -100,6 +101,9 @@ pub const Api = struct {
     /// store, which starts empty every time): the agent's answers then say `"verified": false`
     /// and the agent keeps no pair either (`agent_api.zig`). True in the simulation and tests.
     pair_kept: bool = true,
+    /// The cluster CA (docs/peer.md), for `POST /v1/agent/nodes/{node}/credential`. Null in the
+    /// simulation, which has no peers: the endpoint then answers 404.
+    ca: ?*const peer_ca.Ca = null,
 
     /// Answers one request. `ctx.arena` holds the answer: it stays valid until the arena is reset.
     pub fn handle(api: *Api, ctx: *const Context, request: Request) Response {
@@ -151,6 +155,7 @@ pub const Api = struct {
                 request.hold,
                 api.lease_ttl_ms,
                 api.pair_kept,
+                api.ca,
             );
             return .{
                 .body = agent.body,

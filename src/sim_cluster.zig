@@ -2220,30 +2220,47 @@ fn slowest_node_rate(c: *const Cluster) ?u64 {
 /// were on; null if the nodes were up for less than `cluster_up_ms_min` in all, too little for
 /// a rate to mean anything (a lost call costs 10 s, so a short run is a few calls' luck).
 fn cluster_ok_rate(c: *const Cluster) ?u64 {
-    var steps: u64 = 0;
-    var up_ms: u64 = 0;
-    for (c.nodes) |node| {
-        steps += node.ok_steps;
-        up_ms += node.up_ms;
-    }
+    const up_ms = cluster_up_ms(c);
     if (up_ms < cluster_up_ms_min) return null;
+    var steps: u64 = 0;
+    for (c.nodes) |node| steps += node.ok_steps;
     return steps * 60_000 / up_ms;
+}
+
+/// Agent uptime summed over every node, while the faults were on.
+fn cluster_up_ms(c: *const Cluster) u64 {
+    var up_ms: u64 = 0;
+    for (c.nodes) |node| up_ms += node.up_ms;
+    return up_ms;
+}
+
+/// Whether `delivered` requests reaching the server while the faults were on meet the floor for
+/// a run of `operations` operations and `up_ms` of summed agent uptime. With at least
+/// `cluster_up_ms_min` of uptime the floor is one request per operation (the least seen over
+/// seeds 1 to 60 was 268 in 100 operations; the old fault rates left 39). Below it the run is
+/// too short for that: operations are not time, the draw can hold few `advance` operations, and
+/// one lost call costs the agent 10 s, so a run of 30 to 50 virtual seconds delivers fewer
+/// requests than it has operations by luck alone (seeds 3491114665 and 1995814075: 72 of 73 and
+/// 37 of 38). There the floor is half a request per operation (the lowest ratio seen over seeds
+/// 1 to 200 among such runs was 2.22), which still fails a world that is down most of the time.
+fn request_floor_met(delivered: u64, operations: u32, up_ms: u64) bool {
+    if (up_ms >= cluster_up_ms_min) return delivered >= operations;
+    return delivered * 2 >= operations;
 }
 
 /// The faults must leave the cluster working: a world where the store or every link is down most
 /// of the time proves little, and a change that made it so would pass silently otherwise. The
 /// nodes together got `ok_steps_per_minute_min` successful agent steps per minute they were up
-/// (the least seen is in docs/DECISIONS.md), and one delivered request per operation reached
-/// the server (the least seen over seeds 1 to 60 was 268 in 100 operations; the old fault rates
-/// left 39).
+/// (the least seen is in docs/DECISIONS.md, judged only on enough uptime), and the requests that
+/// reached the server meet `request_floor_met`.
 fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
     const during = c.fault_totals.?;
     if (cluster_ok_rate(c)) |rate| {
         try check(c, rate >= ok_steps_per_minute_min, "too few agent steps while faults were " ++
             "on");
     }
-    try check(c, during.delivered >= operations, "too few requests reached the server " ++
-        "while faults were on");
+    const met = request_floor_met(during.delivered, operations, cluster_up_ms(c));
+    try check(c, met, "too few requests reached the server while faults were on");
 }
 
 fn print_summary(c: *Cluster) void {
@@ -2333,6 +2350,20 @@ fn print_phase(report: *Report, label: []const u8, p: PhaseTotals) void {
 // ---- Tests --------------------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the request floor is one per operation with enough uptime and half below it" {
+    // Goal: the weaker floor for short runs has teeth. Method: the two fleet runs pass it, a run
+    // delivering under half of its operations fails it, and the full floor applies from
+    // `cluster_up_ms_min` of uptime.
+    const short = cluster_up_ms_min - 1;
+    try std.testing.expect(request_floor_met(72, 73, short));
+    try std.testing.expect(request_floor_met(37, 38, short));
+    try std.testing.expect(request_floor_met(20, 40, short));
+    try std.testing.expect(!request_floor_met(19, 40, short));
+    try std.testing.expect(!request_floor_met(0, 40, 0));
+    try std.testing.expect(request_floor_met(40, 40, cluster_up_ms_min));
+    try std.testing.expect(!request_floor_met(39, 40, cluster_up_ms_min));
+}
 
 test "the same seed gives the same report and the same hash" {
     // Goal: determinism, which replay and native-versus-WASM comparison rest on. Method: run two

@@ -98,6 +98,8 @@ pub const Config = struct {
     request_timeout_ms: u32 = constants.fetch_request_timeout_ms,
     peer_rate_bytes_per_s: u32 = constants.fetch_peer_rate_bytes_per_s,
     node_rate_bytes_per_s: u32 = constants.fetch_node_rate_bytes_per_s,
+    /// The whole fetch (list and chunks) ends in an error after this long; read by the worker.
+    total_ms: u32 = constants.fetch_total_ms,
 };
 
 /// What the plan keeps per chunk. The caller provides one per chunk, zeroed or from `init`.

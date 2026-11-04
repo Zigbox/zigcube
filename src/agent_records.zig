@@ -48,6 +48,22 @@ pub const file_child = "child.pid";
 pub const file_supervisor = "supervisor.pid";
 pub const file_lock = "lock";
 pub const file_forced = "forced";
+/// Written by a runtime that has to fetch the image first (C2 slice 6b): the supervisor runs
+/// `argv` (`zcube-agent fetch ...`) after recording its pid and before the command.
+pub const file_fetch = "fetch.json";
+pub const file_fetch_log = "fetch.log";
+
+/// `fetch.json`.
+pub const FetchFile = struct {
+    /// The tree being fetched, for the failure's cause.
+    digest: []const u8,
+    argv: []const []const u8,
+    /// The node's state dir, where the fetch back-off streak is kept (`fetch_backoff.zig`);
+    /// empty: no back-off.
+    state_dir: []const u8 = "",
+    backoff_base_ms: u32 = constants.fetch_backoff_base_ms,
+    backoff_cap_ms: u32 = constants.fetch_backoff_cap_ms,
+};
 
 comptime {
     // The longest path the agent builds: containers/<name>/supervisor.pid.
@@ -70,7 +86,7 @@ pub const SpecFile = struct {
 pub const RunKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
 
 /// Whose fault a start that failed was, so that the agent can blame correctly.
-pub const Blame = enum { user, environment };
+pub const Blame = enum { user, environment, fetch };
 
 /// `run.json`.
 pub const RunFile = struct {
@@ -117,7 +133,10 @@ pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
 pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!void {
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
-    for ([_][]const u8{ file_run, file_child, file_supervisor, file_forced }) |stale| {
+    const files = [_][]const u8{
+        file_run, file_child, file_supervisor, file_forced, file_fetch, file_fetch_log,
+    };
+    for (files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {
             error.Absent => {}, // The usual case.
             else => |other| return other,
@@ -280,7 +299,12 @@ pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
     const cause = run.cause orelse "the supervisor did not say why";
-    if ((run.blame orelse .environment) == .user) {
+    if ((run.blame orelse .environment) == .fetch) {
+        collector.raise(.E0601);
+        collector.cause("{s}", .{cause});
+        const sentence = "check the registry is reachable from this node and the digest was pushed";
+        collector.fix(.{ .sentence = sentence });
+    } else if ((run.blame orelse .environment) == .user) {
         collector.raise(.E0508);
         collector.cause("{s}", .{cause});
         const sentence = "check the command in the service file, then apply it again";

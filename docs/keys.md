@@ -31,8 +31,14 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
 
-An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`. One departure from
-`authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
+The cluster CA (`ca.key`, docs/peer.md) is not a writer: it signs credentials and writes no key.
+Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer.cred` and
+`ca.pub`, live in the state directories, not in the store.
+
+An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
+The `zcube-agent fetch` process reads `/node-store/<node>` (`peer`, `filter`) to find peers, and
+writes nothing.
+One departure from `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
 decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
 refuses a put or delete of a service by any role but the API. `Service` v2 never starts a
@@ -70,7 +76,10 @@ so a decision can say which version it acted on: the image, `source`, the comman
 `limits`.
 **A change of `replicas` alone does not bump it** (owner, 2026-10-26): scaling from 3 to 5 must
 not replace the three that run. The replica controller replaces replicas whose `generation` is
-behind, and only a change of the replica's own inputs puts one behind. `next_replica` is the
+behind, and only a change of the replica's own inputs puts one behind. It also replaces a replica
+whose image, `source`, command, `env` or `limits` differ from the service's whatever its
+`generation` says: `generation` starts again at 1 when a service is deleted and applied again, so a
+replica of the old service can be ahead of the new one or equal to it. `next_replica` is the
 counter that makes replica ids unique forever (below). From slice 3 it lives in
 `/replica-numbers/<service>` (`{"next": N}`), which only the replica controller writes, in the
 same transaction that creates the replica. It is **never deleted**: the key outlives the service
@@ -155,8 +164,12 @@ declared by the agent's configuration (see the open questions in `docs/contracts
 ```json
 { "v": 1, "node": "node1",
   "trees": [{"tree": "b3:51aa9c03", "bytes": 52428800, "chunks": 800, "sample": "<hex>"}],
-  "filter": "<hex Bloom filter of every chunk held>", "filter_chunks": 800, "omitted": 0 }
+  "filter": "<hex Bloom filter of every chunk held>", "filter_chunks": 800, "omitted": 0,
+  "peer": "10.0.0.7:7700" }
 ```
+
+`peer` is the `host:port` of the node's peer server (`--peer-listen`); empty when it serves
+none. A fetch reads it instead of guessing from `/nodes/<node>`, whose port is the agent's API.
 
 Written by the agent, bound to the same lease as `/nodes/<node>` (a separate key, so a summary
 refresh never rewrites the registration), through the lease-bound agent endpoint with the same
