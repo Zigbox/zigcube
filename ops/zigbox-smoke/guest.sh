@@ -305,7 +305,15 @@ holds_tree() {
 }
 
 # The log of the newest container directory of service $1 on B.
-fetch_log_of() { ls -t "$B_DIR"/agent/containers/"$1"-*/fetch.log 2>/dev/null | head -n 1; }
+fetch_log_of() { ls -t "$B_DIR"/agent/containers/*"$1"*/fetch.log 2>/dev/null | head -n 1; }
+
+# What B's state directory holds, for a failure message: the layout and every fetch.log.
+dump_b() {
+    echo "--- B state: $(cd "$B_DIR/agent" 2>/dev/null && find containers zigbox faults -maxdepth 2 2>/dev/null | head -n 60)"
+    for f in "$B_DIR"/agent/containers/*/fetch.log; do
+        [ -e "$f" ] && { echo "--- $f"; head -c 800 "$f"; }
+    done
+}
 
 # A service only B can take: more CPU than A has left (2000 millicores less box's 1000).
 only_b() { service_json "$1" "$2" 1 '{"cpu_millis":1200,"memory_bytes":134217728}' "$(sleep_json)" "$3"; }
@@ -352,7 +360,7 @@ stage_peers_fetch() {
     await_pull "$PYTHON_TREE" "$since"
     echo "pull record of pyone: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
     [ "$PEER" -gt 0 ] || fail "pyone: no bytes came from a peer (registry=$REG peers=$PEERS)" \
-        "fetch.log: $(cat "$(fetch_log_of pyone)" 2>&1 | head -c 1500)"
+        "fetch.log: $(cat "$(fetch_log_of pyone)" 2>&1 | head -c 1500) $(dump_b)"
     [ "$REG" -eq 0 ] || fail "pyone: $REG registry bytes, but A has the image"
     case "$PEERS" in "$NODE="*) ;; *) fail "pyone: peers are '$PEERS', not $NODE" ;; esac
     ok "B fetched python:3.12-slim from peer $NODE: $PEER peer bytes, 0 registry bytes"
