@@ -168,6 +168,8 @@ Record the split in `docs/briefs/M7-build.md` (slice 3 is at about line 166) and
   - a stray `claude/release-retro` branch in Zigbox (the proxy refuses remote deletes; the owner can delete it);
   - Zigbox `mac.yml` still queues a mac job on docs-only PRs;
   - Zigbox branch protection may still name the old per-fuzzer check names after #44.
+  - from #70 (CI speed): the cause of the sim cache's `FileNotFound` is unknown (the probe now drops a bad entry; the key moved to `zig-v2`); the owner could make `simulations (sim-c0, sim-c1)` a required check; the `sim-c1` negative tests could become their own job (about 3.5 minutes saved).
+- C2's ship gate (owner, 2026-11-04): `demo-c2` green in CI, `check` PASS on the shipping commit, two Opus reviews, retro. No 24-hour fleet run for C2 (docs/decisions/2026-11-04-c2-ships-without-fleet-soak.md); C3 starts with the fleet upgrade, #71 first.
 - Open, low priority:
   - Zigbox issue #8, a separate diagnostics module.
   - A real code for `lost`.
