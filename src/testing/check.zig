@@ -65,6 +65,12 @@ fn reports_failure(text: []const u8) bool {
 /// errors do not report a failed build step. The child's stderr goes to a file (not a pipe, which
 /// a detached grandchild such as a supervisor could hold open), is copied to ours, and is read.
 fn run(io: Io, argv: []const []const u8, cwd: ?[]const u8) !void {
+    return run_echo(io, argv, cwd, true);
+}
+
+/// `run`, with the copy of the child's errors on our stderr only if `echo` (the tests keep it
+/// off: a test's stderr is the build's, and would read as a failed step to the gate above it).
+fn run_echo(io: Io, argv: []const []const u8, cwd: ?[]const u8, echo: bool) !void {
     const copy = try Io.Dir.cwd().createFile(io, stderr_copy, .{});
     defer copy.close(io);
     var child = try std.process.spawn(io, .{
@@ -83,9 +89,11 @@ fn run(io: Io, argv: []const []const u8, cwd: ?[]const u8) !void {
         arena.allocator(),
         .limited(stderr_copy_bytes_max),
     ) catch "";
-    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &buffer);
-    stderr_writer.interface.writeAll(text) catch {};
-    stderr_writer.interface.flush() catch {};
+    if (echo) {
+        var stderr_writer: Io.File.Writer = .init(.stderr(), io, &buffer);
+        stderr_writer.interface.writeAll(text) catch {};
+        stderr_writer.interface.flush() catch {};
+    }
     switch (term) {
         .exited => |code| if (code == 0 and !reports_failure(text)) return,
         else => {},
@@ -347,11 +355,11 @@ test "run fails when the child's errors report a failed step despite exit 0" {
     const noisy = [_][]const u8{
         "sh", "-c", "echo 'failed command: zig test --listen=-' >&2; exit 0",
     };
-    try std.testing.expectError(error.CommandFailed, run(io, &noisy, null));
+    try std.testing.expectError(error.CommandFailed, run_echo(io, &noisy, null, false));
     const crash = [_][]const u8{ "sh", "-c", "echo 'test process unexpectedly exited' >&2" };
-    try std.testing.expectError(error.CommandFailed, run(io, &crash, null));
-    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "exit 3" }, null));
-    try run(io, &.{ "sh", "-c", "echo fine >&2" }, null);
+    try std.testing.expectError(error.CommandFailed, run_echo(io, &crash, null, false));
+    try std.testing.expectError(error.CommandFailed, run_echo(io, &.{ "sh", "-c", "exit 3" }, null, false));
+    try run_echo(io, &.{ "sh", "-c", "echo fine >&2" }, null, false);
 }
 
 test "reports_failure recognises a build runner's failure report" {
