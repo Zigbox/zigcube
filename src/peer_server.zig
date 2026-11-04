@@ -31,6 +31,7 @@ const fetch_plan = @import("fetch_plan.zig");
 const peer = @import("peer.zig");
 const peer_limit = @import("peer_limit.zig");
 const peer_serve = @import("peer_serve.zig");
+const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_stream = @import("peer_stream.zig");
 const server_listen = @import("server_listen.zig");
@@ -124,6 +125,11 @@ pub const Server = struct {
     /// Strangers shut down to make room for a newcomer (`evict_oldest`).
     evictions: std.atomic.Value(u32) = .init(0),
 
+    /// Set when the Zigbox store is read with the one-id map (ZBX-W0201 was said); for tests.
+    outside_fallback: bool = false,
+
+    const OutsideMap = zigbox_fetch.OutsideMap;
+
     pub const StartError = error{ Listen, NoThreads, OutOfMemory, Store };
 
     /// Listens and starts the accept task. `server` must stay where it is until `stop`.
@@ -135,6 +141,7 @@ pub const Server = struct {
         };
         errdefer server.listener.deinit(io);
         const gpa = std.heap.page_allocator;
+        const outside = try outside_map(server, io, gpa);
         var opened: usize = 0;
         errdefer for (server.slots[0..opened]) |*slot| free_slot(slot, io, gpa);
         for (&server.slots) |*slot| {
@@ -150,6 +157,7 @@ pub const Server = struct {
                     error.NoStore => error.Store,
                     error.OutOfMemory => error.OutOfMemory,
                 };
+                if (outside) |map| handle.read_from_outside(map);
                 slot.zigbox = handle;
             }
             errdefer if (slot.zigbox) |handle| {
@@ -162,6 +170,27 @@ pub const Server = struct {
             opened += 1;
         }
         server.accept_future = io.concurrent(accept_loop, .{server}) catch return error.NoThreads;
+    }
+
+    /// The store's id map seen from the host, when there is a Zigbox store to serve (Zigbox Z9:
+    /// the server is outside the store's namespace, so an object owned by a container id other
+    /// than the user's reads as Damaged without it). Says ZBX-W0201 when only one id maps.
+    fn outside_map(server: *Server, io: std.Io, gpa: std.mem.Allocator) StartError!?OutsideMap {
+        if (server.config.zigbox_store == null) return null;
+        const facts = gpa.create(zigbox.Facts) catch return error.OutOfMemory;
+        defer gpa.destroy(facts);
+        const outside = zigbox_fetch.outside_owners(facts);
+        if (outside.fallback) {
+            var warning: zigbox.diag.Diag = undefined;
+            warning.reset();
+            warning.raise(.W0201);
+            warning.while_("choosing the id map to read the Zigbox store with", .{});
+            warning.cause("only objects owned by container root can be served to peers; " ++
+                "see zbx doctor (ZBX-E0105) for the subordinate id ranges and helpers", .{});
+            server.outside_fallback = true;
+            if (!server.config.quiet) show_foreign(io, &warning);
+        }
+        return outside.map;
     }
 
     /// The port the server listens on (the system's choice if the configuration said 0).
@@ -403,6 +432,15 @@ fn refuse(server: *Server, io: std.Io, storage: *const Storage, why: []const u8)
     diag.cause("peer address {s} {s}", .{ source_text(&text_buffer, storage), why });
     diag.fix(.{ .sentence = "no action needed; it is tried again by itself" });
     if (!server.config.quiet) show(io, &diag, server.config.verbose);
+}
+
+/// Shows a diagnostic of Zigbox's (ZBX-) as Zigbox wrote it.
+fn show_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    zigbox.diagnostic.from_diag(&diagnostic, collector);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to report it.
 }
 
 fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
@@ -1156,7 +1194,6 @@ test "an IPv6 address is a source by its /64, and a mapped IPv4 address by its I
 const images_mod = @import("zigbox_images.zig");
 const fetch_client = @import("fetch_cli.zig");
 const fetch_worker = @import("fetch_worker.zig");
-const zigbox = @import("zigbox");
 const agent_run = @import("agent_run.zig");
 const agent_config = @import("agent_config.zig");
 

@@ -537,10 +537,27 @@ pub const Opened = struct {
         };
     }
 
+    /// Makes this store read as the host sees it, for a reader that is not in Zigbox's store
+    /// namespace (the peer server, which has threads): an object of one chunk is owned by a
+    /// container id, and `lstat` outside the namespace gives host ids (Zigbox Z9, 0.3.1). Call
+    /// it once, before the first read; never on a store a namespace child works on.
+    pub fn read_from_outside(self: *Opened, map: OutsideMap) void {
+        self.store.owners = .{ .outside = map };
+    }
+
     pub fn close(self: *Opened) void {
         self.images.close();
     }
 };
+
+pub const OutsideMap = @FieldType(zigbox.store.namespace.Outside, "map");
+
+/// The id map a reader outside the namespace needs, from the same choice `namespace.run` makes.
+/// `facts` is large (static or heap) and only scratch.
+pub fn outside_owners(facts: *zigbox.Facts) zigbox.store.namespace.Outside {
+    var real: zigbox.host_real.HostReal = .{};
+    return zigbox.store.namespace.outside_owners(real.interface(), facts);
+}
 
 // ---- Tests ------------------------------------------------------------------------------------
 

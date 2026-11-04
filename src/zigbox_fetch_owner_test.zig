@@ -33,6 +33,9 @@ const Sha256 = @FieldType(store_api.image_peer.Options, "expected_manifest");
 /// The container id the reference import gives one file, when the map has room for it.
 const container_id: u32 = 1000;
 
+/// The group of the one-chunk file: `etc/shadow`'s own, which the object id commits to (Z9).
+const shadow_gid: u32 = 42;
+
 /// How long the fetch may take before the test kills it and fails.
 const fetch_limit_ms: u64 = 60_000;
 
@@ -43,6 +46,8 @@ const Reference = struct {
     /// The source tree, and the file in it that is given `container_id` inside the namespace.
     source: [:0]const u8,
     owned: [:0]const u8,
+    /// A small file, one chunk, given 0:42 as `etc/shadow` is: the peer server reads it outside.
+    shadow: [:0]const u8,
     /// Where the child writes the tree's digest.
     pipe_write: i32,
 
@@ -50,6 +55,8 @@ const Reference = struct {
         const job: *Reference = @ptrCast(@alignCast(context));
         // A one-id map has no id 1000: the file stays 0, as every owner is then.
         _ = linux.fchownat(linux.AT.FDCWD, job.owned, container_id, container_id, 0);
+        // Likewise: with a one-id map there is no gid 42 and the file stays 0:0.
+        _ = linux.fchownat(linux.AT.FDCWD, job.shadow, 0, shadow_gid, 0);
         var result: store_api.import.Result = undefined;
         var diag: zigbox.diag.Diag = undefined;
         diag.reset();
@@ -238,6 +245,8 @@ fn write_source(io: std.Io, dir: std.Io.Dir) !void {
         for (bytes, 0..) |*byte, at| byte.* = @truncate(at *% 31 +% file);
         try dir.writeFile(io, .{ .sub_path = name, .data = bytes });
     }
+    // One chunk, so `read_chunk` rebuilds its object id from the owner (Zigbox Z9).
+    try dir.writeFile(io, .{ .sub_path = "src/etc/shadow", .data = "root:*:20000:0:99999:7:::\n" });
 }
 
 /// Runs `zcube-agent fetch` of `tree` from the peer server on `port` into the store at `root_b`.
@@ -300,10 +309,12 @@ test "a fetched tree's files have the owners and modes Zigbox's own write gives 
         try tmp.dir.createDir(io, name, .default_dir);
     }
     try write_source(io, tmp.dir);
-    var paths: [6][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [7][std.fs.max_path_bytes]u8 = undefined;
     const source = try std.fmt.bufPrintSentinel(&paths[0], "{s}/src", .{base}, 0);
     const owned = try std.fmt.bufPrintSentinel(&paths[1], "{s}/src/etc/owned", .{base}, 0);
     try testing.expectEqual(@as(usize, 0), linux.chmod(owned, 0o604));
+    const shadow = try std.fmt.bufPrintSentinel(&paths[6], "{s}/src/etc/shadow", .{base}, 0);
+    try testing.expectEqual(@as(usize, 0), linux.chmod(shadow, 0o640));
     const root_a = try std.fmt.bufPrint(&paths[2], "{s}/a/store", .{base});
     const root_b = try std.fmt.bufPrint(&paths[3], "{s}/b/store", .{base});
     const state1 = try std.fmt.bufPrint(&paths[4], "{s}/state1", .{base});
@@ -322,6 +333,7 @@ test "a fetched tree's files have the owners and modes Zigbox's own write gives 
         .workspace = workspace,
         .source = source,
         .owned = owned,
+        .shadow = shadow,
         .pipe_write = -1,
     };
     const tree = try import_reference(&job, host);
