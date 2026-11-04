@@ -278,6 +278,10 @@ pub const Agent = struct {
         acted += try pass.flush();
         agent.forget_finished_stops(listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
+        // After the replica pass: the records are statistics, so a failing publish (a server that
+        // cannot be reached, a state directory that cannot be read) never holds replica work back.
+        try agent.publish_pulls(ctx);
+        if (agent.fence.active) return agent.fence_step(ctx, now);
         const at_ms = agent.next_wake(now, mono);
         return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = acted };
     }
@@ -334,6 +338,87 @@ pub const Agent = struct {
         agent.store_lease = agent.lease;
         agent.store_hash = hash;
         agent.store_refused = false;
+    }
+
+    /// Publishes the pull records the fetch children left (`pull.json` in a container's directory)
+    /// as `/pulls/<node>/<tree>`, at most `pulls_per_step_max` a step, and removes each file once
+    /// it is stored or can never be (a server that refuses it, a file that is not a record). The
+    /// records are statistics: a refusal never stops replica work, but a server that cannot be
+    /// reached ends the step as any call does, and a failed tenure compare fences.
+    fn publish_pulls(agent: *Agent, ctx: *const Context) Error!void {
+        const state = ctx.state orelse return;
+        assert(agent.lease != store.lease_none);
+        const entries = state.list(ctx.arena, agent_records.dir_containers) catch |err| {
+            return state_failed(ctx, err, "list the containers for pull records");
+        };
+        var published: u32 = 0;
+        for (entries[0..@min(entries.len, constants.fake_dir_entries_max)]) |entry| {
+            if (published == constants.pulls_per_step_max) break;
+            if (!std.mem.endsWith(u8, entry, "/")) continue;
+            const name = entry[agent_records.dir_containers.len .. entry.len - 1];
+            if (runtime.name_problem(name) != null) continue;
+            var buffer: [agent_state.name_bytes_max]u8 = undefined;
+            const file = agent_records.path(&buffer, name, agent_records.file_pull);
+            const text = state.read(ctx.arena, file) catch |err| switch (err) {
+                error.Absent => continue,
+                // A file past the state limit can never be read: remove it, or it wedges here.
+                error.TooBig => {
+                    try agent.drop_pull(ctx, state, file);
+                    continue;
+                },
+                else => return state_failed(ctx, err, "read a pull record"),
+            };
+            published += 1;
+            try agent.publish_pull(ctx, state, file, text);
+            if (agent.fence.active) return;
+        }
+    }
+
+    fn publish_pull(
+        agent: *Agent,
+        ctx: *const Context,
+        state: agent_state.AgentState,
+        file: []const u8,
+        text: []const u8,
+    ) Error!void {
+        const parsed = std.json.parseFromSliceLeaky(records.Pull, ctx.arena, text, .{
+            .ignore_unknown_fields = true,
+        }) catch return agent.drop_pull(ctx, state, file);
+        const tree_ok = parsed.tree.len > 0 and parsed.tree.len <= constants.tree_digest_bytes;
+        if (!tree_ok or !std.mem.eql(u8, parsed.node, agent.config.node)) {
+            return agent.drop_pull(ctx, state, file);
+        }
+        const value = try records.encode(ctx.arena, parsed, ctx.diag);
+        const key = records.pull_key(agent.config.node, parsed.tree);
+        var tenure: compare_sets.Set = .{};
+        compare_sets.observed_write(&tenure, agent.config.node, agent.tenure);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+        const request: store.TxnRequest = .{ .compares = tenure.compares(), .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = agent.config.node };
+        const done = writers.txn(ctx.store, role, request, ctx.diag) catch |err| {
+            // A server that answered and refused (an older one has no such endpoint) loses the
+            // statistics, never the node's work; any other failure leaves the file for the next
+            // step.
+            const code = ctx.diag.code orelse return err;
+            if (code != .E0504) return err;
+            ctx.diag.reset();
+            return agent.drop_pull(ctx, state, file);
+        };
+        if (!done.succeeded) return agent.begin_fence(ctx, ctx.mono_ms());
+        return agent.drop_pull(ctx, state, file);
+    }
+
+    fn drop_pull(
+        agent: *Agent,
+        ctx: *const Context,
+        state: agent_state.AgentState,
+        file: []const u8,
+    ) Error!void {
+        _ = agent;
+        state.remove(file) catch |err| switch (err) {
+            error.Absent => {},
+            else => return state_failed(ctx, err, "remove a pull record"),
+        };
     }
 
     /// A summary write that failed for any reason but a failed tenure compare. A server that

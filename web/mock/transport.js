@@ -2,7 +2,7 @@
 // the shape of `fetch`: it resolves to {status, headers, body} or rejects like a network failure.
 
 import { StoreDown } from "./engine.js";
-import { CODES, diagCompacted, diagFutureRevision, diagNotFound } from "./fixtures.js";
+import { CODES, diagCompacted, diagBadRequest, diagFutureRevision, diagNotFound } from "./fixtures.js";
 
 const WATCH_MAX_MS = 25000;
 const LATENCY_MS = [15, 60];
@@ -29,6 +29,12 @@ export function createMockTransport(engine, faults) {
       if (path === "/v1/status") return reply(200, status(), requestId);
       if (!engine.storeUp) return fail(503, [engine.storeDiagnostic()], requestId);
       if (path === "/v1/list") return reply(200, list(q), requestId);
+      if (path === "/v1/stats/pull") {
+        const limit = Number(q.get("limit") ?? 50);
+        if (!(limit >= 1 && limit <= 500)) return fail(400, [diagBadRequest("limit", "must be from 1 to 500")], requestId);
+        const pulls = engine.pullList(q.get("node"), limit);
+        return reply(200, { pulls, skipped: 0, matched: engine.pullList(q.get("node"), 500).length, truncated: false, revision: engine.rev }, requestId);
+      }
       if (path === "/v1/leases") return reply(200, leases(), requestId);
       if (path === "/v1/watch") return await watch(q, signal, requestId);
       if (path === "/v1/codes") return reply(200, { codes: CODES.map(({ code, severity, blame, summary }) => ({ code, severity, blame, summary })) }, requestId);

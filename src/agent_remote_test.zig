@@ -327,6 +327,45 @@ test "the node's replicas come back with env values, and its reports go in and o
     try testing.expectEqualStrings("/observed/node1/hello-2", seen.kvs[0].key);
 }
 
+test "a pull record goes in under the tenure; a stale tenure is refused" {
+    // Goal: RemoteStore.pull reaches agent_api.pull over real HTTP and the real store. Method: join
+    // node1, put a pull record under the tenure and read it back; the same put under a tenure that
+    // has ended is not applied and leaves the store as it was.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const remote = rig.remote.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const lease = try remote.lease_grant(10_000, &diag);
+    const joined = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
+    // Stamped now: the server's pull retention would drop a record dated 1970.
+    const finished_ms = std.Io.Clock.real.now(rig.io).toMilliseconds();
+    var body_buffer: [160]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &body_buffer,
+        "{{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:aa\",\"registry_bytes\":9," ++
+            "\"started_at_ms\":{d},\"finished_at_ms\":{d}}}",
+        .{ finished_ms - 5, finished_ms },
+    );
+    const put: store.Op = .{ .put = .{ .key = "/pulls/node1/b3:aa", .value = body } };
+    const ended = joined.revision + 50;
+    const stale = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = ended }};
+    const refused = try remote.txn(.{ .compares = &stale, .on_success = &.{put} }, &diag);
+    try testing.expect(!refused.succeeded);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const held = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = joined.revision }};
+    const done = try remote.txn(.{ .compares = &held, .on_success = &.{put} }, &diag);
+    try testing.expect(done.succeeded);
+    const direct = rig.server.shared.store;
+    const page = try direct.list(arena, .{ .prefix = "/pulls/node1/", .limit = 10 }, &diag);
+    try testing.expectEqual(@as(usize, 1), page.kvs.len);
+    const record = try records.read(records.Pull, arena, page.kvs[0], &diag);
+    try testing.expectEqual(@as(u64, 9), record.registry_bytes);
+}
+
 test "what the agent never does is a bug report, not a wrong answer" {
     // Goal: the adapter refuses calls outside the agent's few, with ZC-B0001 and nothing sent.
     // Method: get, status, watch, a transaction with a compare, a write outside the node's keys.

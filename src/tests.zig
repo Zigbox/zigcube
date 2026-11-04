@@ -49,6 +49,7 @@ test {
     _ = @import("server_static.zig");
     _ = @import("server.zig");
     _ = @import("server_test.zig");
+    _ = @import("pull_arena_test.zig");
     _ = @import("bundle.zig");
     _ = @import("bundle_collect.zig");
     _ = @import("bundle_redact.zig");

@@ -79,7 +79,18 @@ pub const Report = struct {
     peer_chunks: u32 = 0,
     bad_lists: u32 = 0,
     blamed: u32 = 0,
+    /// Bytes by source (C2 slice 7, `/pulls`): what the registry gave, what each peer gave (by
+    /// the place in the caller's list), and what the store already held.
+    registry_bytes: u64 = 0,
+    peer_bytes: [constants.fetch_candidates_max]u64 = @splat(0),
+    cached_bytes: u64 = 0,
+    /// Bit `i` is set for a peer (by the place in the caller's list) the plan struck.
+    struck_peers: u64 = 0,
 };
+
+comptime {
+    assert(constants.fetch_candidates_max <= 64); // `struck_peers` is a u64.
+}
 
 /// Gets the tree `digest` into `store`. `allocator` is used for the buffers of this call only.
 pub fn fetch(
@@ -194,6 +205,7 @@ fn lacking(
     for (refs, 0..) |ref, at| {
         if (store.images().read_chunk(&ref.hash, scratch)) |_| {
             report.already_held += 1;
+            report.cached_bytes += ref.bytes;
             continue;
         } else |_| {}
         refs[kept] = refs[at];
@@ -240,12 +252,19 @@ fn run_plan(
                     const bytes = result.bytes[0..ref.bytes];
                     store.images().put_chunk(&ref.hash, bytes) catch return error.Store;
                     switch (request.source) {
-                        .registry => report.registry_chunks += 1,
-                        .peer => report.peer_chunks += 1,
+                        .registry => {
+                            report.registry_chunks += 1;
+                            report.registry_bytes += ref.bytes;
+                        },
+                        .peer => {
+                            report.peer_chunks += 1;
+                            report.peer_bytes[source.peer] += ref.bytes;
+                        },
                     }
                 }
                 while (plan.take_blame()) |blame| {
                     report.blamed += 1;
+                    report.struck_peers |= @as(u64, 1) << @intCast(order[blame.peer]);
                     const total: u32 = @intCast(chunks.len);
                     transport.blame_fn(transport.context, order[blame.peer], blame.chunk, total);
                 }
@@ -390,6 +409,12 @@ test "a tree is fetched from a peer, a corrupt chunk strikes the peer and the re
     // (the garbled one) and everything after it from the registry.
     try std.testing.expectEqual(@as(u32, 2), report.peer_chunks);
     try std.testing.expectEqual(@as(u32, tree_chunks - 2), table.registry_asked);
+    // Bytes by source: 2 chunks from the peer (the caller's peer 0), the rest from the registry,
+    // none already on disk; and the peer is the one struck.
+    try std.testing.expectEqual(@as(u64, 2 * chunk_len), report.peer_bytes[0]);
+    try std.testing.expectEqual(@as(u64, (tree_chunks - 2) * chunk_len), report.registry_bytes);
+    try std.testing.expectEqual(@as(u64, 0), report.cached_bytes);
+    try std.testing.expectEqual(@as(u64, 1), report.struck_peers);
     var out: [constants.swarm_chunk_bytes]u8 = undefined;
     const read = try store.images().read_chunk(&table.refs[2].hash, out[0..]);
     try std.testing.expectEqualSlices(u8, &table.bodies[2], read);
@@ -412,6 +437,7 @@ test "a second fetch asks for nothing, and a tree no source has fails" {
     try fetch(std.testing.allocator, transport, &store, &table.digest, &.{}, config, &report);
     try std.testing.expectEqual(@as(u32, tree_chunks), table.registry_asked);
     try std.testing.expectEqual(@as(u32, tree_chunks), report.already_held);
+    try std.testing.expectEqual(@as(u64, tree_chunks * chunk_len), report.cached_bytes);
 
     var empty = std.testing.tmpDir(.{});
     defer empty.cleanup();

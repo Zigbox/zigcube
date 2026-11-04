@@ -38,6 +38,8 @@ pub const Driver = struct {
     /// The guard, if the store is wrapped in one: a failed save of its pair is reported here.
     verified: ?*store_verified.VerifiedStore = null,
     saving_reported: bool = false,
+    /// Whether a failing pull-retention pass has been said (once, until it recovers).
+    pulls_reported: bool = false,
     /// Steps that ran, for tests and the status line.
     steps: std.atomic.Value(u64) = .init(0),
 
@@ -86,7 +88,27 @@ pub const Driver = struct {
     fn step(driver: *Driver, ctx: *const controller.Context) controller.Error!controller.Wakeup {
         _ = try driver.store.status(ctx.diag);
         driver.report_saving();
-        return driver.plane.reconcile(ctx);
+        const wake = try driver.plane.reconcile(ctx);
+        driver.report_pull_retention();
+        return wake;
+    }
+
+    /// Pull records are statistics: a retention pass that fails never fails the step, so it is
+    /// said once when it starts failing and once when it stops.
+    fn report_pull_retention(driver: *Driver) void {
+        const cursor = &driver.plane.replicas.pulls;
+        if (cursor.failing == driver.pulls_reported) return;
+        driver.pulls_reported = cursor.failing;
+        if (!driver.report_failures) return;
+        const file = std.Io.File.stderr();
+        if (!cursor.failing) {
+            const line = "zcube-server: pull-record retention works again\n";
+            file.writeStreamingAll(driver.io, line) catch {};
+            return;
+        }
+        var buffer: [constants.diag_output_bytes_max + 128]u8 = undefined;
+        const text = pull_retention_failure(&buffer, &cursor.failure);
+        file.writeStreamingAll(driver.io, text) catch {};
     }
 
     /// A pair that cannot be saved (`ZC-E0216`) is shown once when it starts, and once when it
@@ -244,3 +266,34 @@ pub const Driver = struct {
         std.Io.File.stderr().writeStreamingAll(driver.io, line) catch {};
     }
 };
+
+/// The report of a failed retention pass: a heading, then the diagnostic as `render` shows it
+/// (code, cause and fix), in `buffer`.
+fn pull_retention_failure(buffer: []u8, failure: *const diag_mod.Diag) []const u8 {
+    assert(failure.code != null);
+    assert(buffer.len >= constants.diag_output_bytes_max + 128);
+    const heading = "\nzcube-server: pull-record retention failed; retrying later, nothing waits\n";
+    @memcpy(buffer[0..heading.len], heading);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    var copy = failure.*;
+    diag_mod.to_diagnostic(&diagnostic, &copy);
+    const text = diag_mod.render(&diagnostic, .text, false, buffer[heading.len..]);
+    return buffer[0 .. heading.len + text.len];
+}
+
+test "the retention failure line carries the code, the cause and the fix" {
+    // Goal: DIAGNOSTICS.md: a failure is said whole, not as a bare tag. Method: a cursor holding
+    // a coded failure renders with the ZC- prefix, its cause and its fix.
+    var failure: Diag = undefined;
+    failure.reset();
+    failure.raise(.E0201);
+    failure.cause("the store at {s} did not answer", .{"127.0.0.1:5432"});
+    failure.fix(.{ .sentence = "start the database again" });
+    var buffer: [constants.diag_output_bytes_max + 128]u8 = @splat(0xaa);
+    const text = pull_retention_failure(&buffer, &failure);
+    try std.testing.expect(std.mem.indexOf(u8, text, "pull-record retention failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ZC-E0201") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "127.0.0.1:5432") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "start the database again") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(E0201)") == null);
+}

@@ -155,6 +155,22 @@ pub const request_default_memory_bytes: u64 = 128 * 1024 * 1024;
 pub const decisions_per_subject_max: u32 = 200;
 pub const decision_age_ms_max: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const decision_gone_age_ms_max: u64 = 24 * 60 * 60 * 1000;
+/// Pull records (`/pulls/<node>/<tree>`, docs/keys.md): the newest this many per node and at most
+/// 30 days; a pass reads at most `store_list_limit_max` x `pulls_pages_per_pass_max` records.
+pub const pulls_per_node_max: u32 = 100;
+pub const pull_age_ms_max: u64 = 30 * 24 * 60 * 60 * 1000;
+pub const pulls_pages_per_pass_max: u32 = 4;
+/// Peers one pull record names, each way (bytes given, struck); the rest are summed in none.
+pub const pull_peers_max: u32 = fetch_peers_max;
+/// The body of `POST /v1/agent/nodes/{node}/pulls`: a record of at most this many bytes and the
+/// tenure, with room for the names.
+pub const pull_request_bytes_max: u32 = 8 * 1024;
+/// Pull records an agent publishes in one step, so a burst of finished pulls cannot hold it.
+pub const pulls_per_step_max: u32 = 8;
+/// How often the controller looks for pull records to drop.
+pub const pulls_interval_ms: u32 = 5 * 60 * 1000;
+/// How long retention of pull records waits after a pass failed, before the next try.
+pub const pulls_retry_ms: u32 = 60 * 1000;
 /// How often the controller looks for decisions to drop.
 pub const retention_interval_ms: u32 = 60 * 1000;
 pub const retention_batch_pairs: u32 = store_txn_ops_max / 2;
@@ -632,4 +648,40 @@ comptime {
     assert(fetch_total_ms > fetch_peer_wait_ms);
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
+}
+
+/// The most a validated pull record encodes to: the fixed fields (node, tree, four numbers, with
+/// escapes) under 512 bytes, and `pull_peers_max` peers each in `peer_bytes` (a node name and a
+/// byte count, about 110 bytes) and in `bad_peers` (a node name, 70). The agent endpoint refuses
+/// a record that would encode larger, so this bounds what `/pulls/` holds.
+pub const pull_record_bytes_max: u32 = 4 * 1024;
+
+/// What reading one pull record costs `GET /v1/stats/pull`'s arena at most: its key and value
+/// as the store copies them (SQLite and Postgres copy both; memory copies the page only), the
+/// parsed record (strings and slices, never more than the value again) and the entry that holds
+/// them. Measured (docs/decisions/2026-11-04-pull-stats-caps.md): about 5.0 KB for a 3,036-byte
+/// record; this is for 4 KiB, and about twice that.
+pub const pull_read_arena_bytes: u32 =
+    store_key_bytes_max + 2 * pull_record_bytes_max + 1024;
+
+/// `GET /v1/stats/pull` reads at most this many pull records, ascending by node, then says
+/// `truncated`. Retention keeps up to `nodes_max` x `pulls_per_node_max` (6,400) records, which
+/// the request arena cannot hold at the worst case; this is what it can (checked below).
+pub const pulls_read_max: u32 = 500;
+
+/// What `GET /v1/stats/pull` writes its answer into, taken at once: `api_list_limit_max` records
+/// of at most `pull_record_bytes_max` each, and 4 KiB for the members around them. An arena frees
+/// nothing, so a buffer that grew would leave all its smaller steps behind (about twice its final
+/// size more); this one does not grow, because the agent endpoint refuses a larger record.
+pub const pulls_response_bytes: u32 = api_list_limit_max * pull_record_bytes_max + 4 * 1024;
+
+comptime {
+    // One page is requested at a time and never more than the cap still allows plus one, so the
+    // records the arena holds are the cap plus that one (read, then dropped unused).
+    const records_held = pulls_read_max + 1;
+    const sorted = 4 * pulls_read_max + 1024; // The order array and the pointers of the list.
+    assert(records_held * pull_read_arena_bytes + pulls_response_bytes + sorted + 64 * 1024 <=
+        request_arena_bytes_max / 2);
+    assert(pull_record_bytes_max > 512 + pull_peers_max * (110 + 70));
+    assert(pulls_read_max >= api_list_limit_max);
 }

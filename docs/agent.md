@@ -207,6 +207,20 @@ Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the fir
 chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer
 server, so restart the agent after creating or removing the file.
 
+### Pull records (C2 slice 7)
+
+`zcube-agent fetch --report FILE` writes a `records.Pull` (keys.md, `/pulls/<node>/<tree>`) to
+`FILE.tmp` and renames it, when the pull succeeds: the bytes by source come from the fetch
+worker's `Report` (`registry_bytes`, `peer_bytes` by peer index, `cached_bytes`, `struck_peers`).
+The runtime adapter passes `--report <container dir>/pull.json`. On each `reconcile` the agent
+(`publish_pulls`, after the replica pass, so statistics never hold replicas back) lists
+`containers/`, reads each `pull.json` and writes
+at most `pulls_per_step_max` (8) of them through the tenure-checked pulls endpoint, removing
+each file once it is stored. A record that does not parse, or names another node, is dropped; a
+server without the endpoint (`ZC-E0504`) gets the file dropped; a failed tenure compare begins a
+fence like any other agent write and keeps the file for the next tenure. A failed fetch leaves
+no record.
+
 ## What survives what
 
 | Event | Containers | The agent's work |

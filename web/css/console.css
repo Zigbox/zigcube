@@ -258,3 +258,4 @@ body[data-mock] main, body[data-sim] main { padding-bottom: 7rem; } /* the mock 
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
 @media print { .dev, nav.side, .top { display: none; } }
+.grid tr.detail td { background: var(--surface-2, transparent); padding: .6rem 1rem; }

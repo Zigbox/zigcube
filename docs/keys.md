@@ -24,6 +24,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
 | `/nodes/<node>` | that node's agent | C0 |
 | `/node-store/<node>` | that node's agent | C2 slice 5 |
+| `/pulls/<node>/<tree>` | that node's agent (retention may delete) | C2 slice 7 |
 | `/allocations/<node>` | scheduler | C1 slice 3 |
 | `/audit/allocations/<node>` | allocation auditor | C1 slice 4 |
 | `/node-status/<node>` | node controller | C1 slice 3 |
@@ -35,11 +36,11 @@ The cluster CA (`ca.key`, docs/peer.md) is not a writer: it signs credentials an
 Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer.cred` and
 `ca.pub`, live in the state directories, not in the store.
 
-An agent writes only `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
+An agent writes only `/nodes/<its node>`, `/node-store/<its node>`, `/pulls/<its node>/…` and `/observed/<its node>/…`.
 The `zcube-agent fetch` process reads `/node-store/<node>` (`peer`, `filter`) to find peers, and
 writes nothing.
 One departure from `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
-decisions and so may touch only the decision prefixes. `/services/<name>` is the API's alone:
+decisions (and, from C2 slice 7, expired `/pulls/` records, delete only) and so may touch only those prefixes. `/services/<name>` is the API's alone:
 the replica counter lives in `/replica-numbers/<service>` from slice 3, and `writers.zig`
 refuses a put or delete of a service by any role but the API. `Service` v2 never starts a
 `next_replica`: it carries a C0 record's value forward only until the counter exists (below). The replica controller reads a counter
@@ -50,7 +51,7 @@ number of counters bounds nothing.
 
 Every value has `"v"`. A reader accepts every version up to the one its release writes and
 ignores members it does not know. `Service` and `Replica` write `"v": 3` (C2 slice 2 added
-`source`); `Observed` writes `"v": 2` (it gained members in C1); `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); every other record
+`source`); `Observed` writes `"v": 2` (it gained members in C1); `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
 writes `"v": 1`. Records C0 and C1 wrote still read: the fixtures in `src/testdata/c0_store.txt`
 and `c1_store.txt` were captured from real stores. A value with a **newer**
 version than the reader knows is refused with one line naming the key and both versions,
@@ -186,6 +187,40 @@ The scheduler does **not** watch `/node-store/`: it reads the prefix fresh each 
 revision its other reads use, so a summary refresh never wakes it. It reads tolerantly: a record
 that is malformed or of a version newer than 1 is skipped (and counted), and that node scores 0
 locality; one bad record never stops placement. The endpoint refuses any `v` but 1 (`ZC-E0104`).
+
+## `/pulls/<node>/<tree>`: what a pull moved, by source (C2 slice 7)
+
+```json
+{ "v": 1, "node": "node1", "tree": "b3:51aa9c03…",
+  "registry_bytes": 1048576,
+  "peer_bytes": [{"peer": "node2", "bytes": 2097152}],
+  "cached_bytes": 0, "started_at_ms": 1700000000000, "finished_at_ms": 1700000004000,
+  "bad_peers": ["node3"] }
+```
+
+Written by the agent of `<node>`, for `zcube stats pull` and the console only (owner decision O6,
+2026-11-04). It is **statistics**: no controller reads it, it is in no compare set, and a missing
+or stale record changes nothing else. Unlike `/nodes/<node>` it is **not lease-bound**, so the
+numbers outlive the node. One record per (node, tree); a later pull of the same tree replaces it.
+`registry_bytes` and each peer's `bytes` are chunk bytes fetched; `cached_bytes` is what the node
+already held; `bad_peers` names peers struck for a chunk that did not match its hash (ZC-W0601).
+The record is written only for a pull that finished. The write is a tenure-checked agent write
+(`POST /v1/agent/nodes/{node}/pulls`, docs/api.md), so a replaced agent cannot write one.
+
+Data path: `zcube-agent fetch --report FILE` writes the record to `<container dir>/pull.json`
+when the pull succeeds; the agent publishes it on its next step and removes the file
+(docs/agent.md). A malformed record, or one for another node, is dropped.
+
+Retention (`src/pull_retention.zig`): the newest `pulls_per_node_max` (100) per node, none older
+than `pull_age_ms_max` (30 days) by `finished_at_ms`. The replica controller runs a pass every
+`pulls_interval_ms` (5 minutes) and, when a pass stopped at `pulls_pages_per_pass_max` pages, again
+at once from where it stopped, wrapping to the start when a page ends the prefix. A pass prunes the
+part of each node's run it read: a dropped record always has `pulls_per_node_max` newer ones in
+the whole set, so a partial run is safe and repeated passes converge. The `retention` role deletes
+with a `mod_revision` compare and never puts. A malformed record is left alone and counted, never
+deleted by guess. A pass that fails does not fail the step: it is retried after `pulls_retry_ms`
+and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) and at most
+`pulls_read_max` (500) records (`truncated`).
 
 ## `/observed/<node>/<replica>`: what the agent reports
 

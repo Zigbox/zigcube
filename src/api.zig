@@ -186,6 +186,7 @@ pub const Api = struct {
         if (std.mem.eql(u8, first, "codes")) return call.codes_list();
         if (std.mem.eql(u8, first, "check")) return call.check_allocations();
         if (std.mem.eql(u8, first, "explain")) return call.explain();
+        if (std.mem.eql(u8, first, "stats")) return call.stats();
         return no_such(ctx, request.path);
     }
 };
@@ -206,6 +207,7 @@ const Parts = std.mem.SplitIterator(u8, .scalar);
 
 /// A conflicting write is read and planned again this many times before it is reported.
 const apply_attempts_max: u32 = 3;
+const pulls_limit_default: u64 = 50;
 /// Who a write is attributed to while the API has no auth.
 const anonymous = "anonymous";
 const applied_by_bytes_max: u32 = 64;
@@ -490,9 +492,15 @@ const Out = struct {
     json: std.json.Stringify,
 
     fn create(ctx: *const Context) error{OutOfMemory}!*Out {
+        return create_sized(ctx, 0);
+    }
+
+    /// As `create`, with room for `bytes` of output taken at once: an arena frees nothing, so a
+    /// buffer that grows leaves each smaller one behind. The output may still outgrow `bytes`.
+    fn create_sized(ctx: *const Context, bytes: usize) error{OutOfMemory}!*Out {
         const out = try ctx.arena.create(Out);
         out.ctx = ctx;
-        out.buffer = .init(ctx.arena);
+        out.buffer = try .initCapacity(ctx.arena, bytes);
         out.json = .{ .writer = &out.buffer.writer };
         return out;
     }
@@ -783,6 +791,64 @@ const Call = struct {
         }
         try out.end_object();
         return false;
+    }
+
+    // ---- /v1/stats/pull ----
+
+    /// `GET /v1/stats/pull[?node=NAME][&limit=N]`: the recorded pulls (`/pulls/`), newest first.
+    /// Advisory records: one that does not decode or is from a newer version is counted in
+    /// `skipped`, not an error. A read stops at `pulls_read_max` records (ascending by node) and
+    /// says `truncated`, so a large cluster gets part of the picture, never a failure.
+    fn stats(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const kind = call.parts.next() orelse return no_such(ctx, "/v1/stats");
+        if (!std.mem.eql(u8, kind, "pull")) return no_such(ctx, "/v1/stats/...");
+        try call.no_more();
+        try call.query.allow(ctx, &.{ "node", "limit" });
+        const limit = try call.query.number(ctx, "limit") orelse pulls_limit_default;
+        if (limit == 0 or limit > constants.api_list_limit_max) {
+            return bad_request(ctx, "limit", "must be from 1 to 500");
+        }
+        var prefix: []const u8 = records.prefix_pulls;
+        if (try call.query.one(ctx, "node")) |node| {
+            if (records.name_problem(node, constants.node_name_bytes_max) != null) {
+                return bad_request(ctx, "node", "is not a node name");
+            }
+            prefix = records.pull_prefix(node).slice();
+        }
+        var skipped: u32 = 0;
+        var truncated = false;
+        const found = controller.list_capped_tolerant(
+            records.Pull,
+            ctx,
+            prefix,
+            constants.pulls_read_max,
+            &skipped,
+            &truncated,
+        ) catch return propagate(ctx);
+        const order = ctx.arena.alloc(u32, found.items.len) catch return no_memory(ctx);
+        for (order, 0..) |*slot, at| slot.* = @intCast(at);
+        std.mem.sort(u32, order, found.items, pull_newer);
+        const out = Out.create_sized(ctx, constants.pulls_response_bytes) catch
+            return no_memory(ctx);
+        try out.begin_object();
+        try out.field("pulls");
+        try out.begin_array();
+        for (order[0..@min(order.len, limit)]) |at| try out.value(found.items[at].rec);
+        try out.end_array();
+        try out.member("skipped", skipped);
+        try out.member("matched", found.items.len);
+        try out.member("truncated", truncated);
+        try out.member("revision", found.revision);
+        try out.end_object();
+        return out.finish();
+    }
+
+    fn pull_newer(items: []const controller.Entry(records.Pull), a: u32, b: u32) bool {
+        const left = items[a].rec.finished_at_ms;
+        const right = items[b].rec.finished_at_ms;
+        if (left != right) return left > right;
+        return std.mem.lessThan(u8, items[a].kv.key, items[b].kv.key);
     }
 
     // ---- /v1/list ----

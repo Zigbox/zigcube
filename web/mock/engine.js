@@ -40,6 +40,7 @@ export class Engine {
     this.activeUntil = 0;
     this.dirty = true;
     this.requestSeq = 0;
+    this.pulls = new Map(); // `${node}/${tree}` -> a /pulls/ record (docs/keys.md); not store keys: statistics
   }
 
   now() { return this.base + this.t; }
@@ -465,6 +466,7 @@ export class Engine {
       this.after(START_DELAY_MS, () => {
         a.starting.delete(r.id);
         if (!a.up || !this.get(`/replicas/${r.service}/${r.id}`)) return;
+        if (KNOWN_IMAGES.has(r.image)) this.recordPull(a.name, r.image);
         if (KNOWN_IMAGES.has(r.image)) this.commit([{ put: [`/observed/${a.name}/${r.id}`, this.observed(a, r, "running")] }]);
         else this.commit([{ put: [`/observed/${a.name}/${r.id}`, this.observed(a, r, "stopped", { kind: "start_failed" }, diagImageNotFound(r.image, a.name, r.id))] }]);
       });
@@ -486,4 +488,23 @@ export class Engine {
 
   storeDiagnostic() { return diagStoreDown(this.backend); }
   short(d) { return digestShort(d); }
+
+  /** A node's first start of an image: the pull moved the tree from a peer that held it, else from the registry. */
+  recordPull(node, tree) {
+    const key = `${node}/${tree}`;
+    if (this.pulls.has(key)) return;
+    const donor = [...this.pulls.values()].find(p => p.tree === tree && p.node !== node);
+    const finished = this.now();
+    this.pulls.set(key, {
+      v: 1, node, tree,
+      registry_bytes: donor ? 0 : MOCK_IMAGE_BYTES,
+      peer_bytes: donor ? [{ peer: donor.node, bytes: MOCK_IMAGE_BYTES }] : [],
+      cached_bytes: 0, started_at_ms: finished - 1800, finished_at_ms: finished, bad_peers: [],
+    });
+  }
+
+  /** `GET /v1/stats/pull`: newest first, optionally one node's. */
+  pullList(node, limit) {
+    return [...this.pulls.values()].filter(p => !node || p.node === node).sort((a, b) => b.finished_at_ms - a.finished_at_ms).slice(0, limit);
+  }
 }

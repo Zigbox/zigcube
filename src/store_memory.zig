@@ -215,15 +215,22 @@ pub const MemoryStore = struct {
         const self = from(context);
         const revision = options.at_revision orelse self.revision;
         try self.check_readable(revision, diag);
-        const entries = try self.snapshot(arena, revision, options.prefix, diag);
-        if (options.reverse) std.mem.reverse(store.KeyValue, entries);
         var start: usize = 0;
-        if (options.continue_after) |after| {
-            const wanted: std.math.Order = if (options.reverse) .lt else .gt;
-            while (start < entries.len) : (start += 1) {
-                if (std.mem.order(u8, entries[start].key, after) == wanted) break;
+        const entries = if (revision == self.revision)
+            // The current state: pick the page's entries out of the live table without listing
+            // every entry under the prefix (a paged read would pay that on every page).
+            try self.select_page(arena, options, diag)
+        else history: {
+            const all = try self.snapshot(arena, revision, options.prefix, diag);
+            if (options.reverse) std.mem.reverse(Entry, all);
+            if (options.continue_after) |after| {
+                const wanted: std.math.Order = if (options.reverse) .lt else .gt;
+                while (start < all.len) : (start += 1) {
+                    if (std.mem.order(u8, all[start].key, after) == wanted) break;
+                }
             }
-        }
+            break :history all;
+        };
         var end = start;
         var bytes: usize = 0;
         while (end < entries.len and end - start < options.limit) : (end += 1) {
@@ -233,17 +240,60 @@ pub const MemoryStore = struct {
         }
         const more = end < entries.len;
         const last_key: ?[]const u8 = if (more) entries[end - 1].key else null;
-        return .{ .kvs = entries[start..end], .revision = revision, .continue_after = last_key };
+        // Only the page is copied: copying every entry under the prefix on each call would cost a
+        // paged read of N records N x pages x value size of the arena.
+        const kvs = arena.alloc(store.KeyValue, end - start) catch return no_memory(diag);
+        for (entries[start..end], kvs) |entry, *kv| kv.* = try copy_kv(arena, entry, diag);
+        const last_copy: ?[]const u8 = if (last_key != null) kvs[kvs.len - 1].key else null;
+        return .{ .kvs = kvs, .revision = revision, .continue_after = last_copy };
     }
 
-    /// The keys under `prefix` as they were at `revision`, ascending, copied into `arena`.
+    /// The first `limit` + 1 live entries under the prefix after `continue_after`, in the
+    /// listing's order, borrowed: only that many are held, whatever lies under the prefix. (One
+    /// more than the limit tells the caller that there is more.) Linear in the table times the
+    /// limit, like `find`: the point is clarity, not speed.
+    fn select_page(
+        self: *const MemoryStore,
+        arena: Allocator,
+        options: store.ListOptions,
+        diag: *Diag,
+    ) Error![]Entry {
+        const want = @min(@as(usize, options.limit) +| 1, self.live.items.len);
+        const top = arena.alloc(Entry, want) catch return no_memory(diag);
+        var held: usize = 0;
+        if (want == 0) return top;
+        for (self.live.items) |entry| {
+            if (!std.mem.startsWith(u8, entry.key, options.prefix)) continue;
+            if (options.continue_after) |after| {
+                const wanted: std.math.Order = if (options.reverse) .lt else .gt;
+                if (std.mem.order(u8, entry.key, after) != wanted) continue;
+            }
+            // Where it goes among those held, in listing order.
+            var at = held;
+            while (at > 0 and precedes(options.reverse, entry.key, top[at - 1].key)) at -= 1;
+            if (at >= want) continue; // Later than all `want` held.
+            const last = @min(held, want - 1);
+            std.mem.copyBackwards(Entry, top[at + 1 .. last + 1], top[at..last]);
+            top[at] = entry;
+            held = last + 1;
+        }
+        return top[0..held];
+    }
+
+    fn precedes(reverse: bool, a: []const u8, b: []const u8) bool {
+        const order = std.mem.order(u8, a, b);
+        return if (reverse) order == .gt else order == .lt;
+    }
+
+    /// The entries under `prefix` as they were at `revision`, ascending, borrowed (only the list
+    /// itself is in `arena`).
     fn snapshot(
         self: *const MemoryStore,
         arena: Allocator,
         revision: Revision,
         prefix: []const u8,
         diag: *Diag,
-    ) Error![]store.KeyValue {
+    ) Error![]Entry {
         var state: std.ArrayList(Entry) = .empty; // Borrowed entries; only the list is arena.
         if (revision == self.revision) {
             // The current state is the live table: no need to replay the log, which is linear in
@@ -268,9 +318,7 @@ pub const MemoryStore = struct {
             }
         }
         std.mem.sort(Entry, state.items, {}, entry_key_less);
-        const kvs = arena.alloc(store.KeyValue, state.items.len) catch return no_memory(diag);
-        for (state.items, kvs) |entry, *kv| kv.* = try copy_kv(arena, entry, diag);
-        return kvs;
+        return state.items;
     }
 
     // ---- Transactions --------------------------------------------------------------------

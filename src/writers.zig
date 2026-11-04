@@ -7,7 +7,8 @@
 //! given at each call site; there is no "any".
 //!
 //! Beyond authority.md's six roles there is a seventh, `retention`: it deletes expired decisions
-//! and so may touch only the three decision prefixes, which every role may write.
+//! and old pull records, and so may touch only the three decision prefixes (which every role may
+//! write) and may delete, never write, under `/pulls/`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -51,6 +52,7 @@ pub const rules = [_]Rule{
     .{ .prefix = records.prefix_assigned, .owner = .scheduler },
     .{ .prefix = records.prefix_nodes, .owner = .agent },
     .{ .prefix = records.prefix_node_store, .owner = .agent },
+    .{ .prefix = records.prefix_pulls, .owner = .agent },
     .{ .prefix = records.prefix_allocations, .owner = .scheduler },
     .{ .prefix = records.prefix_audit_allocations, .owner = .auditor },
     .{ .prefix = records.prefix_node_status, .owner = .node_controller },
@@ -142,7 +144,8 @@ fn may_write(role: Role, key: []const u8, op: store.Op) bool {
     }
 }
 
-/// An agent writes `/nodes/<its node>`, `/node-store/<its node>` and `/observed/<its node>/…`.
+/// An agent writes `/nodes/<its node>`, `/node-store/<its node>`, `/observed/<its node>/…` and
+/// `/pulls/<its node>/…`.
 /// The node controller also
 /// removes a lost node's observed records (authority.md §3), and only removes them.
 fn agent_may_write(role: Role, prefix: []const u8, key: []const u8, op: store.Op) bool {
@@ -150,13 +153,18 @@ fn agent_may_write(role: Role, prefix: []const u8, key: []const u8, op: store.Op
     if (std.mem.eql(u8, prefix, records.prefix_observed)) {
         if (role == .node_controller) return op == .delete;
     }
+    // Retention drops a node's old pull records, and only drops them.
+    if (std.mem.eql(u8, prefix, records.prefix_pulls)) {
+        if (role == .retention) return op == .delete;
+    }
     const node = switch (role) {
         .agent => |node| node,
         else => return false,
     };
     if (std.mem.eql(u8, prefix, records.prefix_nodes)) return std.mem.eql(u8, rest, node);
     if (std.mem.eql(u8, prefix, records.prefix_node_store)) return std.mem.eql(u8, rest, node);
-    assert(std.mem.eql(u8, prefix, records.prefix_observed));
+    assert(std.mem.eql(u8, prefix, records.prefix_observed) or
+        std.mem.eql(u8, prefix, records.prefix_pulls));
     if (!std.mem.startsWith(u8, rest, node)) return false;
     return rest.len > node.len and rest[node.len] == '/';
 }
@@ -217,6 +225,7 @@ const samples = [_]struct { key: []const u8, role: Role }{
     .{ .key = "/nodes/n1", .role = .{ .agent = "n1" } },
     .{ .key = "/node-store/n1", .role = .{ .agent = "n1" } },
     .{ .key = "/observed/n1/hello-1", .role = .{ .agent = "n1" } },
+    .{ .key = "/pulls/n1/b3:51aa9c03", .role = .{ .agent = "n1" } },
 };
 
 const every_role = [_]Role{
@@ -298,6 +307,18 @@ test "an agent writes only its own node and its own observed records" {
         try testing.expect(verdict == .refused);
         try testing.expectEqualStrings(key, verdict.refused.key);
     }
+}
+
+test "an agent writes its own pulls only, and retention may delete them but never write them" {
+    // Goal: /pulls/<node>/<tree> is the node's agent's (C2 slice 7), kept down by retention.
+    const role: Role = .{ .agent = "n1" };
+    const own = "/pulls/n1/b3:51aa9c03";
+    try testing.expect(allowed(role, request_of(&.{put_op(own)})) == .allowed);
+    const other = [_][]const u8{ "/pulls/n2/b3:51aa9c03", "/pulls/n10/x", "/pulls/n1", "/pulls/" };
+    for (other) |key| try testing.expect(allowed(role, request_of(&.{put_op(key)})) == .refused);
+    try testing.expect(allowed(.retention, request_of(&.{.{ .delete = own }})) == .allowed);
+    try testing.expect(allowed(.retention, request_of(&.{put_op(own)})) == .refused);
+    try testing.expect(allowed(.scheduler, request_of(&.{.{ .delete = own }})) == .refused);
 }
 
 test "one stray operation refuses the whole transaction and names the key and its owner" {

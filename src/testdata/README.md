@@ -15,3 +15,9 @@ added `source`; `Service` and `Replica` are version 2 in it): `zcube-server` on 
 `limits`, one replica killed with `kill -9` and replaced (`hello-1` by `hello-4`), and `ghost`
 applied with an unknown digest. `store_live` was dumped with Python's `sqlite3`, one
 `key<TAB>value` per line, unedited. Never regenerate it: it is the proof that version 2 still reads.
+
+`c2_pulls.txt` holds the three `/pulls/` rows a C2 slice-7 `zig build swarm-smoke` run left in the
+server's SQLite store (commit `7bceea3` plus the slice's fixes): node2 from the registry, node1
+from node2, node3 from node2 with node1 struck. The rows are what the server stored (each agent's
+`--report` file, parsed and encoded again by `agent_api.pull`), dumped with Python's `sqlite3`,
+one `key<TAB>value` per line, unedited. Never regenerate it: it is the proof that `Pull` v1 reads.

@@ -61,6 +61,7 @@ pub const prefix_allocations = "/allocations/";
 pub const prefix_audit_allocations = "/audit/allocations/";
 pub const prefix_node_status = "/node-status/";
 pub const prefix_node_store = "/node-store/";
+pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
 
@@ -103,6 +104,19 @@ pub fn node_key(name: []const u8) Key {
 pub fn node_store_key(name: []const u8) Key {
     assert(name_problem(name, constants.node_name_bytes_max) == null);
     return Key.build(&.{ prefix_node_store, name });
+}
+
+/// `/pulls/<node>/<tree>`: the record of the last pull of a tree on a node.
+pub fn pull_key(node: []const u8, tree: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    assert(tree.len > 0);
+    assert(tree.len <= constants.tree_digest_bytes);
+    return Key.build(&.{ prefix_pulls, node, "/", tree });
+}
+
+pub fn pull_prefix(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_pulls, node, "/" });
 }
 
 pub fn decision_key(id: []const u8) Key {
@@ -354,6 +368,30 @@ pub const NodeStore = struct {
     omitted: u32 = 0,
 };
 
+/// Bytes one peer gave a pull.
+pub const PullPeer = struct { peer: []const u8, bytes: u64 };
+
+/// `/pulls/<node>/<tree>`: what the last pull of a tree on a node moved, by source (docs/keys.md,
+/// owner decision O6, C2 slice 7). Written by the node's agent from the fetch worker's report
+/// and never read by a controller: it is statistics, so a missing or stale record can change
+/// nothing but `zcube stats pull`. A later pull of the same tree replaces it.
+pub const Pull = struct {
+    v: u32 = 1,
+    node: []const u8,
+    /// The tree's digest as the pull was asked for it.
+    tree: []const u8,
+    /// Bytes the registry gave.
+    registry_bytes: u64 = 0,
+    /// Bytes each peer gave, by the peer's node name; a peer that gave none is left out.
+    peer_bytes: []const PullPeer = &.{},
+    /// Bytes the node already held, so nothing moved for them.
+    cached_bytes: u64 = 0,
+    started_at_ms: u64 = 0,
+    finished_at_ms: u64 = 0,
+    /// Peers the pull struck for a chunk that did not match its hash (ZC-W0601).
+    bad_peers: []const []const u8 = &.{},
+};
+
 pub const ObservedStatus = enum { starting, running, stopped };
 
 pub const ExitKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
@@ -548,6 +586,11 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
 /// Parses the value of `kv` as a `T`. A value that is not one is ZC-E0301 naming the key.
 pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag) Error!T {
     assert(kv.key.len > 0);
+    // The agent endpoint refuses a larger pull record; a row that holds one was not written
+    // through it, and parsing it would cost the arena several times its size.
+    if (T == Pull and kv.value.len > constants.pull_record_bytes_max) {
+        return malformed(diag, kv.key, @typeName(T));
+    }
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
     if (@hasField(T, "v")) {
         // The version comes before the shape: a newer release may have changed the shape.
@@ -559,10 +602,27 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         const known = version_current(T);
         if ((head.v orelse 0) > known) return too_new(diag, kv.key, head.v.?, known);
     }
-    return std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
+    const record = std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
         if (err == error.OutOfMemory) return failures.no_memory(diag);
         return malformed(diag, kv.key, @typeName(T));
     };
+    // The agent endpoint refuses these; a row that holds one anyway was not written through it.
+    if (T == Pull and !pull_peers_named(record)) return malformed(diag, kv.key, @typeName(T));
+    return record;
+}
+
+/// Whether a pull record names at most `pull_peers_max` peers in each list and every one is a
+/// node name.
+fn pull_peers_named(record: Pull) bool {
+    if (record.peer_bytes.len > constants.pull_peers_max) return false;
+    if (record.bad_peers.len > constants.pull_peers_max) return false;
+    for (record.peer_bytes) |sent| {
+        if (name_problem(sent.peer, constants.node_name_bytes_max) != null) return false;
+    }
+    for (record.bad_peers) |named| {
+        if (name_problem(named, constants.node_name_bytes_max) != null) return false;
+    }
+    return true;
 }
 
 /// Raises ZC-E0303: the value at `key` was written in a newer format than this release reads.
@@ -1034,6 +1094,103 @@ test "records a C1 build wrote still read" {
     for (seen) |count| try testing.expect(count > 0);
 }
 
+/// `/pulls/` rows captured from a real swarm-smoke run (src/testdata/README.md).
+const c2_pulls = @embedFile("testdata/c2_pulls.txt");
+
+test "a pull record naming a peer that is not a node name does not read" {
+    // Goal: the read side of the agent endpoint's name check. Method: a row stored with a bad
+    // name in `peer_bytes`, one in `bad_peers`, and a good row; only the good one reads.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const head = "{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:1\",";
+    const bad_sent = head ++ "\"peer_bytes\":[{\"peer\":\"a b\",\"bytes\":1}]}";
+    const bad_struck = head ++ "\"bad_peers\":[\"<script>\"]}";
+    const good = head ++
+        "\"peer_bytes\":[{\"peer\":\"node2\",\"bytes\":1}],\"bad_peers\":[\"node3\"]}";
+    const key = "/pulls/node1/b3:1";
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, bad_sent), &diag));
+    try testing.expect(diag.code == .E0301);
+    diag.reset();
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, bad_struck), &diag));
+    diag.reset();
+    const record = try read(Pull, arena, kv_of(key, good), &diag);
+    try testing.expectEqualStrings("node2", record.peer_bytes[0].peer);
+}
+
+test "a pull record over the size bound or naming too many peers does not read" {
+    // Goal: the read side of the agent endpoint's size and peer-count checks. Method: a valid row
+    // padded past `pull_record_bytes_max` (before parsing), one with `pull_peers_max` + 1 peers,
+    // and the same row at the bounds, which reads.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const key = "/pulls/node1/b3:1";
+    const head = "{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:1\",\"bad_peers\":[";
+    var rows: [3][]const u8 = undefined;
+    var at: usize = 0;
+    var many: std.ArrayList(u8) = .empty;
+    try many.appendSlice(arena, head);
+    for (0..constants.pull_peers_max + 1) |index| {
+        if (index > 0) try many.append(arena, ',');
+        try many.appendSlice(arena, "\"node2\"");
+        if (index == constants.pull_peers_max - 1) {
+            try many.appendSlice(arena, "]}");
+            rows[at] = try arena.dupe(u8, many.items); // Exactly the bound: reads.
+            at += 1;
+            many.shrinkRetainingCapacity(many.items.len - 2);
+            try many.append(arena, ',');
+        }
+    }
+    try many.appendSlice(arena, "]}");
+    rows[at] = many.items; // One past the bound.
+    const padded = try arena.alloc(u8, constants.pull_record_bytes_max + 1);
+    @memset(padded, ' ');
+    @memcpy(padded[0..rows[0].len], rows[0]); // A valid record followed by spaces: too long.
+    _ = try read(Pull, arena, kv_of(key, rows[0]), &diag);
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, rows[1]), &diag));
+    diag.reset();
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, padded), &diag));
+    try testing.expect(diag.code == .E0301);
+}
+
+test "pull records a real run wrote still read" {
+    // Goal: Pull v1 as stored reads under its own key. Method: read each captured row as a `Pull`,
+    // check the key is the one its node and tree give, and check the bytes by source.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    var rows: u32 = 0;
+    var struck: u32 = 0;
+    var lines = std.mem.splitScalar(u8, c2_pulls, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t').?;
+        const kv = kv_of(line[0..tab], line[tab + 1 ..]);
+        const record = try read(Pull, arena, kv, &diag);
+        try testing.expectEqual(@as(u32, 1), record.v);
+        try testing.expectEqualStrings(pull_key(record.node, record.tree).slice(), kv.key);
+        try testing.expectEqual(@as(u64, 1353576), record.registry_bytes + sum_peers(record));
+        try testing.expect(record.finished_at_ms >= record.started_at_ms);
+        struck += @intCast(record.bad_peers.len);
+        rows += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), rows);
+    try testing.expectEqual(@as(u32, 1), struck);
+}
+
+fn sum_peers(record: Pull) u64 {
+    var total: u64 = 0;
+    for (record.peer_bytes) |peer| total += peer.bytes;
+    return total;
+}
+
 test "a newer version is refused with ZC-E0303, not as malformed" {
     // Goal: a value from a newer release is named and left alone. Method: bump the version of a
     // real record, and of a kind that is still at 1.
@@ -1133,7 +1290,7 @@ test "the version a record is written in is the version the reader accepts" {
     diag.reset();
     inline for (.{
         Service, Replica,       Node,     Observed,   Assigned,  Allocation, Audit, NodeStatus,
-        Summary, ReplicaNumber, Decision, IndexEntry, NodeStore,
+        Summary, ReplicaNumber, Decision, IndexEntry, NodeStore, Pull,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);
