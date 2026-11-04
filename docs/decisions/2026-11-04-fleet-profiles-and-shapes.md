@@ -39,7 +39,11 @@ loses operations, never nodes).
   with nodes and replicas (ReleaseSafe, 3 nodes: 100 operations 1.3 s, 400 6.7 s, 800 24 s; 12
   nodes 2.8 s / 11.7 s / 43 s). 5,000 would take tens of minutes a run, the range deadline is 100
   seeds in 1 hour. Two earlier caps (1,500 and 1,000 operations, replicas up to 800 %) left
-  8-10 of 100 seeds above 120 s each; the shipped ones are in the numbers below.
+  8-10 of 100 seeds above 120 s each; the shipped ones were timed on seeds 1..100 with `auto` (four runs in parallel on four cores,
+  ReleaseSafe, each run cut at 120 s): mean 14 s a run counting the cut ones as 120 s, 4 cut
+  (seeds 12, 27, 44, 69, all `partitions`: 164 s for seed 44, which `mixed` runs in 71 s), none
+  failed. That is about 25-30 minutes a range of 100 run one after the other, inside the
+  hour; `partitions` with many nodes is the slow corner and the first knob to turn.
 - **Lease ttl is drawn from 5,000 ms, not just above the fence margin (3,000).** See the bug.
 - `cost_max`, `operations_max` and `long_share_denominator` are constants in `sim_shape.zig`;
   raising them is one line, and the next release should re-measure.
