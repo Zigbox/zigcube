@@ -76,7 +76,9 @@ fn ask(s: store.Store) !u64 {
     std.debug.print("pull stats worst case: used_bytes {d} of {d}\n", .{
         bounded.used_bytes, constants.request_arena_bytes_max,
     });
-    if (response.status != 200) std.debug.print("{s}\n", .{response.body[0..@min(response.body.len, 600)]});
+    if (response.status != 200) {
+        std.debug.print("{s}\n", .{response.body[0..@min(response.body.len, 600)]});
+    }
     try testing.expectEqual(@as(u16, 200), response.status);
     try testing.expect(std.mem.indexOf(u8, response.body, "\"truncated\":true") != null);
     // At least twice the room it needs.
