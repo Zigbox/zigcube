@@ -27,7 +27,10 @@ const peer_serve = @import("peer_serve.zig");
 const peer_stream = @import("peer_stream.zig");
 const records = @import("records.zig");
 const store_failures = @import("store_failures.zig");
+const zigbox = @import("zigbox");
+const zigbox_fetch = @import("zigbox_fetch.zig");
 
+const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
 const ChunkRef = fetch_plan.ChunkRef;
 const Source = fetch_plan.Source;
@@ -60,6 +63,8 @@ pub const Net = struct {
     bad_lists: u32 = 0,
     /// The registry sent a reply larger than `reply_bytes`: refused, and said in ZC-E0601.
     oversize: bool = false,
+    /// Zigbox mode: the image record named a manifest other than the assignment's.
+    refused_record: bool = false,
     /// Times a peer answered that it was busy (counts for tests and the log line).
     busy_seen: u32 = 0,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
@@ -78,6 +83,23 @@ pub const Net = struct {
             .sleep_fn = sleep,
             .blame_fn = blame,
             .bad_list_fn = bad_list,
+            .bundle_fn = bundle,
+        };
+    }
+
+    /// A peer's bundle of the tree (`zigbox_fetch`), into `out`. Only peers have one.
+    fn bundle(context: *anyopaque, source: Source, digest: []const u8, out: []u8) ?[]const u8 {
+        const net = from(context);
+        const index = switch (source) {
+            .registry => return null,
+            .peer => |index| index,
+        };
+        var target: [128]u8 = undefined;
+        const prefix = peer_serve.path_bundle;
+        const path = std.fmt.bufPrint(&target, "{s}{s}", .{ prefix, digest }) catch return null;
+        return switch (net.peer_get(index, path, out)) {
+            .bytes => |bytes| bytes,
+            .refused, .timeout, .busy => null,
         };
     }
 
@@ -504,6 +526,10 @@ pub const Args = struct {
     state_dir: []const u8 = "",
     images_dir: []const u8 = "",
     digest: []const u8 = "",
+    /// Zigbox mode: the absolute root of the node's Zigbox store (instead of `images_dir`) and
+    /// the manifest of the assignment's digest-pinned image, `sha256:HEX`.
+    zigbox_store: []const u8 = "",
+    manifest: []const u8 = "",
     registry: ?IpAddress = null,
     /// zcube-server: where the peers and their chunk filters are read (`/node-store/`).
     server: ?IpAddress = null,
@@ -527,6 +553,10 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.state_dir = value;
         } else if (std.mem.eql(u8, flag, "--images-dir")) {
             parsed.images_dir = value;
+        } else if (std.mem.eql(u8, flag, "--zigbox-store")) {
+            parsed.zigbox_store = value;
+        } else if (std.mem.eql(u8, flag, "--manifest")) {
+            parsed.manifest = value;
         } else if (std.mem.eql(u8, flag, "--digest")) {
             parsed.digest = value;
         } else if (std.mem.eql(u8, flag, "--registry")) {
@@ -538,8 +568,17 @@ pub fn parse(args: []const []const u8) ?Args {
         } else return null;
     }
     const complete = parsed.node.len > 0 and parsed.state_dir.len > 0 and
-        parsed.images_dir.len > 0 and parsed.registry != null;
+        parsed.registry != null;
     if (!complete or !digest_valid(parsed.digest)) return null;
+    if (parsed.zigbox_store.len > 0) {
+        // Zigbox mode: the store and the manifest come together; the digest is a full one.
+        if (parsed.images_dir.len > 0 or parsed.digest.len != constants.tree_digest_bytes) {
+            return null;
+        }
+        if (Zsha256.parse(parsed.manifest) == null) return null;
+        return parsed;
+    }
+    if (parsed.images_dir.len == 0 or parsed.manifest.len > 0) return null;
     return parsed;
 }
 
@@ -593,7 +632,8 @@ fn parse_address(text: []const u8) ?IpAddress {
     return IpAddress.parse(host, port) catch null;
 }
 
-pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR --images-dir DIR " ++
+pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
+    "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX) " ++
     "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
@@ -646,13 +686,25 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const reply = gpa.alloc(u8, reply_bytes) catch
         return no_memory(io, &diag);
     defer gpa.free(reply);
-    var store = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
-        diag.raise(.E0506);
-        diag.cause("the images directory {s} can't be used", .{parsed.images_dir});
-        diag.fix(.{ .sentence = "check the path and its permissions, and the free disk space" });
-        return finish(io, &diag, constants.exit_environment);
+    var dir: dir_images.DirImages = undefined;
+    var opened: zigbox_fetch.Opened = undefined;
+    var target: Target = undefined;
+    if (parsed.zigbox_store.len > 0) {
+        opened.open(gpa, parsed.zigbox_store) catch |err| switch (err) {
+            error.OutOfMemory => return no_memory(io, &diag),
+            error.NoStore => return unusable_images(io, &diag, parsed.zigbox_store),
+        };
+        target = .{ .zigbox = &opened };
+    } else {
+        dir = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
+            return unusable_images(io, &diag, parsed.images_dir);
+        };
+        target = .{ .dir = &dir };
+    }
+    defer switch (target) {
+        .dir => dir.close(gpa),
+        .zigbox => opened.close(),
     };
-    defer store.close(gpa);
     const conns = gpa.alloc(Conn, constants.fetch_candidates_max) catch
         return no_memory(io, &diag);
     defer gpa.free(conns);
@@ -667,14 +719,27 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
         .conns = conns,
     };
     defer net.close_peers();
-    return fetch_from(gpa, &net, &store, &parsed, &diag);
+    return fetch_from(gpa, &net, target, &parsed, &diag);
+}
+
+/// Where the tree goes: a chunk directory, or a Zigbox store (`--zigbox-store`).
+const Target = union(enum) {
+    dir: *dir_images.DirImages,
+    zigbox: *zigbox_fetch.Opened,
+};
+
+fn unusable_images(io: std.Io, diag: *diag_mod.Diag, path: []const u8) u8 {
+    diag.raise(.E0506);
+    diag.cause("the images directory {s} can't be used", .{path});
+    diag.fix(.{ .sentence = "check the path and its permissions, and the free disk space" });
+    return finish(io, diag, constants.exit_environment);
 }
 
 /// Finds the peers (the server's, then the named ones) and runs the worker over them.
 fn fetch_from(
     gpa: std.mem.Allocator,
     net: *Net,
-    store: *dir_images.DirImages,
+    target: Target,
     parsed: *const Args,
     diag: *diag_mod.Diag,
 ) u8 {
@@ -704,9 +769,19 @@ fn fetch_from(
     var report: fetch_worker.Report = .{};
     const transport = net.transport();
     const asked = infos[0..found];
-    fetch_worker.fetch(gpa, transport, store, parsed.digest, asked, .{}, &report) catch |err| {
-        return fetch_failed(net, diag, err);
-    };
+    switch (target) {
+        .dir => |store| {
+            const digest = parsed.digest;
+            fetch_worker.fetch(gpa, transport, store, digest, asked, .{}, &report) catch |err| {
+                return fetch_failed(net, diag, err);
+            };
+        },
+        .zigbox => |opened| {
+            report = fetch_zigbox(gpa, transport, opened, parsed, asked, net) catch |err| {
+                return fetch_failed(net, diag, err);
+            };
+        },
+    }
     var buffer: [256]u8 = undefined;
     const said = "zcube-agent fetch: {s} chunks {d} held {d} peers {d} registry {d} " ++
         "bad lists {d}\n";
@@ -716,6 +791,38 @@ fn fetch_from(
     }) catch return constants.exit_ok;
     std.Io.File.stdout().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
     return constants.exit_ok;
+}
+
+/// Zigbox mode: the tree by bundle and chunks from the peers into the store, its image record
+/// imported for the assignment's manifest only. The report is shaped as the directory mode's.
+fn fetch_zigbox(
+    gpa: std.mem.Allocator,
+    transport: fetch_worker.Transport,
+    opened: *zigbox_fetch.Opened,
+    parsed: *const Args,
+    infos: []const fetch_worker.PeerInfo,
+    net: *Net,
+) fetch_worker.Error!fetch_worker.Report {
+    const tree = zigbox.store.Digest.parse(parsed.digest) orelse return error.TreeUnavailable;
+    const manifest = Zsha256.parse(parsed.manifest) orelse return error.TreeUnavailable;
+    var done: zigbox_fetch.Report = .{};
+    const images = &opened.images;
+    zigbox_fetch.fetch(gpa, transport, images, tree, manifest, infos, .{}, &done) catch |err| {
+        return switch (err) {
+            error.TreeUnavailable, error.ChunkFailed, error.Deadline, error.Store => |same| same,
+            error.OutOfMemory => error.OutOfMemory,
+            error.Refused => {
+                net.refused_record = true;
+                return error.TreeUnavailable;
+            },
+        };
+    };
+    return .{
+        .chunks = done.chunks,
+        .already_held = done.already_held,
+        .peer_chunks = done.peer_chunks,
+        .bad_lists = done.bad_bundles,
+    };
 }
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
@@ -741,6 +848,9 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
         diag.cause("the registry sent a reply larger than the {d} bytes a reply may have", .{
             reply_bytes,
         });
+    }
+    if (net.refused_record) {
+        diag.cause("the image record is not for the manifest this assignment pins", .{});
     }
     switch (err) {
         error.TreeUnavailable => diag.cause("no source sent a list that hashes to the digest", .{}),
@@ -1151,4 +1261,25 @@ test "a reply past the buffer is TooLarge and a write that never drains times ou
 test "the reply buffer holds the largest tree list and a head" {
     try std.testing.expect(reply_bytes >= constants.tree_list_bytes_max + reply_head_slack_bytes);
     try std.testing.expect(reply_bytes >= constants.swarm_chunk_bytes + reply_head_slack_bytes);
+}
+
+test "zigbox mode arguments: a store and a manifest together, a full digest, no images dir" {
+    const full = "b3:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const manifest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const base = [_][]const u8{
+        "--node",     "node1",       "--state-dir", "/s",
+        "--registry", "127.0.0.1:1", "--digest",    full,
+    };
+    const ok = base ++ [_][]const u8{ "--zigbox-store", "/store", "--manifest", manifest };
+    const parsed = parse(&ok).?;
+    try std.testing.expectEqualStrings("/store", parsed.zigbox_store);
+    // The manifest is required, and so is a full digest; the two modes do not mix.
+    try std.testing.expect(parse(&(base ++ [_][]const u8{ "--zigbox-store", "/store" })) == null);
+    const mixed = ok ++ [_][]const u8{ "--images-dir", "/i" };
+    try std.testing.expect(parse(&mixed) == null);
+    var short = ok;
+    short[7] = "b3:abcdef12";
+    try std.testing.expect(parse(&short) == null);
+    const dir_mode = base ++ [_][]const u8{ "--images-dir", "/i", "--manifest", manifest };
+    try std.testing.expect(parse(&dir_mode) == null);
 }
