@@ -11,7 +11,7 @@ Status: done on `claude/c2-slice8` (ea4bea9, 7043838, 58d46c8).
   64-hex digest; the expected manifest comes from the assignment, never from the peer.
 - **CLI.** `zcube-agent fetch --zigbox-store DIR --manifest HEX --source PEER` takes the peer's
   bundle over the peer stream (16 KiB records).
-- **Fallback.** With no peer holding the tree, `fetch` calls Zigbox `pull` (`src/zigbox_pull.zig`,
+- **Fallback (superseded by 2026-11-04-c2-slice8-review-fixes.md: `fetch --source` is gone).** With no peer holding the tree, `fetch` calls Zigbox `pull` (`src/zigbox_pull.zig`,
   `pull_image`, `Pulled.blobs` carries digest, bytes, outcome).
 
 ## Follow-ups from the supervisor (same slice)

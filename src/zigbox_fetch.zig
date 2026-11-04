@@ -11,7 +11,8 @@
 //! * the image record to the manifest of the assignment's digest-pinned image, which the caller
 //!   passes in and the peer never names (`import_image`).
 //!
-//! A bundle that fails any of these is a bad list (ZC-W0602) and the next peer is tried. A
+//! A bundle that fails any of these is a bad list (ZC-W0602) and the next peer is tried. The tree
+//! records of a rejected bundle may already be in the store: they stay unrooted until gc. A
 //! peer is trusted only against the full tree digest: `Digest` has no short form.
 //!
 //! Wire format, little-endian: `ZCB1`; u32 trees, each digest[32] u32 length bytes; u32 objects,
@@ -253,7 +254,8 @@ pub const Report = struct {
     blamed: u32 = 0,
     /// Bytes by source, for `/pulls` (C2 slice 8, Z5): what each peer gave (by the place in the
     /// caller's list), what the store already held. A tree held whole is left alone, so its
-    /// bytes are not counted.
+    /// bytes are not counted. All figures are store chunk bytes (uncompressed); a registry
+    /// pull's `cached_bytes` is compressed blob bytes (`pull_report.zig`).
     peer_bytes: [constants.fetch_candidates_max]u64 = @splat(0),
     cached_bytes: u64 = 0,
     /// Bit `i` is set for a peer that sent a bundle or a chunk that failed its hash.
