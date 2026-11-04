@@ -31,6 +31,7 @@ const fetch_plan = @import("fetch_plan.zig");
 const peer = @import("peer.zig");
 const peer_limit = @import("peer_limit.zig");
 const peer_serve = @import("peer_serve.zig");
+const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_stream = @import("peer_stream.zig");
 const server_listen = @import("server_listen.zig");
 
@@ -43,6 +44,8 @@ pub const Config = struct {
     state_dir: []const u8,
     node: []const u8,
     images_path: []const u8,
+    /// An absolute path to a Zigbox store served instead of `images_path`'s chunk directory.
+    zigbox_store: ?[]const u8 = null,
     verbose: bool = false,
     /// Test fault (`<state dir>/faults/peer-corrupt`, docs/agent.md): the first byte of every chunk
     /// sent is flipped, so a peer that lies reaches its clients' hash check.
@@ -84,6 +87,8 @@ const LinkState = enum(u8) {
 const Slot = struct {
     busy: std.atomic.Value(bool) = .init(false),
     images: dir_images.DirImages = undefined,
+    /// Set when the server serves a Zigbox store: the slot's own handle on it.
+    zigbox: ?*zigbox_fetch.Opened = null,
     scratch: []u8 = &.{},
     refs: []fetch_plan.ChunkRef = &.{},
 };
@@ -135,6 +140,19 @@ pub const Server = struct {
             slot.images = dir_images.DirImages.open(io, gpa, config.images_path) catch
                 return error.Store;
             errdefer slot.images.close(gpa);
+            if (config.zigbox_store) |root| {
+                const handle = try gpa.create(zigbox_fetch.Opened);
+                errdefer gpa.destroy(handle);
+                handle.open(gpa, root) catch |err| return switch (err) {
+                    error.NoStore => error.Store,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+                slot.zigbox = handle;
+            }
+            errdefer if (slot.zigbox) |handle| {
+                handle.close();
+                gpa.destroy(handle);
+            };
             slot.scratch = try gpa.alloc(u8, peer_serve.scratch_bytes);
             errdefer gpa.free(slot.scratch);
             slot.refs = try gpa.alloc(fetch_plan.ChunkRef, constants.fetch_chunks_max);
@@ -164,6 +182,10 @@ pub const Server = struct {
 fn free_slot(slot: *Slot, io: std.Io, gpa: std.mem.Allocator) void {
     _ = io;
     slot.images.close(gpa);
+    if (slot.zigbox) |opened| {
+        opened.close();
+        gpa.destroy(opened);
+    }
     gpa.free(slot.scratch);
     gpa.free(slot.refs);
 }
@@ -458,13 +480,28 @@ fn one_request(stream: *peer_stream.Stream, slot: *Slot, corrupt_chunks: bool) b
         const prefix = "Range: ";
         if (std.mem.startsWith(u8, line, prefix)) range = line[prefix.len..];
     }
+    const target = first[space + 1 ..];
+    // A bundle can be megabytes: its buffer is mapped for this request alone (untouched pages
+    // cost nothing) and the reply is sent before it is unmapped.
+    const wants_bundle = std.mem.startsWith(u8, target, peer_serve.path_bundle);
+    const gpa = std.heap.page_allocator;
+    const bundle_buffer: []u8 = if (wants_bundle and slot.zigbox != null)
+        gpa.alloc(u8, zigbox_fetch.bundle_bytes_max) catch &.{}
+    else
+        &.{};
+    defer if (bundle_buffer.len > 0) gpa.free(bundle_buffer);
+    const seam = if (slot.zigbox) |opened|
+        zigbox_fetch.serving(&opened.images)
+    else
+        slot.images.images();
     const reply = peer_serve.answer(
-        slot.images.images(),
+        seam,
         first[0..space],
-        first[space + 1 ..],
+        target,
         range,
         slot.scratch,
         slot.refs,
+        bundle_buffer,
     );
     const is_chunk = std.mem.startsWith(u8, first[space + 1 ..], peer_serve.path_chunk);
     if (corrupt_chunks and is_chunk and reply.status == 200 and reply.body.len > 0) {

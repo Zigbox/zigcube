@@ -25,6 +25,7 @@ const Hash = chunk_summary.Hash;
 
 pub const path_trees = "/v1/peer/trees/";
 pub const path_chunk = "/v1/peer/chunk/";
+pub const path_bundle = "/v1/peer/bundle/";
 
 /// The head status of a reply from a server whose serving slots are all taken (`peer_server`).
 pub const status_busy: u16 = 503;
@@ -64,7 +65,7 @@ fn number(text: []const u8) ?u32 {
 
 /// The reply to `method target` with the `Range` header value `range_header` (null if none).
 /// `scratch` holds the body: `scratch_bytes` long. `refs` holds a tree's chunks:
-/// `fetch_chunks_max` long.
+/// `fetch_chunks_max` long. `bundle_buffer` holds a bundle (empty: this server has none).
 pub fn answer(
     images: node_store.Images,
     method: []const u8,
@@ -72,12 +73,18 @@ pub fn answer(
     range_header: ?[]const u8,
     scratch: []u8,
     refs: []ChunkRef,
+    bundle_buffer: []u8,
 ) Reply {
     assert(scratch.len >= scratch_bytes);
     assert(refs.len >= constants.fetch_chunks_max);
-    if (std.mem.startsWith(u8, target, path_trees) or std.mem.startsWith(u8, target, path_chunk)) {
-        if (!std.mem.eql(u8, method, "GET")) return fixed(405, "peer routes are read-only");
-    } else return fixed(404, "no such route");
+    const known = std.mem.startsWith(u8, target, path_trees) or
+        std.mem.startsWith(u8, target, path_chunk) or
+        std.mem.startsWith(u8, target, path_bundle);
+    if (!known) return fixed(404, "no such route");
+    if (!std.mem.eql(u8, method, "GET")) return fixed(405, "peer routes are read-only");
+    if (std.mem.startsWith(u8, target, path_bundle)) {
+        return bundle(images, target[path_bundle.len..], bundle_buffer);
+    }
     if (std.mem.startsWith(u8, target, path_trees)) {
         return tree(images, target[path_trees.len..], scratch, refs);
     }
@@ -86,6 +93,13 @@ pub fn answer(
 
 fn fixed(status: u16, message: []const u8) Reply {
     return .{ .status = status, .body = message };
+}
+
+fn bundle(images: node_store.Images, digest: []const u8, buffer: []u8) Reply {
+    // Full digests only, as for a list: a peer is trusted against the whole digest.
+    if (digest.len != constants.tree_digest_bytes) return fixed(400, "not a full tree digest");
+    const bytes = images.bundle(digest, buffer) orelse return fixed(404, "no such bundle");
+    return .{ .status = 200, .body = bytes };
 }
 
 fn tree(images: node_store.Images, digest: []const u8, scratch: []u8, refs: []ChunkRef) Reply {
@@ -214,7 +228,17 @@ const Rig = struct {
     }
 
     fn get(rig: *Rig, target: []const u8, range: ?[]const u8) Reply {
-        return answer(rig.mem.images(), "GET", target, range, rig.scratch, rig.refs);
+        return answer(rig.mem.images(), "GET", target, range, rig.scratch, rig.refs, &.{});
+    }
+
+    fn ask(
+        rig: *Rig,
+        images: node_store.Images,
+        method: []const u8,
+        target: []const u8,
+        room: []u8,
+    ) Reply {
+        return answer(images, method, target, null, rig.scratch, rig.refs, room);
     }
 
     fn chunk_path(rig: *Rig, buffer: []u8, index: usize) []const u8 {
@@ -291,7 +315,37 @@ test "a missing or damaged chunk is not served, and the server is read-only" {
     try std.testing.expectEqual(@as(u16, 404), rig.get(absent, null).status);
     try std.testing.expectEqual(@as(u16, 400), rig.get(path_chunk ++ "../../x", null).status);
     for ([_][]const u8{ "PUT", "POST", "DELETE" }) |method| {
-        const reply = answer(rig.mem.images(), method, second, null, rig.scratch, rig.refs);
+        const reply = answer(rig.mem.images(), method, second, null, rig.scratch, rig.refs, &.{});
         try std.testing.expectEqual(@as(u16, 405), reply.status);
     }
+}
+
+test "a bundle is served for a full digest only, from a store that has one" {
+    // Goal: the bundle route answers from the seam's `bundle_fn`, 404 when the store has none,
+    // 400 for a short digest, 405 for a write. Method: a store whose bundle is a fixed text.
+    const Bundles = struct {
+        fn make(_: *anyopaque, name: []const u8, out: []u8) ?[]const u8 {
+            if (out.len < 4 or !std.mem.endsWith(u8, name, "0")) return null;
+            @memcpy(out[0..4], "ZCB1");
+            return out[0..4];
+        }
+    };
+    var rig = try Rig.init();
+    defer rig.deinit();
+    var images = rig.mem.images();
+    const full: [64]u8 = @splat('0');
+    const path = path_bundle ++ "b3:" ++ full;
+    var room: [16]u8 = undefined;
+    // Without a bundle function, or without room, the store has none.
+    try std.testing.expectEqual(@as(u16, 404), rig.ask(images, "GET", path, &room).status);
+    images.bundle_fn = Bundles.make;
+    const reply = rig.ask(images, "GET", path, &room);
+    try std.testing.expectEqual(@as(u16, 200), reply.status);
+    try std.testing.expectEqualStrings("ZCB1", reply.body);
+    const none = rig.ask(images, "GET", path, &.{});
+    try std.testing.expectEqual(@as(u16, 404), none.status);
+    const short = rig.ask(images, "GET", path_bundle ++ "b3:12345678", &room);
+    try std.testing.expectEqual(@as(u16, 400), short.status);
+    const put = rig.ask(images, "PUT", path, &room);
+    try std.testing.expectEqual(@as(u16, 405), put.status);
 }

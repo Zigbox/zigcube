@@ -26,6 +26,7 @@ const constants = @import("constants.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
 const images_mod = @import("zigbox_images.zig");
+const node_store = @import("node_store.zig");
 
 const Allocator = std.mem.Allocator;
 const ChunkRef = fetch_plan.ChunkRef;
@@ -342,6 +343,49 @@ fn fetch_chunks(
     };
 }
 
+/// The seam a peer server answers from: `images` plus the bundle of a whole tree.
+pub fn serving(images: *ZigboxImages) node_store.Images {
+    var seam = images.images();
+    seam.bundle_fn = serve_bundle;
+    return seam;
+}
+
+fn serve_bundle(context: *anyopaque, tree: []const u8, out: []u8) ?[]const u8 {
+    const images: *ZigboxImages = @ptrCast(@alignCast(context));
+    const digest = Digest.parse(tree) orelse return null;
+    return encode(images.allocator, images, digest, out);
+}
+
+/// A Zigbox store at an absolute path, opened for an existing store, with its `ZigboxImages`.
+/// One thread's: a server opens one per serving slot.
+pub const Opened = struct {
+    host: zigbox.host_real.HostReal = .{},
+    store: zigbox.store.Store = undefined,
+    images: ZigboxImages = undefined,
+
+    pub const OpenError = error{ NoStore, OutOfMemory };
+
+    /// `self` must stay where it is until `close`.
+    pub fn open(self: *Opened, allocator: Allocator, root: []const u8) OpenError!void {
+        if (root.len < 2 or root[0] != '/' or root.len >= self.store.root.len) return error.NoStore;
+        self.host = .{};
+        self.store.at(self.host.interface(), root);
+        var diag: zigbox.diag.Diag = undefined;
+        diag.reset();
+        const present = zigbox.store.open.check(&self.store, .existing, &diag) catch
+            return error.NoStore;
+        if (!present) return error.NoStore;
+        self.images = ZigboxImages.open(allocator, &self.store) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Unusable => error.NoStore,
+        };
+    }
+
+    pub fn close(self: *Opened) void {
+        self.images.close();
+    }
+};
+
 // ---- Tests ------------------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -552,4 +596,24 @@ test "zigbox fetch: every cut of a bundle is refused, never read past" {
         try testing.expectError(error.BadBundle, got);
         to_b.end_claims();
     }
+}
+
+test "zigbox fetch: the serving seam gives the bundle encode makes, and none for a bad name" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try rigged(&pair, &tmp);
+    defer pair.deinit();
+    var from_a = try ZigboxImages.open(testing.allocator, &pair.a);
+    defer from_a.close();
+    const buffer = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(buffer);
+    const direct = encode(testing.allocator, &from_a, pair.tree, buffer).?;
+    const copy = try testing.allocator.dupe(u8, direct);
+    defer testing.allocator.free(copy);
+    const name = pair.tree.text();
+    const served = serving(&from_a).bundle(&name, buffer).?;
+    try testing.expectEqualSlices(u8, copy, served);
+    try testing.expect(serving(&from_a).bundle("b3:nonsense", buffer) == null);
+    try testing.expect(from_a.images().bundle("anything", buffer) == null);
 }
