@@ -9,6 +9,8 @@ covers every simulator C2 gates on.
 
 ## For C3
 
+Owner, 2026-11-04: each item below is a slice of C3. Two more ideas are parked, below.
+
 Variety before machines: each item makes a run explore states the current one never reaches.
 
 1. **Fault profiles (swarm testing).** Each run draws a profile that switches whole fault classes
@@ -20,18 +22,21 @@ Variety before machines: each item makes a run explore states the current one ne
    fail. If a canary passes, the fleet files an issue: the fleet itself has stopped detecting.
 4. **`test-store-faults` daily** on Postgres and SQLite, including the failover runs, with the
    fleet filing failures like simulator failures.
-5. **PR heads, not only main.** The fleet also runs on the head of each open PR for a few hours, so
-   a failure is found before merge, and comments on the PR.
-6. **Mixed versions.** Agents at the previous release with a server at the new one, and the other
-   way round, for rollouts: C3's own subject.
-7. **Coverage feedback.** Record which checks, faults and code paths each seed reached; bias new
+5. **Coverage feedback.** Record which checks, faults and code paths each seed reached; bias new
    seeds toward the least reached (cheap: counters in the simulator report, not a coverage tool).
-8. **Long soak.** One machine runs a single seed for hours with a growing history, for leaks,
+6. **Long soak.** One machine runs a single seed for hours with a growing history, for leaks,
    counter overflow and slow drift that short runs never see.
-9. **Shrinking and replay as artefacts.** Each filed issue carries the shrunk replay command and
+7. **Shrinking and replay as artefacts.** Each filed issue carries the shrunk replay command and
    the trace, so a fix session starts from the smallest failing run.
-10. **Rollout invariants** (C3): no more than the surge budget unavailable during a rollout, no
-    replica running a version that was never applied, a paused rollout stays paused.
+8. **Rollout invariants:** no more than the surge budget unavailable during a rollout, no replica
+   running a version that was never applied, a paused rollout stays paused.
+
+## Parked (owner, 2026-11-04: not in C3)
+
+- **PR heads, not only main.** The fleet also runs on the head of each open PR for a few hours, so
+  a failure is found before merge, and comments on the PR.
+- **Mixed versions.** Agents at the previous release with a server at the new one, and the other
+  way round, for rollouts.
 
 ## Machines
 
