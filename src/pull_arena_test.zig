@@ -1,6 +1,6 @@
 //! The worst case of `GET /v1/stats/pull` against the real request arena (`BoundedArena` of
-//! exactly `request_arena_bytes_max`), on the memory store (which copies only the page it returns) and on SQLite
-//! (which copies every key and value into the arena). Shell test: it needs SQLite and files.
+//! exactly `request_arena_bytes_max`), on the memory store (which copies only the page it
+//! returns) and on SQLite (which copies every key and value into the arena). Shell test: it needs SQLite and files.
 
 const std = @import("std");
 const testing = std.testing;
