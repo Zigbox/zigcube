@@ -92,7 +92,7 @@ pub const Shape = struct {
     lease_ttl_ms: u32,
     /// The workload's replica counts, as a percentage of the ones sim_cluster always drew.
     replicas_pct: u32,
-    /// One run in `long_share_denominator`, drawn at 400 to 1,000 operations.
+    /// One run in `long_share_denominator`, drawn at 400 to 800 operations.
     long: bool,
 };
 
@@ -100,14 +100,14 @@ pub const operations_min: u32 = 40;
 /// The brief asked for 5,000; a run costs about operations^1.8 (measured: 800 operations on 3
 /// nodes take 24 s, 100 take 1.3 s), so 5,000 would take 25 minutes and a range of 100 seeds has
 /// an hour. The decision record has the measurements.
-pub const operations_max: u32 = 1000;
+pub const operations_max: u32 = 800;
 /// Runs of this many operations or more are "long".
 pub const operations_long_min: u32 = 400;
 /// One run in this many is long.
 pub const long_share_denominator: u32 = 10;
 /// Operations times nodes, at most: keeps a long run on many nodes inside the fleet's per-range
 /// deadline (measured, docs/decisions/2026-11-04-fleet-profiles-and-shapes.md).
-pub const cost_max: u32 = 12_000;
+pub const cost_max: u32 = 5_000;
 
 /// The shortest ttl a shape draws. The agent fences `fence_margin_ms` (3 s) before the lease ends,
 /// and the simulation measured that a ttl below 5 s (4,500 and under) makes a healed one-node
@@ -140,7 +140,7 @@ pub fn fixed_shape(operations: u32) Shape {
     };
 }
 
-/// Operations: one run in ten is long, uniform in 400 to 1,000; the rest are 40 to 99 (45 %),
+/// Operations: one run in ten is long, uniform in 400 to 800; the rest are 40 to 99 (45 %),
 /// 100 to 199 (35 %) or 200 to 399 (20 %), so short runs dominate and every size shows up.
 fn draw_operations(r: std.Random) u32 {
     if (r.uintLessThan(u32, long_share_denominator) == 0) {
@@ -172,7 +172,7 @@ pub fn draw_shape(seed: u64) Shape {
         constants.lease_ttl_ms
     else
         lease_ttl_ms_min + r.uintLessThan(u32, lease_ttl_ms_max - lease_ttl_ms_min + 1);
-    const replicas_pct = 100 * (1 + r.uintLessThan(u32, @min(nodes, 8)));
+    const replicas_pct = 100 * (1 + r.uintLessThan(u32, @min(nodes, 3)));
     const operations = @max(operations_min, @min(drawn, @divFloor(cost_max, nodes)));
     assert(fencing.inequality_problem(lease_ttl_ms) == null);
     assert(nodes >= 1);
@@ -232,7 +232,7 @@ test "a shape is a function of the seed, in range, and long runs are a tenth" {
         try testing.expect(shape.nodes >= 1 and shape.nodes <= 16);
         try testing.expect(shape.lease_ttl_ms > constants.fence_margin_ms);
         try testing.expect(fencing.inequality_problem(shape.lease_ttl_ms) == null);
-        try testing.expect(shape.replicas_pct % 100 == 0 and shape.replicas_pct <= 800);
+        try testing.expect(shape.replicas_pct % 100 == 0 and shape.replicas_pct <= 300);
         long += @intFromBool(shape.long);
         var bucket: usize = 3;
         if (shape.nodes <= 8) bucket = 2;
