@@ -324,7 +324,7 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
     teeth.addArtifactArg(built.server);
     teeth.addArtifactArg(teeth_agent);
     teeth.has_side_effects = true;
-    teeth.expectExitCode(1);
+    teeth.expectExitCode(4); // swarm_smoke.exit_unverified: unverified bytes ran.
     const teeth_help = "swarm-smoke with the fetch plan's test-only fault on; it must fail";
     b.step("swarm-smoke-teeth", teeth_help).dependOn(&teeth.step);
 }

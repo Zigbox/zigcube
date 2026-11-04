@@ -165,6 +165,9 @@ const Smoke = struct {
     agents: [3]?std.process.Child = @splat(null),
     server: ?std.process.Child = null,
     failed: bool = false,
+    /// The exit code of a failure: `exit_unverified` once a replica ran on bytes that do not
+    /// hash to what the registry serves, which is what `swarm-smoke-teeth` waits for.
+    exit_code: u8 = 1,
 
     fn say(smoke: *Smoke, comptime format: []const u8, args: anytype) void {
         var buffer: [512]u8 = undefined;
@@ -482,19 +485,54 @@ fn step_third_without_registry(smoke: *Smoke) !void {
     try wait_registered(smoke, 3);
     try smoke.apply(3);
     try wait_running(smoke, 2);
+    try expect_node3_bytes(smoke);
     try expect_registry(smoke, 1, 3, "node3");
     const reached = smoke.proxy.stats().upstream_connects;
     try smoke.expect(reached == 0, "node3 reached the registry {d} times", .{reached});
     const struck = try fetch_log_has(smoke, "ZC-W0601");
     try smoke.expect(struck, "node3's fetch.log has no ZC-W0601", .{});
+    const summary = try fetch_log_has(smoke, "chunks 3 held 0 peers 3 registry 0 ");
+    try smoke.expect(summary, "node3's fetch.log has no summary of 3 chunks, all from peers", .{});
     smoke.say("node3 ran its replica with the registry cut off: node1's bad chunk was struck " ++
         "(ZC-W0601), the rest came from node2", .{});
+}
+
+/// node3 has one container, and every chunk file in its images directory hashes to the body the
+/// registry serves: a replica never ran on bytes that were not verified. A mismatch exits with
+/// `exit_unverified`.
+fn expect_node3_bytes(smoke: *Smoke) !void {
+    const arena = smoke.arena.allocator();
+    const root = try smoke.node_path(nodes[2], "state/containers");
+    var dir = try std.Io.Dir.cwd().openDir(smoke.io, root, .{ .iterate = true });
+    defer dir.close(smoke.io);
+    var containers: u32 = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(smoke.io)) |entry| {
+        if (entry.kind == .directory) containers += 1;
+    }
+    try smoke.expect(containers == 1, "node3 has {d} container directories, expected 1", .{
+        containers,
+    });
+    for (smoke.registry.hashes, smoke.registry.bodies) |hash, body| {
+        const form = "{s}/chunks/{s}";
+        const file = try std.fmt.allocPrint(arena, form, .{
+            try smoke.node_path(nodes[2], "images"), &hash,
+        });
+        const got = std.Io.Dir.cwd().readFileAlloc(smoke.io, file, arena, .limited(body.len + 1)) catch
+            null;
+        const same = if (got) |bytes| std.mem.eql(u8, bytes, body) else false;
+        if (!same) smoke.exit_code = exit_unverified;
+        try smoke.expect(same, "node3's chunk {s} is not the registry's bytes", .{hash[0..8]});
+    }
 }
 
 /// Whether some container of node3 kept `text` in its `fetch.log`.
 fn fetch_log_has(smoke: *Smoke, text: []const u8) !bool {
     return std.mem.find(u8, try smoke.fetch_log(nodes[2]), text) != null;
 }
+
+/// The exit code of a smoke that found a replica running on unverified bytes (the teeth run).
+pub const exit_unverified: u8 = 4;
 
 pub fn main(init: std.process.Init) u8 {
     const io = init.io;
@@ -544,7 +582,7 @@ fn run(smoke: *Smoke) u8 {
     script(smoke) catch |err| {
         if (!smoke.failed) smoke.say("FAILED: {s}", .{@errorName(err)});
         smoke.dump_logs();
-        return 1;
+        return smoke.exit_code;
     };
     smoke.say("ok", .{});
     return 0;
