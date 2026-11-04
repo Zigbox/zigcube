@@ -192,8 +192,14 @@ of its own, with the JDK installed there. It is an interop check, never called a
   (OpenSSL 3.0.13 here; supports Ed25519 in TLS 1.3).
 - A JVM server: a ~60-line `SSLServerSocket` program with `needClientAuth` and a trust store
   holding the CA certificate, run with the container's JDK 21 (`java Server.java`, no build).
-  JDK 15 or later does Ed25519 in TLS 1.3; the container has `openjdk 21.0.12`, `javac` and
-  `keytool` (checked 2026-11-04). The Java file is test tooling, not product (Q3).
+  **The JVM server is JDK 21**, because Botpike's broker runs on JVM 21 (supervisor, 2026-11-04);
+  JDK 21 does Ed25519 in TLS 1.3 in both directions. Where the test gets it: this container has
+  `openjdk 21.0.12` with `javac` and `keytool` (checked 2026-11-04), found as `java` on PATH or by
+  `ZCUBE_JAVA_HOME`. The harness runs `java -version` first and **fails, not skips**, if the major
+  version is not 21 (ZC diagnostic from the harness, naming the version found). CI gets it from
+  `actions/setup-java` pinned to Temurin 21 (GitHub's Ubuntu images also carry it as
+  `JAVA_HOME_21_X64`); slice 7 verifies which the runner uses. The Java file is test tooling, not
+  product (Q3).
 
 **Accepted, with the identity read back** (both servers):
 
