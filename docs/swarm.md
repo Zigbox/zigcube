@@ -71,7 +71,8 @@ The target's sketch is an input. Where the scheduler gets it is slice 5's questi
 
 `zig build sim-swarm [-Dseed=N] [-Dops=N]` runs the simulation natively and as WASM and compares
 the reports byte for byte. `zig build -Doptimize=ReleaseSafe sim-swarm-exe` installs
-`zig-out/bin/sim_swarm <seed> <ops>` or `--seeds A..B <ops>`. The seed draws a universe of 128 to 512
+`zig-out/bin/sim_swarm <seed> <ops|auto> [--profile=NAME|auto]` or
+`--seeds A..B <ops|auto> [--profile=NAME|auto] [--expect-fail]`. The seed draws a universe of 128 to 512
 chunks, 2 to 6 versions of one tree that share most chunks, 3 to 12 nodes that are honest, liars,
 silent or refusers (some with stale filters), and low byte-rate caps so they bind. Operations: a
 node fetches a version, the estimate is checked against the exact count, a node loses chunks.
@@ -80,6 +81,15 @@ Checked: a chunk is accepted exactly when its bytes are right; only a liar is st
 twice; a peer is asked only for what its filter claims, never again for a chunk it failed, never
 after a strike; the caps hold; every fetch finishes (the registry is honest) within a bound and the
 bytes by source add up; the estimate is exact when both samples are, else within 30 % of the tree.
+
+**Profiles (C3 fleet 1).** `--profile=` (`-Dswarm-profile=` in `zig build`) is `mixed` (default,
+the world every earlier build drew), `liars`, `silent`, `refusers`, `honest` or `auto` (drawn from
+the seed, weights 3 3 2 2 1). A non-mixed profile turns every peer the mix made misbehave into
+the profile's one kind (one peer if the mix drew none); `honest` makes all peers honest.
+`<ops>` = `auto` (`-Dauto-shape`) draws the operation count from the seed. The range summary
+then reads `sim-swarm: seeds A..B, drawn operations: F of T failed`. `zig build check` runs
+`sim-swarm` at 100 operations with `-Dswarm-profile=auto`.
+`docs/decisions/2026-11-04-fleet-profiles-and-shapes.md` has the weights.
 
 `zig build sim-swarm-teeth` builds the simulator with the plan's test-only fault ("accept a chunk
 without checking it", declared only by `src/sim_swarm_teeth_main.zig` as `swarm_teeth_skip_verify`)

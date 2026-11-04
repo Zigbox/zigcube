@@ -299,10 +299,12 @@ Debug because that takes 7 s where ReleaseSafe takes 50.
 **Commands.**
 
 ```
-zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]
+zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false] [-Dprofile=NAME|auto] [-Dauto-shape]
 zig build -Doptimize=ReleaseSafe sim-cluster-exe
-zig-out/bin/sim_cluster <seed> <ops> [<nodes>] [--liveness=false] [--heal-at=H]
-zig-out/bin/sim_cluster --seeds A..B <ops> [<nodes>] [--liveness=false] [--shrink] [--trace-steps]
+zig-out/bin/sim_cluster <seed> <ops|auto> [<nodes>] [--liveness=false] [--heal-at=H]
+    [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
+zig-out/bin/sim_cluster --seeds A..B <ops|auto> [<nodes>] [--liveness=false] [--shrink] [--trace-steps]
+    [--profile=NAME|auto] [--lease-ttl-ms=N] [--replicas-pct=N]
 ```
 
 The first runs one seed natively and as WASM and compares. The range form prints a line per failing
@@ -319,6 +321,21 @@ fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the te
 100 operations takes about 0.7 s natively in ReleaseSafe. The range output is what the simulation
 fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and step, so a change to
 either line's format is a change to `src/sim_fleet_issue.zig` too.
+**Profiles and shapes (C3 fleet 1).** `--profile=` is `mixed` (default: the world every earlier
+build drew, bit for bit), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
+the seed, weights 3 2 2 2 2). A profile other than `mixed` zeroes every fault class but its own
+and forces its own on. `<ops>` = `auto` (`-Dauto-shape` in `zig build`) draws the run's size from
+the seed as well: nodes 1 to 16, lease ttl 5,000 to 10,000 ms (the shipped 10 s 40 % of the time),
+replica counts 100 to 300 %, operations 40 to 99 / 100 to 199 / 200 to 399, one run in ten 400 to
+800, with operations times nodes at most 5,000. `--lease-ttl-ms=` and `--replicas-pct=` set those
+two by hand, which is what a replay line carries (with the concrete nodes, `--profile=` and
+`--heal-at=`), so a replay draws nothing. An explicit `<ops>` keeps the seed-picked node count,
+the 10 s ttl and 100 % replicas. A failing seed prints `  profile:` and `  shape:` lines after
+its `  step:` line; the fleet's parser ignores them. The `auto` range summary reads
+`sim-cluster: seeds A..B, drawn operations: F of T failed`. Lease ttls of 4,500 ms or less are
+outside the drawn space until issue #78 (a healed cluster fences again and again) is fixed; they
+still work when given by hand. Every draw has its own generator (the seed xor a salt); the
+decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.
 **Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
 that panics loses no earlier one. `--trace-steps` (either form) writes `step: <name>` to stderr,
 unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end`), so the step a
@@ -334,7 +351,7 @@ operations: 30 of 40 mark a node lost and 27 replace replicas after the grace, w
 range of seeds, not one.
 
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
-operations, native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and
+operations with `-Dprofile=auto` (the shape stays fixed), native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and
 `sim-swarm-teeth` ([swarm.md](swarm.md)).
 
 ## sim-c1
