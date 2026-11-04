@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const agent_config = @import("agent_config.zig");
 const agent_peer = @import("agent_peer.zig");
 const constants = @import("constants.zig");
 const chunk_summary = @import("chunk_summary.zig");
@@ -395,7 +396,7 @@ fn select_candidates(
             continue;
         }
         const address = (string_field(kv.value, "peer") orelse "");
-        const parsed = parse_address(address) orelse {
+        const parsed = usable_address(address) orelse {
             skipped.no_address += 1;
             continue;
         };
@@ -570,6 +571,15 @@ fn parse_peer(parsed: *Args, value: []const u8) bool {
     parsed.peers[parsed.peer_count] = .{ .name = name, .address = address };
     parsed.peer_count += 1;
     return true;
+}
+
+/// A peer address another node published: null when it is not an address or when no peer can
+/// connect to it (port 0, 0.0.0.0, ::).
+fn usable_address(text: []const u8) ?IpAddress {
+    const address = parse_address(text) orelse return null;
+    if (address.getPort() == 0) return null;
+    if (agent_config.is_unspecified(address)) return null;
+    return address;
 }
 
 /// `HOST:PORT`, or `[IPV6]:PORT`.
@@ -905,6 +915,10 @@ test "discovery keeps the nodes it can use and counts the rest" {
         .{ "node6", "not-an-address", test_filter },
         .{ "node7", "127.0.0.1:7", "zzzzzzzzzzzzzzzz" },
         .{ "node8", "127.0.0.1:8", "00ff" },
+        .{ "node9", "0.0.0.0:9", test_filter },
+        .{ "node10", "[::]:10", test_filter },
+        .{ "node11", "127.0.0.1:0", test_filter },
+        .{ "node12", "[::ffff:0.0.0.0]:12", test_filter },
     });
     var peers: [constants.fetch_candidates_max]Peer = undefined;
     var infos: [constants.fetch_candidates_max]fetch_worker.PeerInfo = undefined;
@@ -918,11 +932,11 @@ test "discovery keeps the nodes it can use and counts the rest" {
     try std.testing.expectEqual(@as(usize, 8), infos[0].filter.len);
     try std.testing.expectEqual(@as(u32, 1), skipped.self_node);
     try std.testing.expectEqual(@as(u32, 2), skipped.bad_name);
-    try std.testing.expectEqual(@as(u32, 2), skipped.no_address);
+    try std.testing.expectEqual(@as(u32, 6), skipped.no_address);
     try std.testing.expectEqual(@as(u32, 2), skipped.no_filter);
     var line: [320]u8 = undefined;
     const said = describe_skipped(&line, skipped);
-    try std.testing.expect(std.mem.startsWith(u8, said, "zcube-agent fetch: left out 7 nodes ("));
+    try std.testing.expect(std.mem.startsWith(u8, said, "zcube-agent fetch: left out 11 nodes ("));
     try std.testing.expect(std.mem.find(u8, said, "2 with a name that is not a node name") != null);
 }
 

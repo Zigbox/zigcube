@@ -58,14 +58,26 @@ const Link = struct {
     fd: std.posix.fd_t = -1,
     /// The source key of the connection (`source_key`), valid while `busy`.
     source: u64 = 0,
-    /// True once the handshake succeeded: until then the connection is a stranger's, and one
-    /// source may hold only one such link (`admit`).
-    authenticated: std.atomic.Value(bool) = .init(false),
     /// When the connection was admitted (`peer_stream.boot_ms`), for evicting the oldest stranger.
     started_ms: u64 = 0,
-    /// Whether `fd` is open: 0 closed, 1 open, 2 being shut down by `evict_oldest`. The task that
-    /// serves the link closes the fd by moving 1 to 0, so an evictor never touches a reused fd.
-    fd_state: std.atomic.Value(u8) = .init(0),
+    /// One atomic state for the fd and who it belongs to; see `LinkState`.
+    state: std.atomic.Value(LinkState) = .init(.closed),
+};
+
+/// The state of a link's connection. Moves: `closed` to `stranger` (`start_link`); `stranger` to
+/// `authenticated` by the link's task, or `stranger` to `evicting` by `evict_oldest`, and
+/// whoever loses that compare-and-swap backs off; `evicting` to `evicted` once the evictor has
+/// shut the fd down; any open state to `closed` by the link's own task, which alone closes the fd.
+const LinkState = enum(u8) {
+    closed,
+    /// Open, handshake not finished: one source holds one such link (`admit`).
+    stranger,
+    /// Open, handshake done: never evicted.
+    authenticated,
+    /// An evictor is calling `shutdown` on the fd.
+    evicting,
+    /// Shut down by an evictor; the task ends and closes it.
+    evicted,
 };
 
 /// The buffers of one served connection, lent to a connection once it has authenticated.
@@ -102,6 +114,8 @@ pub const Server = struct {
     refusal_log: RefusalLog = .{},
     /// How many times ZC-E0808 was shown, for tests.
     refusals_shown: u32 = 0,
+    /// Strangers shut down to make room for a newcomer (`evict_oldest`).
+    evictions: std.atomic.Value(u32) = .init(0),
 
     pub const StartError = error{ Listen, NoThreads, OutOfMemory, Store };
 
@@ -257,11 +271,12 @@ fn admit(server: *Server, fd: std.posix.fd_t, storage: *const Storage, io: std.I
         if (link.busy.load(.acquire)) continue;
         return start_link(server, link, fd, source, io);
     }
-    // Every link is taken. Silent strangers must not lock honest peers out: the oldest link that
-    // has not authenticated is shut down, its task ends and frees the link the usual way, and
-    // the newcomer takes it.
+    // Every link is taken. Silent strangers must not lock honest peers out: the oldest stranger
+    // that is old enough (`peer_handshake_evict_min_ms`) is shut down, its task ends and frees
+    // the link the usual way, and the newcomer takes it.
     if (evict_oldest(server, io)) |link| return start_link(server, link, fd, source, io);
-    _ = std.os.linux.close(fd); // Every link is authenticated and serving: the peer tries again.
+    // None can be evicted (all authenticated or too young): the peer tries again.
+    _ = std.os.linux.close(fd);
 }
 
 fn start_link(server: *Server, link: *Link, fd: std.posix.fd_t, source: u64, io: std.Io) void {
@@ -271,11 +286,10 @@ fn start_link(server: *Server, link: *Link, fd: std.posix.fd_t, source: u64, io:
     link.fd = fd;
     link.source = source;
     link.started_ms = peer_stream.boot_ms(io);
-    link.authenticated.store(false, .release);
-    link.fd_state.store(1, .release);
+    link.state.store(.stranger, .release);
     link.busy.store(true, .release);
     link.future = io.concurrent(serve, .{ server, link }) catch {
-        link.fd_state.store(0, .release);
+        link.state.store(.closed, .release);
         link.busy.store(false, .release);
         _ = std.os.linux.close(fd);
         return;
@@ -285,37 +299,51 @@ fn start_link(server: *Server, link: *Link, fd: std.posix.fd_t, source: u64, io:
 /// How long `evict_oldest` waits for the shut-down task to free its link.
 const evict_wait_ms = 500;
 
-/// Shuts down the oldest unauthenticated connection and returns its link once free, or null if
-/// every link is authenticated (or the task did not end in time).
+/// Shuts down the oldest stranger that is at least `peer_handshake_evict_min_ms` old and returns
+/// its link once free. Null when every link is authenticated or too young to evict, or the task
+/// did not end in time. An authenticated link is never touched: the state moves from `stranger`
+/// only by compare-and-swap, so a link whose task has just authenticated is passed over.
 fn evict_oldest(server: *Server, io: std.Io) ?*Link {
-    var oldest: ?*Link = null;
-    for (&server.links) |*link| {
-        if (!link.busy.load(.acquire)) return link; // Freed meanwhile.
-        if (link.authenticated.load(.acquire)) continue;
-        if (oldest) |best| {
-            if (link.started_ms >= best.started_ms) continue;
+    const now = peer_stream.boot_ms(io);
+    var attempts: u32 = 0;
+    while (attempts < constants.peer_handshakes_max) : (attempts += 1) {
+        var oldest: ?*Link = null;
+        for (&server.links) |*link| {
+            if (!link.busy.load(.acquire)) return link; // Freed meanwhile.
+            if (link.state.load(.acquire) != .stranger) continue;
+            if (now -| link.started_ms < constants.peer_handshake_evict_min_ms) continue;
+            if (oldest) |best| {
+                if (link.started_ms >= best.started_ms) continue;
+            }
+            oldest = link;
         }
-        oldest = link;
-    }
-    const link = oldest orelse return null;
-    if (link.fd_state.cmpxchgStrong(1, 2, .acq_rel, .acquire) == null) {
+        const link = oldest orelse return null;
+        const won = link.state.cmpxchgStrong(.stranger, .evicting, .acq_rel, .acquire);
+        if (won != null) continue; // It authenticated or ended first: look again.
         _ = std.os.linux.shutdown(link.fd, std.os.linux.SHUT.RDWR);
-        link.fd_state.store(1, .release);
+        link.state.store(.evicted, .release);
+        _ = server.evictions.fetchAdd(1, .monotonic);
+        const deadline = peer_stream.boot_ms(io) + evict_wait_ms;
+        while (link.busy.load(.acquire)) {
+            if (peer_stream.boot_ms(io) >= deadline) return null;
+            io.sleep(.fromMilliseconds(1), .awake) catch return null;
+        }
+        return link;
     }
-    var waited: u32 = 0;
-    while (link.busy.load(.acquire)) : (waited += 1) {
-        if (waited >= evict_wait_ms) return null;
-        io.sleep(.fromMilliseconds(1), .awake) catch return null;
-    }
-    return link;
+    return null;
 }
 
 /// Closes the link's fd once, after any evictor has finished with it.
 fn close_link_fd(link: *Link) void {
     while (true) {
-        if (link.fd_state.cmpxchgWeak(1, 0, .acq_rel, .acquire) == null) break;
-        if (link.fd_state.load(.acquire) == 0) return;
-        std.atomic.spinLoopHint();
+        const seen = link.state.load(.acquire);
+        switch (seen) {
+            .closed => return,
+            .evicting => std.atomic.spinLoopHint(),
+            .stranger, .authenticated, .evicted => {
+                if (link.state.cmpxchgWeak(seen, .closed, .acq_rel, .acquire) == null) break;
+            },
+        }
     }
     _ = std.os.linux.close(link.fd);
 }
@@ -325,7 +353,8 @@ fn handshake_pending(server: *Server, source: u64) bool {
     for (&server.links) |*link| {
         if (!link.busy.load(.acquire)) continue;
         if (link.source != source) continue;
-        if (!link.authenticated.load(.acquire)) return true;
+        const state = link.state.load(.acquire);
+        if (state != .authenticated and state != .closed) return true;
     }
     return false;
 }
@@ -391,7 +420,8 @@ fn serve(server: *Server, link: *Link) void {
         return;
     };
     defer stream.deinit();
-    link.authenticated.store(true, .release);
+    // Lost to an evictor: the link is being shut down, so end (the fd is closed below).
+    if (link.state.cmpxchgStrong(.stranger, .authenticated, .acq_rel, .acquire) != null) return;
     const slot = claim_slot(server) orelse return tell_busy(&stream);
     defer slot.busy.store(false, .release);
     var count: u32 = 0;
@@ -794,8 +824,7 @@ test "silent connections from more sources than there are serving slots do not l
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    try io.sleep(.fromMilliseconds(200), .awake);
-    try std.testing.expectEqual(@as(u32, silent.len), busy_links(&rig.server));
+    try wait_busy(io, &rig.server, silent.len);
     try expect_served(&rig, address);
 }
 
@@ -830,9 +859,68 @@ fn expect_served(rig: *Rig, address: net.IpAddress) !void {
     try std.testing.expectEqual(@as(u16, 200), std.mem.readInt(u16, head[0..2], .big));
 }
 
+/// Polls until `want` links are busy, up to a deadline.
+fn wait_busy(io: std.Io, server: *const Server, want: u32) !void {
+    const deadline = peer_stream.boot_ms(io) + 5000;
+    while (busy_links(server) != want) {
+        if (peer_stream.boot_ms(io) >= deadline) return error.LinksNeverBusy;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+/// Sleeps until every connection admitted so far is `peer_handshake_evict_min_ms` old.
+fn age_strangers(io: std.Io, since_ms: u64) !void {
+    const due = since_ms + constants.peer_handshake_evict_min_ms + 50;
+    while (peer_stream.boot_ms(io) < due) try io.sleep(.fromMilliseconds(10), .awake);
+}
+
+fn rig_identity(rig: *Rig) !peer.Identity {
+    const now = peer_stream.wall_ms(std.testing.io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    return .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+}
+
+/// A client that handshakes from 127.0.0.`octet` and then sits idle.
+const Idle = struct {
+    fd: std.posix.fd_t,
+    stream: peer_stream.Stream,
+
+    fn open(rig: *Rig, octet: u8, address: net.IpAddress) !Idle {
+        const io = std.testing.io;
+        var identity = try rig_identity(rig);
+        const end = peer_stream.boot_ms(io) + 3000;
+        const fd = try connect_from(io, octet, address);
+        errdefer _ = std.os.linux.close(fd);
+        const stream = try peer_stream.open_client(io, fd, &identity, "node2", end);
+        return .{ .fd = fd, .stream = stream };
+    }
+
+    fn close(idle: *Idle) void {
+        idle.stream.deinit();
+        _ = std.os.linux.close(idle.fd);
+    }
+
+    /// Asks for the rig's chunk and returns the reply status.
+    fn request(idle: *Idle, rig: *Rig) !u16 {
+        const io = std.testing.io;
+        const end = peer_stream.boot_ms(io) + 3000;
+        var target: [128]u8 = undefined;
+        var reply: [1024]u8 = undefined;
+        const path = try std.fmt.bufPrint(&target, "GET {s}{x}\n", .{ chunk_path, &rig.hash });
+        try idle.stream.send(path, end);
+        const head = try idle.stream.recv(&reply, end);
+        return std.mem.readInt(u16, head[0..2], .big);
+    }
+};
+
 test "silent connections taking every link do not lock out an honest peer" {
     // Goal: review follow-up 1. Method: `peer_handshakes_max` silent connections, one source
-    // each, hold every link; an honest handshake evicts the oldest stranger and is served.
+    // each, hold every link and age past the minimum; an honest handshake evicts the oldest
+    // stranger and is served.
     const io = std.testing.io;
     var rig: Rig = .{ .tmp = undefined, .ca = undefined };
     try rig.init();
@@ -843,9 +931,100 @@ test "silent connections taking every link do not lock out an honest peer" {
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    try io.sleep(.fromMilliseconds(300), .awake);
-    try std.testing.expectEqual(constants.peer_handshakes_max, busy_links(&rig.server));
+    const since = peer_stream.boot_ms(io);
+    try wait_busy(io, &rig.server, constants.peer_handshakes_max);
+    try age_strangers(io, since);
     try expect_served(&rig, address);
+    try std.testing.expectEqual(@as(u32, 1), rig.server.evictions.load(.monotonic));
+}
+
+test "authenticated links are never evicted, and a stranger too young to evict is not" {
+    // Goal: review S1/S2/S3. Method: two clients handshake and sit idle; the other links are
+    // silent strangers. (a) At once, the newcomer finds every stranger too young: it is closed,
+    // nothing is evicted. (b) After the minimum age it evicts a stranger and is served, and the
+    // two authenticated clients can still make a request.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    var idle: [2]Idle = undefined;
+    for (&idle, 0..) |*client, at| client.* = try Idle.open(&rig, @intCast(100 + at), address);
+    defer for (&idle) |*client| client.close();
+    var silent: [constants.peer_handshakes_max - 2]std.posix.fd_t = undefined;
+    for (&silent, 0..) |*fd, at| fd.* = try connect_from(io, @intCast(2 + at), address);
+    defer for (silent) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    const since = peer_stream.boot_ms(io);
+    try wait_busy(io, &rig.server, constants.peer_handshakes_max);
+    try std.testing.expect(peer_stream.boot_ms(io) - since < constants.peer_handshake_evict_min_ms);
+    try std.testing.expect(std.meta.isError(expect_served(&rig, address)));
+    try std.testing.expectEqual(@as(u32, 0), rig.server.evictions.load(.monotonic));
+    try age_strangers(io, since);
+    try expect_served(&rig, address);
+    try std.testing.expectEqual(@as(u32, 1), rig.server.evictions.load(.monotonic));
+    for (&idle) |*client| try std.testing.expectEqual(@as(u16, 200), try client.request(&rig));
+}
+
+test "a newcomer is closed when every link is authenticated" {
+    // Goal: review S3. Method: `peer_handshakes_max` clients handshake from sources of their own
+    // and sit idle; one more connection is closed without being served, nothing is evicted, and
+    // the clients that hold serving slots still get their chunk.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    var idle: [constants.peer_handshakes_max]Idle = undefined;
+    for (&idle, 0..) |*client, at| client.* = try Idle.open(&rig, @intCast(2 + at), address);
+    defer for (&idle) |*client| client.close();
+    try wait_busy(io, &rig.server, constants.peer_handshakes_max);
+    try std.testing.expect(std.meta.isError(expect_served(&rig, address)));
+    try std.testing.expectEqual(@as(u32, 0), rig.server.evictions.load(.monotonic));
+    for (idle[0..constants.peer_connections_max]) |*client| {
+        try std.testing.expectEqual(@as(u16, 200), try client.request(&rig));
+    }
+}
+
+test "an eviction whose task never ends gives up after the wait, and skips an authenticated link" {
+    // Goal: review S3, the wait-timeout path, and S1's losing side. Method: every link is made
+    // busy by hand with no task behind it: one old stranger on a socket pair, the rest
+    // authenticated. The evictor shuts the stranger down, waits `evict_wait_ms` and answers
+    // null; with the stranger authenticated too, it answers null at once and touches nothing.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    var pair: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &pair),
+    );
+    defer for (pair) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    const links = &rig.server.links;
+    for (links) |*link| {
+        link.state.store(.authenticated, .release);
+        link.busy.store(true, .release);
+    }
+    defer for (links) |*link| {
+        link.busy.store(false, .release);
+        link.state.store(.closed, .release);
+    };
+    try std.testing.expect(evict_oldest(&rig.server, io) == null);
+    try std.testing.expectEqual(@as(u32, 0), rig.server.evictions.load(.monotonic));
+    links[7].fd = pair[0];
+    links[7].started_ms = 0;
+    links[7].state.store(.stranger, .release);
+    const before = peer_stream.boot_ms(io);
+    try std.testing.expect(evict_oldest(&rig.server, io) == null);
+    try std.testing.expect(peer_stream.boot_ms(io) - before >= evict_wait_ms);
+    try std.testing.expectEqual(LinkState.evicted, links[7].state.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), rig.server.evictions.load(.monotonic));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.read(pair[1], &byte, 1));
 }
 
 test "an authenticated peer finding every serving slot taken is told busy" {
