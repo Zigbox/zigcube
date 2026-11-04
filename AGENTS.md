@@ -126,6 +126,11 @@ A release (a tag, and any milestone that ships) is cut only from a commit that i
 The release PR (or the supervisor's report) quotes the fleet's tracker line, the Jepsen result
 when it applies, and both review verdicts.
 
+Every release also gets a quick retro, written by the supervisor within a day of the release and
+kept short: what assumptions turned out to be off base, what each cost, and what changes because
+of it. It goes in `docs/retros/<version>.md` (one file per release), and any rule it changes lands
+in this file or `docs/decisions/` in the same PR.
+
 ## Git
 
 - Develop on the branch you were given and commit in small, meaningful steps, signed off (`git commit -s`, DCO). Licence is Apache 2.0; there is no CLA.
