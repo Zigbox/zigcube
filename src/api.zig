@@ -492,9 +492,15 @@ const Out = struct {
     json: std.json.Stringify,
 
     fn create(ctx: *const Context) error{OutOfMemory}!*Out {
+        return create_sized(ctx, 0);
+    }
+
+    /// As `create`, with room for `bytes` of output taken at once: an arena frees nothing, so a
+    /// buffer that grows leaves each smaller one behind. The output may still outgrow `bytes`.
+    fn create_sized(ctx: *const Context, bytes: usize) error{OutOfMemory}!*Out {
         const out = try ctx.arena.create(Out);
         out.ctx = ctx;
-        out.buffer = .init(ctx.arena);
+        out.buffer = try .initCapacity(ctx.arena, bytes);
         out.json = .{ .writer = &out.buffer.writer };
         return out;
     }
@@ -823,7 +829,8 @@ const Call = struct {
         const order = ctx.arena.alloc(u32, found.items.len) catch return no_memory(ctx);
         for (order, 0..) |*slot, at| slot.* = @intCast(at);
         std.mem.sort(u32, order, found.items, pull_newer);
-        const out = Out.create(ctx) catch return no_memory(ctx);
+        const out = Out.create_sized(ctx, constants.pulls_response_bytes) catch
+            return no_memory(ctx);
         try out.begin_object();
         try out.field("pulls");
         try out.begin_array();

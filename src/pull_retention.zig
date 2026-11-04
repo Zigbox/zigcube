@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const codes = @import("diag/codes.zig");
+const diag_mod = @import("diag.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
@@ -37,15 +37,20 @@ pub const Cursor = struct {
     resuming: bool = false,
     /// Pull records dropped (counted when the delete is attempted), for tests and the shell.
     dropped: u64 = 0,
-    /// Whether the last pass failed, how many have, and the code of the last failure: statistics
+    /// Whether the last pass failed, how many have, and the last failure whole: statistics
     /// must not stop replica work, so a failure is kept here for the shell to say once.
     failing: bool = false,
     failures: u64 = 0,
-    failure_code: ?codes.Code = null,
+    /// The last failure's diagnostic, cause and fix; meaningful only while `failing`.
+    failure: diag_mod.Diag = undefined,
 };
 
 /// `prune` for the replica controller: a failed pass is recorded in `cursor` and retried after
-/// `pulls_retry_ms`, and its diagnostic is cleared, so nothing else in the step is held back.
+/// `pulls_retry_ms`, and its diagnostic is moved into the cursor and cleared from `ctx`, so
+/// nothing else in the step is held back. Every error path of `prune` sets a diagnostic code (the
+/// assertion relies on it): the store's and the records' errors are coded where they arise. A
+/// `VerifiedStore` halt (ZC-E0215) comes out of here as an ordinary failure too, and the next
+/// step's `status` call reports it, so this function never has to.
 pub fn prune_or_back_off(ctx: *const Context, cursor: *Cursor, now_ms: u64) u64 {
     assert(ctx.diag.code == null);
     if (prune(ctx, cursor, now_ms)) |due| {
@@ -55,7 +60,7 @@ pub fn prune_or_back_off(ctx: *const Context, cursor: *Cursor, now_ms: u64) u64 
         assert(ctx.diag.code != null); // Every failure of the store or a record is coded.
         cursor.failing = true;
         cursor.failures += 1;
-        cursor.failure_code = ctx.diag.code;
+        cursor.failure = ctx.diag.*;
         ctx.diag.reset();
         return now_ms + constants.pulls_retry_ms;
     }
@@ -355,16 +360,23 @@ test "a node past its count keeps its newest and another node is untouched" {
     try testing.expect(got.kv == null);
 }
 
-test "a pass resumes where the last stopped, so every node is pruned and the cursor wraps" {
-    // Goal: no node is starved by the ones before it (the old pass restarted at the first key
-    // and never got past 2,000 records). Method: five nodes of 500 pulls, 2,500 in all, more than
-    // one pass reads; passes run until the cursor wraps, in at most three; each node is then at
-    // its limit and the cursor is back at the start.
+test "a pass resumes where the last stopped, so a node past the first 2,000 records is pruned" {
+    // Goal: no node is starved by the ones before it. A pass that restarted at the first key (the
+    // old one) read the same first 2,000 records every time and never reached a later node.
+    // Method: twenty nodes a01..a20 at 100 records each, exactly a pass's 2,000 and nothing to
+    // drop, then node z21 with 500; passes run until the cursor wraps (two); z21 is then at its
+    // limit, the others are untouched and the cursor is back at the start.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
-    const nodes = [_][]const u8{ "n1", "n2", "n3", "n4", "n5" };
-    for (nodes) |node| try fixture.pull_many(node, 500);
+    comptime assert(constants.pulls_per_node_max == 100);
+    const pass_records = constants.store_list_limit_max * constants.pulls_pages_per_pass_max;
+    comptime assert(20 * 100 == pass_records);
+    for (1..21) |at| {
+        var node: [3]u8 = undefined;
+        try fixture.pull_many(try std.fmt.bufPrint(&node, "a{d:0>2}", .{at}), 100);
+    }
+    try fixture.pull_many("z21", 500);
     const ctx = fixture.context();
     var cursor: Cursor = .{};
     var passes: u32 = 0;
@@ -380,12 +392,11 @@ test "a pass resumes where the last stopped, so every node is pruned and the cur
     }
     try testing.expectEqual(@as(u32, 2), passes);
     try testing.expectEqual(@as(usize, 0), cursor.after.len);
-    for (nodes) |node| {
-        var prefix: [16]u8 = undefined;
-        const text = try std.fmt.bufPrint(&prefix, "/pulls/{s}/", .{node});
-        try testing.expectEqual(@as(usize, constants.pulls_per_node_max), try fixture.count(text));
-    }
-    try testing.expectEqual(@as(u64, 5 * (500 - constants.pulls_per_node_max)), cursor.dropped);
+    const limit: usize = constants.pulls_per_node_max;
+    try testing.expectEqual(limit, try fixture.count("/pulls/z21/"));
+    try testing.expectEqual(limit, try fixture.count("/pulls/a01/"));
+    try testing.expectEqual(limit, try fixture.count("/pulls/a20/"));
+    try testing.expectEqual(@as(u64, 500 - limit), cursor.dropped);
 }
 
 test "one node with more records than a pass reads converges to its limit" {

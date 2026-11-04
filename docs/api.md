@@ -203,12 +203,14 @@ What pulls moved, by source: the `/pulls/` records of keys.md, newest `finished_
   "skipped": 0, "matched": 1, "truncated": false, "revision": 512 }
 ```
 
-`matched` is how many records were read before `limit` cut the list, and `truncated` is `true`
-when the server stopped reading at `pulls_read_max` (1,000) records, which it reads in key order
-(by node): the answer is then part of the picture, never a failure (it was `ZC-E0302` before).
-Both are additive members of version 1. `node` limits the answer to one node; `limit` defaults to 50 and is at most 500 (above it, or
-0, is `400` `ZC-E0104`, as is a `node` that is not a node name). The read is tolerant: a record
-that is malformed or newer than the server's reader counts in `skipped` and is left out. Reads
+`matched` is how many records were read and kept (those counted in `skipped` are not in it)
+before `limit` cut the list, and `truncated` is `true` when the server stopped reading at
+`pulls_read_max` (1,000) records, which it reads in key order (by node): the answer is then part
+of the picture, never a failure (it was `ZC-E0302` before). Both are additive members of
+version 1. `node` limits the answer to one node; `limit` defaults to 50 and is at most 500
+(above it, or 0, is `400` `ZC-E0104`, as is a `node` that is not a node name). The read is
+tolerant: a record that is malformed, newer than the server's reader, or with a peer name that is
+not a node name counts in `skipped` and is left out. Reads
 need no auth beyond the server's own.
 
 ### `GET /v1/codes` and `GET /v1/explain/{code}`
@@ -529,7 +531,8 @@ notes it once on stderr and goes on, because replica work never waits for a summ
 ### `POST /v1/agent/nodes/{node}/pulls` (C2 slice 7)
 
 Writes one pull record, `/pulls/<node>/<tree>` of keys.md. Not lease-bound: statistics outlive
-the node. The body is the agent's tenure (the revision of its registration, as for an observed write) and the record:
+the node. The body is the agent's tenure (the revision of its registration, as for an observed
+write) and the record:
 
 ```json
 { "tenure": 430,
@@ -538,7 +541,8 @@ the node. The body is the agent's tenure (the revision of its registration, as f
 ```
 
 Answer `{"revision": 434, "chain": …}`. One transaction under the node's tenure compare. Refusals:
-`v` other than 1, `node` other than `{node}`, an empty `tree`, a peer name (in `peer_bytes` or `bad_peers`) that is not a node name, more than `pull_peers_max`
+`v` other than 1, `node` other than `{node}`, an empty `tree`, a peer name (in `peer_bytes` or
+`bad_peers`) that is not a node name, more than `pull_peers_max`
 peers, a record that encodes past `pull_record_bytes_max` (4 KiB), or a body over
 `pull_request_bytes_max` (8 KiB) are `400` `ZC-E0104`; a tenure that has ended is
 `503` `ZC-E0510`. A server older than C2 slice 7 answers `404` (`ZC-E0504`): the agent drops the

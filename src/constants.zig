@@ -662,10 +662,18 @@ pub const pull_read_arena_bytes: u32 =
 /// the request arena cannot hold at the worst case; this is what it can (checked below).
 pub const pulls_read_max: u32 = 1000;
 
+/// What `GET /v1/stats/pull` writes its answer into, taken at once: `api_list_limit_max` records
+/// of at most `pull_record_bytes_max` each, and 4 KiB for the members around them. An arena frees
+/// nothing, so a buffer that grew would leave all its smaller steps behind (about twice its final
+/// size more); this one does not grow, because the agent endpoint refuses a larger record.
+pub const pulls_response_bytes: u32 = api_list_limit_max * pull_record_bytes_max + 4 * 1024;
+
 comptime {
-    // The response is at most `api_list_limit_max` records, written into a buffer that doubles.
-    const response = 2 * api_list_limit_max * pull_record_bytes_max;
-    assert(pulls_read_max * pull_read_arena_bytes + response + 64 * 1024 <=
+    // One page is requested at a time and never more than the cap still allows plus one, so the
+    // records the arena holds are the cap plus that one (read, then dropped unused).
+    const records_held = pulls_read_max + 1;
+    const sorted = 4 * pulls_read_max + 1024; // The order array and the pointers of the list.
+    assert(records_held * pull_read_arena_bytes + pulls_response_bytes + sorted + 64 * 1024 <=
         request_arena_bytes_max);
     assert(pull_record_bytes_max > 512 + pull_peers_max * (110 + 70));
     assert(pulls_read_max >= api_list_limit_max);

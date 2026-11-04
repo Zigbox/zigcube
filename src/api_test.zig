@@ -609,6 +609,26 @@ test "stats pull lists the pulls newest first, by node, with a limit, and counts
     try testing.expectEqual(@as(usize, 0), field(none, "pulls").array.items.len);
 }
 
+test "stats pull counts a stored row that names a peer that is not a node name as skipped" {
+    // Goal: the read side of the agent endpoint's peer-name check. Method: one good pull and one
+    // row stored with a bad peer name (written straight to the store, as a bug or another
+    // writer could); the bad one is skipped, not served.
+    var rig = try Rig.start(10);
+    defer rig.stop();
+    try put_pull(&rig, "node1", "b3:00000001", 100, 1);
+    const ctx = rig.world.controller_context();
+    const value =
+        \\{"v":1,"node":"node1","tree":"b3:00000002","peer_bytes":[{"peer":"a b","bytes":1}]}
+    ;
+    const key = records.pull_key("node1", "b3:00000002");
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+    _ = try writers.txn(ctx.store, .{ .agent = "node1" }, .{ .on_success = &.{op} }, ctx.diag);
+    const reply = try rig.ok("/v1/stats/pull", "");
+    try testing.expectEqual(@as(usize, 1), field(reply, "pulls").array.items.len);
+    try testing.expectEqual(@as(i64, 1), field(reply, "skipped").integer);
+    try testing.expectEqual(@as(i64, 1), field(reply, "matched").integer);
+}
+
 test "stats pull stops at its read cap and says truncated instead of failing" {
     // Goal: more records than the cap (retention is eventual, so a cluster can hold them) is a
     // partial answer, not ZC-E0302. Method: cap + 5 pulls on two nodes; ask for 500; the reply
@@ -628,6 +648,59 @@ test "stats pull stops at its read cap and says truncated instead of failing" {
     const small = try rig.ok("/v1/stats/pull", "node=node2");
     try testing.expectEqual(false, field(small, "truncated").bool);
     try testing.expectEqual(@as(usize, 10), field(small, "pulls").array.items.len);
+}
+
+test "stats pull at its read cap with the largest records fits the request arena" {
+    // Goal: constants.zig's claim that the cap's worst case fits `request_arena_bytes_max`, which
+    // an arena that frees nothing makes easy to get wrong. Method: `pulls_read_max` + 5 records
+    // each with the most peers, bad peers and longest names the agent endpoint accepts; one
+    // request with limit 500; the arena's whole capacity must stay within the real limit.
+    var rig = try Rig.start(9);
+    defer rig.stop();
+    const node: [constants.node_name_bytes_max]u8 = @splat('n');
+    const peer: [constants.node_name_bytes_max]u8 = @splat('p');
+    var peers: [constants.pull_peers_max]records.PullPeer = undefined;
+    for (&peers) |*slot| slot.* = .{ .peer = &peer, .bytes = std.math.maxInt(u64) };
+    var bad: [constants.pull_peers_max][]const u8 = undefined;
+    for (&bad) |*slot| slot.* = &peer;
+    var longest: usize = 0;
+    for (0..constants.pulls_read_max + 5) |at| {
+        const ctx = rig.world.controller_context();
+        var tree: [64]u8 = @splat('t');
+        _ = std.fmt.bufPrint(&tree, "b3:{x:0>8}", .{at}) catch unreachable; // 11 bytes fit in 64.
+        const record: records.Pull = .{
+            .node = &node,
+            .tree = &tree,
+            .registry_bytes = std.math.maxInt(u64),
+            .peer_bytes = &peers,
+            .cached_bytes = std.math.maxInt(u64),
+            .started_at_ms = std.math.maxInt(u64),
+            .finished_at_ms = 1000 + at,
+            .bad_peers = &bad,
+        };
+        const bytes = try records.encode(ctx.arena, record, ctx.diag);
+        try testing.expect(bytes.len <= constants.pull_record_bytes_max);
+        longest = @max(longest, bytes.len);
+        const key = records.pull_key(&node, &tree);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes } };
+        _ = try writers.txn(ctx.store, .{ .agent = &node }, .{ .on_success = &.{op} }, ctx.diag);
+    }
+    try testing.expect(longest > constants.pull_record_bytes_max / 2); // Really near the worst.
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = rig.world.controller_context();
+    ctx.arena = arena.allocator();
+    const response = rig.api.handle(&ctx, .{
+        .method = "GET",
+        .path = "/v1/stats/pull",
+        .query = "limit=500",
+    });
+    try testing.expectEqual(@as(u16, 200), response.status);
+    // Every byte the arena took, chunk overhead included, is at most what the real one allows.
+    try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
+    try testing.expect(response.body.len > 400 * constants.pull_record_bytes_max / 2);
+    try testing.expect(std.mem.indexOf(u8, response.body, "\"truncated\":true") != null);
 }
 
 test "stats pull refuses a bad node, a bad limit, an unknown parameter and an unknown kind" {
@@ -691,7 +764,7 @@ test "a pull retention pass that fails is recorded and does not fail the control
     const cursor = &rig.world.server.replicas.pulls;
     try testing.expect(cursor.failing);
     try testing.expect(cursor.failures > 0);
-    try testing.expectEqual(codes.Code.E0201, cursor.failure_code.?);
+    try testing.expectEqual(codes.Code.E0201, cursor.failure.code.?);
     try testing.expectEqual(@as(u32, 2), rig.world.running_count("hello"));
     rig.world.switched.down_write_prefix = null;
     rig.world.advance(constants.pulls_retry_ms + 3000);

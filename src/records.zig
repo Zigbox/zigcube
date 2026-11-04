@@ -597,10 +597,24 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         const known = version_current(T);
         if ((head.v orelse 0) > known) return too_new(diag, kv.key, head.v.?, known);
     }
-    return std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
+    const record = std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
         if (err == error.OutOfMemory) return failures.no_memory(diag);
         return malformed(diag, kv.key, @typeName(T));
     };
+    // The agent endpoint refuses these; a row that holds one anyway was not written through it.
+    if (T == Pull and !pull_peers_named(record)) return malformed(diag, kv.key, @typeName(T));
+    return record;
+}
+
+/// Whether every peer a pull record names (`peer_bytes`, `bad_peers`) is a node name.
+fn pull_peers_named(record: Pull) bool {
+    for (record.peer_bytes) |sent| {
+        if (name_problem(sent.peer, constants.node_name_bytes_max) != null) return false;
+    }
+    for (record.bad_peers) |named| {
+        if (name_problem(named, constants.node_name_bytes_max) != null) return false;
+    }
+    return true;
 }
 
 /// Raises ZC-E0303: the value at `key` was written in a newer format than this release reads.
@@ -1074,6 +1088,29 @@ test "records a C1 build wrote still read" {
 
 /// `/pulls/` rows captured from a real swarm-smoke run (src/testdata/README.md).
 const c2_pulls = @embedFile("testdata/c2_pulls.txt");
+
+test "a pull record naming a peer that is not a node name does not read" {
+    // Goal: the read side of the agent endpoint's name check. Method: a row stored with a bad
+    // name in `peer_bytes`, one in `bad_peers`, and a good row; only the good one reads.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const head = "{\"v\":1,\"node\":\"node1\",\"tree\":\"b3:1\",";
+    const bad_sent = head ++ "\"peer_bytes\":[{\"peer\":\"a b\",\"bytes\":1}]}";
+    const bad_struck = head ++ "\"bad_peers\":[\"<script>\"]}";
+    const good = head ++
+        "\"peer_bytes\":[{\"peer\":\"node2\",\"bytes\":1}],\"bad_peers\":[\"node3\"]}";
+    const key = "/pulls/node1/b3:1";
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, bad_sent), &diag));
+    try testing.expect(diag.code == .E0301);
+    diag.reset();
+    try testing.expectError(error.Malformed, read(Pull, arena, kv_of(key, bad_struck), &diag));
+    diag.reset();
+    const record = try read(Pull, arena, kv_of(key, good), &diag);
+    try testing.expectEqualStrings("node2", record.peer_bytes[0].peer);
+}
 
 test "pull records a real run wrote still read" {
     // Goal: Pull v1 as stored reads under its own key. Method: read each captured row as a `Pull`,

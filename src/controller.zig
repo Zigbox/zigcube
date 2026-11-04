@@ -220,10 +220,13 @@ fn list_pages_capped(
     var after: ?[]const u8 = null;
     const pages_max = @divFloor(count_max, constants.store_list_limit_max) + 1;
     for (0..pages_max + 1) |_| {
+        // Ask for no more than the cap still allows, plus one to see that there is more: at the
+        // cap a full third page would cost the arena records that are then thrown away.
+        const wanted = count_max -| @as(u32, @intCast(items.items.len)) +| 1;
         const page = try ctx.store.list(ctx.arena, .{
             .prefix = prefix,
             .at_revision = revision,
-            .limit = constants.store_list_limit_max,
+            .limit = @min(constants.store_list_limit_max, wanted),
             .continue_after = after,
         }, ctx.diag);
         revision = page.revision;

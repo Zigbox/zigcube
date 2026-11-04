@@ -190,7 +190,8 @@ The digest is cut to 15 bytes and "..." (the table pads by bytes, so the ellipsi
 No pulls prints `no pulls have been recorded` and is not an error. Under the table, one line each
 for records that could not be read (`1 record could not be read`), pulls the server read but the
 50-row limit left out (`3 more not shown`), and a server that stopped at its own cap (`the server
-read only part of the records`). A node name is percent-encoded in the request. Code: `src/cli_stats.zig`; tests there and in
+read only part of the records`). A node name is percent-encoded in the request. Code:
+`src/cli_stats.zig`; tests there and in
 `src/cli_test.zig` (against a live server).
 
 ## explain
