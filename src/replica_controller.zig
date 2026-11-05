@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
@@ -558,6 +559,9 @@ const Run = struct {
     /// record as read (absent is revision 0). Once per node per batch: a second replica of the
     /// node adds nothing.
     fn expect_node_judged(run: *Run, batch: *Batch, node: []const u8) Error!void {
+        // The `sim-c1-teeth-stale` negative test: without these compares a node that registers
+        // again between the read and the commit goes unnoticed (must break I3).
+        if (c1_teeth.stale_observation) return;
         const status = run.snap.status_of(node).?;
         for (batch.compares[0..batch.compares_count]) |compare| {
             if (std.mem.eql(u8, compare.key, status.kv.key)) return;
