@@ -798,7 +798,7 @@ test "create writes the job, its input and a decision; the same spec again is th
     input.input_env = "PAYLOAD";
     const first = try create(&ctx, &rig.source, input);
     try testing.expectEqualStrings("sha256:", first.created.job.input_digest.?[0..7]);
-    try testing.expectEqual(@as(?usize, 6), first.created.job.input_bytes);
+    try testing.expectEqual(@as(?u64, 6), first.created.job.input_bytes);
     const again = try create(&ctx, &rig.source, input);
     try testing.expectEqualStrings("nightly", again.same.name);
     var other = input;
@@ -825,7 +825,7 @@ test "a 64 KiB input of control characters is accepted; one more byte is ZC-E013
     input.input_env = "PAYLOAD";
     const made = try create(&ctx, &rig.source, input);
     const stored_bytes = made.created.job.input_bytes;
-    try testing.expectEqual(@as(?usize, constants.job_input_bytes_max), stored_bytes);
+    try testing.expectEqual(@as(?u64, constants.job_input_bytes_max), stored_bytes);
     const input_key = records.job_input_key("big");
     const stored = try ctx.store.get(ctx.arena, input_key.slice(), null, &rig.diag);
     try testing.expect(stored.kv != null);
