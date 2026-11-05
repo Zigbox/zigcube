@@ -130,7 +130,8 @@ test "the ttl floor admits what a late renewal survives and refuses what it does
         try testing.expectEqual(@as(?Problem, .ttl_below_floor), inequality_problem(5_000));
         const slack = floor - @divFloor(floor, constants.lease_renew_divisor);
         try testing.expect(slack >= constants.fence_margin_ms + constants.lease_renew_jitter_ms);
-        const under = floor - 1;
+        // The renewal interval rounds down, so floor - 1 has the same slack; two under has less.
+        const under = floor - 2;
         const slack_under = under - @divFloor(under, constants.lease_renew_divisor);
         const needed = constants.fence_margin_ms + constants.lease_renew_jitter_ms;
         try testing.expect(slack_under < needed);

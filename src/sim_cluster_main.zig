@@ -376,16 +376,18 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expectEqual(@as(u64, 9), range.last_seed);
     try std.testing.expectEqual(@as(?u32, 60), range.operations);
     const drawn = parse(&.{
-        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=5000",
+        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=8000",
     }).?;
     try std.testing.expectEqual(@as(?u32, null), drawn.operations);
     try std.testing.expect(drawn.options.profile_auto);
-    try std.testing.expectEqual(@as(?u32, 5000), drawn.options.lease_ttl_ms);
+    try std.testing.expectEqual(@as(?u32, 8000), drawn.options.lease_ttl_ms);
     const named = parse(&.{ "sim", "7", "60", "--profile=skew", "--replicas-pct=200" }).?;
     try std.testing.expect(named.options.profile == .skew and !named.options.profile_auto);
     try std.testing.expectEqual(@as(?u32, 200), named.options.replicas_pct);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--profile=nope" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=2000" }) == null);
+    // Under the ttl floor (#78) is refused too, though the margin alone would allow it.
+    try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=5000" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "0" }) == null);
     try std.testing.expectEqual(@as(?u32, null), range.options.nodes);
 
