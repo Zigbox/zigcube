@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
     });
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
+    add_mtls_interop_step(b, shared_options);
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
     add_bench_watch_step(b, shared_options);
@@ -338,6 +339,27 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
     teeth.expectExitCode(4); // swarm_smoke.exit_unverified: the plan took a bad chunk.
     const teeth_help = "swarm-smoke with the fetch plan's test-only fault on; it must fail";
     b.step("swarm-smoke-teeth", teeth_help).dependOn(&teeth.step);
+}
+
+/// `zig build mtls-interop` (src/mtls_interop.zig): the mTLS client against `openssl s_server` and
+/// a JDK 21 server. Needs OpenSSL and a JDK, so it is not in `check`; CI runs it in a job of its
+/// own. An interop check, never a demo.
+fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "mtls_interop",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mtls_interop.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = options.zigbox }},
+        }),
+    });
+    b.installArtifact(exe); // Plain `zig build` keeps it compiling.
+    const run = b.addRunArtifact(exe);
+    run.addFileArg(b.path("ops/mtls-interop/InteropServer.java"));
+    run.has_side_effects = true;
+    const help = "Run the mTLS client against openssl s_server and a JDK 21 server (not a demo)";
+    b.step("mtls-interop", help).dependOn(&run.step);
 }
 
 /// `zig build local-smoke`: `zcube local up` and `down` as a person would use them
