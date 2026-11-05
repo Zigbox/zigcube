@@ -996,13 +996,25 @@ fn observe_stamped(
     exit: ?records.Exit,
     tenure: u64,
 ) !void {
-    const node = "node1";
+    try observe_on(fixture, "node1", replica, status, exit, null, tenure);
+}
+
+fn observe_on(
+    fixture: *Fixture,
+    node: []const u8,
+    replica: []const u8,
+    status: records.ObservedStatus,
+    exit: ?records.Exit,
+    raw: ?records.Raw,
+    tenure: u64,
+) !void {
     const observed: records.Observed = .{
         .replica = replica,
         .node = node,
         .generation = 1,
         .status = status,
         .exit = exit,
+        .diagnostic = raw,
         .reported_at_ms = fixture.manual.ms,
         .tenure = tenure,
     };
@@ -1294,4 +1306,139 @@ fn count_decisions(fixture: *Fixture, name: []const u8, action: []const u8) !u64
         if (std.mem.eql(u8, entry.action, action)) count += 1;
     }
     return count;
+}
+
+const node_names = [_][]const u8{ "node1", "node2", "node3" };
+
+/// Three replicas of `hello` placed on three ready nodes (the scheduler spreads them), each
+/// reported running under its node's tenure.
+fn start_spread(fixture: *Fixture) !void {
+    try fixture.start();
+    for (node_names) |name| try fixture.register_node(name);
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    const listed = try fixture.ids("hello");
+    defer Fixture.free_ids(listed);
+    for (listed) |id| {
+        const node = try node_of(fixture, id);
+        try observe_on(fixture, node, id, .running, null, null, try tenure_of(fixture, node));
+    }
+    _ = try fixture.settle();
+}
+
+/// The node `replica` is assigned to.
+fn node_of(fixture: *Fixture, replica: []const u8) ![]const u8 {
+    const ctx = fixture.context();
+    for (node_names) |name| {
+        const key = records.assigned_key(name, replica);
+        const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+        if (got.kv != null) return name;
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Every replica of `hello` reported stopped with `exit` (and `raw`) under its node's tenure.
+fn stop_all(fixture: *Fixture, exit: records.Exit, raw: ?records.Raw) !void {
+    const listed = try fixture.ids("hello");
+    defer Fixture.free_ids(listed);
+    for (listed) |id| {
+        const node = try node_of(fixture, id);
+        const tenure = try tenure_of(fixture, node);
+        try observe_on(fixture, node, id, .stopped, exit, raw, tenure);
+    }
+}
+
+test "three dead replicas on three ready nodes are all replaced within the compare budget" {
+    // Goal: the removal batch holds the compare budget however many nodes the reports come from
+    // (`Batch.expect` asserts past `store_txn_compares_max`). Method: all three replicas stop on
+    // three nodes; passes of the replica controller alone replace each, none panics.
+    var fixture: Fixture = undefined;
+    try start_spread(&fixture);
+    defer fixture.stop();
+    try stop_all(&fixture, .{ .kind = .signaled, .signal = 9 }, null);
+    var passes: u32 = 0;
+    while (passes < 4 and (try replica_pass(&fixture)) > 0) passes += 1;
+    try testing.expect(passes >= 2);
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try testing.expectEqual(@as(usize, 3), now.len);
+    for (now) |id| {
+        try testing.expect(!std.mem.eql(u8, id, "hello-1"));
+        try testing.expect(!std.mem.eql(u8, id, "hello-2"));
+        try testing.expect(!std.mem.eql(u8, id, "hello-3"));
+    }
+}
+
+test "three failed starts held in one batch fit the compare budget" {
+    // Goal: the hold batch compares each report, its assignment and its node, within the
+    // budget. Method: all three replicas fail to start for a user reason on three nodes; one
+    // pass writes three holds and nothing panics, a second writes nothing.
+    var fixture: Fixture = undefined;
+    try start_spread(&fixture);
+    defer fixture.stop();
+    const raw = try fixture.user_diagnostic(true);
+    defer testing.allocator.free(raw.text);
+    try stop_all(&fixture, .{ .kind = .start_failed }, raw);
+    try testing.expect((try replica_pass(&fixture)) > 0);
+    var chain = try fixture.decisions(.service, "hello");
+    defer chain.deinit(testing.allocator);
+    var holds: u32 = 0;
+    var parts = std.mem.splitScalar(u8, chain.items, ';');
+    while (parts.next()) |part| {
+        if (std.mem.startsWith(u8, part, "hold_failed_replica")) holds += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), holds);
+    try testing.expectEqual(@as(u32, 0), try replica_pass(&fixture));
+}
+
+test "a failed start reported under a replaced tenure is not held (I3)" {
+    // Goal: a hold cites its report, so it needs an admissible one. Method: hello-2's failed
+    // start is reported under t1, the node registers again (t2); the pass holds nothing. Once the
+    // node is judged for t2 and reports under it, the hold is written.
+    var fixture: Fixture = undefined;
+    const old = try start_stamped(&fixture);
+    defer fixture.stop();
+    const raw = try fixture.user_diagnostic(true);
+    defer testing.allocator.free(raw.text);
+    try fixture.register_node("node1");
+    try observe_on(&fixture, "node1", "hello-2", .stopped, .{ .kind = .start_failed }, raw, old);
+    try testing.expectEqual(@as(u32, 0), try replica_pass(&fixture));
+    var chain = try fixture.decisions(.service, "hello");
+    defer chain.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, chain.items, "hold_failed_replica") == null);
+
+    _ = try fixture.settle();
+    const current = try tenure_of(&fixture, "node1");
+    try testing.expect(current != old);
+    const failed: records.Exit = .{ .kind = .start_failed };
+    try observe_on(&fixture, "node1", "hello-2", .stopped, failed, raw, current);
+    try testing.expect((try replica_pass(&fixture)) > 0);
+    var after = try fixture.decisions(.service, "hello");
+    defer after.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, after.items, "hold_failed_replica") != null);
+}
+
+test "the replacement fails when only the node's registration moved after the report was read" {
+    // Goal: `/nodes/<node>` is in the read set of a removal that cites an exit report, by itself
+    // (the status test moves only `/node-status`). Method: the registration is put back
+    // unchanged just before the commit: a new revision, so the tenure is not the one judged.
+    var fixture: Fixture = undefined;
+    const tenure = try start_stamped(&fixture);
+    defer fixture.stop();
+    try observe_stamped(&fixture, "hello-2", .stopped, .{ .kind = .signaled, .signal = 9 }, tenure);
+    var ctx = fixture.context();
+    const key = records.node_key("node1");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = got.kv.?.value,
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
 }
