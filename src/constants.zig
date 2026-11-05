@@ -454,6 +454,21 @@ pub const fetch_total_ms: u32 = 30 * 60 * 1000;
 /// The Zigbox supervisor kills a `zcube-agent fetch` that is still running this long after it
 /// started: the fetch's own limit and a minute for it to say why it failed.
 pub const zigbox_fetch_deadline_ms: u32 = fetch_total_ms + 60 * 1000;
+/// After the fetch's process group is sent SIGKILL (at the deadline, or after the fetch ended),
+/// how long the supervisor waits for every process of it to be gone. One still there then is in
+/// uninterruptible sleep and may still write the store, so no pull starts (ZC-E0515).
+pub const zigbox_fetch_kill_wait_ms: u32 = 5 * 1000;
+/// How many times `process_session.kill_all` reads `/proc` for a session's processes: a process
+/// forked while the first read went by is found by the next.
+pub const session_kill_rounds: u32 = 3;
+/// The most `/proc` entries one read looks at: Linux's largest `pid_max` (2^22) and the
+/// non-process entries beside them.
+pub const proc_entries_max: u32 = (1 << 22) + 1024;
+
+comptime {
+    assert(zigbox_fetch_kill_wait_ms < zigbox_fetch_deadline_ms);
+    assert(session_kill_rounds >= 2);
+}
 /// The wait before a fetch on a node whose last fetch failed, doubling from the base to the cap
 /// (`fetch_backoff.zig`), so an unreachable tree does not make replicas churn at the speed of the
 /// refusals.

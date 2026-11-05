@@ -210,6 +210,13 @@ milliseconds, at least 1, that replaces the supervisor's fetch deadline
 (`zigbox_fetch_deadline_ms`, 31 minutes) when it is shorter; the fetch is killed at it and the
 supervisor falls back to the pull. It is read at each fetch. `zigbox-smoke` uses it.
 
+The fetch runs in a process group of its own, because its store worker (Zigbox's `namespace.run`
+child) is a grandchild that neither dies with the fetch nor hears its signals. Whenever the fetch
+ends, at its deadline or not, the supervisor sends SIGKILL to the whole group and reaps it (it is
+the group's subreaper meanwhile), for at most `zigbox_fetch_kill_wait_ms` (5 s): the pull is
+another store writer and starts only once no process of the fetch is left. One that outlives that
+wait (in uninterruptible sleep) fails the start with ZC-E0515, and `fetch.log` says so.
+
 Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the first byte of every
 chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer
 server, so restart the agent after creating or removing the file.
@@ -302,7 +309,10 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   `supervisor.pid` (the time has one-second resolution, so a relaunch within the second would
   otherwise adopt the old record). A record with pid 0 is Zigbox's start window, before the
   container exists: it is `starting`, never `running`, and `stop` kills the supervisor, never
-  pid 0; if the supervisor dies there the record reads `lost`.
+  pid 0; if the supervisor dies there the record reads `lost`. Killing a supervisor kills its
+  whole session (it leads one of its own): SIGKILL to its group and then to every process whose
+  session is the supervisor's, read from `/proc` (`process_session.zig`), because the swarm fetch
+  and its store worker are in that session but in a group of their own.
 - **Images** (`zigbox_image.zig`): the supervisor tries `zigbox.start` with the locked tree
   digest; on ZBX-E0410 (tree not in the store) and a known reference it pulls once, checks the
   tree it got is the locked one (ZC-E0511 if not) and starts again. The locked digest must be

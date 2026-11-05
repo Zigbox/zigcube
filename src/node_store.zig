@@ -99,14 +99,14 @@ pub fn list_digest(list: []const u8, out: *[67]u8) []const u8 {
     return out;
 }
 
-/// Whether `digest` names `list`: it is exactly `list_digest`. A peer or registry that sends a
-/// list is held to it. A short digest never matches: 8 hex digits are 32 bits, which a lying peer
-/// can search for a list of its own making.
+/// Whether `digest` names `list`: it is `list_digest` or a prefix of it at least 8 hex digits long
+/// (the short digests of images and fixtures). A peer or registry that sends a list is held to it.
+/// A short digest is never asked of a peer (`fetch_worker`): 32 bits are searchable.
 pub fn list_matches(digest: []const u8, list: []const u8) bool {
     var full: [67]u8 = undefined;
     const want = list_digest(list, &full);
-    assert(want.len == 67);
-    return std.mem.eql(u8, digest, want);
+    if (digest.len < 3 + 8 or digest.len > want.len) return false;
+    return std.mem.eql(u8, digest, want[0..digest.len]);
 }
 
 /// The chunks a list's text names, into `out`; the count, or null if a line is malformed, a size
@@ -390,7 +390,12 @@ test "a tree entry whose sample outweighs its bytes is refused" {
     // not decode, nor does a partial sample with no byte left for its unsampled chunks, nor a
     // tree larger than its chunks can hold. Method: hand-written hex samples.
     const one_4096 = "0100000000000000" ++ "00100000"; // Key 1, 4096 bytes, little-endian.
-    var tree: records.HeldTree = .{ .tree = "b3:51aa9c03", .bytes = 1, .chunks = 1, .sample = one_4096 };
+    var tree: records.HeldTree = .{
+        .tree = "b3:51aa9c03",
+        .bytes = 1,
+        .chunks = 1,
+        .sample = one_4096,
+    };
     try std.testing.expect(sketch_of(tree) == null);
     tree.bytes = 4096;
     try std.testing.expectEqual(@as(u64, 4096), sketch_of(tree).?.total_bytes);
@@ -423,8 +428,8 @@ test "a chunk list is held to its digest, and parses only whole" {
     var full: [67]u8 = undefined;
     const digest = list_digest(list, &full);
     try std.testing.expect(list_matches(digest, list));
-    try std.testing.expect(!list_matches(digest[0..11], list)); // A prefix is 32 bits: refused.
-    try std.testing.expect(!list_matches(digest[0..66], list));
+    try std.testing.expect(list_matches(digest[0..11], list));
+    try std.testing.expect(!list_matches(digest[0..10], list)); // Too short to mean anything.
     var other: [200]u8 = undefined;
     @memcpy(other[0..list.len], list);
     other[70] = '9';

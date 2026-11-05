@@ -1,0 +1,9 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0515]: a swarm fetch outlived its kill, so the image was not pulled
+  cause  a process of the swarm fetch was still alive after SIGKILL to its
+         process group, so the image was not pulled: the store takes one writer
+         at a time
+  reqid  r-0000001
+  fix    find the process in state D and the disk it waits on; the start is retried   ps -eo pid,stat,wchan:32,args | awk '$2 ~ /D/'
+  more   zcube explain E0515
+  docs   https://zigbox.github.io/zigcube/errors/E0515.html
