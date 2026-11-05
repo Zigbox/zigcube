@@ -53,13 +53,22 @@ pub const scheme_ed25519: u16 = 0x0807;
 pub const version_tls13: u16 = 0x0304;
 pub const version_tls12: u16 = 0x0303;
 
+/// The extension types seen so far in one block: RFC 8446 section 4.2 forbids any type twice.
+const SeenExtensions = struct {
+    set: std.StaticBitSet(1 << 16) = .empty,
+
+    fn add(self: *SeenExtensions, kind: u16) Error!void {
+        if (self.set.isSet(kind)) return error.DuplicateExtension;
+        self.set.set(kind);
+    }
+};
+
 const ext_server_name: u16 = 0;
 const ext_supported_groups: u16 = 10;
 const ext_signature_algorithms: u16 = 13;
 const ext_supported_versions: u16 = 43;
 const ext_key_share: u16 = 51;
 const ext_signature_algorithms_cert: u16 = 50;
-const ext_certificate_authorities: u16 = 47;
 
 /// The random that marks a HelloRetryRequest (RFC 8446 section 4.1.3): SHA-256 of
 /// "HelloRetryRequest".
@@ -343,9 +352,11 @@ const HelloExtensions = struct {
 
 fn read_hello_extensions(reader: *Reader, parsed: *HelloExtensions) Error!void {
     var count: u32 = 0;
+    var seen: SeenExtensions = .{};
     while (reader.remaining() > 0) {
         const kind = try reader.read_u16();
         const data = try reader.vector16();
+        try seen.add(kind);
         count += 1;
         assert(count <= constants.tls_handshake_message_bytes_max); // Each takes four bytes.
         switch (kind) {
@@ -474,23 +485,14 @@ pub fn parse_certificate_request(body: []const u8) Error!Request {
     try reader.finish();
     var schemes: ?bool = null;
     var cert_schemes: ?bool = null;
-    var authorities = false;
+    var seen: SeenExtensions = .{};
     while (extensions.remaining() > 0) {
         const kind = try extensions.read_u16();
         const data = try extensions.vector16();
+        try seen.add(kind);
         switch (kind) {
-            ext_signature_algorithms => {
-                if (schemes != null) return error.DuplicateExtension;
-                schemes = try lists_ed25519(data);
-            },
-            ext_signature_algorithms_cert => {
-                if (cert_schemes != null) return error.DuplicateExtension;
-                cert_schemes = try lists_ed25519(data);
-            },
-            ext_certificate_authorities => {
-                if (authorities) return error.DuplicateExtension;
-                authorities = true;
-            },
+            ext_signature_algorithms => schemes = try lists_ed25519(data),
+            ext_signature_algorithms_cert => cert_schemes = try lists_ed25519(data),
             else => {},
         }
     }

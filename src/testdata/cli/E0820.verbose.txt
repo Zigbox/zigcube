@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0820]: the key behind the client certificate did not sign
+  cause  the signer holding the client certificate's key did not sign
+  sent   alert internal_error (80)
+  reqid  r-0000001
+  fix    Check that the process or device holding this workload's key is running and reachable, then reconnect.
+  more   zcube explain E0820
+  docs   https://zigbox.github.io/zigcube/errors/E0820.html

@@ -110,6 +110,7 @@ pub const Code = enum(u8) {
     E0817,
     E0818,
     E0819,
+    E0820,
     B0001,
     B0002,
     B0003,
@@ -1492,6 +1493,23 @@ pub const registry = [_]Entry{
         \\
         \\The cause names the kind found and the kind needed. Give the peer a
         \\certificate issued for its role: a server certificate for a server.
+        ,
+    },
+    .{
+        .code = .E0820,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the key behind the client certificate did not sign",
+        .explanation =
+        \\The server asked for a client certificate and the client has one, but the
+        \\signer that holds its private key returned no signature, so the proof of
+        \\possession (CertificateVerify) could not be made. The connection is
+        \\closed with an internal_error alert; nothing was accepted.
+        \\
+        \\The key never enters the TLS client: it sits behind a signer, in the same
+        \\process or in another. This is that signer failing, not the server or the
+        \\certificate. Check that the process or device holding the key is running
+        \\and reachable, then reconnect.
         ,
     },
     .{

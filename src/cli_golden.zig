@@ -31,6 +31,7 @@ const fetch_worker = @import("fetch_worker.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
 const x509 = @import("x509.zig");
+const x509_test = @import("x509_test.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 const testing = std.testing;
@@ -566,11 +567,10 @@ fn tls_not_asked(diag: *diag_mod.Diag) void { // tls_client.zig
         .random = @splat(2),
         .session_id = @splat(3),
         .secret = @splat(4),
-        .identity = .{
+        .client_auth = .{ .required = .{
             .certificates = &.{"workload certificate"},
             .signer = tls_client.key_pair_signer(&key),
-        },
-        .require_client_auth = true,
+        } },
     });
     var peer = testpeer.Peer.init(.{
         .certificates = &.{"server certificate"},
@@ -579,6 +579,46 @@ fn tls_not_asked(diag: *diag_mod.Diag) void { // tls_client.zig
         .secret = @splat(6),
     });
     var flight: [1024]u8 = undefined;
+    tls_refused(&client, peer.respond(sent, &flight), diag);
+}
+
+fn no_signature(context: *const anyopaque, message: []const u8) ?[64]u8 {
+    _ = context;
+    _ = message;
+    return null;
+}
+
+fn tls_signer_failed(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    const ca = x509_test.ca_pair() catch unreachable; // A fixed seed.
+    const key = Ed25519.KeyPair.generateDeterministic(@splat(5)) catch unreachable; // A seed works.
+    var leaf: x509.Der = undefined;
+    x509.issue_server(&leaf, ca, &.{
+        .dns_name = "broker.botpike.com",
+        .subject_key = key.public_key.toBytes(),
+        .lifetime = x509_test.window,
+    }) catch unreachable; // The request is within the bounds.
+    const sent = tls_started_with(&client, &hello, &.{
+        .anchor = ca.public_key.toBytes(),
+        .server_name = "broker.botpike.com",
+        .now_ms = x509_test.now,
+        .random = @splat(2),
+        .session_id = @splat(3),
+        .secret = @splat(4),
+        .client_auth = .{ .optional = .{
+            .certificates = &.{"workload certificate"},
+            .signer = .{ .context = &key, .sign = no_signature },
+        } },
+    });
+    var peer = testpeer.Peer.init(.{
+        .certificates = &.{leaf.slice()},
+        .key = key,
+        .random = @splat(0),
+        .secret = @splat(6),
+        .client_auth = .{ .anchor = ca.public_key.toBytes(), .now_ms = x509_test.now },
+    });
+    var flight: [4096]u8 = undefined;
     tls_refused(&client, peer.respond(sent, &flight), diag);
 }
 
@@ -763,6 +803,7 @@ const cases = [_]Case{
     relayed(.E0817, x509_not_issued),
     relayed(.E0818, tls_retry_request),
     relayed(.E0819, x509_wrong_use),
+    relayed(.E0820, tls_signer_failed),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

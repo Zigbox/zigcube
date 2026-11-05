@@ -150,6 +150,7 @@ test "the TLS client tests are in this root" {
     // Goal: the client handshake runs under WASI too. Method: import its tests; the scripted
     // server they use is a test fixture and is imported only here.
     _ = @import("tls_client_test.zig");
+    _ = @import("tls_wire_test.zig");
 }
 
 test "the TLS key schedule and record layer tests are in this root" {

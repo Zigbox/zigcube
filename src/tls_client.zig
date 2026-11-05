@@ -49,11 +49,18 @@ pub const Config = struct {
     session_id: [32]u8,
     /// The ephemeral x25519 secret.
     secret: [32]u8,
-    /// The workload identity to present when the server asks; null is server authentication only
-    /// (an empty Certificate answers a request).
-    identity: ?Identity = null,
-    /// The handshake fails (ZC-E0814) unless the server asks for a certificate. Needs `identity`.
-    require_client_auth: bool = false,
+    client_auth: ClientAuth = .none,
+};
+
+/// Whether and how the client authenticates. A required authentication always has an identity, so
+/// the state "required, with nothing to present" cannot be written.
+pub const ClientAuth = union(enum) {
+    /// Server authentication only: a request is answered with an empty Certificate.
+    none,
+    /// Presents the identity when the server asks; a server that does not ask is not an error.
+    optional: Identity,
+    /// Presents the identity, and fails (ZC-E0814) if the server does not ask for it.
+    required: Identity,
 };
 
 /// Signs `message` with the key of the identity's certificate: Ed25519, 64 bytes. Null means the
@@ -164,8 +171,9 @@ pub const Client = struct {
     request_answerable: bool,
     request_context: [constants.tls_request_context_bytes_max]u8,
     request_context_length: u32,
-    /// A Certificate went to the server: a certificate alert is then about it.
-    auth_sent: bool,
+    /// A Certificate message, empty or not, went to the server: a certificate alert after it is
+    /// the server's answer to what the client showed (ZC-E0814), not a broken handshake.
+    certificate_sent: bool,
     record: [schedule.sealed_bytes_max]u8,
     record_length: u32,
     record_total: u32,
@@ -208,12 +216,16 @@ pub const Client = struct {
         self.identity_count = 0;
         self.identity_lengths = @splat(0);
         self.signer = null;
-        self.require_auth = config.require_client_auth;
+        self.require_auth = config.client_auth == .required;
         self.request_seen = false;
         self.request_answerable = false;
         self.request_context_length = 0;
-        self.auth_sent = false;
-        if (config.identity) |identity| {
+        self.certificate_sent = false;
+        const presented: ?Identity = switch (config.client_auth) {
+            .none => null,
+            .optional, .required => |identity| identity,
+        };
+        if (presented) |identity| {
             assert(identity.certificates.len >= 1);
             assert(identity.certificates.len <= constants.tls_chain_certificates_max);
             for (identity.certificates, 0..) |certificate, index| {
@@ -315,18 +327,31 @@ pub const Client = struct {
 
     // ---- Sending ------------------------------------------------------------------------------
 
-    /// Protects application data as one record into `out` and returns it.
-    pub fn seal_application(self: *Client, plain: []const u8, out: []u8) Error![]u8 {
+    /// The most bytes `seal_application` writes for `plain_length` bytes of data: the record, and
+    /// before it a KeyUpdate when the write keys have reached their limit.
+    pub fn application_bytes_max(plain_length: usize) usize {
+        const key_update = schedule.sealed_bytes(schedule.key_update_bytes);
+        return schedule.sealed_bytes(plain_length) + key_update;
+    }
+
+    /// Protects application data as one record into `out` and returns what to send. When the
+    /// write keys are at their record limit the KeyUpdate goes first, in the same slice, so the
+    /// caller needs no other step to stay inside the limit (RFC 8446 section 5.5). A direction
+    /// that cannot move on is a refusal with a diagnostic (ZC-E0815).
+    pub fn seal_application(
+        self: *Client,
+        plain: []const u8,
+        out: []u8,
+        diag: *Diag,
+    ) Error![]u8 {
         assert(self.state == .connected);
         assert(plain.len <= constants.tls_record_plaintext_bytes_max);
-        assert(out.len >= schedule.sealed_bytes(plain.len));
-        return self.write.seal(out, .application_data, plain) catch |err| {
-            self.fail_silently();
-            switch (err) {
-                error.KeyLimit, error.Dead => return error.Closed,
-                else => unreachable,
-            }
-        };
+        assert(out.len >= application_bytes_max(plain.len));
+        var used: usize = 0;
+        if (self.write.update_due()) used = try self.seal_key_update(out, false, diag);
+        const record = self.write.seal(out[used..], .application_data, plain) catch |err|
+            return self.fail_send(diag, err);
+        return out[0 .. used + record.len];
     }
 
     /// Sends close_notify and ends the connection.
@@ -338,21 +363,45 @@ pub const Client = struct {
         self.state = .closed;
     }
 
-    /// Sends a KeyUpdate and moves the write keys on (RFC 8446 section 4.6.3); slice 6 calls it
-    /// when `write.update_due()`.
-    pub fn send_key_update(self: *Client, request: bool) Error!void {
+    /// Sends a KeyUpdate and moves the write keys on (RFC 8446 section 4.6.3). `seal_application`
+    /// does it by itself at the limit; a connection layer may also call it to rotate keys sooner.
+    pub fn send_key_update(self: *Client, request: bool, diag: *Diag) Error!void {
         assert(self.state == .connected);
         assert(self.out_length == 0);
+        const sealed = try self.seal_key_update(self.out[0..], request, diag);
+        self.out_length = @intCast(sealed);
+    }
+
+    /// Seals a KeyUpdate under the old keys into `out`, moves on, and returns its length.
+    fn seal_key_update(self: *Client, out: []u8, request: bool, diag: *Diag) Error!usize {
         const message = [_]u8{ schedule.key_update_type, 0, 0, 1, @intFromBool(request) };
-        const sealed = self.write.seal(self.out[0..], .handshake, &message) catch {
-            self.fail_silently();
-            return error.Closed;
-        };
-        self.out_length = @intCast(sealed.len);
-        self.write.rekey() catch {
-            self.fail_silently();
-            return error.Closed;
-        };
+        const sealed = self.write.seal(out, .handshake, &message) catch |err|
+            return self.fail_send(diag, err);
+        self.write.rekey() catch |err| return self.fail_send(diag, err);
+        return sealed.len;
+    }
+
+    /// The write side cannot go on. A dead direction means the connection is already over and
+    /// diagnosed; the other two are the limits of the write keys.
+    fn fail_send(self: *Client, diag: *Diag, err: schedule.Error) Error {
+        switch (err) {
+            error.Dead => {
+                self.fail_silently();
+                return error.Closed;
+            },
+            error.KeyLimit => diag.raise(.E0815),
+            error.TooManyKeyUpdates => diag.raise(.E0815),
+            else => unreachable, // Sealing fails only on these three.
+        }
+        if (err == error.KeyLimit) {
+            diag.cause("the write keys reached their record limit without a KeyUpdate", .{});
+        } else {
+            diag.cause("this client updated its write keys over {d} times", .{
+                constants.tls_key_updates_per_connection_max,
+            });
+        }
+        self.add_fix(diag, .E0815);
+        return self.refuse(diag, null);
     }
 
     // ---- Records ------------------------------------------------------------------------------
@@ -461,13 +510,8 @@ pub const Client = struct {
             self.state = .closed;
             return .closed;
         }
-        if (self.auth_sent and refuses_certificate(code) and !fault_on(.certificate_alert)) {
-            diag.raise(.E0814);
-            diag.cause("the server refused the client certificate with the alert {s} ({d})", .{
-                wire.alert_name(code), code,
-            });
-            self.add_fix(diag, .E0814);
-            return self.refuse(diag, null);
+        if (self.certificate_sent and refuses_certificate(code) and !fault_on(.certificate_alert)) {
+            return self.fail_refused(diag, code);
         }
         diag.raise(.E0813);
         diag.cause("the server sent the fatal alert {s} ({d})", .{ wire.alert_name(code), code });
@@ -495,8 +539,12 @@ pub const Client = struct {
                     diag,
                     .E0813,
                     .decode_error,
-                    "a handshake message of {d} bytes is too long",
-                    .{total},
+                    "the server's {s} of {d} bytes is over the {d} B this client reads",
+                    .{
+                        message_name(self.flight[0]),
+                        total,
+                        constants.tls_handshake_message_bytes_max,
+                    },
                 );
             }
             if (self.flight_length < total) break;
@@ -644,14 +692,15 @@ pub const Client = struct {
             return self.wire_failure(diag, err, "CertificateRequest");
         const answerable = request.accepts_ed25519 or fault_on(.request_scheme);
         if (!answerable and self.require_auth) {
-            return self.fail(
-                diag,
-                .E0814,
-                .handshake_failure,
+            diag.raise(.E0814);
+            diag.cause(
                 "the server's certificate request does not list Ed25519, the only scheme " ++
                     "this client signs and presents",
                 .{},
             );
+            self.fix_e0814(diag, "Configure the server at {s} to accept Ed25519 in " ++
+                "signature_algorithms and signature_algorithms_cert for client certificates.");
+            return self.refuse(diag, .handshake_failure);
         }
         self.transcript.add(message);
         self.request_seen = true;
@@ -662,14 +711,51 @@ pub const Client = struct {
     }
 
     fn fail_not_asked(self: *Client, diag: *Diag) Error {
-        return self.fail(
-            diag,
-            .E0814,
-            .handshake_failure,
+        diag.raise(.E0814);
+        diag.cause(
             "the server did not ask for a client certificate, and this connection must " ++
                 "present one",
             .{},
         );
+        self.fix_e0814(diag, "Check that the server at {s} is configured to request client " ++
+            "certificates (needClientAuth on a JVM, -Verify on OpenSSL) and trusts the cluster " ++
+            "CA.");
+        return self.refuse(diag, .handshake_failure);
+    }
+
+    /// The server's certificate alert, after the client's Certificate went out.
+    fn fail_refused(self: *Client, diag: *Diag, code: u8) Error {
+        diag.raise(.E0814);
+        if (self.request_answerable) {
+            diag.cause("the server refused the client certificate with the alert {s} ({d})", .{
+                wire.alert_name(code), code,
+            });
+            self.fix_e0814(diag, "Check that the server at {s} trusts the cluster CA, and that " ++
+                "this workload's certificate is current and was issued by it.");
+        } else {
+            diag.cause(
+                "the server answered the client's empty Certificate ({s}) with the alert " ++
+                    "{s} ({d})",
+                .{ self.empty_reason(), wire.alert_name(code), code },
+            );
+            self.fix_e0814(diag, "Give this connection a workload certificate from the cluster " ++
+                "CA that the server at {s} can verify; it requires one.");
+        }
+        return self.refuse(diag, null);
+    }
+
+    fn empty_reason(self: *const Client) []const u8 {
+        if (self.identity_count == 0) return "this connection has no workload certificate";
+        return "the server's request does not list Ed25519";
+    }
+
+    fn fix_e0814(self: *const Client, diag: *Diag, comptime format: []const u8) void {
+        var buffer: [constants.tls_server_name_bytes_max + 240]u8 = undefined;
+        // The buffer holds the longest name and the longest of the sentences.
+        const sentence = std.fmt.bufPrint(&buffer, format, .{
+            self.name[0..self.name_length],
+        }) catch unreachable; // Sized above for the longest name and sentence.
+        diag.fix(.{ .sentence = sentence });
     }
 
     fn fail_chain(self: *Client, diag: *Diag) Error {
@@ -765,14 +851,18 @@ pub const Client = struct {
 
     /// RFC 8446 section 4.4.2 and 4.4.3: Certificate with the echoed context, and, when there is a
     /// certificate to prove, CertificateVerify over the transcript through that Certificate.
+    /// Nothing is sealed until the signer has answered: a signer that fails leaves the write
+    /// sequence where the server expects it, so the alert that follows authenticates.
     fn send_authentication(self: *Client, diag: *Diag) Error!void {
         assert(self.request_seen);
         var buffer: [constants.tls_client_certificate_bytes_max]u8 = undefined;
         const certificate = self.certificate_message(&buffer);
         if (!fault_on(.transcript_client_auth)) self.transcript.add(certificate);
-        try self.seal_handshake(diag, certificate);
-        if (!self.request_answerable) return;
-        self.auth_sent = true;
+        if (!self.request_answerable) {
+            try self.seal_handshake(diag, certificate);
+            self.certificate_sent = true;
+            return;
+        }
         const hash = self.transcript.hash();
         const role: schedule.CertificateRole = if (fault_on(.verify_context)) .server else .client;
         const content = schedule.certificate_verify_content(role, &hash);
@@ -780,7 +870,7 @@ pub const Client = struct {
         const signature = signer.sign(signer.context, &content) orelse {
             return self.fail(
                 diag,
-                .E0814,
+                .E0820,
                 .internal_error,
                 "the signer holding the client certificate's key did not sign",
                 .{},
@@ -793,6 +883,8 @@ pub const Client = struct {
         std.mem.writeInt(u16, verify[6..8], 64, .big);
         @memcpy(verify[8..], &signature);
         if (!fault_on(.transcript_client_auth)) self.transcript.add(&verify);
+        try self.seal_handshake(diag, certificate);
+        self.certificate_sent = true;
         try self.seal_handshake(diag, &verify);
     }
 
@@ -844,7 +936,7 @@ pub const Client = struct {
         const requested = wire.parse_key_update(body) catch |err|
             return self.wire_failure(diag, err, "KeyUpdate");
         self.read.rekey() catch |err| return self.record_failure(diag, err);
-        if (requested) self.send_key_update(false) catch return self.refuse(diag, null);
+        if (requested) try self.send_key_update(false, diag);
     }
 
     // ---- Failing ------------------------------------------------------------------------------
@@ -941,12 +1033,6 @@ pub const Client = struct {
                     "and that it offers TLS 1.3 with an Ed25519 certificate from the pinned CA.",
                 .{self.name[0..self.name_length]},
             ) catch unreachable, // The buffer holds the longest name and the sentence.
-            .E0814 => std.fmt.bufPrint(
-                &buffer,
-                "Check that the server at {s} requires client certificates from the cluster " ++
-                    "CA, and that this workload's certificate is current and was issued by it.",
-                .{self.name[0..self.name_length]},
-            ) catch unreachable, // The buffer holds the longest name and the sentence.
             else => fix_sentence(code),
         };
         diag.fix(.{ .sentence = sentence });
@@ -1005,6 +1091,20 @@ pub const Client = struct {
         assert(self.out_length <= constants.tls_output_bytes_max);
     }
 };
+
+fn message_name(kind: u8) []const u8 {
+    return switch (kind) {
+        wire.handshake_server_hello => "ServerHello",
+        wire.handshake_encrypted_extensions => "EncryptedExtensions",
+        wire.handshake_certificate => "Certificate",
+        wire.handshake_certificate_request => "CertificateRequest",
+        wire.handshake_certificate_verify => "CertificateVerify",
+        wire.handshake_finished => "Finished",
+        wire.handshake_new_session_ticket => "NewSessionTicket",
+        wire.handshake_key_update => "KeyUpdate",
+        else => "handshake message",
+    };
+}
 
 fn ed25519_verifies(key: *const [32]u8, content: []const u8, signature: *const [64]u8) bool {
     const public_key = Ed25519.PublicKey.fromBytes(key.*) catch return false;
@@ -1082,6 +1182,8 @@ fn fix_sentence(code: Code) []const u8 {
     return switch (code) {
         .E0815 => "Reconnect; if it repeats, check the network path between the two machines.",
         .E0816 => "Retry the request: what arrived before the break may be incomplete.",
+        .E0820 => "Check that the process or device holding this workload's key is running and " ++
+            "reachable, then reconnect.",
         else => unreachable,
     };
 }

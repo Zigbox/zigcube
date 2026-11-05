@@ -1,6 +1,6 @@
 error[ZC-E0814]: the TLS client certificate was not asked for, or was refused
   cause  the server did not ask for a client certificate, and this connection
          must present one
-  fix    Check that the server at broker.botpike.com requires client certificates from the cluster CA, and that this workload's certificate is current and was issued by it.
+  fix    Check that the server at broker.botpike.com is configured to request client certificates (needClientAuth on a JVM, -Verify on OpenSSL) and trusts the cluster CA.
   more   zcube explain E0814 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0814.html

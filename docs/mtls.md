@@ -107,26 +107,42 @@ Rules the code holds to, each with a test:
   the handshake, and only with the body `01`. The client sends its own before its Finished.
 - A failure queues one alert (sealed if the write keys are live), wipes every secret and buffer,
   and ends the connection: `receive` then answers `error.Closed` and `output()` stays empty.
-- A received KeyUpdate re-keys the receive side; one that asks is answered. The client never starts
-  one by itself (`send_key_update` is for the connection layer).
-- Client authentication (slice 5). `Config.identity` is the workload's chain (at most two
-  certificates) and a `Signer` (a callback that signs the CertificateVerify content and may
-  fail); `require_client_auth` says the connection must authenticate. A CertificateRequest is
-  read once, after EncryptedExtensions: its `signature_algorithms` must be present, and its
-  context (up to 255 bytes) is echoed. `certificate_authorities` is ignored. The client answers
+- A received KeyUpdate re-keys the receive side; one that asks is answered. `seal_application`
+  puts a KeyUpdate of its own in front of the record when the write keys have reached their
+  record limit (RFC 8446 section 5.5), in the same slice, so a caller sizes its buffer with
+  `application_bytes_max` and needs no other step. A direction that cannot move on (the key limit
+  or too many KeyUpdates) is ZC-E0815, never a silent stop. `send_key_update` rotates sooner.
+- Client authentication (slice 5). `Config.client_auth` is `.none`, `.optional` or `.required`,
+  the last two carrying the `Identity`: the workload's chain (at most two certificates) and a
+  `Signer` (a callback that signs the CertificateVerify content and may fail). A required
+  connection without an identity cannot be written down. A CertificateRequest is read once,
+  after EncryptedExtensions: its `signature_algorithms` must be present, no extension type may
+  occur twice, and its context (up to 255 bytes) is echoed. `certificate_authorities` is skipped,
+  so a large list of names is fine until the message passes the limit below. The client answers
   with Certificate, CertificateVerify (context string "TLS 1.3, client CertificateVerify") and
   Finished, all in one flight after the server's Finished; the client's Finished covers them.
-  If the request lists no Ed25519, or there is no identity, an optional client sends an empty
-  Certificate; a required one is refused with ZC-E0814. A request after the handshake, or a
-  second one, is ZC-E0813. After the flight, an alert such as `bad_certificate` or
-  `certificate_required` is ZC-E0814, any other alert ZC-E0813.
+  If the request lists no Ed25519 (in `signature_algorithms` or `signature_algorithms_cert`), or
+  there is no identity, an optional client sends an empty Certificate; a required one is refused
+  with ZC-E0814. A request after the handshake, or a second one, is ZC-E0813. After the flight,
+  an alert such as `bad_certificate` or `certificate_required` is ZC-E0814, any other alert
+  ZC-E0813. If the signer returns nothing the connection ends with ZC-E0820 and an
+  `internal_error` alert; the Certificate is not sent first.
+- **Message limit.** The client reads a handshake message of at most 4096 bytes
+  (`tls_handshake_message_bytes_max`); a longer one is ZC-E0813 and the cause names the message
+  and its size. A CertificateRequest that lists many `certificate_authorities` can pass it, and a
+  server of that kind is refused; raising the limit is a change to `constants.zig`.
+- **Leniency in the context.** The client Certificate echoes whatever context the request
+  carried, non-empty included, as RFC 8446 section 4.4.2 says; the server's own Certificate
+  (in the first flight) must have an empty context and a non-empty one is refused.
 
 Tests: `tls_client_test.zig` (client authentication in all piece sizes, refusals, the server's
-alerts, a failing signer and five teeth tests for it; success at several piece sizes, refusals, pinning, record faults and
+alerts, a failing signer (ZC-E0820) and five teeth tests for it; `tls_wire_test.zig`, tables for `parse_certificate_request`; success at several piece sizes, refusals, pinning, record faults and
 six teeth tests, one each for the pin, the name, the validity window, CertificateVerify, Finished
 and the transcript, which fail when that check is skipped), and `tls_fuzz.zig`, a seeded fuzzer
 that damages a server's flight in thirteen ways (alerts, plain and sealed, at record boundaries;
-any record replayed) and feeds it in random pieces. It checks the client's answer at the moment
+any record replayed), damages the CertificateRequest itself in a third of the runs, draws the
+request's scheme lists, feeds it in random pieces, and after an intact flight runs a script of
+data, KeyUpdates, tickets and alerts both ways. It checks the client's answer at the moment
 of `connected`, whatever follows, and has a teeth test of its own. Tidy allows only test roots to
 import `tls_testpeer.zig`. It is replayed like the others (see "Replaying a fuzz
 failure").
@@ -141,7 +157,8 @@ failure").
 | ZC-E0812 | names another peer; shows both names |
 | ZC-E0817 | an identity could not be issued |
 | ZC-E0813 | the TLS handshake was refused: a malformed or out-of-order message, a CertificateVerify or Finished that does not verify, a server alert, or a CertificateRequest that is malformed or out of order |
-| ZC-E0814 | the client certificate was not asked for though required, could not be answered, or was refused by the server |
+| ZC-E0814 | the client certificate was not asked for though required, could not be answered, or was refused by the server (an empty or absent Certificate answered by a refusal is this too) |
+| ZC-E0820 | the signer holding the client certificate's key did not sign |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
 | ZC-E0816 | the connection ended without close_notify, or before the handshake finished |
 | ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |

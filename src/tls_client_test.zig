@@ -119,16 +119,21 @@ const Rig = struct {
         auth: Auth,
         count: u32,
     ) void {
-        var identity: ?tls_client.Identity = null;
+        var client_auth: tls_client.ClientAuth = .none;
         if (auth.identity) {
-            identity = .{
+            const identity: tls_client.Identity = .{
                 .certificates = rig.client_chain[0..if (auth.with_ca) 2 else 1],
                 .signer = if (auth.broken_signer)
                     .{ .context = &rig.client_key, .sign = broken_sign }
                 else
                     tls_client.key_pair_signer(&rig.client_key),
             };
+            client_auth = if (auth.require)
+                .{ .required = identity }
+            else
+                .{ .optional = identity };
         }
+        if (auth.require) assert(auth.identity);
         rig.peer = testpeer.Peer.init(.{
             .certificates = rig.certificates[0..count],
             .key = rig.server_key,
@@ -152,8 +157,7 @@ const Rig = struct {
             .random = @splat(0x11),
             .session_id = @splat(0x22),
             .secret = @splat(0x33),
-            .identity = identity,
-            .require_client_auth = auth.require,
+            .client_auth = client_auth,
         });
         rig.sent_length = 0;
         rig.flight_length = 0;
@@ -273,7 +277,7 @@ test "application data goes both ways under fresh keys" {
     const event = try rig.feed(record, 4096);
     try std.testing.expectEqualStrings("hello client", event.data);
     var out: [256]u8 = undefined;
-    const sealed = try rig.client.seal_application("hello server", &out);
+    const sealed = try rig.client.seal_application("hello server", &out, &rig.diag);
     const opened = try rig.peer.open(sealed);
     try std.testing.expectEqual(schedule.ContentType.application_data, opened.content_type);
     try std.testing.expectEqualStrings("hello server", opened.content);
@@ -299,7 +303,7 @@ test "a KeyUpdate moves the receive keys, and one that asks is answered" {
     try std.testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, opened.content);
     try rig.peer.read.rekey();
     var out: [256]u8 = undefined;
-    const sealed = try rig.client.seal_application("new keys", &out);
+    const sealed = try rig.client.seal_application("new keys", &out, &rig.diag);
     try std.testing.expectEqualStrings("new keys", (try rig.peer.open(sealed)).content);
 }
 
@@ -674,7 +678,7 @@ test "application data and key updates work after client authentication" {
     rig.peer.read.rekey() catch unreachable; // Keys never run out here.
     rig.sent_length = 0;
     _ = try rig.feed(rig.peer.application(&buffer, "again"), 4096);
-    try rig.client.send_key_update(false);
+    try rig.client.send_key_update(false, &rig.diag);
     rig.collect();
     const opened = try rig.peer.open(rig.sent[0..rig.sent_length]);
     try std.testing.expect(opened.content_type == .handshake);
@@ -759,11 +763,12 @@ test "the server's refusal of the certificate is named after the handshake" {
     try std.testing.expectEqual(testpeer.ClientFlight.ok, try connect_auth(&rig, 4096));
     try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 50), 4096));
     try rig.expect_code(.E0813);
-    // With no certificate sent, bad_certificate is not about the client's.
+    // After an empty Certificate the refusal is still the server's answer to what the client
+    // showed (the brief: ZC-E0814), with the client's lack of a certificate in the cause.
     try rig.setup_auth(.good, .{}, .{ .ask = true, .server_requires = false });
     _ = try connect_auth(&rig, 4096);
     try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 42), 4096));
-    try rig.expect_code(.E0813);
+    try rig.expect_code(.E0814);
 }
 
 test "the peer refuses a certificate from another CA or an expired one" {
@@ -775,11 +780,11 @@ test "the peer refuses a certificate from another CA or an expired one" {
     }
 }
 
-test "a signer that fails is refused with E0814" {
+test "a signer that fails is refused with E0820" {
     var rig: Rig = undefined;
     try rig.setup_auth(.good, .{}, .{ .ask = true, .identity = true, .broken_signer = true });
     try std.testing.expectError(error.Refused, rig.handshake(4096));
-    try rig.expect_code(.E0814);
+    try rig.expect_code(.E0820);
     try expect_context(&rig.diag, "sent", "alert internal_error (80)");
 }
 

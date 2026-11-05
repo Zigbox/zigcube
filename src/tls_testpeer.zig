@@ -48,6 +48,10 @@ pub const Faults = struct {
     second_request: bool = false,
     /// One record for each handshake message; otherwise all of them share one.
     record_per_message: bool = true,
+    /// Damages the CertificateRequest of `Config.client_auth` after it is built (not zero): the
+    /// value picks how and where (see `damage_request`). The record around it stays valid, so
+    /// what fails is the request's own parse.
+    request_damage: u32 = 0,
 };
 
 /// Asks the client for a certificate and checks what it sends.
@@ -219,7 +223,7 @@ pub const Peer = struct {
             used += self.message(out[used..], &scratch, &length, &request, true);
         }
         if (self.config.client_auth) |auth| {
-            const request = request_message(&auth);
+            const request = request_message(&auth, faults.request_damage);
             used += self.message(out[used..], &scratch, &length, request, true);
             if (faults.second_request) {
                 used += self.message(out[used..], &scratch, &length, request, true);
@@ -457,7 +461,7 @@ pub const Peer = struct {
 var request_buffer: [512]u8 = undefined;
 
 /// CertificateRequest (RFC 8446 section 4.3.2): the context and the extensions the config names.
-fn request_message(auth: *const ClientAuth) []const u8 {
+fn request_message(auth: *const ClientAuth, damage: u32) []const u8 {
     const buffer = &request_buffer;
     var length: usize = 4;
     buffer[length] = @intCast(auth.context.len);
@@ -476,7 +480,27 @@ fn request_message(auth: *const ClientAuth) []const u8 {
     std.mem.writeInt(u16, buffer[extensions_at..][0..2], extensions_length, .big);
     buffer[0] = wire.handshake_certificate_request;
     std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+    if (damage != 0) length = damage_request(buffer, length, extensions_at, damage);
     return buffer[0..length];
+}
+
+/// Damages a built request, keeping the message header's length true to what follows: a byte
+/// flipped, the body cut short, junk appended, or the extension list's length replaced.
+fn damage_request(buffer: []u8, length_in: usize, extensions_at: usize, damage: u32) usize {
+    var length = length_in;
+    const pick = damage / 4;
+    switch (damage % 4) {
+        0 => buffer[4 + pick % (length - 4)] ^= @as(u8, 1) << @intCast(pick / 64 % 8),
+        1 => length -= 1 + pick % (length - 4),
+        2 => {
+            const extra = 1 + pick % 8;
+            @memset(buffer[length..][0..extra], @truncate(pick));
+            length += extra;
+        },
+        else => std.mem.writeInt(u16, buffer[extensions_at..][0..2], @truncate(pick), .big),
+    }
+    std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+    return length;
 }
 
 fn put_schemes(out: []u8, kind: u16, schemes: []const u16) usize {
