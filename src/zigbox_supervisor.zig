@@ -329,6 +329,10 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     // Not `init.io`: that is a threaded Io. Zigbox's start and pull make namespaces, which
     // needs a process with one thread, and this Io never starts another.
     var threaded: std.Io.Threaded = .init_single_threaded;
+    // The static Io has a failing allocator, and spawning a process (the swarm fetch) copies
+    // argv and the environment: without one it ends in OutOfMemory.
+    threaded.allocator = init.gpa;
+    threaded.environ.process_environ = init.minimal.environ;
     const io = threaded.io();
     const dir = Dir.openDirAbsolute(io, dir_path, .{}) catch return constants.exit_environment;
     defer dir.close(io);
