@@ -521,8 +521,11 @@ live. `/job-admission` and `/job-endings` are exact keys of their writers and ar
 **A run is created once, ever.** The controller never re-creates a run for a job that had one
 (I8a). A job whose run or status is missing after it had one is contradictory (ZC-E0307): the
 controller changes nothing and creates nothing. An operator who deletes `/job-runs/<name>` and
-`/job-status/<name>` has not cancelled the job. How "had one" is known is an open owner question:
-`docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
+`/job-status/<name>` has not cancelled the job. "Had one" is the `job-created` decision (owner,
+option A): before creating, the controller reads `/decisions-by-subject/job/<name>`, and a
+`job-created` there means the job is contradictory, whatever else is missing. This rests on the
+job controller being the only writer of runs, and on retention judging a job live by
+`/jobs/<name>` alone: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
 
 **I1a, I1b, I2, I6 and I7 hold for runs unchanged:** a run has at most one assignment and its
 observations are admissible under one tenure; the allocation of a node counts runs with replicas;

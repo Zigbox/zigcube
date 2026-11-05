@@ -1,7 +1,7 @@
-# B1: the job controller must never create a second run of a job (open owner question)
+# B1: the job controller must never create a second run of a job
 
-*Open 2026-11-05, raised by the review of slice 1 (PR #98). The rule below is not in question;
-how the controller knows is. Slice 3 builds the controller after the owner answers.*
+*Decided 2026-11-05, by the owner: option A, the `job-created` decision. Raised by the review of
+slice 1 (PR #98). Slice 3 builds it.*
 
 ## The rule
 
@@ -15,7 +15,7 @@ So the controller must create a run only for a job that has never had one. It mu
 re-create one for a job that had, whatever the cause of its absence. ZC-E0307 says "never delete
 a run or a status" for this reason.
 
-## The open part
+## The options
 
 "Never had one" needs a durable fact that outlives the run and the status. Candidates:
 
@@ -56,13 +56,15 @@ transaction (an `api` write of `/job-runs/` and `/job-status/`), and the control
 creates, only advances. Closes the hole completely, but moves a writer: authority.md I4 and the
 brief's writer table change, which are Ask-first.
 
-## Recommendation
+## Decision
 
-None yet; the owner decides. Compare A and D on equal terms: A needs no writer change but rests on
-single-writer authority and on slice 3 getting retention's liveness right, and a hand edit of the
-decision defeats it; D alone closes the hole, and moves a writer (Ask-first). If no answer comes,
-slice 3 builds A with the negative tests (a job with a `job-created` decision and no run is E0307
-and never started, in `sim-c1` and as a unit test of step 1) and says so in its report.
+**A.** The owner chose the `job-created` decision on 2026-11-05. Slice 3 implements it: before
+creating, the controller reads `/decisions-by-subject/job/<name>`, and a `job-created` there makes
+the job contradictory (ZC-E0307), nothing created. Its costs stand as listed under A and bind
+slice 3: retention must judge a job live by `/jobs/<name>` alone (A.2), the job controller stays
+the only writer of runs (A.3), and a hand edit that also deletes the job's decisions still re-runs
+it (A.1, accepted). Slice 3 adds the negative tests: a job with a `job-created` decision and no run
+is E0307 and never started, in `sim-c1` and as a unit test of step 1.
 
 ## What slice 1 did
 
