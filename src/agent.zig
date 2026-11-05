@@ -288,9 +288,11 @@ pub const Agent = struct {
 
     /// The soonest the agent needs to run again: its lease renewal, the fence, a stop's deadline,
     /// or the resync that notices a container that ended. A stop whose deadline has passed is not
-    /// a wake: this pass already killed its container (`stop_once`), and one that is still listed
-    /// (a record whose container never started reads `starting` until `fake_start_timeout_ms`,
-    /// and there is nothing to kill) is looked at again by the resync, not at once, every step.
+    /// a wake: if the container is still an orphan or stale, this pass already killed it
+    /// (`stop_once`), and one that is still listed (a record whose container never started reads
+    /// `starting` until `fake_start_timeout_ms`, and there is nothing to kill) is looked at again
+    /// by the resync, not at once, every step. A pending stop that neither path visits waits
+    /// quietly for its container to end.
     fn next_wake(agent: *const Agent, now: u64, mono: u64) u64 {
         var wake = now + constants.agent_resync_ms;
         if (agent.lease != store.lease_none) {
@@ -1116,4 +1118,32 @@ fn same_state(first: *const records.Observed, second: *const records.Observed) b
 // is told to stop. `sim-teeth` is the one build that sees it on.
 test "the test-only fault is off in this build" {
     try std.testing.expect(!fault_ignore_stop);
+}
+
+test "next_wake: an overdue stop is not a wake time, a future one is (issue 96)" {
+    const agent = try std.testing.allocator.create(Agent);
+    defer std.testing.allocator.destroy(agent);
+    agent.init(.{ .node = "node1", .capacity = .{ .cpu_millis = 1000, .memory_bytes = 1 << 30 } });
+    const now: u64 = 10_000;
+    const resync = now + constants.agent_resync_ms;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+
+    // A deadline that has passed, or is exactly now, leaves the wake at the resync.
+    agent.stops[0] = .{ .handle = runtime.Handle.init("a"), .deadline_ms = now - 1 };
+    agent.stops_count = 1;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+    agent.stops[0].deadline_ms = now;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+
+    // A future deadline sooner than the resync is the wake; one later than it is not.
+    agent.stops[0].deadline_ms = now + 100;
+    try std.testing.expectEqual(now + 100, agent.next_wake(now, 0));
+    agent.stops[0].deadline_ms = resync + 5_000;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+
+    // An overdue stop beside a future one: only the future one counts.
+    agent.stops[1] = .{ .handle = runtime.Handle.init("b"), .deadline_ms = now + 200 };
+    agent.stops[0].deadline_ms = now - 500;
+    agent.stops_count = 2;
+    try std.testing.expectEqual(now + 200, agent.next_wake(now, 0));
 }
