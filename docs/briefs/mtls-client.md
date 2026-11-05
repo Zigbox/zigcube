@@ -51,8 +51,8 @@ A writer and a matching parser, both bounded, for three certificate kinds:
   Labels are sorted by key, keys unique. This is C4's identity: service, image digest,
   placement epoch (docs/decisions/2026-10-27-c4-workload-identity-binds-service-image.md), plus
   B3's labels.
-- **Serial.** 16 bytes, top bit clear: the first 16 bytes of SHA-256 of subject key and
-  `not_before`, so the writer needs no randomness and the output is deterministic.
+- **Serial.** 16 bytes, top bit clear: the first 16 bytes of SHA-256 over every other field of the TBS (kind, issuer, subject, validity, key, name, identity; changed in the follow-ups to #89, the first version hashed only the key and
+  `not_before`), so the writer needs no randomness and the output is deterministic.
 - **Validity.** UTCTime to 2049, GeneralizedTime after (RFC 5280 §4.1.2.5), whole seconds, from
   the caller's wall clock in Unix ms. A leaf lives at most `x509_leaf_ttl_ms_max`; B3 sets it to
   the job's `deadline_ms` plus a small constant.

@@ -1382,7 +1382,9 @@ pub const registry = [_]Entry{
         \\labels together over x509_labels_bytes_max, a cluster or service name that
         \\does not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that
         \\is not lowercase, has a wildcard or an all-digit label, or a lifetime that
-        \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA).
+        \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA), or a
+        \\subject key that is not a valid Ed25519 public key (off the curve, or in a
+        \\small subgroup), which no honest holder has.
         \\
         \\The cause names the rule. Correct the request and issue again; nothing was
         \\written.

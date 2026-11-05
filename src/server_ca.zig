@@ -33,6 +33,9 @@ const pem_bytes_max = pem_begin.len + pem_end.len +
 
 pub const Error = files.Error || error{OutOfMemory};
 
+/// A CA certificate with less than this left is made again at the next start.
+const renew_ahead_ms: u64 = 30 * 24 * 60 * 60 * 1000;
+
 pub const memory_notice = "zcube-server: no state directory, so the peer CA key lives in memory " ++
     "only; agents will join again after a restart\n";
 
@@ -108,7 +111,8 @@ pub fn open(
 }
 
 /// Makes sure `<key name>.crt` holds this key's CA certificate, valid now: a file that is absent,
-/// is not our PEM, names another key (after `--new-ca`) or has expired is made again. The file is
+/// is not our PEM, names another key (after `--new-ca`) or has expired or
+/// will within `renew_ahead_ms` is made again. The file is
 /// derived from the key, so there is nothing to lose by replacing it; but it is a trust anchor
 /// for the services that pin it, so it is read and written under the key's rule (a directory
 /// others cannot write, mode 0600; ZC-E0806). Nothing reads it back for the server's own use.
@@ -126,8 +130,10 @@ fn ensure_certificate(
     if (try files.read(io, dir, path, name, .secret, &text, diag)) |existing| {
         var der_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
         if (pem_decode(existing, &der_buffer)) |bytes| {
-            const now_ms = ca.wall.now_ms();
-            _ = x509.verify(bytes, ca.public(), now_ms, .{ .kind = .ca, .name = null }) catch {
+            // Judged a month ahead, so a certificate near its end is made again while services
+            // that pin it still have time to take the new file.
+            const later_ms = ca.wall.now_ms() +| renew_ahead_ms;
+            _ = x509.verify(bytes, ca.public(), later_ms, .{ .kind = .ca, .name = null }) catch {
                 return write_certificate(ca, io, dir, path, name, diag);
             };
             return;
@@ -146,8 +152,12 @@ fn write_certificate(
 ) Error!void {
     var certificate: x509.Der = .{};
     ca.issue_ca_certificate(&certificate, constants.x509_ca_ttl_ms_max) catch |err| {
-        const fix = "set the clock; the certificate is made again at the next start";
-        return files.unusable_fix(diag, path, name, "make", @errorName(err), fix);
+        diag.raise(peer_ca.code_of(err));
+        diag.cause("can't make the CA certificate {s} in {s}: {s}", .{
+            name, path, peer_ca.reason(err),
+        });
+        diag.fix(.{ .sentence = "set the clock; the certificate is made again at the next start" });
+        return error.Failed;
     };
     var text: [pem_bytes_max]u8 = undefined;
     const pem = pem_encode(&text, certificate.slice());
@@ -486,6 +496,61 @@ test "PEM text round trips only in the exact form written" {
     other[pem_begin.len + 3] = '!';
     try std.testing.expect(pem_decode(other[0..pem.len], &der_buffer) == null);
     try std.testing.expect(pem_decode("", &der_buffer) == null);
+}
+
+const NearEndClock = struct {
+    fn clock(self: *NearEndClock) Clock {
+        return .{ .context = self, .now_ms_fn = now };
+    }
+
+    /// A day before the end of a certificate made at `FixedClock`'s time.
+    fn now(_: *anyopaque) u64 {
+        return 1_000_000 + constants.x509_ca_ttl_ms_max - 24 * 60 * 60 * 1000;
+    }
+};
+
+const FarClock = struct {
+    fn clock(self: *FarClock) Clock {
+        return .{ .context = self, .now_ms_fn = now };
+    }
+
+    /// Past the year 9999, which no certificate can hold.
+    fn now(_: *anyopaque) u64 {
+        return 300_000_000_000_000;
+    }
+};
+
+test "a CA certificate near its end is made again; an unmakeable one is one coded line" {
+    // Goal: renewal ahead of time, and a certificate that cannot be made reports as ZC-E0817
+    // with the reason in words (never a Zig error name). Method: open at the start, again a day
+    // before the end (the file changes), then with a clock past the year 9999 on a new directory.
+    const io = std.testing.io;
+    var dir = try TestDir.make(io);
+    defer dir.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    try open_test(&dir, &ca, .{ .quiet = true }, &diag);
+    var text: [pem_bytes_max]u8 = undefined;
+    var before: [pem_bytes_max]u8 = undefined;
+    const first = (try dir.tmp.dir.readFile(io, "ca.crt", &before)).len;
+    var near = NearEndClock{};
+    const options: Options = .{ .quiet = true, .first_start = false };
+    try open(&ca, std.testing.allocator, io, dir.path(), near.clock(), options, &diag);
+    const after = try dir.tmp.dir.readFile(io, "ca.crt", &text);
+    try std.testing.expect(!std.mem.eql(u8, before[0..first], after));
+
+    var far_dir = try TestDir.make(io);
+    defer far_dir.tmp.cleanup();
+    var far = FarClock{};
+    const failed = open(&ca, std.testing.allocator, io, far_dir.path(), far.clock(), .{
+        .quiet = true,
+    }, &diag);
+    try std.testing.expectError(error.Failed, failed);
+    try std.testing.expectEqual(@import("diag/codes.zig").Code.E0817, diag.code.?);
+    const cause = diag.last_cause().?;
+    try std.testing.expect(std.mem.indexOf(u8, cause, "IssueLifetime") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cause, peer_ca.reason(error.IssueLifetime)) != null);
 }
 
 const LaterClock = struct {
