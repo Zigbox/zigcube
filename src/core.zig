@@ -149,9 +149,11 @@ test "the TLS key schedule and record layer tests are in this root" {
     _ = @import("tls_schedule_test.zig");
 }
 
-test "the controllers' tests are in this root" {
-    // Goal: the controllers' tests run under WASI too. Method: import them (they use only the
-    // memory store, a manual clock and the testing allocator).
+// Plain `test {}`: a named test would hide these imports from `-Dtest-filter`.
+test {
+    // The controllers' tests run under WASI too: they use only the memory store, a manual clock
+    // and the testing allocator.
+
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("api_test.zig");

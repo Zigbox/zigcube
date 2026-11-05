@@ -451,6 +451,24 @@ pub const fetch_list_peers_max: u32 = 4;
 /// One fetch ends in an error after this long, whatever it is doing (a 64 GiB tree at the
 /// node's rate cap takes about 17 minutes).
 pub const fetch_total_ms: u32 = 30 * 60 * 1000;
+/// The Zigbox supervisor kills a `zcube-agent fetch` that is still running this long after it
+/// started: the fetch's own limit and a minute for it to say why it failed.
+pub const zigbox_fetch_deadline_ms: u32 = fetch_total_ms + 60 * 1000;
+/// After the fetch's process group is sent SIGKILL (at the deadline, or after the fetch ended),
+/// how long the supervisor waits for every process of it to be gone. One still there then is in
+/// uninterruptible sleep and may still write the store, so no pull starts (ZC-E0515).
+pub const zigbox_fetch_kill_wait_ms: u32 = 5 * 1000;
+/// How many times `process_session.kill_all` reads `/proc` for a session's processes: a process
+/// forked while the first read went by is found by the next.
+pub const session_kill_rounds: u32 = 3;
+/// The most `/proc` entries one read looks at: Linux's largest `pid_max` (2^22) and the
+/// non-process entries beside them.
+pub const proc_entries_max: u32 = (1 << 22) + 1024;
+
+comptime {
+    assert(zigbox_fetch_kill_wait_ms < zigbox_fetch_deadline_ms);
+    assert(session_kill_rounds >= 2);
+}
 /// The wait before a fetch on a node whose last fetch failed, doubling from the base to the cap
 /// (`fetch_backoff.zig`), so an unreachable tree does not make replicas churn at the speed of the
 /// refusals.
@@ -471,6 +489,8 @@ pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
 /// With no peer holding a chunk, the plan waits this long from its start for a filter to show it
 /// (another node may be fetching it, c2.md O5), then goes to the registry.
 pub const fetch_peer_wait_ms: u32 = 30_000;
+/// A fetch waiting for another node's registry pull (O5) re-reads `/node-store` this often.
+pub const fetch_peer_poll_ms: u32 = 1000;
 /// A request not answered by then is a timeout.
 pub const fetch_request_timeout_ms: u32 = 10_000;
 /// Requests in flight in all, and to one peer.
@@ -507,8 +527,15 @@ pub const peer_join_retry_ms: u32 = 5 * 1000;
 /// One join call waits this long at most (less near the lease's fence).
 pub const peer_join_timeout_ms: u32 = 3 * 1000;
 /// Handshakes the peer server starts for one source address in one window; the next is refused.
-/// An honest agent opens a handshake per fetch connection, a few per node per window.
-pub const peer_handshakes_per_source_max: u32 = 16;
+/// It bounds unauthenticated public-key work (a few hundred microseconds each), and is sized for
+/// a whole cluster behind one NAT address: every fetch connection to this server carries
+/// `peer_connection_requests_max` chunks, so even a server serving at 1 GiB/s sees about 16
+/// handshakes a second from all its fetchers together, and busy answers add a few more.
+pub const peer_handshakes_per_source_max: u32 = 256;
+/// Handshakes of one source address that may be unfinished at once; one more is refused. Above
+/// one so that the nodes of a cluster behind one NAT address can connect together; well under
+/// `peer_handshakes_max`, so that silent strangers of one address hold a few links, not all.
+pub const peer_handshakes_pending_per_source_max: u32 = 8;
 /// The window the per-source bound counts in.
 pub const peer_handshake_window_ms: u64 = 10 * 1000;
 /// Sources the limiter tracks at once. A table full of live windows refuses a new source: the
@@ -517,6 +544,11 @@ pub const peer_sources_max: u32 = 256;
 /// Peer connections the server serves at once (each owns buffers of about 12 MiB). One more
 /// authenticated peer is told it is busy (status 503) and closed.
 pub const peer_connections_max: u32 = 4;
+/// Serving slots one authenticated node name holds at once; its next connection is told busy
+/// (503). An honest fetch keeps one stream per peer, so this is room for two concurrent fetches.
+/// Any API client can mint a credential (docs/peer.md), so this bounds a node name, not an
+/// attacker: the slot count is what bounds the server.
+pub const peer_connections_per_node_max: u32 = 2;
 /// Connections the server holds before they are authenticated: a descriptor, a task and a few
 /// words each, no buffers. A silent stranger holds one for at most `peer_handshake_ms`; the
 /// buffers of a serving slot go to a connection only once it has authenticated.
@@ -527,10 +559,13 @@ pub const peer_handshakes_max: u32 = 32;
 pub const peer_handshake_evict_min_ms: u64 = 750;
 /// Time between two times ZC-E0808 is shown, whatever the sources: a flood must not flood a log.
 pub const peer_refusal_log_ms: u64 = 10 * 1000;
-/// Times a fetch asks a peer again after its server said it is busy, and the pause before each.
-/// A busy peer is not a failed one: no timeout, no strike.
-pub const fetch_busy_retries_max: u32 = 4;
+/// How long a fetch keeps asking a peer whose server said it is busy (status 503) before it
+/// takes the answer as a refusal, and the pauses between asks: the first, doubled up to the
+/// longest. A busy peer is not a failed one: no timeout, no strike
+/// (docs/decisions/2026-11-05-busy-peer-wait.md).
+pub const fetch_busy_wait_ms: u32 = 20 * 1000;
 pub const fetch_busy_sleep_ms: u32 = 250;
+pub const fetch_busy_sleep_max_ms: u32 = 2 * 1000;
 /// Time a peer has to finish the handshake.
 pub const peer_handshake_ms: u32 = 3 * 1000;
 /// Time a served connection waits for its next request before it closes.
@@ -627,7 +662,12 @@ comptime {
 
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
-    assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
+    assert(peer_handshakes_pending_per_source_max > 1);
+    assert(peer_handshakes_pending_per_source_max * 2 <= peer_handshakes_max);
+    assert(peer_connections_per_node_max > 0);
+    assert(peer_connections_per_node_max < peer_connections_max);
+    assert(fetch_busy_sleep_ms <= fetch_busy_sleep_max_ms);
+    assert(fetch_busy_wait_ms < fetch_total_ms);
     assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);
@@ -733,9 +773,30 @@ comptime {
     assert(fetch_candidates_max <= 255); // A peer's index is a u8.
     assert(fetch_list_peers_max <= fetch_peers_max);
     assert(fetch_total_ms > fetch_peer_wait_ms);
+    assert(fetch_peer_poll_ms < fetch_peer_wait_ms);
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }
+
+// The Zigbox store adapter (`zigbox_images.zig`, C2 slice 8). All bounds, none a policy.
+
+/// The scratch one Zigbox call reads or writes through: exactly Zigbox's `store_io_buffer_bytes`
+/// (not exported), which `fs.read` asserts as a most and `chunk_hashes` as a least.
+pub const zigbox_io_bytes: u32 = 256 * 1024;
+/// The depth of the walk's explicit stack, in digests.
+pub const zigbox_walk_stack_max: u32 = 1 << 12;
+/// The chunks one object lists: exactly Zigbox's `store_chunks_max` (not exported), which
+/// `chunk_hashes` asserts of the room it is given.
+pub const zigbox_chunks_per_object_max: u32 = 4096;
+/// The bytes the root listing's names may take.
+pub const zigbox_roots_arena_bytes: u32 = 1 << 14;
+/// The bytes of one image record (a peer's record is held to this before it is parsed).
+pub const zigbox_record_bytes_max: u32 = 80 * 1024;
+/// The objects an in-progress receive may hold claims on: as many as the walk's `entries_max`
+/// (`zigbox_images.zig` asserts it), so every tree the walk accepts can be claimed.
+pub const zigbox_claims_max: u32 = 1 << 16;
+/// The bytes a tree record is read into.
+pub const zigbox_tree_buffer_bytes: u32 = 4 << 20;
 
 /// The most a validated pull record encodes to: the fixed fields (node, tree, four numbers, with
 /// escapes) under 512 bytes, and `pull_peers_max` peers each in `peer_bytes` (a node name and a

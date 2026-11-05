@@ -307,10 +307,13 @@ test "the node's replicas come back with env values, and its reports go in and o
     const replica = try records.read(records.Replica, arena, page.kvs[0], &diag);
     try testing.expectEqualStrings("hello", replica.service);
 
-    const first = "{\"v\":1,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
-        "\"status\":\"running\",\"started_at_ms\":1,\"reported_at_ms\":2}";
-    const second = "{\"v\":1,\"replica\":\"hello-2\",\"node\":\"node1\",\"generation\":1," ++
-        "\"status\":\"running\",\"reported_at_ms\":2}";
+    // A record names the tenure of the request that carries it.
+    const first = try std.fmt.allocPrint(arena, "{{\"v\":1,\"replica\":\"hello-1\"," ++
+        "\"node\":\"node1\",\"generation\":1,\"status\":\"running\",\"started_at_ms\":1," ++
+        "\"reported_at_ms\":2,\"tenure\":{d}}}", .{joined.revision});
+    const second = try std.fmt.allocPrint(arena, "{{\"v\":1,\"replica\":\"hello-2\"," ++
+        "\"node\":\"node1\",\"generation\":1,\"status\":\"running\",\"reported_at_ms\":2," ++
+        "\"tenure\":{d}}}", .{joined.revision});
     const ops = [_]store.Op{
         .{ .put = .{ .key = "/observed/node1/hello-1", .value = first } },
         .{ .put = .{ .key = "/observed/node1/hello-2", .value = second } },

@@ -11,6 +11,11 @@
 //! are named on the command line; each is assumed to hold every chunk, and the plan strikes
 //! one that lies (a hash mismatch) or does not answer. Exit codes: 0 fetched, 1 bad arguments
 //! (ZC-E0505), 2 this node failed (disk, memory), 3 no source had the tree (ZC-E0601).
+//!
+//! With `--zigbox-store` the whole fetch runs in Zigbox's store namespace (`fetch_in_namespace`,
+//! C2 slice 8 M3): the process has one thread (a single-threaded Io, checked), and the child
+//! `namespace.run` makes does the network and every store write, so the files get the owners
+//! Zigbox's own pull gives them. The child's exit code is the command's.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -27,7 +32,12 @@ const peer_serve = @import("peer_serve.zig");
 const peer_stream = @import("peer_stream.zig");
 const records = @import("records.zig");
 const store_failures = @import("store_failures.zig");
+const zigbox = @import("zigbox");
+const zigbox_fetch = @import("zigbox_fetch.zig");
+const zigbox_image = @import("zigbox_image.zig");
+const pull_report = @import("pull_report.zig");
 
+const Zsha256 = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
 const IpAddress = std.Io.net.IpAddress;
 const ChunkRef = fetch_plan.ChunkRef;
 const Source = fetch_plan.Source;
@@ -50,7 +60,8 @@ pub const reply_bytes: usize = @max(
 /// The network side of the worker. `list_scratch` holds one reply; `identity` is the node's.
 pub const Net = struct {
     io: std.Io,
-    registry: IpAddress,
+    /// Null in Zigbox mode with no `--registry`: the peers are the only source.
+    registry: ?IpAddress,
     peers: []const Peer,
     identity: ?peer.Identity,
     reply: []u8,
@@ -60,8 +71,18 @@ pub const Net = struct {
     bad_lists: u32 = 0,
     /// The registry sent a reply larger than `reply_bytes`: refused, and said in ZC-E0601.
     oversize: bool = false,
+    /// Zigbox mode: why Zigbox refused the image record a peer sent, if it did.
+    refusal: ?zigbox.store.image_peer.Refusal = null,
+    /// Zigbox mode: peers whose bundle held up but whose image record was another manifest's.
+    other_images: u32 = 0,
+    /// Zigbox mode: the tree is larger than one peer fetch takes here.
+    too_large: bool = false,
+    /// The process environment, which locates the Zigbox store `pull` writes to.
+    environ: std.process.Environ = .empty,
     /// Times a peer answered that it was busy (counts for tests and the log line).
     busy_seen: u32 = 0,
+    /// How long one request keeps asking a busy peer (`fetch_busy_wait_ms`; tests lower it).
+    busy_wait_ms: u32 = constants.fetch_busy_wait_ms,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
     conns: []Conn = &.{},
 
@@ -78,6 +99,25 @@ pub const Net = struct {
             .sleep_fn = sleep,
             .blame_fn = blame,
             .bad_list_fn = bad_list,
+            .bundle_fn = bundle,
+        };
+    }
+
+    /// A peer's bundle of the tree (`zigbox_fetch`), into `out`. Only peers have one.
+    fn bundle(context: *anyopaque, source: Source, digest: []const u8, out: []u8) ?[]const u8 {
+        const net = from(context);
+        const index = switch (source) {
+            .registry => return null,
+            .peer => |index| index,
+        };
+        var target: [128]u8 = undefined;
+        const prefix = peer_serve.path_bundle;
+        const path = std.fmt.bufPrint(&target, "{s}{s}", .{ prefix, digest }) catch return null;
+        const reply = net.peer_get(index, path, out);
+        if (reply != .bytes) say_bundle_failed(net.io, net.peers[index].name, reply);
+        return switch (reply) {
+            .bytes => |bytes| bytes,
+            .refused, .timeout, .busy => null,
         };
     }
 
@@ -87,7 +127,8 @@ pub const Net = struct {
         switch (source) {
             .registry => {
                 const path = std.fmt.bufPrint(&target, "/trees/{s}", .{digest}) catch return null;
-                return switch (net.http_get(net.registry, path, out)) {
+                const address = net.registry orelse return null;
+                return switch (net.http_get(address, path, out)) {
                     .bytes => |bytes| bytes,
                     .refused, .timeout, .busy => null,
                 };
@@ -111,7 +152,8 @@ pub const Net = struct {
             .registry => {
                 const path = std.fmt.bufPrint(&target, "/chunks/{x}", .{&ref.hash}) catch
                     return .refused;
-                return switch (net.http_get(net.registry, path, out)) {
+                const address = net.registry orelse return .refused;
+                return switch (net.http_get(address, path, out)) {
                     .bytes => |bytes| .{ .bytes = bytes },
                     .refused => .refused,
                     .timeout, .busy => .timeout,
@@ -186,18 +228,30 @@ pub const Net = struct {
     /// reopened after an error or `peer_connection_requests_max` requests. A non-200 head is
     /// `.refused` (the peer lacks it); a connect, handshake or stream failure is `.timeout`.
     /// One deadline covers both tries of a request. A peer whose server says it is busy (every
-    /// serving slot taken, status 503) is asked again after `fetch_busy_sleep_ms`, at most
-    /// `fetch_busy_retries_max` times: it is neither a timeout nor a strike. Still busy after
-    /// that, the answer is `.refused` and the plan takes the chunk from another source.
+    /// serving slot taken, or this node's share of them, status 503) is asked again, the pause
+    /// doubling from `fetch_busy_sleep_ms` to `fetch_busy_sleep_max_ms`, for `busy_wait_ms`: it
+    /// is neither a timeout nor a strike. Still busy after that, the answer is `.refused` and
+    /// the plan takes the chunk from another source. Each answer is counted on the peer's
+    /// `Conn` for the failure's log lines.
     pub fn peer_get(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
-        var retries: u32 = 0;
+        const conn = &net.conns[index];
+        const started = peer_stream.boot_ms(net.io);
+        var pause: u32 = constants.fetch_busy_sleep_ms;
         while (true) {
             const reply = net.peer_get_once(index, path, out);
+            switch (reply) {
+                .bytes => return reply,
+                .refused => conn.refused += 1,
+                .timeout => conn.timeouts += 1,
+                .busy => {},
+            }
             if (reply != .busy) return reply;
             net.busy_seen += 1;
-            if (retries == constants.fetch_busy_retries_max) return .refused;
-            retries += 1;
-            sleep(net, constants.fetch_busy_sleep_ms);
+            conn.busy += 1;
+            const waited = peer_stream.boot_ms(net.io) -| started;
+            if (waited + pause > net.busy_wait_ms) return .refused;
+            sleep(net, pause);
+            pause = @min(pause * 2, constants.fetch_busy_sleep_max_ms);
         }
     }
 
@@ -260,18 +314,44 @@ pub const Net = struct {
 
 pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout, busy };
 
+/// The line `fetch.log` gets when a peer gave no bundle: who, and what it answered. Not a strike
+/// (docs/swarm.md strikes wrong bytes): the fetch asks the next peer.
+pub fn bundle_note(buffer: []u8, peer_name: []const u8, reply: PeerReply) []const u8 {
+    const what = switch (reply) {
+        .bytes => "a bundle",
+        .refused => "a status other than 200 (or a reply too large)",
+        .timeout => "no reply (connection, read or deadline failure)",
+        .busy => "busy until the busy wait ran out",
+    };
+    return std.fmt.bufPrint(buffer, "zcube-agent fetch: peer {s} answered the bundle request " ++
+        "with {s}; asking the next peer\n", .{ peer_name, what }) catch buffer[0..0];
+}
+
+fn say_bundle_failed(io: std.Io, peer_name: []const u8, reply: PeerReply) void {
+    var buffer: [256]u8 = undefined;
+    const text = bundle_note(&buffer, peer_name, reply);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
+
 /// One peer's open stream and how many requests it has carried.
 pub const Conn = struct {
     open: bool = false,
     fd: std.posix.fd_t = -1,
     requests: u32 = 0,
     stream: peer_stream.Stream = undefined,
+    /// What the peer answered over the whole fetch, streams reopened or not: busy (503), a
+    /// status other than 200, no reply. A ZC-E0601 says them per peer.
+    busy: u32 = 0,
+    refused: u32 = 0,
+    timeouts: u32 = 0,
 
     fn close(conn: *Conn) void {
         if (!conn.open) return;
         conn.stream.deinit();
         _ = std.os.linux.close(conn.fd);
-        conn.* = .{};
+        conn.open = false;
+        conn.fd = -1;
+        conn.requests = 0; // The answer counts are the fetch's, not the stream's.
     }
 };
 
@@ -284,9 +364,14 @@ fn write_all(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, end_ms: u64) !vo
         var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
         const ready = std.posix.poll(&wait, @intCast(end_ms - now_ms)) catch return error.Io;
         if (ready == 0) return error.Io;
+        // The descriptor is non-blocking (`peer_stream.connect`), so a write takes what fits
+        // and the poll above is the only wait.
         const wrote = std.os.linux.write(fd, bytes[done..].ptr, bytes.len - done);
-        if (std.os.linux.errno(wrote) != .SUCCESS) return error.Io;
-        done += wrote;
+        switch (std.os.linux.errno(wrote)) {
+            .SUCCESS => done += wrote,
+            .AGAIN, .INTR => {},
+            else => return error.Io,
+        }
     }
 }
 
@@ -307,7 +392,11 @@ fn read_until_close(
         if (ready == 0) return error.Timeout;
         if (filled == buffer.len) return error.TooLarge;
         const got = std.os.linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
-        if (std.os.linux.errno(got) != .SUCCESS) return error.Timeout;
+        switch (std.os.linux.errno(got)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => continue,
+            else => return error.Timeout,
+        }
         if (got == 0) return buffer[0..filled];
         filled += got;
     }
@@ -429,8 +518,11 @@ const Page = struct {
 /// not one.
 fn parse_page(arena: std.mem.Allocator, text: []const u8) ?Page {
     if (text.len > discover_page_bytes_max) return null;
+    // Every string is copied into `arena`: `text` is a reused buffer, and a key or value that
+    // pointed into it would change under its reader at the next request (O5's fetcher names did).
     return std.json.parseFromSliceLeaky(Page, arena, text, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     }) catch null;
 }
 
@@ -478,13 +570,18 @@ fn decode_filter(arena: std.mem.Allocator, value: std.json.Value) ?[]u8 {
     return bytes;
 }
 
-/// "node2, node3 and the registry", or "the registry" when there are no peers.
-fn tried_sources(buffer: []u8, peers: []const Peer) []const u8 {
+/// "node2, node3 and the registry", or "the registry" when there are no peers; without a
+/// registry, "node2 and node3" or "no peer".
+fn tried_sources(buffer: []u8, peers: []const Peer, registry: bool) []const u8 {
     var writer = std.Io.Writer.fixed(buffer);
     for (peers, 0..) |who, at| {
         writer.print("{s}{s}", .{ if (at == 0) "" else ", ", who.name }) catch break;
     }
-    writer.writeAll(if (peers.len > 0) " and the registry" else "the registry") catch {};
+    if (registry) {
+        writer.writeAll(if (peers.len > 0) " and the registry" else "the registry") catch {};
+    } else if (peers.len == 0) {
+        writer.writeAll("no peer, and no registry is given") catch {};
+    }
     return writer.buffered();
 }
 
@@ -504,6 +601,10 @@ pub const Args = struct {
     state_dir: []const u8 = "",
     images_dir: []const u8 = "",
     digest: []const u8 = "",
+    /// Zigbox mode: the absolute root of the node's Zigbox store (instead of `images_dir`) and
+    /// the manifest of the assignment's digest-pinned image, `sha256:HEX`.
+    zigbox_store: []const u8 = "",
+    manifest: []const u8 = "",
     registry: ?IpAddress = null,
     /// zcube-server: where the peers and their chunk filters are read (`/node-store/`).
     server: ?IpAddress = null,
@@ -529,6 +630,10 @@ pub fn parse(args: []const []const u8) ?Args {
             parsed.state_dir = value;
         } else if (std.mem.eql(u8, flag, "--images-dir")) {
             parsed.images_dir = value;
+        } else if (std.mem.eql(u8, flag, "--zigbox-store")) {
+            parsed.zigbox_store = value;
+        } else if (std.mem.eql(u8, flag, "--manifest")) {
+            parsed.manifest = value;
         } else if (std.mem.eql(u8, flag, "--digest")) {
             parsed.digest = value;
         } else if (std.mem.eql(u8, flag, "--registry")) {
@@ -541,9 +646,20 @@ pub fn parse(args: []const []const u8) ?Args {
             if (!parse_peer(&parsed, value)) return null;
         } else return null;
     }
-    const complete = parsed.node.len > 0 and parsed.state_dir.len > 0 and
-        parsed.images_dir.len > 0 and parsed.registry != null;
+    const complete = parsed.node.len > 0 and parsed.state_dir.len > 0;
     if (!complete or !digest_valid(parsed.digest)) return null;
+    if (parsed.zigbox_store.len > 0) {
+        // Zigbox mode: the store and the manifest come together; the digest is a full one.
+        if (parsed.images_dir.len > 0 or parsed.digest.len != constants.tree_digest_bytes) {
+            return null;
+        }
+        if (Zsha256.parse(parsed.manifest) == null) return null;
+        return parsed;
+    }
+    if (parsed.registry == null) return null; // The chunk directory's registry is not optional.
+    if (parsed.images_dir.len == 0 or parsed.manifest.len > 0) {
+        return null;
+    }
     return parsed;
 }
 
@@ -597,8 +713,9 @@ fn parse_address(text: []const u8) ?IpAddress {
     return IpAddress.parse(host, port) catch null;
 }
 
-pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR --images-dir DIR " ++
-    "--digest b3:HEX --registry HOST:PORT [--server HOST:PORT] [--report FILE] " ++
+pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
+    "(--images-dir DIR | --zigbox-store ROOT --manifest sha256:HEX) " ++
+    "--digest b3:HEX [--registry HOST:PORT] [--server HOST:PORT] [--report FILE] " ++
     "[--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
@@ -633,7 +750,10 @@ fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.
 }
 
 pub fn run(init: std.process.Init, args: []const []const u8) u8 {
-    const io = init.io;
+    // Not `init.io`: that is a threaded Io. A Zigbox store is written in Zigbox's store
+    // namespace, which only a process of one thread may make, and this Io never starts another.
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
     var diag: diag_mod.Diag = undefined;
     diag.reset();
     const parsed = parse(args) orelse {
@@ -651,35 +771,152 @@ pub fn run(init: std.process.Init, args: []const []const u8) u8 {
     const reply = gpa.alloc(u8, reply_bytes) catch
         return no_memory(io, &diag);
     defer gpa.free(reply);
-    var store = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
-        diag.raise(.E0506);
-        diag.cause("the images directory {s} can't be used", .{parsed.images_dir});
-        diag.fix(.{ .sentence = "check the path and its permissions, and the free disk space" });
-        return finish(io, &diag, constants.exit_environment);
-    };
-    defer store.close(gpa);
     const conns = gpa.alloc(Conn, constants.fetch_candidates_max) catch
         return no_memory(io, &diag);
     defer gpa.free(conns);
     @memset(conns, .{});
     var net: Net = .{
         .io = io,
-        .registry = parsed.registry.?,
+        .registry = parsed.registry,
         .peers = &.{},
         .identity = identity,
         .reply = reply,
         .digest = parsed.digest,
         .conns = conns,
+        .environ = init.minimal.environ,
     };
     defer net.close_peers();
-    return fetch_from(gpa, &net, &store, &parsed, &diag);
+    if (parsed.zigbox_store.len > 0) return fetch_in_namespace(gpa, &net, &parsed, &diag);
+    var dir = dir_images.DirImages.open(io, gpa, parsed.images_dir) catch {
+        return unusable_images(io, &diag, parsed.images_dir);
+    };
+    defer dir.close(gpa);
+    return fetch_from(gpa, &net, .{ .dir = &dir }, &parsed, &diag);
+}
+
+/// Zigbox mode. The whole fetch (the store opened, the peers asked, every write, the report)
+/// runs in Zigbox's store namespace (`zigbox.store.namespace.run`, Z6): a child of one thread
+/// with the id map Zigbox's own pull uses, so an object's owner lands as the id a container
+/// sees and the store is the one `zbx pull` of the same image would leave. The child inherits
+/// stdout and stderr, and its exit code is the command's. What it set in memory is lost with
+/// it, which is why nothing runs after it here.
+fn fetch_in_namespace(
+    gpa: std.mem.Allocator,
+    net: *Net,
+    parsed: *const Args,
+    diag: *diag_mod.Diag,
+) u8 {
+    assert(parsed.zigbox_store.len > 0);
+    assert(diag.code == null);
+    const io = net.io;
+    var real: zigbox.host_real.HostReal = .{ .environ = net.environ };
+    const host = real.interface();
+    var status: [4096]u8 = undefined;
+    const threads = if (host.read_file("/proc/self/status", &status)) |text|
+        zigbox_image.threads_in(text)
+    else |_|
+        null;
+    if (threads != 1) return not_single_threaded(io, diag, threads);
+    const facts = gpa.create(Facts) catch return no_memory(io, diag);
+    defer gpa.destroy(facts);
+    var job: NamespaceJob = .{ .gpa = gpa, .net = net, .parsed = parsed, .diag = diag };
+    const work: zigbox.store.namespace.Work = .{ .context = &job, .call = NamespaceJob.call };
+    const warn: zigbox.store.namespace.Warn = .{ .context = net, .call = say_warning };
+    var failure: zigbox.diag.Diag = undefined;
+    failure.reset();
+    return zigbox.store.namespace.run(host, facts, work, warn, &failure) catch {
+        say_foreign(io, &failure); // ZBX-E0419: the child could not be made or was killed.
+        return constants.exit_environment;
+    };
+}
+
+/// Zigbox's doctor facts, which `namespace.run` fills to choose the id map (not exported).
+const Facts = @FieldType(zigbox.Handle, "facts");
+
+/// What the namespace child does: everything `run` would do with the store, in the child.
+const NamespaceJob = struct {
+    gpa: std.mem.Allocator,
+    net: *Net,
+    parsed: *const Args,
+    diag: *diag_mod.Diag,
+
+    fn call(context: *anyopaque, squash_owner: bool) u8 {
+        const job: *NamespaceJob = @ptrCast(@alignCast(context));
+        // Only Zigbox's tree import takes an owner; a peer's objects carry theirs in their ids,
+        // and `put_chunk`, `put_tree` and `import_image` store what the namespace's file system
+        // gives (namespace.zig, "For Zigcube"). On a one-id map an owner that is not 0 cannot
+        // be stored: that object fails, and the supervisor's pull is the fallback.
+        _ = squash_owner;
+        const io = job.net.io;
+        var opened: zigbox_fetch.Opened = .{};
+        opened.open(job.gpa, job.parsed.zigbox_store) catch |err| switch (err) {
+            error.OutOfMemory => return no_memory(io, job.diag),
+            error.NoStore => return unusable_images(io, job.diag, job.parsed.zigbox_store),
+        };
+        defer opened.close();
+        const code = fetch_from(job.gpa, job.net, .{ .zigbox = &opened }, job.parsed, job.diag);
+        assert(code != zigbox_setup_failed);
+        return code;
+    }
+};
+
+/// Zigbox's exit code for a namespace child that could not be set up (not exported); the
+/// fetch's own codes never collide with it.
+const zigbox_setup_failed: u8 = 125;
+
+comptime {
+    for ([_]u8{
+        constants.exit_ok,       constants.exit_user,     constants.exit_environment,
+        constants.exit_external, constants.exit_internal,
+    }) |code| assert(code != zigbox_setup_failed);
+}
+
+fn say_warning(context: *anyopaque, warning: *const zigbox.diag.Diag) void {
+    const net: *Net = @ptrCast(@alignCast(context));
+    say_foreign(net.io, warning); // ZBX-W0201: the one-id map.
+}
+
+/// Prints a diagnostic of Zigbox's (ZBX-) on stderr, as Zigbox wrote it.
+fn say_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
+    assert(collector.code != null);
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    zigbox.diagnostic.from_diag(&diagnostic, collector);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
+
+fn not_single_threaded(io: std.Io, diag: *diag_mod.Diag, count: ?u32) u8 {
+    diag.raise(.B0002);
+    if (count) |threads| {
+        diag.cause("zcube-agent fetch has {d} threads; Zigbox's store namespace needs one", .{
+            threads,
+        });
+    } else {
+        diag.cause("zcube-agent fetch can't tell how many threads it has", .{});
+    }
+    diag.fix(.{ .sentence = "report this: the fetch must start no thread before its store work" });
+    return finish(io, diag, constants.exit_internal);
+}
+
+/// Where the tree goes: a chunk directory, or a Zigbox store (`--zigbox-store`).
+const Target = union(enum) {
+    dir: *dir_images.DirImages,
+    zigbox: *zigbox_fetch.Opened,
+};
+
+fn unusable_images(io: std.Io, diag: *diag_mod.Diag, path: []const u8) u8 {
+    diag.raise(.E0506);
+    diag.cause("the images directory {s} can't be used", .{path});
+    diag.fix(.{ .sentence = "check the path and its permissions, and the free disk space" });
+    return finish(io, diag, constants.exit_environment);
 }
 
 /// Finds the peers (the server's, then the named ones) and runs the worker over them.
 fn fetch_from(
     gpa: std.mem.Allocator,
     net: *Net,
-    store: *dir_images.DirImages,
+    target: Target,
     parsed: *const Args,
     diag: *diag_mod.Diag,
 ) u8 {
@@ -698,21 +935,42 @@ fn fetch_from(
         infos[found] = .{ .name = named.name, .filter = &filter };
         found += 1;
     }
+    var poll = std.heap.ArenaAllocator.init(gpa);
+    defer poll.deinit();
+    var start: fetch_plan.Start = .peers;
     if (parsed.server) |server| {
-        const arena = arena_state.allocator();
         const room: Slots = .{ all[found..], infos[found..] };
-        found += discover(arena, net, server, parsed.node, room, &skipped);
+        const arenas: Arenas = .{ &arena_state, &poll };
+        const got = discover(arenas, net, server, parsed, room, &skipped);
+        found += got.count;
+        start = got.start;
     }
     var line: [320]u8 = undefined;
     note(io, describe_skipped(&line, skipped));
+    if (start == .registry_first) {
+        // The peers are still asked, without waiting: in Zigbox mode their refusals and ZC-E0601
+        // go to fetch.log as before O5, and the supervisor's own pull is the registry fetch.
+        note(io, "zcube-agent fetch: no peer holds the tree yet and this node pulls it from " ++
+            "the registry first (O5); the others fetch it from here\n");
+    }
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};
     const started_ms = real_ms(io);
     const transport = net.transport();
     const asked = infos[0..found];
-    fetch_worker.fetch(gpa, transport, store, parsed.digest, asked, .{}, &report) catch |err| {
-        return fetch_failed(net, diag, err);
-    };
+    switch (target) {
+        .dir => |store| {
+            const digest = parsed.digest;
+            fetch_worker.fetch(gpa, transport, store, digest, asked, .{}, &report) catch |err| {
+                return fetch_failed(net, diag, err, target);
+            };
+        },
+        .zigbox => |opened| {
+            report = fetch_zigbox(gpa, transport, opened, parsed, asked, net) catch |err| {
+                return fetch_failed(net, diag, err, target);
+            };
+        },
+    }
     if (parsed.report.len > 0) write_report(gpa, net, parsed, &report, started_ms);
     var buffer: [256]u8 = undefined;
     const said = "zcube-agent fetch: {s} chunks {d} held {d} peers {d} registry {d} " ++
@@ -723,6 +981,49 @@ fn fetch_from(
     }) catch return constants.exit_ok;
     std.Io.File.stdout().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
     return constants.exit_ok;
+}
+
+/// Zigbox mode: the tree by bundle and chunks from the peers into the store, its image record
+/// imported for the assignment's manifest only. The report is shaped as the directory mode's.
+fn fetch_zigbox(
+    gpa: std.mem.Allocator,
+    transport: fetch_worker.Transport,
+    opened: *zigbox_fetch.Opened,
+    parsed: *const Args,
+    infos: []const fetch_worker.PeerInfo,
+    net: *Net,
+) fetch_worker.Error!fetch_worker.Report {
+    const tree = zigbox.store.Digest.parse(parsed.digest) orelse return error.TreeUnavailable;
+    const manifest = Zsha256.parse(parsed.manifest) orelse return error.TreeUnavailable;
+    var done: zigbox_fetch.Report = .{};
+    const images = &opened.images;
+    // No peer had the tree: the supervisor's own pull is the registry fallback (it writes the
+    // pull record from Zigbox's blobs), so a failure here is the exit code it reacts to.
+    const fetched = zigbox_fetch.fetch(gpa, transport, images, tree, manifest, infos, .{}, &done);
+    net.other_images = done.other_images;
+    fetched catch |err| {
+        return switch (err) {
+            error.TreeUnavailable, error.ChunkFailed, error.Deadline, error.Store => |same| same,
+            error.OutOfMemory => error.OutOfMemory,
+            error.Refused => {
+                net.refusal = images.refusal;
+                return error.TreeUnavailable;
+            },
+            error.TooLarge => {
+                net.too_large = true;
+                return error.TreeUnavailable;
+            },
+        };
+    };
+    return .{
+        .chunks = done.chunks,
+        .already_held = done.already_held,
+        .peer_chunks = done.peer_chunks,
+        .bad_lists = done.bad_bundles,
+        .peer_bytes = done.peer_bytes,
+        .cached_bytes = done.cached_bytes,
+        .struck_peers = done.struck_peers,
+    };
 }
 
 fn real_ms(io: std.Io) u64 {
@@ -781,23 +1082,19 @@ fn write_report(
         .finished_at_ms = real_ms(io),
         .bad_peers = bad[0..bad_count],
     };
-    var text: std.Io.Writer.Allocating = .init(gpa);
-    defer text.deinit();
-    std.json.Stringify.value(record, .{}, &text.writer) catch return note(io, report_failed);
-    var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const temporary = std.fmt.bufPrint(&name_buffer, "{s}.tmp", .{parsed.report}) catch
-        return note(io, report_failed);
-    const dir = std.Io.Dir.cwd();
-    dir.writeFile(io, .{ .sub_path = temporary, .data = text.written() }) catch
-        return note(io, report_failed);
-    dir.rename(temporary, dir, parsed.report, io) catch return note(io, report_failed);
+    if (!pull_report.write(gpa, io, parsed.report, record)) note(io, report_failed);
 }
 
 const report_failed = "zcube-agent fetch: the pull report could not be written\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.
-fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) u8 {
+fn fetch_failed(
+    net: *const Net,
+    diag: *diag_mod.Diag,
+    err: fetch_worker.Error,
+    target: Target,
+) u8 {
     diag.reset();
     switch (err) {
         error.OutOfMemory, error.TooMany => {
@@ -805,14 +1102,19 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
         },
         error.Store => {
             diag.raise(.E0506);
-            diag.cause("the chunks could not be written to this node's images directory", .{});
-            diag.fix(.{ .sentence = "check the directory's permissions and the free disk space" });
+            const place = switch (target) {
+                .dir => "images directory",
+                .zigbox => "Zigbox store",
+            };
+            diag.cause("the chunks could not be written to this node's {s}", .{place});
+            diag.fix(.{ .sentence = "check its permissions and the free disk space" });
             return finish(net.io, diag, constants.exit_environment);
         },
         error.TreeUnavailable, error.ChunkFailed, error.Deadline => {},
     }
+    say_peer_answers(net);
     var tried_buffer: [256]u8 = undefined;
-    const tried = tried_sources(&tried_buffer, net.peers);
+    const tried = tried_sources(&tried_buffer, net.peers, net.registry != null);
     fetch_worker.raise_tree_missing(diag, net.digest, tried);
     if (net.oversize) {
         diag.cause("the registry sent a reply larger than the {d} bytes a reply may have", .{
@@ -820,7 +1122,7 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
         });
     }
     switch (err) {
-        error.TreeUnavailable => diag.cause("no source sent a list that hashes to the digest", .{}),
+        error.TreeUnavailable => zigbox_cause(net, diag),
         error.ChunkFailed => diag.cause("a chunk could not be had from any source asked", .{}),
         else => diag.cause("the fetch ran past its limit of {d} minutes", .{
             @divExact(constants.fetch_total_ms, 60_000),
@@ -829,39 +1131,117 @@ fn fetch_failed(net: *const Net, diag: *diag_mod.Diag, err: fetch_worker.Error) 
     return finish(net.io, diag, constants.exit_external);
 }
 
+/// One line per peer asked, before ZC-E0601: what it answered that was not what was asked for.
+/// A plan that ends with no source for a chunk says nothing else about why.
+fn say_peer_answers(net: *const Net) void {
+    for (net.peers, net.conns[0..net.peers.len]) |who, conn| {
+        var buffer: [256]u8 = undefined;
+        note(net.io, peer_answers_line(&buffer, who.name, conn));
+    }
+}
+
+pub fn peer_answers_line(buffer: []u8, name: []const u8, conn: Conn) []const u8 {
+    const form = "zcube-agent fetch: peer {s} answered busy (503) {d} times, a status other " ++
+        "than 200 {d} times, nothing {d} times\n";
+    return std.fmt.bufPrint(buffer, form, .{ name, conn.busy, conn.refused, conn.timeouts }) catch
+        buffer[0..0];
+}
+
+/// The cause of a tree no source gave, in Zigbox mode as in directory mode.
+fn zigbox_cause(net: *const Net, diag: *diag_mod.Diag) void {
+    if (net.refusal) |refusal| {
+        diag.cause("Zigbox refused the image record a peer sent: {s}", .{refusal_text(refusal)});
+    } else if (net.too_large) {
+        diag.cause("the tree has more than the {d} files or {d} chunks one peer fetch takes", .{
+            constants.zigbox_claims_max, constants.fetch_chunks_max,
+        });
+    } else if (net.other_images > 0) {
+        diag.cause("{d} peer(s) hold the tree only under another image's record (a peer sends " ++
+            "the newest image of a tree)", .{net.other_images});
+    } else diag.cause("no source sent a list that hashes to the digest", .{});
+}
+
+/// What a refusal of `zigbox.store.image_peer` means, said to an operator.
+pub fn refusal_text(refusal: zigbox.store.image_peer.Refusal) []const u8 {
+    return switch (refusal) {
+        .no_record => "no image record names the tree",
+        .local_unusable => "an image record of this store is damaged or from a newer zbx",
+        .too_large => "the record is longer than any image record",
+        .malformed => "the record is not one this zbx reads",
+        .newer => "the record is from a newer zbx",
+        .wrong_tree => "the record names another tree",
+        .wrong_manifest => "the record is not for the manifest this assignment pins",
+        .incomplete => "the tree or an object below it is not whole in the store",
+        .tree_damaged => "a tree below is damaged in the store",
+        .too_many_entries => "the tree has more entries than an import checks",
+        .stack_full => "the tree is nested deeper than an import checks",
+        .conflict => "a record of the same manifest already names another tree",
+        .busy => "the store is locked by a gc or a restore",
+        .store_failed => "a read or a write of the store failed",
+    };
+}
+
 /// What `select_candidates` fills: the peers and, beside them, their filters.
 const Slots = struct { []Peer, []fetch_worker.PeerInfo };
+
+/// A `/v1/list` the fetch reads: its prefix, the keys a page asks for, the pages read at most.
+const Listing = struct { prefix: []const u8, limit: u32, pages_max: u32 };
+
+const node_store_listing: Listing = .{
+    .prefix = "/node-store/",
+    .limit = discover_page_nodes,
+    .pages_max = discover_pages_max,
+};
+/// The assignments and replicas, read once per fetch to know which nodes fetch the tree (O5).
+/// Their records are well under a kilobyte, so a page of this many fits `discover_page_bytes_max`.
+const assigned_listing: Listing = .{ .prefix = "/assigned/", .limit = 128, .pages_max = 8 };
+const replicas_listing: Listing = .{ .prefix = "/replicas/", .limit = 128, .pages_max = 8 };
 
 /// Reads the server's `/node-store/` list, a page at a time (`discover_page_nodes` each, at most
 /// `discover_pages_max`); what was read when a later page fails is kept, and null if none was.
 /// `getter.get(path, out)` is the body of a 200 for `path`, copied into `out`, or null.
 fn collect_pages(arena: std.mem.Allocator, getter: anytype, out: []u8) ?[]const Kv {
+    return collect_list(arena, getter, out, node_store_listing);
+}
+
+/// `collect_pages` for any listing.
+fn collect_list(
+    arena: std.mem.Allocator,
+    getter: anytype,
+    out: []u8,
+    listing: Listing,
+) ?[]const Kv {
     var all: std.ArrayList(Kv) = .empty;
     var first_revision: u64 = 0;
     var after: ?[]const u8 = null;
-    for (0..discover_pages_max) |at| {
-        var target: [160]u8 = undefined;
-        const form = "/v1/list?prefix=/node-store/&limit={d}";
+    for (0..listing.pages_max) |at| {
+        var target: [400]u8 = undefined;
+        const form = "/v1/list?prefix={s}&limit={d}";
         const path = if (after) |key|
             std.fmt.bufPrint(&target, form ++ "&at={d}&continue={s}", .{
-                discover_page_nodes, first_revision, key,
+                listing.prefix, listing.limit, first_revision, key,
             })
         else
-            std.fmt.bufPrint(&target, form, .{discover_page_nodes});
+            std.fmt.bufPrint(&target, form, .{ listing.prefix, listing.limit });
         const body = getter.get(path catch break, out) orelse break;
         const page = parse_page(arena, body) orelse break;
         all.appendSlice(arena, page.kvs) catch break;
         if (at == 0) first_revision = page.revision;
         after = page.@"continue" orelse return all.items;
         // The key goes into a request line: a server's reply must not shape it.
-        if (!continue_key_valid(after.?)) break;
+        if (!continue_key_valid_in(listing.prefix, after.?)) break;
     }
     return if (all.items.len == 0) null else all.items;
 }
 
 /// A `continue` key is accepted only as a `/node-store/` key made of `[a-z0-9./-]`.
 fn continue_key_valid(key: []const u8) bool {
-    if (!std.mem.startsWith(u8, key, "/node-store/")) return false;
+    return continue_key_valid_in("/node-store/", key);
+}
+
+/// A `continue` key is accepted only under `prefix` and made of `[a-z0-9./-]`.
+fn continue_key_valid_in(prefix: []const u8, key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, prefix)) return false;
     for (key) |byte| {
         const ok = switch (byte) {
             'a'...'z', '0'...'9', '.', '/', '-' => true,
@@ -885,27 +1265,193 @@ const HttpGetter = struct {
     }
 };
 
-/// Asks the server for the nodes' summaries and picks the candidates among them.
+const Arenas = struct { *std.heap.ArenaAllocator, *std.heap.ArenaAllocator };
+
+/// Asks the server which nodes fetch the tree and for the nodes' summaries (waiting as O5 says,
+/// `begin`), and picks the candidates among them. A digest no peer is asked for waits for none.
 fn discover(
-    arena: std.mem.Allocator,
+    arenas: Arenas,
     net: *Net,
     server: IpAddress,
-    self: []const u8,
+    parsed: *const Args,
     slots: Slots,
     skipped: *Skipped,
-) u32 {
-    const scratch = arena.alloc(u8, discover_page_bytes_max) catch return 0;
-    const getter: HttpGetter = .{ .net = net, .server = server };
-    const stores = collect_pages(arena, getter, scratch) orelse {
+) struct { count: u32, start: fetch_plan.Start } {
+    const arena = arenas[0].allocator();
+    // A digest no peer is asked for (not the full one, fetch_worker.zig) waits for none.
+    const begun: Begun = if (parsed.digest.len == 3 + 64)
+        begin(arena, arenas[1], net, server, parsed)
+    else
+        read_once(arena, net, server);
+    say_begun(net.io, begun);
+    const stores = begun.stores orelse {
         note(net.io, "zcube-agent fetch: the server's node list could not be read; peers: " ++
             "only those named\n");
-        return 0;
+        return .{ .count = 0, .start = begun.start };
     };
     const room = @min(slots[0].len, slots[1].len);
-    return select_candidates(arena, stores, self, slots[0][0..room], slots[1][0..room], skipped);
+    const self = parsed.node;
+    const peers = slots[0][0..room];
+    const count = select_candidates(arena, stores, self, peers, slots[1][0..room], skipped);
+    return .{ .count = count, .start = begun.start };
+}
+
+/// One line in the fetch's log on how O5's wait ended, when there was one to have.
+fn say_begun(io: std.Io, begun: Begun) void {
+    var buffer: [200]u8 = undefined;
+    const text = switch (begun.start) {
+        .peers, .wait => if (begun.waited_ms == 0) return else std.fmt.bufPrint(
+            &buffer,
+            "zcube-agent fetch: a peer came to hold the tree after {d} ms (O5)\n",
+            .{begun.waited_ms},
+        ),
+        .registry_first => return,
+        .waited => std.fmt.bufPrint(&buffer, "zcube-agent fetch: no peer came to hold the " ++
+            "tree in {d} ms; {d} node(s) fetch it (O5)\n", .{ begun.waited_ms, begun.fetchers }),
+    } catch return;
+    note(io, text);
+}
+
+/// The `/node-store/` list read once, with no wait.
+fn read_once(arena: std.mem.Allocator, net: *Net, server: IpAddress) Begun {
+    const getter: HttpGetter = .{ .net = net, .server = server };
+    const none: Begun = .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
+    const scratch = arena.alloc(u8, discover_page_bytes_max) catch return none;
+    var once = none;
+    once.stores = collect_pages(arena, getter, scratch);
+    return once;
+}
+
+/// What `begin` found: the `/node-store/` list read last (null if it could not be read) and
+/// how the wait of O5 ended.
+const Begun = struct {
+    stores: ?[]const Kv,
+    start: fetch_plan.Start,
+    fetchers: u32,
+    waited_ms: u64,
+};
+
+/// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, reads which nodes fetch
+/// the tree and, unless a peer holds it or this node ranks lowest among them, re-reads
+/// `/node-store/` every `fetch_peer_poll_ms` for up to `fetch_peer_wait_ms` until a peer holds
+/// it. `arena` holds the fetchers; `poll` is reset before each read and holds the last.
+fn begin(
+    arena: std.mem.Allocator,
+    poll: *std.heap.ArenaAllocator,
+    net: *Net,
+    server: IpAddress,
+    parsed: *const Args,
+) Begun {
+    const getter: HttpGetter = .{ .net = net, .server = server };
+    const scratch = arena.alloc(u8, discover_page_bytes_max) catch
+        return .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
+    const fetchers = fetching_nodes(arena, getter, scratch, parsed.digest);
+    const started = peer_stream.boot_ms(net.io);
+    while (true) {
+        _ = poll.reset(.retain_capacity);
+        const stores = collect_pages(poll.allocator(), getter, scratch);
+        const self = parsed.node;
+        const tree = parsed.digest;
+        const holds = if (stores) |listed| peer_holds(listed, self, tree) else false;
+        const now = peer_stream.boot_ms(net.io);
+        const wait_ms = constants.fetch_peer_wait_ms;
+        const decided = fetch_plan.start(self, tree, fetchers, holds, started, now, wait_ms);
+        switch (decided) {
+            .wait => |until| {
+                const ms: u32 = @intCast(@max(until -| now, 1));
+                net.io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: read again.
+            },
+            else => return .{
+                .stores = stores,
+                .start = decided,
+                .fetchers = @intCast(fetchers.len),
+                .waited_ms = now - started,
+            },
+        }
+    }
+}
+
+/// The nodes with an assignment of a replica whose image is `digest` (`/assigned/<node>/<id>`
+/// joined to `/replicas/<service>/<id>`), each once. Empty if either list cannot be read: the
+/// fetch then ranks itself alone and does not wait, as before O5.
+fn fetching_nodes(
+    arena: std.mem.Allocator,
+    getter: anytype,
+    scratch: []u8,
+    digest: []const u8,
+) []const []const u8 {
+    const replicas = collect_list(arena, getter, scratch, replicas_listing) orelse return &.{};
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (replicas) |kv| {
+        const image = string_field(kv.value, "image") orelse continue;
+        if (!std.mem.eql(u8, image, digest)) continue;
+        const id = string_field(kv.value, "id") orelse continue;
+        ids.append(arena, id) catch return &.{};
+    }
+    if (ids.items.len == 0) return &.{};
+    const assigned = collect_list(arena, getter, scratch, assigned_listing) orelse return &.{};
+    return assigned_nodes(arena, assigned, ids.items);
+}
+
+/// The nodes of `/assigned/<node>/<id>` keys whose `id` is in `ids`, each once.
+fn assigned_nodes(
+    arena: std.mem.Allocator,
+    assigned: []const Kv,
+    ids: []const []const u8,
+) []const []const u8 {
+    var nodes: std.ArrayList([]const u8) = .empty;
+    for (assigned) |kv| {
+        const rest = strip_prefix(kv.key, "/assigned/") orelse continue;
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+        const node = rest[0..slash];
+        const id = rest[slash + 1 ..];
+        if (!contains(ids, id) or contains(nodes.items, node)) continue;
+        nodes.append(arena, node) catch return nodes.items;
+    }
+    return nodes.items;
+}
+
+fn strip_prefix(text: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    return text[prefix.len..];
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |each| {
+        if (std.mem.eql(u8, each, name)) return true;
+    }
+    return false;
+}
+
+/// Whether a node other than `self` that a fetch can reach (a usable `peer` address) lists
+/// `digest` among the whole trees of its `/node-store/` record.
+fn peer_holds(stores: []const Kv, self: []const u8, digest: []const u8) bool {
+    for (stores) |kv| {
+        const name = strip_prefix(kv.key, "/node-store/") orelse continue;
+        if (std.mem.eql(u8, name, self)) continue;
+        _ = usable_address(string_field(kv.value, "peer") orelse "") orelse continue;
+        if (kv.value != .object) continue;
+        const trees = kv.value.object.get("trees") orelse continue;
+        if (trees != .array) continue;
+        for (trees.array.items) |tree| {
+            const text = string_field(tree, "tree") orelse continue;
+            if (std.mem.eql(u8, text, digest)) return true;
+        }
+    }
+    return false;
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
+
+test "a peer that gave no bundle is named with what it answered" {
+    var buffer: [256]u8 = undefined;
+    const line = bundle_note(&buffer, "node2", .refused);
+    try std.testing.expect(std.mem.indexOf(u8, line, "peer node2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "status other than 200") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n"));
+    const timed_out = bundle_note(&buffer, "n", .timeout);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out, "no reply") != null);
+}
 
 test "an HTTP reply gives its body only for 200" {
     // Goal: the registry client takes the body of a 200 and nothing else. Method: a 200, a 404,
@@ -1187,9 +1733,9 @@ test "the sources a failed fetch names are its peers and the registry" {
     };
     try std.testing.expectEqualStrings(
         "node2, node3 and the registry",
-        tried_sources(&buffer, &peers),
+        tried_sources(&buffer, &peers, true),
     );
-    try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}));
+    try std.testing.expectEqualStrings("the registry", tried_sources(&buffer, &.{}, true));
 }
 
 test "a fetch with an unusable key file says ZC-E0806 and has no identity" {
@@ -1248,4 +1794,114 @@ test "a reply past the buffer is TooLarge and a write that never drains times ou
 test "the reply buffer holds the largest tree list and a head" {
     try std.testing.expect(reply_bytes >= constants.tree_list_bytes_max + reply_head_slack_bytes);
     try std.testing.expect(reply_bytes >= constants.swarm_chunk_bytes + reply_head_slack_bytes);
+}
+
+test "zigbox mode arguments: a store and a manifest together, a full digest, no images dir" {
+    const full = "b3:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const manifest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const base = [_][]const u8{
+        "--node",     "node1",       "--state-dir", "/s",
+        "--registry", "127.0.0.1:1", "--digest",    full,
+    };
+    const ok = base ++ [_][]const u8{ "--zigbox-store", "/store", "--manifest", manifest };
+    const parsed = parse(&ok).?;
+    try std.testing.expectEqualStrings("/store", parsed.zigbox_store);
+    // The manifest is required, and so is a full digest; the two modes do not mix.
+    try std.testing.expect(parse(&(base ++ [_][]const u8{ "--zigbox-store", "/store" })) == null);
+    const mixed = ok ++ [_][]const u8{ "--images-dir", "/i" };
+    try std.testing.expect(parse(&mixed) == null);
+    var short = ok;
+    short[7] = "b3:abcdef12";
+    try std.testing.expect(parse(&short) == null);
+    const dir_mode = base ++ [_][]const u8{ "--images-dir", "/i", "--manifest", manifest };
+    try std.testing.expect(parse(&dir_mode) == null);
+    // Zigbox mode needs no registry (the peers are the only source); the directory mode does.
+    const bare = [_][]const u8{
+        "--node",         "node1",  "--state-dir", "/s",     "--digest", full,
+        "--zigbox-store", "/store", "--manifest",  manifest,
+    };
+    try std.testing.expect(parse(&bare).?.registry == null);
+    const dir_bare = [_][]const u8{
+        "--node", "node1", "--state-dir", "/s", "--digest", full, "--images-dir", "/i",
+    };
+    try std.testing.expect(parse(&dir_bare) == null);
+}
+
+test "without a registry the sources a failed fetch names are the peers alone" {
+    var buffer: [128]u8 = undefined;
+    const peers = [_]Peer{.{ .name = "node2", .address = undefined }};
+    try std.testing.expectEqualStrings("node2", tried_sources(&buffer, &peers, false));
+    try std.testing.expectEqualStrings(
+        "no peer, and no registry is given",
+        tried_sources(&buffer, &.{}, false),
+    );
+}
+
+test "the nodes fetching a tree are those assigned a replica of it, each once" {
+    // Goal: O5's set of fetchers from `/assigned/` and `/replicas/`. Method: two replicas of the
+    // tree on node1 and one on node3, one of another image on node2.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const assigned = parse_kvs(arena,
+        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{"replica":"app-1"}},
+        \\{"key":"/assigned/node1/app-2","value":{}},{"key":"/assigned/node2/web-1","value":{}},
+        \\{"key":"/assigned/node3/app-3","value":{}},{"key":"/assigned/bad","value":{}}]}
+    ).?;
+    const ids = [_][]const u8{ "app-1", "app-2", "app-3" };
+    const nodes = assigned_nodes(arena, assigned, &ids);
+    try std.testing.expectEqual(@as(usize, 2), nodes.len);
+    try std.testing.expectEqualStrings("node1", nodes[0]);
+    try std.testing.expectEqualStrings("node3", nodes[1]);
+}
+
+test "the fetching nodes stay as read when the same buffer serves the next request" {
+    // Goal: the demo-c2 run 41965968058 bug: the names pointed into the reply buffer, so the next
+    // `/node-store/` read changed them and no node ranked lowest. Method: read the fetchers, then
+    // a node-store page through the same buffer; the names and the ids they came from hold.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pages = [_][]const u8{
+        \\{"kvs":[{"key":"/replicas/app/app-1","value":{"id":"app-1","image":"b3:aa"}},
+        \\{"key":"/replicas/app/app-2","value":{"id":"app-2","image":"b3:aa"}}]}
+        ,
+        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{}},
+        \\{"key":"/assigned/node3/app-2","value":{}}]}
+        ,
+        \\{"kvs":[{"key":"/node-store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","value":{
+        \\"peer":"10.0.0.9:7700","trees":[]}}]}
+        ,
+    };
+    var calls: u32 = 0;
+    var last_path: [160]u8 = undefined;
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last_path };
+    const scratch = try arena.alloc(u8, 4096);
+    @memset(scratch, 'x');
+    const nodes = fetching_nodes(arena, getter, scratch, "b3:aa");
+    _ = collect_pages(arena, getter, scratch).?;
+    try std.testing.expectEqual(@as(usize, 2), nodes.len);
+    try std.testing.expectEqualStrings("node1", nodes[0]);
+    try std.testing.expectEqualStrings("node3", nodes[1]);
+}
+
+test "a peer holds a tree when its summary lists it and it can be reached" {
+    // Goal: the condition that ends O5's wait. Method: node2 lists the tree but has no address,
+    // node1 is this node, node3 lists another tree; then node3 lists it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const before = parse_kvs(arena,
+        \\{"kvs":[{"key":"/node-store/node1","value":{"peer":"10.0.0.1:7700",
+        \\"trees":[{"tree":"b3:aa"}]}},{"key":"/node-store/node2","value":{"peer":"",
+        \\"trees":[{"tree":"b3:aa"}]}},{"key":"/node-store/node3","value":{
+        \\"peer":"10.0.0.3:7700","trees":[{"tree":"b3:bb"}]}}]}
+    ).?;
+    try std.testing.expect(!peer_holds(before, "node1", "b3:aa"));
+    try std.testing.expect(peer_holds(before, "node1", "b3:bb"));
+    const after = parse_kvs(arena,
+        \\{"kvs":[{"key":"/node-store/node3","value":{"peer":"10.0.0.3:7700",
+        \\"trees":[{"tree":"b3:bb"},{"tree":"b3:aa"}]}}]}
+    ).?;
+    try std.testing.expect(peer_holds(after, "node1", "b3:aa"));
 }

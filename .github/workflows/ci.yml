@@ -52,6 +52,7 @@ jobs:
       demo_c0: ${{ steps.pick.outputs.demo_c0 || 'true' }}
       demo_c1: ${{ steps.pick.outputs.demo_c1 || 'true' }}
       zigbox_smoke: ${{ steps.pick.outputs.zigbox_smoke || 'true' }}
+      demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -419,7 +420,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.zigbox_smoke == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 40
     env:
       ZBX_REGISTRY_MIRRORS: mirror.gcr.io
       ZCUBE_REAL_HOST: '1'
@@ -452,4 +453,50 @@ jobs:
         with:
           name: zigbox-smoke-output
           path: zigbox-smoke.txt
+          if-no-files-found: warn
+
+  demo-c2:
+    name: demo-c2 (four Ubuntu 24.04 VMs, KVM, GHCR images)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_c2 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ZBX_REGISTRY_MIRRORS: mirror.gcr.io
+      ZCUBE_REAL_HOST: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files, QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The guest image is a download of about 600 MB; its pin is in the Zigbox package, so the
+      # key is the pinned package (build.zig.zon).
+      - name: Cache the VM base image
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/vm/*.img
+          key: zigbox-smoke-image-${{ hashFiles('build.zig.zon') }}
+      # ReleaseSafe: the harness serves files of at most 8 MiB, which a Debug build exceeds.
+      - name: demo-c2
+        shell: bash
+        run: |
+          zig build demo-c2 -Doptimize=ReleaseSafe -Dtranscript=demo-c2-transcript.txt \
+            --summary all 2>&1 | tee demo-c2.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-c2-output
+          path: |
+            demo-c2.txt
+            demo-c2-transcript.txt
           if-no-files-found: warn

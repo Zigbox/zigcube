@@ -25,6 +25,9 @@ The supervisor reviews every slice against this list, so run it yourself first, 
 
 - **Every exit path is tested**, not only the clean one: a refusal, a timeout, SIGKILL of a child, and SIGKILL of the process itself. Anything it starts or holds (a supervisor, a port, a lock, a Postgres) is released on each, or adopted on restart.
 - **A blocking read has a deadline that is not a crash.** A socket timeout made the standard library's reader panic (`ZC-B0001`, 1 run in 6); poll before each read.
+- **Every socket read or write has a deadline.** A peer that stops reading or writing must not hold a slot or a thread for ever (C2 retro).
+- **A child that starts children of its own runs in its own process group, and is killed and reaped as a group.** Killing only its pid leaves the grandchildren writing (C2 retro).
+- **A cache over a store that other processes write re-checks on a miss.** "Already walked" goes stale when another process adds to the store (C2 retro).
 - **A server can restart on its port at once.** Listen with `SO_REUSEADDR` alone (not the std option, which adds `SO_REUSEPORT`), and test the restart after a connection the server closed first.
 - **An identifier that must be unique has a random part.** Counters restart with the process; request IDs once collided across runs.
 - **Time comes from `Clock`.** In the core, never a real clock; in the agent, fencing deadlines use `CLOCK_BOOTTIME`, which counts suspend.
