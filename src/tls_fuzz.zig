@@ -1,7 +1,7 @@
 //! A seeded fuzzer for the TLS client's handshake (`tls_client.zig`, docs/mtls.md): a server's
-//! flight, damaged in one of eleven ways, cut into pieces of random size. The properties: no
-//! crash; the client is `connected` only when the flight was a correct one and the server accepts
-//! the client's Finished; a chain the pinned CA did not sign never connects; after a refusal the
+//! flight, damaged in one of thirteen ways, cut into pieces of random size. The properties: no
+//! crash; the client is `connected` (at any step, whatever follows) only when the flight was a
+//! correct one and the server accepts the client's Finished; a chain the pinned CA did not sign never connects; after a refusal the
 //! client reads nothing and writes nothing more than the one alert; every refusal carries a
 //! code and a cause. Seeds and replay are in `fuzz_seeds.zig`.
 
@@ -32,7 +32,11 @@ const Mutation = enum {
     insert_random_record,
     overlong_header,
     random_bytes,
-    replay_first,
+    replay_record,
+    /// A plaintext alert at a random record boundary.
+    alert_at_boundary,
+    /// An alert sealed under the handshake keys at a random record boundary.
+    sealed_alert_at_boundary,
 };
 
 const Chain = enum { good, other_ca, tampered };
@@ -66,7 +70,13 @@ fn copy_records(
 }
 
 /// Writes the damaged flight to `out` and returns its length.
-fn mutate(random: std.Random, kind: Mutation, flight: []const u8, out: []u8) usize {
+fn mutate(
+    random: std.Random,
+    peer: *testpeer.Peer,
+    kind: Mutation,
+    flight: []const u8,
+    out: []u8,
+) usize {
     var starts: [64]u32 = undefined;
     const count = record_starts(flight, &starts);
     var order: [64]u32 = undefined;
@@ -85,14 +95,48 @@ fn mutate(random: std.Random, kind: Mutation, flight: []const u8, out: []u8) usi
             used += 1;
         },
         .swap_records => std.mem.swap(u32, &order[pick], &order[random.uintLessThan(u32, count)]),
-        .replay_first => {
-            order[used] = order[0];
+        .replay_record => {
+            // Any record, protected ones included, at any position.
+            const at = random.uintLessThan(u32, count + 1);
+            std.mem.copyBackwards(u32, order[at + 1 .. used + 1], order[at..used]);
+            order[at] = order[pick];
             used += 1;
         },
+        .alert_at_boundary, .sealed_alert_at_boundary => {},
+    }
+    if (kind == .alert_at_boundary or kind == .sealed_alert_at_boundary) {
+        return alert_at_boundary(random, peer, kind, flight, out, &starts, count);
     }
     var length = copy_records(out, flight, &starts, order[0..used]);
     length = damage_bytes(random, kind, out, length, starts[pick]);
     return length;
+}
+
+/// The flight with one alert (plain or sealed under the handshake keys) between two records.
+fn alert_at_boundary(
+    random: std.Random,
+    peer: *testpeer.Peer,
+    kind: Mutation,
+    flight: []const u8,
+    out: []u8,
+    starts: *const [64]u32,
+    count: u32,
+) usize {
+    const at = random.uintLessThan(u32, count + 1);
+    const before = starts[at];
+    @memcpy(out[0..before], flight[0..before]);
+    var alert: [64]u8 = undefined;
+    const description = random.int(u8);
+    // A HelloRetryRequest peer has no handshake keys to seal with.
+    const sealed = kind == .sealed_alert_at_boundary and !peer.config.faults.hello_retry;
+    const bytes = if (sealed)
+        peer.handshake_alert(&alert, description)
+    else
+        testpeer.plain_alert(&alert, description);
+    @memcpy(out[before..][0..bytes.len], bytes);
+    const rest = flight[before..];
+    @memcpy(out[before + bytes.len ..][0..rest.len], rest);
+    return flight.len + bytes.len;
 }
 
 fn damage_bytes(random: std.Random, kind: Mutation, out: []u8, length_in: usize, at: u32) usize {
@@ -137,6 +181,11 @@ const World = struct {
     flight: [flight_bytes_max]u8,
     damaged: [flight_bytes_max + 1024]u8,
     clean: bool,
+    /// The client reported `connected` at some step although the flight was not a correct one
+    /// or the server would not accept the client's Finished.
+    false_connect: bool,
+    /// The run ended in a refusal (so a check of the final outcome alone would pass).
+    refused: bool,
 };
 
 fn random_faults(random: std.Random, world: *World, chain: Chain) testpeer.Faults {
@@ -210,11 +259,21 @@ fn collect(world: *World) void {
     world.client.drain();
 }
 
-const Outcome = enum { open, connected, refused, closed };
+const Outcome = enum { open, refused, closed };
+
+/// The property, at the moment of `connected`: only a correct flight, and only if the server
+/// accepts the client's answer. What follows (an alert, a replayed record) cannot undo it.
+fn check_connected(world: *World) void {
+    if (!world.clean) world.false_connect = true;
+    if (!world.client.is_connected()) world.false_connect = true;
+    if (!world.peer.accept_client_finished(world.sent[0..world.sent_length])) {
+        world.false_connect = true;
+    }
+}
 
 /// Feeds the damaged flight in random pieces; checks the properties that hold at every step.
 fn feed(world: *World, random: std.Random, bytes: []const u8) !Outcome {
-    var outcome: Outcome = .open;
+    const outcome: Outcome = .open;
     var offset: usize = 0;
     while (offset < bytes.len) {
         const piece = @min(bytes.len - offset, 1 + random.uintLessThan(usize, 300));
@@ -222,12 +281,12 @@ fn feed(world: *World, random: std.Random, bytes: []const u8) !Outcome {
             collect(world);
             if (err == error.Closed) return if (outcome == .refused) .refused else .closed;
             try expect_refusal(world);
-            outcome = .refused;
+            world.refused = true;
             return try after_refusal(world);
         };
         collect(world);
         offset += step.consumed;
-        if (step.event == .connected) outcome = .connected;
+        if (step.event == .connected) check_connected(world);
     }
     return outcome;
 }
@@ -249,11 +308,14 @@ fn after_refusal(world: *World) !Outcome {
     return .refused;
 }
 
-fn fuzz_once(seed: u64) !void {
+/// One run; true when the client connected falsely (see `World.false_connect`).
+fn run_once(seed: u64, refused: *bool) !bool {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     const world = try testing.allocator.create(World);
     defer testing.allocator.destroy(world);
+    world.false_connect = false;
+    world.refused = false;
     try setup(world, random);
     world.client.start();
     collect(world);
@@ -261,19 +323,37 @@ fn fuzz_once(seed: u64) !void {
     const answer = world.peer.respond(hello, &world.flight);
     world.sent_length = 0;
     const kind = random.enumValue(Mutation);
-    const length = mutate(random, kind, answer, &world.damaged);
-    const outcome = try feed(world, random, world.damaged[0..length]);
-    if (outcome != .connected) return;
-    // Connected: only a correct flight, and only if the server accepts the client's answer.
-    try testing.expect(world.clean);
-    try testing.expect(world.client.is_connected());
-    try testing.expect(world.peer.accept_client_finished(world.sent[0..world.sent_length]));
+    const length = mutate(random, &world.peer, kind, answer, &world.damaged);
+    _ = try feed(world, random, world.damaged[0..length]);
+    refused.* = world.refused;
+    return world.false_connect;
+}
+
+fn fuzz_once(seed: u64) !void {
+    var refused = false;
+    try testing.expect(!try run_once(seed, &refused));
 }
 
 test "fuzz: a damaged server flight never connects falsely and never crashes" {
     // Goal: the handshake survives any flight and connects only to a server that holds the pinned
     // CA's chain and the right keys. Method: a scripted server (random correct or faulty, with a
     // chain the CA signed, another CA signed, or a damaged signature) answers; the flight is
-    // damaged in one of eleven ways and fed in random pieces. A failure prints the seed.
+    // damaged in one of thirteen ways and fed in random pieces. A failure prints the seed.
     try seeds.run("tls fuzz", iterations_default, fuzz_once);
+}
+
+test "teeth: the property catches a false connect that a later error hides" {
+    // Goal: evidence that the check at the moment of `connected` is load-bearing. Method: with
+    // the client's CertificateVerify check off, some seed connects to a forged flight and then
+    // refuses a record that follows it: the run ends refused, so only the check at the step
+    // sees it.
+    tls_client.set_test_fault(.certificate_verify, true);
+    defer tls_client.set_test_fault(.certificate_verify, false);
+    var hidden: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 3000) : (seed += 1) {
+        var refused = false;
+        if (try run_once(seed, &refused) and refused) hidden += 1;
+    }
+    try testing.expect(hidden > 0);
 }

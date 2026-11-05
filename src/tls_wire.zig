@@ -293,18 +293,31 @@ pub fn parse_server_hello(body: []const u8, session_id: *const [32]u8) Error!Ser
     const echoed = try reader.vector8();
     const suite = try reader.read_u16();
     const compression = try reader.read_u8();
-    var extensions = Reader.init(try reader.vector16());
+    // A HelloRetryRequest is told apart by its random alone: its key_share holds only the
+    // group (RFC 8446 section 4.2.8), which the extension parser below would call malformed.
+    if (std.mem.eql(u8, random, &hello_retry_random)) return error.HelloRetryRequest;
+    // A TLS 1.2 (or older) ServerHello may end after the compression method: no extensions.
+    const extension_bytes = if (reader.remaining() == 0) "" else try reader.vector16();
+    var extensions = Reader.init(extension_bytes);
     try reader.finish();
 
+    // The extension parse error waits behind the version checks: a server that speaks another
+    // protocol is called that, whatever its extensions look like.
     var parsed: HelloExtensions = .{};
-    try read_hello_extensions(&extensions, &parsed);
-
-    if (std.mem.eql(u8, random, &hello_retry_random)) return error.HelloRetryRequest;
+    const extension_error: ?Error = if (read_hello_extensions(&extensions, &parsed)) |_|
+        null
+    else |err|
+        err;
     const tail = random[24..32];
     if (std.mem.eql(u8, tail, &downgrade_tls12)) return error.ProtocolVersion;
     if (std.mem.eql(u8, tail, &downgrade_tls11)) return error.ProtocolVersion;
     if (legacy_version != version_tls12) return error.ProtocolVersion;
-    if (parsed.version != version_tls13) return error.ProtocolVersion;
+    if (parsed.version) |version| {
+        if (version != version_tls13) return error.ProtocolVersion;
+    } else if (extension_error == null) {
+        return error.ProtocolVersion;
+    }
+    if (extension_error) |err| return err;
     if (suite != suite_aes_128_gcm_sha256) return error.CipherSuite;
     if (parsed.unexpected) return error.UnexpectedExtension;
     if (!std.mem.eql(u8, echoed, session_id)) return error.IllegalParameter;
@@ -328,19 +341,12 @@ const HelloExtensions = struct {
 };
 
 fn read_hello_extensions(reader: *Reader, parsed: *HelloExtensions) Error!void {
-    var seen: [std.math.maxInt(u8) + 1]bool = @splat(false);
     var count: u32 = 0;
     while (reader.remaining() > 0) {
         const kind = try reader.read_u16();
         const data = try reader.vector16();
         count += 1;
         assert(count <= constants.tls_handshake_message_bytes_max); // Each takes four bytes.
-        // Extension types of interest are small; a repeated type of any size is a repeat.
-        const slot: u8 = @truncate(kind ^ (kind >> 8));
-        if (seen[slot]) {
-            if (known_hello_extension(kind)) return error.DuplicateExtension;
-        }
-        seen[slot] = true;
         switch (kind) {
             ext_supported_versions => {
                 if (data.len != 2) return error.Malformed;
@@ -351,10 +357,6 @@ fn read_hello_extensions(reader: *Reader, parsed: *HelloExtensions) Error!void {
             else => parsed.unexpected = true,
         }
     }
-}
-
-fn known_hello_extension(kind: u16) bool {
-    return kind == ext_supported_versions or kind == ext_key_share;
 }
 
 fn read_server_key_share(data: []const u8, parsed: *HelloExtensions) Error!void {
@@ -423,7 +425,7 @@ pub fn parse_certificate(body: []const u8) Error!Chain {
     while (list.remaining() > 0) {
         const certificate = try list.vector24();
         const extensions = try list.vector16();
-        if (extensions.len != 0) return error.IllegalParameter;
+        if (extensions.len != 0) return error.UnexpectedExtension;
         count += 1;
         if (count > constants.tls_chain_certificates_max) return error.ChainShape;
         if (count == 1) leaf = certificate;

@@ -223,8 +223,8 @@ pub const Client = struct {
             diag.raise(.E0816);
             diag.cause("the server's connection ended before the handshake finished", .{});
         }
-        diag.fix(.{ .sentence = fix_sentence(.E0816) });
-        return self.refuse(null);
+        self.add_fix(diag, .E0816);
+        return self.refuse(diag, null);
     }
 
     // ---- Sending ------------------------------------------------------------------------------
@@ -246,6 +246,7 @@ pub const Client = struct {
     /// Sends close_notify and ends the connection.
     pub fn close_notify(self: *Client) void {
         assert(self.state == .connected);
+        assert(self.out_length == 0); // The caller drained the last step's output.
         self.queue_alert(1, .close_notify);
         self.wipe_secrets();
         self.state = .closed;
@@ -303,6 +304,10 @@ pub const Client = struct {
             return self.record_failure(diag, error.UnexpectedMessage);
         }
         if (body.len == 0) return self.record_failure(diag, error.UnexpectedMessage);
+        // An alert between two halves of a ServerHello is not a server speaking cleanly.
+        if (kind == .alert and self.flight_length != 0) {
+            return self.record_failure(diag, error.UnexpectedMessage);
+        }
         return switch (kind) {
             .handshake => self.on_handshake_bytes(diag, body),
             .alert => self.on_alert(diag, body),
@@ -355,13 +360,15 @@ pub const Client = struct {
         if (content.len != 2) {
             return self.fail(diag, .E0813, .decode_error, "the server sent a malformed alert", .{});
         }
+        // The level (content[0]) is ignored on purpose: in TLS 1.3 every alert but close_notify
+        // (and user_canceled) ends the connection whatever its level (RFC 8446 section 6).
         const code = content[1];
         if (code == @backingInt(wire.Alert.close_notify)) {
             if (self.state != .connected) {
                 diag.raise(.E0816);
                 diag.cause("the server closed the connection before the handshake finished", .{});
-                diag.fix(.{ .sentence = fix_sentence(.E0816) });
-                return self.refuse(null);
+                self.add_fix(diag, .E0816);
+                return self.refuse(diag, null);
             }
             self.queue_alert(1, .close_notify);
             self.wipe_secrets();
@@ -370,8 +377,8 @@ pub const Client = struct {
         }
         diag.raise(.E0813);
         diag.cause("the server sent the fatal alert {s} ({d})", .{ wire.alert_name(code), code });
-        diag.fix(.{ .sentence = fix_sentence(.E0813) });
-        return self.refuse(null);
+        self.add_fix(diag, .E0813);
+        return self.refuse(diag, null);
     }
 
     // ---- Handshake messages -------------------------------------------------------------------
@@ -530,7 +537,7 @@ pub const Client = struct {
             .name = name,
         }, &detail) catch |err| {
             x509.raise(diag, err, name, &detail);
-            return self.refuse(certificate_alert(err));
+            return self.refuse(diag, certificate_alert(err));
         };
         assert(parsed.public_key.of(chain.leaf).len == 32);
         self.leaf_key = parsed.public_key.of(chain.leaf)[0..32].*;
@@ -543,8 +550,8 @@ pub const Client = struct {
         diag.cause("the server sent no certificate, or more than {d}", .{
             constants.tls_chain_certificates_max,
         });
-        diag.fix(.{ .sentence = "Check that the server is a zcube server of this cluster." });
-        return self.refuse(.bad_certificate);
+        self.add_fix(diag, .E0810);
+        return self.refuse(diag, .bad_certificate);
     }
 
     fn on_certificate_verify(self: *Client, diag: *Diag, kind: u8, message: []const u8) Error!void {
@@ -593,6 +600,7 @@ pub const Client = struct {
         finished[0] = wire.handshake_finished;
         std.mem.writeInt(u24, finished[1..4], schedule.hash_bytes, .big);
         @memcpy(finished[4..], &verify_data);
+        defer std.crypto.secureZero(u8, &finished);
         try self.send_final_flight(diag, &finished);
         var application = self.schedule.to_application(&finished_hash);
         defer std.crypto.secureZero(u8, &application.client);
@@ -637,7 +645,7 @@ pub const Client = struct {
         const requested = wire.parse_key_update(body) catch |err|
             return self.wire_failure(diag, err, "KeyUpdate");
         self.read.rekey() catch |err| return self.record_failure(diag, err);
-        if (requested) self.send_key_update(false) catch return self.refuse(null);
+        if (requested) self.send_key_update(false) catch return self.refuse(diag, null);
     }
 
     // ---- Failing ------------------------------------------------------------------------------
@@ -652,8 +660,8 @@ pub const Client = struct {
     ) Error {
         diag.raise(code);
         diag.cause(format, args);
-        diag.fix(.{ .sentence = fix_sentence(code) });
-        return self.refuse(alert);
+        self.add_fix(diag, code);
+        return self.refuse(diag, alert);
     }
 
     fn wire_failure(self: *Client, diag: *Diag, err: wire.Error, message: []const u8) Error {
@@ -688,8 +696,8 @@ pub const Client = struct {
             ),
             else => diag.cause("the server's {s} is {s}", .{ message, wire_reason(err) }),
         }
-        diag.fix(.{ .sentence = fix_sentence(code) });
-        return self.refuse(wire_alert(err));
+        self.add_fix(diag, code);
+        return self.refuse(diag, wire_alert(err));
     }
 
     fn record_failure(self: *Client, diag: *Diag, err: schedule.Error) Error {
@@ -719,15 +727,39 @@ pub const Client = struct {
             ),
             error.Dead => unreachable,
         }
-        diag.fix(.{ .sentence = fix_sentence(.E0815) });
-        return self.refuse(record_alert(err));
+        self.add_fix(diag, .E0815);
+        return self.refuse(diag, record_alert(err));
+    }
+
+    /// The fix line. For a server that is wrong or offers something else, it names the server:
+    /// the client's main use is a relay to a broker that is not a zcube server.
+    fn add_fix(self: *const Client, diag: *Diag, code: Code) void {
+        var buffer: [constants.tls_server_name_bytes_max + 160]u8 = undefined;
+        const sentence = switch (code) {
+            .E0810, .E0813, .E0818 => std.fmt.bufPrint(
+                &buffer,
+                "Check that the server at {s} is the one this connection is configured for, " ++
+                    "and that it offers TLS 1.3 with an Ed25519 certificate from the pinned CA.",
+                .{self.name[0..self.name_length]},
+            ) catch unreachable, // The buffer holds the longest name and the sentence.
+            else => fix_sentence(code),
+        };
+        diag.fix(.{ .sentence = sentence });
     }
 
     /// Ends the connection: queues the alert (if any), wipes every secret and the record buffer,
     /// and stops all further input and output. Always returns `error.Refused`.
-    fn refuse(self: *Client, alert: ?wire.Alert) Error {
+    fn refuse(self: *Client, diag: *Diag, alert: ?wire.Alert) Error {
         self.out_length = 0;
-        if (alert) |description| self.queue_alert(wire.alert_level_fatal, description);
+        if (alert) |description| {
+            self.queue_alert(wire.alert_level_fatal, description);
+            // The diagnostic shows both alerts: the server's (its cause) and ours.
+            if (self.out_length > 0) {
+                diag.context("sent", "alert {s} ({d})", .{
+                    @tagName(description), @backingInt(description),
+                });
+            }
+        }
         self.wipe_secrets();
         self.state = .failed;
         assert(self.read.dead);
@@ -826,10 +858,8 @@ fn wire_reason(err: wire.Error) []const u8 {
 
 fn fix_sentence(code: Code) []const u8 {
     return switch (code) {
-        .E0813 => "Check that the address is a zcube server of this cluster, then retry.",
         .E0815 => "Reconnect; if it repeats, check the network path between the two machines.",
         .E0816 => "Retry the request: what arrived before the break may be incomplete.",
-        .E0818 => "Connect to a zcube server: zcube offers no other TLS settings.",
         else => unreachable,
     };
 }

@@ -406,6 +406,133 @@ test "handshake data behind a key change in one record is refused" {
     try rig.expect_code(.E0813);
 }
 
+// ---- ServerHello layouts, the sent alert and the fix line --------------------------------------
+
+/// A ServerHello body: the fixed fields, then `extensions` behind a length (or nothing at all
+/// when `block` is false, as a TLS 1.2 server may send).
+fn hello_body(
+    out: []u8,
+    random: *const [32]u8,
+    extensions: []const u8,
+    block: bool,
+) []const u8 {
+    var length: usize = 0;
+    std.mem.writeInt(u16, out[0..2], 0x0303, .big);
+    @memcpy(out[2..34], random);
+    out[34] = 32;
+    @memset(out[35..67], 0x22);
+    std.mem.writeInt(u16, out[67..69], wire.suite_aes_128_gcm_sha256, .big);
+    out[69] = 0;
+    length = 70;
+    if (block) {
+        std.mem.writeInt(u16, out[70..72], @intCast(extensions.len), .big);
+        @memcpy(out[72..][0..extensions.len], extensions);
+        length = 72 + extensions.len;
+    }
+    return out[0..length];
+}
+
+const hrr_random = [32]u8{
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+};
+
+test "a HelloRetryRequest in the RFC 8446 layout is named, not called malformed" {
+    // Goal: MUST-1 of the slice 4 review. A real HRR's key_share holds only the group (section
+    // 4.2.8), which the extension parser rejects; the random must decide first. Method: the
+    // layout of section 4.1.4 (supported_versions, key_share with the group alone, a cookie).
+    var buffer: [128]u8 = undefined;
+    const extensions = [_]u8{
+        0, 43, 0, 2, 3, 4, // supported_versions
+        0, 51, 0, 2, 0, 0x1d, // key_share: selected_group only
+        0, 44, 0, 6, 0, 4, 1, 2, 3, 4, // cookie
+    };
+    const body = hello_body(&buffer, &hrr_random, &extensions, true);
+    const session: [32]u8 = @splat(0x22);
+    try std.testing.expectError(error.HelloRetryRequest, wire.parse_server_hello(body, &session));
+}
+
+test "a TLS 1.2 ServerHello without extensions is a version problem, not a decode error" {
+    // Goal: SHOULD-3. A TLS 1.2 server may end its ServerHello after the compression method.
+    // Method: no extensions block; then a block holding a damaged extension beside a
+    // supported_versions that names TLS 1.2.
+    var buffer: [128]u8 = undefined;
+    const random: [32]u8 = @splat(0x77);
+    const session: [32]u8 = @splat(0x22);
+    const bare = hello_body(&buffer, &random, "", false);
+    try std.testing.expectError(error.ProtocolVersion, wire.parse_server_hello(bare, &session));
+    const old = [_]u8{ 0, 43, 0, 2, 3, 3, 0, 0xFF, 0, 9, 1 }; // The last extension is cut short.
+    const body = hello_body(&buffer, &random, &old, true);
+    try std.testing.expectError(error.ProtocolVersion, wire.parse_server_hello(body, &session));
+}
+
+test "an unknown extension is not mistaken for a repeat of a known one" {
+    // Goal: the NIT in the review. Kind 0x2B00 shares a slot with supported_versions (43) in a
+    // folded table. Method: both in one ServerHello; the refusal is the unknown extension.
+    var buffer: [128]u8 = undefined;
+    const random: [32]u8 = @splat(0x77);
+    const session: [32]u8 = @splat(0x22);
+    const extensions = [_]u8{ 0x2B, 0, 0, 0, 0, 43, 0, 2, 3, 4 };
+    const body = hello_body(&buffer, &random, &extensions, true);
+    try std.testing.expectError(
+        error.UnexpectedExtension,
+        wire.parse_server_hello(body, &session),
+    );
+}
+
+test "a certificate entry with extensions is an extension nobody asked for" {
+    // Goal: RFC 8446 section 4.2: an extension in a response that the request lacked is
+    // unsupported_extension. Method: one entry with an empty-looking extension.
+    const body = [_]u8{ 0, 0, 0, 12, 0, 0, 3, 1, 2, 3, 0, 4, 0, 0xFF, 0, 0 };
+    try std.testing.expectError(error.UnexpectedExtension, wire.parse_certificate(&body));
+}
+
+test "a plaintext alert between two halves of a ServerHello is refused" {
+    // Goal: an alert may not interleave with a handshake message. Method: the first bytes of a
+    // ServerHello in one record, then a plaintext alert.
+    var rig: Rig = undefined;
+    var buffer: [16]u8 = undefined;
+    try rig.setup(.good, .{});
+    rig.hello();
+    const half = schedule.write_plain(&rig.flight, .handshake, 0x0303, &.{ 2, 0, 0, 80, 3, 3 });
+    _ = try rig.feed(half, 4096);
+    try std.testing.expectError(error.Refused, rig.feed(testpeer.plain_alert(&buffer, 40), 4096));
+    try rig.expect_code(.E0815);
+}
+
+fn expect_context(diag: *const Diag, key: []const u8, value: []const u8) !void {
+    for (diag.pairs.slice()) |pair| {
+        if (!std.mem.eql(u8, pair.key_slice(), key)) continue;
+        try std.testing.expectEqualStrings(value, pair.value.slice());
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+test "the diagnostic names the alert the client sent, and the fix names the server" {
+    // Goal: SHOULD-1 and SHOULD-2. Method: a bad Finished (decrypt_error), a ServerHello the
+    // client cannot use (handshake_failure), a certificate from another CA (unknown_ca).
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{ .bad_finished = true });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try expect_context(&rig.diag, "sent", "alert decrypt_error (51)");
+    const fix = rig.diag.fixes.slice()[0].sentence.slice();
+    try std.testing.expect(std.mem.indexOf(u8, fix, "server at broker.botpike.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fix, "pinned CA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fix, "zcube server") == null);
+
+    try rig.setup(.good, .{ .wrong_suite = true });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0818);
+    try expect_context(&rig.diag, "sent", "alert handshake_failure (40)");
+    const fix_818 = rig.diag.fixes.slice()[0].sentence.slice();
+    try std.testing.expect(std.mem.indexOf(u8, fix_818, "zcube server") == null);
+
+    try rig.setup(.other_ca, .{});
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try expect_context(&rig.diag, "sent", "alert unknown_ca (48)");
+}
+
 // ---- Teeth: each security check, reverted, lets a refused handshake through ---------------------
 
 test "teeth: without the CertificateVerify check a forged signature connects" {
@@ -448,5 +575,25 @@ test "teeth: without the pin check a damaged certificate connects" {
     x509.set_test_fault(.signature, true);
     defer x509.set_test_fault(.signature, false);
     try rig.setup(.tampered, .{});
+    try expect_connected(&rig, 4096);
+}
+
+test "teeth: without the name check a certificate for another name connects" {
+    // Goal: evidence that the name check is what ties the server to the name dialled. Method:
+    // the refused wrong-name scenario, with x509's name check skipped, connects.
+    var rig: Rig = undefined;
+    x509.set_test_fault(.name, true);
+    defer x509.set_test_fault(.name, false);
+    try rig.setup(.wrong_name, .{});
+    try expect_connected(&rig, 4096);
+}
+
+test "teeth: without the window check an expired certificate connects" {
+    // Goal: as above, for the validity window. Method: the refused expired scenario, with
+    // x509's window check skipped, connects.
+    var rig: Rig = undefined;
+    x509.set_test_fault(.window, true);
+    defer x509.set_test_fault(.window, false);
+    try rig.setup(.expired, .{});
     try expect_connected(&rig, 4096);
 }

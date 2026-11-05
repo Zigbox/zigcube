@@ -139,7 +139,14 @@ pub const Peer = struct {
         std.mem.writeInt(u16, share[2..4], 32, .big);
         const public = X25519.recoverPublicKey(self.config.secret);
         @memcpy(share[4..], &public);
-        length += put_extension(out[length..], 51, &share);
+        if (faults.hello_retry) {
+            // A real HelloRetryRequest (RFC 8446 section 4.1.4): the key_share names only the
+            // group (section 4.2.8), and a cookie asks for an echo.
+            length += put_extension(out[length..], 51, share[0..2]);
+            length += put_extension(out[length..], 44, &.{ 0, 4, 0xC0, 0x0C, 0x1E, 0xED });
+        } else {
+            length += put_extension(out[length..], 51, &share);
+        }
         if (faults.extra_extension) length += put_extension(out[length..], 0x00FF, &.{0});
         std.mem.writeInt(
             u16,

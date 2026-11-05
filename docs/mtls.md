@@ -113,9 +113,12 @@ Rules the code holds to, each with a test:
 - A CertificateRequest is refused: client authentication is slice 5.
 
 Tests: `tls_client_test.zig` (success at several piece sizes, refusals, pinning, record faults and
-four teeth tests, one each for the pin, CertificateVerify, Finished and the transcript, which fail
-when that check is skipped), and `tls_fuzz.zig`, a seeded fuzzer that damages a server's flight in
-eleven ways and feeds it in random pieces. It is replayed like the others (see "Replaying a fuzz
+six teeth tests, one each for the pin, the name, the validity window, CertificateVerify, Finished
+and the transcript, which fail when that check is skipped), and `tls_fuzz.zig`, a seeded fuzzer
+that damages a server's flight in thirteen ways (alerts, plain and sealed, at record boundaries;
+any record replayed) and feeds it in random pieces. It checks the client's answer at the moment
+of `connected`, whatever follows, and has a teeth test of its own. Tidy allows only test roots to
+import `tls_testpeer.zig`. It is replayed like the others (see "Replaying a fuzz
 failure").
 
 ## Diagnostics

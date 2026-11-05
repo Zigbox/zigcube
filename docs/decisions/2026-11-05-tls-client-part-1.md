@@ -16,3 +16,16 @@
   check, the Finished check or the EncryptedExtensions in the transcript, so a test can show that
   each check is what stops a bad server. The pin is covered by a certificate with a damaged
   signature.
+- **A second certificate is carried, not read.** The leaf alone is verified against the pinned CA
+  key; a second certificate (one more is allowed, a third is ZC-E0810) takes no part in trust, so
+  an intermediate cannot widen it. The brief's "any intermediate is refused" holds in that sense:
+  nothing but a leaf the CA signed directly is accepted, and an extra certificate is ignored.
+- **A CertificateEntry with extensions** is refused with the `unsupported_extension` alert: none
+  was asked for.
+- **A HelloRetryRequest is told apart by its random** before any extension is read, because its
+  `key_share` holds the group alone (RFC 8446 section 4.2.8); it is ZC-E0818.
+- **A TLS 1.2 or older ServerHello** may end after the compression method; it is ZC-E0818
+  (`protocol_version`) whatever its extensions look like.
+- **The diagnostic shows the alert sent**, as a `sent` line (`alert decrypt_error (51)`), and the
+  fix names the server connected to, since the main use is a relay to a broker that is not a zcube
+  server.
