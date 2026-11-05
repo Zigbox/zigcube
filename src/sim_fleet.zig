@@ -1,7 +1,7 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
+//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-canary] [--dry-run]
 //!                      < one run kind's output of a round
 //!
 //! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
@@ -29,7 +29,8 @@ const github_api = @import("sim_fleet_github.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
-    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]\n" ++
+    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-canary]\n" ++
+    "                        [--dry-run]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
     "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
     "--shrink` (sim-swarm), concatenated\n";
@@ -951,4 +952,41 @@ test "three kinds on one day: separate issues, separate counts, and the totals b
         "- sim-c1: 100 seeds, 1 failed",
         "- sim-swarm: 50 seeds, 1 failed",
     }) |line| try std.testing.expect(std.mem.indexOf(u8, posted, line) != null);
+}
+
+test "a canary that caught its fault files nothing; one that missed files one issue, once" {
+    // Goal: a canary run that fails as it must is only counted; one whose fault went undetected
+    // is an issue ("the fleet has stopped detecting"), deduplicated by runner like any failure.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
+    defer fake.deinit();
+    var state: state_file.State = .{};
+    var options = test_options("aaa", day_one);
+    options.kind = issue.kind_sim_canary;
+    const caught_text = "sim-canary: seeds 1..1, 100 operations: 0 of 1 failed\n";
+    const caught = try issue.parse(arena, issue.kind_sim_canary, caught_text);
+    const first = try ingest(arena, fake.github(), &state, caught, options);
+    try std.testing.expectEqual(@as(u32, 0), first.filed);
+    try std.testing.expectEqual(@as(u64, 1), first.seeds);
+    const missed_text = "seed 1: FAILED: the fleet has stopped detecting: sim_teeth passed\n" ++
+        "  step: canary\n  replay: zig-out/bin/sim_teeth --seeds 1..10 100 --expect-fail\n" ++
+        "sim-canary: seeds 1..1, 100 operations: 1 of 1 failed\n";
+    const missed = try issue.parse(arena, issue.kind_sim_canary, missed_text);
+    const second = try ingest(arena, fake.github(), &state, missed, options);
+    try std.testing.expectEqual(@as(u32, 1), second.filed);
+    const body = fake.issues.items[0].body;
+    try std.testing.expect(std.mem.indexOf(u8, body, "sim-canary-exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "sim_teeth --seeds 1..10") != null);
+    const title = fake.issues.items[0].title;
+    try std.testing.expect(std.mem.indexOf(u8, title, "stopped detecting") != null);
+    // Missed again on the same commit: no second issue and no comment.
+    const third = try ingest(arena, fake.github(), &state, missed, options);
+    try std.testing.expectEqual(@as(u32, 0), third.filed);
+    try std.testing.expectEqual(@as(u32, 1), third.throttled);
+    try std.testing.expectEqual(@as(usize, 1), fake.issues.items.len);
+    // A canary's summary line is no sim-cluster batch, and back.
+    const as_cluster = issue.parse(arena, issue.kind_sim_cluster, caught_text);
+    try std.testing.expectError(error.NoSummary, as_cluster);
 }

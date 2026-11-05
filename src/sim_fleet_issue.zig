@@ -12,7 +12,10 @@ const constants = @import("constants.zig");
 pub const kind_sim_cluster = "sim-cluster";
 pub const kind_sim_c1 = "sim-c1";
 pub const kind_sim_swarm = "sim-swarm";
-pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm };
+/// Not a simulator: the teeth canary (`run.sh`, `canary_round`). A round of it is one run of a
+/// fault-on runner that must fail; a miss is a failure at the step `canary`.
+pub const kind_sim_canary = "sim-canary";
+pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm, kind_sim_canary };
 
 pub fn kind_known(kind: []const u8) bool {
     for (kinds) |known| {
@@ -24,6 +27,7 @@ pub fn kind_known(kind: []const u8) bool {
 /// The `zig build` step that installs the runner of `kind` (and so the replay's binary).
 fn exe_step(kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm-exe";
+    if (std.mem.eql(u8, kind, kind_sim_canary)) return "sim-canary-exe";
     return "sim-cluster-exe";
 }
 
@@ -33,6 +37,7 @@ fn exe_step(kind: []const u8) []const u8 {
 /// way round.
 fn summary_prefix(kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm: seeds ";
+    if (std.mem.eql(u8, kind, kind_sim_canary)) return "sim-canary: seeds ";
     if (std.mem.eql(u8, kind, kind_sim_c1)) return "sim-cluster --c1: seeds ";
     return "sim-cluster: seeds ";
 }

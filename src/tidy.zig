@@ -46,6 +46,7 @@ const shell_allowlist = [_][]const u8{
     "ops/sim-fleet/run.sh",
     // Sources run.sh and feeds its crash records to the built `sim_fleet`: it tests a shell
     // function, which only a shell can call.
+    "ops/sim-fleet/test-canary.sh",
     "ops/sim-fleet/test-crash-record.sh",
     // The demo's three-node start, stop and kill (c1-7 brief): a handful of long-lived processes
     // started side by side and killed by pid file, which is what a shell is for. Each script opens

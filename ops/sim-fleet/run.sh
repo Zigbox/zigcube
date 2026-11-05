@@ -42,6 +42,10 @@ main() {
     : "${SIM_FLEET_WORKERS_C1:=1}"
     : "${SIM_FLEET_WORKERS_SWARM:=1}"
     : "${SIM_FLEET_CACHE_MB:=8192}"
+    # The teeth canary: about 1 round in this many also runs one fault-on runner that must fail
+    # (canary_round); 0 never does, 1 every round. A miss is filed as an issue.
+    : "${SIM_FLEET_CANARY_ONE_IN:=50}"
+    : "${SIM_FLEET_CANARY_TIMEOUT:=600}"
     : "${SIM_FLEET_TRACKER:=}"
     # Deadlines, in seconds: nothing the loop waits on may hang it.
     : "${SIM_FLEET_GIT_TIMEOUT:=300}"
@@ -112,7 +116,8 @@ follow_main() {
     log "building $head"
     rm -rf "$STATE/bin/$head"
     if timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
-        --prefix "$STATE/bin/$head" sim-cluster-exe sim-swarm-exe sim-fleet-exe >"$STATE/build.log" 2>&1; then
+        --prefix "$STATE/bin/$head" sim-cluster-exe sim-swarm-exe sim-fleet-exe \
+        sim-canary-exe >"$STATE/build.log" 2>&1; then
         echo "$head" >"$STATE/built.new"
         mv "$STATE/built.new" "$STATE/built"
         built="$head"
@@ -226,6 +231,74 @@ run_round() {
         done
         if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind"; fi
     done
+    canary_round
+}
+
+# The teeth canary (docs/briefs/c3-sim-fleet.md, item 3): the fleet's own proof that it still
+# detects. These are the runners `zig build sim-canary-exe` installs, each built with one
+# test-only fault on and each of which must fail within seeds 1..10 (`--expect-fail` exits 0
+# when one does, 1 when none does). The faults and symptoms are build.zig's `c1_teeth_roots`,
+# `sim-teeth` and `sim-swarm-teeth`; keep this list the same.
+CANARIES="sim_teeth sim_swarm_teeth sim_c1_teeth_allocation sim_c1_teeth_readiness \
+    sim_c1_teeth_stale sim_c1_teeth_skew sim_c1_teeth_wedge sim_c1_teeth_locality"
+
+canary_symptom() {
+    case "$1" in
+    sim_c1_teeth_allocation) echo I6 ;;
+    sim_c1_teeth_readiness) echo I7 ;;
+    sim_c1_teeth_stale) echo I3 ;;
+    sim_c1_teeth_skew) echo I1b ;;
+    sim_c1_teeth_wedge) echo "I1b: a replaced replica kept executing longer" ;;
+    sim_c1_teeth_locality) echo L1 ;;
+    esac
+}
+
+# A random number from the kernel.
+draw() {
+    od -An -N4 -tu4 /dev/urandom | tr -d ' '
+}
+
+# About 1 round in SIM_FLEET_CANARY_ONE_IN: runs one canary, picked at random, and hands the
+# reporter kind `sim-canary`: a run that failed as it must is one seed counted, a run whose
+# fault went undetected is a failure at the step `canary` (an issue, "the fleet has stopped
+# detecting"). A crash, a timeout or a missing runner is the host's: logged, not counted.
+canary_round() {
+    one_in=$SIM_FLEET_CANARY_ONE_IN
+    if [ "$one_in" -le 0 ] || [ $(($(draw) % one_in)) -ne 0 ]; then return 0; fi
+    set -- $CANARIES
+    pick=$(($(draw) % $#))
+    shift "$pick"
+    name=$1
+    if [ ! -x "$bin/$name" ]; then
+        log "canary $name is not built at $built; skipped"
+        return 0
+    fi
+    set -- --seeds 1..10 100
+    case "$name" in sim_c1_*) set -- "$@" --c1 ;; esac
+    replay_args="$*"
+    symptom=$(canary_symptom "$name")
+    set -- "$@" --expect-fail
+    if [ -n "$symptom" ]; then set -- "$@" "--expect-symptom=$symptom"; fi
+    code=0
+    timeout "$SIM_FLEET_CANARY_TIMEOUT" "$bin/$name" "$@" >"$round/canary.out" \
+        2>"$round/canary.err" || code=$?
+    case "$code" in
+    0) failed=0 ;;
+    1) failed=1 ;;
+    *)
+        log "canary $name exited $code at $built; not counted"
+        return 0
+        ;;
+    esac
+    {
+        if [ "$failed" -eq 1 ]; then
+            printf 'seed 1: FAILED: the fleet has stopped detecting: %s ran seeds 1..10 and none failed\n' "$name"
+            printf '  step: canary\n  replay: zig-out/bin/%s %s\n' "$name" "$replay_args"
+        fi
+        printf 'sim-canary: seeds 1..1, 100 operations: %s of 1 failed\n' "$failed"
+    } >"$round/all-sim-canary"
+    log "canary $name: $(if [ "$failed" -eq 1 ]; then echo MISSED; else echo caught; fi)"
+    ingest sim-canary "$round/all-sim-canary"
 }
 
 start_worker() {

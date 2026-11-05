@@ -942,6 +942,16 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     add_sim_teeth_step(b, sim);
     add_sim_c1_steps(b, sim);
     add_sim_swarm_teeth_step(b, sim);
+    add_sim_canary_step(b);
+}
+
+/// `zig build sim-canary-exe` installs every fault-on runner the fleet's teeth canary may run
+/// (`ops/sim-fleet/run.sh`, `canary_round`): `sim_teeth`, `sim_swarm_teeth` and the six
+/// `sim_c1_teeth_*`. It only gathers the install steps the teeth tests declare above.
+fn add_sim_canary_step(b: *std.Build) void {
+    const canary = b.step("sim-canary-exe", "Install the fault-on runners of the fleet's canary");
+    const names = [_][]const u8{ "sim-teeth-exe", "sim-swarm-teeth-exe", "sim-c1-teeth-exe" };
+    for (names) |name| canary.dependOn(&b.top_level_steps.get(name).?.step);
 }
 
 /// `zig build sim-cluster [-Dseed=N] [-Dops=N] [-Dnodes=N] [-Dliveness=false]`: the cluster
@@ -1037,6 +1047,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the six fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1058,6 +1069,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         own.dependOn(&teeth_run.step);
         const own_install = b.addInstallArtifact(teeth_exe, .{});
         own.dependOn(&own_install.step);
+        teeth_exes.dependOn(&own_install.step);
     }
 }
 
