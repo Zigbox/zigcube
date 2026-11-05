@@ -1,7 +1,8 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-canary] [--dry-run]
+//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
+//!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT]]
 //!                      < one run kind's output of a round
 //!
 //! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
@@ -17,6 +18,13 @@
 //! filed again; a locked one is skipped. A rate limit stops every write and holds them until
 //! GitHub's wait is over. `--dry-run` asks GitHub nothing and prints what it would do.
 //!
+//! `--canary` reads the output of a teeth canary (`run.sh`, `canary_pick`): the fault-on RUNNER
+//! run like a worker of `--kind` over seeds A..B. Its caught checks are not filed; it is counted
+//! and filed as kind `sim-canary`, where a miss (no seed failed), a wrong symptom (no failure's
+//! check starts with TEXT) and each crash are failures (`issue.canary_verdict`). It prints
+//! `sim-fleet: canary RUNNER: caught|MISSED|WRONG SYMPTOM|CRASHED`, and exits 2 when GitHub's
+//! hold kept a canary failure from being filed, so `run.sh` runs that canary again next round.
+//!
 //! Exit codes: 0 done, 1 usage or bad input, 2 environment (state file, token, GitHub). The state
 //! file is saved whenever it was read, whatever GitHub answered.
 
@@ -29,11 +37,12 @@ const github_api = @import("sim_fleet_github.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
-    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-canary]\n" ++
-    "                        [--dry-run]\n" ++
+    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]\n" ++
+    "                        [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
     "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
-    "--shrink` (sim-swarm), concatenated\n";
+    "--shrink` (sim-swarm), concatenated; with --canary, the fault-on RUNNER's run of that\n" ++
+    "kind over seeds A..B, filed as sim-canary\n";
 
 pub const Options = struct {
     kind: []const u8 = issue.kind_sim_cluster,
@@ -344,7 +353,38 @@ const Args = struct {
     tracker: ?u32 = null,
     kind: []const u8 = issue.kind_sim_cluster,
     dry_run: bool = false,
+    canary: ?[]const u8 = null,
+    canary_seeds: ?[]const u8 = null,
+    symptom: ?[]const u8 = null,
 };
+
+/// The canary of `--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT]`, null without
+/// `--canary`, an error for a canary half given or not of a simulator kind.
+fn canary_of(args: Args) error{BadCanary}!?issue.Canary {
+    const runner = args.canary orelse {
+        if (args.canary_seeds != null or args.symptom != null) return error.BadCanary;
+        return null;
+    };
+    const seeds = args.canary_seeds orelse return error.BadCanary;
+    if (std.mem.eql(u8, args.kind, issue.kind_sim_canary)) return error.BadCanary;
+    // A word: it goes into a replay command and an issue title.
+    if (runner.len == 0) return error.BadCanary;
+    for (runner) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return error.BadCanary;
+    }
+    const dots = std.mem.indexOf(u8, seeds, "..") orelse return error.BadCanary;
+    const first = std.fmt.parseInt(u64, seeds[0..dots], 10) catch return error.BadCanary;
+    const last = std.fmt.parseInt(u64, seeds[dots + 2 ..], 10) catch return error.BadCanary;
+    if (last < first) return error.BadCanary;
+    if (args.symptom) |symptom| if (symptom.len == 0) return error.BadCanary;
+    return .{
+        .runner = runner,
+        .kind = args.kind,
+        .first = first,
+        .last = last,
+        .symptom = args.symptom,
+    };
+}
 
 /// Null if the command line is not valid `ingest`.
 fn parse_args(args: []const []const u8) ?Args {
@@ -370,6 +410,12 @@ fn parse_args(args: []const []const u8) ?Args {
             parsed.token_file = value;
         } else if (std.mem.eql(u8, arg, "--kind")) {
             parsed.kind = value;
+        } else if (std.mem.eql(u8, arg, "--canary")) {
+            parsed.canary = value;
+        } else if (std.mem.eql(u8, arg, "--canary-seeds")) {
+            parsed.canary_seeds = value;
+        } else if (std.mem.eql(u8, arg, "--expect-symptom")) {
+            parsed.symptom = value;
         } else if (std.mem.eql(u8, arg, "--tracker")) {
             parsed.tracker = std.fmt.parseInt(u32, value, 10) catch return null;
             if (parsed.tracker.? == 0) return null;
@@ -381,6 +427,7 @@ fn parse_args(args: []const []const u8) ?Args {
     // The commit and kind are words in the state file.
     if (std.mem.indexOfAny(u8, parsed.commit, " \t\r\n") != null) return null;
     if (!issue.kind_known(parsed.kind)) return null;
+    _ = canary_of(parsed) catch return null;
     if (!parsed.dry_run and (parsed.repo.len == 0 or parsed.token_file == null)) return null;
     return parsed;
 }
@@ -407,7 +454,14 @@ pub fn main(init: std.process.Init) u8 {
 
 const RunError = issue.ParseError || state_file.ParseError || IngestError ||
     std.Io.Writer.Error ||
-    error{ StateUnreadable, StateUnwritable, InputUnreadable, TokenUnreadable, GitHubStopped };
+    error{
+        StateUnreadable,
+        StateUnwritable,
+        InputUnreadable,
+        TokenUnreadable,
+        GitHubStopped,
+        CanaryHeld,
+    };
 
 /// One line: what went wrong and what to do about it. (The fleet's messages are not coded
 /// diagnostics yet: docs/briefs/c1-9.md, "Cuts".)
@@ -434,6 +488,8 @@ fn explain(err: RunError) []const u8 {
             "it must be readable by this user",
         error.GitHubStopped => "GitHub stopped this round (see the lines above); the state " ++
             "is saved and the next round goes on from it",
+        error.CanaryHeld => "GitHub asked to wait, so the canary's failure is not filed; " ++
+            "run.sh runs this canary again next round",
         error.OutOfMemory => "out of memory",
         error.WriteFailed => "cannot write to stdout",
     };
@@ -493,7 +549,9 @@ fn run(
     const input_limit: std.Io.Limit = .limited(constants.fleet_input_bytes_max);
     const input = stdin.interface.allocRemaining(arena, input_limit) catch
         return error.InputUnreadable;
-    const batch = try issue.parse(arena, args.kind, input);
+    const read = try read_input(arena, args, input);
+    const batch = read.batch;
+    const kind = read.kind;
     // A dry run keeps its own state file: it must not mark anything filed in the real one.
     const state_path = if (args.dry_run)
         try std.fmt.allocPrint(arena, "{s}.dry", .{args.state})
@@ -501,7 +559,7 @@ fn run(
         args.state;
     var state = try load_state(arena, io, std.Io.Dir.cwd(), state_path, log);
     const options: Options = .{
-        .kind = args.kind,
+        .kind = kind,
         .commit = args.commit,
         .tracker = args.tracker,
         .now_seconds = std.Io.Clock.real.now(io).toSeconds(),
@@ -527,9 +585,36 @@ fn run(
     // Saved whatever GitHub answered: what was filed stays filed, and a hold stays held.
     try save(arena, io, state_path, &state);
     const summary = try outcome;
-    try print_summary(out, args.kind, &summary, &state, args.dry_run);
+    try print_summary(out, kind, &summary, &state, args.dry_run);
+    if (read.verdict) |verdict| {
+        const word = switch (verdict) {
+            .caught => "caught",
+            .missed => "MISSED",
+            .wrong_symptom => "WRONG SYMPTOM",
+            .crashed => "CRASHED",
+        };
+        try out.print("sim-fleet: canary {s}: {s}\n", .{ args.canary.?, word });
+    }
     if (summary.stopped != null) return error.GitHubStopped;
+    // A canary runs once in many rounds: a failure a hold kept from being filed must be found
+    // again soon, not when the cycle comes back to it.
+    if (read.verdict != null and summary.held and summary.failed > summary.infra) {
+        return error.CanaryHeld;
+    }
     return constants.exit_ok;
+}
+
+/// What a round's input is filed as: the batch as parsed, or a canary's judged batch under the
+/// kind `sim-canary`.
+const Read = struct { kind: []const u8, batch: issue.Batch, verdict: ?issue.Verdict };
+
+fn read_input(arena: std.mem.Allocator, args: Args, text: []const u8) issue.ParseError!Read {
+    const parsed = try issue.parse(arena, args.kind, text);
+    // parse_args checked it.
+    const canary = canary_of(args) catch unreachable;
+    const run_of = canary orelse return .{ .kind = args.kind, .batch = parsed, .verdict = null };
+    const judged = try issue.canary_verdict(arena, run_of, parsed);
+    return .{ .kind = issue.kind_sim_canary, .batch = judged.batch, .verdict = judged.verdict };
 }
 
 fn print_summary(
@@ -954,39 +1039,140 @@ test "three kinds on one day: separate issues, separate counts, and the totals b
     }) |line| try std.testing.expect(std.mem.indexOf(u8, posted, line) != null);
 }
 
-test "a canary that caught its fault files nothing; one that missed files one issue, once" {
-    // Goal: a canary run that fails as it must is only counted; one whose fault went undetected
-    // is an issue ("the fleet has stopped detecting"), deduplicated by runner like any failure.
+/// What `sim_c1_teeth_wedge --seeds 2000..2003 auto --profile=auto --c1 --shrink` printed
+/// (seed 2001 failed; the runner's replays carry `sim_cluster`, the main it is built from).
+const canary_wedge_caught = "seed 2001: FAILED: I1b: a replaced replica kept executing longer " ++
+    "than the lost grace plus the kill latency\n" ++
+    "  step: faults\n" ++
+    "  profile: slow_store\n" ++
+    "  shape: operations=82 nodes=13 lease_ttl_ms=8373 replicas_pct=100\n" ++
+    "  replay: zig-out/bin/sim_cluster 2001 82 13 --c1 --profile=slow_store " ++
+    "--lease-ttl-ms=8373 --replicas-pct=100 --heal-at=41\n" ++
+    "  shrunk to 20 operations\n" ++
+    "  replay: zig-out/bin/sim_cluster 2001 20 13 --c1 --profile=slow_store " ++
+    "--lease-ttl-ms=8373 --replicas-pct=100 --heal-at=41\n" ++
+    "sim-cluster --c1: seeds 2000..2003, drawn operations: 1 of 4 failed\n";
+/// The same run had the fault broken some other check instead.
+const canary_wedge_wrong = "seed 2002: FAILED: I6: an allocation disagrees with the sum of " ++
+    "its node's assignments\n" ++
+    "  step: faults\n" ++
+    "  profile: mixed\n" ++
+    "  shape: operations=109 nodes=8 lease_ttl_ms=9769 replicas_pct=100\n" ++
+    "  replay: zig-out/bin/sim_cluster 2002 109 8 --c1 --lease-ttl-ms=9769 " ++
+    "--replicas-pct=100 --heal-at=89\n" ++
+    "sim-cluster --c1: seeds 2000..2003, drawn operations: 1 of 4 failed\n";
+const canary_wedge_missed = "sim-cluster --c1: seeds 2000..2003, drawn operations: 0 of 4 failed\n";
+const canary_wedge: issue.Canary = .{
+    .runner = "sim_c1_teeth_wedge",
+    .kind = issue.kind_sim_c1,
+    .first = 2000,
+    .last = 2003,
+    .symptom = "I1b: a replaced replica kept executing longer",
+};
+
+fn canary_ingest(
+    arena: std.mem.Allocator,
+    github: github_api.Github,
+    state: *state_file.State,
+    text: []const u8,
+    commit: []const u8,
+) !Summary {
+    const parsed = try issue.parse(arena, canary_wedge.kind, text);
+    const judged = try issue.canary_verdict(arena, canary_wedge, parsed);
+    var options = test_options(commit, day_one);
+    options.kind = issue.kind_sim_canary;
+    return ingest(arena, github, state, judged.batch, options);
+}
+
+test "a canary that caught its fault files nothing; a miss and a wrong symptom are two issues" {
+    // Goal: the canary's real output, read with its kind's parser: a caught fault is counted
+    // and files nothing; a miss and a wrong symptom are each an issue, deduplicated apart.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
     defer fake.deinit();
     var state: state_file.State = .{};
-    var options = test_options("aaa", day_one);
-    options.kind = issue.kind_sim_canary;
-    const caught_text = "sim-canary: seeds 1..1, 100 operations: 0 of 1 failed\n";
-    const caught = try issue.parse(arena, issue.kind_sim_canary, caught_text);
-    const first = try ingest(arena, fake.github(), &state, caught, options);
-    try std.testing.expectEqual(@as(u32, 0), first.filed);
-    try std.testing.expectEqual(@as(u64, 1), first.seeds);
-    const missed_text = "seed 1: FAILED: the fleet has stopped detecting: sim_teeth passed\n" ++
-        "  step: canary\n  replay: zig-out/bin/sim_teeth --seeds 1..10 100 --expect-fail\n" ++
-        "sim-canary: seeds 1..1, 100 operations: 1 of 1 failed\n";
-    const missed = try issue.parse(arena, issue.kind_sim_canary, missed_text);
-    const second = try ingest(arena, fake.github(), &state, missed, options);
-    try std.testing.expectEqual(@as(u32, 1), second.filed);
-    const body = fake.issues.items[0].body;
-    try std.testing.expect(std.mem.indexOf(u8, body, "sim-canary-exe") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "sim_teeth --seeds 1..10") != null);
-    const title = fake.issues.items[0].title;
-    try std.testing.expect(std.mem.indexOf(u8, title, "stopped detecting") != null);
-    // Missed again on the same commit: no second issue and no comment.
-    const third = try ingest(arena, fake.github(), &state, missed, options);
-    try std.testing.expectEqual(@as(u32, 0), third.filed);
-    try std.testing.expectEqual(@as(u32, 1), third.throttled);
-    try std.testing.expectEqual(@as(usize, 1), fake.issues.items.len);
-    // A canary's summary line is no sim-cluster batch, and back.
-    const as_cluster = issue.parse(arena, issue.kind_sim_cluster, caught_text);
-    try std.testing.expectError(error.NoSummary, as_cluster);
+    const caught = try canary_ingest(arena, fake.github(), &state, canary_wedge_caught, "aaa");
+    try std.testing.expectEqual(@as(u32, 0), caught.filed);
+    try std.testing.expectEqual(@as(u64, 4), caught.seeds);
+    try std.testing.expectEqual(@as(u64, 0), caught.failed);
+    const missed = try canary_ingest(arena, fake.github(), &state, canary_wedge_missed, "aaa");
+    try std.testing.expectEqual(@as(u32, 1), missed.filed);
+    const wrong = try canary_ingest(arena, fake.github(), &state, canary_wedge_wrong, "aaa");
+    try std.testing.expectEqual(@as(u32, 1), wrong.filed);
+    try std.testing.expectEqual(@as(usize, 2), fake.issues.items.len);
+    const miss_issue = fake.issues.items[0];
+    try std.testing.expect(std.mem.startsWith(u8, miss_issue.title, "sim-canary: the fleet " ++
+        "has stopped detecting: sim_c1_teeth_wedge failed no seed (step: canary)"));
+    for ([_][]const u8{
+        "sim-canary-exe && zig-out/bin/sim_c1_teeth_wedge --seeds 2000..2003 auto " ++
+            "--profile=auto --c1 --shrink",
+        "- seeds: 2000..2003, each with its own drawn operations and profile",
+        "teeth canary",
+    }) |text| try std.testing.expect(std.mem.indexOf(u8, miss_issue.body, text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, miss_issue.body, "- seed: ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, miss_issue.body, "operations: not") == null);
+    const wrong_issue = fake.issues.items[1];
+    try std.testing.expect(std.mem.indexOf(u8, wrong_issue.title, "but never with") != null);
+    for ([_][]const u8{
+        "- failed instead with: I6: an allocation disagrees",
+        "zig-out/bin/sim_c1_teeth_wedge 2002 109 8 --c1",
+        "- seed: 2002",
+    }) |text| try std.testing.expect(std.mem.indexOf(u8, wrong_issue.body, text) != null);
+    // Missed again on the same commit: no new issue and no comment.
+    const again = try canary_ingest(arena, fake.github(), &state, canary_wedge_missed, "aaa");
+    try std.testing.expectEqual(@as(u32, 0), again.filed);
+    try std.testing.expectEqual(@as(u32, 1), again.throttled);
+    try std.testing.expectEqual(@as(usize, 2), fake.issues.items.len);
+}
+
+test "a canary's crash is filed under sim-canary with the runner's replay" {
+    // Goal: a crash record of the canary's run (run.sh's crash_record) is filed, not dropped,
+    // and its replay runs the fault-on runner, not the plain simulator.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "seed 42: CRASHED: reached unreachable code\n" ++
+        "  step: faults\n" ++
+        "  replay: zig-out/bin/sim_cluster 42 80 3 --c1 --profile=mixed\n" ++
+        "sim-cluster --c1: seeds 42..42, drawn operations: 1 of 1 failed\n";
+    const parsed = try issue.parse(arena, issue.kind_sim_c1, text);
+    var one = canary_wedge;
+    one.first = 42;
+    one.last = 42;
+    const judged = try issue.canary_verdict(arena, one, parsed);
+    // Its only seed crashed: the crash is filed, and no miss (nothing ran to its end).
+    try std.testing.expectEqual(issue.Verdict.crashed, judged.verdict);
+    try std.testing.expectEqual(@as(usize, 1), judged.batch.failures.len);
+    const crash = judged.batch.failures[0];
+    try std.testing.expect(crash.crash);
+    try std.testing.expectEqualStrings(
+        "zig-out/bin/sim_c1_teeth_wedge 42 80 3 --c1 --profile=mixed",
+        crash.replay,
+    );
+    const plain = issue.fingerprint(issue.kind_sim_c1, parsed.failures[0]);
+    const own = issue.fingerprint(issue.kind_sim_canary, crash);
+    try std.testing.expect(!std.mem.eql(u8, &plain, &own));
+}
+
+test "the canary's arguments come together or not at all" {
+    // Goal: --canary needs its seeds, names a simulator kind and a runner that is one word.
+    const base = [_][]const u8{ "sim_fleet", "ingest", "--commit", "c", "--state", "s" } ++
+        [_][]const u8{"--dry-run"};
+    const good = base ++ [_][]const u8{ "--kind", "sim-c1", "--canary", "sim_c1_teeth_wedge" } ++
+        [_][]const u8{ "--canary-seeds", "5..9", "--expect-symptom", "I1b: a replaced" };
+    const args = parse_args(&good).?;
+    const canary = (try canary_of(args)).?;
+    try std.testing.expectEqual(@as(u64, 5), canary.first);
+    try std.testing.expectEqualStrings("I1b: a replaced", canary.symptom.?);
+    for ([_][]const []const u8{
+        &(base ++ [_][]const u8{ "--canary", "sim_teeth" }),
+        &(base ++ [_][]const u8{ "--canary-seeds", "1..2" }),
+        &(base ++ [_][]const u8{ "--canary", "a b", "--canary-seeds", "1..2" }),
+        &(base ++ [_][]const u8{ "--canary", "sim_teeth", "--canary-seeds", "9..2" }),
+        &(base ++ [_][]const u8{
+            "--kind", "sim-canary", "--canary", "sim_teeth", "--canary-seeds", "1..2",
+        }),
+    }) |bad| try std.testing.expect(parse_args(bad) == null);
 }
