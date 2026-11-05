@@ -23,7 +23,8 @@
 //! every one of them failed it, or if there is no peer to wait for; otherwise (nobody claims it)
 //! after `peer_wait_ms` from the start, in which time a filter may come to show it
 //! (docs/briefs/c2.md, O5). A chunk the registry fails `fetch_registry_attempts_max` times fails
-//! the fetch.
+//! the fetch. Which node goes to the registry before any peer holds the tree, and how long the
+//! others wait for one, is decided before the plan, by `start` below.
 //!
 //! **Caps.** A token bucket per peer and one for the node (peers and registry together), each
 //! holding one second of its rate and allowed to go into debt by one chunk, so bytes requested
@@ -502,6 +503,67 @@ pub fn raise_blame(
     diag.fix(.{ .sentence = "no action needed for this fetch; check that node's store and disk" });
 }
 
+// ---- Who pulls from the registry first (O5) ----------------------------------------------------
+
+/// What a fetch does before asking peers for a tree no peer may hold yet (docs/briefs/c2.md, O5,
+/// owner 2026-11-03): among the nodes fetching the tree, the one whose `registry_rank` is lowest
+/// pulls from the registry at once; the others wait up to `peer_wait_ms` from the start for a
+/// peer's `/node-store` to show the tree, re-reading it every `fetch_peer_poll_ms`.
+pub const Start = union(enum) {
+    /// A peer holds the tree: ask the peers.
+    peers,
+    /// This node is the one O5 designates and no peer holds the tree: the registry, at once.
+    registry_first,
+    /// No peer came to hold the tree within the wait: ask the peers once more, then the registry.
+    waited,
+    /// Read `/node-store` again at this time.
+    wait: u64,
+};
+
+/// The rank of `node` for `tree`: the first 8 bytes of BLAKE3(node, 0, tree), little endian. Every
+/// node computes the same ranks from the same names, so they agree on the lowest without talking.
+pub fn registry_rank(node: []const u8, tree: []const u8) u64 {
+    var hasher = Blake3.init(.{});
+    hasher.update(node);
+    hasher.update(&.{0});
+    hasher.update(tree);
+    var out: [8]u8 = undefined;
+    hasher.final(&out);
+    return std.mem.readInt(u64, &out, .little);
+}
+
+/// Whether `self` ranks lowest among `fetchers` (the nodes fetching `tree`; `self` may be among
+/// them or not). Equal ranks go to the lower name.
+pub fn registry_first(self: []const u8, tree: []const u8, fetchers: []const []const u8) bool {
+    const own = registry_rank(self, tree);
+    for (fetchers) |other| {
+        if (std.mem.eql(u8, other, self)) continue;
+        const rank = registry_rank(other, tree);
+        if (rank < own) return false;
+        if (rank == own and std.mem.order(u8, other, self) == .lt) return false;
+    }
+    return true;
+}
+
+/// What a fetch that started at `started_ms` does at `now_ms`, given whether a peer holds the
+/// tree and which nodes are fetching it.
+pub fn start(
+    self: []const u8,
+    tree: []const u8,
+    fetchers: []const []const u8,
+    peer_holds: bool,
+    started_ms: u64,
+    now_ms: u64,
+    peer_wait_ms: u32,
+) Start {
+    assert(now_ms >= started_ms);
+    if (peer_holds) return .peers;
+    if (registry_first(self, tree, fetchers)) return .registry_first;
+    const deadline = started_ms + peer_wait_ms;
+    if (now_ms >= deadline) return .waited;
+    return .{ .wait = @min(deadline, now_ms + constants.fetch_peer_poll_ms) };
+}
+
 // ---- Tests -------------------------------------------------------------------------------------
 
 const chunk_bytes_test = 64;
@@ -833,4 +895,102 @@ test "a struck peer is reported with a coded diagnostic that names it" {
 
 test "the test-only fault is off in this build" {
     try std.testing.expect(!fault_skip_verify);
+}
+
+/// One node of the O5 tests: how it got the tree, and when its `/node-store` shows it whole.
+const Starter = struct {
+    name: []const u8,
+    got: enum { not_yet, registry, peers, waited } = .not_yet,
+    holds_at: ?u64 = null,
+};
+
+/// Plays `start` for `nodes` that all begin fetching `tree` at `t0`; a registry pull or a peer
+/// fetch takes `pull_ms` (`null`: the registry pull never ends). Returns the registry pullers.
+fn play_starts(nodes: []Starter, tree: []const u8, t0: u64, pull_ms: ?u64) u32 {
+    var names: [8][]const u8 = undefined;
+    for (nodes, 0..) |node, at| names[at] = node.name;
+    var now = t0;
+    var pullers: u32 = 0;
+    while (now <= t0 + constants.fetch_peer_wait_ms + 1) : (now += 100) {
+        for (nodes) |*node| {
+            if (node.got != .not_yet) continue;
+            var holds = false;
+            for (nodes) |other| {
+                if (other.holds_at) |at| holds = holds or at <= now;
+            }
+            const fetchers = names[0..nodes.len];
+            const decided = start(node.name, tree, fetchers, holds, t0, now, 30_000);
+            switch (decided) {
+                .wait => |until| assert(until > now),
+                .peers => node.got = .peers,
+                .registry_first => node.got = .registry,
+                .waited => node.got = .waited,
+            }
+            if (node.got == .registry or node.got == .waited) pullers += 1;
+            if (node.got == .registry) {
+                if (pull_ms) |ms| node.holds_at = now + ms;
+            }
+        }
+    }
+    return pullers;
+}
+
+test "three nodes start fetching one tree at once: exactly one pulls from the registry" {
+    // Goal: O5's rule, the demo's step 1. Method: three empty nodes start together with no peer
+    // holding the tree. Without the designation every node finds no peer and pulls (three
+    // pullers, the CI failure of 2026-11-05); with it the lowest rank pulls, and the other two
+    // see it hold the tree within the wait and fetch from it.
+    const tree = "b3:5e1f0c7a9d3b2e4f6a8c0d1e3f5a7b9c2d4e6f8a0b1c3d5e7f9a2b4c6d8e0f1a";
+    var nodes = [_]Starter{ .{ .name = "node1" }, .{ .name = "node2" }, .{ .name = "node3" } };
+    try std.testing.expectEqual(@as(u32, 1), play_starts(&nodes, tree, 1000, 5000));
+    var registry: u32 = 0;
+    for (nodes) |node| {
+        try std.testing.expect(node.got == .registry or node.got == .peers);
+        if (node.got == .registry) {
+            registry += 1;
+            const names = [_][]const u8{ "node3", "node1", "node2" };
+            try std.testing.expect(registry_first(node.name, tree, &names));
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), registry);
+}
+
+test "the designation is the same whatever the order, and depends on the tree" {
+    // Goal: every node reaches the same answer from the names alone. Method: each of three nodes
+    // asks for two orders of the list; exactly one says yes, for each of 32 trees, and over those
+    // trees more than one node is chosen (the load of first pulls spreads).
+    const forward = [_][]const u8{ "node1", "node2", "node3" };
+    const backward = [_][]const u8{ "node3", "node2", "node1" };
+    var chosen = [_]bool{ false, false, false };
+    for (0..32) |index| {
+        var buffer: [16]u8 = undefined;
+        const tree = std.fmt.bufPrint(&buffer, "b3:{d}", .{index}) catch unreachable; // Fits.
+        var yes: u32 = 0;
+        for (forward, 0..) |name, at| {
+            const first = registry_first(name, tree, &forward);
+            try std.testing.expectEqual(first, registry_first(name, tree, &backward));
+            if (first) {
+                yes += 1;
+                chosen[at] = true;
+            }
+        }
+        try std.testing.expectEqual(@as(u32, 1), yes);
+    }
+    var spread: u32 = 0;
+    for (chosen) |was| spread += @intFromBool(was);
+    try std.testing.expect(spread > 1);
+}
+
+test "a designated node that never finishes costs the others the wait, not the image" {
+    // Goal: the fallback. Method: the registry puller never comes to hold the tree; the other
+    // two wait the whole `peer_wait_ms`, then go on (`waited`: peers once more, then registry).
+    const tree = "b3:00";
+    var nodes = [_]Starter{ .{ .name = "a" }, .{ .name = "b" }, .{ .name = "c" } };
+    try std.testing.expectEqual(@as(u32, 3), play_starts(&nodes, tree, 0, null));
+    var waited: u32 = 0;
+    for (nodes) |node| waited += @intFromBool(node.got == .waited);
+    try std.testing.expectEqual(@as(u32, 2), waited);
+    // A node alone, or one that a peer already serves, never waits.
+    try std.testing.expect(start("a", tree, &.{}, false, 0, 0, 30_000) == .registry_first);
+    try std.testing.expect(start("b", tree, &.{ "a", "b" }, true, 0, 0, 30_000) == .peers);
 }

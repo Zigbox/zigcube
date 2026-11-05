@@ -10,6 +10,8 @@
 //!     prints the seed in the `sim-c0: seed N` line above it.
 //!   - `sim-cluster` with a fresh seed (and the fault profile that seed draws, `-Dprofile=auto`)
 //!     and a small number of operations, native against WASM, and
+//!     one more run at a drawn shape (`-Dauto-shape`, its own fresh seed on the
+//!     `sim-cluster auto-shape: seed N` line), and
 //!     `sim-teeth`: the same simulator with the agent's test-only fault on, which must fail
 //!     (docs/core.md, "The cluster simulation"). A failure prints the seed in the
 //!     `sim-cluster: seed N` line above it.
@@ -158,6 +160,22 @@ fn sim_cluster_gates(
     };
     run(io, &cluster, null) catch {
         try err.print("check: FAIL {s} (zig build sim-cluster -Dprofile=auto: seed above)\n", .{
+            label,
+        });
+        return error.CommandFailed;
+    };
+    // One drawn run (size, nodes, ttl, replicas from a second fresh seed), so a change that
+    // breaks the shape draw or a run at a drawn shape fails here and not on the fleet.
+    io.random(&seed_bytes);
+    const shape_seed = std.mem.readInt(u64, &seed_bytes, .little);
+    try err.print("sim-cluster auto-shape: seed {d}\n", .{shape_seed});
+    try err.flush();
+    const shape_option = try std.fmt.allocPrint(gpa, "-Dseed={d}", .{shape_seed});
+    const shaped = [_][]const u8{
+        zig, "build", "sim-cluster", shape_option, "-Dauto-shape", "-Dprofile=auto",
+    };
+    run(io, &shaped, null) catch {
+        try err.print("check: FAIL {s} (zig build sim-cluster -Dauto-shape: seed above)\n", .{
             label,
         });
         return error.CommandFailed;

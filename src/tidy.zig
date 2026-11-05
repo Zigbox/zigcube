@@ -44,6 +44,9 @@ const shell_allowlist = [_][]const u8{
     // calls `zig build` and pipes `sim_cluster` into `sim_fleet`; the logic is Zig.
     "ops/sim-fleet/setup.sh",
     "ops/sim-fleet/run.sh",
+    // Sources run.sh and feeds its crash records to the built `sim_fleet`: it tests a shell
+    // function, which only a shell can call.
+    "ops/sim-fleet/test-crash-record.sh",
     // The demo's three-node start, stop and kill (c1-7 brief): a handful of long-lived processes
     // started side by side and killed by pid file, which is what a shell is for. Each script opens
     // with its own written reason; `down.sh` must work with nothing built.
@@ -55,6 +58,10 @@ const shell_allowlist = [_][]const u8{
     // `curl` against the server, a few lines each; a Zig program would be one more binary to copy
     // in and would shell out to the same tools. Deviation recorded in the slice's report.
     "ops/zigbox-smoke/guest.sh",
+    // The guest half of `zig build demo-c2` (docs/demos/c2.md, "demo-c2"), for the same reason:
+    // it starts and restarts the agent as `cube`, writes the test fault, greps fetch logs and,
+    // as root, adds the nft rule of step 3 and records the failing `curl`.
+    "ops/demo-c2/guest.sh",
     // The owner's one-off recipe for demo-c2's two GHCR images (ops/demo-c2-images): it runs on
     // the owner's machine with docker and a registry login, never in a build or test, and is a
     // list of `docker buildx` calls; the build has no docker to drive from Zig.
@@ -64,6 +71,10 @@ const shell_allowlist = [_][]const u8{
     // Its table test sits beside it and runs in the same job.
     ".github/ci-changes.sh",
     ".github/ci-changes-test.sh",
+    // The OpenSSL fixtures of x509_foreign_test.zig (docs/mtls.md): run by hand only to change a
+    // fixture, never in a build or test, and nothing but a list of `openssl` calls; the point is
+    // certificates another tool made, so the build cannot make them itself.
+    "src/testdata/x509/gen.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).

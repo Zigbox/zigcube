@@ -51,7 +51,14 @@ pub const Transport = struct {
     /// A peer sent a chunk list that does not hash to the tree's digest (ZC-W0602); the argument
     /// is the peer's index.
     bad_list_fn: *const fn (*anyopaque, u8) void,
+    /// The Zigbox bundle of the tree (`zigbox_fetch.zig`) from a peer, into `out`; null if the
+    /// source has none. Registries have none: their fallback is Zigbox's `pull`.
+    bundle_fn: *const fn (*anyopaque, fetch_plan.Source, []const u8, []u8) ?[]const u8 = no_bundle,
 };
+
+fn no_bundle(_: *anyopaque, _: fetch_plan.Source, _: []const u8, _: []u8) ?[]const u8 {
+    return null;
+}
 
 /// Raises ZC-W0602: `peer_name` sent a chunk list that is not the tree's.
 pub fn raise_bad_tree(diag: *diag_mod.Diag, peer_name: []const u8, digest: []const u8) void {
@@ -120,25 +127,26 @@ pub fn fetch(
     store.put_tree(digest, list) catch return error.Store;
     const chunk_buffer = try allocator.alloc(u8, constants.swarm_chunk_bytes);
     defer allocator.free(chunk_buffer);
-    const needed = try lacking(store, refs[0..count], chunk_buffer, report);
+    const needed = try lacking(store.images(), refs[0..count], chunk_buffer, report);
     report.chunks = count;
     if (needed == 0) return;
     const states = try allocator.alloc(fetch_plan.ChunkState, needed);
     defer allocator.free(states);
     const ranked = rank_peers(peers, refs[0..needed]);
     const run: Run = .{ .deadline = deadline, .config = config, .ranked = ranked };
-    try run_plan(transport, store, refs[0..needed], states, peers, &run, chunk_buffer, report);
+    const images = store.images();
+    try run_plan(transport, images, refs[0..needed], states, peers, &run, chunk_buffer, report);
 }
 
 /// The peers a plan uses, best first: `order[i]` is the index in the caller's `peers` of the
 /// plan's peer `i`.
-const Ranked = struct {
+pub const Ranked = struct {
     order: [constants.fetch_peers_max]u8 = undefined,
     count: u8 = 0,
 };
 
 /// What `run_plan` needs besides its buffers.
-const Run = struct {
+pub const Run = struct {
     deadline: u64,
     config: fetch_plan.Config,
     ranked: Ranked,
@@ -146,7 +154,7 @@ const Run = struct {
 
 /// Picks the `fetch_peers_max` peers whose filters claim the most of `chunks`, most first (ties
 /// keep the caller's order). A peer that claims none is left out: the plan would never ask it.
-fn rank_peers(peers: []const PeerInfo, chunks: []const ChunkRef) Ranked {
+pub fn rank_peers(peers: []const PeerInfo, chunks: []const ChunkRef) Ranked {
     assert(peers.len <= constants.fetch_candidates_max);
     var claims: [constants.fetch_candidates_max]u32 = @splat(0);
     for (peers, 0..) |peer, at| {
@@ -195,15 +203,15 @@ fn find_list(
 }
 
 /// Moves the chunks the store lacks to the front of `refs`; returns how many.
-fn lacking(
-    store: *dir_images.DirImages,
+pub fn lacking(
+    store: node_store.Images,
     refs: []ChunkRef,
     scratch: []u8,
     report: *Report,
 ) Error!u32 {
     var kept: u32 = 0;
     for (refs, 0..) |ref, at| {
-        if (store.images().read_chunk(&ref.hash, scratch)) |_| {
+        if (store.read_chunk(&ref.hash, scratch)) |_| {
             report.already_held += 1;
             report.cached_bytes += ref.bytes;
             continue;
@@ -214,9 +222,9 @@ fn lacking(
     return kept;
 }
 
-fn run_plan(
+pub fn run_plan(
     transport: Transport,
-    store: *dir_images.DirImages,
+    store: node_store.Images,
     chunks: []const ChunkRef,
     states: []fetch_plan.ChunkState,
     peers: []const PeerInfo,
@@ -250,7 +258,7 @@ fn run_plan(
                 const outcome = plan.receive(request.id, result, after);
                 if (outcome == .verified) {
                     const bytes = result.bytes[0..ref.bytes];
-                    store.images().put_chunk(&ref.hash, bytes) catch return error.Store;
+                    store.put_chunk(&ref.hash, bytes) catch return error.Store;
                     switch (request.source) {
                         .registry => {
                             report.registry_chunks += 1;

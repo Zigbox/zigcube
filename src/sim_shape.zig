@@ -92,7 +92,8 @@ pub const Shape = struct {
     lease_ttl_ms: u32,
     /// The workload's replica counts, as a percentage of the ones sim_cluster always drew.
     replicas_pct: u32,
-    /// One run in `long_share_denominator`, drawn at 400 to 800 operations.
+    /// The run has `operations_long_min` operations or more, after the cost cap: about one run
+    /// in ten is drawn at 400 to 800, and the cap cuts some of them below.
     long: bool,
 };
 
@@ -110,11 +111,14 @@ pub const long_share_denominator: u32 = 10;
 pub const cost_max: u32 = 5_000;
 
 /// The shortest ttl a shape draws. The agent fences `fence_margin_ms` (3 s) before the lease ends,
-/// and the simulation measured that a ttl below 5 s (4,500 and under) makes a healed one-node
-/// cluster fence about once a second for ever, so a 100-operation run does not finish in two
-/// minutes (`sim_cluster 3 100 1 --lease-ttl-ms=4000`; the decision record has the numbers). The
-/// allowed range is wider (`--lease-ttl-ms` takes it); the draw stays above the cliff.
-pub const lease_ttl_ms_min: u32 = 5000;
+/// and the simulation measured that a ttl of 4,500 ms and under makes a healed one-node cluster
+/// fence about once a second for ever, so a 100-operation run does not finish in two minutes
+/// (`sim_cluster 3 100 1 --lease-ttl-ms=4000`). Issue #78 is that bug, and above 4,500 it still
+/// shows: seed 86 `crash_heavy` with ttl 5959 fails at `end` with a busy-loop verdict. Until #78
+/// is fixed the floor is 8,000 so the fleet does not file its known symptom
+/// (docs/decisions/2026-11-05-fleet-ttl-floor.md); it drops back when #78 closes. The allowed
+/// range is wider (`--lease-ttl-ms` takes any ttl in it by hand); the draw stays above the floor.
+pub const lease_ttl_ms_min: u32 = 8000;
 /// The longest ttl `fencing.inequality_problem` allows with the shipped margin.
 pub const lease_ttl_ms_max: u32 = constants.lease_ttl_ms;
 pub const replicas_pct_default: u32 = 100;
@@ -159,15 +163,24 @@ fn draw_operations(r: std.Random) u32 {
 /// `cost_max` loses operations, not nodes: a node count is the shape, a length is only how long
 /// we watch.
 pub fn draw_shape(seed: u64) Shape {
+    return draw_shape_nodes(seed, null);
+}
+
+/// `draw_shape` with the node count the command line gave, if it did: the cost cap applies to the
+/// nodes the run will have, not to the ones the seed would have drawn. Every other draw is the
+/// same as without the override, so a seed's ttl and the like do not move.
+pub fn draw_shape_nodes(seed: u64, nodes_given: ?u32) Shape {
+    if (nodes_given) |given| assert(given > 0);
     var prng = std.Random.DefaultPrng.init(seed ^ 0x5a9e_5bad_0000_0001);
     const r = prng.random();
     const drawn = draw_operations(r);
-    const nodes: u32 = switch (r.uintLessThan(u32, 100)) {
+    const nodes_drawn: u32 = switch (r.uintLessThan(u32, 100)) {
         0...19 => 1 + r.uintLessThan(u32, 2),
         20...54 => 3 + r.uintLessThan(u32, 2),
         55...84 => 5 + r.uintLessThan(u32, 4),
         else => 9 + r.uintLessThan(u32, 8),
     };
+    const nodes = nodes_given orelse nodes_drawn;
     const lease_ttl_ms: u32 = if (r.uintLessThan(u32, 5) < 2)
         constants.lease_ttl_ms
     else
@@ -176,13 +189,13 @@ pub fn draw_shape(seed: u64) Shape {
     const operations = @max(operations_min, @min(drawn, @divFloor(cost_max, nodes)));
     assert(fencing.inequality_problem(lease_ttl_ms) == null);
     assert(nodes >= 1);
-    assert(nodes <= 16);
+    if (nodes_given == null) assert(nodes <= 16);
     return .{
         .operations = operations,
         .nodes = nodes,
         .lease_ttl_ms = lease_ttl_ms,
         .replicas_pct = replicas_pct,
-        .long = drawn >= operations_long_min,
+        .long = operations >= operations_long_min,
     };
 }
 
@@ -240,7 +253,8 @@ test "a shape is a function of the seed, in range, and long runs are a tenth" {
         if (shape.nodes <= 2) bucket = 0;
         buckets[bucket] += 1;
     }
-    // A tenth of 20,000, give or take five standard deviations (about 212).
+    // A tenth of 20,000 are drawn long; the cost cap cuts some of them below the long minimum
+    // (about 1,860 remain). The bound is wide on purpose: it is a sanity check, not a fit.
     try testing.expect(long > 1_000 and long < 3_000);
     for (buckets) |count| try testing.expect(count > 2_000);
 }

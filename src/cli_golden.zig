@@ -28,6 +28,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const x509 = @import("x509.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -364,6 +365,16 @@ fn agent_too_long(diag: *diag_mod.Diag) void { // zigbox_runtime.zig
     );
 }
 
+fn agent_fetch_outlived(diag: *diag_mod.Diag) void { // zigbox_image.zig
+    diag.raise(.E0515);
+    diag.cause("a process of the swarm fetch was still alive after SIGKILL to its process " ++
+        "group, so the image was not pulled: the store takes one writer at a time", .{});
+    diag.fix(.{
+        .sentence = "find the process in state D and the disk it waits on; the start is retried",
+        .command = "ps -eo pid,stat,wchan:32,args | awk '$2 ~ /D/'",
+    });
+}
+
 fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
     sample(
         diag,
@@ -428,6 +439,42 @@ fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
         &.{"peer address 10.0.0.7 started more handshakes than a window allows"},
         "no action needed; it is tried again by itself",
     );
+}
+
+fn x509_refused(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.BadSan, "node2", &.{ .field = .subject_alt_name });
+}
+
+fn x509_unsigned(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.BadSignature, "node2", &.{});
+}
+
+fn x509_expired(diag: *diag_mod.Diag) void { // x509.zig
+    const hour_ms = 3_600_000;
+    const not_before_ms = 1_793_836_800_000; // 2026-11-05T00:00:00Z
+    x509.raise(diag, error.Expired, "node2", &.{
+        .not_before_ms = not_before_ms,
+        .not_after_ms = not_before_ms + 24 * hour_ms,
+        .now_ms = not_before_ms + 26 * hour_ms,
+    });
+}
+
+fn x509_wrong_server(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.WrongName, "broker.botpike.com", &.{
+        .name_expected = "broker.botpike.com",
+        .name_found = "other.botpike.com",
+    });
+}
+
+fn x509_not_issued(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.TooManyLabels, "broker-1", &.{ .field = .identity });
+}
+
+fn x509_wrong_use(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.WrongUse, "node2", &.{
+        .kind_expected = .server,
+        .kind_found = .workload,
+    });
 }
 
 fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
@@ -590,6 +637,7 @@ const cases = [_]Case{
     relayed(.E0512, agent_no_bus),
     relayed(.E0513, agent_host),
     relayed(.E0514, agent_too_long),
+    relayed(.E0515, agent_fetch_outlived),
     relayed(.W0501, agent_lease),
     relayed(.E0801, peer_foreign_ca),
     relayed(.E0802, peer_expired),
@@ -599,6 +647,12 @@ const cases = [_]Case{
     relayed(.E0806, peer_key_file),
     relayed(.E0807, peer_removed),
     relayed(.E0808, peer_limited),
+    relayed(.E0809, x509_refused),
+    relayed(.E0810, x509_unsigned),
+    relayed(.E0811, x509_expired),
+    relayed(.E0812, x509_wrong_server),
+    relayed(.E0817, x509_not_issued),
+    relayed(.E0819, x509_wrong_use),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

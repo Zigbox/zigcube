@@ -11,7 +11,7 @@
 //! is). `--heal-at=N` makes the faults end before operation N instead of where the seed chose.
 //!
 //! **Variety** (src/sim_shape.zig). `auto` for `<operations>` draws the run's shape from the
-//! seed: operations (40 to 5,000), nodes (unless given), lease ttl, replica counts.
+//! seed: operations (40 to 800), nodes (unless given), lease ttl, replica counts.
 //! `--profile=auto` draws which fault classes are on (`mixed` is today's mix and the default,
 //! so a command line without these flags runs what it always ran; `partitions`, `skew`,
 //! `crash_heavy` and `slow_store` switch the other classes off). A flag given beats the draw.
@@ -195,6 +195,19 @@ fn trace_step(step: []const u8) void {
     std.Io.File.stderr().writeStreamingAll(io, line) catch {}; // Nowhere else to report it.
 }
 
+/// `--trace-steps`: the run's concrete replay command on stderr before the run, so a crash or a
+/// timeout names its seed and what the seed drew (the runner's crash record is built from it).
+fn trace_plan(io: std.Io, seed: u64, resolved: sim_cluster.Plan) void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const heal_at: ?u32 = if (resolved.options.liveness)
+        sim_cluster.heal_point(seed, resolved.operations)
+    else
+        null;
+    print_replay(&writer, seed, resolved.operations, resolved.options, heal_at) catch return;
+    std.Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {}; // Nowhere else.
+}
+
 fn write(io: std.Io, text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io, text);
 }
@@ -278,6 +291,7 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     var seed = parsed.first_seed;
     while (true) : (seed += 1) {
         const resolved = sim_cluster.plan(seed, parsed.operations, parsed.options);
+        if (parsed.trace_steps) trace_plan(init.io, seed, resolved);
         sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
         if (report.failed) {
             failures += 1;
@@ -307,14 +321,16 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         return constants.exit_ok;
     }
     const total = parsed.last_seed - parsed.first_seed + 1;
+    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
+    const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
     if (parsed.operations) |operations| {
-        out.print("sim-cluster: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
-            parsed.first_seed, parsed.last_seed, operations, failures, total,
+        out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
+            run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
         }) catch return constants.exit_environment;
     } else {
-        // Not the fixed form above: the fleet's parser reads only that one.
-        out.print("sim-cluster: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
-            parsed.first_seed, parsed.last_seed, failures, total,
+        // Not the fixed form above: the fleet's parser reads the drawn form separately.
+        out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
+            run_name, parsed.first_seed, parsed.last_seed, failures, total,
         }) catch return constants.exit_environment;
     }
     if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;

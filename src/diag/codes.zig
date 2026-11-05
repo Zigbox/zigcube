@@ -86,6 +86,7 @@ pub const Code = enum(u8) {
     E0512,
     E0513,
     E0514,
+    E0515,
     W0501,
     E0601,
     W0601,
@@ -98,6 +99,12 @@ pub const Code = enum(u8) {
     E0806,
     E0807,
     E0808,
+    E0809,
+    E0810,
+    E0811,
+    E0812,
+    E0817,
+    E0819,
     B0001,
     B0002,
     B0003,
@@ -1067,6 +1074,25 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0515,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a swarm fetch outlived its kill, so the image was not pulled",
+        .explanation =
+        \\A replica's image was being fetched from peers into this node's Zigbox
+        \\store, the fetch passed its deadline (or ended badly), and the supervisor
+        \\killed the fetch's whole process group with SIGKILL. A process of that
+        \\group was still alive afterwards. It may still be writing the store, and
+        \\Zigbox's store takes one writer at a time, so the supervisor did not
+        \\start the registry pull: the replica was not started.
+        \\
+        \\A process that outlives SIGKILL is in uninterruptible sleep, waiting on
+        \\the kernel: usually a disk or a network mount that stopped answering.
+        \\Find it (ps -eo pid,stat,wchan:32,args, state D) and the device it waits
+        \\on. The replica is started again on a later pass once it is gone.
+        ,
+    },
+    .{
         .code = .W0501,
         .severity = .warning,
         .blame = .environment,
@@ -1258,8 +1284,8 @@ pub const registry = [_]Entry{
         \\An agent's peer server limits what one source address may ask of it,
         \\because a handshake costs the server public-key work. A handshake is
         \\refused, and the connection closed without a byte, when the address
-        \\already has a handshake that has not finished (one at a time per
-        \\source), when it has started peer_handshakes_per_source_max
+        \\already has peer_handshakes_pending_per_source_max handshakes that
+        \\have not finished, when it has started peer_handshakes_per_source_max
         \\handshakes in peer_handshake_window_ms, or when the server already
         \\tracks peer_sources_max addresses in the window. An IPv6 address
         \\counts by its /64, one host's whole range.
@@ -1272,6 +1298,109 @@ pub const registry = [_]Entry{
         \\itself, and a fetch falls back to the registry meanwhile. A flood
         \\from many addresses can fill the table and turn honest nodes away
         \\for up to one window; no action is needed unless it repeats.
+        ,
+    },
+    .{
+        .code = .E0809,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a certificate is malformed or outside the bounds",
+        .explanation =
+        \\A certificate was refused before its signature was looked at. Zigcube reads
+        \\X.509 v3 strictly: DER only, Ed25519 only, a lifetime within the bound, at
+        \\most x509_cert_bytes_max bytes. A certificate of this cluster also has one
+        \\commonName, the extensions of its kind in a fixed order and a SPIFFE ID of
+        \\the form spiffe://<cluster>/service/<name> (or one DNS name for a server).
+        \\A server certificate under a pinned anchor of another CA may carry any
+        \\names, key identifiers and extension order, but no unknown critical
+        \\extension, no extension twice, and one DNS name or SPIFFE ID (docs/mtls.md).
+        \\
+        \\The cause names the field and the rule it broke. A certificate that the
+        \\cluster CA issued does not break any; if one does, it did not come from
+        \\zcube (another CA, a hand-made file) or it was damaged on the way.
+        \\
+        \\Ask for a new certificate from the cluster CA, or from the anchor's CA with
+        \\the profile docs/mtls.md describes.
+        ,
+    },
+    .{
+        .code = .E0810,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a certificate is not signed by the pinned anchor",
+        .explanation =
+        \\The certificate's issuer is not this cluster's CA, or its signature does
+        \\not verify under the pinned anchor key.
+        \\
+        \\Only certificates signed directly by the one pinned key are accepted: no
+        \\chain, no intermediate. The check comes before the validity window, so a
+        \\forged certificate is never reported as expired.
+        \\
+        \\Check that both sides were given the same cluster CA, and that the
+        \\certificate was issued after the last --new-ca. A certificate issued by an
+        \\earlier CA must be replaced.
+        ,
+    },
+    .{
+        .code = .E0811,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a certificate is expired or not yet valid",
+        .explanation =
+        \\The certificate is signed by the pinned anchor but the current time is
+        \\outside its validity window, allowing peer_clock_skew_ms of clock difference
+        \\on each side. The signature was checked first, so the certificate is
+        \\genuine. The cause shows notBefore, notAfter and this machine's time.
+        \\
+        \\Check the clocks on both machines. A workload certificate lives for the
+        \\service's deadline, at most x509_leaf_ttl_ms_max: ask for a new one.
+        ,
+    },
+    .{
+        .code = .E0812,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a certificate names another server than the one asked for",
+        .explanation =
+        \\The server's certificate verified against the pinned anchor, but the name
+        \\in its subjectAltName is not the name the connection was made to. Names are
+        \\compared exactly: no wildcard, no case folding. The cause shows both names.
+        \\
+        \\Connect to the name the certificate is for, or issue the server a
+        \\certificate for the name in the configuration.
+        ,
+    },
+    .{
+        .code = .E0817,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "an identity could not be issued",
+        .explanation =
+        \\A workload or server certificate was not made because its request breaks a
+        \\bound: more labels than x509_labels_max, a label key or value over its limit
+        \\or with a character that is not allowed, label keys not sorted and unique,
+        \\labels together over x509_labels_bytes_max, a cluster or service name that
+        \\does not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that
+        \\is not lowercase, has a wildcard or an all-digit label, or a lifetime that
+        \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA).
+        \\
+        \\The cause names the rule. Correct the request and issue again; nothing was
+        \\written.
+        ,
+    },
+    .{
+        .code = .E0819,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a certificate is of another kind than this use needs",
+        .explanation =
+        \\The certificate is genuine and well formed, but it is not for this use: a
+        \\workload's client certificate presented as a server's, a CA certificate
+        \\presented as a leaf, or, under a foreign anchor, a certificate whose
+        \\extended key usage lacks serverAuth or whose basic constraints say CA.
+        \\
+        \\The cause names the kind found and the kind needed. Give the peer a
+        \\certificate issued for its role: a server certificate for a server.
         ,
     },
     .{

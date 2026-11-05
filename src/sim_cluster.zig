@@ -2182,7 +2182,8 @@ pub const Plan = struct {
 pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
     var options = requested;
     var shape = sim_shape.fixed_shape(1);
-    if (operations == null) shape = sim_shape.draw_shape(seed);
+    // The cost cap sees the node count the request gave, if any.
+    if (operations == null) shape = sim_shape.draw_shape_nodes(seed, requested.nodes);
     if (options.profile_auto) {
         options.profile = sim_shape.draw_cluster_profile(seed);
         options.profile_auto = false;

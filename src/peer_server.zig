@@ -10,8 +10,9 @@
 //!   ends at `peer_handshake_ms` at the latest, so strangers that send nothing cannot use up
 //!   the serving slots. A *slot* (`peer_connections_max`) owns a `DirImages` and buffers (pages
 //!   the connection does not touch stay untouched) and goes to a connection only once it has
-//!   authenticated; an authenticated peer that finds every slot taken is answered 503 (busy) to
-//!   its first request and closed. A connection lives while requests keep coming
+//!   authenticated; an authenticated peer that finds every slot taken, or whose node name holds
+//!   `peer_connections_per_node_max` already, is answered 503 (busy) to its first request and
+//!   closed. A connection lives while requests keep coming
 //!   (`peer_idle_ms` between them) and for `peer_connection_requests_max` requests, then the
 //!   client opens another.
 //! * **Identity.** Read from the state directory at each handshake (`agent_peer.load_identity`),
@@ -31,6 +32,8 @@ const fetch_plan = @import("fetch_plan.zig");
 const peer = @import("peer.zig");
 const peer_limit = @import("peer_limit.zig");
 const peer_serve = @import("peer_serve.zig");
+const zigbox = @import("zigbox");
+const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_stream = @import("peer_stream.zig");
 const server_listen = @import("server_listen.zig");
 
@@ -43,6 +46,10 @@ pub const Config = struct {
     state_dir: []const u8,
     node: []const u8,
     images_path: []const u8,
+    /// An absolute path to a Zigbox store served instead of `images_path`'s chunk directory.
+    zigbox_store: ?[]const u8 = null,
+    /// Tests only: the chunk size of the Zigbox store when it is not Zigbox's own (0: its own).
+    zigbox_chunk_bytes: u32 = 0,
     verbose: bool = false,
     /// Test fault (`<state dir>/faults/peer-corrupt`, docs/agent.md): the first byte of every chunk
     /// sent is flipped, so a peer that lies reaches its clients' hash check.
@@ -83,7 +90,11 @@ const LinkState = enum(u8) {
 /// The buffers of one served connection, lent to a connection once it has authenticated.
 const Slot = struct {
     busy: std.atomic.Value(bool) = .init(false),
+    /// The `node_key` of the authenticated peer the slot serves; 0 while free.
+    node: std.atomic.Value(u64) = .init(0),
     images: dir_images.DirImages = undefined,
+    /// Set when the server serves a Zigbox store: the slot's own handle on it.
+    zigbox: ?*zigbox_fetch.Opened = null,
     scratch: []u8 = &.{},
     refs: []fetch_plan.ChunkRef = &.{},
 };
@@ -117,6 +128,11 @@ pub const Server = struct {
     /// Strangers shut down to make room for a newcomer (`evict_oldest`).
     evictions: std.atomic.Value(u32) = .init(0),
 
+    /// Set when the Zigbox store is read with the one-id map (ZBX-W0201 was said); for tests.
+    outside_fallback: bool = false,
+
+    const OutsideMap = zigbox_fetch.OutsideMap;
+
     pub const StartError = error{ Listen, NoThreads, OutOfMemory, Store };
 
     /// Listens and starts the accept task. `server` must stay where it is until `stop`.
@@ -128,6 +144,7 @@ pub const Server = struct {
         };
         errdefer server.listener.deinit(io);
         const gpa = std.heap.page_allocator;
+        const outside = try outside_map(server, io, gpa);
         var opened: usize = 0;
         errdefer for (server.slots[0..opened]) |*slot| free_slot(slot, io, gpa);
         for (&server.slots) |*slot| {
@@ -135,12 +152,48 @@ pub const Server = struct {
             slot.images = dir_images.DirImages.open(io, gpa, config.images_path) catch
                 return error.Store;
             errdefer slot.images.close(gpa);
+            if (config.zigbox_store) |root| {
+                const handle = try gpa.create(zigbox_fetch.Opened);
+                errdefer gpa.destroy(handle);
+                handle.* = .{ .chunk_bytes = config.zigbox_chunk_bytes };
+                handle.open(gpa, root) catch |err| return switch (err) {
+                    error.NoStore => error.Store,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+                if (outside) |map| handle.read_from_outside(map);
+                slot.zigbox = handle;
+            }
+            errdefer if (slot.zigbox) |handle| {
+                handle.close();
+                gpa.destroy(handle);
+            };
             slot.scratch = try gpa.alloc(u8, peer_serve.scratch_bytes);
             errdefer gpa.free(slot.scratch);
             slot.refs = try gpa.alloc(fetch_plan.ChunkRef, constants.fetch_chunks_max);
             opened += 1;
         }
         server.accept_future = io.concurrent(accept_loop, .{server}) catch return error.NoThreads;
+    }
+
+    /// The store's id map seen from the host, when there is a Zigbox store to serve (Zigbox Z9:
+    /// the server is outside the store's namespace, so an object owned by a container id other
+    /// than the user's reads as Damaged without it). Says ZBX-W0201 when only one id maps.
+    fn outside_map(server: *Server, io: std.Io, gpa: std.mem.Allocator) StartError!?OutsideMap {
+        if (server.config.zigbox_store == null) return null;
+        const facts = gpa.create(zigbox.Facts) catch return error.OutOfMemory;
+        defer gpa.destroy(facts);
+        const outside = zigbox_fetch.outside_owners(facts);
+        if (outside.fallback) {
+            var warning: zigbox.diag.Diag = undefined;
+            warning.reset();
+            warning.raise(.W0201);
+            warning.while_("choosing the id map to read the Zigbox store with", .{});
+            warning.cause("only objects owned by container root can be served to peers; " ++
+                "see zbx doctor (ZBX-E0105) for the subordinate id ranges and helpers", .{});
+            server.outside_fallback = true;
+            if (!server.config.quiet) show_foreign(io, &warning);
+        }
+        return outside.map;
     }
 
     /// The port the server listens on (the system's choice if the configuration said 0).
@@ -164,6 +217,10 @@ pub const Server = struct {
 fn free_slot(slot: *Slot, io: std.Io, gpa: std.mem.Allocator) void {
     _ = io;
     slot.images.close(gpa);
+    if (slot.zigbox) |opened| {
+        opened.close();
+        gpa.destroy(opened);
+    }
     gpa.free(slot.scratch);
     gpa.free(slot.refs);
 }
@@ -181,7 +238,10 @@ fn accept_loop(server: *Server) void {
         var storage: std.os.linux.sockaddr.storage = undefined;
         var length: std.posix.socklen_t = @sizeOf(@TypeOf(storage));
         const linux = std.os.linux;
-        const got = linux.accept4(listen_fd, @ptrCast(&storage), &length, linux.SOCK.CLOEXEC);
+        // Non-blocking: a reply's send takes what fits and polls for the rest against its
+        // deadline, so a reader that stops reading cannot hold a link past `peer_reply_ms`.
+        const flags = linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK;
+        const got = linux.accept4(listen_fd, @ptrCast(&storage), &length, flags);
         switch (std.os.linux.errno(got)) {
             .SUCCESS => {},
             .AGAIN, .INTR => continue,
@@ -250,11 +310,12 @@ pub fn source_key(address: []const u8) u64 {
 
 fn admit(server: *Server, fd: std.posix.fd_t, storage: *const Storage, io: std.Io) void {
     const source = source_of(storage);
-    if (handshake_pending(server, source)) {
-        // One unauthenticated connection per source: a stranger that sends nothing cannot take
-        // the links one by one. The refused peer connects again by itself (its handshake, at the
-        // longest `peer_handshake_ms` from now, has ended by then). Not counted by the limiter.
-        refuse(server, io, storage, "already has a handshake that has not finished");
+    if (handshakes_pending(server, source) >= constants.peer_handshakes_pending_per_source_max) {
+        // A few unauthenticated connections per source (several, for a cluster behind one NAT
+        // address): a stranger that sends nothing cannot take the links one by one. The refused
+        // peer connects again by itself (the oldest pending handshake has ended within
+        // `peer_handshake_ms`). Not counted by the limiter.
+        refuse(server, io, storage, "already has as many handshakes unfinished as one may");
         _ = std.os.linux.close(fd);
         return;
     }
@@ -348,23 +409,50 @@ fn close_link_fd(link: *Link) void {
     _ = std.os.linux.close(link.fd);
 }
 
-/// Whether a connection of `source` is still in its handshake in some link.
-fn handshake_pending(server: *Server, source: u64) bool {
+/// How many connections of `source` are still in their handshake. Only the accept task starts
+/// links, so the count cannot grow while it is being taken.
+fn handshakes_pending(server: *Server, source: u64) u32 {
+    var pending: u32 = 0;
     for (&server.links) |*link| {
         if (!link.busy.load(.acquire)) continue;
         if (link.source != source) continue;
         const state = link.state.load(.acquire);
-        if (state != .authenticated and state != .closed) return true;
+        if (state != .authenticated and state != .closed) pending += 1;
     }
-    return false;
+    return pending;
 }
 
-/// A slot for an authenticated connection, or null when every one is serving.
-fn claim_slot(server: *Server) ?*Slot {
-    for (&server.slots) |*slot| {
-        if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) return slot;
+/// The key of an authenticated node name in `Slot.node`; never 0, which is "no node".
+fn node_key(name: []const u8) u64 {
+    return @max(std.hash.Wyhash.hash(2, name), 1);
+}
+
+/// A slot for an authenticated connection of `node` (`node_key`), or null when every one is
+/// serving or the node already holds `peer_connections_per_node_max`. Tasks claim concurrently:
+/// each publishes its node key and then counts the others' (sequentially consistent, so of two
+/// racing claims at least one sees the other), and one over the bound gives its slot back. Two
+/// racing claims may both give up; that is a busy answer, never one slot too many.
+fn claim_slot(server: *Server, node: u64) ?*Slot {
+    assert(node != 0);
+    const slot = for (&server.slots) |*slot| {
+        if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) break slot;
+    } else return null;
+    slot.node.store(node, .seq_cst);
+    var held: u32 = 0;
+    for (&server.slots) |*other| {
+        if (other.node.load(.seq_cst) == node) held += 1;
     }
-    return null;
+    assert(held >= 1);
+    if (held > constants.peer_connections_per_node_max) {
+        release_slot(slot);
+        return null;
+    }
+    return slot;
+}
+
+fn release_slot(slot: *Slot) void {
+    slot.node.store(0, .seq_cst);
+    slot.busy.store(false, .release);
 }
 
 /// Shows ZC-E0808, naming the refused address, at most once per `peer_refusal_log_ms`.
@@ -378,6 +466,15 @@ fn refuse(server: *Server, io: std.Io, storage: *const Storage, why: []const u8)
     diag.cause("peer address {s} {s}", .{ source_text(&text_buffer, storage), why });
     diag.fix(.{ .sentence = "no action needed; it is tried again by itself" });
     if (!server.config.quiet) show(io, &diag, server.config.verbose);
+}
+
+/// Shows a diagnostic of Zigbox's (ZBX-) as Zigbox wrote it.
+fn show_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    zigbox.diagnostic.from_diag(&diagnostic, collector);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to report it.
 }
 
 fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
@@ -422,8 +519,9 @@ fn serve(server: *Server, link: *Link) void {
     defer stream.deinit();
     // Lost to an evictor: the link is being shut down, so end (the fd is closed below).
     if (link.state.cmpxchgStrong(.stranger, .authenticated, .acq_rel, .acquire) != null) return;
-    const slot = claim_slot(server) orelse return tell_busy(&stream);
-    defer slot.busy.store(false, .release);
+    const slot = claim_slot(server, node_key(stream.peer_name())) orelse
+        return tell_busy(&stream);
+    defer release_slot(slot);
     var count: u32 = 0;
     while (count < constants.peer_connection_requests_max) : (count += 1) {
         if (server.stopping.load(.acquire)) return;
@@ -458,13 +556,28 @@ fn one_request(stream: *peer_stream.Stream, slot: *Slot, corrupt_chunks: bool) b
         const prefix = "Range: ";
         if (std.mem.startsWith(u8, line, prefix)) range = line[prefix.len..];
     }
+    const target = first[space + 1 ..];
+    // A bundle can be megabytes: its buffer is mapped for this request alone (untouched pages
+    // cost nothing) and the reply is sent before it is unmapped.
+    const wants_bundle = std.mem.startsWith(u8, target, peer_serve.path_bundle);
+    const gpa = std.heap.page_allocator;
+    const bundle_buffer: []u8 = if (wants_bundle and slot.zigbox != null)
+        gpa.alloc(u8, zigbox_fetch.bundle_bytes_max) catch &.{}
+    else
+        &.{};
+    defer if (bundle_buffer.len > 0) gpa.free(bundle_buffer);
+    const seam = if (slot.zigbox) |opened|
+        zigbox_fetch.serving(&opened.images)
+    else
+        slot.images.images();
     const reply = peer_serve.answer(
-        slot.images.images(),
+        seam,
         first[0..space],
-        first[space + 1 ..],
+        target,
         range,
         slot.scratch,
         slot.refs,
+        bundle_buffer,
     );
     const is_chunk = std.mem.startsWith(u8, first[space + 1 ..], peer_serve.path_chunk);
     if (corrupt_chunks and is_chunk and reply.status == 200 and reply.body.len > 0) {
@@ -506,6 +619,14 @@ const Rig = struct {
     list: [80]u8 = undefined,
     list_len: u32 = 0,
     server: Server = undefined,
+    /// A Zigbox store served beside the chunk directory (bundles), and whether chunks are
+    /// corrupted on the way out.
+    zigbox_root: ?[]const u8 = null,
+    corrupt: bool = false,
+    /// Serve through the agent's own wiring (`agent_run.Swarm`), configured for Zigbox only: no
+    /// `images_dir`, the store named by `zigbox_root`.
+    via_agent: bool = false,
+    swarm: agent_run.Swarm = .{},
 
     fn state(rig: *const Rig) []const u8 {
         return rig.state_buffer[0..rig.state_len];
@@ -537,17 +658,42 @@ const Rig = struct {
         _ = @import("node_store.zig").list_digest(text, &rig.digest);
         try store.put_tree(&rig.digest, text);
         try store.images().put_chunk(&rig.hash, &rig.body);
+        if (rig.via_agent) {
+            const config: agent_config.Config = .{
+                .runtime = .zigbox,
+                .pulls = &.{},
+                .node = "node2",
+                .server = try net.IpAddress.parse("127.0.0.1", 1),
+                .state_dir = rig.state(),
+                .images = &.{},
+                .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+                .address = "",
+                .verbose = false,
+                .peer_listen = try net.IpAddress.parse("127.0.0.1", 0),
+                .peer_advertise = try net.IpAddress.parse("127.0.0.1", 1),
+            };
+            rig.swarm.chunk_bytes_test = 8;
+            try rig.swarm.start_with(io, std.testing.allocator, config, rig.zigbox_root);
+            return;
+        }
         try rig.server.start(io, .{
             .listen = try net.IpAddress.parse("127.0.0.1", 0),
             .state_dir = rig.state(),
             .node = "node2",
             .images_path = images,
+            .zigbox_store = rig.zigbox_root,
+            .zigbox_chunk_bytes = if (rig.zigbox_root != null) 8 else 0,
+            .corrupt_chunks = rig.corrupt,
             .quiet = true,
         });
     }
 
+    fn port(rig: *const Rig) u16 {
+        return if (rig.via_agent) rig.swarm.server.?.port() else rig.server.port();
+    }
+
     fn deinit(rig: *Rig) void {
-        rig.server.stop();
+        if (rig.via_agent) rig.swarm.stop(std.testing.allocator) else rig.server.stop();
         rig.tmp.cleanup();
     }
 };
@@ -652,11 +798,11 @@ test "a chunk of the largest size is served whole" {
     try std.testing.expectEqualSlices(u8, big, body);
 }
 
-test "more requests than the handshake limit are served over one stream, a missing one refused" {
-    // Goal: the fetch client keeps one stream per peer, so an image of many chunks does not hit
-    // `peer_handshakes_per_source_max`, and a non-200 reply is `.refused`, not `.timeout`.
-    // Method: ask one peer server for the same chunk 3 * peer_connection_requests_max times (the
-    // stream is reopened twice, far under the limit) and then for a chunk it does not hold.
+test "many requests are served over a few streams, and a missing one is refused" {
+    // Goal: the fetch client keeps one stream per peer, so an image of many chunks costs a
+    // handshake per `peer_connection_requests_max` chunks, and a non-200 reply is `.refused`, not
+    // `.timeout`. Method: ask one peer server for the same chunk 3 * peer_connection_requests_max
+    // times (the stream is reopened twice) and then for a chunk it does not hold.
     const io = std.testing.io;
     var rig: Rig = .{ .tmp = undefined, .ca = undefined };
     try rig.init();
@@ -687,7 +833,7 @@ test "more requests than the handshake limit are served over one stream, a missi
     var out: [1024]u8 = undefined;
     const path = try std.fmt.bufPrint(&target, "{s}{x}", .{ chunk_path, &rig.hash });
     const requests = 3 * constants.peer_connection_requests_max;
-    comptime assert(requests > 2 * constants.peer_handshakes_per_source_max);
+    comptime assert(requests / constants.peer_connection_requests_max == 3);
     for (0..requests) |_| {
         const got = net_state.peer_get(0, path, &out);
         try std.testing.expectEqualSlices(u8, &rig.body, got.bytes);
@@ -700,28 +846,25 @@ test "more requests than the handshake limit are served over one stream, a missi
     );
 }
 
-test "four silent connections from one source hold one slot, and an honest peer is served" {
-    // Goal: a source that connects and sends nothing cannot take the connection slots from
-    // everyone (review M2). Method: four raw connections that never send; only one is admitted
-    // (the rest are closed at accept, so the slots are not all taken); an honest client of the
-    // same source, which on loopback is every client, is served once the silent handshake has
-    // timed out, retrying meanwhile.
+test "silent connections from one source hold a few links, and an honest peer is served" {
+    // Goal: a source that connects and sends nothing cannot take the links from everyone
+    // (review M2). Method: more raw connections than a source may have pending, none sending;
+    // only `peer_handshakes_pending_per_source_max` are admitted (the rest are closed at accept);
+    // an honest client of the same source, which on loopback is every client, is served once a
+    // silent handshake has timed out, retrying meanwhile.
     const io = std.testing.io;
     var rig: Rig = .{ .tmp = undefined, .ca = undefined };
     try rig.init();
     defer rig.deinit();
     const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
-    var silent: [4]std.posix.fd_t = undefined;
+    var silent: [constants.peer_handshakes_pending_per_source_max + 3]std.posix.fd_t = undefined;
     for (&silent) |*fd| fd.* = try peer_stream.connect(io, address, peer_stream.boot_ms(io) + 5000);
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
     try io.sleep(.fromMilliseconds(200), .awake);
-    var busy: u32 = 0;
-    for (&rig.server.links) |*link| {
-        if (link.busy.load(.acquire)) busy += 1;
-    }
-    try std.testing.expectEqual(@as(u32, 1), busy);
+    const pending = constants.peer_handshakes_pending_per_source_max;
+    try std.testing.expectEqual(pending, busy_links(&rig.server));
     // Three refused connections are one streak: ZC-E0808 was shown once, not three times.
     try std.testing.expectEqual(@as(u32, 1), rig.server.refusals_shown);
 
@@ -753,10 +896,11 @@ test "four silent connections from one source hold one slot, and an honest peer 
     return error.NeverServed;
 }
 
-test "a busy peer is asked again a few times, then refused, and is never a timeout" {
-    // Goal: review S3. Method: every serving slot taken; the client's `peer_get` sees 503 each
-    // time, retries `fetch_busy_retries_max` times and answers `.refused` (a timeout would be a
-    // strike), having seen busy once more than it retried.
+test "a busy peer is asked again until the busy wait runs out, then refused, never a timeout" {
+    // Goal: review S3, and demo-c2's per-peer counts. Method: every serving slot taken; with the
+    // busy wait lowered to 1 s, the client's `peer_get` sees 503, pauses 250 then 500 ms, and
+    // answers `.refused` (a timeout would be a strike) once the next pause would pass the wait;
+    // each busy answer is counted on the peer, and none as a refusal or a timeout.
     const io = std.testing.io;
     var rig: Rig = .{ .tmp = undefined, .ca = undefined };
     try rig.init();
@@ -783,22 +927,43 @@ test "a busy peer is asked again a few times, then refused, and is never a timeo
             .ca_public = rig.ca.public_key.toBytes(),
         },
         .reply = &reply,
+        .busy_wait_ms = 1000,
     };
     defer net_state.close_peers();
     var target: [128]u8 = undefined;
     var out: [1024]u8 = undefined;
     const path = try std.fmt.bufPrint(&target, "{s}{x}", .{ chunk_path, &rig.hash });
     try std.testing.expectEqual(fetch_cli.PeerReply.refused, net_state.peer_get(0, path, &out));
-    try std.testing.expectEqual(constants.fetch_busy_retries_max + 1, net_state.busy_seen);
+    try std.testing.expect(net_state.busy_seen >= 2);
+    try std.testing.expect(net_state.busy_seen <= 3);
+    try std.testing.expectEqual(net_state.busy_seen, conns[0].busy);
+    try std.testing.expectEqual(@as(u32, 0), conns[0].refused + conns[0].timeouts);
+    var line: [256]u8 = undefined;
+    const said = fetch_cli.peer_answers_line(&line, "node2", conns[0]);
+    try std.testing.expect(std.mem.indexOf(u8, said, "busy (503)") != null);
 }
 
 /// A connection to `address` from the loopback address 127.0.0.`octet`, a source of its own.
 fn connect_from(io: std.Io, octet: u8, address: net.IpAddress) !std.posix.fd_t {
+    return connect_from_window(io, octet, address, null);
+}
+
+/// `connect_from`, with the receive buffer set to `receive_bytes` before the connection opens.
+fn connect_from_window(
+    io: std.Io,
+    octet: u8,
+    address: net.IpAddress,
+    receive_bytes: ?i32,
+) !std.posix.fd_t {
     const linux = std.os.linux;
     const opened = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(opened) != .SUCCESS) return error.Io;
     const fd: std.posix.fd_t = @intCast(opened);
     errdefer _ = linux.close(fd);
+    if (receive_bytes) |bytes| {
+        const set = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&bytes), 4);
+        if (linux.errno(set) != .SUCCESS) return error.Io;
+    }
     var text: [16]u8 = undefined;
     const from = try net.IpAddress.parse(try std.fmt.bufPrint(&text, "127.0.0.{d}", .{octet}), 0);
     var from_storage: std.Io.Threaded.PosixAddress = undefined;
@@ -875,13 +1040,22 @@ fn age_strangers(io: std.Io, since_ms: u64) !void {
 }
 
 fn rig_identity(rig: *Rig) !peer.Identity {
+    return rig_identity_named(rig, "node1");
+}
+
+fn rig_identity_named(rig: *Rig, name: []const u8) !peer.Identity {
     const now = peer_stream.wall_ms(std.testing.io);
     const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
     return .{
         .key = key,
-        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .credential = issue(rig.ca, name, key.public_key.toBytes(), now),
         .ca_public = rig.ca.public_key.toBytes(),
     };
+}
+
+/// The node name `peer<n>`, for clients that must not share a name (the bound per node name).
+fn test_name(buffer: *[16]u8, n: u32) []const u8 {
+    return std.fmt.bufPrint(buffer, "peer{d}", .{n}) catch unreachable; // 16 bytes hold a u32.
 }
 
 /// A client that handshakes from 127.0.0.`octet` and then sits idle.
@@ -889,9 +1063,15 @@ const Idle = struct {
     fd: std.posix.fd_t,
     stream: peer_stream.Stream,
 
+    /// Handshakes from 127.0.0.`octet` as node `peer<octet>`, a name of its own.
     fn open(rig: *Rig, octet: u8, address: net.IpAddress) !Idle {
+        var name: [16]u8 = undefined;
+        return open_named(rig, octet, address, test_name(&name, octet));
+    }
+
+    fn open_named(rig: *Rig, octet: u8, address: net.IpAddress, name: []const u8) !Idle {
         const io = std.testing.io;
-        var identity = try rig_identity(rig);
+        var identity = try rig_identity_named(rig, name);
         const end = peer_stream.boot_ms(io) + 3000;
         const fd = try connect_from(io, octet, address);
         errdefer _ = std.os.linux.close(fd);
@@ -1059,6 +1239,150 @@ test "an authenticated peer finding every serving slot taken is told busy" {
     );
 }
 
+test "a peer that stops reading mid-chunk frees its link and slot within peer_reply_ms" {
+    // Goal: release review MUST: a reply's send has a deadline, so a fetcher partitioned in the
+    // middle of a chunk (or a zero window) cannot hold a serving slot. Method: one client asks
+    // for a chunk of the largest size more times than any socket buffers hold, at once, and
+    // reads nothing while it keeps the connection open; the link is still serving a second in,
+    // and has ended within peer_reply_ms (plus slack) of the requests.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const big = try gpa.alloc(u8, constants.swarm_chunk_bytes);
+    defer gpa.free(big);
+    for (big, 0..) |*byte, at| byte.* = @truncate(at *% 7);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(big, &hash, .{});
+    {
+        var store = try dir_images.DirImages.open(io, gpa, rig.images_buffer[0..rig.images_len]);
+        defer store.close(gpa);
+        try store.images().put_chunk(&hash, big);
+    }
+    // A send buffer smaller than one record (accepted sockets inherit it), as under memory
+    // pressure: a blocking send after POLLOUT would then wait for the reader, past any deadline.
+    const linux = std.os.linux;
+    const small: i32 = 4096;
+    const listener = rig.server.listener.socket.handle;
+    const set = linux.setsockopt(listener, linux.SOL.SOCKET, linux.SO.SNDBUF, @ptrCast(&small), 4);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(set));
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    var identity = try rig_identity(&rig);
+    const end = peer_stream.boot_ms(io) + 5000;
+    // A small receive window too: the server's segments are bounded by half of it, so a record
+    // cannot slip into the send buffer as one large segment.
+    const fd = try connect_from_window(io, 1, address, small);
+    defer _ = std.os.linux.close(fd);
+    var stream = try peer_stream.open_client(io, fd, &identity, "node2", end);
+    defer stream.deinit();
+    var target: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&target, "GET {s}{x}\n", .{ chunk_path, &hash });
+    // 63 MiB of replies asked for: far more than loopback's socket buffers take.
+    const requests = constants.peer_connection_requests_max - 1;
+    comptime assert(requests * constants.swarm_chunk_bytes > 32 * 1024 * 1024);
+    for (0..requests) |_| try stream.send(path, end);
+    const sent = peer_stream.boot_ms(io);
+    try io.sleep(.fromMilliseconds(1000), .awake);
+    try std.testing.expectEqual(@as(u32, 1), busy_links(&rig.server)); // Stuck sending.
+    try std.testing.expectEqual(@as(u32, 1), busy_slots(&rig.server));
+    const deadline = sent + constants.peer_reply_ms + 2000;
+    while (busy_links(&rig.server) + busy_slots(&rig.server) != 0) {
+        if (peer_stream.boot_ms(io) >= deadline) return error.SlotNeverFreed;
+        try io.sleep(.fromMilliseconds(20), .awake);
+    }
+}
+
+fn busy_slots(server: *const Server) u32 {
+    var busy: u32 = 0;
+    for (&server.slots) |*slot| {
+        if (slot.busy.load(.acquire)) busy += 1;
+    }
+    return busy;
+}
+
+test "one node name holds at most peer_connections_per_node_max slots; another is served" {
+    // Goal: release review SHOULD, the bound on authenticated work per node name. Method: one
+    // client more than the bound handshakes as node1, each from a source of its own, and asks
+    // for a chunk: exactly the bound are served and the rest told busy; a client of another
+    // name is still served.
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    const count = constants.peer_connections_per_node_max + 1;
+    var clients: [count]Idle = undefined;
+    for (&clients, 0..) |*client, at| {
+        client.* = try Idle.open_named(&rig, @intCast(2 + at), address, "node1");
+    }
+    defer for (&clients) |*client| client.close();
+    var served: u32 = 0;
+    var busy: u32 = 0;
+    for (&clients) |*client| {
+        const status = try client.request(&rig);
+        if (status == 200) served += 1;
+        if (status == peer_serve.status_busy) busy += 1;
+    }
+    try std.testing.expectEqual(constants.peer_connections_per_node_max, served);
+    try std.testing.expectEqual(@as(u32, 1), busy);
+    var other = try Idle.open_named(&rig, 50, address, "node3");
+    defer other.close();
+    try std.testing.expectEqual(@as(u16, 200), try other.request(&rig));
+}
+
+const Handshake = struct {
+    fn run(io: std.Io, fd: std.posix.fd_t, identity: *const peer.Identity) bool {
+        var stream = peer_stream.open_client(io, fd, identity, "node2", peer_stream.boot_ms(io) +
+            5000) catch return false;
+        stream.deinit();
+        return true;
+    }
+};
+
+test "many handshakes from one address by different node names succeed" {
+    // Goal: release review SHOULD: a cluster behind one NAT address (demo-c2's hostfwd: every
+    // peer arrives from 10.0.2.2) is not refused. Method: from 127.0.0.1 alone, the most pending
+    // handshakes a source may have are held open at once, then run concurrently as different
+    // node names; then more handshakes in a row than the old per-window bound (16), each a new
+    // name, all within one window.
+    const io = std.testing.io;
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    try rig.init();
+    defer rig.deinit();
+    const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
+    const pending = constants.peer_handshakes_pending_per_source_max;
+    var fds: [pending]std.posix.fd_t = undefined;
+    var identities: [pending]peer.Identity = undefined;
+    for (&fds, &identities, 0..) |*fd, *identity, at| {
+        var name: [16]u8 = undefined;
+        identity.* = try rig_identity_named(&rig, test_name(&name, @intCast(at)));
+        fd.* = try peer_stream.connect(io, address, peer_stream.boot_ms(io) + 5000);
+    }
+    defer for (fds) |fd| {
+        _ = std.os.linux.close(fd);
+    };
+    try wait_busy(io, &rig.server, pending); // Every one accepted, none handshaken yet.
+    var futures: [pending]std.Io.Future(bool) = undefined;
+    for (&futures, fds, &identities) |*future, fd, *identity| {
+        future.* = try io.concurrent(Handshake.run, .{ io, fd, identity });
+    }
+    var done: u32 = 0;
+    for (&futures) |*future| {
+        if (future.await(io)) done += 1;
+    }
+    try std.testing.expectEqual(pending, done);
+    const in_a_row = 40;
+    comptime assert(in_a_row + pending <= constants.peer_handshakes_per_source_max);
+    for (0..in_a_row) |at| {
+        var name: [16]u8 = undefined;
+        var identity = try rig_identity_named(&rig, test_name(&name, @intCast(100 + at)));
+        const fd = try peer_stream.connect(io, address, peer_stream.boot_ms(io) + 5000);
+        defer _ = std.os.linux.close(fd);
+        try std.testing.expect(Handshake.run(io, fd, &identity));
+    }
+    try std.testing.expectEqual(@as(u32, 0), rig.server.refusals_shown);
+}
+
 test "an IPv6 address is a source by its /64, and a mapped IPv4 address by its IPv4 address" {
     // Goal: one host with a /64 is one source (review M2), and mapped addresses are not all one.
     // Method: addresses that differ in the low 64 bits, the high 64 bits, and mapped forms.
@@ -1078,4 +1402,148 @@ test "an IPv6 address is a source by its /64, and a mapped IPv4 address by its I
     mapped_two[12..16].* = .{ 10, 0, 0, 2 };
     try std.testing.expect(source_key(&mapped_one) != source_key(&mapped_two));
     try std.testing.expectEqual(source_key(&.{ 10, 0, 0, 1 }), source_key(&mapped_one));
+}
+
+const images_mod = @import("zigbox_images.zig");
+const fetch_client = @import("fetch_cli.zig");
+const fetch_worker = @import("fetch_worker.zig");
+const agent_run = @import("agent_run.zig");
+const agent_config = @import("agent_config.zig");
+
+const Digest = zigbox.store.Digest;
+const Manifest = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
+
+/// A fetch of `tree` for `manifest` from the one peer `rig` serves, over a real peer stream,
+/// into `to`. The client is node1 of the rig's CA. The result is the worker's.
+fn fetch_from_rig(
+    rig: *Rig,
+    to: *images_mod.ZigboxImages,
+    tree: Digest,
+    manifest: Manifest,
+) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    const identity: peer.Identity = .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+    const reply = try gpa.alloc(u8, fetch_client.reply_bytes);
+    defer gpa.free(reply);
+    const conns = try gpa.alloc(fetch_client.Conn, constants.fetch_candidates_max);
+    defer gpa.free(conns);
+    @memset(conns, .{});
+    const peers = [_]fetch_client.Peer{.{
+        .name = "node2",
+        .address = try net.IpAddress.parse("127.0.0.1", rig.port()),
+    }};
+    var text = tree.text();
+    var client: fetch_client.Net = .{
+        .io = io,
+        .registry = null,
+        .peers = &peers,
+        .identity = identity,
+        .reply = reply,
+        .digest = &text,
+        .conns = conns,
+    };
+    defer client.close_peers();
+    var filter: [64]u8 = @splat(0xff);
+    const infos = [_]fetch_worker.PeerInfo{.{ .name = "node2", .filter = &filter }};
+    var report: zigbox_fetch.Report = .{};
+    try zigbox_fetch.fetch(gpa, client.transport(), to, tree, manifest, &infos, .{}, &report);
+}
+
+test "a Zigbox store serves a tree to a fetch into an empty store; a lying peer is refused" {
+    // Goal: the bundle path end to end on real stores and a real stream, the tree trusted only
+    // against its full digest. Method: store A holds an image; a corrupting peer, a peer asked
+    // for another manifest and a peer asked for a tree it lacks all fail and root nothing in B;
+    // an honest peer then gives B the tree whole.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    const manifest = Manifest.parse(images_mod.manifest_text).?;
+    {
+        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
+        defer from_a.close();
+        var buffer: [2048]u8 = undefined;
+        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
+        _ = try from_a.import_image(record, pair.tree, manifest);
+    }
+    var to_b = try images_mod.ZigboxImages.open(gpa, &pair.b);
+    defer to_b.close();
+    const name = pair.tree.text();
+
+    var liar: Rig = .{ .tmp = undefined, .ca = undefined, .corrupt = true };
+    liar.zigbox_root = pair.a.root_text();
+    try liar.init();
+    defer liar.deinit();
+    const corrupted = fetch_from_rig(&liar, &to_b, pair.tree, manifest);
+    try std.testing.expectError(error.ChunkFailed, corrupted);
+    try std.testing.expectEqual(@as(usize, 0), rooted_count(&pair.b));
+
+    var honest: Rig = .{ .tmp = undefined, .ca = undefined };
+    honest.zigbox_root = pair.a.root_text();
+    try honest.init();
+    defer honest.deinit();
+    // A tree the peer does not hold is not served.
+    const absent_hex: [64]u8 = @splat('0');
+    const absent = Digest.parse("b3:" ++ &absent_hex).?;
+    const unavailable = fetch_from_rig(&honest, &to_b, absent, manifest);
+    try std.testing.expectError(error.TreeUnavailable, unavailable);
+    try fetch_from_rig(&honest, &to_b, pair.tree, manifest);
+    try std.testing.expect(to_b.images().has(&name));
+    try std.testing.expectEqual(@as(usize, 1), rooted_count(&pair.b));
+}
+
+fn rooted_count(store: *zigbox.store.Store) usize {
+    var listing: [8]zigbox.store.roots.Root = undefined;
+    var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
+    const rooted = zigbox.store.roots.list(store, &names, &listing) catch return 999;
+    return rooted.count;
+}
+
+test "an agent configured for Zigbox only serves its store's tree to a peer fetch" {
+    // Goal: demo-c2 needs a node with no --images-dir to serve what it pulled. Method: the agent's
+    // own wiring (`Swarm`) with `runtime = .zigbox`, `peer_listen` and no `images_dir` serves
+    // store A; a peer fetches the tree into an empty store B, checked against the full digest.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    const manifest = Manifest.parse(images_mod.manifest_text).?;
+    var to_b = try images_mod.ZigboxImages.open(gpa, &pair.b);
+    defer to_b.close();
+    var agent: Rig = .{ .tmp = undefined, .ca = undefined, .via_agent = true };
+    agent.zigbox_root = pair.a.root_text();
+    try agent.init();
+    defer agent.deinit();
+    try std.testing.expect(!agent.swarm.has_store);
+    // The node's summary comes from the Zigbox store the agent opened: it lists the tree.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const seam = agent.swarm.zigbox.?.images.images();
+    {
+        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
+        defer from_a.close();
+        var buffer: [2048]u8 = undefined;
+        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
+        _ = try from_a.import_image(record, pair.tree, manifest);
+    }
+    const held = try seam.summary(arena_state.allocator(), &.{});
+    try std.testing.expectEqual(@as(usize, 1), held.trees.len);
+    const text = pair.tree.text();
+    try std.testing.expectEqualStrings(&text, held.trees[0].digest);
+    try std.testing.expect(held.filter_chunks > 0);
+    try fetch_from_rig(&agent, &to_b, pair.tree, manifest);
+    const name = pair.tree.text();
+    try std.testing.expect(to_b.images().has(&name));
+    try std.testing.expectEqual(@as(usize, 1), rooted_count(&pair.b));
 }

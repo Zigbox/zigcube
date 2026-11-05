@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
     add_local_smoke_step(b, built);
+    add_x509_format_step(b, zigbox_module);
     add_bench_watch_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
@@ -363,6 +364,25 @@ fn add_local_smoke_step(b: *std.Build, built: Built) void {
     b.step("local-smoke", help).dependOn(&run.step);
 }
 
+/// `zig build x509-format`: the certificates `src/x509.zig` writes, read by openssl, keytool and
+/// the JDK (src/x509_format_check.zig, tools/mtls/X509Dump.java). Never cached, not in `check`.
+fn add_x509_format_step(b: *std.Build, zigbox_module: *std.Build.Module) void {
+    const exe = b.addExecutable(.{
+        .name = "x509_format_check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/x509_format_check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox_module }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addFileArg(b.path("tools/mtls/X509Dump.java"));
+    run.has_side_effects = true;
+    const help = "Check the certificates against openssl, keytool and the JDK (test tooling)";
+    b.step("x509-format", help).dependOn(&run.step);
+}
+
 /// `zig build bench-watch`: the watch fan-out row of docs/c1.md (src/bench_watch.zig), a real
 /// server over SQLite with 50 held agent polls in one process. Never cached, not in `check`; a
 /// miss is the result, and the exit code says so.
@@ -512,6 +532,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     const help = "Run HANDOFF's C0 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c0", help).dependOn(&run.step);
     add_demo_c1_step(b, step_options, transcript);
+    add_demo_c2_step(b, step_options, transcript);
 }
 
 /// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
@@ -551,6 +572,41 @@ fn add_demo_c1_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run HANDOFF's C1 demo for real (-Dbackend=sqlite|postgres, -Dtranscript=FILE)";
     b.step("demo-c1", help).dependOn(&run.step);
+}
+
+/// `zig build demo-c2 [-Dtranscript=FILE]`: SPEC's C2 demo, run for real (src/demo_c2.zig): the
+/// server on the host over SQLite, four QEMU guests booted through Zigbox's `zigbox_vm`, each
+/// with one `zcube-agent --runtime zigbox`. Skips unless `ZCUBE_REAL_HOST=1`.
+fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const exe = b.addExecutable(.{
+        .name = "demo_c2",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_c2.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+            },
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addFileArg(stripped(b, built.agent));
+    run.addArg("--zbx");
+    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+    run.addArg("--guest-script");
+    run.addFileArg(b.path("ops/demo-c2/guest.sh"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run SPEC's C2 demo for real in four QEMU guests (needs ZCUBE_REAL_HOST=1)";
+    b.step("demo-c2", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.

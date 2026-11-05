@@ -175,7 +175,7 @@ text in `fetch.log`.
 `chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
 checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
 thread; a `DirImages` belongs to one thread, and the peer server gives each connection its own.
-`--peer-listen HOST:PORT` (needs `--images-dir`) starts the peer server (`peer_server.zig`): read-only,
+`--peer-listen HOST:PORT` (needs `--images-dir`, except with `--runtime zigbox`, where it serves the node's Zigbox store; see below) starts the peer server (`peer_server.zig`): read-only,
 CA-authenticated peers only, rate limited (ZC-E0808). The address the node publishes for peers
 (`/node-store/<node>.peer`) is `--peer-advertise HOST:PORT` (`.peer_advertise` in the ZON file);
 without it, the `--peer-listen` address if that names a host. `--peer-listen 0.0.0.0:P` or `[::]:P`
@@ -184,14 +184,20 @@ without `--peer-advertise` is refused at startup with ZC-E0505, because nobody c
 The server has `peer_handshakes_max` cheap handshake slots and `peer_connections_max` serving
 slots, which hold the big buffers and go only to a peer that authenticated: silent strangers
 cannot lock honest peers out, and a client that finds every serving slot taken gets status 503
-(busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
-without a strike against the peer.
+(busy), which the fetch asks again for up to `fetch_busy_wait_ms` (20 s, pauses doubling from
+`fetch_busy_sleep_ms` to `fetch_busy_sleep_max_ms`) without a strike against the peer. A fetch
+that ends in ZC-E0601 first logs one line per peer asked: how many times it answered busy, a
+status other than 200, or nothing.
+
+**Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. The agent's summary pass (the trees and chunk filter it reports, which the scheduler's locality uses) reads the same Zigbox store on the agent's thread (`ZigboxImages`), so a tree `pull` or a swarm fetch puts there is reported at the next summary; the store is opened in Zigbox mode whether or not `--peer-listen` is given.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
 registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
 whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
-setup. A peer is only ever asked when the digest is
+setup. The node O5 designates to pull from the registry first does not wait: it notes so in
+`fetch.log` and asks the peers at once, so in Zigbox mode it exits 3 with ZC-E0601 and the
+supervisor's pull runs (below). A peer is only ever asked when the digest is
 the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
 - `--server HOST:PORT` gives the peers without naming them. The fetch reads
@@ -200,8 +206,32 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   how many on one line of stderr, and ranks the rest by the chunks their filters claim.
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
   the plan strikes it if it lies.
+- **Who pulls from the registry first (O5, docs/briefs/c2.md).** With `--server` and a full digest,
+  the fetch first reads which nodes fetch the tree: the nodes of `/assigned/<node>/<id>` whose
+  replica (`/replicas/<service>/<id>`) has that image. If a peer's `/node-store/` record lists the
+  tree whole (`trees`) and has a `peer` address, it goes on as above. Else the node with the
+  lowest `fetch_plan.registry_rank(node, tree)` (BLAKE3 of the two; ties to the lower name) goes
+  on at once (no peer holds the tree, so it ends at the registry), and every other node re-reads `/node-store/` every
+  `fetch_peer_poll_ms` (1 s) for up to `fetch_peer_wait_ms` (30 s) until a peer lists the tree,
+  then fetches from peers; after the wait it goes on as it would have without O5. The decision is
+  `fetch_plan.start` (core); `fetch.log` says how the wait ended. A node that cannot read the
+  lists counts itself the only fetcher and does not wait. The wait is on whole trees, not
+  filters, because a Zigbox peer serves a tree only as a bundle of the whole tree
+  (decisions/2026-11-05-o5-registry-first.md).
 
 **Not built yet (6b part 3 cut):** the fake registry, `swarm-smoke` and its teeth fault.
+
+Test fault: `<state-dir>/faults/fetch-deadline-ms` (Zigbox runtime) holds a number of
+milliseconds, at least 1, that replaces the supervisor's fetch deadline
+(`zigbox_fetch_deadline_ms`, 31 minutes) when it is shorter; the fetch is killed at it and the
+supervisor falls back to the pull. It is read at each fetch. `zigbox-smoke` uses it.
+
+The fetch runs in a process group of its own, because its store worker (Zigbox's `namespace.run`
+child) is a grandchild that neither dies with the fetch nor hears its signals. Whenever the fetch
+ends, at its deadline or not, the supervisor sends SIGKILL to the whole group and reaps it (it is
+the group's subreaper meanwhile), for at most `zigbox_fetch_kill_wait_ms` (5 s): the pull is
+another store writer and starts only once no process of the fetch is left. One that outlives that
+wait (in uninterruptible sleep) fails the start with ZC-E0515, and `fetch.log` says so.
 
 Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the first byte of every
 chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer
@@ -295,7 +325,10 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   `supervisor.pid` (the time has one-second resolution, so a relaunch within the second would
   otherwise adopt the old record). A record with pid 0 is Zigbox's start window, before the
   container exists: it is `starting`, never `running`, and `stop` kills the supervisor, never
-  pid 0; if the supervisor dies there the record reads `lost`.
+  pid 0; if the supervisor dies there the record reads `lost`. Killing a supervisor kills its
+  whole session (it leads one of its own): SIGKILL to its group and then to every process whose
+  session is the supervisor's, read from `/proc` (`process_session.zig`), because the swarm fetch
+  and its store worker are in that session but in a group of their own.
 - **Images** (`zigbox_image.zig`): the supervisor tries `zigbox.start` with the locked tree
   digest; on ZBX-E0410 (tree not in the store) and a known reference it pulls once, checks the
   tree it got is the locked one (ZC-E0511 if not) and starts again. The locked digest must be

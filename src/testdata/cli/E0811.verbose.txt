@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0811]: a certificate is expired or not yet valid
+  cause  node2's certificate has expired: valid 2026-11-05T00:00:00Z to
+         2026-11-06T00:00:00Z, now 2026-11-06T02:00:00Z (allowing 60 s of skew)
+  reqid  r-0000001
+  fix    check the clocks on both sides, then ask for a new certificate   timedatectl
+  more   zcube explain E0811
+  docs   https://zigbox.github.io/zigcube/errors/E0811.html
