@@ -103,6 +103,16 @@ An agent re-reads its whole context on every turn, so cost grows with context si
 - **Purely mechanical work goes to Haiku** (owner, 2026-10-30). A change fully specified by a pattern (threading an argument through call sites, a rename, copying generated output into a doc, a status update, a CI tweak) is done by a Haiku subagent or session, given the exact pattern; whoever delegated checks its diff. Anything that needs judgment (design, tests, invariants, review) stays with Sonnet or the supervisor. Briefs name a slice's mechanical parts.
 - The supervisor follows the same rules; its own handoff is [docs/supervisor-handoff.md](docs/supervisor-handoff.md).
 
+## Reviews on GitHub (owner, 2026-11-05)
+
+Every adversarial review of a pull request (a slice review, a re-review, either release reviewer) is posted on that pull request as a GitHub pull request review, so the record stays with the PR.
+
+- One review per pass, with the event `COMMENT`. A review never approves or requests changes: the sessions post from the PR author's account, and merging stays with the supervisor and the owner.
+- The review body opens with the verdict (merge, merge after MUSTs, or rework), then what the reviewer ran and did not run, then any finding that has no line to attach to.
+- Each finding that belongs to a line is an inline comment on that line of the diff, starting with its tag: **MUST**, **SHOULD** or **NIT**, and stating a concrete failure scenario.
+- The reviewer posts the review and nothing else on GitHub. The two release reviewers stay independent: neither reads the other's review before posting its own.
+- The fix session works from the posted review. The supervisor still relays the verdict to the owner.
+
 ## README and site status
 
 - [README.md](README.md) holds the status of every milestone and slice: what is built and reviewed, what is in review, and what is not started. The supervisor updates it in the same push that changes the status. Never mark anything "demonstrated" until its `demo-cN` job is green in CI.
