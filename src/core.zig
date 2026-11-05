@@ -71,7 +71,9 @@ pub const modules = .{
     @import("test_util.zig"),
     @import("testing/history.zig"),
     @import("text.zig"),
+    @import("tls_client.zig"),
     @import("tls_schedule.zig"),
+    @import("tls_wire.zig"),
     @import("x509.zig"),
     @import("x509_der.zig"),
     @import("x509_identity.zig"),
@@ -142,6 +144,12 @@ test "the X.509 tests are in this root" {
     // import their tests; they use no file, clock or environment.
     _ = @import("x509_test.zig");
     _ = @import("x509_foreign_test.zig");
+}
+
+test "the TLS client tests are in this root" {
+    // Goal: the client handshake runs under WASI too. Method: import its tests; the scripted
+    // server they use is a test fixture and is imported only here.
+    _ = @import("tls_client_test.zig");
 }
 
 test "the TLS key schedule and record layer tests are in this root" {

@@ -567,6 +567,9 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
             std.mem.eql(u8, importing_path, "src/fetch_plan.zig") or
             std.mem.eql(u8, importing_path, "src/zcube_agent.zig");
     }
+    // The scripted TLS server is a test fixture (docs/briefs/mtls-client.md): only test roots
+    // may import it, so no shipped binary can link it.
+    if (std.mem.endsWith(u8, target, "tls_testpeer.zig")) return testpeer_importer(importing_path);
     for (module_allowlist) |name| {
         if (std.mem.eql(u8, name, target)) return true;
     }
@@ -585,6 +588,14 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
         if (depth < 0) return false;
     }
     return true;
+}
+
+/// The files that may import `tls_testpeer.zig`: test files and test roots (the fuzzer, the
+/// diagnostics goldens).
+fn testpeer_importer(path: []const u8) bool {
+    if (std.mem.endsWith(u8, path, "_test.zig")) return true;
+    if (std.mem.eql(u8, path, "src/cli_golden.zig")) return true; // A test root.
+    return std.mem.eql(u8, path, "src/tls_fuzz.zig");
 }
 
 pub fn check_source(report: *Report, path: []const u8, source: []const u8) void {
@@ -831,6 +842,24 @@ test "imports: std and in-repo files pass; escapes, absolute paths and packages 
     try testing.expect(!report.contains(.import_not_allowed, 11));
     try testing.expect(!report.contains(.import_not_allowed, 12));
     try testing.expectEqual(@as(u32, 4), report.total());
+}
+
+test "imports: the scripted TLS server is imported only from test roots" {
+    // Goal: no shipped module can link the test peer. Method: the same import from a test file,
+    // the fuzzer and ordinary modules.
+    const source = "const p = @import(\"tls_testpeer.zig\");\n";
+    const cases = [_]struct { path: []const u8, allowed: bool }{
+        .{ .path = "src/tls_client_test.zig", .allowed = true },
+        .{ .path = "src/tls_fuzz.zig", .allowed = true },
+        .{ .path = "src/cli_golden.zig", .allowed = true },
+        .{ .path = "src/tls_client.zig", .allowed = false },
+        .{ .path = "src/zcube_server.zig", .allowed = false },
+    };
+    for (cases) |case| {
+        var report: Report = .{};
+        check_source(&report, case.path, source);
+        try testing.expectEqual(!case.allowed, report.contains(.import_not_allowed, 1));
+    }
 }
 
 test "imports from the repository root cannot climb out" {
