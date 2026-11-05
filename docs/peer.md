@@ -220,6 +220,38 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
   only until API auth lands: anyone who can reach the API can register a name and ask for a
   credential.
 
+## X.509 certificates from the CA (mTLS slice 2)
+
+The same CA key also issues X.509 certificates (`docs/briefs/mtls-client.md`; the format is
+`src/x509.zig`). The credential above is **unchanged**: still 185 bytes, version 1, signed over
+`"zcube-peer-cred-v1" 0x00` and the body. No endpoint, store key, CLI command or agent uses the
+certificates yet; B3 is the first caller.
+
+`peer_ca.Ca` (core, no file or clock of its own; the clock is the `Ca`'s `wall`) has three issuers.
+Each writes into a caller's `x509.Der` and takes its lifetime as an argument: the certificate
+starts at the clock's `now` and lasts `ttl_ms`.
+
+| Function | Certificate | `ttl_ms` at most |
+| --- | --- | --- |
+| `issue_ca_certificate(out, ttl_ms)` | the self-signed CA certificate for this key | `x509_ca_ttl_ms_max` (10 years) |
+| `issue_workload_certificate(out, &WorkloadArgs)` | a client certificate: `spiffe://<cluster>/service/<service>`, the identity extension (image digest, placement epoch, labels) | `x509_leaf_ttl_ms_max` (7 days) |
+| `issue_server_certificate(out, &ServerArgs)` | a server certificate for one DNS name | `x509_leaf_ttl_ms_max` |
+
+A subject key that is not on the curve, or is in a small subgroup, is `error.BadKey`, as for a node
+credential; a bad name, label or lifetime is the `x509.Error` that names it (ZC-E0817 through
+`x509.code_of`). The caller keeps the leaf's private key.
+
+**The CA certificate file.** `zcube-server` writes it as one PEM block beside the key, with the
+key's rule (mode 0600, a directory others cannot write, ZC-E0806): `<state dir>/ca-<hash>.crt`,
+named like the key (`ca.crt` for a store with no file of its own). It is for services that pin the
+anchor. It is made again when it is absent, is not our PEM, belongs to another key or has expired;
+it is never read for any other purpose. A memory store writes none.
+
+**One key, two formats.** The credential's signed message starts with `z` (`0x7A`), a certificate's
+signed bytes (a DER TBSCertificate) with `0x30`, so no message is valid in both and a signature of
+one is refused by the other. The argument and its tests are in
+`docs/decisions/2026-11-05-ca-key-shared-with-x509.md`.
+
 ## What 6b calls
 
 `src/peer.zig` is pure: it takes bytes and an `Identity` and returns bytes and a `Session`.
