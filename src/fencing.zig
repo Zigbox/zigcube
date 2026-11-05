@@ -10,6 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const c1_teeth = @import("c1_teeth.zig");
 
 /// The difference of two hosts' clocks over `ttl_ms`, rounded up.
 pub fn skew_ms(ttl_ms: u32) u32 {
@@ -22,7 +23,29 @@ pub fn margin_needed_ms(ttl_ms: u32) u32 {
     return constants.fence_stop_ms + skew_ms(ttl_ms) + constants.fence_kill_latency_ms;
 }
 
+/// The shortest ttl whose slack survives a late renewal: the agent renews `ttl / divisor` after
+/// the acknowledged keepalive and fences `fence_margin_ms` before the ttl ends, so
+/// `ttl - ttl / divisor >= margin + jitter`. Below it a healed cluster fences again before the
+/// next acknowledgement (#78, docs/decisions/2026-11-05-lease-ttl-floor.md).
+pub fn ttl_floor_ms() u32 {
+    if (c1_teeth.ttl_floor_off) return constants.fence_margin_ms + 1;
+    const slack_ms = constants.fence_margin_ms + constants.lease_renew_jitter_ms;
+    const kept = constants.lease_renew_divisor - 1;
+    assert(kept > 0);
+    // Rounded up: a floor rounded down would admit a ttl one millisecond short.
+    return @divFloor(slack_ms * constants.lease_renew_divisor + kept - 1, kept);
+}
+
+comptime {
+    assert(constants.lease_renew_divisor > 1);
+    assert(ttl_floor_ms() > constants.fence_margin_ms);
+    assert(ttl_floor_ms() <= constants.lease_ttl_ms);
+    if (!c1_teeth.ttl_floor_off) assert(ttl_floor_ms() > 2 * constants.fence_margin_ms);
+}
+
 pub const Problem = enum {
+    /// The ttl is under `ttl_floor_ms`: renewals can arrive too late for the fence.
+    ttl_below_floor,
     /// `fence_margin_ms` is less than the stop, the skew and the kill latency need.
     margin_too_small,
     /// The margin leaves no time before the fence (`ttl <= margin`).
@@ -32,6 +55,7 @@ pub const Problem = enum {
 /// Null if a lease of `ttl_ms` can fence an agent in time.
 pub fn inequality_problem(ttl_ms: u32) ?Problem {
     if (ttl_ms <= constants.fence_margin_ms) return .ttl_too_short;
+    if (ttl_ms < ttl_floor_ms()) return .ttl_below_floor;
     if (constants.fence_margin_ms < margin_needed_ms(ttl_ms)) return .margin_too_small;
     return null;
 }
@@ -93,6 +117,26 @@ test "the fence and the kill come at the margin and the stop time, and beat the 
     // With the clock a full bound slow the last container still dies by the lease's end.
     try testing.expect(real_dead_ms(ttl, constants.clock_skew_per_mille) <= ttl);
     try testing.expect(real_dead_ms(ttl, 0) <= ttl);
+}
+
+test "the ttl floor admits what a late renewal survives and refuses what it does not" {
+    // Goal: the #78 floor is exact. Method: at the floor the slack after a renewal is the margin
+    // plus the jitter; one millisecond under it is refused with its own problem.
+    const floor = ttl_floor_ms();
+    if (!c1_teeth.ttl_floor_off) {
+        try testing.expectEqual(@as(u32, 7500), floor);
+        try testing.expectEqual(@as(?Problem, null), inequality_problem(floor));
+        try testing.expectEqual(@as(?Problem, .ttl_below_floor), inequality_problem(floor - 1));
+        try testing.expectEqual(@as(?Problem, .ttl_below_floor), inequality_problem(5_000));
+        const slack = floor - @divFloor(floor, constants.lease_renew_divisor);
+        try testing.expect(slack >= constants.fence_margin_ms + constants.lease_renew_jitter_ms);
+        const under = floor - 1;
+        const slack_under = under - @divFloor(under, constants.lease_renew_divisor);
+        const needed = constants.fence_margin_ms + constants.lease_renew_jitter_ms;
+        try testing.expect(slack_under < needed);
+    }
+    // A ttl at or under the margin is still the older problem.
+    try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(3_000));
 }
 
 test "a clock that runs slower than the bound kills after the lease has ended" {

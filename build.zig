@@ -932,7 +932,26 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
 
 /// The negative tests of sim-c1 (docs/authority.md §4, docs/core.md "sim-c1"): each root file
 /// declares one test-only switch (`src/c1_teeth.zig`), and the check it breaks.
-const c1_teeth_roots = [_]struct { name: []const u8, root: []const u8, symptom: []const u8 }{
+const c1_teeth_roots = [_]struct {
+    name: []const u8,
+    root: []const u8,
+    symptom: []const u8,
+    /// Seeds, operations and nodes of the run; the floor test needs a cheap one (a ttl below the
+    /// floor makes most seeds fence for ever, which is slow to fail).
+    seeds: []const u8 = "1..10",
+    operations: u32 = c1_teeth_operations,
+    nodes: []const u8 = "0",
+    extra_args: []const []const u8 = &.{},
+}{
+    .{
+        .name = "floor",
+        .root = "src/sim_c1_teeth_floor_main.zig",
+        .symptom = "a healed node kept fencing",
+        .seeds = "3..3",
+        .operations = 40,
+        .nodes = "1",
+        .extra_args = &.{"--lease-ttl-ms=4000"},
+    },
     .{ .name = "allocation", .root = "src/sim_c1_teeth_allocation_main.zig", .symptom = "I6" },
     .{ .name = "readiness", .root = "src/sim_c1_teeth_readiness_main.zig", .symptom = "I7" },
     .{ .name = "stale", .root = "src/sim_c1_teeth_stale_main.zig", .symptom = "I3" },
@@ -993,10 +1012,12 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         const teeth_run = b.addRunArtifact(teeth_exe);
         teeth_run.addArgs(&.{
-            "--seeds",                            b.fmt("1..{d}", .{teeth_seeds_max}),
-            b.fmt("{d}", .{c1_teeth_operations}), "--c1",
-            "--expect-fail",                      b.fmt("--expect-symptom={s}", .{entry.symptom}),
+            "--seeds",                                       entry.seeds,
+            b.fmt("{d}", .{entry.operations}),               entry.nodes,
+            "--c1",                                          "--expect-fail",
+            b.fmt("--expect-symptom={s}", .{entry.symptom}),
         });
+        teeth_run.addArgs(entry.extra_args);
         teeth.dependOn(&teeth_run.step);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);

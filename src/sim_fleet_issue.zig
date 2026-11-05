@@ -374,7 +374,8 @@ test "an auto round's summary says drawn operations; mixing it with a fixed one 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // The runner's auto form (see report_failure in sim_cluster_main.zig): a failure carries profile and shape lines.
+    // The runner's auto form (see report_failure in sim_cluster_main.zig): a failure carries
+    // profile and shape lines.
     const auto =
         \\seed 2: FAILED: a replica is not placed
         \\  step: convergence

@@ -151,6 +151,10 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
     const problem = fencing.inequality_problem(ttl) orelse return ttl;
     diag.raise(.E0121);
     switch (problem) {
+        .ttl_below_floor => diag.cause(
+            "a lease ttl of {d} ms is under the {d} ms a renewal needs to arrive before the fence",
+            .{ ttl, fencing.ttl_floor_ms() },
+        ),
         .ttl_too_short => diag.cause(
             "a lease ttl of {d} ms leaves no time before the {d} ms fence margin",
             .{ ttl, constants.fence_margin_ms },
@@ -160,7 +164,9 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
             .{ ttl, fencing.margin_needed_ms(ttl), constants.fence_margin_ms },
         ),
     }
-    diag.fix(.{ .sentence = "use a ttl the fence margin covers, such as the default of 10000" });
+    diag.fix(.{
+        .sentence = "use a ttl between the floor and the ceiling, such as the default of 10000",
+    });
     return error.BadConfig;
 }
 

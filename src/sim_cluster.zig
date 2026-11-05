@@ -90,6 +90,10 @@ const cluster_up_ms_min: u64 = 120_000;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
 const steps_per_minute_max: u64 = 200;
+/// Once the faults are off, a node may fence at most this many times: the lease it held when the
+/// network came back may have run out (one), and the first renewal after it restores the slack.
+/// A node that keeps fencing has a ttl too short for its renewal (#78, `fencing.ttl_floor_ms`).
+const fences_after_heal_max: u32 = 2;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -371,6 +375,8 @@ const Node = struct {
     last_wedged_ms: ?u64,
     /// Times the agent fenced itself, over the whole run (all agent lives).
     fences: u32,
+    /// `fences` counted only since the heal: a healed cluster must stop fencing (#78).
+    fences_healed: u32,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -480,6 +486,7 @@ const Node = struct {
         const fences_before = node.agent.fences;
         const result = node.agent.reconcile(&ctx);
         node.fences += node.agent.fences - fences_before;
+        if (c.fault_totals != null) node.fences_healed += node.agent.fences - fences_before;
         node.resume_ms = c.manual.ms + node.spent_ms;
         if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
@@ -830,6 +837,7 @@ pub const Cluster = struct {
         node.frozen_until_ms = null;
         node.last_wedged_ms = null;
         node.fences = 0;
+        node.fences_healed = 0;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -2288,6 +2296,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     c.enter("end");
     try safety(c);
     try enough_work_under_faults(c, @min(heal_at, operations));
+    try healed_stops_fencing(c);
     try work_under_ceiling(c);
     try acceptance(c);
 }
@@ -2320,6 +2329,18 @@ fn busiest_node_rate(c: *const Cluster) u64 {
         busiest = @max(busiest, @as(u64, node.all_steps) * 60_000 / node.all_up_ms);
     }
     return busiest;
+}
+
+/// A healed cluster stops fencing: no node fences more than `fences_after_heal_max` times
+/// between the heal and the end of the run. Without the ttl floor, a short ttl makes a healed
+/// agent fence about once a second for ever (docs/decisions/2026-11-05-lease-ttl-floor.md).
+fn healed_stops_fencing(c: *Cluster) Failure!void {
+    if (c.fault_totals == null) return;
+    for (c.nodes) |node| {
+        if (node.fences_healed > fences_after_heal_max) {
+            try check(c, false, "a healed node kept fencing for want of a renewal");
+        }
+    }
 }
 
 /// An agent that never sleeps (a wake time that is always now) passes every other check and

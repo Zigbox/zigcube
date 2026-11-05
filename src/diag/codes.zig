@@ -417,10 +417,13 @@ pub const registry = [_]Entry{
         \\margin must cover the time the agent needs to stop its containers, the
         \\drift between the two clocks over one lease, and the time the kernel
         \\needs to kill a process. These settings leave too little, so two copies
-        \\of a replica could run at once.
+        \\of a replica could run at once. A lease that is too short has the
+        \\opposite fault: the agent fences before its next renewal can arrive and
+        \\keeps fencing, so its replicas never stay up.
         \\
-        \\The cause line names the numbers. Shorten the lease time to live, or
-        \\leave the fencing constants as they are.
+        \\The cause line names the numbers. Choose a lease time to live between
+        \\the floor and the ceiling it names, or leave the fencing constants as
+        \\they are.
         ,
     },
     .{

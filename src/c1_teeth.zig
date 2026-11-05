@@ -29,5 +29,10 @@ pub const stale_observation = declared("c1_teeth_stale_observation");
 /// invariant of `sim-cluster`).
 pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
 
-pub const any = skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge or
+/// The ttl floor is off: any ttl above the fence margin is admitted, as before #78 (must break
+/// `sim-cluster`'s "a healed node kept fencing" check).
+pub const ttl_floor_off = declared("c1_teeth_ttl_floor_off");
+
+pub const any = ttl_floor_off or skip_allocation_compare or skip_readiness_compare or
+    skew_beyond_bound or wedge or
     stale_observation or locality_before_spread;

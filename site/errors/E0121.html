@@ -76,8 +76,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">the lease settings cannot fence an agent in time</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>An agent that loses contact with the server stops its containers a fixed margin before its lease can run out, and the server places replacements only after the lease has run out and a grace period has passed. The margin must cover the time the agent needs to stop its containers, the drift between the two clocks over one lease, and the time the kernel needs to kill a process. These settings leave too little, so two copies of a replica could run at once.</p>
-<p>The cause line names the numbers. Shorten the lease time to live, or leave the fencing constants as they are.</p>
+<p>An agent that loses contact with the server stops its containers a fixed margin before its lease can run out, and the server places replacements only after the lease has run out and a grace period has passed. The margin must cover the time the agent needs to stop its containers, the drift between the two clocks over one lease, and the time the kernel needs to kill a process. These settings leave too little, so two copies of a replica could run at once. A lease that is too short has the opposite fault: the agent fences before its next renewal can arrive and keeps fencing, so its replicas never stay up.</p>
+<p>The cause line names the numbers. Choose a lease time to live between the floor and the ceiling it names, or leave the fencing constants as they are.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0121</pre>

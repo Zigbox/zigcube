@@ -109,12 +109,10 @@ pub const long_share_denominator: u32 = 10;
 /// deadline (measured, docs/decisions/2026-11-04-fleet-profiles-and-shapes.md).
 pub const cost_max: u32 = 5_000;
 
-/// The shortest ttl a shape draws. The agent fences `fence_margin_ms` (3 s) before the lease ends,
-/// and the simulation measured that a ttl below 5 s (4,500 and under) makes a healed one-node
-/// cluster fence about once a second for ever, so a 100-operation run does not finish in two
-/// minutes (`sim_cluster 3 100 1 --lease-ttl-ms=4000`; the decision record has the numbers). The
-/// allowed range is wider (`--lease-ttl-ms` takes it); the draw stays above the cliff.
-pub const lease_ttl_ms_min: u32 = 5000;
+/// The shortest ttl a shape draws, and the shortest the server admits: below
+/// `fencing.ttl_floor_ms` a healed cluster fences again and again (#78; the decision record has
+/// the measurements), so the draw stays on the admitted side.
+pub const lease_ttl_ms_min: u32 = fencing.ttl_floor_ms();
 /// The longest ttl `fencing.inequality_problem` allows with the shipped margin.
 pub const lease_ttl_ms_max: u32 = constants.lease_ttl_ms;
 pub const replicas_pct_default: u32 = 100;

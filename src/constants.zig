@@ -134,6 +134,12 @@ pub const fence_stop_ms: u32 = 2000;
 /// The bound on the difference of two hosts' clock rates, in parts per thousand (1 %).
 pub const clock_skew_per_mille: u32 = 10;
 pub const fence_margin_ms: u32 = 3000;
+/// The agent sends its next keepalive a third of a ttl after the last acknowledged one.
+pub const lease_renew_divisor: u32 = 3;
+/// What a renewal can be late by: the agent wakes on `agent_resync_ms` boundaries, and one retry
+/// follows a failed attempt. A ttl must leave `fence_margin_ms` plus this after the renewal, or a
+/// healed cluster fences again before the next acknowledgement arrives (#78).
+pub const lease_renew_jitter_ms: u32 = 2 * agent_resync_ms;
 /// How often a fencing agent looks at its containers while it waits for them to stop.
 pub const fence_poll_ms: u32 = 100;
 pub const lost_grace_ms: u32 = 1000;
