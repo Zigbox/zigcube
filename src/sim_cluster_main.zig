@@ -262,8 +262,10 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         return constants.exit_ok;
     }
     const total = parsed.last_seed - parsed.first_seed + 1;
-    out.print("sim-cluster: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
-        parsed.first_seed, parsed.last_seed, parsed.operations, failures, total,
+    // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
+    const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
+    out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
+        run_name, parsed.first_seed, parsed.last_seed, parsed.operations, failures, total,
     }) catch return constants.exit_environment;
     if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
     return if (failures == 0) constants.exit_ok else constants.exit_user;
