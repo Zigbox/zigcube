@@ -79,6 +79,7 @@ comptime {
     _ = @import("x509_fuzz.zig"); // The same: the WASI core root has no such environment.
     _ = @import("tls_fuzz.zig"); // The same.
     _ = @import("fuzz_seeds.zig");
+    _ = @import("agent.zig"); // Its tests (next_wake) otherwise ran only in the WASM core root.
     _ = @import("agent_peer.zig");
     _ = @import("peer_files.zig");
     _ = @import("dir_images.zig");
