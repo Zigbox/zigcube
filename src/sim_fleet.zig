@@ -133,12 +133,14 @@ pub fn ingest(
         .infra = counts.infra,
     };
     const today = state_file.ymd_of(options.now_seconds);
-    // A canary that GitHub kept from being filed (held, or stopped) runs again soon and is
-    // counted when it is filed, so its seeds are not counted twice; any other kind is counted
-    // first: its seeds ran whether or not GitHub answers.
+    // A canary with something to file that GitHub kept from being filed (held, or stopped) runs
+    // again soon and is counted when it is filed, so its seeds are not counted twice. Any other
+    // round, and a canary that was caught or not run (nothing to file, so no second run), is
+    // counted first: its seeds ran whether or not GitHub answers.
     const canary = std.mem.eql(u8, options.kind, issue.kind_sim_canary);
     const groups = try group_failures(arena, options.kind, batch.failures);
-    if (!canary) try count_round(arena, state, today, options, counts, groups);
+    const count_after = canary and counts.failed > counts.infra;
+    if (!count_after) try count_round(arena, state, today, options, counts, groups);
     if (options.now_seconds < state.hold_until) {
         summary.held = true;
         return summary;
@@ -156,7 +158,7 @@ pub fn ingest(
             else => |e| return halt(github, state, options, &summary, e),
         };
     }
-    if (canary) try count_round(arena, state, today, options, counts, groups);
+    if (count_after) try count_round(arena, state, today, options, counts, groups);
     return summary;
 }
 
@@ -1175,6 +1177,25 @@ test "a canary held by GitHub is not counted, is not filed, and ends as CanaryHe
     try std.testing.expectEqual(@as(u64, 4), state.days.items[0].seeds);
     const stopped: Summary = .{ .stopped = error.GitHubRateLimited };
     try std.testing.expectError(error.GitHubStopped, exit_of(true, &stopped));
+}
+
+test "a canary that is caught while GitHub holds writes is counted once" {
+    // Goal: a caught canary has nothing to file and is not run again, so a hold must not drop
+    // its seeds from the day. Method: a hold in the future and a caught run as input.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
+    defer fake.deinit();
+    var state: state_file.State = .{};
+    state.hold_until = day_one + 60;
+    const held = try canary_ingest(arena, fake.github(), &state, canary_wedge_caught, "aaa");
+    try std.testing.expect(held.held);
+    try std.testing.expectEqual(constants.exit_ok, try exit_of(true, &held));
+    try std.testing.expectEqual(@as(u64, 4), state.days.items[0].seeds);
+    state.hold_until = 0;
+    _ = try canary_ingest(arena, fake.github(), &state, canary_wedge_caught, "aaa");
+    try std.testing.expectEqual(@as(u64, 8), state.days.items[0].seeds);
 }
 
 test "a canary no seed of which could start is NOT RUN: counted, never filed" {

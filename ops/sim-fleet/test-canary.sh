@@ -197,8 +197,24 @@ round_out
 expect "(try 2)"
 round_out
 expect "gave up after 3 tries"
+# The blind spot is recorded as one crash, in the output and in the crashes kept, and the
+# runner is tried again when the cycle comes round to it.
+expect "could not run in 3 tries"
+expect "sim_c1_teeth_wedge: CRASHED"
+expect "would file issue: sim-canary: crash: not run in N tries (step: canary)"
+ls "$STATE/crashes" | grep -q "canary-sim_c1_teeth_wedge" || fail "no crash record was kept"
 [ "$(cat "$STATE/canary-next")" -eq $((before + 1)) ] || fail "the cycle did not move on"
 [ "$(cat "$STATE/canary-tries")" -eq 0 ] || fail "the tries were not reset"
+echo caught >"$work/mode"
+i=1
+while [ "$i" -lt "$count" ]; do
+    round_out
+    refuse "sim_c1_teeth_wedge"
+    i=$((i + 1))
+done
+round_out
+expect "canary sim_c1_teeth_wedge on seeds"
+echo oom >"$work/mode"
 
 # Not filed because GitHub asked to wait (exit 2): the same canary runs again, three times at
 # most; the reporter refusing the output (exit 1) moves the cycle on and keeps the output.
@@ -218,6 +234,17 @@ expect "(try 2)"
 round_out
 expect "gave up after 3 tries"
 [ "$(cat "$STATE/canary-next")" -eq $((before + 1)) ] || fail "the cycle did not move on"
+# A reporter that outlives SIM_FLEET_REPORT_TIMEOUT (exit 124) is retried like exit 2.
+case_name="reporter timeout"
+at sim_c1_teeth_wedge
+before=$(cat "$STATE/canary-next")
+echo 0 >"$STATE/canary-tries"
+printf '#!/bin/sh\nexec sleep 30\n' >"$bin/sim_fleet"
+SIM_FLEET_REPORT_TIMEOUT=1
+round_out
+SIM_FLEET_REPORT_TIMEOUT=60
+expect "was not filed (sim_fleet exited 124); it runs again next round (try 1)"
+[ "$(cat "$STATE/canary-next")" -eq "$before" ] || fail "the cycle moved on a timeout"
 case_name="refused"
 at sim_c1_teeth_wedge
 before=$(cat "$STATE/canary-next")

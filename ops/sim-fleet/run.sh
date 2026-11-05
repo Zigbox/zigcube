@@ -65,6 +65,12 @@ main() {
         exit 2
         ;;
     esac
+    case "$SIM_FLEET_CANARY_TRIES_MAX" in
+    '' | *[!0-9]* | 0)
+        log "SIM_FLEET_CANARY_TRIES_MAX is '$SIM_FLEET_CANARY_TRIES_MAX': it must be 1 or more"
+        exit 2
+        ;;
+    esac
     if [ -n "${SIM_FLEET_WORKERS:-}" ]; then
         log "SIM_FLEET_WORKERS is ignored: set SIM_FLEET_WORKERS_CLUSTER, _C1 and _SWARM"
     fi
@@ -335,16 +341,37 @@ canary_done() {
 
 # The canary could not be filed or did not run, for a reason that may pass (GitHub asked to wait,
 # the host was short of memory): it runs again next round, but only $SIM_FLEET_CANARY_TRIES_MAX
-# times in a row, then the cycle moves on and the log says so. $1 is the reason.
+# times in a row, then the cycle moves on and the log says so. $1 is the reason. Sets
+# canary_gave_up to 1 when it gave up, else 0.
 canary_retry() {
     tries=$(($(number_in "$STATE/canary-tries") + 1))
+    canary_gave_up=0
     if [ "$tries" -ge "$SIM_FLEET_CANARY_TRIES_MAX" ]; then
         log "canary $canary_runner: $1; gave up after $tries tries, the cycle moves on"
+        canary_gave_up=1
         canary_done
     else
         echo "$tries" >"$STATE/canary-tries"
         log "canary $canary_runner: $1; it runs again next round (try $tries)"
     fi
+}
+
+# A canary the host kept from running $tries tries in a row is a blind spot the operator must
+# see: one crash record under sim-canary (no seed in its text, so a lasting blind spot is one
+# issue), which the tracker's day counts as a crash. The cycle has moved on, so the runner is
+# tried again when its turn comes round; if GitHub refuses the record, the reporter leaves it in
+# $STATE/last-failed-round-sim-canary.txt. $1 is the canary's worker.
+canary_blind() {
+    {
+        printf 'seed %s: CRASHED: not run in %s tries\n' "$base" "$tries"
+        printf '  step: canary\n'
+        printf '  replay: zig-out/bin/%s --seeds %s..%s auto %s\n' "$canary_runner" "$base" \
+            "$last" "$(kind_flags sim-canary)"
+        printf '%s: seeds %s..%s, drawn operations: 1 of 1 failed\n' \
+            "$(kind_prefix sim-canary)" "$base" "$base"
+    } >"$round/blind-sim-canary"
+    log "canary $canary_runner could not run in $tries tries: recording a blind spot"
+    ingest sim-canary "$round/blind-sim-canary" "$base..$last" || true
 }
 
 # Collects canary worker $1 like any worker (a crash is replayed seed by seed and each crashed
@@ -374,13 +401,16 @@ canary_report() {
         log "canary $canary_runner on seeds $base..$last: $word"
         if [ "$word" = "NOT RUN" ]; then
             canary_retry "no seed could run on this host"
+            if [ "$canary_gave_up" -eq 1 ]; then canary_blind "$1"; fi
         else
             canary_done
         fi
     else
         keep_crash "$1" "canary-$canary_runner"
         if [ "$ic" -eq 2 ] || [ "$ic" -eq 124 ]; then
-            # GitHub asked to wait or stopped the round, or the reporter timed out: may pass.
+            # Exit 2 is any environment error of the reporter (GitHub asked to wait or stopped
+            # the round, an unwritable or unreadable state file or token, no memory), 124 a
+            # timeout: any of them may pass, and the cap bounds the ones that do not.
             canary_retry "was not filed (sim_fleet exited $ic)"
         else
             # The reporter refused the input (exit 1): another try gets the same answer.
