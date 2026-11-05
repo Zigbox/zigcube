@@ -217,7 +217,7 @@ const Harness = struct {
     fn check(h: *Harness, ok: bool, comptime what: []const u8, args: anytype) Failed!void {
         if (ok) return;
         const text = std.fmt.bufPrint(&h.why, what, args) catch h.why[0..0];
-        h.why_len = text.len;
+        h.why_len = @intCast(text.len);
         return error.CaseFailed;
     }
 
