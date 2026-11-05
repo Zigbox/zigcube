@@ -30,9 +30,9 @@ test "RFC 8448: the x25519 exchange gives the shared secret, from either side" {
     // Goal: the ECDHE input of the trace is what x25519 makes of its keys, so the vectors and the
     // primitives agree before the schedule is blamed. Method: both directions, and the public
     // keys from the private ones.
-    const client_public = try X25519.recoverPublicKey(vectors.client_private);
+    const client_public = X25519.recoverPublicKey(vectors.client_private);
     try expectEqualSlices(u8, &vectors.client_public, &client_public);
-    const server_public = try X25519.recoverPublicKey(vectors.server_private);
+    const server_public = X25519.recoverPublicKey(vectors.server_private);
     try expectEqualSlices(u8, &vectors.server_public, &server_public);
     const from_client = try X25519.scalarmult(vectors.client_private, vectors.server_public);
     const from_server = try X25519.scalarmult(vectors.server_private, vectors.client_public);
@@ -44,14 +44,14 @@ test "RFC 8448: HkdfLabel is laid out as the RFC's info strings" {
     // Goal: the label bytes, which every derived value depends on, match the trace's `info`
     // fields. Method: the three shapes in it: an empty context (key), a hash context (derived)
     // and the longest label.
-    var buffer: [300]u8 = undefined;
-    const key_info = schedule.hkdf_label(buffer[0..schedule.hkdf_label_bytes_max], "key", "", 16);
+    var buffer: [schedule.hkdf_label_bytes_max]u8 = undefined;
+    const key_info = schedule.hkdf_label(&buffer, "key", "", 16);
     const label_info = [_]u8{ 0, 0x10, 9, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x20, 0x6b, 0x65, 0x79, 0 };
     try expectEqualSlices(u8, &label_info, key_info);
-    const iv_info = schedule.hkdf_label(buffer[0..schedule.hkdf_label_bytes_max], "iv", "", 12);
+    const iv_info = schedule.hkdf_label(&buffer, "iv", "", 12);
     try expectEqualSlices(u8, &.{ 0, 0x0c, 8, 't', 'l', 's', '1', '3', ' ', 'i', 'v', 0 }, iv_info);
     const finished_info = schedule.hkdf_label(
-        buffer[0..schedule.hkdf_label_bytes_max],
+        &buffer,
         "finished",
         "",
         32,
@@ -62,7 +62,7 @@ test "RFC 8448: HkdfLabel is laid out as the RFC's info strings" {
     }, finished_info);
     const hash: schedule.Hash = @splat(7);
     const derived_info = schedule.hkdf_label(
-        buffer[0..schedule.hkdf_label_bytes_max],
+        &buffer,
         "derived",
         &hash,
         32,
@@ -365,7 +365,18 @@ test "every single-bit change to a sealed record is refused and kills the direct
         buffer[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
         var direction = schedule.Direction.init(&vectors.server_application_secret);
         direction.sequence = 1;
-        if (direction.open(&buffer)) |_| {
+        // `open` takes a record framed by its own length field; a flipped length reframes it,
+        // and one that no longer fits the 72 bytes is a short read, which the caller never opens.
+        const length = std.mem.readInt(u16, buffer[3..5], .big);
+        if (schedule.Header.parse(buffer[0..5], .protected)) |_| {} else |_| {
+            flips += 1;
+            continue;
+        }
+        if (5 + @as(usize, length) > buffer.len) {
+            flips += 1;
+            continue;
+        }
+        if (direction.open(buffer[0 .. 5 + @as(usize, length)])) |_| {
             return error.AFlippedRecordOpened;
         } else |_| {}
         try expect(direction.dead);
@@ -484,8 +495,8 @@ test "padding is stripped; a record of nothing but padding, or of an unknown typ
     var unknown = schedule.Direction.init(&vectors.client_application_secret);
     try expectError(error.UnexpectedMessage, unknown.open(forge(&peer, &out, &.{ 'x', 99 })));
     var short = schedule.Direction.init(&vectors.client_application_secret);
-    const zeros: [16]u8 = @splat(fill);
-    const header_only = [_]u8{ 23, 3, 3, 0, 16 } ++ zeros;
+    const body: [16]u8 = @splat(fill);
+    const header_only = [_]u8{ 23, 3, 3, 0, 16 } ++ body;
     var copy = header_only;
     try expectError(error.DecodeError, short.open(&copy));
 }
