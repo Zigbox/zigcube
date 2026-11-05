@@ -1403,12 +1403,12 @@ fn inject_competing_placement(c: *Cluster, node: []const u8, node_revision: u64)
             .node_revision = node_revision,
         };
     const extra: records.Requests = .{ .cpu_millis = 1, .memory_bytes = 1 };
-    const assigned: records.Assigned = .{
-        .replica = "c1-injected",
-        .service = "c1-injected",
-        .requests = extra,
-        .reason = "a competing placement (negative test)",
-    };
+    const assigned = records.assigned_replica(
+        "c1-injected",
+        "c1-injected",
+        extra,
+        "a competing placement (negative test)",
+    );
     const after: records.Allocation = .{
         .allocated = .{
             .cpu_millis = before.allocated.cpu_millis + extra.cpu_millis,

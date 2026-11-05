@@ -1,0 +1,5 @@
+error[ZC-E0134]: the time to submit this job has passed
+  cause  submit_by_ms 1761350000000 is 12000 ms before the server's clock
+  fix    submit again with a new submit-by time
+  more   zcube explain E0134 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0134.html
