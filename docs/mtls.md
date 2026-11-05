@@ -1,9 +1,8 @@
 # Certificates and mTLS
 
 This document describes how Zigcube makes and checks its X.509 certificates. The brief is
-[briefs/mtls-client.md](briefs/mtls-client.md). Slices 1 to 3 (X.509, the CA, the key schedule) are built. Slice 4, the
-TLS 1.3 client handshake without client authentication, is in review; slices 5 (client
-authentication) and 6 (the connection) are not started.
+[briefs/mtls-client.md](briefs/mtls-client.md). Slices 1 to 3 (X.509, the CA, the key schedule) are built. Slices 4 (the TLS 1.3 client handshake) and 5
+(client authentication) are in review; slice 6 (the connection) is not started.
 
 ## Certificates
 
@@ -110,9 +109,20 @@ Rules the code holds to, each with a test:
   and ends the connection: `receive` then answers `error.Closed` and `output()` stays empty.
 - A received KeyUpdate re-keys the receive side; one that asks is answered. The client never starts
   one by itself (`send_key_update` is for the connection layer).
-- A CertificateRequest is refused: client authentication is slice 5.
+- Client authentication (slice 5). `Config.identity` is the workload's chain (at most two
+  certificates) and a `Signer` (a callback that signs the CertificateVerify content and may
+  fail); `require_client_auth` says the connection must authenticate. A CertificateRequest is
+  read once, after EncryptedExtensions: its `signature_algorithms` must be present, and its
+  context (up to 255 bytes) is echoed. `certificate_authorities` is ignored. The client answers
+  with Certificate, CertificateVerify (context string "TLS 1.3, client CertificateVerify") and
+  Finished, all in one flight after the server's Finished; the client's Finished covers them.
+  If the request lists no Ed25519, or there is no identity, an optional client sends an empty
+  Certificate; a required one is refused with ZC-E0814. A request after the handshake, or a
+  second one, is ZC-E0813. After the flight, an alert such as `bad_certificate` or
+  `certificate_required` is ZC-E0814, any other alert ZC-E0813.
 
-Tests: `tls_client_test.zig` (success at several piece sizes, refusals, pinning, record faults and
+Tests: `tls_client_test.zig` (client authentication in all piece sizes, refusals, the server's
+alerts, a failing signer and five teeth tests for it; success at several piece sizes, refusals, pinning, record faults and
 six teeth tests, one each for the pin, the name, the validity window, CertificateVerify, Finished
 and the transcript, which fail when that check is skipped), and `tls_fuzz.zig`, a seeded fuzzer
 that damages a server's flight in thirteen ways (alerts, plain and sealed, at record boundaries;
@@ -130,7 +140,8 @@ failure").
 | ZC-E0811 | expired or not yet valid; shows the window, the time now and the skew |
 | ZC-E0812 | names another peer; shows both names |
 | ZC-E0817 | an identity could not be issued |
-| ZC-E0813 | the TLS handshake was refused: a malformed or out-of-order message, a CertificateVerify or Finished that does not verify, a server alert, or a CertificateRequest |
+| ZC-E0813 | the TLS handshake was refused: a malformed or out-of-order message, a CertificateVerify or Finished that does not verify, a server alert, or a CertificateRequest that is malformed or out of order |
+| ZC-E0814 | the client certificate was not asked for though required, could not be answered, or was refused by the server |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
 | ZC-E0816 | the connection ended without close_notify, or before the handshake finished |
 | ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |

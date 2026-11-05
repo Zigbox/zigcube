@@ -59,6 +59,7 @@ const ext_signature_algorithms: u16 = 13;
 const ext_supported_versions: u16 = 43;
 const ext_key_share: u16 = 51;
 const ext_signature_algorithms_cert: u16 = 50;
+const ext_certificate_authorities: u16 = 47;
 
 /// The random that marks a HelloRetryRequest (RFC 8446 section 4.1.3): SHA-256 of
 /// "HelloRetryRequest".
@@ -453,4 +454,61 @@ pub fn parse_key_update(body: []const u8) Error!bool {
     if (body.len != 1) return error.Malformed;
     if (body[0] > 1) return error.IllegalParameter;
     return body[0] == 1;
+}
+
+pub const Request = struct {
+    /// The `certificate_request_context`, echoed in the client's Certificate.
+    context: []const u8,
+    /// Whether the server accepts an Ed25519 signature and an Ed25519-signed certificate.
+    accepts_ed25519: bool,
+};
+
+/// CertificateRequest (RFC 8446 section 4.3.2) in the handshake: the context, then extensions of
+/// which `signature_algorithms` is required. `signature_algorithms_cert`, when present, must also
+/// list Ed25519 for the request to be answerable. Every other extension (`certificate_authorities`,
+/// `oid_filters`, `status_request`, ...) is skipped: the client has one identity to offer.
+pub fn parse_certificate_request(body: []const u8) Error!Request {
+    var reader = Reader.init(body);
+    const context = try reader.vector8();
+    var extensions = Reader.init(try reader.vector16());
+    try reader.finish();
+    var schemes: ?bool = null;
+    var cert_schemes: ?bool = null;
+    var authorities = false;
+    while (extensions.remaining() > 0) {
+        const kind = try extensions.read_u16();
+        const data = try extensions.vector16();
+        switch (kind) {
+            ext_signature_algorithms => {
+                if (schemes != null) return error.DuplicateExtension;
+                schemes = try lists_ed25519(data);
+            },
+            ext_signature_algorithms_cert => {
+                if (cert_schemes != null) return error.DuplicateExtension;
+                cert_schemes = try lists_ed25519(data);
+            },
+            ext_certificate_authorities => {
+                if (authorities) return error.DuplicateExtension;
+                authorities = true;
+            },
+            else => {},
+        }
+    }
+    const listed = schemes orelse return error.MissingExtension;
+    return .{ .context = context, .accepts_ed25519 = listed and (cert_schemes orelse true) };
+}
+
+/// A `SignatureSchemeList`: a non-empty, even-length vector of two-byte schemes.
+fn lists_ed25519(data: []const u8) Error!bool {
+    var reader = Reader.init(data);
+    const list = try reader.vector16();
+    try reader.finish();
+    if (list.len == 0) return error.Malformed;
+    if (list.len % 2 != 0) return error.Malformed;
+    var found = false;
+    var at: usize = 0;
+    while (at < list.len) : (at += 2) {
+        if (std.mem.readInt(u16, list[at..][0..2], .big) == scheme_ed25519) found = true;
+    }
+    return found;
 }

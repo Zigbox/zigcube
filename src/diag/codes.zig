@@ -104,6 +104,7 @@ pub const Code = enum(u8) {
     E0811,
     E0812,
     E0813,
+    E0814,
     E0815,
     E0816,
     E0817,
@@ -1390,6 +1391,27 @@ pub const registry = [_]Entry{
         \\the key of the certificate it showed, or the two sides saw different
         \\handshakes. Check that the peer is a zcube server and that nothing between
         \\the two rewrites the connection.
+        ,
+    },
+    .{
+        .code = .E0814,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the TLS client certificate was not asked for, or was refused",
+        .explanation =
+        \\The client was told to present a certificate and the server did not ask
+        \\for one, or the server refused the one presented (the alert names why:
+        \\bad_certificate, certificate_expired, unknown_ca, certificate_required),
+        \\or the request cannot be answered (it does not list Ed25519), or the
+        \\signer holding the key failed. The connection is closed; a refusal arrives
+        \\after the client's own handshake is done, so data written before the
+        \\alert was read was not accepted.
+        \\
+        \\A server that never asks cannot learn which workload is calling, so a
+        \\connection that must prove identity stops. Check that the server is
+        \\configured to require client certificates and trusts the cluster CA;
+        \\a refused certificate is expired, issued by another CA, or for a
+        \\different workload than the server allows.
         ,
     },
     .{

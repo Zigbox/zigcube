@@ -1,0 +1,9 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0814]: the TLS client certificate was not asked for, or was refused
+  cause  the server did not ask for a client certificate, and this connection
+         must present one
+  sent   alert handshake_failure (40)
+  reqid  r-0000001
+  fix    Check that the server at broker.botpike.com requires client certificates from the cluster CA, and that this workload's certificate is current and was issued by it.
+  more   zcube explain E0814
+  docs   https://zigbox.github.io/zigcube/errors/E0814.html

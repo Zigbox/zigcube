@@ -1,8 +1,9 @@
 //! A seeded fuzzer for the TLS client's handshake (`tls_client.zig`, docs/mtls.md): a server's
-//! flight, damaged in one of thirteen ways, cut into pieces of random size. The properties: no
-//! crash; the client is `connected` (at any step, whatever follows) only when the flight was a
-//! correct one and the server accepts the client's Finished; a chain the pinned CA did not sign
-//! never connects; after a refusal the client reads nothing and writes nothing more than the one
+//! flight (with or without a request for the client's certificate), damaged in one of thirteen
+//! ways, cut into pieces of random size. The properties: no crash; the client is `connected` (at
+//! any step, whatever follows) only when the flight was a correct one and the server accepts the
+//! client's whole last flight, certificate included; a chain the pinned CA did not sign never
+//! connects; after a refusal the client reads nothing and writes nothing more than the one
 //! alert; every refusal carries a code and a cause. Seeds and replay are in `fuzz_seeds.zig`.
 
 const std = @import("std");
@@ -176,11 +177,22 @@ const World = struct {
     leaf: x509.Der,
     second: x509.Der,
     certificates: [2][]const u8,
-    sent: [1024]u8,
+    sent: [4096]u8,
     sent_length: u32,
+    /// What the client had sent when it reported `connected`.
+    connected_bytes: u32,
+    client_key: Ed25519.KeyPair,
+    client_certificate: x509.Der,
+    client_chain: [1][]const u8,
+    /// What the server must make of the client's last flight, when the run is clean.
+    expect: testpeer.ClientFlight,
     flight: [flight_bytes_max]u8,
     damaged: [flight_bytes_max + 1024]u8,
     clean: bool,
+    has_identity: bool,
+    require_auth: bool,
+    context: [8]u8,
+    context_length: u8,
     /// The client reported `connected` at some step although the flight was not a correct one
     /// or the server would not accept the client's Finished.
     false_connect: bool,
@@ -234,6 +246,7 @@ fn setup(world: *World, random: std.Random) !void {
         .random = random_bytes(random),
         .secret = random_bytes(random),
         .faults = random_faults(random, world, chain),
+        .client_auth = auth_config(random, world, ca),
     });
     world.client.init(&.{
         .anchor = ca.public_key.toBytes(),
@@ -242,8 +255,45 @@ fn setup(world: *World, random: std.Random) !void {
         .random = random_bytes(random),
         .session_id = random_bytes(random),
         .secret = random_bytes(random),
+        .identity = if (world.has_identity) .{
+            .certificates = &world.client_chain,
+            .signer = tls_client.key_pair_signer(&world.client_key),
+        } else null,
+        .require_client_auth = world.require_auth,
     });
     world.sent_length = 0;
+}
+
+/// Whether the server asks for a certificate, and whether the client has one. Only the
+/// combinations a correct server accepts (the others are the client tests' business).
+fn auth_config(random: std.Random, world: *World, ca: Ed25519.KeyPair) ?testpeer.ClientAuth {
+    world.has_identity = false;
+    world.require_auth = false;
+    world.expect = .ok;
+    const ask = random.boolean();
+    world.has_identity = random.boolean();
+    if (ask and world.has_identity) world.require_auth = random.boolean();
+    if (world.has_identity) {
+        world.client_key = Ed25519.KeyPair.generateDeterministic(random_bytes(random)) catch
+            unreachable; // A seed of 32 bytes is always a key.
+        const request = x509_test.workload_request(world.client_key.public_key.toBytes());
+        x509.issue_workload(&world.client_certificate, ca, &request) catch unreachable; // Fits.
+        world.client_chain = .{world.client_certificate.slice()};
+    }
+    if (!ask) return null;
+    if (!world.has_identity) world.expect = .ok_without_certificate;
+    var context: [8]u8 = undefined;
+    const length = random.uintAtMost(usize, context.len);
+    random.bytes(context[0..length]);
+    world.context = context;
+    world.context_length = @intCast(length);
+    return .{
+        .anchor = ca.public_key.toBytes(),
+        .now_ms = x509_test.now,
+        .context = world.context[0..length],
+        .require = world.has_identity,
+        .authorities = random.boolean(),
+    };
 }
 
 fn random_bytes(random: std.Random) [32]u8 {
@@ -266,9 +316,9 @@ const Outcome = enum { open, refused, closed };
 fn check_connected(world: *World) void {
     if (!world.clean) world.false_connect = true;
     if (!world.client.is_connected()) world.false_connect = true;
-    if (!world.peer.accept_client_finished(world.sent[0..world.sent_length])) {
-        world.false_connect = true;
-    }
+    world.connected_bytes = world.sent_length;
+    const flight = world.peer.accept_client_flight(world.sent[0..world.sent_length]);
+    if (flight != world.expect) world.false_connect = true;
 }
 
 /// Feeds the damaged flight in random pieces; checks the properties that hold at every step.
@@ -304,7 +354,7 @@ fn after_refusal(world: *World) !Outcome {
     try testing.expectEqual(@as(usize, 0), world.client.output().len);
     try testing.expectEqual(sent, world.sent_length);
     // At most one alert record (the sealed alert is 24 bytes; a plain one 7).
-    try testing.expect(sent <= 64 + 5 + 40);
+    try testing.expect(sent - world.connected_bytes <= 64 + 5 + 40);
     return .refused;
 }
 
@@ -316,6 +366,7 @@ fn run_once(seed: u64, refused: *bool) !bool {
     defer testing.allocator.destroy(world);
     world.false_connect = false;
     world.refused = false;
+    world.connected_bytes = 0;
     try setup(world, random);
     world.client.start();
     collect(world);

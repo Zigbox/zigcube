@@ -1,10 +1,11 @@
-//! The TLS 1.3 client handshake (docs/briefs/mtls-client.md, slice 4): ClientHello to Finished,
-//! no client authentication yet (slice 5), pinning the server's certificate against the cluster
-//! CA. A pure state machine: bytes in, bytes out, one event per step. It opens no socket and reads
+//! The TLS 1.3 client handshake (docs/briefs/mtls-client.md, slices 4 and 5): ClientHello to
+//! Finished, pinning the server's certificate against the cluster CA, and answering a server's
+//! `CertificateRequest` with the caller's workload certificate and a signature made by a callback.
+//! A pure state machine: bytes in, bytes out, one event per step. It opens no socket and reads
 //! no clock or random source; the shell passes in the randomness, the x25519 secret and the time.
 //!
-//! The cuts, each recorded in docs/decisions/2026-11-05-tls-client-part-1.md:
-//!   - A server `CertificateRequest` is refused (ZC-E0813): client authentication is slice 5.
+//! The cuts, recorded in docs/decisions/2026-11-05-tls-client-part-1.md and -part-2.md:
+//!   - Post-handshake authentication is never offered, so a later `CertificateRequest` is refused.
 //!   - The client never starts a KeyUpdate by itself; `send_key_update` is there for slice 6 to
 //!     call when `update_due` says so. A received KeyUpdate is answered when it asks.
 //!   - The server name is a DNS name (the foreign-server profile is not wired here).
@@ -48,7 +49,36 @@ pub const Config = struct {
     session_id: [32]u8,
     /// The ephemeral x25519 secret.
     secret: [32]u8,
+    /// The workload identity to present when the server asks; null is server authentication only
+    /// (an empty Certificate answers a request).
+    identity: ?Identity = null,
+    /// The handshake fails (ZC-E0814) unless the server asks for a certificate. Needs `identity`.
+    require_client_auth: bool = false,
 };
+
+/// Signs `message` with the key of the identity's certificate: Ed25519, 64 bytes. Null means the
+/// signer failed (a key behind a boundary that did not answer). The key never enters the client.
+pub const Signer = struct {
+    context: *const anyopaque,
+    sign: *const fn (context: *const anyopaque, message: []const u8) ?[64]u8,
+};
+
+pub const Identity = struct {
+    /// DER certificates, the workload's first and optionally the CA's after it. Copied by `init`.
+    certificates: []const []const u8,
+    signer: Signer,
+};
+
+/// A `Signer` for a key pair the caller holds; `key_pair` must outlive the connection.
+pub fn key_pair_signer(key_pair: *const Ed25519.KeyPair) Signer {
+    return .{ .context = key_pair, .sign = sign_with_key_pair };
+}
+
+fn sign_with_key_pair(context: *const anyopaque, message: []const u8) ?[64]u8 {
+    const key_pair: *const Ed25519.KeyPair = @ptrCast(@alignCast(context));
+    const signature = key_pair.sign(message, null) catch return null;
+    return signature.toBytes();
+}
 
 pub const Event = union(enum) {
     none,
@@ -76,8 +106,26 @@ const State = enum {
 
 /// Test-only faults for the teeth tests: each skips one security check. Compiled out of every
 /// build but a test, as `x509.set_test_fault` is.
-pub const TestFault = enum { certificate_verify, finished, transcript_encrypted_extensions };
-var faults: [3]bool = @splat(false);
+pub const TestFault = enum {
+    certificate_verify,
+    finished,
+    transcript_encrypted_extensions,
+    /// The client sends no Certificate when the server never asked and it was required.
+    required_client_auth,
+    /// The client answers a request that does not list Ed25519.
+    request_scheme,
+    /// A server's certificate alert is reported as a plain E0813.
+    certificate_alert,
+    /// The client's Certificate and CertificateVerify stay out of its own transcript.
+    transcript_client_auth,
+    /// The client signs with the server's context string.
+    verify_context,
+    /// The client sends an empty request context.
+    echo_context,
+    /// The client's Finished leaves its Certificate and CertificateVerify out of its hash.
+    finished_omits_auth,
+};
+var faults: [std.enums.values(TestFault).len]bool = @splat(false);
 
 pub fn set_test_fault(fault: TestFault, on: bool) void {
     if (builtin.is_test) faults[@backingInt(fault)] = on;
@@ -105,6 +153,19 @@ pub const Client = struct {
     write_protected: bool,
     ccs_dropped: u32,
     leaf_key: [32]u8,
+    identity: [constants.tls_chain_certificates_max][constants.x509_cert_bytes_max]u8,
+    identity_lengths: [constants.tls_chain_certificates_max]u32,
+    identity_count: u32,
+    signer: ?Signer,
+    require_auth: bool,
+    /// The server sent a CertificateRequest; its context is held for the echo.
+    request_seen: bool,
+    /// The request can be answered with the identity: it lists Ed25519.
+    request_answerable: bool,
+    request_context: [constants.tls_request_context_bytes_max]u8,
+    request_context_length: u32,
+    /// A Certificate went to the server: a certificate alert is then about it.
+    auth_sent: bool,
     record: [schedule.sealed_bytes_max]u8,
     record_length: u32,
     record_total: u32,
@@ -136,10 +197,35 @@ pub const Client = struct {
         self.flight_length = 0;
         self.out_length = 0;
         self.leaf_key = @splat(0);
+        self.init_identity(config);
         self.read.wipe();
         self.write.wipe();
         assert(self.read.dead);
         assert(self.write.dead);
+    }
+
+    fn init_identity(self: *Client, config: *const Config) void {
+        self.identity_count = 0;
+        self.identity_lengths = @splat(0);
+        self.signer = null;
+        self.require_auth = config.require_client_auth;
+        self.request_seen = false;
+        self.request_answerable = false;
+        self.request_context_length = 0;
+        self.auth_sent = false;
+        if (config.identity) |identity| {
+            assert(identity.certificates.len >= 1);
+            assert(identity.certificates.len <= constants.tls_chain_certificates_max);
+            for (identity.certificates, 0..) |certificate, index| {
+                assert(certificate.len > 0);
+                assert(certificate.len <= constants.x509_cert_bytes_max);
+                @memcpy(self.identity[index][0..certificate.len], certificate);
+                self.identity_lengths[index] = @intCast(certificate.len);
+            }
+            self.identity_count = @intCast(identity.certificates.len);
+            self.signer = identity.signer;
+        }
+        if (self.require_auth) assert(self.identity_count > 0);
     }
 
     /// Makes the ClientHello record; the caller sends `output()` and calls `drain`.
@@ -375,6 +461,14 @@ pub const Client = struct {
             self.state = .closed;
             return .closed;
         }
+        if (self.auth_sent and refuses_certificate(code) and !fault_on(.certificate_alert)) {
+            diag.raise(.E0814);
+            diag.cause("the server refused the client certificate with the alert {s} ({d})", .{
+                wire.alert_name(code), code,
+            });
+            self.add_fix(diag, .E0814);
+            return self.refuse(diag, null);
+        }
         diag.raise(.E0813);
         diag.cause("the server sent the fatal alert {s} ({d})", .{ wire.alert_name(code), code });
         self.add_fix(diag, .E0813);
@@ -453,15 +547,6 @@ pub const Client = struct {
 
     fn expect_kind(self: *Client, diag: *Diag, kind: u8, wanted: u8, name: []const u8) Error!void {
         if (kind == wanted) return;
-        if (kind == wire.handshake_certificate_request) {
-            return self.fail(
-                diag,
-                .E0813,
-                .unexpected_message,
-                "the server asked for a client certificate; client authentication is not built yet",
-                .{},
-            );
-        }
         return self.fail(
             diag,
             .E0813,
@@ -525,6 +610,12 @@ pub const Client = struct {
     }
 
     fn on_certificate(self: *Client, diag: *Diag, kind: u8, message: []const u8) Error!void {
+        if (kind == wire.handshake_certificate_request and !self.request_seen) {
+            return self.on_certificate_request(diag, message);
+        }
+        if (kind == wire.handshake_certificate and self.require_auth and !self.request_seen) {
+            if (!fault_on(.required_client_auth)) return self.fail_not_asked(diag);
+        }
         try self.expect_kind(diag, kind, wire.handshake_certificate, "Certificate");
         const chain = wire.parse_certificate(message[4..]) catch |err| switch (err) {
             error.ChainShape => return self.fail_chain(diag),
@@ -543,6 +634,42 @@ pub const Client = struct {
         self.leaf_key = parsed.public_key.of(chain.leaf)[0..32].*;
         self.transcript.add(message);
         self.state = .wait_certificate_verify;
+    }
+
+    /// CertificateRequest (RFC 8446 section 4.3.2): remembers the context for the echo and whether
+    /// the identity can answer. A server that asks for something the identity cannot give is
+    /// refused when authentication is required, and otherwise answered with an empty Certificate.
+    fn on_certificate_request(self: *Client, diag: *Diag, message: []const u8) Error!void {
+        const request = wire.parse_certificate_request(message[4..]) catch |err|
+            return self.wire_failure(diag, err, "CertificateRequest");
+        const answerable = request.accepts_ed25519 or fault_on(.request_scheme);
+        if (!answerable and self.require_auth) {
+            return self.fail(
+                diag,
+                .E0814,
+                .handshake_failure,
+                "the server's certificate request does not list Ed25519, the only scheme " ++
+                    "this client signs and presents",
+                .{},
+            );
+        }
+        self.transcript.add(message);
+        self.request_seen = true;
+        self.request_answerable = answerable and self.identity_count > 0;
+        assert(request.context.len <= constants.tls_request_context_bytes_max);
+        self.request_context_length = @intCast(request.context.len);
+        @memcpy(self.request_context[0..request.context.len], request.context);
+    }
+
+    fn fail_not_asked(self: *Client, diag: *Diag) Error {
+        return self.fail(
+            diag,
+            .E0814,
+            .handshake_failure,
+            "the server did not ask for a client certificate, and this connection must " ++
+                "present one",
+            .{},
+        );
     }
 
     fn fail_chain(self: *Client, diag: *Diag) Error {
@@ -593,15 +720,10 @@ pub const Client = struct {
             }
         }
         self.transcript.add(message);
+        // The application keys come from the transcript up to the server's Finished; the client's
+        // own messages follow it and are not part of that hash (RFC 8446 section 7.1).
         const finished_hash = self.transcript.hash();
-        var verify_data = schedule.finished_verify_data(&self.write.secret, &finished_hash);
-        defer std.crypto.secureZero(u8, &verify_data);
-        var finished: [4 + schedule.hash_bytes]u8 = undefined;
-        finished[0] = wire.handshake_finished;
-        std.mem.writeInt(u24, finished[1..4], schedule.hash_bytes, .big);
-        @memcpy(finished[4..], &verify_data);
-        defer std.crypto.secureZero(u8, &finished);
-        try self.send_final_flight(diag, &finished);
+        try self.send_final_flight(diag);
         var application = self.schedule.to_application(&finished_hash);
         defer std.crypto.secureZero(u8, &application.client);
         defer std.crypto.secureZero(u8, &application.server);
@@ -611,15 +733,92 @@ pub const Client = struct {
         return .connected;
     }
 
-    /// The compatibility change_cipher_spec, then the client Finished under the handshake keys.
-    fn send_final_flight(self: *Client, diag: *Diag, finished: []const u8) Error!void {
+    /// The compatibility change_cipher_spec, the client's Certificate and CertificateVerify when
+    /// the server asked, then the client Finished, all under the handshake keys.
+    fn send_final_flight(self: *Client, diag: *Diag) Error!void {
         assert(self.out_length == 0);
         const ccs = schedule.write_plain(&self.out, .change_cipher_spec, 0x0303, &.{1});
-        const used: u32 = @intCast(ccs.len);
-        const sealed = self.write.seal(self.out[used..], .handshake, finished) catch |err|
-            return self.record_failure(diag, err);
-        self.out_length = used + @as(u32, @intCast(sealed.len));
+        self.out_length = @intCast(ccs.len);
+        const server_view = self.transcript;
+        if (self.request_seen) try self.send_authentication(diag);
+        // Covers the client Certificate and CertificateVerify when they were sent.
+        const hash = if (fault_on(.finished_omits_auth))
+            server_view.hash()
+        else
+            self.transcript.hash();
+        var verify_data = schedule.finished_verify_data(&self.write.secret, &hash);
+        defer std.crypto.secureZero(u8, &verify_data);
+        var finished: [4 + schedule.hash_bytes]u8 = undefined;
+        finished[0] = wire.handshake_finished;
+        std.mem.writeInt(u24, finished[1..4], schedule.hash_bytes, .big);
+        @memcpy(finished[4..], &verify_data);
+        defer std.crypto.secureZero(u8, &finished);
+        try self.seal_handshake(diag, &finished);
         assert(self.out_length <= constants.tls_output_bytes_max);
+    }
+
+    fn seal_handshake(self: *Client, diag: *Diag, message: []const u8) Error!void {
+        const sealed = self.write.seal(self.out[self.out_length..], .handshake, message) catch |err|
+            return self.record_failure(diag, err);
+        self.out_length += @intCast(sealed.len);
+    }
+
+    /// RFC 8446 section 4.4.2 and 4.4.3: Certificate with the echoed context, and, when there is a
+    /// certificate to prove, CertificateVerify over the transcript through that Certificate.
+    fn send_authentication(self: *Client, diag: *Diag) Error!void {
+        assert(self.request_seen);
+        var buffer: [constants.tls_client_certificate_bytes_max]u8 = undefined;
+        const certificate = self.certificate_message(&buffer);
+        if (!fault_on(.transcript_client_auth)) self.transcript.add(certificate);
+        try self.seal_handshake(diag, certificate);
+        if (!self.request_answerable) return;
+        self.auth_sent = true;
+        const hash = self.transcript.hash();
+        const role: schedule.CertificateRole = if (fault_on(.verify_context)) .server else .client;
+        const content = schedule.certificate_verify_content(role, &hash);
+        const signer = self.signer.?;
+        const signature = signer.sign(signer.context, &content) orelse {
+            return self.fail(
+                diag,
+                .E0814,
+                .internal_error,
+                "the signer holding the client certificate's key did not sign",
+                .{},
+            );
+        };
+        var verify: [constants.tls_client_verify_bytes]u8 = undefined;
+        verify[0] = wire.handshake_certificate_verify;
+        std.mem.writeInt(u24, verify[1..4], 2 + 2 + 64, .big);
+        std.mem.writeInt(u16, verify[4..6], wire.scheme_ed25519, .big);
+        std.mem.writeInt(u16, verify[6..8], 64, .big);
+        @memcpy(verify[8..], &signature);
+        if (!fault_on(.transcript_client_auth)) self.transcript.add(&verify);
+        try self.seal_handshake(diag, &verify);
+    }
+
+    /// The Certificate message: the context echoed, and the identity's certificates, or none when
+    /// the identity cannot answer this request.
+    fn certificate_message(self: *const Client, buffer: []u8) []const u8 {
+        assert(buffer.len >= constants.tls_client_certificate_bytes_max);
+        const echo = if (fault_on(.echo_context)) 0 else self.request_context_length;
+        var length: u32 = 4;
+        buffer[length] = @intCast(echo);
+        @memcpy(buffer[length + 1 ..][0..echo], self.request_context[0..echo]);
+        length += 1 + echo;
+        const list_at = length;
+        length += 3;
+        const count = if (self.request_answerable) self.identity_count else 0;
+        for (0..count) |index| {
+            const size = self.identity_lengths[index];
+            std.mem.writeInt(u24, buffer[length..][0..3], @intCast(size), .big);
+            @memcpy(buffer[length + 3 ..][0..size], self.identity[index][0..size]);
+            std.mem.writeInt(u16, buffer[length + 3 + size ..][0..2], 0, .big); // No extensions.
+            length += 3 + size + 2;
+        }
+        std.mem.writeInt(u24, buffer[list_at..][0..3], @intCast(length - list_at - 3), .big);
+        buffer[0] = wire.handshake_certificate;
+        std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+        return buffer[0..length];
     }
 
     fn on_post_handshake(self: *Client, diag: *Diag, kind: u8, body: []const u8) Error!void {
@@ -742,6 +941,12 @@ pub const Client = struct {
                     "and that it offers TLS 1.3 with an Ed25519 certificate from the pinned CA.",
                 .{self.name[0..self.name_length]},
             ) catch unreachable, // The buffer holds the longest name and the sentence.
+            .E0814 => std.fmt.bufPrint(
+                &buffer,
+                "Check that the server at {s} requires client certificates from the cluster " ++
+                    "CA, and that this workload's certificate is current and was issued by it.",
+                .{self.name[0..self.name_length]},
+            ) catch unreachable, // The buffer holds the longest name and the sentence.
             else => fix_sentence(code),
         };
         diag.fix(.{ .sentence = sentence });
@@ -806,6 +1011,23 @@ fn ed25519_verifies(key: *const [32]u8, content: []const u8, signature: *const [
     const parsed = Ed25519.Signature.fromBytes(signature.*);
     parsed.verify(content, public_key) catch return false;
     return true;
+}
+
+/// The alerts a server sends about the certificate it was shown (RFC 8446 section 6.2).
+fn refuses_certificate(code: u8) bool {
+    const alert = std.enums.fromInt(wire.Alert, code) orelse return false;
+    return switch (alert) {
+        .bad_certificate,
+        .unsupported_certificate,
+        .certificate_revoked,
+        .certificate_expired,
+        .certificate_unknown,
+        .unknown_ca,
+        .access_denied,
+        .certificate_required,
+        => true,
+        else => false,
+    };
 }
 
 fn certificate_alert(err: x509.Error) wire.Alert {

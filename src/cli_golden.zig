@@ -482,7 +482,7 @@ fn x509_wrong_use(diag: *diag_mod.Diag) void { // x509.zig
 
 /// A client that has sent its ClientHello, for the TLS cases below; the hello is copied to `hello`.
 fn tls_started(client: *tls_client.Client, hello: []u8) []u8 {
-    client.init(&.{
+    return tls_started_with(client, hello, &.{
         .anchor = @splat(1),
         .server_name = "broker.botpike.com",
         .now_ms = 1_700_000_000_000,
@@ -490,6 +490,14 @@ fn tls_started(client: *tls_client.Client, hello: []u8) []u8 {
         .session_id = @splat(3),
         .secret = @splat(4),
     });
+}
+
+fn tls_started_with(
+    client: *tls_client.Client,
+    hello: []u8,
+    config: *const tls_client.Config,
+) []u8 {
+    client.init(config);
     client.start();
     const sent = client.output();
     @memcpy(hello[0..sent.len], sent);
@@ -544,6 +552,33 @@ fn tls_retry_request(diag: *diag_mod.Diag) void { // tls_client.zig
         .faults = .{ .hello_retry = true },
     });
     var flight: [512]u8 = undefined;
+    tls_refused(&client, peer.respond(sent, &flight), diag);
+}
+
+fn tls_not_asked(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    const key = Ed25519.KeyPair.generateDeterministic(@splat(5)) catch unreachable; // A seed works.
+    const sent = tls_started_with(&client, &hello, &.{
+        .anchor = @splat(1),
+        .server_name = "broker.botpike.com",
+        .now_ms = 1_700_000_000_000,
+        .random = @splat(2),
+        .session_id = @splat(3),
+        .secret = @splat(4),
+        .identity = .{
+            .certificates = &.{"workload certificate"},
+            .signer = tls_client.key_pair_signer(&key),
+        },
+        .require_client_auth = true,
+    });
+    var peer = testpeer.Peer.init(.{
+        .certificates = &.{"server certificate"},
+        .key = key,
+        .random = @splat(0),
+        .secret = @splat(6),
+    });
+    var flight: [1024]u8 = undefined;
     tls_refused(&client, peer.respond(sent, &flight), diag);
 }
 
@@ -722,6 +757,7 @@ const cases = [_]Case{
     relayed(.E0811, x509_expired),
     relayed(.E0812, x509_wrong_server),
     relayed(.E0813, tls_alert),
+    relayed(.E0814, tls_not_asked),
     relayed(.E0815, tls_overlong_record),
     relayed(.E0816, tls_cut_off),
     relayed(.E0817, x509_not_issued),
