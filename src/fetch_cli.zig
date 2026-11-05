@@ -488,8 +488,11 @@ const Page = struct {
 /// not one.
 fn parse_page(arena: std.mem.Allocator, text: []const u8) ?Page {
     if (text.len > discover_page_bytes_max) return null;
+    // Every string is copied into `arena`: `text` is a reused buffer, and a key or value that
+    // pointed into it would change under its reader at the next request (O5's fetcher names did).
     return std.json.parseFromSliceLeaky(Page, arena, text, .{
         .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
     }) catch null;
 }
 
@@ -1800,6 +1803,36 @@ test "the nodes fetching a tree are those assigned a replica of it, each once" {
     ).?;
     const ids = [_][]const u8{ "app-1", "app-2", "app-3" };
     const nodes = assigned_nodes(arena, assigned, &ids);
+    try std.testing.expectEqual(@as(usize, 2), nodes.len);
+    try std.testing.expectEqualStrings("node1", nodes[0]);
+    try std.testing.expectEqualStrings("node3", nodes[1]);
+}
+
+test "the fetching nodes stay as read when the same buffer serves the next request" {
+    // Goal: the demo-c2 run 41965968058 bug: the names pointed into the reply buffer, so the next
+    // `/node-store/` read changed them and no node ranked lowest. Method: read the fetchers, then
+    // a node-store page through the same buffer; the names and the ids they came from hold.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pages = [_][]const u8{
+        \\{"kvs":[{"key":"/replicas/app/app-1","value":{"id":"app-1","image":"b3:aa"}},
+        \\{"key":"/replicas/app/app-2","value":{"id":"app-2","image":"b3:aa"}}]}
+        ,
+        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{}},
+        \\{"key":"/assigned/node3/app-2","value":{}}]}
+        ,
+        \\{"kvs":[{"key":"/node-store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","value":{
+        \\"peer":"10.0.0.9:7700","trees":[]}}]}
+        ,
+    };
+    var calls: u32 = 0;
+    var last_path: [160]u8 = undefined;
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last_path };
+    const scratch = try arena.alloc(u8, 4096);
+    @memset(scratch, 'x');
+    const nodes = fetching_nodes(arena, getter, scratch, "b3:aa");
+    _ = collect_pages(arena, getter, scratch).?;
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("node1", nodes[0]);
     try std.testing.expectEqualStrings("node3", nodes[1]);

@@ -35,3 +35,11 @@ run.
 Where: `src/fetch_plan.zig` ("Who pulls from the registry first (O5)"), `src/fetch_cli.zig`
 (`begin`, `fetching_nodes`, `peer_holds`), `src/constants.zig` (`fetch_peer_poll_ms`),
 `src/sim_swarm.zig` (`check_start`), docs/agent.md, docs/swarm.md.
+
+**Update, same day (CI run 41965968058).** In CI, no node was designated: all three logged
+"no peer came to hold the tree in 30001 ms; 3 node(s) fetch it". The cause was `parse_page`. It
+used `std.json`'s default `.alloc_if_needed`, so the keys and string values it returned were slices
+of the reply buffer. `begin` reads `/node-store/` into that same buffer, so each poll overwrote
+the fetcher names, and every node then ranked itself against garbage. Since then `parse_page`
+copies every string (`.alloc_always`). The test "the fetching nodes stay as read when the same
+buffer serves the next request" fails without the copy.
