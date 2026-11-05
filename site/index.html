@@ -164,9 +164,9 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
 <script>// ===== Site data: update the milestone entries as work lands. =====
 const SITE = {
-  updated: "2026-10-27",
+  updated: "2026-11-05",
   sisterUrl: "../zigbox/", // Zigbox site
-  stage: "Pre-alpha · C0 shipped",
+  stage: "Pre-alpha · C2 shipped",
 };
 // status: "done" | "wip" | "plan"
 // When a milestone ships: status "done", slices {green, total, note}, recorded {url, date} linking the
@@ -180,9 +180,10 @@ const MILESTONES = [
    slices:{green:10, total:10, note:"slices reviewed and merged"},
    recorded:{url:"https://github.com/Zigbox/zigcube/actions/runs/41605325965", date:"2026-11-03"},
    demo:[["$","kill -9 the agent of node3 and its 2 supervisors' groups   # demo/kill-node.sh"],["","  ok: node3 read lost 8709 ms after the power-off (the lease timeout is 8000 ms: expected 4084..10250 ms, the controllers' pass included)"],["","  ok: 6 replicas run again 9760 ms after the power-off (bound: lease timeout 8000 + lost grace 1000 + 5000 ms)"],["$","zcube get replicas hello -o wide"],["","REPLICA  SERVICE  NODE   STATUS   AGE  GEN  CPU   MEMORY  IMAGE        DETAIL"],["","hello-1  hello    node1  running  9s   1    250m  128Mi   b3:51aa9c03"],["","hello-2  hello    node2  running  9s   1    250m  128Mi   b3:51aa9c03"],["","hello-4  hello    node1  running  9s   1    250m  128Mi   b3:51aa9c03"],["","hello-5  hello    node2  running  9s   1    250m  128Mi   b3:51aa9c03"],["","hello-7  hello    node1  running  0s   1    250m  128Mi   b3:51aa9c03"],["","hello-8  hello    node2  running  0s   1    250m  128Mi   b3:51aa9c03"],["$","zcube why node node3"],["","node node3: not registered, last judged lost (tenure 3)"],["","  ← node node3 is lost: its lease 3 (ttl 8000 ms) ran out; the server last heard from it 8107 ms ago"],["","  ok: no overlap: in 257 polls, no old command and replacement ran together"],["","demo-c1 PASSED"]]},
-  {id:"C2", name:"Swarm", status:"wip", goal:"Images reach nodes fast: peers share chunks, the scheduler prefers warm nodes.",
-   slices:{green:7, total:9, note:"slices 1-7 (the real Zigbox runtime, source, Runtime.signal, swarm core, locality scheduling, peer handshake, chunk server and fetch worker, pull stats) merged; not demonstrated"},
-   demo:[["$","zcube stats pull python-app:v2"],["","vm1  registry   0 B    peers  212 KB"],["","vm2  registry   0 B    peers  212 KB"],["","vm3  registry   0 B    peers  212 KB   (registry blocked)"]]},
+  {id:"C2", name:"Swarm", status:"done", goal:"Images reach nodes fast: peers share chunks, the scheduler prefers warm nodes.",
+   slices:{green:9, total:9, note:"slices reviewed and merged"},
+   recorded:{url:"https://github.com/Zigbox/zigcube/actions/runs/41978728250/job/127083637195", date:"2026-11-05"},
+   demo:[["$","zcube apply --yes python-app.zon"],["","  waited 69810 ms for 3 replicas of v1 running"],["","  node2: registry 43273982 B, peers 0 B, cached 0 B, struck 0"],["","  ok: v1 came from the registry on one node only; the other two fetched it from peers"],["","  node1: registry 0 B, peers 516 B, cached 115407369 B, struck 0"],["","  ok: node1 transferred 516 B for v2 (at most 1048576)"],["","  node3: registry 0 B, peers 7783900 B, cached 3144 B, struck 1"],["","  ok: node3 took every byte from peers, none from a registry"],["","alpine-box-3: warning[ZC-W0601]: a peer sent a chunk that does not match its hash"],["","  ok: python-warm's replica is on node1, a node that holds v2, not on the empty node4"],["","  ok: node4 fetched v2 from peers alone"],["$","zcube stats pull"],["","NODE   TREE                REGISTRY  PEERS  CACHED  TOOK   BAD PEERS"],["","node4  b3:7a91b50803ab...  0B        110Mi  0B      39.4s  -"],["","node3  b3:2e478596e56b...  0B        7Mi    3Ki     1.7s   node1"],["","node1  b3:2e478596e56b...  3Mi       0B     0B      2.0s   -"],["","node2  b3:7a91b50803ab...  6Ki       0B     41Mi    2.4s   -"],["","  ok: every rule of the demo held (0 missed)"]]},
   {id:"C3", name:"Rollout", status:"plan", goal:"Image changes roll out gradually, gated by health, and undo themselves on failure.",
    demo:[["$","zcube apply hello-v3-broken.zon"],["","rolling 1/6 … health check /ready failed (503)"],["","rolled back to b3:51aa…9c03   0 requests failed"]]},
   {id:"C4", name:"Mesh", status:"plan", goal:"Services find each other by name and talk only along declared grants.",
