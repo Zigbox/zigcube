@@ -851,6 +851,36 @@ test "a damaged summary entry is ignored, not an error" {
     try fixture.expect_on("web-1", "a");
 }
 
+test "a summary whose sample outweighs its tree scores 0, and the scheduler does not panic" {
+    // Goal: MUST 1 of the C2 release review. A record whose tree is one chunk of 1 byte, sampled
+    // as one chunk of 4096 bytes, became the target sketch; scoring node a (no summary) against
+    // it summed 4096 sampled bytes over a 1-byte tree and failed an assertion, so the server
+    // crash-looped. Method: put that record on c and place a replica; it lands by the order
+    // without locality (a, the lower name) and the decision credits no bytes.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a", 4000, 8 * gib, true);
+    try fixture.node("c", 4000, 8 * gib, true);
+    const lying: records.NodeStore = .{
+        .node = "c",
+        .trees = &.{.{
+            .tree = image,
+            .bytes = 1,
+            .chunks = 1,
+            .sample = "010000000000000000100000", // Key 1, 4096 bytes.
+        }},
+    };
+    try fixture.put(.{ .agent = "c" }, records.node_store_key("c").slice(), lying);
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try fixture.expect_on("web-1", "a");
+    const placed = try fixture.decisions("place_replica");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expectEqual(@as(u64, 0), placed[0].locality_bytes.?);
+}
+
 test "a summary that is newer or malformed is skipped, and placement goes on" {
     // Goal: one node's bad advisory record must not stop every placement (finding 1 of the slice 5
     // review). Method: a holds a record of version 2, b a truncated one, c a good one that holds

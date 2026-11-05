@@ -101,6 +101,7 @@ pub fn list_digest(list: []const u8, out: *[67]u8) []const u8 {
 
 /// Whether `digest` names `list`: it is `list_digest` or a prefix of it at least 8 hex digits long
 /// (the short digests of images and fixtures). A peer or registry that sends a list is held to it.
+/// A short digest is never asked of a peer (`fetch_worker`): 32 bits are searchable.
 pub fn list_matches(digest: []const u8, list: []const u8) bool {
     var full: [67]u8 = undefined;
     const want = list_digest(list, &full);
@@ -204,7 +205,10 @@ pub fn held_of(arena: Allocator, held: Held) Error!records.HeldTree {
 }
 
 /// The sketch a record's tree entry describes, or null if the entry is malformed: a sample that
-/// is not hex, not ascending, or not what its chunk count allows.
+/// is not hex, not ascending, not what its chunk count allows, or whose bytes do not fit the
+/// entry's `bytes`. The record is another node's word, so nothing in it is trusted: the
+/// scheduler's estimate relies on what this checks (O1: a bad summary costs speed, never
+/// correctness).
 pub fn sketch_of(tree: records.HeldTree) ?Sketch {
     const entry_digits = constants.summary_sketch_entry_bytes * 2;
     if (tree.sample.len % entry_digits != 0) return null;
@@ -215,6 +219,7 @@ pub fn sketch_of(tree: records.HeldTree) ?Sketch {
     sketch.total_bytes = tree.bytes;
     sketch.count = @intCast(count);
     var previous: ?u64 = null;
+    var sampled_bytes: u64 = 0;
     for (0..count) |index| {
         var raw: [12]u8 = undefined;
         const digits = tree.sample[index * entry_digits ..][0..entry_digits];
@@ -226,11 +231,27 @@ pub fn sketch_of(tree: records.HeldTree) ?Sketch {
             if (key <= before) return null;
         }
         previous = key;
+        sampled_bytes += bytes;
         sketch.entries[index] = .{ .key = key, .bytes = bytes };
     }
     // A sample is either every chunk or a full K.
     if (count != tree.chunks and count != constants.summary_sketch_keys) return null;
+    if (!bytes_fit(&tree, count, sampled_bytes)) return null;
+    assert(sketch.count <= sketch.chunks);
+    assert(sampled_bytes <= sketch.total_bytes);
     return sketch;
+}
+
+/// Whether a tree entry's `bytes` agrees with its sample, as `Sketch.add` builds one: a sample of
+/// every chunk sums to the tree's bytes; a partial sample leaves at least one byte for each chunk
+/// outside it; and no tree is larger than its chunks at their largest.
+fn bytes_fit(tree: *const records.HeldTree, count: u64, sampled_bytes: u64) bool {
+    assert(count <= tree.chunks);
+    if (tree.bytes > @as(u64, tree.chunks) * constants.swarm_chunk_bytes) return false;
+    if (count == tree.chunks) return sampled_bytes == tree.bytes;
+    const unsampled: u64 = tree.chunks - count;
+    if (sampled_bytes > tree.bytes) return false;
+    return unsampled <= tree.bytes - sampled_bytes;
 }
 
 /// The record for a summary.
@@ -356,6 +377,34 @@ test "a fake summary becomes a record and decodes back to the same sketch" {
     bad = record.trees[0];
     bad.chunks += 1;
     try std.testing.expect(sketch_of(bad) == null);
+    // The bytes must agree with the sample: an exact sample sums to them.
+    bad = record.trees[0];
+    bad.bytes += 1;
+    try std.testing.expect(sketch_of(bad) == null);
+    bad.bytes -= 2;
+    try std.testing.expect(sketch_of(bad) == null);
+}
+
+test "a tree entry whose sample outweighs its bytes is refused" {
+    // Goal: the release review's lying record (one chunk of 1 byte, sampled as 4096 bytes) does
+    // not decode, nor does a partial sample with no byte left for its unsampled chunks, nor a
+    // tree larger than its chunks can hold. Method: hand-written hex samples.
+    const one_4096 = "0100000000000000" ++ "00100000"; // Key 1, 4096 bytes, little-endian.
+    var tree: records.HeldTree = .{
+        .tree = "b3:51aa9c03",
+        .bytes = 1,
+        .chunks = 1,
+        .sample = one_4096,
+    };
+    try std.testing.expect(sketch_of(tree) == null);
+    tree.bytes = 4096;
+    try std.testing.expectEqual(@as(u64, 4096), sketch_of(tree).?.total_bytes);
+    tree.chunks = 2; // Count 1 is neither every chunk nor a full K.
+    try std.testing.expect(sketch_of(tree) == null);
+    tree = .{ .tree = "b3:51aa9c03", .bytes = 0, .chunks = 0, .sample = "" };
+    try std.testing.expectEqual(@as(u32, 0), sketch_of(tree).?.chunks);
+    tree.bytes = 1; // No chunks, yet a byte.
+    try std.testing.expect(sketch_of(tree) == null);
 }
 
 test "a held tree scores its whole size against itself" {
@@ -369,7 +418,7 @@ test "a held tree scores its whole size against itself" {
 
 test "a chunk list is held to its digest, and parses only whole" {
     // Goal: a list from a peer or a registry is accepted only if it is what the digest names.
-    // Method: build a list, check the full digest and a short prefix, flip one digit of the list,
+    // Method: build a list, check the full digest and that a prefix is refused, flip one digit,
     // then malformed lines.
     var list_bytes: [200]u8 = undefined;
     const hash_a: [32]u8 = @splat(0xab);

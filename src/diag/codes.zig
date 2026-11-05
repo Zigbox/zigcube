@@ -86,6 +86,7 @@ pub const Code = enum(u8) {
     E0512,
     E0513,
     E0514,
+    E0515,
     W0501,
     E0601,
     W0601,
@@ -1070,6 +1071,25 @@ pub const registry = [_]Entry{
         \\
         \\The cause line says which. Shorten it in the service file and apply the
         \\file again; the replica is held, not retried.
+        ,
+    },
+    .{
+        .code = .E0515,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a swarm fetch outlived its kill, so the image was not pulled",
+        .explanation =
+        \\A replica's image was being fetched from peers into this node's Zigbox
+        \\store, the fetch passed its deadline (or ended badly), and the supervisor
+        \\killed the fetch's whole process group with SIGKILL. A process of that
+        \\group was still alive afterwards. It may still be writing the store, and
+        \\Zigbox's store takes one writer at a time, so the supervisor did not
+        \\start the registry pull: the replica was not started.
+        \\
+        \\A process that outlives SIGKILL is in uninterruptible sleep, waiting on
+        \\the kernel: usually a disk or a network mount that stopped answering.
+        \\Find it (ps -eo pid,stat,wchan:32,args, state D) and the device it waits
+        \\on. The replica is started again on a later pass once it is gone.
         ,
     },
     .{
