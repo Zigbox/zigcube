@@ -80,6 +80,35 @@ brief's lower bound and what the sweeps above ran with), so the fleet will repor
 about 0.35 % of `auto` seeds; raising the floor to 8,000 ms is one line in `sim_shape.zig` and the
 owner's call (it would hide the failure from the fleet, not fix it).
 
+## The other two 2,000-seed sweeps, the teeth, and the cap re-measure
+
+Same setup for all three (seeds 1..2000, `auto --profile=auto` / `--swarm-profile=auto`,
+ReleaseSafe, one seed per process under a 150 s cap, four in parallel).
+
+| sweep | pass | fail | cut at 150 s | mean per seed |
+|---|---|---|---|---|
+| `sim_cluster` | 1,951 | 7 | 42 (2.1 %) | 11.7 s |
+| `sim_cluster --c1` | 1,934 | 21 | 45 (2.25 %) | 13.8 s |
+| `sim_swarm` | 2,000 | 0 | 0 | 0.025 s |
+
+**`--c1`: 21 failures, none in the shape or profile code.** Six are the busy-loop check of #78
+(all `crash_heavy`). Fifteen are invariant I3, "cites an observation of a node that is not ready"
+(12), "not registered" (2), "from another tenure" (1). With `--lease-ttl-ms=10000` forced and the
+rest of the shape kept, 20 of the 21 pass (seed 1750 is only slow: inconclusive). So they depend
+on a short ttl, like #78. They reach well above 4,500 ms: seed 166 (`slow_store`, 14 nodes) fails
+at 8,203 ms and seed 276 at 9,069 ms, so raising the floor to 8,000 ms would not hide them.
+Replays: `sim_cluster 105 333 15 --c1 --lease-ttl-ms=5250 --replicas-pct=300 --heal-at=277`;
+seed 166 is `--seeds 166..166 auto --profile=auto --c1` (it prints the line). A core issue, to be
+filed next to #78; not fixed here.
+
+**Teeth**: `sim-teeth`, `sim-c1-teeth` (193 s), `-allocation`, `-readiness`, `-skew`, `-wedge`,
+`-stale`, `-locality` and `sim-swarm-teeth` all pass (each fails the seed it must).
+
+**Cap re-measure.** The shipped caps (operations 800, `cost_max` 5,000, one long run in ten) cut
+2.1-2.25 % of seeds at 150 s and cost 12-14 s a seed on average, i.e. about 7 hours of one core
+for 2,000 seeds, inside the fleet's range deadline when spread over the cores. The cut runs are
+the slow corner named above (`partitions`, many nodes, long). No constant changed.
+
 ## Fleet follow-ups (not done: `ops/sim-fleet/`, `src/sim_fleet*` are PR #71's)
 
 - `parse_summary` now reads the `auto` summary (`drawn operations`; done). A failure also prints
