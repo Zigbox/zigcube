@@ -661,6 +661,43 @@ comptime {
     assert(tls_key_updates_per_connection_max > 0);
 }
 
+// ---- TLS 1.3 client handshake (docs/briefs/mtls-client.md, slice 4) ---------------------------
+
+/// One handshake message (type, three length bytes, body): the server flight is a chain of at
+/// most `tls_chain_certificates_max` certificates of `x509_cert_bytes_max` each.
+pub const tls_handshake_message_bytes_max: u32 = 4096;
+/// The server's handshake messages together, EncryptedExtensions to Finished. This is also the
+/// size of the client's reassembly buffer.
+pub const tls_handshake_flight_bytes_max: u32 = 8192;
+/// A server `Certificate` carries the leaf and, optionally, the CA certificate; no more.
+pub const tls_chain_certificates_max: u32 = 2;
+/// Plaintext `change_cipher_spec` records dropped per connection (RFC 8446 appendix D.4). A
+/// server sends one, right after its ServerHello; a second is a fault.
+pub const tls_change_cipher_spec_records_max: u32 = 1;
+/// The longest name the client sends in `server_name` and checks the certificate against.
+pub const tls_server_name_bytes_max: u32 = x509_dns_name_bytes_max;
+/// The ClientHello record: fixed layout, so its size is a constant plus the server name.
+pub const tls_client_hello_bytes_max: u32 =
+    5 + 4 + 2 + 32 + (1 + 32) + (2 + 2) + (1 + 1) + tls_hello_extensions_bytes_max;
+/// Bytes the client has ready to send after one step: the ClientHello, or a compatibility
+/// change_cipher_spec and a Finished, or an alert, or a KeyUpdate. The caller drains it after
+/// every step.
+pub const tls_output_bytes_max: u32 = 512;
+/// Extensions of the ClientHello: server_name, supported_groups, signature_algorithms (twice),
+/// supported_versions and key_share, each with its four-byte header.
+const tls_hello_extensions_bytes_max: u32 = 2 + (4 + 5 + tls_server_name_bytes_max) +
+    (4 + 4) + (4 + 4) + (4 + 4) + (4 + 3) + (4 + 2 + 4 + 32);
+
+comptime {
+    assert(tls_handshake_message_bytes_max >= tls_chain_certificates_max * x509_cert_bytes_max);
+    assert(tls_handshake_flight_bytes_max >= 2 * tls_handshake_message_bytes_max);
+    assert(tls_handshake_flight_bytes_max < tls_record_plaintext_bytes_max);
+    assert(tls_change_cipher_spec_records_max == 1);
+    assert(tls_server_name_bytes_max <= 255);
+    assert(tls_output_bytes_max >= tls_client_hello_bytes_max);
+    assert(tls_output_bytes_max >= 6 + 5 + 4 + 32 + 1 + 16);
+}
+
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
     assert(peer_handshakes_pending_per_source_max > 1);

@@ -114,7 +114,11 @@ pub const Code = enum(u8) {
     E0810,
     E0811,
     E0812,
+    E0813,
+    E0815,
+    E0816,
     E0817,
+    E0818,
     E0819,
     B0001,
     B0002,
@@ -1557,6 +1561,54 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0813,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a TLS handshake was refused",
+        .explanation =
+        \\The peer's handshake message was malformed, came in the wrong order, held
+        \\a signature or Finished that does not verify, or the peer sent a fatal
+        \\alert. Nothing was accepted: the connection is closed and no application
+        \\data was sent. The cause names the message and the rule, or the alert the
+        \\peer sent.
+        \\
+        \\A signature or Finished that does not verify means the peer does not hold
+        \\the key of the certificate it showed, or the two sides saw different
+        \\handshakes. Check that the peer is a zcube server and that nothing between
+        \\the two rewrites the connection.
+        ,
+    },
+    .{
+        .code = .E0815,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a TLS record failed its checks",
+        .explanation =
+        \\A record was too long, too short, did not authenticate, or the connection
+        \\reached the end of what its keys may protect. The connection is closed and
+        \\the keys are wiped.
+        \\
+        \\On a healthy network this does not happen: it means bytes were changed in
+        \\transit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24
+        \\records without updating its keys. Reconnect; if it repeats, check the path
+        \\between the two machines.
+        ,
+    },
+    .{
+        .code = .E0816,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a TLS connection ended without close_notify",
+        .explanation =
+        \\The peer's side of the connection ended before it sent close_notify, so the
+        \\data received may be cut short. Mid-handshake this means the peer hung up
+        \\before the handshake finished.
+        \\
+        \\Treat what arrived as incomplete and retry the request. A peer that
+        \\crashes, or a network that resets the connection, ends this way.
+        ,
+    },
+    .{
         .code = .E0817,
         .severity = .@"error",
         .blame = .user,
@@ -1574,6 +1626,21 @@ pub const registry = [_]Entry{
         \\
         \\The cause names the rule. Correct the request and issue again; nothing was
         \\written.
+        ,
+    },
+    .{
+        .code = .E0818,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a TLS peer needs something zcube does not offer",
+        .explanation =
+        \\zcube speaks TLS 1.3 only, with x25519, TLS_AES_128_GCM_SHA256 and Ed25519
+        \\signatures, and offers no resumption and no retry. The peer answered with
+        \\an older protocol version, another suite, group or signature scheme, or a
+        \\HelloRetryRequest. The cause names which.
+        \\
+        \\Peers of a zcube cluster are zcube servers. If this is not one, connect to
+        \\the right address; there is no setting that widens what zcube offers.
         ,
     },
     .{

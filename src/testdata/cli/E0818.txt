@@ -1,0 +1,6 @@
+error[ZC-E0818]: a TLS peer needs something zcube does not offer
+  cause  the server answered with a HelloRetryRequest; zcube offers one key
+         share and no retry
+  fix    Check that the server at broker.botpike.com is the one this connection is configured for, and that it offers TLS 1.3 with an Ed25519 certificate from the pinned CA.
+  more   zcube explain E0818 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0818.html
