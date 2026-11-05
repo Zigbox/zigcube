@@ -474,6 +474,8 @@ pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
 /// With no peer holding a chunk, the plan waits this long from its start for a filter to show it
 /// (another node may be fetching it, c2.md O5), then goes to the registry.
 pub const fetch_peer_wait_ms: u32 = 30_000;
+/// A fetch waiting for another node's registry pull (O5) re-reads `/node-store` this often.
+pub const fetch_peer_poll_ms: u32 = 1000;
 /// A request not answered by then is a timeout.
 pub const fetch_request_timeout_ms: u32 = 10_000;
 /// Requests in flight in all, and to one peer.
@@ -705,6 +707,7 @@ comptime {
     assert(fetch_candidates_max <= 255); // A peer's index is a u8.
     assert(fetch_list_peers_max <= fetch_peers_max);
     assert(fetch_total_ms > fetch_peer_wait_ms);
+    assert(fetch_peer_poll_ms < fetch_peer_wait_ms);
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }

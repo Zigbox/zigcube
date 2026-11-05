@@ -902,13 +902,24 @@ fn fetch_from(
         infos[found] = .{ .name = named.name, .filter = &filter };
         found += 1;
     }
+    var poll = std.heap.ArenaAllocator.init(gpa);
+    defer poll.deinit();
+    var start: fetch_plan.Start = .peers;
     if (parsed.server) |server| {
-        const arena = arena_state.allocator();
         const room: Slots = .{ all[found..], infos[found..] };
-        found += discover(arena, net, server, parsed.node, room, &skipped);
+        const arenas: Arenas = .{ &arena_state, &poll };
+        const got = discover(arenas, net, server, parsed, room, &skipped);
+        found += got.count;
+        start = got.start;
     }
     var line: [320]u8 = undefined;
     note(io, describe_skipped(&line, skipped));
+    if (start == .registry_first and target == .zigbox) {
+        // Not a failure: the supervisor's own pull is this node's registry fetch (O5).
+        note(io, "zcube-agent fetch: no peer holds the tree yet and this node pulls it from " ++
+            "the registry first (O5); the others fetch it from here\n");
+        return constants.exit_external;
+    }
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};
     const started_ms = real_ms(io);
@@ -1123,36 +1134,64 @@ pub fn refusal_text(refusal: zigbox.store.image_peer.Refusal) []const u8 {
 /// What `select_candidates` fills: the peers and, beside them, their filters.
 const Slots = struct { []Peer, []fetch_worker.PeerInfo };
 
+/// A `/v1/list` the fetch reads: its prefix, the keys a page asks for, the pages read at most.
+const Listing = struct { prefix: []const u8, limit: u32, pages_max: u32 };
+
+const node_store_listing: Listing = .{
+    .prefix = "/node-store/",
+    .limit = discover_page_nodes,
+    .pages_max = discover_pages_max,
+};
+/// The assignments and replicas, read once per fetch to know which nodes fetch the tree (O5).
+/// Their records are well under a kilobyte, so a page of this many fits `discover_page_bytes_max`.
+const assigned_listing: Listing = .{ .prefix = "/assigned/", .limit = 128, .pages_max = 8 };
+const replicas_listing: Listing = .{ .prefix = "/replicas/", .limit = 128, .pages_max = 8 };
+
 /// Reads the server's `/node-store/` list, a page at a time (`discover_page_nodes` each, at most
 /// `discover_pages_max`); what was read when a later page fails is kept, and null if none was.
 /// `getter.get(path, out)` is the body of a 200 for `path`, copied into `out`, or null.
 fn collect_pages(arena: std.mem.Allocator, getter: anytype, out: []u8) ?[]const Kv {
+    return collect_list(arena, getter, out, node_store_listing);
+}
+
+/// `collect_pages` for any listing.
+fn collect_list(
+    arena: std.mem.Allocator,
+    getter: anytype,
+    out: []u8,
+    listing: Listing,
+) ?[]const Kv {
     var all: std.ArrayList(Kv) = .empty;
     var first_revision: u64 = 0;
     var after: ?[]const u8 = null;
-    for (0..discover_pages_max) |at| {
-        var target: [160]u8 = undefined;
-        const form = "/v1/list?prefix=/node-store/&limit={d}";
+    for (0..listing.pages_max) |at| {
+        var target: [400]u8 = undefined;
+        const form = "/v1/list?prefix={s}&limit={d}";
         const path = if (after) |key|
             std.fmt.bufPrint(&target, form ++ "&at={d}&continue={s}", .{
-                discover_page_nodes, first_revision, key,
+                listing.prefix, listing.limit, first_revision, key,
             })
         else
-            std.fmt.bufPrint(&target, form, .{discover_page_nodes});
+            std.fmt.bufPrint(&target, form, .{ listing.prefix, listing.limit });
         const body = getter.get(path catch break, out) orelse break;
         const page = parse_page(arena, body) orelse break;
         all.appendSlice(arena, page.kvs) catch break;
         if (at == 0) first_revision = page.revision;
         after = page.@"continue" orelse return all.items;
         // The key goes into a request line: a server's reply must not shape it.
-        if (!continue_key_valid(after.?)) break;
+        if (!continue_key_valid_in(listing.prefix, after.?)) break;
     }
     return if (all.items.len == 0) null else all.items;
 }
 
 /// A `continue` key is accepted only as a `/node-store/` key made of `[a-z0-9./-]`.
 fn continue_key_valid(key: []const u8) bool {
-    if (!std.mem.startsWith(u8, key, "/node-store/")) return false;
+    return continue_key_valid_in("/node-store/", key);
+}
+
+/// A `continue` key is accepted only under `prefix` and made of `[a-z0-9./-]`.
+fn continue_key_valid_in(prefix: []const u8, key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, prefix)) return false;
     for (key) |byte| {
         const ok = switch (byte) {
             'a'...'z', '0'...'9', '.', '/', '-' => true,
@@ -1176,24 +1215,180 @@ const HttpGetter = struct {
     }
 };
 
-/// Asks the server for the nodes' summaries and picks the candidates among them.
+const Arenas = struct { *std.heap.ArenaAllocator, *std.heap.ArenaAllocator };
+
+/// Asks the server which nodes fetch the tree and for the nodes' summaries (waiting as O5 says,
+/// `begin`), and picks the candidates among them. A digest no peer is asked for waits for none.
 fn discover(
-    arena: std.mem.Allocator,
+    arenas: Arenas,
     net: *Net,
     server: IpAddress,
-    self: []const u8,
+    parsed: *const Args,
     slots: Slots,
     skipped: *Skipped,
-) u32 {
-    const scratch = arena.alloc(u8, discover_page_bytes_max) catch return 0;
-    const getter: HttpGetter = .{ .net = net, .server = server };
-    const stores = collect_pages(arena, getter, scratch) orelse {
+) struct { count: u32, start: fetch_plan.Start } {
+    const arena = arenas[0].allocator();
+    // A digest no peer is asked for (not the full one, fetch_worker.zig) waits for none.
+    const begun: Begun = if (parsed.digest.len == 3 + 64)
+        begin(arena, arenas[1], net, server, parsed)
+    else
+        read_once(arena, net, server);
+    say_begun(net.io, begun);
+    const stores = begun.stores orelse {
         note(net.io, "zcube-agent fetch: the server's node list could not be read; peers: " ++
             "only those named\n");
-        return 0;
+        return .{ .count = 0, .start = begun.start };
     };
     const room = @min(slots[0].len, slots[1].len);
-    return select_candidates(arena, stores, self, slots[0][0..room], slots[1][0..room], skipped);
+    const self = parsed.node;
+    const peers = slots[0][0..room];
+    const count = select_candidates(arena, stores, self, peers, slots[1][0..room], skipped);
+    return .{ .count = count, .start = begun.start };
+}
+
+/// One line in the fetch's log on how O5's wait ended, when there was one to have.
+fn say_begun(io: std.Io, begun: Begun) void {
+    var buffer: [200]u8 = undefined;
+    const text = switch (begun.start) {
+        .peers, .wait => if (begun.waited_ms == 0) return else std.fmt.bufPrint(
+            &buffer,
+            "zcube-agent fetch: a peer came to hold the tree after {d} ms (O5)\n",
+            .{begun.waited_ms},
+        ),
+        .registry_first => return,
+        .waited => std.fmt.bufPrint(&buffer, "zcube-agent fetch: no peer came to hold the " ++
+            "tree in {d} ms; {d} node(s) fetch it (O5)\n", .{ begun.waited_ms, begun.fetchers }),
+    } catch return;
+    note(io, text);
+}
+
+/// The `/node-store/` list read once, with no wait.
+fn read_once(arena: std.mem.Allocator, net: *Net, server: IpAddress) Begun {
+    const getter: HttpGetter = .{ .net = net, .server = server };
+    const none: Begun = .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
+    const scratch = arena.alloc(u8, discover_page_bytes_max) catch return none;
+    var once = none;
+    once.stores = collect_pages(arena, getter, scratch);
+    return once;
+}
+
+/// What `begin` found: the `/node-store/` list read last (null if it could not be read) and
+/// how the wait of O5 ended.
+const Begun = struct {
+    stores: ?[]const Kv,
+    start: fetch_plan.Start,
+    fetchers: u32,
+    waited_ms: u64,
+};
+
+/// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, reads which nodes fetch
+/// the tree and, unless a peer holds it or this node ranks lowest among them, re-reads
+/// `/node-store/` every `fetch_peer_poll_ms` for up to `fetch_peer_wait_ms` until a peer holds
+/// it. `arena` holds the fetchers; `poll` is reset before each read and holds the last.
+fn begin(
+    arena: std.mem.Allocator,
+    poll: *std.heap.ArenaAllocator,
+    net: *Net,
+    server: IpAddress,
+    parsed: *const Args,
+) Begun {
+    const getter: HttpGetter = .{ .net = net, .server = server };
+    const scratch = arena.alloc(u8, discover_page_bytes_max) catch
+        return .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
+    const fetchers = fetching_nodes(arena, getter, scratch, parsed.digest);
+    const started = peer_stream.boot_ms(net.io);
+    while (true) {
+        _ = poll.reset(.retain_capacity);
+        const stores = collect_pages(poll.allocator(), getter, scratch);
+        const self = parsed.node;
+        const tree = parsed.digest;
+        const holds = if (stores) |listed| peer_holds(listed, self, tree) else false;
+        const now = peer_stream.boot_ms(net.io);
+        const wait_ms = constants.fetch_peer_wait_ms;
+        const decided = fetch_plan.start(self, tree, fetchers, holds, started, now, wait_ms);
+        switch (decided) {
+            .wait => |until| {
+                const ms: u32 = @intCast(@max(until -| now, 1));
+                net.io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: read again.
+            },
+            else => return .{
+                .stores = stores,
+                .start = decided,
+                .fetchers = @intCast(fetchers.len),
+                .waited_ms = now - started,
+            },
+        }
+    }
+}
+
+/// The nodes with an assignment of a replica whose image is `digest` (`/assigned/<node>/<id>`
+/// joined to `/replicas/<service>/<id>`), each once. Empty if either list cannot be read: the
+/// fetch then ranks itself alone and does not wait, as before O5.
+fn fetching_nodes(
+    arena: std.mem.Allocator,
+    getter: anytype,
+    scratch: []u8,
+    digest: []const u8,
+) []const []const u8 {
+    const replicas = collect_list(arena, getter, scratch, replicas_listing) orelse return &.{};
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (replicas) |kv| {
+        const image = string_field(kv.value, "image") orelse continue;
+        if (!std.mem.eql(u8, image, digest)) continue;
+        const id = string_field(kv.value, "id") orelse continue;
+        ids.append(arena, id) catch return &.{};
+    }
+    if (ids.items.len == 0) return &.{};
+    const assigned = collect_list(arena, getter, scratch, assigned_listing) orelse return &.{};
+    return assigned_nodes(arena, assigned, ids.items);
+}
+
+/// The nodes of `/assigned/<node>/<id>` keys whose `id` is in `ids`, each once.
+fn assigned_nodes(
+    arena: std.mem.Allocator,
+    assigned: []const Kv,
+    ids: []const []const u8,
+) []const []const u8 {
+    var nodes: std.ArrayList([]const u8) = .empty;
+    for (assigned) |kv| {
+        const rest = strip_prefix(kv.key, "/assigned/") orelse continue;
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+        const node = rest[0..slash];
+        const id = rest[slash + 1 ..];
+        if (!contains(ids, id) or contains(nodes.items, node)) continue;
+        nodes.append(arena, node) catch return nodes.items;
+    }
+    return nodes.items;
+}
+
+fn strip_prefix(text: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    return text[prefix.len..];
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |each| {
+        if (std.mem.eql(u8, each, name)) return true;
+    }
+    return false;
+}
+
+/// Whether a node other than `self` that a fetch can reach (a usable `peer` address) lists
+/// `digest` among the whole trees of its `/node-store/` record.
+fn peer_holds(stores: []const Kv, self: []const u8, digest: []const u8) bool {
+    for (stores) |kv| {
+        const name = strip_prefix(kv.key, "/node-store/") orelse continue;
+        if (std.mem.eql(u8, name, self)) continue;
+        _ = usable_address(string_field(kv.value, "peer") orelse "") orelse continue;
+        if (kv.value != .object) continue;
+        const trees = kv.value.object.get("trees") orelse continue;
+        if (trees != .array) continue;
+        for (trees.array.items) |tree| {
+            const text = string_field(tree, "tree") orelse continue;
+            if (std.mem.eql(u8, text, digest)) return true;
+        }
+    }
+    return false;
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
@@ -1590,4 +1785,43 @@ test "without a registry the sources a failed fetch names are the peers alone" {
         "no peer, and no registry is given",
         tried_sources(&buffer, &.{}, false),
     );
+}
+
+test "the nodes fetching a tree are those assigned a replica of it, each once" {
+    // Goal: O5's set of fetchers from `/assigned/` and `/replicas/`. Method: two replicas of the
+    // tree on node1 and one on node3, one of another image on node2.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const assigned = parse_kvs(arena,
+        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{"replica":"app-1"}},
+        \\{"key":"/assigned/node1/app-2","value":{}},{"key":"/assigned/node2/web-1","value":{}},
+        \\{"key":"/assigned/node3/app-3","value":{}},{"key":"/assigned/bad","value":{}}]}
+    ).?;
+    const ids = [_][]const u8{ "app-1", "app-2", "app-3" };
+    const nodes = assigned_nodes(arena, assigned, &ids);
+    try std.testing.expectEqual(@as(usize, 2), nodes.len);
+    try std.testing.expectEqualStrings("node1", nodes[0]);
+    try std.testing.expectEqualStrings("node3", nodes[1]);
+}
+
+test "a peer holds a tree when its summary lists it and it can be reached" {
+    // Goal: the condition that ends O5's wait. Method: node2 lists the tree but has no address,
+    // node1 is this node, node3 lists another tree; then node3 lists it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const before = parse_kvs(arena,
+        \\{"kvs":[{"key":"/node-store/node1","value":{"peer":"10.0.0.1:7700",
+        \\"trees":[{"tree":"b3:aa"}]}},{"key":"/node-store/node2","value":{"peer":"",
+        \\"trees":[{"tree":"b3:aa"}]}},{"key":"/node-store/node3","value":{
+        \\"peer":"10.0.0.3:7700","trees":[{"tree":"b3:bb"}]}}]}
+    ).?;
+    try std.testing.expect(!peer_holds(before, "node1", "b3:aa"));
+    try std.testing.expect(peer_holds(before, "node1", "b3:bb"));
+    const after = parse_kvs(arena,
+        \\{"kvs":[{"key":"/node-store/node3","value":{"peer":"10.0.0.3:7700",
+        \\"trees":[{"tree":"b3:bb"},{"tree":"b3:aa"}]}}]}
+    ).?;
+    try std.testing.expect(peer_holds(after, "node1", "b3:aa"));
 }

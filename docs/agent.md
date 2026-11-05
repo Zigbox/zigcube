@@ -193,7 +193,8 @@ without a strike against the peer.
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
 registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
 whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
-setup. A peer is only ever asked when the digest is
+setup. In Zigbox mode the node O5 designates to pull from the registry first also exits 3, with a
+note in `fetch.log` and no ZC-E0601, so the supervisor's pull runs at once (below). A peer is only ever asked when the digest is
 the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
 - `--server HOST:PORT` gives the peers without naming them. The fetch reads
@@ -202,6 +203,18 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   how many on one line of stderr, and ranks the rest by the chunks their filters claim.
 - `--peer NAME=HOST:PORT` adds a peer with a full filter: it is assumed to hold every chunk, and
   the plan strikes it if it lies.
+- **Who pulls from the registry first (O5, docs/briefs/c2.md).** With `--server` and a full digest,
+  the fetch first reads which nodes fetch the tree: the nodes of `/assigned/<node>/<id>` whose
+  replica (`/replicas/<service>/<id>`) has that image. If a peer's `/node-store/` record lists the
+  tree whole (`trees`) and has a `peer` address, it goes on as above. Else the node with the
+  lowest `fetch_plan.registry_rank(node, tree)` (BLAKE3 of the two; ties to the lower name) goes
+  to the registry at once, and every other node re-reads `/node-store/` every
+  `fetch_peer_poll_ms` (1 s) for up to `fetch_peer_wait_ms` (30 s) until a peer lists the tree,
+  then fetches from peers; after the wait it goes on as it would have without O5. The decision is
+  `fetch_plan.start` (core); `fetch.log` says how the wait ended. A node that cannot read the
+  lists counts itself the only fetcher and does not wait. The wait is on whole trees, not
+  filters, because a Zigbox peer serves a tree only as a bundle of the whole tree
+  (decisions/2026-11-05-o5-registry-first.md).
 
 **Not built yet (6b part 3 cut):** the fake registry, `swarm-smoke` and its teeth fault.
 
