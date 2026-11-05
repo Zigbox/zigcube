@@ -1,0 +1,5 @@
+error[ZC-E0132]: there are too many jobs
+  cause  512 jobs have not ended; the cluster accepts at most 512
+  fix    wait for jobs to end, or cancel some, then submit again
+  more   zcube explain E0132 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0132.html

@@ -100,6 +100,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0122.html">ZC-E0122</a></td><td>zcube local can't find or start the server or agent</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0123.html">ZC-E0123</a></td><td>the local server or agent did not come up</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0124.html">ZC-E0124</a></td><td>another zcube local command is running</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0130.html">ZC-E0130</a></td><td>a job is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0131.html">ZC-E0131</a></td><td>a different job already has that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0132.html">ZC-E0132</a></td><td>there are too many jobs</td><td>user</td></tr>
+<tr><td class="code"><a href="E0133.html">ZC-E0133</a></td><td>no job by that name</td><td>user</td></tr>
+<tr><td class="code"><a href="E0134.html">ZC-E0134</a></td><td>the time to submit this job has passed</td><td>user</td></tr>
 <tr><td class="code"><a href="E0201.html">ZC-E0201</a></td><td>can't reach the store backend</td><td>external</td></tr>
 <tr><td class="code"><a href="E0202.html">ZC-E0202</a></td><td>the store backend failed an operation</td><td>external</td></tr>
 <tr><td class="code"><a href="E0203.html">ZC-E0203</a></td><td>that revision was compacted away</td><td>user</td></tr>
@@ -119,6 +124,9 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0301.html">ZC-E0301</a></td><td>a stored record can't be read</td><td>external</td></tr>
 <tr><td class="code"><a href="E0302.html">ZC-E0302</a></td><td>there is more to reconcile than one pass holds</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0303.html">ZC-E0303</a></td><td>a stored record is from a newer release</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0307.html">ZC-E0307</a></td><td>a job's stored records contradict each other</td><td>external</td></tr>
+<tr><td class="code"><a href="W0307.html">ZC-W0307</a></td><td>a report for an ended job was dropped</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0308.html">ZC-W0308</a></td><td>a job waits: no node can take it now</td><td>user</td></tr>
 <tr><td class="code"><a href="E0401.html">ZC-E0401</a></td><td>a repair needs confirming</td><td>user</td></tr>
 <tr><td class="code"><a href="E0402.html">ZC-E0402</a></td><td>the node has no open allocation finding</td><td>user</td></tr>
 <tr><td class="code"><a href="E0403.html">ZC-E0403</a></td><td>the node's accounting changed during the repair</td><td>user</td></tr>
@@ -138,7 +146,10 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0513.html">ZC-E0513</a></td><td>this host can't run Zigbox containers</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0514.html">ZC-E0514</a></td><td>the service does not fit Zigbox's limits</td><td>user</td></tr>
 <tr><td class="code"><a href="E0515.html">ZC-E0515</a></td><td>a swarm fetch outlived its kill, so the image was not pulled</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0521.html">ZC-E0521</a></td><td>the agent could not tell how a run ended</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0522.html">ZC-E0522</a></td><td>a run's start record is missing or damaged</td><td>environment</td></tr>
 <tr><td class="code"><a href="W0501.html">ZC-W0501</a></td><td>the agent fenced itself and registered again</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0503.html">ZC-W0503</a></td><td>a job reached its deadline and was stopped</td><td>user</td></tr>
 <tr><td class="code"><a href="E0601.html">ZC-E0601</a></td><td>a tree could not be fetched from any peer or the registry</td><td>external</td></tr>
 <tr><td class="code"><a href="W0601.html">ZC-W0601</a></td><td>a peer sent a chunk that does not match its hash</td><td>external</td></tr>
 <tr><td class="code"><a href="W0602.html">ZC-W0602</a></td><td>a peer's chunk list does not match its digest</td><td>external</td></tr>
@@ -163,6 +174,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="B0001.html">ZC-B0001</a></td><td>zcube hit an internal error</td><td>internal</td></tr>
 <tr><td class="code"><a href="B0002.html">ZC-B0002</a></td><td>zcube failed in a way it should not</td><td>internal</td></tr>
 <tr><td class="code"><a href="B0003.html">ZC-B0003</a></td><td>allocation accounting disagrees with assignments</td><td>internal</td></tr>
+<tr><td class="code"><a href="B0004.html">ZC-B0004</a></td><td>zcube could not map how a job ended</td><td>internal</td></tr>
+<tr><td class="code"><a href="B0005.html">ZC-B0005</a></td><td>a job's run record is larger than a run may be</td><td>internal</td></tr>
 </table>
 </main>
 <footer><div class="wrap">

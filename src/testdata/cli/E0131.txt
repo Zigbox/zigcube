@@ -1,0 +1,5 @@
+error[ZC-E0131]: a different job already has that name
+  cause  a job named train-7 exists and differs from this one in: command
+  fix    use another name, or submit exactly the job that exists
+  more   zcube explain E0131 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0131.html

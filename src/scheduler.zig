@@ -685,12 +685,12 @@ pub const Scheduler = struct {
         };
         try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null, evidence);
         const key = try assign_key(ctx, name, replica.rec.id);
-        const value: records.Assigned = .{
-            .replica = replica.rec.id,
-            .service = replica.rec.service,
-            .requests = need,
-            .reason = reason,
-        };
+        const value = records.assigned_replica(
+            replica.rec.id,
+            replica.rec.service,
+            need,
+            reason,
+        );
         batch.put(key, try records.encode(ctx.arena, value, ctx.diag));
         const after = add(view.allocated, need);
         try put_allocation(ctx, &batch, name, after, view.count + 1, view.node.kv.mod_revision);
@@ -856,12 +856,12 @@ pub const Scheduler = struct {
         batch.delete(from.key);
         const name = target.node.rec.name;
         const key = try assign_key(ctx, name, spec.replica);
-        const value: records.Assigned = .{
-            .replica = spec.replica,
-            .service = replica.rec.service,
-            .requests = need,
-            .reason = spec.reason,
-        };
+        const value = records.assigned_replica(
+            spec.replica,
+            replica.rec.service,
+            need,
+            spec.reason,
+        );
         batch.put(key, try records.encode(ctx.arena, value, ctx.diag));
         const target_after = add(target.allocated, need);
         try put_moved_allocations(ctx, &batch, source, source_after, target, target_after);

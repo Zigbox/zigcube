@@ -161,12 +161,12 @@ fn assignment_put(arena: std.mem.Allocator, node: u32, number: u32, diag: *Diag)
     var replica_buffer: [32]u8 = undefined;
     const replica = try std.fmt.bufPrint(&replica_buffer, "bench-{d}", .{number});
     const key = records.assigned_key(node_name, replica);
-    const record: records.Assigned = .{
-        .replica = try arena.dupe(u8, replica),
-        .service = "bench",
-        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
-        .reason = "benchmark",
-    };
+    const record = records.assigned_replica(
+        try arena.dupe(u8, replica),
+        "bench",
+        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        "benchmark",
+    );
     const value = records.encode(arena, record, diag) catch return error.EncodeFailed;
     return .{ .put = .{ .key = try arena.dupe(u8, key.slice()), .value = value } };
 }
