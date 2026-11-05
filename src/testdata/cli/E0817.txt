@@ -1,0 +1,5 @@
+error[ZC-E0817]: an identity could not be issued
+  cause  no identity for broker-1: there are more labels than the limit
+  fix    correct the name, labels or lifetime, then issue again
+  more   zcube explain E0817 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0817.html

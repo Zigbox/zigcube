@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
     add_local_smoke_step(b, built);
+    add_x509_format_step(b, zigbox_module);
     add_bench_watch_step(b, shared_options);
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
@@ -361,6 +362,25 @@ fn add_local_smoke_step(b: *std.Build, built: Built) void {
     run.has_side_effects = true;
     const help = "Run zcube local up and down against real processes (not demo-c0)";
     b.step("local-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build x509-format`: the certificates `src/x509.zig` writes, read by openssl, keytool and
+/// the JDK (src/x509_format_check.zig, tools/mtls/X509Dump.java). Never cached, not in `check`.
+fn add_x509_format_step(b: *std.Build, zigbox_module: *std.Build.Module) void {
+    const exe = b.addExecutable(.{
+        .name = "x509_format_check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/x509_format_check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "zigbox", .module = zigbox_module }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addFileArg(b.path("tools/mtls/X509Dump.java"));
+    run.has_side_effects = true;
+    const help = "Check the certificates against openssl, keytool and the JDK (test tooling)";
+    b.step("x509-format", help).dependOn(&run.step);
 }
 
 /// `zig build bench-watch`: the watch fan-out row of docs/c1.md (src/bench_watch.zig), a real

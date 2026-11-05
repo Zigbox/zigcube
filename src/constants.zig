@@ -540,6 +540,60 @@ pub const peer_reply_ms: u32 = 5 * 1000;
 /// Requests one connection serves before the client opens another.
 pub const peer_connection_requests_max: u32 = 64;
 
+// ---- X.509 certificates for the mTLS client (docs/briefs/mtls-client.md, slice 1) -------------
+
+/// A certificate in DER, whatever its kind. A CA certificate is about 250 bytes; the largest leaf
+/// the writer makes (longest names, `x509_labels_bytes_max` of labels) is checked against this in
+/// `x509.zig`. One TLS record carries a whole server flight of at most two of them.
+pub const x509_cert_bytes_max: u32 = 1024;
+/// Labels in a workload certificate's identity extension.
+pub const x509_labels_max: u32 = 16;
+pub const x509_label_key_bytes_max: u32 = 63;
+pub const x509_label_value_bytes_max: u32 = 256;
+/// The sum of every label's key and value, so 16 labels cannot push a leaf past
+/// `x509_cert_bytes_max`; the brief's per-label limits alone would allow about 5 KiB.
+pub const x509_labels_bytes_max: u32 = 256;
+/// A leaf's life: the job's deadline bound. A verifier refuses a longer one (fails closed).
+pub const x509_leaf_ttl_ms_max: u64 = 7 * 24 * 60 * 60 * 1000;
+/// The CA certificate outlives `--new-ca` anyway.
+pub const x509_ca_ttl_ms_max: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
+/// A commonName (RFC 5280 `ub-common-name`): a job name, a DNS name or `zcube-ca-<16 hex>`.
+pub const x509_cn_bytes_max: u32 = 64;
+/// A serial number's content, RFC 5280 allows 20; the writer always makes 16.
+pub const x509_serial_bytes_max: u32 = 16;
+/// The foreign server profile (docs/mtls.md): RFC 5280's 20 content bytes of serial;
+pub const x509_foreign_serial_bytes_max: u32 = 20;
+/// sets and attributes in an issuer or subject Name together;
+pub const x509_foreign_name_parts_max: u32 = 16;
+/// extensions (each OID once, compared with every earlier one);
+pub const x509_foreign_extensions_max: u32 = 16;
+/// key purposes in extKeyUsage;
+pub const x509_foreign_key_purposes_max: u32 = 8;
+/// and the longest lifetime: the CA's bound, since another CA's leaf policy is its own.
+pub const x509_foreign_ttl_ms_max: u64 = x509_ca_ttl_ms_max;
+/// The cluster part of a SPIFFE ID: a sequence of DNS labels.
+pub const x509_cluster_bytes_max: u32 = 63;
+/// A server leaf's `dNSName`, exact match (no wildcard); it is also the subject CN.
+pub const x509_dns_name_bytes_max: u32 = x509_cn_bytes_max;
+/// `spiffe://<cluster>/service/<name>`.
+pub const x509_spiffe_bytes_max: u32 = 9 + x509_cluster_bytes_max + 9 + node_name_bytes_max;
+
+comptime {
+    assert(x509_labels_max * x509_label_key_bytes_max > x509_labels_bytes_max);
+    assert(x509_label_key_bytes_max + x509_label_value_bytes_max > x509_labels_bytes_max / 2);
+    assert(x509_labels_bytes_max < x509_cert_bytes_max / 2);
+    assert(x509_leaf_ttl_ms_max < x509_ca_ttl_ms_max);
+    assert(x509_leaf_ttl_ms_max % 1000 == 0);
+    assert(x509_ca_ttl_ms_max % 1000 == 0);
+    assert(x509_cn_bytes_max >= node_name_bytes_max);
+    assert(x509_cn_bytes_max >= 9 + 16);
+    assert(x509_serial_bytes_max == 16);
+    assert(x509_foreign_serial_bytes_max == 20);
+    assert(x509_foreign_extensions_max <= 64);
+    assert(x509_spiffe_bytes_max < 256);
+    assert(x509_cert_bytes_max < 65536);
+}
+
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
     assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
