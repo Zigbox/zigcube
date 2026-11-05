@@ -49,7 +49,8 @@ pub const Error = error{
     BadRecordMac,
     /// An unknown content type, or a record of nothing but padding: `unexpected_message`.
     UnexpectedMessage,
-    /// The direction used its records and the next one is not the `KeyUpdate`.
+    /// The sender used its records and the next one is not the `KeyUpdate`; or a receiver's
+    /// sequence number is about to wrap.
     KeyLimit,
     /// The peer updated its keys more often than `tls_key_updates_per_connection_max`.
     TooManyKeyUpdates,
@@ -175,7 +176,7 @@ pub const Schedule = struct {
     ) Error!HandshakeSecrets {
         assert(self.stage == .early);
         const zero: [32]u8 = @splat(0);
-        if (std.mem.eql(u8, ecdhe, &zero)) return error.ZeroSharedSecret;
+        if (std.crypto.timing_safe.eql([32]u8, ecdhe.*, zero)) return error.ZeroSharedSecret;
         const empty = empty_hash();
         var derived = derive_secret(&self.secret, "derived", &empty);
         defer std.crypto.secureZero(u8, &derived);
@@ -265,10 +266,14 @@ pub const Keys = struct { key: [key_bytes]u8, iv: [iv_bytes]u8 };
 
 /// [sender]_write_key and [sender]_write_iv of RFC 8446 section 7.3.
 pub fn traffic_keys(secret: *const Secret) Keys {
-    return .{
+    const keys: Keys = .{
         .key = expand_label(secret, "key", "", key_bytes),
         .iv = expand_label(secret, "iv", "", iv_bytes),
     };
+    // A key of nothing but zeros means the expansion did not run (a 2^-128 event otherwise).
+    assert(!std.mem.allEqual(u8, &keys.key, 0));
+    assert(!std.mem.allEqual(u8, &keys.iv, 0));
+    return keys;
 }
 
 /// application_traffic_secret_N+1 (RFC 8446 section 7.2).
@@ -313,6 +318,7 @@ pub const Header = struct {
             .protected => constants.tls_record_ciphertext_bytes_max,
         };
         if (length > length_max) return error.RecordOverflow;
+        assert(length <= constants.tls_record_ciphertext_bytes_max);
         return .{
             .content_type = content_type,
             .legacy_version = std.mem.readInt(u16, bytes[1..3], .big),
@@ -351,6 +357,9 @@ pub fn write_plain(
 }
 
 /// A record opened: its inner content type and the content, which lives in the record buffer.
+/// The last sequence number a receiver opens; one more would make the counter wrap.
+pub const receive_sequence_max: u64 = std.math.maxInt(u64) - 1;
+
 pub const Opened = struct { content_type: ContentType, content: []u8 };
 
 /// One direction of protected traffic: the traffic secret, the keys made from it, the record
@@ -359,7 +368,8 @@ pub const Direction = struct {
     secret: Secret,
     keys: Keys,
     /// The next record's sequence number. It restarts at zero with every key and never wraps:
-    /// `tls_records_per_key_max` is far below 2^64.
+    /// sealing stops at `tls_records_per_key_max`, and opening refuses the last value
+    /// (`receive_sequence_max`) so that the counter cannot overflow.
     sequence: u64,
     updates: u32,
     dead: bool,
@@ -381,8 +391,9 @@ pub const Direction = struct {
         self.dead = true;
     }
 
-    /// True once the keys have protected `tls_records_per_key_max` records: the next record sent
-    /// must be a KeyUpdate, and one received must be.
+    /// True once the keys have sealed `tls_records_per_key_max` records: the next record sent
+    /// must be a KeyUpdate. The limit binds the sender only (RFC 8446 section 5.5); a received
+    /// direction has none, because a peer updates at its own point or never.
     pub fn update_due(self: *const Direction) bool {
         return self.sequence >= constants.tls_records_per_key_max;
     }
@@ -392,10 +403,11 @@ pub const Direction = struct {
     pub fn rekey(self: *Direction) Error!void {
         if (self.dead) return error.Dead;
         if (self.updates >= constants.tls_key_updates_per_connection_max) {
-            self.dead = true;
+            self.wipe();
             return error.TooManyKeyUpdates;
         }
-        const next = next_traffic_secret(&self.secret);
+        var next = next_traffic_secret(&self.secret);
+        defer std.crypto.secureZero(u8, &next);
         self.wipe();
         self.secret = next;
         self.keys = traffic_keys(&self.secret);
@@ -419,6 +431,8 @@ pub const Direction = struct {
         const total = sealed_bytes(content.len);
         assert(out.len >= total);
         try self.check_limit(content_type, content);
+        assert(self.sequence < constants.tls_records_per_key_max +
+            constants.tls_records_per_key_slack);
 
         const inner_len = content.len + 1;
         const body_len: u16 = @intCast(inner_len + tag_bytes);
@@ -432,18 +446,27 @@ pub const Direction = struct {
         const tag = out[constants.tls_record_header_bytes + inner_len ..][0..tag_bytes];
         Aes128Gcm.encrypt(inner, tag, inner, header, self.nonce(), self.keys.key);
         self.sequence += 1;
+        assert(inner_len <= constants.tls_record_ciphertext_bytes_max - tag_bytes);
+        assert(out[0] == @backingInt(ContentType.application_data));
         return out[0..total];
     }
 
     /// Opens `record`, a whole record (header and body) as `Header.parse` framed it, in place:
     /// the content is left in the buffer and returned. A failure leaves the direction dead.
+    ///
+    /// The caller must drop, before calling, a plaintext change_cipher_spec record (type 0x14,
+    /// body one byte 0x01) received during the handshake: RFC 8446 appendix D.4 has servers
+    /// send one for middlebox compatibility (OpenSSL does, right after ServerHello). It is
+    /// neither protected nor counted, and `open` would take it for a fault and kill the
+    /// direction. Slice 4 does that dropping in its record reader.
     pub fn open(self: *Direction, record: []u8) Error!Opened {
         if (self.dead) return error.Dead;
         assert(record.len >= constants.tls_record_header_bytes);
         const opened = self.open_checked(record) catch |err| {
-            self.dead = true;
+            self.wipe();
             return err;
         };
+        assert(self.sequence < receive_sequence_max);
         self.sequence += 1;
         return opened;
     }
@@ -451,14 +474,17 @@ pub const Direction = struct {
     fn open_checked(self: *Direction, record: []u8) Error!Opened {
         const header = try Header.parse(record[0..constants.tls_record_header_bytes], .protected);
         assert(record.len == constants.tls_record_header_bytes + header.length);
-        const opened = try self.open_body(record, header);
-        try self.check_limit(opened.content_type, opened.content);
-        return opened;
+        // No per-key limit on received records: it binds the sender (RFC 8446 section 5.5). Only
+        // a counter that would wrap is refused.
+        if (self.sequence >= receive_sequence_max) return error.KeyLimit;
+        return self.open_body(record, header);
     }
 
     fn open_body(self: *Direction, record: []u8, header: Header) Error!Opened {
         if (header.content_type != .application_data) return error.UnexpectedMessage;
         if (header.length < 1 + tag_bytes) return error.DecodeError;
+        assert(header.length <= constants.tls_record_ciphertext_bytes_max);
+        assert(record.len == constants.tls_record_header_bytes + header.length);
         const inner_len = header.length - tag_bytes;
         const body = record[constants.tls_record_header_bytes..];
         const tag = body[inner_len..][0..tag_bytes].*;
@@ -479,12 +505,15 @@ pub const Direction = struct {
         const content_type = std.enums.fromInt(ContentType, body[end - 1]) orelse
             return error.UnexpectedMessage;
         const content_len = end - 1;
+        // RFC 8446 sections 5.1 and 5.4: handshake and alert records are never empty.
+        if (content_len == 0 and content_type != .application_data) return error.UnexpectedMessage;
         if (content_len > constants.tls_record_plaintext_bytes_max) return error.RecordOverflow;
+        assert(content_len < inner_len);
         return .{ .content_type = content_type, .content = body[0..content_len] };
     }
 
-    /// The record about to be sealed or just opened is number `sequence`. At and past the limit
-    /// the one record allowed is the KeyUpdate; nothing is allowed after that.
+    /// The record about to be sealed is number `sequence`. At and past the limit the one record
+    /// allowed is the KeyUpdate (type, length 00 00 01, request 0 or 1); nothing after that.
     fn check_limit(
         self: *const Direction,
         content_type: ContentType,
@@ -493,18 +522,23 @@ pub const Direction = struct {
         const limit = constants.tls_records_per_key_max;
         if (self.sequence < limit) return;
         if (self.sequence >= limit + constants.tls_records_per_key_slack) return error.KeyLimit;
+        comptime assert(key_update_bytes == 5);
         if (content_type != .handshake) return error.KeyLimit;
         if (content.len != key_update_bytes) return error.KeyLimit;
         if (content[0] != key_update_type) return error.KeyLimit;
+        if (!std.mem.eql(u8, content[1..4], &.{ 0, 0, 1 })) return error.KeyLimit;
+        if (content[4] > 1) return error.KeyLimit;
     }
 
     /// The per-record nonce: the IV with the sequence number, big-endian in its last eight
     /// bytes, XORed in (RFC 8446 section 5.3).
     pub fn nonce(self: *const Direction) [iv_bytes]u8 {
         var out = self.keys.iv;
+        const iv_head: [4]u8 = out[0..4].*;
         var sequence_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &sequence_bytes, self.sequence, .big);
         for (sequence_bytes, 0..) |byte, index| out[iv_bytes - 8 + index] ^= byte;
+        assert(std.mem.eql(u8, out[0..4], &iv_head)); // the first four IV bytes are never touched
         return out;
     }
 };

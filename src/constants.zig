@@ -638,11 +638,12 @@ pub const tls_record_plaintext_bytes_max: u32 = 16384;
 pub const tls_record_ciphertext_bytes_max: u32 = 16384 + 256;
 /// A record's header: type, legacy version, length.
 pub const tls_record_header_bytes: u32 = 5;
-/// Records one key protects before the client sends a `KeyUpdate`. The AES-GCM bound for
+/// Records the client seals under one key before it sends a `KeyUpdate`. The AES-GCM bound for
 /// TLS 1.3 (RFC 8446 section 5.5) is about 2^24.5 records per key at a forgery probability of
-/// 2^-57; the same figure applies to a received direction, which the peer must update.
+/// 2^-57. The limit binds the sender: it is not applied to received records, since a peer
+/// (OpenSSL, Go) may never send a KeyUpdate, or send one at a point of its own.
 pub const tls_records_per_key_max: u64 = 1 << 24;
-/// Records past `tls_records_per_key_max` a direction still accepts: exactly the `KeyUpdate` that
+/// Records past `tls_records_per_key_max` a direction still seals: exactly the `KeyUpdate` that
 /// replaces the key, and no data.
 pub const tls_records_per_key_slack: u64 = 1;
 /// Key updates one direction accepts in a connection; a peer that updates without end is refused.

@@ -486,8 +486,13 @@ test "padding is stripped; a record of nothing but padding, or of an unknown typ
     try expectEqualSlices(u8, "hi", opened.content);
 
     var empty = schedule.Direction.init(&vectors.client_application_secret);
-    const none = forge(&peer, &out, &.{22});
-    const opened_empty = try empty.open(none);
+    // RFC 8446 sections 5.1 and 5.4: empty handshake and alert content is refused; empty
+    // application data is allowed.
+    try expectError(error.UnexpectedMessage, empty.open(forge(&peer, &out, &.{22})));
+    var empty_alert = schedule.Direction.init(&vectors.client_application_secret);
+    try expectError(error.UnexpectedMessage, empty_alert.open(forge(&peer, &out, &.{21})));
+    var empty_data = schedule.Direction.init(&vectors.client_application_secret);
+    const opened_empty = try empty_data.open(forge(&peer, &out, &.{23}));
     try expectEqual(@as(usize, 0), opened_empty.content.len);
 
     var zeros = schedule.Direction.init(&vectors.client_application_secret);
@@ -528,10 +533,10 @@ test "content of 2^14 bytes seals; one more byte in the inner text is an overflo
 test "round trips of every length class, both ways, with the sequence in step" {
     // Goal: seal and open are inverses for contents of 0, 1, block-boundary and maximum sizes,
     // over 300 records, each of the three content types, and the sequences stay equal. Method: a
-    // fixed generator (this is a table, not a fuzzer; tls_fuzz.zig draws from seeds).
+    // generator seeded from the test runner (a failure reports the seed; tls_fuzz.zig draws more).
     var sealer = schedule.Direction.init(&vectors.server_application_secret);
     var opener = schedule.Direction.init(&vectors.server_application_secret);
-    var prng = std.Random.DefaultPrng.init(0x7154_5c4e);
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const sizes = [_]usize{
         0, 1, 15, 16, 17, 255, 256, 1000, constants.tls_record_plaintext_bytes_max,
     };
@@ -541,7 +546,8 @@ test "round trips of every length class, both ways, with the sequence in step" {
     for (0..300) |index| {
         const size = sizes[index % sizes.len];
         prng.random().bytes(content[0..size]);
-        const content_type = types[index % types.len];
+        // Empty handshake and alert content is refused (S1), so size 0 is application data.
+        const content_type = if (size == 0) .application_data else types[index % types.len];
         @memset(&out, fill);
         const record = try sealer.seal(&out, content_type, content[0..size]);
         try expectEqual(schedule.sealed_bytes(size), record.len);
@@ -599,9 +605,8 @@ test "KeyUpdate: both ends reach the same new keys, and the old ones stop workin
 
 test "the record limit allows exactly one KeyUpdate and nothing else" {
     // Goal: at tls_records_per_key_max the direction is due; the one record allowed is the
-    // KeyUpdate, sealed or opened, and the one after is refused. Method: set the sequence at the
-    // edge and walk across it for each of: data, a handshake message that is not a KeyUpdate and
-    // a KeyUpdate.
+    // KeyUpdate and the one after is refused (sealing only; the receive side has no limit, see the
+    // next test). Method: set the sequence at the edge and walk across it.
     const limit = constants.tls_records_per_key_max;
     var out: [64]u8 = undefined;
     var direction = schedule.Direction.init(&vectors.client_application_secret);
@@ -614,32 +619,77 @@ test "the record limit allows exactly one KeyUpdate and nothing else" {
     try expectError(error.KeyLimit, direction.seal(&out, .handshake, &.{ 24, 0, 0, 1 }));
     try expectEqual(limit, direction.sequence);
     const message = key_update_message();
-    const update = try direction.seal(&out, .handshake, &message);
+    _ = try direction.seal(&out, .handshake, &message);
     try expectEqual(limit + 1, direction.sequence);
     try expectError(error.KeyLimit, direction.seal(&out, .handshake, &message));
+}
 
-    // The receiver at the same edge accepts the KeyUpdate and then refuses anything else.
+test "the record limit binds the sender: a receiver opens data past 2^24 without an update" {
+    // Goal: RFC 8446 section 5.5 puts the limit on the sender, so a peer that never sends a
+    // KeyUpdate (OpenSSL, Go) or sends it at its own point is not refused. Method: a receiver at
+    // and well past the sender's limit opens data; only the last sequence number before a wrap is
+    // refused.
+    const limit = constants.tls_records_per_key_max;
+    var out: [64]u8 = undefined;
     var receiver = schedule.Direction.init(&vectors.client_application_secret);
-    receiver.sequence = limit;
-    var copy: [64]u8 = undefined;
-    @memcpy(copy[0..update.len], update);
-    var sender = schedule.Direction.init(&vectors.client_application_secret);
-    sender.sequence = limit;
-    const sealed_data = try sender.seal(&out, .handshake, &message);
-    @memcpy(copy[0..sealed_data.len], sealed_data);
-    _ = try receiver.open(copy[0..sealed_data.len]);
-    try receiver.rekey();
-    try expect(!receiver.update_due());
+    for ([_]u64{ limit, limit + 1, limit + 1000, 1 << 40 }) |sequence| {
+        receiver.sequence = sequence;
+        var peer = schedule.Direction.init(&vectors.client_application_secret);
+        peer.sequence = sequence;
+        const opened = try receiver.open(forge(&peer, &out, &.{ 'd', 23 }));
+        try expectEqualSlices(u8, "d", opened.content);
+        try expectEqual(sequence + 1, receiver.sequence);
+    }
+    var wrapping = schedule.Direction.init(&vectors.client_application_secret);
+    wrapping.sequence = schedule.receive_sequence_max;
+    var peer = schedule.Direction.init(&vectors.client_application_secret);
+    peer.sequence = schedule.receive_sequence_max;
+    try expectError(error.KeyLimit, wrapping.open(forge(&peer, &out, &.{ 'd', 23 })));
+    try expect(wrapping.dead);
+}
 
-    var data_receiver = schedule.Direction.init(&vectors.client_application_secret);
-    data_receiver.sequence = limit;
-    var data_sender = schedule.Direction.init(&vectors.client_application_secret);
-    data_sender.sequence = limit;
-    var data_out: [64]u8 = undefined;
-    // A sender that ignored the limit: forged, since seal() would refuse.
-    const forged = forge(&data_sender, &data_out, &.{ 'd', 23 });
-    try expectError(error.KeyLimit, data_receiver.open(forged));
-    try expect(data_receiver.dead);
+test "the sender's KeyUpdate at the limit must be well formed" {
+    // Goal: the one record sealed past the limit is a whole KeyUpdate: length 00 00 01 and a
+    // request byte of 0 or 1. Method: malformed variants at the edge.
+    var out: [64]u8 = undefined;
+    var direction = schedule.Direction.init(&vectors.client_application_secret);
+    direction.sequence = constants.tls_records_per_key_max;
+    try expectError(error.KeyLimit, direction.seal(&out, .handshake, &.{ 24, 0, 0, 2, 0 }));
+    try expectError(error.KeyLimit, direction.seal(&out, .handshake, &.{ 24, 0, 0, 1, 2 }));
+    _ = try direction.seal(&out, .handshake, &.{ 24, 0, 0, 1, 1 });
+}
+
+test "the nonce is the IV XOR the whole 64-bit sequence, and sequences never share one" {
+    // Goal: RFC 8446 section 5.3: the sequence, big-endian and left-padded to the IV length, is
+    // XORed into the IV. Reusing a nonce under one key breaks GCM, so a mutation that keeps only
+    // part of the sequence must fail. Method: compare against a hand-computed value, then seal at
+    // sequences that agree in their low byte and low 32 bits and open them at sequence 0.
+    var direction = schedule.Direction.init(&vectors.client_application_secret);
+    direction.keys.iv = .{ 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44 };
+    direction.sequence = 0x0102030405060708;
+    // Hand computed: bytes 4..12 are 0xbb 0xaa 0x99 0x88 0x77 0x66 0x55 0x44 XOR 01 .. 08.
+    const expected = [_]u8{
+        0xff, 0xee, 0xdd, 0xcc, 0xba, 0xa8, 0x9a, 0x8c, 0x72, 0x60, 0x52, 0x4c,
+    };
+    try expectEqualSlices(u8, &expected, &direction.nonce());
+
+    var out: [64]u8 = undefined;
+    for ([_]u64{ 256, 1 << 32, 1 << 56 }) |sequence| {
+        // Forged, since seal() refuses sequences past the per-key limit.
+        var sealer = schedule.Direction.init(&vectors.client_application_secret);
+        sealer.sequence = sequence;
+        var record: [64]u8 = undefined;
+        const sealed = forge(&sealer, &out, &.{ 'h', 'e', 'l', 'l', 'o', 23 });
+        @memcpy(record[0..sealed.len], sealed);
+        var opener = schedule.Direction.init(&vectors.client_application_secret);
+        // A failed open scrubs its buffer, so the wrong-sequence open gets a copy.
+        var scratch = record;
+        try expectError(error.BadRecordMac, opener.open(scratch[0..sealed.len]));
+        var right = schedule.Direction.init(&vectors.client_application_secret);
+        right.sequence = sequence;
+        const opened = try right.open(record[0..sealed.len]);
+        try expectEqualSlices(u8, "hello", opened.content);
+    }
 }
 
 test "key updates are counted and a peer that never stops is refused" {
