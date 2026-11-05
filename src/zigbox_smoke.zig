@@ -10,6 +10,10 @@
 //! `kill -9` of a container is replaced; an agent restart adopts both with no duplicates; a
 //! memory hog ends `oom`; a pull whose tree is not the locked one is refused (ZC-E0511); an
 //! unknown digest is held (ZBX-E0410); removing a service during its pull leaves the agent up.
+//! Then two agents on the one guest, each with a Zigbox store of its own (slice 8): B fetches
+//! an image from A as a peer (peer bytes, no registry bytes in its pull record), a second image
+//! that overlaps the first moves only the chunks B lacks, an image no peer has is pulled from the
+//! registry with a non-empty `fetch.log`, and a fetch past its deadline is killed.
 //! **What it does not check:** `pid_limit` (a service cannot set `pids`), `stop` with a grace. See
 //! docs/demos/c2.md. A pass is a check, never `demo-c2`.
 //!
@@ -65,6 +69,11 @@ const stages = [_]Stage{
     .{ .name = "oom", .timeout_s = 200 },
     .{ .name = "refusals", .timeout_s = 260 },
     .{ .name = "scale0", .timeout_s = 150 },
+    // Slice 8: a second agent with a Zigbox store of its own fetches from the first.
+    .{ .name = "peers_prep", .timeout_s = 560 },
+    .{ .name = "peers_up", .timeout_s = 120 },
+    .{ .name = "peers_fetch", .timeout_s = 560 },
+    .{ .name = "peers_fallback", .timeout_s = 560 },
 };
 
 pub fn main(init: std.process.Init) !u8 {

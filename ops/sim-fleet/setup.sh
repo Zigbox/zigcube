@@ -71,7 +71,7 @@ fi
 # A first build, so the Zig package cache is warm and a broken host shows now, not at 3 a.m.
 su -s /bin/sh simfleet -c "cd '$HOME_DIR/zigcube' && timeout 300 git fetch --quiet origin main && \
     git checkout --quiet --detach FETCH_HEAD && \
-    zig build -Doptimize=ReleaseSafe sim-cluster-exe sim-fleet-exe"
+    zig build -Doptimize=ReleaseSafe sim-cluster-exe sim-swarm-exe sim-fleet-exe"
 
 mkdir -p /etc/sim-fleet
 if [ ! -f /etc/sim-fleet/fleet.env ]; then

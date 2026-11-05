@@ -239,30 +239,102 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
         .stdin = .ignore,
         .stdout = sink,
         .stderr = sink,
-    }) catch return false;
-    return finished_ok(swarm.io, &child, constants.zigbox_fetch_deadline_ms);
+    }) catch |err| {
+        say_in_log(swarm.io, log, "could not start the fetch: ", @errorName(err));
+        return false;
+    };
+    const deadline_ms = fetch_deadline(swarm);
+    const outcome = finished_ok(swarm.io, &child, deadline_ms);
+    switch (outcome) {
+        .ok => {},
+        .failed => say_in_log(swarm.io, log, "the fetch did not exit with code 0", ""),
+        .killed => {
+            var ms: [16]u8 = undefined;
+            const text = std.fmt.bufPrint(&ms, "{d}", .{deadline_ms}) catch "?";
+            say_in_log(swarm.io, log, "the fetch was killed at its deadline, ms: ", text);
+        },
+    }
+    return outcome == .ok;
 }
 
-/// Waits for `child` to exit, at most `limit_ms`; a child still running then is killed. True only
-/// for an exit with code 0. Polls (`WNOHANG`), because nothing here waits with a deadline.
-fn finished_ok(io: std.Io, child: *std.process.Child, limit_ms: u32) bool {
+/// One line in `fetch.log`, in the supervisor's own voice: a fetch that dies without a word (or
+/// never starts) would otherwise leave the log empty and the pull's fall-back unexplained.
+fn say_in_log(io: std.Io, log: ?std.Io.File, what: []const u8, detail: []const u8) void {
+    const file = log orelse return;
+    var buffer: [160]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "supervisor: {s}{s}\n", .{ what, detail }) catch return;
+    file.writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
+
+/// The fetch's deadline: `constants.zigbox_fetch_deadline_ms`, unless the test fault
+/// `<state dir>/faults/fetch-deadline-ms` holds a shorter one (docs/agent.md). Without it a smoke
+/// would wait half an hour to see the kill.
+fn fetch_deadline(swarm: Swarm) u32 {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}/faults/fetch-deadline-ms", .{
+        swarm.fetch.state_dir,
+    }) catch return constants.zigbox_fetch_deadline_ms;
+    var text: [16]u8 = undefined;
+    const read = std.Io.Dir.cwd().readFile(swarm.io, path, &text) catch
+        return constants.zigbox_fetch_deadline_ms;
+    return deadline_from_fault(read);
+}
+
+/// The milliseconds a fault file holds (digits, then maybe a newline), 1 to the real deadline;
+/// anything else leaves the real deadline in force.
+fn deadline_from_fault(text: []const u8) u32 {
+    const trimmed = std.mem.trim(u8, text, " \n");
+    const value = std.fmt.parseInt(u32, trimmed, 10) catch
+        return constants.zigbox_fetch_deadline_ms;
+    if (value == 0) return constants.zigbox_fetch_deadline_ms;
+    return @min(value, constants.zigbox_fetch_deadline_ms);
+}
+
+/// How a fetch ended: an exit with code 0, any other end, or the deadline's kill.
+const Outcome = enum { ok, failed, killed };
+
+/// Waits for `child` to exit, at most `limit_ms`; a child still running then is killed (`.killed`).
+/// Only an exit with code 0 is `.ok`. Polls (`WNOHANG`), because nothing here waits with a
+/// deadline.
+fn finished_ok(io: std.Io, child: *std.process.Child, limit_ms: u32) Outcome {
     assert(limit_ms > 0);
     const pid = child.id.?;
     const started = awake_ms(io);
     while (true) {
         var status: i32 = 0;
         const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-        if (rc != 0) { // Reaped, or not ours any more: either way it is over.
-            const ours = rc == @as(usize, @intCast(pid));
-            return ours and std.os.linux.W.IFEXITED(@bitCast(status)) and
-                std.os.linux.W.EXITSTATUS(@bitCast(status)) == constants.exit_ok;
+        switch (wait_verdict(rc, pid, status)) {
+            .running => {},
+            .again => continue,
+            .exited_ok => return .ok,
+            .over => return .failed,
         }
         if (awake_ms(io) -| started >= limit_ms) {
             child.kill(io);
-            return false;
+            return .killed;
         }
         io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation only ends the wait early.
     }
+}
+
+const Verdict = enum { running, again, exited_ok, over };
+
+/// What a `waitpid(pid, WNOHANG)` result `rc` (with `status`) says: an error is checked first
+/// (an interrupted wait is tried again; any other, such as ECHILD, means the child is not ours
+/// to wait for and is over, not a success), then 0 (still running), then the child's own exit.
+fn wait_verdict(rc: usize, pid: std.posix.pid_t, status: i32) Verdict {
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        .INTR => return .again,
+        else => return .over,
+    }
+    if (rc == 0) return .running;
+    if (rc != @as(usize, @intCast(pid))) return .over;
+    const exited = std.os.linux.W.IFEXITED(@bitCast(status));
+    if (exited and std.os.linux.W.EXITSTATUS(@bitCast(status)) == constants.exit_ok) {
+        return .exited_ok;
+    }
+    return .over;
 }
 
 pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
@@ -270,6 +342,10 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     // Not `init.io`: that is a threaded Io. Zigbox's start and pull make namespaces, which
     // needs a process with one thread, and this Io never starts another.
     var threaded: std.Io.Threaded = .init_single_threaded;
+    // The static Io has a failing allocator, and spawning a process (the swarm fetch) copies
+    // argv and the environment: without one it ends in OutOfMemory.
+    threaded.allocator = init.gpa;
+    threaded.environ.process_environ = init.minimal.environ;
     const io = threaded.io();
     const dir = Dir.openDirAbsolute(io, dir_path, .{}) catch return constants.exit_environment;
     defer dir.close(io);
@@ -443,12 +519,21 @@ test "the fetch's diagnostics have a log in the container's directory" {
     try std.testing.expectEqualStrings("ZC-W0601", text);
 }
 
+test "the fault file can only shorten the fetch's deadline" {
+    const real = constants.zigbox_fetch_deadline_ms;
+    try std.testing.expectEqual(@as(u32, 50), deadline_from_fault("50\n"));
+    try std.testing.expectEqual(real, deadline_from_fault(""));
+    try std.testing.expectEqual(real, deadline_from_fault("0"));
+    try std.testing.expectEqual(real, deadline_from_fault("soon"));
+    try std.testing.expectEqual(real, deadline_from_fault("4000000000"));
+}
+
 test "a fetch that outlives its deadline is killed, and only an exit 0 counts" {
     const io = std.testing.io;
-    const cases = [_]struct { argv: []const []const u8, limit: u32, ok: bool }{
-        .{ .argv = &.{ "/bin/sh", "-c", "exit 0" }, .limit = 10_000, .ok = true },
-        .{ .argv = &.{ "/bin/sh", "-c", "exit 3" }, .limit = 10_000, .ok = false },
-        .{ .argv = &.{ "/bin/sh", "-c", "exec sleep 30" }, .limit = 200, .ok = false },
+    const cases = [_]struct { argv: []const []const u8, limit: u32, want: Outcome }{
+        .{ .argv = &.{ "/bin/sh", "-c", "exit 0" }, .limit = 10_000, .want = .ok },
+        .{ .argv = &.{ "/bin/sh", "-c", "exit 3" }, .limit = 10_000, .want = .failed },
+        .{ .argv = &.{ "/bin/sh", "-c", "exec sleep 30" }, .limit = 200, .want = .killed },
     };
     for (cases) |case| {
         var child = try std.process.spawn(io, .{
@@ -459,9 +544,24 @@ test "a fetch that outlives its deadline is killed, and only an exit 0 counts" {
         });
         const pid = child.id.?;
         const started = awake_ms(io);
-        try std.testing.expectEqual(case.ok, finished_ok(io, &child, case.limit));
+        try std.testing.expectEqual(case.want, finished_ok(io, &child, case.limit));
         try std.testing.expect(awake_ms(io) - started < 5000); // The sleep did not run its 30 s.
         // Gone: reaped by the wait or by the kill. A live child would answer signal 0.
         try std.testing.expect(std.os.linux.kill(pid, @fromBackingInt(@intCast(0))) != 0);
     }
+}
+
+test "a wait's error is read before its pid: interrupted again, any other over, never ok" {
+    const errno_rc = struct {
+        fn of(code: std.os.linux.E) usize {
+            return @bitCast(-@as(isize, @backingInt(code)));
+        }
+    }.of;
+    const pid: std.posix.pid_t = 4242;
+    try std.testing.expectEqual(Verdict.again, wait_verdict(errno_rc(.INTR), pid, 0));
+    try std.testing.expectEqual(Verdict.over, wait_verdict(errno_rc(.CHILD), pid, 0));
+    try std.testing.expectEqual(Verdict.running, wait_verdict(0, pid, 0));
+    try std.testing.expectEqual(Verdict.exited_ok, wait_verdict(4242, pid, 0));
+    try std.testing.expectEqual(Verdict.over, wait_verdict(4242, pid, 3 << 8));
+    try std.testing.expectEqual(Verdict.over, wait_verdict(4243, pid, 0));
 }

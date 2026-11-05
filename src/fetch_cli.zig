@@ -71,8 +71,12 @@ pub const Net = struct {
     bad_lists: u32 = 0,
     /// The registry sent a reply larger than `reply_bytes`: refused, and said in ZC-E0601.
     oversize: bool = false,
-    /// Zigbox mode: the image record named a manifest other than the assignment's.
-    refused_record: bool = false,
+    /// Zigbox mode: why Zigbox refused the image record a peer sent, if it did.
+    refusal: ?zigbox.store.image_peer.Refusal = null,
+    /// Zigbox mode: peers whose bundle held up but whose image record was another manifest's.
+    other_images: u32 = 0,
+    /// Zigbox mode: the tree is larger than one peer fetch takes here.
+    too_large: bool = false,
     /// The process environment, which locates the Zigbox store `pull` writes to.
     environ: std.process.Environ = .empty,
     /// Times a peer answered that it was busy (counts for tests and the log line).
@@ -107,7 +111,9 @@ pub const Net = struct {
         var target: [128]u8 = undefined;
         const prefix = peer_serve.path_bundle;
         const path = std.fmt.bufPrint(&target, "{s}{s}", .{ prefix, digest }) catch return null;
-        return switch (net.peer_get(index, path, out)) {
+        const reply = net.peer_get(index, path, out);
+        if (reply != .bytes) say_bundle_failed(net.io, net.peers[index].name, reply);
+        return switch (reply) {
             .bytes => |bytes| bytes,
             .refused, .timeout, .busy => null,
         };
@@ -293,6 +299,25 @@ pub const Net = struct {
 };
 
 pub const PeerReply = union(enum) { bytes: []const u8, refused, timeout, busy };
+
+/// The line `fetch.log` gets when a peer gave no bundle: who, and what it answered. Not a strike
+/// (docs/swarm.md strikes wrong bytes): the fetch asks the next peer.
+pub fn bundle_note(buffer: []u8, peer_name: []const u8, reply: PeerReply) []const u8 {
+    const what = switch (reply) {
+        .bytes => "a bundle",
+        .refused => "a status other than 200 (or a reply too large)",
+        .timeout => "no reply (connection, read or deadline failure)",
+        .busy => "busy until the retries ran out",
+    };
+    return std.fmt.bufPrint(buffer, "zcube-agent fetch: peer {s} answered the bundle request " ++
+        "with {s}; asking the next peer\n", .{ peer_name, what }) catch buffer[0..0];
+}
+
+fn say_bundle_failed(io: std.Io, peer_name: []const u8, reply: PeerReply) void {
+    var buffer: [256]u8 = undefined;
+    const text = bundle_note(&buffer, peer_name, reply);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
 
 /// One peer's open stream and how many requests it has carried.
 pub const Conn = struct {
@@ -930,12 +955,18 @@ fn fetch_zigbox(
     const images = &opened.images;
     // No peer had the tree: the supervisor's own pull is the registry fallback (it writes the
     // pull record from Zigbox's blobs), so a failure here is the exit code it reacts to.
-    zigbox_fetch.fetch(gpa, transport, images, tree, manifest, infos, .{}, &done) catch |err| {
+    const fetched = zigbox_fetch.fetch(gpa, transport, images, tree, manifest, infos, .{}, &done);
+    net.other_images = done.other_images;
+    fetched catch |err| {
         return switch (err) {
             error.TreeUnavailable, error.ChunkFailed, error.Deadline, error.Store => |same| same,
             error.OutOfMemory => error.OutOfMemory,
             error.Refused => {
-                net.refused_record = true;
+                net.refusal = images.refusal;
+                return error.TreeUnavailable;
+            },
+            error.TooLarge => {
+                net.too_large = true;
                 return error.TreeUnavailable;
             },
         };
@@ -1046,15 +1077,47 @@ fn fetch_failed(
         });
     }
     switch (err) {
-        error.TreeUnavailable => if (net.refused_record) {
-            diag.cause("the image record is not for the manifest this assignment pins", .{});
-        } else diag.cause("no source sent a list that hashes to the digest", .{}),
+        error.TreeUnavailable => zigbox_cause(net, diag),
         error.ChunkFailed => diag.cause("a chunk could not be had from any source asked", .{}),
         else => diag.cause("the fetch ran past its limit of {d} minutes", .{
             @divExact(constants.fetch_total_ms, 60_000),
         }),
     }
     return finish(net.io, diag, constants.exit_external);
+}
+
+/// The cause of a tree no source gave, in Zigbox mode as in directory mode.
+fn zigbox_cause(net: *const Net, diag: *diag_mod.Diag) void {
+    if (net.refusal) |refusal| {
+        diag.cause("Zigbox refused the image record a peer sent: {s}", .{refusal_text(refusal)});
+    } else if (net.too_large) {
+        diag.cause("the tree has more than the {d} files or {d} chunks one peer fetch takes", .{
+            constants.zigbox_claims_max, constants.fetch_chunks_max,
+        });
+    } else if (net.other_images > 0) {
+        diag.cause("{d} peer(s) hold the tree only under another image's record (a peer sends " ++
+            "the newest image of a tree)", .{net.other_images});
+    } else diag.cause("no source sent a list that hashes to the digest", .{});
+}
+
+/// What a refusal of `zigbox.store.image_peer` means, said to an operator.
+pub fn refusal_text(refusal: zigbox.store.image_peer.Refusal) []const u8 {
+    return switch (refusal) {
+        .no_record => "no image record names the tree",
+        .local_unusable => "an image record of this store is damaged or from a newer zbx",
+        .too_large => "the record is longer than any image record",
+        .malformed => "the record is not one this zbx reads",
+        .newer => "the record is from a newer zbx",
+        .wrong_tree => "the record names another tree",
+        .wrong_manifest => "the record is not for the manifest this assignment pins",
+        .incomplete => "the tree or an object below it is not whole in the store",
+        .tree_damaged => "a tree below is damaged in the store",
+        .too_many_entries => "the tree has more entries than an import checks",
+        .stack_full => "the tree is nested deeper than an import checks",
+        .conflict => "a record of the same manifest already names another tree",
+        .busy => "the store is locked by a gc or a restore",
+        .store_failed => "a read or a write of the store failed",
+    };
 }
 
 /// What `select_candidates` fills: the peers and, beside them, their filters.
@@ -1134,6 +1197,16 @@ fn discover(
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
+
+test "a peer that gave no bundle is named with what it answered" {
+    var buffer: [256]u8 = undefined;
+    const line = bundle_note(&buffer, "node2", .refused);
+    try std.testing.expect(std.mem.indexOf(u8, line, "peer node2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "status other than 200") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n"));
+    const timed_out = bundle_note(&buffer, "n", .timeout);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out, "no reply") != null);
+}
 
 test "an HTTP reply gives its body only for 200" {
     // Goal: the registry client takes the body of a 200 and nothing else. Method: a 200, a 404,

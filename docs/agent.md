@@ -205,6 +205,11 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
 **Not built yet (6b part 3 cut):** the fake registry, `swarm-smoke` and its teeth fault.
 
+Test fault: `<state-dir>/faults/fetch-deadline-ms` (Zigbox runtime) holds a number of
+milliseconds, at least 1, that replaces the supervisor's fetch deadline
+(`zigbox_fetch_deadline_ms`, 31 minutes) when it is shorter; the fetch is killed at it and the
+supervisor falls back to the pull. It is read at each fetch. `zigbox-smoke` uses it.
+
 Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the first byte of every
 chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer
 server, so restart the agent after creating or removing the file.

@@ -1,0 +1,6 @@
+error[ZC-E0812]: a certificate names another server than the one asked for
+  cause  broker.botpike.com's certificate names other.botpike.com, not
+         broker.botpike.com
+  fix    connect to the name the certificate is for, or issue the server a certificate for the name asked for
+  more   zcube explain E0812 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0812.html

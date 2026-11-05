@@ -303,3 +303,13 @@ fn usage(err: *Io.Writer) !u8 {
     try err.print("usage: check <zig> <user|->\n", .{});
     return 2;
 }
+
+// `run` is the gate's only judge of a nested build: a non-zero exit must fail it. (A passing test
+// step that wrote to stderr makes the build runner print `failed command: ... --listen=-` under
+// a success; that line alone is not a failure, so the gate does not read it as one.)
+test "run fails on a non-zero exit and passes on zero" {
+    const io = std.testing.io;
+    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "exit 3" }, null));
+    try std.testing.expectError(error.CommandFailed, run(io, &.{ "sh", "-c", "kill -9 $$" }, null));
+    try run(io, &.{ "sh", "-c", "exit 0" }, null);
+}
