@@ -99,6 +99,12 @@ HelloRetryRequest. The server's chain is checked against the pinned CA (`x509.zi
 the caller connected to; the CertificateVerify and the server's Finished are checked against the
 transcript hash before the message joins it. The handshake reassembly buffer is 8192 bytes.
 
+`tls_conn.zig` is the shell around it (native only): a socket, a `poll` deadline on every read and
+write, a handshake timeout, the wall clock and random from the shell, and a streaming `read`,
+`write`, `flush` and `close`. It adds no diagnostic codes; see
+`docs/decisions/2026-11-05-tls-conn.md`. Its tests run a loopback peer, the server-sent-events
+pattern, a cut at every byte of the server's flight, and a record-limit crossing.
+
 Rules the code holds to, each with a test:
 
 - Keys never change in the middle of a record: bytes left over after the ServerHello, the server's
