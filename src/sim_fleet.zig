@@ -133,15 +133,12 @@ pub fn ingest(
         .infra = counts.infra,
     };
     const today = state_file.ymd_of(options.now_seconds);
-    // Counted first: the seeds ran whether or not GitHub answers.
-    try state.count(arena, today, options.kind, counts, options.commit);
+    // A canary that GitHub kept from being filed (held, or stopped) runs again soon and is
+    // counted when it is filed, so its seeds are not counted twice; any other kind is counted
+    // first: its seeds ran whether or not GitHub answers.
+    const canary = std.mem.eql(u8, options.kind, issue.kind_sim_canary);
     const groups = try group_failures(arena, options.kind, batch.failures);
-    for (groups) |*group| {
-        const fp = try arena.dupe(u8, &group.fingerprint);
-        const number = if (state.find(fp)) |filed| filed.issue else 0;
-        const seen = try state.see(arena, today, fp, number) orelse continue;
-        seen.seeds += group.members.items.len;
-    }
+    if (!canary) try count_round(arena, state, today, options, counts, groups);
     if (options.now_seconds < state.hold_until) {
         summary.held = true;
         return summary;
@@ -159,7 +156,26 @@ pub fn ingest(
             else => |e| return halt(github, state, options, &summary, e),
         };
     }
+    if (canary) try count_round(arena, state, today, options, counts, groups);
     return summary;
+}
+
+/// The round's seeds in the day's totals, and each group's seeds in what the day saw.
+fn count_round(
+    arena: std.mem.Allocator,
+    state: *state_file.State,
+    today: state_file.Ymd,
+    options: Options,
+    counts: state_file.Counts,
+    groups: []Group,
+) error{OutOfMemory}!void {
+    try state.count(arena, today, options.kind, counts, options.commit);
+    for (groups) |*group| {
+        const fp = try arena.dupe(u8, &group.fingerprint);
+        const number = if (state.find(fp)) |filed| filed.issue else 0;
+        const seen = try state.see(arena, today, fp, number) orelse continue;
+        seen.seeds += group.members.items.len;
+    }
 }
 
 /// Records what stopped the round; a rate limit holds every write until GitHub's wait is over.
@@ -592,15 +608,20 @@ fn run(
             .missed => "MISSED",
             .wrong_symptom => "WRONG SYMPTOM",
             .crashed => "CRASHED",
+            .not_run => "NOT RUN",
         };
         try out.print("sim-fleet: canary {s}: {s}\n", .{ args.canary.?, word });
     }
+    return exit_of(read.verdict != null, &summary);
+}
+
+/// How a round that was ingested ends: GitHub stopping it is `GitHubStopped`; a canary's
+/// failure that a hold kept from being filed is `CanaryHeld`. A canary runs once in many
+/// rounds, so both are found again soon (run.sh retries on exit 2, with a cap), not when the
+/// cycle comes back to the canary.
+fn exit_of(canary: bool, summary: *const Summary) error{ GitHubStopped, CanaryHeld }!u8 {
     if (summary.stopped != null) return error.GitHubStopped;
-    // A canary runs once in many rounds: a failure a hold kept from being filed must be found
-    // again soon, not when the cycle comes back to it.
-    if (read.verdict != null and summary.held and summary.failed > summary.infra) {
-        return error.CanaryHeld;
-    }
+    if (canary and summary.held and summary.failed > summary.infra) return error.CanaryHeld;
     return constants.exit_ok;
 }
 
@@ -1107,7 +1128,7 @@ test "a canary that caught its fault files nothing; a miss and a wrong symptom a
         "has stopped detecting: sim_c1_teeth_wedge failed no seed (step: canary)"));
     for ([_][]const u8{
         "sim-canary-exe && zig-out/bin/sim_c1_teeth_wedge --seeds 2000..2003 auto " ++
-            "--profile=auto --c1 --shrink",
+            "--profile=auto --c1",
         "- seeds: 2000..2003, each with its own drawn operations and profile",
         "teeth canary",
     }) |text| try std.testing.expect(std.mem.indexOf(u8, miss_issue.body, text) != null);
@@ -1125,6 +1146,58 @@ test "a canary that caught its fault files nothing; a miss and a wrong symptom a
     try std.testing.expectEqual(@as(u32, 0), again.filed);
     try std.testing.expectEqual(@as(u32, 1), again.throttled);
     try std.testing.expectEqual(@as(usize, 2), fake.issues.items.len);
+}
+
+test "a canary held by GitHub is not counted, is not filed, and ends as CanaryHeld" {
+    // Goal: a canary's miss that a hold keeps from being filed ends the run as CanaryHeld (run.sh
+    // then runs it again), and its seeds are counted once, when it is finally filed.
+    // Method: a hold in the future and a miss as input; then the hold over, the miss again.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
+    defer fake.deinit();
+    var state: state_file.State = .{};
+    state.hold_until = day_one + 60;
+    const held = try canary_ingest(arena, fake.github(), &state, canary_wedge_missed, "aaa");
+    try std.testing.expect(held.held);
+    try std.testing.expectEqual(@as(u32, 0), held.filed);
+    try std.testing.expectEqual(@as(u32, 0), fake.requests);
+    try std.testing.expectError(error.CanaryHeld, exit_of(true, &held));
+    // Any other kind held is not run again by the canary rule.
+    try std.testing.expectEqual(constants.exit_ok, try exit_of(false, &held));
+    try std.testing.expectEqual(@as(usize, 0), state.days.items.len);
+
+    state.hold_until = 0;
+    const filed = try canary_ingest(arena, fake.github(), &state, canary_wedge_missed, "aaa");
+    try std.testing.expectEqual(@as(u32, 1), filed.filed);
+    try std.testing.expectEqual(constants.exit_ok, try exit_of(true, &filed));
+    try std.testing.expectEqual(@as(u64, 4), state.days.items[0].seeds);
+    const stopped: Summary = .{ .stopped = error.GitHubRateLimited };
+    try std.testing.expectError(error.GitHubStopped, exit_of(true, &stopped));
+}
+
+test "a canary no seed of which could start is NOT RUN: counted, never filed" {
+    // Goal: the host's out-of-memory kill (run.sh's record in step setup) is not a crash of the
+    // canary and not a miss; run.sh runs the canary again.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake: github_api.Fake = .{ .gpa = std.testing.allocator };
+    defer fake.deinit();
+    var state: state_file.State = .{};
+    const text = "seed 2000: FAILED: killed (out of memory?)\n  step: setup\n" ++
+        "  replay: zig-out/bin/sim_c1_teeth_wedge --seeds 2000..2003 auto --c1 --profile=auto\n" ++
+        "sim-cluster --c1: seeds 2000..2000, drawn operations: 1 of 1 failed\n";
+    const parsed = try issue.parse(arena, issue.kind_sim_c1, text);
+    const judged = try issue.canary_verdict(arena, canary_wedge, parsed);
+    try std.testing.expectEqual(issue.Verdict.not_run, judged.verdict);
+    var options = test_options("aaa", day_one);
+    options.kind = issue.kind_sim_canary;
+    const summary = try ingest(arena, fake.github(), &state, judged.batch, options);
+    try std.testing.expectEqual(@as(u32, 0), summary.filed);
+    try std.testing.expectEqual(@as(u64, 1), summary.infra);
+    try std.testing.expectEqual(@as(usize, 0), fake.issues.items.len);
 }
 
 test "a canary's crash is filed under sim-canary with the runner's replay" {

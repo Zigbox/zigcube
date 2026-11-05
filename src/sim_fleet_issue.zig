@@ -272,7 +272,9 @@ pub const step_canary_symptom = "canary-symptom";
 
 /// `crashed`: no seed ran to its end (each crashed or could not start), so nothing was judged;
 /// the crashes are filed.
-pub const Verdict = enum { caught, missed, wrong_symptom, crashed };
+/// `not_run`: no seed could start (the host's trouble, step `setup`): counted, never filed, and
+/// run.sh runs the canary again.
+pub const Verdict = enum { caught, missed, wrong_symptom, crashed, not_run };
 
 /// What the canary's run says, and what of it is filed under `kind_sim_canary`.
 pub const Judged = struct { verdict: Verdict, batch: Batch };
@@ -294,6 +296,7 @@ pub fn canary_verdict(
     assert(canary.first <= canary.last);
     var kept: std.ArrayList(Failure) = .empty;
     var checks: u64 = 0;
+    var crashes: u64 = 0;
     var first_check: ?Failure = null;
     var symptom_seen = false;
     for (batch.failures) |failure| {
@@ -303,6 +306,7 @@ pub fn canary_verdict(
             own.shrunk_replay = try runner_replay(arena, canary.runner, shrunk);
         }
         if (failure.crash or failure.infra()) {
+            if (failure.crash) crashes += 1;
             try kept.append(arena, own);
             continue;
         }
@@ -315,9 +319,9 @@ pub fn canary_verdict(
     const ran = batch.seeds - kept.items.len;
     const verdict: Verdict = if (checks > 0)
         (if (symptom_seen) .caught else .wrong_symptom)
-    else if (ran > 0) .missed else .crashed;
+    else if (ran > 0) .missed else if (crashes > 0) .crashed else .not_run;
     switch (verdict) {
-        .caught, .crashed => {},
+        .caught, .crashed, .not_run => {},
         .missed => try kept.append(arena, .{
             .seed = canary.first,
             .range_last = canary.last,
@@ -356,7 +360,7 @@ fn canary_replay(arena: std.mem.Allocator, canary: Canary) error{OutOfMemory}![]
     const c1: []const u8 = if (std.mem.eql(u8, canary.kind, kind_sim_c1)) " --c1" else "";
     return std.fmt.allocPrint(
         arena,
-        "zig-out/bin/{s} --seeds {d}..{d} auto --profile=auto{s} --shrink",
+        "zig-out/bin/{s} --seeds {d}..{d} auto --profile=auto{s}",
         .{ canary.runner, canary.first, canary.last, c1 },
     );
 }

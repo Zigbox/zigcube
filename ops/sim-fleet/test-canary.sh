@@ -26,6 +26,7 @@ SIM_FLEET_REPORT_TIMEOUT=60
 SIM_FLEET_BATCH_TIMEOUT=60
 SIM_FLEET_CANARY_ONE_IN=1
 SIM_FLEET_TRACKER=
+SIM_FLEET_CANARY_TRIES_MAX=3
 SIM_FLEET_PROFILE=auto
 SIM_FLEET_OPS=auto
 token_file=
@@ -39,7 +40,8 @@ refuse() { case "$out" in *"$1"*) fail "unwanted '$1' in: $out" ;; esac; }
 
 # A fake runner prints, for its seeds A..B, what $work/mode asks: `caught` (seed A fails with the
 # symptom), `wrong` (seed A fails with another check), `missed` (no seed fails), `crash` (killed
-# by a signal), `refuse` (exit 2).
+# by a signal), `refuse` (exit 2), `hang` (never ends), `oom` (killed with SIGKILL, as the
+# kernel's OOM killer does).
 fake() { # runner kind symptom
     case "$2" in
     sim-swarm) sim=sim_swarm prefix=sim-swarm step=fetch c1="" ;;
@@ -50,6 +52,7 @@ fake() { # runner kind symptom
     if [ "$check" = - ]; then check="the fault was seen"; fi
     cat >"$bin/$1" <<EOF
 #!/bin/sh
+echo "\$*" >>"$work/args-$1"
 range=\$2
 a=\${range%..*}
 b=\${range#*..}
@@ -69,6 +72,13 @@ missed)
 crash)
     echo "thread 1 panic: reached unreachable code" >&2
     kill -SEGV \$\$
+    ;;
+hang)
+    echo "replay: zig-out/bin/$sim \$a 40 3\$c1 --profile=slow_store" >&2
+    exec sleep 30
+    ;;
+oom)
+    kill -KILL \$\$
     ;;
 *)
     echo "error: bad argument" >&2
@@ -137,13 +147,7 @@ for runner in sim_c1_teeth_wedge sim_swarm_teeth; do
         round_out
         case "$mode" in
         missed) expect "$runner: MISSED"; expect "stopped detecting: $runner failed no seed" ;;
-        wrong)
-            if [ "$runner" = sim_swarm_teeth ]; then
-                expect "$runner: caught" # No symptom: any check is the fault's.
-                continue
-            fi
-            expect "$runner: WRONG SYMPTOM"; expect "but never with"
-            ;;
+        wrong) expect "$runner: WRONG SYMPTOM"; expect "but never with" ;;
         crash) expect "$runner: CRASHED"; expect "replaying them one by one" ;;
         *)
             expect "$runner: CRASHED"
@@ -156,19 +160,78 @@ for runner in sim_c1_teeth_wedge sim_swarm_teeth; do
     done
 done
 
-# Not filed: the reporter failed, so the same canary runs again next round.
+# No --shrink, in the batch or the replay of a crash; the other kinds keep it.
+case_name="no shrink"
+for runner in sim_c1_teeth_wedge sim_swarm_teeth; do
+    [ -s "$work/args-$runner" ] || fail "$runner never ran"
+    ! grep -q -- --shrink "$work/args-$runner" || fail "$runner ran with --shrink"
+done
+[ "$(kind_shrink sim-c1)" = --shrink ] || fail "a worker of another kind lost --shrink"
+
+# A hang is filed as a crash without the seed or the replay in its text (they are in the log);
+# a memory kill is the host's: NOT RUN, counted, never filed, tried again, then given up on.
+case_name="hang"
+SIM_FLEET_BATCH_TIMEOUT=1
+echo hang >"$work/mode"
+at sim_c1_teeth_wedge
+before=$(cat "$STATE/canary-next")
+round_out
+expect "sim_c1_teeth_wedge: CRASHED"
+# The title is the fingerprinted text: digits normalised, no seed, no replay flags.
+expect "would file issue: sim-canary: crash: timed out after N s (step: canary)"
+[ "$(cat "$STATE/canary-next")" -eq $((before + 1)) ] || fail "the cycle did not move"
+SIM_FLEET_BATCH_TIMEOUT=60
+case_name="oom"
+echo oom >"$work/mode"
+at sim_c1_teeth_wedge
+before=$(cat "$STATE/canary-next")
+echo 0 >"$STATE/canary-tries"
+rm -f "$STATE/crashes"/*
+round_out
+expect "sim_c1_teeth_wedge: NOT RUN"
+expect "(try 1)"
+refuse "would file"
+[ "$(cat "$STATE/canary-next")" -eq "$before" ] || fail "the cycle moved on a host event"
+ls "$STATE/crashes" | grep -q "canary-sim_c1_teeth_wedge" || fail "its output was not kept"
+round_out
+expect "(try 2)"
+round_out
+expect "gave up after 3 tries"
+[ "$(cat "$STATE/canary-next")" -eq $((before + 1)) ] || fail "the cycle did not move on"
+[ "$(cat "$STATE/canary-tries")" -eq 0 ] || fail "the tries were not reset"
+
+# Not filed because GitHub asked to wait (exit 2): the same canary runs again, three times at
+# most; the reporter refusing the output (exit 1) moves the cycle on and keeps the output.
 case_name="not filed"
 echo missed >"$work/mode"
 at sim_c1_teeth_wedge
 before=$(cat "$STATE/canary-next")
+echo 0 >"$STATE/canary-tries"
 rm "$bin/sim_fleet"
 printf '#!/bin/sh\necho "sim-fleet: GitHub asked to wait"\nexit 2\n' >"$bin/sim_fleet"
 chmod +x "$bin/sim_fleet"
 round_out
-expect "was not filed; it runs again next round"
+expect "was not filed (sim_fleet exited 2); it runs again next round (try 1)"
 [ "$(cat "$STATE/canary-next")" -eq "$before" ] || fail "the cycle moved"
+round_out
+expect "(try 2)"
+round_out
+expect "gave up after 3 tries"
+[ "$(cat "$STATE/canary-next")" -eq $((before + 1)) ] || fail "the cycle did not move on"
+case_name="refused"
+at sim_c1_teeth_wedge
+before=$(cat "$STATE/canary-next")
+rm -f "$STATE/crashes"/*
+printf '#!/bin/sh\necho "sim-fleet: stdin has a line sim_fleet cannot read"\nexit 1\n' >"$bin/sim_fleet"
+round_out
+expect "sim_fleet exited 1; the output is in"
+expect "the cycle moves on"
+[ "$(cat "$STATE/canary-next")" -eq $((before + 1)) ] || fail "the cycle did not move on"
+ls "$STATE/crashes" | grep -q "canary-sim_c1_teeth_wedge" || fail "its output was not kept"
 rm "$bin/sim_fleet"
 ln -s "$fleet" "$bin/sim_fleet"
+case_name="filed after the retry"
+at sim_c1_teeth_wedge
 round_out
 expect "canary sim_c1_teeth_wedge on seeds"
 expect "sim_c1_teeth_wedge: MISSED"
