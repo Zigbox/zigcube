@@ -343,9 +343,14 @@ fn write_all(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, end_ms: u64) !vo
         var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
         const ready = std.posix.poll(&wait, @intCast(end_ms - now_ms)) catch return error.Io;
         if (ready == 0) return error.Io;
+        // The descriptor is non-blocking (`peer_stream.connect`), so a write takes what fits
+        // and the poll above is the only wait.
         const wrote = std.os.linux.write(fd, bytes[done..].ptr, bytes.len - done);
-        if (std.os.linux.errno(wrote) != .SUCCESS) return error.Io;
-        done += wrote;
+        switch (std.os.linux.errno(wrote)) {
+            .SUCCESS => done += wrote,
+            .AGAIN, .INTR => {},
+            else => return error.Io,
+        }
     }
 }
 
@@ -366,7 +371,11 @@ fn read_until_close(
         if (ready == 0) return error.Timeout;
         if (filled == buffer.len) return error.TooLarge;
         const got = std.os.linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
-        if (std.os.linux.errno(got) != .SUCCESS) return error.Timeout;
+        switch (std.os.linux.errno(got)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => continue,
+            else => return error.Timeout,
+        }
         if (got == 0) return buffer[0..filled];
         filled += got;
     }

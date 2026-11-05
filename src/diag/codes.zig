@@ -1264,8 +1264,8 @@ pub const registry = [_]Entry{
         \\An agent's peer server limits what one source address may ask of it,
         \\because a handshake costs the server public-key work. A handshake is
         \\refused, and the connection closed without a byte, when the address
-        \\already has a handshake that has not finished (one at a time per
-        \\source), when it has started peer_handshakes_per_source_max
+        \\already has peer_handshakes_pending_per_source_max handshakes that
+        \\have not finished, when it has started peer_handshakes_per_source_max
         \\handshakes in peer_handshake_window_ms, or when the server already
         \\tracks peer_sources_max addresses in the window. An IPv6 address
         \\counts by its /64, one host's whole range.

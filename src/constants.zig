@@ -512,8 +512,15 @@ pub const peer_join_retry_ms: u32 = 5 * 1000;
 /// One join call waits this long at most (less near the lease's fence).
 pub const peer_join_timeout_ms: u32 = 3 * 1000;
 /// Handshakes the peer server starts for one source address in one window; the next is refused.
-/// An honest agent opens a handshake per fetch connection, a few per node per window.
-pub const peer_handshakes_per_source_max: u32 = 16;
+/// It bounds unauthenticated public-key work (a few hundred microseconds each), and is sized for
+/// a whole cluster behind one NAT address: every fetch connection to this server carries
+/// `peer_connection_requests_max` chunks, so even a server serving at 1 GiB/s sees about 16
+/// handshakes a second from all its fetchers together, and busy answers add a few more.
+pub const peer_handshakes_per_source_max: u32 = 256;
+/// Handshakes of one source address that may be unfinished at once; one more is refused. Above
+/// one so that the nodes of a cluster behind one NAT address can connect together; well under
+/// `peer_handshakes_max`, so that silent strangers of one address hold a few links, not all.
+pub const peer_handshakes_pending_per_source_max: u32 = 8;
 /// The window the per-source bound counts in.
 pub const peer_handshake_window_ms: u64 = 10 * 1000;
 /// Sources the limiter tracks at once. A table full of live windows refuses a new source: the
@@ -522,6 +529,11 @@ pub const peer_sources_max: u32 = 256;
 /// Peer connections the server serves at once (each owns buffers of about 12 MiB). One more
 /// authenticated peer is told it is busy (status 503) and closed.
 pub const peer_connections_max: u32 = 4;
+/// Serving slots one authenticated node name holds at once; its next connection is told busy
+/// (503). An honest fetch keeps one stream per peer, so this is room for two concurrent fetches.
+/// Any API client can mint a credential (docs/peer.md), so this bounds a node name, not an
+/// attacker: the slot count is what bounds the server.
+pub const peer_connections_per_node_max: u32 = 2;
 /// Connections the server holds before they are authenticated: a descriptor, a task and a few
 /// words each, no buffers. A silent stranger holds one for at most `peer_handshake_ms`; the
 /// buffers of a serving slot go to a connection only once it has authenticated.
@@ -601,6 +613,10 @@ comptime {
 
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
+    assert(peer_handshakes_pending_per_source_max > 1);
+    assert(peer_handshakes_pending_per_source_max * 2 <= peer_handshakes_max);
+    assert(peer_connections_per_node_max > 0);
+    assert(peer_connections_per_node_max < peer_connections_max);
     assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
     assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
