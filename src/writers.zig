@@ -90,6 +90,11 @@ pub const Verdict = union(enum) {
 /// Whether every put and delete of `request`, on success and on failure, is `role`'s to write.
 /// Compares are reads and are not checked. One stray operation refuses the whole request.
 pub fn allowed(role: Role, request: store.TxnRequest) Verdict {
+    if (role == .retention) {
+        if (orphaning_delete(request)) |key| {
+            return .{ .refused = .{ .key = key, .owner = owner_name(key) } };
+        }
+    }
     for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
         for (ops) |op| {
             const key = switch (op) {
@@ -108,6 +113,7 @@ pub fn allowed(role: Role, request: store.TxnRequest) Verdict {
 /// anyone's), may not touch a key under no prefix, and an agent's keys name one node. Returns the
 /// first key that breaks this, or null.
 pub fn foreign_key(request: store.TxnRequest) ?[]const u8 {
+    if (orphaning_delete(request)) |key| return key;
     if (retention_only(request)) return null;
     var owner: ?Owner = null;
     var node: ?[]const u8 = null;
@@ -151,6 +157,26 @@ fn job_record_prefix(prefix: []const u8) bool {
         std.mem.eql(u8, prefix, records.prefix_job_runs) or
         std.mem.eql(u8, prefix, records.prefix_job_status) or
         std.mem.eql(u8, prefix, records.prefix_job_observed);
+}
+
+/// The first delete of a job's run or status in a request that does not delete `/jobs/<name>`
+/// too: the spec would outlive its run and the controller would run the job again (I8a).
+/// authority.md §7: retention removes the spec in the same transaction.
+fn orphaning_delete(request: store.TxnRequest) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
+        for (ops) |op| {
+            const key = switch (op) {
+                .delete => |key| key,
+                .put => continue,
+            };
+            if (std.mem.startsWith(u8, key, records.prefix_jobs)) return null;
+            const run = std.mem.startsWith(u8, key, records.prefix_job_runs);
+            const status = std.mem.startsWith(u8, key, records.prefix_job_status);
+            if ((run or status) and first == null) first = key;
+        }
+    }
+    return first;
 }
 
 /// Whether `request` is what retention writes to remove one ended job: deletes only, of keys that
@@ -554,6 +580,21 @@ test "retention's job transaction names one job and one node, and carries no pul
     // One node's pull records on their own are one owner, as before jobs.
     const pulls = [_]store.Op{ .{ .delete = "/pulls/n1/b3:aa" }, .{ .delete = "/pulls/n1/b3:bb" } };
     try testing.expect(foreign_key(request_of(&pulls)) == null);
+    // The run or the status without the spec would leave a job that is run again (I8a); the
+    // input alone (deleted at the ending) is fine.
+    const orphaning = [_][]const store.Op{
+        &.{ .{ .delete = "/job-runs/a" }, .{ .delete = "/job-status/a" } },
+        &.{.{ .delete = "/job-runs/a" }},
+        &.{ .{ .delete = "/job-status/a" }, .{ .delete = "/job-input/a" } },
+    };
+    for (orphaning) |ops| {
+        try testing.expect(foreign_key(request_of(ops)) != null);
+        try testing.expect(allowed(.retention, request_of(ops)) == .refused);
+    }
+    const whole = [_]store.Op{ .{ .delete = "/job-runs/a" }, .{ .delete = "/jobs/a" } };
+    try testing.expect(allowed(.retention, request_of(&whole)) == .allowed);
+    const input_only = [_]store.Op{.{ .delete = "/job-input/a" }};
+    try testing.expect(retention_only(request_of(&input_only)));
     // A job record with a put is never retention's.
     const with_put = [_]store.Op{ .{ .delete = "/jobs/a" }, put_op("/job-runs/a") };
     try testing.expect(foreign_key(request_of(&with_put)) != null);

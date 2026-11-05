@@ -1,0 +1,12 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  500
+request  r-0000001  GET /v1/status  500
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  500
+bug[ZC-B0005]: a job's run record is larger than a run may be
+  this is a bug in zcube, not something you did
+  saved  diagnostic bundle:
+         <state>/zcube/bundles/1970-01-01T00-00-00Z-last.tar.gz
+  cause  the run train-7-job encodes as 20480 bytes, over the 16384 bytes a run
+         may take
+  report https://github.com/Zigbox/zigcube/issues/new
+  more   zcube explain B0005
+  docs   https://zigbox.github.io/zigcube/errors/B0005.html

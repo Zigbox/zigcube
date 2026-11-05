@@ -293,7 +293,7 @@ fn job_late(diag: *diag_mod.Diag) void { // api.zig
 
 fn job_contradicts(diag: *diag_mod.Diag) void { // job_controller.zig
     const cause = "/job-status/train-7 has ended but /job-runs/train-7 does not exist";
-    const fix = "restore the missing record; never delete a run or status (it runs the job again)";
+    const fix = "restore the missing record, or delete all the job's keys in one transaction";
     sample(diag, .E0307, &.{cause}, fix);
 }
 
@@ -327,6 +327,13 @@ fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
     diag.raise(.B0004);
     diag.cause("train-7-job reported an exit of kind exited with no code and no signal", .{});
     diag.fix(.{ .sentence = "report it with the diagnostic bundle" });
+}
+
+fn run_too_large(diag: *diag_mod.Diag) void { // records.zig
+    diag.raise(.B0005);
+    const cause = "the run train-7-job encodes as 20480 bytes, over the 16384 bytes a run may take";
+    diag.cause(cause, .{});
+    diag.fix(.{ .sentence = "report it with the diagnostic bundle; the job was not started" });
 }
 
 fn unknown_container(diag: *diag_mod.Diag) void { // runtime.zig
@@ -807,6 +814,7 @@ const cases = [_]Case{
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
     relayed(.B0004, job_end_unmapped),
+    relayed(.B0005, run_too_large),
 };
 
 const repair_node1: []const []const u8 = &.{ "repair", "allocations", "node1" };

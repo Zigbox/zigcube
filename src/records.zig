@@ -902,6 +902,17 @@ pub fn decision_id_time(id: []const u8) ?u64 {
 
 // ---- JSON ----------------------------------------------------------------------------------
 
+/// A run that encodes over `job_run_bytes_max` got past the API's checks: our defect (ZC-B0005),
+/// not a capacity the operator can raise.
+fn run_too_large(diag: *Diag, id: []const u8, bytes: usize) Error {
+    diag.raise(.B0005);
+    diag.cause("the run {s} encodes as {d} bytes, over the {d} bytes a run record may take", .{
+        id, bytes, constants.job_run_bytes_max,
+    });
+    diag.fix(.{ .sentence = "report it with the diagnostic bundle; the job was not started" });
+    return error.NoCapacity;
+}
+
 /// Encodes a record as compact JSON in `arena`.
 pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -914,7 +925,9 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
     // The API checks a job's words against its bounds, but escaping can multiply bytes (a control
     // character is six): the encoded run is what the agents' runs reply is sized by.
     const T = @TypeOf(value);
-    if (T == JobRun and bytes.len > constants.job_run_bytes_max) return failures.no_memory(diag);
+    if (T == JobRun and bytes.len > constants.job_run_bytes_max) {
+        return run_too_large(diag, value.id, bytes.len);
+    }
     return bytes;
 }
 
@@ -924,10 +937,6 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
     // The agent endpoint refuses a larger pull record; a row that holds one was not written
     // through it, and parsing it would cost the arena several times its size.
     if (T == Pull and kv.value.len > constants.pull_record_bytes_max) {
-        return malformed(diag, kv.key, @typeName(T));
-    }
-    // The same bound `encode` enforces: the runs reply of a node adds up these records.
-    if (T == JobRun and kv.value.len > constants.job_run_bytes_max) {
         return malformed(diag, kv.key, @typeName(T));
     }
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
@@ -940,6 +949,11 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         };
         const known = version_current(T);
         if ((head.v orelse 0) > known) return too_new(diag, kv.key, head.v.?, known);
+    }
+    // The same bound `encode` enforces: the runs reply of a node adds up these records. After
+    // the version: a newer release may have raised it.
+    if (T == JobRun and kv.value.len > constants.job_run_bytes_max) {
+        return malformed(diag, kv.key, @typeName(T));
     }
     const record = std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
         if (err == error.OutOfMemory) return failures.no_memory(diag);
@@ -1896,6 +1910,7 @@ test "a run record over job_run_bytes_max is refused at write and at read" {
         .env = &.{.{ "K", &control }},
     };
     try testing.expectError(error.NoCapacity, encode(arena, run, &diag));
+    try testing.expectEqual(codes.Code.B0005, diag.code.?);
     diag.reset();
     run.env = &.{.{ "K", "plain" }};
     const bytes = try encode(arena, run, &diag);
@@ -1908,6 +1923,12 @@ test "a run record over job_run_bytes_max is refused at write and at read" {
     });
     const over = read(JobRun, arena, kv_of("/job-runs/j", padded), &diag);
     try testing.expectError(error.Malformed, over);
+    // A newer, larger record is too new (ZC-E0303), not malformed: the version comes first.
+    diag.reset();
+    const newer = try std.fmt.allocPrint(arena, "{{\"v\":99,\"pad\":\"{s}\"}}", .{&pad});
+    const too_new_read = read(JobRun, arena, kv_of("/job-runs/j", newer), &diag);
+    try testing.expectError(error.Malformed, too_new_read);
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
 }
 
 test "a job observation says how the run ended exactly when it stopped" {

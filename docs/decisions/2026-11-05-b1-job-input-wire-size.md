@@ -23,22 +23,34 @@ So the largest valid input (64 KiB of control characters) is 384 KiB on the wire
 CJK input from a default Python client is about 128 KiB plus the rest of the spec, over the
 limit. A valid input would be refused for a reason the owner's answer 5 does not state.
 
+Two facts about the HTTP layer, for the options below. The body limit the server checks is
+`http_body_bytes_max` (64 KiB, `server_http.zig`); a larger body is refused by the HTTP layer as
+413 ZC-E0108 ("the request body is larger than 65536 bytes"), not as ZC-E0130, so any option that
+refuses on size changes that cause for this route. The request arena is
+`request_arena_bytes_max`, 16 MiB per connection (`constants.zig`, `server_http.zig`), not 64 KiB.
+
 The stored form is not affected: `/job-input/<name>` holds base64 (about 88 KiB), which fits a
 store value whatever the content.
 
 ## Options
 
 **A. Keep 128 KiB and say what it means.** The limit is "64 KiB decoded, and the whole request
-at most 128 KiB". Ordinary text fits. Input that escapes heavily is refused with ZC-E0130
-naming the request size, and `docs/api.md` says so. Cheapest; the stated limit is not exactly
+at most 128 KiB". Ordinary text fits. Input that escapes heavily is refused as 413 ZC-E0108 (the
+HTTP layer's own refusal; its cause must name the job route's limit), and `docs/api.md` says so. Cheapest; the stated limit is not exactly
 true, and a client can only learn it by being refused.
+
+**A2. Size the route for the escaping real clients produce.** The route's limit becomes 2x the
+input plus the spec (about 144 KiB), which covers quotes, backslashes and CJK from a client that
+escapes to ASCII. Only the 6x case (control characters) is refused, with ZC-E0130 naming the
+input (the route's handler can say what the HTTP layer cannot). Between A and B: the stated limit
+is true for any text a person writes, and false only for binary-looking input.
 
 **B. Size the route for the worst case.** The route's body limit becomes
 `6 * job_input_bytes_max + 16 KiB` (400 KiB), so every valid input is accepted whatever it
-contains, and the "64 KiB" limit is exactly true. The cost is the HTTP layer's memory per
-request on this one route: up to 96 connections (`http_connections_max`) each holding a
-400 KiB body is 38 MB in the worst case, where the arena asserts today assume 64 KiB. Slice 2
-must check the arena asserts either way (the brief says so).
+contains, and the "64 KiB" limit is exactly true. The body is 2.4% of a
+16 MiB request arena, and the budget already allows 96 connections (`http_connections_max`) of
+16 MiB each, so the extra memory is small (up to 38 MB if every connection holds one such body
+at once). Slice 2 must check the arena asserts either way (the brief says so).
 
 **C. A separate request for the input.** `POST /v1/jobs` carries the spec; the input goes in
 `PUT /v1/jobs/{name}/input` as raw bytes (`application/octet-stream`, 64 KiB exactly, no
@@ -52,10 +64,10 @@ It is a second way to say the same thing, and the owner chose the `input` string
 
 ## Recommendation
 
-**B** if the HTTP layer can take 400 KiB on one route (slice 2 measures: the connection
-arena, `http_body_bytes_max`), because it makes the limit the owner stated true with no new
-concept. If it cannot, **A**, with D added later as a plain field if a client needs it. C is not
-worth its state machine for 64 KiB.
+**B** if the HTTP layer can take 400 KiB on one route (slice 2 measures: the request arena and
+`http_body_bytes_max`; the arena is not the constraint), because it makes the limit the owner
+stated true with no new concept. If it cannot, **A2**, or **A** with D added later as a plain
+field if a client needs it. C is not worth its state machine for 64 KiB. The owner decides.
 
 ## What slice 1 did
 

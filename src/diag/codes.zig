@@ -124,6 +124,7 @@ pub const Code = enum(u8) {
     B0002,
     B0003,
     B0004,
+    B0005,
 };
 
 pub const Entry = struct {
@@ -916,10 +917,12 @@ pub const registry = [_]Entry{
         \\nothing for that job until it is fixed.
         \\
         \\Never fix it by deleting the job's run (/job-runs/NAME) or its status
-        \\(/job-status/NAME). The controller creates a run and a status for a job
-        \\that has none, so deleting them makes it run the job again: a second run
-        \\of a job that may already have run, and its ending lost. Restore the
-        \\missing or damaged record, or remove the whole job.
+        \\(/job-status/NAME) alone. A job that lost its run could be started a
+        \\second time, and its ending lost; the controller refuses to create a run
+        \\for a job that had one, and changes nothing. Restore the missing or
+        \\damaged record, or, to remove the whole job, delete all of its keys in
+        \\one transaction: /jobs/NAME, /job-input/NAME, /job-runs/NAME,
+        \\/job-status/NAME and /job-observed/NODE/NAME.
         ,
     },
     .{
@@ -1727,6 +1730,22 @@ pub const registry = [_]Entry{
         \\agent reported) that none of its rules covers. The job is left as it was;
         \\nothing was ended or started. This is a bug in zcube, not something you
         \\did.
+        \\
+        \\A diagnostic bundle is saved for every bug. Review its manifest, then
+        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        ,
+    },
+    .{
+        .code = .B0005,
+        .severity = .bug,
+        .blame = .internal,
+        .summary = "a job's run record is larger than a run may be",
+        .explanation =
+        \\The record of a job's run, once encoded, is larger than the bound on one
+        \\run (16 KiB). The API checks a job's words against their bounds before it
+        \\accepts the job, so a job that reaches this point got past a check it
+        \\should have failed. This is a bug in zcube, not something you did, and
+        \\not a memory limit: raising limits changes nothing. The job is not started.
         \\
         \\A diagnostic bundle is saved for every bug. Review its manifest, then
         \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.

@@ -518,13 +518,11 @@ rule), and has a precondition: it compares the job's `/job-status/` at the revis
 transaction, so the spec never outlives its status, and the status never goes while the job is
 live. `/job-admission` and `/job-endings` are exact keys of their writers and are never deleted.
 
-**A run is created once, ever.** The job controller creates a job's run and status only for a job
-that never had them. Deleting `/job-runs/<name>` and `/job-status/<name>` by hand must not make
-the controller run the job again (I8a): an operator who deletes them has not cancelled the job, and
-a second run of a job that may have run is the one thing the design forbids. The controller
-therefore treats a job whose run or status is missing, and that has a `job-created` decision, as
-contradictory (ZC-E0307) and changes nothing. How it knows the job had a run is an open owner
-question: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
+**A run is created once, ever.** The controller never re-creates a run for a job that had one
+(I8a). A job whose run or status is missing after it had one is contradictory (ZC-E0307): the
+controller changes nothing and creates nothing. An operator who deletes `/job-runs/<name>` and
+`/job-status/<name>` has not cancelled the job. How "had one" is known is an open owner question:
+`docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
 
 **I1a, I1b, I2, I6 and I7 hold for runs unchanged:** a run has at most one assignment and its
 observations are admissible under one tenure; the allocation of a node counts runs with replicas;

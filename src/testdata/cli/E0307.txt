@@ -1,5 +1,5 @@
 error[ZC-E0307]: a job's stored records contradict each other
   cause  /job-status/train-7 has ended but /job-runs/train-7 does not exist
-  fix    restore the missing record; never delete a run or status (it runs the job again)
+  fix    restore the missing record, or delete all the job's keys in one transaction
   more   zcube explain E0307 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0307.html
