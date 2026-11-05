@@ -896,10 +896,11 @@ test "silent connections from one source hold a few links, and an honest peer is
     return error.NeverServed;
 }
 
-test "a busy peer is asked again a few times, then refused, and is never a timeout" {
-    // Goal: review S3. Method: every serving slot taken; the client's `peer_get` sees 503 each
-    // time, retries `fetch_busy_retries_max` times and answers `.refused` (a timeout would be a
-    // strike), having seen busy once more than it retried.
+test "a busy peer is asked again until the busy wait runs out, then refused, never a timeout" {
+    // Goal: review S3, and demo-c2's per-peer counts. Method: every serving slot taken; with the
+    // busy wait lowered to 1 s, the client's `peer_get` sees 503, pauses 250 then 500 ms, and
+    // answers `.refused` (a timeout would be a strike) once the next pause would pass the wait;
+    // each busy answer is counted on the peer, and none as a refusal or a timeout.
     const io = std.testing.io;
     var rig: Rig = .{ .tmp = undefined, .ca = undefined };
     try rig.init();
@@ -926,13 +927,20 @@ test "a busy peer is asked again a few times, then refused, and is never a timeo
             .ca_public = rig.ca.public_key.toBytes(),
         },
         .reply = &reply,
+        .busy_wait_ms = 1000,
     };
     defer net_state.close_peers();
     var target: [128]u8 = undefined;
     var out: [1024]u8 = undefined;
     const path = try std.fmt.bufPrint(&target, "{s}{x}", .{ chunk_path, &rig.hash });
     try std.testing.expectEqual(fetch_cli.PeerReply.refused, net_state.peer_get(0, path, &out));
-    try std.testing.expectEqual(constants.fetch_busy_retries_max + 1, net_state.busy_seen);
+    try std.testing.expect(net_state.busy_seen >= 2);
+    try std.testing.expect(net_state.busy_seen <= 3);
+    try std.testing.expectEqual(net_state.busy_seen, conns[0].busy);
+    try std.testing.expectEqual(@as(u32, 0), conns[0].refused + conns[0].timeouts);
+    var line: [256]u8 = undefined;
+    const said = fetch_cli.peer_answers_line(&line, "node2", conns[0]);
+    try std.testing.expect(std.mem.indexOf(u8, said, "busy (503)") != null);
 }
 
 /// A connection to `address` from the loopback address 127.0.0.`octet`, a source of its own.

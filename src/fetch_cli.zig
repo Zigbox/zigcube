@@ -81,6 +81,8 @@ pub const Net = struct {
     environ: std.process.Environ = .empty,
     /// Times a peer answered that it was busy (counts for tests and the log line).
     busy_seen: u32 = 0,
+    /// How long one request keeps asking a busy peer (`fetch_busy_wait_ms`; tests lower it).
+    busy_wait_ms: u32 = constants.fetch_busy_wait_ms,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
     conns: []Conn = &.{},
 
@@ -226,18 +228,30 @@ pub const Net = struct {
     /// reopened after an error or `peer_connection_requests_max` requests. A non-200 head is
     /// `.refused` (the peer lacks it); a connect, handshake or stream failure is `.timeout`.
     /// One deadline covers both tries of a request. A peer whose server says it is busy (every
-    /// serving slot taken, status 503) is asked again after `fetch_busy_sleep_ms`, at most
-    /// `fetch_busy_retries_max` times: it is neither a timeout nor a strike. Still busy after
-    /// that, the answer is `.refused` and the plan takes the chunk from another source.
+    /// serving slot taken, or this node's share of them, status 503) is asked again, the pause
+    /// doubling from `fetch_busy_sleep_ms` to `fetch_busy_sleep_max_ms`, for `busy_wait_ms`: it
+    /// is neither a timeout nor a strike. Still busy after that, the answer is `.refused` and
+    /// the plan takes the chunk from another source. Each answer is counted on the peer's
+    /// `Conn` for the failure's log lines.
     pub fn peer_get(net: *Net, index: u8, path: []const u8, out: []u8) PeerReply {
-        var retries: u32 = 0;
+        const conn = &net.conns[index];
+        const started = peer_stream.boot_ms(net.io);
+        var pause: u32 = constants.fetch_busy_sleep_ms;
         while (true) {
             const reply = net.peer_get_once(index, path, out);
+            switch (reply) {
+                .bytes => return reply,
+                .refused => conn.refused += 1,
+                .timeout => conn.timeouts += 1,
+                .busy => {},
+            }
             if (reply != .busy) return reply;
             net.busy_seen += 1;
-            if (retries == constants.fetch_busy_retries_max) return .refused;
-            retries += 1;
-            sleep(net, constants.fetch_busy_sleep_ms);
+            conn.busy += 1;
+            const waited = peer_stream.boot_ms(net.io) -| started;
+            if (waited + pause > net.busy_wait_ms) return .refused;
+            sleep(net, pause);
+            pause = @min(pause * 2, constants.fetch_busy_sleep_max_ms);
         }
     }
 
@@ -307,7 +321,7 @@ pub fn bundle_note(buffer: []u8, peer_name: []const u8, reply: PeerReply) []cons
         .bytes => "a bundle",
         .refused => "a status other than 200 (or a reply too large)",
         .timeout => "no reply (connection, read or deadline failure)",
-        .busy => "busy until the retries ran out",
+        .busy => "busy until the busy wait ran out",
     };
     return std.fmt.bufPrint(buffer, "zcube-agent fetch: peer {s} answered the bundle request " ++
         "with {s}; asking the next peer\n", .{ peer_name, what }) catch buffer[0..0];
@@ -325,12 +339,19 @@ pub const Conn = struct {
     fd: std.posix.fd_t = -1,
     requests: u32 = 0,
     stream: peer_stream.Stream = undefined,
+    /// What the peer answered over the whole fetch, streams reopened or not: busy (503), a
+    /// status other than 200, no reply. A ZC-E0601 says them per peer.
+    busy: u32 = 0,
+    refused: u32 = 0,
+    timeouts: u32 = 0,
 
     fn close(conn: *Conn) void {
         if (!conn.open) return;
         conn.stream.deinit();
         _ = std.os.linux.close(conn.fd);
-        conn.* = .{};
+        conn.open = false;
+        conn.fd = -1;
+        conn.requests = 0; // The answer counts are the fetch's, not the stream's.
     }
 };
 
@@ -1091,6 +1112,7 @@ fn fetch_failed(
         },
         error.TreeUnavailable, error.ChunkFailed, error.Deadline => {},
     }
+    say_peer_answers(net);
     var tried_buffer: [256]u8 = undefined;
     const tried = tried_sources(&tried_buffer, net.peers, net.registry != null);
     fetch_worker.raise_tree_missing(diag, net.digest, tried);
@@ -1107,6 +1129,22 @@ fn fetch_failed(
         }),
     }
     return finish(net.io, diag, constants.exit_external);
+}
+
+/// One line per peer asked, before ZC-E0601: what it answered that was not what was asked for.
+/// A plan that ends with no source for a chunk says nothing else about why.
+fn say_peer_answers(net: *const Net) void {
+    for (net.peers, net.conns[0..net.peers.len]) |who, conn| {
+        var buffer: [256]u8 = undefined;
+        note(net.io, peer_answers_line(&buffer, who.name, conn));
+    }
+}
+
+pub fn peer_answers_line(buffer: []u8, name: []const u8, conn: Conn) []const u8 {
+    const form = "zcube-agent fetch: peer {s} answered busy (503) {d} times, a status other " ++
+        "than 200 {d} times, nothing {d} times\n";
+    return std.fmt.bufPrint(buffer, form, .{ name, conn.busy, conn.refused, conn.timeouts }) catch
+        buffer[0..0];
 }
 
 /// The cause of a tree no source gave, in Zigbox mode as in directory mode.

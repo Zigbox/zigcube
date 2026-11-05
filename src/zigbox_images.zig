@@ -189,8 +189,13 @@ pub const ZigboxImages = struct {
     index: Index = .empty,
     /// Whether `reindex` has walked every root since the store last changed. A chunk the index
     /// lacks then cannot be found by walking again, so a peer asking for unknown hashes costs
-    /// one walk, not one per hash. Cleared by whatever writes to the store.
+    /// one walk, not one per hash. Cleared by whatever writes to the store through this adapter.
     walked: bool = false,
+    /// The roots that walk found (`roots_fingerprint`). Another process writes the store too
+    /// (the supervisor's `zigbox pull`, a fetch child): a miss after a walk lists the roots again
+    /// and walks only if they changed, so a long-lived adapter (a peer server's slot) serves a
+    /// tree pulled after its walk.
+    walked_roots: u64 = 0,
     /// How many walks `reindex` has made (the tests count them).
     walks: u32 = 0,
     claims: std.ArrayList(Claim) = .empty,
@@ -409,7 +414,7 @@ pub const ZigboxImages = struct {
         out: []u8,
     ) node_store.ChunkError![]u8 {
         const self = from(context);
-        if (self.index.get(hash.*) == null and !self.walked) self.reindex();
+        if (self.index.get(hash.*) == null and self.index_stale()) self.reindex();
         const place = self.index.get(hash.*) orelse return error.NotFound;
         const length = store_api.read_chunk(
             self.store,
@@ -432,6 +437,23 @@ pub const ZigboxImages = struct {
         return out[0..length];
     }
 
+    /// Whether a walk could find what the index lacks: none since this adapter last wrote, or
+    /// the store's roots changed since the last one. A listing that fails is not a change.
+    fn index_stale(self: *ZigboxImages) bool {
+        if (!self.walked) return true;
+        var listing: [constants.summary_trees_max]store_api.roots.Root = undefined;
+        var arena: [constants.zigbox_roots_arena_bytes]u8 = undefined;
+        const found = store_api.roots.list(self.store, &arena, &listing) catch return false;
+        return roots_fingerprint(listing[0..found.count]) != self.walked_roots;
+    }
+
+    /// The roots' digests, in any order (a directory lists them in its own).
+    fn roots_fingerprint(roots: []const store_api.roots.Root) u64 {
+        var sum: u64 = roots.len;
+        for (roots) |root| sum +%= std.hash.Wyhash.hash(0, &root.digest.bytes);
+        return sum;
+    }
+
     /// Lists every root's tree, which puts its chunks in the index (best effort).
     fn reindex(self: *ZigboxImages) void {
         self.walked = true;
@@ -439,6 +461,7 @@ pub const ZigboxImages = struct {
         var listing: [constants.summary_trees_max]store_api.roots.Root = undefined;
         var arena: [constants.zigbox_roots_arena_bytes]u8 = undefined;
         const found = store_api.roots.list(self.store, &arena, &listing) catch return;
+        self.walked_roots = roots_fingerprint(listing[0..found.count]);
         const refs = self.allocator.alloc(ChunkRef, constants.fetch_chunks_max) catch return;
         defer self.allocator.free(refs);
         for (listing[0..found.count]) |root| {
@@ -1043,6 +1066,37 @@ test "unknown chunk hashes cost one walk of the roots, not one each" {
     _ = try seam.read_chunk(&refs[0].hash, chunk);
     try testing.expectEqual(@as(u32, 1), adapter.walks);
     adapter.end_claims(); // Something may have been written: the next miss may walk.
+    try testing.expectError(error.NotFound, seam.read_chunk(&unknown, chunk));
+    try testing.expectEqual(@as(u32, 2), adapter.walks);
+}
+
+test "a tree another process added is served after the adapter has walked" {
+    // Goal: demo-c2 step 2. A peer server keeps one adapter per serving slot for its whole life;
+    // after its first walk it answered "not found" for every chunk of a tree the supervisor's
+    // Zigbox pull added later, so the fetchers' plans failed with no strike and no log line.
+    // Method: an adapter over store `a` walks once (an unknown hash); a second tree is imported
+    // into `a` behind the adapter's back, as `zigbox pull` does; a chunk only that tree has must
+    // be served. Its hash is BLAKE3 of its bytes (chunks of 8): asking the seam for the tree's
+    // chunk list would put it in the index and hide the bug.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    var adapter = try ZigboxImages.open(testing.allocator, &pair.a);
+    defer adapter.close();
+    const seam = adapter.images();
+    const chunk = try testing.allocator.alloc(u8, constants.swarm_chunk_bytes);
+    defer testing.allocator.free(chunk);
+    var unknown: Hash = @splat(0xab);
+    try testing.expectError(error.NotFound, seam.read_chunk(&unknown, chunk));
+    try testing.expectEqual(@as(u32, 1), adapter.walks);
+    _ = try pair.add_tree(&tmp);
+    var only_second: Hash = undefined;
+    std.crypto.hash.Blake3.hash("a file o", &only_second, .{});
+    const got = try seam.read_chunk(&only_second, chunk);
+    try testing.expectEqualStrings("a file o", got);
+    // Asking again for unknown hashes with no new tree costs no further walk.
     try testing.expectError(error.NotFound, seam.read_chunk(&unknown, chunk));
     try testing.expectEqual(@as(u32, 2), adapter.walks);
 }

@@ -544,10 +544,13 @@ pub const peer_handshakes_max: u32 = 32;
 pub const peer_handshake_evict_min_ms: u64 = 750;
 /// Time between two times ZC-E0808 is shown, whatever the sources: a flood must not flood a log.
 pub const peer_refusal_log_ms: u64 = 10 * 1000;
-/// Times a fetch asks a peer again after its server said it is busy, and the pause before each.
-/// A busy peer is not a failed one: no timeout, no strike.
-pub const fetch_busy_retries_max: u32 = 4;
+/// How long a fetch keeps asking a peer whose server said it is busy (status 503) before it
+/// takes the answer as a refusal, and the pauses between asks: the first, doubled up to the
+/// longest. A busy peer is not a failed one: no timeout, no strike
+/// (docs/decisions/2026-11-05-busy-peer-wait.md).
+pub const fetch_busy_wait_ms: u32 = 20 * 1000;
 pub const fetch_busy_sleep_ms: u32 = 250;
+pub const fetch_busy_sleep_max_ms: u32 = 2 * 1000;
 /// Time a peer has to finish the handshake.
 pub const peer_handshake_ms: u32 = 3 * 1000;
 /// Time a served connection waits for its next request before it closes.
@@ -617,7 +620,8 @@ comptime {
     assert(peer_handshakes_pending_per_source_max * 2 <= peer_handshakes_max);
     assert(peer_connections_per_node_max > 0);
     assert(peer_connections_per_node_max < peer_connections_max);
-    assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
+    assert(fetch_busy_sleep_ms <= fetch_busy_sleep_max_ms);
+    assert(fetch_busy_wait_ms < fetch_total_ms);
     assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);

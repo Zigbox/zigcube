@@ -184,8 +184,10 @@ without `--peer-advertise` is refused at startup with ZC-E0505, because nobody c
 The server has `peer_handshakes_max` cheap handshake slots and `peer_connections_max` serving
 slots, which hold the big buffers and go only to a peer that authenticated: silent strangers
 cannot lock honest peers out, and a client that finds every serving slot taken gets status 503
-(busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
-without a strike against the peer.
+(busy), which the fetch asks again for up to `fetch_busy_wait_ms` (20 s, pauses doubling from
+`fetch_busy_sleep_ms` to `fetch_busy_sleep_max_ms`) without a strike against the peer. A fetch
+that ends in ZC-E0601 first logs one line per peer asked: how many times it answered busy, a
+status other than 200, or nothing.
 
 **Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. The agent's summary pass (the trees and chunk filter it reports, which the scheduler's locality uses) reads the same Zigbox store on the agent's thread (`ZigboxImages`), so a tree `pull` or a swarm fetch puts there is reported at the next summary; the store is opened in Zigbox mode whether or not `--peer-listen` is given.
 
