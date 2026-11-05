@@ -35,6 +35,15 @@ pub const Images = struct {
     chunk_list_fn: *const fn (*anyopaque, []const u8, []ChunkRef) ChunkError!u32 = no_list,
     read_chunk_fn: *const fn (*anyopaque, *const Hash, []u8) ChunkError![]u8 = no_read,
     put_chunk_fn: *const fn (*anyopaque, *const Hash, []const u8) ChunkError!void = no_put,
+    /// The bundle of a tree (`zigbox_fetch.encode`) into the buffer; null if the store has none.
+    bundle_fn: *const fn (*anyopaque, []const u8, []u8) ?[]const u8 = no_bundle,
+
+    /// The bundle of `tree` in `out`, or null: a store of chunk lists has none.
+    pub fn bundle(images: Images, tree: []const u8, out: []u8) ?[]const u8 {
+        const bytes = images.bundle_fn(images.context, tree, out) orelse return null;
+        assert(bytes.len <= out.len);
+        return bytes;
+    }
 
     /// The complete trees now in the store. `started` is the digests of the images the agent has
     /// started containers from (a store holds what it has run).
@@ -73,6 +82,10 @@ pub const Images = struct {
         return images.put_chunk_fn(images.context, hash, bytes);
     }
 };
+
+fn no_bundle(_: *anyopaque, _: []const u8, _: []u8) ?[]const u8 {
+    return null;
+}
 
 /// The digest a chunk list stands for: `b3:` and the lowercase hex of BLAKE3 of the list's text.
 pub fn list_digest(list: []const u8, out: *[67]u8) []const u8 {

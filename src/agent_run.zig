@@ -43,6 +43,7 @@ const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
 const dir_images = @import("dir_images.zig");
+const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
 const failures = @import("store_failures.zig");
 const store = @import("store.zig");
@@ -372,12 +373,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};
     defer swarm.stop(gpa); // Also after a start that failed with the store open.
-    swarm.start(io, gpa, config) catch |what|
+    swarm.start(init, gpa, config) catch |what|
         return fail_start(io, &diag, config.verbose, @errorName(what));
     var shell: Shell = .{
-        .images = if (swarm.has_store)
-            swarm.store.images()
-        else if (config.runtime == .fake) fake_images.images() else null,
+        .images = node_images(&swarm, config, &fake_images),
         .io = io,
         .clock = real.clock(),
         .boot = boot.clock(),
@@ -457,20 +456,76 @@ fn announce(io: std.Io, config: config_mod.Config) void {
     std.Io.File.stdout().writeStreamingAll(io, line) catch {}; // Nowhere else to report it.
 }
 
+/// The store the agent's summary pass reads: the chunk directory, else the Zigbox store, else
+/// the fixtures of the fake runtime.
+fn node_images(
+    swarm: *Swarm,
+    config: config_mod.Config,
+    fake_images: *node_store.FakeImages,
+) ?node_store.Images {
+    if (swarm.has_store) return swarm.store.images();
+    if (swarm.zigbox) |opened| return opened.images.images();
+    if (config.runtime == .fake) return fake_images.images();
+    return null;
+}
+
 /// The node's chunk store and peer server, when it has them (`--images-dir`, `--peer-listen`).
 /// The summary pass reads the store on the agent's thread; the peer server opens its own
 /// `DirImages` per connection (a `DirImages` is one thread's).
-const Swarm = struct {
+pub const Swarm = struct {
     store: dir_images.DirImages = undefined,
     has_store: bool = false,
+    /// The node's Zigbox store (`--runtime zigbox`), opened on the agent's thread.
+    zigbox: ?*zigbox_fetch.Opened = null,
     server: ?*peer_server_mod.Server = null,
+    zigbox_root: [constants.state_path_bytes_max]u8 = undefined,
+    chunks_path: [constants.state_path_bytes_max + 16]u8 = undefined,
+    /// Tests only: the chunk size of a Zigbox store made with another one (0: Zigbox's own).
+    chunk_bytes_test: u32 = 0,
 
-    fn start(swarm: *Swarm, io: std.Io, gpa: std.mem.Allocator, config: config_mod.Config) !void {
-        const path = config.images_dir orelse return;
-        swarm.store = dir_images.DirImages.open(io, gpa, path) catch
-            return error.@"open the chunk store (--images-dir)";
-        swarm.has_store = true;
+    fn start(
+        swarm: *Swarm,
+        init: std.process.Init,
+        gpa: std.mem.Allocator,
+        config: config_mod.Config,
+    ) !void {
+        var zigbox_root: ?[]const u8 = null;
+        if (config.runtime == .zigbox) {
+            zigbox_root = try swarm.zigbox_store(init.minimal.environ);
+        }
+        try swarm.start_with(init.io, gpa, config, zigbox_root);
+    }
+
+    /// `start` with the Zigbox store's root already found (null: none is served).
+    pub fn start_with(
+        swarm: *Swarm,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        config: config_mod.Config,
+        zigbox_root: ?[]const u8,
+    ) !void {
+        if (zigbox_root) |root| {
+            // The summary pass reads the Zigbox store on the agent's thread; the peer server
+            // opens its own per connection.
+            const opened = gpa.create(zigbox_fetch.Opened) catch return error.OutOfMemory;
+            opened.* = .{ .chunk_bytes = swarm.chunk_bytes_test };
+            opened.open(gpa, root) catch |err| {
+                gpa.destroy(opened);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.NoStore => error.@"open the Zigbox store",
+                };
+            };
+            swarm.zigbox = opened;
+        }
+        if (config.images_dir) |dir| {
+            swarm.store = dir_images.DirImages.open(io, gpa, dir) catch
+                return error.@"open the chunk store (--images-dir)";
+            swarm.has_store = true;
+        }
         const listen = config.peer_listen orelse return;
+        const path = config.images_dir orelse peer_chunks_path(swarm, config, zigbox_root) orelse
+            return error.@"start the peer server";
         const server = gpa.create(peer_server_mod.Server) catch return error.OutOfMemory;
         swarm.server = server;
         server.start(io, .{
@@ -478,6 +533,8 @@ const Swarm = struct {
             .state_dir = config.state_dir,
             .node = config.node,
             .images_path = path,
+            .zigbox_store = zigbox_root,
+            .zigbox_chunk_bytes = swarm.chunk_bytes_test,
             .verbose = config.verbose,
             .corrupt_chunks = test_fault(io, config.state_dir, "peer-corrupt"),
         }) catch {
@@ -487,12 +544,39 @@ const Swarm = struct {
         };
     }
 
-    fn stop(swarm: *Swarm, gpa: std.mem.Allocator) void {
+    /// Where the peer server's unused chunk directory goes when only a Zigbox store is served.
+    fn peer_chunks_path(swarm: *Swarm, config: config_mod.Config, root: ?[]const u8) ?[]const u8 {
+        if (root == null) return null;
+        return std.fmt.bufPrint(&swarm.chunks_path, "{s}/peer-chunks", .{config.state_dir}) catch
+            null;
+    }
+
+    /// The Zigbox store this node pulls into, made if absent (what `pull` would make), so the
+    /// peer server can serve it from the first start.
+    fn zigbox_store(swarm: *Swarm, environ: std.process.Environ) ![]const u8 {
+        var host: zigbox.host_real.HostReal = .{ .environ = environ };
+        var zstore: zigbox.store.Store = undefined;
+        var diag: zigbox.diag.Diag = undefined;
+        diag.reset();
+        const made = zigbox.store.open.open(host.interface(), &zstore, .create, &diag) catch
+            return error.@"open the Zigbox store to serve it";
+        if (!made) return error.@"open the Zigbox store to serve it";
+        const root = zstore.root_text();
+        if (root.len > swarm.zigbox_root.len) return error.@"open the Zigbox store to serve it";
+        @memcpy(swarm.zigbox_root[0..root.len], root);
+        return swarm.zigbox_root[0..root.len];
+    }
+
+    pub fn stop(swarm: *Swarm, gpa: std.mem.Allocator) void {
         if (swarm.server) |server| {
             server.stop();
             gpa.destroy(server);
         }
         if (swarm.has_store) swarm.store.close(gpa);
+        if (swarm.zigbox) |opened| {
+            opened.close();
+            gpa.destroy(opened);
+        }
     }
 };
 
@@ -607,11 +691,23 @@ const Backend = struct {
         for (config.pulls, 0..) |pull, index| {
             box.images[index] = .{ .digest = pull.digest, .reference = pull.reference };
         }
+        // The peers are read from the server by the supervisor's `fetch`; a Zigbox node keeps no
+        // registry of its own (an image's reference is pulled by Zigbox).
+        var server_text: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&server_text);
+        writer.print("{f}", .{config.server}) catch return error.StartFailed;
+        const server = gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
         box.runtime.init(init.io, box.host_real.interface(), .{
             .gpa = gpa,
             .state_dir = config.state_dir,
             .supervisor_exe = exe,
             .images = box.images[0..config.pulls.len],
+            .fetch = .{
+                .exe = exe,
+                .node = config.node,
+                .state_dir = config.state_dir,
+                .server = server,
+            },
         }, diag) catch return error.StartFailed;
         errdefer box.runtime.deinit();
         box.runtime.preflight(diag) catch return error.StartFailed;
@@ -635,3 +731,62 @@ const Backend = struct {
         }
     }
 };
+
+// ---- Tests ------------------------------------------------------------------------------------
+
+test "the store the agent reports from: the chunk directory, else Zigbox's, else the fake's" {
+    // Goal: `Shell.images` is the store the node really holds (slice 8). Method: `node_images`
+    // is that choice; each source is told apart by the summary it gives.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: @import("zigbox_images.zig").Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    var opened: zigbox_fetch.Opened = .{};
+    try opened.open(std.testing.allocator, pair.a.root_text());
+    defer opened.close();
+    var fake: node_store.FakeImages = .{ .digests = &.{} };
+    var swarm: Swarm = .{};
+    var config: config_mod.Config = .{
+        .runtime = .fake,
+        .pulls = &.{},
+        .node = "n1",
+        .server = try std.Io.net.IpAddress.parse("127.0.0.1", 1),
+        .state_dir = "/tmp",
+        .images = &.{},
+        .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+        .address = "",
+        .verbose = false,
+    };
+    // Nothing to read from: a node on the zigbox runtime with no store yet reports none.
+    config.runtime = .zigbox;
+    try std.testing.expect(node_images(&swarm, config, &fake) == null);
+    config.runtime = .fake;
+    const faked = node_images(&swarm, config, &fake).?;
+    try std.testing.expectEqual(@as(*anyopaque, &fake), faked.context);
+    // The Zigbox store wins over the fake's, and is the one opened.
+    swarm.zigbox = &opened;
+    const got = node_images(&swarm, config, &fake).?;
+    try std.testing.expectEqual(@as(*anyopaque, &opened.images), got.context);
+}
+
+test "Swarm finds the Zigbox store from the environment, making it if absent" {
+    // Goal: the real `Swarm.start` lookup (two lines over `start_with`). Method: an environment
+    // whose XDG_DATA_HOME is a scratch directory; the store lands at `$XDG_DATA_HOME/zbx/store`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPathFile(std.testing.io, ".", &path_buffer)];
+    var entry_buffer: [std.fs.max_path_bytes + 32:0]u8 = undefined;
+    const entry = try std.fmt.bufPrint(&entry_buffer, "XDG_DATA_HOME={s}", .{base});
+    entry_buffer[entry.len] = 0;
+    const entries = [_:null]?[*:0]const u8{@ptrCast(&entry_buffer)};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &entries } };
+    var swarm: Swarm = .{};
+    const root = try swarm.zigbox_store(environ);
+    try std.testing.expect(std.mem.startsWith(u8, root, base));
+    try std.testing.expect(std.mem.endsWith(u8, root, "zbx/store"));
+    var opened: zigbox_fetch.Opened = .{};
+    try opened.open(std.testing.allocator, root); // It is a store that opens as existing.
+    opened.close();
+}

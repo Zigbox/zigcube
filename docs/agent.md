@@ -175,7 +175,7 @@ text in `fetch.log`.
 `chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
 checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
 thread; a `DirImages` belongs to one thread, and the peer server gives each connection its own.
-`--peer-listen HOST:PORT` (needs `--images-dir`) starts the peer server (`peer_server.zig`): read-only,
+`--peer-listen HOST:PORT` (needs `--images-dir`, except with `--runtime zigbox`, where it serves the node's Zigbox store; see below) starts the peer server (`peer_server.zig`): read-only,
 CA-authenticated peers only, rate limited (ZC-E0808). The address the node publishes for peers
 (`/node-store/<node>.peer`) is `--peer-advertise HOST:PORT` (`.peer_advertise` in the ZON file);
 without it, the `--peer-listen` address if that names a host. `--peer-listen 0.0.0.0:P` or `[::]:P`
@@ -186,6 +186,8 @@ slots, which hold the big buffers and go only to a peer that authenticated: sile
 cannot lock honest peers out, and a client that finds every serving slot taken gets status 503
 (busy), which the fetch retries a few times (`fetch_busy_retries_max`, `fetch_busy_sleep_ms`)
 without a strike against the peer.
+
+**Zigbox mode (slice 8).** With `--runtime zigbox` and `--peer-listen`, no `--images-dir` is needed: at start the agent finds the node's Zigbox store (`XDG_DATA_HOME` or `HOME`, as `zigbox pull` does), makes it if it is not there yet, and the peer server serves its trees as bundles (`GET /v1/peer/bundle/<digest>`, docs/peer.md) and its chunks. The server's unused chunk directory is `<state-dir>/peer-chunks`. The agent's summary pass (the trees and chunk filter it reports, which the scheduler's locality uses) reads the same Zigbox store on the agent's thread (`ZigboxImages`), so a tree `pull` or a swarm fetch puts there is reported at the next summary; the store is opened in Zigbox mode whether or not `--peer-listen` is given.
 
 `zcube-agent fetch --node N --state-dir D --images-dir I --digest b3:HEX --registry HOST:PORT
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
@@ -202,6 +204,11 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   the plan strikes it if it lies.
 
 **Not built yet (6b part 3 cut):** the fake registry, `swarm-smoke` and its teeth fault.
+
+Test fault: `<state-dir>/faults/fetch-deadline-ms` (Zigbox runtime) holds a number of
+milliseconds, at least 1, that replaces the supervisor's fetch deadline
+(`zigbox_fetch_deadline_ms`, 31 minutes) when it is shorter; the fetch is killed at it and the
+supervisor falls back to the pull. It is read at each fetch. `zigbox-smoke` uses it.
 
 Test fault: `<state-dir>/faults/peer-corrupt` makes the peer server flip the first byte of every
 chunk it sends, so a client's hash check is exercised. It is read when the agent sets up its peer

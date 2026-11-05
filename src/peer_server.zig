@@ -31,6 +31,8 @@ const fetch_plan = @import("fetch_plan.zig");
 const peer = @import("peer.zig");
 const peer_limit = @import("peer_limit.zig");
 const peer_serve = @import("peer_serve.zig");
+const zigbox = @import("zigbox");
+const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_stream = @import("peer_stream.zig");
 const server_listen = @import("server_listen.zig");
 
@@ -43,6 +45,10 @@ pub const Config = struct {
     state_dir: []const u8,
     node: []const u8,
     images_path: []const u8,
+    /// An absolute path to a Zigbox store served instead of `images_path`'s chunk directory.
+    zigbox_store: ?[]const u8 = null,
+    /// Tests only: the chunk size of the Zigbox store when it is not Zigbox's own (0: its own).
+    zigbox_chunk_bytes: u32 = 0,
     verbose: bool = false,
     /// Test fault (`<state dir>/faults/peer-corrupt`, docs/agent.md): the first byte of every chunk
     /// sent is flipped, so a peer that lies reaches its clients' hash check.
@@ -84,6 +90,8 @@ const LinkState = enum(u8) {
 const Slot = struct {
     busy: std.atomic.Value(bool) = .init(false),
     images: dir_images.DirImages = undefined,
+    /// Set when the server serves a Zigbox store: the slot's own handle on it.
+    zigbox: ?*zigbox_fetch.Opened = null,
     scratch: []u8 = &.{},
     refs: []fetch_plan.ChunkRef = &.{},
 };
@@ -117,6 +125,11 @@ pub const Server = struct {
     /// Strangers shut down to make room for a newcomer (`evict_oldest`).
     evictions: std.atomic.Value(u32) = .init(0),
 
+    /// Set when the Zigbox store is read with the one-id map (ZBX-W0201 was said); for tests.
+    outside_fallback: bool = false,
+
+    const OutsideMap = zigbox_fetch.OutsideMap;
+
     pub const StartError = error{ Listen, NoThreads, OutOfMemory, Store };
 
     /// Listens and starts the accept task. `server` must stay where it is until `stop`.
@@ -128,6 +141,7 @@ pub const Server = struct {
         };
         errdefer server.listener.deinit(io);
         const gpa = std.heap.page_allocator;
+        const outside = try outside_map(server, io, gpa);
         var opened: usize = 0;
         errdefer for (server.slots[0..opened]) |*slot| free_slot(slot, io, gpa);
         for (&server.slots) |*slot| {
@@ -135,12 +149,48 @@ pub const Server = struct {
             slot.images = dir_images.DirImages.open(io, gpa, config.images_path) catch
                 return error.Store;
             errdefer slot.images.close(gpa);
+            if (config.zigbox_store) |root| {
+                const handle = try gpa.create(zigbox_fetch.Opened);
+                errdefer gpa.destroy(handle);
+                handle.* = .{ .chunk_bytes = config.zigbox_chunk_bytes };
+                handle.open(gpa, root) catch |err| return switch (err) {
+                    error.NoStore => error.Store,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+                if (outside) |map| handle.read_from_outside(map);
+                slot.zigbox = handle;
+            }
+            errdefer if (slot.zigbox) |handle| {
+                handle.close();
+                gpa.destroy(handle);
+            };
             slot.scratch = try gpa.alloc(u8, peer_serve.scratch_bytes);
             errdefer gpa.free(slot.scratch);
             slot.refs = try gpa.alloc(fetch_plan.ChunkRef, constants.fetch_chunks_max);
             opened += 1;
         }
         server.accept_future = io.concurrent(accept_loop, .{server}) catch return error.NoThreads;
+    }
+
+    /// The store's id map seen from the host, when there is a Zigbox store to serve (Zigbox Z9:
+    /// the server is outside the store's namespace, so an object owned by a container id other
+    /// than the user's reads as Damaged without it). Says ZBX-W0201 when only one id maps.
+    fn outside_map(server: *Server, io: std.Io, gpa: std.mem.Allocator) StartError!?OutsideMap {
+        if (server.config.zigbox_store == null) return null;
+        const facts = gpa.create(zigbox.Facts) catch return error.OutOfMemory;
+        defer gpa.destroy(facts);
+        const outside = zigbox_fetch.outside_owners(facts);
+        if (outside.fallback) {
+            var warning: zigbox.diag.Diag = undefined;
+            warning.reset();
+            warning.raise(.W0201);
+            warning.while_("choosing the id map to read the Zigbox store with", .{});
+            warning.cause("only objects owned by container root can be served to peers; " ++
+                "see zbx doctor (ZBX-E0105) for the subordinate id ranges and helpers", .{});
+            server.outside_fallback = true;
+            if (!server.config.quiet) show_foreign(io, &warning);
+        }
+        return outside.map;
     }
 
     /// The port the server listens on (the system's choice if the configuration said 0).
@@ -164,6 +214,10 @@ pub const Server = struct {
 fn free_slot(slot: *Slot, io: std.Io, gpa: std.mem.Allocator) void {
     _ = io;
     slot.images.close(gpa);
+    if (slot.zigbox) |opened| {
+        opened.close();
+        gpa.destroy(opened);
+    }
     gpa.free(slot.scratch);
     gpa.free(slot.refs);
 }
@@ -380,6 +434,15 @@ fn refuse(server: *Server, io: std.Io, storage: *const Storage, why: []const u8)
     if (!server.config.quiet) show(io, &diag, server.config.verbose);
 }
 
+/// Shows a diagnostic of Zigbox's (ZBX-) as Zigbox wrote it.
+fn show_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
+    var diagnostic: diag_mod.Diagnostic = undefined;
+    zigbox.diagnostic.from_diag(&diagnostic, collector);
+    var buffer: [constants.diag_output_bytes_max]u8 = undefined;
+    const text = diag_mod.render(&diagnostic, .text, false, &buffer);
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to report it.
+}
+
 fn show(io: std.Io, diag: *const Diag, verbose: bool) void {
     var diagnostic: diag_mod.Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, diag);
@@ -458,13 +521,28 @@ fn one_request(stream: *peer_stream.Stream, slot: *Slot, corrupt_chunks: bool) b
         const prefix = "Range: ";
         if (std.mem.startsWith(u8, line, prefix)) range = line[prefix.len..];
     }
+    const target = first[space + 1 ..];
+    // A bundle can be megabytes: its buffer is mapped for this request alone (untouched pages
+    // cost nothing) and the reply is sent before it is unmapped.
+    const wants_bundle = std.mem.startsWith(u8, target, peer_serve.path_bundle);
+    const gpa = std.heap.page_allocator;
+    const bundle_buffer: []u8 = if (wants_bundle and slot.zigbox != null)
+        gpa.alloc(u8, zigbox_fetch.bundle_bytes_max) catch &.{}
+    else
+        &.{};
+    defer if (bundle_buffer.len > 0) gpa.free(bundle_buffer);
+    const seam = if (slot.zigbox) |opened|
+        zigbox_fetch.serving(&opened.images)
+    else
+        slot.images.images();
     const reply = peer_serve.answer(
-        slot.images.images(),
+        seam,
         first[0..space],
-        first[space + 1 ..],
+        target,
         range,
         slot.scratch,
         slot.refs,
+        bundle_buffer,
     );
     const is_chunk = std.mem.startsWith(u8, first[space + 1 ..], peer_serve.path_chunk);
     if (corrupt_chunks and is_chunk and reply.status == 200 and reply.body.len > 0) {
@@ -506,6 +584,14 @@ const Rig = struct {
     list: [80]u8 = undefined,
     list_len: u32 = 0,
     server: Server = undefined,
+    /// A Zigbox store served beside the chunk directory (bundles), and whether chunks are
+    /// corrupted on the way out.
+    zigbox_root: ?[]const u8 = null,
+    corrupt: bool = false,
+    /// Serve through the agent's own wiring (`agent_run.Swarm`), configured for Zigbox only: no
+    /// `images_dir`, the store named by `zigbox_root`.
+    via_agent: bool = false,
+    swarm: agent_run.Swarm = .{},
 
     fn state(rig: *const Rig) []const u8 {
         return rig.state_buffer[0..rig.state_len];
@@ -537,17 +623,42 @@ const Rig = struct {
         _ = @import("node_store.zig").list_digest(text, &rig.digest);
         try store.put_tree(&rig.digest, text);
         try store.images().put_chunk(&rig.hash, &rig.body);
+        if (rig.via_agent) {
+            const config: agent_config.Config = .{
+                .runtime = .zigbox,
+                .pulls = &.{},
+                .node = "node2",
+                .server = try net.IpAddress.parse("127.0.0.1", 1),
+                .state_dir = rig.state(),
+                .images = &.{},
+                .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+                .address = "",
+                .verbose = false,
+                .peer_listen = try net.IpAddress.parse("127.0.0.1", 0),
+                .peer_advertise = try net.IpAddress.parse("127.0.0.1", 1),
+            };
+            rig.swarm.chunk_bytes_test = 8;
+            try rig.swarm.start_with(io, std.testing.allocator, config, rig.zigbox_root);
+            return;
+        }
         try rig.server.start(io, .{
             .listen = try net.IpAddress.parse("127.0.0.1", 0),
             .state_dir = rig.state(),
             .node = "node2",
             .images_path = images,
+            .zigbox_store = rig.zigbox_root,
+            .zigbox_chunk_bytes = if (rig.zigbox_root != null) 8 else 0,
+            .corrupt_chunks = rig.corrupt,
             .quiet = true,
         });
     }
 
+    fn port(rig: *const Rig) u16 {
+        return if (rig.via_agent) rig.swarm.server.?.port() else rig.server.port();
+    }
+
     fn deinit(rig: *Rig) void {
-        rig.server.stop();
+        if (rig.via_agent) rig.swarm.stop(std.testing.allocator) else rig.server.stop();
         rig.tmp.cleanup();
     }
 };
@@ -1078,4 +1189,148 @@ test "an IPv6 address is a source by its /64, and a mapped IPv4 address by its I
     mapped_two[12..16].* = .{ 10, 0, 0, 2 };
     try std.testing.expect(source_key(&mapped_one) != source_key(&mapped_two));
     try std.testing.expectEqual(source_key(&.{ 10, 0, 0, 1 }), source_key(&mapped_one));
+}
+
+const images_mod = @import("zigbox_images.zig");
+const fetch_client = @import("fetch_cli.zig");
+const fetch_worker = @import("fetch_worker.zig");
+const agent_run = @import("agent_run.zig");
+const agent_config = @import("agent_config.zig");
+
+const Digest = zigbox.store.Digest;
+const Manifest = @FieldType(zigbox.store.image_peer.Options, "expected_manifest");
+
+/// A fetch of `tree` for `manifest` from the one peer `rig` serves, over a real peer stream,
+/// into `to`. The client is node1 of the rig's CA. The result is the worker's.
+fn fetch_from_rig(
+    rig: *Rig,
+    to: *images_mod.ZigboxImages,
+    tree: Digest,
+    manifest: Manifest,
+) !void {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const now = peer_stream.wall_ms(io);
+    const key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+    const identity: peer.Identity = .{
+        .key = key,
+        .credential = issue(rig.ca, "node1", key.public_key.toBytes(), now),
+        .ca_public = rig.ca.public_key.toBytes(),
+    };
+    const reply = try gpa.alloc(u8, fetch_client.reply_bytes);
+    defer gpa.free(reply);
+    const conns = try gpa.alloc(fetch_client.Conn, constants.fetch_candidates_max);
+    defer gpa.free(conns);
+    @memset(conns, .{});
+    const peers = [_]fetch_client.Peer{.{
+        .name = "node2",
+        .address = try net.IpAddress.parse("127.0.0.1", rig.port()),
+    }};
+    var text = tree.text();
+    var client: fetch_client.Net = .{
+        .io = io,
+        .registry = null,
+        .peers = &peers,
+        .identity = identity,
+        .reply = reply,
+        .digest = &text,
+        .conns = conns,
+    };
+    defer client.close_peers();
+    var filter: [64]u8 = @splat(0xff);
+    const infos = [_]fetch_worker.PeerInfo{.{ .name = "node2", .filter = &filter }};
+    var report: zigbox_fetch.Report = .{};
+    try zigbox_fetch.fetch(gpa, client.transport(), to, tree, manifest, &infos, .{}, &report);
+}
+
+test "a Zigbox store serves a tree to a fetch into an empty store; a lying peer is refused" {
+    // Goal: the bundle path end to end on real stores and a real stream, the tree trusted only
+    // against its full digest. Method: store A holds an image; a corrupting peer, a peer asked
+    // for another manifest and a peer asked for a tree it lacks all fail and root nothing in B;
+    // an honest peer then gives B the tree whole.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    const manifest = Manifest.parse(images_mod.manifest_text).?;
+    {
+        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
+        defer from_a.close();
+        var buffer: [2048]u8 = undefined;
+        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
+        _ = try from_a.import_image(record, pair.tree, manifest);
+    }
+    var to_b = try images_mod.ZigboxImages.open(gpa, &pair.b);
+    defer to_b.close();
+    const name = pair.tree.text();
+
+    var liar: Rig = .{ .tmp = undefined, .ca = undefined, .corrupt = true };
+    liar.zigbox_root = pair.a.root_text();
+    try liar.init();
+    defer liar.deinit();
+    const corrupted = fetch_from_rig(&liar, &to_b, pair.tree, manifest);
+    try std.testing.expectError(error.ChunkFailed, corrupted);
+    try std.testing.expectEqual(@as(usize, 0), rooted_count(&pair.b));
+
+    var honest: Rig = .{ .tmp = undefined, .ca = undefined };
+    honest.zigbox_root = pair.a.root_text();
+    try honest.init();
+    defer honest.deinit();
+    // A tree the peer does not hold is not served.
+    const absent_hex: [64]u8 = @splat('0');
+    const absent = Digest.parse("b3:" ++ &absent_hex).?;
+    const unavailable = fetch_from_rig(&honest, &to_b, absent, manifest);
+    try std.testing.expectError(error.TreeUnavailable, unavailable);
+    try fetch_from_rig(&honest, &to_b, pair.tree, manifest);
+    try std.testing.expect(to_b.images().has(&name));
+    try std.testing.expectEqual(@as(usize, 1), rooted_count(&pair.b));
+}
+
+fn rooted_count(store: *zigbox.store.Store) usize {
+    var listing: [8]zigbox.store.roots.Root = undefined;
+    var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
+    const rooted = zigbox.store.roots.list(store, &names, &listing) catch return 999;
+    return rooted.count;
+}
+
+test "an agent configured for Zigbox only serves its store's tree to a peer fetch" {
+    // Goal: demo-c2 needs a node with no --images-dir to serve what it pulled. Method: the agent's
+    // own wiring (`Swarm`) with `runtime = .zigbox`, `peer_listen` and no `images_dir` serves
+    // store A; a peer fetches the tree into an empty store B, checked against the full digest.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pair: images_mod.Pair = undefined;
+    try pair.make(&tmp);
+    defer pair.deinit();
+    const manifest = Manifest.parse(images_mod.manifest_text).?;
+    var to_b = try images_mod.ZigboxImages.open(gpa, &pair.b);
+    defer to_b.close();
+    var agent: Rig = .{ .tmp = undefined, .ca = undefined, .via_agent = true };
+    agent.zigbox_root = pair.a.root_text();
+    try agent.init();
+    defer agent.deinit();
+    try std.testing.expect(!agent.swarm.has_store);
+    // The node's summary comes from the Zigbox store the agent opened: it lists the tree.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const seam = agent.swarm.zigbox.?.images.images();
+    {
+        var from_a = try images_mod.ZigboxImages.open(gpa, &pair.a);
+        defer from_a.close();
+        var buffer: [2048]u8 = undefined;
+        const record = try images_mod.record_text(&buffer, pair.tree, images_mod.manifest_text);
+        _ = try from_a.import_image(record, pair.tree, manifest);
+    }
+    const held = try seam.summary(arena_state.allocator(), &.{});
+    try std.testing.expectEqual(@as(usize, 1), held.trees.len);
+    const text = pair.tree.text();
+    try std.testing.expectEqualStrings(&text, held.trees[0].digest);
+    try std.testing.expect(held.filter_chunks > 0);
+    try fetch_from_rig(&agent, &to_b, pair.tree, manifest);
+    const name = pair.tree.text();
+    try std.testing.expect(to_b.images().has(&name));
+    try std.testing.expectEqual(@as(usize, 1), rooted_count(&pair.b));
 }

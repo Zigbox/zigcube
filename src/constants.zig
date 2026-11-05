@@ -451,6 +451,9 @@ pub const fetch_list_peers_max: u32 = 4;
 /// One fetch ends in an error after this long, whatever it is doing (a 64 GiB tree at the
 /// node's rate cap takes about 17 minutes).
 pub const fetch_total_ms: u32 = 30 * 60 * 1000;
+/// The Zigbox supervisor kills a `zcube-agent fetch` that is still running this long after it
+/// started: the fetch's own limit and a minute for it to say why it failed.
+pub const zigbox_fetch_deadline_ms: u32 = fetch_total_ms + 60 * 1000;
 /// The wait before a fetch on a node whose last fetch failed, doubling from the base to the cap
 /// (`fetch_backoff.zig`), so an unreachable tree does not make replicas churn at the speed of the
 /// refusals.
@@ -705,6 +708,26 @@ comptime {
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }
+
+// The Zigbox store adapter (`zigbox_images.zig`, C2 slice 8). All bounds, none a policy.
+
+/// The scratch one Zigbox call reads or writes through: exactly Zigbox's `store_io_buffer_bytes`
+/// (not exported), which `fs.read` asserts as a most and `chunk_hashes` as a least.
+pub const zigbox_io_bytes: u32 = 256 * 1024;
+/// The depth of the walk's explicit stack, in digests.
+pub const zigbox_walk_stack_max: u32 = 1 << 12;
+/// The chunks one object lists: exactly Zigbox's `store_chunks_max` (not exported), which
+/// `chunk_hashes` asserts of the room it is given.
+pub const zigbox_chunks_per_object_max: u32 = 4096;
+/// The bytes the root listing's names may take.
+pub const zigbox_roots_arena_bytes: u32 = 1 << 14;
+/// The bytes of one image record (a peer's record is held to this before it is parsed).
+pub const zigbox_record_bytes_max: u32 = 80 * 1024;
+/// The objects an in-progress receive may hold claims on: as many as the walk's `entries_max`
+/// (`zigbox_images.zig` asserts it), so every tree the walk accepts can be claimed.
+pub const zigbox_claims_max: u32 = 1 << 16;
+/// The bytes a tree record is read into.
+pub const zigbox_tree_buffer_bytes: u32 = 4 << 20;
 
 /// The most a validated pull record encodes to: the fixed fields (node, tree, four numbers, with
 /// escapes) under 512 bytes, and `pull_peers_max` peers each in `peer_bytes` (a node name and a
