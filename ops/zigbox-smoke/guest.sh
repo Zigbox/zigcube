@@ -360,7 +360,8 @@ stage_peers_fetch() {
     await_pull "$PYTHON_TREE" "$since"
     echo "pull record of pyone: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
     [ "$PEER" -gt 0 ] || fail "pyone: no bytes came from a peer (registry=$REG peers=$PEERS)" \
-        "fetch.log: $(cat "$(fetch_log_of pyone)" 2>&1 | head -c 1500) $(dump_b)"
+        "fetch.log: $(cat "$(fetch_log_of pyone)" 2>&1 | head -c 1500)" \
+        "node-store: $(api_get "/v1/list?prefix=/node-store" | head -c 1500) $(dump_b)"
     [ "$REG" -eq 0 ] || fail "pyone: $REG registry bytes, but A has the image"
     case "$PEERS" in "$NODE="*) ;; *) fail "pyone: peers are '$PEERS', not $NODE" ;; esac
     ok "B fetched python:3.12-slim from peer $NODE: $PEER peer bytes, 0 registry bytes"

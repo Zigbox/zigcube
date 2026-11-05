@@ -239,8 +239,22 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
         .stdin = .ignore,
         .stdout = sink,
         .stderr = sink,
-    }) catch return false;
-    return finished_ok(swarm.io, &child, fetch_deadline(swarm));
+    }) catch |err| {
+        say_in_log(swarm.io, log, "could not start the fetch: ", @errorName(err));
+        return false;
+    };
+    const finished = finished_ok(swarm.io, &child, fetch_deadline(swarm));
+    if (!finished) say_in_log(swarm.io, log, "the fetch did not exit with code 0", "");
+    return finished;
+}
+
+/// One line in `fetch.log`, in the supervisor's own voice: a fetch that dies without a word (or
+/// never starts) would otherwise leave the log empty and the pull's fall-back unexplained.
+fn say_in_log(io: std.Io, log: ?std.Io.File, what: []const u8, detail: []const u8) void {
+    const file = log orelse return;
+    var buffer: [160]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "supervisor: {s}{s}\n", .{ what, detail }) catch return;
+    file.writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
 }
 
 /// The fetch's deadline: `constants.zigbox_fetch_deadline_ms`, unless the test fault
