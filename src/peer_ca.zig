@@ -78,6 +78,13 @@ pub const Ca = struct {
         return ca.key.public_key.toBytes();
     }
 
+    /// A leaf's key is a usable public key and is not the CA's own: a leaf holding the CA key
+    /// could sign certificates as the CA.
+    fn check_leaf_key(ca: *const Ca, key: [32]u8) error{BadKey}!void {
+        try check_subject_key(key);
+        if (std.mem.eql(u8, &key, &ca.public())) return error.BadKey;
+    }
+
     /// Signs `node_key` as `node`'s key for `peer_credential_ttl_ms` from now. A removed node is
     /// refused (ZC-E0807 is the caller's to raise), and so is a key that is not a valid Ed25519
     /// public key, which no handshake could use. The caller has checked the node's name.
@@ -121,7 +128,7 @@ pub const Ca = struct {
         out: *x509.Der,
         request: *const WorkloadArgs,
     ) CertificateError!void {
-        try check_subject_key(request.subject_key);
+        try ca.check_leaf_key(request.subject_key);
         const lifetime = try lifetime_from(ca.wall.now_ms(), request.ttl_ms);
         try x509.issue_workload(out, ca.key, &.{
             .cluster = request.cluster,
@@ -140,7 +147,7 @@ pub const Ca = struct {
         out: *x509.Der,
         request: *const ServerArgs,
     ) CertificateError!void {
-        try check_subject_key(request.subject_key);
+        try ca.check_leaf_key(request.subject_key);
         const lifetime = try lifetime_from(ca.wall.now_ms(), request.ttl_ms);
         try x509.issue_server(out, ca.key, &.{
             .dns_name = request.dns_name,
@@ -161,6 +168,19 @@ comptime {
 /// Why a certificate could not be issued: `x509.Error` (a bad name, label or lifetime) or a
 /// subject key that is not a usable Ed25519 public key.
 pub const CertificateError = x509.Error || error{BadKey};
+
+/// The diagnostic code of a refused issue: ZC-E0817 for every one (a request that breaks a
+/// bound, or a subject key no honest holder has); `x509.code_of` for the rest.
+pub fn code_of(err: CertificateError) @import("diag/codes.zig").Code {
+    if (err == error.BadKey) return .E0817;
+    return x509.code_of(@errorCast(err));
+}
+
+/// The refusal in words, for the cause line (no Zig error name reaches a user).
+pub fn reason(err: CertificateError) []const u8 {
+    if (err == error.BadKey) return "the subject key is not a usable Ed25519 public key";
+    return x509.reason(@errorCast(err));
+}
 
 pub const WorkloadArgs = struct {
     cluster: []const u8,
@@ -380,6 +400,20 @@ test "the CA refuses lifetimes over the bound, overflow, bad names and bad subje
         .ttl_ms = 1000,
     };
     try std.testing.expectError(error.BadKey, ca.issue_server_certificate(&out, &server_args));
+    // The CA's own key is never a leaf's.
+    args.subject_key = ca.public();
+    try std.testing.expectError(error.BadKey, ca.issue_workload_certificate(&out, &args));
+    const own: ServerArgs = .{
+        .dns_name = "a.example",
+        .subject_key = ca.public(),
+        .ttl_ms = 1000,
+    };
+    try std.testing.expectError(error.BadKey, ca.issue_server_certificate(&out, &own));
+    // Every refusal has a code and words; no Zig error name is shown.
+    try std.testing.expectEqual(@import("diag/codes.zig").Code.E0817, code_of(error.BadKey));
+    try std.testing.expectEqual(@import("diag/codes.zig").Code.E0817, code_of(error.BadSpiffe));
+    try std.testing.expectEqual(@import("diag/codes.zig").Code.E0810, code_of(error.BadSignature));
+    try std.testing.expect(reason(error.BadKey).len > 0);
     var late: TestClock = .{ .ms = std.math.maxInt(u64) - 10 };
     const late_ca = try test_ca(&late);
     try std.testing.expectError(error.IssueLifetime, late_ca.issue_ca_certificate(&out, 1000));

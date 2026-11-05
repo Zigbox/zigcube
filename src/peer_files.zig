@@ -16,6 +16,9 @@ const Dir = std.Io.Dir;
 
 pub const Error = error{Failed};
 
+/// What `write` adds to a name for its temporary file: a dot, 16 hex digits and ".tmp".
+const temp_suffix_bytes = 1 + 16 + 4;
+
 /// Who may touch a file we read: `secret` is ours alone (no group or other access); `anchor`
 /// is public but a trust anchor, so nobody else may write it; `plain` is not checked.
 pub const Guard = enum { plain, anchor, secret };
@@ -135,12 +138,15 @@ pub fn write(
     diag: *Diag,
 ) Error!void {
     assert(name.len > 0);
-    assert(name.len + ".tmp".len <= 64);
-    var temp: [64]u8 = undefined;
-    const temp_name = std.fmt.bufPrint(&temp, "{s}.tmp", .{name}) catch unreachable; // Sized.
-    // A temporary file left by a killed run, or planted, keeps its own mode and owner and would
-    // receive the secret: remove it and make ours exclusively. Every failure removes ours again.
-    dir.deleteFile(io, temp_name) catch {}; // Absent is the usual case.
+    assert(name.len + temp_suffix_bytes <= 96);
+    // A name of its own per write, so that two writers (two servers on one state directory) never
+    // share a temporary file, and one that is planted or left by a killed run is never reused:
+    // the file is made exclusively. Every failure removes ours again.
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    var temp: [96]u8 = undefined;
+    const temp_name = std.fmt.bufPrint(&temp, "{s}.{x}.tmp", .{ name, &random }) catch
+        unreachable; // The name, a dot, 16 digits and ".tmp" fit 96 bytes (asserted above).
     errdefer dir.deleteFile(io, temp_name) catch {}; // Nothing more to do if this fails too.
     {
         const file = dir.createFile(io, temp_name, .{
@@ -211,7 +217,8 @@ test "a seed is written 0600, read back, and a loose file is refused" {
 
 test "a planted temporary file with a loose mode never receives the secret" {
     // Goal: finding 4. Method: plant `k.tmp` at 0644 holding text of its own, write a seed, and
-    // find the result at 0600, the temporary gone, the planted text not kept.
+    // find the result at 0600; the write uses a temporary of its own, so the planted file is
+    // neither used nor removed, and the seed is not in it.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -229,7 +236,63 @@ test "a planted temporary file with a loose mode never receives the secret" {
     defer file.close(io);
     const stat = try file.stat(io);
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "k.tmp", .{}));
+    var planted: [16]u8 = undefined;
+    const kept = try tmp.dir.readFile(io, "k.tmp", &planted);
+    try std.testing.expectEqualStrings("planted\n", kept);
     const back = try read_seed(io, tmp.dir, "tmp", "k", &diag);
     try std.testing.expectEqualSlices(u8, &seed, &back.?);
+}
+
+fn count_entries(io: std.Io, dir: Dir) !u32 {
+    var listing = try dir.openDir(io, ".", .{ .iterate = true });
+    defer listing.close(io);
+    var iterator = listing.iterate();
+    var count: u32 = 0;
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
+}
+
+test "two writes of one name leave a whole file and no temporary" {
+    // Goal: finding 2 of the review of #89: no fixed temporary name, so interleaved writers
+    // cannot mix their bytes. Method: two threads write different texts of one name many times;
+    // the file is always one of the two whole texts and the directory holds that file alone.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Writer = struct {
+        fn run(dir: Dir, text: []const u8, failed: *std.atomic.Value(bool)) void {
+            var diag: Diag = undefined;
+            diag.reset();
+            for (0..50) |_| {
+                write(std.testing.io, dir, "tmp", "ca.crt", text, &diag) catch {
+                    failed.store(true, .release);
+                };
+            }
+        }
+    };
+    const first: [3000]u8 = @splat('A');
+    const second: [2000]u8 = @splat('B');
+    var failed: std.atomic.Value(bool) = .init(false);
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{ tmp.dir, &first, &failed });
+    Writer.run(tmp.dir, &second, &failed);
+    thread.join();
+    try std.testing.expect(!failed.load(.acquire));
+    var buffer: [4096]u8 = undefined;
+    const text = try tmp.dir.readFile(io, "ca.crt", &buffer);
+    try std.testing.expect(std.mem.eql(u8, text, &first) or std.mem.eql(u8, text, &second));
+    try std.testing.expectEqual(@as(u32, 1), try count_entries(io, tmp.dir));
+}
+
+test "a write that fails removes its temporary file" {
+    // Goal: no leftover on failure. Method: make the target name a directory so the rename
+    // fails, and find the directory holding only that entry afterwards.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "ca.crt", .default_dir);
+    var diag: Diag = undefined;
+    diag.reset();
+    try std.testing.expectError(error.Failed, write(io, tmp.dir, "tmp", "ca.crt", "x", &diag));
+    try std.testing.expectEqual(codes.Code.E0806, diag.code.?);
+    try std.testing.expectEqual(@as(u32, 1), try count_entries(io, tmp.dir));
 }

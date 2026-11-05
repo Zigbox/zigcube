@@ -505,12 +505,24 @@ fn write_certificate(out: *Der, tbs: *const Tbs, signer: Signer) Error!void {
     assert(out.slice().len <= constants.x509_cert_bytes_max);
 }
 
-fn serial_of(public_key: [32]u8, not_before_s: u64) [constants.x509_serial_bytes_max]u8 {
+/// The serial: SHA-256 over every other field of the TBS (kind, issuer, subject, validity, key,
+/// name, identity), each length-prefixed so that no two field splits hash alike. Two certificates
+/// that differ in any of them, even for the same key in the same second, differ in serial.
+fn serial_of(tbs: *const Tbs) [constants.x509_serial_bytes_max]u8 {
     var hasher = Sha256.init(.{});
-    hasher.update(&public_key);
-    var time: [8]u8 = undefined;
-    std.mem.writeInt(u64, &time, not_before_s, .big);
-    hasher.update(&time);
+    hasher.update(&.{@backingInt(tbs.kind)});
+    const fields = [_][]const u8{ tbs.issuer_cn, tbs.subject_cn, tbs.name, tbs.identity };
+    for (fields) |field| {
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(field.len), .big);
+        hasher.update(&length);
+        hasher.update(field);
+    }
+    var times: [16]u8 = undefined;
+    std.mem.writeInt(u64, times[0..8], tbs.not_before_s, .big);
+    std.mem.writeInt(u64, times[8..16], tbs.not_after_s, .big);
+    hasher.update(&times);
+    hasher.update(&tbs.public_key);
     var digest: [Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     var serial: [constants.x509_serial_bytes_max]u8 = digest[0..constants.x509_serial_bytes_max].*;
@@ -540,7 +552,7 @@ pub fn issue_ca(out: *Der, ca: Ed25519.KeyPair, lifetime: Lifetime) Error!void {
     const public = ca.public_key.toBytes();
     const seconds = try lifetime_seconds(.ca, lifetime.not_before_ms, lifetime.not_after_ms);
     const subject = ca_cn(public);
-    const serial = serial_of(public, seconds[0]);
+    var serial: [constants.x509_serial_bytes_max]u8 = undefined;
     const tbs: Tbs = .{
         .kind = .ca,
         .serial = &serial,
@@ -552,6 +564,7 @@ pub fn issue_ca(out: *Der, ca: Ed25519.KeyPair, lifetime: Lifetime) Error!void {
         .name = "",
         .identity = "",
     };
+    serial = serial_of(&tbs);
     try write_certificate(out, &tbs, .{ .key = ca });
 }
 
@@ -573,7 +586,7 @@ pub fn issue_workload(out: *Der, ca: Ed25519.KeyPair, request: *const WorkloadRe
     try identity_mod.encode(&identity_writer, &request.identity);
     const lifetime = request.lifetime;
     const seconds = try lifetime_seconds(.workload, lifetime.not_before_ms, lifetime.not_after_ms);
-    const serial = serial_of(request.subject_key, seconds[0]);
+    var serial: [constants.x509_serial_bytes_max]u8 = undefined;
     const issuer = ca_cn(ca.public_key.toBytes());
     const tbs: Tbs = .{
         .kind = .workload,
@@ -586,6 +599,7 @@ pub fn issue_workload(out: *Der, ca: Ed25519.KeyPair, request: *const WorkloadRe
         .name = uri,
         .identity = identity_writer.written(),
     };
+    serial = serial_of(&tbs);
     try write_certificate(out, &tbs, .{ .key = ca });
 }
 
@@ -602,7 +616,7 @@ pub fn issue_server(out: *Der, ca: Ed25519.KeyPair, request: *const ServerReques
     }
     const lifetime = request.lifetime;
     const seconds = try lifetime_seconds(.server, lifetime.not_before_ms, lifetime.not_after_ms);
-    const serial = serial_of(request.subject_key, seconds[0]);
+    var serial: [constants.x509_serial_bytes_max]u8 = undefined;
     const issuer = ca_cn(ca.public_key.toBytes());
     const tbs: Tbs = .{
         .kind = .server,
@@ -615,6 +629,7 @@ pub fn issue_server(out: *Der, ca: Ed25519.KeyPair, request: *const ServerReques
         .name = request.dns_name,
         .identity = "",
     };
+    serial = serial_of(&tbs);
     try write_certificate(out, &tbs, .{ .key = ca });
 }
 

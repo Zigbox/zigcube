@@ -381,3 +381,53 @@ test "times: the writer switches to GeneralizedTime at 2050 and reads back what 
         try testing.expectEqual(row.seconds, try x509.read_time(written[2..], row.tag));
     }
 }
+
+test "serials: certificates differing only in subject name, or any other field, differ" {
+    // Goal: the serial covers the whole TBS, so a re-issue of the same key in the same second
+    // under another name cannot collide (the first version hashed only key and not_before).
+    // Method: issue workloads and servers for one key and window, changing one field each time,
+    // and compare every serial with the base one; the base is also stable when issued twice.
+    const key = try subject_key(1);
+    var base: x509.Der = .{};
+    try x509.issue_workload(&base, try ca_pair(), &workload_request(key));
+    var again: x509.Der = .{};
+    try x509.issue_workload(&again, try ca_pair(), &workload_request(key));
+    const base_serial = (try x509.parse(base.slice())).serial.of(base.slice());
+    try testing.expectEqual(@as(usize, constants.x509_serial_bytes_max), base_serial.len);
+    try testing.expect(base_serial[0] & 0x80 == 0);
+    try testing.expectEqualSlices(
+        u8,
+        base_serial,
+        (try x509.parse(again.slice())).serial.of(again.slice()),
+    );
+
+    var renamed = workload_request(key);
+    renamed.service = "broker-2";
+    var other_cluster = workload_request(key);
+    other_cluster.cluster = "dev.example";
+    var other_epoch = workload_request(key);
+    other_epoch.identity.placement_epoch = 43;
+    var other_window = workload_request(key);
+    other_window.lifetime.not_after_ms += 2000;
+    const requests = [_]x509.WorkloadRequest{ renamed, other_cluster, other_epoch, other_window };
+    for (requests) |request| {
+        var out: x509.Der = .{};
+        try x509.issue_workload(&out, try ca_pair(), &request);
+        const serial = (try x509.parse(out.slice())).serial.of(out.slice());
+        try testing.expect(!std.mem.eql(u8, base_serial, serial));
+    }
+
+    var server_a: x509.Der = .{};
+    var server_b: x509.Der = .{};
+    var request: x509.ServerRequest = .{
+        .dns_name = "a.example",
+        .subject_key = key,
+        .lifetime = window,
+    };
+    try x509.issue_server(&server_a, try ca_pair(), &request);
+    request.dns_name = "b.example";
+    try x509.issue_server(&server_b, try ca_pair(), &request);
+    const serial_a = (try x509.parse(server_a.slice())).serial.of(server_a.slice());
+    const serial_b = (try x509.parse(server_b.slice())).serial.of(server_b.slice());
+    try testing.expect(!std.mem.eql(u8, serial_a, serial_b));
+}
