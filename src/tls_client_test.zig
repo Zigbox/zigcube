@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const schedule = @import("tls_schedule.zig");
 const tls_client = @import("tls_client.zig");
@@ -305,6 +306,49 @@ test "a KeyUpdate moves the receive keys, and one that asks is answered" {
     var out: [256]u8 = undefined;
     const sealed = try rig.client.seal_application("new keys", &out, &rig.diag);
     try std.testing.expectEqualStrings("new keys", (try rig.peer.open(sealed)).content);
+}
+
+test "the write keys are updated by themselves when their record limit is reached" {
+    // Goal: SHOULD 5, RFC 8446 section 5.5: data is never refused for the limit. Method: set
+    // the sequence at the limit; the next seal carries a KeyUpdate, then the data under new keys.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    rig.client.write.sequence = constants.tls_records_per_key_max;
+    var out: [512]u8 = undefined;
+    const sealed = try rig.client.seal_application("late", &out, &rig.diag);
+    const head = 5 + std.mem.readInt(u16, sealed[3..5], .big);
+    const first = try rig.peer.open(sealed[0..head]);
+    try std.testing.expectEqual(schedule.ContentType.handshake, first.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, first.content);
+    const rest = sealed[head..];
+    try rig.peer.read.rekey();
+    try std.testing.expectEqualStrings("late", (try rig.peer.open(rest)).content);
+}
+
+test "a write side that cannot go on is E0815, never silent" {
+    // Goal: SHOULD 5. Method: a connection that already updated its keys as often as allowed
+    // is asked to update once more.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    rig.client.write.updates = constants.tls_key_updates_per_connection_max;
+    try std.testing.expectError(error.Refused, rig.client.send_key_update(false, &rig.diag));
+    try rig.expect_code(.E0815);
+}
+
+test "a handshake message over the limit is refused, and the cause names the message" {
+    // Goal: SHOULD 6. Method: a NewSessionTicket header that declares 5,000 bytes.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    var out: [64]u8 = undefined;
+    const header = [_]u8{ 4, 0, 0x13, 0x88 };
+    const record = rig.peer.seal(&out, .handshake, &header);
+    try std.testing.expectError(error.Refused, rig.feed(record, 4096));
+    try rig.expect_code(.E0813);
+    const cause = rig.diag.last_cause().?;
+    try std.testing.expect(std.mem.indexOf(u8, cause, "NewSessionTicket of 5004 bytes") != null);
 }
 
 test "a NewSessionTicket is read past and close_notify ends the connection" {
@@ -831,7 +875,8 @@ test "teeth: without the scheme check a request without Ed25519 is answered" {
         .schemes = &.{0x0804},
     });
     const flight = try connect_auth(&rig, 4096);
-    try std.testing.expect(flight != .ok_without_certificate);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok, flight);
+    try std.testing.expect(rig.peer.client_key != null);
 }
 
 test "teeth: without the refusal check an alert about the certificate is a protocol error" {

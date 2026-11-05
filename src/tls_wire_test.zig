@@ -17,7 +17,7 @@ const Body = struct {
         var body: Body = .{};
         body.bytes[0] = @intCast(context.len);
         @memcpy(body.bytes[1..][0..context.len], context);
-        body.length = 1 + context.len + 2;
+        body.length = @intCast(1 + context.len + 2);
         body.extensions_at = body.length - 2;
         return body;
     }
@@ -26,7 +26,7 @@ const Body = struct {
         std.mem.writeInt(u16, body.bytes[body.length..][0..2], kind, .big);
         std.mem.writeInt(u16, body.bytes[body.length + 2 ..][0..2], @intCast(data.len), .big);
         @memcpy(body.bytes[body.length + 4 ..][0..data.len], data);
-        body.length += 4 + data.len;
+        body.length += @intCast(4 + data.len);
         return body;
     }
 
@@ -71,7 +71,14 @@ test "a CertificateRequest that can be answered, and one that cannot" {
             .want = true,
         },
     };
-    try expect_refusals(&cases);
+    for (cases) |case| {
+        var body = Body.begin(case.context);
+        _ = body.schemes(13, case.schemes);
+        if (case.cert) |cert| _ = body.schemes(50, cert);
+        const request = try wire.parse_certificate_request(body.done());
+        try testing.expectEqualSlices(u8, case.context, request.context);
+        try testing.expectEqual(case.want, request.accepts_ed25519);
+    }
 }
 
 test "a CertificateRequest skips extensions it does not use" {
