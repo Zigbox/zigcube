@@ -287,7 +287,10 @@ pub const Agent = struct {
     }
 
     /// The soonest the agent needs to run again: its lease renewal, the fence, a stop's deadline,
-    /// or the resync that notices a container that ended.
+    /// or the resync that notices a container that ended. A stop whose deadline has passed is not
+    /// a wake: this pass already killed its container (`stop_once`), and one that is still listed
+    /// (a record whose container never started reads `starting` until `fake_start_timeout_ms`,
+    /// and there is nothing to kill) is looked at again by the resync, not at once, every step.
     fn next_wake(agent: *const Agent, now: u64, mono: u64) u64 {
         var wake = now + constants.agent_resync_ms;
         if (agent.lease != store.lease_none) {
@@ -295,7 +298,7 @@ pub const Agent = struct {
             wake = @min(wake, now + (agent.fence_at_ms().? -| mono));
         }
         for (agent.stops[0..agent.stops_count]) |stop| {
-            if (stop.deadline_ms < wake) wake = stop.deadline_ms;
+            if (stop.deadline_ms > now and stop.deadline_ms < wake) wake = stop.deadline_ms;
         }
         return @max(wake, now);
     }
