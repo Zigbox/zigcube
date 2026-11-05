@@ -786,6 +786,10 @@ fn sim_container(sim: *HostSim, name: []const u8, replica: ?[]const u8) !void {
     try zigbox.start(sim.interface(), &spec, .{ .detached = true }, &sim_handle, &diagnostic);
 }
 
+test {
+    _ = process_session; // Its tests, which no other root reaches.
+}
+
 /// The sessions a `Rig`'s runtime killed: its supervisors are simulated pids, which a real
 /// `process_session.kill_all` would aim at whatever host process has that number.
 var sessions_killed: [4]i32 = undefined;
