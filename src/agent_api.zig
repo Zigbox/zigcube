@@ -432,7 +432,7 @@ const Call = struct {
         var ops: [constants.agent_report_ops_max]store.Op = undefined;
         var count: u32 = 0;
         for (input.puts) |put| {
-            try call.check_put(&put);
+            try call.check_put(&put, input.tenure);
             const value = records.encode(ctx.arena, put.value, ctx.diag) catch
                 return propagate(ctx);
             ops[count] = .{ .put = .{ .key = put.key, .value = value } };
@@ -579,7 +579,7 @@ const Call = struct {
 
     /// The key is this node's observed key for the replica the record names, and the record says
     /// it is this node's: an agent can write its own node's reports and no other key.
-    fn check_put(call: Call, put: *const ObservedPut) Failure!void {
+    fn check_put(call: Call, put: *const ObservedPut, tenure: u64) Failure!void {
         const ctx = call.ctx;
         const rec = &put.value;
         if (records.name_problem(rec.replica, constants.node_name_bytes_max) != null) {
@@ -587,6 +587,9 @@ const Call = struct {
         }
         if (!std.mem.eql(u8, rec.node, call.node)) {
             return bad_request(ctx, "puts", "a record is for another node");
+        }
+        if (rec.tenure != tenure) {
+            return bad_request(ctx, "puts", "a record does not name the tenure of the request");
         }
         const wanted = records.observed_key(call.node, rec.replica);
         if (!std.mem.eql(u8, put.key, wanted.slice())) {

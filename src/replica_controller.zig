@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
@@ -60,11 +61,14 @@ pub const actor = "replica-controller";
 /// decision, `decision_ops + 1` for each replica (its decision, and the replica record or its
 /// delete), and 1 for the counter.
 const batch_replicas_max: u32 = 3;
-/// Distinct lost nodes one transaction removes replicas from: each costs two compares (its
-/// status and its `/nodes` record), which a batch of `batch_replicas_max` replicas on three
-/// nodes would push past `store_txn_compares_max`. A replica on a further node waits for the
-/// next pass.
-const lost_nodes_batch_max: u32 = 2;
+/// Distinct nodes whose judgement one removing transaction rests on (a lost node, or a ready one
+/// a cited report came from): each costs two compares (its status and its `/nodes` record),
+/// which a batch of `batch_replicas_max` replicas on three nodes would push past
+/// `store_txn_compares_max`. A replica on a further node waits for the next pass.
+const judged_nodes_batch_max: u32 = 2;
+/// Holds one transaction writes: three compares each (the summary, the report, the assignment)
+/// and two for its node, which `store_txn_compares_max` allows for this many.
+const hold_batch_max: u32 = 3;
 const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{
@@ -86,13 +90,15 @@ comptime {
     // replicas the batch removes, the node's status and its `/nodes` record.
     const fixed = 2 + controller.decision_compares;
     const per_replica = 2 + controller.decision_compares;
-    const per_lost_node = 2;
-    assert(fixed + batch_replicas_max * per_replica + lost_nodes_batch_max * per_lost_node <=
+    const per_judged_node = 2;
+    assert(fixed + batch_replicas_max * per_replica + judged_nodes_batch_max * per_judged_node <=
         constants.store_txn_compares_max);
     // One more lost node would not fit, so the limit is what the store allows, not slack.
     assert(fixed + batch_replicas_max * per_replica +
-        (lost_nodes_batch_max + 1) * per_lost_node > constants.store_txn_compares_max);
-    assert(lost_nodes_batch_max <= batch_replicas_max);
+        (judged_nodes_batch_max + 1) * per_judged_node > constants.store_txn_compares_max);
+    assert(judged_nodes_batch_max <= batch_replicas_max);
+    const per_hold = controller.decision_compares + 2 + per_judged_node;
+    assert(hold_batch_max * per_hold <= constants.store_txn_compares_max);
 }
 
 pub const ReplicaController = struct {
@@ -230,7 +236,7 @@ const Run = struct {
             }
             const number = records.replica_number(service.rec.name, replica.rec.id) orelse
                 return records.malformed(run.ctx.diag, replica.kv.key, "Replica");
-            const observed = run.snap.observed_of(&replica.rec);
+            const observed = run.admissible(run.snap.observed_of(&replica.rec));
             var item: Item = .{
                 .replica = replica,
                 .observed = observed,
@@ -254,6 +260,28 @@ const Run = struct {
             .dead => plan.dead += 1,
             .stale => plan.stale += 1,
         };
+    }
+
+    /// `found` if the controller may act on it (authority.md section 3), else null: the replica is
+    /// then treated as not reported, and the node controller's judgement decides what happens to
+    /// it. A C1 report carries the tenure it was written under, the node's `/nodes` record must
+    /// still have that revision, the report's placement epoch (if it names one) must be the
+    /// assignment's revision, and the node's status must be `ready`. A C0 report carries no
+    /// tenure and is taken as it is.
+    fn admissible(run: *Run, found: ?*const Entry(records.Observed)) ?*const Entry(
+        records.Observed,
+    ) {
+        const entry = found orelse return null;
+        const tenure = entry.rec.tenure orelse return entry;
+        const node = run.snap.node_entry(entry.rec.node) orelse return null;
+        if (node.kv.mod_revision != tenure) return null;
+        if (entry.rec.assignment) |epoch| {
+            const placed = run.snap.assigned_of(entry.rec.replica) orelse return null;
+            if (placed.kv.mod_revision != epoch) return null;
+        }
+        const status = run.snap.status_of(entry.rec.node) orelse return null;
+        if (status.rec.state != .ready) return null;
+        return entry;
     }
 
     /// The status of the node `replica` is placed on, if that node is lost for the tenure the
@@ -281,12 +309,20 @@ const Run = struct {
     /// observed record. False if the transaction did not commit (the step stops for this service).
     fn hold_pass(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!bool {
         var batch: Batch = .{};
+        var holds: u32 = 0;
         for (plan.slice()) |item| {
             if (item.class != .held) continue;
+            if (holds == hold_batch_max) break;
             const observed = item.observed.?;
             if (try run.already_held(service.rec.name, observed)) continue;
             if (!batch.has_room(controller.decision_ops)) break;
+            holds += 1;
+            // Each hold compares its report and the assignment it was found through, and the
+            // node it rests on once: `hold_batch_max` holds fit `store_txn_compares_max`.
             batch.expect(observed.kv.key, observed.kv.mod_revision);
+            const placed = run.snap.assigned_of(item.replica.rec.id).?;
+            batch.expect(placed.kv.key, placed.kv.mod_revision);
+            if (judged_by_status(observed)) try run.expect_node_judged(&batch, observed.rec.node);
             const reason = try controller.format(run.ctx, "replica {s} failed to start on {s}; " ++
                 "it was not replaced because a new one would fail the same way", .{
                 item.replica.rec.id, observed.rec.node,
@@ -339,14 +375,13 @@ const Run = struct {
     fn replace(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
         var removed: [batch_replicas_max]*const Item = undefined;
         var removed_count: u32 = 0;
-        var lost_nodes: [lost_nodes_batch_max][]const u8 = undefined;
+        var lost_nodes: [judged_nodes_batch_max][]const u8 = undefined;
         var lost_nodes_count: u32 = 0;
         for (plan.slice()) |*item| {
             if (item.class != .dead and item.class != .stale) continue;
             if (removed_count == batch_replicas_max) break;
-            if (item.lost) |status| {
-                const node = status.kv.key[records.prefix_node_status.len..];
-                if (!note_lost_node(&lost_nodes, &lost_nodes_count, node)) continue;
+            if (judged_node(item)) |node| {
+                if (!note_node(lost_nodes[0..], &lost_nodes_count, node)) continue;
             }
             removed[removed_count] = item;
             removed_count += 1;
@@ -388,17 +423,17 @@ const Run = struct {
         _ = try run.finish(&batch);
     }
 
-    /// Counts `node` among the lost nodes the batch touches. False if it is a new one and the
-    /// batch already has `lost_nodes_batch_max` (the compare budget).
-    fn note_lost_node(
-        nodes: *[lost_nodes_batch_max][]const u8,
+    /// Counts `node` among the nodes whose status the batch compares. False if it is a new one and
+    /// the batch already has `judged_nodes_batch_max` (the compare budget).
+    fn note_node(
+        nodes: [][]const u8,
         count: *u32,
         node: []const u8,
     ) bool {
         for (nodes[0..count.*]) |known| {
             if (std.mem.eql(u8, known, node)) return true;
         }
-        if (count.* == lost_nodes_batch_max) return false;
+        if (count.* == nodes.len) return false;
         nodes[count.*] = node;
         count.* += 1;
         return true;
@@ -490,6 +525,10 @@ const Run = struct {
         // judgement was about another placement, so the assignment is in the read set.
         const placed = run.snap.assigned_of(replica.rec.id).?;
         batch.expect(placed.kv.key, placed.kv.mod_revision);
+        // The report was admissible because the node was ready under the tenure it names. The
+        // report's own key is not compared: the compare budget has no room for it, and any change
+        // to what it says is a new tenure, a new placement or a new status, all of which are.
+        if (judged_by_status(observed)) try run.expect_node_judged(batch, observed.rec.node);
         batch.delete(replica.kv.key);
         return id;
     }
@@ -518,20 +557,20 @@ const Run = struct {
         batch.expect(replica.kv.key, replica.kv.mod_revision);
         const placed = run.snap.assigned_of(replica.rec.id).?;
         batch.expect(placed.kv.key, placed.kv.mod_revision);
-        try run.expect_node_lost(batch, node, status);
+        try run.expect_node_judged(batch, node);
         batch.delete(replica.kv.key);
         return id;
     }
 
-    /// Compares what "the node is lost and has not registered again" was judged from: its
-    /// status at the revision read and its `/nodes` record as read (absent is revision 0). Once
-    /// per node per batch: a second replica of the node adds nothing.
-    fn expect_node_lost(
-        run: *Run,
-        batch: *Batch,
-        node: []const u8,
-        status: *const Entry(records.NodeStatus),
-    ) Error!void {
+    /// Compares what the judgement of a node rests on: its status at the revision read (`lost`
+    /// for a removal off a lost node, `ready` for one that cites a report) and its `/nodes`
+    /// record as read (absent is revision 0). Once per node per batch: a second replica of the
+    /// node adds nothing.
+    fn expect_node_judged(run: *Run, batch: *Batch, node: []const u8) Error!void {
+        // Test-only fault (the sim-c1-teeth-stale negative test): the node's status and
+        // registration are not compared, so a report that went stale before the commit is acted on.
+        if (c1_teeth.stale_observation) return;
+        const status = run.snap.status_of(node).?;
         for (batch.compares[0..batch.compares_count]) |compare| {
             if (std.mem.eql(u8, compare.key, status.kv.key)) return;
         }
@@ -828,6 +867,22 @@ fn by_victim_order(context: void, first: Item, second: Item) bool {
     _ = context;
     if (first.running != second.running) return !first.running;
     return first.number > second.number;
+}
+
+/// Whether the controller judged `observed` admissible from the node's status and tenure (a C1
+/// report); a C0 report has no tenure and nothing to compare.
+fn judged_by_status(observed: *const Entry(records.Observed)) bool {
+    return observed.rec.tenure != null;
+}
+
+/// The node whose status and `/nodes` record the removal of `item` compares: the lost node, or the
+/// ready one an exit report came from.
+fn judged_node(item: *const Item) ?[]const u8 {
+    if (item.lost) |status| return status.kv.key[records.prefix_node_status.len..];
+    const observed = item.observed orelse return null;
+    if (item.class != .dead) return null;
+    if (!judged_by_status(observed)) return null;
+    return observed.rec.node;
 }
 
 fn classify_one(
