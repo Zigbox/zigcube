@@ -33,8 +33,8 @@ WRONG_TREE=b3:00000000000000000000000000000000000000000000000000000000000000aa
 UNKNOWN_TREE=b3:00000000000000000000000000000000000000000000000000000000000000bb
 
 # Zigbox asks the user's systemd for a scope per container: it needs this session's variables.
-export XDG_RUNTIME_DIR=/run/user/0
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+export XDG_RUNTIME_DIR=/run/user/1000
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 export ZBX_REGISTRY_MIRRORS=mirror.gcr.io
 
 fail() {
@@ -116,24 +116,6 @@ start_agent_b() {
 }
 
 agent_pid() { pgrep -f "^$BIN/zcube-agent --runtime"; }
-
-# Root runs the agents (gap 2 in decisions/2026-11-04-c2-slice8-review-fixes.md: a non-root peer
-# server cannot open range-owned objects such as etc/shadow, 0:42 mode 0640), so root gets a
-# subordinate range of its own (cube's is 100000:65536) and a systemd user manager with a bus.
-stage_setup_root() {
-    [ "$(id -u)" -eq 0 ] || fail "setup_root runs as root"
-    for file in /etc/subuid /etc/subgid; do
-        grep -q "^root:" "$file" || echo "root:200000:65536" >>"$file" || fail "append to $file"
-    done
-    loginctl enable-linger root || fail "loginctl enable-linger root"
-    tries=0
-    while [ ! -S /run/user/0/bus ]; do
-        tries=$((tries + 1))
-        [ $tries -le 300 ] || fail "no bus at /run/user/0/bus within 30 s"
-        sleep 0.1
-    done
-    ok "root has $(grep '^root:' /etc/subuid) in /etc/subuid and a bus at /run/user/0/bus"
-}
 
 stage_setup() {
     mkdir -p "$STATE" "$LOG"
