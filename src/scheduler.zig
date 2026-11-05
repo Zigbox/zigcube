@@ -686,6 +686,7 @@ pub const Scheduler = struct {
         try sc.put_place_decision(ctx, &batch, replica, reason, "place_replica", null, evidence);
         const key = try assign_key(ctx, name, replica.rec.id);
         const value: records.Assigned = .{
+            .v = records.assigned_version_plain,
             .replica = replica.rec.id,
             .service = replica.rec.service,
             .requests = need,
@@ -857,6 +858,7 @@ pub const Scheduler = struct {
         const name = target.node.rec.name;
         const key = try assign_key(ctx, name, spec.replica);
         const value: records.Assigned = .{
+            .v = records.assigned_version_plain,
             .replica = spec.replica,
             .service = replica.rec.service,
             .requests = need,

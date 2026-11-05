@@ -834,3 +834,75 @@ comptime {
     assert(pull_record_bytes_max > 512 + pull_peers_max * (110 + 70));
     assert(pulls_read_max >= api_list_limit_max);
 }
+
+// ---- Jobs (B1, docs/briefs/b1.md "Bounds") -------------------------------------------------
+
+/// Jobs not yet ended, cluster-wide: `/job-admission`'s `admitted` less `/job-endings`' `ended`.
+/// A create over it is refused (ZC-E0132, 429).
+pub const jobs_max: u32 = 512;
+/// A node runs at most this many jobs at once; a further run waits `pending` (ZC-W0308).
+pub const jobs_per_node_max: u32 = 64;
+/// The runs list of one node (`GET /v1/agent/nodes/{node}/runs`): more is ZC-E0302, as for
+/// replicas. One unpaged reply, so it stays under half a page (comptime below).
+pub const agent_node_runs_max: u32 = jobs_per_node_max;
+/// A run record: the spec without the input.
+pub const job_run_bytes_max: u32 = 16 * 1024;
+/// `env` of a job; larger is refused (ZC-E0130). The input has a field of its own.
+pub const job_env_bytes_max: u32 = 8 * 1024;
+/// A job's input, as the container receives it: UTF-8 without NUL. It is stored as base64
+/// (`JobInput.data`), so the record is at most four thirds of this, never the sixfold of a JSON
+/// string full of control characters, which would not fit `store_value_bytes_max`.
+pub const job_input_bytes_max: u32 = 64 * 1024;
+/// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`.
+pub const job_request_bytes_max: u32 = 128 * 1024;
+pub const job_command_words_max: u32 = runtime_command_words_max;
+/// Labels of a job: `runtime_labels_max` less `zcube.replica` and `zcube.job`.
+pub const job_labels_max: u32 = runtime_labels_max - 2;
+/// A deadline counts from the start; a run not claimed by its `start_by_ms` (the same length from
+/// creation) ends `failed deadline`. A job with no deadline is a service, so 0 is refused.
+pub const job_deadline_ms_max: u64 = 24 * 60 * 60 * 1000;
+pub const job_grace_ms_max: u32 = 60 * 1000;
+/// `submit_by_ms` may be at most this far ahead of the server's clock at receipt, and a retained
+/// ended job is never younger than `job_finished_age_ms_min` when deleted, so a retried POST
+/// inside the window finds the job it created.
+pub const job_submit_window_ms_max: u64 = 60 * 60 * 1000;
+pub const job_finished_age_ms_max: u64 = 24 * 60 * 60 * 1000;
+pub const job_finished_age_ms_min: u64 = 60 * 60 * 1000;
+/// Jobs created within the admission window: the most that can be retained.
+pub const job_admitted_window_max: u32 = 8192;
+/// The window of `/job-admission`: the start backstop and the deadline (24 h each), retention
+/// (24 h) and an hour for the submit window.
+pub const job_admission_window_h: u32 = 73;
+/// Longest run id: `<name>-job`.
+pub const job_run_id_bytes_max: u32 = service_name_bytes_max + "-job".len;
+
+comptime {
+    assert(jobs_per_node_max <= runtime_handles_max);
+    assert(jobs_max > 0);
+    assert(agent_node_runs_max <= jobs_per_node_max);
+    // The reply is not paged: at most half a store page, as the replicas list is bounded by
+    // `store_list_limit_max`.
+    assert(agent_node_runs_max * job_run_bytes_max <= store_page_bytes_max / 2);
+    assert(agent_node_runs_max <= store_list_limit_max);
+    assert(job_run_bytes_max <= store_value_bytes_max);
+    // An env, the command and the rest of the spec fit a run record.
+    assert(job_env_bytes_max + 4096 < job_run_bytes_max);
+    // The stored input is base64 (four thirds, rounded up to groups of four).
+    assert((job_input_bytes_max + 2) / 3 * 4 < store_value_bytes_max);
+    assert(job_input_bytes_max < job_request_bytes_max);
+    assert(job_request_bytes_max > api_request_bytes_max);
+    assert(job_labels_max == 6);
+    assert(job_command_words_max == runtime_command_words_max);
+    // The run id is a container name (a hostname label), and `<service>-<n>` never equals it.
+    assert(job_run_id_bytes_max <= 63);
+    assert(job_deadline_ms_max <= x509_leaf_ttl_ms_max); // A leaf of a job outlives its deadline.
+    assert(job_grace_ms_max <= job_deadline_ms_max);
+    assert(job_submit_window_ms_max <= job_finished_age_ms_min);
+    assert(job_finished_age_ms_min <= job_finished_age_ms_max);
+    // 73 h: the start backstop, the deadline, retention and an hour's submit window.
+    const window_ms = 2 * job_deadline_ms_max + job_finished_age_ms_max + job_submit_window_ms_max;
+    assert(window_ms == @as(u64, job_admission_window_h) * 60 * 60 * 1000);
+    assert(job_admitted_window_max >= jobs_max);
+    // One aggregate record: an hour's count per hour of the window, in JSON, in one value.
+    assert(job_admission_window_h * 48 + 256 < store_value_bytes_max);
+}

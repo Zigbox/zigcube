@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+warning[ZC-W0308]: a job waits: no node can take it now
+  cause  no node has 2000m CPU free; the most free is 500m on node1
+  reqid  r-0000001
+  fix    lower the job's limits, add a node, or wait for a job to end
+  more   zcube explain W0308
+  docs   https://zigbox.github.io/zigcube/errors/W0308.html

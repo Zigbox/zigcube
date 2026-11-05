@@ -1,0 +1,5 @@
+error[ZC-E0130]: a job is not valid
+  cause  deadline_ms is 0; a job needs a deadline between 1 ms and 24 hours
+  fix    set deadline_ms and submit the job again
+  more   zcube explain E0130 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0130.html

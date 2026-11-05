@@ -263,6 +263,67 @@ fn record_too_new(diag: *diag_mod.Diag) void { // records.zig
     sample(diag, .E0303, &.{cause}, "run the zcube release that wrote it, or upgrade this one");
 }
 
+fn job_invalid(diag: *diag_mod.Diag) void { // api.zig
+    const cause = "deadline_ms is 0; a job needs a deadline between 1 ms and 24 hours";
+    sample(diag, .E0130, &.{cause}, "set deadline_ms and submit the job again");
+}
+
+fn job_differs(diag: *diag_mod.Diag) void { // api.zig
+    const cause = "a job named train-7 exists and differs from this one in: command";
+    sample(diag, .E0131, &.{cause}, "use another name, or submit exactly the job that exists");
+}
+
+fn job_too_many(diag: *diag_mod.Diag) void { // api.zig
+    const cause = "512 jobs have not ended; the cluster accepts at most 512";
+    sample(diag, .E0132, &.{cause}, "wait for jobs to end, or cancel some, then submit again");
+}
+
+fn job_unknown(diag: *diag_mod.Diag) void { // api.zig
+    const cause = "no job named train-7";
+    sample(diag, .E0133, &.{cause}, "zcube job list shows the jobs that exist");
+}
+
+fn job_late(diag: *diag_mod.Diag) void { // api.zig
+    const cause = "submit_by_ms 1761350000000 is 12000 ms before the server's clock";
+    sample(diag, .E0134, &.{cause}, "submit again with a new submit-by time");
+}
+
+fn job_contradicts(diag: *diag_mod.Diag) void { // job_controller.zig
+    const cause = "/job-status/train-7 has ended but /job-runs/train-7 does not exist";
+    sample(diag, .E0307, &.{cause}, "fix or delete those keys; the next pass tries again");
+}
+
+fn job_report_dropped(diag: *diag_mod.Diag) void { // job_controller.zig
+    const cause = "node2 reported train-7-job after the job ended as failed (unreachable)";
+    sample(diag, .W0307, &.{cause}, "zcube why job train-7 shows both");
+}
+
+fn job_waits(diag: *diag_mod.Diag) void { // scheduler.zig
+    const cause = "no node has 2000m CPU free; the most free is 500m on node1";
+    sample(diag, .W0308, &.{cause}, "lower the job's limits, add a node, or wait for a job to end");
+}
+
+fn run_end_unknown(diag: *diag_mod.Diag) void { // agent.zig
+    const cause = "train-7-job has no container and left no exit record in its directory";
+    sample(diag, .E0521, &.{cause}, "none needed: the job ended as failed (unknown)");
+}
+
+fn run_start_record(diag: *diag_mod.Diag) void { // agent_records.zig
+    const cause = "the start record of train-7-job in /var/lib/zcube-agent is missing";
+    sample(diag, .E0522, &.{cause}, "check the state directory's disk and permissions");
+}
+
+fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
+    const cause = "train-7-job ran for 600000 ms, its deadline; it was stopped and then killed";
+    sample(diag, .W0503, &.{cause}, "raise deadline_ms if the job needs the time");
+}
+
+fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
+    diag.raise(.B0004);
+    diag.cause("train-7-job reported an exit of kind lost with stop cause fence", .{});
+    diag.fix(.{ .sentence = "report it with the diagnostic bundle" });
+}
+
 fn unknown_container(diag: *diag_mod.Diag) void { // runtime.zig
     const sentence = "list what the runtime knows, then retry";
     sample(diag, .E0501, &.{"no container by that name"}, sentence);
@@ -600,6 +661,11 @@ const cases = [_]Case{
     with_flags(raised(.E0122, &.{ "local", "up" }), .{ .local = .no_executables }),
     with_flags(raised(.E0123, &.{ "local", "up" }), .{ .local = .dying_executables }),
     with_flags(raised(.E0124, &.{ "local", "up" }), .{ .local = .busy }),
+    relayed(.E0130, job_invalid),
+    relayed(.E0131, job_differs),
+    relayed(.E0132, job_too_many),
+    relayed(.E0133, job_unknown),
+    relayed(.E0134, job_late),
     relayed(.E0201, store_down),
     relayed(.E0202, store_failed),
     relayed(.E0203, compacted),
@@ -619,6 +685,9 @@ const cases = [_]Case{
     relayed(.E0301, bad_record),
     relayed(.E0302, too_many),
     relayed(.E0303, record_too_new),
+    relayed(.E0307, job_contradicts),
+    relayed(.W0307, job_report_dropped),
+    relayed(.W0308, job_waits),
     .{ .code = .E0401, .args = repair_node1, .script = .{ .diagnostic = repair_unconfirmed } },
     .{ .code = .E0402, .args = repair_confirmed, .script = .{ .diagnostic = repair_no_finding } },
     .{ .code = .E0403, .args = repair_confirmed, .script = .{ .diagnostic = repair_moving } },
@@ -638,7 +707,10 @@ const cases = [_]Case{
     relayed(.E0513, agent_host),
     relayed(.E0514, agent_too_long),
     relayed(.E0515, agent_fetch_outlived),
+    relayed(.E0521, run_end_unknown),
+    relayed(.E0522, run_start_record),
     relayed(.W0501, agent_lease),
+    relayed(.W0503, job_deadline),
     relayed(.E0801, peer_foreign_ca),
     relayed(.E0802, peer_expired),
     relayed(.E0803, peer_wrong_node),
@@ -658,6 +730,7 @@ const cases = [_]Case{
     relayed(.W0602, peer_bad_tree),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
+    relayed(.B0004, job_end_unmapped),
 };
 
 const repair_node1: []const []const u8 = &.{ "repair", "allocations", "node1" };

@@ -29,6 +29,9 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/audit/allocations/<node>` | allocation auditor | C1 slice 4 |
 | `/node-status/<node>` | node controller | C1 slice 3 |
 | `/observed/<node>/<id>` | that node's agent (the node controller may delete) | C0 |
+| `/jobs/<name>`, `/job-input/<name>`, `/job-admission` | API | B1 slice 1 |
+| `/job-runs/<name>`, `/job-status/<name>`, `/job-endings` | job controller | B1 slice 1 |
+| `/job-observed/<node>/<name>` | that node's agent (retention may delete) | B1 slice 1 |
 | `/decisions/…`, `/decisions-by-subject/…` | every role, in the transaction of the action | C0 |
 | `/decision-summaries/…` | every role, in the transaction of the decision it counts | C1 slice 4 |
 
@@ -36,7 +39,7 @@ The cluster CA (`ca.key`, docs/peer.md) is not a writer: it signs credentials an
 Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer.cred` and
 `ca.pub`, live in the state directories, not in the store.
 
-An agent writes only `/nodes/<its node>`, `/node-store/<its node>`, `/pulls/<its node>/…` and `/observed/<its node>/…`.
+An agent writes only `/nodes/<its node>`, `/node-store/<its node>`, `/pulls/<its node>/…`, `/observed/<its node>/…` and `/job-observed/<its node>/…`.
 The `zcube-agent fetch` process reads `/node-store/<node>` (`peer`, `filter`) to find peers, and
 writes nothing.
 One departure from `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
@@ -46,12 +49,16 @@ refuses a put or delete of a service by any role but the API. `Service` v2 never
 `next_replica`: it carries a C0 record's value forward only until the counter exists (below). The replica controller reads a counter
 only with a `get` when it is about to create replicas for that service, never by listing, so the
 number of counters bounds nothing.
+B1 adds an eighth role, `job_controller` (below, "Jobs"). `retention` also deletes, never writes, the
+records of an ended job: `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
+`/job-observed/`, and may delete the four of one job in one transaction. It never deletes
+`/job-admission`, `/job-endings` or an assignment.
 
 ## Versions
 
 Every value has `"v"`. A reader accepts every version up to the one its release writes and
 ignores members it does not know. `Service` and `Replica` write `"v": 3` (C2 slice 2 added
-`source`); `Observed` writes `"v": 2` (it gained members in C1); `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
+`source`); `Observed` writes `"v": 2` (it gained members in C1); `Assigned` writes `"v": 2` for a run (B1: it gained `job`) and `"v": 1` for a replica; `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
 writes `"v": 1`. Records C0 and C1 wrote still read: the fixtures in `src/testdata/c0_store.txt`
 and `c1_store.txt` were captured from real stores. A value with a **newer**
 version than the reader knows is refused with one line naming the key and both versions,
@@ -447,6 +454,86 @@ for example `/decision-summaries/service/hello/replace_replica/observed`. A proj
 immutable decisions, updated by the actor in the transaction of each decision it counts, and never
 a cause: `why` shows it beside a chain, not as a step. `<action>` is at most 48 bytes. Lifetime:
 with its subject.
+
+## Jobs (B1 slice 1)
+
+A job is its own object: it runs once, on one node, to an end that is recorded, and is never
+started twice. Design: `docs/briefs/b1.md`; owner's answers: `docs/decisions/2026-11-05-b1-owner-answers.md`.
+The **run id** is `<name>-job` (at most 52 bytes): its last segment is not decimal, so it is never
+a replica id (`<service>-<n>`), and it is a valid container name. Job names follow the service
+name rule (48 bytes).
+
+### `/jobs/<name>`: the desired job (API)
+
+```json
+{"v":1,"name":"train-7","image":"b3:51aa9c03","source":"","command":["run","--x"],
+ "env":[["MODE","fast"]],"limits":{"cpu_millis":500,"memory_bytes":268435456,"pids":64},
+ "deadline_ms":600000,"retries":0,"labels":[["org","acme"]],"grace_ms":5000,
+ "input_env":"BOTPIKE_INPUT","input_digest":"sha256:…","input_bytes":1024,
+ "submit_by_ms":1761350600000,"created_at_ms":1761350000000,"applied_by":"alice",
+ "cancel_requested":{"at_ms":1761350100000,"by":"alice"}}
+```
+
+The spec is immutable. `cancel_requested` is the one member that changes (set once). The input is
+never here, only its digest and size. `retries` is 0 (a larger value is `ZC-E0130`). At most
+`job_labels_max` (6) labels, `job_command_words_max` (64) command words, `env` of at most
+`job_env_bytes_max` (8 KiB). Written with its `/job-input/` and `/job-admission` in one transaction.
+
+### `/job-input/<name>`: the input (API)
+
+`{"v":1,"base64":"…"}`: at most `job_input_bytes_max` (64 KiB) of UTF-8 without NUL, held base64
+encoded so that it always fits a store value. Written once with the job, read only through the agent
+endpoint for the node the run is assigned to, deleted by retention once the job has ended. Never
+returned by a public route and never shown by the console.
+
+### `/job-admission` and `/job-endings`: the aggregates
+
+`/job-admission`: `{"v":1,"admitted":N,"hours":[{"hour":H,"count":C},…]}`: jobs ever created, and
+creations per hour over the last `job_admission_window_h` (73) hours, `hour` increasing. Written by
+every create, which compares it, so creates are serialised and a predicate over the set (jobs not
+ended: `jobs_max`; jobs created in the window: `job_admitted_window_max`) is never missed
+(authority.md, "Predicates over sets"). `/job-endings`: `{"v":1,"ended":N}`, written by every terminal
+status, which compares it. Neither is deleted.
+
+### `/job-runs/<name>`: the run (job controller)
+
+`{"v":1,"id":"train-7-job","job":"train-7",` the spec's `image`, `source`, `command`, `env`,
+`limits`, `deadline_ms`, `grace_ms`, `labels`, `input_env`, `input_digest`, `input_bytes`,
+`"start_by_ms":…,"created_at_ms":…,"stop":{"cause":"cancel","at_ms":…}}`. At most
+`job_run_bytes_max` (16 KiB). Created once, with its status. `stop` is set at most once and never
+removed; its `cause` is `cancel`, `unreachable` or `not_started`. From the revision of the `stop`,
+nothing places or claims the run. `start_by_ms` is creation plus `deadline_ms` on the server's clock.
+
+### `/job-status/<name>`: how it is going and how it ended (job controller)
+
+`{"v":1,"state":"failed","node":"node1","epoch":12,"tenure":7,"started_at_ms":…,"ended_at_ms":…,
+"end":{"kind":"failed","cause":"deadline"},"stop_cause":"deadline","diagnostic":{…},
+"decision":"…","reported_at_ms":…}`.
+
+- `state`: `pending`, `placed`, `running`, then one terminal state: `exited`, `failed`,
+  `cancelled`. A terminal status is written once and never changes (I8a).
+- `end` is present exactly when the state is terminal, with `ended_at_ms`. `exited` carries exactly
+  one of `code` and `signal`; `failed` carries `cause`, one of `oom`, `pid_limit`, `start_failed`,
+  `deadline`, `fenced`, `unreachable`, `not_started`, `unknown`; `cancelled` carries nothing. A
+  record that breaks this is `ZC-E0301` on read.
+- `stop_cause` (`cancel`, `deadline`, `fence`, `not_started`, `unreachable`): why the agent stopped
+  the run, when it did. The ending follows it, never the exit alone.
+- `epoch` and `tenure` are those of the claim; node loss is judged by the run's tenure.
+- `diagnostic`: a `ZC-` diagnostic, as in `/observed`, when the job failed.
+
+### `/job-observed/<node>/<name>`: what the agent reports of a run (that node's agent)
+
+`{"v":1,"run":"train-7-job","node":"node1","tenure":7,"assignment":12,"status":"claimed",
+"exit":{"kind":"exited","code":0},"stop_cause":"cancel","diagnostic":{…},"started_at_ms":…,
+"reported_at_ms":…}`. Its own record kind, not `Observed`. `status` is `claimed` (written before the
+run is started, comparing the agent's tenure and the run's revision), `running` or `stopped`. A run
+has at most one claim, ever. Admissible under the three conditions of authority.md §3.
+
+### `/assigned/<node>/<name>-job`: the placement of a run (scheduler)
+
+`Assigned` version 2 adds `job` (the job name); a run's `service` is empty, and a replica's
+assignment is still written as version 1. Every reader of `service` treats an assignment with a
+`job` as belonging to no service. The epoch is the key's `mod_revision`, as for a replica.
 
 ## Compare sets
 

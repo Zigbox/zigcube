@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+warning[ZC-W0503]: a job reached its deadline and was stopped
+  cause  train-7-job ran for 600000 ms, its deadline; it was stopped and then
+         killed
+  reqid  r-0000001
+  fix    raise deadline_ms if the job needs the time
+  more   zcube explain W0503
+  docs   https://zigbox.github.io/zigcube/errors/W0503.html
