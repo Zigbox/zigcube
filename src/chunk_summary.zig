@@ -241,10 +241,13 @@ pub fn locality_bytes(target: *const Sketch, held: []const Sketch) u64 {
         }
     }
     if (sampled == 0) return 0; // Nothing to judge by: advisory, so no credit.
+    // The target came from a node's summary, so its sizes are that node's word: a sample heavier
+    // than the tree is a lie, which `node_store.sketch_of` refuses and this scores 0 rather than
+    // trusting (O1: a bad summary costs speed, never correctness).
+    if (sampled > target.total_bytes) return 0;
     assert(hit <= sampled);
     const estimate: u64 = @intCast(@as(u128, target.total_bytes) * hit / sampled);
     assert(estimate <= target.total_bytes);
-    if (target.exact()) assert(sampled <= target.total_bytes);
     return estimate;
 }
 
@@ -507,4 +510,20 @@ test "many held versions at about 20 per cent churn estimate the target within b
         }
         try std.testing.expect(error_sum / 20 * 10 < 1000 * constants.swarm_chunk_bytes / 2);
     }
+}
+
+test "a target whose sample outweighs its tree scores 0, not an assertion" {
+    // Goal: locality_bytes never asserts on a node's word. Method: an exact one-chunk sketch of
+    // 4096 bytes, then its total lowered to 1 as a lying record would set it, scored against a
+    // node holding nothing and one holding the chunk.
+    var prng = std.Random.DefaultPrng.init(0x0b1);
+    const chunk = random_hash(prng.random());
+    var target = Sketch.init(random_hash(prng.random()));
+    target.add(&chunk, 4096);
+    var held = Sketch.init(hash_zero);
+    held.add(&chunk, 4096);
+    try std.testing.expectEqual(@as(u64, 4096), locality_bytes(&target, &.{held}));
+    target.total_bytes = 1;
+    try std.testing.expectEqual(@as(u64, 0), locality_bytes(&target, &.{}));
+    try std.testing.expectEqual(@as(u64, 0), locality_bytes(&target, &.{held}));
 }
