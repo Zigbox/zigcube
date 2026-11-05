@@ -689,3 +689,9 @@ rest are about the agent's own host.
 | `ZC-W0501` | environment | the agent's lease ended and it registered again | the agent, a warning |
 | `ZC-E0806` | user | a peer key or trust file can't be used | `zcube-server` and the agent at start |
 | `ZC-E0807` | user | the node was removed from the cluster and is refused a credential | the credential endpoint |
+| `ZC-E0809` | external | a certificate is malformed or outside the bounds (the field named) | the X.509 parser, for a peer's certificate |
+| `ZC-E0810` | external | a certificate is not signed by the pinned anchor | certificate verification |
+| `ZC-E0811` | external | a certificate is expired or not yet valid (both times shown) | certificate verification |
+| `ZC-E0812` | external | a certificate names another peer than the one asked for (both named) | certificate verification |
+| `ZC-E0817` | user | an identity could not be issued | the CA, when it issues a certificate |
+| `ZC-E0819` | external | a certificate was issued for another role (CA, server, workload) | certificate verification |

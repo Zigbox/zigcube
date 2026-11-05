@@ -70,6 +70,9 @@ pub const modules = .{
     @import("test_util.zig"),
     @import("testing/history.zig"),
     @import("text.zig"),
+    @import("x509.zig"),
+    @import("x509_der.zig"),
+    @import("x509_identity.zig"),
     @import("why.zig"),
     @import("writers.zig"),
 };
@@ -130,6 +133,13 @@ test "the peer handshake's tests are in this root" {
     // Goal: the handshake runs under WASI too (32-bit, single thread). Method: import its tests;
     // they use no file, clock or environment.
     _ = @import("peer_test.zig");
+}
+
+test "the X.509 tests are in this root" {
+    // Goal: the certificate writer and parser run under WASI too (32-bit, single thread). Method:
+    // import their tests; they use no file, clock or environment.
+    _ = @import("x509_test.zig");
+    _ = @import("x509_foreign_test.zig");
 }
 
 // Plain `test {}`: a named test would hide these imports from `-Dtest-filter`.

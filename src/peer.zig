@@ -52,7 +52,7 @@ const label = "zcube-peer-v1";
 pub const name_bytes_max = constants.node_name_bytes_max;
 pub const credential_body_bytes = 1 + 8 + 1 + name_bytes_max + 32 + 8 + 8;
 pub const credential_bytes = credential_body_bytes + Ed25519.Signature.encoded_length;
-const credential_domain = "zcube-peer-cred-v1\x00";
+pub const credential_domain = "zcube-peer-cred-v1\x00";
 
 comptime {
     assert(credential_body_bytes == 121);
