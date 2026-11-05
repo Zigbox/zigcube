@@ -155,25 +155,35 @@ fn left_ms(io: std.Io, end_ms: u64) i32 {
 }
 
 pub fn read_exact(io: std.Io, fd: std.posix.fd_t, out: []u8, end_ms: u64) Error!void {
+    const linux = std.os.linux;
     var at: usize = 0;
     while (at < out.len) {
-        var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&wait, left_ms(io, end_ms)) catch return error.Io;
-        if (ready == 0) return error.Timeout;
-        const length = std.posix.read(fd, out[at..]) catch return error.Closed;
-        if (length == 0) return error.Closed;
-        at += length;
+        try wait_ready(io, fd, std.posix.POLL.IN, end_ms);
+        // MSG.DONTWAIT: whatever mode the descriptor is in, the call never blocks, so the poll's
+        // deadline is the only wait.
+        const got = linux.recvfrom(fd, out[at..].ptr, out.len - at, linux.MSG.DONTWAIT, null, null);
+        switch (linux.errno(got)) {
+            .SUCCESS => {
+                if (got == 0) return error.Closed;
+                at += got;
+            },
+            .AGAIN, .INTR => {},
+            else => return error.Closed,
+        }
     }
 }
 
+/// Writes all of `bytes` by `end_ms`. A send never blocks (MSG.DONTWAIT), so a reader that
+/// stops reading, or a zero window, ends in `Timeout` at the deadline (docs/peer.md, "The peer
+/// server": every wait is a poll against one deadline).
 pub fn write_all(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, end_ms: u64) Error!void {
+    const linux = std.os.linux;
+    const flags = linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL;
     var at: usize = 0;
     while (at < bytes.len) {
-        var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
-        const ready = std.posix.poll(&wait, left_ms(io, end_ms)) catch return error.Io;
-        if (ready == 0) return error.Timeout;
-        const wrote = std.os.linux.write(fd, bytes.ptr + at, bytes.len - at);
-        switch (std.os.linux.errno(wrote)) {
+        try wait_ready(io, fd, std.posix.POLL.OUT, end_ms);
+        const wrote = linux.sendto(fd, bytes.ptr + at, bytes.len - at, flags, null, 0);
+        switch (linux.errno(wrote)) {
             .SUCCESS => at += wrote,
             .AGAIN, .INTR => {},
             else => return error.Closed,
@@ -181,8 +191,17 @@ pub fn write_all(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, end_ms: u64)
     }
 }
 
-/// A connected blocking socket to `address`, made with a non-blocking connect and a `poll` until
-/// `end_ms` (the standard library's connect has no timeout on POSIX). The caller closes it.
+/// Polls `fd` for `events` until `end_ms`: `Timeout` once the deadline has passed.
+fn wait_ready(io: std.Io, fd: std.posix.fd_t, events: i16, end_ms: u64) Error!void {
+    if (boot_ms(io) >= end_ms) return error.Timeout;
+    var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+    const ready = std.posix.poll(&wait, left_ms(io, end_ms)) catch return error.Io;
+    if (ready == 0) return error.Timeout;
+}
+
+/// A connected socket to `address`, made with a non-blocking connect and a `poll` until `end_ms`
+/// (the standard library's connect has no timeout on POSIX). It stays non-blocking: every read
+/// and write on it polls against its caller's deadline. The caller closes it.
 pub fn connect(io: std.Io, address: std.Io.net.IpAddress, end_ms: u64) Error!std.posix.fd_t {
     const linux = std.os.linux;
     var storage: std.Io.Threaded.PosixAddress = undefined;
@@ -213,12 +232,6 @@ pub fn connect(io: std.Io, address: std.Io.net.IpAddress, end_ms: u64) Error!std
         },
         else => return error.Closed,
     }
-    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-    if (linux.errno(flags) != .SUCCESS) return error.Io; // Its result is only a mode if it worked.
-    var mode: linux.O = @bitCast(@as(u32, @truncate(flags)));
-    mode.NONBLOCK = false;
-    const set = linux.fcntl(fd, linux.F.SETFL, @as(u32, @bitCast(mode)));
-    if (linux.errno(set) != .SUCCESS) return error.Io;
     return fd;
 }
 
