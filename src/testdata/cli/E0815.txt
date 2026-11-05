@@ -1,0 +1,5 @@
+error[ZC-E0815]: a TLS record failed its checks
+  cause  a record is longer than the protocol allows
+  fix    Reconnect; if it repeats, check the network path between the two machines.
+  more   zcube explain E0815 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0815.html

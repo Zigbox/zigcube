@@ -28,7 +28,10 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const testpeer = @import("tls_testpeer.zig");
+const tls_client = @import("tls_client.zig");
 const x509 = @import("x509.zig");
+const Ed25519 = std.crypto.sign.Ed25519;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -477,6 +480,73 @@ fn x509_wrong_use(diag: *diag_mod.Diag) void { // x509.zig
     });
 }
 
+/// A client that has sent its ClientHello, for the TLS cases below; the hello is copied to `hello`.
+fn tls_started(client: *tls_client.Client, hello: []u8) []u8 {
+    client.init(&.{
+        .anchor = @splat(1),
+        .server_name = "broker.botpike.com",
+        .now_ms = 1_700_000_000_000,
+        .random = @splat(2),
+        .session_id = @splat(3),
+        .secret = @splat(4),
+    });
+    client.start();
+    const sent = client.output();
+    @memcpy(hello[0..sent.len], sent);
+    client.drain();
+    return hello[0..sent.len];
+}
+
+fn tls_refused(client: *tls_client.Client, input: []const u8, diag: *diag_mod.Diag) void {
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const step = client.receive(input[offset..], diag) catch |err| {
+            assert(err == error.Refused);
+            return;
+        };
+        offset += step.consumed;
+    }
+    unreachable; // The input is a refusal.
+}
+
+fn tls_alert(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    _ = tls_started(&client, &hello);
+    var buffer: [16]u8 = undefined;
+    tls_refused(&client, testpeer.plain_alert(&buffer, 40), diag);
+}
+
+fn tls_overlong_record(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    _ = tls_started(&client, &hello);
+    tls_refused(&client, &.{ 22, 3, 3, 0x40, 0x01 }, diag);
+}
+
+fn tls_cut_off(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    _ = tls_started(&client, &hello);
+    assert(client.end_of_input(diag) == error.Refused);
+}
+
+fn tls_retry_request(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    const sent = tls_started(&client, &hello);
+    const key = Ed25519.KeyPair.generateDeterministic(@splat(5)) catch unreachable; // A seed works.
+    var peer = testpeer.Peer.init(.{
+        .certificates = &.{},
+        .key = key,
+        .random = @splat(0),
+        .secret = @splat(6),
+        .faults = .{ .hello_retry = true },
+    });
+    var flight: [512]u8 = undefined;
+    tls_refused(&client, peer.respond(sent, &flight), diag);
+}
+
 fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
     fetch_plan.raise_blame(diag, .{ .peer = 0, .chunk = 4 }, "node2", 24);
 }
@@ -651,7 +721,11 @@ const cases = [_]Case{
     relayed(.E0810, x509_unsigned),
     relayed(.E0811, x509_expired),
     relayed(.E0812, x509_wrong_server),
+    relayed(.E0813, tls_alert),
+    relayed(.E0815, tls_overlong_record),
+    relayed(.E0816, tls_cut_off),
     relayed(.E0817, x509_not_issued),
+    relayed(.E0818, tls_retry_request),
     relayed(.E0819, x509_wrong_use),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),

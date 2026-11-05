@@ -1,0 +1,5 @@
+error[ZC-E0816]: a TLS connection ended without close_notify
+  cause  the server's connection ended before the handshake finished
+  fix    Retry the request: what arrived before the break may be incomplete.
+  more   zcube explain E0816 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0816.html
