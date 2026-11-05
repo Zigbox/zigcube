@@ -864,7 +864,19 @@ const SimStepOptions = struct {
     library: *std.Build.Step.Compile,
     /// `-Dops`: operations of the fuzz variants of sim-c0 and sim-cluster.
     ops: u32,
+    /// `-Dprofile`: the fault profile of sim-cluster and sim-c1 (`auto` draws it from the seed).
+    profile: []const u8 = "mixed",
+    /// `-Dswarm-profile`: the peer profile of sim-swarm.
+    swarm_profile: []const u8 = "mixed",
+    /// `-Dauto-shape`: sim-cluster, sim-c1 and sim-swarm draw their operations (and the cluster
+    /// its nodes, lease ttl and replica counts) from the seed; `-Dops` and `-Dnodes` are ignored.
+    auto_shape: bool = false,
 };
+
+/// The operations argument of a simulator: `auto` or the number.
+fn ops_argument(b: *std.Build, sim: SimStepOptions) []const u8 {
+    return if (sim.auto_shape) "auto" else b.fmt("{d}", .{sim.ops});
+}
 
 /// `zig build sim-c0 [-Dseed=N] [-Dops=N]`: the deterministic simulation of C0 (src/sim_c0.zig),
 /// run natively and as WebAssembly for the same seed, and the two reports compared byte for byte.
@@ -915,6 +927,14 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     const ops_help = "Operations of the fuzz variants of sim-c0 and sim-cluster (default 100)";
     var sim = options;
     sim.ops = b.option(u32, "ops", ops_help) orelse 100;
+    const profile_help = "Fault profile of sim-cluster and sim-c1: mixed (default), partitions, " ++
+        "skew, crash_heavy, slow_store, auto";
+    sim.profile = b.option([]const u8, "profile", profile_help) orelse "mixed";
+    const swarm_help = "Peer profile of sim-swarm: mixed (default), liars, silent, refusers, " ++
+        "honest, auto";
+    sim.swarm_profile = b.option([]const u8, "swarm-profile", swarm_help) orelse "mixed";
+    const shape_help = "Draw operations (and nodes, lease ttl, replicas) from the seed";
+    sim.auto_shape = b.option(bool, "auto-shape", shape_help) orelse false;
     add_sim_step(b, sim);
     add_sim_cluster_step(b, sim);
     add_sim_swarm_step(b, sim);
@@ -945,12 +965,13 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
     const live_help = "sim-cluster: faults end, the world must converge (default true)";
     const liveness = b.option(bool, "liveness", live_help) orelse true;
     const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
-    const ops_text = b.fmt("{d}", .{sim.ops});
-    const nodes_text = b.fmt("{d}", .{nodes});
+    const ops_text = ops_argument(b, sim);
+    const nodes_text = b.fmt("{d}", .{if (sim.auto_shape) 0 else nodes});
     const liveness_text: []const u8 = if (liveness) "true" else "false";
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ seed_text, ops_text, nodes_text });
     run.addArg(b.fmt("--liveness={s}", .{liveness_text}));
+    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
     const native_report = run.captureStdOut(.{});
     const help = "Run the cluster simulation natively and as WASM, and compare (-Dseed=N)";
     const step = b.step("sim-cluster", help);
@@ -959,7 +980,7 @@ fn add_sim_cluster_step(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(b.path("tools/wasm_check.mjs"));
         node.addArg("--sim-cluster");
         node.addFileArg(sim.library.getEmittedBin());
-        node.addArgs(&.{ seed_text, ops_text, nodes_text, liveness_text });
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, liveness_text, sim.profile });
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }
@@ -999,10 +1020,11 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         .dependOn(&install.step);
     const nodes = b.option(u32, "c1-nodes", "Nodes of sim-c1 (default: the seed picks)") orelse 0;
     const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
-    const ops_text = b.fmt("{d}", .{sim.ops});
-    const nodes_text = b.fmt("{d}", .{nodes});
+    const ops_text = ops_argument(b, sim);
+    const nodes_text = b.fmt("{d}", .{if (sim.auto_shape) 0 else nodes});
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
+    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
     const native_report = run.captureStdOut(.{});
     const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");
     for (v8_modes) |mode| {
@@ -1010,7 +1032,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(b.path("tools/wasm_check.mjs"));
         node.addArg("--sim-c1");
         node.addFileArg(sim.library.getEmittedBin());
-        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true" });
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }
@@ -1057,9 +1079,10 @@ fn add_sim_swarm_step(b: *std.Build, sim: SimStepOptions) void {
     const exe_help = "Install the native sim-swarm runner into zig-out/bin";
     b.step("sim-swarm-exe", exe_help).dependOn(&install.step);
     const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
-    const ops_text = b.fmt("{d}", .{sim.ops});
+    const ops_text = ops_argument(b, sim);
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ seed_text, ops_text });
+    run.addArg(b.fmt("--profile={s}", .{sim.swarm_profile}));
     const native_report = run.captureStdOut(.{});
     const help = "Run the swarm simulation natively and as WASM, and compare (-Dseed=N)";
     const step = b.step("sim-swarm", help);
@@ -1068,7 +1091,7 @@ fn add_sim_swarm_step(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(b.path("tools/wasm_check.mjs"));
         node.addArg("--sim-swarm");
         node.addFileArg(sim.library.getEmittedBin());
-        node.addArgs(&.{ seed_text, ops_text });
+        node.addArgs(&.{ seed_text, ops_text, sim.swarm_profile });
         node.addFileArg(native_report);
         step.dependOn(&node.step);
     }

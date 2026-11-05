@@ -21,3 +21,6 @@ server's SQLite store (commit `7bceea3` plus the slice's fixes): node2 from the 
 from node2, node3 from node2 with node1 struck. The rows are what the server stored (each agent's
 `--report` file, parsed and encoded again by `agent_api.pull`), dumped with Python's `sqlite3`,
 one `key<TAB>value` per line, unedited. Never regenerate it: it is the proof that `Pull` v1 reads.
+
+`sim_cluster_drawn.txt` is real output of `sim_teeth --seeds 1..3 auto --profile=auto` (ReleaseSafe, the C3 fleet
+slice-1 build): three failing seeds in the drawn form that `sim_fleet`'s parser test reads. Unedited.

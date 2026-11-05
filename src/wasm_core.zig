@@ -21,7 +21,11 @@ const core = @import("core.zig");
 const core_smoke = @import("core_smoke.zig");
 const sim_c0 = @import("sim_c0.zig");
 const sim_cluster = @import("sim_cluster.zig");
+const sim_shape = @import("sim_shape.zig");
 const sim_swarm = @import("sim_swarm.zig");
+
+/// The profile argument of the `_shaped` exports that asks for the seed's own draw.
+const profile_auto: u32 = 0xffff_ffff;
 
 comptime {
     // Zig analyses only what is referenced; this makes the whole of every core module count.
@@ -60,6 +64,18 @@ export fn zcube_sim_swarm(seed: u64, operations: u32) u32 {
     return @intFromBool(swarm_report.failed);
 }
 
+/// `zcube_sim_swarm` with a profile (`sim_shape.SwarmProfile` index; `profile_auto` draws it from
+/// the seed) and operations 0 for "draw them from the seed".
+export fn zcube_sim_swarm_shaped(seed: u64, operations: u32, profile: u32) u32 {
+    const resolved = sim_swarm.resolve(
+        seed,
+        if (operations == 0) null else operations,
+        if (profile == profile_auto) null else sim_shape.SwarmProfile.from_index(profile).?,
+    );
+    sim_swarm.simulate_profile(seed, resolved.operations, resolved.profile, &swarm_report);
+    return @intFromBool(swarm_report.failed);
+}
+
 export fn zcube_swarm_report_ptr() [*]const u8 {
     return &swarm_report.bytes;
 }
@@ -90,6 +106,43 @@ export fn zcube_sim_c1(seed: u64, operations: u32, nodes: u32) u32 {
         .c1 = true,
     };
     sim_cluster.simulate(std.heap.wasm_allocator, seed, operations, options, &cluster_report);
+    return @intFromBool(cluster_report.failed);
+}
+
+/// The cluster simulation with the knobs of the command line: `operations` 0 draws the whole shape
+/// from the seed (`sim_cluster.plan`), `profile` is a `sim_shape.ClusterProfile` index or
+/// `profile_auto`, and 0 for `nodes`, `lease_ttl_ms` or `replicas_pct` leaves it unset. The report
+/// is what the native runner prints for the same arguments.
+export fn zcube_sim_cluster_shaped(
+    seed: u64,
+    operations: u32,
+    nodes: u32,
+    liveness: u32,
+    c1: u32,
+    profile: u32,
+    lease_ttl_ms: u32,
+    replicas_pct: u32,
+) u32 {
+    const requested: sim_cluster.Options = .{
+        .nodes = if (nodes == 0) null else nodes,
+        .liveness = liveness != 0,
+        .c1 = c1 != 0,
+        .profile_auto = profile == profile_auto,
+        .profile = if (profile == profile_auto)
+            .mixed
+        else
+            sim_shape.ClusterProfile.from_index(profile).?,
+        .lease_ttl_ms = if (lease_ttl_ms == 0) null else lease_ttl_ms,
+        .replicas_pct = if (replicas_pct == 0) null else replicas_pct,
+    };
+    const resolved = sim_cluster.plan(seed, if (operations == 0) null else operations, requested);
+    sim_cluster.simulate(
+        std.heap.wasm_allocator,
+        seed,
+        resolved.operations,
+        resolved.options,
+        &cluster_report,
+    );
     return @intFromBool(cluster_report.failed);
 }
 

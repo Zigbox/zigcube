@@ -1,0 +1,16 @@
+seed 1: FAILED: a container runs on a node whose lease ran out longer ago than the lost grace (self-fencing failed)
+  step: faults
+  profile: mixed
+  shape: operations=57 nodes=4 lease_ttl_ms=10000 replicas_pct=100
+  replay: zig-out/bin/sim_cluster 1 57 4 --lease-ttl-ms=10000 --replicas-pct=100 --heal-at=34
+seed 2: FAILED: a container runs on a node whose lease ran out longer ago than the lost grace (self-fencing failed)
+  step: faults
+  profile: skew
+  shape: operations=357 nodes=1 lease_ttl_ms=9305 replicas_pct=100
+  replay: zig-out/bin/sim_cluster 2 357 1 --profile=skew --lease-ttl-ms=9305 --replicas-pct=100 --heal-at=213
+seed 3: FAILED: a container runs on a node whose lease ran out longer ago than the lost grace (self-fencing failed)
+  step: faults
+  profile: mixed
+  shape: operations=129 nodes=1 lease_ttl_ms=8032 replicas_pct=100
+  replay: zig-out/bin/sim_cluster 3 129 1 --lease-ttl-ms=8032 --replicas-pct=100 --heal-at=84
+sim-cluster: seeds 1..3, drawn operations: 3 of 3 failed
