@@ -1,9 +1,9 @@
 //! A seeded fuzzer for the TLS client's handshake (`tls_client.zig`, docs/mtls.md): a server's
 //! flight, damaged in one of thirteen ways, cut into pieces of random size. The properties: no
 //! crash; the client is `connected` (at any step, whatever follows) only when the flight was a
-//! correct one and the server accepts the client's Finished; a chain the pinned CA did not sign never connects; after a refusal the
-//! client reads nothing and writes nothing more than the one alert; every refusal carries a
-//! code and a cause. Seeds and replay are in `fuzz_seeds.zig`.
+//! correct one and the server accepts the client's Finished; a chain the pinned CA did not sign
+//! never connects; after a refusal the client reads nothing and writes nothing more than the one
+//! alert; every refusal carries a code and a cause. Seeds and replay are in `fuzz_seeds.zig`.
 
 const std = @import("std");
 const diag_mod = @import("diag.zig");
