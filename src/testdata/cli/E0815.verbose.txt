@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0815]: a TLS record failed its checks
+  cause  a record is longer than the protocol allows
+  reqid  r-0000001
+  fix    Reconnect; if it repeats, check the network path between the two machines.
+  more   zcube explain E0815
+  docs   https://zigbox.github.io/zigcube/errors/E0815.html

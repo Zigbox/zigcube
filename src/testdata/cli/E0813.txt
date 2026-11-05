@@ -1,0 +1,5 @@
+error[ZC-E0813]: a TLS handshake was refused
+  cause  the server sent the fatal alert handshake_failure (40)
+  fix    Check that the address is a zcube server of this cluster, then retry.
+  more   zcube explain E0813 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0813.html

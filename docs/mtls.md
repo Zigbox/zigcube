@@ -1,8 +1,9 @@
 # Certificates and mTLS
 
 This document describes how Zigcube makes and checks its X.509 certificates. The brief is
-[briefs/mtls-client.md](briefs/mtls-client.md). Slice 1, the X.509 slice, is built. Slice 2, the
-TLS 1.3 client, is not started.
+[briefs/mtls-client.md](briefs/mtls-client.md). Slices 1 to 3 (X.509, the CA, the key schedule) are built. Slice 4, the
+TLS 1.3 client handshake without client authentication, is in review; slices 5 (client
+authentication) and 6 (the connection) are not started.
 
 ## Certificates
 
@@ -86,6 +87,37 @@ line last:
 ZCUBE_FUZZ_ITERATIONS=20000 .zig-cache/o/<hash>/test --test-filter "x509 fuzz" | cat
 ```
 
+## The TLS 1.3 client (`tls_client.zig`)
+
+A pure state machine: it reads no socket and no clock. The caller feeds it bytes as they arrive
+(`wants()` says how many it will take; `receive` takes at most that many), and after every step
+drains `output()` to the transport. The core modules `tls_client.zig` and `tls_wire.zig` are
+`wasm32-freestanding`-clean; `tls_testpeer.zig`, the scripted server the tests use, is not a core
+module.
+
+What it speaks: TLS 1.3 only, `TLS_AES_128_GCM_SHA256`, x25519 and ed25519; no PSK, no 0-RTT and no
+HelloRetryRequest. The server's chain is checked against the pinned CA (`x509.zig`), for the name
+the caller connected to; the CertificateVerify and the server's Finished are checked against the
+transcript hash before the message joins it. The handshake reassembly buffer is 8192 bytes.
+
+Rules the code holds to, each with a test:
+
+- Keys never change in the middle of a record: bytes left over after the ServerHello, the server's
+  Finished or a KeyUpdate are refused.
+- One compatibility `change_cipher_spec` is dropped, only between the ServerHello and the end of
+  the handshake, and only with the body `01`. The client sends its own before its Finished.
+- A failure queues one alert (sealed if the write keys are live), wipes every secret and buffer,
+  and ends the connection: `receive` then answers `error.Closed` and `output()` stays empty.
+- A received KeyUpdate re-keys the receive side; one that asks is answered. The client never starts
+  one by itself (`send_key_update` is for the connection layer).
+- A CertificateRequest is refused: client authentication is slice 5.
+
+Tests: `tls_client_test.zig` (success at several piece sizes, refusals, pinning, record faults and
+four teeth tests, one each for the pin, CertificateVerify, Finished and the transcript, which fail
+when that check is skipped), and `tls_fuzz.zig`, a seeded fuzzer that damages a server's flight in
+eleven ways and feeds it in random pieces. It is replayed like the others (see "Replaying a fuzz
+failure").
+
 ## Diagnostics
 
 | Code | Refused because |
@@ -95,6 +127,10 @@ ZCUBE_FUZZ_ITERATIONS=20000 .zig-cache/o/<hash>/test --test-filter "x509 fuzz" |
 | ZC-E0811 | expired or not yet valid; shows the window, the time now and the skew |
 | ZC-E0812 | names another peer; shows both names |
 | ZC-E0817 | an identity could not be issued |
+| ZC-E0813 | the TLS handshake was refused: a malformed or out-of-order message, a CertificateVerify or Finished that does not verify, a server alert, or a CertificateRequest |
+| ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
+| ZC-E0816 | the connection ended without close_notify, or before the handshake finished |
+| ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
 
 For ZC-E0819, the fix is to give the peer a certificate issued for its role.
