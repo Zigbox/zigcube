@@ -51,12 +51,22 @@ function firstDifference(left, right) {
   return "(no difference found)";
 }
 
+// The profile names, in the order of `sim_shape.zig`'s enums; "auto" asks for the seed's draw.
+const CLUSTER_PROFILES = ["mixed", "partitions", "skew", "crash_heavy", "slow_store"];
+const SWARM_PROFILES = ["mixed", "liars", "silent", "refusers", "honest"];
+function profileIndex(names, text) {
+  if (text === "auto") return 0xffffffff;
+  const index = names.indexOf(text);
+  if (index < 0) throw new Error(`unknown profile ${text}`);
+  return index;
+}
+
 if (simSwarm) {
   // Same contract as --sim-cluster: the native report arrives as a file and must be equal byte for byte.
-  const [wasmPath, seedText, operationsText, nativePath] = process.argv.slice(3);
+  const [wasmPath, seedText, operationsText, profileText, nativePath] = process.argv.slice(3);
   const exports = await instantiate(readFileSync(wasmPath));
   const started = Date.now();
-  const failed = exports.zcube_sim_swarm(BigInt(seedText), Number(operationsText));
+  const failed = exports.zcube_sim_swarm_shaped(BigInt(seedText), operationsText === "auto" ? 0 : Number(operationsText), profileIndex(SWARM_PROFILES, profileText));
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_swarm_report_ptr(), exports.zcube_swarm_report_len());
   const wasmText = new TextDecoder().decode(rendered);
@@ -73,12 +83,19 @@ if (simSwarm) {
 
 if (simCluster) {
   // Same contract as --sim: the native report arrives as a file; the two must be equal byte for byte.
-  const [wasmPath, seedText, operationsText, nodesText, livenessText, nativePath] = process.argv.slice(3);
+  const [wasmPath, seedText, operationsText, nodesText, livenessText, profileText, nativePath] = process.argv.slice(3);
   const exports = await instantiate(readFileSync(wasmPath));
   const started = Date.now();
-  const failed = simC1
-    ? exports.zcube_sim_c1(BigInt(seedText), Number(operationsText), Number(nodesText))
-    : exports.zcube_sim_cluster(BigInt(seedText), Number(operationsText), Number(nodesText), livenessText === "true" ? 1 : 0);
+  const failed = exports.zcube_sim_cluster_shaped(
+    BigInt(seedText),
+    operationsText === "auto" ? 0 : Number(operationsText),
+    Number(nodesText),
+    simC1 || livenessText === "true" ? 1 : 0,
+    simC1 ? 1 : 0,
+    profileIndex(CLUSTER_PROFILES, profileText),
+    0,
+    0,
+  );
   const label = simC1 ? "sim-c1" : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const rendered = new Uint8Array(exports.memory.buffer, exports.zcube_cluster_report_ptr(), exports.zcube_cluster_report_len());

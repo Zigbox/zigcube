@@ -71,7 +71,9 @@ pub const Failure = struct {
 /// One round of the runner: every batch's seeds and failures, the batches concatenated.
 pub const Batch = struct {
     seeds: u64,
-    operations: u32,
+    /// The fixed operation count of the round, or null when the runner drew each seed's own
+    /// (`auto`: its summary says `drawn operations`).
+    operations: ?u32,
     failures: []const Failure,
 };
 
@@ -117,10 +119,10 @@ fn parse_seed_line(line: []const u8) ?SeedLine {
     return null;
 }
 
-const SummaryLine = struct { seeds: u64, operations: u32, failed: u64 };
+const SummaryLine = struct { seeds: u64, operations: ?u32, failed: u64 };
 
 /// "sim-cluster: seeds A..B, N operations: F of T failed" (`sim-swarm:` for that kind) gives
-/// (T, N, F).
+/// (T, N, F); the `auto` form, "..., drawn operations: F of T failed", gives (T, null, F).
 fn parse_summary(kind: []const u8, line: []const u8) ?SummaryLine {
     const rest = after_prefix(line, summary_prefix(kind)) orelse return null;
     const comma = std.mem.indexOf(u8, rest, ", ") orelse return null;
@@ -129,9 +131,15 @@ fn parse_summary(kind: []const u8, line: []const u8) ?SummaryLine {
     const last = std.fmt.parseInt(u64, rest[dots + 2 .. comma], 10) catch return null;
     if (last < first) return null;
     const tail = rest[comma + 2 ..];
-    const space = std.mem.indexOfScalar(u8, tail, ' ') orelse return null;
-    const operations = std.fmt.parseInt(u32, tail[0..space], 10) catch return null;
-    const counts = after_prefix(tail[space..], " operations: ") orelse return null;
+    var operations: ?u32 = null;
+    var counts: []const u8 = undefined;
+    if (after_prefix(tail, "drawn operations: ")) |drawn| {
+        counts = drawn;
+    } else {
+        const space = std.mem.indexOfScalar(u8, tail, ' ') orelse return null;
+        operations = std.fmt.parseInt(u32, tail[0..space], 10) catch return null;
+        counts = after_prefix(tail[space..], " operations: ") orelse return null;
+    }
     const of = std.mem.indexOf(u8, counts, " of ") orelse return null;
     const failed = std.fmt.parseInt(u64, counts[0..of], 10) catch return null;
     const total_text = counts[of + 4 ..];
@@ -170,6 +178,7 @@ pub fn parse(arena: std.mem.Allocator, kind: []const u8, text: []const u8) Parse
     var failures: std.ArrayList(Failure) = .empty;
     var seeds: u64 = 0;
     var operations: ?u32 = null;
+    var summaries: u32 = 0; // Summary lines seen; the first fixes whether the round is drawn.
     var open = false; // A failure or nothing at all since the last summary.
     var batch_start: usize = 0; // Where the current batch's failures begin.
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -190,8 +199,9 @@ pub fn parse(arena: std.mem.Allocator, kind: []const u8, text: []const u8) Parse
             open = true;
         } else if (parse_summary(kind, line)) |found| {
             // Batches of one round run the same operation count.
-            if (operations) |known| if (known != found.operations) return error.BadLine;
+            if (summaries > 0 and operations != found.operations) return error.BadLine;
             operations = found.operations;
+            summaries += 1;
             // The summary's own count of failures is the check on what was read before it.
             if (failures.items.len - batch_start != found.failed) return error.BadLine;
             batch_start = failures.items.len;
@@ -202,13 +212,13 @@ pub fn parse(arena: std.mem.Allocator, kind: []const u8, text: []const u8) Parse
         }
     }
     if (open) return error.NoSummary;
-    const done = operations orelse return error.NoSummary;
+    if (summaries == 0) return error.NoSummary;
     for (failures.items) |failure| {
         if (failure.step.len == 0) return error.BadLine;
         if (failure.replay.len == 0) return error.BadLine;
     }
     if (failures.items.len > seeds) return error.BadLine;
-    return .{ .seeds = seeds, .operations = done, .failures = failures.items };
+    return .{ .seeds = seeds, .operations = operations, .failures = failures.items };
 }
 
 /// An indented line under a `seed N:` line: step, replay or the shrunk count.
@@ -383,7 +393,7 @@ test "parse reads failures, their shrinks and the seed count" {
     defer arena_state.deinit();
     const batch = try parse(arena_state.allocator(), kind_sim_cluster, sample);
     try std.testing.expectEqual(@as(u64, 10), batch.seeds);
-    try std.testing.expectEqual(@as(u32, 100), batch.operations);
+    try std.testing.expectEqual(@as(?u32, 100), batch.operations);
     try std.testing.expectEqual(@as(usize, 3), batch.failures.len);
     try std.testing.expectEqual(@as(u64, 4), batch.failures[1].seed);
     try std.testing.expectEqual(@as(?u32, 67), batch.failures[1].shrunk_operations);
@@ -407,6 +417,31 @@ test "parse refuses output cut short or without a step" {
     const batch = try parse(arena, kind_sim_cluster, clean);
     try std.testing.expectEqual(@as(u64, 5), batch.seeds);
     try std.testing.expectEqual(@as(usize, 0), batch.failures.len);
+}
+
+test "an auto round's summary says drawn operations; mixing it with a fixed one refuses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Real output (src/testdata/sim_cluster_drawn.txt): `sim_teeth --seeds 1..3 auto
+    // --profile=auto` (the teeth fault makes every seed fail; the format is `sim_cluster`'s).
+    const auto = @embedFile("testdata/sim_cluster_drawn.txt");
+    const batch = try parse(arena, kind_sim_cluster, auto);
+    try std.testing.expectEqual(@as(u64, 3), batch.seeds);
+    try std.testing.expectEqual(@as(?u32, null), batch.operations);
+    try std.testing.expectEqual(@as(usize, 3), batch.failures.len);
+    try std.testing.expectEqualStrings("faults", batch.failures[0].step);
+    try std.testing.expect(
+        std.mem.indexOf(u8, batch.failures[1].replay, "--profile=skew") != null,
+    );
+    // The c1 run names itself in the drawn summary too, and a plain run's is refused as c1.
+    const c1 = try std.mem.replaceOwned(u8, arena, auto, "sim-cluster:", "sim-cluster --c1:");
+    try std.testing.expectEqual(@as(u64, 3), (try parse(arena, kind_sim_c1, c1)).seeds);
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_c1, auto));
+    const two = auto ++ "sim-cluster: seeds 4..5, drawn operations: 0 of 2 failed\n";
+    try std.testing.expectEqual(@as(u64, 5), (try parse(arena, kind_sim_cluster, two)).seeds);
+    const mixed = auto ++ "sim-cluster: seeds 4..5, 100 operations: 0 of 2 failed\n";
+    try std.testing.expectError(error.BadLine, parse(arena, kind_sim_cluster, mixed));
 }
 
 test "the fingerprint ignores the seed, the commit and the shrink; the step changes it" {

@@ -27,6 +27,7 @@ pub const modules = .{
     @import("node_store.zig"),
     @import("fetch_plan.zig"),
     @import("sim_images.zig"),
+    @import("sim_shape.zig"),
     @import("sim_swarm.zig"),
     @import("clock.zig"),
     @import("compare_sets.zig"),

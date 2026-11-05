@@ -21,7 +21,13 @@ main() {
     : "${SIM_FLEET_REMOTE:=https://github.com/Zigbox/zigcube}"
     : "${SIM_FLEET_GH_REPO:=Zigbox/zigcube}"
     : "${SIM_FLEET_BRANCH:=main}"
-    : "${SIM_FLEET_OPS:=100}"
+    # `auto` draws each run's size and shape from its seed, and the profile (which faults are on)
+    # too: the fleet exists for the variety (docs/core.md, "Profiles and shapes"). A number fixes
+    # the operations (the nodes, ttl and replicas stay the seed's own old defaults); a profile
+    # name (`mixed`, `partitions`, ...) fixes the profile. An fleet.env that sets SIM_FLEET_OPS=100
+    # from before the draw keeps the old fixed size.
+    : "${SIM_FLEET_OPS:=auto}"
+    : "${SIM_FLEET_PROFILE:=auto}"
     : "${SIM_FLEET_BATCH:=100}"
     # Seeds per batch by kind; the cluster kinds fall back to SIM_FLEET_BATCH. The swarm's default
     # is 50000 and ignores SIM_FLEET_BATCH, because an installed fleet.env already sets that to
@@ -150,9 +156,15 @@ kind_exe() {
 
 kind_flags() {
     case "$1" in
-    sim-c1) echo "--c1" ;;
-    *) echo "" ;;
+    sim-c1) echo "--c1 --profile=$SIM_FLEET_PROFILE" ;;
+    *) echo "--profile=$SIM_FLEET_PROFILE" ;;
     esac
+}
+
+# The summary line's operations, as the producers print it: `N operations`, or for a drawn size
+# `drawn operations` (src/sim_fleet_issue.zig reads both).
+ops_phrase() {
+    if [ "$SIM_FLEET_OPS" = auto ]; then echo "drawn operations"; else echo "$SIM_FLEET_OPS operations"; fi
 }
 
 # The summary line's prefix and the step of a crash that left none: `sim_swarm` has no
@@ -222,12 +234,16 @@ start_worker() {
     echo "$2" >"$round/kind-$1"
     exe=$(kind_exe "$2")
     flags=$(kind_flags "$2")
+    trace=""
+    # The cluster kinds write each seed's replay line to stderr as the seed starts, so a batch
+    # that times out or is killed says which seed it was on (`sim_swarm` has no such flag).
+    if [ "$exe" = sim_cluster ]; then trace=--trace-steps; fi
     (
         code=0
-        # shellcheck disable=SC2086 # $flags is empty or one flag.
+        # shellcheck disable=SC2086 # $flags and $trace are flags, never empty words.
         timeout "$SIM_FLEET_BATCH_TIMEOUT" "$bin/$exe" \
             --seeds "$base..$((base + $(kind_batch "$2") - 1))" "$SIM_FLEET_OPS" $flags --shrink \
-            >"$round/out-$1" 2>"$round/err-$1" || code=$?
+            $trace >"$round/out-$1" 2>"$round/err-$1" || code=$?
         echo "$code" >"$round/code-$1"
     ) &
 }
@@ -241,10 +257,13 @@ collect() {
     code=$(cat "$round/code-$1")
     case "$code" in
     0 | 1) cat "$round/out-$1" ;;
-    124) log "$2 timed out on seeds $base..$last at $built; not counted" >&2 ;;
-    137)
-        log "$2 was killed (out of memory?) on seeds $base..$last at $built;" \
+    124)
+        log "$2 timed out on seeds $base..$last at $built, on $(seed_in "$round/err-$1");" \
             "not counted" >&2
+        ;;
+    137)
+        log "$2 was killed (out of memory?) on seeds $base..$last at $built," \
+            "on $(seed_in "$round/err-$1"); not counted" >&2
         ;;
     *)
         if [ "$code" -lt 128 ]; then
@@ -257,6 +276,14 @@ collect() {
         replay_range "$base" "$last" "$2"
         ;;
     esac
+}
+
+# The seed a run was on when it ended, from the last `replay:` line it traced to stderr file $1,
+# and that line, so the log has the command that reproduces it.
+seed_in() {
+    line=$(sed -n 's/^ *replay: //p' "$1" | tail -n1)
+    if [ -z "$line" ]; then echo "an unknown seed"; return 0; fi
+    echo "seed $(echo "$line" | awk '{print $2}') ($line)"
 }
 
 # Keeps the crashed run's output and stderr (the last 20 crashes), named by kind.
@@ -286,14 +313,19 @@ replay_range() {
             "$SIM_FLEET_OPS" $flags --shrink $trace >"$round/one" 2>"$round/one.err" || code=$?
         case "$code" in
         0 | 1) cat "$round/one" ;;
-        124 | 137) log "seed $seed timed out or was killed on replay; not counted" >&2 ;;
+        124 | 137)
+            log "seed $seed timed out or was killed on replay ($(seed_in "$round/one.err"));" \
+                "not counted" >&2
+            ;;
         *) crash_record "$seed" "$code" "$3" ;;
         esac
         seed=$((seed + 1))
     done
 }
 
-# The record of seed $1 that crashed with exit code $2 in kind $3.
+# The record of seed $1 that crashed with exit code $2 in kind $3. The replay line is the one the
+# run traced to stderr before it crashed (concrete: profile, ttl, replicas and heal point), else
+# the command line the batch used.
 crash_record() {
     message=$(sed -n 's/^.*panic: //p' "$round/one.err" | head -n1)
     if [ -z "$message" ]; then
@@ -306,15 +338,17 @@ crash_record() {
     printf 'seed %s: CRASHED: %s\n' "$1" "$message"
     if [ "$(kind_exe "$3")" = sim_swarm ]; then
         printf '  step: run\n'
-        printf '  replay: zig-out/bin/sim_swarm %s %s\n' "$1" "$SIM_FLEET_OPS"
+        printf '  replay: zig-out/bin/sim_swarm %s %s %s\n' "$1" "$SIM_FLEET_OPS" "$(kind_flags "$3")"
     else
         step=$(sed -n 's/^step: //p' "$round/one.err" | tail -n1)
         printf '  step: %s\n' "${step:-setup}"
-        printf '  replay: zig-out/bin/sim_cluster %s %s 0%s\n' "$1" "$SIM_FLEET_OPS" \
-            "$(kind_flags "$3" | sed 's/^./ &/')"
+        replay=$(sed -n 's/^ *replay: //p' "$round/one.err" | tail -n1)
+        if [ -z "$replay" ]; then
+            replay="zig-out/bin/sim_cluster $1 $SIM_FLEET_OPS 0 $(kind_flags "$3")"
+        fi
+        printf '  replay: %s\n' "$replay"
     fi
-    printf '%s: seeds %s..%s, %s operations: 1 of 1 failed\n' "$(kind_prefix "$3")" "$1" "$1" \
-        "$SIM_FLEET_OPS"
+    printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' "$(kind_prefix "$3")" "$1" "$1" "$(ops_phrase)"
 }
 
 # Hands kind $1's file $2 to the reporter.
@@ -340,5 +374,7 @@ ingest() {
     fi
 }
 
+# Sourced by ops/sim-fleet/test-crash-record.sh for the functions only.
+if [ -n "${SIM_FLEET_SOURCE_ONLY:-}" ]; then return 0 2>/dev/null || true; fi
 main "$@"
 exit $?
