@@ -299,12 +299,12 @@ test "placements finds an assignment onto an unregistered, unready or other-tenu
     try fixture.start();
     defer fixture.stop();
     const ctx = fixture.context();
-    const assigned: records.Assigned = .{
-        .replica = "hello-1",
-        .service = "hello",
-        .requests = .{ .cpu_millis = 1, .memory_bytes = 1 },
-        .reason = "a test",
-    };
+    const assigned = records.assigned_replica(
+        "hello-1",
+        "hello",
+        .{ .cpu_millis = 1, .memory_bytes = 1 },
+        "a test",
+    );
     const slot = "/assigned/node1/hello-1";
     const first = try fixture.put(slot, assigned);
     try testing.expect(placements(&ctx, 0, first) != null);

@@ -51,7 +51,7 @@ only with a `get` when it is about to create replicas for that service, never by
 number of counters bounds nothing.
 B1 adds an eighth role, `job_controller` (below, "Jobs"). `retention` also deletes, never writes, the
 records of an ended job: `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
-`/job-observed/`, and may delete the four of one job in one transaction. It never deletes
+`/job-observed/`, and may delete the five of one job in one transaction (one job, at most one node). It never deletes
 `/job-admission`, `/job-endings` or an assignment.
 
 ## Versions
@@ -527,7 +527,9 @@ nothing places or claims the run. `start_by_ms` is creation plus `deadline_ms` o
 "exit":{"kind":"exited","code":0},"stop_cause":"cancel","diagnostic":{…},"started_at_ms":…,
 "reported_at_ms":…}`. Its own record kind, not `Observed`. `status` is `claimed` (written before the
 run is started, comparing the agent's tenure and the run's revision), `running` or `stopped`. A run
-has at most one claim, ever. Admissible under the three conditions of authority.md §3.
+has at most one claim, ever. A `stopped` report carries `exit` and no other status does, and a
+`claimed` report has no `started_at_ms`; a record that breaks either is malformed (ZC-E0301).
+Admissible under the three conditions of authority.md §3.
 
 ### `/assigned/<node>/<name>-job`: the placement of a run (scheduler)
 

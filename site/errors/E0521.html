@@ -78,6 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>A run's container is gone and nothing says how it ended: the agent lost its state directory or the supervisor's exit record, or the host restarted, so the process that was running it no longer exists and left no exit status.</p>
 <p>The job ends as failed (unknown). It is never started again: a run is started at most once, and starting it to find out would break that. The cause line names the run and what was missing.</p>
+<p>Find out why: a host restart (uptime, the system log) or a state directory that was cleared, moved or not mounted (the agent's --state-dir). Fix that first, or the next run can be lost the same way; then submit the job again under a new name if it should run.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0521</pre>

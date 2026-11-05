@@ -882,12 +882,14 @@ pub const jobs_per_node_max: u32 = 64;
 /// The runs list of one node (`GET /v1/agent/nodes/{node}/runs`): more is ZC-E0302, as for
 /// replicas. One unpaged reply, so it stays under half a page (comptime below).
 pub const agent_node_runs_max: u32 = jobs_per_node_max;
-/// A run record: the spec without the input.
+/// A run record, as encoded: the spec without the input. Enforced on the encoded JSON by
+/// `records.encode` and `records.read`, not inferred from the raw sizes of its members: JSON
+/// escaping turns one control byte into six.
 pub const job_run_bytes_max: u32 = 16 * 1024;
 /// `env` of a job; larger is refused (ZC-E0130). The input has a field of its own.
 pub const job_env_bytes_max: u32 = 8 * 1024;
 /// A job's input, as the container receives it: UTF-8 without NUL. It is stored as base64
-/// (`JobInput.data`), so the record is at most four thirds of this, never the sixfold of a JSON
+/// (`JobInput.base64`), so the record is at most four thirds of this, never the sixfold of a JSON
 /// string full of control characters, which would not fit `store_value_bytes_max`.
 pub const job_input_bytes_max: u32 = 64 * 1024;
 /// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`.
@@ -922,11 +924,13 @@ comptime {
     assert(agent_node_runs_max * job_run_bytes_max <= store_page_bytes_max / 2);
     assert(agent_node_runs_max <= store_list_limit_max);
     assert(job_run_bytes_max <= store_value_bytes_max);
-    // An env, the command and the rest of the spec fit a run record.
-    assert(job_env_bytes_max + 4096 < job_run_bytes_max);
+    // `job_run_bytes_max` itself is enforced on the encoded record (records.encode and read), so
+    // no relation between it and the raw sizes of env or command is asserted here.
     // The stored input is base64 (four thirds, rounded up to groups of four).
     assert((job_input_bytes_max + 2) / 3 * 4 < store_value_bytes_max);
-    assert(job_input_bytes_max < job_request_bytes_max);
+    // The size of the request body that carries an input is an open question
+    // (docs/decisions/2026-11-05-b1-job-input-wire-size.md): JSON escaping can make a valid
+    // input larger than `job_request_bytes_max`, so no relation is asserted here.
     assert(job_request_bytes_max > api_request_bytes_max);
     assert(job_labels_max == 6);
     assert(job_command_words_max == runtime_command_words_max);
@@ -941,5 +945,7 @@ comptime {
     assert(window_ms == @as(u64, job_admission_window_h) * 60 * 60 * 1000);
     assert(job_admitted_window_max >= jobs_max);
     // One aggregate record: an hour's count per hour of the window, in JSON, in one value.
-    assert(job_admission_window_h * 48 + 256 < store_value_bytes_max);
+    // An entry is at most 49 bytes (`{"hour":N,"count":N},` with N up to 13 and 10 digits), and a
+    // record holds at most `job_admission_window_h + 1` of them (`admission_valid`).
+    assert((job_admission_window_h + 1) * 49 + 256 < store_value_bytes_max);
 }

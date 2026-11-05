@@ -958,12 +958,12 @@ test "why node states its load and its judgement, and notes that nothing is reba
             "0m of 4000m CPU and 0B of 8.0Gi memory in use",
         before.state.text,
     );
-    const assigned: records.Assigned = .{
-        .replica = "hello-1",
-        .service = "hello",
-        .requests = .{ .cpu_millis = 250, .memory_bytes = 128 << 20 },
-        .reason = "test",
-    };
+    const assigned = records.assigned_replica(
+        "hello-1",
+        "hello",
+        .{ .cpu_millis = 250, .memory_bytes = 128 << 20 },
+        "test",
+    );
     const assigned_key = records.assigned_key("node1", "hello-1");
     try put_record(world, .scheduler, assigned_key.slice(), assigned);
     const tenure = try register_node2(world);

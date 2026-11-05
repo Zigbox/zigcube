@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a job is not valid</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it stands. The cause line names the field and the limit it broke: a name that is not a hostname label, no command or too many words, a deadline of zero or above 24 hours, a grace period above 60 seconds, env above 8 KiB, an input above 64 KiB or with a NUL byte, a submit time more than an hour ahead, or more labels than a job may carry.</p>
+<p>`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it stands. The cause line names the field and the limit it broke: a name that is not 1 to 48 bytes of lowercase letters, digits and hyphens (none at either end), no command or too many words, a deadline of zero or above 24 hours, a grace period above 60 seconds, env above 8 KiB, an input above 64 KiB or with a NUL byte, a submit time more than an hour ahead, or more labels than a job may carry.</p>
 <p>Two fields are refused because they are not built yet, and the cause says so: retries above 0 (a job runs at most once), and relay or placement. Accepting a field and ignoring it would say something false about where the job runs.</p>
 <p>Fix the field it names and submit again.</p>
 <h2>Offline</h2>

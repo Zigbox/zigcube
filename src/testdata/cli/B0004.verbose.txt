@@ -5,7 +5,7 @@ bug[ZC-B0004]: zcube could not map how a job ended
   this is a bug in zcube, not something you did
   saved  diagnostic bundle:
          <state>/zcube/bundles/1970-01-01T00-00-00Z-last.tar.gz
-  cause  train-7-job reported an exit of kind lost with stop cause fence
+  cause  train-7-job reported an exit of kind exited with no code and no signal
   report https://github.com/Zigbox/zigcube/issues/new
   more   zcube explain B0004
   docs   https://zigbox.github.io/zigcube/errors/B0004.html

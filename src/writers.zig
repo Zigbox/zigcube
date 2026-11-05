@@ -9,7 +9,8 @@
 //! Beyond authority.md's six roles there is a seventh, `retention`: it deletes expired decisions,
 //! old pull records and ended jobs, and so may touch only the three decision prefixes (which
 //! every role may write) and may delete, never write, under `/pulls/` and the job prefixes
-//! (`retention_deletes`). B1 adds an eighth, `job_controller` (authority.md, "Jobs").
+//! (`retention_deletes`); one ended job's five records go in one transaction (`retention_only`).
+//! B1 adds an eighth, `job_controller` (authority.md, "Jobs").
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -45,17 +46,19 @@ const Owner = enum {
     anyone,
 };
 
-const Rule = struct { prefix: []const u8, owner: Owner };
+/// `exact` rules name one key, not a prefix: `/job-admission` is a record, so `/job-admissions` and
+/// `/job-endings/x` belong to nobody.
+const Rule = struct { prefix: []const u8, owner: Owner, exact: bool = false };
 
 /// The one table of authority.md §2. Longest prefix first where one contains another.
 pub const rules = [_]Rule{
     .{ .prefix = records.prefix_services, .owner = .api },
     .{ .prefix = records.prefix_jobs, .owner = .api },
     .{ .prefix = records.prefix_job_input, .owner = .api },
-    .{ .prefix = records.key_job_admission, .owner = .api },
+    .{ .prefix = records.key_job_admission, .owner = .api, .exact = true },
     .{ .prefix = records.prefix_job_runs, .owner = .job_controller },
     .{ .prefix = records.prefix_job_status, .owner = .job_controller },
-    .{ .prefix = records.key_job_endings, .owner = .job_controller },
+    .{ .prefix = records.key_job_endings, .owner = .job_controller, .exact = true },
     .{ .prefix = records.prefix_job_observed, .owner = .agent },
     .{ .prefix = records.prefix_replica_numbers, .owner = .replica_controller },
     .{ .prefix = records.prefix_replicas, .owner = .replica_controller },
@@ -135,22 +138,29 @@ pub fn foreign_key(request: store.TxnRequest) ?[]const u8 {
     return null;
 }
 
-/// Whether the prefix is one retention may delete from without owning it: an ended job's records.
+/// Whether the prefix is one retention may delete from without owning it: an ended job's records,
+/// and an old pull record.
 fn retention_deletes(prefix: []const u8) bool {
+    return job_record_prefix(prefix) or std.mem.eql(u8, prefix, records.prefix_pulls);
+}
+
+/// The five prefixes that hold the records of one job.
+fn job_record_prefix(prefix: []const u8) bool {
     return std.mem.eql(u8, prefix, records.prefix_jobs) or
         std.mem.eql(u8, prefix, records.prefix_job_input) or
         std.mem.eql(u8, prefix, records.prefix_job_runs) or
         std.mem.eql(u8, prefix, records.prefix_job_status) or
-        std.mem.eql(u8, prefix, records.prefix_job_observed) or
-        std.mem.eql(u8, prefix, records.prefix_pulls);
+        std.mem.eql(u8, prefix, records.prefix_job_observed);
 }
 
-/// Whether `request` is what retention writes: deletes only, each under a prefix of
-/// `retention_deletes` or an every-role prefix, with at least one of the former. It deletes the
-/// records of one ended job in one transaction, which spans three owners, so `foreign_key` lets
-/// it through.
+/// Whether `request` is what retention writes to remove one ended job: deletes only, of keys that
+/// all name the same job, in `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
+/// `/job-observed/<node>/` (under at most one node: a run has one claim, ever), and of every-role
+/// prefixes, with at least one job key. That spans three owners, so `foreign_key` lets it through.
+/// Pull records are not part of it: they are per node, and `foreign_key` checks them as before.
 fn retention_only(request: store.TxnRequest) bool {
-    var deleted = false;
+    var job: ?[]const u8 = null;
+    var node: ?[]const u8 = null;
     for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
         for (ops) |op| {
             const key = switch (op) {
@@ -159,16 +169,33 @@ fn retention_only(request: store.TxnRequest) bool {
             };
             const rule = rule_for(key) orelse return false;
             if (rule.owner == .anyone) continue;
-            if (!retention_deletes(rule.prefix)) return false;
-            deleted = true;
+            if (!job_record_prefix(rule.prefix)) return false;
+            var name = key[rule.prefix.len..];
+            if (std.mem.eql(u8, rule.prefix, records.prefix_job_observed)) {
+                const slash = std.mem.indexOfScalar(u8, name, '/') orelse return false;
+                if (node) |first| {
+                    if (!std.mem.eql(u8, first, name[0..slash])) return false;
+                }
+                node = name[0..slash];
+                name = name[slash + 1 ..];
+            }
+            if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return false;
+            if (job) |first| {
+                if (!std.mem.eql(u8, first, name)) return false;
+            }
+            job = name;
         }
     }
-    return deleted;
+    return job != null;
 }
 
 fn rule_for(key: []const u8) ?Rule {
     for (rules) |rule| {
-        if (std.mem.startsWith(u8, key, rule.prefix)) return rule;
+        const matches = if (rule.exact)
+            std.mem.eql(u8, key, rule.prefix)
+        else
+            std.mem.startsWith(u8, key, rule.prefix);
+        if (matches) return rule;
     }
     return null;
 }
@@ -487,4 +514,64 @@ test "foreign_key lets one job controller or API transaction through and stops a
     try testing.expectEqualStrings("/job-runs/j1", foreign_key(request_of(&mixed)).?);
     const placing = [_]store.Op{ put_op("/job-status/j1"), put_op("/assigned/n1/j1-job") };
     try testing.expectEqualStrings("/assigned/n1/j1-job", foreign_key(request_of(&placing)).?);
+}
+
+test "retention's job transaction names one job and one node, and carries no pull records" {
+    // Goal: `retention_only` lets through exactly the removal of one job's records. Method: the
+    // right transaction, then each way a transaction can name more than that.
+    const deletes = [_]store.Op{
+        .{ .delete = "/jobs/a" },
+        .{ .delete = "/job-input/a" },
+        .{ .delete = "/job-runs/a" },
+        .{ .delete = "/job-status/a" },
+        .{ .delete = "/job-observed/n1/a" },
+        .{ .delete = "/decisions/d1" },
+    };
+    try testing.expect(foreign_key(request_of(&deletes)) == null);
+    const without_observed = [_]store.Op{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-runs/a" } };
+    try testing.expect(foreign_key(request_of(&without_observed)) == null);
+    const wrong = [_][]const store.Op{
+        // Another job's run beside this job.
+        &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-runs/b" } },
+        // The observations of two nodes: a run has one claim.
+        &.{ .{ .delete = "/job-observed/n1/a" }, .{ .delete = "/job-observed/n2/a" } },
+        &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-observed/n1/b" } },
+        // A pull record mixed in, or a node's pull records across nodes.
+        &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/pulls/n1/b3:aa" } },
+        &.{ .{ .delete = "/pulls/n1/b3:aa" }, .{ .delete = "/pulls/n2/b3:aa" } },
+        // Not a job's record: a nested name, no node.
+        &.{ .{ .delete = "/jobs/a/b" }, .{ .delete = "/job-runs/a" } },
+        &.{ .{ .delete = "/job-observed/n1" }, .{ .delete = "/jobs/a" } },
+    };
+    for (wrong) |ops| try testing.expect(foreign_key(request_of(ops)) != null);
+    // One owner's transactions (the API's) pass `foreign_key` on their own; retention's rule must
+    // still refuse them: no name, and an aggregate.
+    const not_retention = [_][]const store.Op{
+        &.{.{ .delete = "/jobs/" }},
+        &.{ .{ .delete = "/job-admission" }, .{ .delete = "/jobs/a" } },
+    };
+    for (not_retention) |ops| try testing.expect(!retention_only(request_of(ops)));
+    // One node's pull records on their own are one owner, as before jobs.
+    const pulls = [_]store.Op{ .{ .delete = "/pulls/n1/b3:aa" }, .{ .delete = "/pulls/n1/b3:bb" } };
+    try testing.expect(foreign_key(request_of(&pulls)) == null);
+    // A job record with a put is never retention's.
+    const with_put = [_]store.Op{ .{ .delete = "/jobs/a" }, put_op("/job-runs/a") };
+    try testing.expect(foreign_key(request_of(&with_put)) != null);
+}
+
+test "the two job aggregates are exact keys, not prefixes" {
+    // Goal: `/job-admissions` and `/job-endings/x` are under no rule (authority.md I4).
+    const strays = [_][]const u8{
+        "/job-admissions", "/job-admission/x", "/job-endings/x", "/job-endingsx",
+    };
+    for (strays) |key| {
+        try testing.expect(rule_for(key) == null);
+        for (every_role) |role| {
+            const verdict = allowed(role, request_of(&.{put_op(key)}));
+            try testing.expectEqualStrings("nobody", verdict.refused.owner);
+        }
+        try testing.expectEqualStrings(key, foreign_key(request_of(&.{put_op(key)})).?);
+    }
+    try testing.expect(rule_for("/job-admission") != null);
+    try testing.expect(rule_for("/job-endings") != null);
 }

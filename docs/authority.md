@@ -510,7 +510,21 @@ A job is run once and never started twice (design: `docs/briefs/b1.md`; owner's 
 `writers.zig`, `job_controller`, writes `/job-runs/`, `/job-status/` and `/job-endings`, and never
 `/assigned/` or `/allocations/`. The scheduler keeps both of those and places and releases runs as
 replicas. Each agent writes `/job-observed/<its node>/`. Retention deletes (never writes) the
-records of an ended job, its four in one transaction.
+records of an ended job, its five (`/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
+`/job-observed/<node>/`) in one transaction. That transaction names one job and at most one node
+(a run has one claim, ever), carries no `/pulls/` key (pull records are per node and keep their own
+rule), and has a precondition: it compares the job's `/job-status/` at the revision retention read
+(terminal, and older than `job_finished_age_ms_min`) and deletes `/jobs/<name>` in the same
+transaction, so the spec never outlives its status, and the status never goes while the job is
+live. `/job-admission` and `/job-endings` are exact keys of their writers and are never deleted.
+
+**A run is created once, ever.** The job controller creates a job's run and status only for a job
+that never had them. Deleting `/job-runs/<name>` and `/job-status/<name>` by hand must not make
+the controller run the job again (I8a): an operator who deletes them has not cancelled the job, and
+a second run of a job that may have run is the one thing the design forbids. The controller
+therefore treats a job whose run or status is missing, and that has a `job-created` decision, as
+contradictory (ZC-E0307) and changes nothing. How it knows the job had a run is an open owner
+question: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
 
 **I1a, I1b, I2, I6 and I7 hold for runs unchanged:** a run has at most one assignment and its
 observations are admissible under one tenure; the allocation of a node counts runs with replicas;

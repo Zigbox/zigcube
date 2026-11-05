@@ -293,7 +293,8 @@ fn job_late(diag: *diag_mod.Diag) void { // api.zig
 
 fn job_contradicts(diag: *diag_mod.Diag) void { // job_controller.zig
     const cause = "/job-status/train-7 has ended but /job-runs/train-7 does not exist";
-    sample(diag, .E0307, &.{cause}, "fix or delete those keys; the next pass tries again");
+    const fix = "restore the missing record; never delete a run or status (it runs the job again)";
+    sample(diag, .E0307, &.{cause}, fix);
 }
 
 fn job_report_dropped(diag: *diag_mod.Diag) void { // job_controller.zig
@@ -308,7 +309,8 @@ fn job_waits(diag: *diag_mod.Diag) void { // scheduler.zig
 
 fn run_end_unknown(diag: *diag_mod.Diag) void { // agent.zig
     const cause = "train-7-job has no container and left no exit record in its directory";
-    sample(diag, .E0521, &.{cause}, "none needed: the job ended as failed (unknown)");
+    const fix = "find why the host restarted or the state directory was lost; it is not run again";
+    sample(diag, .E0521, &.{cause}, fix);
 }
 
 fn run_start_record(diag: *diag_mod.Diag) void { // agent_records.zig
@@ -323,7 +325,7 @@ fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
 
 fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
     diag.raise(.B0004);
-    diag.cause("train-7-job reported an exit of kind lost with stop cause fence", .{});
+    diag.cause("train-7-job reported an exit of kind exited with no code and no signal", .{});
     diag.fix(.{ .sentence = "report it with the diagnostic bundle" });
 }
 

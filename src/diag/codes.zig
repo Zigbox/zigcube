@@ -500,7 +500,8 @@ pub const registry = [_]Entry{
         .explanation =
         \\`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it
         \\stands. The cause line names the field and the limit it broke: a name that
-        \\is not a hostname label, no command or too many words, a deadline of zero or
+        \\is not 1 to 48 bytes of lowercase letters, digits and hyphens (none at
+        \\either end), no command or too many words, a deadline of zero or
         \\above 24 hours, a grace period above 60 seconds, env above 8 KiB, an input
         \\above 64 KiB or with a NUL byte, a submit time more than an hour ahead, or
         \\more labels than a job may carry.
@@ -912,8 +913,13 @@ pub const registry = [_]Entry{
         \\the keys, or the store was edited by hand.
         \\
         \\The cause line names the job and the keys. The job controller changes
-        \\nothing for that job until it is fixed. Do not delete a status that has
-        \\ended: the job would not be started again, but its ending would be lost.
+        \\nothing for that job until it is fixed.
+        \\
+        \\Never fix it by deleting the job's run (/job-runs/NAME) or its status
+        \\(/job-status/NAME). The controller creates a run and a status for a job
+        \\that has none, so deleting them makes it run the job again: a second run
+        \\of a job that may already have run, and its ending lost. Restore the
+        \\missing or damaged record, or remove the whole job.
         ,
     },
     .{
@@ -1250,6 +1256,11 @@ pub const registry = [_]Entry{
         \\The job ends as failed (unknown). It is never started again: a run is
         \\started at most once, and starting it to find out would break that. The
         \\cause line names the run and what was missing.
+        \\
+        \\Find out why: a host restart (uptime, the system log) or a state directory
+        \\that was cleared, moved or not mounted (the agent's --state-dir). Fix that
+        \\first, or the next run can be lost the same way; then submit the job again
+        \\under a new name if it should run.
         ,
     },
     .{

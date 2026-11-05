@@ -77,7 +77,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>The records of one job (its desired state, its run, its status and what its node reported) do not agree: a run with no job, a status that has ended and carries no ending, an ending that does not match its state. The API writes them together and validates what it writes, so something else wrote one of the keys, or the store was edited by hand.</p>
-<p>The cause line names the job and the keys. The job controller changes nothing for that job until it is fixed. Do not delete a status that has ended: the job would not be started again, but its ending would be lost.</p>
+<p>The cause line names the job and the keys. The job controller changes nothing for that job until it is fixed.</p>
+<p>Never fix it by deleting the job's run (/job-runs/NAME) or its status (/job-status/NAME). The controller creates a run and a status for a job that has none, so deleting them makes it run the job again: a second run of a job that may already have run, and its ending lost. Restore the missing or damaged record, or remove the whole job.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0307</pre>
