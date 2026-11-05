@@ -8,6 +8,7 @@
 #   demo_c0       demo-c0 on SQLite and on Postgres
 #   demo_c1       demo-c1 on SQLite and on Postgres
 #   zigbox_smoke  the Zigbox runtime on a real host (QEMU/KVM)
+#   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -18,7 +19,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 zigbox_smoke)
+jobs=(store demo_c0 demo_c1 zigbox_smoke demo_c2)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -47,9 +48,12 @@ classify() {
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
-    # The Zigbox runtime adapter and its smoke: the smoke only. The demos run FakeRuntime; a
-    # compile error in the adapter still fails the build job.
-    src/zigbox_* | ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
+    src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
+    # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
+    # demos run FakeRuntime; a compile error in the adapter still fails the build job.
+    src/zigbox_*) want_one zigbox_smoke; want_one demo_c2; return ;;
+    # The smoke's own files.
+    ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
     # The store suites' own files (the backends themselves are the server and run everything).
     src/store_conformance.zig | src/store_harness.zig | src/store_mutant.zig | \
       src/store_faults.zig | src/store_failover.zig) want_one store; return ;;
