@@ -489,6 +489,8 @@ pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
 /// With no peer holding a chunk, the plan waits this long from its start for a filter to show it
 /// (another node may be fetching it, c2.md O5), then goes to the registry.
 pub const fetch_peer_wait_ms: u32 = 30_000;
+/// A fetch waiting for another node's registry pull (O5) re-reads `/node-store` this often.
+pub const fetch_peer_poll_ms: u32 = 1000;
 /// A request not answered by then is a timeout.
 pub const fetch_request_timeout_ms: u32 = 10_000;
 /// Requests in flight in all, and to one peer.
@@ -557,10 +559,13 @@ pub const peer_handshakes_max: u32 = 32;
 pub const peer_handshake_evict_min_ms: u64 = 750;
 /// Time between two times ZC-E0808 is shown, whatever the sources: a flood must not flood a log.
 pub const peer_refusal_log_ms: u64 = 10 * 1000;
-/// Times a fetch asks a peer again after its server said it is busy, and the pause before each.
-/// A busy peer is not a failed one: no timeout, no strike.
-pub const fetch_busy_retries_max: u32 = 4;
+/// How long a fetch keeps asking a peer whose server said it is busy (status 503) before it
+/// takes the answer as a refusal, and the pauses between asks: the first, doubled up to the
+/// longest. A busy peer is not a failed one: no timeout, no strike
+/// (docs/decisions/2026-11-05-busy-peer-wait.md).
+pub const fetch_busy_wait_ms: u32 = 20 * 1000;
 pub const fetch_busy_sleep_ms: u32 = 250;
+pub const fetch_busy_sleep_max_ms: u32 = 2 * 1000;
 /// Time a peer has to finish the handshake.
 pub const peer_handshake_ms: u32 = 3 * 1000;
 /// Time a served connection waits for its next request before it closes.
@@ -630,7 +635,8 @@ comptime {
     assert(peer_handshakes_pending_per_source_max * 2 <= peer_handshakes_max);
     assert(peer_connections_per_node_max > 0);
     assert(peer_connections_per_node_max < peer_connections_max);
-    assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
+    assert(fetch_busy_sleep_ms <= fetch_busy_sleep_max_ms);
+    assert(fetch_busy_wait_ms < fetch_total_ms);
     assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);
@@ -736,6 +742,7 @@ comptime {
     assert(fetch_candidates_max <= 255); // A peer's index is a u8.
     assert(fetch_list_peers_max <= fetch_peers_max);
     assert(fetch_total_ms > fetch_peer_wait_ms);
+    assert(fetch_peer_poll_ms < fetch_peer_wait_ms);
     assert(fetch_backoff_base_ms > 0);
     assert(fetch_backoff_cap_ms >= fetch_backoff_base_ms);
 }

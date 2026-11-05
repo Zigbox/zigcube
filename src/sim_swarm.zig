@@ -75,6 +75,7 @@ const Totals = struct {
     locality_worst_per_mille: u32 = 0,
     drops: u32 = 0,
     longest_fetch_ms: u64 = 0,
+    starts: u32 = 0,
 };
 
 /// A request waiting for its answer.
@@ -198,11 +199,66 @@ fn run_operation(sim: *Sim) void {
             sim.step = "locality";
             check_locality(sim, node, tree);
         },
-        else => {
+        else => if (random.boolean()) {
             sim.step = "drop";
             drop_chunks(sim, node);
+        } else {
+            sim.step = "start";
+            check_start(sim, tree);
         },
     }
+}
+
+/// O5 (docs/briefs/c2.md): 2 to 4 nodes start fetching one tree at the same time with no peer
+/// holding it. Each asks `fetch_plan.start` every 100 ms; the registry puller comes to hold the
+/// tree after a drawn time, sometimes past `fetch_peer_wait_ms`. Checked: exactly one node pulls
+/// at once, it is the one every node computes, and the others fetch from it, or, when its pull
+/// outlasts the wait, go on alone (`waited`) and never before the wait is over.
+fn check_start(sim: *Sim, tree_index: u32) void {
+    const random = sim.random();
+    var tree_text: [32]u8 = undefined;
+    const tree = std.fmt.bufPrint(&tree_text, "b3:{d}-{d}", .{ sim.seed, tree_index }) catch
+        unreachable; // A u64 and a u32 fit.
+    const names_all = [_][]const u8{ "node1", "node2", "node3", "node4" };
+    const count = 2 + random.uintLessThan(u32, 3);
+    const names = names_all[0..count];
+    const pull_ms: u64 = 100 + random.uintLessThan(u64, constants.fetch_peer_wait_ms + 10_000);
+    const wait_ms = constants.fetch_peer_wait_ms;
+    var got: [4]?fetch_plan.Start = @splat(null);
+    var holds_at: ?u64 = null;
+    var first: u32 = 0;
+    var now: u64 = sim.now_ms;
+    while (now <= sim.now_ms + wait_ms + 100) : (now += 100) {
+        const holds = if (holds_at) |at| at <= now else false;
+        for (names, 0..) |name, at| {
+            if (got[at] != null) continue;
+            const decided = fetch_plan.start(name, tree, names, holds, sim.now_ms, now, wait_ms);
+            if (decided == .wait) continue;
+            got[at] = decided;
+            if (decided == .registry_first) {
+                first += 1;
+                holds_at = now + pull_ms;
+            }
+            if (decided == .waited and now < sim.now_ms + wait_ms) {
+                return sim.fail("a node gave up waiting for the registry puller early", .{});
+            }
+        }
+    }
+    if (first != 1) return sim.fail("{d} nodes pulled from the registry at once, not 1", .{first});
+    for (names, 0..) |name, at| {
+        const decided = got[at] orelse return sim.fail("a node was still waiting", .{});
+        const designated = fetch_plan.registry_first(name, tree, names);
+        if (designated != (decided == .registry_first)) {
+            return sim.fail("a node other than the designated one pulled at once", .{});
+        }
+        const expected: std.meta.Tag(fetch_plan.Start) = if (designated)
+            .registry_first
+        else if (pull_ms <= wait_ms) .peers else .waited;
+        if (decided != expected) {
+            return sim.fail("a waiting node did not fetch from the puller", .{});
+        }
+    }
+    sim.totals.starts += 1;
 }
 
 /// No check can fail here (only an assertion, which is a crash, step `run` in the fleet), so no
@@ -513,7 +569,7 @@ fn print_totals(sim: *Sim) void {
         "fetches: {d} (already held {d}); chunks from peers {d}, from the registry {d}; " ++
             "longest {d} ms\npeers: bad chunks {d}, struck {d}, refused {d}, timeouts {d}\n" ++
             "locality: exact {d}, estimated {d} (worst error {d} per mille); " ++
-            "chunks dropped {d}\n" ++
+            "chunks dropped {d}; simultaneous starts {d}\n" ++
             "stores: {x}\nresult: ok\n",
         .{
             totals.fetches,            totals.already_held,
@@ -522,7 +578,8 @@ fn print_totals(sim: *Sim) void {
             totals.struck,             totals.refused,
             totals.timeouts,           totals.locality_exact,
             totals.locality_estimated, totals.locality_worst_per_mille,
-            totals.drops,              digest[0..8],
+            totals.drops,              totals.starts,
+            digest[0..8],
         },
     );
 }

@@ -97,7 +97,11 @@ instead of a chunk directory (`zigbox_fetch.zig`, `fetch_cli.zig`):
    fetch on this node. That limit is this node's, and the counts come from the digest-checked
    tree, so no peer is struck and no other peer is asked: ZC-E0601 says the tree is too large.
 5. With no peer that has the tree, the fetch fails with ZC-E0601, which names the peers asked.
-   There is no registry fallback inside `fetch`.
+   There is no registry fallback inside `fetch`. Before any of this, O5 decides whether to ask
+   peers at once (docs/agent.md, "Who pulls from the registry first"): the one designated node
+   does, with a note, and fails here with ZC-E0601 so the supervisor's pull starts; the others
+   wait up to `fetch_peer_wait_ms` for a peer to hold the tree whole. So ZC-E0601 in a waiting
+   node's log means no peer came to hold the tree in that time.
 
 The registry fallback is the supervisor's own Zigbox `pull` (`zigbox_supervisor.zig`), which
 runs when the fetch exits non-zero. After a successful pull it writes
@@ -130,7 +134,12 @@ not served whenever its host owner is not its container owner (any container id 
 root agent with the full map; every one-chunk object on an agent that is not root). And a peer
 server that is not root cannot open an object owned by an id of its range that others may not
 read. Both are gaps in the pinned Zigbox, reported in
-`docs/decisions/2026-11-04-c2-slice8-review-fixes.md`.
+`docs/decisions/2026-11-04-c2-slice8-review-fixes.md`. They are not what failed the smoke's first
+`peers_fetch` runs: that was the supervisor's single-threaded Io having a failing allocator, which
+made the fetch's spawn end in OutOfMemory (`docs/decisions/2026-11-05-c2-slice8-peers-fetch-passes-as-cube.md`).
+With that fixed, `peers_fetch` passes as `cube` in CI (python:3.12-slim, 115,409,299 peer bytes, run
+41955830319). The smoke does not prove the gaps closed: the images it moves may simply have no file
+that meets them.
 
 ## sim-swarm
 
@@ -139,7 +148,10 @@ the reports byte for byte. `zig build -Doptimize=ReleaseSafe sim-swarm-exe` inst
 `zig-out/bin/sim_swarm <seed> <ops>` or `--seeds A..B <ops>`. The seed draws a universe of 128 to 512
 chunks, 2 to 6 versions of one tree that share most chunks, 3 to 12 nodes that are honest, liars,
 silent or refusers (some with stale filters), and low byte-rate caps so they bind. Operations: a
-node fetches a version, the estimate is checked against the exact count, a node loses chunks.
+node fetches a version, the estimate is checked against the exact count, a node loses chunks, and
+2 to 4 nodes start fetching one tree at once (`fetch_plan.start`, O5): exactly one, the designated
+node, pulls from the registry first; the others fetch from peers once it holds the tree, or after
+the full `fetch_peer_wait_ms` if its pull takes longer.
 
 Checked: a chunk is accepted exactly when its bytes are right; only a liar is struck; no chunk
 twice; a peer is asked only for what its filter claims, never again for a chunk it failed, never

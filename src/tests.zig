@@ -92,4 +92,5 @@ comptime {
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
     _ = @import("agent_run.zig");
+    _ = @import("demo_c2_check.zig");
 }

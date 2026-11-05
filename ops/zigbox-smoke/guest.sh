@@ -361,7 +361,7 @@ stage_peers_fetch() {
     echo "pull record of pyone: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
     [ "$PEER" -gt 0 ] || fail "pyone: no bytes came from a peer (registry=$REG peers=$PEERS)" \
         "fetch.log: $(cat "$(fetch_log_of pyone)" 2>&1 | head -c 1500)" \
-        "node-store: $(api_get "/v1/list?prefix=/node-store" | head -c 1500) $(dump_b)"
+        "node-store: $(api_get "/v1/list?prefix=/node-store") $(dump_b)"
     [ "$REG" -eq 0 ] || fail "pyone: $REG registry bytes, but A has the image"
     case "$PEERS" in "$NODE="*) ;; *) fail "pyone: peers are '$PEERS', not $NODE" ;; esac
     ok "B fetched python:3.12-slim from peer $NODE: $PEER peer bytes, 0 registry bytes"
@@ -406,18 +406,26 @@ stage_peers_fallback() {
 
     # The deadline: with the fault the fetch of alpine, which A holds, is killed at once, so the
     # tree must come from the registry. Without the kill the peer would have supplied it.
-    echo 50 >"$B_DIR/agent/faults/fetch-deadline-ms" 2>/dev/null ||
-        { mkdir -p "$B_DIR/agent/faults" && echo 50 >"$B_DIR/agent/faults/fetch-deadline-ms"; }
+    fault="$B_DIR/agent/faults/fetch-deadline-ms"
+    mkdir -p "$B_DIR/agent/faults" || fail "cannot create $B_DIR/agent/faults"
+    echo 50 >"$fault" || fail "cannot write the deadline fault $fault"
+    [ "$(cat "$fault")" = 50 ] || fail "the deadline fault file does not hold 50 ($fault)"
     since=$(now_ms)
     apply "$(only_b alp $ALPINE_TREE $ALPINE_REF)"
     alp_up() { [ "$(running_count alp)" -eq 1 ]; }
     until_ok 240 "alp to run on $NODE_B" alp_up
-    rm -f "$B_DIR/agent/faults/fetch-deadline-ms"
+    rm -f "$fault"
     await_pull "$ALPINE_TREE" "$since"
     echo "pull record of alp: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
     [ "$REG" -gt 0 ] || fail "alp: no registry bytes after the fetch was killed"
     [ "$PEER" -eq 0 ] || fail "alp: $PEER peer bytes; the fetch outlived its 50 ms deadline"
     pgrep -f 'zcube-agent fetch' >/dev/null && fail "a fetch is still running"
+    # The registry bytes alone would also fit a peer that refused: the log must name the kill.
+    alog=$(fetch_log_of alp)
+    [ -n "$alog" ] && [ -s "$alog" ] || fail "alp: fetch.log is missing or empty ($alog)"
+    grep -q 'killed at its deadline, ms: 50' "$alog" ||
+        fail "alp: fetch.log does not say the fetch was killed at its 50 ms deadline" \
+            "fetch.log: $(head -c 800 "$alog")"
     ok "a fetch past its deadline (50 ms) is killed: alpine came from the registry ($REG bytes), not from $NODE"
     curl -sf -X DELETE "$API/v1/services/mcached" >/dev/null || fail "delete mcached"
     curl -sf -X DELETE "$API/v1/services/alp" >/dev/null || fail "delete alp"
