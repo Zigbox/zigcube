@@ -917,11 +917,11 @@ fn fetch_from(
     }
     var line: [320]u8 = undefined;
     note(io, describe_skipped(&line, skipped));
-    if (start == .registry_first and target == .zigbox) {
-        // Not a failure: the supervisor's own pull is this node's registry fetch (O5).
+    if (start == .registry_first) {
+        // The peers are still asked, without waiting: in Zigbox mode their refusals and ZC-E0601
+        // go to fetch.log as before O5, and the supervisor's own pull is the registry fetch.
         note(io, "zcube-agent fetch: no peer holds the tree yet and this node pulls it from " ++
             "the registry first (O5); the others fetch it from here\n");
-        return constants.exit_external;
     }
     net.peers = all[0..found];
     var report: fetch_worker.Report = .{};

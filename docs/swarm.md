@@ -98,10 +98,10 @@ instead of a chunk directory (`zigbox_fetch.zig`, `fetch_cli.zig`):
    tree, so no peer is struck and no other peer is asked: ZC-E0601 says the tree is too large.
 5. With no peer that has the tree, the fetch fails with ZC-E0601, which names the peers asked.
    There is no registry fallback inside `fetch`. Before any of this, O5 decides whether to ask
-   peers at all (docs/agent.md, "Who pulls from the registry first"): the one designated node
-   exits 3 at once with a note and no ZC-E0601, and the others wait up to `fetch_peer_wait_ms`
-   for a peer to hold the tree whole. So ZC-E0601 in a waiting node's log means no peer came to
-   hold the tree in that time.
+   peers at once (docs/agent.md, "Who pulls from the registry first"): the one designated node
+   does, with a note, and fails here with ZC-E0601 so the supervisor's pull starts; the others
+   wait up to `fetch_peer_wait_ms` for a peer to hold the tree whole. So ZC-E0601 in a waiting
+   node's log means no peer came to hold the tree in that time.
 
 The registry fallback is the supervisor's own Zigbox `pull` (`zigbox_supervisor.zig`), which
 runs when the fetch exits non-zero. After a successful pull it writes

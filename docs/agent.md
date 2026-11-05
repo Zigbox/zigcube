@@ -193,8 +193,9 @@ without a strike against the peer.
 [--server HOST:PORT] [--peer NAME=HOST:PORT]...` (`fetch_cli.zig`) is `fetch_worker.fetch` over the
 registry (plain HTTP, `/trees/<digest>`, `/chunks/<hex>`) and the peers. It exits 0 when the tree is
 whole in the store and 3 (`exit_external`) with ZC-E0601 when it is not; 1 and 2 are this node's own
-setup. In Zigbox mode the node O5 designates to pull from the registry first also exits 3, with a
-note in `fetch.log` and no ZC-E0601, so the supervisor's pull runs at once (below). A peer is only ever asked when the digest is
+setup. The node O5 designates to pull from the registry first does not wait: it notes so in
+`fetch.log` and asks the peers at once, so in Zigbox mode it exits 3 with ZC-E0601 and the
+supervisor's pull runs (below). A peer is only ever asked when the digest is
 the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
 
 - `--server HOST:PORT` gives the peers without naming them. The fetch reads
@@ -208,7 +209,7 @@ the full `b3:` + 64 hex (decisions/2026-11-03-full-digest-untrusted.md).
   replica (`/replicas/<service>/<id>`) has that image. If a peer's `/node-store/` record lists the
   tree whole (`trees`) and has a `peer` address, it goes on as above. Else the node with the
   lowest `fetch_plan.registry_rank(node, tree)` (BLAKE3 of the two; ties to the lower name) goes
-  to the registry at once, and every other node re-reads `/node-store/` every
+  on at once (no peer holds the tree, so it ends at the registry), and every other node re-reads `/node-store/` every
   `fetch_peer_poll_ms` (1 s) for up to `fetch_peer_wait_ms` (30 s) until a peer lists the tree,
   then fetches from peers; after the wait it goes on as it would have without O5. The decision is
   `fetch_plan.start` (core); `fetch.log` says how the wait ended. A node that cannot read the

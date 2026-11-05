@@ -22,10 +22,10 @@ The fix:
   address. The chunk filter does not end it.** A Zigbox peer serves a tree only as the bundle of
   a whole tree, so a filter that claims some of its chunks is not enough. The wait polls every
   `fetch_peer_poll_ms` (1 s) for at most `fetch_peer_wait_ms` (30 s).
-- **In Zigbox mode the designated node exits 3 with a note and no ZC-E0601.** The registry
-  fallback is the supervisor's pull, so this is the fastest way to start it, and it is not a
-  failure. In dir mode the plan goes to the registry itself, because there is no peer to wait
-  for.
+- **The designated node does not wait, and otherwise fetches as before O5.** It notes that it
+  pulls first, asks the peers (none holds the tree, so each refuses the bundle), and in Zigbox
+  mode exits 3 with ZC-E0601, which starts the supervisor's registry pull. In dir mode the plan
+  goes on to the registry itself.
 
 Trade-off: if the designated node is slow, or never gets the assignment, each of the others loses
 up to 30 s before its own pull, but none of them pulls twice. Adding the "start" operation also
@@ -43,3 +43,9 @@ of the reply buffer. `begin` reads `/node-store/` into that same buffer, so each
 the fetcher names, and every node then ranked itself against garbage. Since then `parse_page`
 copies every string (`.alloc_always`). The test "the fetching nodes stay as read when the same
 buffer serves the next request" fails without the copy.
+
+**Update 2 (same CI run, zigbox-smoke).** The first version made the designated Zigbox node exit 3
+without asking any peer and without ZC-E0601. zigbox-smoke's `peers_fallback` stage (a lone
+fetcher, an image no peer has) requires both the peer's refusal and ZC-E0601 in `fetch.log`, as
+docs/swarm.md item 5 documented. The designated node now asks the peers as before O5; the cost is
+one refused bundle request per peer.
