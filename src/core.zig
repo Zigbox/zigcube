@@ -71,6 +71,7 @@ pub const modules = .{
     @import("test_util.zig"),
     @import("testing/history.zig"),
     @import("text.zig"),
+    @import("tls_schedule.zig"),
     @import("x509.zig"),
     @import("x509_der.zig"),
     @import("x509_identity.zig"),
@@ -143,10 +144,17 @@ test "the X.509 tests are in this root" {
     _ = @import("x509_foreign_test.zig");
 }
 
+test "the TLS key schedule and record layer tests are in this root" {
+    // Goal: the schedule and the record protection run under WASI too (32-bit, single thread).
+    // Method: import their tests; they use no file, clock or environment.
+    _ = @import("tls_schedule_test.zig");
+}
+
 // Plain `test {}`: a named test would hide these imports from `-Dtest-filter`.
 test {
     // The controllers' tests run under WASI too: they use only the memory store, a manual clock
     // and the testing allocator.
+
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("api_test.zig");
