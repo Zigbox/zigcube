@@ -37,14 +37,14 @@ pub fn sample_identity() identity_mod.Identity {
 pub fn workload_request(key: [32]u8) x509.WorkloadRequest {
     return .{
         .cluster = "prod.example",
-        .job = "broker-1",
+        .service = "broker-1",
         .subject_key = key,
         .identity = sample_identity(),
         .lifetime = window,
     };
 }
 
-pub const workload_uri = "spiffe://prod.example/job/broker-1";
+pub const workload_uri = "spiffe://prod.example/service/broker-1";
 
 pub fn make_ca(out: *x509.Der) !void {
     try x509.issue_ca(out, try ca_pair(), window);
@@ -130,13 +130,13 @@ test "a server certificate names one DNS name and nothing else" {
 }
 
 test "the largest certificate the writer makes fits the size limit" {
-    // Goal: `x509_cert_bytes_max` is not a guess. Method: the longest cluster and job names, the
-    // largest label set `validate` allows, issued and parsed; the size is asserted with room.
+    // Goal: `x509_cert_bytes_max` is not a guess. Method: the longest cluster and service names,
+    // the largest label set `validate` allows, issued and parsed; the size is asserted with room.
     var cluster_buffer: [63]u8 = @splat('a');
     cluster_buffer[31] = '.';
     const cluster: []const u8 = &cluster_buffer;
-    const job_buffer: [constants.node_name_bytes_max]u8 = @splat('j');
-    const job: []const u8 = &job_buffer;
+    const service_buffer: [constants.node_name_bytes_max]u8 = @splat('j');
+    const service: []const u8 = &service_buffer;
     var keys: [constants.x509_labels_max][3]u8 = undefined;
     var labels: [constants.x509_labels_max]identity_mod.Label = undefined;
     const value: [constants.x509_labels_bytes_max / constants.x509_labels_max - 3]u8 = @splat('v');
@@ -146,7 +146,7 @@ test "the largest certificate the writer makes fits the size limit" {
     }
     var request = workload_request(try subject_key(1));
     request.cluster = cluster;
-    request.job = job;
+    request.service = service;
     request.identity.labels = &labels;
     request.lifetime = .{
         .not_before_ms = 2_600_000_000_000,
@@ -223,9 +223,9 @@ test "the writer refuses what the bounds forbid" {
     request.lifetime = .{ .not_before_ms = now, .not_after_ms = 253_402_300_800_000 };
     try testing.expectError(error.IssueLifetime, x509.issue_workload(&certificate, ca, &request));
     request = workload_request(try subject_key(1));
-    request.job = "Broker";
-    try testing.expectError(error.BadJobName, x509.issue_workload(&certificate, ca, &request));
-    request.job = "broker";
+    request.service = "Broker";
+    try testing.expectError(error.BadServiceName, x509.issue_workload(&certificate, ca, &request));
+    request.service = "broker";
     request.cluster = "*.prod";
     try testing.expectError(error.BadCluster, x509.issue_workload(&certificate, ca, &request));
     const server: x509.ServerRequest = .{
@@ -332,4 +332,52 @@ test "a credential's signed message and a TBS are disjoint" {
 test "the near-miss table is in this root" {
     // Goal: the table runs wherever these tests do. Method: import it.
     _ = @import("x509_near_miss.zig");
+}
+
+test "times: each form is read only where it is canonical, and the calendar is checked" {
+    // Goal: UTCTime covers 1970..2049 and GeneralizedTime only 2050 on (RFC 5280 4.1.2.5), a
+    // second of 60 and February 29 of a common year are refused, and a leap day is accepted.
+    // Method: call `read_time` on each row.
+    const utc = der.tag_utc_time;
+    const general = der.tag_generalized_time;
+    const Row = struct { text: []const u8, tag: u8, seconds: ?u64 };
+    const rows = [_]Row{
+        .{ .text = "20491231235959Z", .tag = general, .seconds = null },
+        .{ .text = "20231114221320Z", .tag = general, .seconds = null },
+        .{ .text = "20500101000000Z", .tag = general, .seconds = 2_524_608_000 },
+        .{ .text = "491231235959Z", .tag = utc, .seconds = 2_524_607_999 },
+        .{ .text = "500101000000Z", .tag = utc, .seconds = null }, // 1950
+        .{ .text = "231114221360Z", .tag = utc, .seconds = null },
+        .{ .text = "230229000000Z", .tag = utc, .seconds = null },
+        .{ .text = "240229000000Z", .tag = utc, .seconds = 1_709_164_800 },
+        .{ .text = "21000229000000Z", .tag = general, .seconds = null },
+        .{ .text = "24000229000000Z", .tag = general, .seconds = 13_574_563_200 },
+    };
+    for (rows) |row| {
+        if (row.seconds) |seconds| {
+            try testing.expectEqual(seconds, try x509.read_time(row.text, row.tag));
+        } else {
+            try testing.expectError(error.BadTime, x509.read_time(row.text, row.tag));
+        }
+    }
+}
+
+test "times: the writer switches to GeneralizedTime at 2050 and reads back what it wrote" {
+    // Goal: the last second of 2049 is a UTCTime, the first of 2050 a GeneralizedTime, and each
+    // reads back to the same second. Method: write both with `write_time`, compare the bytes.
+    const last_utc: u64 = 2_524_607_999;
+    const Row = struct { seconds: u64, tag: u8, text: []const u8 };
+    const rows = [_]Row{
+        .{ .seconds = last_utc, .tag = der.tag_utc_time, .text = "491231235959Z" },
+        .{ .seconds = last_utc + 1, .tag = der.tag_generalized_time, .text = "20500101000000Z" },
+    };
+    for (rows) |row| {
+        var buffer: [32]u8 = undefined;
+        var writer = der.Writer.init(&buffer);
+        try x509.write_time(&writer, row.seconds);
+        const written = writer.written();
+        try testing.expectEqual(row.tag, written[0]);
+        try testing.expectEqualStrings(row.text, written[2..]);
+        try testing.expectEqual(row.seconds, try x509.read_time(written[2..], row.tag));
+    }
 }

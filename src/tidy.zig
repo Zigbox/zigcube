@@ -64,6 +64,10 @@ const shell_allowlist = [_][]const u8{
     // Its table test sits beside it and runs in the same job.
     ".github/ci-changes.sh",
     ".github/ci-changes-test.sh",
+    // The OpenSSL fixtures of x509_foreign_test.zig (docs/mtls.md): run by hand only to change a
+    // fixture, never in a build or test, and nothing but a list of `openssl` calls; the point is
+    // certificates another tool made, so the build cannot make them itself.
+    "src/testdata/x509/gen.sh",
 };
 
 /// `sqlite_c` and `libpq_c` are the translated C headers (`b.addTranslateC` in build.zig).

@@ -195,11 +195,64 @@ fn alg_other(parts: *Parts, _: *Scratch) void {
 fn alg_outer_other(parts: *Parts, _: *Scratch) void {
     parts.alg = &.{ 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x71 };
 }
+fn serial_padded_17(parts: *Parts, scratch: *Scratch) void {
+    var content: [17]u8 = @splat(0xC1);
+    content[0] = 0x00;
+    parts.tbs[1] = scratch.tlv(der.tag_integer, &content);
+}
+fn serial_zero(parts: *Parts, _: *Scratch) void {
+    parts.tbs[1] = &.{ 0x02, 0x01, 0x00 };
+}
+/// RFC 5280: issuerUniqueID [1] and subjectUniqueID [2] are IMPLICIT BIT STRINGs, so primitive.
 fn issuer_unique_id(parts: *Parts, _: *Scratch) void {
-    parts.push_tbs(&.{ 0xA1, 0x02, 0x00, 0xAA });
+    parts.push_tbs(&.{ 0x81, 0x02, 0x00, 0xAA });
 }
 fn subject_unique_id(parts: *Parts, _: *Scratch) void {
-    parts.push_tbs(&.{ 0xA2, 0x02, 0x00, 0xAA });
+    parts.push_tbs(&.{ 0x82, 0x02, 0x00, 0xAA });
+}
+/// notBefore as a GeneralizedTime in 2023, a year UTCTime reaches: not the canonical form.
+fn validity_generalized(parts: *Parts, scratch: *Scratch) void {
+    var content: [40]u8 = undefined;
+    const before = scratch.tlv(der.tag_generalized_time, "20231114211320Z");
+    const after = scratch.tlv(der.tag_utc_time, "231114231320Z");
+    @memcpy(content[0..before.len], before);
+    @memcpy(content[before.len..][0..after.len], after);
+    parts.tbs[4] = scratch.tlv(der.tag_sequence, content[0 .. before.len + after.len]);
+}
+const oid_key_usage = [_]u8{ 0x55, 0x1D, 0x0F };
+const oid_ext_key_usage = [_]u8{ 0x55, 0x1D, 0x25 };
+const eku_server = [_]u8{
+    0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+};
+fn eku_code_signing(parts: *Parts, scratch: *Scratch) void {
+    const code_signing = [_]u8{
+        0x30, 0x0A, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03,
+    };
+    parts.ext[2] = scratch.extension(&oid_ext_key_usage, &.{0xFF}, &code_signing);
+}
+fn eku_not_critical(parts: *Parts, scratch: *Scratch) void {
+    parts.ext[2] = scratch.extension(&oid_ext_key_usage, null, &eku_server);
+}
+fn ku_extra_bits(parts: *Parts, scratch: *Scratch) void {
+    // digitalSignature and keyEncipherment.
+    parts.ext[1] = scratch.extension(&oid_key_usage, &.{0xFF}, &.{ 0x03, 0x02, 0x05, 0xA0 });
+}
+fn ku_not_critical(parts: *Parts, scratch: *Scratch) void {
+    parts.ext[1] = scratch.extension(&oid_key_usage, null, &.{ 0x03, 0x02, 0x07, 0x80 });
+}
+fn san_two_uris(parts: *Parts, scratch: *Scratch) void {
+    var content: [90]u8 = undefined;
+    const first = scratch.tlv(0x86, "spiffe://prod.example/service/broker-1");
+    const second = scratch.tlv(0x86, "spiffe://prod.example/service/broker-2");
+    @memcpy(content[0..first.len], first);
+    @memcpy(content[first.len..][0..second.len], second);
+    const value = scratch.tlv(der.tag_sequence, content[0 .. first.len + second.len]);
+    parts.ext[3] = scratch.extension(&oid_san, null, value);
+}
+fn san_job_path(parts: *Parts, scratch: *Scratch) void {
+    const uri = "spiffe://prod.example/job/broker-1";
+    const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x86, uri));
+    parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
 fn swap_first_two(parts: *Parts, _: *Scratch) void {
     std.mem.swap(Slice, &parts.ext[0], &parts.ext[1]);
@@ -249,7 +302,8 @@ fn san_two_names(parts: *Parts, scratch: *Scratch) void {
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
 fn san_uri_on_server(parts: *Parts, scratch: *Scratch) void {
-    const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x86, "spiffe://prod.example/job/x"));
+    const uri = scratch.tlv(0x86, "spiffe://prod.example/service/x");
+    const value = scratch.tlv(der.tag_sequence, uri);
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
 fn san_wildcard(parts: *Parts, scratch: *Scratch) void {
@@ -261,13 +315,14 @@ fn san_dns_on_workload(parts: *Parts, scratch: *Scratch) void {
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
 fn san_bad_path(parts: *Parts, scratch: *Scratch) void {
-    const value = scratch.tlv(der.tag_sequence, scratch.tlv(0x86, "spiffe://prod.example/job/"));
+    const uri = scratch.tlv(0x86, "spiffe://prod.example/service/");
+    const value = scratch.tlv(der.tag_sequence, uri);
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
-fn san_other_job(parts: *Parts, scratch: *Scratch) void {
+fn san_other_service(parts: *Parts, scratch: *Scratch) void {
     const value = scratch.tlv(
         der.tag_sequence,
-        scratch.tlv(0x86, "spiffe://prod.example/job/other"),
+        scratch.tlv(0x86, "spiffe://prod.example/service/other"),
     );
     parts.ext[3] = scratch.extension(&oid_san, null, value);
 }
@@ -334,6 +389,9 @@ const rows = [_]Row{
     row("serial empty", .workload, serial_empty, error.BadSerial),
     row("serial padded", .workload, serial_padded, error.BadSerial),
     row("serial 17 bytes", .workload, serial_long, error.BadSerial),
+    row("serial padded to 17", .workload, serial_padded_17, error.BadSerial),
+    row("serial zero", .workload, serial_zero, error.BadSerial),
+    row("not before generalized in 2023", .workload, validity_generalized, error.BadTime),
     row("alg null params", .workload, alg_null, error.BadAlgorithm),
     row("alg other oid", .workload, alg_other, error.BadAlgorithm),
     row("alg copies differ", .workload, alg_outer_other, error.BadAlgorithm),
@@ -356,7 +414,13 @@ const rows = [_]Row{
     row("san wildcard", .server, san_wildcard, error.BadSan),
     row("san dns on workload", .workload, san_dns_on_workload, error.BadSan),
     row("san bad path", .workload, san_bad_path, error.BadSan),
-    row("san other job", .workload, san_other_job, error.BadName),
+    row("san other service", .workload, san_other_service, error.BadName),
+    row("san two uris", .workload, san_two_uris, error.BadSan),
+    row("san job path", .workload, san_job_path, error.BadSan),
+    row("eku code signing", .server, eku_code_signing, error.BadExtension),
+    row("eku not critical", .server, eku_not_critical, error.BadExtension),
+    row("ku extra bits", .server, ku_extra_bits, error.BadExtension),
+    row("ku not critical", .workload, ku_not_critical, error.BadExtension),
     row("subject printable", .workload, subject_printable, error.BadName),
     row("subject empty", .workload, subject_empty, error.BadName),
     row("issuer bad form", .workload, issuer_bad_form, error.BadName),
@@ -425,7 +489,7 @@ const patches = [_]Patch{
     patch("ends before start", not_after, "231114201320Z", error.BadValidity),
     patch("ends at start", not_after, "231114211320Z", error.BadValidity),
     patch("37 days", not_after, "231221231320Z", error.LifetimeTooLong),
-    patch("other job in the name", "broker-1", "broker-2", error.BadName),
+    patch("other service in the name", "broker-1", "broker-2", error.BadName),
 };
 
 test "same-length edits of a workload certificate are refused for their own reason" {

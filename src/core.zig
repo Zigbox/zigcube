@@ -139,6 +139,7 @@ test "the X.509 tests are in this root" {
     // Goal: the certificate writer and parser run under WASI too (32-bit, single thread). Method:
     // import their tests; they use no file, clock or environment.
     _ = @import("x509_test.zig");
+    _ = @import("x509_foreign_test.zig");
 }
 
 test "the controllers' tests are in this root" {

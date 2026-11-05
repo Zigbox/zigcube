@@ -81,6 +81,7 @@ test "the X.509 module's seeded fuzzer is in this root" {
     // Goal: the fuzzer reads ZCUBE_FUZZ_SEED, which the WASI core root cannot, so it is native
     // only. Method: import it; the module's own tests come with the core.
     _ = @import("x509_fuzz.zig");
+    _ = @import("fuzz_seeds.zig");
 }
 
 test "the peer files and the CA's shell are in this root" {

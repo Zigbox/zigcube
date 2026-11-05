@@ -561,12 +561,22 @@ pub const x509_ca_ttl_ms_max: u64 = 10 * 365 * 24 * 60 * 60 * 1000;
 pub const x509_cn_bytes_max: u32 = 64;
 /// A serial number's content, RFC 5280 allows 20; the writer always makes 16.
 pub const x509_serial_bytes_max: u32 = 16;
+/// The foreign server profile (docs/mtls.md): RFC 5280's 20 content bytes of serial;
+pub const x509_foreign_serial_bytes_max: u32 = 20;
+/// sets and attributes in an issuer or subject Name together;
+pub const x509_foreign_name_parts_max: u32 = 16;
+/// extensions (each OID once, compared with every earlier one);
+pub const x509_foreign_extensions_max: u32 = 16;
+/// key purposes in extKeyUsage;
+pub const x509_foreign_key_purposes_max: u32 = 8;
+/// and the longest lifetime: the CA's bound, since another CA's leaf policy is its own.
+pub const x509_foreign_ttl_ms_max: u64 = x509_ca_ttl_ms_max;
 /// The cluster part of a SPIFFE ID: a sequence of DNS labels.
 pub const x509_cluster_bytes_max: u32 = 63;
 /// A server leaf's `dNSName`, exact match (no wildcard); it is also the subject CN.
 pub const x509_dns_name_bytes_max: u32 = x509_cn_bytes_max;
-/// `spiffe://<cluster>/job/<name>`.
-pub const x509_spiffe_bytes_max: u32 = 9 + x509_cluster_bytes_max + 5 + node_name_bytes_max;
+/// `spiffe://<cluster>/service/<name>`.
+pub const x509_spiffe_bytes_max: u32 = 9 + x509_cluster_bytes_max + 9 + node_name_bytes_max;
 
 comptime {
     assert(x509_labels_max * x509_label_key_bytes_max > x509_labels_bytes_max);
@@ -578,6 +588,8 @@ comptime {
     assert(x509_cn_bytes_max >= node_name_bytes_max);
     assert(x509_cn_bytes_max >= 9 + 16);
     assert(x509_serial_bytes_max == 16);
+    assert(x509_foreign_serial_bytes_max == 20);
+    assert(x509_foreign_extensions_max <= 64);
     assert(x509_spiffe_bytes_max < 256);
     assert(x509_cert_bytes_max < 65536);
 }

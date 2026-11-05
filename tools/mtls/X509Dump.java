@@ -53,7 +53,7 @@ public class X509Dump {
         check(workload.getKeyUsage()[0], "workload: keyUsage digitalSignature");
         check(workload.getExtendedKeyUsage().contains("1.3.6.1.5.5.7.3.2"), "workload: clientAuth");
         check(!workload.getExtendedKeyUsage().contains("1.3.6.1.5.5.7.3.1"), "workload: not serverAuth");
-        check(has_name(workload, 6, "spiffe://prod.example/job/broker-1"), "workload: SPIFFE URI SAN");
+        check(has_name(workload, 6, "spiffe://prod.example/service/broker-1"), "workload: SPIFFE URI SAN");
         check(workload.getSubjectX500Principal().getName().equals("CN=broker-1"), "workload: subject CN");
         check(workload.getNonCriticalExtensionOIDs().contains(IDENTITY_OID), "workload: identity ext");
         workload.checkValidity(when);

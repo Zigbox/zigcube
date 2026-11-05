@@ -3,33 +3,65 @@
 //! is exactly what the writer would make (`reencode` returns the same bytes, so the accepted set
 //! is the writer's output set and no second encoding of a certificate exists); a certificate that
 //! differs from one the CA signed never verifies; and a good certificate is refused out of its
-//! window and under another name. A failure prints the seed (`ZCUBE_FUZZ_SEED=<seed> zig build
-//! test` replays it), like `peer_fuzz.zig`.
+//! window and under another name. A second oracle, `x509_oracle.zig`, decodes every input
+//! naively and must agree with `parse` on acceptance and on the fields. Seeds and replay are in
+//! `fuzz_seeds.zig`: a failure prints the run's master seed and the failing iteration's seed, each
+//! with its replay command; `ZCUBE_FUZZ_ITERATIONS=N` makes a long run, which prints its master
+//! seed first. The OpenSSL fixtures of the foreign profile are damaged too.
 
 const std = @import("std");
 const x509 = @import("x509.zig");
 const t = @import("x509_test.zig");
 const constants = @import("constants.zig");
+const oracle = @import("x509_oracle.zig");
+const seeds = @import("fuzz_seeds.zig");
 
 const testing = std.testing;
 
-const iterations = 300;
+const iterations_default = 300;
 /// Longer than any certificate, so that an insertion still fits and an oversize input is tried.
 const buffer_bytes = constants.x509_cert_bytes_max + 64;
 
-fn run_seed() u64 {
-    if (testing.environ.getPosix("ZCUBE_FUZZ_SEED")) |text| {
-        return std.fmt.parseInt(u64, text, 10) catch @panic("ZCUBE_FUZZ_SEED is not a number");
-    }
-    return testing.random_seed;
-}
-
-/// Parse must not accept anything the writer would not make.
+/// Parse must not accept anything the writer would not make, and the naive decoder must agree.
 fn expect_canonical(bytes: []const u8) !void {
-    const parsed = x509.parse(bytes) catch return;
+    const naive = oracle.decode(bytes);
+    const parsed = x509.parse(bytes) catch {
+        if (naive != null) return error.OracleAcceptedRefused;
+        return;
+    };
+    const verdict = naive orelse return error.OracleRefusedAccepted;
+    if (verdict.kind != parsed.kind) return error.OracleDisagrees;
+    if (verdict.not_before_ms != parsed.not_before_ms) return error.OracleDisagrees;
+    if (verdict.not_after_ms != parsed.not_after_ms) return error.OracleDisagrees;
+    if (!std.mem.eql(u8, verdict.name.of(bytes), parsed.name.of(bytes))) {
+        return error.OracleDisagrees;
+    }
     var again: x509.Der = .{};
     try x509.reencode(&again, bytes, &parsed);
     try testing.expectEqualSlices(u8, bytes, again.slice());
+}
+
+const foreign_anchor: [32]u8 = @embedFile("testdata/x509/anchor.pub").*;
+const foreign_fixtures = [_][]const u8{
+    @embedFile("testdata/x509/minimal.der"),
+    @embedFile("testdata/x509/defaults.der"),
+};
+
+/// A damaged OpenSSL leaf: never a crash, and never accepted unless it is the original.
+fn fuzz_foreign(random: std.Random, buffer: *[buffer_bytes]u8) !void {
+    const original = foreign_fixtures[random.uintLessThan(usize, foreign_fixtures.len)];
+    @memcpy(buffer[0..original.len], original);
+    var length = original.len;
+    for (0..random.intRangeAtMost(usize, 1, 3)) |_| length = damage(random, buffer, length);
+    const damaged = buffer[0..length];
+    var detail: x509.Detail = .{};
+    const parsed = x509.parse_profile(original, .foreign_server, &detail) catch unreachable; // A
+    // committed fixture that `x509_foreign_test.zig` accepts.
+    const now_ms = parsed.not_before_ms + t.hour;
+    const name = "broker.botpike.com";
+    if (x509.verify_foreign_server(damaged, foreign_anchor, now_ms, name, &detail)) |_| {
+        if (!std.mem.eql(u8, damaged, original)) return error.AcceptedDamagedCertificate;
+    } else |_| {}
 }
 
 /// Applies one random damage to `buffer[0..length]`; returns the new length.
@@ -103,6 +135,7 @@ fn fuzz_once(seed: u64) !void {
     for (0..random.intRangeAtMost(usize, 1, 3)) |_| length = damage(random, &buffer, length);
     const damaged = buffer[0..length];
     try expect_canonical(damaged);
+    try fuzz_foreign(random, &buffer);
     if (!std.mem.eql(u8, damaged, original)) {
         const expect: x509.Expect = .{ .kind = kind, .name = null };
         if (x509.verify(damaged, ca, t.now, expect)) |_|
@@ -137,24 +170,12 @@ fn fuzz_once(seed: u64) !void {
     }
 }
 
-fn run_all(master_seed: u64, count: usize) !void {
-    var master = std.Random.SplitMix64.init(master_seed);
-    for (0..count) |_| {
-        const seed = master.next();
-        fuzz_once(seed) catch |err| {
-            const format = "x509 fuzz failed: {t}; replay with ZCUBE_FUZZ_SEED={d}\n";
-            std.debug.print(format, .{ err, seed });
-            return err;
-        };
-    }
-}
-
 test "fuzz: damaged and random certificates are refused, never accepted, never crash" {
-    // Goal: the parser survives any input, accepts only the writer's own encoding, and no
-    // certificate but a CA-signed one verifies. Method: derive each iteration's seed from the run's
-    // seed; random bytes and damaged real certificates go into `parse` and `verify`. A failure
-    // prints the seed.
-    try run_all(run_seed(), iterations);
+    // Goal: the parser survives any input, accepts only the writer's own encoding (and agrees
+    // with the naive oracle), and no certificate but a CA-signed one verifies. Method: derive each
+    // iteration's seed from the run's master seed; random bytes and damaged real certificates go
+    // into `parse` and `verify`. A failure prints both seeds and how to replay each.
+    try seeds.run("x509 fuzz", iterations_default, fuzz_once);
 }
 
 test "teeth: with a check skipped the fuzzer fails, so it can see the bug" {

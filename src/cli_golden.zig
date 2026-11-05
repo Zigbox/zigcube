@@ -432,23 +432,39 @@ fn peer_limited(diag: *diag_mod.Diag) void { // peer_serve.zig
 }
 
 fn x509_refused(diag: *diag_mod.Diag) void { // x509.zig
-    x509.raise(diag, error.BadSan, "node2");
+    x509.raise(diag, error.BadSan, "node2", &.{ .field = .subject_alt_name });
 }
 
 fn x509_unsigned(diag: *diag_mod.Diag) void { // x509.zig
-    x509.raise(diag, error.BadSignature, "node2");
+    x509.raise(diag, error.BadSignature, "node2", &.{});
 }
 
 fn x509_expired(diag: *diag_mod.Diag) void { // x509.zig
-    x509.raise(diag, error.Expired, "node2");
+    const hour_ms = 3_600_000;
+    const not_before_ms = 1_793_836_800_000; // 2026-11-05T00:00:00Z
+    x509.raise(diag, error.Expired, "node2", &.{
+        .not_before_ms = not_before_ms,
+        .not_after_ms = not_before_ms + 24 * hour_ms,
+        .now_ms = not_before_ms + 26 * hour_ms,
+    });
 }
 
 fn x509_wrong_server(diag: *diag_mod.Diag) void { // x509.zig
-    x509.raise(diag, error.WrongName, "broker.botpike.com");
+    x509.raise(diag, error.WrongName, "broker.botpike.com", &.{
+        .name_expected = "broker.botpike.com",
+        .name_found = "other.botpike.com",
+    });
 }
 
 fn x509_not_issued(diag: *diag_mod.Diag) void { // x509.zig
-    x509.raise(diag, error.TooManyLabels, "broker-1");
+    x509.raise(diag, error.TooManyLabels, "broker-1", &.{ .field = .identity });
+}
+
+fn x509_wrong_use(diag: *diag_mod.Diag) void { // x509.zig
+    x509.raise(diag, error.WrongUse, "node2", &.{
+        .kind_expected = .server,
+        .kind_found = .workload,
+    });
 }
 
 fn peer_bad_chunk(diag: *diag_mod.Diag) void { // fetch_plan.zig
@@ -625,6 +641,7 @@ const cases = [_]Case{
     relayed(.E0811, x509_expired),
     relayed(.E0812, x509_wrong_server),
     relayed(.E0817, x509_not_issued),
+    relayed(.E0819, x509_wrong_use),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

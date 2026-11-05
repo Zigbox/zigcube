@@ -76,8 +76,8 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a certificate names another server than the one asked for</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
-<p>The server's certificate verified against the pinned CA, but the DNS name in its subjectAltName is not the name the connection was made to. Names are compared exactly: no wildcard, no case folding.</p>
-<p>Check the address in the configuration, and that the server was issued a certificate for it.</p>
+<p>The server's certificate verified against the pinned anchor, but the name in its subjectAltName is not the name the connection was made to. Names are compared exactly: no wildcard, no case folding. The cause shows both names.</p>
+<p>Connect to the name the certificate is for, or issue the server a certificate for the name in the configuration.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0812</pre>

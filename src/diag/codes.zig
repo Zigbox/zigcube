@@ -103,6 +103,7 @@ pub const Code = enum(u8) {
     E0811,
     E0812,
     E0817,
+    E0819,
     B0001,
     B0002,
     B0003,
@@ -1285,30 +1286,31 @@ pub const registry = [_]Entry{
         .blame = .external,
         .summary = "a certificate is malformed or outside the bounds",
         .explanation =
-        \\A certificate this cluster would not have made was refused before its
-        \\signature was looked at. Zigcube reads X.509 v3 strictly: DER only, Ed25519
-        \\only, one commonName, the extensions of its kind in a fixed order, a
-        \\SPIFFE ID of the form spiffe://<cluster>/job/<name> (or one DNS name for a
-        \\server), a lifetime within the bound, and at most x509_cert_bytes_max bytes.
-        \\Anything else is refused, an extra extension from a stock tool included.
+        \\A certificate was refused before its signature was looked at. Zigcube reads
+        \\X.509 v3 strictly: DER only, Ed25519 only, a lifetime within the bound, at
+        \\most x509_cert_bytes_max bytes. A certificate of this cluster also has one
+        \\commonName, the extensions of its kind in a fixed order and a SPIFFE ID of
+        \\the form spiffe://<cluster>/service/<name> (or one DNS name for a server).
+        \\A server certificate under a pinned anchor of another CA may carry any
+        \\names, key identifiers and extension order, but no unknown critical
+        \\extension, no extension twice, and one DNS name or SPIFFE ID (docs/mtls.md).
         \\
-        \\The cause says which rule the certificate broke. A certificate that the
+        \\The cause names the field and the rule it broke. A certificate that the
         \\cluster CA issued does not break any; if one does, it did not come from
         \\zcube (another CA, a hand-made file) or it was damaged on the way.
         \\
-        \\Ask for a new certificate from the cluster CA. A certificate from another
-        \\tool cannot be used here: this code accepts only the shapes it writes.
+        \\Ask for a new certificate from the cluster CA, or from the anchor's CA with
+        \\the profile docs/mtls.md describes.
         ,
     },
     .{
         .code = .E0810,
         .severity = .@"error",
         .blame = .external,
-        .summary = "a certificate is not signed by the pinned CA",
+        .summary = "a certificate is not signed by the pinned anchor",
         .explanation =
-        \\The certificate's issuer is not this cluster's CA, its signature does not
-        \\verify under the pinned CA key, or it is a certificate of another kind than
-        \\this use needs (a client certificate presented as a server's, say).
+        \\The certificate's issuer is not this cluster's CA, or its signature does
+        \\not verify under the pinned anchor key.
         \\
         \\Only certificates signed directly by the one pinned key are accepted: no
         \\chain, no intermediate. The check comes before the validity window, so a
@@ -1325,13 +1327,13 @@ pub const registry = [_]Entry{
         .blame = .external,
         .summary = "a certificate is expired or not yet valid",
         .explanation =
-        \\The certificate is signed by the pinned CA but the current time is outside
-        \\its validity window, allowing peer_clock_skew_ms of clock difference on each
-        \\side. The signature was checked first, so the certificate is the cluster's
-        \\own.
+        \\The certificate is signed by the pinned anchor but the current time is
+        \\outside its validity window, allowing peer_clock_skew_ms of clock difference
+        \\on each side. The signature was checked first, so the certificate is
+        \\genuine. The cause shows notBefore, notAfter and this machine's time.
         \\
         \\Check the clocks on both machines. A workload certificate lives for the
-        \\job's deadline, at most x509_leaf_ttl_ms_max: ask for a new one.
+        \\service's deadline, at most x509_leaf_ttl_ms_max: ask for a new one.
         ,
     },
     .{
@@ -1340,12 +1342,12 @@ pub const registry = [_]Entry{
         .blame = .external,
         .summary = "a certificate names another server than the one asked for",
         .explanation =
-        \\The server's certificate verified against the pinned CA, but the DNS name in
-        \\its subjectAltName is not the name the connection was made to. Names are
-        \\compared exactly: no wildcard, no case folding.
+        \\The server's certificate verified against the pinned anchor, but the name
+        \\in its subjectAltName is not the name the connection was made to. Names are
+        \\compared exactly: no wildcard, no case folding. The cause shows both names.
         \\
-        \\Check the address in the configuration, and that the server was issued a
-        \\certificate for it.
+        \\Connect to the name the certificate is for, or issue the server a
+        \\certificate for the name in the configuration.
         ,
     },
     .{
@@ -1357,13 +1359,28 @@ pub const registry = [_]Entry{
         \\A workload or server certificate was not made because its request breaks a
         \\bound: more labels than x509_labels_max, a label key or value over its limit
         \\or with a character that is not allowed, label keys not sorted and unique,
-        \\labels together over x509_labels_bytes_max, a cluster or job name that does
-        \\not make a SPIFFE ID spiffe://<cluster>/job/<name>, a DNS name that is not
-        \\lowercase or has a wildcard, or a lifetime that is empty or over
-        \\x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA).
+        \\labels together over x509_labels_bytes_max, a cluster or service name that
+        \\does not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that
+        \\is not lowercase, has a wildcard or an all-digit label, or a lifetime that
+        \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA).
         \\
         \\The cause names the rule. Correct the request and issue again; nothing was
         \\written.
+        ,
+    },
+    .{
+        .code = .E0819,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a certificate is of another kind than this use needs",
+        .explanation =
+        \\The certificate is genuine and well formed, but it is not for this use: a
+        \\workload's client certificate presented as a server's, a CA certificate
+        \\presented as a leaf, or, under a foreign anchor, a certificate whose
+        \\extended key usage lacks serverAuth or whose basic constraints say CA.
+        \\
+        \\The cause names the kind found and the kind needed. Give the peer a
+        \\certificate issued for its role: a server certificate for a server.
         ,
     },
     .{

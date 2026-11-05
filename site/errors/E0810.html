@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0810 · Zigcube</title>
-<meta name="description" content="a certificate is not signed by the pinned CA">
+<meta name="description" content="a certificate is not signed by the pinned anchor">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0810.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,10 +73,10 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0810</h1>
-<p class="summary">a certificate is not signed by the pinned CA</p>
+<p class="summary">a certificate is not signed by the pinned anchor</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
-<p>The certificate's issuer is not this cluster's CA, its signature does not verify under the pinned CA key, or it is a certificate of another kind than this use needs (a client certificate presented as a server's, say).</p>
+<p>The certificate's issuer is not this cluster's CA, or its signature does not verify under the pinned anchor key.</p>
 <p>Only certificates signed directly by the one pinned key are accepted: no chain, no intermediate. The check comes before the validity window, so a forged certificate is never reported as expired.</p>
 <p>Check that both sides were given the same cluster CA, and that the certificate was issued after the last --new-ca. A certificate issued by an earlier CA must be replaced.</p>
 <h2>Offline</h2>

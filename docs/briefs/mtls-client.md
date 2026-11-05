@@ -38,8 +38,9 @@ A writer and a matching parser, both bounded, for three certificate kinds:
   TBSCertificate's copy, and as the subject key. Nothing else is parsed: RSA, ECDSA, Ed448 and
   every other OID are refused, so the parser needs no big-number code.
 - **SPIFFE ID.** One `uniformResourceIdentifier` in the subjectAltName of a workload leaf:
-  `spiffe://<cluster>/job/<name>`. `<cluster>` is a lowercase DNS label sequence, `<name>` the job
-  name (the job-name charset B1 fixes; until B1 lands, a hostname label). Exactly one URI, no
+  `spiffe://<cluster>/service/<name>` (decision file 2026-11-04-spiffe-service-path.md).
+  `<cluster>` is a lowercase DNS label sequence, `<name>` the service name (the charset B1 fixes;
+  until B1 lands, a hostname label). Exactly one URI, no
   port, no userinfo, no query, no fragment, no empty or dot path segments. A server leaf carries
   one `dNSName` instead (exact match, no wildcard).
 - **Private extension** (non-critical, so a stock stack that does not know it still accepts the
@@ -47,7 +48,7 @@ A writer and a matching parser, both bounded, for three certificate kinds:
   UUID-derived arc `2.25.192541954756406065736426278304158759968` (Q4). Value is a DER SEQUENCE:
   `{ version INTEGER (1), image_digest OCTET STRING (32, the BLAKE3 tree digest), placement_epoch
   INTEGER (0..2^63-1), labels SEQUENCE OF SEQUENCE { key UTF8String, value UTF8String } }`.
-  Labels are sorted by key, keys unique. This is C4's identity: service or job, image digest,
+  Labels are sorted by key, keys unique. This is C4's identity: service, image digest,
   placement epoch (docs/decisions/2026-10-27-c4-workload-identity-binds-service-image.md), plus
   B3's labels.
 - **Serial.** 16 bytes, top bit clear: the first 16 bytes of SHA-256 of subject key and
@@ -139,7 +140,7 @@ nothing has taken them):
 | Code | Blame | Refused because |
 | --- | --- | --- |
 | E0809 | external | a certificate is malformed or outside the bounds (the parser's every refusal, with the field named) |
-| E0810 | external | a certificate is not signed by the pinned CA, or its chain is longer than the pinned shape |
+| E0810 | external | a certificate is not signed by the pinned anchor, or its chain is longer than the pinned shape |
 | E0811 | external | a certificate is expired or not yet valid |
 | E0812 | external | the server's certificate names another server than the one asked for |
 | E0813 | external | the TLS handshake failed: malformed or out-of-order message, bad `CertificateVerify` or `Finished`, unsupported suite or version, an alert from the server (named) |
@@ -148,6 +149,7 @@ nothing has taken them):
 | E0816 | external | the connection ended without `close_notify` |
 | E0817 | user | an identity could not be issued: too many or too long labels, a bad SPIFFE name, a lifetime over the bound, a CA key that does not match |
 | E0818 | external | the server answered with something this client never offers (HelloRetryRequest, TLS 1.2, another suite or group) |
+| E0819 | external | a certificate was issued for another role: a CA, client or workload certificate where a server's is needed, or the reverse (added by slice 1's review fixes) |
 
 A `ZC-B` code is used only for our own broken invariant. Alerts the client sends map to the same
 causes (`bad_certificate`, `decrypt_error`, `illegal_parameter`, `unexpected_message`,
@@ -203,7 +205,7 @@ of its own, with the JDK installed there. It is an interop check, never called a
 
 - The handshake completes and application bytes flow both ways.
 - The server reads from the client certificate, exactly: the SPIFFE URI SAN
-  `spiffe://<cluster>/job/<name>`, and the private extension's digest, epoch and every label. The
+  `spiffe://<cluster>/service/<name>`, and the private extension's digest, epoch and every label. The
   JVM reads them with `X509Certificate.getSubjectAlternativeNames()` and `getExtensionValue(oid)`;
   OpenSSL's side by `openssl x509 -text` on the certificate `s_server` prints (confirmed in slice 7).
   The harness decodes the extension with an independent decoder (the Java one), not ours.
@@ -347,7 +349,9 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
      epoch". The brief's SPIFFE ID is `spiffe://<cluster>/job/<name>`, with `<name>` the job
      name under B1's charset, and the extension comment says "service or job". Whether C4's
      service name maps onto `/job/<name>`, or needs another path form, is not settled. The
-     label charset in code is provisional for the same reason.
+     label charset in code is provisional for the same reason. *Settled 2026-11-04:* the path is
+     `/service/<name>` (docs/decisions/2026-11-04-spiffe-service-path.md); the charset stays
+     provisional until B1.
   4. **Identity bound to a signed digest.** SPEC C4 acceptance: "A workload's identity changes
      when its digest changes, so a grant can be scoped to signed versions". The extension holds
      a 32-byte BLAKE3 tree digest only. Nothing in the format says whether it is a signed

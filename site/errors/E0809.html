@@ -76,9 +76,9 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a certificate is malformed or outside the bounds</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
-<p>A certificate this cluster would not have made was refused before its signature was looked at. Zigcube reads X.509 v3 strictly: DER only, Ed25519 only, one commonName, the extensions of its kind in a fixed order, a SPIFFE ID of the form spiffe://&lt;cluster&gt;/job/&lt;name&gt; (or one DNS name for a server), a lifetime within the bound, and at most x509_cert_bytes_max bytes. Anything else is refused, an extra extension from a stock tool included.</p>
-<p>The cause says which rule the certificate broke. A certificate that the cluster CA issued does not break any; if one does, it did not come from zcube (another CA, a hand-made file) or it was damaged on the way.</p>
-<p>Ask for a new certificate from the cluster CA. A certificate from another tool cannot be used here: this code accepts only the shapes it writes.</p>
+<p>A certificate was refused before its signature was looked at. Zigcube reads X.509 v3 strictly: DER only, Ed25519 only, a lifetime within the bound, at most x509_cert_bytes_max bytes. A certificate of this cluster also has one commonName, the extensions of its kind in a fixed order and a SPIFFE ID of the form spiffe://&lt;cluster&gt;/service/&lt;name&gt; (or one DNS name for a server). A server certificate under a pinned anchor of another CA may carry any names, key identifiers and extension order, but no unknown critical extension, no extension twice, and one DNS name or SPIFFE ID (docs/mtls.md).</p>
+<p>The cause names the field and the rule it broke. A certificate that the cluster CA issued does not break any; if one does, it did not come from zcube (another CA, a hand-made file) or it was damaged on the way.</p>
+<p>Ask for a new certificate from the cluster CA, or from the anchor's CA with the profile docs/mtls.md describes.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0809</pre>

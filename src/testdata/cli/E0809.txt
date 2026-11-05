@@ -1,6 +1,6 @@
 error[ZC-E0809]: a certificate is malformed or outside the bounds
   cause  node2's certificate was refused: its subjectAltName is not exactly one
-         name of the right shape
-  fix    check that both sides use this cluster's CA (docs/peer.md)
+         name of the right shape (field: subjectAltName)
+  fix    check that both sides use this cluster's CA or the pinned anchor (docs/mtls.md)
   more   zcube explain E0809 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0809.html

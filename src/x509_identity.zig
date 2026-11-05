@@ -29,9 +29,9 @@ pub const Error = error{
     BadLabel,
     /// The cluster part of a SPIFFE ID is not a sequence of lowercase DNS labels.
     BadCluster,
-    /// The job name is not a name (`records.name_problem`).
-    BadJobName,
-    /// Not `spiffe://<cluster>/job/<name>`.
+    /// The service name is not a name (`records.name_problem`).
+    BadServiceName,
+    /// Not `spiffe://<cluster>/service/<name>`.
     BadSpiffe,
     /// Not a lowercase DNS name without wildcard.
     BadDnsName,
@@ -182,8 +182,9 @@ fn check_labels(decoded: *Decoded, bytes: []const u8) Error!void {
 
 // ---- Names -----------------------------------------------------------------------------------
 
-/// A lowercase DNS name: labels of `a-z0-9-` of 1..63 bytes, none starting or ending with `-`,
-/// joined by single dots, no wildcard, at most `bytes_max` bytes.
+/// A lowercase DNS name: labels of `a-z0-9-` of 1..63 bytes, none starting or ending with `-` and
+/// none all digits (so no name reads as an IPv4 address), joined by single dots, no wildcard, at
+/// most `bytes_max` bytes.
 pub fn dns_problem(name: []const u8, bytes_max: u32) bool {
     assert(bytes_max <= 255);
     if (name.len == 0) return true;
@@ -194,31 +195,45 @@ pub fn dns_problem(name: []const u8, bytes_max: u32) bool {
         const dot = std.mem.indexOfScalar(u8, rest, '.');
         const label = if (dot) |at| rest[0..at] else rest;
         if (records.name_problem(label, 63) != null) return true;
+        if (all_digits(label)) return true;
         start += label.len + 1;
     }
     return false;
 }
 
+/// An all-numeric label makes a name read as an IP address (RFC 1123 2.1), so it is refused.
+fn all_digits(label: []const u8) bool {
+    assert(label.len > 0);
+    for (label) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    return true;
+}
+
+/// A workload's SPIFFE ID, `spiffe://<cluster>/service/<name>` (decision file
+/// 2026-11-04-spiffe-service-path.md): `<name>` is the service name. No other path kind is
+/// accepted; one would need its own decision.
 pub const Spiffe = struct {
     cluster: []const u8,
-    job: []const u8,
+    service: []const u8,
 };
 
 const spiffe_prefix = "spiffe://";
-const spiffe_path = "/job/";
+pub const spiffe_path = "/service/";
 
-/// `spiffe://<cluster>/job/<name>` into `buffer`.
+/// `spiffe://<cluster>/service/<name>` into `buffer`.
 pub fn spiffe_write(
     buffer: *[constants.x509_spiffe_bytes_max]u8,
     cluster: []const u8,
-    job: []const u8,
+    service: []const u8,
 ) Error![]const u8 {
     if (dns_problem(cluster, constants.x509_cluster_bytes_max)) return error.BadCluster;
-    if (records.name_problem(job, constants.node_name_bytes_max) != null) return error.BadJobName;
-    const total = spiffe_prefix.len + cluster.len + spiffe_path.len + job.len;
+    const service_problem = records.name_problem(service, constants.node_name_bytes_max);
+    if (service_problem != null) return error.BadServiceName;
+    const total = spiffe_prefix.len + cluster.len + spiffe_path.len + service.len;
     assert(total <= buffer.len);
     var at: usize = 0;
-    inline for (.{ spiffe_prefix, cluster, spiffe_path, job }) |part| {
+    inline for (.{ spiffe_prefix, cluster, spiffe_path, service }) |part| {
         @memcpy(buffer[at..][0..part.len], part);
         at += part.len;
     }
@@ -234,10 +249,11 @@ pub fn spiffe_parse(uri: []const u8) Error!Spiffe {
     const cluster = rest[0..slash];
     const path = rest[slash..];
     if (!std.mem.startsWith(u8, path, spiffe_path)) return error.BadSpiffe;
-    const job = path[spiffe_path.len..];
+    const service = path[spiffe_path.len..];
     if (dns_problem(cluster, constants.x509_cluster_bytes_max)) return error.BadCluster;
-    if (records.name_problem(job, constants.node_name_bytes_max) != null) return error.BadJobName;
-    return .{ .cluster = cluster, .job = job };
+    const service_problem = records.name_problem(service, constants.node_name_bytes_max);
+    if (service_problem != null) return error.BadServiceName;
+    return .{ .cluster = cluster, .service = service };
 }
 
 // ---- Tests -----------------------------------------------------------------------------------
@@ -283,10 +299,9 @@ test "the identity extension round-trips and decode re-encodes to the same bytes
     try testing.expectEqualSlices(u8, bytes, again.written());
 }
 
-test "label bounds are refused on the way in and on the way out" {
-    // Goal: the boundary where valid becomes invalid, for both directions. Method: each limit one
-    // under and one over, through `validate`; the same lists written by hand are refused by
-    // `decode` through the shared rules.
+test "label bounds are refused by validate, on the way in" {
+    // Goal: the boundary where valid becomes invalid when encoding. Method: each limit one under
+    // and one over, through `validate`. The decode side is the next test.
     const long_key: [constants.x509_label_key_bytes_max + 1]u8 = @splat('k');
     const long_value: [constants.x509_label_value_bytes_max + 1]u8 = @splat('v');
     try testing.expectError(error.LabelTooLong, validate(&.{.{ .key = &long_key, .value = "" }}));
@@ -318,6 +333,75 @@ test "label bounds are refused on the way in and on the way out" {
     try testing.expectError(error.TooManyLabels, validate(&many));
 }
 
+/// Test-only: the extension's value with `labels` exactly as given, no checks, so that `decode`
+/// can be shown a list `encode` would refuse.
+pub fn encode_unchecked(writer: *der.Writer, labels: []const Label) Error!void {
+    const outer = writer.mark();
+    const labels_mark = writer.mark();
+    var index = labels.len;
+    while (index > 0) {
+        index -= 1;
+        const pair = writer.mark();
+        try writer.element(der.tag_utf8_string, labels[index].value);
+        try writer.element(der.tag_utf8_string, labels[index].key);
+        try writer.close(der.tag_sequence, pair);
+    }
+    try writer.close(der.tag_sequence, labels_mark);
+    try writer.unsigned(0);
+    try writer.element(der.tag_octet_string, &@as([32]u8, @splat(1)));
+    try writer.unsigned(version);
+    try writer.close(der.tag_sequence, outer);
+}
+
+fn decode_unchecked(buffer: []u8, labels: []const Label) Error!Decoded {
+    var writer = der.Writer.init(buffer);
+    encode_unchecked(&writer, labels) catch unreachable; // The test buffer fits every list.
+    return decode(writer.written());
+}
+
+test "label bounds are refused by decode, on the way out" {
+    // Goal: decode checks every label rule itself, not only encode (the order and the total size
+    // are decode's own checks in `check_labels`). Method: lists `validate` refuses, written by
+    // `encode_unchecked`, each with the exact error; each one under its limit decodes.
+    var buffer: [4096]u8 = undefined;
+    try testing.expectError(error.LabelsNotSorted, decode_unchecked(&buffer, &.{
+        .{ .key = "b", .value = "" }, .{ .key = "a", .value = "" },
+    }));
+    try testing.expectError(error.LabelsNotSorted, decode_unchecked(&buffer, &.{
+        .{ .key = "a", .value = "1" }, .{ .key = "a", .value = "2" },
+    }));
+    _ = try decode_unchecked(&buffer, &.{
+        .{ .key = "a", .value = "1" }, .{ .key = "b", .value = "2" },
+    });
+    const long_key: [constants.x509_label_key_bytes_max + 1]u8 = @splat('k');
+    try testing.expectError(error.LabelTooLong, decode_unchecked(&buffer, &.{
+        .{ .key = &long_key, .value = "" },
+    }));
+    _ = try decode_unchecked(&buffer, &.{.{ .key = long_key[1..], .value = "" }});
+    try testing.expectError(error.BadLabel, decode_unchecked(&buffer, &.{
+        .{ .key = "a b", .value = "x" },
+    }));
+    try testing.expectError(error.BadLabel, decode_unchecked(&buffer, &.{
+        .{ .key = "a", .value = "\xff" },
+    }));
+    const half: [constants.x509_labels_bytes_max / 2]u8 = @splat('x');
+    _ = try decode_unchecked(&buffer, &.{
+        .{ .key = "a", .value = half[2..] }, .{ .key = "b", .value = &half },
+    });
+    try testing.expectError(error.LabelsTooLarge, decode_unchecked(&buffer, &.{
+        .{ .key = "a", .value = half[1..] }, .{ .key = "b", .value = &half },
+    }));
+    var many: [constants.x509_labels_max + 1]Label = undefined;
+    var keys: [many.len][2]u8 = undefined;
+    for (&many, &keys, 0..) |*label, *key, i| {
+        key.* = .{ 'a', 'a' + @as(u8, @intCast(i)) };
+        label.* = .{ .key = key, .value = "" };
+    }
+    const decoded = try decode_unchecked(&buffer, many[0..constants.x509_labels_max]);
+    try testing.expectEqual(constants.x509_labels_max, decoded.labels_count);
+    try testing.expectError(error.TooManyLabels, decode_unchecked(&buffer, &many));
+}
+
 test "decode refuses a damaged extension value" {
     // Goal: every shape error is Malformed. Method: version 2, short digest, trailing byte, a
     // negative epoch, a label with three parts.
@@ -341,30 +425,36 @@ test "decode refuses a damaged extension value" {
 }
 
 test "SPIFFE IDs and DNS names have exactly one shape" {
-    // Goal: the near misses are refused. Method: a table.
+    // Goal: the near misses are refused, `/service/` is the only path. Method: a table.
     var buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
     const uri = try spiffe_write(&buffer, "prod.example", "broker-1");
-    try testing.expectEqualStrings("spiffe://prod.example/job/broker-1", uri);
+    try testing.expectEqualStrings("spiffe://prod.example/service/broker-1", uri);
     const parsed = try spiffe_parse(uri);
     try testing.expectEqualStrings("prod.example", parsed.cluster);
-    try testing.expectEqualStrings("broker-1", parsed.job);
+    try testing.expectEqualStrings("broker-1", parsed.service);
     const bad = [_][]const u8{
-        "spiffe://prod/job/",      "spiffe://prod/job/a/b",
-        "spiffe://prod/job/a?x=1", "spiffe://prod/job/a#f",
-        "spiffe://u@prod/job/a",   "spiffe://prod:80/job/a",
-        "spiffe://prod/service/a", "spiffe://prod/job/A",
-        "spiffe://prod/job/.",     "spiffe://prod/job/..",
-        "spiffe://prod//job/a",    "spiffe:///job/a",
-        "spiffe://Prod/job/a",     "spiffe://pr..od/job/a",
-        "spiffe://-prod/job/a",    "spiffe://prod./job/a",
-        "spiffe://*.prod/job/a",   "http://prod/job/a",
-        "spiffe://prod/job/a/",    "SPIFFE://prod/job/a",
-        "spiffe://prod",           "spiffe://prod/job",
+        "spiffe://prod/service/",      "spiffe://prod/service/a/b",
+        "spiffe://prod/service/a?x=1", "spiffe://prod/service/a#f",
+        "spiffe://u@prod/service/a",   "spiffe://prod:80/service/a",
+        "spiffe://prod/job/a",         "spiffe://prod/node/a",
+        "spiffe://prod/services/a",    "spiffe://prod/service/A",
+        "spiffe://prod/service/.",     "spiffe://prod/service/..",
+        "spiffe://prod//service/a",    "spiffe:///service/a",
+        "spiffe://Prod/service/a",     "spiffe://pr..od/service/a",
+        "spiffe://-prod/service/a",    "spiffe://prod./service/a",
+        "spiffe://*.prod/service/a",   "http://prod/service/a",
+        "spiffe://prod/service/a/",    "SPIFFE://prod/service/a",
+        "spiffe://prod",               "spiffe://prod/service",
+        "spiffe://10.0.0.1/service/a", "spiffe://prod.2024/service/a",
     };
     for (bad) |text| try testing.expect(std.meta.isError(spiffe_parse(text)));
     try testing.expectError(error.BadCluster, spiffe_write(&buffer, "", "a"));
-    try testing.expectError(error.BadJobName, spiffe_write(&buffer, "prod", "a_b"));
+    try testing.expectError(error.BadServiceName, spiffe_write(&buffer, "prod", "a_b"));
     try testing.expect(dns_problem("*.example.com", 64));
+    try testing.expect(dns_problem("192.168.0.1", 64));
+    try testing.expect(dns_problem("broker.123", 64));
+    try testing.expect(!dns_problem("broker1.example2.com", 64));
+    try testing.expect(!dns_problem("1a.example.com", 64));
     const long_name: [65]u8 = @splat('a');
     try testing.expect(dns_problem(&long_name, 64));
     try testing.expect(!dns_problem("broker.botpike.com", 64));
