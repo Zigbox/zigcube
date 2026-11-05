@@ -71,28 +71,25 @@ test {
     _ = @import("tidy.zig");
 }
 
-test "the peer handshake's seeded fuzzer is in this root" {
-    // Goal: the fuzzer reads ZCUBE_FUZZ_SEED, an environment the WASI core root does not have, so
-    // it is native only. Method: import it; the handshake's own tests come with the core.
-    _ = @import("peer_fuzz.zig");
-}
-
-test "the X.509 module's seeded fuzzer is in this root" {
-    // Goal: the fuzzer reads ZCUBE_FUZZ_SEED, which the WASI core root cannot, so it is native
-    // only. Method: import it; the module's own tests come with the core.
-    _ = @import("x509_fuzz.zig");
+// The files below are imported by a file-level `comptime` block, not by a test: a test that a
+// `-Dtest-filter` leaves out never runs its body, and the files it imported would vanish from
+// the run without a word (docs/decisions/2026-11-04-c2-slice8-review-fixes.md).
+comptime {
+    _ = @import("peer_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only, which this root is.
+    _ = @import("x509_fuzz.zig"); // The same: the WASI core root has no such environment.
     _ = @import("fuzz_seeds.zig");
-}
-
-test "the peer files and the CA's shell are in this root" {
-    // Goal: the shell halves of docs/peer.md (key files, CA, agent identity) are tested natively.
     _ = @import("agent_peer.zig");
     _ = @import("peer_files.zig");
     _ = @import("dir_images.zig");
+    _ = @import("zigbox_images.zig");
+    _ = @import("zigbox_fetch.zig");
+    _ = @import("zigbox_fetch_owner_test.zig");
+    _ = @import("pull_report.zig");
     _ = @import("fetch_backoff.zig");
     _ = @import("peer_stream.zig");
     _ = @import("peer_server.zig");
     _ = @import("fetch_cli.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
+    _ = @import("agent_run.zig");
 }

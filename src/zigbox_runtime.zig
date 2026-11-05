@@ -72,6 +72,9 @@ pub const Options = struct {
     supervisor_exe: []const u8,
     /// Where each image can be pulled from. Borrowed.
     images: []const Image,
+    /// Ask the swarm (the peers of `fetch.server`) for a tree before pulling it; null: do not.
+    /// `exe` and `state_dir` are the agent's own and are filled in by `launch_spec`.
+    fetch: ?launch.Fetch = null,
 };
 
 const Tag = enum(u8) { starting, running, stopped };
@@ -180,10 +183,12 @@ pub const ZigboxRuntime = struct {
         };
         for (spec.env, 0..) |item, index| Pairs.env[index] = .{ item.name, item.value };
         for (spec.labels, 0..) |label, index| Pairs.labels[index] = .{ label.key, label.value };
+        const reference = if (spec.source.len > 0) spec.source else self.reference_of(spec.image);
         return .{
             .name = spec.name,
             .tree = spec.image,
-            .reference = if (spec.source.len > 0) spec.source else self.reference_of(spec.image),
+            .reference = reference,
+            .fetch = self.fetch_for(spec.image, reference),
             .command = spec.command,
             .env = Pairs.env[0..spec.env.len],
             .labels = Pairs.labels[0..spec.labels.len],
@@ -192,6 +197,21 @@ pub const ZigboxRuntime = struct {
             .pids = spec.limits.pids,
             .launched = self.host.time_now(),
         };
+    }
+
+    /// The swarm fetch for a launch: configured, and the tree and the reference are both full
+    /// digests (the manifest the fetched record is held to is the reference's).
+    fn fetch_for(
+        self: *const ZigboxRuntime,
+        tree: []const u8,
+        reference: []const u8,
+    ) ?launch.Fetch {
+        var given = self.options.fetch orelse return null;
+        if (tree.len != constants.tree_digest_bytes) return null;
+        if (launch.manifest_of(reference) == null) return null;
+        given.exe = self.options.supervisor_exe;
+        given.state_dir = self.options.state_dir;
+        return given;
     }
 
     /// The reference to pull `digest` from; empty if the node has none (the store may still).

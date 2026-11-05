@@ -27,6 +27,9 @@ pub const Steps = struct {
         reference: []const u8,
         diag: *zigbox.diag.Diag,
     ) error{Failed}![]const u8,
+    /// Asks the swarm for the tree (the peers, `zcube-agent fetch`); true if it is in the store
+    /// now. Null: the node has no peers to ask (no server, or no manifest to hold them to).
+    fetch: ?*const fn (context: *anyopaque) bool = null,
 };
 
 pub const Outcome = union(enum) {
@@ -39,6 +42,8 @@ pub const Outcome = union(enum) {
 /// How far the image got, for the supervisor's log line.
 pub const Trace = struct {
     pulled: bool = false,
+    /// The tree came from a peer.
+    fetched: bool = false,
 };
 
 pub fn start_with_image(
@@ -53,6 +58,15 @@ pub fn start_with_image(
     if (steps.start(steps.context, &collector)) |_| {
         return .started;
     } else |_| {}
+    if (collector.code == .E0410) {
+        if (steps.fetch) |fetch| {
+            if (fetch(steps.context)) {
+                trace.fetched = true;
+                collector.reset();
+                if (steps.start(steps.context, &collector)) |_| return .started else |_| {}
+            }
+        }
+    }
     if (collector.code != .E0410 or reference.len == 0) return foreign_failure(&collector);
     collector.reset();
     const produced = steps.pull(steps.context, reference, &collector) catch
@@ -139,9 +153,22 @@ const Script = struct {
     produces: []const u8,
     starts: u32 = 0,
     pulls: u32 = 0,
+    /// Whether the swarm fetch works; null: the node has no peers to ask.
+    fetch_works: ?bool = null,
+    fetches: u32 = 0,
 
     fn steps(script: *Script) Steps {
-        return .{ .context = script, .start = start, .pull = pull };
+        const asks: ?*const fn (context: *anyopaque) bool = if (script.fetch_works != null)
+            fetch
+        else
+            null;
+        return .{ .context = script, .start = start, .pull = pull, .fetch = asks };
+    }
+
+    fn fetch(context: *anyopaque) bool {
+        const script: *Script = @ptrCast(@alignCast(context));
+        script.fetches += 1;
+        return script.fetch_works.?;
     }
 
     fn start(context: *anyopaque, diag: *zigbox.diag.Diag) error{StartFailed}!void {
@@ -291,4 +318,53 @@ test "a second start that fails is reported, and the pull is not repeated" {
     try testing.expectEqualStrings("ZBX-E0425", outcome.failed.code.slice());
     try testing.expectEqual(@as(u32, 1), script.pulls);
     try testing.expectEqual(@as(u32, 2), script.starts);
+}
+
+test "a tree a peer has is fetched, then started, and nothing is pulled" {
+    var script: Script = .{
+        .first_start = .E0410,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+        .fetch_works = true,
+    };
+    const outcome, const trace = run(&script, true);
+    try testing.expect(outcome == .started);
+    try testing.expect(trace.fetched and !trace.pulled);
+    try testing.expectEqual(@as(u32, 2), script.starts);
+    try testing.expectEqual(@as(u32, 0), script.pulls);
+}
+
+test "a tree no peer has is pulled; a fetch that did not make the tree start is too" {
+    var none: Script = .{
+        .first_start = .E0410,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+        .fetch_works = false,
+    };
+    const outcome, const trace = run(&none, true);
+    try testing.expect(outcome == .started);
+    try testing.expect(!trace.fetched and trace.pulled);
+    try testing.expectEqual(@as(u32, 1), none.fetches);
+    var empty: Script = .{
+        .first_start = .E0410,
+        .later_start = .E0410,
+        .pull_code = null,
+        .produces = locked,
+        .fetch_works = true,
+    };
+    const second, _ = run(&empty, true);
+    try testing.expect(second == .failed);
+    try testing.expectEqual(@as(u32, 1), empty.pulls);
+    // With no reference the E0410 stays what the node says.
+    var bare: Script = .{
+        .first_start = .E0410,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+        .fetch_works = false,
+    };
+    const refused, _ = run(&bare, false);
+    try testing.expect(refused == .failed);
 }
