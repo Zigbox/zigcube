@@ -315,6 +315,7 @@ test "the write keys are updated by themselves when their record limit is reache
     try rig.setup(.good, .{});
     try expect_connected(&rig, 4096);
     rig.client.write.sequence = constants.tls_records_per_key_max;
+    rig.peer.read.sequence = constants.tls_records_per_key_max; // The nonce follows it.
     var out: [512]u8 = undefined;
     const sealed = try rig.client.seal_application("late", &out, &rig.diag);
     const head = 5 + std.mem.readInt(u16, sealed[3..5], .big);
