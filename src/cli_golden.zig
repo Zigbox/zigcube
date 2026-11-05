@@ -365,6 +365,16 @@ fn agent_too_long(diag: *diag_mod.Diag) void { // zigbox_runtime.zig
     );
 }
 
+fn agent_fetch_outlived(diag: *diag_mod.Diag) void { // zigbox_image.zig
+    diag.raise(.E0515);
+    diag.cause("a process of the swarm fetch was still alive after SIGKILL to its process " ++
+        "group, so the image was not pulled: the store takes one writer at a time", .{});
+    diag.fix(.{
+        .sentence = "find the process in state D and the disk it waits on; the start is retried",
+        .command = "ps -eo pid,stat,wchan:32,args | awk '$2 ~ /D/'",
+    });
+}
+
 fn agent_lease(diag: *diag_mod.Diag) void { // agent_run.zig
     sample(
         diag,
@@ -627,6 +637,7 @@ const cases = [_]Case{
     relayed(.E0512, agent_no_bus),
     relayed(.E0513, agent_host),
     relayed(.E0514, agent_too_long),
+    relayed(.E0515, agent_fetch_outlived),
     relayed(.W0501, agent_lease),
     relayed(.E0801, peer_foreign_ca),
     relayed(.E0802, peer_expired),

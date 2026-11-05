@@ -64,14 +64,15 @@ const Real = struct {
     tree_text: [67]u8 = undefined,
 
     fn steps(self: *Real) image.Steps {
-        const asks: ?*const fn (context: *anyopaque) bool = if (self.swarm != null) fetch else null;
+        const asks: ?*const fn (context: *anyopaque) image.Fetched =
+            if (self.swarm != null) fetch else null;
         return .{ .context = self, .start = start, .pull = pull, .fetch = asks };
     }
 
-    /// Runs `zcube-agent fetch` against the node's store: true if it finished (the tree is in
-    /// the store). Its diagnostics go to `<container dir>/fetch.log`; a failure falls back to the
-    /// pull, which says its own.
-    fn fetch(context: *anyopaque) bool {
+    /// Runs `zcube-agent fetch` against the node's store. Its diagnostics go to
+    /// `<container dir>/fetch.log`; a failure falls back to the pull, which says its own, unless
+    /// a process of the fetch outlived its kill (`zigbox_image.Fetched`).
+    fn fetch(context: *anyopaque) image.Fetched {
         const self: *Real = @ptrCast(@alignCast(context));
         return fetch_swarm(self.swarm.?, self.host);
     }
@@ -218,14 +219,14 @@ fn open_log(swarm: Swarm) ?std.Io.File {
     return std.Io.Dir.cwd().createFile(swarm.io, path, .{}) catch null;
 }
 
-fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
+fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) image.Fetched {
     var store: zigbox.store.Store = undefined;
-    if (!zigbox.store.Store.locate(&store, host)) return false;
+    if (!zigbox.store.Store.locate(&store, host)) return .absent;
     // The agent publishes `containers/<name>/pull.json` (agent.zig); the directory may not exist
     // in this runtime, and a report that cannot be written only loses the statistics.
     var report_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const report = container_file(&report_buffer, swarm, agent_records.file_pull) orelse
-        return false;
+        return .absent;
     const parent = std.fs.path.dirname(report).?;
     std.Io.Dir.cwd().createDirPath(swarm.io, parent) catch {}; // Said by the fetch if it matters.
     // ZC-E0601 and ZC-W0601 are the fetch's to say; without a log they would vanish.
@@ -234,18 +235,37 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) bool {
     var words: [fetch_argv_max][]const u8 = undefined;
     const argv = fetch_argv(swarm, store.root_text(), report, &words);
     const sink: std.process.SpawnOptions.StdIo = if (log) |file| .{ .file = file } else .ignore;
+    // A process group of its own: the fetch's store worker (Zigbox's `namespace.run` child) is a
+    // grandchild that neither dies with the fetch nor hears its signals, and the group is how
+    // `finished_ok` reaches it. It stays in the supervisor's session, which is how the runtime
+    // reaches it when it stops a starting replica (`process_session.zig`).
     var child = std.process.spawn(swarm.io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = sink,
         .stderr = sink,
+        .pgid = 0,
     }) catch |err| {
         say_in_log(swarm.io, log, "could not start the fetch: ", @errorName(err));
-        return false;
+        return .absent;
     };
-    const finished = finished_ok(swarm.io, &child, fetch_deadline(swarm));
-    if (!finished) say_in_log(swarm.io, log, "the fetch did not exit with code 0", "");
-    return finished;
+    const deadline_ms = fetch_deadline(swarm);
+    const outcome = finished_ok(swarm.io, &child, deadline_ms);
+    switch (outcome) {
+        .ok => return .in_store,
+        .failed => say_in_log(swarm.io, log, "the fetch did not exit with code 0", ""),
+        .killed => {
+            var ms: [16]u8 = undefined;
+            const text = std.fmt.bufPrint(&ms, "{d}", .{deadline_ms}) catch "?";
+            say_in_log(swarm.io, log, "the fetch was killed at its deadline, ms: ", text);
+        },
+        .outlived_kill => {
+            say_in_log(swarm.io, log, "ZC-E0515: a process of the fetch outlived SIGKILL to " ++
+                "its group; the image is not pulled while it may write the store", "");
+            return .outlived_kill;
+        },
+    }
+    return .absent;
 }
 
 /// One line in `fetch.log`, in the supervisor's own voice: a fetch that dies without a word (or
@@ -281,25 +301,86 @@ fn deadline_from_fault(text: []const u8) u32 {
     return @min(value, constants.zigbox_fetch_deadline_ms);
 }
 
-/// Waits for `child` to exit, at most `limit_ms`; a child still running then is killed. True only
-/// for an exit with code 0. Polls (`WNOHANG`), because nothing here waits with a deadline.
-fn finished_ok(io: std.Io, child: *std.process.Child, limit_ms: u32) bool {
+/// How a fetch ended: an exit with code 0, any other end, the deadline's kill, or a kill that
+/// left a process of the fetch's group alive (which `.killed` and `.failed` never do).
+const Outcome = enum { ok, failed, killed, outlived_kill };
+
+/// Waits for `child`, the leader of a process group of its own, to end, at most `limit_ms`.
+/// Then, however it ended, the whole group is sent SIGKILL and reaped, at most
+/// `zigbox_fetch_kill_wait_ms` more: a fetch that died by a signal, or was killed at its
+/// deadline, can leave its store worker (a grandchild) writing the store, and a process that
+/// writes the store must be gone before the pull, another writer, starts. Polls (`WNOHANG`),
+/// because nothing here waits with a deadline. Takes `child`: its pid is reaped here.
+fn finished_ok(io: std.Io, child: *std.process.Child, limit_ms: u32) Outcome {
     assert(limit_ms > 0);
     const pid = child.id.?;
+    assert(pid > 1);
+    child.id = null; // Reaped below, never by `Child`.
+    // The group's orphans come back to this process to be reaped, not to init, so "gone" does
+    // not wait on init's reaping (or on an init that never reaps). Cleared before returning.
+    const linux = std.os.linux;
+    _ = linux.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0);
+    defer _ = linux.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), 0, 0, 0, 0);
+    const started = awake_ms(io);
+    const over_time = while (true) {
+        if (leader_ended(pid)) break false;
+        if (awake_ms(io) -| started >= limit_ms) break true;
+        io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation only ends the wait early.
+    };
+    // The leader is not reaped yet (`WNOWAIT`), so the group's id is still its pid and can name
+    // no other group: the kill reaches the fetch's processes and nothing else.
+    _ = linux.kill(-pid, .KILL);
+    const leader = reap_group(io, pid, constants.zigbox_fetch_kill_wait_ms) orelse
+        return .outlived_kill;
+    if (over_time) return .killed;
+    return if (leader == .exited_ok) .ok else .failed;
+}
+
+/// Whether the group leader `pid` has ended, without reaping it (`WNOWAIT`), so that its pid
+/// stays the group's. A wait that fails other than by an interruption (ECHILD: not ours) counts
+/// as ended, and `reap_group` then finds what is left.
+fn leader_ended(pid: std.posix.pid_t) bool {
+    assert(pid > 1);
+    const linux = std.os.linux;
+    while (true) {
+        var info: linux.siginfo_t = undefined;
+        @memset(std.mem.asBytes(&info), 0); // `WNOHANG` with no change leaves pid 0.
+        const flags = linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT;
+        const rc = linux.waitid(.PID, pid, &info, flags, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return info.fields.common.first.piduid.pid != 0,
+            .INTR => continue,
+            else => return true,
+        }
+    }
+}
+
+/// Reaps every child in process group `pgid` (the subreaper makes the group's orphans ours)
+/// until no process of the group is left, at most `limit_ms`. The leader's end, or null if a
+/// process of the group is still there at the limit.
+fn reap_group(io: std.Io, pgid: std.posix.pid_t, limit_ms: u32) ?Verdict {
+    assert(pgid > 1);
+    assert(limit_ms > 0);
+    const linux = std.os.linux;
+    var leader: Verdict = .over; // A leader that was not ours to reap did not exit 0.
     const started = awake_ms(io);
     while (true) {
         var status: i32 = 0;
-        const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-        switch (wait_verdict(rc, pid, status)) {
-            .running => {},
-            .again => continue,
-            .exited_ok => return true,
-            .over => return false,
+        const rc = linux.waitpid(-pgid, &status, linux.W.NOHANG);
+        switch (linux.errno(rc)) {
+            .SUCCESS => if (rc != 0) {
+                if (rc == @as(usize, @intCast(pgid))) leader = wait_verdict(rc, pgid, status);
+                continue; // Another may be ready at once.
+            },
+            .INTR => continue,
+            else => {}, // ECHILD: no child of ours is left in the group.
         }
-        if (awake_ms(io) -| started >= limit_ms) {
-            child.kill(io);
-            return false;
+        // Signal 0 finds any process of the group, ours or not (one that escaped to init).
+        if (linux.errno(linux.kill(-pgid, @fromBackingInt(0))) == .SRCH) {
+            assert(leader != .running);
+            return leader;
         }
+        if (awake_ms(io) -| started >= limit_ms) return null;
         io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation only ends the wait early.
     }
 }
@@ -517,10 +598,10 @@ test "the fault file can only shorten the fetch's deadline" {
 
 test "a fetch that outlives its deadline is killed, and only an exit 0 counts" {
     const io = std.testing.io;
-    const cases = [_]struct { argv: []const []const u8, limit: u32, ok: bool }{
-        .{ .argv = &.{ "/bin/sh", "-c", "exit 0" }, .limit = 10_000, .ok = true },
-        .{ .argv = &.{ "/bin/sh", "-c", "exit 3" }, .limit = 10_000, .ok = false },
-        .{ .argv = &.{ "/bin/sh", "-c", "exec sleep 30" }, .limit = 200, .ok = false },
+    const cases = [_]struct { argv: []const []const u8, limit: u32, outcome: Outcome }{
+        .{ .argv = &.{ "/bin/sh", "-c", "exit 0" }, .limit = 10_000, .outcome = .ok },
+        .{ .argv = &.{ "/bin/sh", "-c", "exit 3" }, .limit = 10_000, .outcome = .failed },
+        .{ .argv = &.{ "/bin/sh", "-c", "exec sleep 30" }, .limit = 200, .outcome = .killed },
     };
     for (cases) |case| {
         var child = try std.process.spawn(io, .{
@@ -528,14 +609,45 @@ test "a fetch that outlives its deadline is killed, and only an exit 0 counts" {
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
+            .pgid = 0,
         });
         const pid = child.id.?;
         const started = awake_ms(io);
-        try std.testing.expectEqual(case.ok, finished_ok(io, &child, case.limit));
+        try std.testing.expectEqual(case.outcome, finished_ok(io, &child, case.limit));
         try std.testing.expect(awake_ms(io) - started < 5000); // The sleep did not run its 30 s.
         // Gone: reaped by the wait or by the kill. A live child would answer signal 0.
         try std.testing.expect(std.os.linux.kill(pid, @fromBackingInt(@intCast(0))) != 0);
     }
+}
+
+test "a fetch killed at its deadline takes its grandchildren with it" {
+    // Goal: the store worker of a fetch (a grandchild, as `namespace.run` makes it) does not
+    // outlive the deadline's kill. Method: a shell that starts `sleep 30` in the background,
+    // writes its pid and waits; at the deadline, the grandchild must be gone too.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var script_buffer: [256]u8 = undefined;
+    const script = try std.fmt.bufPrint(
+        &script_buffer,
+        "sleep 30 & echo $! > .zig-cache/tmp/{s}/pid; wait",
+        .{tmp.sub_path},
+    );
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", script },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = 0,
+    });
+    const started = awake_ms(io);
+    try std.testing.expectEqual(Outcome.killed, finished_ok(io, &child, 300));
+    try std.testing.expect(awake_ms(io) - started < 5000);
+    var text: [32]u8 = undefined;
+    const read = try tmp.dir.readFile(io, "pid", &text);
+    const grandchild = try std.fmt.parseInt(i32, std.mem.trim(u8, read, " \n"), 10);
+    try std.testing.expect(grandchild > 1);
+    try std.testing.expect(std.os.linux.kill(grandchild, @fromBackingInt(@intCast(0))) != 0);
 }
 
 test "a wait's error is read before its pid: interrupted again, any other over, never ok" {

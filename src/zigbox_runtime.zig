@@ -33,6 +33,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("fake_files.zig");
 const launch = @import("zigbox_launch.zig");
+const process_session = @import("process_session.zig");
 const map = @import("zigbox_map.zig");
 const runtime = @import("runtime.zig");
 
@@ -75,6 +76,9 @@ pub const Options = struct {
     /// Ask the swarm (the peers of `fetch.server`) for a tree before pulling it; null: do not.
     /// `exe` and `state_dir` are the agent's own and are filled in by `launch_spec`.
     fetch: ?launch.Fetch = null,
+    /// SIGKILL to every process of a supervisor's session (its fetch has a group of its own in
+    /// it). Tests whose supervisors are simulated pids swap in a recorder.
+    kill_session: process_session.Kill = process_session.kill_all,
 };
 
 const Tag = enum(u8) { starting, running, stopped };
@@ -352,15 +356,19 @@ pub const ZigboxRuntime = struct {
         }
     }
 
-    /// SIGKILL to the supervisor of a launch that has no container yet, if it is ours: the lock
-    /// is held, so its pid file names a live supervisor and not a recycled number.
+    /// SIGKILL to the supervisor of a launch that has no container yet, if it is ours, and to
+    /// everything it started: the lock is held, so its pid file names a live supervisor and not
+    /// a recycled number, and the supervisor leads its own session, whose id is that pid. The
+    /// swarm fetch and its store worker are in that session but in a group of their own, and a
+    /// store writer left behind would meet the next launch's pull (`process_session.zig`).
     fn kill_supervisor(self: *ZigboxRuntime, name: []const u8) void {
         const dir = launch.container_dir(self.io, self.root, name) orelse return;
         defer dir.close(self.io);
         if (!launch.supervisor_alive(self.io, dir)) return;
         const pid = files.read_pid(self.io, dir, launch.file_supervisor) catch return;
-        if (pid <= 0) return; // Never signal a process group, or ourselves by a zero.
+        if (pid <= 1) return; // Never signal a group by a zero, or init's session.
         self.host.signal(@intCast(pid), map.bounds.signal_kill) catch {}; // Gone already.
+        self.options.kill_session(self.io, pid);
     }
 
     // ---- inspect, list ----
@@ -778,6 +786,23 @@ fn sim_container(sim: *HostSim, name: []const u8, replica: ?[]const u8) !void {
     try zigbox.start(sim.interface(), &spec, .{ .detached = true }, &sim_handle, &diagnostic);
 }
 
+test {
+    _ = process_session; // Its tests, which no other root reaches.
+}
+
+/// The sessions a `Rig`'s runtime killed: its supervisors are simulated pids, which a real
+/// `process_session.kill_all` would aim at whatever host process has that number.
+var sessions_killed: [4]i32 = undefined;
+var sessions_killed_count: u32 = 0;
+
+fn record_session(io: std.Io, leader: i32) void {
+    _ = io;
+    assert(leader > 1);
+    assert(sessions_killed_count < sessions_killed.len);
+    sessions_killed[sessions_killed_count] = leader;
+    sessions_killed_count += 1;
+}
+
 const Rig = struct {
     tmp: testing.TmpDir,
     sim: HostSim,
@@ -795,7 +820,9 @@ const Rig = struct {
             .state_dir = rig.path[0..length],
             .supervisor_exe = "/nonexistent/zcube-agent",
             .images = &.{},
+            .kill_session = record_session,
         }, &diag);
+        sessions_killed_count = 0;
     }
 
     fn down(rig: *Rig) void {
@@ -1071,6 +1098,51 @@ test "stopping a container in Zigbox's start window kills its supervisor, never 
     try rt.stop(handle, 30_000, &diag);
     try testing.expectEqual(@as(u32, 1), rig.sim.world.received_count);
     try testing.expectEqual(@as(u8, 9), rig.sim.world.received[0]);
+    try testing.expectEqual(@as(u32, 1), sessions_killed_count);
+    try testing.expectEqual(@as(i32, @intCast(container)), sessions_killed[0]);
+}
+
+test "stopping a replica mid-fetch leaves no process of the fetch running" {
+    // Goal: the swarm fetch has a process group of its own, so killing the supervisor's group
+    // does not reach it; `stop` of a starting replica must. Method: a real session leader (the
+    // supervisor) whose shell runs `sleep 30` in a job of its own (the fetch) and writes its
+    // pid; the launch lock held and the supervisor file naming the leader; `stop` with the real
+    // `kill_all`; then neither the leader nor the fetch runs.
+    var rig: Rig = undefined;
+    try rig.up(11);
+    defer rig.down();
+    rig.rt.options.kill_session = process_session.kill_all;
+    try rig.launch_spec("web-1", 5);
+    const dir = launch.container_dir(rig.rt.io, rig.rt.root, "web-1").?;
+    defer dir.close(rig.rt.io);
+    var script_buffer: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buffer, "set -m; sleep 30 & echo $! > " ++
+        "{s}/{s}/web-1/fetch.pid; wait", .{ rig.rt.options.state_dir, launch.dir_name });
+    var leader = (try process_session.spawn_session(testing.io, script)) orelse
+        return error.SkipZigTest;
+    defer leader.kill(testing.io);
+    const fetch = try process_session.wait_pid_file(testing.io, dir, "fetch.pid");
+    const fetch_group = std.os.linux.getpgid(fetch);
+    try testing.expectEqual(@as(usize, @intCast(fetch)), fetch_group); // Out of the leader's.
+    try write_supervisor_pid(&rig, "web-1", leader.id.?);
+    const holder = try dir.createFile(rig.rt.io, launch.file_lock, .{
+        .truncate = false,
+        .lock = .exclusive,
+    });
+    defer holder.close(rig.rt.io);
+    const rt = rig.rt.interface();
+    var diag: Diag = undefined;
+    diag.reset();
+    const handle = runtime.Handle.init("web-1");
+    try testing.expect((try rt.inspect(handle, &diag)) == .starting);
+    try rt.stop(handle, 0, &diag);
+    // Before the leader is reaped: a wait for it would also outwait the fetch's 30 s.
+    var tries: u32 = 0;
+    while (process_session.alive(testing.io, fetch) and tries < 250) : (tries += 1) {
+        testing.io.sleep(.fromMilliseconds(20), .awake) catch {}; // Cancelation: one try less.
+    }
+    try testing.expect(!process_session.alive(testing.io, fetch));
+    try testing.expect(!process_session.alive(testing.io, leader.id.?));
 }
 
 test "stopping a start-window container with no supervisor file signals nothing" {
