@@ -155,10 +155,17 @@ fn watch_query(buffer: []u8, from: i64, timeout_ms: u32) ![]const u8 {
     return std.fmt.bufPrint(buffer, "from={d}&timeout={d}", .{ from, timeout_ms });
 }
 
-fn observed_text(buffer: []u8, node: []const u8, replica: []const u8) ![]const u8 {
+/// A running report that names `tenure`, as the agent stamps its records.
+fn observed_text(
+    buffer: []u8,
+    node: []const u8,
+    replica: []const u8,
+    tenure: i64,
+) ![]const u8 {
     const format = "{{\"v\":1,\"replica\":\"{s}\",\"node\":\"{s}\",\"generation\":1," ++
-        "\"status\":\"running\",\"started_at_ms\":1,\"reported_at_ms\":2}}";
-    return std.fmt.bufPrint(buffer, format, .{ replica, node });
+        "\"status\":\"running\",\"started_at_ms\":1,\"reported_at_ms\":2," ++
+        "\"tenure\":{d}}}";
+    return std.fmt.bufPrint(buffer, format, .{ replica, node, tenure });
 }
 
 test "a node takes a lease, registers on it and renews it" {
@@ -277,8 +284,8 @@ test "observed records are reported, read back, and removed, for the node's own 
     try rig.join("node2");
     var first: [256]u8 = undefined;
     var second: [256]u8 = undefined;
-    const one = try observed_text(&first, "node2", "hello-1");
-    const two = try observed_text(&second, "node2", "hello-2");
+    const one = try observed_text(&first, "node2", "hello-1", rig.tenure);
+    const two = try observed_text(&second, "node2", "hello-2", rig.tenure);
     var body: [1024]u8 = undefined;
     const put_both = try std.fmt.bufPrint(
         &body,
@@ -307,13 +314,15 @@ test "an observed record keeps the diagnostic it carries" {
     var rig = try Rig.start(6);
     defer rig.stop();
     try rig.join("node2");
-    const record = "{\"v\":1,\"replica\":\"broken-1\",\"node\":\"node2\",\"generation\":1," ++
-        "\"status\":\"stopped\",\"exit\":{\"kind\":\"start_failed\"},\"diagnostic\":" ++
+    const rest = "\"status\":\"stopped\",\"exit\":{\"kind\":\"start_failed\"},\"diagnostic\":" ++
         "{\"code\":\"ZBX-E0410\",\"severity\":\"error\",\"blame\":\"user\"," ++
         "\"summary\":\"no tree with that digest\"," ++
         "\"causes\":[\"digest b3:00ff is not in the store\"]," ++
         "\"while\":[],\"context\":{},\"fixes\":[{\"sentence\":\"check the digest\"}]," ++
         "\"omitted\":{\"causes\":0,\"while\":0,\"context\":0,\"fixes\":0}},\"reported_at_ms\":2}";
+    var record_buffer: [768]u8 = undefined;
+    const record = try std.fmt.bufPrint(&record_buffer, "{{\"v\":1,\"replica\":\"broken-1\"," ++
+        "\"node\":\"node2\",\"generation\":1,\"tenure\":{d},{s}", .{ rig.tenure, rest });
     var body: [1024]u8 = undefined;
     const text = try std.fmt.bufPrint(
         &body,
@@ -338,9 +347,9 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     try rig.join("node2");
     const before = try rig.revision();
     var record: [256]u8 = undefined;
-    const mine = try observed_text(&record, "node2", "hello-1");
+    const mine = try observed_text(&record, "node2", "hello-1", rig.tenure);
     var stranger_buffer: [256]u8 = undefined;
-    const stranger = try observed_text(&stranger_buffer, "node3", "hello-1");
+    const stranger = try observed_text(&stranger_buffer, "node3", "hello-1", rig.tenure);
     var body: [2048]u8 = undefined;
     const path = "/v1/agent/nodes/node2/observed";
 
@@ -382,6 +391,32 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     }
     try many.appendSlice(testing.allocator, "]}");
     try rig.refused(rig.call("POST", path, "", many.items), 400, "ZC-E0104");
+    try testing.expectEqual(before, try rig.revision());
+}
+
+test "a report whose record does not name the request's tenure is refused" {
+    // Goal: a record with no tenure would read as C0 and bypass the controller's admissibility
+    // gate (authority.md section 3). Method: a record without one, and one with another tenure.
+    var rig = try Rig.start(7);
+    defer rig.stop();
+    try rig.join("node2");
+    const before = try rig.revision();
+    var body: [2048]u8 = undefined;
+    const path = "/v1/agent/nodes/node2/observed";
+    var bare_buffer: [256]u8 = undefined;
+    const bare = try std.fmt.bufPrint(&bare_buffer, "{{\"v\":1,\"replica\":\"hello-1\"," ++
+        "\"node\":\"node2\",\"generation\":1,\"status\":\"running\"," ++
+        "\"started_at_ms\":1,\"reported_at_ms\":2}}", .{});
+    var other_buffer: [256]u8 = undefined;
+    const other = try observed_text(&other_buffer, "node2", "hello-1", rig.tenure + 1);
+    for ([_][]const u8{ bare, other }) |value| {
+        const wrong_tenure = try std.fmt.bufPrint(
+            &body,
+            "{{\"puts\":[{{\"key\":\"/observed/node2/hello-1\",\"value\":{s}}}]}}",
+            .{value},
+        );
+        try rig.refused(rig.call("POST", path, "", wrong_tenure), 400, "ZC-E0104");
+    }
     try testing.expectEqual(before, try rig.revision());
 }
 
@@ -484,7 +519,7 @@ test "a report under a tenure that has been replaced is ZC-E0510 and writes noth
     try rig.join("node2");
     try testing.expect(rig.tenure > old);
     var record: [256]u8 = undefined;
-    const text = try observed_text(&record, "node2", "hello-1");
+    const text = try observed_text(&record, "node2", "hello-1", old);
     var body: [1024]u8 = undefined;
     const put = try std.fmt.bufPrint(
         &body,
@@ -498,7 +533,14 @@ test "a report under a tenure that has been replaced is ZC-E0510 and writes noth
     try rig.refused(response, 503, "ZC-E0510");
     try testing.expectEqual(before, try rig.revision());
     rig.tenure = current;
-    _ = try rig.ok("POST", "/v1/agent/nodes/node2/observed", "", put);
+    var fresh: [256]u8 = undefined;
+    const current_text = try observed_text(&fresh, "node2", "hello-1", current);
+    const put_current = try std.fmt.bufPrint(
+        &body,
+        "{{\"puts\":[{{\"key\":\"/observed/node2/hello-1\",\"value\":{s}}}]}}",
+        .{current_text},
+    );
+    _ = try rig.ok("POST", "/v1/agent/nodes/node2/observed", "", put_current);
 }
 
 /// The answer's `chain`, checked against the store: `revision` and `hash` are its head now, and
@@ -574,7 +616,7 @@ test "known on the lease grant, assigned and observed endpoints, and on a watch 
     try expect_chain(&rig, granted, head - 1);
 
     var record: [256]u8 = undefined;
-    const value = try observed_text(&record, "node2", "hello-1");
+    const value = try observed_text(&record, "node2", "hello-1", rig.tenure);
     var body: [512]u8 = undefined;
     const put = try std.fmt.bufPrint(
         &body,
