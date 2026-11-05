@@ -961,3 +961,63 @@ test "a server that closed a connection first can be restarted on its port at on
     try testing.expectError(error.StartFailed, third);
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0107), diag.code);
 }
+
+fn job_body(arena: std.mem.Allocator, io: std.Io, name: []const u8, input: []const u8) ![]const u8 {
+    const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+    return std.fmt.allocPrint(arena,
+        \\{{"name":"{s}","image":"b3:51aa9c03","command":["sh","-c","cat"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d},"input_env":"PAYLOAD","input":"{s}"}}
+    , .{ name, now + 30_000, input });
+}
+
+test "POST /v1/jobs takes the worst-case input over the wire; every other body stays at 64 KiB" {
+    // Goal: the owner's decision (job-input-wire-size): a 64 KiB input of control characters is
+    // about 384 KiB of JSON, and the job route (only) takes it; the arena asserts hold. Method:
+    // POST that input, then one byte more (ZC-E0130, decoded), then a body over the job limit
+    // (413 naming it), then 65537 bytes to /v1/apply (413 as before).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    const address = server.address();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const unit = "\\u0001";
+    const worst = try arena.alloc(u8, constants.job_input_bytes_max * unit.len);
+    for (0..constants.job_input_bytes_max) |index| {
+        @memcpy(worst[index * unit.len ..][0..unit.len], unit);
+    }
+    try testing.expect(worst.len > constants.api_request_bytes_max);
+    const made = try send(io, address, "POST", "/v1/jobs", try job_body(arena, io, "worst", worst));
+    defer made.free();
+    if (made.status != 201) std.debug.print("{s}\n", .{made.raw[0..@min(made.raw.len, 600)]});
+    try testing.expectEqual(@as(u16, 201), made.status);
+    const same = try send(io, address, "POST", "/v1/jobs", try job_body(arena, io, "worst", worst));
+    defer same.free();
+    try testing.expectEqual(@as(u16, 200), same.status);
+
+    const over = try arena.alloc(u8, worst.len + 1);
+    @memcpy(over[0..worst.len], worst);
+    over[worst.len] = 'a';
+    const over_body = try job_body(arena, io, "over", over);
+    const refused = try send(io, address, "POST", "/v1/jobs", over_body);
+    defer refused.free();
+    try expect_diagnostic(refused, 400, "ZC-E0130");
+
+    const huge = try arena.alloc(u8, constants.job_request_bytes_max + 1);
+    @memset(huge, 'a');
+    const too_big = try send(io, address, "POST", "/v1/jobs", huge);
+    defer too_big.free();
+    try expect_diagnostic(too_big, 413, "ZC-E0108");
+    try testing.expect(std.mem.indexOf(u8, too_big.body, "409600") != null);
+
+    const apply_body = huge[0 .. constants.http_body_bytes_max + 1];
+    const small = try send(io, address, "POST", "/v1/apply", apply_body);
+    defer small.free();
+    try expect_diagnostic(small, 413, "ZC-E0108");
+    try testing.expect(std.mem.indexOf(u8, small.body, "409600") == null);
+}

@@ -814,7 +814,7 @@ pub fn version_current(comptime T: type) u32 {
     return std.meta.fieldInfo(T, .v).attrs.defaultValue(u32).?;
 }
 
-pub const SubjectKind = enum { service, replica, node };
+pub const SubjectKind = enum { service, replica, node, job };
 
 pub const Subject = struct {
     kind: SubjectKind,

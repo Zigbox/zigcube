@@ -893,9 +893,14 @@ pub const job_env_bytes_max: u32 = 8 * 1024;
 /// (`JobInput.base64`), so the record is at most four thirds of this, never the sixfold of a JSON
 /// string full of control characters, which would not fit `store_value_bytes_max`.
 pub const job_input_bytes_max: u32 = 64 * 1024;
-/// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`.
-pub const job_request_bytes_max: u32 = 128 * 1024;
+/// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`. Six times
+/// the input (every byte a control character escaped as `\u00XX`) plus 16 KiB for the other
+/// fields, so every input that meets `job_input_bytes_max` is accepted however the client escapes
+/// it (docs/decisions/2026-11-05-b1-job-input-wire-size-answer.md, option B).
+pub const job_request_bytes_max: u32 = 6 * job_input_bytes_max + 16 * 1024;
 pub const job_command_words_max: u32 = runtime_command_words_max;
+/// The name of the variable a job's input is given in (`input_env`).
+pub const job_input_env_bytes_max: u32 = 64;
 /// Labels of a job: `runtime_labels_max` less `zcube.replica` and `zcube.job`.
 pub const job_labels_max: u32 = runtime_labels_max - 2;
 /// A deadline counts from the start; a run not claimed by its `start_by_ms` (the same length from
@@ -929,10 +934,12 @@ comptime {
     // no relation between it and the raw sizes of env or command is asserted here.
     // The stored input is base64 (four thirds, rounded up to groups of four).
     assert((job_input_bytes_max + 2) / 3 * 4 < store_value_bytes_max);
-    // The size of the request body that carries an input is an open question
-    // (docs/decisions/2026-11-05-b1-job-input-wire-size.md): JSON escaping can make a valid
-    // input larger than `job_request_bytes_max`, so no relation is asserted here.
+    // The body that carries an input: the worst case is all control characters, six bytes each.
+    assert(job_request_bytes_max >= 6 * job_input_bytes_max + 16 * 1024);
     assert(job_request_bytes_max > api_request_bytes_max);
+    assert(job_request_bytes_max > http_head_bytes_max);
+    // The body, its parse and the decoded input must sit in the request arena well within it.
+    assert(job_request_bytes_max * 8 <= request_arena_bytes_max);
     assert(job_labels_max == 6);
     assert(job_command_words_max == runtime_command_words_max);
     // The run id is a container name (a hostname label), and `<service>-<n>` never equals it.

@@ -1,0 +1,930 @@
+//! The job API's logic (docs/briefs/b1.md, "API, CLI, console"; docs/api.md, "Jobs"): create a job
+//! (validation, idempotency, admission, the input), read one, list, and cancel. The API writes
+//! `/jobs/`, `/job-input/` and `/job-admission` (src/writers.zig); the job controller, a later
+//! slice, takes it from there. Core code: functions over `Store` and `Clock`, no shell.
+//!
+//! **A refusal names its field.** ZC-E0130 says which field broke which limit. The run record the
+//! job controller will write (`records.JobRun`, at most `job_run_bytes_max` encoded) is measured
+//! here, on its escaped size, before anything is written, so `records.encode` never reaches
+//! ZC-B0005 for a job this module accepted: JSON escaping turns one control byte into six, and
+//! the raw sizes of `command` and `env` do not bound the encoded run.
+//!
+//! **Idempotency.** The same spec under the same name is a no-op that returns the job; a
+//! different one is ZC-E0131. The compare covers the spec fields only, never `created_at_ms`,
+//! `applied_by`, `submit_by_ms` or `cancel_requested`.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const constants = @import("constants.zig");
+const controller = @import("controller.zig");
+const evidence = @import("evidence.zig");
+const records = @import("records.zig");
+const store = @import("store.zig");
+const apply_mod = @import("apply.zig");
+
+const Context = controller.Context;
+
+pub const Error = controller.Error || error{Refused};
+
+pub const actor = "api";
+
+/// A job as a client submits it. `input` is decoded.
+pub const Input = struct {
+    name: []const u8,
+    image: []const u8,
+    source: []const u8 = "",
+    command: []const []const u8,
+    env: []const records.Pair = &.{},
+    limits: records.JobLimits = .{},
+    deadline_ms: u64,
+    retries: u32 = 0,
+    labels: []const records.Pair = &.{},
+    grace_ms: u32 = 0,
+    input: ?[]const u8 = null,
+    input_env: ?[]const u8 = null,
+    submit_by_ms: u64,
+    /// The request named a `relay` or a `placement`: refused, they are not built yet.
+    relay: bool = false,
+    placement: bool = false,
+    applied_by: []const u8,
+    request_id: []const u8,
+};
+
+pub const Created = struct {
+    job: records.Job,
+    revision: store.Revision,
+    decision: []const u8,
+};
+
+pub const CreateResult = union(enum) {
+    /// Written: a new job.
+    created: Created,
+    /// The same spec under the same name: nothing was written.
+    same: records.Job,
+    /// The admission record or the name changed while this was made; nothing was written.
+    conflict,
+};
+
+fn no_memory(diag: *@import("diag.zig").Diag) controller.Error {
+    return @import("store_failures.zig").no_memory(diag);
+}
+
+// ---- Validation --------------------------------------------------------------------------------
+
+fn refuse(
+    ctx: *const Context,
+    comptime field: []const u8,
+    comptime format: []const u8,
+    args: anytype,
+) error{Refused} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0130);
+    ctx.diag.cause(field ++ ": " ++ format, args);
+    ctx.diag.fix(.{ .sentence = "correct the field and submit the job again" });
+    return error.Refused;
+}
+
+fn not_built(ctx: *const Context, comptime field: []const u8) error{Refused} {
+    return refuse(ctx, field, "is not built yet; a job is accepted without it", .{});
+}
+
+/// A bare variable name: letters, digits and '_', not starting with a digit.
+pub fn variable_name_valid(name: []const u8) bool {
+    if (name.len == 0 or name.len > constants.job_input_env_bytes_max) return false;
+    for (name, 0..) |byte, index| {
+        const letter = std.ascii.isAlphabetic(byte) or byte == '_';
+        if (letter) continue;
+        if (index > 0 and std.ascii.isDigit(byte)) continue;
+        return false;
+    }
+    return true;
+}
+
+fn has_nul(text: []const u8) bool {
+    return std.mem.indexOfScalar(u8, text, 0) != null;
+}
+
+fn validate_command(ctx: *const Context, input: Input) Error!void {
+    const words = input.command;
+    if (words.len == 0 or words.len > constants.job_command_words_max) {
+        return refuse(ctx, "command", "must have 1 to {d} words, it has {d}", .{
+            constants.job_command_words_max, words.len,
+        });
+    }
+    if (words[0].len == 0) return refuse(ctx, "command", "the first word is empty", .{});
+    for (words) |word| {
+        if (has_nul(word)) return refuse(ctx, "command", "a word holds a NUL byte", .{});
+    }
+}
+
+fn validate_env(ctx: *const Context, input: Input) Error!void {
+    if (input.env.len > constants.runtime_env_count_max) {
+        return refuse(ctx, "env", "at most {d} variables, it has {d}", .{
+            constants.runtime_env_count_max, input.env.len,
+        });
+    }
+    var bytes: usize = 0;
+    for (input.env, 0..) |pair, index| {
+        const name = pair[0];
+        if (name.len == 0) return refuse(ctx, "env", "a variable has no name", .{});
+        if (has_nul(name) or has_nul(pair[1])) {
+            return refuse(ctx, "env", "{s} holds a NUL byte", .{name});
+        }
+        if (std.mem.indexOfScalar(u8, name, '=') != null) {
+            return refuse(ctx, "env", "the name {s} holds '='", .{name});
+        }
+        for (input.env[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier[0], name)) {
+                return refuse(ctx, "env", "{s} is set twice", .{name});
+            }
+        }
+        bytes += name.len + pair[1].len;
+    }
+    if (bytes > constants.job_env_bytes_max) {
+        return refuse(ctx, "env", "names and values take {d} bytes, at most {d}", .{
+            bytes, constants.job_env_bytes_max,
+        });
+    }
+}
+
+fn validate_labels(ctx: *const Context, input: Input) Error!void {
+    if (input.labels.len > constants.job_labels_max) {
+        return refuse(ctx, "labels", "at most {d}, it has {d}", .{
+            constants.job_labels_max, input.labels.len,
+        });
+    }
+    for (input.labels) |pair| {
+        if (pair[0].len == 0) return refuse(ctx, "labels", "a label has no key", .{});
+        // The controller sets `zcube.replica` and `zcube.job` on the container itself.
+        if (std.mem.startsWith(u8, pair[0], "zcube.")) {
+            const problem = "keys starting with zcube. are reserved ({s})";
+            return refuse(ctx, "labels", problem, .{pair[0]});
+        }
+        if (has_nul(pair[0]) or has_nul(pair[1])) {
+            return refuse(ctx, "labels", "{s} holds a NUL byte", .{pair[0]});
+        }
+    }
+}
+
+fn validate_input(ctx: *const Context, input: Input) Error!void {
+    const text = input.input orelse {
+        if (input.input_env != null) {
+            return refuse(ctx, "input_env", "names a variable, but there is no input", .{});
+        }
+        return;
+    };
+    if (text.len > constants.job_input_bytes_max) {
+        return refuse(ctx, "input", "is {d} bytes, at most {d}", .{
+            text.len, constants.job_input_bytes_max,
+        });
+    }
+    if (has_nul(text)) return refuse(ctx, "input", "holds a NUL byte", .{});
+    if (!std.unicode.utf8ValidateSlice(text)) return refuse(ctx, "input", "is not UTF-8", .{});
+    const variable = input.input_env orelse {
+        const problem = "is required with an input: the variable it is given in";
+        return refuse(ctx, "input_env", problem, .{});
+    };
+    if (!variable_name_valid(variable)) {
+        const problem = "must be a variable name of 1 to {d} letters, digits or '_'";
+        return refuse(ctx, "input_env", problem, .{
+            constants.job_input_env_bytes_max,
+        });
+    }
+    for (input.env) |pair| {
+        if (std.mem.eql(u8, pair[0], variable)) {
+            return refuse(ctx, "input_env", "{s} is also set in env", .{variable});
+        }
+    }
+}
+
+fn validate_times(ctx: *const Context, input: Input, now_ms: u64) Error!void {
+    if (input.deadline_ms == 0 or input.deadline_ms > constants.job_deadline_ms_max) {
+        return refuse(ctx, "deadline_ms", "must be 1 to {d} (24 hours), it is {d}", .{
+            constants.job_deadline_ms_max, input.deadline_ms,
+        });
+    }
+    if (input.grace_ms > constants.job_grace_ms_max) {
+        return refuse(ctx, "grace_ms", "at most {d}, it is {d}", .{
+            constants.job_grace_ms_max, input.grace_ms,
+        });
+    }
+    if (input.submit_by_ms > now_ms + constants.job_submit_window_ms_max) {
+        return refuse(ctx, "submit_by_ms", "is more than {d} ms ahead of the server's clock", .{
+            constants.job_submit_window_ms_max,
+        });
+    }
+}
+
+/// The checks that need no store. A job that passes them is one `create` can try to admit.
+pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
+    if (records.name_problem(input.name, constants.service_name_bytes_max) != null) {
+        const problem = "must be 1 to {d} lowercase letters, digits or '-' (none at either end)";
+        return refuse(ctx, "name", problem, .{
+            constants.service_name_bytes_max,
+        });
+    }
+    if (input.image.len == 0 or input.image.len > constants.image_digest_bytes_max) {
+        return refuse(ctx, "image", "must be 1 to {d} bytes", .{constants.image_digest_bytes_max});
+    }
+    if (apply_mod.source_problem(input.source)) |problem| {
+        return refuse(ctx, "source", "{s}", .{problem});
+    }
+    try validate_command(ctx, input);
+    try validate_env(ctx, input);
+    try validate_labels(ctx, input);
+    if (input.retries > 0) return not_built(ctx, "retries");
+    if (input.relay) return not_built(ctx, "relay");
+    if (input.placement) return not_built(ctx, "placement");
+    try validate_times(ctx, input, now_ms);
+    try validate_input(ctx, input);
+    if (now_ms > input.submit_by_ms) return expired(ctx, input.submit_by_ms, now_ms);
+}
+
+fn expired(ctx: *const Context, submit_by_ms: u64, now_ms: u64) error{Refused} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0134);
+    ctx.diag.cause("submit_by_ms {d} passed {d} ms ago", .{ submit_by_ms, now_ms - submit_by_ms });
+    ctx.diag.fix_with(
+        "look for the job an earlier attempt may have made, then submit again",
+        "zcube job get {s}",
+        .{"NAME"},
+    );
+    return error.Refused;
+}
+
+// ---- The run record's size ---------------------------------------------------------------------
+
+fn json_bytes(ctx: *const Context, value: anytype) Error!usize {
+    const text = std.json.Stringify.valueAlloc(ctx.arena, value, .{
+        .emit_null_optional_fields = false,
+    }) catch return @import("store_failures.zig").no_memory(ctx.diag);
+    return text.len;
+}
+
+/// The run the job controller will write for `job`, as large as it can get: stopped, with the
+/// longest time. What the agents' runs reply is sized by this, so it is measured on the escaped
+/// JSON (`records.encode` would otherwise stop it at ZC-B0005).
+pub fn run_of(job: *const records.Job, id: []const u8) records.JobRun {
+    return .{
+        .id = id,
+        .job = job.name,
+        .image = job.image,
+        .source = job.source,
+        .command = job.command,
+        .env = job.env,
+        .limits = job.limits,
+        .deadline_ms = job.deadline_ms,
+        .grace_ms = job.grace_ms,
+        .labels = job.labels,
+        .input_env = job.input_env,
+        .input_digest = job.input_digest,
+        .input_bytes = job.input_bytes,
+        .start_by_ms = job.created_at_ms + job.deadline_ms,
+        .created_at_ms = job.created_at_ms,
+        .stop = .{ .cause = .not_started, .at_ms = std.math.maxInt(u64) },
+    };
+}
+
+/// Refuses (ZC-E0130, naming the field) a job whose run would encode over `job_run_bytes_max`.
+fn check_run_size(ctx: *const Context, job: *const records.Job) Error!void {
+    var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const run = run_of(job, records.job_run_id(&id_buffer, job.name));
+    const total = try json_bytes(ctx, run);
+    if (total <= constants.job_run_bytes_max) return;
+    // Name the member that takes the most room once escaped.
+    const Member = struct { name: []const u8, bytes: usize };
+    const members = [_]Member{
+        .{ .name = "command", .bytes = try json_bytes(ctx, job.command) },
+        .{ .name = "env", .bytes = try json_bytes(ctx, job.env) },
+        .{ .name = "labels", .bytes = try json_bytes(ctx, job.labels) },
+        .{ .name = "source", .bytes = try json_bytes(ctx, job.source) },
+        .{ .name = "image", .bytes = try json_bytes(ctx, job.image) },
+    };
+    var biggest = members[0];
+    for (members[1..]) |member| {
+        if (member.bytes > biggest.bytes) biggest = member;
+    }
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0130);
+    ctx.diag.cause(
+        "{s}: the run record would take {d} bytes once escaped (a control character takes six), " ++
+            "at most {d}; {s} takes {d} of them",
+        .{ biggest.name, total, constants.job_run_bytes_max, biggest.name, biggest.bytes },
+    );
+    ctx.diag.fix(.{ .sentence = "shorten the field, or avoid control characters in it" });
+    return error.Refused;
+}
+
+// ---- Create ------------------------------------------------------------------------------------
+
+const hour_ms: u64 = 60 * 60 * 1000;
+
+fn spec_equal(old: *const records.Job, new: *const records.Job) bool {
+    if (!std.mem.eql(u8, old.image, new.image)) return false;
+    if (!std.mem.eql(u8, old.source, new.source)) return false;
+    if (!strings_equal(old.command, new.command)) return false;
+    if (!pairs_equal(old.env, new.env)) return false;
+    if (!pairs_equal(old.labels, new.labels)) return false;
+    if (!std.meta.eql(old.limits, new.limits)) return false;
+    if (old.deadline_ms != new.deadline_ms or old.retries != new.retries) return false;
+    if (old.grace_ms != new.grace_ms) return false;
+    if (!optional_equal(old.input_env, new.input_env)) return false;
+    return optional_equal(old.input_digest, new.input_digest);
+}
+
+fn optional_equal(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn strings_equal(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn pairs_equal(a: []const records.Pair, b: []const records.Pair) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left[0], right[0])) return false;
+        if (!std.mem.eql(u8, left[1], right[1])) return false;
+    }
+    return true;
+}
+
+fn too_many(ctx: *const Context, comptime format: []const u8, args: anytype) error{Refused} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0132);
+    ctx.diag.cause(format, args);
+    ctx.diag.fix(.{
+        .sentence = "wait for jobs to end, or cancel some, then submit again",
+        .command = "zcube job list",
+    });
+    return error.Refused;
+}
+
+fn digest_of(ctx: *const Context, text: []const u8) controller.Error![]const u8 {
+    var raw: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &raw, .{});
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return controller.format(ctx, "sha256:{s}", .{&hex});
+}
+
+fn base64_of(ctx: *const Context, text: []const u8) controller.Error![]const u8 {
+    const encoder = std.base64.standard.Encoder;
+    const buffer = ctx.arena.alloc(u8, encoder.calcSize(text.len)) catch
+        return @import("store_failures.zig").no_memory(ctx.diag);
+    return encoder.encode(buffer, text);
+}
+
+/// The admission record after one more create at `now_ms`: hours older than the window dropped.
+fn admit_one(
+    ctx: *const Context,
+    old: records.JobAdmission,
+    now_ms: u64,
+) controller.Error!records.JobAdmission {
+    const hour = now_ms / hour_ms;
+    var kept: std.ArrayList(records.HourCount) = .empty;
+    for (old.hours) |entry| {
+        if (entry.hour + constants.job_admission_window_h <= hour) continue;
+        kept.append(ctx.arena, entry) catch return no_memory(ctx.diag);
+    }
+    const last = if (kept.items.len > 0) &kept.items[kept.items.len - 1] else null;
+    // A clock that went back folds into the newest hour, which keeps the hours ascending.
+    if (last != null and last.?.hour >= hour) {
+        last.?.count += 1;
+    } else {
+        kept.append(ctx.arena, .{ .hour = hour, .count = 1 }) catch
+            return @import("store_failures.zig").no_memory(ctx.diag);
+    }
+    return .{ .admitted = old.admitted + 1, .hours = kept.items };
+}
+
+fn window_count(admission: records.JobAdmission, now_ms: u64) u64 {
+    const hour = now_ms / hour_ms;
+    var sum: u64 = 0;
+    for (admission.hours) |entry| {
+        if (entry.hour + constants.job_admission_window_h > hour) sum += entry.count;
+    }
+    return sum;
+}
+
+/// Creates the job, or finds the one this is a retry of. See the module doc for the order.
+pub fn create(
+    ctx: *const Context,
+    source: *controller.DecisionSource,
+    input: Input,
+) Error!CreateResult {
+    const now_ms = ctx.clock.now_ms();
+    try validate(ctx, input, now_ms);
+    const digest = if (input.input) |text| try digest_of(ctx, text) else null;
+    const job: records.Job = .{
+        .name = input.name,
+        .image = input.image,
+        .source = input.source,
+        .command = input.command,
+        .env = input.env,
+        .limits = input.limits,
+        .deadline_ms = input.deadline_ms,
+        .retries = input.retries,
+        .labels = input.labels,
+        .grace_ms = input.grace_ms,
+        .input_env = input.input_env,
+        .input_digest = digest,
+        .input_bytes = if (input.input) |text| text.len else null,
+        .submit_by_ms = input.submit_by_ms,
+        .created_at_ms = now_ms,
+        .applied_by = input.applied_by,
+    };
+    try check_run_size(ctx, &job);
+    const key = records.job_key(input.name);
+    const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+    if (found.kv) |kv| {
+        const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+        if (spec_equal(&old, &job)) return .{ .same = old };
+        return different(ctx, input.name);
+    }
+    return admit(ctx, source, input, job, key);
+}
+
+fn different(ctx: *const Context, name: []const u8) error{Refused} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0131);
+    ctx.diag.cause("job {s} exists with a different spec", .{name});
+    ctx.diag.fix_with("look at the job that exists", "zcube job get {s}", .{name});
+    return error.Refused;
+}
+
+fn admit(
+    ctx: *const Context,
+    source: *controller.DecisionSource,
+    input: Input,
+    job: records.Job,
+    key: records.Key,
+) Error!CreateResult {
+    const now_ms = job.created_at_ms;
+    const admission_at = try ctx.store.get(ctx.arena, records.key_job_admission, null, ctx.diag);
+    var admission: records.JobAdmission = .{};
+    var admission_revision: store.Revision = 0;
+    if (admission_at.kv) |kv| {
+        admission = try records.read(records.JobAdmission, ctx.arena, kv, ctx.diag);
+        admission_revision = kv.mod_revision;
+    }
+    const endings_at = try ctx.store.get(ctx.arena, records.key_job_endings, null, ctx.diag);
+    var ended: u64 = 0;
+    if (endings_at.kv) |kv| {
+        ended = (try records.read(records.JobEndings, ctx.arena, kv, ctx.diag)).ended;
+    }
+    // `/job-endings` only grows, so a read older than the admission compare only under-counts the
+    // jobs that ended: the room it reports is never more than there is.
+    const live = admission.admitted -| ended;
+    if (live >= constants.jobs_max) {
+        return too_many(ctx, "{d} jobs have not ended, the most the cluster holds ({d})", .{
+            live, constants.jobs_max,
+        });
+    }
+    const recent = window_count(admission, now_ms);
+    if (recent >= constants.job_admitted_window_max) {
+        return too_many(
+            ctx,
+            "{d} jobs were created in the last {d} hours, the most that can be kept ({d})",
+            .{ recent, constants.job_admission_window_h, constants.job_admitted_window_max },
+        );
+    }
+    const next = try admit_one(ctx, admission, now_ms);
+    const admitted: Admitted = .{ .next = next, .revision = admission_revision };
+    return write_new(ctx, source, input, job, key, admitted);
+}
+
+const Admitted = struct { next: records.JobAdmission, revision: store.Revision };
+
+fn write_new(
+    ctx: *const Context,
+    source: *controller.DecisionSource,
+    input: Input,
+    job: records.Job,
+    key: records.Key,
+    admitted: Admitted,
+) Error!CreateResult {
+    var batch: controller.Batch = .{};
+    const job_at = try controller.key_copy(ctx, &key);
+    batch.expect(job_at, 0);
+    batch.expect(records.key_job_admission, admitted.revision);
+    batch.put(job_at, try records.encode(ctx.arena, job, ctx.diag));
+    if (input.input) |text| {
+        const input_at = records.job_input_key(job.name);
+        const stored: records.JobInput = .{ .base64 = try base64_of(ctx, text) };
+        const bytes = try records.encode(ctx.arena, stored, ctx.diag);
+        batch.put(try controller.key_copy(ctx, &input_at), bytes);
+    }
+    batch.put(records.key_job_admission, try records.encode(ctx.arena, admitted.next, ctx.diag));
+    const reason = try controller.format(ctx, "{s} submitted job {s} (request {s})", .{
+        input.applied_by, job.name, input.request_id,
+    });
+    const id = try controller.put_decision(ctx, source, .{
+        .actor = actor,
+        .action = "submit",
+        .subject = .{ .kind = .job, .name = job.name },
+        .reason = reason,
+        .change = "created",
+        .cause = .{ .kind = .desired, .key = job_at },
+        .cause_evidence = try evidence.job(ctx, &job, input.request_id),
+    }, &batch);
+    return switch (try controller.commit(ctx, .api, &batch)) {
+        .applied => |revision| .{ .created = .{
+            .job = job,
+            .revision = revision,
+            .decision = try controller.format(ctx, "{s}", .{id.slice()}),
+        } },
+        .conflict => .conflict,
+    };
+}
+
+// ---- Read --------------------------------------------------------------------------------------
+
+fn no_job(ctx: *const Context, name: []const u8) error{Refused} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0133);
+    ctx.diag.cause("no job named {s} is stored", .{name});
+    ctx.diag.fix(.{ .sentence = "list the jobs that exist", .command = "zcube job list" });
+    return error.Refused;
+}
+
+/// A job and where it stands. `status` is null until the job controller has written one.
+pub const View = struct {
+    job: records.Job,
+    status: ?records.JobStatus,
+    revision: store.Revision,
+};
+
+pub fn state_of(status: ?records.JobStatus) records.JobState {
+    return if (status) |known| known.state else .pending;
+}
+
+fn name_checked(ctx: *const Context, name: []const u8) Error!void {
+    if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+        return no_job(ctx, name);
+    }
+}
+
+pub fn get(ctx: *const Context, name: []const u8) Error!View {
+    try name_checked(ctx, name);
+    const at = (try ctx.store.status(ctx.diag)).revision;
+    return read_view(ctx, name, at);
+}
+
+fn read_view(ctx: *const Context, name: []const u8, at: store.Revision) Error!View {
+    const key = records.job_key(name);
+    const found = try ctx.store.get(ctx.arena, key.slice(), at, ctx.diag);
+    const kv = found.kv orelse return no_job(ctx, name);
+    const job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+    return .{ .job = job, .status = try read_status(ctx, name, at), .revision = at };
+}
+
+fn read_status(ctx: *const Context, name: []const u8, at: store.Revision) Error!?records.JobStatus {
+    const key = records.job_status_key(name);
+    const found = try ctx.store.get(ctx.arena, key.slice(), at, ctx.diag);
+    const kv = found.kv orelse return null;
+    return try records.read(records.JobStatus, ctx.arena, kv, ctx.diag);
+}
+
+pub const ListOptions = struct {
+    state: ?records.JobState = null,
+    /// `key=value`, or a bare key for any value.
+    label: ?[]const u8 = null,
+    limit: u32,
+    at: ?store.Revision = null,
+    after: ?[]const u8 = null,
+};
+
+pub const Row = struct {
+    name: []const u8,
+    image: []const u8,
+    state: records.JobState,
+    node: ?[]const u8 = null,
+    labels: []const records.Pair,
+    created_at_ms: u64,
+    deadline_ms: u64,
+    cancel_requested: bool,
+    end: ?records.JobEnd = null,
+};
+
+pub const Listing = struct {
+    revision: store.Revision,
+    rows: []const Row,
+    /// Set when more jobs follow this page: pass it with `at = revision`.
+    continue_after: ?[]const u8,
+};
+
+fn label_matches(labels: []const records.Pair, wanted: []const u8) bool {
+    const split = std.mem.indexOfScalar(u8, wanted, '=');
+    const key = if (split) |at| wanted[0..at] else wanted;
+    for (labels) |pair| {
+        if (!std.mem.eql(u8, pair[0], key)) continue;
+        if (split == null) return true;
+        if (std.mem.eql(u8, pair[1], wanted[split.? + 1 ..])) return true;
+    }
+    return false;
+}
+
+/// One page of jobs by name, at one revision. A filter keeps a subset of the page, so a page
+/// may hold fewer rows than `limit` and still have a `continue_after`: follow it until it ends.
+pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
+    assert(options.limit > 0);
+    assert(options.limit <= constants.store_list_limit_max);
+    const page = try ctx.store.list(ctx.arena, .{
+        .prefix = records.prefix_jobs,
+        .at_revision = options.at,
+        .limit = options.limit,
+        .continue_after = options.after,
+    }, ctx.diag);
+    var rows: std.ArrayList(Row) = .empty;
+    for (page.kvs) |kv| {
+        const job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+        if (options.label) |wanted| {
+            if (!label_matches(job.labels, wanted)) continue;
+        }
+        const status = try read_status(ctx, job.name, page.revision);
+        const state = state_of(status);
+        if (options.state) |only| {
+            if (state != only) continue;
+        }
+        rows.append(ctx.arena, .{
+            .name = job.name,
+            .image = job.image,
+            .state = state,
+            .node = if (status) |known| known.node else null,
+            .labels = job.labels,
+            .created_at_ms = job.created_at_ms,
+            .deadline_ms = job.deadline_ms,
+            .cancel_requested = job.cancel_requested != null,
+            .end = if (status) |known| known.end else null,
+        }) catch return @import("store_failures.zig").no_memory(ctx.diag);
+    }
+    return .{
+        .revision = page.revision,
+        .rows = rows.items,
+        .continue_after = page.continue_after,
+    };
+}
+
+// ---- Cancel ------------------------------------------------------------------------------------
+
+pub const CancelResult = union(enum) {
+    /// The request was recorded: the job controller stops the run.
+    accepted: struct { job: records.Job, revision: store.Revision, decision: []const u8 },
+    /// A cancel was already recorded; nothing was written.
+    already: records.Job,
+    /// The job has ended; nothing was written.
+    finished: View,
+    conflict,
+};
+
+/// Records that `by` wants the job stopped (`cancel_requested`). A job that has ended is not
+/// changed, and says how it ended.
+pub fn cancel(
+    ctx: *const Context,
+    source: *controller.DecisionSource,
+    name: []const u8,
+    by: []const u8,
+    request_id: []const u8,
+) Error!CancelResult {
+    try name_checked(ctx, name);
+    const key = records.job_key(name);
+    const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+    const kv = found.kv orelse return no_job(ctx, name);
+    var job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+    const status = try read_status(ctx, name, (try ctx.store.status(ctx.diag)).revision);
+    if (status) |known| {
+        if (records.job_state_terminal(known.state)) {
+            return .{ .finished = .{ .job = job, .status = status, .revision = kv.mod_revision } };
+        }
+    }
+    if (job.cancel_requested != null) return .{ .already = job };
+    job.cancel_requested = .{ .at_ms = ctx.clock.now_ms(), .by = by };
+    var batch: controller.Batch = .{};
+    batch.expect(key.slice(), kv.mod_revision);
+    batch.put(kv.key, try records.encode(ctx.arena, job, ctx.diag));
+    const reason = try controller.format(ctx, "{s} asked to cancel job {s} (request {s})", .{
+        by, name, request_id,
+    });
+    const id = try controller.put_decision(ctx, source, .{
+        .actor = actor,
+        .action = "cancel",
+        .subject = .{ .kind = .job, .name = name },
+        .reason = reason,
+        .change = "cancel requested",
+        .cause = .{ .kind = .desired, .key = kv.key },
+        .cause_evidence = try evidence.job(ctx, &job, request_id),
+    }, &batch);
+    return switch (try controller.commit(ctx, .api, &batch)) {
+        .applied => |revision| .{ .accepted = .{
+            .job = job,
+            .revision = revision,
+            .decision = try controller.format(ctx, "{s}", .{id.slice()}),
+        } },
+        .conflict => .conflict,
+    };
+}
+
+// ---- Tests -------------------------------------------------------------------------------------
+
+const testing = std.testing;
+const ManualClock = @import("clock.zig").ManualClock;
+const MemoryStore = @import("store_memory.zig").MemoryStore;
+const Diag = @import("diag.zig").Diag;
+const Code = @import("diag/codes.zig").Code;
+
+const now_start: u64 = 1761350000123;
+
+const Rig = struct {
+    arena_state: std.heap.ArenaAllocator,
+    manual: ManualClock,
+    memory: *MemoryStore,
+    diag: Diag,
+    source: controller.DecisionSource,
+
+    fn start(rig: *Rig) !void {
+        rig.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        rig.manual = .{ .ms = now_start };
+        rig.memory = try testing.allocator.create(MemoryStore);
+        rig.memory.init(testing.allocator, rig.manual.clock());
+        rig.diag.reset();
+        rig.source = .{ .instance = 0 };
+    }
+
+    fn stop(rig: *Rig) void {
+        rig.memory.deinit();
+        testing.allocator.destroy(rig.memory);
+        rig.arena_state.deinit();
+    }
+
+    fn context(rig: *Rig) Context {
+        return .{
+            .store = rig.memory.interface(),
+            .clock = rig.manual.clock(),
+            .arena = rig.arena_state.allocator(),
+            .diag = &rig.diag,
+        };
+    }
+
+    fn expect_code(rig: *Rig, code: Code) !void {
+        try testing.expectEqual(code, rig.diag.code.?);
+        rig.diag.reset();
+    }
+};
+
+fn sample(name: []const u8) Input {
+    return .{
+        .name = name,
+        .image = "b3:51aa9c03",
+        .command = &.{ "sh", "-c", "echo hi" },
+        .deadline_ms = 60_000,
+        .submit_by_ms = now_start + 30_000,
+        .applied_by = "alex@laptop",
+        .request_id = "r-0001a4f",
+    };
+}
+
+test "create writes the job, its input and a decision; the same spec again is the same job" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("nightly");
+    input.input = "hello\n";
+    input.input_env = "PAYLOAD";
+    const first = try create(&ctx, &rig.source, input);
+    try testing.expectEqualStrings("sha256:", first.created.job.input_digest.?[0..7]);
+    try testing.expectEqual(@as(?usize, 6), first.created.job.input_bytes);
+    const again = try create(&ctx, &rig.source, input);
+    try testing.expectEqualStrings("nightly", again.same.name);
+    var other = input;
+    other.image = "b3:7c02aaaaaaaa";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, other));
+    try rig.expect_code(.E0131);
+    const view = try get(&ctx, "nightly");
+    try testing.expectEqual(records.JobState.pending, state_of(view.status));
+    try testing.expectError(error.Refused, get(&ctx, "nope"));
+    try rig.expect_code(.E0133);
+}
+
+test "a 64 KiB input of control characters is accepted; one more byte is ZC-E0130" {
+    // Goal: the owner's decision (job-input-wire-size): every input within job_input_bytes_max is
+    // stored, however it is escaped. Method: the worst case, 0x01 repeated.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const bytes = try ctx.arena.alloc(u8, constants.job_input_bytes_max + 1);
+    @memset(bytes, 1);
+    var input = sample("big");
+    input.input = bytes[0..constants.job_input_bytes_max];
+    input.input_env = "PAYLOAD";
+    const made = try create(&ctx, &rig.source, input);
+    const stored_bytes = made.created.job.input_bytes;
+    try testing.expectEqual(@as(?usize, constants.job_input_bytes_max), stored_bytes);
+    const input_key = records.job_input_key("big");
+    const stored = try ctx.store.get(ctx.arena, input_key.slice(), null, &rig.diag);
+    try testing.expect(stored.kv != null);
+    var over = sample("bigger");
+    over.input = bytes;
+    over.input_env = "PAYLOAD";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, over));
+    try rig.expect_code(.E0130);
+}
+
+test "a run record over 16 KiB escaped is ZC-E0130 naming the field, never ZC-B0005" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const bytes = try ctx.arena.alloc(u8, 4000);
+    @memset(bytes, 1);
+    var input = sample("wide");
+    input.env = &.{.{ "A", bytes }};
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, input));
+    try rig.expect_code(.E0130);
+}
+
+test "validation names the field" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var bad = sample("Bad");
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    bad = sample("ok");
+    bad.labels = &.{.{ "zcube.job", "x" }};
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    bad = sample("ok");
+    bad.input_env = "X";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    bad = sample("ok");
+    bad.deadline_ms = constants.job_deadline_ms_max + 1;
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    bad = sample("ok");
+    bad.submit_by_ms = now_start + constants.job_submit_window_ms_max + 1;
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    bad = sample("ok");
+    bad.submit_by_ms = now_start + constants.job_submit_window_ms_max;
+    _ = try create(&ctx, &rig.source, bad);
+    bad = sample("late");
+    bad.submit_by_ms = now_start - 1;
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0134);
+    try testing.expect(variable_name_valid("A_1"));
+    try testing.expect(!variable_name_valid(""));
+    var long: [constants.job_input_env_bytes_max + 1]u8 = undefined;
+    @memset(&long, 'A');
+    try testing.expect(variable_name_valid(long[0..constants.job_input_env_bytes_max]));
+    try testing.expect(!variable_name_valid(&long));
+}
+
+test "jobs_max bounds the jobs in flight; a cancel records itself once" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var names: [constants.jobs_max + 1][8]u8 = undefined;
+    for (&names, 0..) |*name, index| {
+        _ = std.fmt.bufPrint(name, "j{d:0>5}", .{index}) catch unreachable; // 6 of 8 bytes.
+    }
+    for (names[0..constants.jobs_max]) |*name| {
+        _ = try create(&ctx, &rig.source, sample(name[0..6]));
+    }
+    const extra = sample(names[constants.jobs_max][0..6]);
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, extra));
+    try rig.expect_code(.E0132);
+    const first = try cancel(&ctx, &rig.source, "j00000", "alex", "r-1");
+    try testing.expect(first == .accepted);
+    const second = try cancel(&ctx, &rig.source, "j00000", "alex", "r-2");
+    try testing.expect(second == .already);
+    try testing.expectError(error.Refused, cancel(&ctx, &rig.source, "zzz", "alex", "r-3"));
+    try rig.expect_code(.E0133);
+}
+
+test "list filters by label and pages" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var a = sample("alpha");
+    a.labels = &.{.{ "team", "x" }};
+    _ = try create(&ctx, &rig.source, a);
+    _ = try create(&ctx, &rig.source, sample("beta"));
+    const all = try list(&ctx, .{ .limit = 10 });
+    try testing.expectEqual(@as(usize, 2), all.rows.len);
+    const some = try list(&ctx, .{ .limit = 10, .label = "team=x" });
+    try testing.expectEqual(@as(usize, 1), some.rows.len);
+    try testing.expectEqualStrings("alpha", some.rows[0].name);
+    const none = try list(&ctx, .{ .limit = 10, .state = .running });
+    try testing.expectEqual(@as(usize, 0), none.rows.len);
+}
