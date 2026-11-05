@@ -187,7 +187,7 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 | E0805 | a record failed authentication, or a direction reached its record counter limit |
 | E0806 | (environment) the CA key or the node key could not be read, written or parsed |
 | E0807 | (user) a node was refused a credential because it was removed from the cluster |
-| E0808 | (user) a peer's handshake was refused: its address already has one unfinished, started too many in a window, or the table of addresses is full |
+| E0808 | (user) a peer's handshake was refused: its address already has as many unfinished as one may, started too many in a window, or the table of addresses is full |
 
 ## Lifetime, renewal and removal
 
@@ -258,13 +258,17 @@ The handshake is interim: see `docs/decisions/2026-11-03-peer-handshake-interim.
 ## The peer server and the fetch worker (slice 6b, part 2)
 
 `src/peer_stream.zig` runs the handshake and sealed messages over a socket (a message is a u32
-length and its body in records; every wait is a `poll` against one deadline). `src/peer_server.zig`
+length and its body in records; every wait is a `poll` against one deadline, and no read or write
+blocks: sends and receives use `MSG_DONTWAIT` and the sockets are non-blocking, so a peer that stops
+reading mid-reply, or a zero window, ends the connection at `peer_reply_ms`). `src/peer_server.zig`
 listens, asks `peer_limit.Limiter` before each handshake (ZC-E0808 once per streak), loads the
 identity from the state directory at each handshake (`agent_peer.load_identity`) and answers
 `GET /v1/peer/trees/<digest>` and `GET /v1/peer/chunk/<hash>` with `peer_serve.answer`. A reply is a
 14-byte head message (status u16, first, last, total u32 big endian) and a body message. Each connection first
 holds a cheap handshake slot (`peer_handshakes_max`); only after it authenticates does it take one of
-`peer_connections_max` serving slots (the big buffers), else it is told 503 (busy). `src/fetch_worker.zig` drives
+`peer_connections_max` serving slots (the big buffers), else it is told 503 (busy). One node name holds
+at most `peer_connections_per_node_max` (2) serving slots at once; its next connection is told 503 too
+(a bound per name, not per attacker: any API client can mint a credential). `src/fetch_worker.zig` drives
 `fetch_plan` over a `Transport` and a `DirImages`.
 
 The `zcube-agent fetch` command, peer discovery over `/v1/list`, the supervisor running the worker before
@@ -297,15 +301,22 @@ and closes a refused connection without a byte. A source is the peer's address w
 out; an IPv6 address counts by its /64 (one host holds the whole range) and an IPv4-mapped IPv6
 address as the IPv4 address it carries (`peer_server.source_key`).
 
-- **One unfinished handshake per source.** While a connection from a source is still in its
-  handshake, another from the same source is refused and not counted below. A stranger that
-  connects and sends nothing therefore holds one connection slot, not all
-  `peer_connections_max`. The refused peer tries again and is admitted once the first handshake
-  has finished or timed out (`peer_handshake_ms`).
-- **A cap per window.** `peer_handshakes_per_source_max` (16) starts per source in
-  `peer_handshake_window_ms` (10 s) counted from the source's first start (`peer_limit.Limiter`).
-  A fetch keeps one stream per peer for up to `peer_connection_requests_max` requests, so an
-  honest node stays far below it.
+A source may be a whole cluster: nodes behind one NAT address, or demo-c2's VMs, whose peers all
+arrive from the host forward's 10.0.2.2. The per-source bounds are therefore sized for many honest
+nodes and bound only unauthenticated work; authenticated work is bounded per node name (the serving
+slots above).
+
+- **A few unfinished handshakes per source.** While `peer_handshakes_pending_per_source_max` (8)
+  connections from a source are still in their handshake, another from the same source is refused
+  and not counted below. Strangers of one address that connect and send nothing therefore hold 8
+  of the `peer_handshakes_max` (32) links, not all of them (and an old stranger is evicted for a
+  newcomer). The refused peer tries again and is admitted once a handshake has finished or timed
+  out (`peer_handshake_ms`).
+- **A cap per window.** `peer_handshakes_per_source_max` (256) starts per source in
+  `peer_handshake_window_ms` (10 s) counted from the source's first start (`peer_limit.Limiter`):
+  at most about 25 handshakes' public-key work a second per address. A fetch keeps one stream per
+  peer for up to `peer_connection_requests_max` requests, so even a server sending 1 GiB/s to all
+  its fetchers together sees about 16 handshakes a second.
 - **A table of `peer_sources_max` (256) sources.** A source whose window ran out frees its slot.
   A table of live windows refuses a new source: the cheapest answer to a flood from many
   addresses, at the cost that honest peers are refused too, for at most one window, until a
