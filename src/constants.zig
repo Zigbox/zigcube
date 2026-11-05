@@ -594,6 +594,37 @@ comptime {
     assert(x509_cert_bytes_max < 65536);
 }
 
+// ---- TLS 1.3 record layer for the mTLS client (docs/briefs/mtls-client.md, slice 3) -----------
+
+/// RFC 8446 section 5.1: the most content bytes one record carries.
+pub const tls_record_plaintext_bytes_max: u32 = 16384;
+/// RFC 8446 section 5.2: a protected record's body (content, type byte, up to 255 bytes of
+/// padding, 16 bytes of tag). Longer is `record_overflow`.
+pub const tls_record_ciphertext_bytes_max: u32 = 16384 + 256;
+/// A record's header: type, legacy version, length.
+pub const tls_record_header_bytes: u32 = 5;
+/// Records one key protects before the client sends a `KeyUpdate`. The AES-GCM bound for
+/// TLS 1.3 (RFC 8446 section 5.5) is about 2^24.5 records per key at a forgery probability of
+/// 2^-57; the same figure applies to a received direction, which the peer must update.
+pub const tls_records_per_key_max: u64 = 1 << 24;
+/// Records past `tls_records_per_key_max` a direction still accepts: exactly the `KeyUpdate` that
+/// replaces the key, and no data.
+pub const tls_records_per_key_slack: u64 = 1;
+/// Key updates one direction accepts in a connection; a peer that updates without end is refused.
+pub const tls_key_updates_per_connection_max: u32 = 1 << 16;
+
+comptime {
+    assert(tls_record_plaintext_bytes_max == 16384);
+    assert(tls_record_ciphertext_bytes_max == tls_record_plaintext_bytes_max + 256);
+    assert(tls_record_ciphertext_bytes_max + tls_record_header_bytes < std.math.maxInt(u16));
+    // The sequence number is a u64 that never wraps (RFC 8446 section 5.3).
+    assert(tls_records_per_key_max + tls_records_per_key_slack < std.math.maxInt(u64));
+    // Well below the AES-GCM limit, and the nonce space (2^64) is nowhere near.
+    assert(tls_records_per_key_max <= 1 << 24);
+    assert(tls_records_per_key_slack >= 1);
+    assert(tls_key_updates_per_connection_max > 0);
+}
+
 comptime {
     assert(peer_handshakes_max > peer_connections_max);
     assert(fetch_busy_retries_max * fetch_busy_sleep_ms < fetch_request_timeout_ms);
