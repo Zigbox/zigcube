@@ -114,7 +114,7 @@ pub fn parse(words: []const []const u8, diag: *Diag) Error!Job {
     return cli_args.refuse(
         diag,
         "{s} is not a job command (run, get, list, cancel or watch)",
-        .{verb},
+        .{before_equals(verb)},
     );
 }
 
@@ -149,7 +149,13 @@ fn get_of(rest: []const []const u8, diag: *Diag) Error!Job {
 }
 
 fn unknown_flag(diag: *Diag, verb: []const u8, flag: []const u8) Error {
-    return cli_args.refuse(diag, "{s} is not a flag of job {s}", .{ flag, verb });
+    return cli_args.refuse(diag, "{s} is not a flag of job {s}", .{ before_equals(flag), verb });
+}
+
+/// The word up to its first `=`: `--env=TOKEN=secret` is named `--env`. A refusal never repeats
+/// what follows, since a mistyped `--env=K=V` carries a secret.
+fn before_equals(word: []const u8) []const u8 {
+    return word[0 .. std.mem.indexOfScalar(u8, word, '=') orelse word.len];
 }
 
 fn list_of(rest: []const []const u8, diag: *Diag) Error!List {
@@ -271,7 +277,8 @@ fn run_flag(run: *Run, flag: []const u8, cursor: *Cursor, diag: *Diag) Error!voi
     } else if (flag.len > 1 and flag[0] == '-') {
         return unknown_flag(diag, "run", flag);
     } else {
-        return cli_args.refuse(diag, "{s} is not part of job run (use flags)", .{flag});
+        const named = before_equals(flag);
+        return cli_args.refuse(diag, "{s} is not part of job run (use flags)", .{named});
     }
 }
 
@@ -283,11 +290,19 @@ fn pair_of(text: []const u8) ?Pair {
 
 fn duration_value(cursor: *Cursor, diag: *Diag, flag: []const u8) Error!u64 {
     const text = try cursor.value(diag, flag, "a duration such as 90s, 10m or 2h");
-    return duration_ms(text) orelse cli_args.refuse(
+    const ms = duration_ms(text) orelse return cli_args.refuse(
         diag,
         "{s} needs a duration such as 500ms, 90s, 10m or 2h, not {s}",
         .{ flag, text },
     );
+    const max: u64 = if (std.mem.eql(u8, flag, "--deadline"))
+        constants.job_deadline_ms_max
+    else
+        constants.job_submit_window_ms_max;
+    if (ms > max) return cli_args.refuse(diag, "{s} is at most {d}m, not {s}", .{
+        flag, max / (60 * 1000), text,
+    });
+    return ms;
 }
 
 /// `500ms`, `90s`, `10m`, `2h`: a whole number and a unit, above 0.
@@ -311,6 +326,21 @@ pub fn duration_ms(text: []const u8) ?u64 {
 
 const testing = std.testing;
 
+test "a refusal of an unknown flag never repeats what follows the =" {
+    // Goal: --env=TOKEN=secret (the GNU spelling) is not echoed. Method: refuse three spellings.
+    const lines = [_][]const []const u8{
+        &.{ "run", "x", "--image", "d", "--env=TOKEN=s3cretvalue", "--command", "a" },
+        &.{ "run", "x", "TOKEN=s3cretvalue", "--command", "a" },
+        &.{ "get", "--env=TOKEN=s3cretvalue" },
+        &.{ "TOKEN=s3cretvalue", "x" },
+    };
+    for (lines) |line| {
+        const cause = try refusal(line);
+        try testing.expect(std.mem.indexOf(u8, cause, "s3cretvalue") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, try refusal(lines[0]), "--env is not a flag") != null);
+}
+
 fn parse_words(words: []const []const u8) !Job {
     var diag: Diag = undefined;
     diag.reset();
@@ -331,7 +361,7 @@ test "job run: every flag, the command takes the rest of the line" {
         "run",          "etl",       "--image",         "sha256:ab",
         "--env",        "A=1",       "--env",           "B=x=y",
         "--input-file", "in.txt",    "--input-env",     "PAYLOAD",
-        "--deadline",   "90s",       "--submit-within", "2h",
+        "--deadline",   "90s",       "--submit-within", "45m",
         "--label",      "team=data", "--command",       "sh",
         "-c",           "--image",   "exit 3",
     });
@@ -345,7 +375,7 @@ test "job run: every flag, the command takes the rest of the line" {
     try testing.expectEqualStrings("in.txt", run.input_file.?);
     try testing.expectEqualStrings("PAYLOAD", run.input_env.?);
     try testing.expectEqual(@as(u64, 90_000), run.deadline_ms);
-    try testing.expectEqual(@as(u64, 2 * 60 * 60 * 1000), run.submit_within_ms);
+    try testing.expectEqual(@as(u64, 45 * 60 * 1000), run.submit_within_ms);
     try testing.expectEqual(@as(usize, 4), run.command.slice().len);
     try testing.expectEqualStrings("--image", run.command.slice()[2]);
 
@@ -367,6 +397,31 @@ test "job get, list, cancel and watch" {
     try testing.expectEqualStrings("etl", (try parse_words(&.{ "cancel", "etl" })).cancel);
     try testing.expect((try parse_words(&.{"watch"})).watch == null);
     try testing.expectEqual(@as(?u64, 42), (try parse_words(&.{ "watch", "--from", "42" })).watch);
+}
+
+test "job run: a duration above its bound is refused with the bound, not blamed on zcube" {
+    // Goal: no ZC-B0001 from a typo. Method: past each maximum, and past what a u64 holds.
+    const cases = [_]struct { line: []const []const u8, cause: []const u8 }{
+        .{
+            .line = &.{ "run", "x", "--image", "d", "--submit-within", "61m", "--command", "a" },
+            .cause = "--submit-within is at most 60m",
+        },
+        .{
+            .line = &.{
+                "run",       "x", "--image", "d", "--submit-within", "18446744073709551000ms",
+                "--command", "a",
+            },
+            .cause = "--submit-within is at most 60m",
+        },
+        .{
+            .line = &.{ "run", "x", "--image", "d", "--deadline", "25h", "--command", "a" },
+            .cause = "--deadline is at most 1440m",
+        },
+    };
+    for (cases) |case| {
+        const cause = try refusal(case.line);
+        try testing.expect(std.mem.indexOf(u8, cause, case.cause) != null);
+    }
 }
 
 test "the refusals of job: each names the part at fault, never an env value" {

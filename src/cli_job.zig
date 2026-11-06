@@ -30,8 +30,9 @@ const Writer = std.Io.Writer;
 
 /// Pages of a listing one command reads before it calls the server's answer broken.
 const pages_max: u32 = 1024;
-/// Endings `job watch` remembers, to print each `(name, epoch)` once across a relist.
-const seen_max = 1024;
+/// Endings `job watch` remembers, to print each `(name, epoch)` once across a relist: the server
+/// keeps at most this many ended jobs, so a relist cannot return more.
+const seen_max = constants.job_admitted_window_max;
 
 pub fn run(
     env: *const Env,
@@ -161,7 +162,8 @@ fn write_pairs(
 /// The input file: UTF-8 text of at most `job_input_bytes_max`. A refusal names the file and
 /// never its content.
 fn read_input(env: *const Env, path: []const u8, report: *Report) Error![]const u8 {
-    const limit: std.Io.Limit = .limited(constants.job_input_bytes_max);
+    // The limit fails a file that reaches it, so one byte more lets exactly the maximum through.
+    const limit: std.Io.Limit = .limited(constants.job_input_bytes_max + 1);
     const cwd = std.Io.Dir.cwd();
     const text = cwd.readFileAlloc(env.io, path, env.arena, limit) catch |err| {
         if (err == error.StreamTooLong) return cli_args.refuse(
@@ -188,7 +190,7 @@ fn read_input(env: *const Env, path: []const u8, report: *Report) Error![]const 
 fn unreadable(report: *Report, path: []const u8, why: []const u8) Error {
     assert(report.diag.code == null);
     report.diag.raise(.E0109);
-    report.diag.while_("reading the input file", .{});
+    report.diag.while_("reading the input file of job run", .{});
     report.diag.cause("{s}: {s}", .{ path, why });
     report.diag.context("file", "{s}", .{path});
     report.diag.fix(.{ .sentence = "check the path of --input-file" });
@@ -238,13 +240,17 @@ fn get(
 /// Every row of `GET /v1/jobs` for a filter, page after page at the revision of the first.
 const Rows = struct { revision: u64, rows: []const Value };
 
+/// Listings `watch` restarts after the server compacted past one, before it calls it broken.
+const relists_max: u32 = 8;
+
 fn read_rows(
     env: *const Env,
     client: *Client,
     state: ?[]const u8,
     label: ?[]const u8,
+    gone_ok: bool,
     report: *Report,
-) Error!Rows {
+) Error!?Rows {
     const arena = env.arena;
     var rows: std.ArrayList(Value) = .empty;
     var revision: u64 = 0;
@@ -260,7 +266,12 @@ fn read_rows(
         if (after) |token| path.writer.print("&at={d}&continue={s}", .{
             revision, try cli_data.percent_encode(arena, token),
         }) catch return error.OutOfMemory;
-        const reply = try client.get(path.written(), report);
+        const reply = if (gone_ok)
+            try client.attempt("GET", path.written(), "", report)
+        else
+            try client.get(path.written(), report);
+        if (gone_ok and reply.status == 410) return null; // Compacted past this listing's `at`.
+        if (reply.status < 200 or reply.status >= 300) return client.fail(reply, report);
         const body = try cli_data.parse(arena, reply, report);
         if (page == 0) revision = cli_data.number(body, "revision") orelse
             return cli_data.contract(report, reply.request_id, "has no revision");
@@ -281,7 +292,7 @@ fn list(
     report: *Report,
 ) Error!void {
     const arena = env.arena;
-    const found = try read_rows(env, client, filter.state, filter.label, report);
+    const found = (try read_rows(env, client, filter.state, filter.label, false, report)).?;
     if (options.output == .json) {
         var out: Writer.Allocating = .init(arena);
         const whole = .{ .revision = found.revision, .jobs = found.rows };
@@ -309,7 +320,11 @@ fn cancel(
     const arena = env.arena;
     subject(report, name);
     const by = try cli_commands.applied_by(env);
-    const body = try std.fmt.allocPrint(arena, "{{\"applied_by\":\"{s}\"}}", .{by});
+    var request: Writer.Allocating = .init(arena);
+    request.writer.writeAll("{\"applied_by\":") catch return error.OutOfMemory;
+    std.json.Stringify.encodeJsonString(by, .{}, &request.writer) catch return error.OutOfMemory;
+    request.writer.writeByte('}') catch return error.OutOfMemory;
+    const body = request.written();
     const reply = try client.send("POST", try job_path(arena, name, "/cancel"), body, report);
     if (options.output == .json) {
         return emit_json(env, reply.body, report);
@@ -325,20 +340,23 @@ fn cancel(
 
 // ---- watch -------------------------------------------------------------------------------
 
-/// The endings already printed, newest over oldest: a `(name, epoch)` is hashed, and a hash
-/// that is in the ring is not printed again.
+/// The endings already printed, oldest first: a `(name, epoch)` is hashed. The array holds
+/// `seen_max` keys, the most a relist can return, so a listing never evicts a key it still has
+/// to look up.
 const Seen = struct {
     keys: [seen_max]u64 = @splat(0),
+    count: u32 = 0,
     next: u32 = 0,
 
     /// True if `(name, epoch)` was seen; otherwise remembers it.
     fn seen(ring: *Seen, name: []const u8, epoch: u64) bool {
         const key = std.hash.Wyhash.hash(epoch, name) | 1;
-        for (ring.keys) |known| {
+        for (ring.keys[0..ring.count]) |known| {
             if (known == key) return true;
         }
         ring.keys[ring.next] = key;
         ring.next = (ring.next + 1) % seen_max;
+        ring.count = @min(ring.count + 1, seen_max);
         return false;
     }
 };
@@ -426,7 +444,10 @@ fn relist(
     ring: *Seen,
     report: *Report,
 ) Error!u64 {
-    const found = try read_rows(env, client, "ended", null, report);
+    var tries: u32 = 0;
+    const found = while (tries < relists_max) : (tries += 1) {
+        if (try read_rows(env, client, "ended", null, true, report)) |rows| break rows;
+    } else return cli_data.contract(report, report.request_id.slice(), "keeps being compacted");
     for (found.rows) |row| {
         const name = cli_data.text(row, "name") orelse continue;
         try print_ending(env, options, ring, name, row, report);
@@ -513,4 +534,211 @@ test "a watch that is told 410 lists the endings, skips the ones it printed, and
     try testing.expectEqualStrings("", stderr.written());
     try testing.expectEqual(@as(usize, 4), script.paths.items.len);
     try testing.expect(std.mem.startsWith(u8, script.paths.items[3], "/v1/jobs/watch?from=21&"));
+}
+
+/// A scripted server for the tests below: a listing of `total` endings in pages of 500, a watch
+/// that is gone `gone_watches` times, a first listing that is gone once at its second page when
+/// `gone_midway`, and every body that was posted.
+const Big = struct {
+    arena: Allocator,
+    total: u32,
+    gone_watches: u32,
+    gone_midway: bool = false,
+    watches: u32 = 0,
+    lists: u32 = 0,
+    posted: std.ArrayList([]const u8) = .empty,
+    /// The answer to `GET /v1/jobs/x`, when not empty.
+    job_body: []const u8 = "",
+
+    fn exchange(
+        context: *anyopaque,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) ?[]const u8 {
+        const big: *Big = @ptrCast(@alignCast(context));
+        var script: Script = .{ .arena = big.arena };
+        if (std.mem.eql(u8, method, "POST")) {
+            big.posted.append(big.arena, body) catch unreachable; // The test arena has room.
+            return script.reply(200, "{\"state\":\"cancelled\"}");
+        }
+        if (std.mem.startsWith(u8, path, "/v1/jobs?limit=1")) {
+            return script.reply(200, "{\"revision\":10,\"jobs\":[]}");
+        }
+        if (std.mem.startsWith(u8, path, "/v1/jobs/watch?")) {
+            big.watches += 1;
+            if (big.watches <= big.gone_watches) return script.reply(410, "{}");
+            return script.reply(200, "{\"revision\":30,\"events\":[]}");
+        }
+        if (big.job_body.len > 0 and std.mem.startsWith(u8, path, "/v1/jobs/x")) {
+            return script.reply(200, big.job_body);
+        }
+        return big.page(path);
+    }
+
+    fn page(big: *Big, path: []const u8) []const u8 {
+        var script: Script = .{ .arena = big.arena };
+        const marker = "&continue=p";
+        const first: u32 = if (std.mem.indexOf(u8, path, marker)) |at|
+            std.fmt.parseInt(u32, path[at + marker.len ..], 10) catch unreachable // Our token.
+        else
+            0;
+        if (first == 0) big.lists += 1;
+        if (big.gone_midway and big.lists == 1 and first == 500) return script.reply(410, "{}");
+        var out: Writer.Allocating = .init(big.arena);
+        out.writer.writeAll("{\"revision\":20,\"jobs\":[") catch unreachable; // The arena has room.
+        const last = @min(first + 500, big.total);
+        for (first..last) |index| {
+            if (index > first) out.writer.writeByte(',') catch unreachable; // The arena has room.
+            out.writer.print(
+                "{{\"name\":\"j{d}\",\"state\":\"exited\",\"node\":\"n\",\"epoch\":1," ++
+                    "\"end\":{{\"kind\":\"exited\",\"code\":0}}}}",
+                .{index},
+            ) catch unreachable; // The arena has room.
+        }
+        out.writer.writeByte(']') catch unreachable; // The arena has room.
+        if (last < big.total) out.writer.print(",\"continue\":\"p{d}\"", .{last}) catch
+            unreachable; // The arena has room.
+        out.writer.writeByte('}') catch unreachable; // The arena has room.
+        return script.reply(200, out.written());
+    }
+};
+
+fn big_run(
+    arena: Allocator,
+    big: *Big,
+    words: []const []const u8,
+    user: []const u8,
+    rounds: u32,
+    stdout: *Writer.Allocating,
+) !u8 {
+    var environ = std.process.Environ.Map.init(testing.allocator);
+    defer environ.deinit();
+    try environ.put("ZCUBE_SERVER", "127.0.0.1:1");
+    try environ.put("USER", user);
+    var stderr: Writer.Allocating = .init(arena);
+    const env: Env = .{
+        .io = testing.io,
+        .arena = arena,
+        .environ = &environ,
+        .stdout = &stdout.writer,
+        .stderr = &stderr.writer,
+        .stdin = null,
+        .stdin_is_terminal = false,
+        .stderr_is_terminal = false,
+        .version = "0.0.0-test",
+        .deterministic_ids = true,
+        .job_rounds_max = rounds,
+        .transport = .{ .context = big, .exchange = Big.exchange },
+    };
+    return @import("cli.zig").run(&env, words);
+}
+
+test "a relist of more endings than 1,024 prints each ending once, however often it repeats" {
+    // Goal: exactly-once across relists (api.md). Method: 2,000 endings in four pages; the first
+    // listing is gone at its second page and restarts, then the watch is gone twice more, so
+    // the endings are listed three times; each prints once.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var big: Big = .{ .arena = arena, .total = 2000, .gone_watches = 3, .gone_midway = true };
+    var stdout: Writer.Allocating = .init(arena);
+    const words: []const []const u8 = &.{ "job", "watch" };
+    try testing.expectEqual(@as(u8, 0), try big_run(arena, &big, words, "u", 4, &stdout));
+    try testing.expectEqual(@as(u32, 4), big.lists); // A restart, then two more listings.
+    var lines = std.mem.splitScalar(u8, stdout.written(), '\n');
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    var count: u32 = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        count += 1;
+        const name = line[0..std.mem.indexOfScalar(u8, line, ' ').?];
+        try testing.expect(!names.contains(name));
+        try names.put(arena, name, {});
+    }
+    try testing.expectEqual(@as(u32, 2000), count);
+}
+
+test "job cancel escapes the user in its body" {
+    // Goal: USER='CORP\jdoe' can cancel. Method: the body the server is sent is JSON that parses.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var big: Big = .{ .arena = arena, .total = 0, .gone_watches = 0 };
+    var stdout: Writer.Allocating = .init(arena);
+    const user = "CORP\\jdo\"e";
+    const words: []const []const u8 = &.{ "job", "cancel", "j1" };
+    try testing.expectEqual(@as(u8, 0), try big_run(arena, &big, words, user, 1, &stdout));
+    try testing.expectEqual(@as(usize, 1), big.posted.items.len);
+    const parsed = try std.json.parseFromSliceLeaky(
+        struct { applied_by: []const u8 },
+        arena,
+        big.posted.items[0],
+        .{},
+    );
+    try testing.expect(std.mem.startsWith(u8, parsed.applied_by, "CORP\\jdo\"e@"));
+}
+
+test "an input file of exactly 64 KiB is read, one byte more is refused" {
+    // Goal: the server's `<=` (job_api.zig). Method: two files in a scratch directory.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const exact = try arena.alloc(u8, constants.job_input_bytes_max);
+    @memset(exact, 'a');
+    const over = try arena.alloc(u8, constants.job_input_bytes_max + 1);
+    @memset(over, 'a');
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "exact", .data = exact });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "over", .data = over });
+    var environ = std.process.Environ.Map.init(testing.allocator);
+    defer environ.deinit();
+    var stdout: Writer.Allocating = .init(arena);
+    const env: Env = .{
+        .io = testing.io,
+        .arena = arena,
+        .environ = &environ,
+        .stdout = &stdout.writer,
+        .stderr = &stdout.writer,
+        .stdin = null,
+        .stdin_is_terminal = false,
+        .stderr_is_terminal = false,
+        .version = "0.0.0-test",
+        .deterministic_ids = true,
+    };
+    var report: Report = undefined;
+    report.reset();
+    const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/", .{tmp.sub_path});
+    const text = try read_input(&env, try std.fmt.allocPrint(arena, "{s}exact", .{root}), &report);
+    try testing.expectEqual(@as(usize, constants.job_input_bytes_max), text.len);
+    const over_path = try std.fmt.allocPrint(arena, "{s}over", .{root});
+    try testing.expectError(error.Failed, read_input(&env, over_path, &report));
+    try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0111), report.diag.code);
+}
+
+test "job get --wait exits 0, 10, 11 or 12 by how the job ended" {
+    // Goal: the brief's exit codes, golden-tested. Method: a job that has ended each way, as the
+    // server states it; the exit code and the first line of the text are compared.
+    const Case = struct { state: []const u8, end: []const u8, code: u8 };
+    const exited = "{\"kind\":\"exited\",\"code\":";
+    const cases = [_]Case{
+        .{ .state = "exited", .end = exited ++ "0}", .code = 0 },
+        .{ .state = "exited", .end = exited ++ "3}", .code = 10 },
+        .{ .state = "failed", .end = "{\"kind\":\"failed\",\"cause\":\"oom\"}", .code = 11 },
+        .{ .state = "cancelled", .end = "{\"kind\":\"cancelled\"}", .code = 12 },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (cases) |case| {
+        const format = "{{\"revision\":5,\"job\":{{\"name\":\"x\"}},\"state\":\"{s}\"," ++
+            "\"status\":{{\"state\":\"{s}\",\"epoch\":1,\"end\":{s}}}}}";
+        var big: Big = .{ .arena = arena, .total = 0, .gone_watches = 0 };
+        big.job_body = try std.fmt.allocPrint(arena, format, .{ case.state, case.state, case.end });
+        var stdout: Writer.Allocating = .init(arena);
+        const words: []const []const u8 = &.{ "job", "get", "x", "--wait" };
+        try testing.expectEqual(case.code, try big_run(arena, &big, words, "u", 1, &stdout));
+        try testing.expect(std.mem.indexOf(u8, stdout.written(), case.state) != null);
+    }
 }

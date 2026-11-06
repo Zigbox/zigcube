@@ -14,12 +14,14 @@ Date: 2026-11-06. Branch `claude/b1-slice-7`, stacked on slice 6 (#139).
   `/v1/job-status/<name>`, not `/v1/jobs/<name>` (that holds env values and the input).
 - **`--command` ends option parsing** and takes the rest of the line (at most `cli_args_max` = 64
   words).
-- **Input file**: UTF-8, at most 64 KiB, else `ZC-E0111`; unreadable is `ZC-E0109` (its text says
-  "service file"; reused, no new code).
+- **Input file**: UTF-8, at most 64 KiB, else `ZC-E0111`; unreadable is `ZC-E0109` (reworded to cover any file; see
+  2026-11-06-e0109-covers-input-files.md).
 - **Watch resume**: head start via `/v1/jobs?limit=1`; on 410 `ZC-E0203` it relists
   `state=ended` (paged with `at`/`continue`), dedupes by (name, epoch) and continues from the
-  list's revision. Private bounds: 1,024 pages (`ZC-E0103` beyond) and a ring of 1,024 hashed
-  keys, so a relist larger than the ring can print an ending twice.
+  list's revision. Private bounds: 1,024 pages (`ZC-E0103` beyond) and 8,192 hashed keys
+  (`job_admitted_window_max`), so a relist never prints an ending twice. A 410 during relist paging
+  restarts the listing (8 times at most). Rows carry no revision, so a relist also prints endings
+  from before `--from`.
 - Golden harness: for `job` cases the style flags go before the args (`--command` would swallow
   them). E0130-E0134 now use job commands; their verbose goldens changed accordingly.
 

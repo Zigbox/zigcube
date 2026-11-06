@@ -1,4 +1,4 @@
-request  r-0000001  GET /v1/jobs/x  400
+request  r-0000001  GET /v1/jobs/x  404
 error[ZC-E0133]: no job by that name
   cause  no job named train-7
   reqid  r-0000001

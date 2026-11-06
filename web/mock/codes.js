@@ -60,8 +60,8 @@ export const ZC_CODES = [
     "code": "ZC-E0109",
     "severity": "error",
     "blame": "user",
-    "summary": "the service file can't be read",
-    "explanation": "zcube apply could not read the file it was given: it does not exist, is\nnot a regular file, is larger than a service file may be (64 KiB), or you\nmay not read it. Nothing was sent to the server.\n\nThe cause line names the path and the system's reason. Check the path, or\nrun zcube apply from the directory that holds the file."
+    "summary": "a file named on the command line can't be read",
+    "explanation": "zcube could not read a file the command names: the service file of\nzcube apply, or the input file of zcube job run. It does not exist, is\nnot a regular file, or you may not read it, or zcube would need more\nmemory than it may use to read it. Nothing was sent to the server.\n\nThe cause line names the path and the system's reason. Check the path, or\nrun zcube from the directory that holds the file."
   },
   {
     "code": "ZC-E0110",

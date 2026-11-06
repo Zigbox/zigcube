@@ -1004,7 +1004,15 @@ fn diagnostic_reply(arena: Allocator, build: *const fn (*diag_mod.Diag) void) []
         .external => 502,
         .internal => 500,
     };
-    return http(arena, .{ .status = status, .body = body });
+    // The statuses docs/api.md gives the job conflicts.
+    const sent: u16 = switch (diag.code.?) {
+        .E0131 => 409,
+        .E0132 => 429,
+        .E0133 => 404,
+        .E0134 => 410,
+        else => status,
+    };
+    return http(arena, .{ .status = sent, .body = body });
 }
 
 fn exchange(

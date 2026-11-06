@@ -259,14 +259,15 @@ pub const registry = [_]Entry{
         .code = .E0109,
         .severity = .@"error",
         .blame = .user,
-        .summary = "the service file can't be read",
+        .summary = "a file named on the command line can't be read",
         .explanation =
-        \\zcube apply could not read the file it was given: it does not exist, is
-        \\not a regular file, is larger than a service file may be (64 KiB), or you
-        \\may not read it. Nothing was sent to the server.
+        \\zcube could not read a file the command names: the service file of
+        \\zcube apply, or the input file of zcube job run. It does not exist, is
+        \\not a regular file, or you may not read it, or zcube would need more
+        \\memory than it may use to read it. Nothing was sent to the server.
         \\
         \\The cause line names the path and the system's reason. Check the path, or
-        \\run zcube apply from the directory that holds the file.
+        \\run zcube from the directory that holds the file.
         ,
     },
     .{

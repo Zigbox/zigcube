@@ -68,7 +68,7 @@ applied service hello: replicas 3 → 5
   node. `get service -o wide` and `get replicas -o wide` gain a `SOURCE` column, and `-o json`
   a `source` member, only for a service that has one. An unknown field is an
   error, so a typo is not silently ignored. Every problem is `ZC-E0110` with the file, line and
-  column and the line itself (`--verbose`); a file that can't be read is `ZC-E0109`. Nothing is
+  column and the line itself (`--verbose`); a file that can't be read is `ZC-E0109` (any file a command names: the service file, the input file of `job run`). Nothing is
   sent before the file is valid.
 - The change is recorded as `user@host` (`$USER` and the host name); the server does not check it
   (writes are unauthenticated until auth exists, [api.md](api.md)).
@@ -227,8 +227,12 @@ none match. `--state` is a job state or `ended`. `job watch` prints one line per
 (`etl  exited (code 0)  node1`; `--output json`: `{"name","status"}`), and `--from REV` resumes
 after a revision. If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the
 ended jobs, skips those it has already printed (by name and epoch) and goes on from the list's
-revision. The dedupe is a ring of 1,024 keys, so a relist of more endings than that may print an
-ending twice (at least once, not exactly once); a list of more than 1,024 pages is `ZC-E0103`.
+revision. The dedupe holds `job_admitted_window_max` (8,192) keys, the most ended jobs the server keeps,
+so each ending prints once however often the watch relists. A relist prints every ended job
+the server still has, including those from before the watch began or before `--from` (a listed
+row carries no revision to tell them apart); a server that compacts past a listing's page
+restarts the listing (up to 8 times, then `ZC-E0103`); a list of more than 1,024 pages is
+`ZC-E0103`.
 
 `job logs` is not here: slice 8 is cut.
 
@@ -345,7 +349,7 @@ repair's `ZC-E0401` to `E0403` ([api.md](api.md)).
 
 | Code | Blame | Summary |
 | --- | --- | --- |
-| `ZC-E0109` | user | the service file can't be read |
+| `ZC-E0109` | user | a file named on the command line can't be read |
 | `ZC-E0110` | user | the service file isn't valid |
 | `ZC-E0111` | user | the command line can't be understood |
 | `ZC-E0112` | user | the server address can't be used |
