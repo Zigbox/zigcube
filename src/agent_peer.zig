@@ -198,12 +198,12 @@ pub const Peer = struct {
         var ca_text: [65]u8 = undefined;
         const ca_line = std.fmt.bufPrint(&ca_text, "{x}\n", .{&self.ca_public.?}) catch
             unreachable; // Sized.
-        try files.write(self.io, self.dir, self.where, ca_file, ca_line, diag);
+        try files.write(self.io, self.dir, self.where, ca_file, ca_line, 0o600, diag);
         const bytes = peer.encode(&self.credential.?);
         var credential_text: [peer.credential_bytes * 2 + 1]u8 = undefined;
         const line = std.fmt.bufPrint(&credential_text, "{x}\n", .{&bytes}) catch
             unreachable; // Sized.
-        try files.write(self.io, self.dir, self.where, credential_file, line, diag);
+        try files.write(self.io, self.dir, self.where, credential_file, line, 0o600, diag);
     }
 
     /// Reads `peer.cred` and `ca.pub`. A pair that does not belong to this key and node is

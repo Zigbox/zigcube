@@ -164,7 +164,7 @@ fn write_certificate(
     };
     var text: [pem_bytes_max]u8 = undefined;
     const pem = pem_encode(&text, certificate.slice());
-    return files.write(io, dir, path, name, pem, diag);
+    return files.write(io, dir, path, name, pem, 0o600, diag);
 }
 
 /// `bytes` as one PEM CERTIFICATE block: 64 base64 characters a line, a newline after each.
