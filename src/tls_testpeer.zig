@@ -476,8 +476,10 @@ var request_buffer: [512]u8 = undefined;
 var damage_buffer: [constants.tls_handshake_message_bytes_max + 1]u8 = undefined;
 
 /// A handshake message with its content damaged and its length field made to match: the last
-/// body byte gone, one byte more, one body byte flipped, or no body. `damage / 4` picks how and
-/// `damage / 16` where. The result is always different from `bytes`.
+/// body byte gone, one byte more, one body byte flipped, or no body. `damage / 4 % 4` picks
+/// how. The flip reads its position from `damage / 16` and its mask from `damage / 64` (so the
+/// two overlap in bits); the extra byte is `damage / 16`; the other two read nothing more. The
+/// result is always different from `bytes`.
 fn damage_message(bytes: []const u8, damage: u32) []const u8 {
     assert(bytes.len >= 4 + 1);
     assert(bytes.len <= constants.tls_handshake_message_bytes_max);

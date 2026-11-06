@@ -1603,11 +1603,12 @@ pub const registry = [_]Entry{
         \\The client was told to present a certificate and the server did not ask
         \\for one, or the server refused the one presented (the alert names why:
         \\bad_certificate, certificate_expired, unknown_ca, certificate_required).
-        \\A required client facing a request that does not list Ed25519, or having
-        \\no certificate to show, is refused too, and so is an optional one that
-        \\sent an empty Certificate where the server insists on one. The
-        \\connection is closed; a refusal arrives after the client's own handshake
-        \\is done, so data written before the alert was read was not accepted.
+        \\A client that sends an empty Certificate (it has no certificate, or the
+        \\request does not list Ed25519) and is refused by the server is this too,
+        \\and so is a client that must authenticate facing a request without
+        \\Ed25519. The connection is closed; a refusal arrives after the client's
+        \\own handshake is done, so data written before the alert was read was
+        \\not accepted.
         \\
         \\A server that never asks cannot learn which workload is calling, so a
         \\connection that must prove identity stops. Check that the server is
@@ -1812,7 +1813,9 @@ comptime {
     assert(registry.len == fields.len);
     assert(fields.len <= std.math.maxInt(u8));
     assert(prefix.len + tag_bytes <= constants.diag_code_bytes_max);
-    @setEvalBranchQuota(300_000);
+    // The check walks every byte of every summary and explanation (about 4 branches a byte).
+    @setEvalBranchQuota(registry.len * (constants.diag_explanation_bytes_max +
+        constants.diag_summary_bytes_max) * 8);
     for (registry, fields, 0..) |item, name, index| {
         assert(@backingInt(item.code) == index);
         assert(std.mem.eql(u8, @tagName(item.code), name));

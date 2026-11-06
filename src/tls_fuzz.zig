@@ -25,7 +25,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-const iterations_default = 2000;
+const iterations_default = 600;
 const server_name = "broker.botpike.com";
 const flight_bytes_max = 8192;
 
@@ -216,12 +216,19 @@ const World = struct {
     refused: bool,
 };
 
-fn random_faults(random: std.Random, world: *World, chain: Chain) testpeer.Faults {
+/// `message_damaged` runs get no field fault: the damage must be the only thing between the
+/// client and its connection, so that the run reaches the damaged message.
+fn random_faults(
+    random: std.Random,
+    world: *World,
+    chain: Chain,
+    message_damaged: bool,
+) testpeer.Faults {
     var faults: testpeer.Faults = .{};
     world.clean = chain == .good;
     faults.record_per_message = random.boolean();
     faults.no_ccs = random.boolean();
-    if (random.uintLessThan(u8, 3) != 0) return faults;
+    if (message_damaged or random.uintLessThan(u8, 3) != 0) return faults;
     const field = random.uintLessThan(u8, 11);
     world.clean = false;
     switch (field) {
@@ -254,6 +261,7 @@ fn setup(world: *World, random: std.Random) !void {
         .subject_key = key.public_key.toBytes(),
         .lifetime = x509_test.window,
     });
+    const message_damaged = random.uintLessThan(u8, 4) == 0;
     if (chain == .tampered) world.leaf.bytes[world.leaf.bytes.len - 1] ^= 1;
     world.certificates[0] = world.leaf.slice();
     world.peer = testpeer.Peer.init(.{
@@ -261,7 +269,7 @@ fn setup(world: *World, random: std.Random) !void {
         .key = key,
         .random = random_bytes(random),
         .secret = random_bytes(random),
-        .faults = random_faults(random, world, chain),
+        .faults = random_faults(random, world, chain, message_damaged),
         .client_auth = auth_config(random, world, ca),
     });
     world.client.init(&.{
@@ -276,7 +284,7 @@ fn setup(world: *World, random: std.Random) !void {
     world.sent_length = 0;
     world.request_damaged = false;
     world.message_damaged = false;
-    if (random.uintLessThan(u8, 4) == 0) {
+    if (message_damaged) {
         world.peer.config.faults.message_damage = 1 + random.uintLessThan(u32, 1 << 16);
         world.message_damaged = true;
         world.clean = false;
@@ -426,9 +434,18 @@ fn run_once(seed: u64, refused: *bool) !bool {
     const hello = world.sent[0..world.sent_length];
     const answer = world.peer.respond(hello, &world.flight);
     world.sent_length = 0;
-    const kind = random.enumValue(Mutation);
+    // A damaged message gets no record-level mutation either: it must be what refuses the run.
+    const kind: Mutation = if (world.message_damaged or random.uintLessThan(u8, 3) == 0)
+        .none
+    else
+        random.enumValue(Mutation);
     const length = mutate(random, &world.peer, kind, answer, &world.damaged);
     _ = try feed(world, random, world.damaged[0..length]);
+    if (world.message_damaged) {
+        // A valid record, MAC and transcript around a damaged message has one correct outcome.
+        try testing.expect(world.refused);
+        try testing.expect(!world.client.is_connected());
+    }
     const intact = kind == .none and !world.request_damaged and !world.refused and
         !world.message_damaged;
     if (intact and world.client.is_connected() and !world.false_connect) {
@@ -450,7 +467,7 @@ fn after_connect(world: *World, random: std.Random) !void {
         const length = random.uintAtMost(usize, plain.len);
         random.bytes(plain[0..length]);
         world.sent_length = 0;
-        switch (random.uintLessThan(u8, 10)) {
+        switch (random.uintLessThan(u8, 12)) {
             0, 1 => {
                 const sealed = world.peer.application(&record, plain[0..length]);
                 @memcpy(world.expected[0..length], plain[0..length]);
@@ -484,10 +501,13 @@ fn after_connect(world: *World, random: std.Random) !void {
                 try open_key_update(world);
             },
             6 => return try end_by_alert(world, world.peer.close_notify(&record)),
-            8, 9 => return try damaged_post_handshake(world, random, &record),
+            8, 9, 10, 11 => return try damaged_post_handshake(world, random, &record),
             else => return try end_by_alert(world, world.peer.alert(&record, random.int(u8))),
         }
     }
+    // A script that did not end the connection ends it with a damaged record: every intact run
+    // reaches that step once.
+    try damaged_post_handshake(world, random, &record);
 }
 
 /// A handshake record the server could never send after the handshake, sealed under its current

@@ -29,9 +29,7 @@ Date: 2026-11-05. Slice 5 of `docs/briefs/mtls-client.md`.
 - **Constants raised** (`constants.zig`): `tls_output_bytes_max` now holds the change_cipher_spec,
   the client certificate record, the CertificateVerify record and the Finished record (about 2.5
   KiB), because the whole final flight is queued in one step. The reassembly buffer stays 8192
-  bytes. The client sends a Certificate of at most `tls_client_certificate_bytes_max` and accepts
-  a handshake message of at most `tls_handshake_message_bytes_max`; a comptime assert checks
-  that the first is no larger than the second, and the buffer holds two of the second.
+  bytes, which holds the largest message the client sends or accepts (comptime-asserted).
 - `send_key_update` and `close_notify` are for the connection layer (slice 6) to rotate sooner or
   end; tested both ways. A test crossing a test-sized record limit is slice 6's.
 
