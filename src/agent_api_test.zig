@@ -1112,6 +1112,9 @@ test "a damaged input value is ZC-E0523, with nothing left in the diagnostic" {
     const response = rig.call("GET", "/v1/agent/nodes/node2/runs/train/input", "", "");
     try rig.refused(response, response.status, "ZC-E0523");
     try testing.expect(std.mem.indexOf(u8, response.body, records.input_mismatch_phrase) != null);
+    // Wire protocol: the agent's client matches this literal text (agent_client_test.zig pins
+    // the same literal on its side). Change both together, with a version bump.
+    try testing.expect(std.mem.indexOf(u8, response.body, "does not match its digest") != null);
     // Nothing of the failed read stays: the answer carries one diagnostic and one cause.
     const body = try rig.json(response);
     const diagnostics = body.object.get("diagnostics").?.array.items;
