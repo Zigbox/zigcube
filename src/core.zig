@@ -15,6 +15,7 @@ pub const modules = .{
     @import("agent.zig"),
     @import("agent_api.zig"),
     @import("agent_client.zig"),
+    @import("agent_jobs.zig"),
     @import("agent_loop.zig"),
     @import("fencing.zig"),
     @import("agent_records.zig"),
@@ -173,4 +174,5 @@ test {
     _ = @import("agent_api_test.zig");
     _ = @import("agent_fence_test.zig");
     _ = @import("agent_client_test.zig");
+    _ = @import("agent_jobs_test.zig");
 }
