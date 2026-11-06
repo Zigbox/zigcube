@@ -342,8 +342,9 @@ fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Err
     return .{ .world = world, .more = listed.continue_after != null };
 }
 
-/// The record, at the key `key_of_job` names, of each of `jobs` (a page: at most `job_controller_page_max`), read
-/// by key at the step's revision, ascending. A job with none has no entry. Records of no job on
+/// The record, at the key `key_of_job` names, of each of `jobs` (a page: at most
+/// `job_controller_page_max`), read by key at the step's revision, ascending. A job with none has
+/// no entry. Records of no job on
 /// the page (orphans: a restore, a hand edit) are never listed, so they cost nothing however many
 /// there are.
 fn read_each(
