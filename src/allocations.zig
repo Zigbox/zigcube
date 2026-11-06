@@ -66,7 +66,7 @@ pub fn reconstruct(ctx: *const Context) Error!Reconstruction {
         ctx,
         records.prefix_assigned,
         null,
-        constants.replicas_max,
+        constants.assigned_max,
     );
     const allocations = try controller.list_all(
         records.Allocation,

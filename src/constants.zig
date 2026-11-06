@@ -909,6 +909,13 @@ pub const jobs_per_node_max: u32 = 64;
 /// The runs list of one node (`GET /v1/agent/nodes/{node}/runs`): more is ZC-E0302, as for
 /// replicas. One unpaged reply, so it stays under half a page (comptime below).
 pub const agent_node_runs_max: u32 = jobs_per_node_max;
+/// `/assigned/` holds the assignments of replicas and of runs, so every list of it is bounded by
+/// both: a list with `replicas_max` alone fails (ZC-E0302) on a cluster with 300 replicas and 300
+/// jobs (docs/briefs/b1-1.md).
+pub const assigned_max: u32 = replicas_max + jobs_max;
+/// The assignments of one node: its replicas and its runs. A node holds at most
+/// `runtime_handles_max` of the two together (the scheduler refuses more), which this covers.
+pub const agent_node_assigned_max: u32 = agent_node_replicas_max + agent_node_runs_max;
 /// A run record, as encoded: the spec without the input. Enforced on the encoded JSON by
 /// `records.encode` and `records.read`, not inferred from the raw sizes of its members: JSON
 /// escaping turns one control byte into six.
@@ -946,11 +953,26 @@ pub const job_admitted_window_max: u32 = 8192;
 pub const job_admission_window_h: u32 = 73;
 /// Longest run id: `<name>-job`.
 pub const job_run_id_bytes_max: u32 = service_name_bytes_max + "-job".len;
+/// Jobs the job controller reads and judges at a time. `/jobs/` holds up to
+/// `job_admitted_window_max` records (ended jobs stay until retention), far more than one step's
+/// arena holds with their runs, statuses and reports, so it reads a page of jobs with exactly the
+/// records they need into an arena of its own, frees it, and goes on.
+pub const job_controller_page_max: u32 = 16;
+/// What one page of the job controller holds at most: per job the job, its run, its status and
+/// its report (each a record of at most `job_run_bytes_max`), plus a page of decisions read to
+/// tell whether it already decided (`decisions_per_subject_max` index entries of 512 bytes).
+pub const job_controller_page_bytes_max: u64 = @as(u64, job_controller_page_max) *
+    (4 * job_run_bytes_max) + @as(u64, decisions_per_subject_max) * 512 * job_controller_page_max;
 
 comptime {
     assert(jobs_per_node_max <= runtime_handles_max);
     assert(jobs_max > 0);
     assert(agent_node_runs_max <= jobs_per_node_max);
+    assert(assigned_max == replicas_max + jobs_max);
+    assert(agent_node_assigned_max >= runtime_handles_max);
+    // An assignment is a few hundred bytes (its reason is a sentence); the whole list is read into
+    // the step's arena beside the other lists, so it keeps to a fraction of it.
+    assert(assigned_max * 1024 <= request_arena_bytes_max / 8);
     // The reply is not paged: at most half a store page, as the replicas list is bounded by
     // `store_list_limit_max`.
     assert(agent_node_runs_max * job_run_bytes_max <= store_page_bytes_max / 2);
@@ -978,6 +1000,11 @@ comptime {
     const window_ms = 2 * job_deadline_ms_max + job_finished_age_ms_max + job_submit_window_ms_max;
     assert(window_ms == @as(u64, job_admission_window_h) * 60 * 60 * 1000);
     assert(job_admitted_window_max >= jobs_max);
+    assert(job_controller_page_max > 0);
+    assert(job_controller_page_max <= store_list_limit_max);
+    // The pages are freed one by one, so one page is what the job controller costs the step's
+    // arena beyond the lists it reads once (nodes, their statuses and the assignments).
+    assert(job_controller_page_bytes_max <= request_arena_bytes_max / 4);
     // One aggregate record: an hour's count per hour of the window, in JSON, in one value.
     // An entry is at most 49 bytes (`{"hour":N,"count":N},` with N up to 13 and 10 digits), and a
     // record holds at most `job_admission_window_h + 1` of them (`admission_valid`).

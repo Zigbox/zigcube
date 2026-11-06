@@ -727,7 +727,7 @@ const Pass = struct {
             &ctx,
             assigned_prefix.slice(),
             null,
-            constants.replicas_max,
+            constants.agent_node_assigned_max,
         );
         var wanted: std.StringHashMapUnmanaged(void) = .empty;
         for (given.items) |entry| {

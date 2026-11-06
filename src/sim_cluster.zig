@@ -1780,7 +1780,7 @@ fn read_homes(c: *Cluster, ctx: *const controller.Context) Failure!Homes {
         ctx,
         records.prefix_assigned,
         null,
-        constants.replicas_max,
+        constants.assigned_max,
     ) catch {
         try check(c, false, "the assignments cannot be read");
         return error.StepFailed;

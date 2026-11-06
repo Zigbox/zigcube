@@ -163,6 +163,27 @@ test "list pages, reverses, reads at a revision and keeps env values from a read
     try rig.refused(rig.get("/v1/list", "at=1"), 410, "ZC-E0203");
 }
 
+test "a read-only token sees neither a job run's env values nor its input digest" {
+    // Goal: GET /v1/list redaction covers /job-runs/ as it covers /jobs/. Method: put a run
+    // record with a secret and a digest, read it back with both token kinds.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    const run =
+        \\{"v":1,"id":"j-1","job":"j","image":"i","command":["x"],"env":[["K","s3cr3t"]],
+        \\"deadline_ms":1,"input_digest":"sha256:dd","start_by_ms":1,"created_at_ms":1}
+    ;
+    const put = [_]store.Op{.{ .put = .{ .key = "/job-runs/j-1", .value = run } }};
+    _ = try rig.world.store_handle().txn(.{ .on_success = &put }, &rig.world.diag);
+
+    const hidden = rig.get("/v1/list", "prefix=/job-runs/");
+    try testing.expect(std.mem.indexOf(u8, hidden.body, "s3cr3t") == null);
+    try testing.expect(std.mem.indexOf(u8, hidden.body, "sha256:dd") == null);
+    rig.api.read_only = false;
+    const shown = rig.get("/v1/list", "prefix=/job-runs/");
+    try testing.expect(std.mem.indexOf(u8, shown.body, "s3cr3t") != null);
+    try testing.expect(std.mem.indexOf(u8, shown.body, "sha256:dd") != null);
+}
+
 test "watch answers what is ready with a bookmark and leaves the waiting to the shell" {
     // Goal: api.md, "GET /v1/watch": ordered events from `from`, an idle answer that still
     // advances the bookmark, repeated prefixes, deletes with a null value, 410 and 400.
@@ -890,6 +911,15 @@ test "the replies that change nothing carry the job's state, not pending" {
     const ended = post_job(&rig, "/v1/jobs/short/cancel", "");
     try testing.expectEqual(@as(u16, 200), ended.status);
     try testing.expectEqualStrings("exited", field(try rig.json(ended), "state").string);
+    // Goal of the next lines: `state=ended` lists every terminal state and no other.
+    const live = try job_json(&rig, "live", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", live).status);
+    const only_ended = try rig.ok("/v1/jobs", "state=ended");
+    const rows = field(only_ended, "jobs").array.items;
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("short", field(rows[0], "name").string);
+    const pending_rows = field(try rig.ok("/v1/jobs", "state=pending"), "jobs").array.items;
+    try testing.expectEqual(@as(usize, 1), pending_rows.len);
     // A job without a status is pending in all three replies.
     const fresh = try job_json(&rig, "fresh", "b3:51aa9c03");
     try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", fresh).status);
@@ -919,7 +949,14 @@ test "a relay array filling the whole body is refused by name, without building 
     const rest = body.len - tail.len;
     @memset(body[at..rest], ' ');
     @memcpy(body[rest..], tail);
-    const response = post_job(&rig, "/v1/jobs", body);
+    // The parse runs in an arena of its own: every byte it took, chunk overhead included, is at
+    // most what the production request arena allows.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = rig.world.controller_context();
+    ctx.arena = arena.allocator();
+    const response = rig.api.handle(&ctx, .{ .method = "POST", .path = "/v1/jobs", .body = body });
     try rig.refused(response, 400, "ZC-E0130");
     try testing.expect(std.mem.indexOf(u8, response.body, "relay") != null);
+    try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
 }
