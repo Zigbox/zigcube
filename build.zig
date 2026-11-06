@@ -354,7 +354,8 @@ fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions) void {
             .imports = &.{.{ .name = "zigbox", .module = options.zigbox }},
         }),
     });
-    b.installArtifact(exe); // Plain `zig build` keeps it compiling.
+    // Plain `zig build` keeps it compiling and installs nothing.
+    b.getInstallStep().dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.addFileArg(b.path("ops/mtls-interop/InteropServer.java"));
     run.has_side_effects = true;

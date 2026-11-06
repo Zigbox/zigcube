@@ -517,6 +517,7 @@ jobs:
         shell: bash
         run: |
           # The runner image ships JDK 21 and sets JAVA_HOME_21_X64; the harness fails on another.
+          : "${JAVA_HOME_21_X64:?the runner image has no JDK 21}"
           export ZCUBE_JAVA_HOME="$JAVA_HOME_21_X64"
           openssl version
           "$ZCUBE_JAVA_HOME/bin/java" -version

@@ -166,6 +166,29 @@ public class InteropServer {
         return server;
     }
 
+    /**
+     * The server lives no longer than the harness: it exits when its stdin (a pipe the harness
+     * holds) reaches end of stream, and in any case after ten minutes.
+     */
+    static void guard() {
+        Thread eof = new Thread(() -> {
+            try {
+                while (System.in.read() >= 0) { }
+            } catch (IOException ignored) { }
+            Runtime.getRuntime().halt(0);
+        });
+        eof.setDaemon(true);
+        eof.start();
+        Thread limit = new Thread(() -> {
+            try {
+                Thread.sleep(10 * 60 * 1000);
+            } catch (InterruptedException ignored) { }
+            Runtime.getRuntime().halt(0);
+        });
+        limit.setDaemon(true);
+        limit.start();
+    }
+
     public static void main(String[] args) throws Exception {
         if (args.length == 2 && args[0].equals("--decode")) { // The harness checks a PEM.
             X509Certificate decoded = (X509Certificate) certificates(args[1]).iterator().next();
@@ -182,6 +205,7 @@ public class InteropServer {
             else throw new IllegalArgumentException(args[i]);
         }
         SSLServerSocket server = listen(args, needClientAuth, allowed);
+        guard();
         say("LISTENING " + server.getLocalPort());
         while (true) {
             SSLSocket socket = (SSLSocket) server.accept();
@@ -202,6 +226,12 @@ public class InteropServer {
         }
     }
 
+    /** Reads to end of stream: -1 only after the client's close_notify, else an exception. */
+    static void drain(InputStream in) throws IOException {
+        byte[] sink = new byte[4096];
+        while (in.read(sink) >= 0) { }
+    }
+
     static void serve(SSLSocket socket, String mode) throws Exception {
         InputStream in = socket.getInputStream();
         OutputStream out = socket.getOutputStream();
@@ -213,6 +243,7 @@ public class InteropServer {
                 out.flush();
                 Thread.sleep(SSE_GAP_MS);
             }
+            drain(in);
         } else if (mode.equals("bulk")) {
             if (in.read(buffer) <= 0) return;
             byte[] chunk = new byte[16384];
@@ -226,6 +257,7 @@ public class InteropServer {
                 out.write("bulk done\n".getBytes());
                 out.flush();
             }
+            drain(in);
         } else {
             int count;
             while ((count = in.read(buffer)) > 0) {

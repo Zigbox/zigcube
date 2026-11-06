@@ -47,6 +47,11 @@ const spiffe_id = "spiffe://prod.example/service/broker-1";
 const java_major = "21";
 const step_ms: u64 = 5000;
 const events_count = 20;
+/// The longest a helper tool (`javac`, `java --decode`, `openssl x509`) may go without output.
+const tool_timeout: std.Io.Timeout = .{ .duration = .{
+    .raw = .fromMilliseconds(120_000),
+    .clock = .awake,
+} };
 const bulk_bytes: u32 = 3 * 1024 * 1024;
 
 const labels = [_]x509_identity.Label{
@@ -261,6 +266,12 @@ const Harness = struct {
 
     fn send(h: *Harness, server: *Server, text: []const u8) !void {
         const stdin = server.child.stdin orelse return error.NoStdin;
+        // A pipe that polls writable has room for PIPE_BUF bytes, and `text` is shorter: the
+        // write cannot block, and a server that stopped reading fails here, not in CI's timeout.
+        assert(text.len <= 512);
+        var fds = [1]std.posix.pollfd{.{ .fd = stdin.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const ready = try std.posix.poll(&fds, @intCast(step_ms));
+        if (ready == 0) return error.ServerNotReading;
         try stdin.writeStreamingAll(h.io, text);
     }
 };
@@ -297,6 +308,9 @@ fn start_openssl(h: *Harness, spec: ServerSpec) !Server {
     const port = try free_port(h.io);
     const accept = try std.fmt.allocPrint(scratch, "127.0.0.1:{d}", .{port});
     var argv: std.ArrayList([]const u8) = .empty;
+    // s_server ignores end of stdin, so the kernel ends it with the harness: SIGKILL on the
+    // death of its parent, whatever the cause (a signal, a panic).
+    try argv.appendSlice(scratch, &.{ "setpriv", "--pdeathsig", "KILL" });
     try argv.appendSlice(scratch, &.{ "openssl", "s_server", "-accept", accept });
     try argv.append(scratch, if (spec.tls12) "-tls1_2" else "-tls1_3");
     try argv.appendSlice(scratch, &.{
@@ -338,14 +352,15 @@ fn start_java(h: *Harness, spec: ServerSpec) !Server {
     if (spec.allow) |uri| try argv.appendSlice(scratch, &.{ "--allow", uri });
     const log = try std.fmt.allocPrint(scratch, "{s}/java-{d}.log", .{ h.work, h.cases });
     var server: Server = .{
-        .child = try spawn(h, argv.items, log, false),
+        // The pipe is the JVM's lifetime: it exits when the harness dies and the pipe closes.
+        .child = try spawn(h, argv.items, log, true),
         .log = log,
         .port = 0,
         .kind = .java,
     };
     errdefer server.stop(h.io);
     if (!h.wait_log(&server, "LISTENING ", 20_000)) return error.ServerNotUp;
-    const line = h.log_line(&server, "LISTENING ").?;
+    const line = h.log_line(&server, "LISTENING ") orelse return error.ServerNotUp;
     server.port = try std.fmt.parseInt(u16, std.mem.trim(u8, line["LISTENING ".len..], " \r"), 10);
     return server;
 }
@@ -439,7 +454,13 @@ fn send_text(h: *Harness, text: []const u8) tls_conn.Error!void {
 const Expect = union(enum) {
     accepted,
     /// Refused with this code, and a message that holds `text`.
-    refused: struct { code: Code, text: []const u8 },
+    refused: struct {
+        code: Code,
+        text: []const u8,
+        /// Java only: the JVM's own `FAILED` line holds this. The alert alone cannot tell its
+        /// refusals apart (they all say certificate_unknown).
+        says: []const u8 = "",
+    },
 };
 
 const Case = struct {
@@ -451,6 +472,10 @@ const Case = struct {
 
 fn refused(code: Code, text: []const u8) Expect {
     return .{ .refused = .{ .code = code, .text = text } };
+}
+
+fn refused_says(code: Code, text: []const u8, says: []const u8) Expect {
+    return .{ .refused = .{ .code = code, .text = text, .says = says } };
 }
 
 fn both(
@@ -475,10 +500,12 @@ const accepted_cases = both("accepted", .{ .kind = .openssl }, .{}, .{ .accepted
 
 const server_refuses =
     both("refuses a certificate from another CA", .{ .kind = .openssl }, .{ .cert = .other_ca }, .{
-        refused(.E0814, "unknown_ca"), refused(.E0814, "certificate_unknown"),
+        refused(.E0814, "unknown_ca"),
+        refused_says(.E0814, "certificate_unknown", "unable to find valid certification path"),
     }) ++
     both("refuses an expired certificate", .{ .kind = .openssl }, .{ .cert = .expired }, .{
-        refused(.E0814, "certificate_expired"), refused(.E0814, "certificate_unknown"),
+        refused(.E0814, "certificate_expired"),
+        refused_says(.E0814, "certificate_unknown", "validity check failed"),
     }) ++
     both("refuses a client with no certificate", .{ .kind = .openssl }, .{ .cert = .none }, .{
         refused(.E0814, "certificate_required"), refused(.E0814, "certificate_required"),
@@ -487,7 +514,7 @@ const server_refuses =
         .name = "java refuses another job (the allow-list)",
         .server = .{ .kind = .java, .allow = spiffe_id },
         .client = .{ .cert = .other_job },
-        .expect = refused(.E0814, "certificate_unknown"),
+        .expect = refused_says(.E0814, "certificate_unknown", "is not on the allow-list"),
     }};
 
 const client_refuses =
@@ -513,7 +540,7 @@ const other_refusals = [_]Case{.{
 
 // ---- Running a case --------------------------------------------------------------------------
 
-/// What the client saw, as `E0814: ...` text, or null for success.
+/// What the client saw: the connection worked, or it was refused with this code.
 const Seen = union(enum) { accepted, refused: Code };
 
 /// Opens, then sends a line and reads: a TLS 1.3 server that rejects the client's certificate
@@ -568,9 +595,20 @@ fn run_case(h: *Harness, case: *const Case) !void {
             });
             const found = std.mem.find(u8, got, want.text) != null;
             try h.check(found, "message {s} lacks \"{s}\"", .{ got, want.text });
+            if (case.server.kind == .java) try check_java_says(h, &server, want.says);
             h.say("      -> {s}", .{got});
         },
     }
+}
+
+/// The JVM's reason for a refusal, from its `FAILED` line.
+fn check_java_says(h: *Harness, server: *Server, says: []const u8) !void {
+    if (says.len == 0) return;
+    try h.check(h.wait_log(server, "FAILED", step_ms), "the JVM printed no FAILED line", .{});
+    const line = h.log_line(server, "FAILED") orelse return;
+    try h.check(std.mem.find(u8, line, says) != null, "the JVM said {s}, not \"{s}\"", .{
+        line, says,
+    });
 }
 
 /// The identity the server read from our certificate, against what we put in it.
@@ -602,8 +640,12 @@ fn check_openssl_view(h: *Harness, server: *Server, expected: []const u8) !void 
         return h.check(false, "s_server printed no client certificate", .{});
     const begin_text = "-----BEGIN CERTIFICATE-----";
     const end_text = "-----END CERTIFICATE-----";
-    const begin = std.mem.find(u8, log[marker..], begin_text).? + marker;
-    const end = std.mem.find(u8, log[begin..], end_text).? + begin + end_text.len;
+    const begin_at = std.mem.find(u8, log[marker..], begin_text) orelse
+        return h.check(false, "s_server's client certificate has no BEGIN line yet", .{});
+    const begin = begin_at + marker;
+    const end_at = std.mem.find(u8, log[begin..], end_text) orelse
+        return h.check(false, "s_server's client certificate has no END line yet", .{});
+    const end = end_at + begin + end_text.len;
     try h.write_file("seen.pem", try std.fmt.allocPrint(scratch, "{s}\n", .{log[begin..end]}));
     const text = try run_tool(h, &.{
         "openssl", "x509", "-in", h.path("seen.pem"), "-noout", "-text",
@@ -618,7 +660,10 @@ fn check_openssl_view(h: *Harness, server: *Server, expected: []const u8) !void 
 }
 
 fn run_tool(h: *Harness, argv: []const []const u8) ![]const u8 {
-    const result = try std.process.run(h.scratch.allocator(), h.io, .{ .argv = argv });
+    const result = try std.process.run(h.scratch.allocator(), h.io, .{
+        .argv = argv,
+        .timeout = tool_timeout,
+    });
     if (!result.term.success()) return error.ToolFailed;
     return result.stdout;
 }
@@ -704,8 +749,7 @@ fn truncation(h: *Harness) !void {
         try h.check(err == error.Refused, "the read ended with {s}", .{@errorName(err)});
     }
     var buffer: [300]u8 = undefined;
-    const code = h.diag.code orelse .E0815;
-    try h.check(code == .E0816, "got {s}", .{describe(h, &buffer)});
+    try h.check(h.diag.code == .E0816, "got {s}", .{describe(h, &buffer)});
 }
 
 fn sse_java(h: *Harness) !void {
@@ -763,15 +807,18 @@ fn key_update_openssl(h: *Harness) !void {
     try go_live(h, &live, .{ .kind = .openssl, .messages = true });
     try openssl_hello(h, &live);
     try h.send(&live.server, "K\n"); // A KeyUpdate that asks for ours.
-    try h.check(h.wait_log(&live.server, "KeyUpdate", step_ms), "no KeyUpdate in the log", .{});
+    const sent = ">>> TLS 1.3, Handshake [length 0005], KeyUpdate";
+    try h.check(h.wait_log(&live.server, sent, step_ms), "s_server sent no KeyUpdate", .{});
     try h.send(&live.server, "later\n");
     var reply: [6]u8 = undefined;
     try read_exactly(h, &reply, step_ms);
     try h.check(std.mem.eql(u8, &reply, "later\n"), "after the update: {s}", .{&reply});
     try send_text(h, "back\n");
     try h.check(h.wait_log(&live.server, "back", step_ms), "s_server never read back", .{});
-    const count = std.mem.count(u8, h.log_text(&live.server), "KeyUpdate");
-    try h.check(count >= 2, "{d} KeyUpdate lines: ours did not answer", .{count});
+    // Ours, received: the message that proves the client answered with a KeyUpdate of its own.
+    const received = "<<< TLS 1.3, Handshake [length 0005], KeyUpdate";
+    const answered = h.wait_log(&live.server, received, step_ms);
+    try h.check(answered, "s_server received no KeyUpdate: ours did not answer", .{});
     try close_clean(h, &live.server);
 }
 
@@ -796,7 +843,9 @@ fn bulk_java(h: *Harness) !void {
     try read_exactly(h, &reply, step_ms);
     try h.check(std.mem.eql(u8, &reply, "bulk done\n"), "the reply was {s}", .{&reply});
     try h.check(h.wait_log(&live.server, "BULK client sent", step_ms), "the JVM saw no data", .{});
-    const updated = h.wait_log(&live.server, "KeyUpdate", step_ms);
+    // Not "KeyUpdate" alone: the debug output echoes the keyLimits property at startup.
+    const produced = "Produced KeyUpdate post-handshake message";
+    const updated = h.wait_log(&live.server, produced, step_ms);
     try h.check(updated, "the JVM never sent a KeyUpdate", .{});
     try close_clean(h, &live.server);
 }
@@ -852,8 +901,9 @@ fn run(init: std.process.Init, source: []const u8) !u8 {
     };
     defer h.arena.deinit();
     defer h.scratch.deinit();
-    try prepare(&h, source);
+    try make_work_dir(&h);
     defer std.Io.Dir.cwd().deleteTree(h.io, h.work) catch {}; // Best effort: it is in /tmp.
+    try prepare(&h, source);
     for (&cases) |*case| {
         _ = h.scratch.reset(.retain_capacity);
         h.diag.reset();
@@ -870,8 +920,8 @@ fn run(init: std.process.Init, source: []const u8) !u8 {
     return if (h.failures == 0) 0 else 1;
 }
 
-/// The work directory, the files the servers read, and the compiled Java.
-fn prepare(h: *Harness, source: []const u8) !void {
+/// The work directory; the caller registers its removal right away.
+fn make_work_dir(h: *Harness) !void {
     const arena = h.arena.allocator();
     const base = h.environ.get("TMPDIR") orelse "/tmp";
     const stamp = std.Io.Clock.real.now(h.io).toMilliseconds();
@@ -879,6 +929,10 @@ fn prepare(h: *Harness, source: []const u8) !void {
         base, std.os.linux.getpid(), stamp,
     });
     try std.Io.Dir.cwd().createDirPath(h.io, h.work);
+}
+
+/// The files the servers read, and the compiled Java.
+fn prepare(h: *Harness, source: []const u8) !void {
     try find_java(h, source);
     try pki_files(h);
 }
@@ -891,7 +945,10 @@ fn find_java(h: *Harness, source: []const u8) !void {
         try std.fmt.allocPrint(arena, "{s}/bin/javac", .{dir})
     else
         "javac";
-    const result = try std.process.run(arena, h.io, .{ .argv = &.{ h.java, "-version" } });
+    const result = try std.process.run(arena, h.io, .{
+        .argv = &.{ h.java, "-version" },
+        .timeout = tool_timeout,
+    });
     const found = std.mem.find(u8, result.stderr, "version \"" ++ java_major ++ ".") != null;
     if (!found) {
         const text = "FAILED: the JDK must be version " ++ java_major ++
