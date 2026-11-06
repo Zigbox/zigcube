@@ -529,9 +529,20 @@ pub const Agent = struct {
     /// The server acknowledged a request sent at `sent`: the lease runs `ttl_ms` from then at
     /// the least. The state is kept after it is held, so a failure to keep it leaves an older
     /// `s` in the file, which fences earlier, never later.
+    ///
+    /// The ttl comes from the server, so it is checked, not asserted. One the agent cannot fence
+    /// in time (an older server run with `--lease-ttl-ms` under 8,000) is refused with ZC-E0121:
+    /// the agent fences at once, since it cannot promise to stop in time under that lease, and
+    /// the step fails; it does not renew under it and it does not crash. It registers again
+    /// when its containers are dead, is granted the same ttl and refuses it again, so a node
+    /// under such a server runs nothing and says why on every pass.
     fn acknowledged(agent: *Agent, ctx: *const Context, sent: u64, ttl_ms: u32) Error!void {
         assert(agent.lease != store.lease_none);
-        assert(fencing.inequality_problem(ttl_ms) == null);
+        if (fencing.inequality_problem(ttl_ms)) |problem| {
+            try agent.begin_fence(ctx, sent);
+            fencing.raise_problem(ctx.diag, ttl_ms, problem);
+            return error.BackendFailed;
+        }
         agent.lease_ttl_ms = ttl_ms;
         agent.sent_ms = sent;
         agent.renew_at_ms = sent + fencing.renew_after_ms(ttl_ms);
@@ -582,6 +593,11 @@ pub const Agent = struct {
             const kept = if (same_boot and parsed.kill_at_ms > 0) parsed.kill_at_ms else kill_at;
             return agent.start_fence(ctx, @min(kept, kill_at));
         }
+        // A lease file written under a ttl below the bound (by an agent before this rule, against
+        // a server run with a ttl under 8,000 ms) is unusable: the node fences, and the agent
+        // registers again. That is the upgrade note of
+        // docs/decisions/2026-11-06-renewal-before-fence.md: raise the server's ttl and let every
+        // agent renew under it before upgrading any.
         const usable = parsed.lease != store.lease_none and parsed.tenure > 0 and
             fencing.inequality_problem(parsed.ttl_ms) == null and same_boot;
         if (!usable) return agent.begin_fence(ctx, mono);

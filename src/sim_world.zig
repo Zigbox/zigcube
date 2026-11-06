@@ -58,6 +58,9 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A keepalive is answered with this ttl in place of the lease's own, as an older server run
+    /// with a short `--lease-ttl-ms` does; test-only, null in every simulation.
+    keepalive_ttl_ms: ?u32 = null,
     calls: u32 = 0,
 
     const vtable: store.Store.VTable = .{
@@ -186,7 +189,9 @@ pub const SwitchedStore = struct {
     ) store.Error!store.Lease {
         const self = from(context);
         try self.gate(diag);
-        return self.inner.lease_keepalive(id, diag);
+        var lease = try self.inner.lease_keepalive(id, diag);
+        if (self.keepalive_ttl_ms) |ttl_ms| lease.ttl_ms = ttl_ms;
+        return lease;
     }
 
     fn lease_revoke(

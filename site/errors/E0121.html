@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
 <p>An agent that loses contact with the server stops its containers a fixed margin before its lease can run out, and the server places replacements only after the lease has run out and a grace period has passed. The margin must cover the time the agent needs to stop its containers, the drift between the two clocks over one lease, and the time the kernel needs to kill a process. These settings leave too little, so two copies of a replica could run at once.</p>
-<p>The cause line names the numbers. Shorten the lease time to live, or leave the fencing constants as they are.</p>
+<p>The cause line names the numbers. A lease time to live that is too long for the margin must be shortened. One that is too short, under 8000 ms, leaves the agent no time to renew it before it fences, so it must be lengthened; the cause line names the shortest. The default is 10000 ms. An agent that is granted a lease time to live below 8000 ms by an older server stops its containers and reports this code.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0121</pre>

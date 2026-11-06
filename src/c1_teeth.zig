@@ -1,7 +1,8 @@
 //! The test-only switches of the `sim-c1` negative tests (docs/authority.md §4, docs/core.md "The
 //! cluster simulation"). Each is a constant that only a program's root file can switch on, by
-//! declaring `pub const <name> = true;`: the roots that do are `src/sim_c1_teeth_*_main.zig`, which
-//! only the `sim-c1-teeth` build step compiles. Every shipped program, test and the WASM core has
+//! declaring `pub const <name> = true;`: the roots that do are `src/sim_c1_teeth_*_main.zig`.
+//! The `sim-c1-teeth*` steps compile all but `oldrule`, which only `sim-fencing-teeth` compiles.
+//! Every shipped program, test and the WASM core has
 //! another root, so for them each is false; `zcube_server.zig` and `zcube_agent.zig` assert that
 //! at compile time.
 

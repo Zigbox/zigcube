@@ -149,18 +149,7 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
         }, "choose a ttl inside the range");
     }
     const problem = fencing.inequality_problem(ttl) orelse return ttl;
-    diag.raise(.E0121);
-    switch (problem) {
-        .ttl_too_short => diag.cause(
-            "a lease ttl of {d} ms leaves under {d} ms past the {d} ms fence margin for a renewal",
-            .{ ttl, constants.fence_window_min_ms, constants.fence_margin_ms },
-        ),
-        .margin_too_small => diag.cause(
-            "a lease ttl of {d} ms needs a fence margin of {d} ms; it is {d} ms",
-            .{ ttl, fencing.margin_needed_ms(ttl), constants.fence_margin_ms },
-        ),
-    }
-    diag.fix(.{ .sentence = "use a ttl the fence margin covers, such as the default of 10000" });
+    fencing.raise_problem(diag, ttl, problem);
     return error.BadConfig;
 }
 
@@ -408,12 +397,22 @@ test "a lease ttl an agent cannot fence in time is ZC-E0121" {
     diag.reset();
     const ok = try merge(.{}, .{}, &diag);
     try testing.expectEqual(constants.lease_ttl_ms, ok.lease_ttl_ms);
-    const refused = [_]u32{ 20_000, 30_000, 3_000 };
+    const refused = [_]u32{ 20_000, 30_000, 3_000, 5_000, 7_999 };
     for (refused) |ttl| {
         diag.reset();
         try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = ttl }, .{}, &diag));
         try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0121), diag.code);
     }
+    // Too short is told to lengthen, with the shortest ttl named; too long to shorten.
+    diag.reset();
+    try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = 7_999 }, .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "shortest ttl is 8000") != null);
+    diag.reset();
+    try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = 20_000 }, .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "needs a fence margin") != null);
+    diag.reset();
+    const shortest = try merge(.{ .lease_ttl_ms = 8_000 }, .{}, &diag);
+    try testing.expectEqual(@as(u32, 8_000), shortest.lease_ttl_ms);
 }
 
 test "the lost grace is a flag, a file setting, and refused over an hour" {

@@ -11,6 +11,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const c1_teeth = @import("c1_teeth.zig");
+const Diag = @import("diag.zig").Diag;
 
 /// The difference of two hosts' clocks over `ttl_ms`, rounded up.
 pub fn skew_ms(ttl_ms: u32) u32 {
@@ -40,12 +41,40 @@ pub fn inequality_problem(ttl_ms: u32) ?Problem {
     return null;
 }
 
+/// ZC-E0121 for a ttl that `inequality_problem` refused, wherever it came from: the server's
+/// configuration, or a grant an agent was handed. The fix points the way the problem does: a
+/// ttl below the bound is lengthened, one the margin cannot cover is shortened.
+pub fn raise_problem(diag: *Diag, ttl_ms: u32, problem: Problem) void {
+    diag.raise(.E0121);
+    switch (problem) {
+        .ttl_too_short => {
+            const bound = constants.fence_margin_ms + constants.fence_window_min_ms;
+            diag.cause(
+                "a lease ttl of {d} ms leaves under {d} ms past the {d} ms fence margin for a " ++
+                    "renewal; the shortest ttl is {d} ms",
+                .{ ttl_ms, constants.fence_window_min_ms, constants.fence_margin_ms, bound },
+            );
+            diag.fix(.{ .sentence = "lengthen the lease ttl to at least the shortest, " ++
+                "or use the default of 10000" });
+        },
+        .margin_too_small => {
+            diag.cause(
+                "a lease ttl of {d} ms needs a fence margin of {d} ms; it is {d} ms",
+                .{ ttl_ms, margin_needed_ms(ttl_ms), constants.fence_margin_ms },
+            );
+            diag.fix(.{ .sentence = "shorten the lease ttl until the fence margin covers it, " ++
+                "such as the default of 10000" });
+        },
+    }
+}
+
 /// How long after a keepalive was sent the next is due: a third of the ttl, but never later than
 /// `renew_slack_min_ms` before the fence (`ttl - fence_margin`), so the renewal has that long to
 /// be sent, answered and recorded. The slack, `ttl - margin - renew_after_ms`, never shrinks as
-/// the ttl grows (1,000 ms at 5,000 ms, more from 5,001). The old `ttl / 3` alone left 334 ms at
-/// 5,000 ms and fell after the fence below 4,500 ms (issue #78). Unchanged from 6,000 ms up, the
-/// shipped ttl included.
+/// the ttl grows. Within the admitted range (8,000 ms and up) the minimum never binds, so this is
+/// `ttl / 3` with 2,334 ms or more of slack; it is kept so a smaller `fence_window_min_ms` cannot
+/// bring back issue #78 (the old `ttl / 3` alone left 334 ms at 5,000 ms and fell after the
+/// fence below 4,500 ms).
 pub fn renew_after_ms(ttl_ms: u32) u32 {
     assert(ttl_ms > constants.fence_margin_ms);
     if (c1_teeth.old_renewal_rule) return old_rule(ttl_ms);
@@ -86,8 +115,9 @@ test "the shipped constants satisfy the inequality, and every ttl in range that 
     try testing.expectEqual(@as(?Problem, null), inequality_problem(constants.lease_ttl_ms));
     try testing.expectEqual(@as(u32, 100), skew_ms(10_000));
     try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(3_001));
-    try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(4_999));
-    try testing.expectEqual(@as(?Problem, null), inequality_problem(5_000));
+    try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(5_000));
+    try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(7_999));
+    try testing.expectEqual(@as(?Problem, null), inequality_problem(8_000));
     // A longer ttl widens the skew term until the fixed margin no longer covers it.
     try testing.expectEqual(@as(?Problem, .margin_too_small), inequality_problem(30_000));
     try testing.expectEqual(@as(?Problem, .margin_too_small), inequality_problem(20_000));
@@ -135,7 +165,7 @@ test "renewal leaves at least the slack before the fence, and the slack never sh
     // Goal: #78 and its review. Method: every ttl from the shortest admitted to twice the
     // shipped one (the admitted ones among them), the slack compared with the last ttl's.
     var ttl: u32 = constants.fence_margin_ms + constants.fence_window_min_ms;
-    try testing.expectEqual(@as(u32, 5_000), ttl);
+    try testing.expectEqual(@as(u32, 8_000), ttl);
     var last_slack: u64 = 0;
     while (ttl <= constants.lease_ttl_ms * 2) : (ttl += 1) {
         const renew = renew_after_ms(ttl);
@@ -146,17 +176,16 @@ test "renewal leaves at least the slack before the fence, and the slack never sh
         last_slack = slack;
     }
     try testing.expectEqual(constants.lease_ttl_ms / 3, renew_after_ms(constants.lease_ttl_ms));
-    try testing.expectEqual(@as(u32, 1_000), renew_after_ms(5_000));
-    try testing.expectEqual(@as(u32, 1_999), renew_after_ms(5_999));
-    try testing.expectEqual(@as(u32, 2_000), renew_after_ms(6_000));
+    try testing.expectEqual(@as(u32, 2_666), renew_after_ms(8_000));
+    try testing.expect(fence_at_ms(0, 8_000) - renew_after_ms(8_000) >= 2_334);
 }
 
 test "the old ttl / 3 rule fails where the new one holds" {
     // Goal: the loop above has teeth. Method: old_rule leaves under the slack at 5,000 ms and
     // falls after the fence from 3,500 ms up to 4,500 (it falls at 4,500: 1500 is not before
-    // 1500); ttls below 5,000 are refused now, so the old rule is not reachable there.
+    // 1500); ttls below 8,000 are refused now, so the old rule is not reachable there.
     try testing.expect(fence_at_ms(0, 5_000) - old_rule(5_000) < constants.renew_slack_min_ms);
     try testing.expect(old_rule(4_500) >= fence_at_ms(0, 4_500));
     try testing.expect(old_rule(4_501) < fence_at_ms(0, 4_501));
-    try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(4_999));
+    try testing.expectEqual(@as(?Problem, .ttl_too_short), inequality_problem(7_999));
 }

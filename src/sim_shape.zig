@@ -110,10 +110,9 @@ pub const long_share_denominator: u32 = 10;
 /// deadline (measured, docs/decisions/2026-11-04-fleet-profiles-and-shapes.md).
 pub const cost_max: u32 = 5_000;
 
-/// The shortest ttl a shape draws. `fencing.inequality_problem` admits 5,000 ms, but seeds 254
-/// (ttl 5,181) and 343 (5,129) fail the busy-loop check under crash_heavy at 5,000 to 6,000 ms
-/// (issue #125), so the draw stays at 8,000 while a ttl given by hand may go down to the bound
-/// (docs/decisions/2026-11-06-renewal-before-fence.md).
+/// The shortest ttl a shape draws, and the shortest `fencing.inequality_problem` admits (owner,
+/// 2026-11-06: 3,000 ms of margin plus `fence_window_min_ms`): the drawn and the admitted
+/// ranges agree (docs/decisions/2026-11-06-renewal-before-fence.md).
 pub const lease_ttl_ms_min: u32 = 8000;
 /// The longest ttl `fencing.inequality_problem` allows with the shipped margin.
 pub const lease_ttl_ms_max: u32 = constants.lease_ttl_ms;
