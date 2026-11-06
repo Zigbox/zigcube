@@ -45,8 +45,12 @@ pub const State = struct {
 pub const Watch = struct {
     node: u32,
     name_hash: u64,
+    /// When the tracker first saw the container: the run's start on the ledger, within a tick.
     first_seen_ms: u64,
     ended_since_ms: ?u64,
+    /// The node's totals of wedged time and of cut-link time when the container was first seen.
+    wedged_base_ms: u64 = 0,
+    link_base_ms: u64 = 0,
 };
 
 /// The bound of J6: from the commit of a run's `stop`, the larger of what an agent whose link is
@@ -59,23 +63,39 @@ pub fn stop_bound_ms(lease_ttl_ms: u64, grace_ms: u64, granularity_ms: u64) u64 
     return @max(linked, fenced) + granularity_ms;
 }
 
-/// The bound of J8: the deadline, the grace, the kill, one resync for the agent to look, the
-/// clocks' rate error (`clock_ppm`, either way) and the simulator's granularity. An agent that is
-/// cut off from the server cannot read its run, so it enforces the deadline only through the
-/// fence: a cut that begins just before the deadline adds what the fence needs (the lease's ttl
-/// less the margin, the stop, the kill).
+/// How much of its window a run's node could not enforce the deadline.
+pub const Cut = struct {
+    /// Time the agent was down or frozen, or a container ignored its stop, during the window.
+    wedged_ms: u64,
+    /// Whether the node's link or the store was cut at any time during the window: the agent could
+    /// not read its run, so it enforced the deadline only through the fence.
+    link: bool,
+};
+
+/// The bound of J8: the deadline, the grace, the clocks' rate error (`clock_ppm`, either way),
+/// the simulator's granularity, the kill and two resyncs for the agent to look (to stop, to
+/// kill). Only if the node was cut off during the run's window (`cut`: partitioned, the store
+/// out, a failed step or a failed watch and its back-off) the fence replaces the resync and
+/// the kill (the lease's ttl less the margin, the stop, the kill), and the time the node was
+/// wedged is added: its supervisors run on, but nobody enforces the deadline. A node that was
+/// never cut off gets no more, so a deadline enforced merely late is caught.
 pub fn deadline_bound_ms(
     deadline_ms: u64,
     grace_ms: u64,
     clock_ppm: u64,
     lease_ttl_ms: u64,
     granularity_ms: u64,
+    cut: Cut,
 ) u64 {
     const base = deadline_ms + grace_ms;
+    // The agent looks at the run once a resync: the first look after the deadline stops it, the
+    // first look after the grace kills it.
+    const linked = constants.fence_kill_latency_ms + 2 * constants.agent_resync_ms;
     const fenced = lease_ttl_ms - constants.fence_margin_ms + constants.fence_stop_ms +
         constants.fence_kill_latency_ms;
-    return base + base * clock_ppm / 1_000_000 + constants.fence_kill_latency_ms +
-        constants.agent_resync_ms + fenced + granularity_ms;
+    const cut_off = cut.link or cut.wedged_ms > 0;
+    const extra = if (cut_off) @max(linked, fenced) + cut.wedged_ms else linked;
+    return base + base * clock_ppm / 1_000_000 + extra + granularity_ms;
 }
 
 /// J2 and J7 for one `Runtime.start`: the run id was never started before, and a claim for this
@@ -168,6 +188,10 @@ fn claim_problem(
 test "bounds grow with the grace and the deadline" {
     const short = stop_bound_ms(10_000, 0, 0);
     try std.testing.expect(stop_bound_ms(10_000, 60_000, 0) > short);
-    try std.testing.expect(deadline_bound_ms(10_000, 0, 10_000, 10_000, 0) >
-        deadline_bound_ms(10_000, 0, 0, 10_000, 0));
+    const none: Cut = .{ .wedged_ms = 0, .link = false };
+    try std.testing.expect(deadline_bound_ms(10_000, 0, 10_000, 10_000, 0, none) >
+        deadline_bound_ms(10_000, 0, 0, 10_000, 0, none));
+    const cut: Cut = .{ .wedged_ms = 0, .link = true };
+    try std.testing.expect(deadline_bound_ms(10_000, 0, 0, 10_000, 0, cut) >
+        deadline_bound_ms(10_000, 0, 0, 10_000, 0, none));
 }

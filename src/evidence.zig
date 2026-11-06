@@ -88,7 +88,9 @@ pub fn job_observed(
         .run = record.run,
         .node = record.node,
         .assignment = record.assignment,
+        .tenure = record.tenure,
         .status = @tagName(record.status),
         .exit = record.exit,
+        .stop_cause = if (record.stop_cause) |cause| @tagName(cause) else null,
     });
 }

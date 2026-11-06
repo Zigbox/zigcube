@@ -404,14 +404,20 @@ if the transaction then commits, because a failed compare is the store doing its
   deadline of 3 to 43 s or 10 minutes, a grace of 0 to 2 s). **J1** a job container is not alive
   more than `overlap_ms_max` after its job reached a terminal status. **J2** no run id is
   started twice, in any node and any agent life (a ledger fed by the simulated runtime's start
-  hook). **J3** a job's status never leaves a terminal state or changes to another terminal
-  state, and no status is kept for a job whose records are gone. **J5** a run, once its stop is
+  hook). **J3** a terminal job status never changes to another status or to other content, and
+  a status is deleted only in the transaction that deletes its job (the brief's further half, that
+  a deleted status is not recreated while its job exists, is slice 6). **J5** a run, once its stop is
   committed, is never assigned again. **J6** a container runs no longer than `stop_bound_ms`
   after its run's `stop` committed. **J7** each start has a committed claim of this run, tenure
   and epoch, and the run has no stop. **J8** a container runs no longer than `deadline_bound_ms`
-  after the tracker first saw it, and after the heal no run is open long after its latest
-  possible end. J4 (the watch and retention) is slice 6. A node that is down, frozen or cut off
-  restarts the J6 and J8 clocks: it cannot enforce what it cannot reach.
+  after the tracker first saw it (the run's start on the ledger, within a tick), and after the
+  heal no run is open long after its latest possible end. J4 (the watch and retention) is slice 6.
+  The clocks are never restarted. A node that was wedged (its agent down or frozen, or a
+  container ignoring a stop) is not judged until `wedge_memory_ms` after, and its wedged time is
+  added to the J6 and J8 bounds; a node whose link or store was cut at any time in a run's window
+  gets the fence's allowance (`ttl - margin + stop + kill`) in J8; a node that was never cut gets
+  only the deadline, the grace, the kill, two resyncs and the granularity, so a deadline
+  enforced merely late fails (`sim-c1-teeth-job_deadline_late`: 9 s late).
 
 The evidence acceptance test (§5, `src/why_acceptance.zig`): each decision's terminal evidence is
 recorded as `why` renders it right after commit; at the end of the run every cited key is deleted or
@@ -428,10 +434,10 @@ breaks I7; a node that registers again between a controller's read of a report a
 commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of
 spread breaks L1 (C2 slice 5: each placement is no worse on spread, among the nodes that fit, than an order of fit and
 spread alone would choose, `scheduler.placement_problem`; every node holds a seed-chosen subset of
-the images and advertises it as `/node-store/<node>`).  The six job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline`): an
+the images and advertises it as `/node-store/<node>`).  The seven job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late`): an
 agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
-that places a stopped run breaks J5; a controller that rewrites a terminal status breaks J3; an
-agent that ignores a cancel breaks J6; one that ignores the deadline breaks J8. Their
+that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
+agent that ignores a cancel breaks J6; one that ignores the deadline, or enforces it 9 s late, breaks J8. Their
 switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 

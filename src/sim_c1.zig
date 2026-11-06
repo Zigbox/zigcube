@@ -380,8 +380,8 @@ fn run_reassigned(ctx: *const Context, key: []const u8, tally: *Tally) Found {
         ctx.diag.reset();
         return "J5: an assignment cannot be read";
     };
-    if (existing.kv != null) return null; // Not a new assignment.
-    tally.runs_placed_judged += 1;
+    const fresh = existing.kv == null;
+    if (fresh) tally.runs_placed_judged += 1;
     const run_at = records.job_run_key(name);
     const run_got = ctx.store.get(ctx.arena, run_at.slice(), null, ctx.diag) catch {
         ctx.diag.reset();
@@ -399,6 +399,7 @@ fn run_reassigned(ctx: *const Context, key: []const u8, tally: *Tally) Found {
         ctx.diag.reset();
         return "J5: a job status cannot be read";
     };
+    if (!fresh) return null; // A put to an existing key is judged by the run's stop only.
     if (status_got.kv) |kv| {
         const status = records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch {
             ctx.diag.reset();

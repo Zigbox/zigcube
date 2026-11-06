@@ -663,6 +663,7 @@ const Pass = struct {
             .subject = .{ .kind = .job, .name = job.rec.name },
             .reason = "the run was claimed by its node",
             .cause = .{ .kind = .observed, .key = entry.kv.key, .revision = entry.kv.mod_revision },
+            .cause_evidence = try evidence.job_observed(ctx, &entry.rec),
             .read_revision = pass.world.revision,
         }, &batch);
         const next: records.JobStatus = .{
@@ -921,6 +922,10 @@ const Pass = struct {
             .subject = .{ .kind = .job, .name = name },
             .reason = done.reason,
             .cause = cause,
+            .cause_evidence = if (done.report) |report|
+                try evidence.job_observed(ctx, &report.rec)
+            else
+                null,
             .read_revision = pass.world.revision,
         }, &batch);
         var next = status.rec;

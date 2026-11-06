@@ -456,7 +456,10 @@ const Work = struct {
             return;
         }
         if (current.deadline_mono_ms) |at| {
-            work.agent.jobs_wake_mono_ms = @min(work.agent.jobs_wake_mono_ms, at);
+            work.agent.jobs_wake_mono_ms = @min(
+                work.agent.jobs_wake_mono_ms,
+                at +| c1_teeth.job_deadline_late_ms,
+            );
         }
     }
 
@@ -476,7 +479,8 @@ const Work = struct {
         };
         const at = record.deadline_mono_ms orelse return null;
         if (!std.mem.eql(u8, record.boot_id, work.ctx.boot_id)) return null;
-        if (mono >= at and !c1_teeth.job_deadline) return .deadline;
+        const due = at +| c1_teeth.job_deadline_late_ms;
+        if (mono >= due and !c1_teeth.job_deadline) return .deadline;
         return null;
     }
 
