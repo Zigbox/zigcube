@@ -6,6 +6,7 @@
 // Time is virtual: `advance(ms)` moves it, a ticker in the transport drives it in real time, and
 // the scenario runner can fast-forward. Nothing here touches the DOM.
 
+import { Jobs } from "./jobs.js";
 import {
   KNOWN_IMAGES, NODE_CAPACITY, LEASE_TTL_MS, diagImageNotFound, diagStoreDown, digestShort,
 } from "./fixtures.js";
@@ -40,6 +41,7 @@ export class Engine {
     this.activeUntil = 0;
     this.dirty = true;
     this.requestSeq = 0;
+    this.jobs = new Jobs(this);
     this.pulls = new Map(); // `${node}/${tree}` -> a /pulls/ record (docs/keys.md); not store keys: statistics
   }
 
@@ -162,6 +164,7 @@ export class Engine {
     if (!this.storeUp) return;
     for (const agent of this.agents.values()) this.agentTick(agent);
     this.expireLeases();
+    this.jobs.tick();
     if (this.dirty) { this.dirty = false; this.reconcile(); }
   }
 
@@ -240,6 +243,7 @@ export class Engine {
   reconcile() {
     this.nodeController();
     for (const svc of this.values("/services/")) this.serviceController(svc);
+    this.jobs.reconcile();
   }
 
   nodeController() {

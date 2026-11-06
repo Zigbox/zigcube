@@ -1,7 +1,7 @@
 // A dev-time browser check of the console, with Playwright and the Chromium that is already
 // installed (never `playwright install`; no npm dependency is added to this repository).
 //
-//   node tools/browser_check.mjs <base-url> [--mode sim|server] [--seed-hello] [--shots <dir>]
+//   node tools/browser_check.mjs <base-url> [--mode sim|server|mock] [--seed-hello] [--shots <dir>]
 //
 // sim:    opens <base>/?sim=c0, plays the C0 scenario through the panel at 8x and checks what the
 //         real core, running as WebAssembly, tells: the `why service broken` chain, hello at 2/2,
@@ -9,7 +9,10 @@
 // server: opens <base>/ (a running zcube-server); with --seed-hello it first applies a 2-replica
 //         hello through POST /v1/apply. Checks the page loads, the pill reaches Live, the service
 //         shows and the why view renders.
-// Both: no request leaves the origin, no page error, no console error.
+// mock:   opens <base>/?mock=b1&at=3 (the JavaScript mock, B1's jobs, docs/console.md "Jobs"):
+//         the list, the state filter, one job page per ending cause, the logs placeholder (and no
+//         log request), and that no environment value or input text is on any page.
+// All: no request leaves the origin, no page error, no console error.
 // Prints one PASS/FAIL line per check and exits non-zero if any failed.
 
 import { createRequire } from "node:module";
@@ -22,7 +25,7 @@ const flag = name => args.includes(name);
 const option = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
 const mode = option("--mode") || "sim";
 const shots = option("--shots");
-if (!base || !["sim", "server"].includes(mode)) { console.error("usage: node tools/browser_check.mjs <base-url> [--mode sim|server] [--seed-hello] [--shots <dir>]"); process.exit(2); }
+if (!base || !["sim", "server", "mock"].includes(mode)) { console.error("usage: node tools/browser_check.mjs <base-url> [--mode sim|server|mock] [--seed-hello] [--shots <dir>]"); process.exit(2); }
 if (shots) mkdirSync(shots, { recursive: true });
 
 let failures = 0;
@@ -110,6 +113,47 @@ if (mode === "sim") {
     });
   }
   await phone.context().close();
+} else if (mode === "mock") {
+  const logRequests = [];
+  const page = await open({ width: 1280, height: 900 }, `${base}/?mock=b1&at=3#/jobs`);
+  page.on("request", r => { if (/log/i.test(new URL(r.url()).pathname)) logRequests.push(r.url()); });
+  const text = () => page.evaluate(() => document.querySelector("main")?.innerText || "");
+  const rowsWith = () => page.$$eval("tr[data-job]", trs => trs.map(t => [t.dataset.job, t.dataset.end]));
+  await check("mock: the list shows all seventeen jobs", async () => {
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 17, null, { timeout: 15000 });
+    await shot(page, "mock-jobs");
+  });
+  await check("mock: the state filter narrows the list", async () => {
+    await page.selectOption("main select", "running");
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 1, null, { timeout: 15000 });
+    await page.selectOption("main select", "ended");
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 14, null, { timeout: 15000 });
+    await page.selectOption("main select", "");
+  });
+  const ends = { "train-ok": "exit 0", "export-exit3": "exit 3", "probe-sigkill": "signal 9", "fit-oom": "oom", "fork-bomb": "pid_limit", "bad-image": "start_failed", "slow-merge": "deadline", "fenced-write": "fenced", "lost-node": "unreachable", "never-started": "not_started", "mystery": "unknown", "cancel-running": "cancelled", "run-forever": "running", "waiting": "pending" };
+  for (const [name, want] of Object.entries(ends)) {
+    await check(`mock: job page ${name} (${want})`, async () => {
+      await page.evaluate(n => { location.hash = `#/jobs/${n}`; }, name);
+      await page.waitForFunction(n => document.querySelector("main h1")?.textContent === n && /Spec/.test(document.querySelector("main")?.innerText || ""), name, { timeout: 15000 });
+      const t = await text();
+      must(t.includes("Logs are not part of this release"), "no logs placeholder");
+      must(!t.includes("s3cr3t-token") && !t.includes("epochs=3"), "an env value or the input is on the page");
+      must(!/\bnull\b|undefined/.test(t), "null or undefined on the page");
+      if (want !== "running" && want !== "pending") must(t.includes("Why") && /because/i.test(t), "no why chain");
+      if (name === "bad-image") must(/ZBX-E0410/.test(t), "no diagnostic");
+      if (name === "train-ok") await shot(page, "mock-job-train-ok");
+    });
+  }
+  await check("mock: an unknown job is a diagnostic with its code", async () => {
+    await page.evaluate(() => { location.hash = "#/jobs/nope"; });
+    await page.waitForFunction(() => /ZC-E0133/.test(document.querySelector("main")?.innerText || ""), null, { timeout: 15000 });
+  });
+  await check("mock: why job renders its chain", async () => {
+    await page.evaluate(() => { location.hash = "#/why/job/fit-oom"; });
+    await page.waitForFunction(() => /job fit-oom/.test(document.querySelector("main")?.innerText || ""), null, { timeout: 15000 });
+  });
+  await check("mock: no log request was made", async () => { must(!logRequests.length, logRequests.join(", ")); });
+  await page.context().close();
 } else {
   if (flag("--seed-hello")) {
     const body = { name: "hello", image: "b3:51aa9c03", replicas: 2, command: ["sh", "-c", "while true; do sleep 1; done"], applied_by: "browser-check" };
