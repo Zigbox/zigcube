@@ -1018,8 +1018,10 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
+            // The wedge and cut-link totals J1, J6 and J8 judge by are kept whenever jobs are on,
+            // not only under c1: a plain run judges the same bounds.
+            if (c.c1 or c.jobs_on) c.note_wedged();
             if (c.c1) {
-                c.note_wedged();
                 track_overlap(c) catch return;
                 c1_check(c) catch return;
             }
@@ -2925,6 +2927,21 @@ test "a few seeds hold every invariant, and the swarm differs between them" {
         @memcpy(&swarm_lines[index], line[start..][0..80]);
     }
     try testing.expect(!std.mem.eql(u8, &swarm_lines[0], &swarm_lines[1]));
+}
+
+test "J8 holds on drawn worlds whose agents' steps fail, without c1" {
+    // Goal: regression for the J8 release blocker. A plain run (no `c1`) once judged J8 without
+    // the wedge and cut-link allowance, because `note_wedged` ran only under `c1`, so a run
+    // whose agent was backed off by failed steps looked like one that outlived its deadline.
+    // Method: replay the seeds that failed, shaped as `sim_cluster <seed> auto --profile=auto`
+    // draws them (seed 1 had `nodes` 0 on its command line, which is the same draw).
+    var report: Report = undefined;
+    for ([_]u64{ 4026630699808099468, 8059167289430031834, 130, 148 }) |seed| {
+        const drawn = plan(seed, null, .{ .profile_auto = true });
+        simulate(testing.allocator, seed, drawn.operations, drawn.options, &report);
+        if (report.failed) std.debug.print("{s}\n", .{report.text()});
+        try testing.expect(!report.failed);
+    }
 }
 
 test "a node count can be asked for" {
