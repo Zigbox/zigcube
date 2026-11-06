@@ -16,6 +16,7 @@ test {
     _ = @import("store_postgres.zig");
     _ = @import("runtime.zig");
     _ = @import("records.zig");
+    _ = @import("job_retention.zig");
     _ = @import("agent_clock.zig");
     _ = @import("agent_config.zig");
     _ = @import("agent_http.zig");

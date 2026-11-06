@@ -453,6 +453,48 @@ test "a claiming record of a run that is not assigned and not claimed is removed
     try testing.expectEqual(@as(?Seen, null), try rig.observed());
 }
 
+fn stop_the_run(context: *anyopaque) void {
+    const rig: *Rig = @ptrCast(@alignCast(context));
+    rig.ask_stop(.cancel, 60_000) catch unreachable; // A test: the rig's own write cannot fail.
+}
+
+test "a claim the server refuses starts nothing, and its record goes once the run is released" {
+    // The refused-claim test of review 5797621715: the run gets a `stop` after the agent read
+    // it and before its claim commits, so the claim is refused (applied: false). Nothing is
+    // started and no observation is written; the claiming record stays while the run is
+    // assigned, and is removed once the job ends and the assignment is released.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.world.switched.before_put = .{
+        .prefix = records.prefix_job_observed,
+        .context = &rig,
+        .run = stop_the_run,
+    };
+    rig.step();
+    try testing.expect(rig.world.switched.before_put == null);
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(agent_jobs.Phase.claiming, kept.phase);
+    // The job ends: its assignment is released.
+    const released = [_]store.Op{.{ .delete = records.assigned_key(
+        sim_world.node_name,
+        run_id,
+    ).slice() }};
+    const done = try writers.txn(
+        rig.world.store_handle(),
+        .scheduler,
+        .{ .on_success = &released },
+        &rig.world.diag,
+    );
+    try testing.expect(done.succeeded);
+    rig.step();
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+}
+
 const hello_digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
 fn assign_with_input(rig: *Rig, input_digest: []const u8, base64: ?[]const u8) !void {

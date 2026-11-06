@@ -56,6 +56,7 @@ const sim_world = @import("sim_world.zig");
 const job_api = @import("job_api.zig");
 const runtime = @import("runtime.zig");
 const sim_jobs = @import("sim_jobs.zig");
+const sim_jobs_watch = @import("sim_jobs_watch.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const store = @import("store.zig");
 const why_mod = @import("why.zig");
@@ -379,6 +380,9 @@ const Node = struct {
     up_ms: u64,
     /// Whether the agent's last step worked: a step that fails says why nothing moved.
     last_ok: bool,
+    /// Whether the agent's latest call to the server failed: the link was cut, as far as it can
+    /// tell (a local runtime failure is not a cut link).
+    call_failed: bool,
     /// Since when the server has had no registration of this node (its lease ran out), while
     /// the agent was up; null while it has one. The fencing invariant's clock.
     unregistered_since_ms: ?u64,
@@ -425,6 +429,7 @@ const Node = struct {
         const node: *Node = @ptrCast(@alignCast(context));
         const net = &node.cluster.net;
         const result = net.transport(node.index).call(arena, request, diag);
+        node.call_failed = if (result) |_| false else |_| true;
         node.spent_ms += net.last_call_ms;
         return result;
     }
@@ -725,6 +730,9 @@ pub const Cluster = struct {
     /// The job workload is on (`Options.jobs`); the ledger and trackers' state; the next number.
     jobs_on: bool,
     jobs: sim_jobs.State,
+    /// J4: the client that follows the job endings through the watch, and its own random stream.
+    jobs_watch: sim_jobs_watch.State,
+    watch_prng: std.Random.DefaultPrng,
     job_next: u32,
 
     pub fn create(
@@ -782,6 +790,8 @@ pub const Cluster = struct {
         c.report = report;
         c.jobs_on = false;
         c.jobs = .{};
+        c.jobs_watch = .{};
+        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
@@ -868,6 +878,7 @@ pub const Cluster = struct {
         node.crashes = 0;
         node.ok_steps = 0;
         node.last_ok = true;
+        node.call_failed = false;
         node.unregistered_since_ms = null;
         node.frozen_until_ms = null;
         node.last_wedged_ms = null;
@@ -1018,6 +1029,7 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
+            if (c.c1 and c.jobs_on) c.watch_client();
             if (c.c1) {
                 c.note_wedged();
                 track_overlap(c) catch return;
@@ -1039,6 +1051,31 @@ pub const Cluster = struct {
                 safety(c) catch return; // The report says what failed.
             }
         }
+    }
+
+    /// J4's client, once per poll: it is killed now and then, away for less than a minute or for
+    /// minutes, and resumes from its revision. The simulation compacts to the head every 60 s,
+    /// so even a short absence can end in a 410 (relist and dedupe); the real keep window is
+    /// not simulated, and a plain in-window resume is the rarer path here.
+    fn watch_client(c: *Cluster) void {
+        const w = &c.jobs_watch;
+        const now = c.manual.ms;
+        if (now < w.away_until_ms or now < w.next_poll_ms) return;
+        const random = c.watch_prng.random();
+        w.next_poll_ms = now + 1000 + random.uintLessThan(u32, 4000);
+        if (random.uintLessThan(u32, 60) == 0) {
+            const long = random.uintLessThan(u32, 4) == 0;
+            const span: u64 = if (long)
+                60_000 + random.uintLessThan(u32, 600_000)
+            else
+                1000 + random.uintLessThan(u32, 59_000);
+            w.away_until_ms = now + span;
+            w.restarts += 1;
+            return;
+        }
+        if (store_faulty(c)) return;
+        const ctx = c.controller_context();
+        sim_jobs_watch.poll(w, &c.api, &ctx);
     }
 
     fn node_named(c: *const Cluster, name: []const u8) ?*Node {
@@ -1195,7 +1232,7 @@ pub const Cluster = struct {
                 node.last_wedged_ms = c.manual.ms;
                 node.wedged_total_ms += passed;
             }
-            if (node.partitioned_until_ms != null or store_faulty(c) or !node.last_ok) {
+            if (node.partitioned_until_ms != null or store_faulty(c) or node.call_failed) {
                 node.link_cut_total_ms += passed;
             }
         }
@@ -1452,6 +1489,9 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         .diag = &c.tap_diag,
     };
     if (request) |txn| c.recorder.record_request(&ctx, txn);
+    if (request) |txn| {
+        if (c.jobs_on) sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+    }
     if (c.c1_violation != null) return;
     if (request != null) {
         if (c.c1_pending) |found| {
@@ -2198,6 +2238,7 @@ fn watch_of(c: *const Cluster, node: u32, name_hash: u64) ?sim_jobs.Watch {
 fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
+    try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
     if (store_faulty(c)) return;
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
@@ -2225,7 +2266,9 @@ fn track_jobs(c: *Cluster) Failure!void {
                 watch.wedged_base_ms = node.wedged_total_ms;
                 watch.link_base_ms = node.link_cut_total_ms;
             }
-            if (!c.wedged_lately(node)) try judge_job_container(c, &ctx, job, node, &watch);
+            const run = job_run_of(&ctx, job);
+            if (run) |known| note_marks(c, known, node, &watch);
+            if (!c.wedged_lately(node)) try judge_job_container(c, &ctx, job, node, &watch, run);
             if (count == sim_jobs.watch_max) continue;
             next[count] = watch;
             count += 1;
@@ -2235,21 +2278,36 @@ fn track_jobs(c: *Cluster) Failure!void {
     c.jobs.watch_count = count;
 }
 
+fn note_marks(
+    c: *const Cluster,
+    run: records.JobRun,
+    node: *const Node,
+    watch: *sim_jobs.Watch,
+) void {
+    const stopped = run.stop != null;
+    sim_jobs.note_marks(
+        watch,
+        c.manual.ms,
+        run.deadline_ms,
+        stopped,
+        c.api.lease_ttl_ms,
+        node.wedged_total_ms,
+        node.link_cut_total_ms,
+    );
+}
+
 fn judge_job_container(
     c: *Cluster,
     ctx: *const controller.Context,
     job: []const u8,
     node: *const Node,
     watch: *sim_jobs.Watch,
+    found: ?records.JobRun,
 ) Failure!void {
     const now = c.manual.ms;
-    const wedged_ms = node.wedged_total_ms - watch.wedged_base_ms;
-    const cut: sim_jobs.Cut = .{
-        .wedged_ms = wedged_ms,
-        .link = node.link_cut_total_ms > watch.link_base_ms,
-    };
+    const run = found orelse return;
+    const cut = sim_jobs.cut_since(watch, node.wedged_total_ms, node.link_cut_total_ms);
     const granularity = tick_ms + 2 * check_interval_ms;
-    const run = job_run_of(ctx, job) orelse return;
     const bound = sim_jobs.deadline_bound_ms(
         run.deadline_ms,
         run.grace_ms,
@@ -2264,7 +2322,8 @@ fn judge_job_container(
         "deadline, its grace and the kill");
     if (run.stop) |stop| {
         const stop_bound = sim_jobs.stop_bound_ms(c.api.lease_ttl_ms, run.grace_ms, granularity);
-        const since = (now -| stop.at_ms) -| wedged_ms;
+        const base = watch.stop_wedged_base_ms orelse node.wedged_total_ms;
+        const since = (now -| stop.at_ms) -| (node.wedged_total_ms - base);
         c.jobs.stop_worst_ms = @max(c.jobs.stop_worst_ms, since);
         try check(c, since <= stop_bound, "J6: a run kept executing after its stop committed, " ++
             "past the bound");
@@ -2306,6 +2365,10 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
             }
         }
     }
+    // J4: the watching client, back from any outage, has seen every ending the store committed.
+    const head = ctx.store.status(ctx.diag) catch return check(c, false, "the head is unreadable");
+    sim_jobs_watch.finish(&c.jobs_watch, &c.api, ctx, head.revision);
+    try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
 }
 
 /// Every fault off; the agents come back up as time passes. Ends the fault phase.
@@ -2861,6 +2924,10 @@ fn print_jobs(c: *Cluster) void {
         j.stop_worst_ms,               j.overlap_worst_ms,
         j.deadline_worst_ms,           c.c1_tally.job_statuses_judged,
         c.c1_tally.runs_placed_judged,
+    });
+    const w = &c.jobs_watch;
+    c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{
+        w.truth_count, w.handled_count, w.watches, w.relists, w.restarts,
     });
 }
 
