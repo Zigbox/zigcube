@@ -6,8 +6,8 @@
 //!
 //! The cuts, recorded in docs/decisions/2026-11-05-tls-client-part-1.md and -part-2.md:
 //!   - Post-handshake authentication is never offered, so a later `CertificateRequest` is refused.
-//!   - The client never starts a KeyUpdate by itself; `send_key_update` is there for slice 6 to
-//!     call when `update_due` says so. A received KeyUpdate is answered when it asks.
+//!   - `seal_application` starts a KeyUpdate itself when the write keys reach their record limit.
+//!     A received KeyUpdate is answered when it asks.
 //!   - The server name is a DNS name (the foreign-server profile is not wired here).
 //!
 //! The rules the code keeps, from the slice 3 handoff: a plaintext change_cipher_spec is dropped

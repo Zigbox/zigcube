@@ -262,8 +262,8 @@ fn echo_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     const options = f.options(io, fd);
     try conn.open(&options, &diag);
     const end = end_in(io, deadline_ms);
+    // No flush: a write leaves at once, or the server never answers.
     try conn.write("ping", end, &diag);
-    try conn.flush(end, &diag);
     var out: [16]u8 = undefined;
     const got = try conn.read(&out, end, &diag);
     try std.testing.expectEqualStrings("pong", out[0..got]);
@@ -434,14 +434,14 @@ fn bulk_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expect(diag.code == null);
 }
 
-test "forty thousand bytes cross in whole records both ways" {
-    // Goal: the writer coalesces small writes into full records and the reader reassembles
-    // several. Method: 40 piece-by-1000 writes; the server counts the records it opens (two
-    // full and one part: 40000 = 2 * 16384 + 7232) and answers in 7000-byte records.
+test "forty thousand bytes cross as one record per write and come back in pieces" {
+    // Goal: each write leaves as records of its own and the reader reassembles several.
+    // Method: 40 writes of 1000 bytes; the server counts the records it opens (one per write)
+    // and answers in 7000-byte records.
     var f: Fixture = undefined;
     try f.init(std.testing.io, .{});
     try run(bulk_body, bulk_client, &f);
-    try std.testing.expectEqual(@as(u32, 3), f.param);
+    try std.testing.expectEqual(@as(u32, 40), f.param);
 }
 
 // ---- A read that times out ----
@@ -654,7 +654,7 @@ fn timeout_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     const started = peer_stream.boot_ms(io);
     try std.testing.expectError(error.Refused, conn.open(&options, &diag));
     const took = peer_stream.boot_ms(io) - started;
-    try expect_code(&diag, .E0813);
+    try expect_code(&diag, .E0816);
     try std.testing.expect(took >= 200);
     try std.testing.expect(took < deadline_ms);
     var out: [4]u8 = undefined;
@@ -811,4 +811,83 @@ test "the server's flight cut at every byte is a refusal, never a connection" {
         f.param = cut;
         try run_lenient(cut_body, cut_client, &f);
     }
+}
+
+// ---- Sends made on a read's behalf ----
+
+/// Fills the client's send buffer with junk, outside the connection, until the socket refuses.
+/// Nothing the client sends next can leave. Junk is fine: these tests end at the client.
+fn fill_socket(fd: std.posix.fd_t) !void {
+    const junk: [4096]u8 = @splat(0xa5);
+    for ([_]usize{ junk.len, 1 }) |size| {
+        var sent: usize = 0;
+        while (true) {
+            const wrote = linux.sendto(fd, &junk, size, linux.MSG.DONTWAIT, null, 0);
+            switch (linux.errno(wrote)) {
+                .SUCCESS => sent += wrote,
+                .AGAIN => break,
+                else => return error.TestUnexpectedResult,
+            }
+            if (sent > (64 << 20)) return error.TestUnexpectedResult; // Never fills.
+        }
+    }
+}
+
+fn full_update_body(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
+    try server_handshake(io, fd, f);
+    var out: [64]u8 = undefined;
+    try send_raw(io, fd, f.peer.key_update(&out, true));
+}
+
+fn full_update_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
+    var conn: Conn = undefined;
+    defer conn.deinit();
+    var diag = new_diag();
+    const options = f.options(io, fd);
+    try conn.open(&options, &diag);
+    try fill_socket(fd);
+    var out: [16]u8 = undefined;
+    // The answer cannot leave: the write keys have moved on, so this is the end of the connection.
+    try std.testing.expectError(error.Timeout, conn.read(&out, end_in(io, 200), &diag));
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 200), &diag));
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+    try std.testing.expect(diag.code == null);
+}
+
+test "a KeyUpdate answer that times out ends the connection" {
+    // Goal: a send made for a read is as fatal on timeout as a write: its keys cannot be undone.
+    // Method: the client's send buffer is full when the server asks for a KeyUpdate.
+    var f: Fixture = undefined;
+    try f.init(std.testing.io, .{});
+    try run(full_update_body, full_update_client, &f);
+}
+
+fn full_bye_body(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
+    try server_handshake(io, fd, f);
+    var out: [64]u8 = undefined;
+    try send_raw(io, fd, f.peer.close_notify(&out));
+}
+
+fn full_bye_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
+    var conn: Conn = undefined;
+    defer conn.deinit();
+    var diag = new_diag();
+    const options = f.options(io, fd);
+    try conn.open(&options, &diag);
+    try fill_socket(fd);
+    var out: [16]u8 = undefined;
+    // The reply to close_notify cannot leave; the stream has ended all the same, for every read.
+    try std.testing.expectEqual(@as(usize, 0), try conn.read(&out, end_in(io, 200), &diag));
+    try std.testing.expectEqual(@as(usize, 0), try conn.read(&out, end_in(io, 200), &diag));
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+    try conn.close(end_in(io, 200), &diag);
+    try std.testing.expect(diag.code == null);
+}
+
+test "a close_notify whose reply cannot be sent still ends the stream" {
+    // Goal: a repeated read after the peer's close_notify is end of stream, never a panic.
+    // Method: the client's send buffer is full when the server says goodbye.
+    var f: Fixture = undefined;
+    try f.init(std.testing.io, .{});
+    try run(full_bye_body, full_bye_client, &f);
 }

@@ -12,7 +12,7 @@
 //! The reader is a stream. The client takes at most `wants()` bytes per step, so the connection
 //! never reads ahead of a record, and a record is handed over as soon as it is whole: a server-sent
 //! event is readable the moment its record has arrived (docs/briefs/mtls-client.md, "SSE").
-//! The writer buffers up to one record: `write` seals each full record, `flush` seals the rest.
+//! `write` seals and sends everything it is given before it returns.
 //!
 //! What a call returns:
 //!   - `Refused`: the connection failed and `diag` holds the one coded diagnostic.
@@ -21,8 +21,8 @@
 //!     may be repeated; for a write the record may be half sent, so the connection is over.
 //!
 //! The cuts, recorded in docs/decisions/2026-11-05-tls-conn.md: no new diagnostic (a transport
-//! that breaks is ZC-E0816, a handshake that runs out of time is ZC-E0813); `close` does not wait
-//! for the server's close_notify; after the server's close_notify nothing more is written.
+//! that breaks is ZC-E0816, a handshake that runs out of time is ZC-E0816 too); `close` does not
+//! wait for the server's close_notify; after the server's close_notify nothing more is written.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -172,17 +172,25 @@ pub const Conn = struct {
             const step = conn.client.receive(conn.stage[0..got], diag) catch |err|
                 return conn.refused(err);
             assert(step.consumed == got);
-            try conn.send_output(end_ms, diag, .read);
+            if (step.event == .closed) {
+                // The reply to the server's close_notify is a courtesy, and the stream has ended
+                // either way: a failure to send it changes nothing, and `phase` must say so, or
+                // a repeated read would ask a closed client for more input.
+                conn.phase = .peer_closed;
+                conn.push(conn.client.output(), end_ms) catch {}; // The peer need not hear it.
+                conn.client.drain();
+                return 0;
+            }
+            // The answer to a KeyUpdate: the write keys have moved on, so a record that is not
+            // whole on the wire cannot be taken back. A timeout here ends the connection.
+            try conn.send_output(end_ms, diag, .write);
             switch (step.event) {
                 .none => {},
                 .data => |data| if (data.len > 0) {
                     conn.pending = data;
                     return conn.take_pending(out);
                 },
-                .closed => {
-                    conn.phase = .peer_closed;
-                    return 0;
-                },
+                .closed => unreachable, // Handled above.
                 .connected => unreachable, // Once.
             }
         }
@@ -199,8 +207,8 @@ pub const Conn = struct {
 
     // ---- Writing ------------------------------------------------------------------------------
 
-    /// Queues `bytes`, sealing and sending each record that fills. Nothing short of a record
-    /// leaves until `flush`.
+    /// Seals and sends `bytes`, one record per `plaintext_max` bytes; the call ends with nothing
+    /// queued. `flush` is for a caller that wrote nothing since the last call (and so a no-op).
     pub fn write(conn: *Conn, bytes: []const u8, end_ms: u64, diag: *Diag) Error!void {
         try conn.writable();
         var rest = bytes;
@@ -213,7 +221,8 @@ pub const Conn = struct {
             rest = rest[count..];
             if (conn.plain_length == plaintext_max) try conn.send_record(end_ms, diag);
         }
-        assert(conn.plain_length < plaintext_max);
+        try conn.flush(end_ms, diag);
+        assert(conn.plain_length == 0);
     }
 
     /// Seals and sends what `write` has queued.
@@ -229,7 +238,11 @@ pub const Conn = struct {
     pub fn close(conn: *Conn, end_ms: u64, diag: *Diag) Error!void {
         switch (conn.phase) {
             .open => {},
-            .peer_closed, .shut, .broken => return,
+            .peer_closed, .shut, .broken => {
+                // `write` sends every byte before it returns, so nothing queued can be lost here.
+                assert(conn.plain_length == 0);
+                return;
+            },
             .handshake => unreachable,
         }
         try conn.flush(end_ms, diag);
@@ -304,7 +317,7 @@ pub const Conn = struct {
 
     fn handshake_timeout(conn: *Conn, diag: *Diag, timeout_ms: u32) Error {
         conn.phase = .broken;
-        diag.raise(.E0813);
+        diag.raise(.E0816);
         diag.cause("the TLS handshake did not finish within {d} ms", .{timeout_ms});
         var buffer: [constants.tls_server_name_bytes_max + 160]u8 = undefined;
         const name = conn.client.name[0..conn.client.name_length];
@@ -353,10 +366,22 @@ pub const Conn = struct {
     }
 
     fn push(conn: *Conn, bytes: []const u8, end_ms: u64) Wire!void {
-        assert(bytes.len > 0);
-        peer_stream.write_all(conn.io, conn.fd, bytes, end_ms) catch |err| {
-            if (err == error.Timeout) return error.Timeout;
-            return error.Ended;
-        };
+        const flags = linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL;
+        var at: usize = 0;
+        while (at < bytes.len) {
+            peer_stream.wait_ready(conn.io, conn.fd, std.posix.POLL.OUT, end_ms) catch |err| {
+                if (err == error.Timeout) return error.Timeout;
+                return error.Ended;
+            };
+            const wrote = linux.sendto(conn.fd, bytes.ptr + at, bytes.len - at, flags, null, 0);
+            switch (linux.errno(wrote)) {
+                .SUCCESS => at += wrote,
+                .AGAIN, .INTR => {},
+                else => |code| {
+                    conn.errno = code;
+                    return error.Ended;
+                },
+            }
+        }
     }
 };
