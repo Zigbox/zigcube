@@ -374,7 +374,10 @@ are escaped (a control character takes six bytes in JSON).
 about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
 (`6 * job_input_bytes_max + 16 KiB`, 409,600 bytes); every other route keeps `http_body_bytes_max`
 (64 KiB). A longer body is `413` ZC-E0108 and its cause names the limit of this route. The limit is
-decided on the decoded input, not the wire: an input within 64 KiB is always stored.
+decided on the decoded input, not the wire: an input within 64 KiB, with the rest of the job
+within 16 KiB as sent, is always stored. A body must arrive within `http_idle_timeout_ms`; a client
+that stalls part way is disconnected. The `state` of a `200` (same job) and of every cancel
+reply is the job's state now, `pending` only while it has no status.
 
 ### `GET /v1/jobs/{name}`, `GET /v1/jobs`
 

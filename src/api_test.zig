@@ -8,6 +8,7 @@ const api_mod = @import("api.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
+const controller = @import("controller.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -861,4 +862,61 @@ test "a read-only list shows no job env value and no job input" {
     try testing.expectEqual(@as(u16, 200), listed.status);
     try testing.expect(std.mem.indexOf(u8, listed.body, "s3cr3t") == null);
     try testing.expect(std.mem.indexOf(u8, listed.body, "dG9wIHNlY3JldA") == null);
+}
+
+test "the replies that change nothing carry the job's state, not pending" {
+    // Goal: a client that retries a create after the job ended is told how it ended.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = try job_json(&rig, "short", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    const ctx = rig.world.controller_context();
+    const status: records.JobStatus = .{
+        .state = .exited,
+        .ended_at_ms = 1,
+        .end = .{ .kind = .exited, .code = 0 },
+        .reported_at_ms = 1,
+    };
+    var batch: controller.Batch = .{};
+    const key = records.job_status_key("short");
+    batch.put(try controller.key_copy(&ctx, &key), try records.encode(ctx.arena, status, ctx.diag));
+    _ = try controller.commit(&ctx, .job_controller, &batch);
+    const same = post_job(&rig, "/v1/jobs", body);
+    try testing.expectEqual(@as(u16, 200), same.status);
+    try testing.expectEqualStrings("exited", field(try rig.json(same), "state").string);
+    const ended = post_job(&rig, "/v1/jobs/short/cancel", "");
+    try testing.expectEqual(@as(u16, 200), ended.status);
+    try testing.expectEqualStrings("exited", field(try rig.json(ended), "state").string);
+    // A job without a status is pending in all three replies.
+    const fresh = try job_json(&rig, "fresh", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", fresh).status);
+    const cancelled = post_job(&rig, "/v1/jobs/fresh/cancel", "");
+    try testing.expectEqualStrings("pending", field(try rig.json(cancelled), "state").string);
+    const again = post_job(&rig, "/v1/jobs/fresh/cancel", "");
+    try testing.expectEqual(@as(u16, 202), again.status);
+    try testing.expectEqualStrings("pending", field(try rig.json(again), "state").string);
+}
+
+test "a relay array filling the whole body is refused by name, without building it" {
+    // Goal: `relay` is skipped, not parsed into a value 37 times its size, so the answer is
+    // ZC-E0130 naming relay, not ZC-E0207 (the arena is spent).
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const head = "{\"name\":\"big\",\"image\":\"b3:51aa9c03\",\"command\":[\"true\"]," ++
+        "\"deadline_ms\":1000,\"submit_by_ms\":9999999999999,\"relay\":[";
+    const tail = "0]}";
+    const body = try rig.parsed.allocator().alloc(u8, constants.job_request_bytes_max);
+    @memset(body, '0');
+    @memcpy(body[0..head.len], head);
+    var at: usize = head.len;
+    while (at + 2 < body.len - tail.len) : (at += 2) {
+        body[at] = '0';
+        body[at + 1] = ',';
+    }
+    const rest = body.len - tail.len;
+    @memset(body[at..rest], ' ');
+    @memcpy(body[rest..], tail);
+    const response = post_job(&rig, "/v1/jobs", body);
+    try rig.refused(response, 400, "ZC-E0130");
+    try testing.expect(std.mem.indexOf(u8, response.body, "relay") != null);
 }

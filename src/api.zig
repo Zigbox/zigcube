@@ -367,6 +367,21 @@ fn check_applied_by(ctx: *const Context, text: []const u8) Failure!void {
     }
 }
 
+/// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
+/// 409,600-byte array of zeros takes about 37 times that in the arena.
+const Present = struct {
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Present {
+        _ = allocator;
+        _ = options;
+        try source.skipValue();
+        return .{};
+    }
+};
+
 /// The body of `POST /v1/jobs`: a job as JSON. `relay` and `placement` are parsed so that they
 /// can be refused by name (not built yet), not as unknown fields.
 const JobBody = struct {
@@ -383,8 +398,8 @@ const JobBody = struct {
     input: ?[]const u8 = null,
     input_env: ?[]const u8 = null,
     submit_by_ms: u64,
-    relay: ?std.json.Value = null,
-    placement: ?std.json.Value = null,
+    relay: ?Present = null,
+    placement: ?Present = null,
     applied_by: []const u8 = anonymous,
 };
 
@@ -464,14 +479,18 @@ fn job_conflict(ctx: *const Context, name: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0105);
     ctx.diag.cause("job {s} or the job counters changed during the request", .{name});
-    ctx.diag.fix_with("look at it as it is now, then try again", "zcube get job {s}", .{name});
+    ctx.diag.fix_with("look at it as it is now, then try again", "zcube job get {s}", .{name});
     return error.Failed;
 }
 
 fn job_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!job_api.Input {
     if (body.len == 0) return bad_request(ctx, "body", "is required: the job as JSON");
     if (body.len > constants.job_request_bytes_max) {
-        return bad_request(ctx, "body", "is larger than 409600 bytes");
+        const problem = std.fmt.comptimePrint(
+            "is larger than {d} bytes",
+            .{constants.job_request_bytes_max},
+        );
+        return bad_request(ctx, "body", problem);
     }
     const parsed = std.json.parseFromSliceLeaky(JobBody, ctx.arena, body, .{}) catch |err| {
         if (err == error.OutOfMemory) return no_memory(ctx);
@@ -1415,7 +1434,7 @@ const Call = struct {
                     .request_id = id,
                     .action = "none",
                     .name = old.name,
-                    .state = .pending,
+                    .state = job_api.current_state(ctx, old.name) catch return propagate(ctx),
                 }),
                 .conflict => {},
             }
@@ -1440,7 +1459,7 @@ const Call = struct {
                     .request_id = id,
                     .action = "cancel",
                     .name = name,
-                    .state = .pending,
+                    .state = done.state,
                     .revision = done.revision,
                     .decision = done.decision,
                 }),
@@ -1448,7 +1467,7 @@ const Call = struct {
                     .request_id = id,
                     .action = "none",
                     .name = name,
-                    .state = .pending,
+                    .state = job_api.current_state(ctx, name) catch return propagate(ctx),
                 }),
                 .finished => |view| return job_reply(ctx, 200, .{
                     .request_id = id,
