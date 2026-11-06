@@ -324,6 +324,17 @@ fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
     sample(diag, .W0503, &.{cause}, "raise deadline_ms if the job needs the time");
 }
 
+fn pull_record_lost(diag: *diag_mod.Diag) void { // agent.zig
+    const cause = "the pull record could not be written to pull.json: NoSpaceLeft";
+    sample(diag, .W0504, &.{cause}, "check the state directory's disk space and permissions");
+}
+
+fn swarm_fetch_ended(diag: *diag_mod.Diag) void { // zigbox_supervisor.zig
+    const cause = "the fetch was killed at its deadline, ms: 1800000";
+    const fix = "if it repeats on every start, check the peers and the network";
+    sample(diag, .W0603, &.{cause}, fix);
+}
+
 fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
     diag.raise(.B0004);
     diag.cause("train-7-job reported an exit of kind exited with no code and no signal", .{});
@@ -865,6 +876,7 @@ const cases = [_]Case{
     relayed(.E0522, run_start_record),
     relayed(.W0501, agent_lease),
     relayed(.W0503, job_deadline),
+    relayed(.W0504, pull_record_lost),
     relayed(.E0801, peer_foreign_ca),
     relayed(.E0802, peer_expired),
     relayed(.E0803, peer_wrong_node),
@@ -888,6 +900,7 @@ const cases = [_]Case{
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),
+    relayed(.W0603, swarm_fetch_ended),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
     relayed(.B0004, job_end_unmapped),

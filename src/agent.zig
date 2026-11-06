@@ -183,12 +183,32 @@ pub const Agent = struct {
     /// The first cause of the last counted refusal, for the shell to say.
     store_refusal_text: [store_refusal_text_bytes]u8,
     store_refusal_len: u8,
+    /// Pull records dropped unpublished (ZC-W0504), and the last one's container and reason, for
+    /// the shell to say: a dropped record is statistics lost, and it must not be silent.
+    pull_drops: u32,
+    pull_drop_text: [pull_drop_text_bytes]u8,
+    pull_drop_len: u8,
 
     const store_refusal_text_bytes = 160;
+    const pull_drop_text_bytes = 200;
 
     /// What the last counted summary refusal said (empty if none).
     pub fn store_refusal(agent: *const Agent) []const u8 {
         return agent.store_refusal_text[0..agent.store_refusal_len];
+    }
+
+    /// The container and reason of the last dropped pull record (empty if none).
+    pub fn pull_drop(agent: *const Agent) []const u8 {
+        return agent.pull_drop_text[0..agent.pull_drop_len];
+    }
+
+    /// Keeps the container and reason of a pull record about to be dropped; `drop_pull` counts it
+    /// once the file is gone, so a remove that fails does not count the same file every step.
+    fn note_pull_drop(agent: *Agent, name: []const u8, reason: []const u8) void {
+        var writer: std.Io.Writer = .fixed(&agent.pull_drop_text);
+        // A text too long for the buffer is cut: the line is a hint, never a failure.
+        writer.print("container {s}: {s}", .{ name, reason }) catch {};
+        agent.pull_drop_len = @intCast(writer.end);
     }
 
     /// Initialises in place: the stop table is large.
@@ -205,6 +225,8 @@ pub const Agent = struct {
         agent.store_refusals = 0;
         agent.store_refused = false;
         agent.store_refusal_len = 0;
+        agent.pull_drops = 0;
+        agent.pull_drop_len = 0;
         agent.restored = false;
         agent.stops_count = 0;
         agent.store_lease = store.lease_none;
@@ -368,13 +390,14 @@ pub const Agent = struct {
                 error.Absent => continue,
                 // A file past the state limit can never be read: remove it, or it wedges here.
                 error.TooBig => {
+                    agent.note_pull_drop(name, "its pull.json is too big to read");
                     try agent.drop_pull(ctx, state, file);
                     continue;
                 },
                 else => return state_failed(ctx, err, "read a pull record"),
             };
             published += 1;
-            try agent.publish_pull(ctx, state, file, text);
+            try agent.publish_pull(ctx, state, file, name, text);
             if (agent.fence.active) return;
         }
     }
@@ -384,13 +407,18 @@ pub const Agent = struct {
         ctx: *const Context,
         state: agent_state.AgentState,
         file: []const u8,
+        name: []const u8,
         text: []const u8,
     ) Error!void {
         const parsed = std.json.parseFromSliceLeaky(records.Pull, ctx.arena, text, .{
             .ignore_unknown_fields = true,
-        }) catch return agent.drop_pull(ctx, state, file);
+        }) catch {
+            agent.note_pull_drop(name, "its pull.json is not a pull record");
+            return agent.drop_pull(ctx, state, file);
+        };
         const tree_ok = parsed.tree.len > 0 and parsed.tree.len <= constants.tree_digest_bytes;
         if (!tree_ok or !std.mem.eql(u8, parsed.node, agent.config.node)) {
+            agent.note_pull_drop(name, "its pull record names another node or no usable tree");
             return agent.drop_pull(ctx, state, file);
         }
         const value = try records.encode(ctx.arena, parsed, ctx.diag);
@@ -406,20 +434,31 @@ pub const Agent = struct {
             // step.
             const code = ctx.diag.code orelse return err;
             if (code != .E0504) return err;
+            agent.note_pull_drop(name, ctx.diag.last_cause() orelse "zcube-server refused it");
             ctx.diag.reset();
             return agent.drop_pull(ctx, state, file);
         };
         if (!done.succeeded) return agent.begin_fence(ctx, ctx.mono_ms());
-        return agent.drop_pull(ctx, state, file);
+        return remove_pull(ctx, state, file);
     }
 
+    /// Removes a pull record that could not be published and counts it (ZC-W0504), after the
+    /// remove: a file that stays would be noted again at the next step.
     fn drop_pull(
         agent: *Agent,
         ctx: *const Context,
         state: agent_state.AgentState,
         file: []const u8,
     ) Error!void {
-        _ = agent;
+        try remove_pull(ctx, state, file);
+        agent.pull_drops += 1;
+    }
+
+    fn remove_pull(
+        ctx: *const Context,
+        state: agent_state.AgentState,
+        file: []const u8,
+    ) Error!void {
         state.remove(file) catch |err| switch (err) {
             error.Absent => {},
             else => return state_failed(ctx, err, "remove a pull record"),
