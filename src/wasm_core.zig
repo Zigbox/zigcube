@@ -19,6 +19,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const core_smoke = @import("core_smoke.zig");
+const mtls_smoke = @import("mtls_smoke.zig");
 const sim_c0 = @import("sim_c0.zig");
 const sim_cluster = @import("sim_cluster.zig");
 const sim_shape = @import("sim_shape.zig");
@@ -38,6 +39,12 @@ var report: core_smoke.Report = .{};
 export fn zcube_smoke() u32 {
     core_smoke.run(std.heap.wasm_allocator, &report);
     return @backingInt(report.failed);
+}
+
+/// Runs the mTLS scenario (`mtls_smoke.zig`): certificates issued, verified and refused, and a
+/// ClientHello. 0: every step held; otherwise the number of the step that did not.
+export fn zcube_mtls_smoke() u32 {
+    return @backingInt(mtls_smoke.run());
 }
 
 var sim_report: sim_c0.Report = .{};

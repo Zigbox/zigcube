@@ -25,6 +25,7 @@
 //! Then it prints the line a report quotes:
 //!
 //!     check: PASS 1a2b3c4d5e6f (build test tidy errors-site wasm-check wasm-test console-wasm
+//!     mtls-teeth
 //!     store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth,
 //!     test as tester)
 //!
@@ -43,7 +44,7 @@ const cache_note_bytes: u64 = 6 << 30;
 const sim_operations = "200";
 const cluster_operations = "40";
 const swarm_operations = "100";
-const gates = "build test tidy errors-site wasm-check wasm-test console-wasm";
+const gates = "build test tidy errors-site wasm-check wasm-test console-wasm mtls-teeth";
 
 /// Runs `argv` (in `cwd` if given) with its errors on stderr; fails unless it exits 0.
 fn run(io: Io, argv: []const []const u8, cwd: ?[]const u8) !void {

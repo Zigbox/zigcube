@@ -74,11 +74,15 @@ fn ask(s: store.Store) !u64 {
         .path = "/v1/stats/pull",
         .query = "limit=500",
     });
-    std.debug.print("pull stats worst case: used_bytes {d} of {d}\n", .{
-        bounded.used_bytes, constants.request_arena_bytes_max,
-    });
-    if (response.status != 200) {
-        std.debug.print("{s}\n", .{response.body[0..@min(response.body.len, 600)]});
+    // Silent on a pass: a passing test step that writes to stderr is reported by the build
+    // runner as `failed command: ...` (docs/STYLE.md, "Randomised and racing tests"). The
+    // measurement is in docs/decisions/2026-11-04-pull-stats-caps.md.
+    if (response.status != 200 or bounded.used_bytes * 2 > constants.request_arena_bytes_max) {
+        std.debug.print("pull stats worst case: used_bytes {d} of {d}\n{s}\n", .{
+            bounded.used_bytes,
+            constants.request_arena_bytes_max,
+            response.body[0..@min(response.body.len, 600)],
+        });
     }
     try testing.expectEqual(@as(u16, 200), response.status);
     try testing.expect(std.mem.indexOf(u8, response.body, "\"truncated\":true") != null);

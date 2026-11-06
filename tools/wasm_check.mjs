@@ -209,6 +209,14 @@ if (failed !== 0 || missing.length > 0) {
   process.exit(1);
 }
 
+// The mTLS scenario, run in the module: certificates issued, verified and refused, and a
+// ClientHello (src/mtls_smoke.zig). 0 means every step held.
+const mtlsStopped = (await instantiate(bytes)).zcube_mtls_smoke();
+if (mtlsStopped !== 0) {
+  console.error(`wasm check failed: the mTLS scenario stopped at step ${mtlsStopped} (mtls_smoke.Step)`);
+  process.exit(1);
+}
+
 // The C0 simulation, run in the module: the scenario for a few seeds, and the fuzz variant. Each
 // returns the step it stopped at (0: every step held) and a report to read.
 const simSeeds = [1n, 2n, 3n, 0xdeadbeefn];
@@ -237,4 +245,4 @@ if (simProblems.length > 0) {
   for (const problem of simProblems) console.error(problem);
   process.exit(1);
 }
-console.log(`wasm check: ok (${rendered.length} bytes of rendered diagnostics; the C0 simulation held for ${simSeeds.length} seeds and ${fuzzSeeds.length} fuzz runs, ${simBytes} bytes of report)`);
+console.log(`wasm check: ok (the mTLS scenario held; ${rendered.length} bytes of rendered diagnostics; the C0 simulation held for ${simSeeds.length} seeds and ${fuzzSeeds.length} fuzz runs, ${simBytes} bytes of report)`);
