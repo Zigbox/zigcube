@@ -558,7 +558,8 @@ test "a damaged input is told from an absent one, and neither is a fault of the 
 test "a keepalive answered with a ttl the agent cannot fence under is ZC-E0121" {
     // Goal: RemoteStore refuses a short ttl from the server, as `heartbeat` relies on.
     var rig: Rig = undefined;
-    const bodies = [_][]const u8{"{\"lease\":{\"id\":7,\"ttl_ms\":4000}}"};
+    const bodies = [_][]const u8{"{\"lease\":{\"id\":7,\"ttl_ms\":4000},\"chain\":{\"revision\":5,\"hash\":\"" ++
+        hash_a ++ "\"}}"};
     rig.init(&bodies);
     defer rig.deinit();
     rig.diag.reset();

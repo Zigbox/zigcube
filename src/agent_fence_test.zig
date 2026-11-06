@@ -255,6 +255,7 @@ test "a keepalive the client refuses for a short ttl (ZC-E0121) fences the node 
     world.switched.keepalive_refuse_short = true;
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
     advance_to(world, world.agent.renew_at_ms + sim_world.tick_ms);
+    world.advance(constants.fence_stop_ms + 2 * sim_world.tick_ms);
     try testing.expect(world.agent.fences >= 1);
 }
 
