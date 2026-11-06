@@ -557,7 +557,7 @@ const Big = struct {
         body: []const u8,
     ) ?[]const u8 {
         const big: *Big = @ptrCast(@alignCast(context));
-        const script: Script = .{ .arena = big.arena };
+        var script: Script = .{ .arena = big.arena };
         if (std.mem.eql(u8, method, "POST")) {
             big.posted.append(big.arena, body) catch unreachable; // The test arena has room.
             return script.reply(200, "{\"state\":\"cancelled\"}");
@@ -577,7 +577,7 @@ const Big = struct {
     }
 
     fn page(big: *Big, path: []const u8) []const u8 {
-        const script: Script = .{ .arena = big.arena };
+        var script: Script = .{ .arena = big.arena };
         const marker = "&continue=p";
         const first: u32 = if (std.mem.indexOf(u8, path, marker)) |at|
             std.fmt.parseInt(u32, path[at + marker.len ..], 10) catch unreachable // Our token.
@@ -688,8 +688,10 @@ test "an input file of exactly 64 KiB is read, one byte more is refused" {
     const arena = arena_state.allocator();
     const exact = try arena.alloc(u8, constants.job_input_bytes_max);
     @memset(exact, 'a');
+    const over = try arena.alloc(u8, constants.job_input_bytes_max + 1);
+    @memset(over, 'a');
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "exact", .data = exact });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "over", .data = exact ++ "a" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "over", .data = over });
     var environ = std.process.Environ.Map.init(testing.allocator);
     defer environ.deinit();
     var stdout: Writer.Allocating = .init(arena);
@@ -710,8 +712,8 @@ test "an input file of exactly 64 KiB is read, one byte more is refused" {
     const root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/", .{tmp.sub_path});
     const text = try read_input(&env, try std.fmt.allocPrint(arena, "{s}exact", .{root}), &report);
     try testing.expectEqual(@as(usize, constants.job_input_bytes_max), text.len);
-    const over = try std.fmt.allocPrint(arena, "{s}over", .{root});
-    try testing.expectError(error.Failed, read_input(&env, over, &report));
+    const over_path = try std.fmt.allocPrint(arena, "{s}over", .{root});
+    try testing.expectError(error.Failed, read_input(&env, over_path, &report));
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0111), report.diag.code);
 }
 

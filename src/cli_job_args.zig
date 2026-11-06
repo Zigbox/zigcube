@@ -361,7 +361,7 @@ test "job run: every flag, the command takes the rest of the line" {
         "run",          "etl",       "--image",         "sha256:ab",
         "--env",        "A=1",       "--env",           "B=x=y",
         "--input-file", "in.txt",    "--input-env",     "PAYLOAD",
-        "--deadline",   "90s",       "--submit-within", "2h",
+        "--deadline",   "90s",       "--submit-within", "45m",
         "--label",      "team=data", "--command",       "sh",
         "-c",           "--image",   "exit 3",
     });
@@ -375,7 +375,7 @@ test "job run: every flag, the command takes the rest of the line" {
     try testing.expectEqualStrings("in.txt", run.input_file.?);
     try testing.expectEqualStrings("PAYLOAD", run.input_env.?);
     try testing.expectEqual(@as(u64, 90_000), run.deadline_ms);
-    try testing.expectEqual(@as(u64, 2 * 60 * 60 * 1000), run.submit_within_ms);
+    try testing.expectEqual(@as(u64, 45 * 60 * 1000), run.submit_within_ms);
     try testing.expectEqual(@as(usize, 4), run.command.slice().len);
     try testing.expectEqualStrings("--image", run.command.slice()[2]);
 
