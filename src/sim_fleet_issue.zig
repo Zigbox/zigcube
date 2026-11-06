@@ -12,7 +12,16 @@ const constants = @import("constants.zig");
 pub const kind_sim_cluster = "sim-cluster";
 pub const kind_sim_c1 = "sim-c1";
 pub const kind_sim_swarm = "sim-swarm";
-pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm };
+/// Not a simulator: the teeth canary (`run.sh`, `canary_pick`). A batch of it is one fault-on
+/// runner's run over fresh seeds, read with its simulator kind's parser and judged by
+/// `canary_verdict`: a miss or a wrong symptom is a failure of this kind.
+pub const kind_sim_canary = "sim-canary";
+pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm, kind_sim_canary };
+
+comptime {
+    // The state file refuses more kinds per day than this (sim_fleet_state.zig).
+    assert(kinds.len <= constants.fleet_kinds_max);
+}
 
 pub fn kind_known(kind: []const u8) bool {
     for (kinds) |known| {
@@ -24,6 +33,7 @@ pub fn kind_known(kind: []const u8) bool {
 /// The `zig build` step that installs the runner of `kind` (and so the replay's binary).
 fn exe_step(kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm-exe";
+    if (std.mem.eql(u8, kind, kind_sim_canary)) return "sim-canary-exe";
     return "sim-cluster-exe";
 }
 
@@ -33,6 +43,7 @@ fn exe_step(kind: []const u8) []const u8 {
 /// way round.
 fn summary_prefix(kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm: seeds ";
+    if (std.mem.eql(u8, kind, kind_sim_canary)) return "sim-canary: seeds ";
     if (std.mem.eql(u8, kind, kind_sim_c1)) return "sim-cluster --c1: seeds ";
     return "sim-cluster: seeds ";
 }
@@ -61,10 +72,16 @@ pub const Failure = struct {
     shrunk_replay: ?[]const u8 = null,
     /// The simulator panicked or died on this seed; `check` is its message, digits elided.
     crash: bool = false,
+    /// A canary's verdict on a whole run (`canary_verdict`): it covers seeds `seed..range_last`,
+    /// not one seed, and nothing was shrunk.
+    range_last: ?u64 = null,
+    /// A canary that failed with the wrong symptom: the check the first failing seed broke.
+    observed: ?[]const u8 = null,
 
-    /// A run that never started is the host's trouble (see `step_setup`).
+    /// A run that never started is the host's trouble (see `step_setup`). A crash is never: it
+    /// is a bug wherever it happened, and run.sh records a crash that traced no step in `setup`.
     pub fn infra(failure: *const Failure) bool {
-        return std.mem.eql(u8, failure.step, step_setup);
+        return !failure.crash and std.mem.eql(u8, failure.step, step_setup);
     }
 };
 
@@ -239,6 +256,130 @@ fn parse_detail(failure: *Failure, line: []const u8) ParseError!void {
     }
 }
 
+/// A teeth canary's run (`sim_fleet ingest --canary`): the fault-on runner, the simulator kind
+/// whose parser reads its output, the seeds it ran (`auto` operations, `--profile=auto`) and the
+/// text a caught failure's check starts with (null: any check).
+pub const Canary = struct {
+    runner: []const u8,
+    kind: []const u8,
+    first: u64,
+    last: u64,
+    symptom: ?[]const u8,
+};
+
+pub const step_canary = "canary";
+pub const step_canary_symptom = "canary-symptom";
+
+/// `crashed`: no seed ran to its end (each crashed or could not start), so nothing was judged;
+/// the crashes are filed.
+/// `not_run`: no seed could start (the host's trouble, step `setup`): counted, never filed, and
+/// run.sh runs the canary again.
+pub const Verdict = enum { caught, missed, wrong_symptom, crashed, not_run };
+
+/// What the canary's run says, and what of it is filed under `kind_sim_canary`.
+pub const Judged = struct { verdict: Verdict, batch: Batch };
+
+/// Judges a canary's parsed run. Its checks that failed are the fault being caught, so they are
+/// not filed; its crashes and seeds that could not start are filed as they are (crashes under
+/// the canary's own fingerprint). No seed failing a check is a miss: the fleet has stopped
+/// detecting, unless no seed ran to its end. Seeds that failed, but none with the symptom, are a
+/// wrong symptom: the check meant
+/// to fire did not. Each is one failure at a step of its own, so the two never share an issue.
+/// Every replay names the runner, which prints its simulator's name.
+pub fn canary_verdict(
+    arena: std.mem.Allocator,
+    canary: Canary,
+    batch: Batch,
+) error{OutOfMemory}!Judged {
+    assert(kind_known(canary.kind));
+    assert(!std.mem.eql(u8, canary.kind, kind_sim_canary));
+    assert(canary.first <= canary.last);
+    var kept: std.ArrayList(Failure) = .empty;
+    var checks: u64 = 0;
+    var crashes: u64 = 0;
+    var first_check: ?Failure = null;
+    var symptom_seen = false;
+    for (batch.failures) |failure| {
+        var own = failure;
+        own.replay = try runner_replay(arena, canary.runner, failure.replay);
+        if (failure.shrunk_replay) |shrunk| {
+            own.shrunk_replay = try runner_replay(arena, canary.runner, shrunk);
+        }
+        if (failure.crash or failure.infra()) {
+            if (failure.crash) crashes += 1;
+            try kept.append(arena, own);
+            continue;
+        }
+        checks += 1;
+        if (first_check == null) first_check = own;
+        const symptom = canary.symptom orelse "";
+        if (std.mem.startsWith(u8, failure.check, symptom)) symptom_seen = true;
+    }
+    // Seeds that ran to their end: every seed but those kept above.
+    const ran = batch.seeds - kept.items.len;
+    const verdict: Verdict = if (checks > 0)
+        (if (symptom_seen) .caught else .wrong_symptom)
+    else if (ran > 0) .missed else if (crashes > 0) .crashed else .not_run;
+    switch (verdict) {
+        .caught, .crashed, .not_run => {},
+        .missed => try kept.append(arena, .{
+            .seed = canary.first,
+            .range_last = canary.last,
+            .check = try std.fmt.allocPrint(
+                arena,
+                "the fleet has stopped detecting: {s} failed no seed",
+                .{canary.runner},
+            ),
+            .step = step_canary,
+            .replay = try canary_replay(arena, canary),
+        }),
+        .wrong_symptom => {
+            const seen = first_check.?;
+            try kept.append(arena, .{
+                .seed = seen.seed,
+                .check = try std.fmt.allocPrint(
+                    arena,
+                    "{s} failed, but never with \"{s}\"",
+                    .{ canary.runner, canary.symptom.? },
+                ),
+                .step = step_canary_symptom,
+                .replay = seen.shrunk_replay orelse seen.replay,
+                .observed = seen.check,
+            });
+        },
+    }
+    assert(kept.items.len <= batch.failures.len + 1);
+    return .{
+        .verdict = verdict,
+        .batch = .{ .seeds = batch.seeds, .operations = batch.operations, .failures = kept.items },
+    };
+}
+
+/// The command that runs the canary's whole range again.
+fn canary_replay(arena: std.mem.Allocator, canary: Canary) error{OutOfMemory}![]const u8 {
+    const c1: []const u8 = if (std.mem.eql(u8, canary.kind, kind_sim_c1)) " --c1" else "";
+    return std.fmt.allocPrint(
+        arena,
+        "zig-out/bin/{s} --seeds {d}..{d} auto --profile=auto{s}",
+        .{ canary.runner, canary.first, canary.last, c1 },
+    );
+}
+
+/// A replay line with the simulator's name (which a fault-on runner prints, being built from the
+/// same main) replaced by the runner's, so the replay runs with the fault on.
+fn runner_replay(
+    arena: std.mem.Allocator,
+    runner: []const u8,
+    replay: []const u8,
+) error{OutOfMemory}![]const u8 {
+    for ([_][]const u8{ "zig-out/bin/sim_cluster ", "zig-out/bin/sim_swarm " }) |simulator| {
+        if (after_prefix(replay, simulator)) |rest| {
+            return std.fmt.allocPrint(arena, "zig-out/bin/{s} {s}", .{ runner, rest });
+        }
+    }
+    return replay;
+}
+
 /// The line that rebuilds and replays a failure on the commit that found it.
 pub fn replay_line(
     arena: std.mem.Allocator,
@@ -296,21 +437,33 @@ fn write_failure(
     replay: []const u8,
 ) std.Io.Writer.Error!void {
     const failure = report.failure;
-    try out.print("- run: {s}\n- commit: `{s}`\n- seed: {d}\n", .{
-        report.kind, report.commit, failure.seed,
-    });
+    try out.print("- run: {s}\n- commit: `{s}`\n", .{ report.kind, report.commit });
+    if (failure.range_last) |last| {
+        try out.print("- seeds: {d}..{d}, each with its own drawn operations and profile\n", .{
+            failure.seed, last,
+        });
+    } else {
+        try out.print("- seed: {d}\n", .{failure.seed});
+    }
+    if (failure.observed) |observed| try out.print("- failed instead with: {s}\n", .{observed});
+    // A canary's whole run (`range_last`) has no operation count and nothing shrunk.
+    if (failure.range_last == null) try write_operations(out, failure);
+    try out.print("\nReplay:\n\n```\n{s}\n```\n", .{replay});
+    if (report.more.len > 0) {
+        try out.writeAll("\nAlso failing this way in the same round: seeds ");
+        try write_seeds(out, report.more);
+        try out.writeAll(".\n");
+    }
+}
+
+fn write_operations(out: *std.Io.Writer, failure: Failure) std.Io.Writer.Error!void {
+    assert(failure.range_last == null);
     if (failure.crash) {
         try out.writeAll("- operations: not shrunk (the simulator crashed)\n");
     } else if (failure.shrunk_operations) |shrunk| {
         try out.print("- operations: shrunk to {d}\n", .{shrunk});
     } else {
         try out.writeAll("- operations: not shrunk\n");
-    }
-    try out.print("\nReplay:\n\n```\n{s}\n```\n", .{replay});
-    if (report.more.len > 0) {
-        try out.writeAll("\nAlso failing this way in the same round: seeds ");
-        try write_seeds(out, report.more);
-        try out.writeAll(".\n");
     }
 }
 
@@ -331,6 +484,10 @@ fn write_body(
 ) std.Io.Writer.Error!void {
     const failure = report.failure;
     try w.writeAll("The simulation fleet found a failure no open or closed issue covers.\n\n");
+    if (std.mem.eql(u8, report.kind, kind_sim_canary)) {
+        try w.writeAll("This is the fleet's teeth canary: the runner is built with a test-only ");
+        try w.writeAll("fault on, and the fleet must catch it (ops/sim-fleet/README.md).\n\n");
+    }
     if (failure.crash) {
         try w.print("- crash: {s}\n- step: {s}\n", .{ failure.check, failure.step });
         try w.writeAll("- the message has its digits replaced by N; the replay prints it whole\n");
@@ -581,6 +738,12 @@ test "a run that could not allocate its world is infrastructure, and its step pa
         "sim-cluster: seeds 1..9, 100 operations: 1 of 9 failed\n";
     const arena = arena_state.allocator();
     try std.testing.expectError(error.BadLine, parse(arena, kind_sim_cluster, empty_step));
+    // A crash before the first traced step: run.sh's crash_record names the step `setup`.
+    const crashed = "seed 5: CRASHED: reached unreachable code\n  step: setup\n  replay: r\n" ++
+        "sim-cluster: seeds 5..5, 100 operations: 1 of 1 failed\n";
+    const crash_batch = try parse(arena, kind_sim_cluster, crashed);
+    try std.testing.expect(crash_batch.failures[0].crash);
+    try std.testing.expect(!crash_batch.failures[0].infra());
 }
 
 test "the marker hashes the kind of the run it reports" {

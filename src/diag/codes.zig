@@ -49,6 +49,11 @@ pub const Code = enum(u8) {
     E0122,
     E0123,
     E0124,
+    E0130,
+    E0131,
+    E0132,
+    E0133,
+    E0134,
     E0201,
     E0202,
     E0203,
@@ -68,6 +73,9 @@ pub const Code = enum(u8) {
     E0301,
     E0302,
     E0303,
+    E0307,
+    W0307,
+    W0308,
     E0401,
     E0402,
     E0403,
@@ -87,7 +95,10 @@ pub const Code = enum(u8) {
     E0513,
     E0514,
     E0515,
+    E0521,
+    E0522,
     W0501,
+    W0503,
     E0601,
     W0601,
     W0602,
@@ -114,6 +125,8 @@ pub const Code = enum(u8) {
     B0001,
     B0002,
     B0003,
+    B0004,
+    B0005,
 };
 
 pub const Entry = struct {
@@ -483,6 +496,88 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0130,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a job is not valid",
+        .explanation =
+        \\`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it
+        \\stands. The cause line names the field and the limit it broke: a name that
+        \\is not 1 to 48 bytes of lowercase letters, digits and hyphens (none at
+        \\either end), no command or too many words, a deadline of zero or
+        \\above 24 hours, a grace period above 60 seconds, env above 8 KiB, an input
+        \\above 64 KiB or with a NUL byte, a submit time more than an hour ahead, or
+        \\more labels than a job may carry.
+        \\
+        \\Two fields are refused because they are not built yet, and the cause says
+        \\so: retries above 0 (a job runs at most once), and relay or placement.
+        \\Accepting a field and ignoring it would say something false about where the
+        \\job runs.
+        \\
+        \\Fix the field it names and submit again.
+        ,
+    },
+    .{
+        .code = .E0131,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a different job already has that name",
+        .explanation =
+        \\A job named this exists, and what you submitted differs from it in its
+        \\image, source, command, env, limits, deadline, grace period, labels, retries
+        \\or input. Submitting the same job again is safe and changes nothing: the
+        \\second POST answers with the job that exists. A different job is refused so
+        \\that a retry can never replace the one that ran.
+        \\
+        \\Use another name, or wait until the old job has ended and been removed (an
+        \\ended job is kept for at least an hour), then submit again.
+        ,
+    },
+    .{
+        .code = .E0132,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "there are too many jobs",
+        .explanation =
+        \\The cluster holds as many jobs as it accepts: either the jobs not yet ended
+        \\have reached their bound, or too many jobs were created in the last 73
+        \\hours, the longest an ended job can still be kept. The cause line says which
+        \\bound and its value. The job was not created.
+        \\
+        \\Wait for jobs to end, or cancel the ones you no longer need
+        \\(zcube job cancel), and submit again. Ended jobs are removed by age, after
+        \\at least an hour; nothing here removes them sooner.
+        ,
+    },
+    .{
+        .code = .E0133,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no job by that name",
+        .explanation =
+        \\No job with this name is stored. Either it never existed, or it ended and
+        \\was removed: an ended job is kept for at least an hour and at most a day.
+        \\
+        \\zcube job list shows the jobs that exist. A client that watches endings must
+        \\record each one it has handled; a job it has not seen end may be gone.
+        ,
+    },
+    .{
+        .code = .E0134,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the time to submit this job has passed",
+        .explanation =
+        \\Every job is submitted with a submit-by time, at most an hour ahead. This
+        \\POST arrived after it, so the job was not created. The deadline exists so
+        \\that a retry of a POST can always find the job the first one made: an ended
+        \\job is kept for at least as long as a submit window.
+        \\
+        \\Submit again with a new submit-by time. If the job was created by an
+        \\earlier attempt, zcube job get NAME shows it; do not assume it did not run.
+        ,
+    },
+    .{
         .code = .E0201,
         .severity = .@"error",
         .blame = .external,
@@ -809,6 +904,61 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0307,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a job's stored records contradict each other",
+        .explanation =
+        \\The records of one job (its desired state, its run, its status and what its
+        \\node reported) do not agree: a run with no job, a status that has ended and
+        \\carries no ending, an ending that does not match its state. The API writes
+        \\them together and validates what it writes, so something else wrote one of
+        \\the keys, or the store was edited by hand.
+        \\
+        \\The cause line names the job and the keys. The job controller changes
+        \\nothing for that job until it is fixed.
+        \\
+        \\Never fix it by deleting the job's run (/job-runs/NAME) or its status
+        \\(/job-status/NAME) alone. A job that lost its run could be started a
+        \\second time, and its ending lost; the controller refuses to create a run
+        \\for a job that had one, and changes nothing. Restore the missing or
+        \\damaged record, or, to remove the whole job, delete all of its keys in
+        \\one transaction: /jobs/NAME, /job-input/NAME, /job-runs/NAME,
+        \\/job-status/NAME and /job-observed/NODE/NAME.
+        ,
+    },
+    .{
+        .code = .W0307,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a report for an ended job was dropped",
+        .explanation =
+        \\An agent reported on a run whose job had already ended. A job's ending is
+        \\written once and never changes, so the report was not applied; it is
+        \\recorded in the job's decisions so that it can be seen.
+        \\
+        \\This is normal after a node was cut off and came back: the control plane
+        \\ended the job as unreachable, and the agent then reported what it had
+        \\done. zcube why job NAME shows both.
+        ,
+    },
+    .{
+        .code = .W0308,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a job waits: no node can take it now",
+        .explanation =
+        \\The scheduler placed nothing for this job yet. Either no node has the CPU,
+        \\memory or room it asks for, or every node already holds the most jobs it
+        \\may. The job stays pending and is looked at again whenever a node or an
+        \\assignment changes.
+        \\
+        \\A job that is not started within its deadline ends as failed (deadline).
+        \\Lower its limits, add a node, or wait for a job to end. zcube why job NAME
+        \\names the shortfall.
+        ,
+    },
+    .{
         .code = .E0401,
         .severity = .@"error",
         .blame = .user,
@@ -1099,6 +1249,41 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0521,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the agent could not tell how a run ended",
+        .explanation =
+        \\A run's container is gone and nothing says how it ended: the agent lost its
+        \\state directory or the supervisor's exit record, or the host restarted, so
+        \\the process that was running it no longer exists and left no exit status.
+        \\
+        \\The job ends as failed (unknown). It is never started again: a run is
+        \\started at most once, and starting it to find out would break that. The
+        \\cause line names the run and what was missing.
+        \\
+        \\Find out why: a host restart (uptime, the system log) or a state directory
+        \\that was cleared, moved or not mounted (the agent's --state-dir). Fix that
+        \\first, or the next run can be lost the same way; then submit the job again
+        \\under a new name if it should run.
+        ,
+    },
+    .{
+        .code = .E0522,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a run's start record is missing or damaged",
+        .explanation =
+        \\Before a run is started the agent writes a record of it in its state
+        \\directory, so that after a crash it can tell a run it has started from one
+        \\it has not. This record was missing, or could not be read.
+        \\
+        \\The agent does not guess: it starts nothing it cannot prove it has not
+        \\started. The run is reported as lost and its job ends as failed (unknown).
+        \\Check the state directory's disk and permissions.
+        ,
+    },
+    .{
         .code = .W0501,
         .severity = .warning,
         .blame = .environment,
@@ -1111,6 +1296,21 @@ pub const registry = [_]Entry{
         \\
         \\This happens when the agent was paused or cut off from the server for
         \\longer than the lease time to live less the fencing margin.
+        ,
+    },
+    .{
+        .code = .W0503,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a job reached its deadline and was stopped",
+        .explanation =
+        \\A job ran for as long as its deadline allows, counted from the moment it
+        \\started on this node's clock. The agent asked the process to stop, waited
+        \\for the job's grace period, and then killed it. The job ends as failed
+        \\(deadline).
+        \\
+        \\Raise the deadline, at most 24 hours, if the job needs the time; a job that
+        \\should be faster is a job to look at.
         ,
     },
     .{
@@ -1558,6 +1758,37 @@ pub const registry = [_]Entry{
         \\right, zcube repair allocations <node> --confirm writes it. Please
         \\report it at https://github.com/Zigbox/zigcube/issues/new with the
         \\output of zcube why node <node>.
+        ,
+    },
+    .{
+        .code = .B0004,
+        .severity = .bug,
+        .blame = .internal,
+        .summary = "zcube could not map how a job ended",
+        .explanation =
+        \\The job controller read an end of a run (an exit, a stop cause and what the
+        \\agent reported) that none of its rules covers. The job is left as it was;
+        \\nothing was ended or started. This is a bug in zcube, not something you
+        \\did.
+        \\
+        \\A diagnostic bundle is saved for every bug. Review its manifest, then
+        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
+        ,
+    },
+    .{
+        .code = .B0005,
+        .severity = .bug,
+        .blame = .internal,
+        .summary = "a job's run record is larger than a run may be",
+        .explanation =
+        \\The record of a job's run, once encoded, is larger than the bound on one
+        \\run (16 KiB). The API checks a job's words against their bounds before it
+        \\accepts the job, so a job that reaches this point got past a check it
+        \\should have failed. This is a bug in zcube, not something you did, and
+        \\not a memory limit: raising limits changes nothing. The job is not started.
+        \\
+        \\A diagnostic bundle is saved for every bug. Review its manifest, then
+        \\attach it to a report at https://github.com/Zigbox/zigcube/issues/new.
         ,
     },
 };

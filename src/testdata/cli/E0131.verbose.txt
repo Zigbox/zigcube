@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0131]: a different job already has that name
+  cause  a job named train-7 exists and differs from this one in: command
+  reqid  r-0000001
+  fix    use another name, or submit exactly the job that exists
+  more   zcube explain E0131
+  docs   https://zigbox.github.io/zigcube/errors/E0131.html

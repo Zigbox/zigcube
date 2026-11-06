@@ -310,6 +310,10 @@ fn exists(snapshot: *const Snapshot, subject: Subject) bool {
             }
             return false;
         },
+        // The snapshot holds no jobs, and a job's chain is short (`decisions_per_subject_max` is
+        // far more than a job needs): never claim it gone, so a live job's chain is not cut as
+        // an orphan's.
+        .job => return true,
     }
 }
 

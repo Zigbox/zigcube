@@ -2,9 +2,10 @@
 # The simulation fleet's loop (ops/sim-fleet/README.md): follow the tip of main, rebuild when it
 # moves, run three producers over fresh seeds in parallel batches (`sim_cluster`, `sim_cluster
 # --c1` and `sim_swarm`; the kinds `sim-cluster`, `sim-c1`, `sim-swarm`), and hand each round
-# (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Settings come from the
-# environment (the unit reads /etc/sim-fleet/fleet.env). The token is a file; this script never
-# prints it.
+# (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Every
+# SIM_FLEET_CANARY_ONE_IN rounds a fourth worker runs the teeth canary, a fault-on runner that
+# must fail. Settings come from the environment (the unit reads /etc/sim-fleet/fleet.env). The
+# token is a file; this script never prints it.
 set -eu
 
 main() {
@@ -31,8 +32,9 @@ main() {
     : "${SIM_FLEET_BATCH:=100}"
     # Seeds per batch by kind; the cluster kinds fall back to SIM_FLEET_BATCH. The swarm's default
     # is 50000 and ignores SIM_FLEET_BATCH, because an installed fleet.env already sets that to
-    # 100 (setup.sh never overwrites it) and the swarm worker would idle. A swarm seed takes ~1.5 ms to a cluster seed's ~1.1 s (measured 2026-11-04, ReleaseSafe, 100
-    # operations), so 50000 keep its core about as busy as 100 cluster seeds keep theirs.
+    # 100 (setup.sh never overwrites it) and the swarm worker would idle. A swarm seed takes
+    # ~1.5 ms to a cluster seed's ~1.1 s (measured 2026-11-04, ReleaseSafe, 100 operations), so
+    # 50000 keep its core about as busy as 100 cluster seeds keep theirs.
     : "${SIM_FLEET_BATCH_CLUSTER:=$SIM_FLEET_BATCH}"
     : "${SIM_FLEET_BATCH_C1:=$SIM_FLEET_BATCH}"
     : "${SIM_FLEET_BATCH_SWARM:=50000}"
@@ -42,6 +44,12 @@ main() {
     : "${SIM_FLEET_WORKERS_C1:=1}"
     : "${SIM_FLEET_WORKERS_SWARM:=1}"
     : "${SIM_FLEET_CACHE_MB:=8192}"
+    # The teeth canary: 1 round in this many also runs the next fault-on runner of the cycle
+    # (canary_pick); 0 never does, 1 every round. A miss is filed as an issue.
+    : "${SIM_FLEET_CANARY_ONE_IN:=50}"
+    # A canary GitHub held back, or the host kept from running, runs again next round, this many
+    # tries in a row at most (canary_retry).
+    : "${SIM_FLEET_CANARY_TRIES_MAX:=5}"
     : "${SIM_FLEET_TRACKER:=}"
     # Deadlines, in seconds: nothing the loop waits on may hang it.
     : "${SIM_FLEET_GIT_TIMEOUT:=300}"
@@ -51,6 +59,18 @@ main() {
     # 0: run forever (the service). N: stop after N rounds (a dry run, a test).
     : "${SIM_FLEET_ROUNDS:=0}"
     : "${SIM_FLEET_IDLE_SECONDS:=60}"
+    case "$SIM_FLEET_CANARY_ONE_IN" in
+    '' | *[!0-9]*)
+        log "SIM_FLEET_CANARY_ONE_IN is '$SIM_FLEET_CANARY_ONE_IN': it must be a number (0: off)"
+        exit 2
+        ;;
+    esac
+    case "$SIM_FLEET_CANARY_TRIES_MAX" in
+    '' | *[!0-9]* | 0)
+        log "SIM_FLEET_CANARY_TRIES_MAX is '$SIM_FLEET_CANARY_TRIES_MAX': it must be 1 or more"
+        exit 2
+        ;;
+    esac
     if [ -n "${SIM_FLEET_WORKERS:-}" ]; then
         log "SIM_FLEET_WORKERS is ignored: set SIM_FLEET_WORKERS_CLUSTER, _C1 and _SWARM"
     fi
@@ -112,7 +132,8 @@ follow_main() {
     log "building $head"
     rm -rf "$STATE/bin/$head"
     if timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build -Doptimize=ReleaseSafe \
-        --prefix "$STATE/bin/$head" sim-cluster-exe sim-swarm-exe sim-fleet-exe >"$STATE/build.log" 2>&1; then
+        --prefix "$STATE/bin/$head" sim-cluster-exe sim-swarm-exe sim-fleet-exe \
+        sim-canary-exe >"$STATE/build.log" 2>&1; then
         echo "$head" >"$STATE/built.new"
         mv "$STATE/built.new" "$STATE/built"
         built="$head"
@@ -146,44 +167,71 @@ prune_cache() {
     fi
 }
 
-# The executable that produces kind $1, and the flags that make it that kind.
+# The simulator kind whose output kind $1 prints: itself, or for the canary its runner's
+# (canary_pick sets canary_kind).
+kind_sim() {
+    if [ "$1" = sim-canary ]; then echo "$canary_kind"; else echo "$1"; fi
+}
+
+# The executable that produces kind $1, and the flags that make it that kind. The canary runs
+# with the fleet's widest settings whatever SIM_FLEET_OPS and SIM_FLEET_PROFILE say.
 kind_exe() {
     case "$1" in
+    sim-canary) echo "$canary_runner" ;;
     sim-swarm) echo sim_swarm ;;
     *) echo sim_cluster ;;
     esac
 }
 
 kind_flags() {
-    case "$1" in
-    sim-c1) echo "--c1 --profile=$SIM_FLEET_PROFILE" ;;
-    *) echo "--profile=$SIM_FLEET_PROFILE" ;;
+    profile=$SIM_FLEET_PROFILE
+    if [ "$1" = sim-canary ]; then profile=auto; fi
+    case "$(kind_sim "$1")" in
+    sim-c1) echo "--c1 --profile=$profile" ;;
+    *) echo "--profile=$profile" ;;
     esac
+}
+
+# `--shrink` for every kind but the canary: its fault is on, so a failure is the point and has
+# nothing to shrink (owner decision, 2026-11-05).
+kind_shrink() {
+    if [ "$1" = sim-canary ]; then echo ""; else echo --shrink; fi
+}
+
+kind_ops() {
+    if [ "$1" = sim-canary ]; then echo auto; else echo "$SIM_FLEET_OPS"; fi
 }
 
 # The summary line's operations, as the producers print it: `N operations`, or for a drawn size
 # `drawn operations` (src/sim_fleet_issue.zig reads both).
 ops_phrase() {
-    if [ "$SIM_FLEET_OPS" = auto ]; then echo "drawn operations"; else echo "$SIM_FLEET_OPS operations"; fi
+    ops=$(kind_ops "$1")
+    if [ "$ops" = auto ]; then echo "drawn operations"; else echo "$ops operations"; fi
 }
 
-# The summary line's prefix and the step of a crash that left none: `sim_swarm` has no
-# --trace-steps, so a swarm crash is in the step "run".
+# The summary line's prefix.
 kind_prefix() {
-    case "$1" in
+    case "$(kind_sim "$1")" in
     sim-swarm) echo sim-swarm ;;
     sim-c1) echo "sim-cluster --c1" ;;
     *) echo sim-cluster ;;
     esac
 }
 
-# Seeds per batch of kind $1 (defaults above).
+# Seeds per batch of kind $1 (defaults above; the canary's from its manifest).
 kind_batch() {
     case "$1" in
+    sim-canary) echo "$canary_seeds" ;;
     sim-cluster) echo "$SIM_FLEET_BATCH_CLUSTER" ;;
     sim-c1) echo "$SIM_FLEET_BATCH_C1" ;;
     *) echo "$SIM_FLEET_BATCH_SWARM" ;;
     esac
+}
+
+# The flag that traces each seed's replay line and step to stderr: the cluster runners have it,
+# `sim_swarm` (and its fault-on runner) not, so a swarm crash is in the step "run".
+kind_trace() {
+    if [ "$(kind_sim "$1")" = sim-swarm ]; then echo ""; else echo --trace-steps; fi
 }
 
 kind_workers() {
@@ -204,6 +252,7 @@ run_round() {
     round="$STATE/round"
     rm -rf "$round"
     mkdir -p "$round"
+    canary_pick
     workers=0
     for kind in $KINDS; do
         n=$(kind_workers "$kind")
@@ -214,6 +263,11 @@ run_round() {
             i=$((i + 1))
         done
     done
+    if [ -n "$canary_runner" ]; then
+        canary_worker=$workers
+        start_worker "$workers" sim-canary
+        workers=$((workers + 1))
+    fi
     wait
     for kind in $KINDS; do
         : >"$round/all-$kind"
@@ -224,8 +278,178 @@ run_round() {
             fi
             w=$((w + 1))
         done
-        if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind"; fi
+        if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind" || true; fi
     done
+    if [ -n "$canary_runner" ]; then canary_report "$canary_worker"; fi
+}
+
+# The teeth canary (docs/briefs/c3-sim-fleet.md, item 3): the fleet's own proof that it still
+# detects. Every SIM_FLEET_CANARY_ONE_IN rounds, the next runner of the manifest
+# `sim-canary-exe` installs (generated from build.zig's `c1_teeth_roots`: `<runner> <kind>
+# <seeds> <symptom>`, `-` for any) runs as one more worker of the round, like a worker of its
+# kind (fresh seeds, drawn operations and profile; no --shrink, since a miss has nothing to
+# shrink and the owner decided 2026-11-05 that a caught fault need not be), and its output goes
+# to `sim_fleet ingest --canary`, which files a miss, a wrong symptom or a crash
+# (canary_report). The cycle's place is kept in $STATE/canary-next and $STATE/canary-due; a
+# canary that GitHub held back or that the host kept from running runs again next round, at
+# most SIM_FLEET_CANARY_TRIES_MAX times in a row (canary_retry). Sets canary_runner (empty: no
+# canary this round), canary_kind, canary_seeds and canary_symptom.
+canary_pick() {
+    canary_runner=""
+    if [ "$SIM_FLEET_CANARY_ONE_IN" -eq 0 ]; then return 0; fi
+    due=$(number_in "$STATE/canary-due")
+    due=$((due + 1))
+    if [ "$due" -lt "$SIM_FLEET_CANARY_ONE_IN" ]; then
+        echo "$due" >"$STATE/canary-due"
+        return 0
+    fi
+    manifest="$STATE/bin/$built/share/sim-fleet/canaries.txt"
+    count=$(grep -c '^[a-z]' "$manifest" 2>/dev/null || true)
+    if [ "${count:-0}" -eq 0 ]; then
+        log "no canary manifest at $built ($manifest); no canary until the next cycle"
+        echo 0 >"$STATE/canary-due"
+        return 0
+    fi
+    next=$(($(number_in "$STATE/canary-next") % count))
+    line=$(grep '^[a-z]' "$manifest" | sed -n "$((next + 1))p")
+    canary_runner=${line%% *}
+    rest=${line#* }
+    canary_kind=${rest%% *}
+    rest=${rest#* }
+    canary_seeds=${rest%% *}
+    canary_symptom=${rest#* }
+    if [ "$canary_symptom" = - ]; then canary_symptom=""; fi
+    if [ ! -x "$bin/$canary_runner" ]; then
+        log "canary $canary_runner is in the manifest but not built at $built; skipped"
+        canary_runner=""
+        canary_done
+    fi
+}
+
+# The number in file $1, or 0 if it has none.
+number_in() {
+    value=$(cat "$1" 2>/dev/null || true)
+    case "$value" in '' | *[!0-9]*) echo 0 ;; *) echo "$value" ;; esac
+}
+
+# The cycle moves on: the next canary runs SIM_FLEET_CANARY_ONE_IN rounds from now.
+canary_done() {
+    echo $(($(number_in "$STATE/canary-next") + 1)) >"$STATE/canary-next"
+    echo 0 >"$STATE/canary-due"
+    echo 0 >"$STATE/canary-tries"
+}
+
+# The canary could not be filed or did not run, for a reason that may pass (GitHub asked to wait,
+# the host was short of memory): it runs again next round, but only $SIM_FLEET_CANARY_TRIES_MAX
+# times in a row, then the cycle moves on and the log says so. $1 is the reason. Sets
+# canary_gave_up to 1 when it gave up, else 0.
+canary_retry() {
+    tries=$(($(number_in "$STATE/canary-tries") + 1))
+    canary_gave_up=0
+    if [ "$tries" -ge "$SIM_FLEET_CANARY_TRIES_MAX" ]; then
+        log "canary $canary_runner: $1; gave up after $tries tries, the cycle moves on"
+        canary_gave_up=1
+        canary_done
+    else
+        echo "$tries" >"$STATE/canary-tries"
+        log "canary $canary_runner: $1; it runs again next round (try $tries)"
+    fi
+}
+
+# A canary the host kept from running $tries tries in a row is a blind spot the operator must
+# see: one crash record under sim-canary (no seed in its text, so a lasting blind spot is one
+# issue), which the tracker's day counts as a crash. The cycle has moved on, so the runner is
+# tried again when its turn comes round; if GitHub refuses the record, the reporter leaves it in
+# $STATE/last-failed-round-sim-canary.txt. $1 is the canary's worker.
+canary_blind() {
+    {
+        printf 'seed %s: CRASHED: not run in %s tries\n' "$base" "$tries"
+        printf '  step: canary\n'
+        printf '  replay: zig-out/bin/%s --seeds %s..%s auto %s\n' "$canary_runner" "$base" \
+            "$last" "$(kind_flags sim-canary)"
+        printf '%s: seeds %s..%s, drawn operations: 1 of 1 failed\n' \
+            "$(kind_prefix sim-canary)" "$base" "$base"
+    } >"$round/blind-sim-canary"
+    log "canary $canary_runner could not run in $tries tries: recording a blind spot"
+    ingest sim-canary "$round/blind-sim-canary" "$base..$last" || true
+}
+
+# Collects canary worker $1 like any worker (a crash is replayed seed by seed and each crashed
+# seed recorded); a run that timed out, was killed or refused its arguments is one crash record
+# too, since a canary that cannot run proves nothing. Then `sim_fleet ingest --canary`. A run
+# that was not caught keeps its output and stderr in $STATE/crashes.
+canary_report() {
+    code=$(cat "$round/code-$1")
+    base=$(cat "$round/base-$1")
+    last=$((base + canary_seeds - 1))
+    case "$code" in
+    0 | 1) collect "$1" sim-canary ;;
+    124 | 137) canary_record "$1" "$code" ;;
+    *)
+        if [ "$code" -ge 128 ]; then
+            collect "$1" sim-canary
+        else
+            canary_record "$1" "$code"
+        fi
+        ;;
+    esac >"$round/all-sim-canary"
+    ic=0
+    ingest sim-canary "$round/all-sim-canary" "$base..$last" || ic=$?
+    if [ "$ic" -eq 0 ]; then
+        word=$(sed -n "s/^sim-fleet: canary $canary_runner: //p" "$round/ingest-sim-canary")
+        if [ "$word" != caught ]; then keep_crash "$1" "canary-$canary_runner"; fi
+        log "canary $canary_runner on seeds $base..$last: $word"
+        if [ "$word" = "NOT RUN" ]; then
+            canary_retry "no seed could run on this host"
+            if [ "$canary_gave_up" -eq 1 ]; then canary_blind "$1"; fi
+        else
+            canary_done
+        fi
+    else
+        keep_crash "$1" "canary-$canary_runner"
+        if [ "$ic" -eq 2 ] || [ "$ic" -eq 124 ]; then
+            # Exit 2 is any environment error of the reporter (GitHub asked to wait or stopped
+            # the round, an unwritable or unreadable state file or token, no memory), 124 a
+            # timeout: any of them may pass, and the cap bounds the ones that do not.
+            canary_retry "was not filed (sim_fleet exited $ic)"
+        else
+            # The reporter refused the input (exit 1): another try gets the same answer.
+            log "canary $canary_runner: sim_fleet exited $ic; the output is in $STATE/crashes" \
+                "and the cycle moves on"
+            canary_done
+        fi
+    fi
+}
+
+# The record of canary worker $1's whole run, which ended with exit code $2 and no output to
+# read: one crash at its first seed, counted as that one seed (a kill for memory, 137, is the
+# host's: step setup, counted and never filed).
+canary_record() {
+    case "$2" in
+    124)
+        # No seed or replay line in the message: it is part of the fingerprint, and one hang
+        # under different profiles must stay one issue. The log has the seed.
+        log "canary $canary_runner timed out on $(seed_in "$round/err-$1")" >&2
+        verdict="CRASHED: timed out after $SIM_FLEET_BATCH_TIMEOUT s"
+        where=canary
+        ;;
+    137)
+        # The host's memory, not a bug of the canary: a record that is counted and not filed.
+        log "canary $canary_runner was killed (out of memory?) on $(seed_in "$round/err-$1")" >&2
+        verdict="FAILED: killed (out of memory?)"
+        where=setup
+        ;;
+    *)
+        verdict="CRASHED: exited $2: $(head -n1 "$round/err-$1")"
+        where=canary
+        ;;
+    esac
+    printf 'seed %s: %s\n' "$base" "$verdict"
+    printf '  step: %s\n' "$where"
+    printf '  replay: zig-out/bin/%s --seeds %s..%s auto %s\n' "$canary_runner" "$base" \
+        "$last" "$(kind_flags sim-canary)"
+    printf '%s: seeds %s..%s, drawn operations: 1 of 1 failed\n' "$(kind_prefix sim-canary)" \
+        "$base" "$base"
 }
 
 start_worker() {
@@ -234,15 +458,16 @@ start_worker() {
     echo "$2" >"$round/kind-$1"
     exe=$(kind_exe "$2")
     flags=$(kind_flags "$2")
-    trace=""
+    ops=$(kind_ops "$2")
     # The cluster kinds write each seed's replay line to stderr as the seed starts, so a batch
     # that times out or is killed says which seed it was on (`sim_swarm` has no such flag).
-    if [ "$exe" = sim_cluster ]; then trace=--trace-steps; fi
+    trace=$(kind_trace "$2")
+    shrink=$(kind_shrink "$2")
     (
         code=0
-        # shellcheck disable=SC2086 # $flags and $trace are flags, never empty words.
+        # shellcheck disable=SC2086 # $flags, $shrink and $trace are flags, or empty.
         timeout "$SIM_FLEET_BATCH_TIMEOUT" "$bin/$exe" \
-            --seeds "$base..$((base + $(kind_batch "$2") - 1))" "$SIM_FLEET_OPS" $flags --shrink \
+            --seeds "$base..$((base + $(kind_batch "$2") - 1))" "$ops" $flags $shrink \
             $trace >"$round/out-$1" 2>"$round/err-$1" || code=$?
         echo "$code" >"$round/code-$1"
     ) &
@@ -286,7 +511,8 @@ seed_in() {
     echo "seed $(echo "$line" | awk '{print $2}') ($line)"
 }
 
-# Keeps the crashed run's output and stderr (the last 20 crashes), named by kind.
+# Keeps the crashed run's output and stderr (the last 20 crashes), named by kind (or for a
+# canary that was not caught, `canary-<runner>`).
 keep_crash() {
     stamp="$(date -u +%Y%m%dT%H%M%SZ)-$2-$1"
     cp "$round/out-$1" "$STATE/crashes/$stamp.out"
@@ -304,13 +530,13 @@ replay_range() {
     seed=$1
     exe=$(kind_exe "$3")
     flags=$(kind_flags "$3")
-    trace=""
-    if [ "$exe" = sim_cluster ]; then trace=--trace-steps; fi
+    trace=$(kind_trace "$3")
+    shrink=$(kind_shrink "$3")
     while [ "$seed" -le "$2" ]; do
         code=0
         # shellcheck disable=SC2086 # $flags and $trace are empty or one flag.
         timeout "$SIM_FLEET_BATCH_TIMEOUT" "$bin/$exe" --seeds "$seed..$seed" \
-            "$SIM_FLEET_OPS" $flags --shrink $trace >"$round/one" 2>"$round/one.err" || code=$?
+            "$(kind_ops "$3")" $flags $shrink $trace >"$round/one" 2>"$round/one.err" || code=$?
         case "$code" in
         0 | 1) cat "$round/one" ;;
         124 | 137)
@@ -336,26 +562,34 @@ crash_record() {
         fi
     fi
     printf 'seed %s: CRASHED: %s\n' "$1" "$message"
-    if [ "$(kind_exe "$3")" = sim_swarm ]; then
+    if [ "$(kind_sim "$3")" = sim-swarm ]; then
         printf '  step: run\n'
-        printf '  replay: zig-out/bin/sim_swarm %s %s %s\n' "$1" "$SIM_FLEET_OPS" "$(kind_flags "$3")"
+        printf '  replay: zig-out/bin/%s %s %s %s\n' "$(kind_exe "$3")" "$1" "$(kind_ops "$3")" \
+            "$(kind_flags "$3")"
     else
         step=$(sed -n 's/^step: //p' "$round/one.err" | tail -n1)
         printf '  step: %s\n' "${step:-setup}"
         replay=$(sed -n 's/^ *replay: //p' "$round/one.err" | tail -n1)
         if [ -z "$replay" ]; then
-            replay="zig-out/bin/sim_cluster $1 $SIM_FLEET_OPS 0 $(kind_flags "$3")"
+            replay="zig-out/bin/$(kind_exe "$3") $1 $(kind_ops "$3") 0 $(kind_flags "$3")"
         fi
         printf '  replay: %s\n' "$replay"
     fi
-    printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' "$(kind_prefix "$3")" "$1" "$1" "$(ops_phrase)"
+    printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' "$(kind_prefix "$3")" "$1" "$1" \
+        "$(ops_phrase "$3")"
 }
 
-# Hands kind $1's file $2 to the reporter.
+# Hands kind $1's file $2 to the reporter; for the canary, $3 is the seeds it ran. What the
+# reporter prints is also kept in $round/ingest-$1. Returns its exit code.
 ingest() {
     kind=$1
     input=$2
-    set -- ingest --kind "$kind" --commit "$built" --state "$STATE/state.txt"
+    seeds=${3:-}
+    set -- ingest --kind "$(kind_sim "$kind")" --commit "$built" --state "$STATE/state.txt"
+    if [ "$kind" = sim-canary ]; then
+        set -- "$@" --canary "$canary_runner" --canary-seeds "$seeds"
+        if [ -n "$canary_symptom" ]; then set -- "$@" --expect-symptom "$canary_symptom"; fi
+    fi
     if [ -n "$SIM_FLEET_DRY_RUN" ]; then
         set -- "$@" --dry-run
     else
@@ -363,7 +597,9 @@ ingest() {
     fi
     if [ -n "$SIM_FLEET_TRACKER" ]; then set -- "$@" --tracker "$SIM_FLEET_TRACKER"; fi
     code=0
-    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$bin/sim_fleet" "$@" <"$input" || code=$?
+    timeout "$SIM_FLEET_REPORT_TIMEOUT" "$bin/sim_fleet" "$@" <"$input" \
+        >"$round/ingest-$kind" || code=$?
+    cat "$round/ingest-$kind"
     if [ "$code" -eq 0 ]; then return 0; fi
     cp "$input" "$STATE/last-failed-round-$kind.txt"
     if [ "$code" -eq 124 ]; then
@@ -372,9 +608,10 @@ ingest() {
         # sim_fleet said why on the line before; 2 with GitHub stopped is retried next round.
         log "sim_fleet ingest exited $code; the round is in $STATE/last-failed-round-$kind.txt"
     fi
+    return "$code"
 }
 
-# Sourced by ops/sim-fleet/test-crash-record.sh for the functions only.
+# Sourced by ops/sim-fleet/test-crash-record.sh and test-canary.sh for the functions only.
 if [ -n "${SIM_FLEET_SOURCE_ONLY:-}" ]; then return 0 2>/dev/null || true; fi
 main "$@"
 exit $?

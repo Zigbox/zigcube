@@ -348,6 +348,58 @@ it (a body over the limit, too many connections) still answers with the error bo
 The agent's endpoints (registration, its watch, observed-state reports) arrive with the agent in
 slice 6. Auth, scopes and the `--force`/plan-hash flow of SPEC do not exist yet.
 
+## Jobs (B1 slice 2)
+
+`src/job_api.zig` decides, `src/api.zig` routes. Like the writes above they are unauthenticated until
+auth exists, and so are the secrets in them: **a job's `env` values and `input` are readable by
+anyone who can reach the server's address** (the read-only `GET /v1/list` redacts them; the writing
+token does not, and the agent's endpoints serve them to the node). Do not put a secret in a job on a
+shared network.
+
+### `POST /v1/jobs`
+
+The body is the job as JSON: `name`, `image`, `command`, `deadline_ms`, `submit_by_ms` (required),
+`source`, `env` (`[["NAME","value"]]`), `limits`, `labels`, `grace_ms`, `input` (UTF-8 text, at most
+64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`. `retries` above 0,
+`relay` and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
+ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the same spec already
+exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
+it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job_admitted_window_max`
+creations in `job_admission_window_h` hours, `410` ZC-E0134 when `submit_by_ms` has passed,
+`400` ZC-E0130 naming the field for everything else, including a job whose run record would take
+more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source` and `image`
+are escaped (a control character takes six bytes in JSON).
+
+**This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
+about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
+(`6 * job_input_bytes_max + 16 KiB`, 409,600 bytes); every other route keeps `http_body_bytes_max`
+(64 KiB). A longer body is `413` ZC-E0108 and its cause names the limit of this route. The limit is
+decided on the decoded input, not the wire: an input within 64 KiB is always stored.
+
+### `GET /v1/jobs/{name}`, `GET /v1/jobs`
+
+The first answers `{revision, job, state, status}`: `job` is the spec with `env_names` (names, never
+values), `input_digest` and `input_bytes` (never the input), `cancel_requested`. `404` ZC-E0133 for
+a job that does not exist. The second takes `state=`, `label=key[=value]`, `limit=` (1 to 500,
+default 50), `at=` and `continue=`, and answers `{revision, jobs, continue}`; a filter keeps a
+subset of each store page, so a page may hold fewer than `limit` rows and `continue` may still be
+set.
+
+### `POST /v1/jobs/{name}/cancel`
+
+Body empty or `{"applied_by": "..."}`. Records `cancel_requested` and answers `202`; the job
+controller stops the run. A second cancel answers `202` and writes nothing; a job that has ended
+answers `200` with its `end`. `404` ZC-E0133 if there is no such job. `GET /v1/why/job/{name}` is
+the job's chain of decisions.
+
+| Code | Blame | Summary | Status |
+| --- | --- | --- | --- |
+| `ZC-E0130` | user | the job can't be accepted (its cause names the field) | `400` |
+| `ZC-E0131` | user | a job with this name exists with another spec | `409` |
+| `ZC-E0132` | user | too many jobs | `429` |
+| `ZC-E0133` | user | no such job | `404` |
+| `ZC-E0134` | user | `submit_by_ms` has passed | `410` |
+
 ## New diagnostic codes this needs
 
 The console has to explain its own failures. The `01xx` range is "API and CLI". Proposed, for

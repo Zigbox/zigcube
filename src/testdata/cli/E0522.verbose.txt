@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0522]: a run's start record is missing or damaged
+  cause  the start record of train-7-job in /var/lib/zcube-agent is missing
+  reqid  r-0000001
+  fix    check the state directory's disk and permissions
+  more   zcube explain E0522
+  docs   https://zigbox.github.io/zigcube/errors/E0522.html

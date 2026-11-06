@@ -169,6 +169,45 @@ fn state_of(
         .service => service_state(ctx, snapshot, subject.name),
         .replica => replica_state(ctx, snapshot, subject.name),
         .node => node_state(ctx, snapshot, subject.name),
+        .job => job_state(ctx, subject.name),
+    };
+}
+
+/// A job's line: its state from `/job-status/<name>` once the job controller has written one.
+/// The job is read directly, not from the snapshot, which holds no jobs.
+fn job_state(ctx: *const Context, name: []const u8) Error!State {
+    const job_key = records.job_key(name);
+    const found = try ctx.store.get(ctx.arena, job_key.slice(), null, ctx.diag);
+    const kv = found.kv orelse return .{
+        .exists = false,
+        .health = .gone,
+        .desired = 0,
+        .running = 0,
+        .text = try controller.format(ctx, "job {s}: removed", .{name}),
+    };
+    const job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+    const status_key = records.job_status_key(name);
+    const status_found = try ctx.store.get(ctx.arena, status_key.slice(), null, ctx.diag);
+    const status_kv = status_found.kv orelse return .{
+        .exists = true,
+        .health = .degraded,
+        .desired = 1,
+        .running = 0,
+        .text = try controller.format(ctx, "job {s}: pending, {s}", .{
+            name, if (job.cancel_requested != null) "cancel requested" else "not yet placed",
+        }),
+    };
+    const status = try records.read(records.JobStatus, ctx.arena, status_kv, ctx.diag);
+    const ended = records.job_state_terminal(status.state);
+    var health: Health = .degraded;
+    if (status.state == .running or status.state == .exited) health = .healthy;
+    if (status.state == .failed or status.state == .cancelled) health = .failing;
+    return .{
+        .exists = true,
+        .health = health,
+        .desired = if (ended) 0 else 1,
+        .running = if (status.state == .running) 1 else 0,
+        .text = try controller.format(ctx, "job {s}: {s}", .{ name, @tagName(status.state) }),
     };
 }
 
@@ -597,6 +636,15 @@ fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched)
                 const replica = try records.read(records.Replica, ctx.arena, kv, ctx.diag);
                 text = try controller.format(ctx, "replica {s} of service {s} is desired " ++
                     "(generation {d})", .{ replica.id, replica.service, replica.generation });
+            } else if (std.mem.startsWith(u8, key, records.prefix_jobs)) {
+                const job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+                const format = "job {s} was submitted by {s}: deadline {d} ms{s}";
+                text = try controller.format(ctx, format, .{
+                    job.name,
+                    if (job.applied_by.len > 0) job.applied_by else "someone",
+                    job.deadline_ms,
+                    if (job.cancel_requested != null) ", cancel requested" else "",
+                });
             } else {
                 const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
                 text = try controller.format(ctx, "service {s} was applied by {s} " ++
@@ -958,12 +1006,12 @@ test "why node states its load and its judgement, and notes that nothing is reba
             "0m of 4000m CPU and 0B of 8.0Gi memory in use",
         before.state.text,
     );
-    const assigned: records.Assigned = .{
-        .replica = "hello-1",
-        .service = "hello",
-        .requests = .{ .cpu_millis = 250, .memory_bytes = 128 << 20 },
-        .reason = "test",
-    };
+    const assigned = records.assigned_replica(
+        "hello-1",
+        "hello",
+        .{ .cpu_millis = 250, .memory_bytes = 128 << 20 },
+        "test",
+    );
     const assigned_key = records.assigned_key("node1", "hello-1");
     try put_record(world, .scheduler, assigned_key.slice(), assigned);
     const tenure = try register_node2(world);
