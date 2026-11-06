@@ -486,7 +486,8 @@ test "a job report is one POST to job-observed, and a claim that did not apply i
     // refusal of an ended tenure (ZC-E0510); each is a result, not an error, and the target is
     // the job-observed endpoint. A compare the server cannot carry never reaches the transport.
     const bodies = [_][]const u8{
-        "{\"revision\":9,\"applied\":true,\"chain\":{\"revision\":9,\"hash\":\"" ++ hash_a ++ "\"}}",
+        "{\"revision\":9,\"applied\":true,\"chain\":{\"revision\":9,\"hash\":\"" ++
+            hash_a ++ "\"}}",
         "{\"revision\":10,\"applied\":false,\"chain\":{\"revision\":10,\"hash\":\"" ++ hash_b ++
             "\",\"known_hash\":\"" ++ hash_a ++ "\"}}",
     };

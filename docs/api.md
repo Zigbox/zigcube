@@ -507,6 +507,9 @@ runs unchanged on the far side of HTTP:
 | `list(/replicas/)`, filtered to the node | `GET /v1/agent/nodes/{node}/replicas` |
 | `list(/observed/<node>/)` | `GET /v1/agent/nodes/{node}/observed` |
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
+| `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
+| `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
+| `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
 `{node}` is a node name (a hostname label, at most 63 bytes). Errors are the diagnostics of
@@ -664,6 +667,26 @@ runtime's own diagnostic (`ZBX-E0410` for an image that is not in the node's sto
 store as the agent built it, and `zcube why` renders it. The server refuses (`400`, `ZC-E0104`,
 nothing written) a put whose record is for another node, whose key is not the observed key of its
 record, a delete outside `/observed/<node>/`, a key named twice, and more than 16 operations.
+
+### `GET /v1/agent/nodes/{node}/runs`, `GET .../runs/{name}/input`, `GET` and `POST .../job-observed` (B1 slice 4)
+
+`runs` lists the job runs (`/job-runs/`) assigned to the node, as `{"revision", "kvs"}` like
+`replicas`; more than `agent_node_runs_max` is `ZC-E0302`. `runs/{name}/input` answers the job's `JobInput` (keys.md) only to the node that holds the run's
+assignment and only after it has claimed the run (its `/job-observed/<node>/<name>` exists), and
+`ZC-E0133` otherwise, so an input never reaches a node that was not placed the run or that lost the
+claim. The agent checks `sha256:<hex>` over the decoded bytes against the job's `input_digest`.
+
+`job-observed` `GET` lists `/job-observed/<node>/`; `POST` is one put of
+`/job-observed/<node>/<name>`:
+
+```json
+{ "tenure": 412, "run_revision": 87, "value": {"v": 1, "run": "batch-job", "status": "claimed"} }
+```
+
+The server compares the tenure, and for a claim (`status` `claimed`) also the run's `mod_revision`
+(`run_revision`), the assignment's `mod_revision` (the epoch in the record) and the absence of the
+observation. A claim whose compares fail while the tenure holds answers `200 {"applied": false}`
+and writes nothing: the run moved or was claimed before. A replaced tenure is `503` `ZC-E0510`.
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

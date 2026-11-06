@@ -251,6 +251,31 @@ server without the endpoint (`ZC-E0504`) gets the file dropped; a failed tenure 
 fence like any other agent write and keeps the file for the next tenure. A failed fetch leaves
 no record.
 
+## Runs (B1 slice 4)
+
+A job is a run: container `<job>-job`, labels `zcube.replica` (the run id) and `zcube.job`. `src/agent_jobs.zig`
+is one pass of `reconcile`, after the replicas. It wants a run when the node holds its
+`/assigned/<node>/<run>`; the epoch is that assignment's `mod_revision`.
+
+1. **Claim, then start.** The agent writes the start record `jobs/<run>.json` (phase `claiming`, the
+   `boot_id`, `deadline_mono_ms`) and then one transaction: the tenure, the run record's revision, the
+   assignment's epoch, and `/job-observed/<node>/<name>` absent. Only when it applies does it fetch
+   the input (digest checked), set phase `claimed` and call `Runtime.start`. A refused claim starts
+   nothing. The server's `{applied:false}` is a result, not an error.
+2. **A run is started at most once.** A claim in the store without a start record, or a `claimed`
+   record whose container is gone, ends the run `lost`; the agent never starts it again. A record
+   still `claiming` after a restart claims again (the compare says whether it won).
+3. **The deadline** is `deadline_mono_ms` on the boot clock, written before the start and compared
+   only under the same `boot_id`; after a reboot the container is gone and the run ends `lost`, not
+   `deadline`.
+4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `not_started`) is written to the start record
+   before the container is signalled and reported with the exit. An exit the agent saw first
+   carries none. A fence under a replaced tenure is reported under the next tenure, once it holds.
+5. **Adoption.** After `kill -9` the new agent lists the runtime, reads the start records, and adopts
+   a `claimed` run without a second start.
+
+The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
+
 ## What survives what
 
 | Event | Containers | The agent's work |
