@@ -31,7 +31,10 @@ Status: handoff note for the next implementer.
   Delete-while-job-exists is already caught by `status_orphaned`. A put of `/job-status/<name>`
   with no `/jobs/<name>` is the candidate J3 check, but J1's "at most one tenure" meaning is not
   settled in the brief (b1.md around lines 236-245, 292, 430). Left for slice 7 or a decision.
-- A job-observed record whose node differs from `status.node` would not be pruned by retention.
+- Retention now removes `/job-observed/<node>/<name>` on every node (review of #139). It still
+  rescans every status per pass (O(N^2/8) reads for a backlog of N): known cost, not fixed.
+- The sim client's kill only pauses between polls; not fixed.
+- The dedupe key for unplaced endings: `2026-11-06-job-watch-dedupe-key.md`.
 
 ## Teeth rates (`--seeds 1..40 100 --c1`)
 
