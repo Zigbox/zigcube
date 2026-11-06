@@ -17,6 +17,7 @@ const cli_commands = @import("cli_commands.zig");
 const cli_env = @import("cli_env.zig");
 const cli_get = @import("cli_get.zig");
 const cli_http = @import("cli_http.zig");
+const cli_job = @import("cli_job.zig");
 const cli_local = @import("cli_local.zig");
 const cli_report = @import("cli_report.zig");
 const constants = @import("constants.zig");
@@ -82,7 +83,7 @@ pub fn run_with(env: *const Env, args: []const []const u8, executor: Executor) u
         return finish(&ending, &report);
     };
     if (parsed.options.verbose and parsed.options.output != .json) write_traces(env, &client);
-    return constants.exit_ok;
+    return report.outcome;
 }
 
 /// The commands that need no server. Null for one that does; otherwise the exit code, with the
@@ -132,6 +133,7 @@ pub fn execute(
             const out = try bundle_collect.run(env, client, options, target, line, report);
             try cli_commands.emit(env, .stdout, out, report);
         },
+        .job => |*job| try cli_job.run(env, client, options, job, report),
         .accept_rollback => try cli_commands.accept_rollback(env, client, options, report),
         .check_allocations => try cli_allocations.check(env, client, options, report),
         .stats_pull => |node| try cli_stats.pull(env, client, options, node, report),
@@ -145,11 +147,20 @@ pub fn execute(
 fn command_line(env: *const Env, args: []const []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     out.appendSlice(env.arena, "zcube") catch return "zcube";
+    var hide_next = false;
     for (args) |arg| {
         out.append(env.arena, ' ') catch return "zcube";
-        out.appendSlice(env.arena, arg) catch return "zcube";
+        // The value of `--env K=V` is a secret as often as not: the record keeps `K=...`.
+        const shown = if (hide_next) hide_value(env.arena, arg) else arg;
+        hide_next = std.mem.eql(u8, arg, "--env");
+        out.appendSlice(env.arena, shown) catch return "zcube";
     }
     return out.items;
+}
+
+fn hide_value(arena: std.mem.Allocator, pair: []const u8) []const u8 {
+    const equals = std.mem.indexOfScalar(u8, pair, '=') orelse return pair;
+    return std.fmt.allocPrint(arena, "{s}=...", .{pair[0..equals]}) catch "...";
 }
 
 fn raise_out_of_memory(report: *Report) void {

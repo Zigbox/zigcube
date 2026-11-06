@@ -218,7 +218,7 @@ fn short(hash: ?[]const u8) []const u8 {
     return text[0..@min(text.len, 8)];
 }
 
-fn json_line(arena: Allocator, body: []const u8) Allocator.Error![]const u8 {
+pub fn json_line(arena: Allocator, body: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "{s}\n", .{std.mem.trimEnd(u8, body, "\n")});
 }
 
