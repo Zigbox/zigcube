@@ -1,6 +1,6 @@
 # ZC-W0603: the swarm fetch ended without the tree
 
-Status: proposed, awaiting the owner's confirmation of the number (issue #93, PR #109 review).
+*Decided 2026-11-06, by the owner* (issue #93, PR #109 review).
 
 The supervisor's end lines in `fetch.log` reused ZC-E0601 ("not fetched from any peer or the
 registry", error, external) before the registry was tried. ZC-W0603 (warning, environment) says
