@@ -22,6 +22,7 @@ const agent_mod = @import("agent.zig");
 const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
 const constants = @import("constants.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
@@ -419,7 +420,13 @@ const Work = struct {
     ) Error!void {
         switch (listing.status) {
             .starting, .running => try work.running(subject, record, listing, seen, run),
-            .stopped => |reason| try work.stopped(subject, record, reason, seen),
+            .stopped => |reason| {
+                if (c1_teeth.job_restart and record.stop_cause == null) {
+                    // Test-only: start a run whose container already exited (J2, J7).
+                    if (run) |entry| return work.start(subject, record, &entry.rec, null);
+                }
+                try work.stopped(subject, record, reason, seen);
+            },
         }
     }
 
@@ -461,7 +468,10 @@ const Work = struct {
             return;
         }
         if (current.deadline_mono_ms) |at| {
-            work.agent.jobs_wake_mono_ms = @min(work.agent.jobs_wake_mono_ms, at);
+            work.agent.jobs_wake_mono_ms = @min(
+                work.agent.jobs_wake_mono_ms,
+                at +| c1_teeth.job_deadline_late_ms,
+            );
         }
     }
 
@@ -474,14 +484,15 @@ const Work = struct {
         mono: u64,
     ) ?records.StopCause {
         const entry = run orelse return null;
-        if (entry.rec.stop) |asked| return switch (asked.cause) {
+        if (entry.rec.stop) |asked| if (!c1_teeth.job_cancel) return switch (asked.cause) {
             .cancel => .cancel,
             .@"unreachable" => .@"unreachable",
             .not_started => .not_started,
         };
         const at = record.deadline_mono_ms orelse return null;
         if (!std.mem.eql(u8, record.boot_id, work.ctx.boot_id)) return null;
-        if (mono >= at) return .deadline;
+        const due = at +| c1_teeth.job_deadline_late_ms;
+        if (mono >= due and !c1_teeth.job_deadline) return .deadline;
         return null;
     }
 
@@ -544,6 +555,12 @@ const Work = struct {
             .deadline_mono_ms = ctx.mono_ms() +| fetch_bound_ms(ctx, run),
         };
         try write_record(ctx, work.state, &record);
+        if (c1_teeth.job_claim) {
+            // Test-only: start before the claim commits (J7).
+            try work.begin(subject, entry, record);
+            _ = try work.report_claim(subject, entry);
+            return;
+        }
         const claimed = try work.report_claim(subject, entry);
         if (!claimed) return;
         try work.begin(subject, entry, record);

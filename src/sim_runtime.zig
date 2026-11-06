@@ -111,6 +111,10 @@ pub const SimRuntime = struct {
     pid_next: u32,
     changes: [events_max]Change,
     changes_count: u32,
+    /// Called for every `start` of a known image, before anything is created. The cluster
+    /// simulation sets it to keep a ledger of starts (sim-c1's J2 and J7).
+    on_start: ?*const fn (context: *anyopaque, spec: *const runtime.Spec) void = null,
+    on_start_context: *anyopaque = undefined,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -338,6 +342,7 @@ pub const SimRuntime = struct {
             image_not_found(&failure, spec.name, spec.image);
             return .{ .failed = failure };
         }
+        if (self.on_start) |hook| hook(self.on_start_context, spec);
         if (self.find(spec.name)) |existing| {
             // Names are unique among containers that have not stopped; a stopped one with the
             // same name is replaced, the way a runtime reuses a name.

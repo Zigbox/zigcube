@@ -585,20 +585,11 @@ fn observed_step(
             const name = key[records.prefix_nodes.len..];
             text = try controller.format(ctx, "node {s} registered ({s})", .{ name, key });
         } else if (std.mem.startsWith(u8, key, records.prefix_job_observed)) {
-            // What an agent reported of a run: its own record kind.
-            const report = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
-            var buffer: [64]u8 = undefined;
-            const phrase = switch (report.status) {
-                .claimed => "claimed",
-                .running => "running",
-                .stopped => try controller.format(ctx, "stopped ({s})", .{
-                    records.exit_text(report.exit orelse .{ .kind = .lost }, &buffer),
-                }),
-            };
+            const seen = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
             text = try controller.format(ctx, "{s} on {s}: {s}", .{
-                report.run, report.node, phrase,
+                seen.run, seen.node, @tagName(seen.status),
             });
-            if (report.diagnostic) |raw| diagnostic = raw;
+            if (seen.diagnostic) |raw| diagnostic = raw;
         } else {
             const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
             const phrase = try observed_phrase(ctx, &observed);
@@ -661,23 +652,17 @@ fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched)
                     if (job.cancel_requested != null) ", cancel requested" else "",
                 });
             } else if (std.mem.startsWith(u8, key, records.prefix_job_runs)) {
-                // The run a job's decisions (hold, place, stop, an end with no report) cite.
                 const run = try records.read(records.JobRun, ctx.arena, kv, ctx.diag);
-                text = try controller.format(ctx, "run {s} of job {s} is desired: " ++
+                text = try controller.format(ctx, "run {s} of job {s} was created: " ++
                     "deadline {d} ms{s}", .{
                     run.id,
                     run.job,
                     run.deadline_ms,
                     if (run.stop != null) ", stopped" else "",
                 });
-            } else if (std.mem.startsWith(u8, key, records.prefix_assigned)) {
-                // The placement `job_placed` cites; a replica's is read the same way.
-                const placed = try records.read(records.Assigned, ctx.arena, kv, ctx.diag);
-                text = try controller.format(ctx, "{s} {s} is assigned to {s}", .{
-                    if (placed.job != null) "run" else "replica",
-                    placed.replica,
-                    assigned_node(key) orelse "a node",
-                });
+            } else if (!std.mem.startsWith(u8, key, records.prefix_services)) {
+                // A placement or a node's claim of a job: the key itself is the cause.
+                text = try controller.format(ctx, "{s} exists", .{key});
             } else {
                 const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
                 text = try controller.format(ctx, "service {s} was applied by {s} " ++
@@ -1395,7 +1380,7 @@ test "why job: a pending job ends at its run" {
     try testing.expectEqual(StepType.desired, result.steps[1].type);
     try testing.expectEqualStrings("/job-runs/train", result.steps[1].key.?);
     try testing.expectEqualStrings(
-        "run train-job of job train is desired: deadline 60000 ms",
+        "run train-job of job train was created: deadline 60000 ms",
         result.steps[1].text,
     );
 }
@@ -1411,7 +1396,7 @@ test "why job: a placed job ends at its assignment" {
     });
     try testing.expectEqualStrings("job train: placed", result.state.text);
     try testing.expectEqualStrings("/assigned/node1/train-job", result.steps[1].key.?);
-    try testing.expectEqualStrings("run train-job is assigned to node1", result.steps[1].text);
+    try testing.expectEqualStrings("/assigned/node1/train-job exists", result.steps[1].text);
 }
 
 test "why job: a running job ends at the agent's report" {
@@ -1446,25 +1431,25 @@ test "why job: an ending the agent reported ends at that report" {
             .exit = .{ .kind = .exited, .code = 0 },
             .end = .{ .kind = .exited, .code = 0 },
             .state = .exited,
-            .text = "train-job on node1: stopped (exited with code 0)",
+            .text = "train-job on node1: stopped",
         },
         .{
             .exit = .{ .kind = .oom },
             .end = .{ .kind = .failed, .cause = .oom },
             .state = .failed,
-            .text = "train-job on node1: stopped (ran out of memory)",
+            .text = "train-job on node1: stopped",
         },
         .{
             .exit = .{ .kind = .signaled, .signal = 15 },
             .end = .{ .kind = .failed, .cause = .deadline },
             .state = .failed,
-            .text = "train-job on node1: stopped (was stopped by signal 15 (SIGTERM))",
+            .text = "train-job on node1: stopped",
         },
         .{
             .exit = .{ .kind = .lost },
             .end = .{ .kind = .failed, .cause = .fenced },
             .state = .failed,
-            .text = "train-job on node1: stopped (was lost)",
+            .text = "train-job on node1: stopped",
         },
     };
     for (cases, 0..) |case, index| {
@@ -1532,7 +1517,7 @@ test "why job: an ending with no agent report ends at the desired run" {
         try testing.expectEqual(StepType.desired, result.steps[1].type);
         try testing.expectEqualStrings("/job-runs/train", result.steps[1].key.?);
         try testing.expectEqualStrings(
-            "run train-job of job train is desired: deadline 60000 ms, stopped",
+            "run train-job of job train was created: deadline 60000 ms, stopped",
             result.steps[1].text,
         );
     }
