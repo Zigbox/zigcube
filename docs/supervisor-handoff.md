@@ -144,7 +144,7 @@ Record the split in `docs/briefs/M7-build.md` (slice 3 is at about line 166) and
 - No `--shrink` for the canary.
 - Auto-merge: the owner will set it up later; until then the supervisor merges by hand.
 
-**Waiting on the owner:** confirm ZC-E0523 (docs/decisions/2026-11-06-zc-e0523-job-input-digest.md, on #116); confirm the sim-c1 negative test moving to B1 slice 5 (docs/decisions/2026-11-06-b1-sim-c1-negative-test-moves-to-slice-5.md); auto-merge rulesets; the canary host redeploy and dry run.
+**Waiting on the owner:** auto-merge rulesets; the canary host redeploy and dry run. (ZC-E0523 and the sim-c1 negative test in B1 slice 5 were confirmed on 2026-11-06: `docs/decisions/2026-11-06-owner-confirms-*.md`.)
 
 ## Next steps
 

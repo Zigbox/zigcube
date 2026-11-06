@@ -700,7 +700,10 @@ pub const RemoteStore = struct {
                     return .{ .kv = null, .revision = 1 };
                 }
                 // A damaged input is not an absent one: hand over a value that does not
-                // decode, which the agent reads as a mismatch.
+                // decode, which the agent reads as a mismatch. The phrase above is wire
+                // protocol (see `records.input_mismatch_phrase`). The "null" stands for
+                // "damaged" through the `Store` interface: `records.read(JobInput)` must
+                // keep refusing it.
                 const damaged: store.KeyValue = .{
                     .key = key,
                     .value = "null",

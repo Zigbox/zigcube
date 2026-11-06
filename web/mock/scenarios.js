@@ -1,8 +1,8 @@
-// The mock now has the C1 scenario only: the core has no C1 yet (C0 runs the real core, web/sim/).
+// The mock has the C1 and B1 scenarios: the core has no C1 yet (C0 runs the real core, web/sim/), and sim mode has no jobs.
 // Scenarios replay HANDOFF's demos against the engine. A step has the CLI line it stands for, a
 // `run(engine, ctl)` that does what that line would do, and optionally a console view to open.
 
-import { HELLO } from "./fixtures.js";
+import { HELLO, diagImageNotFound } from "./fixtures.js";
 
 const helloWith = replicas => ({ ...HELLO, replicas });
 
@@ -102,3 +102,40 @@ export class Runner {
     }, 3500 / (this.engine.speed || 1));
   }
 }
+
+// `?mock=b1`: B1's jobs (docs/briefs/b1.md). Every state and every ending cause of the closed set,
+// so the Jobs screen can be seen in each. A plan is the mock's own script for a run (web/mock/jobs.js).
+const JOB = { image: "b3:51aa9c03", command: ["run", "--epochs", "3"], env: [["MODE", "fast"], ["API_TOKEN", "s3cr3t-token"]], limits: { cpu_millis: 500, memory_bytes: 268435456, pids: 64 }, deadline_ms: 600000, grace_ms: 5000 };
+const BAD = "b3:00000000"; // not in KNOWN_IMAGES: the fake runtime cannot start it
+const submit = (e, name, over = {}, plan = {}) => e.jobs.submit({ ...JOB, name, submit_by_ms: e.now() + 3600000, labels: [["team", "ml"]], applied_by: "alex@laptop", ...over }, plan);
+const failed = (cause, extra = {}) => ({ outcome: { kind: "failed", cause }, ...extra });
+
+SCENARIOS.b1 = {
+  title: "B1 · Jobs (every state and ending)",
+  setup() {},
+  steps: [
+    { title: "Three agents join", cli: "zcube get nodes", go: "#/nodes", run: e => { for (const n of ["node1", "node2", "node3"]) e.addAgent(n); } },
+    { title: "Submit jobs that end every way", cli: "zcube job run train-ok --image b3:51aa9c03 --command run --epochs 3  # and seventeen more", go: "#/jobs", run: e => {
+      submit(e, "train-ok", { labels: [["team", "ml"], ["kind", "train"]], input: "epochs=3\n", input_env: "TRAIN_INPUT" }, { node: "node1", run: 2500 });
+      submit(e, "export-exit3", {}, { node: "node2", run: 2000, outcome: { kind: "exited", code: 3 } });
+      submit(e, "probe-sigkill", { labels: [["team", "infra"]] }, { node: "node3", run: 2200, outcome: { kind: "exited", signal: 9 } });
+      submit(e, "fit-oom", {}, { node: "node1", run: 3000, ...failed("oom") });
+      submit(e, "fork-bomb", {}, { node: "node2", run: 1800, ...failed("pid_limit") });
+      submit(e, "bad-image", { image: BAD }, { node: "node3", start: 800, run: 500, ...failed("start_failed", { diagnostic: diagImageNotFound(BAD, "node3", "bad-image-job") }) });
+      submit(e, "slow-merge", { deadline_ms: 6000 }, { node: "node1", run: 5000, ...failed("deadline") });
+      submit(e, "fenced-write", {}, { node: "node2", run: 4000, ...failed("fenced") });
+      submit(e, "lost-node", {}, { node: "node3", run: 4500, ...failed("unreachable") });
+      submit(e, "never-started", {}, { node: "node1", start: 500, outcome: { kind: "failed", cause: "deadline", never_started: true } }); // placed, never claimed: failed deadline
+      submit(e, "lost-early", {}, { node: "node3", start: 500, outcome: { kind: "failed", cause: "not_started", lost_before_start: true } }); // node lost before any claim: failed not_started
+      submit(e, "mystery", {}, { node: "node2", run: 2600, ...failed("unknown") });
+      submit(e, "no-room", { deadline_ms: 9000 }, { hold: 9000 });
+      submit(e, "run-forever", { labels: [["team", "ml"], ["kind", "serve"]] }, { node: "node1", run: null });
+      submit(e, "placed-wait", {}, { node: "node2", start: null });
+      submit(e, "waiting", { labels: [["team", "infra"]] }, { hold: 3600000 });
+      submit(e, "cancel-running", {}, { node: "node3", run: null });
+      submit(e, "cancel-waiting", {}, { hold: 3600000 });
+    } },
+    { title: "Cancel a running job and a waiting one", cli: "zcube job cancel cancel-running && zcube job cancel cancel-waiting", go: "#/jobs", run: e => { e.jobs.cancel("cancel-running"); e.jobs.cancel("cancel-waiting"); } },
+    { title: "Ask why a job failed", cli: "zcube why job fit-oom", go: "#/why/job/fit-oom", run: () => {} },
+  ],
+};

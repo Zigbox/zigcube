@@ -72,7 +72,10 @@ These arrive with the scaffold; keep this list current as they land.
   or `check: FAIL <commit> (what failed)`. The gates are build-step dependencies; then
   `src/testing/check.zig` runs the Postgres suite (only when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` and
   `sim-cluster` (40 operations) each with a fresh seed (printed as `sim-c0: seed N`, `sim-cluster: seed N` first), `sim-teeth`, `sim-swarm` (100 operations, fresh seed, printed as `sim-swarm: seed N`), `sim-swarm-teeth` and, as root, `zig build test` as `tester` in a scratch
-  worktree of HEAD (`-Dcheck-user=-` skips it; `useradd -m tester` creates the user). `+dirty` after the commit
+  worktree of HEAD (`-Dcheck-user=-` skips it; `useradd -m tester` creates the user). That run's
+  caches are kept in `.zig-cache/zcube-check-cache` (tester-owned, about 0.4 GiB, emptied past 8 GiB;
+  `rm -rf .zig-cache` resets it), so only the first check of a worktree builds from nothing
+  (`docs/decisions/2026-11-06-check-keeps-tester-cache.md`). `+dirty` after the commit
   means uncommitted changes the user run did not see. It leaves out `agent-smoke` and `demo-c0`.
 - `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]` runs HANDOFF's C1 demo for real:
   `zcube-server` with `--lease-ttl-ms 8000`, three `zcube-agent`s with `FakeRuntime` (node1 behind a
@@ -90,6 +93,9 @@ These arrive with the scaffold; keep this list current as they land.
 - In a cloud session the container is ephemeral, so push each slice to your own session branch. Never push to `main`, and never to another session's branch.
 - **Before you report, run [REVIEW.md](REVIEW.md) on your own diff**, and say which of its items your slice touched and what you checked.
 - **Gates, on the commit you report:** `zig build check`; paste its last line (`check: PASS <commit>`, without `+dirty`). A report without that line, or with another commit's, is not a report. It does not run `agent-smoke` or `demo-c0` (CI does), nor the Postgres suite unless `ZCUBE_TEST_POSTGRES` is set: when the store changed, set it (`zig build pg-up` prints it) so the PASS line names `postgres`.
+- Stop and ask the supervisor before a change alters a user-visible bound, limit or default, or registers a new code; give the evidence and the choice. Do not pick one and leave it to review.
+- Run long commands (`zig build check`, sweeps) in the background and wait for them to finish; do not poll with sleep loops. Kill what earlier runs left before running again.
+- Run every gate once, on the final commit, then push once. Never push before the gates finish.
 - Report what you ran and its output (the last lines, not the log), what you did not run and why, every deviation from HANDOFF or the brief, and anything in HANDOFF, DIAGNOSTICS or the Zigbox code that seemed wrong. End the report with the handoff note described below.
 
 ## Agent context discipline

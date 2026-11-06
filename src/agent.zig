@@ -188,6 +188,12 @@ pub const Agent = struct {
     store_refusal_len: u8,
     /// When the job pass next needs to run (a run's deadline), monotonic; maxInt if never.
     jobs_wake_mono_ms: u64,
+    /// The last failure to fetch a run's input that said nothing about the input (the server or
+    /// the link): which run (a hash of its id) and what it said. In memory only; it names the
+    /// cause when the run ends `not_started`.
+    input_failure_run: u64,
+    input_failure_text: [input_failure_text_bytes]u8,
+    input_failure_len: u8,
     /// Pull records dropped unpublished (ZC-W0504), and the last one's container and reason, for
     /// the shell to say: a dropped record is statistics lost, and it must not be silent.
     pull_drops: u32,
@@ -196,6 +202,7 @@ pub const Agent = struct {
 
     const store_refusal_text_bytes = 160;
     const pull_drop_text_bytes = 200;
+    const input_failure_text_bytes = 160;
 
     /// What the last counted summary refusal said (empty if none).
     pub fn store_refusal(agent: *const Agent) []const u8 {
@@ -236,6 +243,23 @@ pub const Agent = struct {
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
         agent.jobs_wake_mono_ms = maxInt(u64);
+        agent.input_failure_run = 0;
+        agent.input_failure_len = 0;
+    }
+
+    /// Keeps what the last failed input fetch of `run` said.
+    pub fn note_input_failure(agent: *Agent, run: []const u8, text: []const u8) void {
+        const len = @min(text.len, agent.input_failure_text.len);
+        @memcpy(agent.input_failure_text[0..len], text[0..len]);
+        agent.input_failure_len = @intCast(len);
+        agent.input_failure_run = std.hash.Wyhash.hash(0, run);
+    }
+
+    /// What the last failed input fetch of `run` said, if it was this run's.
+    pub fn input_failure(agent: *const Agent, run: []const u8) ?[]const u8 {
+        if (agent.input_failure_len == 0) return null;
+        if (agent.input_failure_run != std.hash.Wyhash.hash(0, run)) return null;
+        return agent.input_failure_text[0..agent.input_failure_len];
     }
 
     /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is

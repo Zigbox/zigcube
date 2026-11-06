@@ -387,13 +387,25 @@ const Work = struct {
     }
 
     fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
-        try work.report(.{
+        var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
             .epoch = record.epoch,
             .exit = .{ .kind = .lost },
             .stop_cause = .not_started,
-        });
+        };
+        // A run whose input could not be fetched before its bound says why (ZC-W0503). Other
+        // routes here (a lost claim answer, a stop) have no failure of this run to name.
+        if (work.agent.input_failure(subject.id)) |failure| {
+            var collector: Diag = undefined;
+            collector.reset();
+            raise_not_started(&collector, subject.id, failure);
+            var finished: Diagnostic = undefined;
+            diag_mod.to_diagnostic(&finished, &collector);
+            const ctx = work.ctx;
+            wanted.diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
+        }
+        try work.report(wanted);
     }
 
     // ---- A container of this run exists ----
@@ -540,7 +552,7 @@ const Work = struct {
             .grace_ms = run.grace_ms,
             // Bounds the input fetch's retries: `begin` re-arms it with the start.
             .boot_id = ctx.boot_id,
-            .deadline_mono_ms = ctx.mono_ms() +| run.deadline_ms,
+            .deadline_mono_ms = ctx.mono_ms() +| fetch_bound_ms(ctx, run),
         };
         try write_record(ctx, work.state, &record);
         if (c1_teeth.job_claim) {
@@ -552,6 +564,14 @@ const Work = struct {
         const claimed = try work.report_claim(subject, entry);
         if (!claimed) return;
         try work.begin(subject, entry, record);
+    }
+
+    /// How long the input fetch may be retried from now: what is left of the server's start
+    /// backstop (`start_by_ms`, the same length as the deadline from creation), at most
+    /// `deadline_ms`. The start then arms the deadline in full, so a job ends within twice
+    /// `deadline_ms` of creation (docs/briefs/b1.md, Q7), however long the fetch took.
+    fn fetch_bound_ms(ctx: *const Context, run: *const records.JobRun) u64 {
+        return @min(run.start_by_ms -| ctx.clock.now_ms(), run.deadline_ms);
     }
 
     /// The run is claimed by this node, this tenure and epoch, and nothing is started: fetch the
@@ -568,6 +588,7 @@ const Work = struct {
         const ctx = work.ctx;
         const run = &entry.rec;
         var record = claiming;
+        if (past_bound(ctx, record)) return work.not_started(subject, record);
         const input = work.input_of(subject, run) catch |err| switch (err) {
             error.InputAbsent => return work.cannot_start(subject, record, .{ .input = .absent }),
             error.InputMismatch => {
@@ -577,18 +598,24 @@ const Work = struct {
             // the link): keep it inside this run. The record stays `claiming`, a later pass
             // comes back, and the other runs of this pass are not held back.
             else => {
+                keep_failure(work.agent, subject.id, ctx.diag);
                 ctx.diag.reset();
                 const mono = ctx.mono_ms();
                 if (record.deadline_mono_ms) |at| {
-                    // Past the run's own deadline nothing has started: report it as not
-                    // started (the server ends it `failed deadline`). Another boot's
-                    // deadline is not comparable and is armed again below.
+                    // Past the retry bound nothing has started: report it as not started
+                    // (the server ends it `failed deadline`). A bound written by another
+                    // boot is not comparable. `Agent.restore` fences, so after another boot
+                    // the claim's tenure no longer matches and `claimed_unstarted` reports
+                    // `not_started` before it gets here: only a `claiming` record written
+                    // before the bound existed reaches the re-arm below. Were `restore` to
+                    // keep the tenure over a reboot, that re-arm would restart the bound in
+                    // full after every reboot.
                     const this_boot = std.mem.eql(u8, record.boot_id, ctx.boot_id);
                     if (this_boot and mono >= at) return work.not_started(subject, record);
                     if (this_boot) return work.retry_input(at);
                 }
                 record.boot_id = ctx.boot_id;
-                record.deadline_mono_ms = mono +| run.deadline_ms;
+                record.deadline_mono_ms = mono +| fetch_bound_ms(ctx, run);
                 try write_record(ctx, work.state, &record);
                 return work.retry_input(record.deadline_mono_ms.?);
             },
@@ -599,6 +626,24 @@ const Work = struct {
         record.deadline_mono_ms = ctx.mono_ms() +| run.deadline_ms;
         try write_record(ctx, work.state, &record);
         try work.start(subject, record, run, input);
+    }
+
+    /// The retry bound of a `claiming` record has been reached on this boot: the pass is late (the
+    /// agent paused), and a start now would arm a full deadline on top of it.
+    fn past_bound(ctx: *const Context, record: StartRecord) bool {
+        const at = record.deadline_mono_ms orelse return false;
+        if (!std.mem.eql(u8, record.boot_id, ctx.boot_id)) return false;
+        return ctx.mono_ms() >= at;
+    }
+
+    /// Keeps the failure being dropped, for `not_started` to name.
+    fn keep_failure(agent: *Agent, run: []const u8, failed: *const Diag) void {
+        var text: [160]u8 = undefined;
+        const code = failed.code orelse return;
+        const cause = failed.last_cause() orelse "no cause given";
+        const said = std.fmt.bufPrint(&text, "ZC-{s}: {s}", .{ @tagName(code), cause }) catch
+            text[0..];
+        agent.note_input_failure(run, said);
     }
 
     /// Wake for another fetch, but not later than the deadline that bounds the retries.
@@ -883,6 +928,15 @@ pub fn raise_deadline(diag: *Diag, run: []const u8, killed: bool) void {
         diag.cause("{s} reached its deadline; it was stopped", .{run});
     }
     diag.fix(.{ .sentence = "raise deadline_ms if the job needs the time" });
+}
+
+/// ZC-W0503: a run was claimed and its input could not be fetched before its start bound.
+pub fn raise_not_started(diag: *Diag, run: []const u8, failure: []const u8) void {
+    diag.raise(.W0503);
+    diag.cause("{s} was claimed, but its input could not be fetched before the deadline: {s}", .{
+        run, failure,
+    });
+    diag.fix(.{ .sentence = "check that the node reaches the server; submit the job again" });
 }
 
 pub const InputProblem = enum { absent, mismatch };
