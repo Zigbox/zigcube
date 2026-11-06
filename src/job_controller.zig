@@ -320,26 +320,12 @@ fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Err
         .assigned_of = shared.assigned_of,
     };
     if (jobs.len > 0) {
-        const first = after orelse "";
-        const last = jobs[jobs.len - 1].kv.key[records.prefix_jobs.len..];
-        const from = if (first.len > records.prefix_jobs.len)
-            first[records.prefix_jobs.len..]
-        else
-            null;
-        world.runs = try read_range(
-            records.JobRun,
-            ctx,
-            records.prefix_job_runs,
-            from,
-            last,
-            shared,
-        );
-        world.statuses = try read_range(
+        world.runs = try read_each(records.JobRun, ctx, records.job_run_key, jobs, shared);
+        world.statuses = try read_each(
             records.JobStatus,
             ctx,
-            records.prefix_job_status,
-            from,
-            last,
+            records.job_status_key,
+            jobs,
             shared,
         );
         for (world.runs, 0..) |entry, at| {
@@ -356,38 +342,29 @@ fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Err
     return .{ .world = world, .more = listed.continue_after != null };
 }
 
-/// The records under `prefix` for the job names after `from` up to and including `last`, ascending.
-/// Records of no job in between (orphans) are read and left out.
-fn read_range(
+/// The record, at the key `key_of_job` names, of each of `jobs` (a page: at most
+/// `job_controller_page_max`), read by key at the step's revision, ascending. A job with none has
+/// no entry. Records of no job on
+/// the page (orphans: a restore, a hand edit) are never listed, so they cost nothing however many
+/// there are.
+fn read_each(
     comptime T: type,
     ctx: *const Context,
-    prefix: []const u8,
-    from: ?[]const u8,
-    last: []const u8,
+    comptime key_of_job: fn ([]const u8) records.Key,
+    jobs: []const Entry(records.Job),
     shared: *const Shared,
 ) Error![]const Entry(T) {
     var items: std.ArrayList(Entry(T)) = .empty;
-    var after: ?[]const u8 = null;
-    if (from) |name| {
-        after = std.mem.concat(ctx.arena, u8, &.{ prefix, name }) catch
+    for (jobs) |job| {
+        const name = job.kv.key[records.prefix_jobs.len..];
+        const key = key_of_job(name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), shared.revision, ctx.diag);
+        const kv = got.kv orelse continue;
+        const rec = try records.read(T, ctx.arena, kv, ctx.diag);
+        items.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
             return failures.no_memory(ctx.diag);
     }
-    for (0..pages_max) |_| {
-        const page = try ctx.store.list(ctx.arena, .{
-            .prefix = prefix,
-            .at_revision = shared.revision,
-            .limit = constants.job_controller_page_max,
-            .continue_after = after,
-        }, ctx.diag);
-        for (page.kvs) |kv| {
-            if (std.mem.order(u8, kv.key[prefix.len..], last) == .gt) return items.items;
-            const rec = try records.read(T, ctx.arena, kv, ctx.diag);
-            items.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
-                return failures.no_memory(ctx.diag);
-        }
-        after = page.continue_after orelse return items.items;
-    }
-    return failures.no_memory(ctx.diag);
+    return items.items;
 }
 
 // ---- How a run ended -------------------------------------------------------------------------
@@ -1091,7 +1068,10 @@ fn has_decision(
         }
         after = page.continue_after orelse return false;
     }
-    return false;
+    // The index is longer than the budget reads: whether this was decided is unknown. Treat it as
+    // decided (I8a fails closed: no second run, no second hold) rather than fail the step, which
+    // would stop every controller after this one on each pass.
+    return true;
 }
 
 /// A diagnostic as the JSON a decision embeds (DIAGNOSTICS.md).

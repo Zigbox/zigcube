@@ -574,3 +574,84 @@ test "a report that arrives after the job ended is dropped with a W0307 decision
     try testing.expectEqual(@as(u32, 0), try f.pass());
     try testing.expectEqual(@as(u64, 1), try f.endings());
 }
+
+test "a job whose decisions outrun the page budget is not given a second run" {
+    // Goal: has_decision fails closed (I8a). The job's index holds more entries than the two
+    // pages `has_decision` reads, none of them `job_created`; it is read as decided, so no run is
+    // created and no hold is recorded, rather than a second run on an unknown history.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("train", 60 * 1000, false);
+    const entries = 2 * constants.store_list_limit_max + 100;
+    for (0..entries) |at| {
+        const id = records.decision_id(f.manual.ms - 5000, 1, @intCast(at));
+        const key = records.index_key(.job, "train", id.slice());
+        const entry: records.IndexEntry = .{
+            .id = id.slice(),
+            .at_ms = f.manual.ms - 5000,
+            .action = "other",
+            .summary = "x",
+        };
+        try f.put(.job_controller, key.slice(), entry);
+    }
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    try testing.expect((try f.read_run("train")) == null);
+    try testing.expectEqual(@as(u32, 0), try f.decisions("train", "hold_contradictory_job"));
+}
+
+test "orphan runs and statuses before the first job do not exhaust the step's arena" {
+    // Goal: the step reads the run and status of each paged job by key, so records of no job
+    // cost nothing. 1,300 orphan runs of 14 KB each (18 MB) sort before the one live job.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const filler = try testing.allocator.alloc(u8, 14_000);
+    defer testing.allocator.free(filler);
+    @memset(filler, 'x');
+    const env = [_]records.Pair{.{ "FILLER", filler }};
+    for (0..1300) |at| {
+        var name: [5]u8 = undefined;
+        _ = std.fmt.bufPrint(&name, "a{d:0>4}", .{at}) catch unreachable; // 5 bytes hold 4 digits.
+        var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const run: records.JobRun = .{
+            .id = records.job_run_id(&buffer, &name),
+            .job = &name,
+            .image = "b3:51aa9c03",
+            .command = &.{"true"},
+            .env = &env,
+            .deadline_ms = 60 * 1000,
+            .start_by_ms = f.manual.ms + 60 * 1000,
+            .created_at_ms = f.manual.ms,
+        };
+        try f.put(.job_controller, records.job_run_key(&name).slice(), run);
+    }
+    try f.job("zz-new", 60 * 1000, false);
+    const buffer = try testing.allocator.alloc(u8, constants.request_arena_bytes_max);
+    defer testing.allocator.free(buffer);
+    try testing.expectEqual(@as(u32, 1), try f.pass_bounded(buffer));
+    try testing.expect((try f.read_run("zz-new")) != null);
+}
+
+test "a job added behind the cursor between steps gets its run within two more steps" {
+    // Goal: a resumed step that reaches the end asks to run again at once, because the jobs
+    // before the cursor were not judged by this sweep. Method: more jobs than one step's
+    // transactions, one step, then job `a` (it sorts before the cursor).
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const total = constants.controller_txns_per_step_max + 3;
+    for (0..total) |at| {
+        var name: [4]u8 = undefined;
+        _ = std.fmt.bufPrint(&name, "b{d:0>3}", .{at}) catch unreachable; // 4 bytes hold 3 digits.
+        try f.job(&name, 60 * 1000, false);
+    }
+    const first = try f.jc.reconcile(&f.context());
+    try testing.expectEqual(constants.controller_txns_per_step_max, first.acted);
+    try f.job("a", 60 * 1000, false);
+    const second = try f.jc.reconcile(&f.context());
+    try testing.expectEqual(@as(u32, 3), second.acted);
+    try testing.expect(second.at_ms <= f.manual.ms);
+    _ = try f.jc.reconcile(&f.context());
+    try testing.expect((try f.read_run("a")) != null);
+}
