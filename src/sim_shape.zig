@@ -110,11 +110,13 @@ pub const long_share_denominator: u32 = 10;
 /// deadline (measured, docs/decisions/2026-11-04-fleet-profiles-and-shapes.md).
 pub const cost_max: u32 = 5_000;
 
-/// The shortest ttl a shape draws: the shortest `fencing.inequality_problem` admits. Issue #78
+/// The shortest ttl a shape draws. Below about 4,500 ms a renewal every `(ttl - margin) / 2`
+/// alone costs 200 steps a minute, the busy-loop ceiling (seeds 99, 105, 162, 180 at 3,584 to
+/// 3,825 ms), so the draw stays at 5,000 while a ttl given by hand may go down to the bound. Issue #78
 /// (a ttl of 4,500 ms or less made a healed cluster fence once a second for ever) was a renewal
 /// interval of `ttl / 3` that fell after the fence; `fencing.renew_after_ms` fixed it
 /// (docs/decisions/2026-11-06-renewal-before-fence.md).
-pub const lease_ttl_ms_min: u32 = constants.fence_margin_ms + constants.fence_window_min_ms;
+pub const lease_ttl_ms_min: u32 = 5000;
 /// The longest ttl `fencing.inequality_problem` allows with the shipped margin.
 pub const lease_ttl_ms_max: u32 = constants.lease_ttl_ms;
 pub const replicas_pct_default: u32 = 100;

@@ -17,5 +17,5 @@ steps), and `ZC-E0121` refuses it as `ttl_too_short`. No new code.
 heal (`fencing_settles`). The unit test in `fencing.zig` fails with the old `ttl / 3`. No
 `sim-c1-teeth` root was added: it needs a seventh root, canary and fleet entries.
 
-**Fleet.** The draw floor drops from 8,000 to 3,500 ms (`sim_shape.lease_ttl_ms_min`), which
+**Fleet.** The draw floor drops from 8,000 to 5,000 ms (not to the 3,500 bound: a sweep of seeds 1..200 at a 3,500 floor failed seeds 99, 105, 162, 180 at ttls 3,584 to 3,825 ms on the busy-loop step ceiling, since renewals every `(ttl - margin) / 2` alone approach 200 steps a minute; none was refencing) (`sim_shape.lease_ttl_ms_min`), which
 changes which world a seed means for `auto` runs. Supersedes `2026-11-05-fleet-ttl-floor.md`.
