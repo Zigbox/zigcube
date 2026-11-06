@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0109 · Zigcube</title>
-<meta name="description" content="the service file can't be read">
+<meta name="description" content="a file named on the command line can't be read">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0109.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,11 +73,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0109</h1>
-<p class="summary">the service file can't be read</p>
+<p class="summary">a file named on the command line can't be read</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>zcube apply could not read the file it was given: it does not exist, is not a regular file, is larger than a service file may be (64 KiB), or you may not read it. Nothing was sent to the server.</p>
-<p>The cause line names the path and the system's reason. Check the path, or run zcube apply from the directory that holds the file.</p>
+<p>zcube could not read a file the command names: the service file of zcube apply, or the input file of zcube job run. It does not exist, is not a regular file, or you may not read it, or zcube would need more memory than it may use to read it. Nothing was sent to the server.</p>
+<p>The cause line names the path and the system's reason. Check the path, or run zcube from the directory that holds the file.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0109</pre>

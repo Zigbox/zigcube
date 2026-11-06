@@ -303,8 +303,9 @@ pub const RemoteStore = struct {
         if (answer.lease.id == store.lease_none) {
             return bad(diag, "the server granted lease 0");
         }
-        if (fencing.inequality_problem(answer.lease.ttl_ms) != null) {
-            return bad(diag, "the server granted a lease too short for the agent to fence in");
+        if (fencing.inequality_problem(answer.lease.ttl_ms)) |problem| {
+            fencing.raise_problem(diag, answer.lease.ttl_ms, problem);
+            return error.BackendFailed;
         }
         return .{ .id = answer.lease.id, .ttl_ms = answer.lease.ttl_ms };
     }

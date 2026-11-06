@@ -1,6 +1,6 @@
 error[ZC-E0121]: the lease settings cannot fence an agent in time
-  cause  lease time to live 30000 ms needs a fence margin of 4000 ms; it is 3000
-         ms
-  fix    shorten --lease-ttl-ms, or leave the fencing constants alone
+  cause  a lease ttl of 4000 ms leaves under 5000 ms past the 3000 ms fence
+         margin for a renewal; the shortest ttl is 8000 ms
+  fix    lengthen the lease ttl to at least the shortest, or use the default of 10000
   more   zcube explain E0121 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0121.html

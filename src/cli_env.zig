@@ -49,6 +49,13 @@ pub const Env = struct {
     bin_dir: ?[]const u8 = null,
     /// How long `zcube local` waits for another `zcube local` to finish; the tests shorten it.
     local_lock_wait_ms: u32 = constants.local_lock_wait_ms,
+    /// How long `zcube job get --wait` sleeps between two looks, and how long a `job watch`
+    /// request is held by the server; the tests shorten both.
+    job_poll_ms: u32 = constants.cli_job_poll_ms,
+    job_watch_hold_ms: u32 = constants.cli_job_watch_hold_ms,
+    /// How many requests `job watch` and `job get --wait` make before they stop; null means no
+    /// end (the real commands run until interrupted or the job ends). Only the tests set it.
+    job_rounds_max: ?u32 = null,
 
     pub fn getenv(env: *const Env, name: []const u8) ?[]const u8 {
         assert(name.len > 0);

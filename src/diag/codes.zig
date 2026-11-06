@@ -259,14 +259,15 @@ pub const registry = [_]Entry{
         .code = .E0109,
         .severity = .@"error",
         .blame = .user,
-        .summary = "the service file can't be read",
+        .summary = "a file named on the command line can't be read",
         .explanation =
-        \\zcube apply could not read the file it was given: it does not exist, is
-        \\not a regular file, is larger than a service file may be (64 KiB), or you
-        \\may not read it. Nothing was sent to the server.
+        \\zcube could not read a file the command names: the service file of
+        \\zcube apply, or the input file of zcube job run. It does not exist, is
+        \\not a regular file, or you may not read it, or zcube would need more
+        \\memory than it may use to read it. Nothing was sent to the server.
         \\
         \\The cause line names the path and the system's reason. Check the path, or
-        \\run zcube apply from the directory that holds the file.
+        \\run zcube from the directory that holds the file.
         ,
     },
     .{
@@ -448,8 +449,12 @@ pub const registry = [_]Entry{
         \\needs to kill a process. These settings leave too little, so two copies
         \\of a replica could run at once.
         \\
-        \\The cause line names the numbers. Shorten the lease time to live, or
-        \\leave the fencing constants as they are.
+        \\The cause line names the numbers. A lease time to live that is too
+        \\long for the margin must be shortened. One that is too short, under
+        \\8000 ms, leaves the agent no time to renew it before it fences, so it
+        \\must be lengthened; the cause line names the shortest. The default is
+        \\10000 ms. An agent that is granted a lease time to live below 8000 ms
+        \\by an older server stops its containers and reports this code.
         ,
     },
     .{
@@ -507,9 +512,10 @@ pub const registry = [_]Entry{
         \\`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it
         \\stands. The cause line names the field and the limit it broke: a name that
         \\is not 1 to 48 bytes of lowercase letters, digits and hyphens (none at
-        \\either end), no command or too many words, a deadline of zero or
-        \\above 24 hours, a grace period above 60 seconds, env above 8 KiB, an input
-        \\above 64 KiB or with a NUL byte, a submit time more than an hour ahead, or
+        \\either end), or the name `watch`, which /v1/jobs/watch reserves, no
+        \\command or too many words, a deadline of zero or above 24 hours, a grace
+        \\period above 60 seconds, env above 8 KiB, an input above 64 KiB or with a
+        \\NUL byte, a submit time more than an hour ahead, or
         \\more labels than a job may carry.
         \\
         \\Two fields are refused because they are not built yet, and the cause says

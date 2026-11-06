@@ -14,19 +14,21 @@
 //! zcube [options] stats pull [node]
 //! zcube [options] repair allocations <node> [--confirm]
 //! zcube [options] local up|down
+//! zcube [options] job run|get|list|cancel|watch ...    (src/cli_job_args.zig)
 //! ```
 
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const cli_job_args = @import("cli_job_args.zig");
 
 const Diag = diag_mod.Diag;
 
 pub const Output = enum { text, wide, json };
 
 /// What `why` and `bundle` can be asked about: the kinds of `GET /v1/why`.
-pub const Kind = enum { service, replica, node };
+pub const Kind = enum { service, replica, node, job };
 
 pub const Subject = struct { kind: Kind, name: []const u8 };
 
@@ -68,6 +70,8 @@ pub const Command = union(enum) {
     /// `repair allocations <node>`: the node. Without `--confirm` it shows what it would write.
     repair_allocations: []const u8,
     local: LocalAction,
+    /// `job run|get|list|cancel|watch`.
+    job: cli_job_args.Job,
     help,
     version,
 };
@@ -94,6 +98,14 @@ pub const help_text =
     \\  check allocations            compare each node's accounting with its assignments
     \\  stats pull [node]            the recorded image pulls: bytes by source, time, struck peers
     \\  repair allocations <node>    show the repair of a node's accounting; --confirm writes it
+    \\  job run <name> --image <digest> [--env K=V] [--input-file F --input-env VAR]
+    \\      [--deadline 10m] [--submit-within 10m] [--label k=v] --command <word>...
+    \\                               run a command in an image once, to its end
+    \\  job get <name> [--wait]      a job's state and ending; --wait waits for the ending
+    \\  job list [--state S] [--label k=v]
+    \\                               jobs, newest names first; S is a state or ended
+    \\  job cancel <name>            stop a job
+    \\  job watch [--from REV]       one line per ending, as they happen
     \\  local up                     start a server and an agent on this machine (SQLite)
     \\  local down                   stop them; the state and the containers are kept
     \\  help                         show this text
@@ -110,6 +122,7 @@ pub const help_text =
     \\  --no-redact                  bundle: keep secrets in the bundle (prints a warning)
     \\
     \\exit codes: 0 ok, 1 your input, 2 your environment, 3 an external service, 70 a bug
+    \\  job get --wait: 0 exited with code 0, 10 exited otherwise, 11 failed, 12 cancelled
     \\
 ;
 
@@ -126,7 +139,7 @@ pub fn scan(args: []const []const u8) Options {
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--") or std.mem.eql(u8, arg, "--command")) break;
         if (is_verbose(arg)) options.verbose = true;
         if (!is_output(arg)) continue;
         if (index + 1 >= args.len) continue;
@@ -180,9 +193,10 @@ fn split(
             return refuse(diag, "an argument is over {d} bytes", .{constants.cli_arg_bytes_max});
         }
         const is_flag = !only_words and arg.len > 1 and arg[0] == '-';
-        if (!is_flag) {
+        if (!is_flag or job_flag(positional[0..count.*], arg)) {
             positional[count.*] = arg;
             count.* += 1;
+            if (is_job_command(positional[0..count.*], arg)) only_words = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--")) {
@@ -211,6 +225,31 @@ fn split(
             count.* += 1;
         }
     }
+}
+
+/// In a job line the flags `zcube` does not have are the job command's, kept as words in order
+/// (`cli_job_args.zig`). `--command` ends the options of `zcube`: what follows it is the job's
+/// command, whatever it looks like.
+fn job_flag(words: []const []const u8, arg: []const u8) bool {
+    if (words.len == 0 or !std.mem.eql(u8, words[0], "job")) return false;
+    return !is_global(arg);
+}
+
+fn is_job_command(words: []const []const u8, arg: []const u8) bool {
+    return words.len > 1 and std.mem.eql(u8, words[0], "job") and
+        std.mem.eql(u8, arg, "--command");
+}
+
+fn is_global(arg: []const u8) bool {
+    const names = [_][]const u8{
+        "--",        "-v", "--verbose", "-o",        "--output",
+        "--server",  "-y", "--yes",     "--dry-run", "--no-redact",
+        "--confirm",
+    };
+    for (names) |name| {
+        if (std.mem.eql(u8, arg, name)) return true;
+    }
+    return false;
 }
 
 fn output_value(args: []const []const u8, index: usize, diag: *Diag) Error!Output {
@@ -243,6 +282,7 @@ fn command_of(words: []const []const u8, diag: *Diag) Error!Command {
     if (std.mem.eql(u8, name, "repair")) return repair_of(diag, rest);
     if (std.mem.eql(u8, name, "stats")) return stats_of(diag, rest);
     if (std.mem.eql(u8, name, "local")) return local_of(diag, rest);
+    if (std.mem.eql(u8, name, "job")) return .{ .job = try cli_job_args.parse(rest, diag) };
     if (std.mem.eql(u8, name, "store")) {
         if (rest.len == 1 and std.mem.eql(u8, rest[0], "accept-rollback")) return .accept_rollback;
         return refuse(diag, "store takes accept-rollback", .{});
@@ -372,9 +412,17 @@ fn check_options(options: *const Options, command: Command, diag: *Diag) Error!v
     if (options.no_redact and command != .bundle) {
         return refuse(diag, "--no-redact is for zcube bundle", .{});
     }
-    if (options.output == .wide and command != .get and command != .stats_pull) {
-        return refuse(diag, "--output wide is for zcube get and stats pull", .{});
+    if (options.output == .wide and !takes_wide(command)) {
+        return refuse(diag, "--output wide is for zcube get, stats pull and job list", .{});
     }
+}
+
+fn takes_wide(command: Command) bool {
+    return switch (command) {
+        .get, .stats_pull => true,
+        .job => |job| job == .list,
+        else => false,
+    };
 }
 
 fn missing_value(diag: *Diag, flag: []const u8, what: []const u8) Error {
@@ -382,7 +430,7 @@ fn missing_value(diag: *Diag, flag: []const u8, what: []const u8) Error {
 }
 
 /// `ZC-E0111` with the one fix that always applies.
-fn refuse(diag: *Diag, comptime format: []const u8, args: anytype) Error {
+pub fn refuse(diag: *Diag, comptime format: []const u8, args: anytype) Error {
     assert(diag.code == null);
     diag.raise(.E0111);
     diag.while_("reading the command line", .{});

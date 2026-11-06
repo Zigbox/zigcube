@@ -228,6 +228,37 @@ test "an observed write under a replaced tenure is refused and the agent fences"
     try testing.expect(world.agent.tenure > first);
 }
 
+test "a ttl from the network that the agent cannot fence in time is refused, not asserted" {
+    // Goal: a server run with a ttl under the bound (an old one) must not crash the agent.
+    // Method: the keepalive answers 4,000 ms; the agent fences its node at once (it cannot
+    // promise to stop in time under that lease) and goes on running steps.
+    const world = try start(17);
+    defer world.destroy();
+    world.switched.keepalive_ttl_ms = 4_000;
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    advance_to(world, world.agent.renew_at_ms + sim_world.tick_ms);
+    world.advance(constants.fence_stop_ms + 2 * sim_world.tick_ms);
+    try testing.expect(world.agent.fences >= 1);
+    // It keeps stepping: no panic, the node registers again, and the cycle repeats.
+    world.advance(2 * constants.lease_ttl_ms);
+    try testing.expect(world.agent.fences >= 2);
+}
+
+test "a keepalive the client refuses for a short ttl (ZC-E0121) fences the node at once" {
+    // Goal: the production path. `RemoteStore` refuses a 4,000 ms reply with ZC-E0121 before the
+    // agent sees a ttl (agent_client_test.zig), so `heartbeat` must fence on that error itself.
+    // Method: the keepalive is refused as the client refuses it; the fence follows the first
+    // renewal, not the lease's end.
+    const world = try start(17);
+    defer world.destroy();
+    world.switched.keepalive_ttl_ms = 4_000;
+    world.switched.keepalive_refuse_short = true;
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    advance_to(world, world.agent.renew_at_ms + sim_world.tick_ms);
+    world.advance(constants.fence_stop_ms + 2 * sim_world.tick_ms);
+    try testing.expect(world.agent.fences >= 1);
+}
+
 test "the shipped constants satisfy the inequality" {
     try testing.expectEqual(
         @as(?fencing.Problem, null),

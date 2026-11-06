@@ -46,6 +46,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const evidence = @import("evidence.zig");
 const failures = @import("store_failures.zig");
+const job_retention = @import("job_retention.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 const zigbox = @import("zigbox");
@@ -97,6 +98,9 @@ pub const JobController = struct {
     cursor: ?records.Key = null,
     seen: [seen_max]Seen = @splat(.{ .run = 0, .tenure = 0, .at_ms = 0 }),
     seen_next: u32 = 0,
+    /// The retention of ended jobs (job_retention.zig): the job controller is the role that
+    /// reads the jobs' window anyway, and a failed pass never fails its step.
+    retention: job_retention.Cursor = .{},
 
     /// Decision ids of the controllers are `instance*4 + role`; this one takes the top quarter
     /// of the numbers, which the others never reach for the instances a shell hands out.
@@ -144,6 +148,10 @@ pub const JobController = struct {
             }
         }
         jc.cursor = if (finished) null else after;
+        if (now >= jc.retention.due_ms) {
+            jc.retention.due_ms = job_retention.prune_or_back_off(ctx, &jc.retention, now);
+        }
+        pass.wake_at_ms = @min(pass.wake_at_ms, @max(jc.retention.due_ms, now));
         // A sweep that began in the middle has not judged the jobs before its start.
         const again = pass.more or pass.txns_left == 0 or !finished or resumed;
         return .{

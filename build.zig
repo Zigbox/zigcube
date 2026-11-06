@@ -1150,6 +1150,12 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J8",
         .canary_seeds = 50,
     },
+    .{
+        .name = "job_gap",
+        .root = "src/sim_c1_teeth_job_gap_main.zig",
+        .symptom = "J4",
+        .canary_seeds = 50,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1165,7 +1171,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the thirteen negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the fourteen negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1198,7 +1204,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the thirteen fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the fourteen fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1222,6 +1228,31 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
     }
+    add_fencing_teeth_step(b, sim);
+}
+
+/// `zig build sim-fencing-teeth`: the negative test of `fencing_settles`. The simulator with
+/// the old `ttl / 3` renewal rule and the shortest-ttl bound lifted, at a ttl of 4,000 ms (the
+/// server refuses it now), must fail with that check's symptom. Not in `c1_teeth_roots`: the
+/// fleet's canary draws no ttl by hand.
+fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_teeth_oldrule",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_teeth_oldrule_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                              "1..3",                "100",
+        "1",                                    "--lease-ttl-ms=4000", "--expect-fail",
+        "--expect-symptom=agents kept fencing",
+    });
+    const help = "Run the simulator with the old renewal rule at ttl 4000; it must fail";
+    b.step("sim-fencing-teeth", help).dependOn(&run.step);
 }
 
 const c1_teeth_operations = 100;
