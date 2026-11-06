@@ -321,7 +321,8 @@ test "a write that fails removes its temporary file" {
     try tmp.dir.createDir(io, "ca.crt", .default_dir);
     var diag: Diag = undefined;
     diag.reset();
-    try std.testing.expectError(error.Failed, write(io, tmp.dir, "tmp", "ca.crt", "x", 0o600, &diag));
+    const failed = write(io, tmp.dir, "tmp", "ca.crt", "x", 0o600, &diag);
+    try std.testing.expectError(error.Failed, failed);
     try std.testing.expectEqual(codes.Code.E0806, diag.code.?);
     try std.testing.expectEqual(@as(u32, 1), try count_entries(io, tmp.dir));
 }
