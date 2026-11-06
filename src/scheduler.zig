@@ -716,9 +716,10 @@ pub const Scheduler = struct {
         try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
     }
 
-    /// Releases a run whose job is over (its status terminal) or gone (no status): the run
-    /// controller's terminal status is what frees the node, and retention's delete of the status
-    /// is what frees a node whose run was never ended. A run whose job is live keeps its node.
+    /// Releases a run whose job is over (its status terminal) or gone (neither a status nor a run
+    /// record): the job controller's terminal status is what frees the node, and retention's
+    /// delete of the job's records is what frees a node whose run was never ended. A run whose
+    /// job is live, or whose status alone is missing, keeps its node.
     fn release_run(
         sc: *Scheduler,
         ctx: *const Context,
@@ -731,6 +732,10 @@ pub const Scheduler = struct {
         const status = world.job_status(job);
         if (status) |found| {
             if (!records.job_state_terminal(found.rec.state)) return;
+        } else if (try Scheduler.run_record_exists(ctx, world, job)) {
+            // A run without a status is the job controller's contradiction (ZC-E0307): the job
+            // is not gone, its workload may be live, and nothing about it changes.
+            return;
         }
         if (assign.node == no_node) return;
         const view = &world.nodes[assign.node];
@@ -757,6 +762,12 @@ pub const Scheduler = struct {
             .status_revision = if (status) |found| found.kv.mod_revision else 0,
         };
         try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
+    }
+
+    fn run_record_exists(ctx: *const Context, world: *const World, job: []const u8) Error!bool {
+        const key = records.job_run_key(job);
+        const got = try ctx.store.get(ctx.arena, key.slice(), world.revision, ctx.diag);
+        return got.kv != null;
     }
 
     /// Releases assignment `index`: its decision, the assignment deleted and the allocation
