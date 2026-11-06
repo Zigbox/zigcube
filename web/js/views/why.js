@@ -5,13 +5,57 @@ import { h, setText, rebuild, timeEl, command, copyButton, whyHref, pill, setPil
 import { diagnosticBlock, cliWhy } from "../diag.js";
 import { exitText } from "../model.js";
 
-const KINDS = ["service", "replica", "node"];
+const KINDS = ["service", "replica", "node", "job"];
 let verbose = false;
 
 function redact(spec) {
   const out = { ...spec };
   if (Array.isArray(out.env)) out.env = out.env.map(([k]) => [k, "[hidden]"]);
   return out;
+}
+
+export function completenessEl(c) {
+  if (!c) return null;
+  if (c.verdict === "complete") return h("p", { class: "why-complete ok" }, h("strong", {}, "complete"), " · the chain reaches its cause");
+  const why = ({ retention: "a decision was removed by retention", subject_deleted: "the subject was deleted and a decision was removed", compacted: "a record the chain cites was compacted" })[c.reason] || c.reason;
+  return h("p", { class: "why-complete cut" }, h("strong", {}, `truncated: ${c.reason}`), ` · ${why}`, c.at ? [" · at ", h("code", {}, c.at)] : "");
+}
+
+export function stepEl(step, i) {
+  const li = h("li", { class: `step ${step.type}` });
+  const mark = h("span", { class: "because", "aria-hidden": "true" }, "because");
+  const body = h("div", { class: "step-body" });
+  if (step.type === "decision") {
+    const d = step.decision;
+    body.append(...[
+      h("div", { class: "step-h" }, h("span", { class: "chip" }, d.actor), h("span", { class: "step-act" }, d.action), h("span", { class: "grow" }), timeEl(d.at_ms)),
+      h("p", { class: "step-t" }, step.text),
+      h("p", { class: "step-m" }, "about ", h("a", { href: whyHref(d.subject.kind, d.subject.name) }, `${d.subject.kind} ${d.subject.name}`), " · decision ", h("code", { title: d.id }, d.id.slice(-9)), " ", copyButton(d.id, "Copy decision id")),
+      d.locality_bytes == null ? null
+        : h("p", { class: "step-m" }, `locality ${d.locality_bytes >= 1048576 ? Math.round(d.locality_bytes / 1048576) + " MiB" : d.locality_bytes >= 1024 ? Math.round(d.locality_bytes / 1024) + " KiB" : d.locality_bytes + " B"} held`, d.node_store_revision ? ` · node summary at revision ${d.node_store_revision}` : " · no node summary"),
+    ].filter(Boolean));
+  } else if (step.type === "observed") {
+    body.append(...[
+      h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "observed"), h("span", { class: "step-act" }, step.text)),
+      step.diagnostic ? diagnosticBlock(step.diagnostic) : null,
+      h("p", { class: "step-m" }, h("code", {}, step.key), ` at revision ${step.revision}`),
+    ].filter(Boolean));
+  } else if (step.type === "desired") {
+    body.append(
+      h("div", { class: "step-h" }, h("span", { class: "chip des" }, "apply"), h("span", { class: "step-act" }, step.text)),
+      h("p", { class: "step-m" }, step.applied_by ? ["by ", h("strong", {}, step.applied_by), step.request_id ? [" · request ", h("code", {}, step.request_id)] : ""] : "No author recorded for this apply."));
+  } else if (step.type === "lease_expired") {
+    body.append(h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "lease"), h("span", { class: "step-act" }, step.text)), h("p", { class: "step-m" }, h("code", {}, step.key), ` deleted at revision ${step.revision}`));
+  } else if (step.type === "note") {
+    // A statement of a rule, not a cause: no "because", its own chip.
+    body.append(h("div", { class: "step-h" }, h("span", { class: "chip" }, "note"), h("span", { class: "step-act" }, step.text)));
+    li.append(body);
+    return li;
+  } else {
+    body.append(h("div", { class: "step-h" }, h("span", { class: "chip" }, step.type === "resync" ? "resync" : "history"), h("span", { class: "step-act" }, step.text)));
+  }
+  li.append(mark, body);
+  return li;
 }
 
 function picker({ model, nav }) {
@@ -43,7 +87,7 @@ export function why(ctx, params, query) {
   form.addEventListener("submit", e => { e.preventDefault(); const n = nameIn.value.trim(); if (n) nav(`#/why/${kindSel.value}/${encodeURIComponent(n)}`); });
   const fillNames = () => {
     const k = kindSel.value;
-    const list = k === "service" ? model.serviceViews().map(s => s.name) : k === "replica" ? model.replicaViews().map(r => r.id) : model.nodeViews().map(n => n.name);
+    const list = k === "job" ? [] : k === "service" ? model.serviceViews().map(s => s.name) : k === "replica" ? model.replicaViews().map(r => r.id) : model.nodeViews().map(n => n.name);
     const sig = list.join();
     if (names._sig !== sig) { names._sig = sig; names.replaceChildren(...list.map(v => h("option", { value: v }))); }
   };
@@ -97,48 +141,6 @@ export function why(ctx, params, query) {
     render();
   }
 
-  function completenessEl(c) {
-    if (!c) return null;
-    if (c.verdict === "complete") return h("p", { class: "why-complete ok" }, h("strong", {}, "complete"), " · the chain reaches its cause");
-    const why = ({ retention: "a decision was removed by retention", subject_deleted: "the subject was deleted and a decision was removed", compacted: "a record the chain cites was compacted" })[c.reason] || c.reason;
-    return h("p", { class: "why-complete cut" }, h("strong", {}, `truncated: ${c.reason}`), ` · ${why}`, c.at ? [" · at ", h("code", {}, c.at)] : "");
-  }
-
-  function stepEl(step, i) {
-    const li = h("li", { class: `step ${step.type}` });
-    const mark = h("span", { class: "because", "aria-hidden": "true" }, "because");
-    const body = h("div", { class: "step-body" });
-    if (step.type === "decision") {
-      const d = step.decision;
-      body.append(
-        h("div", { class: "step-h" }, h("span", { class: "chip" }, d.actor), h("span", { class: "step-act" }, d.action), h("span", { class: "grow" }), timeEl(d.at_ms)),
-        h("p", { class: "step-t" }, step.text),
-        h("p", { class: "step-m" }, "about ", h("a", { href: whyHref(d.subject.kind, d.subject.name) }, `${d.subject.kind} ${d.subject.name}`), " · decision ", h("code", { title: d.id }, d.id.slice(-9)), " ", copyButton(d.id, "Copy decision id")),
-        d.locality_bytes == null ? null
-          : h("p", { class: "step-m" }, `locality ${d.locality_bytes >= 1048576 ? Math.round(d.locality_bytes / 1048576) + " MiB" : d.locality_bytes >= 1024 ? Math.round(d.locality_bytes / 1024) + " KiB" : d.locality_bytes + " B"} held`, d.node_store_revision ? ` · node summary at revision ${d.node_store_revision}` : " · no node summary"));
-    } else if (step.type === "observed") {
-      body.append(
-        h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "observed"), h("span", { class: "step-act" }, step.text)),
-        step.diagnostic ? diagnosticBlock(step.diagnostic) : null,
-        h("p", { class: "step-m" }, h("code", {}, step.key), ` at revision ${step.revision}`));
-    } else if (step.type === "desired") {
-      body.append(
-        h("div", { class: "step-h" }, h("span", { class: "chip des" }, "apply"), h("span", { class: "step-act" }, step.text)),
-        h("p", { class: "step-m" }, step.applied_by ? ["by ", h("strong", {}, step.applied_by), step.request_id ? [" · request ", h("code", {}, step.request_id)] : ""] : "No author recorded for this apply."));
-    } else if (step.type === "lease_expired") {
-      body.append(h("div", { class: "step-h" }, h("span", { class: "chip obs" }, "lease"), h("span", { class: "step-act" }, step.text)), h("p", { class: "step-m" }, h("code", {}, step.key), ` deleted at revision ${step.revision}`));
-    } else if (step.type === "note") {
-      // A statement of a rule, not a cause: no "because", its own chip.
-      body.append(h("div", { class: "step-h" }, h("span", { class: "chip" }, "note"), h("span", { class: "step-act" }, step.text)));
-      li.append(body);
-      return li;
-    } else {
-      body.append(h("div", { class: "step-h" }, h("span", { class: "chip" }, step.type === "resync" ? "resync" : "history"), h("span", { class: "step-act" }, step.text)));
-    }
-    li.append(mark, body);
-    return li;
-  }
-
   function renderRecord() {
     const parts = [];
     if (kind === "service") {
@@ -152,6 +154,8 @@ export function why(ctx, params, query) {
         parts.push(h("details", {}, h("summary", {}, "Replica and observed records"), h("pre", { class: "json" }, JSON.stringify({ desired: redact(r.spec), observed: r.obs || null }, null, 2))));
         parts.push(h("div", { class: "rel" }, h("h3", {}, "Related"), h("ul", { class: "chips" }, h("li", {}, h("a", { href: whyHref("service", r.service) }, `service ${r.service}`)), r.node && h("li", {}, h("a", { href: whyHref("node", r.node) }, `node ${r.node}`)))));
       }
+    } else if (kind === "job") {
+      parts.push(h("div", { class: "rel" }, h("h3", {}, "Related"), h("ul", { class: "chips" }, h("li", {}, h("a", { href: `#/jobs/${encodeURIComponent(name)}` }, `job ${name}`)))));
     } else {
       const n = model.nodeViews().find(x => x.name === name);
       if (n && n.replicas.length) parts.push(h("div", { class: "rel" }, h("h3", {}, "Replicas here"), h("ul", { class: "chips" }, ...n.replicas.map(r => h("li", {}, h("a", { href: whyHref("replica", r.id) }, r.id), " ", pill(r.state))))));
@@ -165,7 +169,7 @@ export function why(ctx, params, query) {
       rebuild(errorBox, JSON.stringify(error.diagnostics) + error.requestId, () => [
         h("h2", { class: "sr-only" }, "The console could not answer"),
         ...error.diagnostics.map(d => diagnosticBlock(d, { origin: error.origin === "console" ? "raised by the console" : null, requestId: error.requestId })),
-        error.status === 404 ? h("p", { class: "muted" }, "Look for the name on ", h("a", { href: kind === "service" ? "#/services" : kind === "node" ? "#/nodes" : "#/replicas" }, `the ${kind} list`), ".") : null,
+        error.status === 404 ? h("p", { class: "muted" }, "Look for the name on ", h("a", { href: kind === "service" ? "#/services" : kind === "node" ? "#/nodes" : kind === "job" ? "#/jobs" : "#/replicas" }, `the ${kind} list`), ".") : null,
       ]);
     } else rebuild(errorBox, "none", () => []);
     if (!chain) { rebuild(headline, error ? "x" : "loading", () => (error ? [] : [h("p", { class: "muted" }, "Loading…")])); headline.hidden = !!error; chainEl.replaceChildren(); sideCli.textContent = ""; return; }

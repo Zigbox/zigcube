@@ -6,6 +6,7 @@
 // Time is virtual: `advance(ms)` moves it, a ticker in the transport drives it in real time, and
 // the scenario runner can fast-forward. Nothing here touches the DOM.
 
+import { Jobs } from "./jobs.js";
 import {
   KNOWN_IMAGES, NODE_CAPACITY, LEASE_TTL_MS, diagImageNotFound, diagStoreDown, digestShort,
 } from "./fixtures.js";
@@ -40,6 +41,7 @@ export class Engine {
     this.activeUntil = 0;
     this.dirty = true;
     this.requestSeq = 0;
+    this.jobs = new Jobs(this);
     this.pulls = new Map(); // `${node}/${tree}` -> a /pulls/ record (docs/keys.md); not store keys: statistics
   }
 
@@ -162,6 +164,7 @@ export class Engine {
     if (!this.storeUp) return;
     for (const agent of this.agents.values()) this.agentTick(agent);
     this.expireLeases();
+    this.jobs.tick();
     if (this.dirty) { this.dirty = false; this.reconcile(); }
   }
 
@@ -200,12 +203,13 @@ export class Engine {
   // ---- Decisions ---------------------------------------------------------------------------
 
   /** Builds a decision plus the index op that must be committed with it. */
-  decision({ actor, action, subject, reason, cause, causeDiagnostic, locality }) {
+  decision({ actor, action, subject, reason, cause, causeDiagnostic, evidence, locality }) {
     const at = this.now();
     const id = `${String(at).padStart(13, "0")}-rc01-${String(++this.decisionCounter).padStart(4, "0")}`;
     const value = { v: locality ? 3 : 1, id, at_ms: at, actor, action, subject, reason, cause };
     if (locality) { value.locality_bytes = locality.bytes; value.node_store_revision = locality.revision; }
     if (causeDiagnostic) value.cause_diagnostic = causeDiagnostic;
+    if (evidence) value.cause_evidence = { text: evidence };
     return {
       id,
       ops: [
@@ -240,6 +244,7 @@ export class Engine {
   reconcile() {
     this.nodeController();
     for (const svc of this.values("/services/")) this.serviceController(svc);
+    this.jobs.reconcile();
   }
 
   nodeController() {
