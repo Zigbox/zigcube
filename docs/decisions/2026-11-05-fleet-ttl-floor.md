@@ -1,4 +1,4 @@
-# The fleet's lease ttl floor is 8,000 ms until #78 is fixed
+# The fleet's lease ttl floor is 8,000 ms until #78 is fixed (now: until #125)
 
 *Decided 2026-11-05, by the supervisor.*
 
@@ -14,7 +14,7 @@ So until #78 is fixed the draw's floor is 8,000 ms. A ttl given by hand
 (`--lease-ttl-ms=N`) is still accepted at any value in range, so a replay of the known failure
 still works. In that sweep seed 254 holds at 8,000 and fails at 6,000, and seed 343 fails at 7,000.
 
-**When #78 closes** the floor drops back (to 5,000 or lower, as the fix allows) in
+**#78 is fixed** (`2026-11-06-renewal-before-fence.md`), but the floor stays: seeds 254 and 343 are a busy loop of their own, issue #125. **When #125 closes** the floor drops back (to 5,000 or lower, as the fix allows) in
 `sim_shape.lease_ttl_ms_min`, in `docs/core.md`, and a new decision file says so. Drawing
 different ttls from the same seed changes which world a seed means, so the change lands with a
 note in that file.

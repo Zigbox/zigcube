@@ -332,7 +332,7 @@ two by hand, which is what a replay line carries (with the concrete nodes, `--pr
 `--heal-at=`), so a replay draws nothing. An explicit `<ops>` keeps the seed-picked node count,
 the 10 s ttl and 100 % replicas. A failing seed prints `  profile:` and `  shape:` lines after
 its `  step:` line; the fleet's parser ignores them. The `auto` range summary reads
-`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 5,000 ms (the bound admits 3,500; below about 4,500 the renewals alone reach the busy-loop ceiling)
+`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 8,000 ms (the bound admits 5,000; 5,000 to 8,000 is not drawn until #125 is resolved)
 (`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
 own generator (the seed xor a salt); the
 decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.

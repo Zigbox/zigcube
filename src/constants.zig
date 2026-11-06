@@ -137,7 +137,12 @@ pub const fence_margin_ms: u32 = 3000;
 /// The least time a lease must leave between its last acknowledged keepalive and the fence
 /// (`ttl - fence_margin`): room for a renewal to be sent, answered and recorded. With less the
 /// agent renews on every pass and still fences (issue #78: `--lease-ttl-ms=3001` never settles).
-pub const fence_window_min_ms: u32 = 500;
+/// 2,000 makes the shortest admitted ttl 5,000 ms, the shortest the simulator passes at: a
+/// renewal 1,000 ms before the fence leaves `renew_slack_min_ms` for the pass, the round trip
+/// and the commit.
+pub const fence_window_min_ms: u32 = 2000;
+/// The time `fencing.renew_after_ms` leaves between a renewal due and the fence, at the least.
+pub const renew_slack_min_ms: u32 = 1000;
 /// How often a fencing agent looks at its containers while it waits for them to stop.
 pub const fence_poll_ms: u32 = 100;
 pub const lost_grace_ms: u32 = 1000;
