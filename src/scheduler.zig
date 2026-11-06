@@ -891,14 +891,17 @@ pub const Scheduler = struct {
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
         const run_id = ctx.arena.dupe(u8, records.job_run_id(&buffer, job)) catch
             return failures.no_memory(ctx.diag);
-        if (world.assigned_by.contains(run_id)) return;
+        const assigned = world.assigned_by.contains(run_id);
+        if (assigned and !c1_teeth.job_double) return;
         const run_at = records.job_run_key(job);
         const got = try ctx.store.get(ctx.arena, run_at.slice(), world.revision, ctx.diag);
         // The job controller writes the run and its status together: a status alone is its
         // contradiction to report (ZC-E0307), not a run to place.
         const run_kv = got.kv orelse return;
         const run = try records.read(records.JobRun, ctx.arena, run_kv, ctx.diag);
-        if (run.stop != null) return;
+        if (run.stop != null and !c1_teeth.job_double) return;
+        // Test-only: a stopped run is placed again even where it is assigned (J5).
+        if (assigned and run.stop == null) return;
         const need = run_requests_of(&run);
         var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];

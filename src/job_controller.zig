@@ -41,8 +41,10 @@ const std = @import("std");
 const assert = std.debug.assert;
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
+const evidence = @import("evidence.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
@@ -446,7 +448,10 @@ const Pass = struct {
         const status = pass.world.status(name);
         if (run == null and status == null) return pass.create(job);
         if (run == null or status == null) return pass.contradict(job, run, status);
-        if (records.job_state_terminal(status.?.rec.state)) return pass.late_report(job, status.?);
+        if (records.job_state_terminal(status.?.rec.state)) {
+            if (c1_teeth.job_rewrite) try pass.rewrite(status.?);
+            return pass.late_report(job, status.?);
+        }
         try pass.advance(job, run.?, status.?);
     }
 
@@ -680,6 +685,9 @@ const Pass = struct {
         run: *const Entry(records.JobRun),
         status: *const Entry(records.JobStatus),
     ) Error!void {
+        if (run.rec.stop == null and job.rec.cancel_requested != null) {
+            return pass.write_stop(job, run, status, .cancel);
+        }
         const node = status.rec.node orelse return;
         const tenure = status.rec.tenure orelse return;
         const since = pass.tenure_ended_at(node, tenure, run.rec.id) orelse return;
@@ -799,7 +807,7 @@ const Pass = struct {
             .action = "stop_job",
             .subject = .{ .kind = .job, .name = name },
             .reason = switch (cause) {
-                .cancel => "the job was cancelled before it was claimed",
+                .cancel => "the job was cancelled; its run is to stop",
                 .not_started => "the run did not start within its deadline",
                 .@"unreachable" => "the node of the run was lost before it claimed the run",
             },
@@ -974,12 +982,28 @@ const Pass = struct {
             .reason = "the agent's report maps to no ending; the job is left as it was",
             .cause = .{ .kind = .observed, .key = entry.kv.key, .revision = entry.kv.mod_revision },
             .cause_diagnostic = raw,
+            .cause_evidence = try evidence.job_observed(ctx, &entry.rec),
             .read_revision = pass.world.revision,
         }, &batch);
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
     }
 
     // ---- A report for an ended job ----
+
+    /// Test-only (`c1_teeth.job_rewrite`, must break J3): a terminal status written again, once,
+    /// with a later `ended_at_ms`.
+    fn rewrite(pass: *Pass, status: *const Entry(records.JobStatus)) Error!void {
+        const ctx = pass.ctx;
+        const ended_at = status.rec.ended_at_ms orelse return;
+        if (status.rec.reported_at_ms != ended_at) return;
+        var next = status.rec;
+        next.ended_at_ms = ended_at + 1;
+        next.reported_at_ms = ended_at + 1;
+        var batch: Batch = .{};
+        batch.expect(status.kv.key, status.kv.mod_revision);
+        batch.put(status.kv.key, try records.encode(ctx.arena, next, ctx.diag));
+        _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
+    }
 
     /// ZC-W0307: the node reported after the job ended. The ending stays; one decision says so,
     /// once for each revision of the report. Only jobs that ended within `job_finished_age_ms_min`
@@ -1022,6 +1046,7 @@ const Pass = struct {
             .reason = "the job had ended; the report was not applied",
             .cause = .{ .kind = .observed, .key = kv.key, .revision = kv.mod_revision },
             .cause_diagnostic = raw,
+            .cause_evidence = try evidence.job_observed(ctx, &report),
             .read_revision = pass.world.revision,
         }, &batch);
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;

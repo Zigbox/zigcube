@@ -29,5 +29,19 @@ pub const stale_observation = declared("c1_teeth_stale_observation");
 /// invariant of `sim-cluster`).
 pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
 
+/// The agent starts a run whose container already exited (must break J2 and J7).
+pub const job_restart = declared("c1_teeth_job_restart");
+/// The agent starts a run before its claim commits (must break J7).
+pub const job_claim = declared("c1_teeth_job_claim");
+/// The scheduler places a run that has a `stop` (must break J5 and J7).
+pub const job_double = declared("c1_teeth_job_double");
+/// The job controller rewrites a terminal status (must break J3).
+pub const job_rewrite = declared("c1_teeth_job_rewrite");
+/// The agent ignores a run's `stop` (must break J6).
+pub const job_cancel = declared("c1_teeth_job_cancel");
+/// The agent ignores a run's deadline (must break J8).
+pub const job_deadline = declared("c1_teeth_job_deadline");
+
 pub const any = skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge or
-    stale_observation or locality_before_spread;
+    stale_observation or locality_before_spread or job_restart or job_claim or job_double or
+    job_rewrite or job_cancel or job_deadline;
