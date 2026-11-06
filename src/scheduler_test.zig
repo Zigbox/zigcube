@@ -116,6 +116,38 @@ const Fixture = struct {
         try self.put(.replica_controller, records.replica_key(service, id).slice(), value);
     }
 
+    /// Writes a job's run and its status, as the job controller would.
+    fn job(self: *Fixture, name: []const u8, cpu: ?u32, state: records.JobState) !void {
+        var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const run: records.JobRun = .{
+            .id = records.job_run_id(&buffer, name),
+            .job = name,
+            .image = "b3:51aa9c03",
+            .command = &.{"true"},
+            .limits = .{ .cpu_millis = cpu, .memory_bytes = gib },
+            .deadline_ms = 60 * 1000,
+            .start_by_ms = self.manual.ms + 60 * 1000,
+            .created_at_ms = self.manual.ms,
+        };
+        try self.put(.job_controller, records.job_run_key(name).slice(), run);
+        try self.job_state(name, state);
+    }
+
+    fn job_state(self: *Fixture, name: []const u8, state: records.JobState) !void {
+        const terminal = records.job_state_terminal(state);
+        const record: records.JobStatus = .{
+            .state = state,
+            .ended_at_ms = if (terminal) self.manual.ms else null,
+            .end = if (!terminal) null else switch (state) {
+                .exited => .{ .kind = .exited, .code = 0 },
+                .cancelled => .{ .kind = .cancelled },
+                else => .{ .kind = .failed, .cause = .unknown },
+            },
+            .reported_at_ms = self.manual.ms,
+        };
+        try self.put(.job_controller, records.job_status_key(name).slice(), record);
+    }
+
     /// Writes the node's `/node-store` summary: the fake trees of `digests`.
     fn summary(self: *Fixture, name: []const u8, digests: []const []const u8) !void {
         var fake: node_store.FakeImages = .{ .digests = digests };
@@ -981,4 +1013,105 @@ test "L1 does not fail a placement that lost a race to a change after its read" 
         @as(?[]const u8, null),
         scheduler.placement_problem(&ctx_after, .{ .on_success = &ops }, &judged),
     );
+}
+
+test "a run is placed with its decision, its assignment and its allocation" {
+    // Goal: B1's placement. Method: one node, one job; the assignment is an Assigned v2 for the
+    // run, the allocation counts it, the decision is `place_run` about the job, and a second pass
+    // writes nothing.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("train", 500, .pending);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("train-job", "n1");
+    const allocation = try fixture.allocation("n1");
+    try testing.expectEqual(@as(u32, 500), allocation.allocated.cpu_millis);
+    try testing.expectEqual(@as(u32, 1), allocation.count);
+    const placed = try fixture.decisions("place_run");
+    defer testing.allocator.free(placed);
+    try testing.expectEqual(@as(usize, 1), placed.len);
+    try testing.expectEqual(records.SubjectKind.job, placed[0].subject.kind);
+    try testing.expectEqualStrings("train", placed[0].subject.name);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a run whose job has a terminal status or a stop is not placed" {
+    // Goal: nothing is placed for a job that is over or stopping. Method: one run terminal, one
+    // with a stop; neither is assigned.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("done", 500, .failed);
+    try fixture.job("stopping", 500, .pending);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const stopping: records.JobRun = .{
+        .id = records.job_run_id(&buffer, "stopping"),
+        .job = "stopping",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .deadline_ms = 60 * 1000,
+        .start_by_ms = 1,
+        .created_at_ms = 1,
+        .stop = .{ .cause = .cancel, .at_ms = 2 },
+    };
+    try fixture.put(.job_controller, records.job_run_key("stopping").slice(), stopping);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("done-job", null);
+    try fixture.expect_on("stopping-job", null);
+}
+
+test "a run is released when its status is terminal or gone, and not before" {
+    // Goal: release. Method: place two runs; one job ends, the other's status and run go; the
+    // assignments and allocations follow, each with one `release_run` decision.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("a", 500, .pending);
+    try fixture.job("b", 500, .pending);
+    try fixture.settle();
+    try testing.expectEqual(@as(u32, 2), (try fixture.allocation("n1")).count);
+    try fixture.job_state("a", .running);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.job_state("a", .failed);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("a-job", null);
+    try fixture.expect_on("b-job", "n1");
+    const ctx = fixture.context();
+    const gone = [_]store.Op{
+        .{ .delete = records.job_status_key("b").slice() },
+        .{ .delete = records.job_run_key("b").slice() },
+    };
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("b-job", null);
+    try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 2), try fixture.count("release_run"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "a node takes at most jobs_per_node_max runs and the rest wait with a hold" {
+    // Goal: the per-node cap. Method: one roomy node, one run over the cap; the extra run is
+    // held once (`hold_pending` about the job) and placed after another ends.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const total: u32 = constants.jobs_per_node_max + 1;
+    try fixture.node("n1", total * 10, total * gib, true);
+    var index: u32 = 0;
+    while (index < total) : (index += 1) {
+        var name: [8]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "j{d}", .{index});
+        try fixture.job(text, 1, .pending);
+    }
+    try fixture.settle();
+    try testing.expectEqual(constants.jobs_per_node_max, (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("hold_pending"));
+    try fixture.job_state("j0", .exited);
+    try fixture.settle();
+    try testing.expectEqual(constants.jobs_per_node_max, (try fixture.allocation("n1")).count);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_run"));
 }

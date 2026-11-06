@@ -901,6 +901,13 @@ pub const jobs_per_node_max: u32 = 64;
 /// The runs list of one node (`GET /v1/agent/nodes/{node}/runs`): more is ZC-E0302, as for
 /// replicas. One unpaged reply, so it stays under half a page (comptime below).
 pub const agent_node_runs_max: u32 = jobs_per_node_max;
+/// `/assigned/` holds the assignments of replicas and of runs, so every list of it is bounded by
+/// both: a list with `replicas_max` alone fails (ZC-E0302) on a cluster with 300 replicas and 300
+/// jobs (docs/briefs/b1-1.md).
+pub const assigned_max: u32 = replicas_max + jobs_max;
+/// The assignments of one node: its replicas and its runs. A node holds at most
+/// `runtime_handles_max` of the two together (the scheduler refuses more), which this covers.
+pub const agent_node_assigned_max: u32 = agent_node_replicas_max + agent_node_runs_max;
 /// A run record, as encoded: the spec without the input. Enforced on the encoded JSON by
 /// `records.encode` and `records.read`, not inferred from the raw sizes of its members: JSON
 /// escaping turns one control byte into six.
@@ -943,6 +950,11 @@ comptime {
     assert(jobs_per_node_max <= runtime_handles_max);
     assert(jobs_max > 0);
     assert(agent_node_runs_max <= jobs_per_node_max);
+    assert(assigned_max == replicas_max + jobs_max);
+    assert(agent_node_assigned_max >= runtime_handles_max);
+    // An assignment is a few hundred bytes (its reason is a sentence); the whole list is read into
+    // the step's arena beside the other lists, so it keeps to a fraction of it.
+    assert(assigned_max * 1024 <= request_arena_bytes_max / 8);
     // The reply is not paged: at most half a store page, as the replicas list is bounded by
     // `store_list_limit_max`.
     assert(agent_node_runs_max * job_run_bytes_max <= store_page_bytes_max / 2);

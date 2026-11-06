@@ -356,7 +356,7 @@ const Call = struct {
             ctx,
             records.assigned_prefix(call.node).slice(),
             all.revision,
-            constants.agent_node_replicas_max,
+            constants.agent_node_assigned_max,
         ) catch return propagate(ctx);
         // The replicas the scheduler assigned to this node, in `/replicas` order. An assignment
         // whose replica is gone is not served, so the agent stops the container.
@@ -386,7 +386,7 @@ const Call = struct {
             ctx,
             records.assigned_prefix(call.node).slice(),
             null,
-            constants.agent_node_replicas_max,
+            constants.agent_node_assigned_max,
         ) catch return propagate(ctx);
         const items = ctx.arena.alloc(Item(records.Assigned), given.items.len) catch
             return no_memory(ctx);
