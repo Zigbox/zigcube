@@ -1,8 +1,10 @@
 # Certificates and mTLS
 
 This document describes how Zigcube makes and checks its X.509 certificates. The brief is
-[briefs/mtls-client.md](briefs/mtls-client.md). Slices 1 to 3 (X.509, the CA, the key schedule) are built. Slices 4 (the TLS 1.3 client handshake) and 5
-(client authentication) are in review; slice 6 (the connection) is not started.
+[briefs/mtls-client.md](briefs/mtls-client.md). All eight slices are built: X.509, the CA, the key schedule, the TLS 1.3 client with client
+authentication, the connection, the stock-server interop harness and, in slice 8, the wiring (the
+WASM smoke, `mtls-teeth` in `check`) and this document. The rest of mTLS (the relay's listener,
+issuance in the control plane) is out of scope (brief).
 
 ## Certificates
 
@@ -155,6 +157,55 @@ data, KeyUpdates, tickets and alerts both ways. It checks the client's answer at
 of `connected`, whatever follows, and has a teeth test of its own. Tidy allows only test roots to
 import `tls_testpeer.zig`. It is replayed like the others (see "Replaying a fuzz
 failure").
+
+## The handshake
+
+```
+idle --start--> wait_server_hello --ServerHello--> wait_encrypted_extensions
+     --EncryptedExtensions--> wait_certificate --Certificate--> wait_certificate_verify
+     --CertificateVerify--> wait_finished --server Finished-->
+     (client flight: [Certificate, CertificateVerify,] Finished) --> connected
+connected --close_notify (either way)--> closed
+any state --refuse / fail_silently--> failed
+```
+
+`CertificateRequest` is optional and read only in `wait_certificate`, where it is a self-edge (the
+state does not change). Any failure, from any state, queues at most one alert, wipes the secrets
+and goes to `failed`, a sink of its own (ZC-E0813 to E0820 as the table below). `closed` is reached
+only through `close_notify`. In `connected`, `KeyUpdate` re-keys one direction, and a key limit is
+ZC-E0815.
+
+## The constants
+
+All are in `src/constants.zig` with their reasons; changing one is a change to that file.
+
+| Constant | Value | Bounds |
+| --- | --- | --- |
+| `x509_cert_bytes_max` | 1024 | a certificate we write or accept |
+| `x509_leaf_ttl_ms_max` / `x509_ca_ttl_ms_max` | 7 days / 10 years | lifetimes |
+| `x509_labels_max`, `_label_key_bytes_max`, `_label_value_bytes_max`, `_labels_bytes_max` | 16, 63, 256, 256 | identity labels |
+| `tls_handshake_message_bytes_max` / `_flight_bytes_max` | 4096 / 8192 | one message / the reassembly buffer |
+| `tls_chain_certificates_max` | 2 | leaf and CA |
+| `tls_request_context_bytes_max` | 255 | the CertificateRequest context |
+| `tls_records_per_key_max` | 2^24 | records before a KeyUpdate is due |
+| `tls_key_updates_per_connection_max` | 2^16 | KeyUpdates in one connection |
+| `tls_handshake_timeout_ms` / `tls_alert_flush_ms` | 10000 / 1000 | handshake deadline / alert send |
+
+## Checks that run where
+
+- `zig build wasm-check` runs `src/mtls_smoke.zig` in the WASM module (`zcube_mtls_smoke`): a CA
+  issues a server and a workload certificate, both verify, a damaged byte, another CA, another
+  name and a time past the window are each refused, and the client writes a ClientHello.
+  `wasm-test` runs every core module's unit tests, the TLS ones included.
+- `zig build mtls-teeth` (in `check`) runs the tests named `teeth:`: each switches one check off
+  (chain signature, name, window, CertificateVerify, Finished, transcript, client-auth rules) and
+  passes only if the matching test then fails.
+- `zig build mtls-interop` (not in `check`; CI job of its own) runs the client against
+  `openssl s_server` and a JDK 21 server. It needs `openssl`, JDK 21 and `setpriv` (util-linux),
+  and fails, not skips, without them
+  (decisions/2026-11-06-interop-needs-setpriv.md). The JVM runs with
+  `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
+  fails the clean-close check.
 
 ## Diagnostics
 

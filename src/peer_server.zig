@@ -1526,6 +1526,14 @@ test "an agent configured for Zigbox only serves its store's tree to a peer fetc
     try agent.init();
     defer agent.deinit();
     try std.testing.expect(!agent.swarm.has_store);
+    // ZBX-W0201 is said (and the flag set) exactly when this host maps one id only; the agent
+    // starts the server quiet in a test, so the flag is how the test sees the warning.
+    {
+        const facts = try gpa.create(zigbox.Facts);
+        defer gpa.destroy(facts);
+        const expected = zigbox_fetch.outside_owners(facts).fallback;
+        try std.testing.expectEqual(expected, agent.swarm.server.?.outside_fallback);
+    }
     // The node's summary comes from the Zigbox store the agent opened: it lists the tree.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
