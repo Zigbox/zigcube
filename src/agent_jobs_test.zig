@@ -75,7 +75,10 @@ const Rig = struct {
 
     /// The run and its assignment to this node; returns the assignment's revision (the epoch).
     fn assign(rig: *Rig, deadline_ms: u64) !store.Revision {
-        const run = rig.run_record(null, deadline_ms);
+        return rig.assign_run(rig.run_record(null, deadline_ms));
+    }
+
+    fn assign_run(rig: *Rig, run: records.JobRun) !store.Revision {
         _ = try rig.put(.job_controller, records.job_run_key(job_name).slice(), run);
         const assigned: records.Assigned = .{
             .replica = run_id,
@@ -248,6 +251,7 @@ test "the deadline stops the run on the monotonic clock, under the same boot" {
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
     try testing.expectEqual(@as(?records.StopCause, .deadline), seen.stop_cause);
+    try testing.expect(seen.has_diagnostic); // ZC-W0503
 }
 
 test "a deadline of another boot is not compared: the run is stopped by the host's loss" {
@@ -344,4 +348,184 @@ test "an oom or a pid limit ends the run with that kind, and no cause" {
         try testing.expectEqual(case[1], seen.exit.?.kind);
         try testing.expectEqual(@as(?records.StopCause, null), seen.stop_cause);
     }
+}
+
+// ---- The windows of a claim, and the failures of a start ----
+
+/// What a claim committed and the agent did not see leaves: the `claiming` record and the
+/// `claimed` observation (a reply lost; a crash between the claim and the record write).
+fn leave_claim(rig: *Rig, epoch: store.Revision, tenure: u64) !void {
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, run_id);
+    const record: agent_jobs.StartRecord = .{ .run = run_id, .epoch = epoch, .phase = .claiming };
+    const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
+    try rig.world.files.interface().put_atomic(name, bytes);
+    const claimed: records.JobObserved = .{
+        .run = run_id,
+        .node = sim_world.node_name,
+        .tenure = tenure,
+        .assignment = epoch,
+        .status = .claimed,
+        .reported_at_ms = rig.world.now_ms(),
+    };
+    const key = records.job_observed_key(sim_world.node_name, job_name);
+    _ = try rig.put(.{ .agent = sim_world.node_name }, key.slice(), claimed);
+}
+
+test "a claim applied and not seen by the agent is started, once" {
+    // Goal: a lost reply (or a crash between the claim and the record) must not end a run that
+    // never started as `lost`. Method: leave exactly the state those windows leave.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const epoch = try rig.assign(60_000);
+    try leave_claim(&rig, epoch, rig.world.agent.tenure);
+    rig.step();
+    try testing.expect(rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+    try testing.expectEqual(agent_jobs.Phase.claimed, (try rig.start_record()).?.phase);
+    rig.step();
+    try testing.expectEqual(@as(u32, 1), rig.world.sim.running_count());
+}
+
+test "a claim of an earlier tenure is reported not started, never lost" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const epoch = try rig.assign(60_000);
+    try leave_claim(&rig, epoch, rig.world.agent.tenure - 1);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
+    try testing.expect(!seen.has_diagnostic);
+}
+
+test "a claimed run that carries a stop is reported not started, never started" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const epoch = try rig.assign(60_000);
+    try leave_claim(&rig, epoch, rig.world.agent.tenure);
+    try rig.ask_stop(.cancel, 60_000);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
+    try testing.expect(!seen.has_diagnostic);
+}
+
+test "a claiming record of a run that is not assigned and not claimed is removed" {
+    // Goal: a refused claim leaves no file behind once the run is released.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, run_id);
+    const record: agent_jobs.StartRecord = .{ .run = run_id, .epoch = 7, .phase = .claiming };
+    const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
+    try rig.world.files.interface().put_atomic(name, bytes);
+    rig.step();
+    try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+}
+
+const hello_digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+fn assign_with_input(rig: *Rig, input_digest: []const u8, base64: ?[]const u8) !void {
+    var run = rig.run_record(null, 60_000);
+    run.input_env = "INPUT";
+    run.input_digest = input_digest;
+    _ = try rig.assign_run(run);
+    if (base64) |text| {
+        const key = records.job_input_key(job_name);
+        _ = try rig.put(.api, key.slice(), records.JobInput{ .base64 = text });
+    }
+}
+
+test "an input that cannot be fetched is tried again, and does not end the run" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const digest = hello_digest;
+    try assign_with_input(&rig, digest, "aGVsbG8=");
+    rig.world.switched.down_get_prefix = records.prefix_job_input;
+    _ = rig.world.agent_step();
+    try testing.expect(!rig.running());
+    const waiting = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.claimed, waiting.status);
+    try testing.expect(rig.world.last_failure != null);
+    rig.world.last_failure = null;
+    rig.world.switched.down_get_prefix = null;
+    rig.world.advance(5_000);
+    rig.step();
+    rig.step();
+    try testing.expect(rig.running());
+    try testing.expectEqual(records.JobObservedStatus.running, (try rig.observed()).?.status);
+}
+
+test "an input that does not match its digest, or is absent, ends the run as start_failed" {
+    const cases = [_]?[]const u8{ "b3RoZXI=", null };
+    for (cases) |base64| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const digest = hello_digest;
+        try assign_with_input(&rig, digest, base64);
+        rig.step();
+        try testing.expect(!rig.running());
+        const seen = (try rig.observed()).?;
+        try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+        try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
+        try testing.expect(seen.has_diagnostic);
+        rig.step();
+        try testing.expectEqual(records.JobObservedStatus.stopped, (try rig.observed()).?.status);
+    }
+}
+
+test "a start the runtime refuses ends the run as start_failed" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    var run = rig.run_record(null, 60_000);
+    run.image = "b3:ffffffff";
+    _ = try rig.assign_run(run);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
+    try testing.expect(seen.has_diagnostic);
+}
+
+test "a damaged start record ends the run lost, with a diagnostic" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    var buffer: [96]u8 = undefined;
+    try rig.world.files.interface().put_atomic(agent_jobs.record_name(&buffer, run_id), "{not");
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.ExitKind.lost, seen.exit.?.kind);
+    try testing.expect(seen.has_diagnostic);
+}
+
+test "a running run the server no longer serves is stopped with a recorded cause" {
+    // Goal: the stop the agent makes on its own is recorded before it signals, so the report
+    // does not read as the job crashing.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const world = rig.world;
+    const key = records.job_run_key(job_name);
+    const op: store.Op = .{ .delete = key.slice() };
+    const txn: store.TxnRequest = .{ .on_success = &.{op} };
+    const done = try writers.txn(world.store_handle(), .job_controller, txn, &world.diag);
+    try testing.expect(done.succeeded);
+    rig.step();
+    try testing.expect(!rig.running());
+    try testing.expectEqual(
+        @as(?records.StopCause, .@"unreachable"),
+        (try rig.start_record()).?.stop_cause,
+    );
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), seen.stop_cause);
 }

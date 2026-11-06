@@ -469,8 +469,9 @@ const Call = struct {
             slot.* = ctx.store.get(ctx.arena, key, null, ctx.diag) catch return propagate(ctx);
         }
         // Only the node the run is assigned to, and only after it claimed the run.
-        const input_kv = found[2].kv orelse return no_input(ctx, name);
-        if (found[0].kv == null or found[1].kv == null) return no_input(ctx, name);
+        if (found[0].kv == null) return no_input(ctx, name, .unassigned);
+        if (found[1].kv == null) return no_input(ctx, name, .unclaimed);
+        const input_kv = found[2].kv orelse return no_input(ctx, name, .missing);
         const input = records.read(records.JobInput, ctx.arena, input_kv, ctx.diag) catch
             return propagate(ctx);
         const pair = try call.chain();
@@ -1040,15 +1041,27 @@ fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
     return error.Failed;
 }
 
-fn no_input(ctx: *const Context, name: []const u8) Failure {
+/// The input of a run is not given: the node is not assigned the run, has not claimed it, or the
+/// run's input is missing (ZC-E0523: the API wrote the run, so that is not the caller's fault).
+fn no_input(ctx: *const Context, name: []const u8, why: InputWhy) Failure {
     assert(ctx.diag.code == null);
-    ctx.diag.raise(.E0133);
-    ctx.diag.cause("job {s} has no input for this node: not assigned, not claimed, or none", .{
-        name,
-    });
-    ctx.diag.fix(.{ .sentence = "the agent claims the run first, then asks for its input" });
+    switch (why) {
+        .missing => @import("agent_jobs.zig").raise_input(ctx.diag, name, .absent),
+        .unassigned, .unclaimed => {
+            ctx.diag.raise(.E0133);
+            if (why == .unassigned) {
+                ctx.diag.cause("job {s} is not assigned to this node", .{name});
+            } else {
+                ctx.diag.cause("this node has not claimed the run of job {s}", .{name});
+            }
+            const sentence = "the agent claims the run first, then asks for its input";
+            ctx.diag.fix(.{ .sentence = sentence });
+        },
+    }
     return error.Failed;
 }
+
+const InputWhy = enum { unassigned, unclaimed, missing };
 
 fn too_many_runs(ctx: *const Context) Failure {
     assert(ctx.diag.code == null);

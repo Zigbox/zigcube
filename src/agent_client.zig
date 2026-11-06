@@ -691,7 +691,13 @@ pub const RemoteStore = struct {
             return failures.no_memory(diag);
         const target = try remote.path(arena, suffix, diag);
         const reply = try remote.exchange(arena, .{ .method = "GET", .target = target }, diag);
-        if (reply.status != 200) return refused(arena, reply, diag);
+        if (reply.status != 200) {
+            // The server's own answer that the run has no input it can give: not a fault of
+            // the link (ZC-E0523), so the agent can tell it from one.
+            const code = refusal_code(arena, reply.body) orelse "";
+            if (std.mem.endsWith(u8, code, "E0523")) return .{ .kv = null, .revision = 1 };
+            return refused(arena, reply, diag);
+        }
         const Answer = struct { input: Json };
         const answer = try parse(Answer, arena, reply.body, diag);
         const value = std.json.Stringify.valueAlloc(arena, answer.input, .{}) catch

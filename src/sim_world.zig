@@ -58,6 +58,9 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
+    /// test-only, null in every simulation.
+    down_get_prefix: ?[]const u8 = null,
     calls: u32 = 0,
 
     const vtable: store.Store.VTable = .{
@@ -118,6 +121,14 @@ pub const SwitchedStore = struct {
     ) store.Error!store.GetResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.down_get_prefix) |prefix| {
+            if (std.mem.startsWith(u8, key, prefix)) {
+                diag.raise(.E0201);
+                diag.cause("connection refused", .{});
+                diag.fix(.{ .sentence = "switch it back on" });
+                return error.BackendFailed;
+            }
+        }
         return self.inner.get(arena, key, at_revision, diag);
     }
 

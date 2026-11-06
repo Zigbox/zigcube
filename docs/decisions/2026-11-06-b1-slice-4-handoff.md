@@ -27,15 +27,32 @@ Date: 2026-11-06. Branch `claude/b1-slice-4`, stacked on `claude/b1-slice-3` (PR
 - `zig build test` run through a tool with a 120 s timeout is cut off and reports a failed command
   with no test name; run the test binary directly to see the result.
 
+## Review fixes (review 5796099523)
+
+- Restart table gap: a `claiming` start record with our own `claimed` observation (current tenure,
+  this epoch, run served, no stop) now writes `claimed` and starts, still at most once. This is the
+  claim applied with the reply lost, and a crash between the claim and the record write; both leave
+  the same state, so the tests build that state directly rather than through `sim_net`. Under an
+  older tenure or with a stop the run is `stopped` with `stop_cause` `not_started`, never `lost`.
+  A `claiming` record with no observation and no assignment is removed.
+- The input is fetched before the `claimed` record is written. A store or transport error leaves the run
+  claimed and not started, and a later pass retries. Only a digest mismatch or a server saying the
+  input is absent (ZC-E0523 from the input endpoint) ends it, as `start_failed`.
+- ZC-E0523 is new, proposed in `2026-11-06-zc-e0523-job-input-digest.md`. A refused spec is ZC-E0130 with
+  the runtime's `spec_problem`.
+- ZC-W0503 is raised for `stop_cause == .deadline`. A stop for a run the server no longer serves records
+  `unreachable` first, and uses the run's `grace_ms` from the start record.
+- E0521/E0522 are built by one function each, which the golden test also calls.
+- Slice 5 must run agents through the endpoint, not `sim_world`'s direct-store shape: the
+  E0523-to-absent mapping and the HTTP statuses are covered only by the api, client and smoke tests.
+
 ## Cut
 
-- ZC-W0307 (a dropped report) is not raised.
 - Retention of `/job-observed/` records (slice 6).
 - A watch prefix for `/job-runs/`: a stop is picked up by the 1 s resync, not at once.
 - The cluster simulation of jobs (slice 5).
-- `Agent` quirk: `claim` has an unused `existing` parameter.
+- ZC-W0307 (a dropped report) is raised by slice 3, so it is not a cut here.
 
 ## Proposed new codes
 
-None. "The input could not be fetched, or its digest did not match" uses ZC-E0301 (via
-`raise_malformed`), the closest; the owner may want a code of its own.
+ZC-E0523, a run's input does not match its digest; see the decision record.

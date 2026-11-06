@@ -54,6 +54,9 @@ pub const StartRecord = struct {
     /// When the run's deadline falls, on the monotonic clock of `boot_id`.
     deadline_mono_ms: ?u64 = null,
     stop_cause: ?records.StopCause = null,
+    /// The run's grace period, kept so a stop made without the run's record (it is no longer
+    /// served) still gives the process the time the job asked for.
+    grace_ms: u32 = 0,
 };
 
 /// The record's name in the state directory.
@@ -261,7 +264,7 @@ const Work = struct {
             .absent, .damaged => {
                 if (listing == null and seen == null and subject.assigned) {
                     if (found == .damaged) return work.lost(subject, null, seen, .damaged);
-                    if (run) |entry| return work.claim(subject, entry, null);
+                    if (run) |entry| return work.claim(subject, entry);
                     return;
                 }
                 if (listing == null and seen == null) return;
@@ -282,7 +285,11 @@ const Work = struct {
         seen: ?*const records.JobObserved,
     ) Error!void {
         if (listing) |present| {
-            if (is_running(present)) try work.stop(present, 0);
+            if (is_running(present)) {
+                // No start record to say; the run's own grace, if it is still served.
+                const grace = if (work.run_of(subject.id)) |entry| entry.rec.grace_ms else 0;
+                try work.stop(present, grace);
+            }
         }
         try work.lost(subject, null, seen, .missing);
     }
@@ -329,11 +336,10 @@ const Work = struct {
         seen: ?*const records.JobObserved,
         run: ?*const Entry(records.JobRun),
     ) Error!void {
-        if (record.phase == .claiming and seen == null) {
-            // Nothing was started: claim again, unless the run is not to be claimed.
-            const entry = run orelse return;
-            if (!subject.assigned) return;
-            return work.claim(subject, entry, record);
+        if (record.phase == .claiming) {
+            if (seen == null) return work.unclaimed(subject, run);
+            const held = seen.?;
+            if (held.status == .claimed) return work.claimed_unstarted(subject, record, held, run);
         }
         try work.lost(subject, record, seen, .vanished);
         if (!subject.assigned) {
@@ -341,6 +347,48 @@ const Work = struct {
             const ended = if (done) |held| held.status == .stopped else false;
             if (ended) try remove_record(work.ctx, work.state, subject.id);
         }
+    }
+
+    /// A `claiming` record and no observation: nothing was started, because the claim comes
+    /// first. A run that is still assigned is claimed again; a leaked record (the claim was
+    /// refused and the run has since been released) is removed.
+    fn unclaimed(
+        work: *Work,
+        subject: Subject,
+        run: ?*const Entry(records.JobRun),
+    ) Error!void {
+        if (!subject.assigned) return remove_record(work.ctx, work.state, subject.id);
+        const entry = run orelse return;
+        return work.claim(subject, entry);
+    }
+
+    /// A `claiming` record, our own `claimed` observation and no container: the claim was
+    /// applied and the agent did not learn it (a reply lost, or a crash before the record was
+    /// written). Nothing was started, because `start` follows the `claimed` record. Under the
+    /// current tenure and epoch, with the run served and no `stop`, it is started now (still at
+    /// most once); otherwise it is reported stopped as not started.
+    fn claimed_unstarted(
+        work: *Work,
+        subject: Subject,
+        record: StartRecord,
+        held: *const records.JobObserved,
+        run: ?*const Entry(records.JobRun),
+    ) Error!void {
+        const entry = run orelse return work.not_started(subject, record);
+        const mine = subject.assigned and held.tenure == work.agent.tenure and
+            held.assignment == record.epoch and entry.rec.stop == null;
+        if (mine) return work.begin(subject, entry, record);
+        return work.not_started(subject, record);
+    }
+
+    fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
+        try work.report(.{
+            .run = subject.id,
+            .status = .stopped,
+            .epoch = record.epoch,
+            .exit = .{ .kind = .lost },
+            .stop_cause = .not_started,
+        });
     }
 
     // ---- A container of this run exists ----
@@ -385,11 +433,14 @@ const Work = struct {
             });
         }
         if (current.stop_cause == null) {
-            current.stop_cause = work.cause_to_stop(current, run, mono);
+            // A run the server no longer serves ended while this node was cut off: the only
+            // reason it stops serving a running run is `unreachable`.
+            current.stop_cause = work.cause_to_stop(current, run, mono) orelse
+                if (run == null) records.StopCause.@"unreachable" else null;
             if (current.stop_cause != null) try write_record(ctx, work.state, &current);
         }
-        if (current.stop_cause != null or run == null) {
-            const grace = if (run) |entry| entry.rec.grace_ms else 0;
+        if (current.stop_cause != null) {
+            const grace = if (run) |entry| entry.rec.grace_ms else current.grace_ms;
             try work.stop(listing, grace);
             return;
         }
@@ -439,6 +490,15 @@ const Work = struct {
             .started_at_ms = record.started_at_ms,
         };
         try work.apply_exit(&wanted, reason);
+        if (record.stop_cause == .deadline) {
+            var collector: Diag = undefined;
+            collector.reset();
+            raise_deadline(&collector, subject.id);
+            var finished: Diagnostic = undefined;
+            diag_mod.to_diagnostic(&finished, &collector);
+            const ctx = work.ctx;
+            wanted.diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
+        }
         try work.report(wanted);
     }
 
@@ -453,27 +513,49 @@ const Work = struct {
         work: *Work,
         subject: Subject,
         entry: *const Entry(records.JobRun),
-        existing: ?StartRecord,
     ) Error!void {
         const ctx = work.ctx;
         const run = &entry.rec;
         if (run.stop != null) return; // Never claimed: the run moved.
-        _ = existing;
-        var record: StartRecord = .{
+        const record: StartRecord = .{
             .run = subject.id,
             .epoch = subject.epoch,
             .phase = .claiming,
+            .grace_ms = run.grace_ms,
         };
         try write_record(ctx, work.state, &record);
         const claimed = try work.report_claim(subject, entry);
         if (!claimed) return;
-        const now = ctx.clock.now_ms();
+        try work.begin(subject, entry, record);
+    }
+
+    /// The run is claimed by this node, this tenure and epoch, and nothing is started: fetch the
+    /// input, then write the `claimed` record, then start. A failure to fetch the input that
+    /// says nothing about the input (the server or the link) leaves the record as it is, so a
+    /// later pass comes back here; only an input that is absent or does not match its digest
+    /// ends the run.
+    fn begin(
+        work: *Work,
+        subject: Subject,
+        entry: *const Entry(records.JobRun),
+        claiming: StartRecord,
+    ) Error!void {
+        const ctx = work.ctx;
+        const run = &entry.rec;
+        var record = claiming;
+        const input = work.input_of(subject, run) catch |err| switch (err) {
+            error.InputAbsent => return work.cannot_start(subject, record, .{ .input = .absent }),
+            error.InputMismatch => {
+                return work.cannot_start(subject, record, .{ .input = .mismatch });
+            },
+            else => |other| return other,
+        };
         record.phase = .claimed;
         record.boot_id = ctx.boot_id;
-        record.started_at_ms = now;
+        record.started_at_ms = ctx.clock.now_ms();
         record.deadline_mono_ms = ctx.mono_ms() +| run.deadline_ms;
         try write_record(ctx, work.state, &record);
-        try work.start(subject, record, run);
+        try work.start(subject, record, run, input);
     }
 
     fn report_claim(
@@ -512,6 +594,7 @@ const Work = struct {
         subject: Subject,
         record: StartRecord,
         run: *const records.JobRun,
+        input: ?[]const u8,
     ) Error!void {
         const ctx = work.ctx;
         var wanted: Report = .{
@@ -519,10 +602,6 @@ const Work = struct {
             .status = .running,
             .epoch = record.epoch,
             .started_at_ms = record.started_at_ms,
-        };
-        const input = work.input_of(subject, run) catch |err| switch (err) {
-            error.Unreadable => return work.cannot_start(&wanted),
-            else => |other| return other,
         };
         var created: [20]u8 = undefined;
         const created_text = std.fmt.bufPrint(&created, "{d}", .{subject.epoch}) catch
@@ -553,7 +632,9 @@ const Work = struct {
             },
             .labels = &labels,
         };
-        if (runtime.spec_problem(&spec) != null) return work.cannot_start(&wanted);
+        if (runtime.spec_problem(&spec)) |problem| {
+            return work.cannot_start(subject, record, .{ .spec = problem });
+        }
         const outcome = try ctx.runtime.start(&spec, ctx.diag);
         switch (outcome) {
             .started => {},
@@ -562,51 +643,58 @@ const Work = struct {
         try work.report(wanted);
     }
 
-    /// The run was claimed and cannot start (its input is unreadable, or its spec is one the
-    /// runtime refuses): it ends as a start failure, blamed outside.
-    fn cannot_start(work: *Work, wanted: *Report) Error!void {
+    const Refusal = union(enum) {
+        input: InputProblem,
+        spec: runtime.SpecProblem,
+    };
+
+    /// The run was claimed and cannot start (its input is absent or does not match its digest,
+    /// or its spec is one the runtime refuses): it ends as a start failure.
+    fn cannot_start(work: *Work, subject: Subject, record: StartRecord, why: Refusal) Error!void {
         const ctx = work.ctx;
         var collector: Diag = undefined;
         collector.reset();
-        const key = records.job_run_key(records.job_of_run(wanted.run).?);
-        records.raise_malformed(&collector, key.slice(), "JobRun");
+        switch (why) {
+            .input => |problem| raise_input(&collector, subject.id, problem),
+            .spec => |problem| raise_spec(&collector, subject.id, problem),
+        }
         var finished: Diagnostic = undefined;
         diag_mod.to_diagnostic(&finished, &collector);
-        wanted.status = .stopped;
-        wanted.exit = .{ .kind = .start_failed };
-        wanted.diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
-        wanted.started_at_ms = null;
-        try work.report(wanted.*);
+        try work.report(.{
+            .run = subject.id,
+            .status = .stopped,
+            .epoch = record.epoch,
+            .exit = .{ .kind = .start_failed },
+            .diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag),
+        });
     }
 
-    const InputError = error{Unreadable} || Error;
+    const InputError = error{ InputAbsent, InputMismatch } || Error;
 
     /// The run's input, fetched after the claim and checked against its digest; null if it has
-    /// none. A server that cannot give it, or a digest that does not match, is `Unreadable`.
+    /// none. A store or transport error is returned as it is (the run is tried again); only a
+    /// server that says the input is absent, or a digest that does not match, ends the run.
     fn input_of(work: *Work, subject: Subject, run: *const records.JobRun) InputError!?[]const u8 {
         const ctx = work.ctx;
         const digest = run.input_digest orelse return null;
         if (run.input_env == null) return null;
         const key = records.job_input_key(subject.name);
-        const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
-            ctx.diag.reset();
-            return error.Unreadable;
-        };
-        const kv = got.kv orelse return error.Unreadable;
+        const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+        const kv = got.kv orelse return error.InputAbsent;
         const input = records.read(records.JobInput, ctx.arena, kv, ctx.diag) catch {
             ctx.diag.reset();
-            return error.Unreadable;
+            return error.InputMismatch;
         };
         const decoder = std.base64.standard.Decoder;
-        const size = decoder.calcSizeForSlice(input.base64) catch return error.Unreadable;
+        const size = decoder.calcSizeForSlice(input.base64) catch return error.InputMismatch;
         const text = ctx.arena.alloc(u8, size) catch return failures.no_memory(ctx.diag);
-        decoder.decode(text, input.base64) catch return error.Unreadable;
+        decoder.decode(text, input.base64) catch return error.InputMismatch;
         var raw: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(text, &raw, .{});
         const hex = std.fmt.bytesToHex(raw, .lower);
         const expected = std.fmt.allocPrint(ctx.arena, "sha256:{s}", .{&hex}) catch
             return failures.no_memory(ctx.diag);
-        if (!std.mem.eql(u8, expected, digest)) return error.Unreadable;
+        if (!std.mem.eql(u8, expected, digest)) return error.InputMismatch;
         return text;
     }
 
@@ -708,25 +796,60 @@ const Work = struct {
         const ctx = work.ctx;
         var collector: Diag = undefined;
         collector.reset();
-        collector.raise(switch (code) {
-            .E0521 => .E0521,
-            .E0522 => .E0522,
-        });
         switch (code) {
-            .E0521 => {
-                collector.cause("run {s} has no container and nothing says how it ended", .{run});
-                collector.fix(.{ .sentence = "see ZC-E0521: find out why the host lost it" });
-            },
-            else => {
-                collector.cause("run {s} has no usable start record", .{run});
-                collector.fix(.{ .sentence = "see ZC-E0522: check the state directory" });
-            },
+            .E0521 => raise_run_end_unknown(&collector, run, ctx.state_dir),
+            .E0522 => raise_start_record(&collector, run, ctx.state_dir),
         }
         var finished: Diagnostic = undefined;
         diag_mod.to_diagnostic(&finished, &collector);
         return records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
     }
 };
+
+// ---- The diagnostics of a run (one function each, which the golden test also calls) ----
+
+/// ZC-E0521: a run's container is gone and nothing says how it ended.
+pub fn raise_run_end_unknown(diag: *Diag, run: []const u8, state_dir: []const u8) void {
+    diag.raise(.E0521);
+    diag.cause("{s} has no container and left no exit record in {s}", .{ run, state_dir });
+    diag.fix(.{
+        .sentence = "find why the host restarted or the state directory was lost; " ++
+            "it is not run again",
+    });
+}
+
+/// ZC-E0522: a run's start record is missing or damaged.
+pub fn raise_start_record(diag: *Diag, run: []const u8, state_dir: []const u8) void {
+    diag.raise(.E0522);
+    diag.cause("the start record of {s} in {s} is missing or damaged", .{ run, state_dir });
+    diag.fix(.{ .sentence = "check the state directory's disk and permissions" });
+}
+
+/// ZC-W0503: a run reached its deadline and was stopped.
+pub fn raise_deadline(diag: *Diag, run: []const u8) void {
+    diag.raise(.W0503);
+    diag.cause("{s} reached its deadline; it was stopped and then killed", .{run});
+    diag.fix(.{ .sentence = "raise deadline_ms if the job needs the time" });
+}
+
+pub const InputProblem = enum { absent, mismatch };
+
+/// ZC-E0523: a run's input is not the one its digest names.
+pub fn raise_input(diag: *Diag, run: []const u8, problem: InputProblem) void {
+    diag.raise(.E0523);
+    switch (problem) {
+        .absent => diag.cause("{s} names an input by digest and the server holds none", .{run}),
+        .mismatch => diag.cause("the input held for {s} does not match its digest", .{run}),
+    }
+    diag.fix(.{ .sentence = "report it with the diagnostic bundle; submit the job again" });
+}
+
+/// ZC-E0130: the runtime refuses a run's spec.
+pub fn raise_spec(diag: *Diag, run: []const u8, problem: runtime.SpecProblem) void {
+    diag.raise(.E0130);
+    diag.cause("the runtime refused the spec of {s}: {s}", .{ run, @tagName(problem) });
+    diag.fix(.{ .sentence = "submit the job again with that field corrected" });
+}
 
 fn same(existing: *const records.JobObserved, wanted: Work.Report) bool {
     if (existing.status != wanted.status) return false;

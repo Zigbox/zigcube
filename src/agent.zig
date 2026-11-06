@@ -83,6 +83,8 @@ pub const Context = struct {
     /// Where the lease, its send time and the tenure are kept across a restart. Null keeps
     /// nothing (the tests that do not restart).
     state: ?agent_state.AgentState = null,
+    /// The state directory's path, for what a diagnostic says about it; empty where there is none.
+    state_dir: []const u8 = "",
     /// The host's boot id (`/proc/sys/kernel/random/boot_id`), kept with the lease: a kept send
     /// time is on a clock that restarts at boot, so a lease kept under another boot fences.
     /// Empty where there is none (the tests and the simulator, which do not reboot).

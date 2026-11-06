@@ -636,8 +636,9 @@ fn step_job(smoke: *Smoke) !void {
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"name\":\"{s}\",\"image\":\"b3:51aa9c03\",\"deadline_ms\":120000," ++
-            "\"submit_by_ms\":{d},\"command\":[\"sh\",\"-c\",\"sleep 8; exit 7\"]}}",
-        .{ job_name, stamp + 60_000 },
+            "\"submit_by_ms\":{d},\"command\":[\"sh\",\"-c\"," ++
+            "\"echo start >> {s}/job-starts; sleep 8; exit 7\"]}}",
+        .{ job_name, stamp + 60_000, smoke.work },
     );
     const reply = try smoke.call("POST", "/v1/jobs", body);
     try smoke.expect(reply.status == 201, "POST /v1/jobs answered {d}: {s}", .{
@@ -676,6 +677,14 @@ fn step_job(smoke: *Smoke) !void {
     try smoke.expect(now.code == 7, "the job's exit code is {any}, expected 7", .{now.code});
     const supervisors = try smoke.supervisors();
     try smoke.expect(supervisors == 3, "{d} supervisors after the job, expected 3", .{supervisors});
+    const starts = try std.Io.Dir.cwd().readFileAlloc(
+        smoke.io,
+        try std.fmt.allocPrint(arena, "{s}/job-starts", .{smoke.work}),
+        arena,
+        .limited(4096),
+    );
+    const count = std.mem.count(u8, starts, "start\n");
+    try smoke.expect(count == 1, "the job's command started {d} times, expected once", .{count});
     smoke.say("job: claimed, run once, adopted after kill -9 of the agent, exit 7 recorded", .{});
 }
 
