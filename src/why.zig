@@ -1267,3 +1267,355 @@ test "why never shows the current value as the reason for a compacted record" {
         kept.steps[kept.steps.len - 1].text,
     );
 }
+
+// ---- Jobs: the chain cites job records, not services -----------------------------------------
+
+const train: records.Job = .{
+    .name = "train",
+    .image = "trainer",
+    .command = &.{"run"},
+    .deadline_ms = 60_000,
+    .submit_by_ms = 1,
+    .created_at_ms = 1,
+    .applied_by = "ana",
+};
+
+/// What the newest decision of the job cites, and how the job stands.
+const Scene = struct {
+    action: []const u8,
+    reason: []const u8,
+    cites: enum { job, run, assigned, report },
+    report: ?records.JobObservedStatus = null,
+    exit: ?records.Exit = null,
+    diagnostic: ?[]const u8 = null,
+    stop: ?records.RunStopCause = null,
+    status: ?records.JobStatus = null,
+};
+
+fn revision_of(world: *sim_world.World, key: []const u8) !u64 {
+    const ctx = world.controller_context();
+    const got = try ctx.store.get(ctx.arena, key, null, ctx.diag);
+    return got.kv.?.mod_revision;
+}
+
+/// Writes the records of job `train` the scene needs and its one decision.
+fn put_scene(world: *sim_world.World, scene: Scene) !void {
+    const run: records.JobRun = .{
+        .id = "train-job",
+        .job = "train",
+        .image = "trainer",
+        .command = &.{"run"},
+        .deadline_ms = 60_000,
+        .start_by_ms = 70_000,
+        .created_at_ms = 1,
+        .stop = if (scene.stop) |cause| .{ .cause = cause, .at_ms = 5 } else null,
+    };
+    const placed = records.assigned_run("train-job", "train", .{
+        .cpu_millis = 250,
+        .memory_bytes = 128 << 20,
+    }, "fits");
+    try put_record(world, .api, records.job_key("train").slice(), train);
+    try put_record(world, .job_controller, records.job_run_key("train").slice(), run);
+    try put_record(world, .scheduler, records.assigned_key("node1", "train-job").slice(), placed);
+    if (scene.report) |status| {
+        const report: records.JobObserved = .{
+            .run = "train-job",
+            .node = "node1",
+            .tenure = 1,
+            .assignment = 1,
+            .status = status,
+            .exit = scene.exit,
+            .diagnostic = if (scene.diagnostic) |text| .{ .text = text } else null,
+            .started_at_ms = if (status == .claimed) null else 3,
+            .reported_at_ms = 4,
+        };
+        const key = records.job_observed_key("node1", "train");
+        try put_record(world, .{ .agent = "node1" }, key.slice(), report);
+    }
+    if (scene.status) |status| {
+        try put_record(world, .job_controller, records.job_status_key("train").slice(), status);
+    }
+    const key: []const u8 = switch (scene.cites) {
+        .job => records.job_key("train").slice(),
+        .run => records.job_run_key("train").slice(),
+        .assigned => records.assigned_key("node1", "train-job").slice(),
+        .report => records.job_observed_key("node1", "train").slice(),
+    };
+    var ctx = world.controller_context();
+    var source: controller.DecisionSource = .{ .instance = 7 };
+    var batch: controller.Batch = .{};
+    _ = try controller.put_decision(&ctx, &source, .{
+        .actor = "job-controller",
+        .action = scene.action,
+        .subject = .{ .kind = .job, .name = "train" },
+        .reason = scene.reason,
+        .cause = .{
+            .kind = if (scene.cites == .report) .observed else .desired,
+            .key = key,
+            .revision = try revision_of(world, key),
+        },
+    }, &batch);
+    _ = try controller.commit(&ctx, .job_controller, &batch);
+}
+
+/// The chain of job `train` after `put_scene`: the decision, then one step for the cited record.
+fn scene_chain(world: *sim_world.World, scene: Scene) !Result {
+    try put_scene(world, scene);
+    const ctx = world.controller_context();
+    const result = try why(&ctx, .{ .kind = .job, .name = "train" }, null);
+    try testing.expectEqual(.complete, result.completeness.verdict);
+    try testing.expectEqual(@as(usize, 2), result.steps.len);
+    try testing.expectEqualStrings(scene.action, result.steps[0].decision.?.action);
+    try testing.expectEqual(StepType.decision, result.steps[0].type);
+    return result;
+}
+
+test "why job: a pending job ends at its run" {
+    const world = try new_world(20);
+    defer world.destroy();
+    const result = try scene_chain(world, .{
+        .action = "hold_pending",
+        .reason = "no node fits",
+        .cites = .run,
+    });
+    try testing.expectEqualStrings("job train: pending, not yet placed", result.state.text);
+    try testing.expectEqual(StepType.desired, result.steps[1].type);
+    try testing.expectEqualStrings("/job-runs/train", result.steps[1].key.?);
+    try testing.expectEqualStrings(
+        "run train-job of job train was created: deadline 60000 ms",
+        result.steps[1].text,
+    );
+}
+
+test "why job: a placed job ends at its assignment" {
+    const world = try new_world(21);
+    defer world.destroy();
+    const result = try scene_chain(world, .{
+        .action = "job_placed",
+        .reason = "the run was assigned to a node",
+        .cites = .assigned,
+        .status = .{ .state = .placed, .node = "node1", .epoch = 1, .reported_at_ms = 2 },
+    });
+    try testing.expectEqualStrings("job train: placed", result.state.text);
+    try testing.expectEqualStrings("/assigned/node1/train-job", result.steps[1].key.?);
+    try testing.expectEqualStrings("/assigned/node1/train-job exists", result.steps[1].text);
+}
+
+test "why job: a running job ends at the agent's report" {
+    const world = try new_world(22);
+    defer world.destroy();
+    const result = try scene_chain(world, .{
+        .action = "job_running",
+        .reason = "the run was claimed by its node",
+        .cites = .report,
+        .report = .running,
+        .status = .{
+            .state = .running,
+            .node = "node1",
+            .started_at_ms = 3,
+            .reported_at_ms = 4,
+        },
+    });
+    try testing.expectEqualStrings("job train: running", result.state.text);
+    try testing.expectEqual(StepType.observed, result.steps[1].type);
+    try testing.expectEqualStrings("/job-observed/node1/train", result.steps[1].key.?);
+    try testing.expectEqualStrings("train-job on node1: running", result.steps[1].text);
+}
+
+/// The report `/job-observed/node1/train` carries the exit the ending came from.
+fn expect_report_exit(world: *sim_world.World, exit: records.Exit) !void {
+    const ctx = world.controller_context();
+    const key = records.job_observed_key("node1", "train");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+    const seen = try records.read(records.JobObserved, ctx.arena, got.kv.?, ctx.diag);
+    try testing.expectEqual(exit.kind, seen.exit.?.kind);
+    try testing.expectEqual(exit.code, seen.exit.?.code);
+    try testing.expectEqual(exit.signal, seen.exit.?.signal);
+}
+
+fn expect_diagnostic(step: Step, want: ?[]const u8) !void {
+    if (want) |text| {
+        try testing.expectEqualStrings(text, step.diagnostic.?.text);
+    } else {
+        try testing.expect(step.diagnostic == null);
+    }
+}
+
+test "why job: an ending the agent reported ends at that report" {
+    // The step's words are the same for every exit (`{run} on {node}: stopped`); what tells the
+    // endings apart is the report the step cites and the diagnostic it carries.
+    const cases = [_]struct {
+        exit: records.Exit,
+        end: records.JobEnd,
+        state: records.JobState,
+        diagnostic: ?[]const u8,
+    }{
+        .{
+            .exit = .{ .kind = .exited, .code = 0 },
+            .end = .{ .kind = .exited, .code = 0 },
+            .state = .exited,
+            .diagnostic = null,
+        },
+        .{
+            .exit = .{ .kind = .oom },
+            .end = .{ .kind = .failed, .cause = .oom },
+            .state = .failed,
+            .diagnostic = "{\"code\":\"ZC-E0000\",\"what\":\"oom\"}",
+        },
+        .{
+            .exit = .{ .kind = .signaled, .signal = 15 },
+            .end = .{ .kind = .failed, .cause = .deadline },
+            .state = .failed,
+            .diagnostic = "{\"code\":\"ZC-E0000\",\"what\":\"deadline\"}",
+        },
+        .{
+            .exit = .{ .kind = .lost },
+            .end = .{ .kind = .failed, .cause = .fenced },
+            .state = .failed,
+            .diagnostic = "{\"code\":\"ZC-E0000\",\"what\":\"lost\"}",
+        },
+    };
+    for (cases, 0..) |case, index| {
+        const world = try new_world(30 + index);
+        defer world.destroy();
+        const result = try scene_chain(world, .{
+            .action = "end_job",
+            .reason = "the run ended",
+            .cites = .report,
+            .report = .stopped,
+            .exit = case.exit,
+            .diagnostic = case.diagnostic,
+            .status = .{
+                .state = case.state,
+                .node = "node1",
+                .end = case.end,
+                .ended_at_ms = 5,
+                .reported_at_ms = 5,
+            },
+        });
+        try testing.expect(std.mem.startsWith(u8, result.state.text, "job train: "));
+        const word = result.state.text["job train: ".len..];
+        try testing.expectEqualStrings(@tagName(case.state), word);
+        const step = result.steps[1];
+        try testing.expectEqual(StepType.observed, step.type);
+        try testing.expectEqualStrings("/job-observed/node1/train", step.key.?);
+        try testing.expectEqualStrings("train-job on node1: stopped", step.text);
+        // Last: a new controller context reuses the arena the step's slices live in.
+        try expect_diagnostic(step, case.diagnostic);
+        try expect_report_exit(world, case.exit);
+    }
+}
+
+test "why job: a running job whose node is lost ends at the desired run" {
+    // Demo b1 item 4: judge_running/judge_claimed end the job `failed unreachable` with no agent
+    // report and no stop on the run; the end cites `/job-runs/<name>`.
+    const world = try new_world(38);
+    defer world.destroy();
+    const result = try scene_chain(world, .{
+        .action = "end_job",
+        .reason = "the node was lost",
+        .cites = .run,
+        .status = .{
+            .state = .failed,
+            .node = "node1",
+            .end = .{ .kind = .failed, .cause = .@"unreachable" },
+            .ended_at_ms = 6,
+            .reported_at_ms = 6,
+        },
+    });
+    try testing.expectEqualStrings("job train: failed", result.state.text);
+    try testing.expectEqual(StepType.desired, result.steps[1].type);
+    try testing.expectEqualStrings("/job-runs/train", result.steps[1].key.?);
+    try testing.expectEqualStrings(
+        "run train-job of job train was created: deadline 60000 ms",
+        result.steps[1].text,
+    );
+    // The decision above it carries the answer to "why": the reason and the action.
+    try testing.expectEqualStrings("the node was lost", result.steps[0].decision.?.reason);
+}
+
+test "why job: an ending with no agent report ends at the desired run" {
+    // Cancelled before a claim, past its deadline before a claim, and its node lost before a
+    // claim: `Pass.end` cites `/job-runs/<name>`, the run the stop was written on.
+    const cases = [_]struct {
+        stop: records.RunStopCause,
+        end: records.JobEnd,
+        state: records.JobState,
+    }{
+        .{ .stop = .cancel, .end = .{ .kind = .cancelled }, .state = .cancelled },
+        .{
+            .stop = .not_started,
+            .end = .{ .kind = .failed, .cause = .deadline },
+            .state = .failed,
+        },
+        .{
+            .stop = .@"unreachable",
+            .end = .{ .kind = .failed, .cause = .not_started },
+            .state = .failed,
+        },
+    };
+    for (cases, 0..) |case, index| {
+        const world = try new_world(40 + index);
+        defer world.destroy();
+        const result = try scene_chain(world, .{
+            .action = "end_job",
+            .reason = "the run had not started",
+            .cites = .run,
+            .stop = case.stop,
+            .status = .{
+                .state = case.state,
+                .end = case.end,
+                .ended_at_ms = 6,
+                .reported_at_ms = 6,
+            },
+        });
+        const word = result.state.text["job train: ".len..];
+        try testing.expectEqualStrings(@tagName(case.state), word);
+        try testing.expectEqual(StepType.desired, result.steps[1].type);
+        try testing.expectEqualStrings("/job-runs/train", result.steps[1].key.?);
+        try testing.expectEqualStrings(
+            "run train-job of job train was created: deadline 60000 ms, stopped",
+            result.steps[1].text,
+        );
+    }
+}
+
+test "why job: a stop ends at the job, and a malformed run is still ZC-E0301" {
+    const world = try new_world(50);
+    defer world.destroy();
+    const result = try scene_chain(world, .{
+        .action = "stop_job",
+        .reason = "the job was cancelled before it was claimed",
+        .cites = .job,
+        .stop = .cancel,
+    });
+    try testing.expectEqualStrings(
+        "job train was submitted by ana: deadline 60000 ms",
+        result.steps[1].text,
+    );
+
+    // A cited run that is not a run record is malformed, not a service.
+    const bad = try new_world(51);
+    defer bad.destroy();
+    var ctx = bad.controller_context();
+    const op: store.Op = .{ .put = .{ .key = "/job-runs/train", .value = "{\"v\":1}" } };
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &.{op} }, ctx.diag);
+    ctx = bad.controller_context();
+    var source: controller.DecisionSource = .{ .instance = 7 };
+    var batch: controller.Batch = .{};
+    _ = try controller.put_decision(&ctx, &source, .{
+        .actor = "job-controller",
+        .action = "hold_pending",
+        .subject = .{ .kind = .job, .name = "train" },
+        .reason = "no node fits",
+        .cause = .{
+            .kind = .desired,
+            .key = "/job-runs/train",
+            .revision = try revision_of(bad, "/job-runs/train"),
+        },
+    }, &batch);
+    _ = try controller.commit(&ctx, .job_controller, &batch);
+    ctx = bad.controller_context();
+    try testing.expectError(error.Malformed, why(&ctx, .{ .kind = .job, .name = "train" }, null));
+    try testing.expectEqual(.E0301, ctx.diag.code.?);
+}

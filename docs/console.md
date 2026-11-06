@@ -403,8 +403,10 @@ for a job that cannot be placed is the scheduler's real `hold_pending` (the reas
 format, the evidence numbers are the mock's); a placement is the scheduler's `place_run` and then
 the controller's `job_placed`; a run that was never claimed has the controller's `stop_job` and ends
 from it (`not_started` -> `failed deadline`, `unreachable` -> `failed not_started`, `cancel` ->
-`cancelled`). The why steps for the `/job-runs/` and `/assigned/` keys are the mock's own wording
-(see the slice 9 handoff).
+`cancelled`). A run that ended with no agent report has an `end_job` that cites the desired
+`/job-runs/<name>`, as the server's does: the `stop_job` before it is a decision of its own, not a
+link of that chain. The why steps for the `/job-runs/` and `/assigned/` keys use the server's words
+(`src/why.zig` `desired_step`; docs/decisions/2026-11-06-why-job-desired-keys.md).
 
 The mock's panel has Play, Step and Reset, a speed selector, the "open the matching screen"
 checkbox and faults (stop Postgres, cut the API, "Sleep + compact", freeze time).

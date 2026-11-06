@@ -178,9 +178,8 @@ export function createMockTransport(engine, faults) {
       const live = engine.get(c.key);
       const diagnostic = d.cause_diagnostic || live?.diagnostic || null;
       if (c.key.startsWith("/job-observed/")) {
-        const signalled = live?.exit?.kind === "exited" && live.exit.signal != null;
-        const exit = live?.exit ? ` (${signalled ? `exited on signal ${live.exit.signal}` : engine.exitText(live.exit)})` : "";
-        const text = live ? `run ${live.run} on ${live.node}: ${live.status}${exit}${live.stop_cause ? `, stopped for ${live.stop_cause}` : ""}` : `${c.key} as it was at revision ${c.revision}`;
+        // The words of src/why.zig `observed_step`: no exit, the report's diagnostic beside them.
+        const text = live ? `${live.run} on ${live.node}: ${live.status}` : `${c.key} as it was at revision ${c.revision}`;
         return { type: "observed", key: c.key, revision: c.revision, text, diagnostic };
       }
       const o = c.key.startsWith("/observed/") ? live : null;
@@ -194,9 +193,11 @@ export function createMockTransport(engine, faults) {
       return { type: "desired", key: c.key, revision: c.revision, text, applied_by: j?.applied_by || null, request_id: null };
     }
     if (c.kind === "desired" && (c.key.startsWith("/job-runs/") || c.key.startsWith("/assigned/"))) {
-      // The mock's own wording: src/why.zig's `desired_step` reads any other key as a service.
+      // The words of src/why.zig `desired_step`, which reads a run and an assignment as what they
+      // are (docs/decisions/2026-11-06-why-job-desired-keys.md). The mock reads the record now.
       const v = engine.getKv(c.key)?.value;
-      const text = c.key.startsWith("/assigned/") ? `run ${c.key.split("/").pop()} is assigned to ${c.key.split("/")[2]}` : `run ${v?.id ?? c.key.split("/").pop()} of job ${v?.job ?? "?"} is desired`;
+      const text = c.key.startsWith("/assigned/") ? `${c.key} exists`
+        : `run ${v?.id ?? c.key.split("/").pop()} of job ${v?.job ?? "?"} was created: deadline ${v?.deadline_ms ?? 0} ms${v?.stop ? ", stopped" : ""}`;
       return { type: "desired", key: c.key, revision: c.revision, text, applied_by: null, request_id: null };
     }
     if (c.kind === "desired") {
