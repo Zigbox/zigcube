@@ -383,7 +383,7 @@ reply is the job's state now, `pending` only while it has no status.
 
 The first answers `{revision, job, state, status}`: `job` is the spec with `env_names` (names, never
 values), `input_digest` and `input_bytes` (never the input), `cancel_requested`. `404` ZC-E0133 for
-a job that does not exist. The second takes `state=`, `label=key[=value]`, `limit=` (1 to 500,
+a job that does not exist. The second takes `state=` (a job state, or `ended` for every terminal state), `label=key[=value]`, `limit=` (1 to 500,
 default 50), `at=` and `continue=`, and answers `{revision, jobs, continue}`; a filter keeps a
 subset of each store page, so a page may hold fewer than `limit` rows and `continue` may still be
 set.

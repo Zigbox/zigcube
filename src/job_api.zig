@@ -607,6 +607,8 @@ pub fn current_state(ctx: *const Context, name: []const u8) Error!records.JobSta
 
 pub const ListOptions = struct {
     state: ?records.JobState = null,
+    /// `state=ended`: every terminal state.
+    ended: bool = false,
     /// `key=value`, or a bare key for any value.
     label: ?[]const u8 = null,
     limit: u32,
@@ -665,6 +667,9 @@ pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
         const state = state_of(status);
         if (options.state) |only| {
             if (state != only) continue;
+        }
+        if (options.ended) {
+            if (!records.job_state_terminal(state)) continue;
         }
         rows.append(ctx.arena, .{
             .name = job.name,

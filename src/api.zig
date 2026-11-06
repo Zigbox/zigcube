@@ -827,6 +827,12 @@ fn write_value(api: *const Api, out: *Out, key: []const u8, bytes: []const u8) F
         std.mem.startsWith(u8, key, records.prefix_replicas);
     if (api.read_only and secret) redact_env(&parsed);
     if (api.read_only and std.mem.startsWith(u8, key, records.prefix_jobs)) redact_env(&parsed);
+    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_runs)) {
+        redact_env(&parsed);
+        if (parsed == .object) {
+            if (parsed.object.getPtr("input_digest")) |digest| digest.* = .null;
+        }
+    }
     if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_input)) {
         if (parsed == .object) {
             if (parsed.object.getPtr("base64")) |input| input.* = .null;
@@ -1504,8 +1510,12 @@ const Call = struct {
         try call.query.allow(ctx, &.{ "state", "label", "limit", "continue", "at" });
         var options: job_api.ListOptions = .{ .limit = 50 };
         if (try call.query.one(ctx, "state")) |text| {
-            options.state = std.meta.stringToEnum(records.JobState, text) orelse
-                return bad_request(ctx, "state", "is not a job state");
+            if (std.mem.eql(u8, text, "ended")) {
+                options.ended = true;
+            } else {
+                options.state = std.meta.stringToEnum(records.JobState, text) orelse
+                    return bad_request(ctx, "state", "is not a job state");
+            }
         }
         options.label = try call.query.one(ctx, "label");
         if (try call.query.number(ctx, "limit")) |limit| {
