@@ -53,5 +53,5 @@ pub const job_deadline_late = declared("c1_teeth_job_deadline_late");
 pub const job_deadline_late_ms: u64 = if (job_deadline_late) 9_000 else 0;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
-    skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or job_claim or job_double or
-    job_rewrite or job_cancel or job_deadline or job_deadline_late;
+    skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
+    job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late;
