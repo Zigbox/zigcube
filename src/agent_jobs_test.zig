@@ -25,6 +25,8 @@ const Seen = struct {
     assignment: u64,
     tenure: u64,
     has_diagnostic: bool,
+    /// The code of the stored diagnostic, e.g. `ZC-E0523`.
+    code: ?[12]u8,
     started: bool,
 };
 
@@ -115,6 +117,7 @@ const Rig = struct {
             .assignment = value.assignment,
             .tenure = value.tenure,
             .has_diagnostic = value.diagnostic != null,
+            .code = if (value.diagnostic) |raw| code_of(raw.text) else null,
             .started = value.started_at_ms != null,
         };
     }
@@ -139,6 +142,20 @@ const Rig = struct {
         return parsed;
     }
 };
+
+/// The first `ZC-` code in a stored diagnostic's JSON.
+fn code_of(text: []const u8) ?[12]u8 {
+    const at = std.mem.indexOf(u8, text, "Z") orelse return null;
+    var out: [12]u8 = @splat(0);
+    const end = std.mem.indexOfScalarPos(u8, text, at, '"') orelse return null;
+    @memcpy(out[0..@min(12, end - at)], text[at..][0..@min(12, end - at)]);
+    return out;
+}
+
+fn expect_code(seen: Seen, expected: []const u8) !void {
+    const code = seen.code orelse return error.TestExpectedEqual;
+    try testing.expectEqualStrings(expected, std.mem.sliceTo(&code, 0));
+}
 
 fn try_ok(ok: bool) void {
     std.debug.assert(ok);
@@ -192,7 +209,7 @@ test "a claim in the store without a start record is never started again" {
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
     try testing.expectEqual(records.ExitKind.lost, seen.exit.?.kind);
-    try testing.expect(seen.has_diagnostic);
+    try expect_code(seen, "ZC-E0522");
 }
 
 test "an exit is reported with its code and no stop cause" {
@@ -251,7 +268,7 @@ test "the deadline stops the run on the monotonic clock, under the same boot" {
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
     try testing.expectEqual(@as(?records.StopCause, .deadline), seen.stop_cause);
-    try testing.expect(seen.has_diagnostic); // ZC-W0503
+    try expect_code(seen, "ZC-W0503");
 }
 
 test "a deadline of another boot is not compared: the run is stopped by the host's loss" {
@@ -451,8 +468,7 @@ test "an input that cannot be fetched is tried again, and does not end the run" 
     try testing.expect(!rig.running());
     const waiting = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.claimed, waiting.status);
-    try testing.expect(rig.world.last_failure != null);
-    rig.world.last_failure = null;
+    try testing.expect(rig.world.last_failure == null); // The failure stayed inside the run.
     rig.world.switched.down_get_prefix = null;
     rig.world.advance(5_000);
     rig.step();
@@ -473,7 +489,7 @@ test "an input that does not match its digest, or is absent, ends the run as sta
         const seen = (try rig.observed()).?;
         try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
         try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
-        try testing.expect(seen.has_diagnostic);
+        try expect_code(seen, "ZC-E0523");
         rig.step();
         try testing.expectEqual(records.JobObservedStatus.stopped, (try rig.observed()).?.status);
     }
@@ -489,7 +505,30 @@ test "a start the runtime refuses ends the run as start_failed" {
     try testing.expect(!rig.running());
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
-    try testing.expect(seen.has_diagnostic);
+    try expect_code(seen, "ZBX-E0410"); // The runtime's own refusal, relayed.
+}
+
+test "a spec the runtime's rules refuse ends the run start_failed with ZC-E0130" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    var run = rig.run_record(null, 60_000);
+    var env: [constants.runtime_env_count_max][2][]const u8 = undefined;
+    var names: [constants.runtime_env_count_max][8]u8 = undefined;
+    for (&env, &names, 0..) |*pair, *name, index| {
+        const text = std.fmt.bufPrint(name, "V{d}", .{index}) catch unreachable; // Fits 8 bytes.
+        pair.* = .{ text, "x" };
+    }
+    run.env = &env;
+    run.input_env = "INPUT";
+    run.input_digest = hello_digest;
+    _ = try rig.assign_run(run);
+    const key = records.job_input_key(job_name);
+    _ = try rig.put(.api, key.slice(), records.JobInput{ .base64 = "aGVsbG8=" });
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
+    try expect_code(seen, "ZC-E0130");
 }
 
 test "a damaged start record ends the run lost, with a diagnostic" {
@@ -502,7 +541,7 @@ test "a damaged start record ends the run lost, with a diagnostic" {
     try testing.expect(!rig.running());
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.ExitKind.lost, seen.exit.?.kind);
-    try testing.expect(seen.has_diagnostic);
+    try expect_code(seen, "ZC-E0522");
 }
 
 test "a running run the server no longer serves is stopped with a recorded cause" {
@@ -528,4 +567,97 @@ test "a running run the server no longer serves is stopped with a recorded cause
     rig.step();
     const seen = (try rig.observed()).?;
     try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), seen.stop_cause);
+}
+
+test "a damaged input value ends the run start_failed with ZC-E0523" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try assign_with_input(&rig, hello_digest, null);
+    const key = records.job_input_key(job_name);
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = "{not json" } };
+    const done = try writers.txn(
+        rig.world.store_handle(),
+        .api,
+        .{ .on_success = &.{op} },
+        &rig.world.diag,
+    );
+    try testing.expect(done.succeeded);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
+    try expect_code(seen, "ZC-E0523");
+}
+
+test "a run whose input fetch fails does not hold back another run's exit report" {
+    // Goal: a per-run failure stays in the run. "zeta-job" sorts after "train-job", so the
+    // pass reaches the failing run first.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var other = rig.run_record(null, 60_000);
+    other.id = "zeta-job";
+    other.job = "zeta";
+    _ = try rig.put(.job_controller, records.job_run_key("zeta").slice(), other);
+    const assigned: records.Assigned = .{
+        .replica = "zeta-job",
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = "zeta",
+    };
+    const other_key = records.assigned_key(sim_world.node_name, "zeta-job");
+    _ = try rig.put(.scheduler, other_key.slice(), assigned);
+    rig.step();
+    try testing.expectEqual(@as(u32, 1), rig.world.sim.running_count());
+    try assign_with_input(&rig, hello_digest, "aGVsbG8=");
+    try rig.world.sim.inject("zeta-job", .{ .exit = 4 });
+    rig.world.switched.down_get_prefix = records.prefix_job_input;
+    rig.step();
+    try testing.expect(rig.world.last_failure == null);
+    const arena = rig.world.fresh_arena();
+    const key = records.job_observed_key(sim_world.node_name, "zeta");
+    const got = try rig.world.store_handle().get(arena, key.slice(), null, &rig.world.diag);
+    const value = try records.read(records.JobObserved, arena, got.kv.?, &rig.world.diag);
+    try testing.expectEqual(records.JobObservedStatus.stopped, value.status);
+    try testing.expectEqual(@as(?u8, 4), value.exit.?.code);
+}
+
+test "a claim left under an older epoch is not started under the new assignment" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const epoch = try rig.assign(60_000);
+    try leave_claim(&rig, epoch - 1, rig.world.agent.tenure);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
+}
+
+test "a spec the runtime refuses is rendered with its field and its limit" {
+    // Goal: ZC-E0130's cause names the field and the limit it broke, for each problem, and the
+    // deadline cause says "killed" only for a SIGKILL.
+    const diag_mod = @import("diag.zig");
+    const runtime = @import("runtime.zig");
+    const expected = [_]struct { runtime.SpecProblem, []const u8, []const u8 }{
+        .{ .bad_name, "name:", "valid container name" },
+        .{ .bad_image, "image:", "1 to 67 bytes" },
+        .{ .bad_command, "command:", "1 to 64 words" },
+        .{ .bad_source, "source:", "over 1024 bytes" },
+        .{ .too_many_env, "env:", "more than 16 variables" },
+        .{ .too_many_labels, "labels:", "more than 8 labels" },
+        .{ .bad_label, "labels:", "key over 32 bytes" },
+        .{ .missing_replica_label, "labels:", "replica label" },
+    };
+    for (expected) |case| {
+        var collector: diag_mod.Diag = undefined;
+        collector.reset();
+        agent_jobs.raise_spec(&collector, "train-job", case[0]);
+        try testing.expect(collector.code.? == .E0130);
+        const cause = collector.causes.slice()[0].slice();
+        try testing.expect(std.mem.indexOf(u8, cause, case[1]) != null);
+        try testing.expect(std.mem.indexOf(u8, cause, case[2]) != null);
+    }
+    var collector: diag_mod.Diag = undefined;
+    collector.reset();
+    agent_jobs.raise_deadline(&collector, "train-job", false);
+    try testing.expect(std.mem.indexOf(u8, collector.causes.slice()[0].slice(), "killed") == null);
 }

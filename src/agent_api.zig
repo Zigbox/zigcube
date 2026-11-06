@@ -472,8 +472,11 @@ const Call = struct {
         if (found[0].kv == null) return no_input(ctx, name, .unassigned);
         if (found[1].kv == null) return no_input(ctx, name, .unclaimed);
         const input_kv = found[2].kv orelse return no_input(ctx, name, .missing);
-        const input = records.read(records.JobInput, ctx.arena, input_kv, ctx.diag) catch
-            return propagate(ctx);
+        // A value that does not decode is a damaged input: the same ZC-E0523 as a mismatch.
+        const input = records.read(records.JobInput, ctx.arena, input_kv, ctx.diag) catch {
+            ctx.diag.reset();
+            return no_input(ctx, name, .damaged);
+        };
         const pair = try call.chain();
         return reply(ctx, .{ .input = input, .chain = pair });
     }
@@ -1047,6 +1050,7 @@ fn no_input(ctx: *const Context, name: []const u8, why: InputWhy) Failure {
     assert(ctx.diag.code == null);
     switch (why) {
         .missing => @import("agent_jobs.zig").raise_input(ctx.diag, name, .absent),
+        .damaged => @import("agent_jobs.zig").raise_input(ctx.diag, name, .mismatch),
         .unassigned, .unclaimed => {
             ctx.diag.raise(.E0133);
             if (why == .unassigned) {
@@ -1061,7 +1065,7 @@ fn no_input(ctx: *const Context, name: []const u8, why: InputWhy) Failure {
     return error.Failed;
 }
 
-const InputWhy = enum { unassigned, unclaimed, missing };
+const InputWhy = enum { unassigned, unclaimed, missing, damaged };
 
 fn too_many_runs(ctx: *const Context) Failure {
     assert(ctx.diag.code == null);

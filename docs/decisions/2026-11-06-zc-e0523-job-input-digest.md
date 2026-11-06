@@ -16,8 +16,10 @@ Register ZC-E0523, "a run's input does not match its digest".
 - Blame `environment`, severity `error`. Blame `internal` would make the code a bug by the registry
   invariant (`internal` if and only if `bug`); a mismatch can come from a damaged store or transfer
   as well as from a defect, so it is not claimed as a bug.
-- Raised by the input endpoint when the input key is absent or fails its digest, and by the agent
-  when the bytes it read do not match. The agent ends the run as `start_failed` with this
+- Raised by the input endpoint when the input key is absent or holds a value that does not decode
+  (the endpoint does not check the digest), and by the agent when the input is absent, damaged
+  or its bytes do not match the digest in the run record; the client reads the endpoint's E0523
+  as "no input". The agent ends the run as `start_failed` with this
   diagnostic. A store or transport error is not this code: the run stays claimed, not started,
   and the agent retries on a later pass.
 - A spec the runtime refuses is ZC-E0130 with the runtime's text, blamed on the user.

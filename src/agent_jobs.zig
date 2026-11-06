@@ -181,6 +181,9 @@ pub fn pass(
     return work.commits;
 }
 
+/// How long a run whose input could not be fetched waits before the next try.
+const input_retry_ms: u64 = 1_000;
+
 const Work = struct {
     agent: *Agent,
     ctx: *const Context,
@@ -376,7 +379,8 @@ const Work = struct {
     ) Error!void {
         const entry = run orelse return work.not_started(subject, record);
         const mine = subject.assigned and held.tenure == work.agent.tenure and
-            held.assignment == record.epoch and entry.rec.stop == null;
+            held.assignment == record.epoch and record.epoch == subject.epoch and
+            entry.rec.stop == null;
         if (mine) return work.begin(subject, entry, record);
         return work.not_started(subject, record);
     }
@@ -490,10 +494,11 @@ const Work = struct {
             .started_at_ms = record.started_at_ms,
         };
         try work.apply_exit(&wanted, reason);
-        if (record.stop_cause == .deadline) {
+        if (record.stop_cause == .deadline and wanted.diagnostic == null) {
             var collector: Diag = undefined;
             collector.reset();
-            raise_deadline(&collector, subject.id);
+            const killed = if (wanted.exit) |exit| exit.signal == 9 else false;
+            raise_deadline(&collector, subject.id, killed);
             var finished: Diagnostic = undefined;
             diag_mod.to_diagnostic(&finished, &collector);
             const ctx = work.ctx;
@@ -548,7 +553,15 @@ const Work = struct {
             error.InputMismatch => {
                 return work.cannot_start(subject, record, .{ .input = .mismatch });
             },
-            else => |other| return other,
+            // The fetch failed for a reason that says nothing about the input (the server or
+            // the link): keep it inside this run. The record stays `claiming`, a later pass
+            // comes back, and the other runs of this pass are not held back.
+            else => {
+                ctx.diag.reset();
+                const later = ctx.mono_ms() +| input_retry_ms;
+                work.agent.jobs_wake_mono_ms = @min(work.agent.jobs_wake_mono_ms, later);
+                return;
+            },
         };
         record.phase = .claimed;
         record.boot_id = ctx.boot_id;
@@ -826,9 +839,13 @@ pub fn raise_start_record(diag: *Diag, run: []const u8, state_dir: []const u8) v
 }
 
 /// ZC-W0503: a run reached its deadline and was stopped.
-pub fn raise_deadline(diag: *Diag, run: []const u8) void {
+pub fn raise_deadline(diag: *Diag, run: []const u8, killed: bool) void {
     diag.raise(.W0503);
-    diag.cause("{s} reached its deadline; it was stopped and then killed", .{run});
+    if (killed) {
+        diag.cause("{s} reached its deadline; it was stopped and then killed", .{run});
+    } else {
+        diag.cause("{s} reached its deadline; it was stopped", .{run});
+    }
     diag.fix(.{ .sentence = "raise deadline_ms if the job needs the time" });
 }
 
@@ -844,11 +861,35 @@ pub fn raise_input(diag: *Diag, run: []const u8, problem: InputProblem) void {
     diag.fix(.{ .sentence = "report it with the diagnostic bundle; submit the job again" });
 }
 
-/// ZC-E0130: the runtime refuses a run's spec.
+/// ZC-E0130: the runtime refuses a run's spec. The cause names the field and its limit, as
+/// the API's own E0130 does; the API checks these at submit, so reaching this is our gap.
 pub fn raise_spec(diag: *Diag, run: []const u8, problem: runtime.SpecProblem) void {
     diag.raise(.E0130);
-    diag.cause("the runtime refused the spec of {s}: {s}", .{ run, @tagName(problem) });
-    diag.fix(.{ .sentence = "submit the job again with that field corrected" });
+    const c = constants;
+    switch (problem) {
+        .bad_name => diag.cause("name: the run id {s} is not a valid container name", .{run}),
+        .bad_image => diag.cause("image: {s} must be 1 to {d} bytes", .{
+            run, c.image_digest_bytes_max,
+        }),
+        .bad_command => diag.cause("command: {s} must have 1 to {d} words, the first not empty", .{
+            run, c.runtime_command_words_max,
+        }),
+        .bad_source => diag.cause("source: {s} is over {d} bytes", .{ run, c.source_bytes_max }),
+        .too_many_env => diag.cause("env: {s} has more than {d} variables, with the input", .{
+            run, c.runtime_env_count_max,
+        }),
+        .too_many_labels => diag.cause("labels: {s} has more than {d} labels", .{
+            run, c.runtime_labels_max,
+        }),
+        .bad_label => diag.cause(
+            "labels: a label of {s} has an empty key, a key over {d} bytes, a value over {d} " ++
+                "bytes or '=' in its key",
+            .{ run, c.label_key_bytes_max, c.label_value_bytes_max },
+        ),
+        .missing_replica_label => diag.cause("labels: {s} lacks the replica label", .{run}),
+    }
+    diag.fix(.{ .sentence = "submit the job again with that field corrected, and report this " ++
+        "with the diagnostic bundle: the API should have refused it" });
 }
 
 fn same(existing: *const records.JobObserved, wanted: Work.Report) bool {

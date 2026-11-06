@@ -318,7 +318,7 @@ fn run_start_record(diag: *diag_mod.Diag) void { // agent_jobs.zig
 }
 
 fn job_deadline(diag: *diag_mod.Diag) void { // agent_jobs.zig
-    agent_jobs.raise_deadline(diag, "train-7-job");
+    agent_jobs.raise_deadline(diag, "train-7-job", true);
 }
 
 fn run_input_digest(diag: *diag_mod.Diag) void { // agent_jobs.zig
