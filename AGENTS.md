@@ -72,7 +72,10 @@ These arrive with the scaffold; keep this list current as they land.
   or `check: FAIL <commit> (what failed)`. The gates are build-step dependencies; then
   `src/testing/check.zig` runs the Postgres suite (only when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` and
   `sim-cluster` (40 operations) each with a fresh seed (printed as `sim-c0: seed N`, `sim-cluster: seed N` first), `sim-teeth`, `sim-swarm` (100 operations, fresh seed, printed as `sim-swarm: seed N`), `sim-swarm-teeth` and, as root, `zig build test` as `tester` in a scratch
-  worktree of HEAD (`-Dcheck-user=-` skips it; `useradd -m tester` creates the user). `+dirty` after the commit
+  worktree of HEAD (`-Dcheck-user=-` skips it; `useradd -m tester` creates the user). That run's
+  caches are kept in `.zig-cache/zcube-check-cache` (tester-owned, about 0.4 GiB, emptied past 8 GiB;
+  `rm -rf .zig-cache` resets it), so only the first check of a worktree builds from nothing
+  (`docs/decisions/2026-11-06-check-keeps-tester-cache.md`). `+dirty` after the commit
   means uncommitted changes the user run did not see. It leaves out `agent-smoke` and `demo-c0`.
 - `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]` runs HANDOFF's C1 demo for real:
   `zcube-server` with `--lease-ttl-ms 8000`, three `zcube-agent`s with `FakeRuntime` (node1 behind a
