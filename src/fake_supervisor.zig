@@ -301,7 +301,7 @@ test "a SIGTERM that came before the fetch's pid was published still reaches the
     term_received.store(true, .seq_cst);
     defer term_received.store(false, .seq_cst);
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "sleep", "30" },
+        .argv = &.{ "sleep", "5" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -309,5 +309,5 @@ test "a SIGTERM that came before the fetch's pid was published still reaches the
     publish_child(child.id.?);
     defer child_pid.store(0, .seq_cst);
     const term = try child.wait(io);
-    try std.testing.expectEqual(std.posix.SIG.TERM, term.signal);
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, term);
 }
