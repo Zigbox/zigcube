@@ -5,9 +5,11 @@
 const std = @import("std");
 const testing = std.testing;
 const api_mod = @import("api.zig");
+const agent_state = @import("agent_state.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
+const controller = @import("controller.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -160,6 +162,27 @@ test "list pages, reverses, reads at a revision and keeps env values from a read
     try rig.refused(rig.get("/v1/list", "at=9999999"), 400, "ZC-E0204");
     try rig.compact(field(first, "revision").integer);
     try rig.refused(rig.get("/v1/list", "at=1"), 410, "ZC-E0203");
+}
+
+test "a read-only token sees neither a job run's env values nor its input digest" {
+    // Goal: GET /v1/list redaction covers /job-runs/ as it covers /jobs/. Method: put a run
+    // record with a secret and a digest, read it back with both token kinds.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    const run =
+        \\{"v":1,"id":"j-1","job":"j","image":"i","command":["x"],"env":[["K","s3cr3t"]],
+        \\"deadline_ms":1,"input_digest":"sha256:dd","start_by_ms":1,"created_at_ms":1}
+    ;
+    const put = [_]store.Op{.{ .put = .{ .key = "/job-runs/j-1", .value = run } }};
+    _ = try rig.world.store_handle().txn(.{ .on_success = &put }, &rig.world.diag);
+
+    const hidden = rig.get("/v1/list", "prefix=/job-runs/");
+    try testing.expect(std.mem.indexOf(u8, hidden.body, "s3cr3t") == null);
+    try testing.expect(std.mem.indexOf(u8, hidden.body, "sha256:dd") == null);
+    rig.api.read_only = false;
+    const shown = rig.get("/v1/list", "prefix=/job-runs/");
+    try testing.expect(std.mem.indexOf(u8, shown.body, "s3cr3t") != null);
+    try testing.expect(std.mem.indexOf(u8, shown.body, "sha256:dd") != null);
 }
 
 test "watch answers what is ready with a bookmark and leaves the waiting to the shell" {
@@ -759,6 +782,9 @@ test "the agent publishes the pull records its fetches left, and removes every f
     try files.put_atomic("containers/hello-3/pull.json", "{");
     const stepped = rig.world.agent_step();
     try testing.expect(stepped.failed == null);
+    // The two it dropped are counted and named, for ZC-W0504 (issue #93); the stored one is not.
+    try testing.expectEqual(@as(u32, 2), rig.world.agent.pull_drops);
+    try testing.expect(std.mem.startsWith(u8, rig.world.agent.pull_drop(), "container hello-"));
 
     const ctx = rig.world.controller_context();
     const options: store.ListOptions = .{ .prefix = records.prefix_pulls, .limit = 10 };
@@ -773,6 +799,114 @@ test "the agent publishes the pull records its fetches left, and removes every f
     for (names) |name| {
         try testing.expectError(error.Absent, files.read(ctx.arena, name));
     }
+}
+
+/// The agent's files with `remove` failing as a host refusing it does; everything else passes
+/// through to the simulated files.
+const FailingRemove = struct {
+    inner: agent_state.AgentState,
+    removes: u32 = 0,
+
+    const vtable: agent_state.AgentState.VTable = .{
+        .put_atomic = put_atomic,
+        .append = append,
+        .read = read,
+        .remove = remove,
+        .list = list,
+    };
+
+    fn interface(self: *FailingRemove) agent_state.AgentState {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *FailingRemove {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn put_atomic(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return from(context).inner.put_atomic(name, data);
+    }
+
+    fn append(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return from(context).inner.append(name, data);
+    }
+
+    fn read(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        name: []const u8,
+    ) agent_state.Error![]const u8 {
+        return from(context).inner.read(arena, name);
+    }
+
+    fn remove(context: *anyopaque, name: []const u8) agent_state.Error!void {
+        _ = name;
+        from(context).removes += 1;
+        return error.Io;
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        prefix: []const u8,
+    ) agent_state.Error![]const []const u8 {
+        return from(context).inner.list(arena, prefix);
+    }
+};
+
+test "a pull record whose file cannot be removed is not counted as dropped, in any step" {
+    // Goal: ZC-W0504's count is of records dropped, and a record is dropped only once its file is
+    // gone (else each retried step would count it again). Method: a record for another node, every
+    // remove failing; two steps both fail with the state-file code, `pull_drops` stays 0 and no
+    // text is noted, though the remove was tried both times.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const files = rig.world.files.interface();
+    const foreign = "{\"v\":1,\"node\":\"node2\",\"tree\":\"b3:51aa9c03\"}";
+    try files.put_atomic("containers/hello-2/pull.json", foreign);
+    var failing: FailingRemove = .{ .inner = files };
+    rig.world.state_override = failing.interface();
+    for (0..2) |_| {
+        const stepped = rig.world.agent_step();
+        try testing.expect(stepped.failed != null);
+        try testing.expectEqual(@as(u32, 0), rig.world.agent.pull_drops);
+        try testing.expectEqual(@as(usize, 0), rig.world.agent.pull_drop().len);
+        rig.world.advance(2000);
+    }
+    try testing.expect(failing.removes >= 2);
+    // Once the host lets the remove through, the record is dropped and counted once.
+    rig.world.state_override = null;
+    rig.world.advance(2000);
+    _ = rig.world.agent_step();
+    try testing.expectEqual(@as(u32, 1), rig.world.agent.pull_drops);
+}
+
+test "a pull record the server refuses puts the server's cause into the drop text" {
+    // Goal: ZC-W0504 names why a record was dropped. Method: a good record, a store that refuses
+    // every write under /pulls/ with ZC-E0504 and a known cause; `pull_drop_text` is filled with a
+    // known byte first, so a text that is not rewritten (or not cut at its length) shows.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const files = rig.world.files.interface();
+    const good =
+        \\{"v":1,"node":"node1","tree":"b3:51aa9c03","registry_bytes":7,"finished_at_ms":9}
+    ;
+    try files.put_atomic("containers/hello-1/pull.json", good);
+    @memset(&rig.world.agent.pull_drop_text, 0xAA);
+    rig.world.switched.refuse_put_prefix = records.prefix_pulls;
+    const stepped = rig.world.agent_step();
+    try testing.expect(stepped.failed == null);
+    try testing.expectEqual(@as(u32, 1), rig.world.agent.pull_drops);
+    const text = rig.world.agent.pull_drop();
+    try testing.expect(std.mem.startsWith(u8, text, "container hello-1"));
+    try testing.expect(std.mem.indexOf(u8, text, "the server refused the write") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, text, 0xAA) == null);
+    const gone = files.read(rig.parsed.allocator(), "containers/hello-1/pull.json");
+    try testing.expectError(error.Absent, gone);
 }
 
 test "a pull retention pass that fails is recorded and does not fail the controller step" {
@@ -795,4 +929,143 @@ test "a pull retention pass that fails is recorded and does not fail the control
     rig.world.advance(constants.pulls_retry_ms + 3000);
     try testing.expect(!cursor.failing);
     try testing.expectEqual(@as(u64, 1), cursor.dropped);
+}
+
+fn job_json(rig: *Rig, name: []const u8, image: []const u8) ![]const u8 {
+    const submit_by = rig.world.now_ms() + 30_000;
+    return std.fmt.allocPrint(rig.parsed.allocator(),
+        \\{{"name":"{s}","image":"{s}","command":["sh","-c","cat"],"env":[["API_TOKEN","s3cr3t"]],
+    ++
+        \\"deadline_ms":60000,"submit_by_ms":{d},"input":"top secret","input_env":"PAYLOAD",
+    ++
+        \\"labels":[["team","x"]]}}
+    , .{ name, image, submit_by });
+}
+
+fn post_job(rig: *Rig, path: []const u8, body: []const u8) api_mod.Response {
+    return rig.call(.{ .method = "POST", .path = path, .body = body });
+}
+
+test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why" {
+    // Goal: the status table of the b1 brief and the secrecy of env values and the input.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = try job_json(&rig, "nightly", "b3:51aa9c03");
+    const created = post_job(&rig, "/v1/jobs", body);
+    try testing.expectEqual(@as(u16, 201), created.status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", body).status);
+    const other = try job_json(&rig, "nightly", "b3:7c02aaaaaaaa");
+    try rig.refused(post_job(&rig, "/v1/jobs", other), 409, "ZC-E0131");
+    const late = try std.fmt.allocPrint(rig.parsed.allocator(),
+        \\{{"name":"late","image":"b3:51aa9c03","command":["true"],"deadline_ms":1,
+    ++
+        \\"submit_by_ms":1}}
+    , .{});
+    try rig.refused(post_job(&rig, "/v1/jobs", late), 410, "ZC-E0134");
+    const unknown = "{\"name\":\"x\",\"image\":\"i\",\"command\":[\"a\"],\"deadline_ms\":1," ++
+        "\"submit_by_ms\":1,\"surprise\":1}";
+    try rig.refused(post_job(&rig, "/v1/jobs", unknown), 400, "ZC-E0104");
+
+    const got = rig.get("/v1/jobs/nightly", "");
+    try testing.expect(std.mem.indexOf(u8, got.body, "s3cr3t") == null);
+    try testing.expect(std.mem.indexOf(u8, got.body, "top secret") == null);
+    const view = try rig.json(got);
+    const names = field(field(view, "job"), "env_names");
+    try testing.expectEqualStrings("API_TOKEN", names.array.items[0].string);
+    try testing.expectEqualStrings("pending", field(view, "state").string);
+    try rig.refused(rig.get("/v1/jobs/nope", ""), 404, "ZC-E0133");
+
+    const listed = try rig.ok("/v1/jobs", "label=team%3Dx");
+    try testing.expectEqual(@as(usize, 1), field(listed, "jobs").array.items.len);
+    try rig.refused(rig.get("/v1/jobs", "state=bogus"), 400, "ZC-E0104");
+
+    const cancel = post_job(&rig, "/v1/jobs/nightly/cancel", "");
+    try testing.expectEqual(@as(u16, 202), cancel.status);
+    try rig.refused(post_job(&rig, "/v1/jobs/nope/cancel", ""), 404, "ZC-E0133");
+    const why = try rig.ok("/v1/why/job/nightly", "");
+    try testing.expect(why.object.count() > 0);
+}
+
+test "a read-only list shows no job env value and no job input" {
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const created = post_job(&rig, "/v1/jobs", try job_json(&rig, "nightly", "b3:51aa9c03"));
+    try testing.expectEqual(@as(u16, 201), created.status);
+    const listed = rig.get("/v1/list", "prefix=%2Fjob");
+    try testing.expectEqual(@as(u16, 200), listed.status);
+    try testing.expect(std.mem.indexOf(u8, listed.body, "s3cr3t") == null);
+    try testing.expect(std.mem.indexOf(u8, listed.body, "dG9wIHNlY3JldA") == null);
+}
+
+test "the replies that change nothing carry the job's state, not pending" {
+    // Goal: a client that retries a create after the job ended is told how it ended.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = try job_json(&rig, "short", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    const ctx = rig.world.controller_context();
+    const status: records.JobStatus = .{
+        .state = .exited,
+        .ended_at_ms = 1,
+        .end = .{ .kind = .exited, .code = 0 },
+        .reported_at_ms = 1,
+    };
+    var batch: controller.Batch = .{};
+    const key = records.job_status_key("short");
+    batch.put(try controller.key_copy(&ctx, &key), try records.encode(ctx.arena, status, ctx.diag));
+    _ = try controller.commit(&ctx, .job_controller, &batch);
+    const same = post_job(&rig, "/v1/jobs", body);
+    try testing.expectEqual(@as(u16, 200), same.status);
+    try testing.expectEqualStrings("exited", field(try rig.json(same), "state").string);
+    const ended = post_job(&rig, "/v1/jobs/short/cancel", "");
+    try testing.expectEqual(@as(u16, 200), ended.status);
+    try testing.expectEqualStrings("exited", field(try rig.json(ended), "state").string);
+    // Goal of the next lines: `state=ended` lists every terminal state and no other.
+    const live = try job_json(&rig, "live", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", live).status);
+    const only_ended = try rig.ok("/v1/jobs", "state=ended");
+    const rows = field(only_ended, "jobs").array.items;
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("short", field(rows[0], "name").string);
+    const pending_rows = field(try rig.ok("/v1/jobs", "state=pending"), "jobs").array.items;
+    try testing.expectEqual(@as(usize, 1), pending_rows.len);
+    // A job without a status is pending in all three replies.
+    const fresh = try job_json(&rig, "fresh", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", fresh).status);
+    const cancelled = post_job(&rig, "/v1/jobs/fresh/cancel", "");
+    try testing.expectEqualStrings("pending", field(try rig.json(cancelled), "state").string);
+    const again = post_job(&rig, "/v1/jobs/fresh/cancel", "");
+    try testing.expectEqual(@as(u16, 202), again.status);
+    try testing.expectEqualStrings("pending", field(try rig.json(again), "state").string);
+}
+
+test "a relay array filling the whole body is refused by name, without building it" {
+    // Goal: `relay` is skipped, not parsed into a value 37 times its size, so the answer is
+    // ZC-E0130 naming relay, not ZC-E0207 (the arena is spent).
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const head = "{\"name\":\"big\",\"image\":\"b3:51aa9c03\",\"command\":[\"true\"]," ++
+        "\"deadline_ms\":1000,\"submit_by_ms\":9999999999999,\"relay\":[";
+    const tail = "0]}";
+    const body = try rig.parsed.allocator().alloc(u8, constants.job_request_bytes_max);
+    @memset(body, '0');
+    @memcpy(body[0..head.len], head);
+    var at: usize = head.len;
+    while (at + 2 < body.len - tail.len) : (at += 2) {
+        body[at] = '0';
+        body[at + 1] = ',';
+    }
+    const rest = body.len - tail.len;
+    @memset(body[at..rest], ' ');
+    @memcpy(body[rest..], tail);
+    // The parse runs in an arena of its own: every byte it took, chunk overhead included, is at
+    // most what the production request arena allows.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ctx = rig.world.controller_context();
+    ctx.arena = arena.allocator();
+    const response = rig.api.handle(&ctx, .{ .method = "POST", .path = "/v1/jobs", .body = body });
+    try rig.refused(response, 400, "ZC-E0130");
+    try testing.expect(std.mem.indexOf(u8, response.body, "relay") != null);
+    try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
 }

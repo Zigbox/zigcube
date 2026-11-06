@@ -354,10 +354,19 @@ controller records its choices about a service's replica set with the service as
 `scale_up`, `scale_down`, `replace_replica` and `hold_failed_replica`, each linking by `cause` to
 the observed record or decision that provoked it. A decision about one replica (`create_replica`,
 `stop_replica`, `mark_replica_lost`) keeps that replica as its subject, with a `cause` that points
-at the service-level decision above it, so the two chains join. (`mark_replica_lost` for a
-replica whose node was lost points at the node's `mark_lost` instead, and the `replace_replica`
-it provokes at it, so `why` on the replacement, a new id, reaches the lease.) A decision with a
-service as subject is indexed under `/decisions-by-subject/service/<name>/<id>` like any other.
+at the service-level decision above it, so the two chains join.
+
+**Job decisions (B1).** The job controller's decisions have a job as subject
+(`/decisions-by-subject/job/<name>/<id>`), and their actions are written in snake_case like every
+other: `job_created` (the run and its pending status exist; the rule "a run is created once"
+rests on it, judged per incarnation by the index entry's `create_revision`), `job_placed`,
+`job_running`, `stop_job`, `end_job`, `hold_contradictory_job` (ZC-E0307), `hold_unmapped_ending`
+(ZC-B0004) and `drop_report` (ZC-W0307: a report that arrived after the job ended, which changes
+nothing). A decision that holds or drops is not repeated for the same record revision.
+(`mark_replica_lost` for a replica whose node was lost points at the node's `mark_lost` instead, and
+the `replace_replica` it provokes at it, so `why` on the replacement, a new id, reaches the lease.)
+A decision with a service as subject is indexed under `/decisions-by-subject/service/<name>/<id>`
+like any other.
 
 ## `/decisions-by-subject/<kind>/<name>/<id>`: the index for `zcube why`
 

@@ -85,6 +85,12 @@ pub const Net = struct {
     busy_wait_ms: u32 = constants.fetch_busy_wait_ms,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
     conns: []Conn = &.{},
+    /// Chunk requests made to peers and the bytes they brought, for the progress line (#93:
+    /// a fetch that is slow and one that is stuck wrote the same, nothing).
+    chunks_asked: u32 = 0,
+    chunk_bytes: u64 = 0,
+    /// `boot_ms` of the last progress line, 0 before the first.
+    progress_ms: u64 = 0,
 
     fn from(context: *anyopaque) *Net {
         return @ptrCast(@alignCast(context));
@@ -100,6 +106,7 @@ pub const Net = struct {
             .blame_fn = blame,
             .bad_list_fn = bad_list,
             .bundle_fn = bundle,
+            .phase_fn = phase,
         };
     }
 
@@ -163,13 +170,70 @@ pub const Net = struct {
                 const prefix = peer_serve.path_chunk;
                 const path = std.fmt.bufPrint(&target, "{s}{x}", .{ prefix, &ref.hash }) catch
                     return .refused;
-                return switch (net.peer_get(index, path, out)) {
+                const reply = net.peer_get(index, path, out);
+                net.chunks_asked += 1;
+                if (reply == .bytes) net.chunk_bytes += reply.bytes.len;
+                net.say_progress();
+                return switch (reply) {
                     .bytes => |bytes| .{ .bytes = bytes },
                     .refused, .busy => .refused, // `peer_get` has waited out a busy peer.
                     .timeout => .timeout,
                 };
             },
         }
+    }
+
+    /// One line per phase change; the first progress line is written on the first chunk answer.
+    fn phase(
+        context: *anyopaque,
+        which: fetch_worker.Phase,
+        chunks: u32,
+        lacking: u32,
+        detail: []const u8,
+    ) void {
+        const net = from(context);
+        var buffer: [200]u8 = undefined;
+        const head = "zcube-agent fetch: ";
+        const text = switch (which) {
+            .bundle_found => std.fmt.bufPrint(
+                &buffer,
+                head ++ "bundle found: {d} chunks, {d} lacking\n",
+                .{ chunks, lacking },
+            ),
+            .chunks_done => std.fmt.bufPrint(
+                &buffer,
+                head ++ "chunks done; importing the record\n",
+                .{},
+            ),
+            .chunks_failed => std.fmt.bufPrint(
+                &buffer,
+                head ++ "the chunk phase failed: {s}\n",
+                .{detail},
+            ),
+            .chunks_missing => std.fmt.bufPrint(
+                &buffer,
+                head ++ "the store does not hold every chunk after the chunk phase\n",
+                .{},
+            ),
+            .import_failed => std.fmt.bufPrint(
+                &buffer,
+                head ++ "importing the record failed: {s}\n",
+                .{detail},
+            ),
+            .imported => std.fmt.bufPrint(&buffer, head ++ "record imported\n", .{}),
+        } catch return;
+        note(net.io, text);
+    }
+
+    /// At most one line per `fetch_progress_ms` to fetch.log: what the chunk requests have
+    /// brought and what the peers answered instead.
+    fn say_progress(net: *Net) void {
+        const now_ms = peer_stream.boot_ms(net.io);
+        const first = net.progress_ms == 0;
+        if (!first and now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
+        net.progress_ms = now_ms;
+        var buffer: [256]u8 = undefined;
+        note(net.io, progress_line(&buffer, net));
     }
 
     fn now(context: *anyopaque) u64 {
@@ -330,7 +394,7 @@ pub fn bundle_note(buffer: []u8, peer_name: []const u8, reply: PeerReply) []cons
 fn say_bundle_failed(io: std.Io, peer_name: []const u8, reply: PeerReply) void {
     var buffer: [256]u8 = undefined;
     const text = bundle_note(&buffer, peer_name, reply);
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    to_stderr(io, text);
 }
 
 /// One peer's open stream and how many requests it has carried.
@@ -591,7 +655,7 @@ fn emit(io: std.Io, diag: *const diag_mod.Diag) void {
     diag_mod.to_diagnostic(&diagnostic, diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
     const text = diag_mod.render(&diagnostic, .text, false, &buffer);
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    to_stderr(io, text);
 }
 
 // ---- The command ----------------------------------------------------------------------------
@@ -719,7 +783,8 @@ pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
     "[--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
-/// memory), 3 is that no source had the tree (the supervisor records that as ZC-E0601).
+/// memory), 3 is that no source had the tree (the supervisor says ZC-W0603 and pulls from the
+/// registry).
 fn finish(io: std.Io, diag: *const diag_mod.Diag, code: u8) u8 {
     assert(code != constants.exit_ok);
     emit(io, diag);
@@ -732,8 +797,18 @@ fn no_memory(io: std.Io, diag: *diag_mod.Diag) u8 {
     return finish(io, diag, constants.exit_environment);
 }
 
-fn note(io: std.Io, text: []const u8) void {
+/// Says `text` on stderr; there is nowhere else to say it. Silent in a unit test: a passing test
+/// step that writes to stderr is reported by the build runner as `failed command: ...`, which
+/// read like a crash (docs/STYLE.md). Nothing in `zig build check` reads the real stream: the
+/// swarm smoke (not in `check`) reads `fetch.log` for ZC-W0601 only, and ZBX-W0201 and the bundle
+/// notes are not asserted on it anywhere.
+fn to_stderr(io: std.Io, text: []const u8) void {
+    if (@import("builtin").is_test) return;
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
+
+fn note(io: std.Io, text: []const u8) void {
+    to_stderr(io, text);
 }
 
 /// The node's identity, or null when it has none or its files cannot be used; the second case
@@ -883,7 +958,7 @@ fn say_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
     zigbox.diagnostic.from_diag(&diagnostic, collector);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
     const text = diag_mod.render(&diagnostic, .text, false, &buffer);
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    to_stderr(io, text);
 }
 
 fn not_single_threaded(io: std.Io, diag: *diag_mod.Diag, count: ?u32) u8 {
@@ -1082,10 +1157,16 @@ fn write_report(
         .finished_at_ms = real_ms(io),
         .bad_peers = bad[0..bad_count],
     };
-    if (!pull_report.write(gpa, io, parsed.report, record)) note(io, report_failed);
+    pull_report.write(gpa, io, parsed.report, record) catch |err| {
+        var buffer: [192]u8 = undefined;
+        const text = "zcube-agent fetch: ZC-W0504: the pull report could not be written: {s}; " ++
+            "its statistics are lost\n";
+        note(io, std.fmt.bufPrint(&buffer, text, .{@errorName(err)}) catch report_failed);
+    };
 }
 
-const report_failed = "zcube-agent fetch: the pull report could not be written\n";
+const report_failed = "zcube-agent fetch: ZC-W0504: the pull report could not be written; " ++
+    "its statistics are lost\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.
@@ -1138,6 +1219,23 @@ fn say_peer_answers(net: *const Net) void {
         var buffer: [256]u8 = undefined;
         note(net.io, peer_answers_line(&buffer, who.name, conn));
     }
+}
+
+/// The progress line: requests made, bytes got, and the peers' answers that were not a chunk.
+pub fn progress_line(buffer: []u8, net: *const Net) []const u8 {
+    var busy: u32 = 0;
+    var refused: u32 = 0;
+    var silent: u32 = 0;
+    for (net.conns[0..net.peers.len]) |conn| {
+        busy += conn.busy;
+        refused += conn.refused;
+        silent += conn.timeouts;
+    }
+    const form = "zcube-agent fetch: progress: {d} chunk requests, {d} bytes from peers; " ++
+        "answers: busy {d}, refused {d}, nothing {d}\n";
+    return std.fmt.bufPrint(buffer, form, .{
+        net.chunks_asked, net.chunk_bytes, busy, refused, silent,
+    }) catch buffer[0..0];
 }
 
 pub fn peer_answers_line(buffer: []u8, name: []const u8, conn: Conn) []const u8 {
@@ -1442,6 +1540,30 @@ fn peer_holds(stores: []const Kv, self: []const u8, digest: []const u8) bool {
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
+
+test "the progress line counts requests, bytes and the answers that were not a chunk" {
+    var conns = [_]Conn{ .{ .busy = 2, .refused = 3 }, .{ .timeouts = 5, .busy = 1 } };
+    const peers = [_]Peer{
+        .{ .name = "a", .address = try IpAddress.parse("127.0.0.1", 1) },
+        .{ .name = "b", .address = try IpAddress.parse("127.0.0.1", 2) },
+    };
+    var scratch: [8]u8 = undefined;
+    const net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &peers,
+        .identity = null,
+        .reply = &scratch,
+        .conns = &conns,
+        .chunks_asked = 7,
+        .chunk_bytes = 4096,
+    };
+    var buffer: [256]u8 = @splat(0xaa);
+    const line = progress_line(&buffer, &net);
+    const want = "zcube-agent fetch: progress: 7 chunk requests, 4096 bytes from peers; " ++
+        "answers: busy 3, refused 3, nothing 5\n";
+    try std.testing.expectEqualStrings(want, line);
+}
 
 test "a peer that gave no bundle is named with what it answered" {
     var buffer: [256]u8 = undefined;

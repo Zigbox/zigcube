@@ -13,6 +13,8 @@ const constants = @import("constants.zig");
 const schedule = @import("tls_schedule.zig");
 const wire = @import("tls_wire.zig");
 
+const x509 = @import("x509.zig");
+
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 
@@ -39,10 +41,53 @@ pub const Faults = struct {
     extra_extension: bool = false,
     /// No compatibility change_cipher_spec.
     no_ccs: bool = false,
-    /// A CertificateRequest after EncryptedExtensions.
+    /// A CertificateRequest with no extensions at all (no signature_algorithms) after
+    /// EncryptedExtensions: malformed. A real request is `Config.client_auth`.
     certificate_request: bool = false,
+    /// A second CertificateRequest right after the first: not allowed.
+    second_request: bool = false,
     /// One record for each handshake message; otherwise all of them share one.
     record_per_message: bool = true,
+    /// Damages the CertificateRequest of `Config.client_auth` after it is built (not zero): the
+    /// value picks how and where (see `damage_request`). The record around it stays valid, so
+    /// what fails is the request's own parse.
+    request_damage: u32 = 0,
+    /// Damages one of EncryptedExtensions, Certificate, CertificateVerify and Finished (not
+    /// zero): the value picks which, how and where (see `damage_message`). The message is
+    /// damaged before it is sealed and enters the transcript as damaged, so the record, the
+    /// MAC and the transcript are all valid and what fails is the message's own content.
+    message_damage: u32 = 0,
+};
+
+/// Asks the client for a certificate and checks what it sends.
+pub const ClientAuth = struct {
+    /// The CA key the client's certificate must be signed by.
+    anchor: [32]u8,
+    now_ms: u64,
+    /// The `certificate_request_context` the client must echo.
+    context: []const u8 = &.{},
+    /// The schemes the request lists.
+    schemes: []const u16 = &.{wire.scheme_ed25519},
+    /// An empty client Certificate is refused (certificate_required).
+    require: bool = true,
+    /// A `certificate_authorities` extension holding one name, which a client skips.
+    authorities: bool = false,
+    /// The `signature_algorithms_cert` extension, when set, lists these.
+    cert_schemes: ?[]const u16 = null,
+};
+
+/// What the peer made of the client's last flight.
+pub const ClientFlight = enum {
+    /// Everything verified (and, if a certificate was required, it came).
+    ok,
+    /// The client sent an empty Certificate and none was required.
+    ok_without_certificate,
+    no_certificate,
+    bad_context,
+    bad_certificate,
+    bad_verify,
+    bad_finished,
+    malformed,
 };
 
 pub const Config = struct {
@@ -53,6 +98,7 @@ pub const Config = struct {
     random: [32]u8,
     secret: [32]u8,
     faults: Faults = .{},
+    client_auth: ?ClientAuth = null,
 };
 
 pub const Peer = struct {
@@ -65,14 +111,17 @@ pub const Peer = struct {
     handshake_write: schedule.Direction,
     client_handshake_secret: schedule.Secret,
     client_application_secret: schedule.Secret,
-    /// The transcript hash a client Finished is checked against.
+    /// The transcript hash through the server's Finished: the application keys come from it.
     finished_hash: schedule.Hash,
+    /// The public key of the client certificate that verified, when one did.
+    client_key: ?[32]u8,
 
     pub fn init(config: Config) Peer {
         var peer: Peer = undefined;
         peer.config = config;
         peer.transcript = schedule.Transcript.init();
         peer.secrets = schedule.Schedule.init();
+        peer.client_key = null;
         return peer;
     }
 
@@ -171,28 +220,44 @@ pub const Peer = struct {
             out[used..],
             &scratch,
             &length,
-            &encrypted_extensions,
+            self.damaged(0, &encrypted_extensions),
             !faults.skip_encrypted_extensions_in_transcript,
         );
         if (faults.certificate_request) {
-            const request = [_]u8{ wire.handshake_certificate_request, 0, 0, 4, 0, 0, 0, 0 };
+            const request = [_]u8{ wire.handshake_certificate_request, 0, 0, 3, 0, 0, 0 };
             used += self.message(out[used..], &scratch, &length, &request, true);
+        }
+        if (self.config.client_auth) |auth| {
+            const request = request_message(&auth, faults.request_damage);
+            used += self.message(out[used..], &scratch, &length, request, true);
+            if (faults.second_request) {
+                used += self.message(out[used..], &scratch, &length, request, true);
+            }
         }
         used += self.message(
             out[used..],
             &scratch,
             &length,
-            self.certificate_message(&scratch),
+            self.damaged(1, self.certificate_message(&scratch)),
             true,
         );
-        used += self.message(out[used..], &scratch, &length, self.verify_message(&scratch), true);
-        used += self.message(out[used..], &scratch, &length, self.finished_message(&scratch), true);
+        const verify = self.damaged(2, self.verify_message(&scratch));
+        used += self.message(out[used..], &scratch, &length, verify, true);
+        const finished = self.damaged(3, self.finished_message(&scratch));
+        used += self.message(out[used..], &scratch, &length, finished, true);
         if (!faults.record_per_message) used += self.flush(out[used..], scratch[0..length]);
         self.finished_hash = self.transcript.hash();
         const secrets = self.secrets.to_application(&self.finished_hash);
         self.write = schedule.Direction.init(&secrets.server);
         self.client_application_secret = secrets.client;
         return used;
+    }
+
+    /// `bytes` as it is, or damaged when `Faults.message_damage` picks message number `which`.
+    fn damaged(self: *Peer, which: u32, bytes: []const u8) []const u8 {
+        const damage = self.config.faults.message_damage;
+        if (damage == 0 or damage % 4 != which) return bytes;
+        return damage_message(bytes, damage);
     }
 
     /// Adds one message to the transcript and either seals it alone or holds it for `flush`.
@@ -274,26 +339,87 @@ pub const Peer = struct {
 
     // ---- After the server's flight ------------------------------------------------------------
 
-    /// Reads the client's last flight: an optional compatibility change_cipher_spec and its
-    /// Finished. Returns whether the Finished verified; on success the peer reads application
-    /// data from the client.
+    /// Reads the client's last flight with no client authentication asked for: an optional
+    /// compatibility change_cipher_spec and its Finished. Returns whether it verified.
     pub fn accept_client_finished(self: *Peer, bytes: []u8) bool {
+        assert(self.config.client_auth == null);
+        return self.accept_client_flight(bytes) == .ok;
+    }
+
+    /// Reads the client's last flight: an optional change_cipher_spec, then, when the peer asked,
+    /// Certificate and CertificateVerify, then Finished, each in a record of its own. On success
+    /// the peer reads application data from the client. The checks are the ones a stock server
+    /// makes: the context is echoed, the chain verifies under the anchor, the signature covers the
+    /// transcript through the Certificate, and the Finished covers everything.
+    pub fn accept_client_flight(self: *Peer, bytes: []u8) ClientFlight {
         var rest = bytes;
         if (rest.len > 0 and rest[0] == @backingInt(schedule.ContentType.change_cipher_spec)) {
+            if (rest.len < 6) return .malformed;
             rest = rest[6..];
         }
-        const opened = self.read.open(rest) catch return false;
-        if (opened.content_type != .handshake) return false;
-        if (opened.content.len != 4 + schedule.hash_bytes) return false;
-        if (opened.content[0] != wire.handshake_finished) return false;
-        const ok = schedule.finished_matches(
-            &self.client_handshake_secret,
-            &self.finished_hash,
-            opened.content[4..],
-        );
-        if (!ok) return false;
+        var result: ClientFlight = .ok;
+        if (self.config.client_auth) |auth| {
+            result = self.accept_certificate(&auth, &rest);
+            if (result != .ok and result != .ok_without_certificate) return result;
+        }
+        const finished = self.next_message(&rest) orelse return .malformed;
+        if (rest.len != 0) return .malformed;
+        if (finished.len != 4 + schedule.hash_bytes) return .malformed;
+        if (finished[0] != wire.handshake_finished) return .malformed;
+        const hash = self.transcript.hash();
+        if (!schedule.finished_matches(&self.client_handshake_secret, &hash, finished[4..])) {
+            return .bad_finished;
+        }
         self.read = schedule.Direction.init(&self.client_application_secret);
-        return true;
+        return result;
+    }
+
+    /// Opens the next record of `rest` and returns its handshake message.
+    fn next_message(self: *Peer, rest: *[]u8) ?[]u8 {
+        if (rest.len < constants.tls_record_header_bytes) return null;
+        const length = std.mem.readInt(u16, rest.*[3..5], .big);
+        const total = constants.tls_record_header_bytes + length;
+        if (rest.len < total) return null;
+        const opened = self.read.open(rest.*[0..total]) catch return null;
+        rest.* = rest.*[total..];
+        if (opened.content_type != .handshake) return null;
+        return opened.content;
+    }
+
+    fn accept_certificate(self: *Peer, auth: *const ClientAuth, rest: *[]u8) ClientFlight {
+        const body = self.next_message(rest) orelse return .malformed;
+        if (body.len < 4 or body[0] != wire.handshake_certificate) return .malformed;
+        var reader = wire.Reader.init(body[4..]);
+        const context = reader.vector8() catch return .malformed;
+        if (!std.mem.eql(u8, context, auth.context)) return .bad_context;
+        var list = wire.Reader.init(reader.vector24() catch return .malformed);
+        reader.finish() catch return .malformed;
+        if (list.remaining() == 0) {
+            if (auth.require) return .no_certificate;
+            self.transcript.add(body);
+            return .ok_without_certificate;
+        }
+        const leaf = list.vector24() catch return .malformed;
+        _ = list.vector16() catch return .malformed;
+        var detail: x509.Detail = .{};
+        const parsed = x509.verify_detailed(leaf, auth.anchor, auth.now_ms, .{
+            .kind = .workload,
+            .name = null,
+        }, &detail) catch return .bad_certificate;
+        self.transcript.add(body);
+        const hash = self.transcript.hash();
+        const verify = self.next_message(rest) orelse return .malformed;
+        if (verify.len != 4 + 2 + 2 + 64) return .malformed;
+        if (verify[0] != wire.handshake_certificate_verify) return .malformed;
+        if (std.mem.readInt(u16, verify[4..6], .big) != wire.scheme_ed25519) return .malformed;
+        const content = schedule.certificate_verify_content(.client, &hash);
+        const key = parsed.public_key.of(leaf)[0..32].*;
+        const public = Ed25519.PublicKey.fromBytes(key) catch return .bad_certificate;
+        const signature = Ed25519.Signature.fromBytes(verify[8..][0..64].*);
+        signature.verify(&content, public) catch return .bad_verify;
+        self.transcript.add(verify);
+        self.client_key = key;
+        return .ok;
     }
 
     /// One protected record of `kind` and `content` under the server's current write keys.
@@ -345,6 +471,88 @@ pub const Peer = struct {
         return self.read.open(record);
     }
 };
+
+var request_buffer: [512]u8 = undefined;
+var damage_buffer: [constants.tls_handshake_message_bytes_max + 1]u8 = undefined;
+
+/// A handshake message with its content damaged and its length field made to match: the last
+/// body byte gone, one byte more, one body byte flipped, or no body. `damage / 4 % 4` picks
+/// how. The flip reads its position from `damage / 16` and its mask from `damage / 64` (so the
+/// two overlap in bits); the extra byte is `damage / 16`; the other two read nothing more. The
+/// result is always different from `bytes`.
+fn damage_message(bytes: []const u8, damage: u32) []const u8 {
+    assert(bytes.len >= 4 + 1);
+    assert(bytes.len <= constants.tls_handshake_message_bytes_max);
+    const buffer = &damage_buffer;
+    @memcpy(buffer[0..bytes.len], bytes);
+    var length = bytes.len;
+    switch ((damage / 4) % 4) {
+        0 => length -= 1,
+        1 => {
+            buffer[length] = @truncate(damage / 16);
+            length += 1;
+        },
+        2 => {
+            const flip: u8 = 1 + @as(u8, @truncate(damage / 64)) % 255;
+            buffer[4 + (damage / 16) % (bytes.len - 4)] ^= flip;
+        },
+        else => length = 4,
+    }
+    std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+    return buffer[0..length];
+}
+
+/// CertificateRequest (RFC 8446 section 4.3.2): the context and the extensions the config names.
+fn request_message(auth: *const ClientAuth, damage: u32) []const u8 {
+    const buffer = &request_buffer;
+    var length: usize = 4;
+    buffer[length] = @intCast(auth.context.len);
+    @memcpy(buffer[length + 1 ..][0..auth.context.len], auth.context);
+    length += 1 + auth.context.len;
+    const extensions_at = length;
+    length += 2;
+    length += put_schemes(buffer[length..], 13, auth.schemes);
+    if (auth.cert_schemes) |schemes| length += put_schemes(buffer[length..], 50, schemes);
+    if (auth.authorities) {
+        // One DistinguishedName of three bytes, in a two-byte-length list.
+        const names = [_]u8{ 0, 5, 0, 3, 0x30, 0x01, 0x00 };
+        length += put_extension(buffer[length..], 47, &names);
+    }
+    const extensions_length: u16 = @intCast(length - extensions_at - 2);
+    std.mem.writeInt(u16, buffer[extensions_at..][0..2], extensions_length, .big);
+    buffer[0] = wire.handshake_certificate_request;
+    std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+    if (damage != 0) length = damage_request(buffer, length, extensions_at, damage);
+    return buffer[0..length];
+}
+
+/// Damages a built request, keeping the message header's length true to what follows: a byte
+/// flipped, the body cut short, junk appended, or the extension list's length replaced.
+fn damage_request(buffer: []u8, length_in: usize, extensions_at: usize, damage: u32) usize {
+    var length = length_in;
+    const pick = damage / 4;
+    switch (damage % 4) {
+        0 => buffer[4 + pick % (length - 4)] ^= @as(u8, 1) << @intCast(pick / 64 % 8),
+        1 => length -= 1 + pick % (length - 4),
+        2 => {
+            const extra = 1 + pick % 8;
+            @memset(buffer[length..][0..extra], @truncate(pick));
+            length += extra;
+        },
+        else => std.mem.writeInt(u16, buffer[extensions_at..][0..2], @truncate(pick), .big),
+    }
+    std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+    return length;
+}
+
+fn put_schemes(out: []u8, kind: u16, schemes: []const u16) usize {
+    var data: [64]u8 = undefined;
+    std.mem.writeInt(u16, data[0..2], @intCast(schemes.len * 2), .big);
+    for (schemes, 0..) |scheme, index| {
+        std.mem.writeInt(u16, data[2 + index * 2 ..][0..2], scheme, .big);
+    }
+    return put_extension(out, kind, data[0 .. 2 + schemes.len * 2]);
+}
 
 var certificate_buffer: [constants.tls_handshake_message_bytes_max]u8 = undefined;
 var verify_buffer: [72]u8 = undefined;

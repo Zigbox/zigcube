@@ -1,9 +1,10 @@
 # Certificates and mTLS
 
 This document describes how Zigcube makes and checks its X.509 certificates. The brief is
-[briefs/mtls-client.md](briefs/mtls-client.md). Slices 1 to 3 (X.509, the CA, the key schedule) are built. Slice 4, the
-TLS 1.3 client handshake without client authentication, is in review; slices 5 (client
-authentication) and 6 (the connection) are not started.
+[briefs/mtls-client.md](briefs/mtls-client.md). All eight slices are built: X.509, the CA, the key schedule, the TLS 1.3 client with client
+authentication, the connection, the stock-server interop harness and, in slice 8, the wiring (the
+WASM smoke, `mtls-teeth` in `check`) and this document. The rest of mTLS (the relay's listener,
+issuance in the control plane) is out of scope (brief).
 
 ## Certificates
 
@@ -100,6 +101,12 @@ HelloRetryRequest. The server's chain is checked against the pinned CA (`x509.zi
 the caller connected to; the CertificateVerify and the server's Finished are checked against the
 transcript hash before the message joins it. The handshake reassembly buffer is 8192 bytes.
 
+`tls_conn.zig` is the shell around it (native only): a socket, a `poll` deadline on every read and
+write, a handshake timeout, the wall clock and random from the shell, and a streaming `read`,
+`write`, `flush` and `close`. It adds no diagnostic codes; see
+`docs/decisions/2026-11-05-tls-conn.md`. Its tests run a loopback peer, the server-sent-events
+pattern, a cut at every byte of the server's flight, and a record-limit crossing.
+
 Rules the code holds to, each with a test:
 
 - Keys never change in the middle of a record: bytes left over after the ServerHello, the server's
@@ -108,18 +115,97 @@ Rules the code holds to, each with a test:
   the handshake, and only with the body `01`. The client sends its own before its Finished.
 - A failure queues one alert (sealed if the write keys are live), wipes every secret and buffer,
   and ends the connection: `receive` then answers `error.Closed` and `output()` stays empty.
-- A received KeyUpdate re-keys the receive side; one that asks is answered. The client never starts
-  one by itself (`send_key_update` is for the connection layer).
-- A CertificateRequest is refused: client authentication is slice 5.
+- A received KeyUpdate re-keys the receive side; one that asks is answered. `seal_application`
+  puts a KeyUpdate of its own in front of the record when the write keys have reached their
+  record limit (RFC 8446 section 5.5), in the same slice, so a caller sizes its buffer with
+  `application_bytes_max` and needs no other step. A direction that cannot move on (the key limit
+  or too many KeyUpdates) is ZC-E0815, never a silent stop. `send_key_update` rotates sooner.
+- Client authentication (slice 5). `Config.client_auth` is `.none`, `.optional` or `.required`,
+  the last two carrying the `Identity`: the workload's chain (at most two certificates) and a
+  `Signer` (a callback that signs the CertificateVerify content and may fail). A required
+  connection without an identity cannot be written down. A CertificateRequest is read once,
+  after EncryptedExtensions: its `signature_algorithms` must be present, no extension type may
+  occur twice, and its context (up to 255 bytes) is echoed. `certificate_authorities` is skipped,
+  so a large list of names is fine until the message passes the limit below. The client answers
+  with Certificate, CertificateVerify (context string "TLS 1.3, client CertificateVerify") and
+  Finished, all in one flight after the server's Finished; the client's Finished covers them.
+  If the request lists no Ed25519 (in `signature_algorithms` or `signature_algorithms_cert`), or
+  there is no identity, an optional client sends an empty Certificate; a required one is refused
+  with ZC-E0814. A request after the handshake, or a second one, is ZC-E0813. After the flight,
+  an alert such as `bad_certificate` or `certificate_required` is ZC-E0814, any other alert
+  ZC-E0813. If the signer returns nothing the connection ends with ZC-E0820 and an
+  `internal_error` alert; the Certificate is not sent first.
+- **Message limit.** The client reads a handshake message of at most 4096 bytes
+  (`tls_handshake_message_bytes_max`); a longer one is ZC-E0813 and the cause names the message
+  and its size. A CertificateRequest that lists many `certificate_authorities` can pass it, and a
+  server of that kind is refused; raising the limit is a change to `constants.zig`.
+- **Leniency in the context.** The client Certificate echoes whatever context the request
+  carried, non-empty included. This is a deliberate leniency: RFC 8446 section 4.3.2 says the
+  context SHALL be zero length in a request sent during the handshake, and a strict client
+  would refuse it. The client accepts and echoes it so a peer that sends one still completes
+  (the test peer does); the echo is what section 4.4.2 asks of a response. The server's own
+  Certificate (in the first flight) must have an empty context and a non-empty one is refused.
 
-Tests: `tls_client_test.zig` (success at several piece sizes, refusals, pinning, record faults and
+Tests: `tls_client_test.zig` (client authentication in all piece sizes, refusals, the server's
+alerts, a failing signer (ZC-E0820) and five teeth tests for it; `tls_wire_test.zig`, tables for `parse_certificate_request`; success at several piece sizes, refusals, pinning, record faults and
 six teeth tests, one each for the pin, the name, the validity window, CertificateVerify, Finished
 and the transcript, which fail when that check is skipped), and `tls_fuzz.zig`, a seeded fuzzer
 that damages a server's flight in thirteen ways (alerts, plain and sealed, at record boundaries;
-any record replayed) and feeds it in random pieces. It checks the client's answer at the moment
+any record replayed), damages the CertificateRequest itself in a third of the runs, draws the
+request's scheme lists, feeds it in random pieces, and after an intact flight runs a script of
+data, KeyUpdates, tickets and alerts both ways. It checks the client's answer at the moment
 of `connected`, whatever follows, and has a teeth test of its own. Tidy allows only test roots to
 import `tls_testpeer.zig`. It is replayed like the others (see "Replaying a fuzz
 failure").
+
+## The handshake
+
+```
+idle --start--> wait_server_hello --ServerHello--> wait_encrypted_extensions
+     --EncryptedExtensions--> wait_certificate --Certificate--> wait_certificate_verify
+     --CertificateVerify--> wait_finished --server Finished-->
+     (client flight: [Certificate, CertificateVerify,] Finished) --> connected
+connected --close_notify (either way)--> closed
+any state --refuse / fail_silently--> failed
+```
+
+`CertificateRequest` is optional and read only in `wait_certificate`, where it is a self-edge (the
+state does not change). Any failure, from any state, queues at most one alert, wipes the secrets
+and goes to `failed`, a sink of its own (ZC-E0813 to E0820 as the table below). `closed` is reached
+only through `close_notify`. In `connected`, `KeyUpdate` re-keys one direction, and a key limit is
+ZC-E0815.
+
+## The constants
+
+All are in `src/constants.zig` with their reasons; changing one is a change to that file.
+
+| Constant | Value | Bounds |
+| --- | --- | --- |
+| `x509_cert_bytes_max` | 1024 | a certificate we write or accept |
+| `x509_leaf_ttl_ms_max` / `x509_ca_ttl_ms_max` | 7 days / 10 years | lifetimes |
+| `x509_labels_max`, `_label_key_bytes_max`, `_label_value_bytes_max`, `_labels_bytes_max` | 16, 63, 256, 256 | identity labels |
+| `tls_handshake_message_bytes_max` / `_flight_bytes_max` | 4096 / 8192 | one message / the reassembly buffer |
+| `tls_chain_certificates_max` | 2 | leaf and CA |
+| `tls_request_context_bytes_max` | 255 | the CertificateRequest context |
+| `tls_records_per_key_max` | 2^24 | records before a KeyUpdate is due |
+| `tls_key_updates_per_connection_max` | 2^16 | KeyUpdates in one connection |
+| `tls_handshake_timeout_ms` / `tls_alert_flush_ms` | 10000 / 1000 | handshake deadline / alert send |
+
+## Checks that run where
+
+- `zig build wasm-check` runs `src/mtls_smoke.zig` in the WASM module (`zcube_mtls_smoke`): a CA
+  issues a server and a workload certificate, both verify, a damaged byte, another CA, another
+  name and a time past the window are each refused, and the client writes a ClientHello.
+  `wasm-test` runs every core module's unit tests, the TLS ones included.
+- `zig build mtls-teeth` (in `check`) runs the tests named `teeth:`: each switches one check off
+  (chain signature, name, window, CertificateVerify, Finished, transcript, client-auth rules) and
+  passes only if the matching test then fails.
+- `zig build mtls-interop` (not in `check`; CI job of its own) runs the client against
+  `openssl s_server` and a JDK 21 server. It needs `openssl`, JDK 21 and `setpriv` (util-linux),
+  and fails, not skips, without them
+  (decisions/2026-11-06-interop-needs-setpriv.md). The JVM runs with
+  `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
+  fails the clean-close check.
 
 ## Diagnostics
 
@@ -130,9 +216,11 @@ failure").
 | ZC-E0811 | expired or not yet valid; shows the window, the time now and the skew |
 | ZC-E0812 | names another peer; shows both names |
 | ZC-E0817 | an identity could not be issued |
-| ZC-E0813 | the TLS handshake was refused: a malformed or out-of-order message, a CertificateVerify or Finished that does not verify, a server alert, or a CertificateRequest |
+| ZC-E0813 | the TLS handshake was refused: a malformed or out-of-order message, a CertificateVerify or Finished that does not verify, a server alert, or a CertificateRequest that is malformed or out of order |
+| ZC-E0814 | the client certificate was not asked for though required, could not be answered, or was refused by the server (an empty or absent Certificate answered by a refusal is this too) |
+| ZC-E0820 | the signer holding the client certificate's key did not sign |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
-| ZC-E0816 | the connection ended without close_notify, or before the handshake finished |
+| ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time |
 | ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
 

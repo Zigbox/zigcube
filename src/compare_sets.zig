@@ -17,6 +17,11 @@ pub const set_max: u32 = 10;
 pub const placement_count: u32 = 6;
 pub const release_count: u32 = 2;
 pub const observed_count: u32 = 1;
+/// A run's placement adds the run and its status to a replica's six, less the replica's own
+/// compare: the run and its status stand where the replica stood (B1, docs/briefs/b1.md).
+pub const placement_run_count: u32 = 7;
+/// A run's release adds the status to the release's two.
+pub const release_run_count: u32 = 3;
 
 pub const Set = struct {
     keys: [set_max]records.Key = undefined,
@@ -87,6 +92,50 @@ fn add_replica_facts(set: *Set, replica: ReplicaRead, target: []const u8) void {
     set.add(records.assigned_key(target, replica.replica), 0);
 }
 
+/// A run to place: `/job-runs/<job>` and `/job-status/<job>` read at their revisions. Placing a run
+/// rests on both: a run with a `stop` is never placed (the run moved), and a job whose status is
+/// terminal or gone is never placed (the status moved).
+pub const RunRead = struct {
+    job: []const u8,
+    run: []const u8,
+    run_revision: store.Revision,
+    status_revision: store.Revision,
+};
+
+/// The seven compares of a run's placement: the run, its status, its assignment absent, the node,
+/// its status, its allocation, no finding.
+pub fn placement_run(set: *Set, run: RunRead, target: NodeRead) void {
+    assert(set.count == 0);
+    assert(run.run_revision > 0);
+    assert(run.status_revision > 0);
+    set.add(records.job_run_key(run.job), run.run_revision);
+    set.add(records.job_status_key(run.job), run.status_revision);
+    set.add(records.assigned_key(target.node, run.run), 0);
+    add_node_facts(set, target);
+    assert(set.count == placement_run_count);
+}
+
+/// The three compares of a run's release: the assignment and the allocation as a replica's, and
+/// the job's status at the revision read (0: there is none, the job is gone).
+pub fn release_run(
+    set: *Set,
+    node: []const u8,
+    run: []const u8,
+    job: []const u8,
+    reads: ReleaseRead,
+) void {
+    assert(set.count == 0);
+    release(set, node, run, reads.assigned_revision, reads.allocation_revision);
+    set.add(records.job_status_key(job), reads.status_revision);
+    assert(set.count == release_run_count);
+}
+
+pub const ReleaseRead = struct {
+    assigned_revision: store.Revision,
+    allocation_revision: store.Revision,
+    status_revision: store.Revision,
+};
+
 /// A release on `node`: the assignment at the revision read, and the allocation it is taken from.
 pub fn release(
     set: *Set,
@@ -118,6 +167,27 @@ pub fn move(set: *Set, replica: ReplicaRead, from: Source, to: NodeRead) void {
     assert(set.count == placement_count + release_count);
 }
 
+/// A node's claim of a run: its tenure, the run as read (so a run with a `stop` is never
+/// claimed), the assignment it ran under, and no observation of the run yet, which makes a run
+/// claimed at most once, ever.
+pub fn job_claim(
+    set: *Set,
+    node: []const u8,
+    tenure_revision: store.Revision,
+    job: []const u8,
+    run_revision: store.Revision,
+    assignment: store.Revision,
+) void {
+    assert(run_revision > 0);
+    assert(assignment > 0);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const run = records.job_run_id(&buffer, job);
+    observed_write(set, node, tenure_revision);
+    set.add(records.job_run_key(job), run_revision);
+    set.add(records.assigned_key(node, run), assignment);
+    set.add(records.job_observed_key(node, job), 0);
+}
+
 /// An agent's observed write: its tenure is still current.
 pub fn observed_write(set: *Set, node: []const u8, tenure_revision: store.Revision) void {
     assert(set.count == 0);
@@ -128,6 +198,9 @@ pub fn observed_write(set: *Set, node: []const u8, tenure_revision: store.Revisi
 
 comptime {
     assert(placement_count + release_count <= set_max);
+    assert(placement_run_count + release_count <= set_max);
+    assert(placement_run_count == placement_count + 1);
+    assert(release_run_count == release_count + 1);
     assert(set_max <= constants.store_txn_compares_max);
 }
 
@@ -187,4 +260,41 @@ test "a move, a release and an observed write have the counts of authority.md" {
     try testing.expectEqual(@as(usize, 1), only.len);
     try testing.expectEqualStrings("/nodes/n1", only[0].key);
     try testing.expectEqual(@as(store.Revision, 3), only[0].mod_revision);
+}
+
+test "a run's placement and release add the run and the status" {
+    var placed: Set = .{};
+    const run: RunRead = .{
+        .job = "train",
+        .run = "train-job",
+        .run_revision = 11,
+        .status_revision = 12,
+    };
+    placement_run(&placed, run, node_read);
+    const compares = placed.compares();
+    try testing.expectEqual(@as(usize, 7), compares.len);
+    const expected = [_]store.Compare{
+        .{ .key = "/job-runs/train", .mod_revision = 11 },
+        .{ .key = "/job-status/train", .mod_revision = 12 },
+        .{ .key = "/assigned/n1/train-job", .mod_revision = 0 },
+        .{ .key = "/nodes/n1", .mod_revision = 3 },
+        .{ .key = "/node-status/n1", .mod_revision = 4 },
+        .{ .key = "/allocations/n1", .mod_revision = 5 },
+        .{ .key = "/audit/allocations/n1", .mod_revision = 0 },
+    };
+    for (expected, compares) |want, got| {
+        try testing.expectEqualStrings(want.key, got.key);
+        try testing.expectEqual(want.mod_revision, got.mod_revision);
+    }
+    var released: Set = .{};
+    const reads: ReleaseRead = .{
+        .assigned_revision = 9,
+        .allocation_revision = 8,
+        .status_revision = 0,
+    };
+    release_run(&released, "n1", "train-job", "train", reads);
+    const freed = released.compares();
+    try testing.expectEqual(@as(usize, 3), freed.len);
+    try testing.expectEqualStrings("/job-status/train", freed[2].key);
+    try testing.expectEqual(@as(store.Revision, 0), freed[2].mod_revision);
 }

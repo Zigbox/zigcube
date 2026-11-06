@@ -368,11 +368,23 @@ pub fn fetch(
     );
     defer allocator.free(got.chunks);
     report.chunks = @intCast(got.chunks.len);
-    try fetch_chunks(allocator, transport, images, got.chunks, peers, config, deadline, report);
-    if (!images.claims_complete()) return error.ChunkFailed;
+    const args = .{ allocator, transport, images, got.chunks, peers, config, deadline, report };
+    @call(.auto, fetch_chunks, args) catch |err| {
+        transport.phase_fn(transport.context, .chunks_failed, 0, 0, @errorName(err));
+        return err;
+    };
+    transport.phase_fn(transport.context, .chunks_done, 0, 0, "");
+    if (!images.claims_complete()) {
+        transport.phase_fn(transport.context, .chunks_missing, 0, 0, "");
+        return error.ChunkFailed;
+    }
     _ = images.import_image(got.record, tree, expected_manifest) catch |err| switch (err) {
-        error.StoreFailed => return error.Store,
+        error.StoreFailed => {
+            transport.phase_fn(transport.context, .import_failed, 0, 0, "StoreFailed");
+            return error.Store;
+        },
         error.Refused => {
+            transport.phase_fn(transport.context, .import_failed, 0, 0, @tagName(images.refusal.?));
             // A record that is not one, or names another tree, is the peer's wrong bytes.
             if (record_fault(images.refusal.?)) {
                 report.bad_bundles += 1;
@@ -382,6 +394,7 @@ pub fn fetch(
             return error.Refused;
         },
     };
+    transport.phase_fn(transport.context, .imported, 0, 0, "");
 }
 
 /// Whether a refusal of a peer's record is that record's own fault, not this store's.
@@ -468,6 +481,7 @@ fn fetch_chunks(
         return error.OutOfMemory;
     report.already_held = inner.already_held;
     report.cached_bytes = inner.cached_bytes;
+    transport.phase_fn(transport.context, .bundle_found, @intCast(chunks.len), needed, "");
     if (needed == 0) return;
     const states = try allocator.alloc(fetch_plan.ChunkState, needed);
     defer allocator.free(states);
@@ -578,6 +592,15 @@ const Rig = struct {
     bad: u32 = 0,
     chunks_served: u32 = 0,
     garbage: [constants.swarm_chunk_bytes]u8 = undefined,
+    /// The phases `fetch` announced, in order.
+    phases: [8]fetch_worker.Phase = undefined,
+    phases_count: u32 = 0,
+
+    fn phase(context: *anyopaque, which: fetch_worker.Phase, _: u32, _: u32, _: []const u8) void {
+        const rig = self(context);
+        rig.phases[rig.phases_count] = which;
+        rig.phases_count += 1;
+    }
 
     fn self(context: *anyopaque) *Rig {
         return @ptrCast(@alignCast(context));
@@ -642,6 +665,7 @@ const Rig = struct {
             .blame_fn = blame,
             .bad_list_fn = bad_list,
             .bundle_fn = bundle,
+            .phase_fn = phase,
         };
     }
 };
@@ -796,6 +820,12 @@ test "zigbox fetch: a tree comes from a peer by bundle and chunks, and is rooted
     try testing.expect(report.peer_bytes[0] > 0);
     try testing.expectEqual(@as(u64, 0), report.cached_bytes);
     try testing.expectEqual(@as(u64, 0), report.struck_peers);
+    const Phase = fetch_worker.Phase;
+    try testing.expectEqualSlices(
+        Phase,
+        &.{ .bundle_found, .chunks_done, .imported },
+        rig.phases[0..rig.phases_count],
+    );
     var listing: [8]zigbox.store.roots.Root = undefined;
     var names: [constants.zigbox_roots_arena_bytes]u8 = undefined;
     const rooted = try zigbox.store.roots.list(&pair.b, &names, &listing);
@@ -854,6 +884,10 @@ test "zigbox fetch: a peer that corrupts chunks fails the fetch and nothing is r
     try testing.expect(report.blamed > 0);
     try testing.expectEqual(@as(u64, 1), report.struck_peers);
     try testing.expectEqual(@as(u64, 0), report.peer_bytes[0]);
+    // The log names where it ended: the chunk phase, never the import.
+    const Phase = fetch_worker.Phase;
+    const seen = rig.phases[0..rig.phases_count];
+    try testing.expectEqualSlices(Phase, &.{ .bundle_found, .chunks_failed }, seen);
 }
 
 test "zigbox fetch: a bundle whose first tree is not the tree asked for is a bad bundle" {

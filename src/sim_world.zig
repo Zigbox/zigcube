@@ -58,6 +58,9 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
+    /// test-only, null in every simulation.
+    down_get_prefix: ?[]const u8 = null,
     calls: u32 = 0,
 
     const vtable: store.Store.VTable = .{
@@ -118,6 +121,14 @@ pub const SwitchedStore = struct {
     ) store.Error!store.GetResult {
         const self = from(context);
         try self.gate(diag);
+        if (self.down_get_prefix) |prefix| {
+            if (std.mem.startsWith(u8, key, prefix)) {
+                diag.raise(.E0201);
+                diag.cause("connection refused", .{});
+                diag.fix(.{ .sentence = "switch it back on" });
+                return error.BackendFailed;
+            }
+        }
         return self.inner.get(arena, key, at_revision, diag);
     }
 
@@ -258,6 +269,8 @@ pub const World = struct {
     /// A runtime the agent uses instead of `sim` (a test's wrapper that watches the specs it is
     /// given and passes them on to `sim.interface()`); null in every simulation.
     runtime_override: ?runtime_mod.Runtime = null,
+    /// The agent's files as a wrapper of `files` that injects failures; null in every simulation.
+    state_override: ?agent_state.AgentState = null,
     /// The agent's image store, for the summary it writes; null in every simulation but a test's.
     images: ?@import("node_store.zig").Images = null,
     server: control_plane.ControlPlane,
@@ -316,6 +329,7 @@ pub const World = struct {
         world.last_failure = null;
         world.boot_id = "";
         world.runtime_override = null;
+        world.state_override = null;
         world.images = null;
         return world;
     }
@@ -391,7 +405,7 @@ pub const World = struct {
             .arena = world.fresh_arena(),
             .diag = &world.diag,
             .images = world.images,
-            .state = world.files.interface(),
+            .state = world.state_override orelse world.files.interface(),
             .boot_id = world.boot_id,
         };
         world.stats.agent_steps += 1;

@@ -46,13 +46,13 @@ pub const actor = "scheduler";
 /// was missed, not a polling loop: a pass that finds nothing to do writes nothing.
 pub const resync_ms: u64 = 30 * 1000;
 /// Replicas whose hold the scheduler remembers, so a hold is written once per change in its
-/// reason. A restart forgets them and writes each hold once more. One slot for every replica
-/// there can be: with fewer, a pass over more held replicas than slots would miss every time,
-/// rewrite every hold and never converge.
-pub const hold_memory_max: u32 = constants.replicas_max;
+/// reason. A restart forgets them and writes each hold once more. One slot for every replica and
+/// every run there can be: with fewer, a pass over more held subjects than slots would miss every
+/// time, rewrite every hold and never converge.
+pub const hold_memory_max: u32 = constants.replicas_max + constants.jobs_max;
 
 comptime {
-    assert(hold_memory_max >= constants.replicas_max);
+    assert(hold_memory_max >= constants.replicas_max + constants.jobs_max);
     // The largest compare set and the summary compare of the one decision in the transaction.
     const compares = compare_sets.set_max + controller.decision_compares;
     assert(compares <= constants.store_txn_compares_max);
@@ -66,6 +66,8 @@ pub const watch_prefixes = [_][]const u8{
     records.prefix_node_status,
     records.prefix_allocations,
     records.prefix_audit_allocations,
+    records.prefix_job_runs,
+    records.prefix_job_status,
 };
 
 /// What the scheduler resolves a replica to need: its limits, else the default.
@@ -73,6 +75,14 @@ pub fn requests_of(replica: *const records.Replica) Requests {
     return .{
         .cpu_millis = replica.limits.cpu_millis orelse constants.request_default_cpu_millis,
         .memory_bytes = replica.limits.memory_bytes orelse constants.request_default_memory_bytes,
+    };
+}
+
+/// What the scheduler resolves a run to need: its limits, else the default.
+pub fn run_requests_of(run: *const records.JobRun) Requests {
+    return .{
+        .cpu_millis = run.limits.cpu_millis orelse constants.request_default_cpu_millis,
+        .memory_bytes = run.limits.memory_bytes orelse constants.request_default_memory_bytes,
     };
 }
 
@@ -100,6 +110,10 @@ pub const Reason = enum {
     unknown_replica,
     /// A move of a replica that is not assigned to any node.
     not_assigned,
+    /// The node already holds `jobs_per_node_max` runs (a run waits `pending`, ZC-W0308).
+    jobs_full,
+    /// The node already holds `runtime_handles_max` assignments in all.
+    handles_full,
     /// A move to the node the replica is already on.
     same_node,
 };
@@ -122,6 +136,8 @@ const NodeView = struct {
     alloc_node_revision: u64,
     allocated: Requests,
     count: u32,
+    /// Of `count`, the assignments that are runs (`<job>-job`), counted from `/assigned/`.
+    jobs: u32,
     /// The `/node-store/<node>` the pass read: its revision (0 if the node has none) and the
     /// trees it advertises. Advisory evidence; never compared (authority.md section 2).
     store_revision: Revision,
@@ -146,6 +162,8 @@ const Assign = struct {
     requests: Requests,
     revision: Revision,
     live: bool,
+    /// A run: its `replica` is the run id and `service` is empty.
+    job: bool = false,
 };
 
 /// Everything a pass reads, at one revision, and kept current as the pass commits.
@@ -158,8 +176,17 @@ pub const World = struct {
     assigned_by: std.StringHashMapUnmanaged(u32),
     /// Replica id -> index in `replicas`.
     desired: std.StringHashMapUnmanaged(u32),
+    /// `/job-status/`, every retained job's, at the world's revision.
+    job_statuses: []const Entry(records.JobStatus) = &.{},
+    /// Job name -> index in `job_statuses`.
+    job_index: std.StringHashMapUnmanaged(u32) = .empty,
     /// `/node-store/` records the read left out because they did not decode or were newer.
     summaries_skipped: u32 = 0,
+
+    fn job_status(world: *const World, job: []const u8) ?*const Entry(records.JobStatus) {
+        const index = world.job_index.get(job) orelse return null;
+        return &world.job_statuses[index];
+    }
 
     fn node_index(world: *const World, name: []const u8) ?u32 {
         for (world.nodes, 0..) |view, index| {
@@ -183,7 +210,14 @@ pub fn read_world(ctx: *const Context) Error!World {
     const list = controller.list_all;
     const replicas = try list(rec.Replica, ctx, rec.prefix_replicas, null, con.replicas_max);
     const at = replicas.revision;
-    const assigned = try list(rec.Assigned, ctx, rec.prefix_assigned, at, con.replicas_max);
+    const assigned = try list(rec.Assigned, ctx, rec.prefix_assigned, at, con.assigned_max);
+    const job_statuses = try list(
+        rec.JobStatus,
+        ctx,
+        rec.prefix_job_status,
+        at,
+        con.job_admitted_window_max,
+    );
     const nodes = try list(rec.Node, ctx, rec.prefix_nodes, at, con.nodes_max);
     const statuses = try list(rec.NodeStatus, ctx, rec.prefix_node_status, at, con.nodes_max);
     const allocations = try list(rec.Allocation, ctx, rec.prefix_allocations, at, con.nodes_max);
@@ -213,7 +247,9 @@ pub fn read_world(ctx: *const Context) Error!World {
         .desired = .empty,
         .summaries_skipped = summaries_skipped,
     };
+    world.job_statuses = job_statuses.items;
     try index_replicas(ctx, &world);
+    try index_jobs(ctx, &world);
     try index_assigned(ctx, &world, assigned.items);
     return world;
 }
@@ -308,6 +344,7 @@ fn view_of(
             .memory_bytes = 0,
         },
         .count = if (alloc) |found| found.rec.count else 0,
+        .jobs = 0,
         .store_revision = if (summary) |found| found.kv.mod_revision else 0,
         .held = if (summary) |found| try decode_held(ctx, found.rec.trees) else &.{},
     };
@@ -335,6 +372,14 @@ fn index_replicas(ctx: *const Context, world: *World) Error!void {
     }
 }
 
+fn index_jobs(ctx: *const Context, world: *World) Error!void {
+    for (world.job_statuses, 0..) |*status, index| {
+        const name = status.kv.key[records.prefix_job_status.len..];
+        world.job_index.put(ctx.arena, name, @intCast(index)) catch
+            return failures.no_memory(ctx.diag);
+    }
+}
+
 fn index_assigned(
     ctx: *const Context,
     world: *World,
@@ -352,7 +397,9 @@ fn index_assigned(
             .requests = entry.rec.requests,
             .revision = entry.kv.mod_revision,
             .live = true,
+            .job = entry.rec.job != null,
         });
+        if (entry.rec.job != null and node != no_node) world.nodes[node].jobs += 1;
     }
 }
 
@@ -367,7 +414,7 @@ fn add_assign(ctx: *const Context, world: *World, assign: Assign) Error!void {
 
 /// Whether `view` can take a replica needing `need`, and if not, why. The order is the order a
 /// reader fixes first: readiness, then findings, then capacity.
-fn judge(view: *const NodeView, need: Requests) Verdict {
+fn judge(view: *const NodeView, need: Requests, is_run: bool) Verdict {
     const status = view.status orelse return .{ .reason = .no_status };
     switch (status.state) {
         .lost => return .{ .reason = .lost },
@@ -376,6 +423,8 @@ fn judge(view: *const NodeView, need: Requests) Verdict {
     }
     if (status.tenure != view.node.kv.mod_revision) return .{ .reason = .older_tenure };
     if (view.audit_open) return .{ .reason = .audit_open };
+    if (view.count >= constants.runtime_handles_max) return .{ .reason = .handles_full };
+    if (is_run and view.jobs >= constants.jobs_per_node_max) return .{ .reason = .jobs_full };
     const capacity = view.node.rec.capacity;
     if (view.allocated.cpu_millis > capacity.cpu_millis) return .{ .reason = .over_capacity };
     if (view.allocated.memory_bytes > capacity.memory_bytes) return .{ .reason = .over_capacity };
@@ -519,6 +568,33 @@ fn choose(
 
 const Hold = struct { replica: u64, evidence: u64 };
 
+/// What a hold is about: a replica, or a run (whose status is compared too).
+const Held = struct {
+    kind: records.SubjectKind,
+    /// The replica id or run id: the key of the hold memory.
+    id: []const u8,
+    /// The decision's subject name when it is not `id` (a job's name, not its run id).
+    name: ?[]const u8 = null,
+    key: []const u8,
+    revision: Revision,
+    status_key: ?[]const u8 = null,
+    status_revision: Revision = 0,
+};
+
+/// The run a placement is for, as read.
+const RunTarget = struct {
+    job: []const u8,
+    run_id: []const u8,
+    run_kv: store.KeyValue,
+    status: *const Entry(records.JobStatus),
+};
+
+/// A member of a node's assignments, as the world records it.
+const Member = struct { id: []const u8, service: []const u8, job: bool = false };
+
+/// The words of a placement reason that differ between a replica and a run.
+const PlaceWords = struct { note: []const u8, group: []const u8 };
+
 const Pass = struct {
     txns_left: u32 = constants.controller_txns_per_step_max,
     acted: u32 = 0,
@@ -550,6 +626,16 @@ const Pass = struct {
     }
 };
 
+/// What a release is: the decision's action and subject, and for a run the revision of the job's
+/// status that was read (0: there is none), which the release compares.
+const ReleaseAs = struct {
+    action: []const u8,
+    subject: records.Subject,
+    status_revision: ?Revision = null,
+};
+
+const ReleaseWhy = struct { cause: records.Cause, reason: []const u8 };
+
 pub const Scheduler = struct {
     source: controller.DecisionSource,
     holds: [hold_memory_max]Hold = @splat(.{ .replica = 0, .evidence = 0 }),
@@ -569,7 +655,7 @@ pub const Scheduler = struct {
     /// A pass over a world already read: releases first (they free capacity), then places.
     pub fn reconcile_world(sc: *Scheduler, ctx: *const Context, world: *World) Error!Wakeup {
         var pass: Pass = .{};
-        sc.sweep_holds(world);
+        try sc.sweep_holds(ctx, world);
         var index: u32 = 0;
         while (index < world.assigns.items.len and !pass.stopped) : (index += 1) {
             try sc.release_one(ctx, world, &pass, index);
@@ -577,6 +663,10 @@ pub const Scheduler = struct {
         for (0..world.replicas.len) |replica| {
             if (pass.stopped) break;
             try sc.place_one(ctx, world, &pass, @intCast(replica));
+        }
+        for (0..world.job_statuses.len) |status| {
+            if (pass.stopped) break;
+            try sc.place_run(ctx, world, &pass, @intCast(status));
         }
         const now = ctx.clock.now_ms();
         const wake_at = if (pass.more) now else now + resync_ms;
@@ -593,7 +683,9 @@ pub const Scheduler = struct {
         index: u32,
     ) Error!void {
         const assign = world.assigns.items[index];
-        if (!assign.live or world.desired.contains(assign.replica)) return;
+        if (!assign.live) return;
+        if (assign.job) return sc.release_run(ctx, world, pass, index);
+        if (world.desired.contains(assign.replica)) return;
         if (assign.node == no_node) return; // No record names the node: nothing to release from.
         const view = &world.nodes[assign.node];
         if (view.alloc_revision == 0) return; // Unaccounted: the auditor's finding, not ours.
@@ -617,7 +709,67 @@ pub const Scheduler = struct {
             mib_of(assign.requests.memory_bytes),
             view.node.rec.name,
         });
-        try sc.commit_release(ctx, world, pass, index, cause, reason);
+        const as: ReleaseAs = .{
+            .action = "release_replica",
+            .subject = .{ .kind = .replica, .name = assign.replica },
+        };
+        try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
+    }
+
+    /// Releases a run whose job is over (its status terminal) or gone (no `/jobs/<name>` and no
+    /// status): the job controller's terminal status is what frees the node, and retention's
+    /// delete of the job is what frees a node whose run was never ended. A run whose job still
+    /// has a non-terminal status keeps its node, gone job or not, and so does a run whose job is
+    /// live with its run and status missing: that is the job controller's contradiction hold, and
+    /// nothing about the workload changes.
+    fn release_run(
+        sc: *Scheduler,
+        ctx: *const Context,
+        world: *World,
+        pass: *Pass,
+        index: u32,
+    ) Error!void {
+        const assign = world.assigns.items[index];
+        const job = records.job_of_run(assign.replica) orelse return;
+        const status = world.job_status(job);
+        if (status) |found| {
+            if (!records.job_state_terminal(found.rec.state)) return;
+        } else if (try Scheduler.job_record_exists(ctx, world, job)) {
+            // A live job without a status is the job controller's contradiction (ZC-E0307):
+            // its workload may be live, and nothing about it changes.
+            return;
+        }
+        if (assign.node == no_node) return;
+        const view = &world.nodes[assign.node];
+        if (view.alloc_revision == 0) return;
+        if (subtract(view, assign.requests) == null) return;
+        if (!pass.budget()) return;
+        var cause: records.Cause = .{ .kind = .resync };
+        if (status) |found| {
+            const text = found.rec.decision orelse "";
+            if (text.len == records.decision_id_bytes) cause = .{ .kind = .decision, .id = text };
+        }
+        const why = if (status == null) "its job is gone" else "its job has ended";
+        const fmt = "run {s} is over ({s}); its {d}m CPU and {d} MiB on {s} are released";
+        const reason = try controller.format(ctx, fmt, .{
+            assign.replica,
+            why,
+            assign.requests.cpu_millis,
+            mib_of(assign.requests.memory_bytes),
+            view.node.rec.name,
+        });
+        const as: ReleaseAs = .{
+            .action = "release_run",
+            .subject = .{ .kind = .job, .name = job },
+            .status_revision = if (status) |found| found.kv.mod_revision else 0,
+        };
+        try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
+    }
+
+    fn job_record_exists(ctx: *const Context, world: *const World, job: []const u8) Error!bool {
+        const key = records.job_key(job);
+        const got = try ctx.store.get(ctx.arena, key.slice(), world.revision, ctx.diag);
+        return got.kv != null;
     }
 
     /// Releases assignment `index`: its decision, the assignment deleted and the allocation
@@ -628,8 +780,8 @@ pub const Scheduler = struct {
         world: *World,
         pass: *Pass,
         index: u32,
-        cause: records.Cause,
-        reason: []const u8,
+        as: ReleaseAs,
+        why: ReleaseWhy,
     ) Error!void {
         const assign = world.assigns.items[index];
         const view = &world.nodes[assign.node];
@@ -637,14 +789,24 @@ pub const Scheduler = struct {
         const name = view.node.rec.name;
         var batch: Batch = .{};
         var set: compare_sets.Set = .{};
-        compare_sets.release(&set, name, assign.replica, assign.revision, view.alloc_revision);
+        if (as.status_revision) |status_revision| {
+            const reads: compare_sets.ReleaseRead = .{
+                .assigned_revision = assign.revision,
+                .allocation_revision = view.alloc_revision,
+                .status_revision = status_revision,
+            };
+            compare_sets.release_run(&set, name, assign.replica, as.subject.name, reads);
+        } else {
+            const alloc = view.alloc_revision;
+            compare_sets.release(&set, name, assign.replica, assign.revision, alloc);
+        }
         expect_all(&batch, &set);
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
-            .action = "release_replica",
-            .subject = .{ .kind = .replica, .name = assign.replica },
-            .reason = reason,
-            .cause = cause,
+            .action = as.action,
+            .subject = as.subject,
+            .reason = why.reason,
+            .cause = why.cause,
         }, &batch);
         batch.delete(assign.key);
         try put_allocation(ctx, &batch, name, after, view.count - 1, view.alloc_node_revision);
@@ -666,9 +828,15 @@ pub const Scheduler = struct {
         const need = requests_of(&replica.rec);
         var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];
-        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need);
+        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need, false);
         const chosen = choose(world, replica.rec.service, replica.rec.image, judged) orelse {
-            return sc.hold(ctx, world, pass, replica, judged);
+            const subject: Held = .{
+                .kind = .replica,
+                .id = replica.rec.id,
+                .key = replica.kv.key,
+                .revision = replica.kv.mod_revision,
+            };
+            return sc.hold(ctx, world, pass, subject, need, judged);
         };
         if (!pass.budget()) return;
         const view = &world.nodes[chosen.index];
@@ -677,7 +845,13 @@ pub const Scheduler = struct {
         var set: compare_sets.Set = .{};
         compare_sets.placement(&set, replica_read(replica), node_read(view));
         expect_placement(&batch, &set);
-        const reason = try place_reason(ctx, world, replica, chosen, need);
+        const defaulted = replica.rec.limits.cpu_millis == null or
+            replica.rec.limits.memory_bytes == null;
+        const words: PlaceWords = .{
+            .note = if (defaulted) " (a default: the service sets no limits)" else "",
+            .group = "replicas of this service",
+        };
+        const reason = try place_reason(ctx, world, words, chosen, need);
         const evidence: Placed = .{
             .locality_bytes = chosen.locality_bytes,
             .store_revision = chosen.store_revision,
@@ -695,8 +869,113 @@ pub const Scheduler = struct {
         const after = add(view.allocated, need);
         try put_allocation(ctx, &batch, name, after, view.count + 1, view.node.kv.mod_revision);
         const revision = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
-        try adopt_assign(ctx, world, chosen.index, key, replica, need, after, revision);
+        const member: Member = .{ .id = replica.rec.id, .service = replica.rec.service };
+        try adopt_assign(ctx, world, chosen.index, key, member, need, after, revision);
         sc.forget_hold(replica.rec.id);
+    }
+
+    /// Places the run of a job whose status is not terminal and which no node holds. The run is
+    /// read at the world's revision and compared with the status: a run stopped since, or a job
+    /// that ended since, fails the transaction and the next pass looks again.
+    fn place_run(
+        sc: *Scheduler,
+        ctx: *const Context,
+        world: *World,
+        pass: *Pass,
+        status_index: u32,
+    ) Error!void {
+        const status = &world.job_statuses[status_index];
+        if (records.job_state_terminal(status.rec.state)) return;
+        const job = status.kv.key[records.prefix_job_status.len..];
+        if (records.name_problem(job, constants.service_name_bytes_max) != null) return;
+        var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const run_id = ctx.arena.dupe(u8, records.job_run_id(&buffer, job)) catch
+            return failures.no_memory(ctx.diag);
+        if (world.assigned_by.contains(run_id)) return;
+        const run_at = records.job_run_key(job);
+        const got = try ctx.store.get(ctx.arena, run_at.slice(), world.revision, ctx.diag);
+        // The job controller writes the run and its status together: a status alone is its
+        // contradiction to report (ZC-E0307), not a run to place.
+        const run_kv = got.kv orelse return;
+        const run = try records.read(records.JobRun, ctx.arena, run_kv, ctx.diag);
+        if (run.stop != null) return;
+        const need = run_requests_of(&run);
+        var verdicts: [views_max]Verdict = undefined;
+        const judged = verdicts[0..world.nodes.len];
+        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need, true);
+        const chosen = choose(world, "", run.image, judged) orelse {
+            const subject: Held = .{
+                .kind = .job,
+                .id = run_id,
+                .name = job,
+                .key = run_kv.key,
+                .revision = run_kv.mod_revision,
+                .status_key = status.kv.key,
+                .status_revision = status.kv.mod_revision,
+            };
+            return sc.hold(ctx, world, pass, subject, need, judged);
+        };
+        if (!pass.budget()) return;
+        const target: RunTarget = .{
+            .job = job,
+            .run_id = run_id,
+            .run_kv = run_kv,
+            .status = status,
+        };
+        try sc.commit_run_placement(ctx, world, pass, target, run, chosen);
+    }
+
+    fn commit_run_placement(
+        sc: *Scheduler,
+        ctx: *const Context,
+        world: *World,
+        pass: *Pass,
+        target: RunTarget,
+        run: records.JobRun,
+        chosen: Chosen,
+    ) Error!void {
+        const job = target.job;
+        const run_id = target.run_id;
+        const run_kv = target.run_kv;
+        const status = target.status;
+        const need = run_requests_of(&run);
+        const view = &world.nodes[chosen.index];
+        const name = view.node.rec.name;
+        var batch: Batch = .{};
+        var set: compare_sets.Set = .{};
+        const read: compare_sets.RunRead = .{
+            .job = job,
+            .run = run_id,
+            .run_revision = run_kv.mod_revision,
+            .status_revision = status.kv.mod_revision,
+        };
+        compare_sets.placement_run(&set, read, node_read(view));
+        expect_placement(&batch, &set);
+        const defaulted = run.limits.cpu_millis == null or run.limits.memory_bytes == null;
+        const words: PlaceWords = .{
+            .note = if (defaulted) " (a default: the job sets no limits)" else "",
+            .group = "runs",
+        };
+        const reason = try place_reason(ctx, world, words, chosen, need);
+        _ = try controller.put_decision(ctx, &sc.source, .{
+            .actor = actor,
+            .action = "place_run",
+            .subject = .{ .kind = .job, .name = job },
+            .reason = reason,
+            .cause = .{ .kind = .desired, .key = run_kv.key, .revision = run_kv.mod_revision },
+            .locality_bytes = chosen.locality_bytes,
+            .node_store_revision = chosen.store_revision,
+            .read_revision = world.revision,
+        }, &batch);
+        const key = try assign_key(ctx, name, run_id);
+        const value = records.assigned_run(run_id, job, need, reason);
+        batch.put(key, try records.encode(ctx.arena, value, ctx.diag));
+        const after = add(view.allocated, need);
+        try put_allocation(ctx, &batch, name, after, view.count + 1, view.node.kv.mod_revision);
+        const revision = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
+        const member: Member = .{ .id = run_id, .service = "", .job = true };
+        try adopt_assign(ctx, world, chosen.index, key, member, need, after, revision);
+        sc.forget_hold(run_id);
     }
 
     /// The decision of a placement: caused by the replica's creation if it can be found, else by
@@ -741,34 +1020,31 @@ pub const Scheduler = struct {
         ctx: *const Context,
         world: *const World,
         pass: *Pass,
-        replica: *const Entry(records.Replica),
+        subject: Held,
+        need: Requests,
         verdicts: []const Verdict,
     ) Error!void {
-        const need = requests_of(&replica.rec);
         const shape_hash = shape_of(world, need, verdicts);
-        const slot = sc.hold_slot(replica.rec.id);
-        if (sc.holds[slot].replica == hold_key(replica.rec.id)) {
+        const slot = sc.hold_slot(subject.id);
+        if (sc.holds[slot].replica == hold_key(subject.id)) {
             if (sc.holds[slot].evidence == shape_hash) return;
         }
         if (!pass.budget()) return;
         var batch: Batch = .{};
-        batch.expect(replica.kv.key, replica.kv.mod_revision);
+        batch.expect(subject.key, subject.revision);
+        if (subject.status_key) |status_key| batch.expect(status_key, subject.status_revision);
         const evidence = try evidence_of(ctx, world, need, verdicts);
         const reason = try hold_reason(ctx, world, need, verdicts);
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
             .action = "hold_pending",
-            .subject = .{ .kind = .replica, .name = replica.rec.id },
+            .subject = .{ .kind = subject.kind, .name = subject.name orelse subject.id },
             .reason = reason,
-            .cause = .{
-                .kind = .desired,
-                .key = replica.kv.key,
-                .revision = replica.kv.mod_revision,
-            },
+            .cause = .{ .kind = .desired, .key = subject.key, .revision = subject.revision },
             .cause_evidence = .{ .text = evidence },
         }, &batch);
         _ = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
-        sc.holds[slot] = .{ .replica = hold_key(replica.rec.id), .evidence = shape_hash };
+        sc.holds[slot] = .{ .replica = hold_key(subject.id), .evidence = shape_hash };
     }
 
     fn hold_key(replica: []const u8) u64 {
@@ -789,15 +1065,28 @@ pub const Scheduler = struct {
         return index;
     }
 
-    /// Forgets the holds of replicas that are gone, so the memory never holds more than the
-    /// replicas there are and `hold_slot` always finds a slot without evicting a live one.
-    fn sweep_holds(sc: *Scheduler, world: *const World) void {
+    /// Forgets the holds of replicas and runs that are gone, so the memory never holds more than
+    /// the subjects there are and `hold_slot` always finds a slot without evicting a live one.
+    fn sweep_holds(sc: *Scheduler, ctx: *const Context, world: *const World) Error!void {
+        var any = false;
+        for (sc.holds) |held| any = any or held.replica != 0;
+        if (!any) return;
+        var live: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (world.replicas) |replica| {
+            live.put(ctx.arena, hold_key(replica.rec.id), {}) catch
+                return failures.no_memory(ctx.diag);
+        }
+        for (world.job_statuses) |status| {
+            if (records.job_state_terminal(status.rec.state)) continue;
+            const job = status.kv.key[records.prefix_job_status.len..];
+            if (records.name_problem(job, constants.service_name_bytes_max) != null) continue;
+            var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+            live.put(ctx.arena, hold_key(records.job_run_id(&buffer, job)), {}) catch
+                return failures.no_memory(ctx.diag);
+        }
         for (&sc.holds) |*held| {
-            if (held.replica == 0) continue;
-            const live = for (world.replicas) |replica| {
-                if (hold_key(replica.rec.id) == held.replica) break true;
-            } else false;
-            if (!live) held.* = .{ .replica = 0, .evidence = 0 };
+            if (held.replica == 0 or live.contains(held.replica)) continue;
+            held.* = .{ .replica = 0, .evidence = 0 };
         }
     }
 
@@ -834,7 +1123,7 @@ pub const Scheduler = struct {
         if (from.node == to_node) return .{ .refused = .{ .reason = .same_node } };
         const need = from.requests;
         const target = &world.nodes[to_node];
-        const verdict = judge(target, need);
+        const verdict = judge(target, need, false);
         if (verdict.reason != .fits) return .{ .refused = verdict };
         if (from.node == no_node) return .{ .refused = .{ .reason = .unaccounted } };
         const source = &world.nodes[from.node];
@@ -871,7 +1160,8 @@ pub const Scheduler = struct {
             .applied => |revision| revision,
         };
         forget_assign(world, from_index, source_after, revision);
-        try adopt_assign(ctx, world, to_node, key, replica, need, target_after, revision);
+        const member: Member = .{ .id = replica.rec.id, .service = replica.rec.service };
+        try adopt_assign(ctx, world, to_node, key, member, need, target_after, revision);
         return .moved;
     }
 };
@@ -951,6 +1241,7 @@ fn forget_assign(world: *World, index: u32, allocated: Requests, revision: Revis
     assert(assign.live);
     const view = &world.nodes[assign.node];
     world_note(view, allocated, view.count - 1, revision);
+    if (assign.job) view.jobs -= 1;
     assign.live = false;
     _ = world.assigned_by.remove(assign.replica);
 }
@@ -960,7 +1251,7 @@ fn adopt_assign(
     world: *World,
     node: u32,
     key: []const u8,
-    replica: *const Entry(records.Replica),
+    member: Member,
     need: Requests,
     allocated: Requests,
     revision: Revision,
@@ -968,14 +1259,16 @@ fn adopt_assign(
     const view = &world.nodes[node];
     world_note(view, allocated, view.count + 1, revision);
     view.alloc_node_revision = view.node.kv.mod_revision;
+    if (member.job) view.jobs += 1;
     try add_assign(ctx, world, .{
         .key = key,
         .node = node,
-        .replica = replica.rec.id,
-        .service = replica.rec.service,
+        .replica = member.id,
+        .service = member.service,
         .requests = need,
         .revision = revision,
         .live = true,
+        .job = member.job,
     });
 }
 
@@ -1056,21 +1349,19 @@ fn size_words(ctx: *const Context, bytes: u64) Error![]const u8 {
 fn place_reason(
     ctx: *const Context,
     world: *const World,
-    replica: *const Entry(records.Replica),
+    words: PlaceWords,
     chosen: Chosen,
     need: Requests,
 ) Error![]const u8 {
     const name = world.nodes[chosen.index].node.rec.name;
-    const defaulted = replica.rec.limits.cpu_millis == null or
-        replica.rec.limits.memory_bytes == null;
-    const note = if (defaulted) " (a default: the service sets no limits)" else "";
+    const note = words.note;
     const total: u32 = @intCast(world.nodes.len);
     if (total == 1) {
         return controller.format(ctx, "{s} is the only node, and it fits {d}m CPU and {d} " ++
             "MiB{s}", .{ name, need.cpu_millis, mib_of(need.memory_bytes), note });
     }
     return controller.format(ctx, "{s} is the best of the {d} of {d} nodes that fit {d}m CPU " ++
-        "and {d} MiB{s}: {d} replicas of this service there, then {s} of the image already " ++
+        "and {d} MiB{s}: {d} {s} there, then {s} of the image already " ++
         "there ({s}), then least allocated, then name", .{
         name,
         chosen.candidates,
@@ -1079,6 +1370,7 @@ fn place_reason(
         mib_of(need.memory_bytes),
         note,
         chosen.service_count,
+        words.group,
         try size_words(ctx, chosen.locality_bytes),
         if (chosen.store_revision == 0) "no summary" else "by its summary",
     });
@@ -1120,7 +1412,8 @@ fn shape_of(world: *const World, need: Requests, verdicts: []const Verdict) u64 
 
 const exclusions = [_]Reason{
     .unknown_node, .lost,       .fenced,        .no_status,
-    .older_tenure, .audit_open, .over_capacity,
+    .older_tenure, .audit_open, .over_capacity, .jobs_full,
+    .handles_full,
 };
 
 /// Room kept free in the evidence for the closing brackets and the `omitted` count.
@@ -1294,9 +1587,9 @@ pub fn placement_problem(
         service_counts(&world, world.replicas[index].rec.service, counts[0..world.nodes.len]);
         // Whether the node still fits at the head is I6's and I7's to say (a placement whose
         // compare was skipped lands on a node that changed): L1 judges only a placement that does.
-        if (judge(&world.nodes[at], need).reason != .fits) continue;
+        if (judge(&world.nodes[at], need, false).reason != .fits) continue;
         for (world.nodes, 0..) |*view, other| {
-            if (judge(view, need).reason != .fits) continue;
+            if (judge(view, need, false).reason != .fits) continue;
             // A rival that changed after the scheduler read the world was judged on what the
             // scheduler saw, not on this: a lost race is not a wrong choice.
             if (changed_since(view, read_revision)) continue;

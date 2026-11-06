@@ -66,7 +66,7 @@ Each container is a directory `<state>/containers/<replica id>/`:
 | `child.pid` | the supervisor | the command's pid, once it runs |
 | `forced` | a test fault | `oom` or `pid_limit`, before the kill |
 | `fetch.json` | the runtime, when the image must be fetched first | `{digest, argv}`: the `zcube-agent fetch` command the supervisor runs before the command |
-| `fetch.log` | the fetch's stderr, while and after it runs | the text of ZC-W0601 and ZC-E0601, when they are raised |
+| `fetch.log` | the fetch's stderr, while and after it runs | the text of ZC-W0601 and ZC-E0601, when they are raised; the supervisor appends ZC-W0603 for a fetch that failed, was killed at its deadline or did not start (the registry pull follows; the fetch's own ZC-E0601 is the fetch's line), a line saying no fetch was needed when the tree was already in the store, and ZC-W0504 when it cannot write `pull.json`; a line when the supervisor's registry pull starts and one with its outcome, and, while a fetch asks peers for chunks, a progress line (chunks asked, bytes received) at most every `fetch_progress_ms` (10 s), so a stalled fetch is told apart from a slow one (issue #93) |
 | `run.json` | the supervisor, last | how the command ended; the truth for `list` and `inspect` |
 
 `start` writes the spec and starts `zcube-agent supervise <dir>`, then waits (at most
@@ -171,6 +171,11 @@ the container's supervisor runs `zcube-agent fetch` for the image (`fetch.json`,
 replica reports `starting` while that runs. A failed fetch is a start failure with ZC-E0601, the
 text in `fetch.log`.
 
+A `pull.json` the agent cannot publish (unparseable, naming another node or no tree, too big, or
+refused by the server) is dropped, counted, and said once per step on the agent's stderr with
+ZC-W0504, so a missing /pulls record has a line to find. `ops/zigbox-smoke/guest.sh` prints the
+last 2 KB of each agent's `fetch.log`, the container directories and any running `zcube-agent fetch` when any stage fails.
+
 `--images-dir DIR` gives the node a chunk store (`dir_images.zig`: `trees/<digest>` lists and
 `chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk
 checked against its BLAKE3 on write and on read). The agent's summary pass reads it on its own
@@ -250,6 +255,31 @@ each file once it is stored. A record that does not parse, or names another node
 server without the endpoint (`ZC-E0504`) gets the file dropped; a failed tenure compare begins a
 fence like any other agent write and keeps the file for the next tenure. A failed fetch leaves
 no record.
+
+## Runs (B1 slice 4)
+
+A job is a run: container `<job>-job`, labels `zcube.replica` (the run id) and `zcube.job`. `src/agent_jobs.zig`
+is one pass of `reconcile`, after the replicas. It wants a run when the node holds its
+`/assigned/<node>/<run>`; the epoch is that assignment's `mod_revision`.
+
+1. **Claim, then start.** The agent writes the start record `jobs/<run>.json` (phase `claiming`, the
+   `boot_id`, `deadline_mono_ms`) and then one transaction: the tenure, the run record's revision, the
+   assignment's epoch, and `/job-observed/<node>/<name>` absent. Only when it applies does it fetch
+   the input (digest checked), set phase `claimed` and call `Runtime.start`. A refused claim starts
+   nothing. The server's `{applied:false}` is a result, not an error.
+2. **A run is started at most once.** A claim in the store without a start record, or a `claimed`
+   record whose container is gone, ends the run `lost`; the agent never starts it again. A record
+   still `claiming` after a restart claims again (the compare says whether it won).
+3. **The deadline** is `deadline_mono_ms` on the boot clock, written before the start and compared
+   only under the same `boot_id`; after a reboot the container is gone and the run ends `lost`, not
+   `deadline`.
+4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `not_started`) is written to the start record
+   before the container is signalled and reported with the exit. An exit the agent saw first
+   carries none. A fence under a replaced tenure is reported under the next tenure, once it holds.
+5. **Adoption.** After `kill -9` the new agent lists the runtime, reads the start records, and adopts
+   a `claimed` run without a second start.
+
+The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
 
 ## What survives what
 

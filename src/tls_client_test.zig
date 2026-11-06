@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const schedule = @import("tls_schedule.zig");
 const tls_client = @import("tls_client.zig");
@@ -17,6 +18,33 @@ const Event = tls_client.Event;
 
 const server_name = "broker.botpike.com";
 
+/// Client authentication for a test: what the server asks and what the client has.
+const Auth = struct {
+    /// The server sends a CertificateRequest.
+    ask: bool = false,
+    context: []const u8 = "",
+    schemes: []const u16 = &.{wire.scheme_ed25519},
+    cert_schemes: ?[]const u16 = null,
+    authorities: bool = false,
+    /// The server refuses an empty Certificate.
+    server_requires: bool = true,
+    /// The client has a workload identity.
+    identity: bool = false,
+    /// The client fails unless asked.
+    require: bool = false,
+    /// With the CA certificate after the workload's.
+    with_ca: bool = false,
+    certificate: enum { good, other_ca, expired } = .good,
+    /// The signer returns nothing.
+    broken_signer: bool = false,
+};
+
+fn broken_sign(context: *const anyopaque, message: []const u8) ?[64]u8 {
+    _ = context;
+    _ = message;
+    return null;
+}
+
 const CertKind = enum { good, other_ca, expired, wrong_name, workload, tampered, none, three };
 
 /// A client, a scripted server and the bytes between them.
@@ -28,12 +56,20 @@ const Rig = struct {
     leaf: x509.Der,
     second: x509.Der,
     certificates: [3][]const u8,
-    sent: [1024]u8,
+    client_key: Ed25519.KeyPair,
+    client_certificate: x509.Der,
+    client_chain: [2][]const u8,
+    ca_certificate: x509.Der,
+    sent: [4096]u8,
     sent_length: u32,
     flight: [8192]u8,
     flight_length: u32,
 
     fn setup(rig: *Rig, kind: CertKind, faults: testpeer.Faults) !void {
+        return rig.setup_auth(kind, faults, .{});
+    }
+
+    fn setup_auth(rig: *Rig, kind: CertKind, faults: testpeer.Faults, auth: Auth) !void {
         rig.diag.reset();
         rig.server_key = try Ed25519.KeyPair.generateDeterministic(@splat(5));
         const ca = try x509_test.ca_pair();
@@ -61,7 +97,7 @@ const Rig = struct {
             try x509.issue_server(&rig.leaf, signer, &request);
         }
         try x509.issue_ca(&rig.second, ca, x509_test.window);
-        var count: usize = 1;
+        var count: u32 = 1;
         rig.certificates[0] = rig.leaf.slice();
         if (kind == .three) {
             rig.certificates[1] = rig.second.slice();
@@ -73,12 +109,47 @@ const Rig = struct {
             // The last byte is the end of the signature: the certificate no longer verifies.
             rig.leaf.bytes[rig.leaf.bytes.len - 1] ^= 1;
         }
+        try rig.issue_client(ca, auth);
+        rig.start_peer_and_client(ca, faults, auth, count);
+    }
+
+    fn start_peer_and_client(
+        rig: *Rig,
+        ca: Ed25519.KeyPair,
+        faults: testpeer.Faults,
+        auth: Auth,
+        count: u32,
+    ) void {
+        var client_auth: tls_client.ClientAuth = .none;
+        if (auth.identity) {
+            const identity: tls_client.Identity = .{
+                .certificates = rig.client_chain[0..if (auth.with_ca) 2 else 1],
+                .signer = if (auth.broken_signer)
+                    .{ .context = &rig.client_key, .sign = broken_sign }
+                else
+                    tls_client.key_pair_signer(&rig.client_key),
+            };
+            client_auth = if (auth.require)
+                .{ .required = identity }
+            else
+                .{ .optional = identity };
+        }
+        if (auth.require) assert(auth.identity);
         rig.peer = testpeer.Peer.init(.{
             .certificates = rig.certificates[0..count],
             .key = rig.server_key,
             .random = @splat(0x77),
             .secret = @splat(0x55),
             .faults = faults,
+            .client_auth = if (!auth.ask) null else .{
+                .anchor = ca.public_key.toBytes(),
+                .now_ms = x509_test.now,
+                .context = auth.context,
+                .schemes = auth.schemes,
+                .cert_schemes = auth.cert_schemes,
+                .authorities = auth.authorities,
+                .require = auth.server_requires,
+            },
         });
         rig.client.init(&.{
             .anchor = ca.public_key.toBytes(),
@@ -87,9 +158,28 @@ const Rig = struct {
             .random = @splat(0x11),
             .session_id = @splat(0x22),
             .secret = @splat(0x33),
+            .client_auth = client_auth,
         });
         rig.sent_length = 0;
         rig.flight_length = 0;
+    }
+
+    /// The client's workload certificate, from the CA or another, and its CA certificate.
+    fn issue_client(rig: *Rig, ca: Ed25519.KeyPair, auth: Auth) !void {
+        rig.client_key = try Ed25519.KeyPair.generateDeterministic(@splat(9));
+        var signer = ca;
+        var request = x509_test.workload_request(rig.client_key.public_key.toBytes());
+        switch (auth.certificate) {
+            .good => {},
+            .other_ca => signer = try Ed25519.KeyPair.generateDeterministic(@splat(0xCC)),
+            .expired => request.lifetime = .{
+                .not_before_ms = x509_test.now - 3 * x509_test.hour,
+                .not_after_ms = x509_test.now - 2 * x509_test.hour,
+            },
+        }
+        try x509.issue_workload(&rig.client_certificate, signer, &request);
+        try x509.issue_ca(&rig.ca_certificate, ca, x509_test.window);
+        rig.client_chain = .{ rig.client_certificate.slice(), rig.ca_certificate.slice() };
     }
 
     /// Takes what the client has ready, so the next step may run.
@@ -188,7 +278,7 @@ test "application data goes both ways under fresh keys" {
     const event = try rig.feed(record, 4096);
     try std.testing.expectEqualStrings("hello client", event.data);
     var out: [256]u8 = undefined;
-    const sealed = try rig.client.seal_application("hello server", &out);
+    const sealed = try rig.client.seal_application("hello server", &out, &rig.diag);
     const opened = try rig.peer.open(sealed);
     try std.testing.expectEqual(schedule.ContentType.application_data, opened.content_type);
     try std.testing.expectEqualStrings("hello server", opened.content);
@@ -214,8 +304,52 @@ test "a KeyUpdate moves the receive keys, and one that asks is answered" {
     try std.testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, opened.content);
     try rig.peer.read.rekey();
     var out: [256]u8 = undefined;
-    const sealed = try rig.client.seal_application("new keys", &out);
+    const sealed = try rig.client.seal_application("new keys", &out, &rig.diag);
     try std.testing.expectEqualStrings("new keys", (try rig.peer.open(sealed)).content);
+}
+
+test "the write keys are updated by themselves when their record limit is reached" {
+    // Goal: SHOULD 5, RFC 8446 section 5.5: data is never refused for the limit. Method: set
+    // the sequence at the limit; the next seal carries a KeyUpdate, then the data under new keys.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    rig.client.write.sequence = constants.tls_records_per_key_max;
+    rig.peer.read.sequence = constants.tls_records_per_key_max; // The nonce follows it.
+    var out: [512]u8 = undefined;
+    const sealed = try rig.client.seal_application("late", &out, &rig.diag);
+    const head = 5 + std.mem.readInt(u16, sealed[3..5], .big);
+    const first = try rig.peer.open(sealed[0..head]);
+    try std.testing.expectEqual(schedule.ContentType.handshake, first.content_type);
+    try std.testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, first.content);
+    const rest = sealed[head..];
+    try rig.peer.read.rekey();
+    try std.testing.expectEqualStrings("late", (try rig.peer.open(rest)).content);
+}
+
+test "a write side that cannot go on is E0815, never silent" {
+    // Goal: SHOULD 5. Method: a connection that already updated its keys as often as allowed
+    // is asked to update once more.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    rig.client.write.updates = constants.tls_key_updates_per_connection_max;
+    try std.testing.expectError(error.Refused, rig.client.send_key_update(false, &rig.diag));
+    try rig.expect_code(.E0815);
+}
+
+test "a handshake message over the limit is refused, and the cause names the message" {
+    // Goal: SHOULD 6. Method: a NewSessionTicket header that declares 5,000 bytes.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    var out: [64]u8 = undefined;
+    const header = [_]u8{ 4, 0, 0x13, 0x88 };
+    const record = rig.peer.seal(&out, .handshake, &header);
+    try std.testing.expectError(error.Refused, rig.feed(record, 4096));
+    try rig.expect_code(.E0813);
+    const cause = rig.diag.last_cause().?;
+    try std.testing.expect(std.mem.indexOf(u8, cause, "NewSessionTicket of 5004 bytes") != null);
 }
 
 test "a NewSessionTicket is read past and close_notify ends the connection" {
@@ -531,6 +665,239 @@ test "the diagnostic names the alert the client sent, and the fix names the serv
     try rig.setup(.other_ca, .{});
     try std.testing.expectError(error.Refused, rig.handshake(4096));
     try expect_context(&rig.diag, "sent", "alert unknown_ca (48)");
+}
+
+// ---- Client authentication ----------------------------------------------------------------------
+
+/// Runs the handshake and returns what the peer made of the client's last flight.
+fn connect_auth(rig: *Rig, chunk: usize) !testpeer.ClientFlight {
+    const event = try rig.handshake(chunk);
+    try std.testing.expect(event == .connected);
+    try std.testing.expect(rig.client.is_connected());
+    const result = rig.peer.accept_client_flight(rig.sent[0..rig.sent_length]);
+    rig.sent_length = 0;
+    return result;
+}
+
+const asked: Auth = .{ .ask = true, .identity = true };
+
+test "a client with a certificate answers a request, whatever the size of the pieces" {
+    // Goal: the client's Certificate, CertificateVerify and Finished verify at the server.
+    // Method: one chain and then two, empty and long contexts, authorities, in all chunk sizes.
+    var rig: Rig = undefined;
+    const long: [255]u8 = @splat(0xAB);
+    for ([_]usize{ 1, 5, 100, 4096 }) |chunk| {
+        for ([_]bool{ true, false }) |per_message| {
+            const variants = [_]Auth{
+                asked,
+                .{ .ask = true, .identity = true, .with_ca = true },
+                .{ .ask = true, .identity = true, .context = "ctx" },
+                .{ .ask = true, .identity = true, .context = &long, .authorities = true },
+                .{ .ask = true, .identity = true, .require = true },
+                .{ .ask = true, .identity = true, .server_requires = false },
+                .{ .ask = true, .identity = true, .cert_schemes = &.{wire.scheme_ed25519} },
+            };
+            for (variants) |auth| {
+                try rig.setup_auth(.good, .{ .record_per_message = per_message }, auth);
+                const flight = try connect_auth(&rig, chunk);
+                try std.testing.expectEqual(testpeer.ClientFlight.ok, flight);
+                try std.testing.expect(rig.peer.client_key != null);
+            }
+        }
+    }
+}
+
+test "application data and key updates work after client authentication" {
+    // Goal: the keys after a client-auth handshake are the right ones. Method: data both ways,
+    // then a KeyUpdate each way, then close_notify from the client.
+    var rig: Rig = undefined;
+    try rig.setup_auth(.good, .{}, asked);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok, try connect_auth(&rig, 4096));
+    var buffer: [256]u8 = undefined;
+    const event = try rig.feed(rig.peer.application(&buffer, "hello"), 4096);
+    try std.testing.expect(event == .data);
+    _ = try rig.feed(rig.peer.key_update(&buffer, true), 4096);
+    // The answer to the request is a KeyUpdate the peer reads under the old keys.
+    try std.testing.expect(rig.sent_length > 0);
+    _ = try rig.peer.open(rig.sent[0..rig.sent_length]);
+    rig.peer.read.rekey() catch unreachable; // Keys never run out here.
+    rig.sent_length = 0;
+    _ = try rig.feed(rig.peer.application(&buffer, "again"), 4096);
+    try rig.client.send_key_update(false, &rig.diag);
+    rig.collect();
+    const opened = try rig.peer.open(rig.sent[0..rig.sent_length]);
+    try std.testing.expect(opened.content_type == .handshake);
+    rig.sent_length = 0;
+    rig.peer.read.rekey() catch unreachable; // Keys never run out here.
+    rig.client.close_notify();
+    rig.collect();
+    const closing = try rig.peer.open(rig.sent[0..rig.sent_length]);
+    try std.testing.expect(closing.content_type == .alert);
+}
+
+test "a client without a usable certificate says so when the server asks" {
+    // Goal: no identity, or a request that cannot be answered, is an empty Certificate when
+    // authentication is optional; the server may accept or refuse it.
+    var rig: Rig = undefined;
+    try rig.setup_auth(.good, .{}, .{ .ask = true, .server_requires = false });
+    var flight = try connect_auth(&rig, 4096);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok_without_certificate, flight);
+    try rig.setup_auth(.good, .{}, .{ .ask = true });
+    flight = try connect_auth(&rig, 4096);
+    try std.testing.expectEqual(testpeer.ClientFlight.no_certificate, flight);
+    try rig.setup_auth(.good, .{}, .{
+        .ask = true,
+        .identity = true,
+        .server_requires = false,
+        .schemes = &.{0x0804},
+    });
+    flight = try connect_auth(&rig, 4096);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok_without_certificate, flight);
+    try rig.setup_auth(.good, .{}, .{
+        .ask = true,
+        .identity = true,
+        .server_requires = false,
+        .cert_schemes = &.{0x0804},
+    });
+    flight = try connect_auth(&rig, 4096);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok_without_certificate, flight);
+}
+
+test "required client authentication refuses a server that does not ask or cannot be answered" {
+    // Goal: a client that must authenticate never connects without doing so. Method: no
+    // request, and requests it cannot answer.
+    var rig: Rig = undefined;
+    try rig.setup_auth(.good, .{}, .{ .identity = true, .require = true });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0814);
+    try expect_context(&rig.diag, "sent", "alert handshake_failure (40)");
+    try rig.setup_auth(.good, .{}, .{
+        .ask = true,
+        .identity = true,
+        .require = true,
+        .schemes = &.{0x0804},
+    });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0814);
+    // A client that need not authenticate connects when the server does not ask.
+    try rig.setup_auth(.good, .{}, .{ .identity = true });
+    try expect_connected(&rig, 4096);
+}
+
+test "a malformed or repeated certificate request is refused" {
+    var rig: Rig = undefined;
+    try expect_refused(&rig, .good, .{ .certificate_request = true }, .E0813);
+    try rig.setup_auth(.good, .{ .second_request = true }, asked);
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0813);
+}
+
+test "the server's refusal of the certificate is named after the handshake" {
+    // Goal: a server refuses the certificate after the client's flight; the client reports
+    // E0814 and not a broken handshake.
+    var rig: Rig = undefined;
+    var buffer: [64]u8 = undefined;
+    for ([_]u8{ 42, 43, 44, 45, 46, 48, 49, 116 }) |code| {
+        try rig.setup_auth(.good, .{}, asked);
+        try std.testing.expectEqual(testpeer.ClientFlight.ok, try connect_auth(&rig, 4096));
+        try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, code), 4096));
+        try rig.expect_code(.E0814);
+    }
+    // Another alert is the server breaking the protocol, not a refusal of the certificate.
+    try rig.setup_auth(.good, .{}, asked);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok, try connect_auth(&rig, 4096));
+    try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 50), 4096));
+    try rig.expect_code(.E0813);
+    // After an empty Certificate the refusal is still the server's answer to what the client
+    // showed (the brief: ZC-E0814), with the client's lack of a certificate in the cause.
+    try rig.setup_auth(.good, .{}, .{ .ask = true, .server_requires = false });
+    _ = try connect_auth(&rig, 4096);
+    try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 42), 4096));
+    try rig.expect_code(.E0814);
+}
+
+test "the peer refuses a certificate from another CA or an expired one" {
+    var rig: Rig = undefined;
+    for ([_]@TypeOf(asked.certificate){ .other_ca, .expired }) |kind| {
+        try rig.setup_auth(.good, .{}, .{ .ask = true, .identity = true, .certificate = kind });
+        const flight = try connect_auth(&rig, 4096);
+        try std.testing.expectEqual(testpeer.ClientFlight.bad_certificate, flight);
+    }
+}
+
+test "a signer that fails is refused with E0820" {
+    var rig: Rig = undefined;
+    try rig.setup_auth(.good, .{}, .{ .ask = true, .identity = true, .broken_signer = true });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0820);
+    try expect_context(&rig.diag, "sent", "alert internal_error (80)");
+    // The Certificate is held back until the signer answers, so the first record the peer can
+    // open is the alert, at sequence 0 under the client's handshake keys: a server sees
+    // internal_error and not a bad MAC.
+    var sent = rig.sent[0..rig.sent_length];
+    if (sent.len > 0 and sent[0] == @backingInt(schedule.ContentType.change_cipher_spec))
+        sent = sent[6..];
+    const opened = try rig.peer.open(sent);
+    try std.testing.expectEqual(schedule.ContentType.alert, opened.content_type);
+    try std.testing.expectEqual(@as(u8, 80), opened.content[1]);
+}
+
+fn expect_flight(auth: Auth, want: testpeer.ClientFlight) !void {
+    var rig: Rig = undefined;
+    try rig.setup_auth(.good, .{}, auth);
+    try std.testing.expectEqual(want, try connect_auth(&rig, 4096));
+}
+
+test "teeth: each client-auth rule, broken, is seen at the server" {
+    // Goal: evidence that the client's signing, echo and transcript rules are load-bearing.
+    // Method: the client with one rule broken is refused by the peer.
+    const auth: Auth = .{ .ask = true, .identity = true, .context = "c" };
+    const cases = [_]struct { fault: tls_client.TestFault, want: testpeer.ClientFlight }{
+        .{ .fault = .verify_context, .want = .bad_verify },
+        .{ .fault = .echo_context, .want = .bad_context },
+        .{ .fault = .transcript_client_auth, .want = .bad_verify },
+        .{ .fault = .finished_omits_auth, .want = .bad_finished },
+    };
+    for (cases) |case| {
+        try expect_flight(auth, .ok);
+        tls_client.set_test_fault(case.fault, true);
+        defer tls_client.set_test_fault(case.fault, false);
+        try expect_flight(auth, case.want);
+    }
+}
+
+test "teeth: without the required-auth check a client connects unauthenticated" {
+    var rig: Rig = undefined;
+    tls_client.set_test_fault(.required_client_auth, true);
+    defer tls_client.set_test_fault(.required_client_auth, false);
+    try rig.setup_auth(.good, .{}, .{ .identity = true, .require = true });
+    try expect_connected(&rig, 4096);
+}
+
+test "teeth: without the scheme check a request without Ed25519 is answered" {
+    var rig: Rig = undefined;
+    tls_client.set_test_fault(.request_scheme, true);
+    defer tls_client.set_test_fault(.request_scheme, false);
+    try rig.setup_auth(.good, .{}, .{
+        .ask = true,
+        .identity = true,
+        .server_requires = false,
+        .schemes = &.{0x0804},
+    });
+    const flight = try connect_auth(&rig, 4096);
+    try std.testing.expectEqual(testpeer.ClientFlight.ok, flight);
+    try std.testing.expect(rig.peer.client_key != null);
+}
+
+test "teeth: without the refusal check an alert about the certificate is a protocol error" {
+    var rig: Rig = undefined;
+    tls_client.set_test_fault(.certificate_alert, true);
+    defer tls_client.set_test_fault(.certificate_alert, false);
+    try rig.setup_auth(.good, .{}, asked);
+    _ = try connect_auth(&rig, 4096);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 42), 4096));
+    try rig.expect_code(.E0813);
 }
 
 // ---- Teeth: each security check, reverted, lets a refused handshake through ---------------------

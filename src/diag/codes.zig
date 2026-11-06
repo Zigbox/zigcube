@@ -97,11 +97,14 @@ pub const Code = enum(u8) {
     E0515,
     E0521,
     E0522,
+    E0523,
     W0501,
     W0503,
+    W0504,
     E0601,
     W0601,
     W0602,
+    W0603,
     E0801,
     E0802,
     E0803,
@@ -115,11 +118,13 @@ pub const Code = enum(u8) {
     E0811,
     E0812,
     E0813,
+    E0814,
     E0815,
     E0816,
     E0817,
     E0818,
     E0819,
+    E0820,
     B0001,
     B0002,
     B0003,
@@ -1282,6 +1287,26 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0523,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a run's input does not match its digest",
+        .explanation =
+        \\A job that was submitted with an input stores the input once and names it
+        \\in the run by its SHA-256 digest. The agent fetched the input after it
+        \\claimed the run and checked it against that digest. Either the server
+        \\holds no input for the run, or what it holds does not hash to the digest.
+        \\
+        \\The API wrote both the run and the input, so this is a damaged or edited
+        \\store, or a bug in Zigcube, never something the job's author did. The
+        \\agent starts nothing it cannot verify: the run ends as failed
+        \\(start_failed) and is not started again. A fetch that fails for any
+        \\other reason, such as a network error, is not this: it is tried again.
+        \\
+        \\Report it with the diagnostic bundle, then submit the job again.
+        ,
+    },
+    .{
         .code = .W0501,
         .severity = .warning,
         .blame = .environment,
@@ -1309,6 +1334,26 @@ pub const registry = [_]Entry{
         \\
         \\Raise the deadline, at most 24 hours, if the job needs the time; a job that
         \\should be faster is a job to look at.
+        ,
+    },
+    .{
+        .code = .W0504,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a pull record was not stored",
+        .explanation =
+        \\A fetch or a pull on this node finished, but the record of what
+        \\it moved (the bytes by source, which /v1/stats/pull shows) was
+        \\lost. It could not be written to the container's directory, or
+        \\the agent read it and dropped it because it was not a pull
+        \\record for this node, or zcube-server refused it; the cause line
+        \\says which. The image is not affected and the replica goes on;
+        \\only the statistics are missing.
+        \\
+        \\The agent drops a record it cannot store so that one bad file
+        \\never blocks the ones after it. If the cause is a refusal, use
+        \\the agent that came with the server. If it is the state
+        \\directory, check its disk space and permissions.
         ,
     },
     .{
@@ -1354,6 +1399,25 @@ pub const registry = [_]Entry{
         \\The image is not affected: a tree is used only when its digest matches.
         \\No action is needed. If it repeats, check the peer node, whose store may
         \\be damaged or running a different build.
+        ,
+    },
+    .{
+        .code = .W0603,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the swarm fetch ended without the tree",
+        .explanation =
+        \\The supervisor of a replica tried to get the image's chunk tree from peers
+        \\first, and that fetch ended without it: it did not start, it exited with a
+        \\failure, or it was killed at its deadline. The cause line says which.
+        \\The registry pull follows, so the replica can still start; this line
+        \\only explains why the peers did not supply the tree.
+        \\
+        \\The fetch's own diagnostic, in the same fetch.log, names the real
+        \\reason when it had one (ZC-E0601 for a tree no peer could give, or the
+        \\code of this node's disk or memory failing). If the replica did not
+        \\start, the pull's own diagnostic follows it. If it repeats on every
+        \\start, check the peers and the network between them.
         ,
     },
     .{
@@ -1593,6 +1657,30 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0814,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the TLS client certificate was not asked for, or was refused",
+        .explanation =
+        \\The client was told to present a certificate and the server did not ask
+        \\for one, or the server refused the one presented (the alert names why:
+        \\bad_certificate, certificate_expired, unknown_ca, certificate_required).
+        \\A client that sends an empty Certificate (it has no certificate, or the
+        \\request does not list Ed25519) and is refused by the server is this too,
+        \\and so is a client that must authenticate facing a request without
+        \\Ed25519. The connection is closed; a refusal arrives after the client's
+        \\own handshake is done, so data written before the alert was read was
+        \\not accepted.
+        \\
+        \\A server that never asks cannot learn which workload is calling, so a
+        \\connection that must prove identity stops. Check that the server is
+        \\configured to require client certificates and trusts the cluster CA;
+        \\a refused certificate is expired, issued by another CA, or for a
+        \\different workload than the server allows. A signer that fails is a
+        \\different error (ZC-E0820).
+        ,
+    },
+    .{
         .code = .E0815,
         .severity = .@"error",
         .blame = .external,
@@ -1612,14 +1700,20 @@ pub const registry = [_]Entry{
         .code = .E0816,
         .severity = .@"error",
         .blame = .external,
-        .summary = "a TLS connection ended without close_notify",
+        .summary = "a TLS connection ended or stalled without close_notify",
         .explanation =
         \\The peer's side of the connection ended before it sent close_notify, so the
         \\data received may be cut short. Mid-handshake this means the peer hung up
         \\before the handshake finished.
         \\
+        \\The connection also ends this way when the peer stays connected and goes
+        \\quiet: a handshake, or the answer to a KeyUpdate, did not finish in time
+        \\because the peer stopped reading or answering. A black hole, an overloaded
+        \\server or a middlebox that drops packets looks like this.
+        \\
         \\Treat what arrived as incomplete and retry the request. A peer that
-        \\crashes, or a network that resets the connection, ends this way.
+        \\crashes, or a network that resets the connection, ends this way; for a
+        \\stall, check that the server is reachable and keeping up.
         ,
     },
     .{
@@ -1670,6 +1764,23 @@ pub const registry = [_]Entry{
         \\
         \\The cause names the kind found and the kind needed. Give the peer a
         \\certificate issued for its role: a server certificate for a server.
+        ,
+    },
+    .{
+        .code = .E0820,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the key behind the client certificate did not sign",
+        .explanation =
+        \\The server asked for a client certificate and the client has one, but the
+        \\signer that holds its private key returned no signature, so the proof of
+        \\possession (CertificateVerify) could not be made. The connection is
+        \\closed with an internal_error alert; nothing was accepted.
+        \\
+        \\The key never enters the TLS client: it sits behind a signer, in the same
+        \\process or in another. This is that signer failing, not the server or the
+        \\certificate. Check that the process or device holding the key is running
+        \\and reachable, then reconnect.
         ,
     },
     .{
@@ -1764,7 +1875,9 @@ comptime {
     assert(registry.len == fields.len);
     assert(fields.len <= std.math.maxInt(u8));
     assert(prefix.len + tag_bytes <= constants.diag_code_bytes_max);
-    @setEvalBranchQuota(200_000);
+    // The check walks every byte of every summary and explanation (about 4 branches a byte).
+    @setEvalBranchQuota(registry.len * (constants.diag_explanation_bytes_max +
+        constants.diag_summary_bytes_max) * 8);
     for (registry, fields, 0..) |item, name, index| {
         assert(@backingInt(item.code) == index);
         assert(std.mem.eql(u8, @tagName(item.code), name));

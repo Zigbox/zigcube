@@ -30,6 +30,7 @@ test {
     _ = @import("sim_fleet_github.zig");
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
+    _ = @import("fake_supervisor.zig");
     _ = @import("fake_runtime_test.zig");
     _ = @import("zigbox_map.zig");
     _ = @import("zigbox_image.zig");
@@ -67,6 +68,9 @@ test {
     _ = @import("cli_service.zig");
     _ = @import("cli_view.zig");
     _ = @import("cli_golden.zig");
+}
+
+test {
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }
@@ -78,7 +82,10 @@ comptime {
     _ = @import("peer_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only, which this root is.
     _ = @import("x509_fuzz.zig"); // The same: the WASI core root has no such environment.
     _ = @import("tls_fuzz.zig"); // The same.
+    _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
+    _ = @import("tls_conn_test.zig");
     _ = @import("fuzz_seeds.zig");
+    _ = @import("agent.zig"); // Its tests (next_wake) otherwise ran only in the WASM core root.
     _ = @import("agent_peer.zig");
     _ = @import("peer_files.zig");
     _ = @import("dir_images.zig");
@@ -94,4 +101,5 @@ comptime {
     _ = @import("server_ca.zig");
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");
+    _ = @import("job_api.zig");
 }

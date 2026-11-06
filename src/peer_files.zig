@@ -69,6 +69,14 @@ pub fn check_dir(
     }
 }
 
+/// What `read_bounded` found.
+pub const Found = union(enum) {
+    absent,
+    /// The file fills the whole buffer, so it may be longer than the caller accepts.
+    too_long,
+    bytes: []u8,
+};
+
 /// The file's bytes in `buffer`, null if there is no such file. A file that does not fit is
 /// refused (it is not ours). `guard` says which owner and mode checks apply.
 pub fn read(
@@ -80,10 +88,28 @@ pub fn read(
     buffer: []u8,
     diag: *Diag,
 ) Error!?[]u8 {
+    switch (try read_bounded(io, dir, where, name, guard, buffer, diag)) {
+        .absent => return null,
+        .too_long => return unusable(diag, where, name, "read", "it is too long"),
+        .bytes => |bytes| return bytes,
+    }
+}
+
+/// `read`, but a file that does not fit is reported as `.too_long` and not raised, for a caller
+/// that replaces a file it does not recognise. The owner and mode checks still raise.
+pub fn read_bounded(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    name: []const u8,
+    guard: Guard,
+    buffer: []u8,
+    diag: *Diag,
+) Error!Found {
     assert(buffer.len > 0);
     assert(buffer.len <= constants.peer_file_bytes_max + 1);
     const file = dir.openFile(io, name, .{}) catch |err| {
-        if (err == error.FileNotFound) return null;
+        if (err == error.FileNotFound) return .absent;
         return unusable(diag, where, name, "read", @errorName(err));
     };
     defer file.close(io);
@@ -102,8 +128,8 @@ pub fn read(
     const length = file.readPositionalAll(io, buffer, 0) catch |err| {
         return unusable(diag, where, name, "read", @errorName(err));
     };
-    if (length == buffer.len) return unusable(diag, where, name, "read", "it is too long");
-    return buffer[0..length];
+    if (length == buffer.len) return .too_long;
+    return .{ .bytes = buffer[0..length] };
 }
 
 /// A secret seed from `name`: 64 hex digits and a newline. Null if the file is absent.
@@ -128,15 +154,18 @@ pub fn read_seed(
     return seed;
 }
 
-/// Writes `text` as `name`, mode 0600, whole or not at all.
+/// Writes `text` as `name` with permissions `mode`, whole or not at all. A private key is 0600.
 pub fn write(
     io: std.Io,
     dir: Dir,
     where: []const u8,
     name: []const u8,
     text: []const u8,
+    mode: std.posix.mode_t,
     diag: *Diag,
 ) Error!void {
+    assert(mode & 0o600 == 0o600); // Ours to read and write, whatever else the mode allows.
+    assert(mode & ~@as(std.posix.mode_t, 0o777) == 0);
     assert(name.len > 0);
     assert(name.len + temp_suffix_bytes <= 96);
     // A name of its own per write, so that two writers (two servers on one state directory) never
@@ -150,7 +179,7 @@ pub fn write(
     errdefer dir.deleteFile(io, temp_name) catch {}; // Nothing more to do if this fails too.
     {
         const file = dir.createFile(io, temp_name, .{
-            .permissions = .fromMode(0o600),
+            .permissions = .fromMode(mode),
             .exclusive = true,
         }) catch |err| return unusable(diag, where, name, "write", @errorName(err));
         defer file.close(io);
@@ -183,7 +212,7 @@ pub fn write_seed(
     defer std.crypto.secureZero(u8, &line);
     const text = std.fmt.bufPrint(&line, "{x}\n", .{&seed}) catch
         unreachable; // 64 digits and "\n".
-    return write(io, dir, where, name, text, diag);
+    return write(io, dir, where, name, text, 0o600, diag);
 }
 
 test "a seed is written 0600, read back, and a loose file is refused" {
@@ -264,7 +293,7 @@ test "two writes of one name leave a whole file and no temporary" {
             var diag: Diag = undefined;
             diag.reset();
             for (0..50) |_| {
-                write(std.testing.io, dir, "tmp", "ca.crt", text, &diag) catch {
+                write(std.testing.io, dir, "tmp", "ca.crt", text, 0o600, &diag) catch {
                     failed.store(true, .release);
                 };
             }
@@ -292,7 +321,26 @@ test "a write that fails removes its temporary file" {
     try tmp.dir.createDir(io, "ca.crt", .default_dir);
     var diag: Diag = undefined;
     diag.reset();
-    try std.testing.expectError(error.Failed, write(io, tmp.dir, "tmp", "ca.crt", "x", &diag));
+    const failed = write(io, tmp.dir, "tmp", "ca.crt", "x", 0o600, &diag);
+    try std.testing.expectError(error.Failed, failed);
     try std.testing.expectEqual(codes.Code.E0806, diag.code.?);
     try std.testing.expectEqual(@as(u32, 1), try count_entries(io, tmp.dir));
+}
+
+test "write takes the mode of the file" {
+    // Goal: the mode parameter. Method: write at 0600 and 0640 and read the modes back from disk.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    try write(io, tmp.dir, "tmp", "private", "x\n", 0o600, &diag);
+    try write(io, tmp.dir, "tmp", "shared", "x\n", 0o640, &diag);
+    inline for (.{ .{ "private", 0o600 }, .{ "shared", 0o640 } }) |case| {
+        const file = try tmp.dir.openFile(io, case[0], .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        const mode: std.posix.mode_t = case[1];
+        try std.testing.expectEqual(mode, stat.permissions.toMode() & 0o777);
+    }
 }

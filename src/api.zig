@@ -19,6 +19,11 @@
 //! /v1/services/{name}` deletes one. Both are `apply.zig`'s functions behind a route, and both
 //! are unauthenticated until the API has auth.
 //!
+//! **Jobs** (B1; docs/api.md): `POST /v1/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{name}`, `POST
+//! /v1/jobs/{name}/cancel` and `GET /v1/why/job/{name}` are `job_api.zig`'s functions behind
+//! routes. `POST /v1/jobs` is the one body over `api_request_bytes_max`: it may be
+//! `job_request_bytes_max`.
+//!
 //! **Secrets.** `env` values in `/services/` and `/replicas/` records are never sent to a
 //! read-only token: the names stay and each value is `null` (docs/api.md item 8; the replica
 //! carries a copy, docs/keys.md).
@@ -29,6 +34,7 @@ const zigbox = @import("zigbox");
 const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
 const apply_mod = @import("apply.zig");
+const job_api = @import("job_api.zig");
 const constants = @import("constants.zig");
 const accounting = @import("allocations.zig");
 const controller = @import("controller.zig");
@@ -55,7 +61,8 @@ pub const Request = struct {
     query: []const u8 = "",
     /// The client's `X-Request-Id` header, if it sent one.
     request_id: ?[]const u8 = null,
-    /// The request body, for `POST /v1/apply` (the only endpoint that reads one).
+    /// The request body, for `POST /v1/apply` and `POST /v1/jobs`. The shell reads at most
+    /// `http_body_bytes_max` of it, and `job_request_bytes_max` for `POST /v1/jobs`.
     body: []const u8 = "",
     /// False asks a watch not to say "hold me": the shell sets it when it asks again after a hold
     /// ended, so the same request is answered with what is ready and nothing more.
@@ -63,6 +70,7 @@ pub const Request = struct {
 };
 
 pub const Response = struct {
+    /// 200 unless a route says otherwise (201 created, 202 accepted).
     status: u16,
     /// For the `X-Request-Id` header, on success and failure.
     request_id: []const u8,
@@ -111,7 +119,7 @@ pub const Api = struct {
         const id = api.assign_id(ctx, request);
         if (api.route(ctx, request, id)) |reply| {
             return .{
-                .status = 200,
+                .status = reply.status,
                 .request_id = id,
                 .body = reply.body,
                 .hold_ms = reply.hold_ms,
@@ -180,6 +188,7 @@ pub const Api = struct {
         }
         if (std.mem.eql(u8, first, "status")) return call.status();
         if (std.mem.eql(u8, first, "list")) return call.list();
+        if (std.mem.eql(u8, first, "jobs")) return call.jobs_get();
         if (std.mem.eql(u8, first, "watch")) return call.watch();
         if (std.mem.eql(u8, first, "leases")) return call.leases();
         if (std.mem.eql(u8, first, "why")) return call.why();
@@ -193,6 +202,7 @@ pub const Api = struct {
 
 /// A reply that is not yet a `Response`: what a route returns.
 const Reply = struct {
+    status: u16 = 200,
     body: []const u8,
     hold_ms: u32 = 0,
     hold_prefixes: []const []const u8 = &.{},
@@ -357,6 +367,158 @@ fn check_applied_by(ctx: *const Context, text: []const u8) Failure!void {
     }
 }
 
+/// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
+/// 409,600-byte array of zeros takes about 37 times that in the arena.
+const Present = struct {
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Present {
+        _ = allocator;
+        _ = options;
+        try source.skipValue();
+        return .{};
+    }
+};
+
+/// The body of `POST /v1/jobs`: a job as JSON. `relay` and `placement` are parsed so that they
+/// can be refused by name (not built yet), not as unknown fields.
+const JobBody = struct {
+    name: []const u8,
+    image: []const u8,
+    source: []const u8 = "",
+    command: []const []const u8,
+    env: []const records.Pair = &.{},
+    limits: records.JobLimits = .{},
+    deadline_ms: u64,
+    retries: u32 = 0,
+    labels: []const records.Pair = &.{},
+    grace_ms: u32 = 0,
+    input: ?[]const u8 = null,
+    input_env: ?[]const u8 = null,
+    submit_by_ms: u64,
+    relay: ?Present = null,
+    placement: ?Present = null,
+    applied_by: []const u8 = anonymous,
+};
+
+const CancelBody = struct { applied_by: []const u8 = anonymous };
+
+/// A job's spec as `GET /v1/jobs/{name}` shows it: the names of its variables, never their
+/// values (the input is not returned at all, only its digest and size).
+const JobSpec = struct {
+    name: []const u8,
+    image: []const u8,
+    source: []const u8,
+    command: []const []const u8,
+    env_names: []const []const u8,
+    limits: records.JobLimits,
+    deadline_ms: u64,
+    retries: u32,
+    labels: []const records.Pair,
+    grace_ms: u32,
+    input_env: ?[]const u8,
+    input_digest: ?[]const u8,
+    input_bytes: ?u64,
+    submit_by_ms: u64,
+    created_at_ms: u64,
+    applied_by: []const u8,
+    cancel_requested: ?records.JobCancel,
+
+    fn of(ctx: *const Context, job: records.Job) Failure!JobSpec {
+        return .{
+            .name = job.name,
+            .image = job.image,
+            .source = job.source,
+            .command = job.command,
+            .env_names = try env_names(ctx, job.env),
+            .limits = job.limits,
+            .deadline_ms = job.deadline_ms,
+            .retries = job.retries,
+            .labels = job.labels,
+            .grace_ms = job.grace_ms,
+            .input_env = job.input_env,
+            .input_digest = job.input_digest,
+            .input_bytes = job.input_bytes,
+            .submit_by_ms = job.submit_by_ms,
+            .created_at_ms = job.created_at_ms,
+            .applied_by = job.applied_by,
+            .cancel_requested = job.cancel_requested,
+        };
+    }
+};
+
+fn env_names(ctx: *const Context, env: []const records.Pair) Failure![]const []const u8 {
+    assert(env.len <= constants.runtime_env_count_max);
+    const names = ctx.arena.alloc([]const u8, env.len) catch return no_memory(ctx);
+    for (env, names) |pair, *name| name.* = pair[0];
+    return names;
+}
+
+const JobReply = struct {
+    request_id: []const u8,
+    action: []const u8,
+    name: []const u8,
+    state: records.JobState,
+    revision: ?store.Revision = null,
+    decision: ?[]const u8 = null,
+    end: ?records.JobEnd = null,
+};
+
+fn job_reply(ctx: *const Context, status: u16, reply: JobReply) Failure!Reply {
+    const out = Out.create(ctx) catch return no_memory(ctx);
+    out.json.options.emit_null_optional_fields = false;
+    try out.value(reply);
+    var done = try out.finish();
+    done.status = status;
+    return done;
+}
+
+fn job_conflict(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0105);
+    ctx.diag.cause("job {s} or the job counters changed during the request", .{name});
+    ctx.diag.fix_with("look at it as it is now, then try again", "zcube job get {s}", .{name});
+    return error.Failed;
+}
+
+fn job_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!job_api.Input {
+    if (body.len == 0) return bad_request(ctx, "body", "is required: the job as JSON");
+    if (body.len > constants.job_request_bytes_max) {
+        const problem = std.fmt.comptimePrint(
+            "is larger than {d} bytes",
+            .{constants.job_request_bytes_max},
+        );
+        return bad_request(ctx, "body", problem);
+    }
+    const parsed = std.json.parseFromSliceLeaky(JobBody, ctx.arena, body, .{}) catch |err| {
+        if (err == error.OutOfMemory) return no_memory(ctx);
+        const problem = "is not a job: it needs name, image, command, deadline_ms, submit_by_ms";
+        return bad_request(ctx, "body", problem);
+    };
+    try check_applied_by(ctx, parsed.applied_by);
+    return .{
+        .name = parsed.name,
+        .image = parsed.image,
+        .source = parsed.source,
+        .command = parsed.command,
+        .env = parsed.env,
+        .limits = parsed.limits,
+        .deadline_ms = parsed.deadline_ms,
+        .retries = parsed.retries,
+        .labels = parsed.labels,
+        .grace_ms = parsed.grace_ms,
+        .input = parsed.input,
+        .input_env = parsed.input_env,
+        .submit_by_ms = parsed.submit_by_ms,
+        .relay = parsed.relay != null,
+        .placement = parsed.placement != null,
+        .applied_by = parsed.applied_by,
+        .request_id = id,
+    };
+}
+
 fn write_reply(ctx: *const Context, reply: WriteReply) Failure!Reply {
     const out = Out.create(ctx) catch return no_memory(ctx);
     out.json.options.emit_null_optional_fields = false;
@@ -458,6 +620,10 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
             if (code == .E0203) return 410;
             // The state the request rested on is not (or no longer) there.
             if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
+            if (code == .E0131) return 409;
+            if (code == .E0132) return 429;
+            if (code == .E0133) return 404;
+            if (code == .E0134) return 410;
             return 400;
         },
         .environment => return 503,
@@ -660,6 +826,18 @@ fn write_value(api: *const Api, out: *Out, key: []const u8, bytes: []const u8) F
     const secret = std.mem.startsWith(u8, key, records.prefix_services) or
         std.mem.startsWith(u8, key, records.prefix_replicas);
     if (api.read_only and secret) redact_env(&parsed);
+    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_jobs)) redact_env(&parsed);
+    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_runs)) {
+        redact_env(&parsed);
+        if (parsed == .object) {
+            if (parsed.object.getPtr("input_digest")) |digest| digest.* = .null;
+        }
+    }
+    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_input)) {
+        if (parsed == .object) {
+            if (parsed.object.getPtr("base64")) |input| input.* = .null;
+        }
+    }
     try out.value(parsed);
 }
 
@@ -1013,7 +1191,7 @@ const Call = struct {
         const name = call.parts.next() orelse return no_such(ctx, "/v1/why/<kind>");
         try call.no_more();
         const kind = std.meta.stringToEnum(records.SubjectKind, kind_text) orelse
-            return no_such(ctx, "/v1/why/<kind>: kind is service, replica or node");
+            return no_such(ctx, "/v1/why/<kind>: kind is service, replica, node or job");
         if (records.name_problem(name, constants.node_name_bytes_max) != null) {
             return bad_request(ctx, "name", "is not a valid name");
         }
@@ -1150,8 +1328,9 @@ const Call = struct {
         const ctx = call.ctx;
         if (std.mem.eql(u8, first, "store")) return call.accept_rollback();
         if (std.mem.eql(u8, first, "repair")) return call.repair_allocation(id);
+        if (std.mem.eql(u8, first, "jobs")) return call.jobs_post(body, id);
         if (!std.mem.eql(u8, first, "apply")) {
-            const where = "POST is accepted at /v1/apply, /v1/store and /v1/repair";
+            const where = "POST is accepted at /v1/apply, /v1/jobs, /v1/store and /v1/repair";
             return bad_request(ctx, "method", where);
         }
         try call.query.allow(ctx, &.{"dry_run"});
@@ -1227,6 +1406,138 @@ const Call = struct {
             }
         }
         return conflict(ctx, name);
+    }
+
+    // ---- /v1/jobs ----
+
+    fn jobs_post(call: Call, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{});
+        const name = call.parts.next();
+        if (name == null) return call.job_create(body, id);
+        const verb = call.parts.next() orelse return no_such(ctx, "/v1/jobs/<name>");
+        try call.no_more();
+        if (!std.mem.eql(u8, verb, "cancel")) return no_such(ctx, "/v1/jobs/<name>/<verb>");
+        return call.job_cancel(name.?, body, id);
+    }
+
+    fn job_create(call: Call, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        const input = try job_input(ctx, body, id);
+        for (0..apply_attempts_max) |_| {
+            const result = job_api.create(ctx, &call.api.source, input) catch
+                return propagate(ctx);
+            switch (result) {
+                .created => |done| return job_reply(ctx, 201, .{
+                    .request_id = id,
+                    .action = "create",
+                    .name = input.name,
+                    .state = .pending,
+                    .revision = done.revision,
+                    .decision = done.decision,
+                }),
+                .same => |old| return job_reply(ctx, 200, .{
+                    .request_id = id,
+                    .action = "none",
+                    .name = old.name,
+                    .state = job_api.current_state(ctx, old.name) catch return propagate(ctx),
+                }),
+                .conflict => {},
+            }
+        }
+        return job_conflict(ctx, input.name);
+    }
+
+    fn job_cancel(call: Call, name: []const u8, body: []const u8, id: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        var by: []const u8 = anonymous;
+        if (body.len > 0) {
+            const parsed = std.json.parseFromSliceLeaky(CancelBody, ctx.arena, body, .{}) catch
+                return bad_request(ctx, "body", "is not {\"applied_by\": \"...\"} or empty");
+            by = parsed.applied_by;
+        }
+        try check_applied_by(ctx, by);
+        for (0..apply_attempts_max) |_| {
+            const result = job_api.cancel(ctx, &call.api.source, name, by, id) catch
+                return propagate(ctx);
+            switch (result) {
+                .accepted => |done| return job_reply(ctx, 202, .{
+                    .request_id = id,
+                    .action = "cancel",
+                    .name = name,
+                    .state = done.state,
+                    .revision = done.revision,
+                    .decision = done.decision,
+                }),
+                .already => return job_reply(ctx, 202, .{
+                    .request_id = id,
+                    .action = "none",
+                    .name = name,
+                    .state = job_api.current_state(ctx, name) catch return propagate(ctx),
+                }),
+                .finished => |view| return job_reply(ctx, 200, .{
+                    .request_id = id,
+                    .action = "none",
+                    .name = name,
+                    .state = job_api.state_of(view.status),
+                    .end = if (view.status) |known| known.end else null,
+                }),
+                .conflict => {},
+            }
+        }
+        return job_conflict(ctx, name);
+    }
+
+    fn jobs_get(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const name = call.parts.next() orelse return call.job_list();
+        try call.no_more();
+        try call.query.allow(ctx, &.{});
+        const view = job_api.get(ctx, name) catch return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        out.json.options.emit_null_optional_fields = false;
+        try out.begin_object();
+        try out.member("revision", view.revision);
+        try out.member("job", try JobSpec.of(ctx, view.job));
+        try out.member("state", job_api.state_of(view.status));
+        try out.member("status", view.status);
+        try out.end_object();
+        return out.finish();
+    }
+
+    fn job_list(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{ "state", "label", "limit", "continue", "at" });
+        var options: job_api.ListOptions = .{ .limit = 50 };
+        if (try call.query.one(ctx, "state")) |text| {
+            if (std.mem.eql(u8, text, "ended")) {
+                options.ended = true;
+            } else {
+                options.state = std.meta.stringToEnum(records.JobState, text) orelse
+                    return bad_request(ctx, "state", "is not a job state");
+            }
+        }
+        options.label = try call.query.one(ctx, "label");
+        if (try call.query.number(ctx, "limit")) |limit| {
+            if (limit == 0 or limit > constants.api_list_limit_max) {
+                return bad_request(ctx, "limit", "must be from 1 to 500");
+            }
+            options.limit = @intCast(limit);
+        }
+        options.at = try call.query.number(ctx, "at");
+        options.after = try call.query.one(ctx, "continue");
+        if (options.after != null and options.at == null) {
+            return bad_request(ctx, "continue", "needs `at`, the revision of the first page");
+        }
+        const listing = job_api.list(ctx, options) catch return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        out.json.options.emit_null_optional_fields = false;
+        try out.begin_object();
+        try out.member("revision", listing.revision);
+        try out.member("jobs", listing.rows);
+        try out.member("continue", listing.continue_after);
+        try out.end_object();
+        return out.finish();
     }
 
     // ---- /v1/codes and /v1/explain/{code} ----

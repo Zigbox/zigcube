@@ -39,6 +39,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
+const agent_jobs = @import("agent_jobs.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -82,6 +83,8 @@ pub const Context = struct {
     /// Where the lease, its send time and the tenure are kept across a restart. Null keeps
     /// nothing (the tests that do not restart).
     state: ?agent_state.AgentState = null,
+    /// The state directory's path, for what a diagnostic says about it; empty where there is none.
+    state_dir: []const u8 = "",
     /// The host's boot id (`/proc/sys/kernel/random/boot_id`), kept with the lease: a kept send
     /// time is on a clock that restarts at boot, so a lease kept under another boot fences.
     /// Empty where there is none (the tests and the simulator, which do not reboot).
@@ -98,7 +101,7 @@ pub const Context = struct {
         return clock.now_ms();
     }
 
-    fn as_controller(ctx: *const Context) controller.Context {
+    pub fn as_controller(ctx: *const Context) controller.Context {
         return .{ .store = ctx.store, .clock = ctx.clock, .arena = ctx.arena, .diag = ctx.diag };
     }
 };
@@ -183,12 +186,33 @@ pub const Agent = struct {
     /// The first cause of the last counted refusal, for the shell to say.
     store_refusal_text: [store_refusal_text_bytes]u8,
     store_refusal_len: u8,
+    /// When the job pass next needs to run (a run's deadline), monotonic; maxInt if never.
+    jobs_wake_mono_ms: u64,
+    /// Pull records dropped unpublished (ZC-W0504), and the last one's container and reason, for
+    /// the shell to say: a dropped record is statistics lost, and it must not be silent.
+    pull_drops: u32,
+    pull_drop_text: [pull_drop_text_bytes]u8,
+    pull_drop_len: u8,
 
     const store_refusal_text_bytes = 160;
+    const pull_drop_text_bytes = 200;
 
     /// What the last counted summary refusal said (empty if none).
     pub fn store_refusal(agent: *const Agent) []const u8 {
         return agent.store_refusal_text[0..agent.store_refusal_len];
+    }
+
+    /// The container and reason of the last dropped pull record (empty if none).
+    pub fn pull_drop(agent: *const Agent) []const u8 {
+        return agent.pull_drop_text[0..agent.pull_drop_len];
+    }
+
+    /// Keeps the container and reason of a dropped pull record (called by `drop_pull`).
+    fn note_pull_drop(agent: *Agent, name: []const u8, reason: []const u8) void {
+        var writer: std.Io.Writer = .fixed(&agent.pull_drop_text);
+        // A text too long for the buffer is cut: the line is a hint, never a failure.
+        writer.print("container {s}: {s}", .{ name, reason }) catch {};
+        agent.pull_drop_len = @intCast(writer.end);
     }
 
     /// Initialises in place: the stop table is large.
@@ -205,10 +229,13 @@ pub const Agent = struct {
         agent.store_refusals = 0;
         agent.store_refused = false;
         agent.store_refusal_len = 0;
+        agent.pull_drops = 0;
+        agent.pull_drop_len = 0;
         agent.restored = false;
         agent.stops_count = 0;
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
+        agent.jobs_wake_mono_ms = maxInt(u64);
     }
 
     /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is
@@ -273,6 +300,7 @@ pub const Agent = struct {
         };
         try pass.load();
         try pass.replicas();
+        acted += try agent_jobs.pass(agent, ctx, listings, pass.given);
         try pass.orphan_containers();
         try pass.orphan_records();
         acted += try pass.flush();
@@ -287,7 +315,12 @@ pub const Agent = struct {
     }
 
     /// The soonest the agent needs to run again: its lease renewal, the fence, a stop's deadline,
-    /// or the resync that notices a container that ended.
+    /// or the resync that notices a container that ended. A stop whose deadline has passed is not
+    /// a wake: if the container is still an orphan or stale, this pass already killed it
+    /// (`stop_once`), and one that is still listed (a record whose container never started reads
+    /// `starting` until `fake_start_timeout_ms`, and there is nothing to kill) is looked at again
+    /// by the resync, not at once, every step. A pending stop that neither path visits waits
+    /// quietly for its container to end.
     fn next_wake(agent: *const Agent, now: u64, mono: u64) u64 {
         var wake = now + constants.agent_resync_ms;
         if (agent.lease != store.lease_none) {
@@ -295,7 +328,10 @@ pub const Agent = struct {
             wake = @min(wake, now + (agent.fence_at_ms().? -| mono));
         }
         for (agent.stops[0..agent.stops_count]) |stop| {
-            if (stop.deadline_ms < wake) wake = stop.deadline_ms;
+            if (stop.deadline_ms > now and stop.deadline_ms < wake) wake = stop.deadline_ms;
+        }
+        if (agent.jobs_wake_mono_ms != maxInt(u64)) {
+            wake = @min(wake, now + (agent.jobs_wake_mono_ms -| mono));
         }
         return @max(wake, now);
     }
@@ -363,13 +399,13 @@ pub const Agent = struct {
                 error.Absent => continue,
                 // A file past the state limit can never be read: remove it, or it wedges here.
                 error.TooBig => {
-                    try agent.drop_pull(ctx, state, file);
+                    try agent.drop_pull(ctx, state, file, name, "its pull.json is too big to read");
                     continue;
                 },
                 else => return state_failed(ctx, err, "read a pull record"),
             };
             published += 1;
-            try agent.publish_pull(ctx, state, file, text);
+            try agent.publish_pull(ctx, state, file, name, text);
             if (agent.fence.active) return;
         }
     }
@@ -379,14 +415,18 @@ pub const Agent = struct {
         ctx: *const Context,
         state: agent_state.AgentState,
         file: []const u8,
+        name: []const u8,
         text: []const u8,
     ) Error!void {
         const parsed = std.json.parseFromSliceLeaky(records.Pull, ctx.arena, text, .{
             .ignore_unknown_fields = true,
-        }) catch return agent.drop_pull(ctx, state, file);
+        }) catch {
+            return agent.drop_pull(ctx, state, file, name, "its pull.json is not a pull record");
+        };
         const tree_ok = parsed.tree.len > 0 and parsed.tree.len <= constants.tree_digest_bytes;
         if (!tree_ok or !std.mem.eql(u8, parsed.node, agent.config.node)) {
-            return agent.drop_pull(ctx, state, file);
+            const reason = "its pull record names another node or no usable tree";
+            return agent.drop_pull(ctx, state, file, name, reason);
         }
         const value = try records.encode(ctx.arena, parsed, ctx.diag);
         const key = records.pull_key(agent.config.node, parsed.tree);
@@ -401,20 +441,39 @@ pub const Agent = struct {
             // step.
             const code = ctx.diag.code orelse return err;
             if (code != .E0504) return err;
+            // The cause is copied by `drop_pull` before the collector is reset.
+            const reason = ctx.diag.last_cause() orelse "zcube-server refused it";
+            var kept: [pull_drop_text_bytes]u8 = undefined;
+            const copied = kept[0..@min(reason.len, kept.len)];
+            @memcpy(copied, reason[0..copied.len]);
             ctx.diag.reset();
-            return agent.drop_pull(ctx, state, file);
+            return agent.drop_pull(ctx, state, file, name, copied);
         };
         if (!done.succeeded) return agent.begin_fence(ctx, ctx.mono_ms());
-        return agent.drop_pull(ctx, state, file);
+        return remove_pull(ctx, state, file);
     }
 
+    /// Removes a pull record that could not be published, then counts it (ZC-W0504) and keeps
+    /// its container and `reason`: after the remove, because a file that stays would be counted
+    /// and noted again at the next step.
     fn drop_pull(
         agent: *Agent,
         ctx: *const Context,
         state: agent_state.AgentState,
         file: []const u8,
+        name: []const u8,
+        reason: []const u8,
     ) Error!void {
-        _ = agent;
+        try remove_pull(ctx, state, file);
+        agent.note_pull_drop(name, reason);
+        agent.pull_drops += 1;
+    }
+
+    fn remove_pull(
+        ctx: *const Context,
+        state: agent_state.AgentState,
+        file: []const u8,
+    ) Error!void {
         state.remove(file) catch |err| switch (err) {
             error.Absent => {},
             else => return state_failed(ctx, err, "remove a pull record"),
@@ -544,7 +603,7 @@ pub const Agent = struct {
     }
 
     /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.
-    fn begin_fence(agent: *Agent, ctx: *const Context, nominal_ms: u64) Error!void {
+    pub fn begin_fence(agent: *Agent, ctx: *const Context, nominal_ms: u64) Error!void {
         if (agent.fence.active) return;
         return agent.start_fence(ctx, fencing.kill_at_ms(nominal_ms));
     }
@@ -576,6 +635,7 @@ pub const Agent = struct {
             if (label_value(listing.labels, runtime.label_replica) == null) continue;
             if (!is_running(listing)) continue;
             running += 1;
+            if (!agent.fence.asked) try agent_jobs.note_fence(ctx, listing);
             if (fault_ignore_stop) continue;
             if (!kill and agent.fence.asked) continue;
             const diag = if (failed == null) ctx.diag else &spare;
@@ -633,6 +693,33 @@ pub const Agent = struct {
         agent.stops_count = kept;
     }
 
+    /// Asks for `listing`'s container to stop, once; a later call kills it if it is still
+    /// running after `grace_ms`.
+    pub fn stop_listing(
+        agent: *Agent,
+        ctx: *const Context,
+        listing: *const runtime.Listing,
+        grace_ms: u32,
+    ) Error!void {
+        assert(is_running(listing));
+        const now = ctx.clock.now_ms();
+        const name = listing.handle.name();
+        if (fault_ignore_stop) return;
+        if (agent.pending_stop(name)) |stop| {
+            if (now < stop.deadline_ms) return;
+            try ctx.runtime.stop(listing.handle, 0, ctx.diag);
+            return;
+        }
+        try ctx.runtime.stop(listing.handle, grace_ms, ctx.diag);
+        if (agent.stops_count == constants.agent_stops_max) return;
+        agent.stops[agent.stops_count] = .{
+            .handle = listing.handle,
+            .deadline_ms = now + grace_ms,
+        };
+        agent.stops_count += 1;
+        assert(agent.pending_stop(name) != null);
+    }
+
     fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
         for (agent.stops[0..agent.stops_count]) |*stop| {
             if (std.mem.eql(u8, stop.handle.name(), name)) return stop;
@@ -662,6 +749,7 @@ const Pass = struct {
     ctx: *const Context,
     listings: []const runtime.Listing,
     mine: []const controller.Entry(records.Replica) = &.{},
+    given: []const controller.Entry(records.Assigned) = &.{},
     observed: []const controller.Entry(records.Observed) = &.{},
     writes: std.ArrayList(Write) = .empty,
     node_key: records.Key = undefined,
@@ -683,7 +771,7 @@ const Pass = struct {
             &ctx,
             assigned_prefix.slice(),
             null,
-            constants.replicas_max,
+            constants.agent_node_assigned_max,
         );
         var wanted: std.StringHashMapUnmanaged(void) = .empty;
         for (given.items) |entry| {
@@ -696,6 +784,7 @@ const Pass = struct {
             mine.append(ctx.arena, item) catch return failures.no_memory(ctx.diag);
         }
         pass.mine = mine.items;
+        pass.given = given.items;
         const prefix = records.observed_prefix(pass.agent.config.node);
         const seen = try controller.list_all(
             records.Observed,
@@ -725,6 +814,11 @@ const Pass = struct {
     fn is_desired(pass: *const Pass, id: []const u8) bool {
         for (pass.mine) |item| {
             if (std.mem.eql(u8, item.rec.id, id)) return true;
+        }
+        for (pass.given) |item| {
+            if (records.assigned_is_job(&item.rec) and std.mem.eql(u8, item.rec.replica, id)) {
+                return true;
+            }
         }
         return false;
     }
@@ -803,24 +897,7 @@ const Pass = struct {
     /// Asks for `listing`'s container to stop, once; a later step kills it if it is still
     /// running after its grace period.
     fn stop_once(pass: *Pass, listing: *const runtime.Listing) Error!void {
-        assert(is_running(listing));
-        const ctx = pass.ctx;
-        const now = ctx.clock.now_ms();
-        const name = listing.handle.name();
-        if (fault_ignore_stop) return;
-        if (pass.agent.pending_stop(name)) |stop| {
-            if (now < stop.deadline_ms) return;
-            try ctx.runtime.stop(listing.handle, 0, ctx.diag);
-            return;
-        }
-        try ctx.runtime.stop(listing.handle, constants.stop_grace_ms, ctx.diag);
-        if (pass.agent.stops_count == constants.agent_stops_max) return;
-        pass.agent.stops[pass.agent.stops_count] = .{
-            .handle = listing.handle,
-            .deadline_ms = now + constants.stop_grace_ms,
-        };
-        pass.agent.stops_count += 1;
-        assert(pass.agent.pending_stop(name) != null);
+        return pass.agent.stop_listing(pass.ctx, listing, constants.stop_grace_ms);
     }
 
     /// Writes the observed record for a container the runtime has, if it differs from the
@@ -1040,7 +1117,7 @@ fn state_failed(ctx: *const Context, err: agent_state.Error, operation: []const 
     return agent_records.state_failed(ctx.diag, mapped, operation);
 }
 
-fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
+pub fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
     for (labels) |label| {
         if (std.mem.eql(u8, label.key, key)) return label.value;
     }
@@ -1068,7 +1145,7 @@ fn is_this_replica(
     return std.mem.eql(u8, text, created_text(&buffer, item.kv.create_revision));
 }
 
-fn find_listing_by_replica(
+pub fn find_listing_by_replica(
     listings: []const runtime.Listing,
     id: []const u8,
 ) ?*const runtime.Listing {
@@ -1089,7 +1166,7 @@ fn find_listing_by_name(
     return null;
 }
 
-fn is_running(listing: ?*const runtime.Listing) bool {
+pub fn is_running(listing: ?*const runtime.Listing) bool {
     const found = listing orelse return false;
     return switch (found.status) {
         .starting, .running => true,
@@ -1113,4 +1190,32 @@ fn same_state(first: *const records.Observed, second: *const records.Observed) b
 // is told to stop. `sim-teeth` is the one build that sees it on.
 test "the test-only fault is off in this build" {
     try std.testing.expect(!fault_ignore_stop);
+}
+
+test "next_wake: an overdue stop is not a wake time, a future one is (issue 96)" {
+    const agent = try std.testing.allocator.create(Agent);
+    defer std.testing.allocator.destroy(agent);
+    agent.init(.{ .node = "node1", .capacity = .{ .cpu_millis = 1000, .memory_bytes = 1 << 30 } });
+    const now: u64 = 10_000;
+    const resync = now + constants.agent_resync_ms;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+
+    // A deadline that has passed, or is exactly now, leaves the wake at the resync.
+    agent.stops[0] = .{ .handle = runtime.Handle.init("a"), .deadline_ms = now - 1 };
+    agent.stops_count = 1;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+    agent.stops[0].deadline_ms = now;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+
+    // A future deadline sooner than the resync is the wake; one later than it is not.
+    agent.stops[0].deadline_ms = now + 100;
+    try std.testing.expectEqual(now + 100, agent.next_wake(now, 0));
+    agent.stops[0].deadline_ms = resync + 5_000;
+    try std.testing.expectEqual(resync, agent.next_wake(now, 0));
+
+    // An overdue stop beside a future one: only the future one counts.
+    agent.stops[1] = .{ .handle = runtime.Handle.init("b"), .deadline_ms = now + 200 };
+    agent.stops[0].deadline_ms = now - 500;
+    agent.stops_count = 2;
+    try std.testing.expectEqual(now + 200, agent.next_wake(now, 0));
 }

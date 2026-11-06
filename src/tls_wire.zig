@@ -53,6 +53,16 @@ pub const scheme_ed25519: u16 = 0x0807;
 pub const version_tls13: u16 = 0x0304;
 pub const version_tls12: u16 = 0x0303;
 
+/// The extension types seen so far in one block: RFC 8446 section 4.2 forbids any type twice.
+const SeenExtensions = struct {
+    set: std.StaticBitSet(1 << 16) = .empty,
+
+    fn add(self: *SeenExtensions, kind: u16) Error!void {
+        if (self.set.isSet(kind)) return error.DuplicateExtension;
+        self.set.set(kind);
+    }
+};
+
 const ext_server_name: u16 = 0;
 const ext_supported_groups: u16 = 10;
 const ext_signature_algorithms: u16 = 13;
@@ -342,9 +352,11 @@ const HelloExtensions = struct {
 
 fn read_hello_extensions(reader: *Reader, parsed: *HelloExtensions) Error!void {
     var count: u32 = 0;
+    var seen: SeenExtensions = .{};
     while (reader.remaining() > 0) {
         const kind = try reader.read_u16();
         const data = try reader.vector16();
+        try seen.add(kind);
         count += 1;
         assert(count <= constants.tls_handshake_message_bytes_max); // Each takes four bytes.
         switch (kind) {
@@ -453,4 +465,52 @@ pub fn parse_key_update(body: []const u8) Error!bool {
     if (body.len != 1) return error.Malformed;
     if (body[0] > 1) return error.IllegalParameter;
     return body[0] == 1;
+}
+
+pub const Request = struct {
+    /// The `certificate_request_context`, echoed in the client's Certificate.
+    context: []const u8,
+    /// Whether the server accepts an Ed25519 signature and an Ed25519-signed certificate.
+    accepts_ed25519: bool,
+};
+
+/// CertificateRequest (RFC 8446 section 4.3.2) in the handshake: the context, then extensions of
+/// which `signature_algorithms` is required. `signature_algorithms_cert`, when present, must also
+/// list Ed25519 for the request to be answerable. Every other extension (`certificate_authorities`,
+/// `oid_filters`, `status_request`, ...) is skipped: the client has one identity to offer.
+pub fn parse_certificate_request(body: []const u8) Error!Request {
+    var reader = Reader.init(body);
+    const context = try reader.vector8();
+    var extensions = Reader.init(try reader.vector16());
+    try reader.finish();
+    var schemes: ?bool = null;
+    var cert_schemes: ?bool = null;
+    var seen: SeenExtensions = .{};
+    while (extensions.remaining() > 0) {
+        const kind = try extensions.read_u16();
+        const data = try extensions.vector16();
+        try seen.add(kind);
+        switch (kind) {
+            ext_signature_algorithms => schemes = try lists_ed25519(data),
+            ext_signature_algorithms_cert => cert_schemes = try lists_ed25519(data),
+            else => {},
+        }
+    }
+    const listed = schemes orelse return error.MissingExtension;
+    return .{ .context = context, .accepts_ed25519 = listed and (cert_schemes orelse true) };
+}
+
+/// A `SignatureSchemeList`: a non-empty, even-length vector of two-byte schemes.
+fn lists_ed25519(data: []const u8) Error!bool {
+    var reader = Reader.init(data);
+    const list = try reader.vector16();
+    try reader.finish();
+    if (list.len == 0) return error.Malformed;
+    if (list.len % 2 != 0) return error.Malformed;
+    var found = false;
+    var at: usize = 0;
+    while (at < list.len) : (at += 2) {
+        if (std.mem.readInt(u16, list[at..][0..2], .big) == scheme_ed25519) found = true;
+    }
+    return found;
 }

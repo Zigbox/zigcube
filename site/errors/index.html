@@ -148,11 +148,14 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0515.html">ZC-E0515</a></td><td>a swarm fetch outlived its kill, so the image was not pulled</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0521.html">ZC-E0521</a></td><td>the agent could not tell how a run ended</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0522.html">ZC-E0522</a></td><td>a run's start record is missing or damaged</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0523.html">ZC-E0523</a></td><td>a run's input does not match its digest</td><td>environment</td></tr>
 <tr><td class="code"><a href="W0501.html">ZC-W0501</a></td><td>the agent fenced itself and registered again</td><td>environment</td></tr>
 <tr><td class="code"><a href="W0503.html">ZC-W0503</a></td><td>a job reached its deadline and was stopped</td><td>user</td></tr>
+<tr><td class="code"><a href="W0504.html">ZC-W0504</a></td><td>a pull record was not stored</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0601.html">ZC-E0601</a></td><td>a tree could not be fetched from any peer or the registry</td><td>external</td></tr>
 <tr><td class="code"><a href="W0601.html">ZC-W0601</a></td><td>a peer sent a chunk that does not match its hash</td><td>external</td></tr>
 <tr><td class="code"><a href="W0602.html">ZC-W0602</a></td><td>a peer's chunk list does not match its digest</td><td>external</td></tr>
+<tr><td class="code"><a href="W0603.html">ZC-W0603</a></td><td>the swarm fetch ended without the tree</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0801.html">ZC-E0801</a></td><td>a peer's credential is not signed by this cluster</td><td>external</td></tr>
 <tr><td class="code"><a href="E0802.html">ZC-E0802</a></td><td>a peer's credential is expired or not yet valid</td><td>external</td></tr>
 <tr><td class="code"><a href="E0803.html">ZC-E0803</a></td><td>the peer is not the node that was asked for</td><td>external</td></tr>
@@ -166,11 +169,13 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0811.html">ZC-E0811</a></td><td>a certificate is expired or not yet valid</td><td>external</td></tr>
 <tr><td class="code"><a href="E0812.html">ZC-E0812</a></td><td>a certificate names another server than the one asked for</td><td>external</td></tr>
 <tr><td class="code"><a href="E0813.html">ZC-E0813</a></td><td>a TLS handshake was refused</td><td>external</td></tr>
+<tr><td class="code"><a href="E0814.html">ZC-E0814</a></td><td>the TLS client certificate was not asked for, or was refused</td><td>external</td></tr>
 <tr><td class="code"><a href="E0815.html">ZC-E0815</a></td><td>a TLS record failed its checks</td><td>external</td></tr>
-<tr><td class="code"><a href="E0816.html">ZC-E0816</a></td><td>a TLS connection ended without close_notify</td><td>external</td></tr>
+<tr><td class="code"><a href="E0816.html">ZC-E0816</a></td><td>a TLS connection ended or stalled without close_notify</td><td>external</td></tr>
 <tr><td class="code"><a href="E0817.html">ZC-E0817</a></td><td>an identity could not be issued</td><td>user</td></tr>
 <tr><td class="code"><a href="E0818.html">ZC-E0818</a></td><td>a TLS peer needs something zcube does not offer</td><td>external</td></tr>
 <tr><td class="code"><a href="E0819.html">ZC-E0819</a></td><td>a certificate is of another kind than this use needs</td><td>external</td></tr>
+<tr><td class="code"><a href="E0820.html">ZC-E0820</a></td><td>the key behind the client certificate did not sign</td><td>environment</td></tr>
 <tr><td class="code"><a href="B0001.html">ZC-B0001</a></td><td>zcube hit an internal error</td><td>internal</td></tr>
 <tr><td class="code"><a href="B0002.html">ZC-B0002</a></td><td>zcube failed in a way it should not</td><td>internal</td></tr>
 <tr><td class="code"><a href="B0003.html">ZC-B0003</a></td><td>allocation accounting disagrees with assignments</td><td>internal</td></tr>

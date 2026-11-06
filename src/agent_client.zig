@@ -322,16 +322,18 @@ pub const RemoteStore = struct {
         assert(!options.reverse);
         const observed = records.observed_prefix(remote.node);
         const assigned = records.assigned_prefix(remote.node);
-        const is_replicas = std.mem.eql(u8, options.prefix, records.prefix_replicas);
-        const is_observed = std.mem.eql(u8, options.prefix, observed.slice());
-        const is_assigned = std.mem.eql(u8, options.prefix, assigned.slice());
-        if (!is_replicas and !is_observed and !is_assigned) {
-            return unsupported(diag, "a list of anything but the node's replicas and records");
-        }
-        const suffix: []const u8 = if (is_replicas) "/replicas" else if (is_assigned)
-            "/assigned"
-        else
-            "/observed";
+        const job_observed = records.job_observed_prefix(remote.node);
+        const Mapped = struct { prefix: []const u8, suffix: []const u8 };
+        const mapped = [_]Mapped{
+            .{ .prefix = records.prefix_replicas, .suffix = "/replicas" },
+            .{ .prefix = observed.slice(), .suffix = "/observed" },
+            .{ .prefix = assigned.slice(), .suffix = "/assigned" },
+            .{ .prefix = records.prefix_job_runs, .suffix = "/runs" },
+            .{ .prefix = job_observed.slice(), .suffix = "/job-observed" },
+        };
+        const suffix: []const u8 = for (mapped) |entry| {
+            if (std.mem.eql(u8, options.prefix, entry.prefix)) break entry.suffix;
+        } else return unsupported(diag, "a list of anything but the node's records");
         const target = try remote.path(arena, suffix, diag);
         const reply = try remote.exchange(arena, .{ .method = "GET", .target = target }, diag);
         if (reply.status != 200) return refused(arena, reply, diag);
@@ -388,6 +390,9 @@ pub const RemoteStore = struct {
         diag: *Diag,
     ) store.Error!store.TxnResult {
         const remote = from(context);
+        if (request.on_success.len == 1 and is_job_report(remote, request.on_success[0])) {
+            return remote.job_txn(request, diag);
+        }
         const tenure = try remote.tenure_of(request.compares, diag);
         if (request.on_failure.len > 0) return unsupported(
             diag,
@@ -425,6 +430,71 @@ pub const RemoteStore = struct {
         const Answer = struct { revision: u64 };
         const answer = try parse(Answer, arena, reply.body, diag);
         return .{ .succeeded = true, .revision = answer.revision };
+    }
+
+    fn is_job_report(remote: *const RemoteStore, op: store.Op) bool {
+        const prefix = records.job_observed_prefix(remote.node);
+        return std.mem.startsWith(u8, store.op_key(op), prefix.slice());
+    }
+
+    /// `POST /v1/agent/nodes/{node}/job-observed`: one put of `/job-observed/<node>/<name>`. Its
+    /// compares are the tenure and, for a claim, the run's revision; the server derives the rest
+    /// (the assignment and the absent observation) from the record.
+    fn job_txn(
+        remote: *RemoteStore,
+        request: store.TxnRequest,
+        diag: *Diag,
+    ) store.Error!store.TxnResult {
+        if (request.on_failure.len > 0) return unsupported(diag, "a report with a failure branch");
+        var arena_state = std.heap.ArenaAllocator.init(remote.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const put = switch (request.on_success[0]) {
+            .put => |value| value,
+            .delete => return unsupported(diag, "the delete of a job observation"),
+        };
+        var tenure: u64 = 0;
+        var run_revision: u64 = 0;
+        const node_key = records.node_key(remote.node);
+        for (request.compares) |cmp| {
+            if (std.mem.eql(u8, cmp.key, node_key.slice())) {
+                tenure = cmp.mod_revision;
+            } else if (std.mem.startsWith(u8, cmp.key, records.prefix_job_runs)) {
+                run_revision = cmp.mod_revision;
+            } else if (!std.mem.startsWith(u8, cmp.key, records.prefix_job_observed) and
+                !std.mem.startsWith(u8, cmp.key, records.assigned_prefix(remote.node).slice()))
+            {
+                return unsupported(diag, "a report with a compare the server cannot carry");
+            }
+        }
+        if (tenure == 0) return unsupported(diag, "a job report without a tenure");
+        var out: std.Io.Writer.Allocating = .init(arena);
+        var json: std.json.Stringify = .{ .writer = &out.writer };
+        json.beginObject() catch return failures.no_memory(diag);
+        json.objectField("tenure") catch return failures.no_memory(diag);
+        json.write(tenure) catch return failures.no_memory(diag);
+        json.objectField("run_revision") catch return failures.no_memory(diag);
+        json.write(run_revision) catch return failures.no_memory(diag);
+        json.objectField("value") catch return failures.no_memory(diag);
+        json.beginWriteRaw() catch return failures.no_memory(diag);
+        json.writer.writeAll(put.value) catch return failures.no_memory(diag);
+        json.endWriteRaw();
+        json.endObject() catch return failures.no_memory(diag);
+        const body = out.toOwnedSlice() catch return failures.no_memory(diag);
+        const target = try remote.path(arena, "/job-observed", diag);
+        const request_http: Request = .{ .method = "POST", .target = target, .body = body };
+        const reply = try remote.exchange(arena, request_http, diag);
+        if (reply.status != 200) {
+            if (refusal_code(arena, reply.body)) |text| {
+                if (std.mem.eql(u8, text, "ZC-E0510")) {
+                    return .{ .succeeded = false, .revision = 0 };
+                }
+            }
+            return refused(arena, reply, diag);
+        }
+        const Answer = struct { revision: u64, applied: bool = true };
+        const answer = try parse(Answer, arena, reply.body, diag);
+        return .{ .succeeded = answer.applied, .revision = answer.revision };
     }
 
     /// The tenure a transaction's one compare names: a compare on this node's `/nodes/<node>`
@@ -607,11 +677,54 @@ pub const RemoteStore = struct {
         at_revision: ?store.Revision,
         diag: *Diag,
     ) store.Error!store.GetResult {
-        _ = context;
-        _ = arena;
-        _ = key;
-        _ = at_revision;
-        return unsupported(diag, "get");
+        const remote = from(context);
+        // The one read the agent makes of a single key: the input of a run it has claimed.
+        const prefix = records.prefix_job_input;
+        if (at_revision != null or !std.mem.startsWith(u8, key, prefix)) {
+            return unsupported(diag, "get of anything but a run's input");
+        }
+        const name = key[prefix.len..];
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return unsupported(diag, "get of a run's input under a bad name");
+        }
+        const suffix = std.fmt.allocPrint(arena, "/runs/{s}/input", .{name}) catch
+            return failures.no_memory(diag);
+        const target = try remote.path(arena, suffix, diag);
+        const reply = try remote.exchange(arena, .{ .method = "GET", .target = target }, diag);
+        if (reply.status != 200) {
+            // The server's own answer that the run has no input it can give: not a fault of
+            // the link (ZC-E0523), so the agent can tell it from one.
+            const code = refusal_code(arena, reply.body) orelse "";
+            if (std.mem.endsWith(u8, code, "E0523")) {
+                if (!refusal_says(arena, reply.body, records.input_mismatch_phrase)) {
+                    return .{ .kv = null, .revision = 1 };
+                }
+                // A damaged input is not an absent one: hand over a value that does not
+                // decode, which the agent reads as a mismatch.
+                const damaged: store.KeyValue = .{
+                    .key = key,
+                    .value = "null",
+                    .create_revision = 1,
+                    .mod_revision = 1,
+                    .lease = store.lease_none,
+                };
+                return .{ .kv = damaged, .revision = 1 };
+            }
+            return refused(arena, reply, diag);
+        }
+        const Answer = struct { input: Json };
+        const answer = try parse(Answer, arena, reply.body, diag);
+        const value = std.json.Stringify.valueAlloc(arena, answer.input, .{}) catch
+            return failures.no_memory(diag);
+        // The agent reads the value and nothing else of the record.
+        const kv: store.KeyValue = .{
+            .key = key,
+            .value = value,
+            .create_revision = 1,
+            .mod_revision = 1,
+            .lease = store.lease_none,
+        };
+        return .{ .kv = kv, .revision = 1 };
     }
 
     fn watch_impl(
@@ -967,6 +1080,17 @@ pub fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return null;
     if (parsed.diagnostics.len == 0) return null;
     return parsed.diagnostics[0].code;
+}
+
+/// Whether any cause of the server's first diagnostic contains `phrase`.
+fn refusal_says(arena: Allocator, body: []const u8, phrase: []const u8) bool {
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return false;
+    if (parsed.diagnostics.len == 0) return false;
+    for (parsed.diagnostics[0].causes) |text| {
+        if (std.mem.indexOf(u8, text, phrase) != null) return true;
+    }
+    return false;
 }
 
 /// ZC-E0504 carrying the server's own diagnostic: its code and summary, and its innermost cause.

@@ -348,6 +348,64 @@ it (a body over the limit, too many connections) still answers with the error bo
 The agent's endpoints (registration, its watch, observed-state reports) arrive with the agent in
 slice 6. Auth, scopes and the `--force`/plan-hash flow of SPEC do not exist yet.
 
+## Jobs (B1 slice 2)
+
+`src/job_api.zig` decides, `src/api.zig` routes. Like the writes above they are unauthenticated until
+auth exists, and so are the secrets in them: **a job's `env` values and `input` are readable by
+anyone who can reach the server's address** (the read-only `GET /v1/list` redacts them; the writing
+token does not, and the agent's endpoints serve them to the node). Do not put a secret in a job on a
+shared network.
+
+### `POST /v1/jobs`
+
+The body is the job as JSON: `name`, `image`, `command`, `deadline_ms`, `submit_by_ms` (required),
+`source`, `env` (`[["NAME","value"]]`), `limits`, `labels`, `grace_ms`, `input` (UTF-8 text, at most
+64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`. `retries` above 0,
+`relay` and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
+ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the same spec already
+exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
+it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job_admitted_window_max`
+creations in `job_admission_window_h` hours, `410` ZC-E0134 when `submit_by_ms` has passed,
+`400` ZC-E0130 naming the field for everything else, including a job whose run record would take
+more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source` and `image`
+are escaped (a control character takes six bytes in JSON).
+
+**This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
+about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
+(`6 * job_input_bytes_max + 16 KiB`, 409,600 bytes); every other route keeps `http_body_bytes_max`
+(64 KiB). A longer body is `413` ZC-E0108 and its cause names the limit of this route. The limit is
+decided on the decoded input, not the wire: an input within 64 KiB, with the rest of the job
+within 16 KiB as sent, is always stored. A body must arrive within `http_idle_timeout_ms` (10 s) of
+the request's start, so the slowest client the largest body allows is `job_request_bytes_max` over
+10 s, about 40 KB/s (40,960 bytes a second); a slower client, or one that stalls part way, is
+disconnected with no code. (`docs/decisions/2026-11-06-b1-slice-2-review-followups.md`.) The
+`state` of a `200` (same job) and of every cancel reply is the job's state now, `pending` only while
+it has no status.
+
+### `GET /v1/jobs/{name}`, `GET /v1/jobs`
+
+The first answers `{revision, job, state, status}`: `job` is the spec with `env_names` (names, never
+values), `input_digest` and `input_bytes` (never the input), `cancel_requested`. `404` ZC-E0133 for
+a job that does not exist. The second takes `state=` (a job state, or `ended` for every terminal
+state), `label=key[=value]`, `limit=` (1 to 500, default 50), `at=` and `continue=`, and answers
+`{revision, jobs, continue}`; a filter keeps a subset of each store page, so a page may hold fewer
+than `limit` rows and `continue` may still be set.
+
+### `POST /v1/jobs/{name}/cancel`
+
+Body empty or `{"applied_by": "..."}`. Records `cancel_requested` and answers `202`; the job
+controller stops the run. A second cancel answers `202` and writes nothing; a job that has ended
+answers `200` with its `end`. `404` ZC-E0133 if there is no such job. `GET /v1/why/job/{name}` is
+the job's chain of decisions.
+
+| Code | Blame | Summary | Status |
+| --- | --- | --- | --- |
+| `ZC-E0130` | user | the job can't be accepted (its cause names the field) | `400` |
+| `ZC-E0131` | user | a job with this name exists with another spec | `409` |
+| `ZC-E0132` | user | too many jobs | `429` |
+| `ZC-E0133` | user | no such job | `404` |
+| `ZC-E0134` | user | `submit_by_ms` has passed | `410` |
+
 ## New diagnostic codes this needs
 
 The console has to explain its own failures. The `01xx` range is "API and CLI". Proposed, for
@@ -452,6 +510,9 @@ runs unchanged on the far side of HTTP:
 | `list(/replicas/)`, filtered to the node | `GET /v1/agent/nodes/{node}/replicas` |
 | `list(/observed/<node>/)` | `GET /v1/agent/nodes/{node}/observed` |
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
+| `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
+| `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
+| `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
 `{node}` is a node name (a hostname label, at most 63 bytes). Errors are the diagnostics of
@@ -609,6 +670,26 @@ runtime's own diagnostic (`ZBX-E0410` for an image that is not in the node's sto
 store as the agent built it, and `zcube why` renders it. The server refuses (`400`, `ZC-E0104`,
 nothing written) a put whose record is for another node, whose key is not the observed key of its
 record, a delete outside `/observed/<node>/`, a key named twice, and more than 16 operations.
+
+### `GET /v1/agent/nodes/{node}/runs`, `GET .../runs/{name}/input`, `GET` and `POST .../job-observed` (B1 slice 4)
+
+`runs` lists the job runs (`/job-runs/`) assigned to the node, as `{"revision", "kvs"}` like
+`replicas`; more than `agent_node_runs_max` is `ZC-E0302`. `runs/{name}/input` answers the job's `JobInput` (keys.md) only to the node that holds the run's
+assignment and only after it has claimed the run (its `/job-observed/<node>/<name>` exists), and
+`ZC-E0133` otherwise, so an input never reaches a node that was not placed the run or that lost the
+claim. The agent checks `sha256:<hex>` over the decoded bytes against the job's `input_digest`.
+
+`job-observed` `GET` lists `/job-observed/<node>/`; `POST` is one put of
+`/job-observed/<node>/<name>`:
+
+```json
+{ "tenure": 412, "run_revision": 87, "value": {"v": 1, "run": "batch-job", "status": "claimed"} }
+```
+
+The server compares the tenure, and for a claim (`status` `claimed`) also the run's `mod_revision`
+(`run_revision`), the assignment's `mod_revision` (the epoch in the record) and the absence of the
+observation. A claim whose compares fail while the tenure holds answers `200 {"applied": false}`
+and writes nothing: the run moved or was claimed before. A replaced tenure is `503` `ZC-E0510`.
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

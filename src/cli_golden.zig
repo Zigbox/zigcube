@@ -18,6 +18,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
+const agent_jobs = @import("agent_jobs.zig");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
 const cli_local = @import("cli_local.zig");
@@ -31,6 +32,7 @@ const fetch_worker = @import("fetch_worker.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
 const x509 = @import("x509.zig");
+const x509_test = @import("x509_test.zig");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 const testing = std.testing;
@@ -307,20 +309,31 @@ fn job_waits(diag: *diag_mod.Diag) void { // scheduler.zig
     sample(diag, .W0308, &.{cause}, "lower the job's limits, add a node, or wait for a job to end");
 }
 
-fn run_end_unknown(diag: *diag_mod.Diag) void { // agent.zig
-    const cause = "train-7-job has no container and left no exit record in its directory";
-    const fix = "find why the host restarted or the state directory was lost; it is not run again";
-    sample(diag, .E0521, &.{cause}, fix);
+fn run_end_unknown(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_run_end_unknown(diag, "train-7-job", "/var/lib/zcube-agent");
 }
 
-fn run_start_record(diag: *diag_mod.Diag) void { // agent_records.zig
-    const cause = "the start record of train-7-job in /var/lib/zcube-agent is missing";
-    sample(diag, .E0522, &.{cause}, "check the state directory's disk and permissions");
+fn run_start_record(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_start_record(diag, "train-7-job", "/var/lib/zcube-agent");
 }
 
-fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
-    const cause = "train-7-job ran for 600000 ms, its deadline; it was stopped and then killed";
-    sample(diag, .W0503, &.{cause}, "raise deadline_ms if the job needs the time");
+fn job_deadline(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_deadline(diag, "train-7-job", true);
+}
+
+fn run_input_digest(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_input(diag, "train-7-job", .mismatch);
+}
+
+fn pull_record_lost(diag: *diag_mod.Diag) void { // agent.zig
+    const cause = "the pull record could not be written to pull.json: NoSpaceLeft";
+    sample(diag, .W0504, &.{cause}, "check the state directory's disk space and permissions");
+}
+
+fn swarm_fetch_ended(diag: *diag_mod.Diag) void { // zigbox_supervisor.zig
+    const cause = "the fetch was killed at its deadline, ms: 1800000";
+    const fix = "if it repeats on every start, check the peers and the network";
+    sample(diag, .W0603, &.{cause}, fix);
 }
 
 fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
@@ -552,7 +565,7 @@ fn x509_wrong_use(diag: *diag_mod.Diag) void { // x509.zig
 
 /// A client that has sent its ClientHello, for the TLS cases below; the hello is copied to `hello`.
 fn tls_started(client: *tls_client.Client, hello: []u8) []u8 {
-    client.init(&.{
+    return tls_started_with(client, hello, &.{
         .anchor = @splat(1),
         .server_name = "broker.botpike.com",
         .now_ms = 1_700_000_000_000,
@@ -560,6 +573,14 @@ fn tls_started(client: *tls_client.Client, hello: []u8) []u8 {
         .session_id = @splat(3),
         .secret = @splat(4),
     });
+}
+
+fn tls_started_with(
+    client: *tls_client.Client,
+    hello: []u8,
+    config: *const tls_client.Config,
+) []u8 {
+    client.init(config);
     client.start();
     const sent = client.output();
     @memcpy(hello[0..sent.len], sent);
@@ -614,6 +635,72 @@ fn tls_retry_request(diag: *diag_mod.Diag) void { // tls_client.zig
         .faults = .{ .hello_retry = true },
     });
     var flight: [512]u8 = undefined;
+    tls_refused(&client, peer.respond(sent, &flight), diag);
+}
+
+fn tls_not_asked(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    const key = Ed25519.KeyPair.generateDeterministic(@splat(5)) catch unreachable; // A seed works.
+    const sent = tls_started_with(&client, &hello, &.{
+        .anchor = @splat(1),
+        .server_name = "broker.botpike.com",
+        .now_ms = 1_700_000_000_000,
+        .random = @splat(2),
+        .session_id = @splat(3),
+        .secret = @splat(4),
+        .client_auth = .{ .required = .{
+            .certificates = &.{"workload certificate"},
+            .signer = tls_client.key_pair_signer(&key),
+        } },
+    });
+    var peer = testpeer.Peer.init(.{
+        .certificates = &.{"server certificate"},
+        .key = key,
+        .random = @splat(0),
+        .secret = @splat(6),
+    });
+    var flight: [1024]u8 = undefined;
+    tls_refused(&client, peer.respond(sent, &flight), diag);
+}
+
+fn no_signature(context: *const anyopaque, message: []const u8) ?[64]u8 {
+    _ = context;
+    _ = message;
+    return null;
+}
+
+fn tls_signer_failed(diag: *diag_mod.Diag) void { // tls_client.zig
+    var client: tls_client.Client = undefined;
+    var hello: [1024]u8 = undefined;
+    const ca = x509_test.ca_pair() catch unreachable; // A fixed seed.
+    const key = Ed25519.KeyPair.generateDeterministic(@splat(5)) catch unreachable; // A seed works.
+    var leaf: x509.Der = undefined;
+    x509.issue_server(&leaf, ca, &.{
+        .dns_name = "broker.botpike.com",
+        .subject_key = key.public_key.toBytes(),
+        .lifetime = x509_test.window,
+    }) catch unreachable; // The request is within the bounds.
+    const sent = tls_started_with(&client, &hello, &.{
+        .anchor = ca.public_key.toBytes(),
+        .server_name = "broker.botpike.com",
+        .now_ms = x509_test.now,
+        .random = @splat(2),
+        .session_id = @splat(3),
+        .secret = @splat(4),
+        .client_auth = .{ .optional = .{
+            .certificates = &.{"workload certificate"},
+            .signer = .{ .context = &key, .sign = no_signature },
+        } },
+    });
+    var peer = testpeer.Peer.init(.{
+        .certificates = &.{leaf.slice()},
+        .key = key,
+        .random = @splat(0),
+        .secret = @splat(6),
+        .client_auth = .{ .anchor = ca.public_key.toBytes(), .now_ms = x509_test.now },
+    });
+    var flight: [4096]u8 = undefined;
     tls_refused(&client, peer.respond(sent, &flight), diag);
 }
 
@@ -788,8 +875,10 @@ const cases = [_]Case{
     relayed(.E0515, agent_fetch_outlived),
     relayed(.E0521, run_end_unknown),
     relayed(.E0522, run_start_record),
+    relayed(.E0523, run_input_digest),
     relayed(.W0501, agent_lease),
     relayed(.W0503, job_deadline),
+    relayed(.W0504, pull_record_lost),
     relayed(.E0801, peer_foreign_ca),
     relayed(.E0802, peer_expired),
     relayed(.E0803, peer_wrong_node),
@@ -803,14 +892,17 @@ const cases = [_]Case{
     relayed(.E0811, x509_expired),
     relayed(.E0812, x509_wrong_server),
     relayed(.E0813, tls_alert),
+    relayed(.E0814, tls_not_asked),
     relayed(.E0815, tls_overlong_record),
     relayed(.E0816, tls_cut_off),
     relayed(.E0817, x509_not_issued),
     relayed(.E0818, tls_retry_request),
     relayed(.E0819, x509_wrong_use),
+    relayed(.E0820, tls_signer_failed),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),
+    relayed(.W0603, swarm_fetch_ended),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
     relayed(.B0004, job_end_unmapped),

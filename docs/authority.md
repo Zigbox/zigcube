@@ -521,11 +521,25 @@ live. `/job-admission` and `/job-endings` are exact keys of their writers and ar
 **A run is created once, ever.** The controller never re-creates a run for a job that had one
 (I8a). A job whose run or status is missing after it had one is contradictory (ZC-E0307): the
 controller changes nothing and creates nothing. An operator who deletes `/job-runs/<name>` and
-`/job-status/<name>` has not cancelled the job. "Had one" is the `job-created` decision (owner,
+`/job-status/<name>` has not cancelled the job. "Had one" is the `job_created` decision (owner,
 option A): before creating, the controller reads `/decisions-by-subject/job/<name>`, and a
-`job-created` there means the job is contradictory, whatever else is missing. This rests on the
+`job_created` there means the job is contradictory, whatever else is missing. This rests on the
 job controller being the only writer of runs, and on retention judging a job live by
 `/jobs/<name>` alone: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
+
+**Decision actions of a job** (subject kind `job`), in snake_case: `job_created`, `job_placed`,
+`job_running`, `stop_job`, `end_job`, `hold_contradictory_job`, `hold_unmapped_ending` and
+`drop_report`. "Had a run" is `job_created` *of this incarnation*: the decision's index entry
+`create_revision` is at least the job's `create_revision`, so a job deleted and created again
+under its name starts afresh. A hold or a drop is written once per revision of the record it is
+about (the job's, the report's), judged from the store, so a restart repeats nothing.
+
+**A claim is judged by its tenure.** A run with a claim (a report in `/job-observed/<node>/`) is
+never ended as unstarted. An admissible report (tenure is the node's `mod_revision`, assignment is
+the placement's, node `ready`) ends it or marks it running; an inadmissible one leaves it
+`placed` until the claim's tenure has ended and stayed ended for `lost_grace_ms`, then it ends
+`failed unreachable`. A report that arrives after the job ended is recorded as `drop_report`
+(ZC-W0307) and changes nothing.
 
 **I1a, I1b, I2, I6 and I7 hold for runs unchanged:** a run has at most one assignment and its
 observations are admissible under one tenure; the allocation of a node counts runs with replicas;

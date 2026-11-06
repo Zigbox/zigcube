@@ -15,6 +15,7 @@ pub const modules = .{
     @import("agent.zig"),
     @import("agent_api.zig"),
     @import("agent_client.zig"),
+    @import("agent_jobs.zig"),
     @import("agent_loop.zig"),
     @import("fencing.zig"),
     @import("agent_records.zig"),
@@ -22,8 +23,10 @@ pub const modules = .{
     @import("allocations.zig"),
     @import("api.zig"),
     @import("auditor.zig"),
+    @import("job_api.zig"),
     @import("apply.zig"),
     @import("chunk_summary.zig"),
+    @import("mtls_smoke.zig"),
     @import("node_store.zig"),
     @import("fetch_plan.zig"),
     @import("sim_images.zig"),
@@ -48,6 +51,7 @@ pub const modules = .{
     @import("runtime_codes.zig"),
     @import("retention.zig"),
     @import("pull_retention.zig"),
+    @import("job_controller.zig"),
     @import("scheduler.zig"),
     @import("runtime.zig"),
     @import("sim_c0.zig"),
@@ -150,6 +154,7 @@ test "the TLS client tests are in this root" {
     // Goal: the client handshake runs under WASI too. Method: import its tests; the scripted
     // server they use is a test fixture and is imported only here.
     _ = @import("tls_client_test.zig");
+    _ = @import("tls_wire_test.zig");
 }
 
 test "the TLS key schedule and record layer tests are in this root" {
@@ -165,8 +170,10 @@ test {
 
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");
+    _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");
     _ = @import("agent_api_test.zig");
     _ = @import("agent_fence_test.zig");
     _ = @import("agent_client_test.zig");
+    _ = @import("agent_jobs_test.zig");
 }

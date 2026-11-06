@@ -380,8 +380,9 @@ pub const fleet_token_bytes_max: u32 = 4096;
 pub const fleet_filed_max: u32 = 1024;
 /// UTC days the state file keeps counts for; the oldest is dropped past this.
 pub const fleet_days_kept: u32 = 31;
-/// The run kinds a day is broken down by (sim-cluster, sim-c1, sim-swarm, and room for one more).
-pub const fleet_kinds_max: u32 = 4;
+/// The run kinds a day is broken down by (sim-cluster, sim-c1, sim-swarm, sim-canary) with room
+/// for four more; `sim_fleet_issue.kinds` asserts it fits. Only a bound on reading the state file.
+pub const fleet_kinds_max: u32 = 8;
 /// Distinct failures counted per day for the tracker comment; more are in the day's total only.
 pub const fleet_seen_per_day_max: u32 = 256;
 /// Comments one failure gets per UTC day, and never two for the same commit.
@@ -491,6 +492,8 @@ pub const tree_list_bytes_max: u32 = fetch_chunks_max * 80;
 pub const fetch_peer_wait_ms: u32 = 30_000;
 /// A fetch waiting for another node's registry pull (O5) re-reads `/node-store` this often.
 pub const fetch_peer_poll_ms: u32 = 1000;
+/// A fetch says how far it is at most this often (fetch.log).
+pub const fetch_progress_ms: u32 = 10_000;
 /// A request not answered by then is a timeout.
 pub const fetch_request_timeout_ms: u32 = 10_000;
 /// Requests in flight in all, and to one peer.
@@ -648,6 +651,12 @@ pub const tls_records_per_key_max: u64 = 1 << 24;
 pub const tls_records_per_key_slack: u64 = 1;
 /// Key updates one direction accepts in a connection; a peer that updates without end is refused.
 pub const tls_key_updates_per_connection_max: u32 = 1 << 16;
+/// One deadline for a whole TLS handshake, from the first byte sent to the client's last flight
+/// (`tls_conn.zig` enforces it; a server that answers a byte a second still ends here).
+pub const tls_handshake_timeout_ms: u32 = 10_000;
+/// How long a refused connection gets to send its alert before it is dropped: a courtesy to the
+/// server, never worth holding a slot for.
+pub const tls_alert_flush_ms: u32 = 1_000;
 
 comptime {
     assert(tls_record_plaintext_bytes_max == 16384);
@@ -679,10 +688,24 @@ pub const tls_server_name_bytes_max: u32 = x509_dns_name_bytes_max;
 /// The ClientHello record: fixed layout, so its size is a constant plus the server name.
 pub const tls_client_hello_bytes_max: u32 =
     5 + 4 + 2 + 32 + (1 + 32) + (2 + 2) + (1 + 1) + tls_hello_extensions_bytes_max;
+/// The longest `certificate_request_context` a server may send (a one-byte length): the client
+/// echoes it in its Certificate.
+pub const tls_request_context_bytes_max: u32 = 255;
+/// The client's Certificate message: type and length, the echoed context, and at most
+/// `tls_chain_certificates_max` certificates each with its three-byte length and empty
+/// extensions (two bytes).
+pub const tls_client_certificate_bytes_max: u32 = 4 + 1 + tls_request_context_bytes_max + 3 +
+    tls_chain_certificates_max * (3 + x509_cert_bytes_max + 2);
+/// What one protected handshake record adds to its message: header, inner type and tag.
+pub const tls_record_overhead_bytes: u32 = tls_record_header_bytes + 1 + 16;
+/// The client's CertificateVerify message: type and length, scheme, and a 64-byte signature.
+pub const tls_client_verify_bytes: u32 = 4 + 2 + 2 + 64;
 /// Bytes the client has ready to send after one step: the ClientHello, or a compatibility
-/// change_cipher_spec and a Finished, or an alert, or a KeyUpdate. The caller drains it after
-/// every step.
-pub const tls_output_bytes_max: u32 = 512;
+/// change_cipher_spec and its whole last flight (Certificate, CertificateVerify, Finished, each
+/// in a record of its own), or an alert, or a KeyUpdate. The caller drains it after every step.
+pub const tls_output_bytes_max: u32 = (5 + 1) +
+    (tls_client_certificate_bytes_max + tls_record_overhead_bytes) +
+    (tls_client_verify_bytes + tls_record_overhead_bytes) + (4 + 32 + tls_record_overhead_bytes);
 /// Extensions of the ClientHello: server_name, supported_groups, signature_algorithms (twice),
 /// supported_versions and key_share, each with its four-byte header.
 const tls_hello_extensions_bytes_max: u32 = 2 + (4 + 5 + tls_server_name_bytes_max) +
@@ -693,9 +716,15 @@ comptime {
     assert(tls_handshake_flight_bytes_max >= 2 * tls_handshake_message_bytes_max);
     assert(tls_handshake_flight_bytes_max < tls_record_plaintext_bytes_max);
     assert(tls_change_cipher_spec_records_max == 1);
+    assert(tls_alert_flush_ms < tls_handshake_timeout_ms);
+    assert(tls_handshake_timeout_ms < std.math.maxInt(i32)); // `poll` takes an i32.
     assert(tls_server_name_bytes_max <= 255);
     assert(tls_output_bytes_max >= tls_client_hello_bytes_max);
     assert(tls_output_bytes_max >= 6 + 5 + 4 + 32 + 1 + 16);
+    // One message of the client's flight fits the handshake message bound.
+    assert(tls_client_certificate_bytes_max <= tls_handshake_message_bytes_max);
+    assert(tls_request_context_bytes_max < 256);
+    assert(tls_output_bytes_max < tls_record_plaintext_bytes_max);
 }
 
 comptime {
@@ -706,6 +735,7 @@ comptime {
     assert(peer_connections_per_node_max < peer_connections_max);
     assert(fetch_busy_sleep_ms <= fetch_busy_sleep_max_ms);
     assert(fetch_busy_wait_ms < fetch_total_ms);
+    assert(fetch_progress_ms < fetch_busy_wait_ms + fetch_request_timeout_ms);
     assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);
@@ -882,6 +912,13 @@ pub const jobs_per_node_max: u32 = 64;
 /// The runs list of one node (`GET /v1/agent/nodes/{node}/runs`): more is ZC-E0302, as for
 /// replicas. One unpaged reply, so it stays under half a page (comptime below).
 pub const agent_node_runs_max: u32 = jobs_per_node_max;
+/// `/assigned/` holds the assignments of replicas and of runs, so every list of it is bounded by
+/// both: a list with `replicas_max` alone fails (ZC-E0302) on a cluster with 300 replicas and 300
+/// jobs (docs/briefs/b1-1.md).
+pub const assigned_max: u32 = replicas_max + jobs_max;
+/// The assignments of one node: its replicas and its runs. A node holds at most
+/// `runtime_handles_max` of the two together (the scheduler refuses more), which this covers.
+pub const agent_node_assigned_max: u32 = agent_node_replicas_max + agent_node_runs_max;
 /// A run record, as encoded: the spec without the input. Enforced on the encoded JSON by
 /// `records.encode` and `records.read`, not inferred from the raw sizes of its members: JSON
 /// escaping turns one control byte into six.
@@ -892,9 +929,14 @@ pub const job_env_bytes_max: u32 = 8 * 1024;
 /// (`JobInput.base64`), so the record is at most four thirds of this, never the sixfold of a JSON
 /// string full of control characters, which would not fit `store_value_bytes_max`.
 pub const job_input_bytes_max: u32 = 64 * 1024;
-/// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`.
-pub const job_request_bytes_max: u32 = 128 * 1024;
+/// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`. Six times
+/// the input (every byte a control character escaped as `\u00XX`) plus 16 KiB for the other
+/// fields, so every input that meets `job_input_bytes_max` is accepted however the client escapes
+/// it (docs/decisions/2026-11-05-b1-job-input-wire-size-answer.md, option B).
+pub const job_request_bytes_max: u32 = 6 * job_input_bytes_max + 16 * 1024;
 pub const job_command_words_max: u32 = runtime_command_words_max;
+/// The name of the variable a job's input is given in (`input_env`).
+pub const job_input_env_bytes_max: u32 = 64;
 /// Labels of a job: `runtime_labels_max` less `zcube.replica` and `zcube.job`.
 pub const job_labels_max: u32 = runtime_labels_max - 2;
 /// A deadline counts from the start; a run not claimed by its `start_by_ms` (the same length from
@@ -914,11 +956,26 @@ pub const job_admitted_window_max: u32 = 8192;
 pub const job_admission_window_h: u32 = 73;
 /// Longest run id: `<name>-job`.
 pub const job_run_id_bytes_max: u32 = service_name_bytes_max + "-job".len;
+/// Jobs the job controller reads and judges at a time. `/jobs/` holds up to
+/// `job_admitted_window_max` records (ended jobs stay until retention), far more than one step's
+/// arena holds with their runs, statuses and reports, so it reads a page of jobs with exactly the
+/// records they need into an arena of its own, frees it, and goes on.
+pub const job_controller_page_max: u32 = 16;
+/// What one page of the job controller holds at most: per job the job, its run, its status and
+/// its report (each a record of at most `job_run_bytes_max`), plus a page of decisions read to
+/// tell whether it already decided (`decisions_per_subject_max` index entries of 512 bytes).
+pub const job_controller_page_bytes_max: u64 = @as(u64, job_controller_page_max) *
+    (4 * job_run_bytes_max) + @as(u64, decisions_per_subject_max) * 512 * job_controller_page_max;
 
 comptime {
     assert(jobs_per_node_max <= runtime_handles_max);
     assert(jobs_max > 0);
     assert(agent_node_runs_max <= jobs_per_node_max);
+    assert(assigned_max == replicas_max + jobs_max);
+    assert(agent_node_assigned_max >= runtime_handles_max);
+    // An assignment is a few hundred bytes (its reason is a sentence); the whole list is read into
+    // the step's arena beside the other lists, so it keeps to a fraction of it.
+    assert(assigned_max * 1024 <= request_arena_bytes_max / 8);
     // The reply is not paged: at most half a store page, as the replicas list is bounded by
     // `store_list_limit_max`.
     assert(agent_node_runs_max * job_run_bytes_max <= store_page_bytes_max / 2);
@@ -928,10 +985,12 @@ comptime {
     // no relation between it and the raw sizes of env or command is asserted here.
     // The stored input is base64 (four thirds, rounded up to groups of four).
     assert((job_input_bytes_max + 2) / 3 * 4 < store_value_bytes_max);
-    // The size of the request body that carries an input is an open question
-    // (docs/decisions/2026-11-05-b1-job-input-wire-size.md): JSON escaping can make a valid
-    // input larger than `job_request_bytes_max`, so no relation is asserted here.
+    // The body that carries an input: the worst case is all control characters, six bytes each.
+    assert(job_request_bytes_max >= 6 * job_input_bytes_max + 16 * 1024);
     assert(job_request_bytes_max > api_request_bytes_max);
+    assert(job_request_bytes_max > http_head_bytes_max);
+    // The body, its parse and the decoded input must sit in the request arena well within it.
+    assert(job_request_bytes_max * 8 <= request_arena_bytes_max);
     assert(job_labels_max == 6);
     assert(job_command_words_max == runtime_command_words_max);
     // The run id is a container name (a hostname label), and `<service>-<n>` never equals it.
@@ -944,6 +1003,11 @@ comptime {
     const window_ms = 2 * job_deadline_ms_max + job_finished_age_ms_max + job_submit_window_ms_max;
     assert(window_ms == @as(u64, job_admission_window_h) * 60 * 60 * 1000);
     assert(job_admitted_window_max >= jobs_max);
+    assert(job_controller_page_max > 0);
+    assert(job_controller_page_max <= store_list_limit_max);
+    // The pages are freed one by one, so one page is what the job controller costs the step's
+    // arena beyond the lists it reads once (nodes, their statuses and the assignments).
+    assert(job_controller_page_bytes_max <= request_arena_bytes_max / 4);
     // One aggregate record: an hour's count per hour of the window, in JSON, in one value.
     // An entry is at most 49 bytes (`{"hour":N,"count":N},` with N up to 13 and 10 digits), and a
     // record holds at most `job_admission_window_h + 1` of them (`admission_valid`).

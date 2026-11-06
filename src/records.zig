@@ -65,6 +65,10 @@ pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
 pub const prefix_jobs = "/jobs/";
+/// What the cause of ZC-E0523 says of a damaged input; the agent's client tells it from an
+/// absent one by this.
+pub const input_mismatch_phrase = "does not match its digest";
+
 pub const prefix_job_input = "/job-input/";
 pub const key_job_admission = "/job-admission";
 pub const prefix_job_runs = "/job-runs/";
@@ -814,7 +818,7 @@ pub fn version_current(comptime T: type) u32 {
     return std.meta.fieldInfo(T, .v).attrs.defaultValue(u32).?;
 }
 
-pub const SubjectKind = enum { service, replica, node };
+pub const SubjectKind = enum { service, replica, node, job };
 
 pub const Subject = struct {
     kind: SubjectKind,

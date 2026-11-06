@@ -470,3 +470,85 @@ test "a pull record a server refuses is ZC-E0504, and a foreign one is never sen
     }
     try testing.expectEqual(@as(u32, 1), rig.script.next);
 }
+
+const job_claim_value = "{\"v\":1,\"run\":\"batch-job\",\"status\":\"claimed\"}";
+
+fn job_claim_request(compares: []const store.Compare) store.TxnRequest {
+    const put: store.Op = .{ .put = .{
+        .key = "/job-observed/node1/batch",
+        .value = job_claim_value,
+    } };
+    return .{ .compares = compares, .on_success = &.{put} };
+}
+
+test "a job report is one POST to job-observed, and a claim that did not apply is not a fault" {
+    // Goal: the job report mapping. Method: a scripted applied:true, then applied:false, then a
+    // refusal of an ended tenure (ZC-E0510); each is a result, not an error, and the target is
+    // the job-observed endpoint. A compare the server cannot carry never reaches the transport.
+    const bodies = [_][]const u8{
+        "{\"revision\":9,\"applied\":true,\"chain\":{\"revision\":9,\"hash\":\"" ++
+            hash_a ++ "\"}}",
+        "{\"revision\":10,\"applied\":false,\"chain\":{\"revision\":10,\"hash\":\"" ++ hash_b ++
+            "\",\"known_hash\":\"" ++ hash_a ++ "\"}}",
+    };
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    const remote = rig.remote.interface();
+    const compares = [_]store.Compare{
+        .{ .key = "/nodes/node1", .mod_revision = 4 },
+        .{ .key = "/job-runs/batch", .mod_revision = 6 },
+        .{ .key = "/assigned/node1/batch-job", .mod_revision = 7 },
+        .{ .key = "/job-observed/node1/batch", .mod_revision = 0 },
+    };
+    const first = try remote.txn(job_claim_request(&compares), &rig.diag);
+    try testing.expect(first.succeeded);
+    try testing.expectEqualStrings(
+        "/v1/agent/nodes/node1/job-observed",
+        rig.script.targets[0],
+    );
+    const second = try remote.txn(job_claim_request(&compares), &rig.diag);
+    try testing.expect(!second.succeeded);
+
+    const stale = [_]store.Compare{.{ .key = "/replicas/a/b", .mod_revision = 1 }};
+    rig.diag.reset();
+    try testing.expectError(
+        error.BackendFailed,
+        remote.txn(job_claim_request(&stale), &rig.diag),
+    );
+    try testing.expectEqual(@as(u32, 2), rig.script.next);
+}
+
+test "a job report under an ended tenure comes back as not succeeded" {
+    const bodies = [_][]const u8{"{\"diagnostics\":[{\"code\":\"ZC-E0510\"}]}"};
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    rig.script.status = 503;
+    const compares = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = 4 }};
+    const result = try rig.remote.interface().txn(job_claim_request(&compares), &rig.diag);
+    try testing.expect(!result.succeeded);
+}
+
+test "a damaged input is told from an absent one, and neither is a fault of the link" {
+    // Goal: ZC-E0523 over HTTP keeps its two causes. Method: scripted refusals of the input
+    // endpoint; the absent one reads as no value, the damaged one as a value that does not decode.
+    const prefix = "{\"diagnostics\":[{\"code\":\"ZC-E0523\",\"summary\":\"s\",\"causes\":[\"";
+    const absent = prefix ++ "train-job names an input by digest and the server holds none\"]}]}";
+    const damaged = prefix ++ "the input held for train-job " ++ records.input_mismatch_phrase ++
+        "\"]}]}";
+    const bodies = [_][]const u8{ absent, damaged };
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    rig.script.status = 404;
+    defer rig.deinit();
+    const remote = rig.remote.interface();
+    const arena = rig.arena.allocator();
+    const key = records.job_input_key("train");
+    const first = try remote.get(arena, key.slice(), null, &rig.diag);
+    try testing.expect(first.kv == null);
+    const second = try remote.get(arena, key.slice(), null, &rig.diag);
+    const kv = second.kv orelse return error.TestExpectedEqual;
+    const decoded = records.read(records.JobInput, arena, kv, &rig.diag);
+    try testing.expect(std.meta.isError(decoded));
+}

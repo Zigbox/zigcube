@@ -390,7 +390,7 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         ctx,
         records.prefix_assigned,
         at,
-        constants.replicas_max,
+        constants.assigned_max,
     );
     const statuses = try list_all(
         records.NodeStatus,

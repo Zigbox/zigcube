@@ -11,6 +11,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const auditor = @import("auditor.zig");
 const controller = @import("controller.zig");
+const job_controller = @import("job_controller.zig");
 const node_controller = @import("node_controller.zig");
 const replica_controller = @import("replica_controller.zig");
 const scheduler = @import("scheduler.zig");
@@ -21,7 +22,7 @@ const Wakeup = controller.Wakeup;
 
 /// Every prefix any of the four watches. The auditor's are all the scheduler's too.
 pub const watch_prefixes = node_controller.watch_prefixes ++ scheduler.watch_prefixes ++
-    replica_controller.watch_prefixes;
+    replica_controller.watch_prefixes ++ job_controller.watch_prefixes;
 
 comptime {
     for (auditor.watch_prefixes) |prefix| {
@@ -34,6 +35,7 @@ comptime {
 pub const ControlPlane = struct {
     nodes: node_controller.NodeController,
     scheduler: scheduler.Scheduler,
+    jobs: job_controller.JobController,
     replicas: replica_controller.ReplicaController,
     auditor: auditor.Auditor,
     /// Run `scheduler.find_mismatch` after each scheduler pass (the simulations and tests do;
@@ -51,6 +53,7 @@ pub const ControlPlane = struct {
         return .{
             .nodes = node_controller.NodeController.init(instance *% 4),
             .scheduler = scheduler.Scheduler.init(instance *% 4 +% 2),
+            .jobs = job_controller.JobController.init(instance),
             .replicas = replica_controller.ReplicaController.init(instance *% 4 +% 1),
             .auditor = auditor.Auditor.init(instance *% 4 +% 3),
         };
@@ -60,6 +63,7 @@ pub const ControlPlane = struct {
     /// new ids) or removed (docs/authority.md §3; `zcube-server --lost-grace-ms`).
     pub fn set_lost_grace(plane: *ControlPlane, grace_ms: u32) void {
         plane.nodes.lost_grace_ms = grace_ms;
+        plane.jobs.lost_grace_ms = grace_ms;
         plane.replicas.lost_grace_ms = grace_ms;
     }
 
@@ -70,11 +74,15 @@ pub const ControlPlane = struct {
         const second = try plane.scheduler.reconcile(ctx);
         if (plane.check_i6) plane.mismatch = try scheduler.find_mismatch(ctx);
         const audited = try plane.auditor.reconcile(ctx);
+        const jobs = try plane.jobs.reconcile(ctx);
         const third = try plane.replicas.reconcile(ctx);
         return .{
-            .at_ms = @min(@min(first.at_ms, second.at_ms), @min(audited.at_ms, third.at_ms)),
+            .at_ms = @min(
+                @min(@min(first.at_ms, second.at_ms), @min(audited.at_ms, third.at_ms)),
+                jobs.at_ms,
+            ),
             .prefixes = &watch_prefixes,
-            .acted = first.acted + second.acted + audited.acted + third.acted,
+            .acted = first.acted + second.acted + audited.acted + third.acted + jobs.acted,
         };
     }
 };

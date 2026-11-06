@@ -54,7 +54,7 @@ fn exclusive_assignments(ctx: *const Context) Found {
         ctx,
         records.prefix_assigned,
         null,
-        constants.replicas_max,
+        constants.assigned_max,
     ) catch {
         ctx.diag.reset();
         return "I1a: the assignments cannot be listed";

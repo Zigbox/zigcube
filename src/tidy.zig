@@ -44,8 +44,10 @@ const shell_allowlist = [_][]const u8{
     // calls `zig build` and pipes `sim_cluster` into `sim_fleet`; the logic is Zig.
     "ops/sim-fleet/setup.sh",
     "ops/sim-fleet/run.sh",
-    // Sources run.sh and feeds its crash records to the built `sim_fleet`: it tests a shell
-    // function, which only a shell can call.
+    // Both source run.sh to test its shell functions, which only a shell can call:
+    // `test-canary.sh` runs its canary cycle against fake fault-on runners and the built
+    // `sim_fleet`, and `test-crash-record.sh` feeds its crash records to `sim_fleet`.
+    "ops/sim-fleet/test-canary.sh",
     "ops/sim-fleet/test-crash-record.sh",
     // The demo's three-node start, stop and kill (c1-7 brief): a handful of long-lived processes
     // started side by side and killed by pid file, which is what a shell is for. Each script opens
@@ -634,6 +636,29 @@ fn print_violations(out: *std.Io.Writer, path: []const u8, report: *const Report
     if (report.dropped > 0) try out.print("{s}: {d} more not shown\n", .{ path, report.dropped });
 }
 
+/// The root of `zig build mtls-teeth`. A file with a `teeth:` test that it does not import never
+/// runs in that gate, so the gate would pass without it.
+const teeth_root = "src/mtls_teeth.zig";
+
+/// Files with `teeth:` tests that belong to another gate (the store history checker's, run by
+/// `zig build test`), so `teeth_root` does not import them.
+const teeth_other_gates = [_][]const u8{"src/testing/history.zig"};
+
+/// True when `source` (the file at `path`) has a `teeth:` test that `root_source` does not
+/// import and no other gate owns.
+fn teeth_not_imported(path: []const u8, source: []const u8, root_source: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "src/")) return false;
+    if (std.mem.eql(u8, path, teeth_root)) return false;
+    for (teeth_other_gates) |other| {
+        if (std.mem.eql(u8, path, other)) return false;
+    }
+    if (std.mem.indexOf(u8, source, "test \"teeth:") == null) return false;
+    var needle: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&needle, "@import(\"{s}\")", .{path["src/".len..]}) catch
+        return true;
+    return std.mem.indexOf(u8, root_source, text) == null;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -646,6 +671,7 @@ pub fn main(init: std.process.Init) !u8 {
     var walker = try root.walkSelectively(arena);
     defer walker.deinit();
 
+    const root_source = try root.readFileAlloc(io, teeth_root, arena, .limited(source_bytes_max));
     var violations: u32 = 0;
     var files: u32 = 0;
     while (try walker.next(io)) |entry| {
@@ -663,6 +689,12 @@ pub fn main(init: std.process.Init) !u8 {
             const limit: std.Io.Limit = .limited(source_bytes_max);
             const source = try entry.dir.readFileAlloc(io, entry.basename, arena, limit);
             check_source(&report, entry.path, source);
+            if (teeth_not_imported(entry.path, source, root_source)) {
+                try out.print("{s}: has teeth: tests that {s} does not import\n", .{
+                    entry.path, teeth_root,
+                });
+                violations += 1;
+            }
         }
         try print_violations(out, entry.path, &report);
         violations += report.total();
@@ -988,4 +1020,14 @@ test "the repository's own sources are clean" {
         std.debug.print("tidy.zig:{d}: {s}\n", .{ item.line, item.rule.message() });
     }
     try testing.expectEqual(@as(u32, 0), report.total());
+}
+
+test "a file with teeth tests must be imported by the mtls-teeth root" {
+    const body = "test \"teeth:" ++ " x\" {}\n";
+    const root_source = "test { _ = @import(\"a_test.zig\"); }\n";
+    try testing.expect(!teeth_not_imported("src/a_test.zig", body, root_source));
+    try testing.expect(teeth_not_imported("src/b_test.zig", body, root_source));
+    try testing.expect(!teeth_not_imported("src/b_test.zig", "test \"plain\" {}\n", root_source));
+    try testing.expect(!teeth_not_imported("src/testing/history.zig", body, root_source));
+    try testing.expect(!teeth_not_imported("tools/x.zig", body, root_source));
 }

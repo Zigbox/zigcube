@@ -1,5 +1,5 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
-error[ZC-E0816]: a TLS connection ended without close_notify
+error[ZC-E0816]: a TLS connection ended or stalled without close_notify
   cause  the server's connection ended before the handshake finished
   reqid  r-0000001
   fix    Retry the request: what arrived before the break may be incomplete.
