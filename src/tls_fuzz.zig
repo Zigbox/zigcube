@@ -443,8 +443,13 @@ fn run_once(seed: u64, refused: *bool) !bool {
     _ = try feed(world, random, world.damaged[0..length]);
     if (world.message_damaged) {
         // A valid record, MAC and transcript around a damaged message has one correct outcome.
-        try testing.expect(world.refused);
-        try testing.expect(!world.client.is_connected());
+        // Connecting is a false connect (the teeth test turns a check off and counts those);
+        // neither connecting nor refusing is a client left waiting.
+        if (world.client.is_connected()) {
+            world.false_connect = true;
+        } else {
+            try testing.expect(world.refused);
+        }
     }
     const intact = kind == .none and !world.request_damaged and !world.refused and
         !world.message_damaged;
