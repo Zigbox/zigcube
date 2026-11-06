@@ -173,7 +173,7 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
 
 pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return constants.exit_user;
-    var parsed = parse(args) orelse return usage(init.io);
+    var parsed = parse(args) orelse return usage(init.io, args);
     if (parsed.trace_steps) {
         trace_io = init.io;
         parsed.options.on_step = trace_step;
@@ -380,9 +380,28 @@ fn report_failure(
     try print_replay(out, seed, smallest, options, heal_at);
 }
 
-fn usage(io: std.Io) u8 {
-    std.Io.File.stderr().writeStreamingAll(io, usage_text) catch {}; // Nowhere else to report it.
+fn usage(io: std.Io, args: []const []const u8) u8 {
+    const stderr = std.Io.File.stderr();
+    if (ttl_refusal(args)) |reason| {
+        stderr.writeStreamingAll(io, reason) catch {}; // Nowhere else to report it.
+    }
+    stderr.writeStreamingAll(io, usage_text) catch {}; // Nowhere else to report it.
     return 2;
+}
+
+const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 8,000 ms is refused: an agent " ++
+    "cannot fence in time under it (ZC-E0121, issue #78)\n";
+
+/// The one-line reason for a `--lease-ttl-ms` under the bound, which `parse` refuses as any
+/// bad argument; null for every other refusal.
+fn ttl_refusal(args: []const []const u8) ?[]const u8 {
+    const flag = "--lease-ttl-ms=";
+    for (args) |arg| {
+        if (!std.mem.startsWith(u8, arg, flag)) continue;
+        const ttl = std.fmt.parseInt(u32, arg[flag.len..], 10) catch continue;
+        if (fencing.inequality_problem(ttl) != null) return ttl_refusal_text;
+    }
+    return null;
 }
 
 test "the command lines: one seed, a range, and what is refused" {
@@ -410,6 +429,9 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expectEqual(@as(?u32, 200), named.options.replicas_pct);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--profile=nope" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=2000" }) == null);
+    const short = ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=2000" }).?;
+    try std.testing.expectEqual(ttl_refusal_text, short);
+    try std.testing.expect(ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=8000" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "0" }) == null);
     try std.testing.expectEqual(@as(?u32, null), range.options.nodes);
 

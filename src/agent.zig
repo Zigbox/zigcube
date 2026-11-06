@@ -533,6 +533,13 @@ pub const Agent = struct {
                 try agent.acknowledged(ctx, sent, granted.ttl_ms);
                 return .idle;
             } else |err| {
+                if (err == error.BackendFailed and ctx.diag.code == .E0121) {
+                    // The server renewed under a ttl the agent cannot fence in time (the client
+                    // refuses it): as in `acknowledged`, fence at once and fail the step with
+                    // the diagnostic kept.
+                    try agent.begin_fence(ctx, sent);
+                    return err;
+                }
                 if (err != error.LeaseNotFound) return err;
                 // The lease has ended, so the server will take the node for lost: stop at once.
                 ctx.diag.reset();

@@ -24,6 +24,7 @@ const control_plane = @import("control_plane.zig");
 const runtime = @import("runtime.zig");
 const runtime_mod = runtime;
 const sim_runtime = @import("sim_runtime.zig");
+const fencing = @import("fencing.zig");
 const store = @import("store.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 const MemoryStore = @import("store_memory.zig").MemoryStore;
@@ -61,6 +62,10 @@ pub const SwitchedStore = struct {
     /// A keepalive is answered with this ttl in place of the lease's own, as an older server run
     /// with a short `--lease-ttl-ms` does; test-only, null in every simulation.
     keepalive_ttl_ms: ?u32 = null,
+    /// With `keepalive_ttl_ms`: the keepalive is refused with ZC-E0121 when the ttl is too short,
+    /// as `RemoteStore` refuses a reply it cannot fence under; test-only, false in every
+    /// simulation.
+    keepalive_refuse_short: bool = false,
     /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_get_prefix: ?[]const u8 = null,
@@ -221,6 +226,12 @@ pub const SwitchedStore = struct {
         try self.gate(diag);
         var lease = try self.inner.lease_keepalive(id, diag);
         if (self.keepalive_ttl_ms) |ttl_ms| lease.ttl_ms = ttl_ms;
+        if (self.keepalive_refuse_short) {
+            if (fencing.inequality_problem(lease.ttl_ms)) |problem| {
+                fencing.raise_problem(diag, lease.ttl_ms, problem);
+                return error.BackendFailed;
+            }
+        }
         return lease;
     }
 

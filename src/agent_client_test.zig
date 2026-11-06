@@ -554,3 +554,15 @@ test "a damaged input is told from an absent one, and neither is a fault of the 
     const decoded = records.read(records.JobInput, arena, kv, &rig.diag);
     try testing.expect(std.meta.isError(decoded));
 }
+
+test "a keepalive answered with a ttl the agent cannot fence under is ZC-E0121" {
+    // Goal: RemoteStore refuses a short ttl from the server, as `heartbeat` relies on.
+    var rig: Rig = undefined;
+    const bodies = [_][]const u8{"{\"lease\":{\"id\":7,\"ttl_ms\":4000}}"};
+    rig.init(&bodies);
+    defer rig.deinit();
+    rig.diag.reset();
+    const remote = rig.remote.interface();
+    try testing.expectError(error.BackendFailed, remote.lease_keepalive(7, &rig.diag));
+    try testing.expectEqual(.E0121, rig.diag.code.?);
+}
