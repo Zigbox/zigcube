@@ -106,6 +106,7 @@ pub const Net = struct {
             .blame_fn = blame,
             .bad_list_fn = bad_list,
             .bundle_fn = bundle,
+            .phase_fn = phase,
         };
     }
 
@@ -182,12 +183,27 @@ pub const Net = struct {
         }
     }
 
+    /// One line per phase change; the first progress line is written on the first chunk answer.
+    fn phase(context: *anyopaque, which: fetch_worker.Phase, chunks: u32, lacking: u32) void {
+        const net = from(context);
+        var buffer: [160]u8 = undefined;
+        const text = switch (which) {
+            .bundle_found => std.fmt.bufPrint(
+                &buffer,
+                "zcube-agent fetch: bundle found: {d} chunks, {d} lacking\n",
+                .{ chunks, lacking },
+            ) catch return,
+            .chunks_done => "zcube-agent fetch: chunks done; importing the record\n",
+        };
+        note(net.io, text);
+    }
+
     /// At most one line per `fetch_progress_ms` to fetch.log: what the chunk requests have
     /// brought and what the peers answered instead.
     fn say_progress(net: *Net) void {
         const now_ms = peer_stream.boot_ms(net.io);
-        if (net.progress_ms == 0) net.progress_ms = now_ms;
-        if (now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
+        const first = net.progress_ms == 0;
+        if (!first and now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
         net.progress_ms = now_ms;
         var buffer: [256]u8 = undefined;
         note(net.io, progress_line(&buffer, net));

@@ -369,6 +369,7 @@ pub fn fetch(
     defer allocator.free(got.chunks);
     report.chunks = @intCast(got.chunks.len);
     try fetch_chunks(allocator, transport, images, got.chunks, peers, config, deadline, report);
+    transport.phase_fn(transport.context, .chunks_done, 0, 0);
     if (!images.claims_complete()) return error.ChunkFailed;
     _ = images.import_image(got.record, tree, expected_manifest) catch |err| switch (err) {
         error.StoreFailed => return error.Store,
@@ -468,6 +469,7 @@ fn fetch_chunks(
         return error.OutOfMemory;
     report.already_held = inner.already_held;
     report.cached_bytes = inner.cached_bytes;
+    transport.phase_fn(transport.context, .bundle_found, @intCast(chunks.len), needed);
     if (needed == 0) return;
     const states = try allocator.alloc(fetch_plan.ChunkState, needed);
     defer allocator.free(states);

@@ -31,3 +31,10 @@ Make the next occurrence say where it stopped, without a new code:
 
 If the next flake shows a progress line that stops, the stall is in the peer transport at that
 chunk; if there is none, it is before the first chunk (the bundle). The issue stays open until then.
+
+How to read the log: the fetch also writes one line per phase (`bundle found: N chunks, M
+lacking`, `chunks done; importing the record`), and the first progress line on the first chunk
+answer. A gap between lines longer than `fetch_busy_wait_ms + fetch_request_timeout_ms` means the
+stall is outside the transport (the store or the plan loop), since no single request waits longer.
+Lines that keep coming without the fetch finishing mean a slow fetch, not a stall (the smoke
+waits 240 s; the fetch deadline is 31 min).

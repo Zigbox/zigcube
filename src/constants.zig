@@ -493,7 +493,7 @@ pub const fetch_peer_wait_ms: u32 = 30_000;
 /// A fetch waiting for another node's registry pull (O5) re-reads `/node-store` this often.
 pub const fetch_peer_poll_ms: u32 = 1000;
 /// A fetch says how far it is at most this often (fetch.log).
-pub const fetch_progress_ms: u64 = 10_000;
+pub const fetch_progress_ms: u32 = 10_000;
 /// A request not answered by then is a timeout.
 pub const fetch_request_timeout_ms: u32 = 10_000;
 /// Requests in flight in all, and to one peer.
@@ -735,6 +735,7 @@ comptime {
     assert(peer_connections_per_node_max < peer_connections_max);
     assert(fetch_busy_sleep_ms <= fetch_busy_sleep_max_ms);
     assert(fetch_busy_wait_ms < fetch_total_ms);
+    assert(fetch_progress_ms < fetch_busy_wait_ms + fetch_request_timeout_ms);
     assert(peer_handshake_evict_min_ms < peer_handshake_ms);
     assert(peer_handshakes_per_source_max > 0);
     assert(peer_handshake_window_ms > 0);

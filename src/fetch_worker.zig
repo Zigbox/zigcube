@@ -54,7 +54,14 @@ pub const Transport = struct {
     /// The Zigbox bundle of the tree (`zigbox_fetch.zig`) from a peer, into `out`; null if the
     /// source has none. Registries have none: their fallback is Zigbox's `pull`.
     bundle_fn: *const fn (*anyopaque, fetch_plan.Source, []const u8, []u8) ?[]const u8 = no_bundle,
+    /// The fetch changed phase (#93: say where it is). Arguments: chunks in the tree, chunks
+    /// lacking here (`.chunks_done` passes 0 for both).
+    phase_fn: *const fn (*anyopaque, Phase, u32, u32) void = no_phase,
 };
+
+pub const Phase = enum { bundle_found, chunks_done };
+
+fn no_phase(_: *anyopaque, _: Phase, _: u32, _: u32) void {}
 
 fn no_bundle(_: *anyopaque, _: fetch_plan.Source, _: []const u8, _: []u8) ?[]const u8 {
     return null;
