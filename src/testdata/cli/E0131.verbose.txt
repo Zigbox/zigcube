@@ -1,4 +1,4 @@
-request  r-0000001  POST /v1/jobs  400
+request  r-0000001  POST /v1/jobs  409
 error[ZC-E0131]: a different job already has that name
   cause  a job named train-7 exists and differs from this one in: command
   reqid  r-0000001
