@@ -115,11 +115,13 @@ pub const Code = enum(u8) {
     E0811,
     E0812,
     E0813,
+    E0814,
     E0815,
     E0816,
     E0817,
     E0818,
     E0819,
+    E0820,
     B0001,
     B0002,
     B0003,
@@ -1593,6 +1595,27 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0814,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "the TLS client certificate was not asked for, or was refused",
+        .explanation =
+        \\The client was told to present a certificate and the server did not ask
+        \\for one, or the server refused the one presented (the alert names why:
+        \\bad_certificate, certificate_expired, unknown_ca, certificate_required),
+        \\or the request cannot be answered (it does not list Ed25519), or the
+        \\signer holding the key failed. The connection is closed; a refusal arrives
+        \\after the client's own handshake is done, so data written before the
+        \\alert was read was not accepted.
+        \\
+        \\A server that never asks cannot learn which workload is calling, so a
+        \\connection that must prove identity stops. Check that the server is
+        \\configured to require client certificates and trusts the cluster CA;
+        \\a refused certificate is expired, issued by another CA, or for a
+        \\different workload than the server allows.
+        ,
+    },
+    .{
         .code = .E0815,
         .severity = .@"error",
         .blame = .external,
@@ -1670,6 +1693,23 @@ pub const registry = [_]Entry{
         \\
         \\The cause names the kind found and the kind needed. Give the peer a
         \\certificate issued for its role: a server certificate for a server.
+        ,
+    },
+    .{
+        .code = .E0820,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the key behind the client certificate did not sign",
+        .explanation =
+        \\The server asked for a client certificate and the client has one, but the
+        \\signer that holds its private key returned no signature, so the proof of
+        \\possession (CertificateVerify) could not be made. The connection is
+        \\closed with an internal_error alert; nothing was accepted.
+        \\
+        \\The key never enters the TLS client: it sits behind a signer, in the same
+        \\process or in another. This is that signer failing, not the server or the
+        \\certificate. Check that the process or device holding the key is running
+        \\and reachable, then reconnect.
         ,
     },
     .{

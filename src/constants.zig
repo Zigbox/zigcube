@@ -680,10 +680,24 @@ pub const tls_server_name_bytes_max: u32 = x509_dns_name_bytes_max;
 /// The ClientHello record: fixed layout, so its size is a constant plus the server name.
 pub const tls_client_hello_bytes_max: u32 =
     5 + 4 + 2 + 32 + (1 + 32) + (2 + 2) + (1 + 1) + tls_hello_extensions_bytes_max;
+/// The longest `certificate_request_context` a server may send (a one-byte length): the client
+/// echoes it in its Certificate.
+pub const tls_request_context_bytes_max: u32 = 255;
+/// The client's Certificate message: type and length, the echoed context, and at most
+/// `tls_chain_certificates_max` certificates each with its three-byte length and empty
+/// extensions (two bytes).
+pub const tls_client_certificate_bytes_max: u32 = 4 + 1 + tls_request_context_bytes_max + 3 +
+    tls_chain_certificates_max * (3 + x509_cert_bytes_max + 2);
+/// What one protected handshake record adds to its message: header, inner type and tag.
+pub const tls_record_overhead_bytes: u32 = tls_record_header_bytes + 1 + 16;
+/// The client's CertificateVerify message: type and length, scheme, and a 64-byte signature.
+pub const tls_client_verify_bytes: u32 = 4 + 2 + 2 + 64;
 /// Bytes the client has ready to send after one step: the ClientHello, or a compatibility
-/// change_cipher_spec and a Finished, or an alert, or a KeyUpdate. The caller drains it after
-/// every step.
-pub const tls_output_bytes_max: u32 = 512;
+/// change_cipher_spec and its whole last flight (Certificate, CertificateVerify, Finished, each
+/// in a record of its own), or an alert, or a KeyUpdate. The caller drains it after every step.
+pub const tls_output_bytes_max: u32 = (5 + 1) +
+    (tls_client_certificate_bytes_max + tls_record_overhead_bytes) +
+    (tls_client_verify_bytes + tls_record_overhead_bytes) + (4 + 32 + tls_record_overhead_bytes);
 /// Extensions of the ClientHello: server_name, supported_groups, signature_algorithms (twice),
 /// supported_versions and key_share, each with its four-byte header.
 const tls_hello_extensions_bytes_max: u32 = 2 + (4 + 5 + tls_server_name_bytes_max) +
@@ -697,6 +711,10 @@ comptime {
     assert(tls_server_name_bytes_max <= 255);
     assert(tls_output_bytes_max >= tls_client_hello_bytes_max);
     assert(tls_output_bytes_max >= 6 + 5 + 4 + 32 + 1 + 16);
+    // One message of the client's flight fits the handshake message bound.
+    assert(tls_client_certificate_bytes_max <= tls_handshake_message_bytes_max);
+    assert(tls_request_context_bytes_max < 256);
+    assert(tls_output_bytes_max < tls_record_plaintext_bytes_max);
 }
 
 comptime {
