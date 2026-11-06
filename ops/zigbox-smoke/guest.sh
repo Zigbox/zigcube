@@ -52,6 +52,17 @@ dump_fetch_logs() {
     ls -d "$STATE"/containers/*/ "$B_DIR"/agent/containers/*/ 2>/dev/null
     echo "--- running fetches"
     pgrep -af 'zcube-agent fetch' || echo "(none)"
+    # Where each running fetch is stuck; every command may fail and none changes the exit status.
+    for pid in $(pgrep -f 'zcube-agent fetch' || true); do
+        echo "--- fetch $pid"
+        echo "wchan: $(cat /proc/$pid/wchan 2>/dev/null || true)"
+        echo "syscall: $(cat /proc/$pid/syscall 2>/dev/null || true)"
+        echo "stack:"
+        cat /proc/$pid/stack 2>/dev/null || true
+        ls -l /proc/$pid/fd 2>/dev/null || true
+    done
+    echo "--- sockets"
+    ss -tnp 2>/dev/null || true
 }
 
 fail() {

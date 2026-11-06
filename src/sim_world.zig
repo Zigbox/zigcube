@@ -258,6 +258,8 @@ pub const World = struct {
     /// A runtime the agent uses instead of `sim` (a test's wrapper that watches the specs it is
     /// given and passes them on to `sim.interface()`); null in every simulation.
     runtime_override: ?runtime_mod.Runtime = null,
+    /// The agent's files as a wrapper of `files` that injects failures; null in every simulation.
+    state_override: ?agent_state.AgentState = null,
     /// The agent's image store, for the summary it writes; null in every simulation but a test's.
     images: ?@import("node_store.zig").Images = null,
     server: control_plane.ControlPlane,
@@ -316,6 +318,7 @@ pub const World = struct {
         world.last_failure = null;
         world.boot_id = "";
         world.runtime_override = null;
+        world.state_override = null;
         world.images = null;
         return world;
     }
@@ -391,7 +394,7 @@ pub const World = struct {
             .arena = world.fresh_arena(),
             .diag = &world.diag,
             .images = world.images,
-            .state = world.files.interface(),
+            .state = world.state_override orelse world.files.interface(),
             .boot_id = world.boot_id,
         };
         world.stats.agent_steps += 1;
