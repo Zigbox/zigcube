@@ -56,6 +56,7 @@ const sim_world = @import("sim_world.zig");
 const job_api = @import("job_api.zig");
 const runtime = @import("runtime.zig");
 const sim_jobs = @import("sim_jobs.zig");
+const sim_jobs_watch = @import("sim_jobs_watch.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const store = @import("store.zig");
 const why_mod = @import("why.zig");
@@ -725,6 +726,9 @@ pub const Cluster = struct {
     /// The job workload is on (`Options.jobs`); the ledger and trackers' state; the next number.
     jobs_on: bool,
     jobs: sim_jobs.State,
+    /// J4: the client that follows the job endings through the watch, and its own random stream.
+    jobs_watch: sim_jobs_watch.State,
+    watch_prng: std.Random.DefaultPrng,
     job_next: u32,
 
     pub fn create(
@@ -782,6 +786,8 @@ pub const Cluster = struct {
         c.report = report;
         c.jobs_on = false;
         c.jobs = .{};
+        c.jobs_watch = .{};
+        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
@@ -1018,6 +1024,7 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
+            if (c.c1 and c.jobs_on) c.watch_client();
             if (c.c1) {
                 c.note_wedged();
                 track_overlap(c) catch return;
@@ -1039,6 +1046,27 @@ pub const Cluster = struct {
                 safety(c) catch return; // The report says what failed.
             }
         }
+    }
+
+    /// J4's client, once per poll: it is killed now and then, away for less than a minute (the
+    /// store has not compacted past it) or for minutes (it has), and resumes from its revision.
+    fn watch_client(c: *Cluster) void {
+        const w = &c.jobs_watch;
+        const now = c.manual.ms;
+        if (now < w.away_until_ms or now < w.next_poll_ms) return;
+        const random = c.watch_prng.random();
+        w.next_poll_ms = now + 1000 + random.uintLessThan(u32, 4000);
+        if (random.uintLessThan(u32, 20) == 0) {
+            const long = random.boolean();
+            const span: u64 = if (long) 60_000 + random.uintLessThan(u32, 600_000) else
+                1000 + random.uintLessThan(u32, 59_000);
+            w.away_until_ms = now + span;
+            w.restarts += 1;
+            return;
+        }
+        if (store_faulty(c)) return;
+        const ctx = c.controller_context();
+        sim_jobs_watch.poll(w, &c.api, &ctx);
     }
 
     fn node_named(c: *const Cluster, name: []const u8) ?*Node {
@@ -1452,6 +1480,9 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         .diag = &c.tap_diag,
     };
     if (request) |txn| c.recorder.record_request(&ctx, txn);
+    if (request) |txn| {
+        if (c.jobs_on) sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+    }
     if (c.c1_violation != null) return;
     if (request != null) {
         if (c.c1_pending) |found| {
@@ -2198,6 +2229,7 @@ fn watch_of(c: *const Cluster, node: u32, name_hash: u64) ?sim_jobs.Watch {
 fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
+    try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
     if (store_faulty(c)) return;
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
@@ -2306,6 +2338,10 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
             }
         }
     }
+    // J4: the watching client, back from any outage, has seen every ending the store committed.
+    const head = ctx.store.status(ctx.diag) catch return check(c, false, "the head is unreadable");
+    sim_jobs_watch.finish(&c.jobs_watch, &c.api, ctx, head.revision);
+    try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
 }
 
 /// Every fault off; the agents come back up as time passes. Ends the fault phase.
@@ -2861,6 +2897,10 @@ fn print_jobs(c: *Cluster) void {
         j.stop_worst_ms,               j.overlap_worst_ms,
         j.deadline_worst_ms,           c.c1_tally.job_statuses_judged,
         c.c1_tally.runs_placed_judged,
+    });
+    const w = &c.jobs_watch;
+    c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{
+        w.truth_count, w.handled_count, w.watches, w.relists, w.restarts,
     });
 }
 

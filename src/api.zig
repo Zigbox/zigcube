@@ -1121,6 +1121,34 @@ const Call = struct {
         timeout_ms: u32,
     ) Failure!Reply {
         const ctx = call.ctx;
+        const read = try call.watch_read(open, head, prefixes);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        try out.begin_object();
+        try out.member("revision", read.bookmark);
+        try out.field("events");
+        try out.begin_array();
+        for (read.events) |event| {
+            try out.begin_object();
+            try out.member("type", @tagName(event.kind));
+            try out.field("kv");
+            try write_kv(call.api, out, event.kv, event.kind == .delete);
+            try out.end_object();
+        }
+        try out.end_array();
+        try out.end_object();
+        return call.held(try out.finish(), read.events.len, prefixes, timeout_ms);
+    }
+
+    const WatchRead = struct { events: []const store.Event, bookmark: store.Revision };
+
+    /// The batches ready now, up to `head`, under the prefixes: the events and the bookmark.
+    fn watch_read(
+        call: Call,
+        open: *store.Watch,
+        head: store.Revision,
+        prefixes: []const []const u8,
+    ) Failure!WatchRead {
+        const ctx = call.ctx;
         var events: std.ArrayList(store.Event) = .empty;
         var bookmark = open.delivered;
         for (0..watch_batches_max) |_| {
@@ -1131,30 +1159,56 @@ const Call = struct {
             events.appendSlice(ctx.arena, kept) catch return no_memory(ctx);
             bookmark = batch.revision;
         }
-        const out = Out.create(ctx) catch return no_memory(ctx);
-        try out.begin_object();
-        try out.member("revision", bookmark);
-        try out.field("events");
-        try out.begin_array();
-        for (events.items) |event| {
-            try out.begin_object();
-            try out.member("type", @tagName(event.kind));
-            try out.field("kv");
-            try write_kv(call.api, out, event.kv, event.kind == .delete);
-            try out.end_object();
-        }
-        try out.end_array();
-        try out.end_object();
-        var reply = try out.finish();
-        if (events.items.len == 0) {
-            if (call.hold) {
-                if (timeout_ms > 0) {
-                    reply.hold_ms = timeout_ms;
-                    reply.hold_prefixes = prefixes;
-                }
-            }
+        return .{ .events = events.items, .bookmark = bookmark };
+    }
+
+    /// An answer with no event is held until a change under `prefixes` or the timeout.
+    fn held(
+        call: Call,
+        reply_in: Reply,
+        events: usize,
+        prefixes: []const []const u8,
+        timeout_ms: u32,
+    ) Reply {
+        var reply = reply_in;
+        if (events == 0 and call.hold and timeout_ms > 0) {
+            reply.hold_ms = timeout_ms;
+            reply.hold_prefixes = prefixes;
         }
         return reply;
+    }
+
+    // ---- /v1/jobs/watch ----
+
+    /// `/v1/watch` over `/job-status/`, the values decoded to job statuses (docs/api.md). A
+    /// batch whose events all fall to `label` still advances the bookmark.
+    fn jobs_watch(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{ "from", "timeout", "label" });
+        try call.no_more();
+        const from = try call.query.number(ctx, "from") orelse
+            return bad_request(ctx, "from", "is required: the revision to resume from");
+        if (from == 0) return bad_request(ctx, "from", "must be at least 1");
+        const timeout = try call.query.number(ctx, "timeout") orelse
+            constants.api_watch_timeout_ms_max;
+        if (timeout > constants.api_watch_timeout_ms_max) {
+            return bad_request(ctx, "timeout", "must be at most 25000");
+        }
+        const label = try call.query.one(ctx, "label");
+        const prefixes: []const []const u8 = &.{records.prefix_job_status};
+        const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
+        var open = ctx.store.watch(.{ .prefix = "", .from_revision = from }, ctx.diag) catch
+            return propagate(ctx);
+        defer open.close();
+        const read = try call.watch_read(&open, head.revision, prefixes);
+        const events = job_api.watch_events(ctx, read.events, label) catch return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        out.json.options.emit_null_optional_fields = false;
+        try out.begin_object();
+        try out.member("revision", read.bookmark);
+        try out.member("events", events);
+        try out.end_object();
+        return call.held(try out.finish(), events.len, prefixes, @intCast(timeout));
     }
 
     // ---- /v1/leases ----
@@ -1491,6 +1545,7 @@ const Call = struct {
     fn jobs_get(call: Call) Failure!Reply {
         const ctx = call.ctx;
         const name = call.parts.next() orelse return call.job_list();
+        if (std.mem.eql(u8, name, job_api.reserved_name)) return call.jobs_watch();
         try call.no_more();
         try call.query.allow(ctx, &.{});
         const view = job_api.get(ctx, name) catch return propagate(ctx);
