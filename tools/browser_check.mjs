@@ -142,12 +142,12 @@ if (mode === "sim") {
     "slow-merge": ["failed", "deadline", "failed: passed its deadline", "deadline"],
     "fenced-write": ["failed", "fenced", "failed: was stopped", "fence"],
     "lost-node": ["failed", "unreachable", "failed: its node stopped being heard", "unreachable"],
-    "never-started": ["failed", "deadline", "failed: passed its deadline", "not_started", "stop_job"], // placed, never claimed
-    "lost-early": ["failed", "not_started", "failed: its node was lost before the run was claimed", "unreachable", "stop_job"],
+    "never-started": ["failed", "deadline", "failed: passed its deadline", "not_started", "end_job"], // placed, never claimed: end_job cites the desired run (no stop_job link)
+    "lost-early": ["failed", "not_started", "failed: its node was lost before the run was claimed", "unreachable", "end_job"],
     "mystery": ["failed", "unknown", "failed: ended for a reason", null],
-    "no-room": ["failed", "deadline", "failed: passed its deadline", "not_started", "stop_job"], // held, then the backstop
+    "no-room": ["failed", "deadline", "failed: passed its deadline", "not_started", "end_job"], // held, then the backstop
     "cancel-running": ["cancelled", "cancelled", "cancelled", "cancel"],
-    "cancel-waiting": ["cancelled", "cancelled", "cancelled", "cancel", "stop_job"], // cancelled before placement
+    "cancel-waiting": ["cancelled", "cancelled", "cancelled", "cancel", "end_job"], // cancelled before placement
     "run-forever": ["running", "", null, null],
     "placed-wait": ["placed", "", null, null, "job_placed"],
     "waiting": ["pending", "", null, null, "hold_pending"], // the no-room hold
@@ -173,6 +173,7 @@ if (mode === "sim") {
       else must(!/Stopped because/.test(t), "a stop cause on a job that had none");
       must(t.includes("Why") && /because/i.test(t), "no why chain");
       if (decision) must(t.includes(decision), `the chain does not name ${decision}`);
+      if (decision === "end_job") must(!t.includes("stop_job"), "an unclaimed run's end cites the desired run: stop_job is not a link of its chain");
       if (name === "bad-image") must(/ZBX-E0410/.test(t), "no diagnostic");
       if (name === "train-ok") await shot(page, "mock-job-train-ok");
     });

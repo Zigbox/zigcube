@@ -8,7 +8,8 @@
 // that fits gets the scheduler's `place_run` and then the controller's `job_placed`; one that
 // does not gets `hold_pending`. A run that was never claimed has a `stop_job` decision and ends
 // from its stop (`not_started` -> `failed deadline`, `unreachable` -> `failed not_started`,
-// `cancel` -> `cancelled`); a claimed run ends as its agent reported (`end_job`).
+// `cancel` -> `cancelled`); a claimed run ends as its agent reported (`end_job`, citing the report; with no report it cites
+// the desired `/job-runs/<name>`, and the `stop_job` is not a link of that chain).
 //
 // Not modelled: retries, relay, placement (ZC-E0130 by name, as the server), the admission window
 // beyond `jobs_max`, log output (cut from B1), node loss (a plan may end `unreachable` directly).
@@ -305,7 +306,10 @@ export class Jobs {
     const p = this.plans.get(name);
     const node = st.node || null;
     const started = !!st.started_at_ms;
-    let cause = { kind: "decision", id: after };
+    // Without an agent report the end cites the desired run, as `Pass.end` does (job_controller.zig);
+    // the `stop_job` before it is a decision of its own, not a link of this chain.
+    const runKv = e.getKv(`/job-runs/${name}`);
+    let cause = { kind: "desired", key: runKv.key, revision: runKv.mod_revision };
     if (node && started && stop !== "unreachable") { // the agent's last report: the evidence the end rests on
       const rec = { v: 1, run: `${name}-job`, node, tenure: st.tenure || 7, assignment: st.epoch || e.rev, status: "stopped", exit: this.exitOf(end), reported_at_ms: e.now() };
       rec.started_at_ms = st.started_at_ms;

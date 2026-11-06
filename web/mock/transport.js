@@ -194,9 +194,11 @@ export function createMockTransport(engine, faults) {
       return { type: "desired", key: c.key, revision: c.revision, text, applied_by: j?.applied_by || null, request_id: null };
     }
     if (c.kind === "desired" && (c.key.startsWith("/job-runs/") || c.key.startsWith("/assigned/"))) {
-      // The mock's own wording: src/why.zig's `desired_step` reads any other key as a service.
+      // The words of src/why.zig `desired_step`, which reads a run and an assignment as what they
+      // are (docs/decisions/2026-11-06-why-job-desired-keys.md). The mock reads the record now.
       const v = engine.getKv(c.key)?.value;
-      const text = c.key.startsWith("/assigned/") ? `run ${c.key.split("/").pop()} is assigned to ${c.key.split("/")[2]}` : `run ${v?.id ?? c.key.split("/").pop()} of job ${v?.job ?? "?"} is desired`;
+      const text = c.key.startsWith("/assigned/") ? `${v?.job ? "run" : "replica"} ${c.key.split("/").pop()} is assigned to ${c.key.split("/")[2]}`
+        : `run ${v?.id ?? c.key.split("/").pop()} of job ${v?.job ?? "?"} is desired: deadline ${v?.deadline_ms ?? 0} ms${v?.stop ? ", stopped" : ""}`;
       return { type: "desired", key: c.key, revision: c.revision, text, applied_by: null, request_id: null };
     }
     if (c.kind === "desired") {
