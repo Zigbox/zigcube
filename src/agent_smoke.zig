@@ -318,6 +318,7 @@ fn script(smoke: *Smoke) !void {
     try step_restart_agent(smoke, before);
     try step_restart_server(smoke);
     try step_unknown_digest(smoke);
+    try step_job(smoke);
 }
 
 const three_run = struct {
@@ -588,6 +589,94 @@ fn step_unknown_digest(smoke: *Smoke) !void {
         .{},
     );
     smoke.say("unknown digest: {s} held with ZBX-E0410 in its observed state", .{later[0]});
+}
+
+/// The job state and exit code of `GET /v1/jobs/<name>`; an empty state when there is none.
+const JobNow = struct { state: []const u8, code: ?i64 };
+
+fn job_now(smoke: *Smoke, name: []const u8) !JobNow {
+    const arena = smoke.arena.allocator();
+    const path = try std.fmt.allocPrint(arena, "/v1/jobs/{s}", .{name});
+    const reply = try smoke.call("GET", path, "");
+    if (reply.status != 200) return .{ .state = "", .code = null };
+    const value = try std.json.parseFromSliceLeaky(Json, arena, reply.body, .{});
+    const state = value.object.get("state").?.string;
+    const status = value.object.get("status") orelse return .{ .state = state, .code = null };
+    if (status != .object) return .{ .state = state, .code = null };
+    const end = status.object.get("end") orelse return .{ .state = state, .code = null };
+    if (end != .object) return .{ .state = state, .code = null };
+    const code = end.object.get("code") orelse return .{ .state = state, .code = null };
+    return .{ .state = state, .code = code.integer };
+}
+
+const job_name = "batch";
+
+const job_running = struct {
+    fn check(s: *Smoke) !bool {
+        return std.mem.eql(u8, (try job_now(s, job_name)).state, "running");
+    }
+};
+
+const job_started = struct {
+    fn check(s: *Smoke) !bool {
+        return (try s.running_containers()).len == 4;
+    }
+};
+
+const job_exited = struct {
+    fn check(s: *Smoke) !bool {
+        return std.mem.eql(u8, (try job_now(s, job_name)).state, "exited");
+    }
+};
+
+/// A job: claimed, started once, adopted by a new agent after `kill -9`, ended with its exit code.
+fn step_job(smoke: *Smoke) !void {
+    const arena = smoke.arena.allocator();
+    const stamp: u64 = @intCast(std.Io.Clock.real.now(smoke.io).toMilliseconds());
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"name\":\"{s}\",\"image\":\"b3:51aa9c03\",\"deadline_ms\":120000," ++
+            "\"submit_by_ms\":{d},\"command\":[\"sh\",\"-c\",\"sleep 8; exit 7\"]}}",
+        .{ job_name, stamp + 60_000 },
+    );
+    const reply = try smoke.call("POST", "/v1/jobs", body);
+    try smoke.expect(reply.status == 201, "POST /v1/jobs answered {d}: {s}", .{
+        reply.status, reply.body,
+    });
+    try smoke.wait_until("the job to run", job_running.check, wait_ms_default);
+    try smoke.wait_until("the job's command to run", job_started.check, wait_ms_default);
+    const claimed = try smoke.json("/v1/list?prefix=/job-observed/" ++ node ++ "/");
+    try smoke.expect(
+        claimed.object.get("kvs").?.array.items.len == 1,
+        "the job has no observed record once it runs",
+        .{},
+    );
+    const record = try std.fmt.allocPrint(
+        arena,
+        "{s}/jobs/{s}-job.json",
+        .{ smoke.state, job_name },
+    );
+    _ = std.Io.Dir.cwd().statFile(smoke.io, record, .{}) catch {
+        try smoke.expect(false, "no start record at {s}", .{record});
+    };
+    const before = try smoke.running_containers();
+    try smoke.expect(before.len == 4, "{d} containers run, expected 3 and the job", .{before.len});
+    // `kill -9` of the agent: the supervisor, and the job under it, live on.
+    try std.posix.kill(smoke.agent.?.id.?, .KILL);
+    _ = try smoke.agent.?.wait(smoke.io);
+    smoke.agent = null;
+    try smoke.expect(
+        try same_containers(smoke, before),
+        "killing the agent changed what runs",
+        .{},
+    );
+    try smoke.start_agent();
+    try smoke.wait_until("the job to exit", job_exited.check, wait_ms_default + 20_000);
+    const now = try job_now(smoke, job_name);
+    try smoke.expect(now.code == 7, "the job's exit code is {any}, expected 7", .{now.code});
+    const supervisors = try smoke.supervisors();
+    try smoke.expect(supervisors == 3, "{d} supervisors after the job, expected 3", .{supervisors});
+    smoke.say("job: claimed, run once, adopted after kill -9 of the agent, exit 7 recorded", .{});
 }
 
 /// A port the system is not using now: bind port 0, read it, let go.
