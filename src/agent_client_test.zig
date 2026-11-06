@@ -529,3 +529,26 @@ test "a job report under an ended tenure comes back as not succeeded" {
     const result = try rig.remote.interface().txn(job_claim_request(&compares), &rig.diag);
     try testing.expect(!result.succeeded);
 }
+
+test "a damaged input is told from an absent one, and neither is a fault of the link" {
+    // Goal: ZC-E0523 over HTTP keeps its two causes. Method: scripted refusals of the input
+    // endpoint; the absent one reads as no value, the damaged one as a value that does not decode.
+    const prefix = "{\"diagnostics\":[{\"code\":\"ZC-E0523\",\"summary\":\"s\",\"causes\":[\"";
+    const absent = prefix ++ "train-job names an input by digest and the server holds none\"]}]}";
+    const damaged = prefix ++ "the input held for train-job " ++ records.input_mismatch_phrase ++
+        "\"]}]}";
+    const bodies = [_][]const u8{ absent, damaged };
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    rig.script.status = 404;
+    defer rig.deinit();
+    const remote = rig.remote.interface();
+    const arena = rig.arena.allocator();
+    const key = records.job_input_key("train");
+    const first = try remote.get(arena, key.slice(), null, &rig.diag);
+    try testing.expect(first.kv == null);
+    const second = try remote.get(arena, key.slice(), null, &rig.diag);
+    const kv = second.kv orelse return error.TestExpectedEqual;
+    const decoded = records.read(records.JobInput, arena, kv, &rig.diag);
+    try testing.expect(std.meta.isError(decoded));
+}
