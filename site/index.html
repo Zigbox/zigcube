@@ -224,7 +224,7 @@ $("#milestones").innerHTML = MILESTONES.map(m=>`
     <div class="term"><div class="bar"><span>demo · ${m.id.toLowerCase()}</span>${m.recorded?`<a class="rec" href="${m.recorded.url}">✓ recorded in CI · ${m.recorded.date}</a>`:(m.status==="done"?"<span>recorded output</span>":'<span class="planned">planned output</span>')}</div><pre>${termHTML(m.demo)}</pre></div>
   </article>`).join("");
 $("#docs-list").innerHTML = DOCS.map(d=>{const ms=MILESTONES.find(x=>x.id===d.m); const st=ms?ms.status:"plan";
-  return `<div class="doc"><h3>${d.href?`<a href="${d.href}">${d.t}</a>`:d.t}</h3><p>${d.d}</p><span class="when">${st==="done"?"Available":"Arrives with "+d.m}</span></div>`}).join("");
+  return `<div class="doc"><h3>${d.href?`<a href="${d.href}">${d.t}</a>`:d.t}</h3><p>${d.d}</p><span class="when">${d.href||st==="done"?"Available":"Arrives with "+d.m}</span></div>`}).join("");
 $("#updated").textContent = SITE.updated;
 $("#hdr-status").textContent = SITE.stage;
 $("#digest").textContent = "site tree b3:" + [...SITE.updated+MILESTONES.map(m=>m.status).join("")].reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))>>>0,7).toString(16).padStart(8,"0");

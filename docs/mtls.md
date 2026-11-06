@@ -159,15 +159,18 @@ failure").
 
 ```
 idle --start--> wait_server_hello --ServerHello--> wait_encrypted_extensions
-     --EncryptedExtensions--> [wait_certificate_request] --CertificateRequest-->
-     wait_certificate --Certificate--> wait_certificate_verify --CertificateVerify-->
-     wait_finished --server Finished--> (client flight: [Certificate, CertificateVerify,] Finished)
-     --> connected --close_notify (either way)--> closed
+     --EncryptedExtensions--> wait_certificate --Certificate--> wait_certificate_verify
+     --CertificateVerify--> wait_finished --server Finished-->
+     (client flight: [Certificate, CertificateVerify,] Finished) --> connected
+connected --close_notify (either way)--> closed
+any state --refuse / fail_silently--> failed
 ```
 
-`CertificateRequest` is optional and read only here. Any failure, from any state, queues one alert,
-wipes the secrets and goes to `closed` (ZC-E0813 to E0820 as the table below). In `connected`,
-`KeyUpdate` re-keys one direction, and a key limit is ZC-E0815.
+`CertificateRequest` is optional and read only in `wait_certificate`, where it is a self-edge (the
+state does not change). Any failure, from any state, queues at most one alert, wipes the secrets
+and goes to `failed`, a sink of its own (ZC-E0813 to E0820 as the table below). `closed` is reached
+only through `close_notify`. In `connected`, `KeyUpdate` re-keys one direction, and a key limit is
+ZC-E0815.
 
 ## The constants
 

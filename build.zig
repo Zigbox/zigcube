@@ -347,6 +347,7 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
 fn add_mtls_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
     const tests = b.addTest(.{
         .filters = &.{"teeth:"},
+        .test_runner = .{ .path = b.path("src/mtls_teeth_runner.zig"), .mode = .simple },
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/mtls_teeth.zig"),
             .target = options.target,
