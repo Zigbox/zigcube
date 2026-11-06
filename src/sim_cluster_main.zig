@@ -452,6 +452,28 @@ test "the step hook hears every step the run enters, in order" {
     try std.testing.expectEqualStrings("end", traced_steps[3]);
 }
 
+test "a stop past its grace over a record that never started does not make a busy loop (issue 96)" {
+    // Goal: regression for issue 96. A stop asked for a container that has no process (its
+    // record was written and the agent crashed before the start, so the runtime says `starting`
+    // until `fake_start_timeout_ms`) stayed pending; once its grace passed the agent's next wake
+    // was always now, about 200 steps in 10 s, over the busy-loop ceiling. Method: the shrunk
+    // run that failed, pinned (2 nodes, crash_heavy, ttl 8,516 ms, 200 % replicas, heal at 72).
+    const gpa = std.testing.allocator;
+    const report = try gpa.create(sim_cluster.Report);
+    defer gpa.destroy(report);
+    const options: sim_cluster.Options = .{
+        .nodes = 2,
+        .c1 = true,
+        .profile = .crash_heavy,
+        .lease_ttl_ms = 8516,
+        .replicas_pct = 200,
+        .heal_at = 72,
+    };
+    sim_cluster.simulate(gpa, 2230515380, 85, options, report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try std.testing.expect(!report.failed);
+}
+
 test "a short fault phase is not judged by one request per operation (fleet issue 56)" {
     // Goal: regression for the simulation fleet's issue 56. Method: replay the two shrunk
     // failures (73 operations healing at 79, 38 operations healing at 50); each had 47 and 31

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+warning[ZC-W0307]: a report for an ended job was dropped
+  cause  node2 reported train-7-job after the job ended as failed (unreachable)
+  reqid  r-0000001
+  fix    zcube why job train-7 shows both
+  more   zcube explain W0307
+  docs   https://zigbox.github.io/zigcube/errors/W0307.html

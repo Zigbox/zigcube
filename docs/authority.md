@@ -68,6 +68,9 @@ the layout.
 | Prefix | Sole writer | Holds | Lifetime |
 | --- | --- | --- | --- |
 | `/services/<name>` | API (`apply`, `delete`) | desired service | until deleted |
+| `/jobs/<name>`, `/job-input/<name>`, `/job-admission` | API | B1 (§7): the job's spec, its input, and the aggregate of creations | until retention |
+| `/job-runs/<name>`, `/job-status/<name>`, `/job-endings` | job controller | B1 (§7): the run, how it is going and how it ended, the aggregate of endings | until retention |
+| `/job-observed/<node>/<name>` | that node's agent | B1 (§7): a run's claim and what the agent saw | until retention |
 | `/replicas/<svc>/<id>` | replica controller | desired replica: spec and generation; **no placement** | until the replica is retired |
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |
@@ -81,7 +84,8 @@ the layout.
 | `/decision-summaries/<kind>/<name>/<action>/<cause-kind>` | the actor of the decisions it counts, in the same transaction | a projection over immutable decisions: count, first and last time, the newest decision's id | with its subject |
 
 A seventh role, `retention`, deletes expired decisions (§5). It may write only `/decisions/`,
-`/decisions-by-subject/` and `/decision-summaries/`, which every role may write.
+`/decisions-by-subject/` and `/decision-summaries/`, which every role may write, and delete (never
+write) an ended job's records (§7); B1 adds an eighth role, `job_controller` (§7).
 
 - **`/assigned/<node>/` replaces the `node` field.** An agent's long-poll watches its own prefix,
   so fan-out is O(replicas on the node), not O(all replicas). The agent endpoint joins each
@@ -496,3 +500,58 @@ cause).
 
 **Follow-ups to this document once C1 lands:** keys.md takes the new prefixes and fields, api.md
 takes `completeness`, and console.md shows it.
+
+## 7. Jobs (B1)
+
+A job is run once and never started twice (design: `docs/briefs/b1.md`; owner's answers:
+`docs/decisions/2026-11-05-b1-owner-answers.md`). Its run is `<name>-job`.
+
+**Writers (I4).** The API writes `/jobs/`, `/job-input/` and `/job-admission`. An eighth role of
+`writers.zig`, `job_controller`, writes `/job-runs/`, `/job-status/` and `/job-endings`, and never
+`/assigned/` or `/allocations/`. The scheduler keeps both of those and places and releases runs as
+replicas. Each agent writes `/job-observed/<its node>/`. Retention deletes (never writes) the
+records of an ended job, its five (`/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
+`/job-observed/<node>/`) in one transaction. That transaction names one job and at most one node
+(a run has one claim, ever), carries no `/pulls/` key (pull records are per node and keep their own
+rule), and has a precondition: it compares the job's `/job-status/` at the revision retention read
+(terminal, and older than `job_finished_age_ms_min`) and deletes `/jobs/<name>` in the same
+transaction, so the spec never outlives its status, and the status never goes while the job is
+live. `/job-admission` and `/job-endings` are exact keys of their writers and are never deleted.
+
+**A run is created once, ever.** The controller never re-creates a run for a job that had one
+(I8a). A job whose run or status is missing after it had one is contradictory (ZC-E0307): the
+controller changes nothing and creates nothing. An operator who deletes `/job-runs/<name>` and
+`/job-status/<name>` has not cancelled the job. "Had one" is the `job-created` decision (owner,
+option A): before creating, the controller reads `/decisions-by-subject/job/<name>`, and a
+`job-created` there means the job is contradictory, whatever else is missing. This rests on the
+job controller being the only writer of runs, and on retention judging a job live by
+`/jobs/<name>` alone: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
+
+**I1a, I1b, I2, I6 and I7 hold for runs unchanged:** a run has at most one assignment and its
+observations are admissible under one tenure; the allocation of a node counts runs with replicas;
+a placement of a run compares the run and its status beside the placement compare set (7 compares,
+within `store_txn_compares_max`); a placement is on a `ready` node.
+
+**Endings are two-phase.** A server-side ending (`cancel`, `not_started`, `unreachable` before a
+claim) first writes `stop` into the run; only when the store proves no claim of the run exists is the
+terminal status written. This is because "no claim, anywhere" cannot be one transaction's compare
+set (`nodes_max` absences exceed `store_txn_compares_max`). The agent claims a run in
+`/job-observed/` before it starts it, comparing its tenure and the run's revision, so "never started
+after a `stop`" is a store fact and not a race.
+
+**Node loss is judged by the run's tenure,** the tenure recorded at its claim. When that tenure has
+ended and `lost_grace_ms` has passed, the run ends `failed unreachable`; if the agent comes back and
+reports it stopped the run, `failed fenced`; a run that was never claimed ends `failed not_started`.
+An ending written for a lost node rests on the agent having fenced itself first (the bound of I1b),
+and a wedged node breaks it, as for services.
+
+- **I8a (authoritative, always).** A job's terminal status is written once and never changes. No
+  claim, placement or start record of its run commits after the run's `stop` or its terminal
+  status. A run id has at most one claim, ever.
+- **I8b (physical, within the stated window).** No execution of a run is alive after its terminal
+  status for longer than I1b's window (`lost_grace_ms` plus kill latency) after the fence bound,
+  provided the node is not wedged and clock-rate skew is within bound. Under a wedged node the
+  simulation records the overlap and does not count it as a violation, exactly as I1b.
+
+Slice 1 builds the records, the writer rows and their tests, and the codes. The controller, the
+scheduler's handling of runs, the agent and these checks in `sim-c1` are later slices.

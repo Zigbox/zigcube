@@ -1,0 +1,5 @@
+error[ZC-E0133]: no job by that name
+  cause  no job named train-7
+  fix    zcube job list shows the jobs that exist
+  more   zcube explain E0133 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0133.html

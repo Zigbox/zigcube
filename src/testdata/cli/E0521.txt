@@ -1,0 +1,5 @@
+error[ZC-E0521]: the agent could not tell how a run ended
+  cause  train-7-job has no container and left no exit record in its directory
+  fix    find why the host restarted or the state directory was lost; it is not run again
+  more   zcube explain E0521 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0521.html

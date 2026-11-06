@@ -1,0 +1,1 @@
+{"code":"ZC-E0133","severity":"error","blame":"user","summary":"no job by that name","causes":["no job named train-7"],"while":[],"context":{"reqid":"r-0000001"},"fixes":[{"sentence":"zcube job list shows the jobs that exist","command":null}],"docs":"https://zigbox.github.io/zigcube/errors/E0133.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}

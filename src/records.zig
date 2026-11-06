@@ -64,6 +64,63 @@ pub const prefix_node_store = "/node-store/";
 pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
+pub const prefix_jobs = "/jobs/";
+pub const prefix_job_input = "/job-input/";
+pub const key_job_admission = "/job-admission";
+pub const prefix_job_runs = "/job-runs/";
+pub const prefix_job_status = "/job-status/";
+pub const key_job_endings = "/job-endings";
+pub const prefix_job_observed = "/job-observed/";
+
+/// A job's run id: `<name>-job`. The last segment is not decimal, so it is never a replica id
+/// (`<service>-<n>`), and it is a valid container name (docs/keys.md, "Jobs").
+pub fn job_run_id(buffer: *[constants.job_run_id_bytes_max]u8, name: []const u8) []const u8 {
+    assert(name_problem(name, constants.service_name_bytes_max) == null);
+    @memcpy(buffer[0..name.len], name);
+    @memcpy(buffer[name.len..][0..job_run_suffix.len], job_run_suffix);
+    return buffer[0 .. name.len + job_run_suffix.len];
+}
+
+pub const job_run_suffix = "-job";
+
+/// The job a run id names, or null if `id` is not a run id.
+pub fn job_of_run(id: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, id, job_run_suffix)) return null;
+    const name = id[0 .. id.len - job_run_suffix.len];
+    if (name_problem(name, constants.service_name_bytes_max) != null) return null;
+    return name;
+}
+
+pub fn job_key(name: []const u8) Key {
+    assert(name_problem(name, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_jobs, name });
+}
+
+pub fn job_input_key(name: []const u8) Key {
+    assert(name_problem(name, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_job_input, name });
+}
+
+pub fn job_run_key(name: []const u8) Key {
+    assert(name_problem(name, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_job_runs, name });
+}
+
+pub fn job_status_key(name: []const u8) Key {
+    assert(name_problem(name, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_job_status, name });
+}
+
+pub fn job_observed_prefix(node: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_job_observed, node, "/" });
+}
+
+pub fn job_observed_key(node: []const u8, name: []const u8) Key {
+    assert(name_problem(node, constants.node_name_bytes_max) == null);
+    assert(name_problem(name, constants.service_name_bytes_max) == null);
+    return Key.build(&.{ prefix_job_observed, node, "/", name });
+}
 
 pub fn service_key(name: []const u8) Key {
     assert(name_problem(name, constants.service_name_bytes_max) == null);
@@ -185,6 +242,229 @@ comptime {
     const longest = prefix_index.len + "service".len + 1 + constants.node_name_bytes_max + 1 +
         decision_id_bytes;
     assert(longest <= constants.store_key_bytes_max);
+}
+
+// ---- Jobs (B1) -----------------------------------------------------------------------------
+
+pub const JobLimits = struct {
+    cpu_millis: ?u32 = null,
+    memory_bytes: ?u64 = null,
+    pids: ?u32 = null,
+};
+
+pub const JobCancel = struct { at_ms: u64, by: []const u8 = "" };
+
+/// The desired state of a job: the immutable spec, and the one mutable member, `cancel_requested`.
+/// The input is never here, only its digest and size (`/job-input/<name>` holds it).
+pub const Job = struct {
+    v: u32 = 1,
+    name: []const u8,
+    image: []const u8,
+    source: []const u8 = "",
+    command: []const []const u8,
+    env: []const Pair = &.{},
+    limits: JobLimits = .{},
+    deadline_ms: u64,
+    /// Always 0 in B1; a larger value is refused (ZC-E0130).
+    retries: u32 = 0,
+    labels: []const Pair = &.{},
+    grace_ms: u32 = 0,
+    input_env: ?[]const u8 = null,
+    input_digest: ?[]const u8 = null,
+    input_bytes: ?u64 = null,
+    submit_by_ms: u64,
+    created_at_ms: u64,
+    applied_by: []const u8 = "",
+    cancel_requested: ?JobCancel = null,
+};
+
+/// The input of a job, written once with the job. Held base64-encoded: the encoding of 64 KiB of
+/// text always fits a store value, where JSON escaping of control characters might not.
+pub const JobInput = struct {
+    v: u32 = 1,
+    base64: []const u8,
+};
+
+pub const HourCount = struct { hour: u64, count: u32 };
+
+/// The aggregate every create rewrites (authority.md, "Predicates over sets"): jobs ever created
+/// and creations per hour over the last `job_admission_window_h` hours, oldest first.
+pub const JobAdmission = struct {
+    v: u32 = 1,
+    admitted: u64 = 0,
+    hours: []const HourCount = &.{},
+};
+
+/// The aggregate every terminal status rewrites: how many jobs have ended, ever.
+pub const JobEndings = struct {
+    v: u32 = 1,
+    ended: u64 = 0,
+};
+
+/// Why a run is stopped by the server (the first phase of an ending).
+pub const RunStopCause = enum { cancel, @"unreachable", not_started };
+
+pub const RunStop = struct {
+    cause: RunStopCause,
+    at_ms: u64,
+};
+
+/// What the agent runs: a job's spec without the input, with the server's start backstop.
+pub const JobRun = struct {
+    v: u32 = 1,
+    id: []const u8,
+    job: []const u8,
+    image: []const u8,
+    source: []const u8 = "",
+    command: []const []const u8,
+    env: []const Pair = &.{},
+    limits: JobLimits = .{},
+    deadline_ms: u64,
+    grace_ms: u32 = 0,
+    labels: []const Pair = &.{},
+    input_env: ?[]const u8 = null,
+    input_digest: ?[]const u8 = null,
+    input_bytes: ?u64 = null,
+    start_by_ms: u64,
+    created_at_ms: u64,
+    stop: ?RunStop = null,
+};
+
+pub const JobState = enum { pending, placed, running, exited, failed, cancelled };
+
+pub fn job_state_terminal(state: JobState) bool {
+    return switch (state) {
+        .pending, .placed, .running => false,
+        .exited, .failed, .cancelled => true,
+    };
+}
+
+/// The closed set of causes of a `failed` ending (docs/keys.md, "Jobs").
+pub const JobFailure = enum {
+    oom,
+    pid_limit,
+    start_failed,
+    deadline,
+    fenced,
+    @"unreachable",
+    not_started,
+    unknown,
+};
+
+/// How a job ended: `exited` carries exactly one of `code` and `signal`, `failed` a `cause`,
+/// `cancelled` nothing.
+pub const JobEnd = struct {
+    kind: enum { exited, failed, cancelled },
+    code: ?u8 = null,
+    signal: ?u8 = null,
+    cause: ?JobFailure = null,
+
+    pub fn valid(end: JobEnd) bool {
+        return switch (end.kind) {
+            .exited => (end.code == null) != (end.signal == null) and end.cause == null,
+            .failed => end.cause != null and end.code == null and end.signal == null,
+            .cancelled => end.cause == null and end.code == null and end.signal == null,
+        };
+    }
+};
+
+/// Why an agent stopped a run on its own, recorded before it stops the container.
+pub const StopCause = enum { cancel, deadline, fence, not_started, @"unreachable" };
+
+pub const JobStatus = struct {
+    v: u32 = 1,
+    state: JobState,
+    node: ?[]const u8 = null,
+    /// The `/assigned/<node>/<run>` revision (the placement epoch) the run was claimed under.
+    epoch: ?u64 = null,
+    /// The `/nodes/<node>` revision of the tenure that claimed it.
+    tenure: ?u64 = null,
+    started_at_ms: ?u64 = null,
+    ended_at_ms: ?u64 = null,
+    end: ?JobEnd = null,
+    stop_cause: ?StopCause = null,
+    diagnostic: ?Raw = null,
+    /// The id of the last decision about the job.
+    decision: ?[]const u8 = null,
+    reported_at_ms: u64,
+
+    /// A terminal state carries its `end` and `ended_at_ms`; no other state carries either.
+    pub fn valid(status: JobStatus) bool {
+        const terminal = job_state_terminal(status.state);
+        if (terminal != (status.end != null)) return false;
+        if (terminal != (status.ended_at_ms != null)) return false;
+        const end = status.end orelse return true;
+        if (!end.valid()) return false;
+        return switch (status.state) {
+            .exited => end.kind == .exited,
+            .failed => end.kind == .failed,
+            .cancelled => end.kind == .cancelled,
+            .pending, .placed, .running => false,
+        };
+    }
+};
+
+pub const JobObservedStatus = enum { claimed, running, stopped };
+
+/// What an agent saw of a run, under its own record kind (not `Observed`, which is a replica's).
+pub const JobObserved = struct {
+    v: u32 = 1,
+    run: []const u8,
+    node: []const u8,
+    tenure: u64,
+    /// The `/assigned/<node>/<run>` revision it ran under.
+    assignment: u64,
+    status: JobObservedStatus,
+    exit: ?Exit = null,
+    stop_cause: ?StopCause = null,
+    diagnostic: ?Raw = null,
+    started_at_ms: ?u64 = null,
+    reported_at_ms: u64,
+
+    /// A `stopped` report says how the run ended, and no other report does: a claim and a running
+    /// run have no exit yet, and a claim has not started.
+    pub fn valid(observed: JobObserved) bool {
+        return switch (observed.status) {
+            .claimed => observed.exit == null and observed.started_at_ms == null,
+            .running => observed.exit == null,
+            .stopped => observed.exit != null,
+        };
+    }
+};
+
+/// Whether a job record's collections are within the bounds the API enforces. A row that fails
+/// was not written through it.
+pub fn job_shape_valid(command: []const []const u8, env: []const Pair, labels: []const Pair) bool {
+    if (command.len == 0) return false;
+    if (command.len > constants.job_command_words_max) return false;
+    if (labels.len > constants.job_labels_max) return false;
+    var env_bytes: usize = 0;
+    for (env) |pair| env_bytes += pair[0].len + pair[1].len;
+    return env_bytes <= constants.job_env_bytes_max;
+}
+
+fn job_valid(record: anytype) bool {
+    return job_shape_valid(record.command, record.env, record.labels);
+}
+
+/// A replica's assignment names a service and no job; a run's is version 2 or later, names no
+/// service, and its replica is the run id of its job. No other combination was written by us.
+fn assigned_valid(record: Assigned) bool {
+    const run = record.service.len == 0;
+    if ((record.job != null) != run) return false;
+    const job = record.job orelse return true;
+    if (record.v < assigned_version_job) return false;
+    return std.mem.eql(u8, job_of_run(record.replica) orelse return false, job);
+}
+
+fn admission_valid(record: JobAdmission) bool {
+    if (record.hours.len > constants.job_admission_window_h + 1) return false;
+    var sum: u64 = 0;
+    for (record.hours, 0..) |entry, index| {
+        if (index > 0 and entry.hour <= record.hours[index - 1].hour) return false;
+        sum += entry.count;
+    }
+    return sum <= record.admitted;
 }
 
 // ---- Names ---------------------------------------------------------------------------------
@@ -427,12 +707,63 @@ pub const Observed = struct {
 
 /// The placement: the scheduler's decision to run a replica on a node.
 pub const Assigned = struct {
-    v: u32 = 1,
+    v: u32 = 2,
+    replica: []const u8,
+    /// The service a replica belongs to; empty for a run (version 2).
+    service: []const u8 = "",
+    requests: Requests,
+    reason: []const u8,
+    /// The job a run belongs to (version 2): set for `<name>-job` ids, absent for replicas. Every
+    /// reader of `service` takes this branch for a run (`assigned_group`).
+    job: ?[]const u8 = null,
+};
+
+/// Assignments are written at the oldest version that holds their members: version 2 only for a
+/// run, so a replica's assignment stays readable by a build that predates jobs.
+pub const assigned_version_plain: u32 = 1;
+pub const assigned_version_job: u32 = 2;
+
+/// A replica's assignment, at the version that a build predating jobs reads. Every site that places
+/// a replica builds it here, so none leaves `v` at its default (the job version).
+pub fn assigned_replica(
     replica: []const u8,
     service: []const u8,
     requests: Requests,
     reason: []const u8,
-};
+) Assigned {
+    assert(service.len > 0);
+    return .{
+        .v = assigned_version_plain,
+        .replica = replica,
+        .service = service,
+        .requests = requests,
+        .reason = reason,
+    };
+}
+
+/// A job's run assignment: version 2, an empty `service` and `job` set. The run id is
+/// `<job>-job` (`job_run_id`); `read` refuses any other combination.
+pub fn assigned_run(
+    run: []const u8,
+    job: []const u8,
+    requests: Requests,
+    reason: []const u8,
+) Assigned {
+    assert(std.mem.eql(u8, job_of_run(run) orelse "", job));
+    return .{
+        .v = assigned_version_job,
+        .replica = run,
+        .requests = requests,
+        .reason = reason,
+        .job = job,
+    };
+}
+
+/// Whether the assignment is a job's run. A run's `service` is empty and no service has an empty
+/// name, so the scheduler's per-service spread never counts a run toward a service.
+pub fn assigned_is_job(assigned: *const Assigned) bool {
+    return assigned.job != null;
+}
 
 /// The authoritative accounting of a node: the sum of the `requests` of its assignments.
 pub const Allocation = struct {
@@ -483,7 +814,7 @@ pub fn version_current(comptime T: type) u32 {
     return std.meta.fieldInfo(T, .v).attrs.defaultValue(u32).?;
 }
 
-pub const SubjectKind = enum { service, replica, node };
+pub const SubjectKind = enum { service, replica, node, job };
 
 pub const Subject = struct {
     kind: SubjectKind,
@@ -571,6 +902,17 @@ pub fn decision_id_time(id: []const u8) ?u64 {
 
 // ---- JSON ----------------------------------------------------------------------------------
 
+/// A run that encodes over `job_run_bytes_max` got past the API's checks: our defect (ZC-B0005),
+/// not a capacity the operator can raise.
+fn run_too_large(diag: *Diag, id: []const u8, bytes: usize) Error {
+    diag.raise(.B0005);
+    diag.cause("the run {s} encodes as {d} bytes, over the {d} bytes a run record may take", .{
+        id, bytes, constants.job_run_bytes_max,
+    });
+    diag.fix(.{ .sentence = "report it with the diagnostic bundle; the job was not started" });
+    return error.NoCapacity;
+}
+
 /// Encodes a record as compact JSON in `arena`.
 pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -580,6 +922,12 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
     const bytes = out.toOwnedSlice() catch return failures.no_memory(diag);
     assert(bytes.len > 0);
     if (bytes.len > constants.store_value_bytes_max) return failures.no_memory(diag);
+    // The API checks a job's words against its bounds, but escaping can multiply bytes (a control
+    // character is six): the encoded run is what the agents' runs reply is sized by.
+    const T = @TypeOf(value);
+    if (T == JobRun and bytes.len > constants.job_run_bytes_max) {
+        return run_too_large(diag, value.id, bytes.len);
+    }
     return bytes;
 }
 
@@ -602,12 +950,26 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         const known = version_current(T);
         if ((head.v orelse 0) > known) return too_new(diag, kv.key, head.v.?, known);
     }
+    // The same bound `encode` enforces: the runs reply of a node adds up these records. After
+    // the version: a newer release may have raised it.
+    if (T == JobRun and kv.value.len > constants.job_run_bytes_max) {
+        return malformed(diag, kv.key, @typeName(T));
+    }
     const record = std.json.parseFromSliceLeaky(T, arena, kv.value, options) catch |err| {
         if (err == error.OutOfMemory) return failures.no_memory(diag);
         return malformed(diag, kv.key, @typeName(T));
     };
     // The agent endpoint refuses these; a row that holds one anyway was not written through it.
     if (T == Pull and !pull_peers_named(record)) return malformed(diag, kv.key, @typeName(T));
+    if (T == Job or T == JobRun) {
+        if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    }
+    if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    if (T == JobStatus and !record.valid()) return malformed(diag, kv.key, @typeName(T));
+    if (T == JobObserved and !record.valid()) return malformed(diag, kv.key, @typeName(T));
+    if (T == JobAdmission and !admission_valid(record)) {
+        return malformed(diag, kv.key, @typeName(T));
+    }
     return record;
 }
 
@@ -871,6 +1233,7 @@ test "each record of C1 encodes and reads back" {
 
     const requests: Requests = .{ .cpu_millis = 250, .memory_bytes = 134217728 };
     const assigned: Assigned = .{
+        .v = assigned_version_plain,
         .replica = "hello-1",
         .service = "hello",
         .requests = requests,
@@ -1289,11 +1652,18 @@ test "the version a record is written in is the version the reader accepts" {
     var diag: Diag = undefined;
     diag.reset();
     inline for (.{
-        Service, Replica,       Node,     Observed,   Assigned,  Allocation, Audit, NodeStatus,
-        Summary, ReplicaNumber, Decision, IndexEntry, NodeStore, Pull,
+        Service,       Replica,    Node,
+        Observed,      Assigned,   Allocation,
+        Audit,         NodeStatus, Summary,
+        ReplicaNumber, Decision,   IndexEntry,
+        NodeStore,     Pull,       JobInput,
+        JobAdmission,  JobEndings, JobStatus,
+        JobObserved,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);
+        // A replica's assignment: `read` refuses one with neither a service nor a job.
+        if (T == Assigned) value.service = "s";
         const bytes = try encode(arena, value, &diag);
         const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
         try testing.expect(std.mem.startsWith(u8, bytes, prefix));
@@ -1302,6 +1672,301 @@ test "the version a record is written in is the version the reader accepts" {
         diag.reset();
         try testing.expectError(error.Malformed, read(T, arena, kv_of("/k", newer), &diag));
         try testing.expectEqual(codes.Code.E0303, diag.code.?);
+        diag.reset();
+    }
+}
+
+test "the keys of B1 follow docs/keys.md" {
+    // Goal: one implementation of the job layout. Method: build each and compare.
+    try testing.expectEqualStrings("/jobs/job1", job_key("job1").slice());
+    try testing.expectEqualStrings("/job-input/job1", job_input_key("job1").slice());
+    try testing.expectEqualStrings("/job-runs/job1", job_run_key("job1").slice());
+    try testing.expectEqualStrings("/job-status/job1", job_status_key("job1").slice());
+    try testing.expectEqualStrings("/job-observed/n1/", job_observed_prefix("n1").slice());
+    try testing.expectEqualStrings("/job-observed/n1/job1", job_observed_key("n1", "job1").slice());
+    try testing.expectEqualStrings("/job-admission", key_job_admission);
+    try testing.expectEqualStrings("/job-endings", key_job_endings);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const id = job_run_id(&buffer, "job1");
+    try testing.expectEqualStrings("job1-job", id);
+    try testing.expectEqualStrings("job1", job_of_run(id).?);
+    try testing.expect(job_of_run("hello-1") == null);
+    try testing.expect(job_of_run("-job") == null);
+    // A run id is never a replica id of any service, and is a container name.
+    try testing.expect(replica_number("job1", id) == null);
+    try testing.expect(replica_number("job1-job", id) == null);
+    const longest: [constants.service_name_bytes_max]u8 = @splat('j');
+    const long_id = job_run_id(&buffer, &longest);
+    try testing.expect(long_id.len <= constants.node_name_bytes_max);
+    try testing.expect(job_observed_key(&longest, &longest).len <= constants.store_key_bytes_max);
+}
+
+test "job records encode, read back, and keep the invariants of their members" {
+    // Goal: the job records round-trip, and a row the API could not have written is malformed.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const job: Job = .{
+        .name = "j",
+        .image = "sha256:aa",
+        .command = &.{ "run", "--x" },
+        .deadline_ms = 1000,
+        .input_env = "INPUT",
+        .input_digest = "sha256:bb",
+        .input_bytes = 9,
+        .submit_by_ms = 5,
+        .created_at_ms = 1,
+        .cancel_requested = .{ .at_ms = 4, .by = "me" },
+    };
+    const bytes = try encode(arena, job, &diag);
+    try testing.expect(std.mem.startsWith(u8, bytes, "{\"v\":1,"));
+    const back = try read(Job, arena, kv_of("/jobs/j", bytes), &diag);
+    try testing.expectEqual(@as(u64, 4), back.cancel_requested.?.at_ms);
+    try testing.expectEqual(@as(u32, 0), back.retries);
+    try job_without_command_is_malformed(arena, &diag);
+}
+
+fn job_without_command_is_malformed(arena: Allocator, diag: *Diag) !void {
+    const no_command = try encode(arena, Job{
+        .name = "j",
+        .image = "i",
+        .command = &.{},
+        .deadline_ms = 1,
+        .submit_by_ms = 1,
+        .created_at_ms = 1,
+    }, diag);
+    try testing.expectError(error.Malformed, read(Job, arena, kv_of("/jobs/j", no_command), diag));
+    diag.reset();
+}
+
+test "a job status must say how it ended exactly when it has ended" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+
+    const ended: JobStatus = .{
+        .state = .exited,
+        .end = .{ .kind = .exited, .code = 3 },
+        .ended_at_ms = 9,
+        .reported_at_ms = 9,
+    };
+    const status_bytes = try encode(arena, ended, &diag);
+    _ = try read(JobStatus, arena, kv_of("/job-status/j", status_bytes), &diag);
+    const bad = [_]JobStatus{
+        .{ .state = .running, .reported_at_ms = 1, .end = .{ .kind = .cancelled } },
+        .{ .state = .exited, .reported_at_ms = 1 },
+        .{ .state = .exited, .reported_at_ms = 1, .ended_at_ms = 1, .end = .{ .kind = .failed } },
+        .{ .state = .exited, .reported_at_ms = 1, .ended_at_ms = 1, .end = .{
+            .kind = .exited,
+            .code = 1,
+            .signal = 9,
+        } },
+        .{ .state = .failed, .reported_at_ms = 1, .ended_at_ms = 1, .end = .{ .kind = .failed } },
+    };
+    for (bad) |status| {
+        const text = try encode(arena, status, &diag);
+        try testing.expectError(
+            error.Malformed,
+            read(JobStatus, arena, kv_of("/job-status/j", text), &diag),
+        );
+        diag.reset();
+    }
+    const cause = try encode(arena, JobStatus{
+        .state = .failed,
+        .reported_at_ms = 1,
+        .ended_at_ms = 1,
+        .end = .{ .kind = .failed, .cause = .@"unreachable" },
+    }, &diag);
+    try testing.expect(std.mem.indexOf(u8, cause, "\"cause\":\"unreachable\"") != null);
+}
+
+test "an admission record must add up" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const good: JobAdmission = .{ .admitted = 5, .hours = &.{
+        .{ .hour = 1, .count = 2 }, .{ .hour = 2, .count = 3 },
+    } };
+    const bytes = try encode(arena, good, &diag);
+    _ = try read(JobAdmission, arena, kv_of(key_job_admission, bytes), &diag);
+    const lies = [_]JobAdmission{
+        .{ .admitted = 4, .hours = good.hours },
+        .{ .admitted = 5, .hours = &.{ .{ .hour = 2, .count = 2 }, .{ .hour = 2, .count = 3 } } },
+    };
+    for (lies) |lie| {
+        const text = try encode(arena, lie, &diag);
+        try testing.expectError(
+            error.Malformed,
+            read(JobAdmission, arena, kv_of(key_job_admission, text), &diag),
+        );
+        diag.reset();
+    }
+}
+
+test "assigned: a version 1 record reads, and a run's assignment names its job" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const old = "{\"v\":1,\"replica\":\"h-1\",\"service\":\"h\"," ++
+        "\"requests\":{\"cpu_millis\":1,\"memory_bytes\":2},\"reason\":\"r\"}";
+    const back = try read(Assigned, arena, kv_of("/assigned/n/h-1", old), &diag);
+    try testing.expect(back.job == null);
+    try testing.expect(!assigned_is_job(&back));
+    const run = assigned_run("j-job", "j", .{ .cpu_millis = 1, .memory_bytes = 2 }, "r");
+    const bytes = try encode(arena, run, &diag);
+    try testing.expect(std.mem.startsWith(u8, bytes, "{\"v\":2,"));
+    const again = try read(Assigned, arena, kv_of("/assigned/n/j-job", bytes), &diag);
+    try testing.expect(assigned_is_job(&again));
+    try testing.expectEqual(assigned_version_job, version_current(Assigned));
+}
+
+test "assigned: a replica is written at version 1, and only a run at version 2" {
+    // Goal: the mixed-version rule of the brief (Assigned v2). Method: what a reader of the
+    // previous release (version 1, no `job`) does with what this release writes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const requests: Requests = .{ .cpu_millis = 1, .memory_bytes = 2 };
+    const replica = assigned_replica("h-1", "h", requests, "r");
+    const replica_bytes = try encode(arena, replica, &diag);
+    try testing.expect(std.mem.startsWith(u8, replica_bytes, "{\"v\":1,"));
+    // The previous release's record: version 1, no job. It reads the replica's record as it did.
+    const Previous = struct {
+        v: u32 = 1,
+        replica: []const u8,
+        service: []const u8,
+        requests: Requests,
+        reason: []const u8,
+    };
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const old = try std.json.parseFromSliceLeaky(Previous, arena, replica_bytes, options);
+    try testing.expect(old.v <= 1);
+    try testing.expectEqualStrings("h", old.service);
+    // A run is version 2, which that release refuses as too new (it does not misread it as a
+    // replica of no service): the scheduler writes runs only once every agent is upgraded.
+    const run_bytes = try encode(arena, assigned_run("j-job", "j", requests, "r"), &diag);
+    const run_head = try std.json.parseFromSliceLeaky(struct { v: u32 }, arena, run_bytes, options);
+    try testing.expect(run_head.v > 1);
+    // This release reads both, and an old v1 text as it was written.
+    const back = try read(Assigned, arena, kv_of("/assigned/n/h-1", replica_bytes), &diag);
+    try testing.expect(back.job == null and back.v == 1);
+}
+
+test "assigned: a job is set exactly when the service is empty, and names its run" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const requests: Requests = .{ .cpu_millis = 1, .memory_bytes = 2 };
+    const bad = [_]Assigned{
+        // A service and a job.
+        .{ .replica = "j-job", .service = "s", .requests = requests, .reason = "r", .job = "j" },
+        // Neither.
+        .{ .v = 1, .replica = "s-1", .requests = requests, .reason = "r" },
+        // A job at version 1.
+        .{ .v = 1, .replica = "j-job", .requests = requests, .reason = "r", .job = "j" },
+        // A run whose replica is not `<job>-job`.
+        .{ .replica = "k-job", .requests = requests, .reason = "r", .job = "j" },
+        .{ .replica = "j-1", .requests = requests, .reason = "r", .job = "j" },
+    };
+    for (bad) |record| {
+        const text = try encode(arena, record, &diag);
+        try testing.expectError(
+            error.Malformed,
+            read(Assigned, arena, kv_of("/assigned/n/x", text), &diag),
+        );
+        diag.reset();
+    }
+}
+
+test "a run record over job_run_bytes_max is refused at write and at read" {
+    // Goal: the runs reply rests on an enforced bound. Method: an env of 8 KiB of control
+    // characters is within job_env_bytes_max raw and six times that once JSON-escaped.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const control: [constants.job_env_bytes_max - 8]u8 = @splat(1);
+    var run: JobRun = .{
+        .id = "j-job",
+        .job = "j",
+        .image = "i",
+        .command = &.{"x"},
+        .deadline_ms = 1,
+        .start_by_ms = 2,
+        .created_at_ms = 1,
+        .env = &.{.{ "K", &control }},
+    };
+    try testing.expectError(error.NoCapacity, encode(arena, run, &diag));
+    try testing.expectEqual(codes.Code.B0005, diag.code.?);
+    diag.reset();
+    run.env = &.{.{ "K", "plain" }};
+    const bytes = try encode(arena, run, &diag);
+    _ = try read(JobRun, arena, kv_of("/job-runs/j", bytes), &diag);
+    // A row that is over the bound anyway (not written through `encode`) is malformed.
+    const pad: [constants.job_run_bytes_max]u8 = @splat('p');
+    const padded = try std.fmt.allocPrint(arena, "{s},\"pad\":\"{s}\"}}", .{
+        bytes[0 .. bytes.len - 1],
+        &pad,
+    });
+    const over = read(JobRun, arena, kv_of("/job-runs/j", padded), &diag);
+    try testing.expectError(error.Malformed, over);
+    // A newer, larger record is too new (ZC-E0303), not malformed: the version comes first.
+    diag.reset();
+    const newer = try std.fmt.allocPrint(arena, "{{\"v\":99,\"pad\":\"{s}\"}}", .{&pad});
+    const too_new_read = read(JobRun, arena, kv_of("/job-runs/j", newer), &diag);
+    try testing.expectError(error.Malformed, too_new_read);
+    try testing.expectEqual(codes.Code.E0303, diag.code.?);
+}
+
+test "a job observation says how the run ended exactly when it stopped" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const base: JobObserved = .{
+        .run = "j-job",
+        .node = "n1",
+        .tenure = 1,
+        .assignment = 2,
+        .status = .claimed,
+        .reported_at_ms = 3,
+    };
+    var running = base;
+    running.status = .running;
+    running.started_at_ms = 4;
+    var stopped = running;
+    stopped.status = .stopped;
+    stopped.exit = .{ .kind = .exited, .code = 0 };
+    for ([_]JobObserved{ base, running, stopped }) |good| {
+        const text = try encode(arena, good, &diag);
+        _ = try read(JobObserved, arena, kv_of("/job-observed/n1/j", text), &diag);
+    }
+    var no_exit = stopped;
+    no_exit.exit = null;
+    var early_exit = running;
+    early_exit.exit = .{ .kind = .exited, .code = 0 };
+    var claimed_started = base;
+    claimed_started.started_at_ms = 4;
+    for ([_]JobObserved{ no_exit, early_exit, claimed_started }) |bad| {
+        const text = try encode(arena, bad, &diag);
+        try testing.expectError(
+            error.Malformed,
+            read(JobObserved, arena, kv_of("/job-observed/n1/j", text), &diag),
+        );
         diag.reset();
     }
 }

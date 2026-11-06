@@ -33,6 +33,7 @@ check $PR x "" "src/README.md" TTTTTTT
 check $PR x "" "web/README.md" TFFFFFF
 check $PR x "" "site/errors/ZC-E0001.html" TFFFFFF
 check $PR x "" "README.md ops/sim-fleet/run.sh" TFFFFFF
+check $PR x "" "ops/sim-fleet/test-canary.sh ops/sim-fleet/test-crash-record.sh" TFFFFFF
 # Docs only, but asked for in full.
 check $PR x "full-ci" "README.md" TTTTTTT
 check $PR claude/release-0.4 "" "README.md" TTTTTTT

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0133]: no job by that name
+  cause  no job named train-7
+  reqid  r-0000001
+  fix    zcube job list shows the jobs that exist
+  more   zcube explain E0133
+  docs   https://zigbox.github.io/zigcube/errors/E0133.html
