@@ -1,7 +1,12 @@
 //! A seeded fuzzer for the TLS client's handshake (`tls_client.zig`, docs/mtls.md): a server's
 //! flight (with or without a request for the client's certificate, the request itself damaged in a
-//! third of the runs), damaged in one of thirteen ways, cut into pieces of random size. A flight
-//! left intact is followed by a random script of data, KeyUpdates, tickets and alerts both ways.
+//! third of the runs), damaged in one of thirteen ways, cut into pieces of random size; in a
+//! quarter of the runs one of EncryptedExtensions, Certificate, CertificateVerify and Finished
+//! has its content damaged and is sealed and hashed as damaged, so only its parse can refuse it.
+//! A flight left intact is followed by a random script of data, KeyUpdates, tickets and alerts
+//! both ways, and of handshake records that may not follow a handshake (a KeyUpdate of the wrong
+//! length or value, an empty ticket, an unknown type, bytes behind a KeyUpdate), which must end
+//! the connection with a code.
 //! The properties: no crash; the client is `connected` (at
 //! any step, whatever follows) only when the flight was a correct one and the server accepts the
 //! client's whole last flight, certificate included; a chain the pinned CA did not sign never
@@ -20,7 +25,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-const iterations_default = 400;
+const iterations_default = 2000;
 const server_name = "broker.botpike.com";
 const flight_bytes_max = 8192;
 
@@ -201,6 +206,9 @@ const World = struct {
     /// The CertificateRequest was damaged: the client may refuse it, answer it as it stands, or
     /// connect; what it must never do is connect against a verdict the peer cannot accept.
     request_damaged: bool,
+    /// One of the server's EncryptedExtensions, Certificate, CertificateVerify and Finished was
+    /// damaged in its content: the client must not connect.
+    message_damaged: bool,
     /// The client reported `connected` at some step although the flight was not a correct one
     /// or the server would not accept the client's Finished.
     false_connect: bool,
@@ -267,6 +275,12 @@ fn setup(world: *World, random: std.Random) !void {
     });
     world.sent_length = 0;
     world.request_damaged = false;
+    world.message_damaged = false;
+    if (random.uintLessThan(u8, 4) == 0) {
+        world.peer.config.faults.message_damage = 1 + random.uintLessThan(u32, 1 << 16);
+        world.message_damaged = true;
+        world.clean = false;
+    }
     if (world.peer.config.client_auth != null and random.uintLessThan(u8, 3) == 0) {
         world.peer.config.faults.request_damage = 1 + random.uintLessThan(u32, 1 << 20);
         world.request_damaged = true;
@@ -415,7 +429,8 @@ fn run_once(seed: u64, refused: *bool) !bool {
     const kind = random.enumValue(Mutation);
     const length = mutate(random, &world.peer, kind, answer, &world.damaged);
     _ = try feed(world, random, world.damaged[0..length]);
-    const intact = kind == .none and !world.request_damaged and !world.refused;
+    const intact = kind == .none and !world.request_damaged and !world.refused and
+        !world.message_damaged;
     if (intact and world.client.is_connected() and !world.false_connect) {
         try after_connect(world, random);
     }
@@ -435,7 +450,7 @@ fn after_connect(world: *World, random: std.Random) !void {
         const length = random.uintAtMost(usize, plain.len);
         random.bytes(plain[0..length]);
         world.sent_length = 0;
-        switch (random.uintLessThan(u8, 8)) {
+        switch (random.uintLessThan(u8, 10)) {
             0, 1 => {
                 const sealed = world.peer.application(&record, plain[0..length]);
                 @memcpy(world.expected[0..length], plain[0..length]);
@@ -469,9 +484,61 @@ fn after_connect(world: *World, random: std.Random) !void {
                 try open_key_update(world);
             },
             6 => return try end_by_alert(world, world.peer.close_notify(&record)),
+            8, 9 => return try damaged_post_handshake(world, random, &record),
             else => return try end_by_alert(world, world.peer.alert(&record, random.int(u8))),
         }
     }
+}
+
+/// A handshake record the server could never send after the handshake, sealed under its current
+/// keys: a KeyUpdate with two body bytes, none or a value over 1, an empty NewSessionTicket, a
+/// type the client does not take (a CertificateRequest among them), or a KeyUpdate with bytes
+/// behind it in the same record. The client must refuse it with a code and a cause, send at most
+/// one alert and then read and write nothing.
+fn damaged_post_handshake(world: *World, random: std.Random, record: []u8) !void {
+    const wire = @import("tls_wire.zig");
+    var message: [24]u8 = undefined;
+    var length: usize = 0;
+    const key_update = wire.handshake_key_update;
+    switch (random.uintLessThan(u8, 6)) {
+        0 => length = put_message(&message, key_update, &.{ random.int(u8), random.int(u8) }),
+        1 => length = put_message(&message, key_update, &.{}),
+        2 => length = put_message(&message, key_update, &.{2 + random.uintLessThan(u8, 254)}),
+        3 => length = put_message(&message, wire.handshake_new_session_ticket, &.{}),
+        4 => {
+            // Not 4 (NewSessionTicket) and not 24 (KeyUpdate); 13 is a CertificateRequest.
+            const types = [_]u8{ 1, 2, 8, 11, 13, 15, 20, 25, 254 };
+            var body: [8]u8 = undefined;
+            random.bytes(&body);
+            const types_pick = types[random.uintLessThan(usize, types.len)];
+            length = put_message(&message, types_pick, body[0..random.uintAtMost(usize, 8)]);
+        },
+        else => {
+            length = put_message(&message, key_update, &.{random.uintLessThan(u8, 2)});
+            const extra = 1 + random.uintLessThan(usize, 8);
+            random.bytes(message[length..][0..extra]);
+            length += extra;
+        },
+    }
+    const sealed = world.peer.seal(record, .handshake, message[0..length]);
+    world.sent_length = 0;
+    const accepted = receive_all(world, sealed);
+    collect(world);
+    if (accepted) |_| return error.DamagedMessageAccepted else |err| {
+        if (err == error.Closed) return error.DamagedMessageAccepted;
+    }
+    try expect_refusal(world);
+    try testing.expectError(error.Closed, world.client.receive("x", &world.diag));
+    try testing.expectEqual(@as(usize, 0), world.client.output().len);
+    try testing.expect(world.sent_length <= 64);
+}
+
+/// A handshake message of `kind` with `body` at the start of `out`; returns its length.
+fn put_message(out: []u8, kind: u8, body: []const u8) usize {
+    out[0] = kind;
+    std.mem.writeInt(u24, out[1..4], @intCast(body.len), .big);
+    @memcpy(out[4..][0..body.len], body);
+    return 4 + body.len;
 }
 
 /// Feeds `bytes` until the client has consumed them all; returns the bytes of application data

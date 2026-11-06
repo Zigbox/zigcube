@@ -337,7 +337,8 @@ pub const Client = struct {
     /// Protects application data as one record into `out` and returns what to send. When the
     /// write keys are at their record limit the KeyUpdate goes first, in the same slice, so the
     /// caller needs no other step to stay inside the limit (RFC 8446 section 5.5). A direction
-    /// that cannot move on is a refusal with a diagnostic (ZC-E0815).
+    /// that cannot move on is a refusal with a diagnostic (ZC-E0815). The caller has sent
+    /// `output()` first: an answer queued by `receive` is sealed under the keys from before.
     pub fn seal_application(
         self: *Client,
         plain: []const u8,
@@ -345,6 +346,7 @@ pub const Client = struct {
         diag: *Diag,
     ) Error![]u8 {
         assert(self.state == .connected);
+        assert(self.out_length == 0); // The caller drained the last step's output.
         assert(plain.len <= constants.tls_record_plaintext_bytes_max);
         assert(out.len >= application_bytes_max(plain.len));
         var used: usize = 0;

@@ -831,6 +831,15 @@ test "a signer that fails is refused with E0820" {
     try std.testing.expectError(error.Refused, rig.handshake(4096));
     try rig.expect_code(.E0820);
     try expect_context(&rig.diag, "sent", "alert internal_error (80)");
+    // The Certificate is held back until the signer answers, so the first record the peer can
+    // open is the alert, at sequence 0 under the client's handshake keys: a server sees
+    // internal_error and not a bad MAC.
+    var sent = rig.sent[0..rig.sent_length];
+    if (sent.len > 0 and sent[0] == @backingInt(schedule.ContentType.change_cipher_spec))
+        sent = sent[6..];
+    const opened = try rig.peer.open(sent);
+    try std.testing.expectEqual(schedule.ContentType.alert, opened.content_type);
+    try std.testing.expectEqual(@as(u8, 80), opened.content[1]);
 }
 
 fn expect_flight(auth: Auth, want: testpeer.ClientFlight) !void {
