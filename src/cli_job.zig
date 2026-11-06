@@ -30,8 +30,8 @@ const Writer = std.Io.Writer;
 
 /// Pages of a listing one command reads before it calls the server's answer broken.
 const pages_max: u32 = 1024;
-/// Endings `job watch` remembers, to print each `(name, epoch)` once across a relist: the server
-/// keeps at most this many ended jobs, so a relist cannot return more.
+/// Endings `job watch` remembers, to print each `(name, epoch, ended_at_ms)` once across a
+/// relist: the server keeps at most this many ended jobs, so a relist cannot return more.
 const seen_max = constants.job_admitted_window_max;
 
 pub fn run(
@@ -340,17 +340,18 @@ fn cancel(
 
 // ---- watch -------------------------------------------------------------------------------
 
-/// The endings already printed, oldest first: a `(name, epoch)` is hashed. The array holds
-/// `seen_max` keys, the most a relist can return, so a listing never evicts a key it still has
-/// to look up.
+/// The endings already printed, oldest first: a `(name, epoch, ended_at_ms)` is hashed. The
+/// array holds `seen_max` keys, the most a relist can return, so a listing never evicts a key it
+/// still has to look up.
 const Seen = struct {
     keys: [seen_max]u64 = @splat(0),
     count: u32 = 0,
     next: u32 = 0,
 
-    /// True if `(name, epoch)` was seen; otherwise remembers it.
-    fn seen(ring: *Seen, name: []const u8, epoch: u64) bool {
-        const key = std.hash.Wyhash.hash(epoch, name) | 1;
+    /// True if `(name, epoch, ended_at_ms)` was seen; otherwise remembers it. An unplaced ending
+    /// has no epoch (0 here), so `ended_at_ms` is what tells two endings of a reused name apart.
+    fn seen(ring: *Seen, name: []const u8, epoch: u64, ended_at_ms: u64) bool {
+        const key = std.hash.Wyhash.hash(epoch ^ std.math.rotl(u64, ended_at_ms, 32), name) | 1;
         for (ring.keys[0..ring.count]) |known| {
             if (known == key) return true;
         }
@@ -426,7 +427,9 @@ fn print_ending(
 ) Error!void {
     const state = cli_data.text(status, "state") orelse return;
     if (!cli_job_view.terminal(state)) return;
-    if (ring.seen(name, cli_data.number(status, "epoch") orelse 0)) return;
+    const epoch = cli_data.number(status, "epoch") orelse 0;
+    const ended_at_ms = cli_data.number(status, "ended_at_ms") orelse 0;
+    if (ring.seen(name, epoch, ended_at_ms)) return;
     const arena = env.arena;
     const line = if (options.output == .json)
         try cli_job_view.ending_json(arena, name, status)
@@ -487,13 +490,13 @@ const Script = struct {
         if (std.mem.startsWith(u8, path, "/v1/jobs?limit=500&state=ended")) {
             return script.reply(200,
                 \\{"revision":20,"jobs":[{"name":"a","state":"exited","node":"n1","epoch":3,
-                \\"end":{"kind":"exited","code":0}}]}
+                \\"ended_at_ms":900,"end":{"kind":"exited","code":0}}]}
             );
         }
         return script.reply(200,
             \\{"revision":22,"events":[
             \\{"type":"put","name":"a","revision":21,"status":{"state":"exited","node":"n1",
-            \\"epoch":3,"end":{"kind":"exited","code":0}}},
+            \\"epoch":3,"ended_at_ms":900,"end":{"kind":"exited","code":0}}},
             \\{"type":"put","name":"c","revision":21,"status":{"state":"running","epoch":6}},
             \\{"type":"put","name":"b","revision":22,"status":{"state":"failed","node":"n2",
             \\"epoch":5,"end":{"kind":"failed","cause":"oom"}}}]}
@@ -657,6 +660,18 @@ test "a relist of more endings than 1,024 prints each ending once, however often
         try names.put(arena, name, {});
     }
     try testing.expectEqual(@as(u32, 2000), count);
+}
+
+test "two unplaced endings of a reused name differ by ended_at_ms, one ending repeats" {
+    // Goal: docs/api.md's dedupe key. Method: the key of a cancelled-before-claim job (no epoch)
+    // is the same for a reused name unless `ended_at_ms` is part of it; a repeat of one ending
+    // (a watch event after the list) is still seen.
+    var ring: Seen = .{};
+    try testing.expect(!ring.seen("a", 0, 1_000));
+    try testing.expect(ring.seen("a", 0, 1_000));
+    try testing.expect(!ring.seen("a", 0, 4_000_000));
+    try testing.expect(!ring.seen("a", 7, 1_000));
+    try testing.expect(!ring.seen("b", 0, 1_000));
 }
 
 test "job cancel escapes the user in its body" {

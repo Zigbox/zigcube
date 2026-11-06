@@ -156,6 +156,8 @@ export class Jobs {
       const row = { name: job.name, image: job.image, state, labels: job.labels, created_at_ms: job.created_at_ms, deadline_ms: job.deadline_ms, cancel_requested: !!job.cancel_requested };
       if (st?.node) row.node = st.node;
       if (st?.end) row.end = st.end;
+      if (st?.epoch != null) row.epoch = st.epoch;
+      if (st?.ended_at_ms != null) row.ended_at_ms = st.ended_at_ms;
       jobs.push(row);
     }
     return { revision: this.engine.rev, jobs, continue: page.more ? page.last.slice("/jobs/".length) : null };

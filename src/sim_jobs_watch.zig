@@ -2,8 +2,9 @@
 //! follows job endings through the real API and must see each one exactly once, however often it
 //! is killed and however long it is away. It keeps the revision it last handled and the endings
 //! it handled; it asks `GET /v1/jobs/watch?from=`, and on a 410 (`ZC-E0203`, the store compacted
-//! past it) lists `state=ended`, deduplicates by `(name, epoch)` and watches on from the list's
-//! revision (docs/api.md). The truth is every terminal `/job-status/` put the tap saw commit.
+//! past it) lists `state=ended`, deduplicates by `(name, epoch, ended_at_ms)` and watches on from
+//! the list's revision (docs/api.md). The truth is every terminal `/job-status/` put the tap saw
+//! commit.
 //! Core code: it drives `Api.handle` and keeps no thread, clock or file.
 
 const std = @import("std");
@@ -17,7 +18,7 @@ const Context = controller.Context;
 /// Endings the truth and the client's memory can hold; past it the run is counted, not judged.
 pub const endings_max: u32 = 1024;
 
-pub const Ending = struct { name_hash: u64, epoch: u64 };
+pub const Ending = struct { name_hash: u64, epoch: u64, ended_at_ms: u64 };
 
 pub const State = struct {
     /// What the store committed: every terminal status put, once.
@@ -37,12 +38,16 @@ pub const State = struct {
     violation: ?[]const u8 = null,
 };
 
-pub fn ending_of(name: []const u8, epoch: ?u64) Ending {
-    return .{ .name_hash = std.hash.Wyhash.hash(0, name), .epoch = epoch orelse 0 };
+pub fn ending_of(name: []const u8, epoch: ?u64, ended_at_ms: ?u64) Ending {
+    return .{
+        .name_hash = std.hash.Wyhash.hash(0, name),
+        .epoch = epoch orelse 0,
+        .ended_at_ms = ended_at_ms orelse 0,
+    };
 }
 
 fn same(a: Ending, b: Ending) bool {
-    return a.name_hash == b.name_hash and a.epoch == b.epoch;
+    return a.name_hash == b.name_hash and a.epoch == b.epoch and a.ended_at_ms == b.ended_at_ms;
 }
 
 fn contains(list: []const Ending, ending: Ending) bool {
@@ -68,7 +73,7 @@ pub fn note_commit(state: *State, request: store.TxnRequest, arena: std.mem.Allo
         ) catch continue;
         if (!records.job_state_terminal(parsed.state)) continue;
         const name = put.key[records.prefix_job_status.len..];
-        const ending = ending_of(name, parsed.epoch);
+        const ending = ending_of(name, parsed.epoch, parsed.ended_at_ms);
         if (contains(state.truth[0..state.truth_count], ending)) continue;
         if (state.truth_count < endings_max) {
             state.truth[state.truth_count] = ending;
@@ -98,7 +103,7 @@ const Event = struct {
     status: ?records.JobStatus = null,
 };
 const Watched = struct { revision: u64, events: []const Event = &.{} };
-const Row = struct { name: []const u8, epoch: ?u64 = null };
+const Row = struct { name: []const u8, epoch: ?u64 = null, ended_at_ms: ?u64 = null };
 const Listed = struct { revision: u64, jobs: []const Row = &.{}, @"continue": ?[]const u8 = null };
 
 const Answer = struct { status: u16, body: []const u8 };
@@ -134,7 +139,7 @@ fn relist(state: *State, api: *api_mod.Api, ctx: *const Context) bool {
             .ignore_unknown_fields = true,
         }) catch return false;
         if (at == null) at = page.revision;
-        for (page.jobs) |row| handle(state, ending_of(row.name, row.epoch));
+        for (page.jobs) |row| handle(state, ending_of(row.name, row.epoch, row.ended_at_ms));
         after = page.@"continue" orelse {
             state.revision = at.?;
             return true;
@@ -170,7 +175,7 @@ pub fn poll(state: *State, api: *api_mod.Api, ctx: *const Context) void {
         }
         const status = event.status orelse continue;
         if (!records.job_state_terminal(status.state)) continue;
-        handle(state, ending_of(event.name, status.epoch));
+        handle(state, ending_of(event.name, status.epoch, status.ended_at_ms));
     }
     state.revision = @max(state.revision, watched.revision);
 }
