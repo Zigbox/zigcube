@@ -49,6 +49,7 @@ pub const modules = .{
     @import("runtime_codes.zig"),
     @import("retention.zig"),
     @import("pull_retention.zig"),
+    @import("job_controller.zig"),
     @import("scheduler.zig"),
     @import("runtime.zig"),
     @import("sim_c0.zig"),
@@ -167,6 +168,7 @@ test {
 
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");
+    _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");
     _ = @import("agent_api_test.zig");
     _ = @import("agent_fence_test.zig");
