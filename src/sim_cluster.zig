@@ -373,6 +373,8 @@ const Node = struct {
     last_wedged_ms: ?u64,
     /// Times the agent fenced itself, over the whole run (all agent lives).
     fences: u32,
+    /// `fences` when the heal began.
+    fences_at_heal: u32,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -664,8 +666,6 @@ pub const Cluster = struct {
     stats: Stats,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
-    /// The fences all nodes had made when the heal began.
-    fences_at_heal: u32,
     /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
     /// report names it (the simulation fleet files a failure by its check and this step).
     step: []const u8,
@@ -758,7 +758,6 @@ pub const Cluster = struct {
         c.check_ms = 0;
         c.stats = .{};
         c.fault_totals = null;
-        c.fences_at_heal = 0;
         c.step = "faults";
         c.on_step = null;
         c.liveness = true;
@@ -835,6 +834,7 @@ pub const Cluster = struct {
         node.frozen_until_ms = null;
         node.last_wedged_ms = null;
         node.fences = 0;
+        node.fences_at_heal = 0;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -1936,7 +1936,6 @@ fn track_starved(
 /// Every fault off; the agents come back up as time passes. Ends the fault phase.
 fn heal(c: *Cluster) void {
     c.fault_totals = c.phase_totals();
-    c.fences_at_heal = total_fences(c);
     c.set_store_down(false);
     c.ack_loss.loss_per_mille = 0;
     c.swarm.net = .{};
@@ -1944,6 +1943,7 @@ fn heal(c: *Cluster) void {
     for (c.nodes) |node| {
         node.partitioned_until_ms = null;
         node.frozen_until_ms = null;
+        node.fences_at_heal = node.fences;
     }
 }
 
@@ -2341,10 +2341,10 @@ fn total_fences(c: *const Cluster) u32 {
 /// back-off, but not once a second for the rest of the run. Each node gets
 /// `fences_after_heal_per_node_max`.
 fn fencing_settles(c: *Cluster) Failure!void {
-    const after = total_fences(c) - c.fences_at_heal;
-    const allowed: u32 = @intCast(c.nodes.len * fences_after_heal_per_node_max);
-    try check(c, after <= allowed, "agents kept fencing after the cluster healed (a lease " ++
-        "renewal that cannot beat its fence)");
+    var worst: u32 = 0;
+    for (c.nodes) |node| worst = @max(worst, node.fences - node.fences_at_heal);
+    try check(c, worst <= fences_after_heal_per_node_max, "agents kept fencing after the " ++
+        "cluster healed (a lease renewal that cannot beat its fence)");
 }
 
 /// An agent that never sleeps (a wake time that is always now) passes every other check and
