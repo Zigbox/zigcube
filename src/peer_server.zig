@@ -254,6 +254,7 @@ fn accept_loop(server: *Server) void {
             },
         }
         const fd: std.posix.fd_t = @intCast(got);
+        peer_stream.set_nodelay(fd);
         admit(server, fd, &storage, io);
     }
 }

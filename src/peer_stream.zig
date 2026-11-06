@@ -199,6 +199,16 @@ pub fn wait_ready(io: std.Io, fd: std.posix.fd_t, events: i16, end_ms: u64) Erro
     if (ready == 0) return error.Timeout;
 }
 
+/// Turns Nagle's algorithm off. A reply is two sends (head, then body); with Nagle the body, when
+/// shorter than a segment, waits for the ACK of the head, which the peer's delayed ACK holds back
+/// for tens of milliseconds: one chunk request cost ~60 ms and a fetch ran at ~400 KB/s (#93).
+/// Failure is ignored: the link is only slower.
+pub fn set_nodelay(fd: std.posix.fd_t) void {
+    const on = std.mem.toBytes(@as(c_int, 1));
+    const linux = std.os.linux;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, &on, on.len);
+}
+
 /// A connected socket to `address`, made with a non-blocking connect and a `poll` until `end_ms`
 /// (the standard library's connect has no timeout on POSIX). It stays non-blocking: every read
 /// and write on it polls against its caller's deadline. The caller closes it.
@@ -212,6 +222,7 @@ pub fn connect(io: std.Io, address: std.Io.net.IpAddress, end_ms: u64) Error!std
     if (linux.errno(opened) != .SUCCESS) return error.Io;
     const fd: std.posix.fd_t = @intCast(opened);
     errdefer _ = linux.close(fd);
+    set_nodelay(fd);
     switch (linux.errno(linux.connect(fd, &storage.any, length))) {
         .SUCCESS => {},
         .INPROGRESS => {
@@ -236,6 +247,33 @@ pub fn connect(io: std.Io, address: std.Io.net.IpAddress, end_ms: u64) Error!std
 }
 
 // ---- Tests -----------------------------------------------------------------------------------
+
+test "a connected socket has Nagle off" {
+    const linux = std.os.linux;
+    const listener = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expect(linux.errno(listener) == .SUCCESS);
+    const lfd: std.posix.fd_t = @intCast(listener);
+    defer _ = linux.close(lfd);
+    var addr = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    try std.testing.expect(linux.errno(linux.bind(lfd, @ptrCast(&addr), size)) == .SUCCESS);
+    try std.testing.expect(linux.errno(linux.listen(lfd, 1)) == .SUCCESS);
+    const named = linux.getsockname(lfd, @ptrCast(&addr), &size);
+    try std.testing.expect(linux.errno(named) == .SUCCESS);
+    const io = std.testing.io;
+    const address: std.Io.net.IpAddress = .{ .ip4 = .{
+        .bytes = .{ 127, 0, 0, 1 },
+        .port = std.mem.bigToNative(u16, addr.port),
+    } };
+    const fd = try connect(io, address, boot_ms(io) + 5000);
+    defer _ = linux.close(fd);
+    var value: i32 = 0;
+    var length: linux.socklen_t = @sizeOf(i32);
+    const level = linux.IPPROTO.TCP;
+    const got = linux.getsockopt(fd, level, linux.TCP.NODELAY, @ptrCast(&value), &length);
+    try std.testing.expect(linux.errno(got) == .SUCCESS);
+    try std.testing.expect(value != 0);
+}
 
 const Ed25519 = std.crypto.sign.Ed25519;
 
