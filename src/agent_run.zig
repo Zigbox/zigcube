@@ -536,6 +536,9 @@ pub const Swarm = struct {
             .zigbox_store = zigbox_root,
             .zigbox_chunk_bytes = swarm.chunk_bytes_test,
             .verbose = config.verbose,
+            // A passing test step that writes to stderr is reported by the build runner as
+            // `failed command: ...` (docs/STYLE.md); the product's stderr is unchanged.
+            .quiet = @import("builtin").is_test,
             .corrupt_chunks = test_fault(io, config.state_dir, "peer-corrupt"),
         }) catch {
             gpa.destroy(server);

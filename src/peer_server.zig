@@ -470,9 +470,6 @@ fn refuse(server: *Server, io: std.Io, storage: *const Storage, why: []const u8)
 
 /// Shows a diagnostic of Zigbox's (ZBX-) as Zigbox wrote it.
 fn show_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
-    // Silent in a unit test: a passing test step that writes to stderr is reported by the build
-    // runner as `failed command: ...` (docs/STYLE.md). Tests see it through the flag at line 131.
-    if (@import("builtin").is_test) return;
     var diagnostic: diag_mod.Diagnostic = undefined;
     zigbox.diagnostic.from_diag(&diagnostic, collector);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
@@ -1529,6 +1526,14 @@ test "an agent configured for Zigbox only serves its store's tree to a peer fetc
     try agent.init();
     defer agent.deinit();
     try std.testing.expect(!agent.swarm.has_store);
+    // ZBX-W0201 is said (and the flag set) exactly when this host maps one id only; the agent
+    // starts the server quiet in a test, so the flag is how the test sees the warning.
+    {
+        const facts = try gpa.create(zigbox.Facts);
+        defer gpa.destroy(facts);
+        const expected = zigbox_fetch.outside_owners(facts).fallback;
+        try std.testing.expectEqual(expected, agent.swarm.server.?.outside_fallback);
+    }
     // The node's summary comes from the Zigbox store the agent opened: it lists the tree.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

@@ -734,7 +734,9 @@ fn no_memory(io: std.Io, diag: *diag_mod.Diag) u8 {
 
 /// Says `text` on stderr; there is nowhere else to say it. Silent in a unit test: a passing test
 /// step that writes to stderr is reported by the build runner as `failed command: ...`, which
-/// read like a crash (docs/STYLE.md). The real streams are covered by the process tests.
+/// read like a crash (docs/STYLE.md). Nothing in `zig build check` reads the real stream: the
+/// swarm smoke (not in `check`) reads `fetch.log` for ZC-W0601 only, and ZBX-W0201 and the bundle
+/// notes are not asserted on it anywhere.
 fn to_stderr(io: std.Io, text: []const u8) void {
     if (@import("builtin").is_test) return;
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
