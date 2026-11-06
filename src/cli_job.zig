@@ -30,7 +30,7 @@ const Writer = std.Io.Writer;
 
 /// Pages of a listing one command reads before it calls the server's answer broken.
 const pages_max: u32 = 1024;
-/// Endings `job watch` remembers, to print each `(name, epoch, ended_at_ms)` once across a
+/// Endings `job watch` remembers, to print each once across a
 /// relist: the server keeps at most this many ended jobs, so a relist cannot return more.
 const seen_max = constants.job_admitted_window_max;
 
@@ -340,7 +340,8 @@ fn cancel(
 
 // ---- watch -------------------------------------------------------------------------------
 
-/// The endings already printed, oldest first: a `(name, epoch, ended_at_ms)` is hashed. The
+/// The endings already printed, oldest first: a placed ending's `(name, epoch)` or an unplaced
+/// ending's `(name, ended_at_ms)` is hashed (docs/api.md). The
 /// array holds `seen_max` keys, the most a relist can return, so a listing never evicts a key it
 /// still has to look up.
 const Seen = struct {
@@ -348,10 +349,16 @@ const Seen = struct {
     count: u32 = 0,
     next: u32 = 0,
 
-    /// True if `(name, epoch, ended_at_ms)` was seen; otherwise remembers it. An unplaced ending
-    /// has no epoch (0 here), so `ended_at_ms` is what tells two endings of a reused name apart.
+    /// True if the ending was seen; otherwise remembers it. A placed ending (`epoch` non-zero, a
+    /// store revision) is told by its epoch alone; an unplaced one has no epoch (0 here), so
+    /// `ended_at_ms` is what tells two endings of a reused name apart.
     fn seen(ring: *Seen, name: []const u8, epoch: u64, ended_at_ms: u64) bool {
-        const key = std.hash.Wyhash.hash(epoch ^ std.math.rotl(u64, ended_at_ms, 32), name) | 1;
+        const time: u64 = if (epoch != 0) 0 else ended_at_ms;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(name);
+        hasher.update(std.mem.asBytes(&epoch));
+        hasher.update(std.mem.asBytes(&time));
+        const key = hasher.final() | 1;
         for (ring.keys[0..ring.count]) |known| {
             if (known == key) return true;
         }
@@ -671,6 +678,9 @@ test "two unplaced endings of a reused name differ by ended_at_ms, one ending re
     try testing.expect(ring.seen("a", 0, 1_000));
     try testing.expect(!ring.seen("a", 0, 4_000_000));
     try testing.expect(!ring.seen("a", 7, 1_000));
+    // A placed ending is one key whether or not the row carries `ended_at_ms`.
+    try testing.expect(ring.seen("a", 7, 0));
+    try testing.expect(ring.seen("a", 7, 5));
     try testing.expect(!ring.seen("b", 0, 1_000));
 }
 

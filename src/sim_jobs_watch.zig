@@ -2,9 +2,9 @@
 //! follows job endings through the real API and must see each one exactly once, however often it
 //! is killed and however long it is away. It keeps the revision it last handled and the endings
 //! it handled; it asks `GET /v1/jobs/watch?from=`, and on a 410 (`ZC-E0203`, the store compacted
-//! past it) lists `state=ended`, deduplicates by `(name, epoch, ended_at_ms)` and watches on from
-//! the list's revision (docs/api.md). The truth is every terminal `/job-status/` put the tap saw
-//! commit.
+//! past it) lists `state=ended`, deduplicates by `(name, epoch)` (`(name, ended_at_ms)` if
+//! unplaced) and watches on from the list's revision (docs/api.md). The truth is every terminal
+//! `/job-status/` put the tap saw commit.
 //! Core code: it drives `Api.handle` and keeps no thread, clock or file.
 
 const std = @import("std");
@@ -46,13 +46,21 @@ pub fn ending_of(name: []const u8, epoch: ?u64, ended_at_ms: ?u64) Ending {
     };
 }
 
+/// docs/api.md's key: `(name, epoch)` for a placed ending (epoch non-zero, a store revision),
+/// `(name, ended_at_ms)` for an unplaced one.
 fn same(a: Ending, b: Ending) bool {
+    if (a.name_hash != b.name_hash or a.epoch != b.epoch) return false;
+    return a.epoch != 0 or a.ended_at_ms == b.ended_at_ms;
+}
+
+fn exact(a: Ending, b: Ending) bool {
     return a.name_hash == b.name_hash and a.epoch == b.epoch and a.ended_at_ms == b.ended_at_ms;
 }
 
+/// Whether `list` holds this ending to the last member (the truth and coverage compare so).
 fn contains(list: []const Ending, ending: Ending) bool {
     for (list) |known| {
-        if (same(known, ending)) return true;
+        if (exact(known, ending)) return true;
     }
     return false;
 }
@@ -85,7 +93,14 @@ pub fn note_commit(state: *State, request: store.TxnRequest, arena: std.mem.Allo
 }
 
 fn handle(state: *State, ending: Ending) void {
-    if (contains(state.handled[0..state.handled_count], ending)) return;
+    for (state.handled[0..state.handled_count]) |known| {
+        if (!same(known, ending)) continue;
+        // One placed ending under two times is one ending under two keys: the exactly-once half.
+        if (known.ended_at_ms != ending.ended_at_ms and ending.epoch != 0) {
+            return fail(state, "J4: one job ending was reported with two ended_at_ms values");
+        }
+        return;
+    }
     if (state.handled_count < endings_max) {
         state.handled[state.handled_count] = ending;
         state.handled_count += 1;

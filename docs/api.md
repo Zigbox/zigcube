@@ -400,12 +400,15 @@ absent on a delete). `revision` is the bookmark: pass `revision + 1` as the next
 when `events` is empty (a batch whose events all fell to `label` still advances it). A `label`
 keeps the events of jobs that match it at the head (the job now holding the name, a reused one included) and drops deletes. `410` ZC-E0203 when `from`
 is below the compaction point, `400` ZC-E0204 when it is beyond the head. The client's contract:
-watch; on a 410, list `state=ended`, deduplicate by `(name, epoch, ended_at_ms)` (a row carries
-the `epoch` of the run it ended under, none for an unplaced ending, and `ended_at_ms`; an event's
-`status` carries the same members) and watch again from the list's `revision + 1`. Every ending
-is then seen at least once; handle it by `(name, epoch, ended_at_ms)` to see it exactly once. An
-absent `epoch` counts as none; `ended_at_ms` tells apart two unplaced endings of a name that was
-reused after retention (`docs/decisions/2026-11-06-job-dedupe-key-adopted.md`). The name `watch`
+watch; on a 410, list `state=ended`, deduplicate (a row carries the `epoch` of the run it ended
+under, none for an unplaced ending, and `ended_at_ms`; an event's `status` carries the same
+members) and watch again from the list's `revision + 1`. Every ending is then seen at least once;
+handle it by its key to see it exactly once. The key is `(name, epoch)` when `epoch` is present and
+non-zero (a store revision, unique per placed ending, so it works against any server) and
+`(name, ended_at_ms)` only for an unplaced ending, where it is the only thing that tells two
+endings of a name reused after retention apart. An absent `epoch` counts as none, an absent
+`ended_at_ms` as 0 (an older server's row; it only matters for an unplaced ending)
+(`docs/decisions/2026-11-06-job-dedupe-key-adopted.md`). The name `watch`
 is reserved: `POST /v1/jobs` refuses it with ZC-E0130.
 
 ### `POST /v1/jobs/{name}/cancel`
