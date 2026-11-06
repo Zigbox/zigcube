@@ -85,6 +85,12 @@ pub const Net = struct {
     busy_wait_ms: u32 = constants.fetch_busy_wait_ms,
     /// The open stream to each peer, by index (one `Conn` per entry of `peers`).
     conns: []Conn = &.{},
+    /// Chunk requests made to peers and the bytes they brought, for the progress line (#93:
+    /// a fetch that is slow and one that is stuck wrote the same, nothing).
+    chunks_asked: u32 = 0,
+    chunk_bytes: u64 = 0,
+    /// `boot_ms` of the last progress line, 0 before the first.
+    progress_ms: u64 = 0,
 
     fn from(context: *anyopaque) *Net {
         return @ptrCast(@alignCast(context));
@@ -163,13 +169,28 @@ pub const Net = struct {
                 const prefix = peer_serve.path_chunk;
                 const path = std.fmt.bufPrint(&target, "{s}{x}", .{ prefix, &ref.hash }) catch
                     return .refused;
-                return switch (net.peer_get(index, path, out)) {
+                const reply = net.peer_get(index, path, out);
+                net.chunks_asked += 1;
+                if (reply == .bytes) net.chunk_bytes += reply.bytes.len;
+                net.say_progress();
+                return switch (reply) {
                     .bytes => |bytes| .{ .bytes = bytes },
                     .refused, .busy => .refused, // `peer_get` has waited out a busy peer.
                     .timeout => .timeout,
                 };
             },
         }
+    }
+
+    /// At most one line per `fetch_progress_ms` to fetch.log: what the chunk requests have
+    /// brought and what the peers answered instead.
+    fn say_progress(net: *Net) void {
+        const now_ms = peer_stream.boot_ms(net.io);
+        if (net.progress_ms == 0) net.progress_ms = now_ms;
+        if (now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
+        net.progress_ms = now_ms;
+        var buffer: [256]u8 = undefined;
+        note(net.io, progress_line(&buffer, net));
     }
 
     fn now(context: *anyopaque) u64 {
@@ -719,7 +740,8 @@ pub const usage = "usage: zcube-agent fetch --node NAME --state-dir DIR " ++
     "[--peer NAME=HOST:PORT]...";
 
 /// Prints `diag` and gives the exit code. 1 is a bad command line, 2 is this node (disk,
-/// memory), 3 is that no source had the tree (the supervisor records that as ZC-E0601).
+/// memory), 3 is that no source had the tree (the supervisor says ZC-W0603 and pulls from the
+/// registry).
 fn finish(io: std.Io, diag: *const diag_mod.Diag, code: u8) u8 {
     assert(code != constants.exit_ok);
     emit(io, diag);
@@ -1146,6 +1168,23 @@ fn say_peer_answers(net: *const Net) void {
     }
 }
 
+/// The progress line: requests made, bytes got, and the peers' answers that were not a chunk.
+pub fn progress_line(buffer: []u8, net: *const Net) []const u8 {
+    var busy: u32 = 0;
+    var refused: u32 = 0;
+    var silent: u32 = 0;
+    for (net.conns[0..net.peers.len]) |conn| {
+        busy += conn.busy;
+        refused += conn.refused;
+        silent += conn.timeouts;
+    }
+    const form = "zcube-agent fetch: progress: {d} chunk requests, {d} bytes from peers; " ++
+        "answers: busy {d}, refused {d}, nothing {d}\n";
+    return std.fmt.bufPrint(buffer, form, .{
+        net.chunks_asked, net.chunk_bytes, busy, refused, silent,
+    }) catch buffer[0..0];
+}
+
 pub fn peer_answers_line(buffer: []u8, name: []const u8, conn: Conn) []const u8 {
     const form = "zcube-agent fetch: peer {s} answered busy (503) {d} times, a status other " ++
         "than 200 {d} times, nothing {d} times\n";
@@ -1448,6 +1487,30 @@ fn peer_holds(stores: []const Kv, self: []const u8, digest: []const u8) bool {
 }
 
 // ---- Tests ----------------------------------------------------------------------------------
+
+test "the progress line counts requests, bytes and the answers that were not a chunk" {
+    var conns = [_]Conn{ .{ .busy = 2, .refused = 3 }, .{ .timeouts = 5, .busy = 1 } };
+    const peers = [_]Peer{
+        .{ .name = "a", .address = try IpAddress.parse("127.0.0.1", 1) },
+        .{ .name = "b", .address = try IpAddress.parse("127.0.0.1", 2) },
+    };
+    var scratch: [8]u8 = undefined;
+    const net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &peers,
+        .identity = null,
+        .reply = &scratch,
+        .conns = &conns,
+        .chunks_asked = 7,
+        .chunk_bytes = 4096,
+    };
+    var buffer: [256]u8 = @splat(0xaa);
+    const line = progress_line(&buffer, &net);
+    const want = "zcube-agent fetch: progress: 7 chunk requests, 4096 bytes from peers; " ++
+        "answers: busy 3, refused 3, nothing 5\n";
+    try std.testing.expectEqualStrings(want, line);
+}
 
 test "a peer that gave no bundle is named with what it answered" {
     var buffer: [256]u8 = undefined;

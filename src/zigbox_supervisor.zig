@@ -104,7 +104,10 @@ const Real = struct {
             ) orelse "",
         };
         const started_ms = if (self.swarm) |swarm| real_ms(swarm.io) else 0;
-        try zigbox.pull.pull(
+        // The pull writes nothing to fetch.log until it is done: a stuck one and a slow one
+        // looked alike (issue #93). These two lines tell them apart.
+        if (self.swarm) |swarm| append_to_log(swarm, "supervisor: the registry pull starts\n");
+        zigbox.pull.pull(
             self.host,
             &storage.pull_facts,
             &request,
@@ -113,7 +116,11 @@ const Real = struct {
             &storage.import_workspace,
             &storage.pull_result,
             diag,
-        );
+        ) catch |err| {
+            if (self.swarm) |swarm| say_pull_ended(swarm, started_ms, false);
+            return err;
+        };
+        if (self.swarm) |swarm| say_pull_ended(swarm, started_ms, true);
         const text = storage.pull_result.tree.text();
         if (self.swarm) |swarm| {
             const result = &storage.pull_result;
@@ -285,6 +292,24 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) image.Fetched {
         },
     }
     return .absent;
+}
+
+/// Saying nothing when the tree was already in the store would look like a stalled fetch in a
+/// dump (issue #93).
+fn say_no_fetch(swarm: Swarm, fetched: bool, pulled: bool) void {
+    if (fetched or pulled) return;
+    append_to_log(swarm, "supervisor: the tree was already in the store; no fetch was needed\n");
+}
+
+/// The registry pull's outcome in fetch.log: how long it took and whether it gave the tree (its
+/// own diagnostic is the container's `failed.json`).
+fn say_pull_ended(swarm: Swarm, started_ms: u64, ok: bool) void {
+    var buffer: [128]u8 = undefined;
+    const spent = real_ms(swarm.io) -| started_ms;
+    const text = std.fmt.bufPrint(&buffer, "supervisor: the registry pull {s} after {d} ms\n", .{
+        if (ok) "finished" else "failed", spent,
+    }) catch return;
+    append_to_log(swarm, text);
 }
 
 /// ZC-W0603: the swarm fetch ended without the tree and the registry pull follows (not yet
@@ -494,11 +519,7 @@ fn supervise(
     }
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {
-        .started => if (real.swarm) |swarm| {
-            // Saying nothing here would look like a stalled fetch in a dump (issue #93).
-            if (!trace.fetched and !trace.pulled) append_to_log(swarm, "supervisor: the tree " ++
-                "was already in the store; no fetch was needed\n");
-        },
+        .started => if (real.swarm) |swarm| say_no_fetch(swarm, trace.fetched, trace.pulled),
         .failed => |diagnostic| return record_failure(io, dir, &diagnostic),
     }
     _ = zigbox.wait(&storage.handle);
@@ -638,6 +659,36 @@ test "a line appended to the fetch's log follows what the fetch wrote" {
     defer std.testing.allocator.free(text);
     const want = "fetch said this\nZC-W0504: and the supervisor this\n";
     try std.testing.expectEqualStrings(want, text);
+}
+
+test "the end of a swarm fetch and of the registry pull are said in fetch.log" {
+    // Goal: the lines a stuck fetch lacked (#93). Method: write each into a scratch log filled
+    // with a known byte and read them back.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [768]u8 = undefined;
+    const swarm = try scratch_swarm(&tmp, &buffer);
+    const log = open_log(swarm).?;
+    defer log.close(swarm.io);
+    say_swarm_ended(swarm.io, log, "the fetch could not be started: ", "FileNotFound");
+    say_pull_ended(swarm, real_ms(swarm.io), true);
+    say_pull_ended(swarm, real_ms(swarm.io), false);
+    say_no_fetch(swarm, true, false); // A fetch was made: nothing to add.
+    say_no_fetch(swarm, false, false);
+    const text = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "containers/web-0/fetch.log",
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ZC-W0603: the swarm fetch ended") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "started: FileNotFound\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "registry pull finished after ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "registry pull failed after ") != null);
+    const said = "the tree was already in the store; no fetch was needed";
+    const first = std.mem.indexOf(u8, text, said) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(first, std.mem.lastIndexOf(u8, text, said).?); // Said once.
 }
 
 test "a pull record that cannot be written is said in fetch.log with ZC-W0504" {
