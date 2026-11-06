@@ -269,7 +269,11 @@ const Harness = struct {
         // A pipe that polls writable has room for PIPE_BUF bytes, and `text` is shorter: the
         // write cannot block, and a server that stopped reading fails here, not in CI's timeout.
         assert(text.len <= 512);
-        var fds = [1]std.posix.pollfd{.{ .fd = stdin.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
+        var fds = [1]std.posix.pollfd{.{
+            .fd = stdin.handle,
+            .events = std.posix.POLL.OUT,
+            .revents = 0,
+        }};
         const ready = try std.posix.poll(&fds, @intCast(step_ms));
         if (ready == 0) return error.ServerNotReading;
         try stdin.writeStreamingAll(h.io, text);
