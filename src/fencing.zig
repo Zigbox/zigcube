@@ -136,7 +136,7 @@ test "renewal leaves at least the slack before the fence, and the slack never sh
     // shipped one (the admitted ones among them), the slack compared with the last ttl's.
     var ttl: u32 = constants.fence_margin_ms + constants.fence_window_min_ms;
     try testing.expectEqual(@as(u32, 5_000), ttl);
-    var last_slack: u32 = 0;
+    var last_slack: u64 = 0;
     while (ttl <= constants.lease_ttl_ms * 2) : (ttl += 1) {
         const renew = renew_after_ms(ttl);
         const slack = fence_at_ms(0, ttl) - renew;
