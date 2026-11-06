@@ -9,8 +9,8 @@
 #   - A change that touches only documentation (ci-changes.sh says what counts) skips every other
 #     job: they report as skipped, which required checks count as passing.
 #   - Any other change runs format, build, test, wasm and the simulations, and of the rest only
-#     what its paths can affect on a pull request: the Postgres store suites, demo-c0, demo-c1
-#     and the Zigbox smoke. A path no rule names runs everything.
+#     what its paths can affect on a pull request: the Postgres store suites, demo-c0, demo-c1,
+#     demo-b1 and the Zigbox smoke. A path no rule names runs everything.
 #   - A push to main, a pull request from a claude/release-* branch and a pull request labelled
 #     full-ci run everything, so a break the filter missed shows on main.
 #   - The jobs whose time is compiling restore the Zig build cache (.github/actions/zig-cache);
@@ -51,6 +51,7 @@ jobs:
       store: ${{ steps.pick.outputs.store || 'true' }}
       demo_c0: ${{ steps.pick.outputs.demo_c0 || 'true' }}
       demo_c1: ${{ steps.pick.outputs.demo_c1 || 'true' }}
+      demo_b1: ${{ steps.pick.outputs.demo_b1 || 'true' }}
       zigbox_smoke: ${{ steps.pick.outputs.zigbox_smoke || 'true' }}
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
       mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
@@ -348,6 +349,68 @@ jobs:
         with:
           name: demo-c1-postgres-transcript
           path: demo-c1-postgres.txt
+          if-no-files-found: warn
+
+  # B1's demo, run for real (docs/demos/b1.md): zcube-server, two zcube-agents with FakeRuntime
+  # and the zcube command as real processes, on each backend: jobs end, are watched, adopted,
+  # failed on a lost node and packed by CPU. A transcript is kept as an artifact.
+  demo-b1-sqlite:
+    name: demo-b1 (sqlite)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: demo-b1 on SQLite
+        run: zig build demo-b1 -Dbackend=sqlite -Dtranscript=demo-b1-sqlite.txt --summary all
+      - name: Keep the transcript
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-b1-sqlite-transcript
+          path: demo-b1-sqlite.txt
+          if-no-files-found: warn
+
+  # The same image as demo-c0-postgres. demo-b1 does not stop the database.
+  demo-b1-postgres:
+    name: demo-b1 (postgres)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.demo_b1 == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.15@sha256:9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+        env:
+          POSTGRES_USER: zcube
+          POSTGRES_PASSWORD: zcube
+          POSTGRES_DB: zcube
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zcube -d zcube"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      ZCUBE_TEST_POSTGRES: host=127.0.0.1 port=5432 user=zcube password=zcube dbname=zcube
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: SQLite and libpq development files
+        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+      - name: demo-b1 on Postgres
+        run: zig build demo-b1 -Dbackend=postgres -Dtranscript=demo-b1-postgres.txt --summary all
+      - name: Keep the transcript
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: demo-b1-postgres-transcript
+          path: demo-b1-postgres.txt
           if-no-files-found: warn
 
   # The control-plane core must compile for wasm32-freestanding (docs/wasm.md): no libc, no OS,
