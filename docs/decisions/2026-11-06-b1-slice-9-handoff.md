@@ -30,11 +30,9 @@ Date: 2026-11-06. Branch `claude/b1-slice-9`. Console and mock only; no core, AP
   `place_run`, then the controller's `job_placed`, and ends runs as `src/job_controller.zig`
   does: a job never placed by its start-by time, and a placed run never claimed, end
   `failed deadline` with stop cause `not_started`; `failed not_started` is stop `unreachable`
-  before any claim. Only the `hold_pending` evidence numbers and the why steps for `/job-runs/`
-  and `/assigned/` keys are the mock's. **Possible real gap:** `desired_step` in `src/why.zig`
-  reads any key that is not `/replicas/` or `/jobs/` as a Service, and `place_run`,
-  `hold_pending` and `job_placed` cite `/job-runs/` and `/assigned/` keys; check that `why job`
-  on a real server does not fail on them.
+  before any claim. Only the `hold_pending` evidence numbers are the mock's. **Real gap (it was one):**
+  `desired_step` in `src/why.zig` read `/job-runs/` and `/assigned/` as a Service and failed
+  `why job`; fixed in docs/decisions/2026-11-06-why-job-desired-keys.md.
 - `CAUSE_TEXT` (the one-line wording of each failure cause in `web/js/views/jobs.js`) follows owner answer 6 and the controller; the
   CLI's wording for `zcube job get` should be the source once it is settled, and the two compared.
 - The list has no label filter box (the API takes `label`); only state and name.
