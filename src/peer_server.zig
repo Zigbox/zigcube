@@ -470,6 +470,9 @@ fn refuse(server: *Server, io: std.Io, storage: *const Storage, why: []const u8)
 
 /// Shows a diagnostic of Zigbox's (ZBX-) as Zigbox wrote it.
 fn show_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
+    // Silent in a unit test: a passing test step that writes to stderr is reported by the build
+    // runner as `failed command: ...` (docs/STYLE.md). Tests see it through the flag at line 131.
+    if (@import("builtin").is_test) return;
     var diagnostic: diag_mod.Diagnostic = undefined;
     zigbox.diagnostic.from_diag(&diagnostic, collector);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;

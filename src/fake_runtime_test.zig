@@ -18,6 +18,7 @@ const diag_mod = @import("diag.zig");
 const fake_files = @import("fake_files.zig");
 const fake_runtime = @import("fake_runtime.zig");
 const runtime = @import("runtime.zig");
+const fetch_backoff = @import("fetch_backoff.zig");
 
 const Diag = diag_mod.Diag;
 const net = std.Io.net;
@@ -703,22 +704,33 @@ test "a replica stopped while it fetches ends as stopped, not as a failed start"
 test "after a failed fetch the next one on the node waits, longer each time, up to the cap" {
     // Goal: the back-off of fetch_backoff.zig as the supervisors apply it (review S6). Method: a
     // registry nobody listens on; the first failure comes at once, the second replica waits the
-    // base (200 ms), the third twice that, the fourth the cap (400 ms). Lower bounds only: a
-    // loaded machine may be slower, never faster.
+    // base (200 ms), the third twice that, the fourth the cap (400 ms). The wait counts from the
+    // previous failure, not from this test's call to `launch` (the test's own latency between the
+    // two is part of the wait), so the bound is on the gap between the failures the supervisors
+    // recorded, `at_ms` in the streak file. Lower bound only: a loaded machine may be slower,
+    // never faster. (Measuring from `launch` failed 1 run in many on a loaded machine.)
     var rig = try Rig.start();
     defer rig.stop();
     try fetch_from(rig, "127.0.0.1:1", 200, 400);
     const names = [_][]const u8{ "back-1", "back-2", "back-3", "back-4" };
-    const waits_ms = [_]i64{ 0, 200, 400, 400 };
-    for (names, waits_ms) |name, wait_ms| {
-        const began = std.Io.Clock.boot.now(testing.io).toMilliseconds();
+    const waits_ms = [_]u64{ 0, 200, 400, 400 };
+    var previous_ms: u64 = 0;
+    for (names, waits_ms, 1..) |name, wait_ms, failures| {
         const outcome = try rig.launch(name, unfetched, &forever, &.{});
         const reason = switch (outcome) {
             .started => |handle| try rig.wait_stopped(handle),
             .failed => |diagnostic| runtime.ExitReason{ .start_failed = diagnostic },
         };
-        const took = std.Io.Clock.boot.now(testing.io).toMilliseconds() - began;
         try testing.expectEqualStrings("ZC-E0601", reason.start_failed.code.slice());
-        try testing.expect(took >= wait_ms - 20);
+        const streak = fetch_backoff.read(
+            testing.io,
+            rig.tmp.dir,
+            rig.arena.allocator(),
+            unfetched,
+        );
+        try testing.expectEqual(@as(u32, @intCast(failures)), streak.failures);
+        // A millisecond of slack: both times were cut to whole milliseconds.
+        try testing.expect(streak.at_ms + 1 >= previous_ms + wait_ms);
+        previous_ms = streak.at_ms;
     }
 }
