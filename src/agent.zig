@@ -202,12 +202,13 @@ pub const Agent = struct {
         return agent.pull_drop_text[0..agent.pull_drop_len];
     }
 
+    /// Keeps the container and reason of a pull record about to be dropped; `drop_pull` counts it
+    /// once the file is gone, so a remove that fails does not count the same file every step.
     fn note_pull_drop(agent: *Agent, name: []const u8, reason: []const u8) void {
         var writer: std.Io.Writer = .fixed(&agent.pull_drop_text);
         // A text too long for the buffer is cut: the line is a hint, never a failure.
         writer.print("container {s}: {s}", .{ name, reason }) catch {};
         agent.pull_drop_len = @intCast(writer.end);
-        agent.pull_drops += 1;
     }
 
     /// Initialises in place: the stop table is large.
@@ -438,16 +439,26 @@ pub const Agent = struct {
             return agent.drop_pull(ctx, state, file);
         };
         if (!done.succeeded) return agent.begin_fence(ctx, ctx.mono_ms());
-        return agent.drop_pull(ctx, state, file);
+        return remove_pull(ctx, state, file);
     }
 
+    /// Removes a pull record that could not be published and counts it (ZC-W0504), after the
+    /// remove: a file that stays would be noted again at the next step.
     fn drop_pull(
         agent: *Agent,
         ctx: *const Context,
         state: agent_state.AgentState,
         file: []const u8,
     ) Error!void {
-        _ = agent;
+        try remove_pull(ctx, state, file);
+        agent.pull_drops += 1;
+    }
+
+    fn remove_pull(
+        ctx: *const Context,
+        state: agent_state.AgentState,
+        file: []const u8,
+    ) Error!void {
         state.remove(file) catch |err| switch (err) {
             error.Absent => {},
             else => return state_failed(ctx, err, "remove a pull record"),

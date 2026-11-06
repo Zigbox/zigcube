@@ -325,8 +325,14 @@ fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
 }
 
 fn pull_record_lost(diag: *diag_mod.Diag) void { // agent.zig
-    const cause = "container web-1: its pull.json is not a pull record";
+    const cause = "the pull record could not be written to pull.json: NoSpaceLeft";
     sample(diag, .W0504, &.{cause}, "check the state directory's disk space and permissions");
+}
+
+fn swarm_fetch_ended(diag: *diag_mod.Diag) void { // zigbox_supervisor.zig
+    const cause = "the fetch was killed at its deadline, ms: 1800000";
+    const fix = "if it repeats on every start, check the peers and the network";
+    sample(diag, .W0603, &.{cause}, fix);
 }
 
 fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
@@ -894,6 +900,7 @@ const cases = [_]Case{
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),
+    relayed(.W0603, swarm_fetch_ended),
     with_flags(routed(.B0002, get_service, route_empty), .{ .silent_failure = true }),
     relayed(.B0003, accounting_bug),
     relayed(.B0004, job_end_unmapped),

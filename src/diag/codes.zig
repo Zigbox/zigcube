@@ -103,6 +103,7 @@ pub const Code = enum(u8) {
     E0601,
     W0601,
     W0602,
+    W0603,
     E0801,
     E0802,
     E0803,
@@ -1377,6 +1378,25 @@ pub const registry = [_]Entry{
         \\The image is not affected: a tree is used only when its digest matches.
         \\No action is needed. If it repeats, check the peer node, whose store may
         \\be damaged or running a different build.
+        ,
+    },
+    .{
+        .code = .W0603,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the swarm fetch ended without the tree",
+        .explanation =
+        \\The supervisor of a replica tried to get the image's chunk tree from peers
+        \\first, and that fetch ended without it: it did not start, it exited with a
+        \\failure, or it was killed at its deadline. The cause line says which.
+        \\The registry pull follows, so the replica can still start; this line
+        \\only explains why the peers did not supply the tree.
+        \\
+        \\The fetch's own diagnostic, in the same fetch.log, names the real
+        \\reason when it had one (ZC-E0601 for a tree no peer could give, or the
+        \\code of this node's disk or memory failing). If the replica did not
+        \\start, the pull's own diagnostic follows it. If it repeats on every
+        \\start, check the peers and the network between them.
         ,
     },
     .{
