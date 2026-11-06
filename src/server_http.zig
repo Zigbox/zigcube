@@ -47,8 +47,10 @@ pub const Options = struct {
 
 /// What a connection is doing, for the watchdog: waiting for a client to send or to read is
 /// bounded by the idle timeout, working and holding are not (the store has timeouts of its own,
-/// and a hold is bounded by its own deadline).
-const State = enum { waiting, working, holding, writing };
+/// and a hold is bounded by its own deadline). `reading` is the body of a request: the whole
+/// body must arrive within the idle timeout, so a client that stalls half way cannot hold the
+/// slot.
+const State = enum { waiting, reading, working, holding, writing };
 
 const Slot = struct {
     mutex: std.Io.Mutex = .init,
@@ -339,7 +341,10 @@ fn read_body(
         constants.http_body_bytes_max;
     if (length > limit) {
         const cause = if (job_path)
-            "the request body is larger than 409600 bytes, the most POST /v1/jobs takes"
+            std.fmt.comptimePrint(
+                "the request body is larger than {d} bytes, the most POST /v1/jobs takes",
+                .{constants.job_request_bytes_max},
+            )
         else if (limit == constants.http_body_bytes_max)
             "the request body is larger than 65536 bytes"
         else
@@ -355,9 +360,11 @@ fn read_body(
         refuse_request(work, ctx, request, 400, .E0104, "this method has no request body");
         return error.Refused;
     }
+    work.shared.set_state(work.slot, .reading);
     const reader = request.readerExpectContinue(&.{}) catch return error.Closed;
     const buffer = ctx.arena.alloc(u8, @intCast(length)) catch return error.Closed;
     reader.readSliceAll(buffer) catch return error.Closed;
+    work.shared.set_state(work.slot, .working);
     return buffer;
 }
 

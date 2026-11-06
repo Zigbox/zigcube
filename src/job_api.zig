@@ -237,17 +237,17 @@ pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     if (input.placement) return not_built(ctx, "placement");
     try validate_times(ctx, input, now_ms);
     try validate_input(ctx, input);
-    if (now_ms > input.submit_by_ms) return expired(ctx, input.submit_by_ms, now_ms);
+    if (now_ms > input.submit_by_ms) return expired(ctx, input.name, input.submit_by_ms, now_ms);
 }
 
-fn expired(ctx: *const Context, submit_by_ms: u64, now_ms: u64) error{Refused} {
+fn expired(ctx: *const Context, name: []const u8, submit_by_ms: u64, now_ms: u64) error{Refused} {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0134);
     ctx.diag.cause("submit_by_ms {d} passed {d} ms ago", .{ submit_by_ms, now_ms - submit_by_ms });
     ctx.diag.fix_with(
         "look for the job an earlier attempt may have made, then submit again",
         "zcube job get {s}",
-        .{"NAME"},
+        .{name},
     );
     return error.Refused;
 }
@@ -580,14 +580,29 @@ fn read_view(ctx: *const Context, name: []const u8, at: store.Revision) Error!Vi
     const found = try ctx.store.get(ctx.arena, key.slice(), at, ctx.diag);
     const kv = found.kv orelse return no_job(ctx, name);
     const job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
-    return .{ .job = job, .status = try read_status(ctx, name, at), .revision = at };
+    const read = try read_status(ctx, name, at);
+    return .{ .job = job, .status = read.status, .revision = at };
 }
 
-fn read_status(ctx: *const Context, name: []const u8, at: store.Revision) Error!?records.JobStatus {
+/// A job's status as read at one revision, with the revision of the record (0 if absent) so a
+/// transaction can compare it.
+const StatusRead = struct { status: ?records.JobStatus, revision: store.Revision };
+
+fn read_status(ctx: *const Context, name: []const u8, at: store.Revision) Error!StatusRead {
     const key = records.job_status_key(name);
     const found = try ctx.store.get(ctx.arena, key.slice(), at, ctx.diag);
-    const kv = found.kv orelse return null;
-    return try records.read(records.JobStatus, ctx.arena, kv, ctx.diag);
+    const kv = found.kv orelse return .{ .status = null, .revision = 0 };
+    const status = try records.read(records.JobStatus, ctx.arena, kv, ctx.diag);
+    return .{ .status = status, .revision = kv.mod_revision };
+}
+
+/// The state of an existing job now: its status's, or `pending` while it has none. For the
+/// replies that say a request changed nothing, so a client that retries after the job ended is
+/// told so.
+pub fn current_state(ctx: *const Context, name: []const u8) Error!records.JobState {
+    try name_checked(ctx, name);
+    const at = (try ctx.store.status(ctx.diag)).revision;
+    return state_of((try read_status(ctx, name, at)).status);
 }
 
 pub const ListOptions = struct {
@@ -646,7 +661,7 @@ pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
         if (options.label) |wanted| {
             if (!label_matches(job.labels, wanted)) continue;
         }
-        const status = try read_status(ctx, job.name, page.revision);
+        const status = (try read_status(ctx, job.name, page.revision)).status;
         const state = state_of(status);
         if (options.state) |only| {
             if (state != only) continue;
@@ -674,7 +689,13 @@ pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
 
 pub const CancelResult = union(enum) {
     /// The request was recorded: the job controller stops the run.
-    accepted: struct { job: records.Job, revision: store.Revision, decision: []const u8 },
+    accepted: struct {
+        job: records.Job,
+        revision: store.Revision,
+        decision: []const u8,
+        /// The job's state when the request was recorded.
+        state: records.JobState,
+    },
     /// A cancel was already recorded; nothing was written.
     already: records.Job,
     /// The job has ended; nothing was written.
@@ -696,16 +717,21 @@ pub fn cancel(
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
     const kv = found.kv orelse return no_job(ctx, name);
     var job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
-    const status = try read_status(ctx, name, (try ctx.store.status(ctx.diag)).revision);
+    const at = (try ctx.store.status(ctx.diag)).revision;
+    const read = try read_status(ctx, name, at);
+    const status = read.status;
     if (status) |known| {
         if (records.job_state_terminal(known.state)) {
-            return .{ .finished = .{ .job = job, .status = status, .revision = kv.mod_revision } };
+            return .{ .finished = .{ .job = job, .status = status, .revision = at } };
         }
     }
     if (job.cancel_requested != null) return .{ .already = job };
     job.cancel_requested = .{ .at_ms = ctx.clock.now_ms(), .by = by };
     var batch: controller.Batch = .{};
     batch.expect(key.slice(), kv.mod_revision);
+    // The status decided the answer: if the run ended since, the cancel must not be recorded.
+    const status_key = records.job_status_key(name);
+    batch.expect(status_key.slice(), read.revision);
     batch.put(kv.key, try records.encode(ctx.arena, job, ctx.diag));
     const reason = try controller.format(ctx, "{s} asked to cancel job {s} (request {s})", .{
         by, name, request_id,
@@ -724,6 +750,7 @@ pub fn cancel(
             .job = job,
             .revision = revision,
             .decision = try controller.format(ctx, "{s}", .{id.slice()}),
+            .state = state_of(status),
         } },
         .conflict => .conflict,
     };
@@ -927,4 +954,158 @@ test "list filters by label and pages" {
     try testing.expectEqualStrings("alpha", some.rows[0].name);
     const none = try list(&ctx, .{ .limit = 10, .state = .running });
     try testing.expectEqual(@as(usize, 0), none.rows.len);
+}
+
+// ---- Follow-up tests (review of PR 106) ------------------------------------------------------
+
+/// Writes `/job-status/<name>` as the job controller would.
+fn put_status(rig: *Rig, name: []const u8, state: records.JobState) !void {
+    const ctx = rig.context();
+    const terminal = records.job_state_terminal(state);
+    const status: records.JobStatus = .{
+        .state = state,
+        .ended_at_ms = if (terminal) now_start else null,
+        .end = if (terminal) .{ .kind = .exited, .code = 0 } else null,
+        .reported_at_ms = now_start,
+    };
+    var batch: controller.Batch = .{};
+    const key = records.job_status_key(name);
+    batch.put(try controller.key_copy(&ctx, &key), try records.encode(ctx.arena, status, ctx.diag));
+    _ = try controller.commit(&ctx, .job_controller, &batch);
+}
+
+fn put_admission(rig: *Rig, admission: records.JobAdmission) !void {
+    const ctx = rig.context();
+    var batch: controller.Batch = .{};
+    batch.put(records.key_job_admission, try records.encode(ctx.arena, admission, ctx.diag));
+    _ = try controller.commit(&ctx, .api, &batch);
+}
+
+test "cancel of an ended job changes nothing and reports the revision the status was read at" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    _ = try create(&ctx, &rig.source, sample("done"));
+    try put_status(&rig, "done", .exited);
+    const status_revision = (try ctx.store.status(ctx.diag)).revision;
+    const result = try cancel(&ctx, &rig.source, "done", "alex", "r-9");
+    try testing.expect(result == .finished);
+    try testing.expectEqual(status_revision, result.finished.revision);
+    try testing.expectEqual(records.JobState.exited, state_of(result.finished.status));
+    try testing.expectEqual(records.JobState.exited, try current_state(&ctx, "done"));
+    const again = try create(&ctx, &rig.source, sample("done"));
+    try testing.expect(again == .same);
+    const view = try get(&ctx, "done");
+    try testing.expect(view.job.cancel_requested == null);
+}
+
+/// Runs `after_status` once, after the store answered its next `status` call: a write that lands
+/// between the reads of a request and its commit. State is global because the memory store's
+/// context is its own.
+const Race = struct {
+    var rig: *Rig = undefined;
+    var armed: bool = false;
+    var original: *const store.Store.VTable = undefined;
+
+    fn status(context: *anyopaque, diag: *Diag) store.Error!store.Status {
+        const answer = try original.status(context, diag);
+        if (armed) {
+            armed = false;
+            put_status(rig, "racing", .exited) catch @panic("race: status write failed");
+        }
+        return answer;
+    }
+};
+
+test "a cancel does not commit over a status that changed after it was read" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var ctx = rig.context();
+    _ = try create(&ctx, &rig.source, sample("racing"));
+    var vtable = rig.memory.interface().vtable.*;
+    Race.original = rig.memory.interface().vtable;
+    Race.rig = &rig;
+    vtable.status = Race.status;
+    ctx.store = .{ .context = rig.memory.interface().context, .vtable = &vtable };
+    Race.armed = true;
+    const result = try cancel(&ctx, &rig.source, "racing", "alex", "r-1");
+    try testing.expect(result == .conflict);
+    const view = try get(&rig.context(), "racing");
+    try testing.expect(view.job.cancel_requested == null);
+    // A retry sees the ending and reports it.
+    const retry = try cancel(&rig.context(), &rig.source, "racing", "alex", "r-2");
+    try testing.expect(retry == .finished);
+}
+
+test "the admission window drops old hours, and a clock that went back keeps them ascending" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const hour = now_start / hour_ms;
+    try put_admission(&rig, .{
+        .admitted = constants.job_admitted_window_max,
+        .hours = &.{.{ .hour = hour - 1, .count = constants.job_admitted_window_max }},
+    });
+    var ended: controller.Batch = .{};
+    const endings: records.JobEndings = .{ .ended = constants.job_admitted_window_max };
+    ended.put(records.key_job_endings, try records.encode(ctx.arena, endings, ctx.diag));
+    _ = try controller.commit(&ctx, .job_controller, &ended);
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, sample("full")));
+    try rig.expect_code(.E0132);
+    // The hour rolls out of the window: one create fits, and the old hour is gone.
+    rig.manual.advance(@as(u64, constants.job_admission_window_h) * hour_ms);
+    var input = sample("rolled");
+    input.submit_by_ms = rig.manual.ms + 30_000;
+    _ = try create(&ctx, &rig.source, input);
+    const kv = (try ctx.store.get(ctx.arena, records.key_job_admission, null, ctx.diag)).kv.?;
+    const now = try records.read(records.JobAdmission, ctx.arena, kv, ctx.diag);
+    try testing.expectEqual(@as(usize, 1), now.hours.len);
+    try testing.expectEqual(@as(u32, 1), now.hours[0].count);
+    // The clock goes back an hour: the create folds into the newest hour.
+    rig.manual.ms -= hour_ms;
+    var back = sample("back");
+    back.submit_by_ms = rig.manual.ms + 30_000;
+    _ = try create(&ctx, &rig.source, back);
+    const kv2 = (try ctx.store.get(ctx.arena, records.key_job_admission, null, ctx.diag)).kv.?;
+    const folded = try records.read(records.JobAdmission, ctx.arena, kv2, ctx.diag);
+    try testing.expectEqual(@as(usize, 1), folded.hours.len);
+    try testing.expectEqual(@as(u32, 2), folded.hours[0].count);
+}
+
+test "a run record of exactly job_run_bytes_max is accepted and one byte more is refused" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const pad = try ctx.arena.alloc(u8, constants.job_run_bytes_max + 1);
+    @memset(pad, 'a');
+    var job = sample("sized");
+    job.command = &.{pad[0..1]};
+    const small = try measured(&ctx, job);
+    const fit = 1 + (constants.job_run_bytes_max - small);
+    job.command = &.{pad[0..fit]};
+    try testing.expectEqual(@as(usize, constants.job_run_bytes_max), try measured(&ctx, job));
+    _ = try create(&ctx, &rig.source, job);
+    var over = sample("sized-over");
+    over.command = &.{pad[0 .. fit + 1]};
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, over));
+    try rig.expect_code(.E0130);
+}
+
+/// The size `check_run_size` measures for `input`, with the id the run would get.
+fn measured(ctx: *const Context, input: Input) !usize {
+    const job: records.Job = .{
+        .name = input.name,
+        .image = input.image,
+        .command = input.command,
+        .deadline_ms = input.deadline_ms,
+        .submit_by_ms = input.submit_by_ms,
+        .created_at_ms = now_start,
+        .applied_by = input.applied_by,
+    };
+    var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    return json_bytes(ctx, run_of(&job, records.job_run_id(&id_buffer, job.name)));
 }
