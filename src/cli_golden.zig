@@ -18,6 +18,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
+const agent_jobs = @import("agent_jobs.zig");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
 const cli_local = @import("cli_local.zig");
@@ -309,20 +310,20 @@ fn job_waits(diag: *diag_mod.Diag) void { // scheduler.zig
     sample(diag, .W0308, &.{cause}, "lower the job's limits, add a node, or wait for a job to end");
 }
 
-fn run_end_unknown(diag: *diag_mod.Diag) void { // agent.zig
-    const cause = "train-7-job has no container and left no exit record in its directory";
-    const fix = "find why the host restarted or the state directory was lost; it is not run again";
-    sample(diag, .E0521, &.{cause}, fix);
+fn run_end_unknown(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_run_end_unknown(diag, "train-7-job", "/var/lib/zcube-agent");
 }
 
-fn run_start_record(diag: *diag_mod.Diag) void { // agent_records.zig
-    const cause = "the start record of train-7-job in /var/lib/zcube-agent is missing";
-    sample(diag, .E0522, &.{cause}, "check the state directory's disk and permissions");
+fn run_start_record(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_start_record(diag, "train-7-job", "/var/lib/zcube-agent");
 }
 
-fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
-    const cause = "train-7-job ran for 600000 ms, its deadline; it was stopped and then killed";
-    sample(diag, .W0503, &.{cause}, "raise deadline_ms if the job needs the time");
+fn job_deadline(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_deadline(diag, "train-7-job", true);
+}
+
+fn run_input_digest(diag: *diag_mod.Diag) void { // agent_jobs.zig
+    agent_jobs.raise_input(diag, "train-7-job", .mismatch);
 }
 
 fn pull_record_lost(diag: *diag_mod.Diag) void { // agent.zig
@@ -874,6 +875,7 @@ const cases = [_]Case{
     relayed(.E0515, agent_fetch_outlived),
     relayed(.E0521, run_end_unknown),
     relayed(.E0522, run_start_record),
+    relayed(.E0523, run_input_digest),
     relayed(.W0501, agent_lease),
     relayed(.W0503, job_deadline),
     relayed(.W0504, pull_record_lost),

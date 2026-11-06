@@ -9,6 +9,7 @@ import { serviceDetail, nodeDetail } from "./views/details.js";
 import { why } from "./views/why.js";
 import { codes } from "./views/codes.js";
 import { pulls } from "./views/pulls.js";
+import { jobs, jobDetail } from "./views/jobs.js";
 
 const ROUTES = [
   [/^$/, overview, "overview"],
@@ -19,11 +20,13 @@ const ROUTES = [
   [/^nodes\/([^/]+)$/, nodeDetail, "nodes"],
   [/^decisions$/, decisions, "decisions"],
   [/^pulls$/, pulls, "pulls"],
-  [/^why\/(service|replica|node)\/([^/]+)$/, why, "why"],
+  [/^jobs$/, jobs, "jobs"],
+  [/^jobs\/([^/]+)$/, jobDetail, "jobs"],
+  [/^why\/(service|replica|node|job)\/([^/]+)$/, why, "why"],
   [/^why$/, why, "why"],
   [/^codes(?:\/([^/]+))?$/, codes, "codes"],
 ];
-const TITLES = { overview: "Overview", services: "Services", replicas: "Replicas", nodes: "Nodes", decisions: "Decisions", pulls: "Pulls", why: "Why", codes: "Codes" };
+const TITLES = { overview: "Overview", services: "Services", replicas: "Replicas", nodes: "Nodes", decisions: "Decisions", pulls: "Pulls", jobs: "Jobs", why: "Why", codes: "Codes" };
 
 // ---- Theme -----------------------------------------------------------------------------------
 
@@ -170,7 +173,7 @@ async function boot() {
     if (e.key === "?") { $("#help").hidden = !$("#help").hidden; return; }
     if (e.key === "Escape") { $("#help").hidden = true; connLog.hidden = true; return; }
     if (pendingG && Date.now() - pendingG < 1200) {
-      const go = { o: "#/", s: "#/services", r: "#/replicas", n: "#/nodes", d: "#/decisions", p: "#/pulls", w: "#/why", c: "#/codes" }[e.key];
+      const go = { o: "#/", s: "#/services", r: "#/replicas", n: "#/nodes", d: "#/decisions", p: "#/pulls", j: "#/jobs", w: "#/why", c: "#/codes" }[e.key];
       pendingG = 0;
       if (go) { location.hash = go; e.preventDefault(); }
       return;

@@ -65,6 +65,14 @@ pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
 pub const prefix_jobs = "/jobs/";
+/// What the cause of ZC-E0523 says of a damaged input; the agent's client tells it from an
+/// absent one by this. THIS TEXT IS WIRE PROTOCOL: the refusal carries no structured member
+/// to tell the two apart, and an agent and a server of different versions meet during an
+/// upgrade. Rewording it makes an old agent (or server) report a damaged input as absent.
+/// Do not change it without a version bump of the agent API; `agent_client_test.zig` and
+/// `agent_api_test.zig` pin the literal text on both sides.
+pub const input_mismatch_phrase = "does not match its digest";
+
 pub const prefix_job_input = "/job-input/";
 pub const key_job_admission = "/job-admission";
 pub const prefix_job_runs = "/job-runs/";

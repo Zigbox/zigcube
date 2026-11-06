@@ -641,7 +641,7 @@ fn print_violations(out: *std.Io.Writer, path: []const u8, report: *const Report
 const teeth_root = "src/mtls_teeth.zig";
 
 /// Files with `teeth:` tests that belong to another gate (the store history checker's, run by
-/// `test-store`), so `teeth_root` does not import them.
+/// `zig build test`), so `teeth_root` does not import them.
 const teeth_other_gates = [_][]const u8{"src/testing/history.zig"};
 
 /// True when `source` (the file at `path`) has a `teeth:` test that `root_source` does not

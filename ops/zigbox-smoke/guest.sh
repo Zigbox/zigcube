@@ -342,6 +342,10 @@ dump_b() {
     for f in "$B_DIR"/agent/containers/*/fetch.log; do
         [ -e "$f" ] && { echo "--- $f"; head -c 800 "$f"; }
     done
+    # A start that failed says why in failed.json; a retry then runs on what it left (#127).
+    for f in "$B_DIR"/agent/containers/*/failed.json; do
+        [ -e "$f" ] && { echo "--- $f"; head -c 1500 "$f"; }
+    done
 }
 
 # A service only B can take: more CPU than A has left (2000 millicores less box's 1000).
@@ -448,7 +452,8 @@ stage_peers_fallback() {
     rm -f "$fault"
     await_pull "$ALPINE_TREE" "$since"
     echo "pull record of alp: registry=$REG cached=$CACHED peer=$PEER peers=$PEERS"
-    [ "$REG" -gt 0 ] || fail "alp: no registry bytes after the fetch was killed"
+    [ "$REG" -gt 0 ] || fail "alp: no registry bytes after the fetch was killed" \
+        "(cached $CACHED: an earlier start of alp pulled and then failed; see failed.json)"
     [ "$PEER" -eq 0 ] || fail "alp: $PEER peer bytes; the fetch outlived its 50 ms deadline"
     pgrep -f 'zcube-agent fetch' >/dev/null && fail "a fetch is still running"
     # The registry bytes alone would also fit a peer that refused: the log must name the kill.

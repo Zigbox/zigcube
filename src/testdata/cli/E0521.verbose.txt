@@ -1,6 +1,7 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
 error[ZC-E0521]: the agent could not tell how a run ended
-  cause  train-7-job has no container and left no exit record in its directory
+  cause  train-7-job has no container and left no exit record in
+         /var/lib/zcube-agent
   reqid  r-0000001
   fix    find why the host restarted or the state directory was lost; it is not run again
   more   zcube explain E0521

@@ -27,6 +27,8 @@
 //! `--expect-fail` turns the range into the teeth test (`sim_teeth_main.zig`): it stops at the
 //! first seed that fails and exits 0 only if there was one.
 //!
+//! `--jobs=false` leaves the job workload and its checks out (J1 to J3, J5 to J8; on by default).
+//!
 //! `--c1` runs sim-c1 (docs/core.md, "sim-c1"): the per-revision checks of docs/authority.md §4.
 //! `--expect-symptom=TEXT` with `--expect-fail` makes the failure count only if it starts with
 //! TEXT; the negative tests of sim-c1 use it (`sim_c1_teeth_main.zig`).
@@ -48,9 +50,10 @@ const sim_shape = @import("sim_shape.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--trace-steps]\n       sim-cluster --seeds A..B <operations|auto> " ++
+    "[--replicas-pct=N] [--jobs=true|false] [--trace-steps]\n" ++
+    "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--expect-fail] [--trace-steps]\n";
+    "[--replicas-pct=N] [--jobs=true|false] [--expect-fail] [--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -139,6 +142,10 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.shrink = true;
     } else if (std.mem.eql(u8, arg, "--expect-fail")) {
         parsed.expect_fail = true;
+    } else if (std.mem.eql(u8, arg, "--jobs=true")) {
+        parsed.options.jobs = true;
+    } else if (std.mem.eql(u8, arg, "--jobs=false")) {
+        parsed.options.jobs = false;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
@@ -274,6 +281,7 @@ fn print_replay(
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c1) try out.writeAll(" --c1");
+    if (!options.jobs) try out.writeAll(" --jobs=false");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});

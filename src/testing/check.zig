@@ -20,7 +20,9 @@
 //!     seed in the `sim-c1: seed N` line above it.
 //!   - The one gate a root build container cannot see: CI runs `zig build test` as an ordinary
 //!     user. When this runs as root and <user> is not "-", the committed tree is checked out into
-//!     a scratch worktree owned by <user> and tested as that user, with its own cache.
+//!     a scratch worktree owned by <user> and tested as that user. Its build caches are kept
+//!     between checks in `.zig-cache/zcube-check-cache` (owned by <user>), so only the first check
+//!     of a worktree, or the first after `rm -rf .zig-cache`, builds from nothing.
 //!
 //! Then it prints the line a report quotes:
 //!
@@ -40,7 +42,11 @@ const std = @import("std");
 const Io = std.Io;
 
 const scratch = ".zig-cache/zcube-check-tree";
+const kept_cache = ".zig-cache/zcube-check-cache";
 const cache_note_bytes: u64 = 6 << 30;
+/// The kept test cache is emptied before a run once it is past this, so it cannot grow without
+/// bound (every changed binary adds a copy and Zig removes none).
+const kept_cache_max_bytes: u64 = 8 << 30;
 const sim_operations = "200";
 const cluster_operations = "40";
 const swarm_operations = "100";
@@ -247,12 +253,17 @@ fn sim_swarm_gates(
     };
 }
 
+/// The size in bytes of `path` (0 if it is not there).
+fn tree_bytes(gpa: std.mem.Allocator, io: Io, path: []const u8) u64 {
+    const text = output(gpa, io, &.{ "du", "-sb", path }) catch return 0;
+    const end = std.mem.indexOfAny(u8, text, " \t") orelse return 0;
+    return std.fmt.parseInt(u64, text[0..end], 10) catch 0;
+}
+
 /// Says so when `.zig-cache/o` is past `cache_note_bytes`. Every rebuild of a changed binary
 /// adds a copy and nothing removes the old ones; emptying it costs one full rebuild.
 fn note_cache(gpa: std.mem.Allocator, io: Io, err: *Io.Writer) void {
-    const text = output(gpa, io, &.{ "du", "-sb", ".zig-cache/o" }) catch return;
-    const end = std.mem.indexOfAny(u8, text, " \t") orelse return;
-    const bytes = std.fmt.parseInt(u64, text[0..end], 10) catch return;
+    const bytes = tree_bytes(gpa, io, ".zig-cache/o");
     if (bytes < cache_note_bytes) return;
     err.print("check: note: .zig-cache/o holds {d} MiB; outside a build, rm -rf .zig-cache\n", .{
         bytes >> 20,
@@ -276,13 +287,15 @@ fn test_as(
     try run(io, &.{ "git", "worktree", "add", "--quiet", "--detach", scratch, "HEAD" }, null);
     defer run(io, &.{ "git", "worktree", "remove", "--force", scratch }, null) catch {};
     const absolute = try Io.Dir.cwd().realPathFileAlloc(io, scratch, gpa);
-    const global = try std.fmt.allocPrint(gpa, "{s}/.zig-global", .{absolute});
-    try seed_packages(gpa, io, zig, global, absolute);
+    const kept = try keep_cache(gpa, io, user);
+    const global = try std.fmt.allocPrint(gpa, "{s}/global", .{kept});
+    const local = try std.fmt.allocPrint(gpa, "{s}/local", .{kept});
+    try seed_packages(gpa, io, zig, global, absolute, user);
     try run(io, &.{ "chown", "-R", user, scratch }, null);
     const cache = try std.fmt.allocPrint(gpa, "ZIG_GLOBAL_CACHE_DIR={s}", .{global});
     const home = try std.fmt.allocPrint(gpa, "HOME={s}", .{absolute});
     const argv = [_][]const u8{
-        "runuser", "-u", user, "--", "env", cache, home, zig, "build", "test",
+        "runuser", "-u", user, "--", "env", cache, home, zig, "build", "test", "--cache-dir", local,
     };
     try run(io, &argv, scratch);
     const agent = try std.fmt.allocPrint(gpa, "{s}/zig-out/bin/zcube-agent", .{absolute});
@@ -298,15 +311,35 @@ fn test_as(
     }
 }
 
+/// The directory that keeps the tester run's local and global caches between checks. It lives
+/// under this worktree's `.zig-cache` (so `rm -rf .zig-cache` resets it and two worktrees never
+/// share one), is created empty and handed to `user` here, and from then on is written only by
+/// `user`'s build. Past `kept_cache_max_bytes` it is deleted first. Returns its absolute path.
+fn keep_cache(gpa: std.mem.Allocator, io: Io, user: []const u8) ![]const u8 {
+    if (tree_bytes(gpa, io, kept_cache) > kept_cache_max_bytes) {
+        try run(io, &.{ "rm", "-rf", kept_cache }, null);
+    }
+    try run(io, &.{ "mkdir", "-p", kept_cache ++ "/local", kept_cache ++ "/global" }, null);
+    const dirs = [_][]const u8{
+        "chown",                 user,
+        kept_cache,              kept_cache ++ "/local",
+        kept_cache ++ "/global",
+    };
+    try run(io, &dirs, null);
+    return Io.Dir.cwd().realPathFileAlloc(io, kept_cache, gpa);
+}
+
 /// The scratch tree starts without packages, so the pinned `zigbox` package would be fetched
 /// again. Copy what the build just used: the unpacked `zig-pkg` of this tree and the packages
-/// of the invoking user's global cache.
+/// of the invoking user's global cache, which are added to the kept cache only where missing
+/// and handed to `user` (root is the only writer, and only of these entries).
 fn seed_packages(
     gpa: std.mem.Allocator,
     io: Io,
     zig: []const u8,
     global: []const u8,
     tree: []const u8,
+    user: []const u8,
 ) !void {
     if (Io.Dir.cwd().access(io, "zig-pkg", .{})) |_| {
         try run(io, &.{ "cp", "-a", "zig-pkg", tree }, null);
@@ -317,8 +350,9 @@ fn seed_packages(
     const length = std.mem.indexOfScalar(u8, env[start..], '"') orelse return;
     const packages = try std.fmt.allocPrint(gpa, "{s}/p", .{env[start..][0..length]});
     Io.Dir.cwd().access(io, packages, .{}) catch return;
-    try run(io, &.{ "mkdir", "-p", global }, null);
-    try run(io, &.{ "cp", "-a", packages, global }, null);
+    try run(io, &.{ "cp", "-a", "--update=none", packages, global }, null);
+    const kept_packages = try std.fmt.allocPrint(gpa, "{s}/p", .{global});
+    try run(io, &.{ "chown", "-R", user, kept_packages }, null);
 }
 
 fn usage(err: *Io.Writer) !u8 {

@@ -8,6 +8,8 @@ The supervisor reviews every slice against this list, so run it yourself first, 
 - **A stored value is read by the next release, and by the one after.** Bump its version when the format changes, keep reading every older version, and test that with real text an older build wrote.
 - **Every new command, flag, endpoint and diagnostic is in `--help`, `docs/api.md` or `docs/cli.md`, the goldens and the error pages** in the same commit. `zig build errors-site-check` catches pages; nothing catches the rest.
 - **`Store` and `Runtime` are approved contracts.** A change to either is on HANDOFF's **Ask first** list, and so is a key layout that works on one backend only.
+- **An upgrade note covers every component that reads the changed value** (server and agent, or CLI and store), and says in what order to upgrade.
+- **A merged file in `docs/decisions/` is never edited.** A new decision file supersedes it and names it.
 
 ## Authority and concurrency (`docs/authority.md`)
 
@@ -36,6 +38,7 @@ The supervisor reviews every slice against this list, so run it yourself first, 
 
 - **Every failure is one coded diagnostic** with a cause and a fix (`DIAGNOSTICS.md`). An `errno` alone, an empty reason, or a line that blames the wrong layer is a bug, including in the test harness.
 - **A `ZC-B` code means our bug.** Never use it for something an operator or the environment can cause.
+- **A change to what a check refuses (a range, a bound, a limit) updates that code's explanation** (`explain` text and the generated errors site) in the same change.
 
 ## Tests and gates
 
@@ -45,3 +48,4 @@ The supervisor reviews every slice against this list, so run it yourself first, 
 - **A fixture parsed from text is checked against real output**, captured from a real run, not written from what the code is believed to print.
 - **A simulation is never called a demo.** `sim-cN` and `agent-smoke` are checks; only `demo-cN` passing in CI demonstrates a milestone.
 - **CI conditions fail safe.** A job guarded by a condition runs when the guard cannot decide (`!cancelled()`, never `always()`; an empty diff counts as code).
+- **Every new teeth step runs somewhere**: in `zig build check` or in CI, with a `.github/ci-changes.sh` rule and a table-test row, and it is listed in AGENTS.md's commands.

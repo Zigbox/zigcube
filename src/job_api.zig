@@ -123,6 +123,12 @@ fn validate_env(ctx: *const Context, input: Input) Error!void {
             constants.runtime_env_count_max, input.env.len,
         });
     }
+    // The input is given in one more variable, and the runtime takes `runtime_env_count_max`.
+    if (input.input != null and input.env.len >= constants.runtime_env_count_max) {
+        return refuse(ctx, "env", "at most {d} variables with an input, it has {d}", .{
+            constants.runtime_env_count_max - 1, input.env.len,
+        });
+    }
     var bytes: usize = 0;
     for (input.env, 0..) |pair, index| {
         const name = pair[0];
@@ -162,6 +168,19 @@ fn validate_labels(ctx: *const Context, input: Input) Error!void {
         }
         if (has_nul(pair[0]) or has_nul(pair[1])) {
             return refuse(ctx, "labels", "{s} holds a NUL byte", .{pair[0]});
+        }
+        if (pair[0].len > constants.label_key_bytes_max) {
+            return refuse(ctx, "labels", "a key is over {d} bytes", .{
+                constants.label_key_bytes_max,
+            });
+        }
+        if (pair[1].len > constants.label_value_bytes_max) {
+            return refuse(ctx, "labels", "the value of {s} is over {d} bytes", .{
+                pair[0], constants.label_value_bytes_max,
+            });
+        }
+        if (std.mem.indexOfScalar(u8, pair[0], '=') != null) {
+            return refuse(ctx, "labels", "the key {s} holds '='", .{pair[0]});
         }
     }
 }
@@ -895,6 +914,22 @@ test "validation names the field" {
     try rig.expect_code(.E0130);
     bad = sample("ok");
     bad.input_env = "X";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    // What the runtime would refuse at the start is refused here: the input takes a variable.
+    var env: [constants.runtime_env_count_max][2][]const u8 = undefined;
+    var names: [constants.runtime_env_count_max][8]u8 = undefined;
+    for (&env, &names, 0..) |*pair, *name, index| {
+        pair.* = .{ std.fmt.bufPrint(name, "V{d}", .{index}) catch unreachable, "x" }; // 8 bytes.
+    }
+    bad = sample("ok");
+    bad.env = &env;
+    bad.input = "hello";
+    bad.input_env = "INPUT";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+    try rig.expect_code(.E0130);
+    bad = sample("ok");
+    bad.labels = &.{.{ "a=b", "x" }};
     try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
     try rig.expect_code(.E0130);
     bad = sample("ok");

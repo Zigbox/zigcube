@@ -25,9 +25,14 @@ One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_sw
    | `sim_c1_teeth_skew` | 207 of 240 | 0.6 | 30 | 1.2e-12 |
    | `sim_c1_teeth_locality` | 206 of 240 (reviewer: 10 of 11) | 0.6 | 30 | 1.2e-12 |
    | `sim_c1_teeth_wedge` (with its symptom) | 163 of 240 (reviewer: 4 of 11) | 0.5 | 40 | 9.1e-13 |
+   | `sim_c1_teeth_job_claim`, `_double`, `_rewrite` | 39, 40, 40 of 40 (100 operations, `--c1`, 2026-11-06) | 0.7 | 40 | 1.2e-21 |
+   | `sim_c1_teeth_job_restart` | 33 of 40 (same) | 0.5 | 40 | 9.1e-13 |
+   | `sim_c1_teeth_job_cancel` | 15 of 40 (same) | 0.25 | 80 | 1.0e-10 |
+   | `sim_c1_teeth_job_deadline`, `_deadline_late` | 25 and 24 of 40 (same) | 0.4 | 50 | 8.1e-12 |
    | `sim_swarm_teeth` | 192 of 400 (reviewer: 51 of 101) | 0.4 | 200 | 4e-45 |
 
    At one canary every 50 rounds, one round a minute, the fleet runs about 10,500 canaries a year (525,600 / 50), so a false miss in a year stays below about 1.1e-6 (the worst row, 1.0e-10 per run, times 10,500); rounds longer than a minute make it smaller. A filed miss is therefore a real loss of detection until shown otherwise. Change a seed count in `build.zig` (`c1_teeth_roots`, `canary_seeds_teeth`, `canary_seeds_swarm_teeth`) and in this table together. `zig build test` runs `ops/sim-fleet/test-canary.sh` (fake runners that print what the real ones print, the generated manifest and the real `sim_fleet --dry-run`) and `test-crash-record.sh`. No step on the host: the fleet follows `main` and rebuilds.
+   Replay lines of `sim-cluster` issues filed before B1 slice 5 need `--jobs=false`: jobs are on by default and give every seed another world (`--jobs=false` leaves the existing draws unchanged).
 5. One `sim_fleet ingest --kind K` per kind of the round (10 minute deadline each; the kinds one after another), so the state file has one writer and each failure is looked at once per round.
 
 `sh ops/sim-fleet/test-crash-record.sh zig-out/bin/sim_fleet` checks that a crash record `run.sh` writes for each kind (drawn and fixed operations) is read back by `sim_fleet ingest --dry-run`; run it after changing `crash_record`.

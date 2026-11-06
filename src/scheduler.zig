@@ -716,11 +716,12 @@ pub const Scheduler = struct {
         try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
     }
 
-    /// Releases a run whose job is over (its status terminal) or gone (no `/jobs/<name>` at the
-    /// world's revision): the job controller's terminal status is what frees the node, and
-    /// retention's delete of the job is what frees a node whose run was never ended. A run whose
-    /// job is live keeps its node, even with its run and status missing: that is the job
-    /// controller's contradiction hold, and nothing about the workload changes.
+    /// Releases a run whose job is over (its status terminal) or gone (no `/jobs/<name>` and no
+    /// status): the job controller's terminal status is what frees the node, and retention's
+    /// delete of the job is what frees a node whose run was never ended. A run whose job still
+    /// has a non-terminal status keeps its node, gone job or not, and so does a run whose job is
+    /// live with its run and status missing: that is the job controller's contradiction hold, and
+    /// nothing about the workload changes.
     fn release_run(
         sc: *Scheduler,
         ctx: *const Context,
@@ -890,7 +891,8 @@ pub const Scheduler = struct {
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
         const run_id = ctx.arena.dupe(u8, records.job_run_id(&buffer, job)) catch
             return failures.no_memory(ctx.diag);
-        if (world.assigned_by.contains(run_id)) return;
+        const assigned = world.assigned_by.contains(run_id);
+        if (assigned) return;
         const run_at = records.job_run_key(job);
         const got = try ctx.store.get(ctx.arena, run_at.slice(), world.revision, ctx.diag);
         // The job controller writes the run and its status together: a status alone is its
@@ -1294,7 +1296,8 @@ fn expect_all(batch: *Batch, set: *compare_sets.Set) void {
 
 /// `expect_all` for a placement, and the one place the sim-c1 negative tests weaken the scheduler:
 /// in a build whose root switched on `c1_teeth.skip_allocation_compare`, `/allocations/<node>` is
-/// left out; with `skip_readiness_compare`, `/node-status/<node>` and `/nodes/<node>` are.
+/// left out; with `skip_readiness_compare`, `/node-status/<node>` and `/nodes/<node>` are; with
+/// `job_double`, the run's own `/job-runs/<name>`.
 /// Both constants are false in every other build, so this is `expect_all`.
 fn expect_placement(batch: *Batch, set: *compare_sets.Set) void {
     if (!c1_teeth.any) return expect_all(batch, set);
@@ -1304,7 +1307,9 @@ fn expect_placement(batch: *Batch, set: *compare_sets.Set) void {
         const skip_readiness = c1_teeth.skip_readiness_compare and
             (std.mem.startsWith(u8, compare.key, records.prefix_node_status) or
                 std.mem.startsWith(u8, compare.key, records.prefix_nodes));
-        if (skip_allocation or skip_readiness) continue;
+        const skip_run = c1_teeth.job_double and
+            std.mem.startsWith(u8, compare.key, records.prefix_job_runs);
+        if (skip_allocation or skip_readiness or skip_run) continue;
         batch.expect(compare.key, compare.mod_revision);
     }
 }

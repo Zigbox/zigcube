@@ -387,6 +387,28 @@ test "a cancel that raced an exit is judged by the exit" {
     try testing.expectEqual(records.JobState.exited, (try f.read_status("train")).?.state);
 }
 
+test "a running run that is cancelled is stopped, reports stopped cancel, and ends cancelled" {
+    // Goal: the slice-3 regression: running, cancel_requested, `stop` (cancel) written, the
+    // agent's `stopped`/`cancel` report, then `cancelled`, once.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.running("train");
+    try f.job("train", 60 * 1000, true);
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // phase one: the stop
+    const stop = (try f.read_run("train")).?.stop.?;
+    try testing.expectEqual(records.RunStopCause.cancel, stop.cause);
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // nothing more until the agent reports
+    try f.report("n1", "train", .stopped, .{ .kind = .signaled, .signal = 15 }, .cancel);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const status = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.cancelled, status.state);
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+}
+
 test "a report from a node that is not ready is not believed" {
     // Goal: an admissible report needs a `ready` node (authority.md I6); a stopped report from a
     // fenced node ends nothing.

@@ -154,6 +154,9 @@ pub const Tally = struct {
     facts_other: u64 = 0,
     /// Placements checked for fit and spread (L1, `scheduler.placement_problem`).
     placements_judged: u64 = 0,
+    /// Writes of a job's status checked for J3, and new assignments of a run checked for J5.
+    job_statuses_judged: u64 = 0,
+    runs_placed_judged: u64 = 0,
 };
 
 /// Checks one transaction about to commit against the head it will commit over (I2 and I3). The
@@ -162,6 +165,7 @@ pub const Tally = struct {
 pub fn before_commit(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
     if (scheduler.placement_problem(ctx, request, &tally.placements_judged)) |found| return found;
     if (superseded(ctx, request, tally)) |found| return found;
+    if (job_problem(ctx, request, tally)) |found| return found;
     return admissible_observations(ctx, request, tally);
 }
 
@@ -171,10 +175,15 @@ pub fn before_commit(ctx: *const Context, request: store.TxnRequest, tally: *Tal
 /// a node whose tenure is gone, so it is not guarded.
 fn guard_of(op: store.Op) ?records.Key {
     switch (op) {
-        .put => |put| if (std.mem.startsWith(u8, put.key, records.prefix_observed)) {
-            const rest = put.key[records.prefix_observed.len..];
-            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
-            return records.node_key(rest[0..slash]);
+        .put => |put| {
+            // A run's observation (`/job-observed/<node>/<job>`) rests on the tenure too.
+            const prefixes = [_][]const u8{ records.prefix_observed, records.prefix_job_observed };
+            for (prefixes) |prefix| {
+                if (!std.mem.startsWith(u8, put.key, prefix)) continue;
+                const rest = put.key[prefix.len..];
+                const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+                return records.node_key(rest[0..slash]);
+            }
         },
         .delete => {},
     }
@@ -301,6 +310,104 @@ fn admissible(ctx: *const Context, kv: store.KeyValue) Found {
     };
     if (judged.state != .ready) {
         return "I3: a decision cites an observation of a node that is not ready";
+    }
+    return null;
+}
+
+/// J3 and J5 (docs/briefs/b1.md, "The checks and their teeth"), over the head a transaction is
+/// about to commit over. J3: a job's terminal status is written once, so a put over a terminal
+/// status changes nothing, and a status is deleted only with its job. J5: `retries` is 0, so a
+/// run with a `stop` or a terminal status gets no new assignment.
+fn job_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
+    for (request.on_success) |op| {
+        switch (op) {
+            .put => |put| {
+                if (std.mem.startsWith(u8, put.key, records.prefix_job_status)) {
+                    if (status_rewritten(ctx, put, tally)) |found| return found;
+                } else if (std.mem.startsWith(u8, put.key, records.prefix_assigned)) {
+                    if (run_reassigned(ctx, put.key, tally)) |found| return found;
+                }
+            },
+            .delete => |key| {
+                if (!std.mem.startsWith(u8, key, records.prefix_job_status)) continue;
+                if (status_orphaned(ctx, request, key)) |found| return found;
+            },
+        }
+    }
+    return null;
+}
+
+fn status_rewritten(ctx: *const Context, put: store.Put, tally: *Tally) Found {
+    const got = ctx.store.get(ctx.arena, put.key, null, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J3: a job status cannot be read";
+    };
+    const kv = got.kv orelse return null; // A first status.
+    tally.job_statuses_judged += 1;
+    const head = records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J3: a job status cannot be decoded";
+    };
+    if (!records.job_state_terminal(head.state)) return null;
+    if (std.mem.eql(u8, kv.value, put.value)) return null;
+    return "J3: a terminal job status was written again with other content";
+}
+
+/// A status is deleted only in the transaction that deletes its job (retention).
+fn status_orphaned(ctx: *const Context, request: store.TxnRequest, key: []const u8) Found {
+    const name = key[records.prefix_job_status.len..];
+    if (records.name_problem(name, constants.service_name_bytes_max) != null) return null;
+    const job_at = records.job_key(name);
+    for (request.on_success) |op| {
+        switch (op) {
+            .delete => |deleted| if (std.mem.eql(u8, deleted, job_at.slice())) return null,
+            .put => {},
+        }
+    }
+    const got = ctx.store.get(ctx.arena, job_at.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J3: a job cannot be read";
+    };
+    if (got.kv == null) return null;
+    return "J3: a job status was deleted while its job exists";
+}
+
+fn run_reassigned(ctx: *const Context, key: []const u8, tally: *Tally) Found {
+    const rest = key[records.prefix_assigned.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const name = records.job_of_run(rest[slash + 1 ..]) orelse return null;
+    const existing = ctx.store.get(ctx.arena, key, null, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J5: an assignment cannot be read";
+    };
+    const fresh = existing.kv == null;
+    if (fresh) tally.runs_placed_judged += 1;
+    const run_at = records.job_run_key(name);
+    const run_got = ctx.store.get(ctx.arena, run_at.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J5: a run cannot be read";
+    };
+    if (run_got.kv) |kv| {
+        const run = records.read(records.JobRun, ctx.arena, kv, ctx.diag) catch {
+            ctx.diag.reset();
+            return "J5: a run cannot be decoded";
+        };
+        if (run.stop != null) return "J5: a run was assigned after its stop";
+    }
+    const status_at = records.job_status_key(name);
+    const status_got = ctx.store.get(ctx.arena, status_at.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J5: a job status cannot be read";
+    };
+    if (!fresh) return null; // A put to an existing key is judged by the run's stop only.
+    if (status_got.kv) |kv| {
+        const status = records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch {
+            ctx.diag.reset();
+            return "J5: a job status cannot be decoded";
+        };
+        if (records.job_state_terminal(status.state)) {
+            return "J5: a run was assigned after its job ended";
+        }
     }
     return null;
 }

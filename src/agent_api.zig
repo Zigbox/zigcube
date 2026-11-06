@@ -133,6 +133,8 @@ pub fn route(
     if (std.mem.eql(u8, what, "replicas")) return call.replicas();
     if (std.mem.eql(u8, what, "assigned")) return call.assigned();
     if (std.mem.eql(u8, what, "observed")) return call.observed();
+    if (std.mem.eql(u8, what, "runs")) return call.runs();
+    if (std.mem.eql(u8, what, "job-observed")) return call.job_observed();
     if (std.mem.eql(u8, what, "store")) return call.summary();
     if (std.mem.eql(u8, what, "pulls")) return call.pull();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
@@ -393,6 +395,175 @@ const Call = struct {
         for (given.items, items) |entry, *slot| slot.* = item_of(records.Assigned, entry);
         const pair = try call.chain();
         return reply(ctx, .{ .revision = given.revision, .kvs = items, .chain = pair });
+    }
+
+    // ---- GET /v1/agent/nodes/{node}/runs and .../runs/{name}/input ----
+
+    /// The runs assigned to this node whose job has not ended, each the `/job-runs` record, in
+    /// `/job-runs` order; the input is not in it. A run whose job ended is not served, so the
+    /// agent stops its container. `.../runs/{name}/input` is the one run's input, for the node it
+    /// is assigned to and once that node has claimed it.
+    fn runs(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("GET");
+        try call.only_known();
+        if (call.parts.next()) |name| return call.run_input(name);
+        const all = controller.list_all(
+            records.JobRun,
+            ctx,
+            records.prefix_job_runs,
+            null,
+            constants.jobs_max,
+        ) catch return propagate(ctx);
+        const given = controller.list_all(
+            records.Assigned,
+            ctx,
+            records.assigned_prefix(call.node).slice(),
+            all.revision,
+            constants.agent_node_assigned_max,
+        ) catch return propagate(ctx);
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        for (given.items) |entry| {
+            if (!records.assigned_is_job(&entry.rec)) continue;
+            wanted.put(ctx.arena, entry.rec.replica, {}) catch return no_memory(ctx);
+        }
+        var mine: std.ArrayList(Item(records.JobRun)) = .empty;
+        for (all.items) |entry| {
+            if (!wanted.contains(entry.rec.id)) continue;
+            if (try call.job_ended(entry.rec.job, all.revision)) continue;
+            mine.append(ctx.arena, item_of(records.JobRun, entry)) catch return no_memory(ctx);
+        }
+        if (mine.items.len > constants.agent_node_runs_max) return too_many_runs(ctx);
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = all.revision, .kvs = mine.items, .chain = pair });
+    }
+
+    /// True if the job's status is terminal. A job with no status is not ended.
+    fn job_ended(call: Call, job: []const u8, at_revision: store.Revision) Failure!bool {
+        const ctx = call.ctx;
+        const key = records.job_status_key(job);
+        const found = ctx.store.get(ctx.arena, key.slice(), at_revision, ctx.diag) catch
+            return propagate(ctx);
+        const kv = found.kv orelse return false;
+        const status = records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch
+            return propagate(ctx);
+        return records.job_state_terminal(status.state);
+    }
+
+    fn run_input(call: Call, name: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        const tail = call.parts.next() orelse return no_such(ctx, "that path");
+        if (!std.mem.eql(u8, tail, "input")) return no_such(ctx, "that path");
+        try call.no_more();
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid job name");
+        }
+        var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const id = records.job_run_id(&id_buffer, name);
+        const assigned_key = records.assigned_key(call.node, id);
+        const claim_key = records.job_observed_key(call.node, name);
+        const input_key = records.job_input_key(name);
+        const keys = [_][]const u8{ assigned_key.slice(), claim_key.slice(), input_key.slice() };
+        var found: [keys.len]store.GetResult = undefined;
+        for (keys, &found) |key, *slot| {
+            slot.* = ctx.store.get(ctx.arena, key, null, ctx.diag) catch return propagate(ctx);
+        }
+        // Only the node the run is assigned to, and only after it claimed the run.
+        if (found[0].kv == null) return no_input(ctx, name, .unassigned);
+        if (found[1].kv == null) return no_input(ctx, name, .unclaimed);
+        const input_kv = found[2].kv orelse return no_input(ctx, name, .missing);
+        // A value that does not decode is a damaged input: the same ZC-E0523 as a mismatch.
+        const input = records.read(records.JobInput, ctx.arena, input_kv, ctx.diag) catch {
+            ctx.diag.reset();
+            return no_input(ctx, name, .damaged);
+        };
+        const pair = try call.chain();
+        return reply(ctx, .{ .input = input, .chain = pair });
+    }
+
+    // ---- POST /v1/agent/nodes/{node}/job-observed ----
+
+    /// One run's observation under the agent's tenure. A `claimed` one also rests on the run, as
+    /// the agent read it, being unchanged (so a run with a `stop` is never claimed), on the
+    /// assignment it names being the one in the store, and on there being no observation yet: a
+    /// run is claimed at most once, ever. `applied: false` says a claim's compares failed and
+    /// the tenure holds: the agent reads again.
+    fn job_observed(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.only_known();
+        try call.no_more();
+        if (std.mem.eql(u8, call.method, "GET")) return call.job_observed_list();
+        try call.require_method("POST");
+        const input = try parse_body(JobObservedBody, ctx, call.body);
+        if (input.tenure == 0) return bad_request(ctx, "tenure", "is needed: it must not be 0");
+        const rec = &input.value;
+        const name = records.job_of_run(rec.run) orelse
+            return bad_request(ctx, "value", "names a run that is not a run id");
+        if (!std.mem.eql(u8, rec.node, call.node)) {
+            return bad_request(ctx, "value", "is for another node");
+        }
+        if (rec.tenure != input.tenure) {
+            return bad_request(ctx, "value", "does not name the tenure of the request");
+        }
+        if (!rec.valid()) return bad_request(ctx, "value", "is not a consistent observation");
+        const key = records.job_observed_key(call.node, name);
+        var set: compare_sets.Set = .{};
+        compare_sets.observed_write(&set, call.node, input.tenure);
+        if (rec.status == .claimed) {
+            if (input.run_revision == 0) {
+                return bad_request(ctx, "run_revision", "is needed to claim a run");
+            }
+            set = .{};
+            const assignment = rec.assignment;
+            compare_sets.job_claim(
+                &set,
+                call.node,
+                input.tenure,
+                name,
+                input.run_revision,
+                assignment,
+            );
+        }
+        const value = records.encode(ctx.arena, rec.*, ctx.diag) catch return propagate(ctx);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+        const request: store.TxnRequest = .{ .compares = set.compares(), .on_success = &.{op} };
+        const role: writers.Role = .{ .agent = call.node };
+        const result = writers.txn(ctx.store, role, request, ctx.diag) catch
+            return propagate(ctx);
+        if (!result.succeeded) return call.job_refused(input.tenure);
+        const pair = try call.chain_written(result);
+        return reply(ctx, .{ .revision = result.revision, .applied = true, .chain = pair });
+    }
+
+    /// GET: the node's own observations of runs, as stored.
+    fn job_observed_list(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        const prefix = records.job_observed_prefix(call.node);
+        const all = controller.list_all(
+            records.JobObserved,
+            ctx,
+            prefix.slice(),
+            null,
+            constants.jobs_max,
+        ) catch return propagate(ctx);
+        const items = ctx.arena.alloc(Item(records.JobObserved), all.items.len) catch
+            return no_memory(ctx);
+        for (all.items, items) |entry, *slot| slot.* = item_of(records.JobObserved, entry);
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = all.revision, .kvs = items, .chain = pair });
+    }
+
+    /// A compare of `job_observed` failed: either the tenure ended (ZC-E0510) or, for a claim,
+    /// the run, its assignment or its observation moved. The node's key tells which.
+    fn job_refused(call: Call, tenure: u64) Failure!Reply {
+        const ctx = call.ctx;
+        const key = records.node_key(call.node);
+        const found = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch
+            return propagate(ctx);
+        const kv = found.kv orelse return tenure_ended(ctx, call.node);
+        if (kv.mod_revision != tenure) return tenure_ended(ctx, call.node);
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = found.revision, .applied = false, .chain = pair });
     }
 
     // ---- GET and POST /v1/agent/nodes/{node}/observed ----
@@ -696,6 +867,13 @@ const CredentialBody = struct { node_key: []const u8, lease: u64 };
 
 const LeaseBody = struct { ttl_ms: u32 = 0 };
 
+const JobObservedBody = struct {
+    tenure: u64 = 0,
+    /// The revision of `/job-runs/<name>` the agent read: needed for a claim.
+    run_revision: u64 = 0,
+    value: records.JobObserved,
+};
+
 const ObservedPut = struct { key: []const u8, value: records.Observed };
 
 /// The chain pair every answer carries (docs/api.md, "The chain pair"): hashes in lower-case hex.
@@ -863,6 +1041,37 @@ fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
     ctx.diag.raise(.E0510);
     ctx.diag.cause("node {s} is not registered under the tenure this write names", .{node});
     ctx.diag.fix(.{ .sentence = "the agent stops its containers and registers the node again" });
+    return error.Failed;
+}
+
+/// The input of a run is not given: the node is not assigned the run, has not claimed it, or the
+/// run's input is missing (ZC-E0523: the API wrote the run, so that is not the caller's fault).
+fn no_input(ctx: *const Context, name: []const u8, why: InputWhy) Failure {
+    assert(ctx.diag.code == null);
+    switch (why) {
+        .missing => @import("agent_jobs.zig").raise_input(ctx.diag, name, .absent),
+        .damaged => @import("agent_jobs.zig").raise_input(ctx.diag, name, .mismatch),
+        .unassigned, .unclaimed => {
+            ctx.diag.raise(.E0133);
+            if (why == .unassigned) {
+                ctx.diag.cause("job {s} is not assigned to this node", .{name});
+            } else {
+                ctx.diag.cause("this node has not claimed the run of job {s}", .{name});
+            }
+            const sentence = "the agent claims the run first, then asks for its input";
+            ctx.diag.fix(.{ .sentence = sentence });
+        },
+    }
+    return error.Failed;
+}
+
+const InputWhy = enum { unassigned, unclaimed, missing, damaged };
+
+fn too_many_runs(ctx: *const Context) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0302);
+    ctx.diag.cause("this node has more than {d} runs", .{constants.agent_node_runs_max});
+    ctx.diag.fix(.{ .sentence = "cancel jobs that are no longer needed" });
     return error.Failed;
 }
 

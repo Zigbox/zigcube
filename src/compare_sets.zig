@@ -167,6 +167,27 @@ pub fn move(set: *Set, replica: ReplicaRead, from: Source, to: NodeRead) void {
     assert(set.count == placement_count + release_count);
 }
 
+/// A node's claim of a run: its tenure, the run as read (so a run with a `stop` is never
+/// claimed), the assignment it ran under, and no observation of the run yet, which makes a run
+/// claimed at most once, ever.
+pub fn job_claim(
+    set: *Set,
+    node: []const u8,
+    tenure_revision: store.Revision,
+    job: []const u8,
+    run_revision: store.Revision,
+    assignment: store.Revision,
+) void {
+    assert(run_revision > 0);
+    assert(assignment > 0);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const run = records.job_run_id(&buffer, job);
+    observed_write(set, node, tenure_revision);
+    set.add(records.job_run_key(job), run_revision);
+    set.add(records.assigned_key(node, run), assignment);
+    set.add(records.job_observed_key(node, job), 0);
+}
+
 /// An agent's observed write: its tenure is still current.
 pub fn observed_write(set: *Set, node: []const u8, tenure_revision: store.Revision) void {
     assert(set.count == 0);

@@ -15,6 +15,7 @@ pub const modules = .{
     @import("agent.zig"),
     @import("agent_api.zig"),
     @import("agent_client.zig"),
+    @import("agent_jobs.zig"),
     @import("agent_loop.zig"),
     @import("fencing.zig"),
     @import("agent_records.zig"),
@@ -61,6 +62,7 @@ pub const modules = .{
     @import("sim_checks.zig"),
     @import("sim_clock.zig"),
     @import("sim_cluster.zig"),
+    @import("sim_jobs.zig"),
     @import("sim_net.zig"),
     @import("sim_node.zig"),
     @import("sim_runtime.zig"),
@@ -174,4 +176,5 @@ test {
     _ = @import("agent_api_test.zig");
     _ = @import("agent_fence_test.zig");
     _ = @import("agent_client_test.zig");
+    _ = @import("agent_jobs_test.zig");
 }

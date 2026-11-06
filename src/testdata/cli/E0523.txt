@@ -1,0 +1,5 @@
+error[ZC-E0523]: a run's input does not match its digest
+  cause  the input held for train-7-job does not match its digest
+  fix    report it with the diagnostic bundle; submit the job again
+  more   zcube explain E0523 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0523.html
