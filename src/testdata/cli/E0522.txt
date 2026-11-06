@@ -1,5 +1,6 @@
 error[ZC-E0522]: a run's start record is missing or damaged
-  cause  the start record of train-7-job in /var/lib/zcube-agent is missing
+  cause  the start record of train-7-job in /var/lib/zcube-agent is missing or
+         damaged
   fix    check the state directory's disk and permissions
   more   zcube explain E0522 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0522.html

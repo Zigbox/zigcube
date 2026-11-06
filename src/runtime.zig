@@ -79,6 +79,8 @@ pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
 /// The label every container carries so that a restarted agent can re-adopt it.
 pub const label_replica = "zcube.replica";
+/// The job a run container belongs to (the run's `zcube.replica` is its run id, `<name>-job`).
+pub const label_job = "zcube.job";
 /// The image digest the container was started for, and the store revision its replica key was
 /// created at (decimal): together they tell a container from an earlier replica with the same
 /// id (a service deleted and applied again) from this one's.
