@@ -716,11 +716,12 @@ pub const Scheduler = struct {
         try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
     }
 
-    /// Releases a run whose job is over (its status terminal) or gone (no `/jobs/<name>` at the
-    /// world's revision): the job controller's terminal status is what frees the node, and
-    /// retention's delete of the job is what frees a node whose run was never ended. A run whose
-    /// job is live keeps its node, even with its run and status missing: that is the job
-    /// controller's contradiction hold, and nothing about the workload changes.
+    /// Releases a run whose job is over (its status terminal) or gone (no `/jobs/<name>` and no
+    /// status): the job controller's terminal status is what frees the node, and retention's
+    /// delete of the job is what frees a node whose run was never ended. A run whose job still
+    /// has a non-terminal status keeps its node, gone job or not, and so does a run whose job is
+    /// live with its run and status missing: that is the job controller's contradiction hold, and
+    /// nothing about the workload changes.
     fn release_run(
         sc: *Scheduler,
         ctx: *const Context,
