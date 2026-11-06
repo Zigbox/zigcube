@@ -265,7 +265,8 @@ const Fixture = struct {
         };
         try self.put(records.job_key(name).slice(), try records.encode(arena, spec, ctx.diag));
         const input: records.JobInput = .{ .base64 = "aGk=" };
-        try self.put(records.job_input_key(name).slice(), try records.encode(arena, input, ctx.diag));
+        const encoded = try records.encode(arena, input, ctx.diag);
+        try self.put(records.job_input_key(name).slice(), encoded);
         try self.put(records.job_run_key(name).slice(), "{}");
         const status: records.JobStatus = if (ended_ago_ms) |ago| .{
             .state = .exited,

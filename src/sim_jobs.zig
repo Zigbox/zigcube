@@ -51,6 +51,13 @@ pub const Watch = struct {
     /// The node's totals of wedged time and of cut-link time when the container was first seen.
     wedged_base_ms: u64 = 0,
     link_base_ms: u64 = 0,
+    /// Whether those two were re-taken at the start of the window that matters to J8: the link's
+    /// at the fence's reach before the deadline, the wedge's at the deadline.
+    link_marked: bool = false,
+    wedge_marked: bool = false,
+    /// The node's total of wedged time when the run's `stop` was first seen (J6 counts only
+    /// wedged time after the stop).
+    stop_wedged_base_ms: ?u64 = null,
 };
 
 /// The bound of J6: from the commit of a run's `stop`, the larger of what an agent whose link is

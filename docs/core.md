@@ -411,7 +411,7 @@ if the transaction then commits, because a failed compare is the store doing its
   after its run's `stop` committed. **J7** each start has a committed claim of this run, tenure
   and epoch, and the run has no stop. **J8** a container runs no longer than `deadline_bound_ms`
   after the tracker first saw it (the run's start on the ledger, within a tick), and after the
-  heal no run is open long after its latest possible end. J4 (the watch and retention) is slice 6.
+  heal no run is open long after its latest possible end. **J4** a client that follows the endings through `GET /v1/jobs/watch` (`src/sim_jobs_watch.zig`), is killed now and then (away for under a minute, or for minutes: the sim compacts to the head every `server_compact_ms`, so a longer outage gets the 410 and the list) and resumes from its revision, has seen every ending the store committed by the end of the run (each terminal `/job-status/` put the tap saw), and is never given an event twice. Age retention (`src/job_retention.zig`) is covered by its unit tests: the sim's runs are minutes long, far below `job_finished_age_ms_min`.
   The clocks are never restarted. A node that was wedged (its agent down or frozen, or a
   container ignoring a stop) is not judged until `wedge_memory_ms` after, and its wedged time is
   added to the J6 and J8 bounds; a node whose link or store was cut at any time in a run's window
@@ -434,10 +434,10 @@ breaks I7; a node that registers again between a controller's read of a report a
 commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of
 spread breaks L1 (C2 slice 5: each placement is no worse on spread, among the nodes that fit, than an order of fit and
 spread alone would choose, `scheduler.placement_problem`; every node holds a seed-chosen subset of
-the images and advertises it as `/node-store/<node>`).  The seven job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late`): an
+the images and advertises it as `/node-store/<node>`).  The eight job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|gap`): an
 agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
 that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
-agent that ignores a cancel breaks J6; one that ignores the deadline, or enforces it 9 s late, breaks J8. Their
+agent that ignores a cancel breaks J6; one that ignores the deadline, or enforces it 9 s late, breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
 switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 

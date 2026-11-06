@@ -388,8 +388,22 @@ The first answers `{revision, job, state, status}`: `job` is the spec with `env_
 values), `input_digest` and `input_bytes` (never the input), `cancel_requested`. `404` ZC-E0133 for
 a job that does not exist. The second takes `state=` (a job state, or `ended` for every terminal
 state), `label=key[=value]`, `limit=` (1 to 500, default 50), `at=` and `continue=`, and answers
-`{revision, jobs, continue}`; a filter keeps a subset of each store page, so a page may hold fewer
+`{revision, jobs, continue}` (a row of an ended job carries `epoch`); a filter keeps a subset of each store page, so a page may hold fewer
 than `limit` rows and `continue` may still be set.
+
+### `GET /v1/jobs/watch`
+
+`/v1/watch` over `/job-status/`, the values decoded to job statuses: `from=` (required, at least
+1: the first revision wanted), `timeout=` (at most 25000 ms) and `label=key[=value]`. It answers
+`{revision, events}`; each event is `{type: put|delete, name, revision, status}` (`status` is
+absent on a delete). `revision` is the bookmark: pass `revision + 1` as the next `from`, also
+when `events` is empty (a batch whose events all fell to `label` still advances it). A `label`
+keeps the events of jobs that match it at the head and drops deletes. `410` ZC-E0203 when `from`
+is below the compaction point, `400` ZC-E0204 when it is beyond the head. The client's contract:
+watch; on a 410, list `state=ended`, deduplicate by `(name, epoch)` (a row carries the `epoch`
+of the run it ended under) and watch again from the list's `revision + 1`. Every ending is
+then seen at least once; handle it by `(name, epoch)` to see it exactly once. The name `watch`
+is reserved: `POST /v1/jobs` refuses it with ZC-E0130.
 
 ### `POST /v1/jobs/{name}/cancel`
 

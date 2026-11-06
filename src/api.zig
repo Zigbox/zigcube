@@ -1136,7 +1136,7 @@ const Call = struct {
         }
         try out.end_array();
         try out.end_object();
-        return call.held(try out.finish(), read.events.len, prefixes, timeout_ms);
+        return call.held(try out.finish(), @intCast(read.events.len), prefixes, timeout_ms);
     }
 
     const WatchRead = struct { events: []const store.Event, bookmark: store.Revision };
@@ -1166,7 +1166,7 @@ const Call = struct {
     fn held(
         call: Call,
         reply_in: Reply,
-        events: usize,
+        events: u32,
         prefixes: []const []const u8,
         timeout_ms: u32,
     ) Reply {
@@ -1208,7 +1208,7 @@ const Call = struct {
         try out.member("revision", read.bookmark);
         try out.member("events", events);
         try out.end_object();
-        return call.held(try out.finish(), events.len, prefixes, @intCast(timeout));
+        return call.held(try out.finish(), @intCast(events.len), prefixes, @intCast(timeout));
     }
 
     // ---- /v1/leases ----
