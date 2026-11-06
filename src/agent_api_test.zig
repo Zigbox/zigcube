@@ -1092,6 +1092,33 @@ test "the runs of a node are listed, and a run's input is given only after its c
     try testing.expect(other.status != 200);
 }
 
+test "a damaged input value is ZC-E0523, with nothing left in the diagnostic" {
+    var rig = try Rig.start(23);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    const key = records.job_input_key("train");
+    const op: store.Op = .{ .put = .{ .key = key.slice(), .value = "{not json" } };
+    const done = try @import("writers.zig").txn(
+        rig.world.store_handle(),
+        .api,
+        .{ .on_success = &.{op} },
+        &rig.world.diag,
+    );
+    try testing.expect(done.succeeded);
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    _ = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    const response = rig.call("GET", "/v1/agent/nodes/node2/runs/train/input", "", "");
+    try rig.refused(response, response.status, "ZC-E0523");
+    try testing.expect(std.mem.indexOf(u8, response.body, records.input_mismatch_phrase) != null);
+    // Nothing of the failed read stays: the answer carries one diagnostic and one cause.
+    const body = try rig.json(response);
+    const diagnostics = body.object.get("diagnostics").?.array.items;
+    try testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try testing.expectEqual(@as(usize, 1), diagnostics[0].object.get("causes").?.array.items.len);
+}
+
 test "a claim is applied once; a second, a moved run or a moved assignment is applied: false" {
     var rig = try Rig.start(22);
     defer rig.stop();

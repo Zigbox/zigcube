@@ -143,12 +143,19 @@ const Rig = struct {
     }
 };
 
-/// The first `ZC-` code in a stored diagnostic's JSON.
+/// The `code` of a stored diagnostic's JSON.
 fn code_of(text: []const u8) ?[12]u8 {
-    const at = std.mem.indexOf(u8, text, "Z") orelse return null;
+    const Shape = struct { code: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(
+        Shape,
+        testing.allocator,
+        text,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
     var out: [12]u8 = @splat(0);
-    const end = std.mem.indexOfScalarPos(u8, text, at, '"') orelse return null;
-    @memcpy(out[0..@min(12, end - at)], text[at..][0..@min(12, end - at)]);
+    if (parsed.value.code.len == 0 or parsed.value.code.len > out.len) return null;
+    @memcpy(out[0..parsed.value.code.len], parsed.value.code);
     return out;
 }
 
@@ -660,4 +667,26 @@ test "a spec the runtime refuses is rendered with its field and its limit" {
     collector.reset();
     agent_jobs.raise_deadline(&collector, "train-job", false);
     try testing.expect(std.mem.indexOf(u8, collector.causes.slice()[0].slice(), "killed") == null);
+}
+
+test "a run whose input fetch keeps failing ends at its deadline, not started" {
+    // The fetch fails for a reason that is not about the input, for good: the run's own
+    // deadline is what ends it (stop_cause not_started, which the server ends failed deadline).
+    var rig = try Rig.start();
+    defer rig.stop();
+    try assign_with_input(&rig, hello_digest, "aGVsbG8=");
+    rig.world.switched.down_get_prefix = records.prefix_job_input;
+    _ = rig.world.agent_step();
+    try testing.expectEqual(records.JobObservedStatus.claimed, (try rig.observed()).?.status);
+    rig.world.advance(30_000);
+    _ = rig.world.agent_step();
+    try testing.expect(!rig.running());
+    try testing.expectEqual(records.JobObservedStatus.claimed, (try rig.observed()).?.status);
+    rig.world.advance(40_000); // Past deadline_ms (60 s) from the claim.
+    _ = rig.world.agent_step();
+    _ = rig.world.agent_step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
+    try testing.expect(!rig.running());
 }

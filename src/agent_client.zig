@@ -695,7 +695,21 @@ pub const RemoteStore = struct {
             // The server's own answer that the run has no input it can give: not a fault of
             // the link (ZC-E0523), so the agent can tell it from one.
             const code = refusal_code(arena, reply.body) orelse "";
-            if (std.mem.endsWith(u8, code, "E0523")) return .{ .kv = null, .revision = 1 };
+            if (std.mem.endsWith(u8, code, "E0523")) {
+                if (!refusal_says(arena, reply.body, records.input_mismatch_phrase)) {
+                    return .{ .kv = null, .revision = 1 };
+                }
+                // A damaged input is not an absent one: hand over a value that does not
+                // decode, which the agent reads as a mismatch.
+                const damaged: store.KeyValue = .{
+                    .key = key,
+                    .value = "null",
+                    .create_revision = 1,
+                    .mod_revision = 1,
+                    .lease = store.lease_none,
+                };
+                return .{ .kv = damaged, .revision = 1 };
+            }
             return refused(arena, reply, diag);
         }
         const Answer = struct { input: Json };
@@ -1066,6 +1080,17 @@ pub fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return null;
     if (parsed.diagnostics.len == 0) return null;
     return parsed.diagnostics[0].code;
+}
+
+/// Whether any cause of the server's first diagnostic contains `phrase`.
+fn refusal_says(arena: Allocator, body: []const u8, phrase: []const u8) bool {
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return false;
+    if (parsed.diagnostics.len == 0) return false;
+    for (parsed.diagnostics[0].causes) |text| {
+        if (std.mem.indexOf(u8, text, phrase) != null) return true;
+    }
+    return false;
 }
 
 /// ZC-E0504 carrying the server's own diagnostic: its code and summary, and its innermost cause.
