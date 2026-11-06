@@ -48,10 +48,18 @@ const Fixture = struct {
         };
     }
 
-    /// One pass; the number of transactions it committed.
+    /// One pass; the number of transactions it committed. A step that keeps its place in the
+    /// jobs and asks to run again at once (`at_ms` not after now) is run again: a pass is a sweep
+    /// of all the jobs, however many steps it takes.
     fn pass(self: *Fixture) !u32 {
-        const ctx = self.context();
-        return (try self.jc.reconcile(&ctx)).acted;
+        var acted: u32 = 0;
+        for (0..64) |_| {
+            const ctx = self.context();
+            const wake = try self.jc.reconcile(&ctx);
+            acted += wake.acted;
+            if (wake.at_ms > self.manual.ms) return acted;
+        }
+        return error.TestUnexpectedResult;
     }
 
     fn put(self: *Fixture, role: writers.Role, key: []const u8, value: anytype) !void {
@@ -202,9 +210,77 @@ const Fixture = struct {
         const status = (try self.read_status(name)).?;
         try testing.expectEqual(records.JobState.running, status.state);
     }
+
+    fn delete(self: *Fixture, role: writers.Role, key: []const u8) !void {
+        const ctx = self.context();
+        const gone = [_]store.Op{.{ .delete = key }};
+        const done = try writers.txn(ctx.store, role, .{ .on_success = &gone }, &self.diag);
+        try testing.expect(done.succeeded);
+    }
+
+    /// A job that has ended, its run and its terminal status written directly, `env_bytes` of
+    /// environment in each of the job and the run (the node, if any, is the one it ran on).
+    fn ended(self: *Fixture, name: []const u8, env_bytes: usize, node_name: ?[]const u8) !void {
+        // `put` starts the fixture's arena afresh: the filler lives apart from it.
+        const filler = try testing.allocator.alloc(u8, env_bytes);
+        defer testing.allocator.free(filler);
+        @memset(filler, 'x');
+        const env = [_]records.Pair{.{ "FILLER", filler }};
+        const spec: records.Job = .{
+            .name = name,
+            .image = "b3:51aa9c03",
+            .command = &.{"true"},
+            .env = &env,
+            .deadline_ms = 60 * 1000,
+            .submit_by_ms = self.manual.ms,
+            .created_at_ms = self.manual.ms,
+        };
+        var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const id = records.job_run_id(&buffer, name);
+        const run: records.JobRun = .{
+            .id = id,
+            .job = name,
+            .image = spec.image,
+            .command = spec.command,
+            .env = &env,
+            .deadline_ms = spec.deadline_ms,
+            .start_by_ms = self.manual.ms + 60 * 1000,
+            .created_at_ms = self.manual.ms,
+        };
+        const status: records.JobStatus = .{
+            .state = .exited,
+            .node = node_name,
+            .end = .{ .kind = .exited, .code = 0 },
+            .ended_at_ms = self.manual.ms,
+            .decision = "x",
+            .reported_at_ms = self.manual.ms,
+        };
+        try self.put(.api, records.job_key(name).slice(), spec);
+        try self.put(.job_controller, records.job_run_key(name).slice(), run);
+        try self.put(.job_controller, records.job_status_key(name).slice(), status);
+    }
+
+    /// As `pass`, in an arena of exactly `buffer`, which every step starts afresh: the step must
+    /// fit the bound the production arena has.
+    fn pass_bounded(self: *Fixture, buffer: []u8) !u32 {
+        var acted: u32 = 0;
+        for (0..64) |_| {
+            var fixed = std.heap.FixedBufferAllocator.init(buffer);
+            const ctx: controller.Context = .{
+                .store = self.memory.interface(),
+                .clock = self.manual.clock(),
+                .arena = fixed.allocator(),
+                .diag = &self.diag,
+            };
+            const wake = try self.jc.reconcile(&ctx);
+            acted += wake.acted;
+            if (wake.at_ms > self.manual.ms) return acted;
+        }
+        return error.TestUnexpectedResult;
+    }
 };
 
-test "a job gets its run and a pending status once, with a job-created decision" {
+test "a job gets its run and a pending status once, with a job_created decision" {
     var f: Fixture = undefined;
     try f.start();
     defer f.stop();
@@ -213,11 +289,11 @@ test "a job gets its run and a pending status once, with a job-created decision"
     const run = (try f.read_run("train")).?;
     try testing.expectEqual(f.manual.ms + 60 * 1000, run.start_by_ms);
     try testing.expectEqual(records.JobState.pending, (try f.read_status("train")).?.state);
-    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "job-created"));
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "job_created"));
     try testing.expectEqual(@as(u32, 0), try f.pass());
 }
 
-test "a job that has a job-created decision and no run is contradictory and never started" {
+test "a job that has a job_created decision and no run is contradictory and never started" {
     var f: Fixture = undefined;
     try f.start();
     defer f.stop();
@@ -232,10 +308,10 @@ test "a job that has a job-created decision and no run is contradictory and neve
     try testing.expectEqual(@as(u32, 1), try f.pass());
     try testing.expect((try f.read_run("train")) == null);
     try testing.expect((try f.read_status("train")) == null);
-    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold-contradictory-job"));
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
     // Recorded once, not once a pass.
     try testing.expectEqual(@as(u32, 0), try f.pass());
-    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold-contradictory-job"));
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
 }
 
 test "a run without a status is contradictory and changes nothing" {
@@ -311,7 +387,9 @@ test "a cancel that raced an exit is judged by the exit" {
     try testing.expectEqual(records.JobState.exited, (try f.read_status("train")).?.state);
 }
 
-test "a report from a node that is not ready, or from an old tenure, is not believed" {
+test "a report from a node that is not ready is not believed" {
+    // Goal: an admissible report needs a `ready` node (authority.md I6); a stopped report from a
+    // fenced node ends nothing.
     var f: Fixture = undefined;
     try f.start();
     defer f.stop();
@@ -322,26 +400,23 @@ test "a report from a node that is not ready, or from an old tenure, is not beli
     try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
 }
 
-test "a running run whose node is gone is failed unreachable after the grace" {
+test "a report from a tenure the node no longer holds is not believed" {
+    // Goal: the tenure check of admissible() (authority.md I2) on its own: the node is ready, the
+    // assignment is the one reported, and only the node's record changed since the report.
     var f: Fixture = undefined;
     try f.start();
     defer f.stop();
     try f.running("train");
-    const ctx = f.context();
-    const node_at = records.node_key("n1");
-    const gone = [_]store.Op{.{ .delete = node_at.slice() }};
-    _ = try writers.txn(ctx.store, .{ .agent = "n1" }, .{ .on_success = &gone }, &f.diag);
-    try testing.expectEqual(@as(u32, 0), try f.pass()); // seen now
-    f.manual.ms += 500;
+    try f.report("n1", "train", .stopped, .{ .kind = .exited, .code = 0 }, null);
+    try f.node("n1", .ready); // The node registered again: a new tenure, and ready.
     try testing.expectEqual(@as(u32, 0), try f.pass());
-    f.manual.ms += 600;
-    try testing.expectEqual(@as(u32, 1), try f.pass());
-    const status = (try f.read_status("train")).?;
-    try testing.expectEqual(records.JobState.failed, status.state);
-    try testing.expectEqual(records.JobFailure.@"unreachable", status.end.?.cause.?);
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
 }
 
-test "a placed run whose node is lost is stopped, then ended failed not_started" {
+test "a claim that is not admissible is never ended as unstarted and ends unreachable" {
+    // Goal: a run its node claimed may be running. A cancel is written but the run is not ended
+    // as unstarted (the claim guard); it ends `failed unreachable` once the claim's tenure has
+    // been over for the grace, and does not stay `placed` for ever.
     var f: Fixture = undefined;
     try f.start();
     defer f.stop();
@@ -350,75 +425,152 @@ test "a placed run whose node is lost is stopped, then ended failed not_started"
     try testing.expectEqual(@as(u32, 1), try f.pass());
     try f.assign("n1", "train");
     try testing.expectEqual(@as(u32, 1), try f.pass()); // placed
+    try f.node_status("n1", .fenced);
+    try f.report("n1", "train", .claimed, null, null);
+    try f.job("train", 600 * 1000, true);
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the cancel is written
+    try testing.expect((try f.read_run("train")).?.stop != null);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // and the run is not ended as unstarted
     try testing.expectEqual(records.JobState.placed, (try f.read_status("train")).?.state);
     try f.node_status("n1", .lost);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // inside the grace
     f.manual.ms += 1001;
-    try testing.expectEqual(@as(u32, 1), try f.pass()); // stop
-    try testing.expectEqual(@as(u32, 1), try f.pass()); // end
-    const status = (try f.read_status("train")).?;
-    try testing.expectEqual(records.JobFailure.not_started, status.end.?.cause.?);
-}
-
-test "a fence report from a newer tenure ends a running run failed fenced" {
-    var f: Fixture = undefined;
-    try f.start();
-    defer f.stop();
-    try f.running("train");
-    // The agent comes back under a new tenure and says it fenced the run it held.
-    const old_epoch = (try f.read_status("train")).?.epoch.?;
-    try f.node("n1", .ready);
-    const tenure = try f.revision_of(records.node_key("n1").slice());
-    const value: records.JobObserved = .{
-        .run = "train-job",
-        .node = "n1",
-        .tenure = tenure,
-        .assignment = old_epoch,
-        .status = .stopped,
-        .exit = .{ .kind = .signaled, .signal = 9 },
-        .stop_cause = .fence,
-        .reported_at_ms = f.manual.ms,
-    };
-    try f.put(.{ .agent = "n1" }, records.job_observed_key("n1", "train").slice(), value);
     try testing.expectEqual(@as(u32, 1), try f.pass());
     const status = (try f.read_status("train")).?;
-    try testing.expectEqual(records.JobFailure.fenced, status.end.?.cause.?);
-}
-
-test "an exit that maps to no ending is B0004 and leaves the job as it was" {
-    var f: Fixture = undefined;
-    try f.start();
-    defer f.stop();
-    try f.running("train");
-    try f.report("n1", "train", .stopped, .{ .kind = .exited }, null);
-    try testing.expectEqual(@as(u32, 1), try f.pass());
-    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
-    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold-unmapped-ending"));
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expectEqual(records.JobFailure.@"unreachable", status.end.?.cause.?);
     try testing.expectEqual(@as(u32, 0), try f.pass());
 }
 
-test "the ending table follows the stop cause before the exit" {
-    const killed: records.JobObserved = .{
-        .run = "x-job",
-        .node = "n",
-        .tenure = 1,
-        .assignment = 1,
-        .status = .stopped,
-        .exit = .{ .kind = .signaled, .signal = 15 },
-        .stop_cause = .cancel,
-        .reported_at_ms = 0,
-    };
-    try testing.expectEqual(records.JobState.cancelled, job_controller.map_ending(&killed).?.state);
-    var oom = killed;
-    oom.stop_cause = null;
-    oom.exit = .{ .kind = .oom };
-    try testing.expectEqual(records.JobFailure.oom, job_controller.map_ending(&oom).?.end.cause.?);
-    oom.exit = .{ .kind = .lost };
-    try testing.expectEqual(
-        records.JobFailure.unknown,
-        job_controller.map_ending(&oom).?.end.cause.?,
-    );
-    oom.exit = .{ .kind = .signaled, .signal = 9 };
-    try testing.expectEqual(@as(?u8, 9), job_controller.map_ending(&oom).?.end.signal);
-    oom.exit = .{ .kind = .signaled };
-    try testing.expect(job_controller.map_ending(&oom) == null);
+test "a job deleted and created again under its name gets a run" {
+    // Goal: "the job ever had a run" is about this incarnation (docs/decisions/
+    // 2026-11-05-b1-controller-never-recreates-a-run.md): the job_created decision of an earlier
+    // job of the same name is not a contradiction.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.job("train", 60 * 1000, true);
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // stop
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // end cancelled
+    try f.delete(.api, records.job_key("train").slice());
+    try f.delete(.job_controller, records.job_run_key("train").slice());
+    try f.delete(.job_controller, records.job_status_key("train").slice());
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(records.JobState.pending, (try f.read_status("train")).?.state);
+    try testing.expectEqual(@as(u32, 2), try f.decisions("train", "job_created"));
+    try testing.expectEqual(@as(u32, 0), try f.decisions("train", "hold_contradictory_job"));
+}
+
+test "65 contradictory jobs are held once each" {
+    // Goal: nothing bounds how many jobs can be contradictory at once; each is recorded once,
+    // and a pass over a converged store acts on none (the old ring of 64 forgot the first).
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var names: [65][3]u8 = undefined;
+    for (&names, 0..) |*name, at| {
+        const tens: u8 = @intCast(at / 10);
+        name.* = .{ 'j', '0' + tens, '0' + @as(u8, @intCast(at % 10)) };
+    }
+    for (&names) |*name| try f.job(name, 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 65), try f.pass());
+    for (&names) |*name| {
+        try f.delete(.job_controller, records.job_run_key(name).slice());
+        try f.delete(.job_controller, records.job_status_key(name).slice());
+    }
+    try testing.expectEqual(@as(u32, 65), try f.pass());
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    for (&names) |*name| {
+        try testing.expectEqual(@as(u32, 1), try f.decisions(name, "hold_contradictory_job"));
+    }
+}
+
+test "150 running runs on nodes that are gone all end unreachable" {
+    // Goal: the controller's memory of when a tenure ended holds every live run (the old ring of
+    // 128 forgot some, and their grace started again).
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const nodes = [_][]const u8{ "n1", "n2", "n3" };
+    for (nodes) |name| try f.node(name, .ready);
+    var names: [150][4]u8 = undefined;
+    for (&names, 0..) |*name, at| {
+        const hundreds: u8 = @intCast(at / 100);
+        const tens: u8 = @intCast(at / 10 % 10);
+        name.* = .{ 'j', '0' + hundreds, '0' + tens, '0' + @as(u8, @intCast(at % 10)) };
+    }
+    for (&names) |*name| try f.job(name, 600 * 1000, false);
+    try testing.expectEqual(@as(u32, 150), try f.pass());
+    for (&names, 0..) |*name, at| try f.assign(nodes[at % 3], name);
+    try testing.expectEqual(@as(u32, 150), try f.pass()); // placed
+    for (&names, 0..) |*name, at| try f.report(nodes[at % 3], name, .claimed, null, null);
+    try testing.expectEqual(@as(u32, 150), try f.pass()); // running
+    for (nodes) |name| try f.delete(.{ .agent = name }, records.node_key(name).slice());
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    f.manual.ms += 1001;
+    try testing.expectEqual(@as(u32, 150), try f.pass());
+    try testing.expectEqual(@as(u64, 150), try f.endings());
+}
+
+test "more ended jobs than jobs_max do not stop the controller" {
+    // Goal: /jobs/ holds the ended jobs of the retention window, more than jobs_max; the
+    // controller reads them a page at a time and still creates the run of a new job.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const count = constants.jobs_max + 90;
+    for (0..count) |at| {
+        var name: [4]u8 = undefined;
+        _ = std.fmt.bufPrint(&name, "e{d:0>3}", .{at}) catch unreachable; // 4 bytes hold 3 digits.
+        try f.ended(&name, 8, null);
+    }
+    try f.job("zz-new", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expect((try f.read_run("zz-new")) != null);
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+}
+
+test "a step over many large ended jobs fits the step's arena" {
+    // Goal: the step's memory is one page of jobs, not the retention window. Each job and run
+    // carries 7 KB of environment; all of them read at once would not fit 16 MiB.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const count = 600;
+    for (0..count) |at| {
+        var name: [4]u8 = undefined;
+        _ = std.fmt.bufPrint(&name, "e{d:0>3}", .{at}) catch unreachable; // 4 bytes hold 3 digits.
+        try f.ended(&name, 7000, null);
+    }
+    try f.job("zz-new", 60 * 1000, false);
+    const buffer = try testing.allocator.alloc(u8, constants.request_arena_bytes_max);
+    defer testing.allocator.free(buffer);
+    try testing.expectEqual(@as(u32, 1), try f.pass_bounded(buffer));
+    try testing.expectEqual(@as(u32, 0), try f.pass_bounded(buffer));
+}
+
+test "a report that arrives after the job ended is dropped with a W0307 decision" {
+    // Goal: the ending is written once; a later report changes nothing and is recorded, once.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.running("train");
+    try f.delete(.{ .agent = "n1" }, records.node_key("n1").slice());
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    f.manual.ms += 1001;
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const cause = (try f.read_status("train")).?.end.?.cause.?;
+    try testing.expectEqual(records.JobFailure.@"unreachable", cause);
+    try testing.expectEqual(@as(u32, 0), try f.decisions("train", "drop_report"));
+    try f.node("n1", .ready);
+    try f.report("n1", "train", .stopped, .{ .kind = .exited, .code = 0 }, null);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "drop_report"));
+    const status = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    try testing.expectEqual(@as(u64, 1), try f.endings());
 }
