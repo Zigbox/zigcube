@@ -118,28 +118,61 @@ if (mode === "sim") {
   const page = await open({ width: 1280, height: 900 }, `${base}/?mock=b1&at=3#/jobs`);
   page.on("request", r => { if (/log/i.test(new URL(r.url()).pathname)) logRequests.push(r.url()); });
   const text = () => page.evaluate(() => document.querySelector("main")?.innerText || "");
-  const rowsWith = () => page.$$eval("tr[data-job]", trs => trs.map(t => [t.dataset.job, t.dataset.end]));
-  await check("mock: the list shows all seventeen jobs", async () => {
-    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 17, null, { timeout: 15000 });
+  const rowsWith = () => page.$$eval("tr[data-job]", trs => trs.map(t => [t.dataset.job, t.dataset.state, t.dataset.end]));
+  await check("mock: the list shows all eighteen jobs", async () => {
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 18, null, { timeout: 15000 });
     await shot(page, "mock-jobs");
   });
   await check("mock: the state filter narrows the list", async () => {
     await page.selectOption("main select", "running");
     await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 1, null, { timeout: 15000 });
     await page.selectOption("main select", "ended");
-    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 14, null, { timeout: 15000 });
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 15, null, { timeout: 15000 });
     await page.selectOption("main select", "");
   });
-  const ends = { "train-ok": "exit 0", "export-exit3": "exit 3", "probe-sigkill": "signal 9", "fit-oom": "oom", "fork-bomb": "pid_limit", "bad-image": "start_failed", "slow-merge": "deadline", "fenced-write": "fenced", "lost-node": "unreachable", "never-started": "not_started", "mystery": "unknown", "cancel-running": "cancelled", "run-forever": "running", "waiting": "pending" };
-  for (const [name, want] of Object.entries(ends)) {
-    await check(`mock: job page ${name} (${want})`, async () => {
+  // Every ending the controller can record (src/job_controller.zig `map_ending`, `end_unstarted`):
+  // [state, the Ended-with word on the row, the page's Ended line, the stop cause or null, a decision the chain must name].
+  const ends = {
+    "train-ok": ["exited", "exit 0", "exited with code 0", null],
+    "export-exit3": ["exited", "exit 3", "exited with code 3", null],
+    "probe-sigkill": ["exited", "signal 9", "exited: killed by signal 9", null],
+    "fit-oom": ["failed", "oom", "failed: ran out of memory", null],
+    "fork-bomb": ["failed", "pid_limit", "failed: hit its process limit", null],
+    "bad-image": ["failed", "start_failed", "failed: could not be started", null],
+    "slow-merge": ["failed", "deadline", "failed: passed its deadline", "deadline"],
+    "fenced-write": ["failed", "fenced", "failed: was stopped", "fence"],
+    "lost-node": ["failed", "unreachable", "failed: its node stopped being heard", "unreachable"],
+    "never-started": ["failed", "deadline", "failed: passed its deadline", "not_started", "stop_job"], // placed, never claimed
+    "lost-early": ["failed", "not_started", "failed: its node was lost before the run was claimed", "unreachable", "stop_job"],
+    "mystery": ["failed", "unknown", "failed: ended for a reason", null],
+    "no-room": ["failed", "deadline", "failed: passed its deadline", "not_started", "stop_job"], // held, then the backstop
+    "cancel-running": ["cancelled", "cancelled", "cancelled", "cancel"],
+    "cancel-waiting": ["cancelled", "cancelled", "cancelled", "cancel", "stop_job"], // cancelled before placement
+    "run-forever": ["running", "", null, null],
+    "placed-wait": ["placed", "", null, null, "job_placed"],
+    "waiting": ["pending", "", null, null, "hold_pending"], // the no-room hold
+  };
+  await check("mock: the list rows show each job's state and ending", async () => {
+    await page.waitForFunction(() => document.querySelectorAll("tr[data-job]").length === 18, null, { timeout: 15000 });
+    const rows = Object.fromEntries((await rowsWith()).map(([n, st, en]) => [n, [st, en]]));
+    for (const [name, [state, word]] of Object.entries(ends)) must(rows[name] && rows[name][0] === state && rows[name][1] === word, `${name}: row is ${JSON.stringify(rows[name])}, want ${state} / "${word}"`);
+  });
+  for (const [name, [state, word, longText, stop, decision]] of Object.entries(ends)) {
+    await check(`mock: job page ${name} (${state} ${word})`, async () => {
       await page.evaluate(n => { location.hash = `#/jobs/${n}`; }, name);
       await page.waitForFunction(n => document.querySelector("main h1")?.textContent === n && /Spec/.test(document.querySelector("main")?.innerText || ""), name, { timeout: 15000 });
+      await page.waitForFunction(() => !/Loading…/.test(document.querySelector("main")?.innerText || ""), null, { timeout: 15000 });
       const t = await text();
       must(t.includes("Logs are not part of this release"), "no logs placeholder");
       must(!t.includes("s3cr3t-token") && !t.includes("epochs=3"), "an env value or the input is on the page");
       must(!/\bnull\b|undefined/.test(t), "null or undefined on the page");
-      if (want !== "running" && want !== "pending") must(t.includes("Why") && /because/i.test(t), "no why chain");
+      must(new RegExp(`State\\s+\\S*\\s*${state}\\b`, "i").test(t), `the page does not say the state is ${state}`);
+      if (longText) must(new RegExp(`Ended\\s+${longText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(t), `the Ended line is not "${longText}"`);
+      else must(!/\bEnded\s/.test(t), "an unended job shows an Ended line");
+      if (stop) must(new RegExp(`Stopped because\\s+${stop}\\b`).test(t), `the stop cause is not ${stop}`);
+      else must(!/Stopped because/.test(t), "a stop cause on a job that had none");
+      must(t.includes("Why") && /because/i.test(t), "no why chain");
+      if (decision) must(t.includes(decision), `the chain does not name ${decision}`);
       if (name === "bad-image") must(/ZBX-E0410/.test(t), "no diagnostic");
       if (name === "train-ok") await shot(page, "mock-job-train-ok");
     });

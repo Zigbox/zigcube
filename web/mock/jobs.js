@@ -4,6 +4,12 @@
 // `submit`), and writes the decisions `why job` walks. It never stores an env value's twin or the
 // input: public replies carry `env_names`, `input_digest` and `input_bytes` only.
 //
+// Decisions and endings follow the real core (src/scheduler.zig, src/job_controller.zig): a job
+// that fits gets the scheduler's `place_run` and then the controller's `job_placed`; one that
+// does not gets `hold_pending`. A run that was never claimed has a `stop_job` decision and ends
+// from its stop (`not_started` -> `failed deadline`, `unreachable` -> `failed not_started`,
+// `cancel` -> `cancelled`); a claimed run ends as its agent reported (`end_job`).
+//
 // Not modelled: retries, relay, placement (ZC-E0130 by name, as the server), the admission window
 // beyond `jobs_max`, log output (cut from B1), node loss (a plan may end `unreachable` directly).
 
@@ -37,6 +43,7 @@ export class Jobs {
     this.plans = new Map(); // name -> {node, place, start, run, outcome}
     this.inputBytes = new Map(); // name -> bytes, for display only; the input itself is not kept
     this.decisions = new Map(); // name -> the job's newest decision id
+    this.stopping = new Set(); // jobs whose run has a stop in flight
     this.timers = []; // long waits (over LONG_MS) that must not keep the engine "active" forever
   }
 
@@ -132,7 +139,9 @@ export class Jobs {
     if (!(limit >= 1 && limit <= 500)) throw jobError(400, diagBadRequest("limit", "must be from 1 to 500"));
     const want = q.get("state");
     const label = q.get("label");
-    const page = this.engine.list("/jobs/", { limit, after: q.get("continue") ? `/jobs/${q.get("continue")}` : null });
+    const after = q.get("continue");
+    if (after != null && q.get("at") == null) throw jobError(400, diagBadRequest("continue", "needs `at`, the revision of the first page"));
+    const page = this.engine.list("/jobs/", { limit, after: after ? `/jobs/${after}` : null });
     const jobs = [];
     for (const kv of page.kvs) {
       const job = kv.value;
@@ -199,27 +208,40 @@ export class Jobs {
     const run = `${name}-job`;
     let last = createdId;
     const note = id => { last = id; this.decisions.set(name, id); };
-    if (p.hold) { // ZC-W0308: no node fits; the job waits, then the start-by time passes
+    if (p.hold) { // no node fits: the scheduler's `hold_pending`; the start-by backstop then stops the run
       this.later(p.place, () => {
         if (!alive()) return;
+        const kv = e.getKv(`/job-runs/${name}`);
+        const need = { cpu_millis: 500, memory_bytes: 268435456 };
         const d = e.decision({
-          actor: "scheduler", action: "hold_job", subject: { kind: "job", name },
-          reason: "no node fits the run, or every node that fits is at jobs_per_node_max; it stays pending (ZC-W0308)", cause: { kind: "decision", id: last },
+          actor: "scheduler", action: "hold_pending", subject: { kind: "job", name },
+          reason: "no node fits 500m CPU and 256 MiB: 3 of 3 nodes lack the room, 0 are excluded",
+          cause: { kind: "desired", key: kv.key, revision: kv.mod_revision },
+          evidence: JSON.stringify({ need, cpu_short: { node1: 250, node2: 250, node3: 250 }, omitted: 0 }),
         });
         e.commit(d.ops); note(d.id);
       });
-      this.later(p.hold, () => { if (alive()) this.stop(name, "deadline", last, null); });
+      this.later(p.hold, () => { if (alive()) this.stop(name, "not_started", last, null); });
       return;
     }
-    this.later(p.place, () => {
+    this.later(p.place, () => { // the scheduler assigns the run ...
       if (!alive()) return;
-      const d = e.decision({ actor: "scheduler", action: "job_placed", subject: { kind: "job", name }, reason: "the run was assigned to a node", cause: { kind: "decision", id: last } });
-      e.commit([...d.ops, { put: [`/assigned/${p.node}/${run}`, { v: 2, replica: run, service: "", job: name, requests: { cpu_millis: 250, memory_bytes: 134217728 }, reason: `${p.node} fits the run` }] },
-        { put: [`/job-status/${name}`, { v: 1, state: "placed", node: p.node, epoch: e.rev + 1, decision: d.id, reported_at_ms: e.now() }] }]);
+      const kv = e.getKv(`/job-runs/${name}`);
+      const d = e.decision({ actor: "scheduler", action: "place_run", subject: { kind: "job", name }, reason: `${p.node} fits the run`, cause: { kind: "desired", key: kv.key, revision: kv.mod_revision } });
+      e.commit([...d.ops, { put: [`/assigned/${p.node}/${run}`, { v: 2, replica: run, service: "", job: name, requests: { cpu_millis: 250, memory_bytes: 134217728 }, reason: `${p.node} fits the run` }] }]);
+      note(d.id);
+    });
+    this.later(p.place + 150, () => { // ... and the job controller shows the placement in the status
+      if (!alive()) return;
+      const key = `/assigned/${p.node}/${run}`;
+      const akv = e.getKv(key);
+      const d = e.decision({ actor: "job-controller", action: "job_placed", subject: { kind: "job", name }, reason: "the run was assigned to a node", cause: { kind: "desired", key, revision: akv.mod_revision } });
+      e.commit([...d.ops, { put: [`/job-status/${name}`, { v: 1, state: "placed", node: p.node, epoch: akv.mod_revision, decision: d.id, reported_at_ms: e.now() }] }]);
       note(d.id);
     });
     if (p.start == null) return; // stays placed
-    if (p.outcome.never_started) { this.later(p.place + 1500, () => { if (alive()) this.stop(name, "not_started", last, null); }); return; }
+    if (p.outcome.never_started) { this.later(p.place + 1500, () => { if (alive()) this.stop(name, "not_started", last, null); }); return; } // the start-by time passes unclaimed
+    if (p.outcome.lost_before_start) { this.later(p.place + 1500, () => { if (alive()) this.stop(name, "unreachable", last, null); }); return; }
     this.later(p.place + p.start, () => {
       if (!alive()) return;
       const obs = { v: 1, run, node: p.node, tenure: 7, assignment: e.rev, status: "running", started_at_ms: e.now(), reported_at_ms: e.now() };
@@ -244,30 +266,31 @@ export class Jobs {
     const job = e.get(`/jobs/${name}`);
     if (!job?.cancel_requested) return;
     const st = this.statusOf(name);
-    if (st.stop_cause) return;
+    if (this.stopping.has(name)) return;
     this.stop(name, "cancel", this.decisions?.get(name), null);
   }
 
-  /** A stop decision, then the end it leads to (the ending follows the stop cause, not the exit alone). */
+  /** An unclaimed run gets the controller's `stop_job` and ends from it; a claimed one ends as its agent reports. */
   stop(name, cause, after, outcome) {
     const e = this.engine;
     const st = this.statusOf(name);
     const kv = e.getKv(`/jobs/${name}`);
-    const reason = ({
-      cancel: "the job was cancelled, so its run is stopped",
-      deadline: "the job's deadline passed before it ended, so its run is stopped",
-      fence: "the run's node was fenced, so the run is stopped",
-      not_started: "the run was assigned but the agent never started it before its start-by time",
-      unreachable: "the node of the run was lost and did not come back within the grace",
-    })[cause];
-    const d = e.decision({
-      actor: "job-controller", action: "stop_job", subject: { kind: "job", name }, reason,
-      cause: cause === "cancel" ? { kind: "desired", key: kv.key, revision: kv.mod_revision } : { kind: "decision", id: after },
-    });
-    e.commit([...d.ops, { put: [`/job-status/${name}`, { ...st, stop_cause: cause, decision: d.id, reported_at_ms: e.now() }] }]);
-    this.decisions.set(name, d.id);
-    const end = cause === "cancel" ? { kind: "cancelled" } : { kind: "failed", cause: outcome?.cause ?? (cause === "fence" ? "fenced" : cause) };
-    this.later(st.state === "pending" ? 0 : 400, () => { if (!this.ended(name)) this.finish(name, end, d.id, cause, outcome); });
+    const started = !!st.started_at_ms;
+    this.stopping.add(name);
+    let id = after;
+    if (!started) { // job_controller.zig `write_stop`
+      const d = e.decision({
+        actor: "job-controller", action: "stop_job", subject: { kind: "job", name },
+        reason: ({ cancel: "the job was cancelled before it was claimed", not_started: "the run did not start within its deadline", unreachable: "the node of the run was lost before it claimed the run" })[cause],
+        cause: { kind: "desired", key: kv.key, revision: kv.mod_revision },
+      });
+      e.commit(d.ops); id = d.id;
+      this.decisions.set(name, id);
+    }
+    // The ending follows the stop cause (job_controller.zig `map_ending`, `end_unstarted`).
+    const failure = ({ deadline: "deadline", not_started: "deadline", fence: "fenced", unreachable: started ? "unreachable" : "not_started" })[cause];
+    const end = cause === "cancel" ? { kind: "cancelled" } : { kind: "failed", cause: failure };
+    this.later(started ? 400 : 0, () => { if (!this.ended(name)) this.finish(name, end, id, cause, outcome); });
   }
 
   exitOf(end) {
@@ -281,17 +304,23 @@ export class Jobs {
     const st = this.statusOf(name);
     const p = this.plans.get(name);
     const node = st.node || null;
+    const started = !!st.started_at_ms;
     let cause = { kind: "decision", id: after };
-    if (node && st.state !== "pending" && stop !== "not_started" && stop !== "unreachable") { // the agent's last report: the evidence the end rests on
+    if (node && started && stop !== "unreachable") { // the agent's last report: the evidence the end rests on
       const rec = { v: 1, run: `${name}-job`, node, tenure: st.tenure || 7, assignment: st.epoch || e.rev, status: "stopped", exit: this.exitOf(end), reported_at_ms: e.now() };
-      if (st.started_at_ms) rec.started_at_ms = st.started_at_ms;
+      rec.started_at_ms = st.started_at_ms;
       if (stop) rec.stop_cause = stop;
       const rev = e.commit([{ put: [`/job-observed/${node}/${name}-job`, rec] }]);
       cause = { kind: "observed", key: `/job-observed/${node}/${name}-job`, revision: rev };
     }
-    const text = end.kind === "exited" ? (end.signal != null ? `exited on signal ${end.signal}` : `exited with code ${end.code}`) : end.kind === "failed" ? `failed: ${end.cause}` : "cancelled";
+    // The reasons are the controller's own (job_controller.zig): unclaimed runs end from their stop.
+    const reason = !started && stop === "cancel" ? "the job was cancelled and the run had not started"
+      : !started && stop === "not_started" ? "the run did not start within its deadline"
+      : !started && stop === "unreachable" ? "the node was lost before it started the run"
+      : stop === "unreachable" ? "the node of the run was lost and did not come back within the grace"
+      : "the run ended as its agent reported";
     const d = e.decision({
-      actor: "job-controller", action: "end_job", subject: { kind: "job", name }, reason: `the run ended as its agent reported: ${text}`,
+      actor: "job-controller", action: "end_job", subject: { kind: "job", name }, reason,
       cause, causeDiagnostic: end.kind === "failed" ? p?.diagnostic : undefined,
     });
     const status = { ...st, state: end.kind, end, ended_at_ms: e.now(), decision: d.id, reported_at_ms: e.now() };

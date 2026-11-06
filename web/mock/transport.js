@@ -41,7 +41,8 @@ export function createMockTransport(engine, faults) {
         return reply(200, engine.jobs.list(q), requestId);
       }
       m = path.match(/^\/v1\/jobs\/([\w-]+)(\/cancel)?$/);
-      if (m && (m[2] ? method === "POST" : true)) {
+      // `/v1/jobs/watch` is the watch stream's route, not a job named "watch"; a job is read with GET only.
+      if (m && m[1] !== "watch" && (m[2] ? method === "POST" : method === "GET")) {
         if (m[2]) { const r = engine.jobs.cancel(m[1], body?.applied_by); return reply(r.status, r.body, requestId); }
         return reply(200, engine.jobs.get(m[1]), requestId);
       }
@@ -191,6 +192,12 @@ export function createMockTransport(engine, faults) {
       const j = engine.get(c.key);
       const text = j ? `job ${j.name} was submitted by ${j.applied_by || "someone"}: deadline ${j.deadline_ms} ms${j.cancel_requested ? ", cancel requested" : ""}` : `submit of ${c.key} (revision ${c.revision})`;
       return { type: "desired", key: c.key, revision: c.revision, text, applied_by: j?.applied_by || null, request_id: null };
+    }
+    if (c.kind === "desired" && (c.key.startsWith("/job-runs/") || c.key.startsWith("/assigned/"))) {
+      // The mock's own wording: src/why.zig's `desired_step` reads any other key as a service.
+      const v = engine.getKv(c.key)?.value;
+      const text = c.key.startsWith("/assigned/") ? `run ${c.key.split("/").pop()} is assigned to ${c.key.split("/")[2]}` : `run ${v?.id ?? c.key.split("/").pop()} of job ${v?.job ?? "?"} is desired`;
+      return { type: "desired", key: c.key, revision: c.revision, text, applied_by: null, request_id: null };
     }
     if (c.kind === "desired") {
       const kv = engine.getKv(c.key);

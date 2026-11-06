@@ -203,12 +203,13 @@ export class Engine {
   // ---- Decisions ---------------------------------------------------------------------------
 
   /** Builds a decision plus the index op that must be committed with it. */
-  decision({ actor, action, subject, reason, cause, causeDiagnostic, locality }) {
+  decision({ actor, action, subject, reason, cause, causeDiagnostic, evidence, locality }) {
     const at = this.now();
     const id = `${String(at).padStart(13, "0")}-rc01-${String(++this.decisionCounter).padStart(4, "0")}`;
     const value = { v: locality ? 3 : 1, id, at_ms: at, actor, action, subject, reason, cause };
     if (locality) { value.locality_bytes = locality.bytes; value.node_store_revision = locality.revision; }
     if (causeDiagnostic) value.cause_diagnostic = causeDiagnostic;
+    if (evidence) value.cause_evidence = { text: evidence };
     return {
       id,
       ops: [

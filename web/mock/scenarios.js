@@ -115,7 +115,7 @@ SCENARIOS.b1 = {
   setup() {},
   steps: [
     { title: "Three agents join", cli: "zcube get nodes", go: "#/nodes", run: e => { for (const n of ["node1", "node2", "node3"]) e.addAgent(n); } },
-    { title: "Submit jobs that end every way", cli: "zcube job submit train.zon  # and sixteen more", go: "#/jobs", run: e => {
+    { title: "Submit jobs that end every way", cli: "zcube job run train-ok --image b3:51aa9c03 --command run --epochs 3  # and seventeen more", go: "#/jobs", run: e => {
       submit(e, "train-ok", { labels: [["team", "ml"], ["kind", "train"]], input: "epochs=3\n", input_env: "TRAIN_INPUT" }, { node: "node1", run: 2500 });
       submit(e, "export-exit3", {}, { node: "node2", run: 2000, outcome: { kind: "exited", code: 3 } });
       submit(e, "probe-sigkill", { labels: [["team", "infra"]] }, { node: "node3", run: 2200, outcome: { kind: "exited", signal: 9 } });
@@ -125,7 +125,8 @@ SCENARIOS.b1 = {
       submit(e, "slow-merge", { deadline_ms: 6000 }, { node: "node1", run: 5000, ...failed("deadline") });
       submit(e, "fenced-write", {}, { node: "node2", run: 4000, ...failed("fenced") });
       submit(e, "lost-node", {}, { node: "node3", run: 4500, ...failed("unreachable") });
-      submit(e, "never-started", {}, { node: "node1", start: 500, outcome: { kind: "failed", cause: "not_started", never_started: true } });
+      submit(e, "never-started", {}, { node: "node1", start: 500, outcome: { kind: "failed", cause: "deadline", never_started: true } }); // placed, never claimed: failed deadline
+      submit(e, "lost-early", {}, { node: "node3", start: 500, outcome: { kind: "failed", cause: "not_started", lost_before_start: true } }); // node lost before any claim: failed not_started
       submit(e, "mystery", {}, { node: "node2", run: 2600, ...failed("unknown") });
       submit(e, "no-room", { deadline_ms: 9000 }, { hold: 9000 });
       submit(e, "run-forever", { labels: [["team", "ml"], ["kind", "serve"]] }, { node: "node1", run: null });

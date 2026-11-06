@@ -15,15 +15,21 @@ const REFRESH_MS = 2000;
 const STATES = ["pending", "placed", "running", "ended", "exited", "failed", "cancelled"]; // `ended`: every terminal state (api.md)
 const filter = { state: "", text: "" };
 
-/** The closed set of ending causes of a failed job, in plain words (docs/keys.md, `/job-status/`). */
+/**
+ * The closed set of ending causes of a failed job, in plain words. The meanings follow
+ * docs/decisions/2026-11-05-b1-owner-answers.md (answer 6) and src/job_controller.zig: `fenced` is
+ * an ending the agent reported (it stopped the run); `unreachable` is inferred (the node stopped
+ * being heard); `not_started` is a node lost before any claim; `deadline` also covers a run that
+ * did not start before its start-by time.
+ */
 export const CAUSE_TEXT = {
   oom: "ran out of memory",
   pid_limit: "hit its process limit",
   start_failed: "could not be started",
-  deadline: "passed its deadline",
-  fenced: "was fenced: another claim replaced it",
-  unreachable: "its node was unreachable",
-  not_started: "was placed but never started",
+  deadline: "passed its deadline, or did not start in time",
+  fenced: "was stopped: its agent reported that it stopped the run",
+  unreachable: "its node stopped being heard",
+  not_started: "its node was lost before the run was claimed",
   unknown: "ended for a reason the agent could not tell",
 };
 
@@ -70,6 +76,7 @@ function makeRow() {
       setPill(state, jobPill(j.state, j.end));
       setText(endEl, j.end ? endShort(j.end) : j.cancel_requested ? "cancel requested" : "");
       el.dataset.end = j.end ? endShort(j.end) : "";
+      el.dataset.state = j.state;
       setText(node, j.node || "–");
       setText(image, j.image, { flash: false });
       setText(labels, j.labels.map(([k, v]) => `${k}=${v}`).join(" ") || "–", { flash: false });
@@ -85,7 +92,7 @@ export function jobs({ client }) {
   const sel = h("select", { id: "f-job-state", "aria-label": "Filter jobs by state", "data-fid": "f-job-state" }, h("option", { value: "" }, "All states"), ...STATES.map(s => h("option", { value: s }, s === "ended" ? "ended (any end)" : s)));
   const box = h("input", { id: "f-jobs", type: "search", class: "filter", placeholder: "Filter by name", "aria-label": "Filter jobs by name", autocomplete: "off", spellcheck: "false", "data-filter": "1" });
   sel.value = filter.state; box.value = filter.text;
-  let data = null, error = null, inflight = false, stopped = false, timer = 0, wantState = filter.state;
+  let data = null, error = null, inflight = false, stopped = false, timer = 0, wantState = filter.state, depth = 0;
 
   const el = h("div", { class: "view" },
     pageHead("Jobs", "A job runs once, on one node, to an end that is recorded."),
@@ -100,15 +107,19 @@ export function jobs({ client }) {
     const all = data?.jobs ?? [];
     const list = all.filter(j => !q || j.name.toLowerCase().includes(q));
     keyed(body, list, j => j.name, makeRow);
-    const more = data?.continue ? "; more are not shown (the filter keeps a subset of each store page)" : "";
+    const more = data?.continue ? "; more pages exist (the filter keeps a subset of each store page)" : "";
     setText(count, data ? `${list.length} of ${plural(all.length, "job")}${more}` : "Loading…", { flash: false });
-    rebuild(slot, JSON.stringify([!!data, all.length, list.length, wantState, error && error.diagnostics]), () => {
+    rebuild(slot, JSON.stringify([!!data, all.length, list.length, wantState, data?.continue, error && error.diagnostics]), () => {
       if (error) return errorBlocks(error);
       if (!data) return [];
+      const next = data.continue ? h("p", { class: "pad" }, h("button", { class: "btn", type: "button", "data-next-page": "1", onclick: () => { depth++; load(); } }, "Show the next page")) : null;
+      if (!list.length && data.continue) { // a filtered store page can be empty while more pages exist (api.md)
+        return [h("p", { class: "muted pad" }, all.length ? "No job on this page matches that filter; more pages exist." : wantState ? `This page holds no ${wantState} job; more pages exist.` : "This page holds no job; more pages exist."), next];
+      }
       if (!all.length) return [wantState
         ? h("p", { class: "muted pad" }, `No job is ${wantState}.`)
-        : emptyState("No jobs yet.", "A job is submitted once and runs to an end.", "zcube job submit job.zon")];
-      return list.length ? [] : [h("p", { class: "muted pad" }, "No job matches that filter.")];
+        : emptyState("No jobs yet.", "A job is submitted once and runs to an end. The command is the brief's (docs/briefs/b1.md); it arrives with the CLI.", "zcube job run NAME --image DIGEST --command ...")];
+      return list.length ? [next] : [h("p", { class: "muted pad" }, "No job matches that filter.")];
     });
   }
 
@@ -116,14 +127,24 @@ export function jobs({ client }) {
     if (inflight || stopped) return;
     inflight = true;
     const asked = filter.state;
-    try { const r = (await client.get(`/v1/jobs?limit=500${asked ? `&state=${asked}` : ""}`)).body; if (asked === filter.state) data = r; error = null; }
-    catch (e) { if (!e.diagnostics) throw e; error = e; }
+    const base = `/v1/jobs?limit=500${asked ? `&state=${asked}` : ""}`;
+    try {
+      const r = (await client.get(base)).body;
+      // Follow `continue` as far as the reader has asked, each page at the first page's revision.
+      for (let i = 0; i < depth && r.continue; i++) {
+        const n = (await client.get(`${base}&at=${r.revision}&continue=${encodeURIComponent(r.continue)}`)).body;
+        r.jobs = r.jobs.concat(n.jobs); r.continue = n.continue;
+      }
+      if (asked === filter.state) data = r;
+      error = null;
+    } catch (e) { if (!e.diagnostics) throw e; error = e; }
     finally { inflight = false; }
+    if (asked !== filter.state) { if (!stopped) return load(); return; } // the filter moved while this load ran
     wantState = filter.state;
     if (!stopped) paint();
   }
   const tick = () => { if (stopped) return; load(); timer = setTimeout(tick, REFRESH_MS); };
-  sel.addEventListener("change", () => { filter.state = sel.value; data = null; paint(); load(); });
+  sel.addEventListener("change", () => { filter.state = sel.value; depth = 0; data = null; paint(); load(); });
   box.addEventListener("input", paint);
   tick();
   return { el, update() { paint(); }, destroy() { stopped = true; clearTimeout(timer); } };
@@ -184,7 +205,7 @@ export function jobDetail({ client }, params) {
     h("div", { class: "cols" },
       h("div", { class: "col" }, h("section", { class: "card", "aria-labelledby": "h-status" }, h("h2", { id: "h-status" }, "Status"), status, diag), chainBox),
       h("div", { class: "col" }, h("section", { class: "card", "aria-labelledby": "h-spec" }, h("h2", { id: "h-spec" }, "Spec"), spec), logs)));
-  const el = h("div", { class: "view" }, head, main, missing);
+  const el = h("div", { class: "view" }, head, missing, main);
 
   function paint() {
     main.hidden = head.querySelector(".page-actions").hidden = !job;
@@ -194,7 +215,7 @@ export function jobDetail({ client }, params) {
         : [h("p", { class: "muted pad" }, "Loading…")]);
       return;
     }
-    missing.replaceChildren();
+    rebuild(missing, JSON.stringify(error?.diagnostics || null), () => (error ? [h("p", { class: "muted pad" }, "The server could not be read just now; what follows may be out of date."), ...errorBlocks(error)] : []));
     const st = job.status;
     rebuild(status, JSON.stringify([job.state, st]), () => dl(statusRows(job.state, st, job.job)));
     rebuild(diag, JSON.stringify(st?.diagnostic || null), () => (st?.diagnostic ? [diagnosticBlock(st.diagnostic)] : []));
