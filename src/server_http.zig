@@ -328,12 +328,19 @@ fn read_body(
     const length = request.head.content_length.?;
     // The agent's summary is the one body larger than the rest (hex of a Bloom filter).
     const agent_path = std.mem.startsWith(u8, parsed.path, "/v1/agent/");
+    // `POST /v1/jobs` is the other: an input escaped by the client can be six times its size.
+    const job_path = std.mem.eql(u8, parsed.method, "POST") and
+        std.mem.eql(u8, parsed.path, "/v1/jobs");
     const limit = if (agent_path)
         agent_api.body_bytes_max(parsed.path)
+    else if (job_path)
+        constants.job_request_bytes_max
     else
         constants.http_body_bytes_max;
     if (length > limit) {
-        const cause = if (limit == constants.http_body_bytes_max)
+        const cause = if (job_path)
+            "the request body is larger than 409600 bytes, the most POST /v1/jobs takes"
+        else if (limit == constants.http_body_bytes_max)
             "the request body is larger than 65536 bytes"
         else
             "the request body is larger than a node summary can be";

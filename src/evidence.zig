@@ -22,6 +22,10 @@ comptime {
     const observed_max = 160 + replica_id_max + constants.node_name_bytes_max;
     assert(service_max <= constants.decision_evidence_bytes_max);
     assert(observed_max <= constants.decision_evidence_bytes_max);
+    // A job's: name, a deadline, applied_by, a request id and 96 bytes of JSON syntax.
+    const job_max = 96 + constants.service_name_bytes_max + 20 + 64 +
+        constants.request_id_bytes_max;
+    assert(job_max <= constants.decision_evidence_bytes_max);
 }
 
 fn render(ctx: *const Context, value: anytype) controller.Error!records.Raw {
@@ -40,6 +44,20 @@ pub fn service(ctx: *const Context, record: *const records.Service) controller.E
         .replicas = record.replicas,
         .applied_by = record.applied_by,
         .request_id = record.request_id,
+    });
+}
+
+/// A job as a submit or a cancel read it: who asked, and under which request.
+pub fn job(
+    ctx: *const Context,
+    record: *const records.Job,
+    request_id: []const u8,
+) controller.Error!records.Raw {
+    return render(ctx, .{
+        .name = record.name,
+        .deadline_ms = record.deadline_ms,
+        .applied_by = record.applied_by,
+        .request_id = request_id,
     });
 }
 

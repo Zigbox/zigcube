@@ -22,6 +22,7 @@ pub const modules = .{
     @import("allocations.zig"),
     @import("api.zig"),
     @import("auditor.zig"),
+    @import("job_api.zig"),
     @import("apply.zig"),
     @import("chunk_summary.zig"),
     @import("node_store.zig"),

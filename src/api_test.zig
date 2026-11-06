@@ -796,3 +796,69 @@ test "a pull retention pass that fails is recorded and does not fail the control
     try testing.expect(!cursor.failing);
     try testing.expectEqual(@as(u64, 1), cursor.dropped);
 }
+
+fn job_json(rig: *Rig, name: []const u8, image: []const u8) ![]const u8 {
+    const submit_by = rig.world.now_ms() + 30_000;
+    return std.fmt.allocPrint(rig.parsed.allocator(),
+        \\{{"name":"{s}","image":"{s}","command":["sh","-c","cat"],"env":[["API_TOKEN","s3cr3t"]],
+    ++
+        \\"deadline_ms":60000,"submit_by_ms":{d},"input":"top secret","input_env":"PAYLOAD",
+    ++
+        \\"labels":[["team","x"]]}}
+    , .{ name, image, submit_by });
+}
+
+fn post_job(rig: *Rig, path: []const u8, body: []const u8) api_mod.Response {
+    return rig.call(.{ .method = "POST", .path = path, .body = body });
+}
+
+test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why" {
+    // Goal: the status table of the b1 brief and the secrecy of env values and the input.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = try job_json(&rig, "nightly", "b3:51aa9c03");
+    const created = post_job(&rig, "/v1/jobs", body);
+    try testing.expectEqual(@as(u16, 201), created.status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", body).status);
+    const other = try job_json(&rig, "nightly", "b3:7c02aaaaaaaa");
+    try rig.refused(post_job(&rig, "/v1/jobs", other), 409, "ZC-E0131");
+    const late = try std.fmt.allocPrint(rig.parsed.allocator(),
+        \\{{"name":"late","image":"b3:51aa9c03","command":["true"],"deadline_ms":1,
+    ++
+        \\"submit_by_ms":1}}
+    , .{});
+    try rig.refused(post_job(&rig, "/v1/jobs", late), 410, "ZC-E0134");
+    const unknown = "{\"name\":\"x\",\"image\":\"i\",\"command\":[\"a\"],\"deadline_ms\":1," ++
+        "\"submit_by_ms\":1,\"surprise\":1}";
+    try rig.refused(post_job(&rig, "/v1/jobs", unknown), 400, "ZC-E0104");
+
+    const got = rig.get("/v1/jobs/nightly", "");
+    try testing.expect(std.mem.indexOf(u8, got.body, "s3cr3t") == null);
+    try testing.expect(std.mem.indexOf(u8, got.body, "top secret") == null);
+    const view = try rig.json(got);
+    const names = field(field(view, "job"), "env_names");
+    try testing.expectEqualStrings("API_TOKEN", names.array.items[0].string);
+    try testing.expectEqualStrings("pending", field(view, "state").string);
+    try rig.refused(rig.get("/v1/jobs/nope", ""), 404, "ZC-E0133");
+
+    const listed = try rig.ok("/v1/jobs", "label=team%3Dx");
+    try testing.expectEqual(@as(usize, 1), field(listed, "jobs").array.items.len);
+    try rig.refused(rig.get("/v1/jobs", "state=bogus"), 400, "ZC-E0104");
+
+    const cancel = post_job(&rig, "/v1/jobs/nightly/cancel", "");
+    try testing.expectEqual(@as(u16, 202), cancel.status);
+    try rig.refused(post_job(&rig, "/v1/jobs/nope/cancel", ""), 404, "ZC-E0133");
+    const why = try rig.ok("/v1/why/job/nightly", "");
+    try testing.expect(why.object.count() > 0);
+}
+
+test "a read-only list shows no job env value and no job input" {
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const created = post_job(&rig, "/v1/jobs", try job_json(&rig, "nightly", "b3:51aa9c03"));
+    try testing.expectEqual(@as(u16, 201), created.status);
+    const listed = rig.get("/v1/list", "prefix=%2Fjob");
+    try testing.expectEqual(@as(u16, 200), listed.status);
+    try testing.expect(std.mem.indexOf(u8, listed.body, "s3cr3t") == null);
+    try testing.expect(std.mem.indexOf(u8, listed.body, "dG9wIHNlY3JldA") == null);
+}
