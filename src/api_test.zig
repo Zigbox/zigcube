@@ -759,6 +759,9 @@ test "the agent publishes the pull records its fetches left, and removes every f
     try files.put_atomic("containers/hello-3/pull.json", "{");
     const stepped = rig.world.agent_step();
     try testing.expect(stepped.failed == null);
+    // The two it dropped are counted and named, for ZC-W0504 (issue #93); the stored one is not.
+    try testing.expectEqual(@as(u32, 2), rig.world.agent.pull_drops);
+    try testing.expect(std.mem.startsWith(u8, rig.world.agent.pull_drop(), "container hello-"));
 
     const ctx = rig.world.controller_context();
     const options: store.ListOptions = .{ .prefix = records.prefix_pulls, .limit = 10 };

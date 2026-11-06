@@ -208,7 +208,23 @@ fn write_pull_record(
         .finished_at_ms = real_ms(swarm.io),
     };
     std.Io.Dir.cwd().createDirPath(swarm.io, std.fs.path.dirname(path).?) catch {}; // Said below.
-    _ = pull_report.write(std.heap.page_allocator, swarm.io, path, record);
+    if (!pull_report.write(std.heap.page_allocator, swarm.io, path, record)) {
+        append_to_log(swarm, "ZC-W0504: the pull record could not be written to pull.json; " ++
+            "its statistics are lost\n");
+    }
+}
+
+/// Adds `line` to the end of `fetch.log` (the fetch's own handle is closed by then). The pull
+/// that follows a failed fetch says its own failures through Zigbox's diagnostics, so this is
+/// for what only the supervisor knows.
+fn append_to_log(swarm: Swarm, line: []const u8) void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = container_file(&path_buffer, swarm, agent_records.file_fetch_log) orelse return;
+    const dir = std.Io.Dir.cwd();
+    const file = dir.createFile(swarm.io, path, .{ .truncate = false }) catch return;
+    defer file.close(swarm.io);
+    const end = file.length(swarm.io) catch return;
+    file.writePositionalAll(swarm.io, line, end) catch {}; // Nowhere else to say it.
 }
 
 /// `<container dir>/fetch.log`, where the fetch's diagnostics go (null: it could not be made).
@@ -246,18 +262,19 @@ fn fetch_swarm(swarm: Swarm, host: zigbox.host.Host) image.Fetched {
         .stderr = sink,
         .pgid = 0,
     }) catch |err| {
-        say_in_log(swarm.io, log, "could not start the fetch: ", @errorName(err));
+        say_in_log(swarm.io, log, "ZC-E0601: could not start the fetch: ", @errorName(err));
         return .absent;
     };
     const deadline_ms = fetch_deadline(swarm);
     const outcome = finished_ok(swarm.io, &child, deadline_ms);
     switch (outcome) {
         .ok => return .in_store,
-        .failed => say_in_log(swarm.io, log, "the fetch did not exit with code 0", ""),
+        .failed => say_in_log(swarm.io, log, "ZC-E0601: the fetch did not exit with code 0; the " ++
+            "registry pull follows", ""),
         .killed => {
             var ms: [16]u8 = undefined;
             const text = std.fmt.bufPrint(&ms, "{d}", .{deadline_ms}) catch "?";
-            say_in_log(swarm.io, log, "the fetch was killed at its deadline, ms: ", text);
+            say_in_log(swarm.io, log, "ZC-E0601: the fetch was killed at its deadline, ms: ", text);
         },
         .outlived_kill => {
             say_in_log(swarm.io, log, "ZC-E0515: a process of the fetch outlived SIGKILL to " ++
@@ -585,6 +602,45 @@ test "the fetch's diagnostics have a log in the container's directory" {
     );
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("ZC-W0601", text);
+}
+
+test "a line appended to the fetch's log follows what the fetch wrote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [768]u8 = undefined;
+    const swarm = try scratch_swarm(&tmp, &buffer);
+    const log = open_log(swarm).?;
+    try log.writeStreamingAll(swarm.io, "fetch said this\n");
+    log.close(swarm.io);
+    append_to_log(swarm, "ZC-W0504: and the supervisor this\n");
+    const text = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "containers/web-0/fetch.log",
+        std.testing.allocator,
+        .limited(256),
+    );
+    defer std.testing.allocator.free(text);
+    const want = "fetch said this\nZC-W0504: and the supervisor this\n";
+    try std.testing.expectEqualStrings(want, text);
+}
+
+test "a pull record that cannot be written is said in fetch.log with ZC-W0504" {
+    // Method: pull.json is a directory, so the rename onto it fails; the pull's statistics are
+    // lost, and the log must say so.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [768]u8 = undefined;
+    const swarm = try scratch_swarm(&tmp, &buffer);
+    try tmp.dir.createDirPath(std.testing.io, "containers/web-0/pull.json");
+    write_pull_record(swarm, "b3:aa", &.{}, 1000);
+    const text = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "containers/web-0/fetch.log",
+        std.testing.allocator,
+        .limited(256),
+    );
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "ZC-W0504: "));
 }
 
 test "the fault file can only shorten the fetch's deadline" {

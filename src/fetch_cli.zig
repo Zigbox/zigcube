@@ -1085,7 +1085,8 @@ fn write_report(
     if (!pull_report.write(gpa, io, parsed.report, record)) note(io, report_failed);
 }
 
-const report_failed = "zcube-agent fetch: the pull report could not be written\n";
+const report_failed = "zcube-agent fetch: ZC-W0504: the pull report could not be written; " ++
+    "its statistics are lost\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.

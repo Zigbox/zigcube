@@ -324,6 +324,11 @@ fn job_deadline(diag: *diag_mod.Diag) void { // agent.zig
     sample(diag, .W0503, &.{cause}, "raise deadline_ms if the job needs the time");
 }
 
+fn pull_record_lost(diag: *diag_mod.Diag) void { // agent.zig
+    const cause = "container web-1: its pull.json is not a pull record";
+    sample(diag, .W0504, &.{cause}, "check the state directory's disk space and permissions");
+}
+
 fn job_end_unmapped(diag: *diag_mod.Diag) void { // job_controller.zig
     diag.raise(.B0004);
     diag.cause("train-7-job reported an exit of kind exited with no code and no signal", .{});
@@ -865,6 +870,7 @@ const cases = [_]Case{
     relayed(.E0522, run_start_record),
     relayed(.W0501, agent_lease),
     relayed(.W0503, job_deadline),
+    relayed(.W0504, pull_record_lost),
     relayed(.E0801, peer_foreign_ca),
     relayed(.E0802, peer_expired),
     relayed(.E0803, peer_wrong_node),

@@ -66,7 +66,7 @@ Each container is a directory `<state>/containers/<replica id>/`:
 | `child.pid` | the supervisor | the command's pid, once it runs |
 | `forced` | a test fault | `oom` or `pid_limit`, before the kill |
 | `fetch.json` | the runtime, when the image must be fetched first | `{digest, argv}`: the `zcube-agent fetch` command the supervisor runs before the command |
-| `fetch.log` | the fetch's stderr, while and after it runs | the text of ZC-W0601 and ZC-E0601, when they are raised |
+| `fetch.log` | the fetch's stderr, while and after it runs | the text of ZC-W0601 and ZC-E0601, when they are raised; the supervisor appends ZC-E0601 for a fetch that failed, was killed at its deadline or did not start, and ZC-W0504 when it cannot write `pull.json` |
 | `run.json` | the supervisor, last | how the command ended; the truth for `list` and `inspect` |
 
 `start` writes the spec and starts `zcube-agent supervise <dir>`, then waits (at most
@@ -170,6 +170,11 @@ fetches an image that is not in its fixtures, rather than refusing it. Before it
 the container's supervisor runs `zcube-agent fetch` for the image (`fetch.json`, above), and the
 replica reports `starting` while that runs. A failed fetch is a start failure with ZC-E0601, the
 text in `fetch.log`.
+
+A `pull.json` the agent cannot publish (unparseable, naming another node or no tree, too big, or
+refused by the server) is dropped, counted, and said once per step on the agent's stderr with
+ZC-W0504, so a missing /pulls record has a line to find. `ops/zigbox-smoke/guest.sh` prints the
+last 2 KB of each agent's `fetch.log` when any stage fails.
 
 `--images-dir DIR` gives the node a chunk store (`dir_images.zig`: `trees/<digest>` lists and
 `chunks/<64 hex>` files, each written whole under a unique temporary name and renamed, each chunk

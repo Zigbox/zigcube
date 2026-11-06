@@ -151,8 +151,12 @@ const Shell = struct {
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
         const refusals = shell.agent.store_refusals;
+        const drops = shell.agent.pull_drops;
         const result = shell.agent.reconcile(&ctx);
         if (shell.agent.store_refusals != refusals) shell.notice_refused_summary();
+        if (shell.agent.pull_drops != drops) {
+            shell.notice_dropped_pull(shell.agent.pull_drops - drops);
+        }
         shell.save_pair(false);
         shell.notice_pair();
         // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
@@ -291,6 +295,17 @@ const Shell = struct {
         const text = "zcube-agent: zcube-server refused the node's image summary (ZC-E0504): " ++
             "{s}; replicas go on, and it will be sent again\n";
         const line = std.fmt.bufPrint(&buffer, text, .{shell.agent.store_refusal()}) catch return;
+        std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
+    }
+
+    /// A pull record was dropped unpublished (ZC-W0504): its statistics are lost, and a smoke
+    /// that waits for it would otherwise wait in silence (issue #93).
+    fn notice_dropped_pull(shell: *Shell, count: u32) void {
+        var buffer: [320]u8 = undefined;
+        const text = "zcube-agent: ZC-W0504: {d} pull record(s) not stored, the last: {s}; " ++
+            "the replicas are not affected\n";
+        const line = std.fmt.bufPrint(&buffer, text, .{ count, shell.agent.pull_drop() }) catch
+            return;
         std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
     }
 

@@ -99,6 +99,7 @@ pub const Code = enum(u8) {
     E0522,
     W0501,
     W0503,
+    W0504,
     E0601,
     W0601,
     W0602,
@@ -1314,6 +1315,26 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .W0504,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a pull record was not stored",
+        .explanation =
+        \\A fetch or a pull on this node finished, but the record of what
+        \\it moved (the bytes by source, which /v1/stats/pull shows) was
+        \\lost. It could not be written to the container's directory, or
+        \\the agent read it and dropped it because it was not a pull
+        \\record for this node, or zcube-server refused it; the cause line
+        \\says which. The image is not affected and the replica goes on;
+        \\only the statistics are missing.
+        \\
+        \\The agent drops a record it cannot store so that one bad file
+        \\never blocks the ones after it. If the cause is a refusal, use
+        \\the agent that came with the server. If it is the state
+        \\directory, check its disk space and permissions.
+        ,
+    },
+    .{
         .code = .E0601,
         .severity = .@"error",
         .blame = .external,
@@ -1804,7 +1825,7 @@ comptime {
     assert(registry.len == fields.len);
     assert(fields.len <= std.math.maxInt(u8));
     assert(prefix.len + tag_bytes <= constants.diag_code_bytes_max);
-    @setEvalBranchQuota(200_000);
+    @setEvalBranchQuota(220_000);
     for (registry, fields, 0..) |item, name, index| {
         assert(@backingInt(item.code) == index);
         assert(std.mem.eql(u8, @tagName(item.code), name));

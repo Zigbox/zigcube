@@ -37,12 +37,24 @@ export XDG_RUNTIME_DIR=/run/user/1000
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 export ZBX_REGISTRY_MIRRORS=mirror.gcr.io
 
+# Every agent's `<container dir>/fetch.log` (the swarm fetch's stderr, and the supervisor's coded
+# lines about it), newest first, each cut to its last 2000 bytes, at most 12 files: a pull that
+# stalls says nothing in the agent's own log (issue #93). Bounded so a failure stays readable.
+dump_fetch_logs() {
+    for f in $(ls -t "$STATE"/containers/*/fetch.log "$B_DIR"/agent/containers/*/fetch.log \
+        2>/dev/null | head -n 12); do
+        echo "--- $f ($(wc -c <"$f") bytes)"
+        tail -c 2000 "$f"
+    done
+}
+
 fail() {
     echo "FAIL: $*"
     for f in "$LOG"/*.log; do
         echo "--- $f"
         tail -n 25 "$f"
     done
+    dump_fetch_logs
     exit 1
 }
 
