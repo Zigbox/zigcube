@@ -184,17 +184,44 @@ pub const Net = struct {
     }
 
     /// One line per phase change; the first progress line is written on the first chunk answer.
-    fn phase(context: *anyopaque, which: fetch_worker.Phase, chunks: u32, lacking: u32) void {
+    fn phase(
+        context: *anyopaque,
+        which: fetch_worker.Phase,
+        chunks: u32,
+        lacking: u32,
+        detail: []const u8,
+    ) void {
         const net = from(context);
-        var buffer: [160]u8 = undefined;
+        var buffer: [200]u8 = undefined;
+        const head = "zcube-agent fetch: ";
         const text = switch (which) {
             .bundle_found => std.fmt.bufPrint(
                 &buffer,
-                "zcube-agent fetch: bundle found: {d} chunks, {d} lacking\n",
+                head ++ "bundle found: {d} chunks, {d} lacking\n",
                 .{ chunks, lacking },
-            ) catch return,
-            .chunks_done => "zcube-agent fetch: chunks done; importing the record\n",
-        };
+            ),
+            .chunks_done => std.fmt.bufPrint(
+                &buffer,
+                head ++ "chunks done; importing the record\n",
+                .{},
+            ),
+            .chunks_failed => std.fmt.bufPrint(
+                &buffer,
+                head ++ "the chunk phase failed: {s}\n",
+                .{detail},
+            ),
+            .chunks_missing => std.fmt.bufPrint(
+                &buffer,
+                head ++ "the store does not hold every chunk after the chunk phase\n",
+                .{},
+            ),
+            .import_failed => std.fmt.bufPrint(
+                &buffer,
+                head ++ "importing the record failed: {s}\n",
+                .{detail},
+            ),
+            .imported => std.fmt.bufPrint(&buffer, head ++ "record imported\n", .{}),
+        } catch return;
         note(net.io, text);
     }
 
