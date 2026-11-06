@@ -534,7 +534,7 @@ pub const Agent = struct {
         assert(fencing.inequality_problem(ttl_ms) == null);
         agent.lease_ttl_ms = ttl_ms;
         agent.sent_ms = sent;
-        agent.renew_at_ms = sent + @divFloor(ttl_ms, 3);
+        agent.renew_at_ms = sent + fencing.renew_after_ms(ttl_ms);
         try agent.persist(ctx);
     }
 
@@ -589,7 +589,7 @@ pub const Agent = struct {
         agent.tenure = parsed.tenure;
         agent.lease_ttl_ms = parsed.ttl_ms;
         agent.sent_ms = parsed.sent_ms;
-        agent.renew_at_ms = parsed.sent_ms + @divFloor(parsed.ttl_ms, 3);
+        agent.renew_at_ms = parsed.sent_ms + fencing.renew_after_ms(parsed.ttl_ms);
     }
 
     /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.

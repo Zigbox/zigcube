@@ -134,6 +134,10 @@ pub const fence_stop_ms: u32 = 2000;
 /// The bound on the difference of two hosts' clock rates, in parts per thousand (1 %).
 pub const clock_skew_per_mille: u32 = 10;
 pub const fence_margin_ms: u32 = 3000;
+/// The least time a lease must leave between its last acknowledged keepalive and the fence
+/// (`ttl - fence_margin`): room for a renewal to be sent, answered and recorded. With less the
+/// agent renews on every pass and still fences (issue #78: `--lease-ttl-ms=3001` never settles).
+pub const fence_window_min_ms: u32 = 500;
 /// How often a fencing agent looks at its containers while it waits for them to stop.
 pub const fence_poll_ms: u32 = 100;
 pub const lost_grace_ms: u32 = 1000;

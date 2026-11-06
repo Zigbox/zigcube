@@ -152,8 +152,8 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
     diag.raise(.E0121);
     switch (problem) {
         .ttl_too_short => diag.cause(
-            "a lease ttl of {d} ms leaves no time before the {d} ms fence margin",
-            .{ ttl, constants.fence_margin_ms },
+            "a lease ttl of {d} ms leaves under {d} ms past the {d} ms fence margin for a renewal",
+            .{ ttl, constants.fence_window_min_ms, constants.fence_margin_ms },
         ),
         .margin_too_small => diag.cause(
             "a lease ttl of {d} ms needs a fence margin of {d} ms; it is {d} ms",

@@ -90,6 +90,8 @@ const cluster_up_ms_min: u64 = 120_000;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
 const steps_per_minute_max: u64 = 200;
+/// How often a node may fence in the healed phase: 240 s long, against about 240 for the bug.
+const fences_after_heal_per_node_max: u32 = 4;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -662,6 +664,8 @@ pub const Cluster = struct {
     stats: Stats,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
+    /// The fences all nodes had made when the heal began.
+    fences_at_heal: u32,
     /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
     /// report names it (the simulation fleet files a failure by its check and this step).
     step: []const u8,
@@ -754,6 +758,7 @@ pub const Cluster = struct {
         c.check_ms = 0;
         c.stats = .{};
         c.fault_totals = null;
+        c.fences_at_heal = 0;
         c.step = "faults";
         c.on_step = null;
         c.liveness = true;
@@ -1931,6 +1936,7 @@ fn track_starved(
 /// Every fault off; the agents come back up as time passes. Ends the fault phase.
 fn heal(c: *Cluster) void {
     c.fault_totals = c.phase_totals();
+    c.fences_at_heal = total_fences(c);
     c.set_store_down(false);
     c.ack_loss.loss_per_mille = 0;
     c.swarm.net = .{};
@@ -2283,6 +2289,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.report.failed) return error.StepFailed;
         c.enter("convergence");
         try converged(c);
+        try fencing_settles(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
@@ -2321,6 +2328,23 @@ fn busiest_node_rate(c: *const Cluster) u64 {
         busiest = @max(busiest, @as(u64, node.all_steps) * 60_000 / node.all_up_ms);
     }
     return busiest;
+}
+
+fn total_fences(c: *const Cluster) u32 {
+    var fences: u32 = 0;
+    for (c.nodes) |node| fences += node.fences;
+    return fences;
+}
+
+/// A healed cluster stops fencing (issue #78): once the faults have ended, a node may still
+/// fence for a lease it lost, and again for one that ran out while its renewal waited out a
+/// back-off, but not once a second for the rest of the run. Each node gets
+/// `fences_after_heal_per_node_max`.
+fn fencing_settles(c: *Cluster) Failure!void {
+    const after = total_fences(c) - c.fences_at_heal;
+    const allowed: u32 = @intCast(c.nodes.len * fences_after_heal_per_node_max);
+    try check(c, after <= allowed, "agents kept fencing after the cluster healed (a lease " ++
+        "renewal that cannot beat its fence)");
 }
 
 /// An agent that never sleeps (a wake time that is always now) passes every other check and
@@ -2428,8 +2452,7 @@ fn print_summary(c: *Cluster) void {
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
         total.parked,    total.delivered_late,   total.partitioned,
     });
-    var fences: u32 = 0;
-    for (c.nodes) |node| fences += node.fences;
+    const fences = total_fences(c);
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
     report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
         "counted otherwise)\n", .{
