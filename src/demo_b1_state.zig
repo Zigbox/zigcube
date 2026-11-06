@@ -27,6 +27,9 @@ pub const job_wait_ms: u32 = 25_000;
 /// A node powered off and its job read `failed`: the lease runs out, the grace passes, and the
 /// controllers and agents take a few of their one-second passes.
 pub const failover_ms: u32 = c1.failover_ms;
+/// How old the last acknowledged keepalive may be when a node's power goes off (the agent's
+/// one-second pass).
+pub const keepalive_slack_ms: u32 = 1_000;
 /// A window in which nothing may change.
 pub const settle_ms: u32 = c1.settle_ms;
 /// The longest the watcher's printed lines may take to arrive.
@@ -40,6 +43,8 @@ pub const Demo = struct {
     postgres: []const u8,
     /// Watcher processes alive, killed by the cleanup if a step failed first.
     watcher: ?std.process.Child = null,
+    /// The largest revision of the jobs the first watcher printed (set by step 1).
+    bookmark: i64 = 0,
 };
 
 // ---- A job, as the server says it ----
@@ -196,13 +201,22 @@ pub fn run_job(
     return host.zcube(args.items);
 }
 
-/// `zcube job get NAME --wait`, shown; the demo fails unless it exits with `code`.
+fn has_ended(want: Want, host: *Host) !bool {
+    const view = (try job_view(host, want.name)) orelse return false;
+    return view.end_kind != null;
+}
+
+/// `zcube job get NAME --wait`, shown; the demo fails unless it exits with `code`. The wait is
+/// bounded by `job_wait_ms` first (the command itself has no bound but the host's timeout), so
+/// `--wait` finds an ended job and returns at once.
 pub fn wait_job(
     host: *Host,
     name: []const u8,
     code: u8,
     comptime meaning: []const u8,
 ) !demo_host.Cli {
+    const want: Want = .{ .name = name, .state = "" };
+    try host.wait_for(want, has_ended, "a job to end", job_wait_ms);
     const cli = try host.zcube(&.{ "job", "get", name, "--wait" });
     try host.check(cli.code == code, "job get {s} --wait exits {d}: " ++ meaning, .{ name, code });
     return cli;

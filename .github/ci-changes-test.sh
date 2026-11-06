@@ -46,7 +46,10 @@ check $PR x "" "src/tidy.zig src/testing/check.zig" TFFFFFFF
 check $PR x "" "src/console_wasm.zig src/web_embed.zig" TFFFFFFF
 # One demo, one smoke, the store suites' own files.
 check $PR x "" "src/demo_c0_steps.zig" TFTFFFFF
-check $PR x "" "src/demo_c1_fleet.zig docs/demos/c1.md" TFFTFFFF
+check $PR x "" "src/demo_c1_fleet.zig docs/demos/c1.md" TFFTTFFF
+check $PR x "" "src/demo_c1_state.zig" TFFTTFFF
+check $PR x "" "src/demo_c0_state.zig" TFTTTFFF
+check $PR x "" "src/demo_c1_partition.zig" TFFTFFFF
 check $PR x "" "src/zigbox_runtime.zig" TFFFFTTF
 check $PR x "" "ops/zigbox-smoke/guest.sh" TFFFFTFF
 check $PR x "" "src/store_faults.zig src/store_failover.zig" TTFFFFFF

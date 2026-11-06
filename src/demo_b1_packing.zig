@@ -54,7 +54,8 @@ pub fn run(demo: *Demo) !void {
     }
     try host.check(waiting.len > 0, "one job is pending", .{});
     const why = try host.zcube(&.{ "why", "job", waiting });
-    const names_shortfall = state.contains(why.out, "no node fits 500m CPU");
+    const names_shortfall = state.contains(why.out, "no node fits 500m CPU and 128 MiB: " ++
+        "2 of 2 nodes lack the room");
     try host.check(why.code == 0 and names_shortfall, "zcube why job {s} names the CPU " ++
         "shortfall", .{waiting});
     var other: []const u8 = "";

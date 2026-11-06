@@ -48,6 +48,9 @@ classify() {
     # The shared driver of both demos.
     src/demo_host.zig) want_all; return ;;
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
+    # demo-b1 imports demo_c1_state.zig, which imports demo_c1_fleet.zig and demo_c0_state.zig.
+    src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; return ;;
+    src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;

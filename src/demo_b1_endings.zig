@@ -28,6 +28,7 @@ pub fn first_three(demo: *Demo) !void {
     try same_name(demo);
     try wait_lines(demo, "watch-1.txt", 3);
     try host.settle("the watcher may print each ending once", state.settle_ms);
+    demo.bookmark = try last_ending_revision(host);
     const seen = try read_file(host, "watch-1.txt");
     try host.check(state.lines_with(seen, "") == 3, "the watcher printed exactly 3 lines", .{});
     for ([_][]const u8{ "exit0  ", "exit3  ", "echoin  " }) |prefix| {
@@ -83,11 +84,22 @@ fn same_name(demo: *Demo) !void {
         after.revision == before.revision, "the job exit0 did not change", .{});
 }
 
+/// The largest revision among the three jobs of step 1: where the watcher's own bookmark stands.
+fn last_ending_revision(host: *Host) !i64 {
+    var largest: i64 = 0;
+    for ([_][]const u8{ "exit0", "exit3", "echoin" }) |name| {
+        largest = @max(largest, (try state.need_job(host, name)).revision);
+    }
+    assert(largest > 0);
+    return largest;
+}
+
 /// The last three end while no watcher runs; one started from the last bookmark sees them.
 pub fn last_three(demo: *Demo) !void {
     const host = demo.host;
     host.section("2. three more end while the watcher is dead; it restarts from its last revision");
-    const bookmark = try state.head_revision(host);
+    const bookmark = demo.bookmark;
+    assert(bookmark > 0);
     host.say("  the watcher's last revision is {d}", .{bookmark});
     try ends_oom(demo);
     try ends_deadline(demo);

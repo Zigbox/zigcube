@@ -50,27 +50,47 @@ fn node_ready(want: Ready, host: *Host) !bool {
 pub fn power_off(demo: *Demo) !void {
     const host = demo.host;
     host.section("4. power off the node under a running job: failed, not started elsewhere");
-    _ = try state.run_job(host, "doomed", &.{}, "sleep 300");
+    const mark = try host.path_in_work("doomed-starts");
+    const script = try std.fmt.allocPrint(host.arena(), "echo start >> {s}; sleep 300", .{mark});
+    _ = try state.run_job(host, "doomed", &.{}, script);
     try state.wait_state(host, "doomed", "running", state.job_wait_ms);
     const index = try state.node_index(host, try state.need_job(host, "doomed"));
     const other = 1 - index;
     const name = fleet_mod.names[index];
     host.say("  # power off {s}: kill -9 of its agent, then of every supervisor's group", .{name});
+    const off_ms = host.now_ms();
     try demo.fleet.power_off(index);
     try state.wait_state(host, "doomed", "failed", state.failover_ms + state.job_wait_ms);
+    const failed_after: u64 = host.now_ms() - off_ms;
     const cli = try state.wait_job(host, "doomed", 11, "failed");
     try host.check(state.contains(cli.out, "end: failed (unreachable)"), "doomed failed: " ++
-        "unreachable, after the lease ran out and the grace passed", .{});
+        "unreachable", .{});
+    // The server's expiry is at or after the last acknowledged keepalive's receipt plus the
+    // ttl, and that keepalive is at most one pass old when the power goes off. The job is failed
+    // at the expiry (`lost_grace_ms` only holds back unstarted claims).
+    const floor: u64 = state.ttl_ms - state.keepalive_slack_ms;
+    try host.check(failed_after + state.c1.tolerance_ms >= floor, "it was read failed {d} ms " ++
+        "after the power-off (not before the lease ran out: at least {d} ms)", .{
+        failed_after, floor,
+    });
     const view = try state.need_job(host, "doomed");
     try host.check(view.retries == 0, "its retries are 0", .{});
     try host.settle("the job must not be started on the other node", state.settle_ms);
     try host.check(!(try state.runs_on(demo, other, "doomed-job")), "doomed-job is not " ++
         "running on {s}", .{fleet_mod.names[other]});
-    try host.check(std.mem.eql(u8, (try state.need_job(host, "doomed")).state, "failed"), "" ++
-        "the job stays failed", .{});
+    const starts = std.Io.Dir.cwd().readFileAlloc(host.io, mark, host.arena(), .limited(4096));
+    try host.check(state.lines_with(starts catch "", "start") == 1, "the command started " ++
+        "once, never on the other node (its marker file has one line)", .{});
+    const after = try state.need_job(host, "doomed");
+    const still = after.node != null and std.mem.eql(u8, after.node.?, name);
+    try host.check(std.mem.eql(u8, after.state, "failed") and still, "the job stays failed, " ++
+        "on {s}", .{name});
     const why = try host.zcube(&.{ "why", "job", "doomed" });
     try host.check(why.code == 0 and state.contains(why.out, "the node of the run was lost"), "" ++
         "zcube why job doomed names the lost node", .{});
+    const rows = (try state.c1.node_rows(host)) orelse return host.fail("no node list", .{});
+    const lost = state.c1.find_node(rows, name) orelse return host.fail("{s} unlisted", .{name});
+    try host.check(!lost.is_ready(), "{s} is not ready before its agent is back", .{name});
     try demo.fleet.start_agent(index);
     const ready: Ready = .{ .index = index };
     try host.wait_for(ready, node_ready, "the powered-off node to rejoin", state.start_wait_ms);
