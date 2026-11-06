@@ -1,0 +1,5 @@
+warning[ZC-W0504]: a pull record was not stored
+  cause  the pull record could not be written to pull.json: NoSpaceLeft
+  fix    check the state directory's disk space and permissions
+  more   zcube explain W0504 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0504.html

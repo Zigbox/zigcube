@@ -37,12 +37,30 @@ export XDG_RUNTIME_DIR=/run/user/1000
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 export ZBX_REGISTRY_MIRRORS=mirror.gcr.io
 
+# Every agent's `<container dir>/fetch.log` (the swarm fetch's stderr, and the supervisor's coded
+# lines about it), newest first, each cut to its last 2000 bytes, at most 12 files: a pull that
+# stalls says nothing in the agent's own log (issue #93). Bounded so a failure stays readable.
+dump_fetch_logs() {
+    for f in $(ls -t "$STATE"/containers/*/fetch.log "$B_DIR"/agent/containers/*/fetch.log \
+        2>/dev/null | head -n 12); do
+        echo "--- $f ($(wc -c <"$f") bytes)"
+        tail -c 2000 "$f"
+    done
+    # A container directory without a fetch.log: its fetch never ran. A fetch still running
+    # with nothing written is a stall.
+    echo "--- container dirs"
+    ls -d "$STATE"/containers/*/ "$B_DIR"/agent/containers/*/ 2>/dev/null
+    echo "--- running fetches"
+    pgrep -af 'zcube-agent fetch' || echo "(none)"
+}
+
 fail() {
     echo "FAIL: $*"
     for f in "$LOG"/*.log; do
         echo "--- $f"
         tail -n 25 "$f"
     done
+    dump_fetch_logs
     exit 1
 }
 
@@ -398,7 +416,9 @@ stage_peers_fallback() {
     [ "$PEER" -eq 0 ] || fail "mcached: $PEER peer bytes, but no peer has the image"
     log=$(fetch_log_of mcached)
     [ -n "$log" ] && [ -s "$log" ] || fail "mcached: fetch.log is missing or empty ($log)"
-    grep -q 'ZC-E0601' "$log" || fail "mcached: fetch.log does not say ZC-E0601 ($log)"
+    # The fetch's own rendered diagnostic: the supervisor's ZC-W0603 line must not satisfy this.
+    grep -q 'error\[ZC-E0601\]' "$log" ||
+        fail "mcached: fetch.log has no ZC-E0601 from the fetch itself ($log)"
     # A holds no memcached, so it refuses the bundle request (404) and the fetch says so.
     grep -q 'answered the bundle request' "$log" ||
         fail "mcached: fetch.log does not name the peer that refused the bundle ($log)"

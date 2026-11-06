@@ -99,9 +99,11 @@ pub const Code = enum(u8) {
     E0522,
     W0501,
     W0503,
+    W0504,
     E0601,
     W0601,
     W0602,
+    W0603,
     E0801,
     E0802,
     E0803,
@@ -1314,6 +1316,26 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .W0504,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a pull record was not stored",
+        .explanation =
+        \\A fetch or a pull on this node finished, but the record of what
+        \\it moved (the bytes by source, which /v1/stats/pull shows) was
+        \\lost. It could not be written to the container's directory, or
+        \\the agent read it and dropped it because it was not a pull
+        \\record for this node, or zcube-server refused it; the cause line
+        \\says which. The image is not affected and the replica goes on;
+        \\only the statistics are missing.
+        \\
+        \\The agent drops a record it cannot store so that one bad file
+        \\never blocks the ones after it. If the cause is a refusal, use
+        \\the agent that came with the server. If it is the state
+        \\directory, check its disk space and permissions.
+        ,
+    },
+    .{
         .code = .E0601,
         .severity = .@"error",
         .blame = .external,
@@ -1356,6 +1378,25 @@ pub const registry = [_]Entry{
         \\The image is not affected: a tree is used only when its digest matches.
         \\No action is needed. If it repeats, check the peer node, whose store may
         \\be damaged or running a different build.
+        ,
+    },
+    .{
+        .code = .W0603,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "the swarm fetch ended without the tree",
+        .explanation =
+        \\The supervisor of a replica tried to get the image's chunk tree from peers
+        \\first, and that fetch ended without it: it did not start, it exited with a
+        \\failure, or it was killed at its deadline. The cause line says which.
+        \\The registry pull follows, so the replica can still start; this line
+        \\only explains why the peers did not supply the tree.
+        \\
+        \\The fetch's own diagnostic, in the same fetch.log, names the real
+        \\reason when it had one (ZC-E0601 for a tree no peer could give, or the
+        \\code of this node's disk or memory failing). If the replica did not
+        \\start, the pull's own diagnostic follows it. If it repeats on every
+        \\start, check the peers and the network between them.
         ,
     },
     .{

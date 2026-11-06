@@ -30,6 +30,7 @@ test {
     _ = @import("sim_fleet_github.zig");
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
+    _ = @import("fake_supervisor.zig");
     _ = @import("fake_runtime_test.zig");
     _ = @import("zigbox_map.zig");
     _ = @import("zigbox_image.zig");
@@ -67,6 +68,9 @@ test {
     _ = @import("cli_service.zig");
     _ = @import("cli_view.zig");
     _ = @import("cli_golden.zig");
+}
+
+test {
     _ = @import("cli_test.zig");
     _ = @import("tidy.zig");
 }

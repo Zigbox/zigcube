@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+warning[ZC-W0504]: a pull record was not stored
+  cause  the pull record could not be written to pull.json: NoSpaceLeft
+  reqid  r-0000001
+  fix    check the state directory's disk space and permissions
+  more   zcube explain W0504
+  docs   https://zigbox.github.io/zigcube/errors/W0504.html

@@ -1,0 +1,5 @@
+warning[ZC-W0603]: the swarm fetch ended without the tree
+  cause  the fetch was killed at its deadline, ms: 1800000
+  fix    if it repeats on every start, check the peers and the network
+  more   zcube explain W0603 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0603.html

@@ -1082,10 +1082,16 @@ fn write_report(
         .finished_at_ms = real_ms(io),
         .bad_peers = bad[0..bad_count],
     };
-    if (!pull_report.write(gpa, io, parsed.report, record)) note(io, report_failed);
+    pull_report.write(gpa, io, parsed.report, record) catch |err| {
+        var buffer: [192]u8 = undefined;
+        const text = "zcube-agent fetch: ZC-W0504: the pull report could not be written: {s}; " ++
+            "its statistics are lost\n";
+        note(io, std.fmt.bufPrint(&buffer, text, .{@errorName(err)}) catch report_failed);
+    };
 }
 
-const report_failed = "zcube-agent fetch: the pull report could not be written\n";
+const report_failed = "zcube-agent fetch: ZC-W0504: the pull report could not be written; " ++
+    "its statistics are lost\n";
 
 /// ZC-E0601 for a tree no source could give in time (exit 3, external); this node's own memory
 /// or disk failing is exit 2, with the code of the one that ran out.
