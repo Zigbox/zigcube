@@ -629,9 +629,14 @@ const Backend = struct {
     runtime: runtime_mod.Runtime,
     pair_state: *@import("fake_files.zig").DirState,
     which: union(enum) { fake: *fake_runtime.FakeRuntime, zigbox: *ZigboxBackend },
+    /// The server's `HOST:PORT` the fake runtime's fetch borrows (`fetch_options`); owned here,
+    /// freed by `stop`. Empty when none was allocated.
+    fetch_server: []const u8 = &.{},
 
     const ZigboxBackend = struct {
         host_real: zigbox.host_real.HostReal,
+        /// The server's `HOST:PORT`, which `runtime.fetch` borrows.
+        server_text: [64]u8,
         runtime: zigbox_runtime.ZigboxRuntime,
         images: [constants.fixture_images_max]zigbox_runtime.Image,
     };
@@ -644,39 +649,57 @@ const Backend = struct {
         exe: []const u8,
         diag: *Diag,
     ) error{StartFailed}!void {
-        const gpa = init.gpa;
         switch (config.runtime) {
-            .fake => {
-                const fake = gpa.create(fake_runtime.FakeRuntime) catch return error.StartFailed;
-                errdefer gpa.destroy(fake);
-                fake.init(init.io, real.clock(), .{
-                    .gpa = gpa,
-                    .state_dir = config.state_dir,
-                    .supervisor_exe = exe,
-                    .fixtures = config.images,
-                    .fetch = try fetch_options(gpa, config),
-                }, diag) catch return error.StartFailed;
-                self.* = .{
-                    .runtime = fake.interface(),
-                    .pair_state = &fake.state,
-                    .which = .{ .fake = fake },
-                };
-            },
+            .fake => try self.start_fake(init.io, init.gpa, real, config, exe, diag),
             .zigbox => try self.start_zigbox(init, config, exe, diag),
         }
     }
 
-    /// How the fake runtime fetches an image it lacks, when `--registry` is given. Allocated once
-    /// at startup and kept for the life of the process.
-    fn fetch_options(
+    fn start_fake(
+        self: *Backend,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        real: *clock_mod.RealClock,
+        config: config_mod.Config,
+        exe: []const u8,
+        diag: *Diag,
+    ) error{StartFailed}!void {
+        const fake = gpa.create(fake_runtime.FakeRuntime) catch return error.StartFailed;
+        errdefer gpa.destroy(fake);
+        const server = try fetch_server_text(gpa, config);
+        errdefer gpa.free(server);
+        fake.init(io, real.clock(), .{
+            .gpa = gpa,
+            .state_dir = config.state_dir,
+            .supervisor_exe = exe,
+            .fixtures = config.images,
+            .fetch = fetch_options(config, server),
+        }, diag) catch return error.StartFailed;
+        self.* = .{
+            .runtime = fake.interface(),
+            .pair_state = &fake.state,
+            .which = .{ .fake = fake },
+            .fetch_server = server,
+        };
+    }
+
+    /// The server's `HOST:PORT` for the fake runtime's fetch; empty (and not allocated) without
+    /// `--registry`. The caller frees it with `gpa` once the runtime is gone.
+    fn fetch_server_text(
         gpa: std.mem.Allocator,
         config: config_mod.Config,
-    ) error{StartFailed}!?fake_runtime.Fetch {
-        const registry = config.registry orelse return null;
+    ) error{StartFailed}![]const u8 {
+        if (config.registry == null) return &.{};
         var text: [64]u8 = undefined;
         var writer = std.Io.Writer.fixed(&text);
         writer.print("{f}", .{config.server}) catch return error.StartFailed;
-        const server = gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
+        return gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
+    }
+
+    /// How the fake runtime fetches an image it lacks, when `--registry` is given. Borrows
+    /// `server` (from `fetch_server_text`) and the config's strings.
+    fn fetch_options(config: config_mod.Config, server: []const u8) ?fake_runtime.Fetch {
+        const registry = config.registry orelse return null;
         return .{
             .node = config.node,
             .images_dir = config.images_dir.?,
@@ -708,10 +731,9 @@ const Backend = struct {
         }
         // The peers are read from the server by the supervisor's `fetch`; a Zigbox node keeps no
         // registry of its own (an image's reference is pulled by Zigbox).
-        var server_text: [64]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&server_text);
+        var writer = std.Io.Writer.fixed(&box.server_text);
         writer.print("{f}", .{config.server}) catch return error.StartFailed;
-        const server = gpa.dupe(u8, writer.buffered()) catch return error.StartFailed;
+        const server = writer.buffered();
         box.runtime.init(init.io, box.host_real.interface(), .{
             .gpa = gpa,
             .state_dir = config.state_dir,
@@ -738,6 +760,7 @@ const Backend = struct {
             .fake => |fake| {
                 fake.deinit();
                 gpa.destroy(fake);
+                gpa.free(self.fetch_server);
             },
             .zigbox => |box| {
                 box.runtime.deinit();
@@ -822,4 +845,41 @@ test "the dropped pull record line names the count, the container and the server
     // A reason too long for the line is no line, never a crash.
     var small: [16]u8 = undefined;
     try std.testing.expect(dropped_pull_line(&small, 1, "x") == null);
+}
+
+test "stopping a fake backend started with a registry frees what the start allocated" {
+    // Goal: `--registry` makes the start allocate the server text for the fetch; `stop` owns and
+    // frees it (a 14-byte leak the safe allocator reported at every agent exit). Method: start
+    // and stop a fake backend under the leak-checking test allocator.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const path_length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const config: config_mod.Config = .{
+        .runtime = .fake,
+        .pulls = &.{},
+        .node = "n1",
+        .server = try std.Io.net.IpAddress.parse("127.0.0.1", 4000),
+        .state_dir = path_buffer[0..path_length],
+        .images = &.{},
+        .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+        .address = "",
+        .verbose = false,
+        .images_dir = "/images",
+        .registry = "127.0.0.1:5000",
+    };
+    var real: clock_mod.RealClock = .{ .io = std.testing.io };
+    var diag: Diag = undefined;
+    diag.reset();
+    var backend: Backend = undefined;
+    try backend.start_fake(
+        std.testing.io,
+        std.testing.allocator,
+        &real,
+        config,
+        "/zcube-agent",
+        &diag,
+    );
+    try std.testing.expectEqualStrings("127.0.0.1:4000", backend.fetch_server);
+    backend.stop(std.testing.allocator);
 }
