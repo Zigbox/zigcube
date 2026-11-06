@@ -69,6 +69,14 @@ pub fn check_dir(
     }
 }
 
+/// What `read_bounded` found.
+pub const Found = union(enum) {
+    absent,
+    /// The file fills the whole buffer, so it may be longer than the caller accepts.
+    too_long,
+    bytes: []u8,
+};
+
 /// The file's bytes in `buffer`, null if there is no such file. A file that does not fit is
 /// refused (it is not ours). `guard` says which owner and mode checks apply.
 pub fn read(
@@ -80,10 +88,28 @@ pub fn read(
     buffer: []u8,
     diag: *Diag,
 ) Error!?[]u8 {
+    switch (try read_bounded(io, dir, where, name, guard, buffer, diag)) {
+        .absent => return null,
+        .too_long => return unusable(diag, where, name, "read", "it is too long"),
+        .bytes => |bytes| return bytes,
+    }
+}
+
+/// `read`, but a file that does not fit is reported as `.too_long` and not raised, for a caller
+/// that replaces a file it does not recognise. The owner and mode checks still raise.
+pub fn read_bounded(
+    io: std.Io,
+    dir: Dir,
+    where: []const u8,
+    name: []const u8,
+    guard: Guard,
+    buffer: []u8,
+    diag: *Diag,
+) Error!Found {
     assert(buffer.len > 0);
     assert(buffer.len <= constants.peer_file_bytes_max + 1);
     const file = dir.openFile(io, name, .{}) catch |err| {
-        if (err == error.FileNotFound) return null;
+        if (err == error.FileNotFound) return .absent;
         return unusable(diag, where, name, "read", @errorName(err));
     };
     defer file.close(io);
@@ -102,8 +128,8 @@ pub fn read(
     const length = file.readPositionalAll(io, buffer, 0) catch |err| {
         return unusable(diag, where, name, "read", @errorName(err));
     };
-    if (length == buffer.len) return unusable(diag, where, name, "read", "it is too long");
-    return buffer[0..length];
+    if (length == buffer.len) return .too_long;
+    return .{ .bytes = buffer[0..length] };
 }
 
 /// A secret seed from `name`: 64 hex digits and a newline. Null if the file is absent.

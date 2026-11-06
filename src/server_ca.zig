@@ -127,7 +127,10 @@ fn ensure_certificate(
     var name_buffer: [key_name_bytes_max]u8 = undefined;
     const name = cert_name_for(key_name, &name_buffer);
     var text: [pem_bytes_max]u8 = undefined;
-    if (try files.read(io, dir, path, name, .secret, &text, diag)) |existing| {
+    // A file too long for a certificate of ours is not ours: it is replaced, like any other text.
+    const found = try files.read_bounded(io, dir, path, name, .secret, &text, diag);
+    if (found == .bytes) {
+        const existing = found.bytes;
         var der_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
         if (pem_decode(existing, &der_buffer)) |bytes| {
             // Judged a month ahead, so a certificate near its end is made again while services
@@ -573,3 +576,28 @@ const FixedClock = struct {
         return 1_000_000;
     }
 };
+
+test "a ca.crt one byte over the longest PEM is replaced, not fatal" {
+    // Goal: a file too long to be ours does not stop the server. Method: open once to make the
+    // file, overwrite it with `pem_bytes_max` bytes (the smallest size `read` calls too long),
+    // reopen and find the first file's bytes again.
+    const io = std.testing.io;
+    var dir = try TestDir.make(io);
+    defer dir.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    try open_test(&dir, &ca, .{ .quiet = true }, &diag);
+    var text: [pem_bytes_max]u8 = undefined;
+    const first = try dir.tmp.dir.readFile(io, "ca.crt", &text);
+    var first_copy: [pem_bytes_max]u8 = undefined;
+    @memcpy(first_copy[0..first.len], first);
+    const long: [pem_bytes_max]u8 = @splat('A');
+    try dir.tmp.dir.writeFile(io, .{ .sub_path = "ca.crt", .data = &long });
+    try dir.tmp.dir.setFilePermissions(io, "ca.crt", .fromMode(0o600), .{});
+    var again: peer_ca.Ca = undefined;
+    try open_test(&dir, &again, .{ .quiet = true, .first_start = false }, &diag);
+    try std.testing.expect(diag.code == null);
+    const replaced = try dir.tmp.dir.readFile(io, "ca.crt", &text);
+    try std.testing.expectEqualSlices(u8, first_copy[0..first.len], replaced);
+}
