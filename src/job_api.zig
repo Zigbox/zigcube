@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
@@ -234,12 +235,20 @@ fn validate_times(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     }
 }
 
+/// `GET /v1/jobs/watch` takes the place of a job of this name, so no job has it.
+pub const reserved_name = "watch";
+
 /// The checks that need no store. A job that passes them is one `create` can try to admit.
 pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     if (records.name_problem(input.name, constants.service_name_bytes_max) != null) {
         const problem = "must be 1 to {d} lowercase letters, digits or '-' (none at either end)";
         return refuse(ctx, "name", problem, .{
             constants.service_name_bytes_max,
+        });
+    }
+    if (std.mem.eql(u8, input.name, reserved_name)) {
+        return refuse(ctx, "name", "'{s}' is the route of the jobs watch; choose another", .{
+            reserved_name,
         });
     }
     if (input.image.len == 0 or input.image.len > constants.image_digest_bytes_max) {
@@ -645,6 +654,8 @@ pub const Row = struct {
     deadline_ms: u64,
     cancel_requested: bool,
     end: ?records.JobEnd = null,
+    /// The placement epoch the run was claimed under: with `name`, what identifies an ending.
+    epoch: ?u64 = null,
 };
 
 pub const Listing = struct {
@@ -654,7 +665,7 @@ pub const Listing = struct {
     continue_after: ?[]const u8,
 };
 
-fn label_matches(labels: []const records.Pair, wanted: []const u8) bool {
+pub fn label_matches(labels: []const records.Pair, wanted: []const u8) bool {
     const split = std.mem.indexOfScalar(u8, wanted, '=');
     const key = if (split) |at| wanted[0..at] else wanted;
     for (labels) |pair| {
@@ -700,6 +711,7 @@ pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
             .deadline_ms = job.deadline_ms,
             .cancel_requested = job.cancel_requested != null,
             .end = if (status) |known| known.end else null,
+            .epoch = if (status) |known| known.epoch else null,
         }) catch return @import("store_failures.zig").no_memory(ctx.diag);
     }
     return .{
@@ -707,6 +719,55 @@ pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
         .rows = rows.items,
         .continue_after = page.continue_after,
     };
+}
+
+// ---- Watch -------------------------------------------------------------------------------------
+
+/// One change of a job's status, as `GET /v1/jobs/watch` reports it.
+pub const WatchEvent = struct {
+    /// "put" or "delete".
+    type: []const u8,
+    name: []const u8,
+    /// The store revision of the change.
+    revision: store.Revision,
+    /// Absent on a delete.
+    status: ?records.JobStatus = null,
+};
+
+/// The `/job-status/` events among `events`, decoded. With `label`, a change is kept only if the
+/// job exists now and carries it: a deleted job, and the deletion of a status, match no label.
+/// A status that cannot be decoded is an error, never skipped (a client would miss an ending).
+pub fn watch_events(
+    ctx: *const Context,
+    events: []const store.Event,
+    label: ?[]const u8,
+) Error![]const WatchEvent {
+    var found: std.ArrayList(WatchEvent) = .empty;
+    for (events) |event| {
+        if (!std.mem.startsWith(u8, event.kv.key, records.prefix_job_status)) continue;
+        const name = event.kv.key[records.prefix_job_status.len..];
+        if (label) |wanted| {
+            if (event.kind == .delete) continue;
+            const key = records.job_key(name);
+            const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+            const kv = got.kv orelse continue;
+            const job = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+            if (!label_matches(job.labels, wanted)) continue;
+        }
+        const status: ?records.JobStatus = switch (event.kind) {
+            .put => try records.read(records.JobStatus, ctx.arena, event.kv, ctx.diag),
+            .delete => null,
+        };
+        if (c1_teeth.job_gap and status != null and records.job_state_terminal(status.?.state) and
+            event.kv.mod_revision % 2 == 0) continue;
+        found.append(ctx.arena, .{
+            .type = @tagName(event.kind),
+            .name = name,
+            .revision = event.kv.mod_revision,
+            .status = status,
+        }) catch return @import("store_failures.zig").no_memory(ctx.diag);
+    }
+    return found.items;
 }
 
 // ---- Cancel ------------------------------------------------------------------------------------

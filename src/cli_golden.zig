@@ -792,6 +792,13 @@ fn relayed(code: codes.Code, build: Builder) Case {
     return .{ .code = code, .args = get_service, .script = .{ .diagnostic = build } };
 }
 
+/// A diagnostic the server sends, answered to the command that would meet it.
+fn relayed_to(code: codes.Code, args: []const []const u8, build: Builder) Case {
+    return .{ .code = code, .args = args, .script = .{ .diagnostic = build } };
+}
+
+const job_run = [_][]const u8{ "job", "run", "x", "--image", "b3:51aa9c03", "--command", "true" };
+
 /// A condition of the command line itself, run for real against a server that is not there.
 fn raised(code: codes.Code, args: []const []const u8) Case {
     return .{ .code = code, .args = args, .script = .closed_port };
@@ -827,11 +834,11 @@ const cases = [_]Case{
     with_flags(raised(.E0122, &.{ "local", "up" }), .{ .local = .no_executables }),
     with_flags(raised(.E0123, &.{ "local", "up" }), .{ .local = .dying_executables }),
     with_flags(raised(.E0124, &.{ "local", "up" }), .{ .local = .busy }),
-    relayed(.E0130, job_invalid),
-    relayed(.E0131, job_differs),
-    relayed(.E0132, job_too_many),
-    relayed(.E0133, job_unknown),
-    relayed(.E0134, job_late),
+    relayed_to(.E0130, &job_run, job_invalid),
+    relayed_to(.E0131, &job_run, job_differs),
+    relayed_to(.E0132, &job_run, job_too_many),
+    relayed_to(.E0133, &.{ "job", "get", "x" }, job_unknown),
+    relayed_to(.E0134, &job_run, job_late),
     relayed(.E0201, store_down),
     relayed(.E0202, store_failed),
     relayed(.E0203, compacted),
@@ -997,7 +1004,15 @@ fn diagnostic_reply(arena: Allocator, build: *const fn (*diag_mod.Diag) void) []
         .external => 502,
         .internal => 500,
     };
-    return http(arena, .{ .status = status, .body = body });
+    // The statuses docs/api.md gives the job conflicts.
+    const sent: u16 = switch (diag.code.?) {
+        .E0131 => 409,
+        .E0132 => 429,
+        .E0133 => 404,
+        .E0134 => 410,
+        else => status,
+    };
+    return http(arena, .{ .status = sent, .body = body });
 }
 
 fn exchange(
@@ -1069,12 +1084,15 @@ const Directory = struct {
 
 fn run_case(arena: Allocator, case: *const Case, style: Style, state_root: []const u8) !Output {
     var args: std.ArrayList([]const u8) = .empty;
-    try args.appendSlice(arena, case.args);
+    // `job run ... --command WORD...` takes the rest of the line: the style's flags go first.
+    const flags_first = std.mem.eql(u8, case.args[0], "job");
+    if (!flags_first) try args.appendSlice(arena, case.args);
     switch (style) {
         .text => {},
         .verbose => try args.append(arena, "-v"),
         .json => try args.appendSlice(arena, &.{ "--output", "json" }),
     }
+    if (flags_first) try args.appendSlice(arena, case.args);
     var environ = std.process.Environ.Map.init(arena);
     try environ.put("USER", "tester");
     if (case.flags.missing_state) {

@@ -104,12 +104,18 @@ const World = struct {
     stdin_text: []const u8 = "",
     stdin_terminal: bool = false,
     reply_timeout_ms: u32 = constants.cli_reply_timeout_ms,
+    job_poll_ms: u32 = 25,
+    job_watch_hold_ms: u32 = 200,
+    job_rounds_max: ?u32 = null,
 
     fn start(world: *World) !void {
         // `world` is `undefined` before this: the defaults of the fields are set here.
         world.stdin_text = "";
         world.stdin_terminal = false;
         world.reply_timeout_ms = constants.cli_reply_timeout_ms;
+        world.job_poll_ms = 25;
+        world.job_watch_hold_ms = 200;
+        world.job_rounds_max = null;
         world.io = world.test_io.start();
         world.tmp = testing.tmpDir(.{});
         world.arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -166,6 +172,9 @@ const World = struct {
             .version = "0.0.0-test",
             .deterministic_ids = true,
             .reply_timeout_ms = world.reply_timeout_ms,
+            .job_poll_ms = world.job_poll_ms,
+            .job_watch_hold_ms = world.job_watch_hold_ms,
+            .job_rounds_max = world.job_rounds_max,
         };
         return cli.run(&env, args);
     }
@@ -787,4 +796,59 @@ fn put_pull(world: *World, node: []const u8, tree: []const u8, at_ms: u64, peer:
     const op: store_mod.Op = .{ .put = .{ .key = key.slice(), .value = value } };
     const handle = world.server.backend.handle();
     _ = try writers.txn(handle, .{ .agent = node }, .{ .on_success = &.{op} }, &diag);
+}
+
+test "job run, get --wait, cancel, list and watch against a live server, and no secret is printed" {
+    // Goal: B1 slice 7 by hand, in a test. Method: submit a job with an env value and an input,
+    // cancel it (the job controller ends a job that never ran as cancelled), wait for it (exit
+    // 12), list it, watch from the start (one ending line); every output is searched for the
+    // secrets.
+    var world: World = undefined;
+    try world.start();
+    defer world.stop();
+    const input = try world.file("data.txt", "input-secret-text");
+    const run_args = [_][]const u8{
+        "job",   "run",                    "etl",          "--image",   "b3:51aa9c03",
+        "--env", "TOKEN=env-secret-value", "--input-file", input,       "--input-env",
+        "DATA",  "--label",                "team=x",       "--command", "sh",
+        "-c",    "exit 3",
+    };
+    try testing.expectEqual(@as(u8, 0), world.run(&run_args));
+    try testing.expectEqualStrings("job etl: submitted\n", world.out());
+    try testing.expectEqual(@as(u8, 0), world.run(&run_args));
+    try expect_contains(world.out(), "job etl: unchanged");
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "job", "get", "etl" }));
+    try expect_contains(world.out(), "env (names only): TOKEN");
+    try expect_contains(world.out(), "input: 17 bytes, given as DATA");
+    try expect_contains(world.out(), "command: sh -c 'exit 3'");
+    var seen = std.ArrayList(u8).empty;
+    defer seen.deinit(testing.allocator);
+    try seen.appendSlice(testing.allocator, world.out());
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "job", "cancel", "etl" }));
+    try seen.appendSlice(testing.allocator, world.out());
+    try testing.expectEqual(@as(u8, 12), world.run(&.{ "job", "get", "etl", "--wait" }));
+    try expect_contains(world.out(), "job etl: cancelled");
+    try seen.appendSlice(testing.allocator, world.out());
+    const list_args = [_][]const u8{ "job", "list", "--state", "ended", "-o", "wide" };
+    try testing.expectEqual(@as(u8, 0), world.run(&list_args));
+    try expect_contains(world.out(), "etl");
+    try seen.appendSlice(testing.allocator, world.out());
+    world.job_rounds_max = 1;
+    try testing.expectEqual(@as(u8, 0), world.run(&.{ "job", "watch", "--from", "1" }));
+    try testing.expectEqualStrings("etl  cancelled  -\n", world.out());
+    const watch_args = [_][]const u8{ "job", "watch", "--from", "1", "-o", "json" };
+    try testing.expectEqual(@as(u8, 0), world.run(&watch_args));
+    try seen.appendSlice(testing.allocator, world.out());
+    try testing.expect(std.mem.indexOf(u8, seen.items, "env-secret-value") == null);
+    try testing.expect(std.mem.indexOf(u8, seen.items, "input-secret-text") == null);
+    // A refusal prints neither.
+    try testing.expectEqual(@as(u8, 1), world.run(&.{ "job", "get", "nosuch" }));
+    try expect_contains(world.err(), "ZC-E0133");
+    world.job_rounds_max = null;
+    try testing.expectEqual(@as(u8, 1), world.run(&.{
+        "job",       "run",   "etl", "--image", "b3:51aa9c03", "--env", "TOKEN=env-secret-value",
+        "--command", "other",
+    }));
+    try expect_contains(world.err(), "ZC-E0131");
+    try testing.expect(std.mem.indexOf(u8, world.err(), "env-secret-value") == null);
 }

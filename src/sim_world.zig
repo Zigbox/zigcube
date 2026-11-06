@@ -64,7 +64,17 @@ pub const SwitchedStore = struct {
     /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_get_prefix: ?[]const u8 = null,
+    /// Runs once, just before the first transaction that puts a key under `prefix` is applied;
+    /// it may write through the world's store (the transaction then meets that write). Test-only,
+    /// null in every simulation.
+    before_put: ?BeforePut = null,
     calls: u32 = 0,
+
+    pub const BeforePut = struct {
+        prefix: []const u8,
+        context: *anyopaque,
+        run: *const fn (context: *anyopaque) void,
+    };
 
     const vtable: store.Store.VTable = .{
         .status = status,
@@ -172,6 +182,15 @@ pub const SwitchedStore = struct {
                 diag.cause("connection refused", .{});
                 diag.fix(.{ .sentence = "switch it back on" });
                 return error.BackendFailed;
+            }
+        }
+        if (self.before_put) |hook| {
+            for (request.on_success) |op| {
+                if (op != .put) continue;
+                if (!std.mem.startsWith(u8, op.put.key, hook.prefix)) continue;
+                self.before_put = null;
+                hook.run(hook.context);
+                break;
             }
         }
         return self.inner.txn(request, diag);

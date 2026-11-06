@@ -12,6 +12,11 @@ pub const exit_environment: u8 = 2;
 pub const exit_external: u8 = 3;
 /// EX_SOFTWARE: an internal bug.
 pub const exit_internal: u8 = 70;
+/// `zcube job get --wait` ends with the job's ending, in codes that are none of the blame codes
+/// above, so a script can tell "the job failed" from "the command did" (docs/cli.md).
+pub const exit_job_exited: u8 = 10;
+pub const exit_job_failed: u8 = 11;
+pub const exit_job_cancelled: u8 = 12;
 
 // ---- Diagnostics: the bounds of the collector (same values as Zigbox's) --------------------
 
@@ -310,8 +315,14 @@ pub const cli_args_max: u32 = 64;
 pub const cli_arg_bytes_max: u32 = 1024;
 /// A service file: well under `api_request_bytes_max`, so the JSON made from it fits one request.
 pub const service_file_bytes_max: u32 = 32 * 1024;
-/// The longest the command line waits for a reply; a watch is never used by it.
+/// The longest the command line waits for a piece of a reply.
 pub const cli_reply_timeout_ms: u32 = 30 * 1000;
+/// `zcube job get --wait` looks again this often (a GET each time: a held watch would take one of
+/// the server's `http_holds_max` for every waiting command).
+pub const cli_job_poll_ms: u32 = 1000;
+/// `zcube job watch` asks the server to hold a poll this long: under both the server's cap and
+/// `cli_reply_timeout_ms`, so an empty answer arrives before the command gives up on it.
+pub const cli_job_watch_hold_ms: u32 = 20 * 1000;
 pub const cli_reply_bytes_max: u32 = api_response_bytes_max;
 /// Diagnostics one command reports at most (the server may send several in one reply).
 pub const cli_diagnostics_max: u32 = 8;
@@ -476,6 +487,12 @@ pub const session_kill_rounds: u32 = 3;
 pub const proc_entries_max: u32 = (1 << 22) + 1024;
 
 comptime {
+    assert(cli_job_watch_hold_ms <= api_watch_timeout_ms_max);
+    assert(cli_job_watch_hold_ms < cli_reply_timeout_ms);
+    assert(exit_job_exited > exit_external);
+    assert(exit_job_exited < exit_job_failed);
+    assert(exit_job_failed < exit_job_cancelled);
+    assert(exit_job_cancelled < exit_internal);
     assert(zigbox_fetch_kill_wait_ms < zigbox_fetch_deadline_ms);
     assert(session_kill_rounds >= 2);
 }

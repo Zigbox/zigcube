@@ -51,7 +51,50 @@ pub const Watch = struct {
     /// The node's totals of wedged time and of cut-link time when the container was first seen.
     wedged_base_ms: u64 = 0,
     link_base_ms: u64 = 0,
+    /// Whether those two were re-taken at the start of the window that matters to J8: the link's
+    /// at the fence's reach before the deadline, the wedge's at the deadline.
+    link_marked: bool = false,
+    wedge_marked: bool = false,
+    /// The node's total of wedged time when the run's `stop` was first seen (J6 counts only
+    /// wedged time after the stop).
+    stop_wedged_base_ms: ?u64 = null,
 };
+
+/// What a node's totals add up to for a watched run since the marks `note_marks` took.
+pub fn cut_since(watch: *const Watch, wedged_total_ms: u64, link_total_ms: u64) Cut {
+    return .{
+        .wedged_ms = wedged_total_ms - watch.wedged_base_ms,
+        .link = link_total_ms > watch.link_base_ms,
+    };
+}
+
+/// Takes the node's totals at the moments the bounds start to count them (every tick, wedged or
+/// not): J8's link at the fence's reach before the run's deadline (a cut earlier than that was
+/// mended by the time the deadline came, and the fence is the agent's way of enforcing it only
+/// for a cut that spans it), its wedged time at the deadline, and J6's at the run's stop.
+pub fn note_marks(
+    watch: *Watch,
+    now_ms: u64,
+    deadline_ms: u64,
+    stopped: bool,
+    lease_ttl_ms: u64,
+    wedged_total_ms: u64,
+    link_total_ms: u64,
+) void {
+    const age = now_ms - watch.first_seen_ms;
+    const reach = lease_ttl_ms -| constants.fence_margin_ms;
+    if (!watch.link_marked and age >= deadline_ms -| reach) {
+        watch.link_marked = true;
+        watch.link_base_ms = link_total_ms;
+    }
+    if (!watch.wedge_marked and age >= deadline_ms) {
+        watch.wedge_marked = true;
+        watch.wedged_base_ms = wedged_total_ms;
+    }
+    if (stopped and watch.stop_wedged_base_ms == null) {
+        watch.stop_wedged_base_ms = wedged_total_ms;
+    }
+}
 
 /// The bound of J6: from the commit of a run's `stop`, the larger of what an agent whose link is
 /// up needs (a resync, the grace, the kill) and what the fence needs when it is cut off (the
@@ -194,4 +237,43 @@ test "bounds grow with the grace and the deadline" {
     const cut: Cut = .{ .wedged_ms = 0, .link = true };
     try std.testing.expect(deadline_bound_ms(10_000, 0, 0, 10_000, 0, cut) >
         deadline_bound_ms(10_000, 0, 0, 10_000, 0, none));
+}
+
+test "note_marks: wedges before the deadline and cuts before the fence's reach do not count" {
+    // Goal: pin the tightening of J6 and J8 (#127): the bases are re-taken at the start of the
+    // window that matters, not kept from first sight. A mutant that never re-takes them leaves
+    // a base of 0 and this test fails.
+    const ttl: u64 = 10_000;
+    const deadline: u64 = 60_000;
+    const reach = ttl - constants.fence_margin_ms;
+    var watch: Watch = .{
+        .node = 0,
+        .name_hash = 1,
+        .first_seen_ms = 1000,
+        .ended_since_ms = null,
+    };
+    // 5 s of wedge and 3 s of link cut, both long before the window.
+    note_marks(&watch, 1000 + 10_000, deadline, false, ttl, 5000, 3000);
+    try std.testing.expect(!watch.link_marked and !watch.wedge_marked);
+    // At the fence's reach before the deadline: the link base is taken (3000 cut so far).
+    note_marks(&watch, 1000 + deadline - reach, deadline, false, ttl, 5000, 3000);
+    try std.testing.expect(watch.link_marked and !watch.wedge_marked);
+    try std.testing.expectEqual(@as(u64, 3000), watch.link_base_ms);
+    // Nothing since: the earlier cut and wedge are not counted.
+    var cut = cut_since(&watch, 5000, 3000);
+    try std.testing.expect(!cut.link);
+    // At the deadline: the wedge base is taken.
+    note_marks(&watch, 1000 + deadline, deadline, false, ttl, 7000, 3000);
+    try std.testing.expectEqual(@as(u64, 7000), watch.wedged_base_ms);
+    cut = cut_since(&watch, 7000, 3000);
+    try std.testing.expectEqual(@as(u64, 0), cut.wedged_ms);
+    // A cut and a wedge after the marks do count.
+    cut = cut_since(&watch, 7500, 3100);
+    try std.testing.expect(cut.link);
+    try std.testing.expectEqual(@as(u64, 500), cut.wedged_ms);
+    // J6: the stop's base is taken once, at first sight of the stop.
+    note_marks(&watch, 1000 + deadline + 5, deadline, true, ttl, 7600, 3100);
+    try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
+    note_marks(&watch, 1000 + deadline + 9, deadline, true, ttl, 9000, 3100);
+    try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
 }
