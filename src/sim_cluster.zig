@@ -1053,8 +1053,10 @@ pub const Cluster = struct {
         }
     }
 
-    /// J4's client, once per poll: it is killed now and then, away for less than a minute (the
-    /// store has not compacted past it) or for minutes (it has), and resumes from its revision.
+    /// J4's client, once per poll: it is killed now and then, away for less than a minute or for
+    /// minutes, and resumes from its revision. The simulation compacts to the head every 60 s,
+    /// so even a short absence can end in a 410 (relist and dedupe); the real keep window is
+    /// not simulated, and a plain in-window resume is the rarer path here.
     fn watch_client(c: *Cluster) void {
         const w = &c.jobs_watch;
         const now = c.manual.ms;
@@ -2276,29 +2278,22 @@ fn track_jobs(c: *Cluster) Failure!void {
     c.jobs.watch_count = count;
 }
 
-/// Takes the node's totals at the moments the bounds start to count them (every tick, wedged or
-/// not): J8's link at the fence's reach before the run's deadline (a cut earlier than that was
-/// mended by the time the deadline came, and the fence is the agent's way of enforcing it only
-/// for a cut that spans it), its wedged time at the deadline, and J6's at the run's stop.
 fn note_marks(
     c: *const Cluster,
     run: records.JobRun,
     node: *const Node,
     watch: *sim_jobs.Watch,
 ) void {
-    const age = c.manual.ms - watch.first_seen_ms;
-    const reach = c.api.lease_ttl_ms -| constants.fence_margin_ms;
-    if (!watch.link_marked and age >= run.deadline_ms -| reach) {
-        watch.link_marked = true;
-        watch.link_base_ms = node.link_cut_total_ms;
-    }
-    if (!watch.wedge_marked and age >= run.deadline_ms) {
-        watch.wedge_marked = true;
-        watch.wedged_base_ms = node.wedged_total_ms;
-    }
-    if (run.stop != null and watch.stop_wedged_base_ms == null) {
-        watch.stop_wedged_base_ms = node.wedged_total_ms;
-    }
+    const stopped = run.stop != null;
+    sim_jobs.note_marks(
+        watch,
+        c.manual.ms,
+        run.deadline_ms,
+        stopped,
+        c.api.lease_ttl_ms,
+        node.wedged_total_ms,
+        node.link_cut_total_ms,
+    );
 }
 
 fn judge_job_container(
@@ -2311,10 +2306,7 @@ fn judge_job_container(
 ) Failure!void {
     const now = c.manual.ms;
     const run = found orelse return;
-    const cut: sim_jobs.Cut = .{
-        .wedged_ms = node.wedged_total_ms - watch.wedged_base_ms,
-        .link = node.link_cut_total_ms > watch.link_base_ms,
-    };
+    const cut = sim_jobs.cut_since(watch, node.wedged_total_ms, node.link_cut_total_ms);
     const granularity = tick_ms + 2 * check_interval_ms;
     const bound = sim_jobs.deadline_bound_ms(
         run.deadline_ms,

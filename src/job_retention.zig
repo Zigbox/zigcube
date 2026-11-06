@@ -74,7 +74,13 @@ const Ended = struct {
     ended_at_ms: u64,
     node: ?[]const u8,
     has_input: bool = false,
+    /// The `mod_revision` of the input read with `has_input`; the delete expects it.
+    input_revision: store.Revision = 0,
 };
+
+/// Every `/job-observed/<node>/<name>` key a pass read, whichever node wrote it: a node that
+/// lost the claim leaves its record behind, and it would block the name's next claim there.
+const Observed = []const []const u8;
 
 /// One pass; returns when the next is due.
 pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
@@ -83,6 +89,7 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
     var ended: std.ArrayList(Ended) = .empty;
     try read_ended(ctx, revision, &ended);
     try mark_inputs(ctx, revision, ended.items);
+    const observed = try read_observed(ctx, revision);
     const Rank = struct {
         fn older(_: void, first: Ended, second: Ended) bool {
             if (first.ended_at_ms != second.ended_at_ms) {
@@ -101,7 +108,7 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
             more = true;
             break;
         }
-        try drop_job(ctx, cursor, job);
+        try drop_job(ctx, cursor, job, observed);
         dropped += 1;
     }
     var inputs: u32 = 0;
@@ -113,7 +120,7 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
             more = true;
             break;
         }
-        try drop_input(ctx, cursor, job.name);
+        try drop_input(ctx, cursor, job);
         inputs += 1;
     }
     if (more) return now_ms;
@@ -174,15 +181,65 @@ fn mark_inputs(ctx: *const Context, revision: store.Revision, ended: []Ended) Er
             const name = kv.key[records.prefix_job_input.len..];
             while (at < ended.len and std.mem.lessThan(u8, ended[at].name, name)) at += 1;
             if (at == ended.len) continue;
-            if (std.mem.eql(u8, ended[at].name, name)) ended[at].has_input = true;
+            if (!std.mem.eql(u8, ended[at].name, name)) continue;
+            ended[at].has_input = true;
+            ended[at].input_revision = kv.mod_revision;
         }
         after = page.continue_after orelse return;
     }
 }
 
+/// Pages of `/job-observed/` a pass reads.
+const observed_pages_max: u32 = 64;
+
+fn read_observed(ctx: *const Context, revision: store.Revision) Error!Observed {
+    var keys: std.ArrayList([]const u8) = .empty;
+    var after: ?[]const u8 = null;
+    for (0..observed_pages_max) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = records.prefix_job_observed,
+            .at_revision = revision,
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, ctx.diag);
+        for (page.kvs) |kv| {
+            keys.append(ctx.arena, kv.key) catch return failures.no_memory(ctx.diag);
+        }
+        after = page.continue_after orelse break;
+    }
+    return keys.items;
+}
+
+/// Whether `key` is `/job-observed/<node>/<name>` for this name (a name holds no `/`).
+fn observed_of(key: []const u8, name: []const u8) bool {
+    const at = std.mem.lastIndexOfScalar(u8, key, '/') orelse return false;
+    return std.mem.eql(u8, key[at + 1 ..], name);
+}
+
 /// Deletes the job's records in one transaction. A conflict (the status changed since the read)
-/// leaves the job for the next pass.
-fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended) Error!void {
+/// leaves the job for the next pass. Observations on any node go with it; those that do not fit
+/// the transaction go first, in transactions of their own (an observation of an ended job is
+/// never read again).
+fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended, observed: Observed) Error!void {
+    const fixed: u32 = 4;
+    var mine: u32 = 0;
+    for (observed) |key| {
+        if (observed_of(key, job.name)) mine += 1;
+    }
+    const early: u32 = (fixed + mine) -| constants.store_txn_ops_max;
+    var skip: u32 = early; // The job's first `early` observations go in transactions of their own.
+    var spill: Batch = .{};
+    var spilled: u32 = 0;
+    for (observed) |key| {
+        if (spilled == early) break;
+        if (!observed_of(key, job.name)) continue;
+        spill.delete(key);
+        spilled += 1;
+        if (spill.ops_count == constants.store_txn_ops_max or spilled == early) {
+            _ = try controller.commit(ctx, .retention, &spill);
+            spill = .{};
+        }
+    }
     var batch: Batch = .{};
     // The keys must outlive the commit below, so they live in the arena.
     batch.expect(try arena_key(ctx, records.job_status_key(job.name)), job.status_revision);
@@ -190,16 +247,25 @@ fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended) Error!void {
     batch.delete(try arena_key(ctx, records.job_input_key(job.name)));
     batch.delete(try arena_key(ctx, records.job_run_key(job.name)));
     batch.delete(try arena_key(ctx, records.job_status_key(job.name)));
-    if (job.node) |node| {
-        batch.delete(try arena_key(ctx, records.job_observed_key(node, job.name)));
+    for (observed) |key| {
+        if (!observed_of(key, job.name)) continue;
+        if (skip > 0) {
+            skip -= 1;
+            continue;
+        }
+        batch.delete(key);
     }
     const done = try controller.commit(ctx, .retention, &batch);
     if (done == .applied) cursor.dropped += 1;
 }
 
-fn drop_input(ctx: *const Context, cursor: *Cursor, name: []const u8) Error!void {
+/// Deletes an ended job's input if it is still the one the scan read: a name created again
+/// after the read has a new input, which stays.
+fn drop_input(ctx: *const Context, cursor: *Cursor, job: Ended) Error!void {
     var batch: Batch = .{};
-    batch.delete(try arena_key(ctx, records.job_input_key(name)));
+    const key = try arena_key(ctx, records.job_input_key(job.name));
+    batch.expect(key, job.input_revision);
+    batch.delete(key);
     const done = try controller.commit(ctx, .retention, &batch);
     if (done == .applied) cursor.inputs_dropped += 1;
 }
@@ -374,4 +440,72 @@ test "a status that does not parse is kept" {
     try testing.expect(!cursor.failing);
     try testing.expectEqual(@as(u64, 1), cursor.dropped);
     try testing.expectEqual(@as(usize, 1), try fixture.count(records.prefix_job_status));
+}
+
+test "a dropped name is free again: an orphan observation on another node does not block it" {
+    // Goal: retention removes `/job-observed/<node>/<name>` on every node, so a reused name can
+    // be claimed anywhere (review of #139: a claim needs the node's observation absent). Method: a
+    // job ended on n1 with leftovers on n2 and n3; after the drop only another job's is left,
+    // and the name created again keeps its own records through a later pass.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.job("again", constants.job_finished_age_ms_max + 1);
+    try fixture.put(records.job_observed_key("n2", "again").slice(), "{}");
+    try fixture.put(records.job_observed_key("n3", "again").slice(), "{}");
+    try fixture.put(records.job_observed_key("n3", "other").slice(), "{}"); // Another job's.
+    const ctx = fixture.context();
+    var cursor: Cursor = .{};
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
+    try testing.expectEqual(@as(usize, 1), try fixture.count(records.prefix_job_observed));
+    try testing.expectEqual(@as(usize, 0), try fixture.count("/job-observed/n1/again"));
+    // Created again: it runs, and a later pass leaves it alone.
+    try fixture.job("again", null);
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
+    try testing.expectEqual(@as(usize, 1), try fixture.count(records.prefix_job_status));
+    try testing.expectEqual(@as(usize, 2), try fixture.count(records.prefix_job_observed));
+}
+
+test "observations past one transaction are all removed" {
+    // Goal: a job with more observations than a transaction holds loses them all and the job
+    // goes in the end.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.job("wide", constants.job_finished_age_ms_max + 1);
+    const nodes = constants.store_txn_ops_max + 3;
+    for (0..nodes) |at| {
+        var node: [8]u8 = undefined;
+        const text = try std.fmt.bufPrint(&node, "m{d:0>3}", .{at});
+        try fixture.put(records.job_observed_key(text, "wide").slice(), "{}");
+    }
+    const ctx = fixture.context();
+    var cursor: Cursor = .{};
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
+    try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_job_observed));
+    try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_jobs));
+}
+
+test "an input delete never takes the input of a job created again" {
+    // Goal: `drop_input` compares the revision the scan read. Method: the scan reads an ended
+    // job's input; before the delete the name is retired and created again with a new input;
+    // the stale delete is refused and the new input stays.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.job("reused", 5000);
+    const ctx = fixture.context();
+    const revision = (try ctx.store.status(ctx.diag)).revision;
+    var ended: std.ArrayList(Ended) = .empty;
+    try read_ended(&ctx, revision, &ended);
+    try mark_inputs(&ctx, revision, ended.items);
+    try testing.expect(ended.items[0].has_input);
+    try fixture.job("reused", null); // New input, new revisions.
+    var cursor: Cursor = .{};
+    try drop_input(&ctx, &cursor, ended.items[0]);
+    try testing.expectEqual(@as(u64, 0), cursor.inputs_dropped);
+    try testing.expectEqual(@as(usize, 1), try fixture.count(records.prefix_job_input));
 }

@@ -508,9 +508,10 @@ pub const registry = [_]Entry{
         \\`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it
         \\stands. The cause line names the field and the limit it broke: a name that
         \\is not 1 to 48 bytes of lowercase letters, digits and hyphens (none at
-        \\either end), no command or too many words, a deadline of zero or
-        \\above 24 hours, a grace period above 60 seconds, env above 8 KiB, an input
-        \\above 64 KiB or with a NUL byte, a submit time more than an hour ahead, or
+        \\either end), or the name `watch`, which /v1/jobs/watch reserves, no
+        \\command or too many words, a deadline of zero or above 24 hours, a grace
+        \\period above 60 seconds, env above 8 KiB, an input above 64 KiB or with a
+        \\NUL byte, a submit time more than an hour ahead, or
         \\more labels than a job may carry.
         \\
         \\Two fields are refused because they are not built yet, and the cause says
