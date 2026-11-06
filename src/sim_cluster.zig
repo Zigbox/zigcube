@@ -1276,7 +1276,8 @@ pub const Cluster = struct {
     fn create_job(c: *Cluster) void {
         const random = c.prng.random();
         var name_buffer: [16]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable; // "jb-" and a u32 fit.
+        // "jb-" and a u32 fit.
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);

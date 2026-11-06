@@ -50,7 +50,8 @@ const sim_shape = @import("sim_shape.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--trace-steps]\n       sim-cluster --seeds A..B <operations|auto> " ++
+    "[--replicas-pct=N] [--jobs=true|false] [--trace-steps]\n" ++
+    "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
     "[--replicas-pct=N] [--jobs=true|false] [--expect-fail] [--trace-steps]\n";
 

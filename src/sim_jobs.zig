@@ -150,12 +150,18 @@ fn claim_problem(
         ctx.diag.reset();
         return "J7: a claim cannot be decoded";
     };
-    if (!std.mem.eql(u8, claim.run, spec.name)) return "J7: a run was started on another run's claim";
-    if (claim.tenure != tenure) return "J7: a run was started under another tenure than its claim";
+    if (!std.mem.eql(u8, claim.run, spec.name)) {
+        return "J7: a run was started on another run's claim";
+    }
+    if (claim.tenure != tenure) {
+        return "J7: a run was started under another tenure than its claim";
+    }
     const text = label_value(spec.labels, runtime.label_created) orelse
         return "J7: a run was started with no epoch";
     const epoch = std.fmt.parseInt(u64, text, 10) catch return "J7: a run's epoch is not a number";
-    if (claim.assignment != epoch) return "J7: a run was started under another epoch than its claim";
+    if (claim.assignment != epoch) {
+        return "J7: a run was started under another epoch than its claim";
+    }
     return null;
 }
 
