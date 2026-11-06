@@ -35,9 +35,19 @@ var child_pid: std.atomic.Value(i32) = .init(0);
 var term_received: std.atomic.Value(bool) = .init(false);
 
 fn on_term(_: std.posix.SIG) callconv(.c) void {
-    term_received.store(true, .release);
-    const pid = child_pid.load(.acquire);
+    term_received.store(true, .seq_cst);
+    const pid = child_pid.load(.seq_cst);
     if (pid > 1) _ = std.os.linux.kill(pid, .TERM);
+}
+
+/// Makes `pid` the child a `SIGTERM` is passed to. The handler stores the flag and then reads the
+/// pid; this stores the pid and then reads the flag, all sequentially consistent, so at least one
+/// side sees the other: a `SIGTERM` that came before the pid was published (the child already
+/// exists, so a stopper can see it) is passed on here, not lost until the child ends by itself.
+fn publish_child(pid: i32) void {
+    assert(pid > 1);
+    child_pid.store(pid, .seq_cst);
+    if (term_received.load(.seq_cst)) _ = std.os.linux.kill(pid, .TERM);
 }
 
 pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
@@ -54,17 +64,19 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     const lock = dir.createFile(io, files.file_lock, .{ .truncate = false, .lock = .exclusive });
     // Not closed: the lock is released when the process ends, and that is what the agent tests.
     _ = lock catch return constants.exit_environment;
-    const own_pid: i32 = @intCast(std.os.linux.getpid());
-    files.write_pid(io, dir, files.file_supervisor, own_pid) catch
-        return constants.exit_environment;
-    const spec = files.read_json(files.SpecFile, io, dir, files.file_spec, arena) catch
-        return constants.exit_environment;
+    // Before the pid file: whoever sees the supervisor (the pid file is how) may stop it, and a
+    // `SIGTERM` before the handler stands would kill it with the default action.
     const action: std.posix.Sigaction = .{
         .handler = .{ .handler = on_term },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(.TERM, &action, null);
+    const own_pid: i32 = @intCast(std.os.linux.getpid());
+    files.write_pid(io, dir, files.file_supervisor, own_pid) catch
+        return constants.exit_environment;
+    const spec = files.read_json(files.SpecFile, io, dir, files.file_spec, arena) catch
+        return constants.exit_environment;
     if (files.exists(io, dir, files.file_fetch)) {
         const failure = after_fetch(fetch_first(init, dir, arena));
         if (failure) |over| return record(io, dir, over);
@@ -76,7 +88,7 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
 /// supervisor was sent `SIGTERM` meanwhile (the command must not start after it), else null.
 fn after_fetch(failure: ?files.RunFile) ?files.RunFile {
     if (failure) |over| return over;
-    if (term_received.load(.acquire)) return stopped_run();
+    if (term_received.load(.seq_cst)) return stopped_run();
     return null;
 }
 
@@ -107,9 +119,9 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
         .stdout = .{ .file = log },
         .stderr = .{ .file = log },
     }) catch return failed(.environment, "the host refused to start the fetch");
-    child_pid.store(child.id.?, .release);
+    publish_child(child.id.?);
     const term = child.wait(io) catch return .{ .kind = .lost };
-    child_pid.store(0, .release);
+    child_pid.store(0, .seq_cst);
     const result = fetch_ended(arena, plan.digest, term);
     if (state) |opened| settle_streak(io, opened, arena, plan.digest, result);
     return result;
@@ -149,7 +161,7 @@ fn wait_for_backoff(
     assert(plan.backoff_cap_ms >= plan.backoff_base_ms);
     const streak = backoff.read(io, state, arena, plan.digest);
     while (true) {
-        if (term_received.load(.acquire)) {
+        if (term_received.load(.seq_cst)) {
             return stopped_run();
         }
         const left = backoff.wait_remaining_ms(
@@ -173,7 +185,7 @@ fn fetch_ended(arena: Allocator, digest: []const u8, term: std.process.Child.Ter
         // Stopped while fetching: the container ended by that signal, it did not fail to start.
         // A signal this supervisor was not sent is the fetch crashing or being killed.
         .signal => |signal| {
-            if (term_received.load(.acquire)) {
+            if (term_received.load(.seq_cst)) {
                 return .{ .kind = .signaled, .signal = @intCast(@backingInt(signal)) };
             }
             return failed(.fetch, "the fetch ended by a signal before it finished the tree");
@@ -217,10 +229,10 @@ fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {
         .stderr = .ignore,
     }) catch |err| return record(io, dir, spawn_failure(err));
     const pid: i32 = child.id.?;
-    child_pid.store(pid, .release);
+    publish_child(pid);
     files.write_pid(io, dir, files.file_child, pid) catch child.kill(io);
     const term = child.wait(io) catch return record(io, dir, .{ .kind = .lost });
-    child_pid.store(0, .release);
+    child_pid.store(0, .seq_cst);
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     return record(io, dir, ended(io, dir, arena_state.allocator(), term));
@@ -278,4 +290,24 @@ test "a SIGTERM during the fetch ends the container before its command; a failur
     defer term_received.store(false, .release);
     const stopped = after_fetch(null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(files.RunKind.signaled, stopped.kind);
+}
+
+test "a SIGTERM that came before the fetch's pid was published still reaches the fetch" {
+    // Goal: issue #90. A stopper can see the fetch (it is a child) before the supervisor has
+    // published its pid, and the handler then had nobody to pass the signal to; the fetch ran on
+    // to its own failure and the stopped replica ended as a failed start. Method: `term_received`
+    // set first, then a real child published; it must die of SIGTERM.
+    const io = std.testing.io;
+    term_received.store(true, .seq_cst);
+    defer term_received.store(false, .seq_cst);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    publish_child(child.id.?);
+    defer child_pid.store(0, .seq_cst);
+    const term = try child.wait(io);
+    try std.testing.expectEqual(std.posix.SIG.TERM, term.signal);
 }
