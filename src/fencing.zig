@@ -37,13 +37,17 @@ pub fn inequality_problem(ttl_ms: u32) ?Problem {
     return null;
 }
 
-/// How long after a keepalive was sent the next is due. A third of the ttl, but at most half
-/// the time before the fence (`ttl - fence_margin`): the old `ttl / 3` alone fell after the fence
-/// for any ttl up to 4,500 ms (issue #78), so a healthy agent fenced before every renewal.
-/// Unchanged for ttls above 6,000 ms, including the shipped one.
+/// How long after a keepalive was sent the next is due: a third of the ttl while that leaves at
+/// least a sixth of the time before the fence (`ttl - fence_margin`) for the renewal to be
+/// answered, else half that time. The old `ttl / 3` alone fell after the fence for any ttl up to
+/// 4,500 ms (issue #78), so a healthy agent fenced before every renewal. Unchanged from 5,000 ms
+/// up, the shipped ttl included.
 pub fn renew_after_ms(ttl_ms: u32) u32 {
     assert(ttl_ms > constants.fence_margin_ms);
-    return @min(ttl_ms / 3, (ttl_ms - constants.fence_margin_ms) / 2);
+    const window = ttl_ms - constants.fence_margin_ms;
+    const third = ttl_ms / 3;
+    if (@as(u64, third) * 6 <= @as(u64, window) * 5) return third;
+    return window / 2;
 }
 
 /// When the agent starts stopping its containers, on its own clock.
@@ -124,10 +128,11 @@ test "renewal always falls before the fence, at every ttl the inequality admits"
         if (inequality_problem(ttl) != null) continue;
         const renew = renew_after_ms(ttl);
         try testing.expect(renew <= ttl / 3);
-        try testing.expect(renew <= (fence_at_ms(0, ttl)) / 2);
+        try testing.expect(renew * 6 <= fence_at_ms(0, ttl) * 5);
     }
     try testing.expectEqual(constants.lease_ttl_ms / 3, renew_after_ms(constants.lease_ttl_ms));
     try testing.expectEqual(@as(u32, 500), renew_after_ms(4_000));
+    try testing.expectEqual(@as(u32, 5_129 / 3), renew_after_ms(5_129));
     // The old interval missed the fence at 4,500 and below, and not above 4,501.
     try testing.expect(4_500 / 3 >= 4_500 - constants.fence_margin_ms);
     try testing.expect(renew_after_ms(4_500) < fence_at_ms(0, 4_500));

@@ -7,8 +7,10 @@ fences at `ttl - fence_margin` (3,000 ms). For `ttl <= 4,500` the renewal falls 
 fence, so a healthy agent fenced before every renewal and registered again, once a second for
 ever. `fencing.zig` only required `ttl > margin`.
 
-**Fix.** `fencing.renew_after_ms(ttl)` is `min(ttl / 3, (ttl - margin) / 2)`: unchanged for
-ttls above 6,000 ms (the shipped 10 s included), half the time before the fence below that.
+**Fix.** `fencing.renew_after_ms(ttl)` is `ttl / 3` while that is at most 5/6 of the time before the
+fence (`ttl - margin`), else half that time: unchanged from 5,000 ms up (the shipped 10 s
+included). A first version capped at half the window for ttls up to 6,000 and raised seed 180
+(`--c1 crash_heavy`, ttl 5,129) over the step ceiling.
 The shortest admitted ttl is now `margin + fence_window_min_ms` (500) = 3,500 ms; below it a
 renewal does not fit (`--lease-ttl-ms=3001` still never settled, 3,200 doubled the agent's
 steps), and `ZC-E0121` refuses it as `ttl_too_short`. No new code.
