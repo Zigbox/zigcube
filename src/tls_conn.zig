@@ -247,8 +247,8 @@ pub const Conn = struct {
 
     /// Flushes, then sends close_notify and ends the connection. It does not wait for the
     /// server's: the client has stopped reading by then, and a slot is not worth holding for a
-    /// goodbye. A peer that is already gone costs nothing: that failure is dropped. After a peer
-    /// close_notify, or a failed seal, nothing queued is sent: both wipe `plain` (see `send_record`).
+    /// goodbye. A peer that is already gone costs nothing: that failure is dropped. Nothing is
+    /// queued once the connection is over, even after a failed seal (see `send_record`).
     pub fn close(conn: *Conn, end_ms: u64, diag: *Diag) Error!void {
         switch (conn.phase) {
             .open => {},
