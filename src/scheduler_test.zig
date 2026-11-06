@@ -1081,11 +1081,14 @@ test "a run is released when its status is terminal or gone, and not before" {
     try fixture.expect_on("a-job", null);
     try fixture.expect_on("b-job", "n1");
     const ctx = fixture.context();
-    const gone = [_]store.Op{
-        .{ .delete = records.job_status_key("b").slice() },
-        .{ .delete = records.job_run_key("b").slice() },
-    };
-    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &fixture.diag);
+    // A status alone missing is the job controller's contradiction, not a job that is gone: the
+    // workload may be live, so its node stays booked (review of PR 112).
+    const no_status = [_]store.Op{.{ .delete = records.job_status_key("b").slice() }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &no_status }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("b-job", "n1");
+    const no_run = [_]store.Op{.{ .delete = records.job_run_key("b").slice() }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &no_run }, &fixture.diag);
     try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
     try fixture.expect_on("b-job", null);
     try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);

@@ -945,6 +945,16 @@ pub const job_admitted_window_max: u32 = 8192;
 pub const job_admission_window_h: u32 = 73;
 /// Longest run id: `<name>-job`.
 pub const job_run_id_bytes_max: u32 = service_name_bytes_max + "-job".len;
+/// Jobs the job controller reads and judges at a time. `/jobs/` holds up to
+/// `job_admitted_window_max` records (ended jobs stay until retention), far more than one step's
+/// arena holds with their runs, statuses and reports, so it reads a page of jobs with exactly the
+/// records they need into an arena of its own, frees it, and goes on.
+pub const job_controller_page_max: u32 = 16;
+/// What one page of the job controller holds at most: per job the job, its run, its status and
+/// its report (each a record of at most `job_run_bytes_max`), plus a page of decisions read to
+/// tell whether it already decided (`decisions_per_subject_max` index entries of 512 bytes).
+pub const job_controller_page_bytes_max: u64 = @as(u64, job_controller_page_max) *
+    (4 * job_run_bytes_max) + @as(u64, decisions_per_subject_max) * 512 * job_controller_page_max;
 
 comptime {
     assert(jobs_per_node_max <= runtime_handles_max);
@@ -982,6 +992,11 @@ comptime {
     const window_ms = 2 * job_deadline_ms_max + job_finished_age_ms_max + job_submit_window_ms_max;
     assert(window_ms == @as(u64, job_admission_window_h) * 60 * 60 * 1000);
     assert(job_admitted_window_max >= jobs_max);
+    assert(job_controller_page_max > 0);
+    assert(job_controller_page_max <= store_list_limit_max);
+    // The pages are freed one by one, so one page is what the job controller costs the step's
+    // arena beyond the lists it reads once (nodes, their statuses and the assignments).
+    assert(job_controller_page_bytes_max <= request_arena_bytes_max / 4);
     // One aggregate record: an hour's count per hour of the window, in JSON, in one value.
     // An entry is at most 49 bytes (`{"hour":N,"count":N},` with N up to 13 and 10 digits), and a
     // record holds at most `job_admission_window_h + 1` of them (`admission_valid`).

@@ -5,21 +5,37 @@
 //!
 //! For each job, in this order (a job takes at most one transaction a pass):
 //!
-//!   1. no run and no status: create both, with a `job-created` decision, unless the job ever had
-//!      them. "Ever had" is that decision in `/decisions-by-subject/job/<name>` (owner's choice
-//!      A, docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md); a run without a
-//!      status, a status without a run, or that decision without a run is ZC-E0307 and nothing
-//!      about the job changes;
+//!   1. no run and no status: create both, with a `job_created` decision, unless this incarnation
+//!      of the job ever had them. "Ever had" is that decision in
+//!      `/decisions-by-subject/job/<name>`, written after the job was created (owner's choice A,
+//!      docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md; a job deleted and
+//!      created again under the same name is a new incarnation); a run without a status, a status
+//!      without a run, or that decision without a run is ZC-E0307 and nothing about the job
+//!      changes;
 //!   2. an admissible report of the run (tenure, assignment epoch and node `ready`: I2, I6) ends it
 //!      (the exit table, `map_ending`), or marks it `running`;
-//!   3. a run with no claim anywhere gets `stop` (phase one) when the job was cancelled, when its
+//!   3. a run its node never claimed gets `stop` (phase one) when the job was cancelled, when its
 //!      start-by time passed, or when its node was lost; once it has `stop` and no claim exists
 //!      the status is written terminal (phase two), comparing the run, the status and the count;
-//!   4. a running run whose tenure ended and stayed ended for `lost_grace_ms` is `failed
-//!      unreachable`; a fence report from a newer tenure ends it `failed fenced`.
+//!   4. a run its node claimed, or that is running, but whose report is not admissible, ends
+//!      `failed unreachable` once the claim's (or the status's) tenure ended and stayed ended for
+//!      `lost_grace_ms`: a claimed run is never ended as unstarted, because it may be running; a
+//!      fence report from a newer tenure ends a running run `failed fenced`.
 //!
-//! A terminal status is written once. A report that arrives for an ended job is ignored (ZC-W0307
-//! is not yet recorded: slice 3 cut it). Core: no thread, no clock but the context's, no I/O.
+//! A terminal status is written once. A report that arrives for a job that ended within
+//! `job_finished_age_ms_min` is dropped with a `drop_report` decision carrying ZC-W0307.
+//!
+//! Reads: the nodes, their statuses and the assignments are read once a step; the jobs are read
+//! `job_controller_page_max` at a time, each page with its runs, statuses and reports in an arena
+//! of its own that is reset before the next page (`constants.job_controller_page_bytes_max`),
+//! because `/jobs/` also holds the ended jobs of the retention window. A step that runs out of
+//! transactions keeps its place (`cursor`) and the next carries on; one that resumed and reached
+//! the end asks for one more full sweep. A report is looked for under the node the run is
+//! assigned to: a job's run is never reassigned.
+//!
+//! Every hold and every dropped report is recorded once per record revision and found again in
+//! the job's decisions (`has_decision`), so a restart records nothing twice and nothing bounds
+//! how many jobs may hold at once. Core: no thread, no clock but the context's, no I/O.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -52,26 +68,32 @@ pub const watch_prefixes = [_][]const u8{
 };
 
 const resync_ms: u64 = 30 * 1000;
-/// Jobs whose contradiction or unmappable ending this controller already recorded, so a
-/// contradictory job costs one decision, not one a pass. A restart forgets them.
-const noted_max = 64;
 /// Runs whose node's tenure ended without a `lost` judgement of its own, with the time the
-/// controller first saw it end.
-const seen_max = 128;
+/// controller first saw it end: one slot for each run that can be live.
+const seen_max = constants.jobs_max;
 const none: u32 = std.math.maxInt(u32);
+/// Pages of jobs one step can read: the whole retention window, and a page for the end.
+const pages_max = constants.job_admitted_window_max / constants.job_controller_page_max + 2;
+
+comptime {
+    assert(seen_max >= constants.jobs_max);
+    assert(pages_max * constants.job_controller_page_max >= constants.job_admitted_window_max);
+}
 
 const Map = std.StringHashMapUnmanaged(u32);
 
-const Seen = struct { hash: u64, at_ms: u64 };
+/// A run (by hash) whose tenure (by hash) the controller saw end at `at_ms`.
+const Seen = struct { run: u64, tenure: u64, at_ms: u64 };
 
 pub const JobController = struct {
     source: controller.DecisionSource,
     /// How long after a run's tenure ended it is failed `unreachable`. A parameter, as the replica
     /// controller's.
     lost_grace_ms: u64 = constants.lost_grace_ms,
-    noted: [noted_max]u64 = @splat(0),
-    noted_next: u32 = 0,
-    seen: [seen_max]Seen = @splat(.{ .hash = 0, .at_ms = 0 }),
+    /// The last job a step that ran out of transactions finished with; the next one starts after
+    /// it. Null: from the first job.
+    cursor: ?records.Key = null,
+    seen: [seen_max]Seen = @splat(.{ .run = 0, .tenure = 0, .at_ms = 0 }),
     seen_next: u32 = 0,
 
     /// Decision ids of the controllers are `instance*4 + role`; this one takes the top quarter
@@ -83,19 +105,45 @@ pub const JobController = struct {
     pub fn reconcile(jc: *JobController, ctx: *const Context) Error!Wakeup {
         assert(ctx.diag.code == null);
         const now = ctx.clock.now_ms();
-        const world = try read_world(ctx);
+        const shared = try read_shared(ctx);
         var pass: Pass = .{
             .jc = jc,
             .ctx = ctx,
-            .world = &world,
+            .world = undefined,
             .txns_left = constants.controller_txns_per_step_max,
             .wake_at_ms = now + resync_ms,
         };
-        for (world.jobs) |*job| {
+        const resumed = jc.cursor != null;
+        var after: ?records.Key = jc.cursor;
+        var arena_state = std.heap.ArenaAllocator.init(ctx.arena);
+        defer arena_state.deinit();
+        var finished = false;
+        for (0..pages_max) |_| {
+            _ = arena_state.reset(.retain_capacity);
+            const page_ctx: Context = .{
+                .store = ctx.store,
+                .clock = ctx.clock,
+                .arena = arena_state.allocator(),
+                .diag = ctx.diag,
+            };
+            const after_key: ?[]const u8 = if (after) |*key| key.slice() else null;
+            const page = try read_page(&page_ctx, &shared, after_key);
+            pass.ctx = &page_ctx;
+            pass.world = &page.world;
+            for (page.world.jobs) |*job| {
+                if (pass.stopped or pass.txns_left == 0) break;
+                try pass.step_job(job);
+                if (!pass.stopped) after = key_of(job.kv.key);
+            }
             if (pass.stopped or pass.txns_left == 0) break;
-            try pass.step_job(job);
+            if (!page.more) {
+                finished = true;
+                break;
+            }
         }
-        const again = pass.more or pass.txns_left == 0;
+        jc.cursor = if (finished) null else after;
+        // A sweep that began in the middle has not judged the jobs before its start.
+        const again = pass.more or pass.txns_left == 0 or !finished or resumed;
         return .{
             .at_ms = if (again) now else pass.wake_at_ms,
             .prefixes = &watch_prefixes,
@@ -103,24 +151,38 @@ pub const JobController = struct {
         };
     }
 
-    fn was_noted(jc: *const JobController, hash: u64) bool {
-        for (jc.noted) |one| if (one == hash) return true;
-        return false;
-    }
-
-    fn note(jc: *JobController, hash: u64) void {
-        jc.noted[jc.noted_next % noted_max] = hash;
-        jc.noted_next +%= 1;
-    }
-
-    /// When the controller first saw `hash` (a run's tenure) ended: now, the first time.
-    fn first_seen(jc: *JobController, hash: u64, now: u64) u64 {
-        for (jc.seen) |one| if (one.hash == hash) return one.at_ms;
-        jc.seen[jc.seen_next % seen_max] = .{ .hash = hash, .at_ms = now };
-        jc.seen_next +%= 1;
+    /// When the controller first saw the tenure `tenure` of run `run` ended: now, the first
+    /// time. A run holds one slot, whatever its tenures; the oldest slot goes when none is free.
+    fn first_seen(jc: *JobController, run: u64, tenure: u64, now: u64) u64 {
+        var free: ?u32 = null;
+        for (&jc.seen, 0..) |*one, at| {
+            if (one.run == run) {
+                if (one.tenure == tenure) return one.at_ms;
+                one.* = .{ .run = run, .tenure = tenure, .at_ms = now };
+                return now;
+            }
+            if (one.run == 0 and free == null) free = @intCast(at);
+        }
+        const at = free orelse jc.seen_next % seen_max;
+        jc.seen[at] = .{ .run = run, .tenure = tenure, .at_ms = now };
+        if (free == null) jc.seen_next +%= 1;
         return now;
     }
+
+    /// The run ended: its slot is free for another.
+    fn forget_run(jc: *JobController, run: u64) void {
+        for (&jc.seen) |*one| {
+            if (one.run == run) one.* = .{ .run = 0, .tenure = 0, .at_ms = 0 };
+        }
+    }
 };
+
+fn key_of(bytes: []const u8) records.Key {
+    var key: records.Key = .{};
+    @memcpy(key.bytes[0..bytes.len], bytes);
+    key.len = @intCast(bytes.len);
+    return key;
+}
 
 fn hash_of(parts: []const []const u8, number: u64) u64 {
     var hasher = std.hash.Wyhash.init(number);
@@ -131,21 +193,27 @@ fn hash_of(parts: []const []const u8, number: u64) u64 {
 
 // ---- The world a pass reads ------------------------------------------------------------------
 
+/// What every page shares, read once a step at one revision.
+const Shared = struct {
+    revision: Revision,
+    nodes: []const Entry(records.Node),
+    node_statuses: []const Entry(records.NodeStatus),
+    assigned: []const Entry(records.Assigned),
+    assigned_of: Map,
+};
+
+/// One page of jobs with the records they need, read at the step's revision.
 const World = struct {
     revision: Revision,
     jobs: []const Entry(records.Job),
     runs: []const Entry(records.JobRun),
     statuses: []const Entry(records.JobStatus),
-    observed: []const Entry(records.JobObserved),
     nodes: []const Entry(records.Node),
     node_statuses: []const Entry(records.NodeStatus),
     assigned: []const Entry(records.Assigned),
-    endings: ?Entry(records.JobEndings),
     run_of: Map,
     status_of: Map,
     assigned_of: Map,
-    observed_head: Map,
-    observed_next: []u32,
 
     fn run(world: *const World, name: []const u8) ?*const Entry(records.JobRun) {
         const at = world.run_of.get(name) orelse return null;
@@ -174,15 +242,9 @@ const World = struct {
         }
         return null;
     }
-
-    fn endings_revision(world: *const World) Revision {
-        return if (world.endings) |entry| entry.kv.mod_revision else 0;
-    }
-
-    fn ended_count(world: *const World) u64 {
-        return if (world.endings) |entry| entry.rec.ended else 0;
-    }
 };
+
+const Page = struct { world: World, more: bool };
 
 /// The node an assignment key `/assigned/<node>/<run>` names.
 fn assigned_node(key: []const u8) []const u8 {
@@ -194,26 +256,15 @@ fn rows(
     comptime T: type,
     ctx: *const Context,
     prefix: []const u8,
-    at: Revision,
+    at: ?Revision,
     count_max: u32,
-) Error![]const Entry(T) {
-    return (try controller.list_all(T, ctx, prefix, at, count_max)).items;
+) Error!controller.List(T) {
+    return controller.list_all(T, ctx, prefix, at, count_max);
 }
 
-fn read_world(ctx: *const Context) Error!World {
-    const window = constants.job_admitted_window_max;
-    const jobs = try controller.list_all(
-        records.Job,
-        ctx,
-        records.prefix_jobs,
-        null,
-        constants.jobs_max,
-    );
-    const at = jobs.revision;
-    const runs = try rows(records.JobRun, ctx, records.prefix_job_runs, at, window);
-    const statuses = try rows(records.JobStatus, ctx, records.prefix_job_status, at, window);
-    const observed = try rows(records.JobObserved, ctx, records.prefix_job_observed, at, window);
-    const nodes = try rows(records.Node, ctx, records.prefix_nodes, at, constants.nodes_max);
+fn read_shared(ctx: *const Context) Error!Shared {
+    const nodes = try rows(records.Node, ctx, records.prefix_nodes, null, constants.nodes_max);
+    const at = nodes.revision;
     const node_statuses = try rows(
         records.NodeStatus,
         ctx,
@@ -228,54 +279,115 @@ fn read_world(ctx: *const Context) Error!World {
         at,
         constants.assigned_max,
     );
-    const got = try ctx.store.get(ctx.arena, records.key_job_endings, at, ctx.diag);
-    var endings: ?Entry(records.JobEndings) = null;
-    if (got.kv) |kv| {
-        const rec = try records.read(records.JobEndings, ctx.arena, kv, ctx.diag);
-        endings = .{ .kv = kv, .rec = rec };
-    }
-    var world: World = .{
+    var shared: Shared = .{
         .revision = at,
-        .jobs = jobs.items,
-        .runs = runs,
-        .statuses = statuses,
-        .observed = observed,
-        .nodes = nodes,
-        .node_statuses = node_statuses,
-        .assigned = assigned,
-        .endings = endings,
-        .run_of = .empty,
-        .status_of = .empty,
+        .nodes = nodes.items,
+        .node_statuses = node_statuses.items,
+        .assigned = assigned.items,
         .assigned_of = .empty,
-        .observed_head = .empty,
-        .observed_next = ctx.arena.alloc(u32, observed.len) catch
-            return failures.no_memory(ctx.diag),
     };
-    try index_world(ctx, &world);
-    return world;
+    for (shared.assigned, 0..) |entry, index| {
+        if (entry.rec.job == null) continue;
+        shared.assigned_of.put(ctx.arena, entry.rec.replica, @intCast(index)) catch
+            return failures.no_memory(ctx.diag);
+    }
+    return shared;
 }
 
-fn index_world(ctx: *const Context, world: *World) Error!void {
-    for (world.runs, 0..) |entry, at| {
-        world.run_of.put(ctx.arena, entry.rec.job, @intCast(at)) catch
+/// The next page of jobs after the key `after`, with the runs and statuses of exactly those jobs.
+fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Error!Page {
+    const listed = try ctx.store.list(ctx.arena, .{
+        .prefix = records.prefix_jobs,
+        .at_revision = shared.revision,
+        .limit = constants.job_controller_page_max,
+        .continue_after = after,
+    }, ctx.diag);
+    const jobs = ctx.arena.alloc(Entry(records.Job), listed.kvs.len) catch
+        return failures.no_memory(ctx.diag);
+    for (listed.kvs, 0..) |kv, at| {
+        jobs[at] = .{ .kv = kv, .rec = try records.read(records.Job, ctx.arena, kv, ctx.diag) };
+    }
+    var world: World = .{
+        .revision = shared.revision,
+        .jobs = jobs,
+        .runs = &.{},
+        .statuses = &.{},
+        .nodes = shared.nodes,
+        .node_statuses = shared.node_statuses,
+        .assigned = shared.assigned,
+        .run_of = .empty,
+        .status_of = .empty,
+        .assigned_of = shared.assigned_of,
+    };
+    if (jobs.len > 0) {
+        const first = after orelse "";
+        const last = jobs[jobs.len - 1].kv.key[records.prefix_jobs.len..];
+        const from = if (first.len > records.prefix_jobs.len)
+            first[records.prefix_jobs.len..]
+        else
+            null;
+        world.runs = try read_range(
+            records.JobRun,
+            ctx,
+            records.prefix_job_runs,
+            from,
+            last,
+            shared,
+        );
+        world.statuses = try read_range(
+            records.JobStatus,
+            ctx,
+            records.prefix_job_status,
+            from,
+            last,
+            shared,
+        );
+        for (world.runs, 0..) |entry, at| {
+            const name = entry.kv.key[records.prefix_job_runs.len..];
+            world.run_of.put(ctx.arena, name, @intCast(at)) catch
+                return failures.no_memory(ctx.diag);
+        }
+        for (world.statuses, 0..) |entry, at| {
+            const name = entry.kv.key[records.prefix_job_status.len..];
+            world.status_of.put(ctx.arena, name, @intCast(at)) catch
+                return failures.no_memory(ctx.diag);
+        }
+    }
+    return .{ .world = world, .more = listed.continue_after != null };
+}
+
+/// The records under `prefix` for the job names after `from` up to and including `last`, ascending.
+/// Records of no job in between (orphans) are read and left out.
+fn read_range(
+    comptime T: type,
+    ctx: *const Context,
+    prefix: []const u8,
+    from: ?[]const u8,
+    last: []const u8,
+    shared: *const Shared,
+) Error![]const Entry(T) {
+    var items: std.ArrayList(Entry(T)) = .empty;
+    var after: ?[]const u8 = null;
+    if (from) |name| {
+        after = std.mem.concat(ctx.arena, u8, &.{ prefix, name }) catch
             return failures.no_memory(ctx.diag);
     }
-    for (world.statuses, 0..) |entry, at| {
-        const name = entry.kv.key[records.prefix_job_status.len..];
-        world.status_of.put(ctx.arena, name, @intCast(at)) catch
-            return failures.no_memory(ctx.diag);
+    for (0..pages_max) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = prefix,
+            .at_revision = shared.revision,
+            .limit = constants.job_controller_page_max,
+            .continue_after = after,
+        }, ctx.diag);
+        for (page.kvs) |kv| {
+            if (std.mem.order(u8, kv.key[prefix.len..], last) == .gt) return items.items;
+            const rec = try records.read(T, ctx.arena, kv, ctx.diag);
+            items.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
+                return failures.no_memory(ctx.diag);
+        }
+        after = page.continue_after orelse return items.items;
     }
-    for (world.assigned, 0..) |entry, at| {
-        if (entry.rec.job == null) continue;
-        world.assigned_of.put(ctx.arena, entry.rec.replica, @intCast(at)) catch
-            return failures.no_memory(ctx.diag);
-    }
-    for (world.observed, 0..) |entry, at| {
-        const head = world.observed_head.get(entry.rec.run) orelse none;
-        world.observed_next[at] = head;
-        world.observed_head.put(ctx.arena, entry.rec.run, @intCast(at)) catch
-            return failures.no_memory(ctx.diag);
-    }
+    return failures.no_memory(ctx.diag);
 }
 
 // ---- How a run ended -------------------------------------------------------------------------
@@ -357,7 +469,7 @@ const Pass = struct {
         const status = pass.world.status(name);
         if (run == null and status == null) return pass.create(job);
         if (run == null or status == null) return pass.contradict(job, run, status);
-        if (records.job_state_terminal(status.?.rec.state)) return;
+        if (records.job_state_terminal(status.?.rec.state)) return pass.late_report(job, status.?);
         try pass.advance(job, run.?, status.?);
     }
 
@@ -366,7 +478,9 @@ const Pass = struct {
     fn create(pass: *Pass, job: *const Entry(records.Job)) Error!void {
         const ctx = pass.ctx;
         const name = job.rec.name;
-        if (try created_before(ctx, name)) return pass.contradict(job, null, null);
+        if (try has_decision(ctx, name, "job_created", job.kv.create_revision)) {
+            return pass.contradict(job, null, null);
+        }
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
         const id = ctx.arena.dupe(u8, records.job_run_id(&buffer, name)) catch
             return failures.no_memory(ctx.diag);
@@ -398,7 +512,7 @@ const Pass = struct {
         batch.expect(status_at, 0);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "job-created",
+            .action = "job_created",
             .subject = .{ .kind = .job, .name = name },
             .reason = "created the run for the job",
             .cause = .{ .kind = .desired, .key = job.kv.key, .revision = job.kv.mod_revision },
@@ -423,10 +537,9 @@ const Pass = struct {
     ) Error!void {
         const ctx = pass.ctx;
         const name = job.rec.name;
-        const hash = hash_of(&.{ "contradiction", name }, 0);
-        if (pass.jc.was_noted(hash)) return;
+        if (try has_decision(ctx, name, "hold_contradictory_job", job.kv.mod_revision)) return;
         const what = if (run == null and status == null)
-            "has a job-created decision but neither a run nor a status"
+            "has a job_created decision but neither a run nor a status"
         else if (run == null)
             "has a status but no run"
         else
@@ -441,7 +554,7 @@ const Pass = struct {
         var batch: Batch = .{};
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "hold-contradictory-job",
+            .action = "hold_contradictory_job",
             .subject = .{ .kind = .job, .name = name },
             .reason = "the job's records contradict each other; nothing about it changes",
             .cause = .{ .kind = .desired, .key = job.kv.key, .revision = job.kv.mod_revision },
@@ -450,7 +563,6 @@ const Pass = struct {
         }, &batch);
         batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
-        pass.jc.note(hash);
     }
 
     // ---- Steps 2 to 5: a live run ----
@@ -461,14 +573,10 @@ const Pass = struct {
         run: *const Entry(records.JobRun),
         status: *const Entry(records.JobStatus),
     ) Error!void {
-        const world = pass.world;
-        var any = false;
         var live: ?*const Entry(records.JobObserved) = null;
         var fence: ?*const Entry(records.JobObserved) = null;
-        var at = world.observed_head.get(run.rec.id) orelse none;
-        while (at != none) : (at = world.observed_next[at]) {
-            const entry = &world.observed[at];
-            any = true;
+        const claim_seen = try pass.claim(job.rec.name, run);
+        if (claim_seen) |entry| {
             if (pass.admissible(entry, run)) {
                 live = entry;
             } else if (entry.rec.stop_cause == .fence and entry.rec.status == .stopped) {
@@ -488,7 +596,26 @@ const Pass = struct {
             }
         }
         if (status.rec.state == .running) return pass.judge_running(job, run, status);
-        try pass.judge_unclaimed(job, run, status, any);
+        try pass.judge_unclaimed(job, run, status, claim_seen);
+    }
+
+    /// What the node the run is assigned to reported of it, if anything.
+    fn claim(
+        pass: *Pass,
+        name: []const u8,
+        run: *const Entry(records.JobRun),
+    ) Error!?*const Entry(records.JobObserved) {
+        const ctx = pass.ctx;
+        const placed = pass.world.assignment(run.rec.id) orelse return null;
+        const key = records.job_observed_key(assigned_node(placed.kv.key), name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), pass.world.revision, ctx.diag);
+        const kv = got.kv orelse return null;
+        const rec = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
+        if (!std.mem.eql(u8, rec.run, run.rec.id)) return null;
+        const entry = ctx.arena.create(Entry(records.JobObserved)) catch
+            return failures.no_memory(ctx.diag);
+        entry.* = .{ .kv = kv, .rec = rec };
+        return entry;
     }
 
     /// A report is admissible when it comes from the tenure the node holds now, under the epoch
@@ -550,7 +677,7 @@ const Pass = struct {
         batch.expect(entry.kv.key, entry.kv.mod_revision);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "job-running",
+            .action = "job_running",
             .subject = .{ .kind = .job, .name = job.rec.name },
             .reason = "the run was claimed by its node",
             .cause = .{ .kind = .observed, .key = entry.kv.key, .revision = entry.kv.mod_revision },
@@ -597,8 +724,8 @@ const Pass = struct {
         }
         const entry = world.node_entry(node);
         if (entry != null and entry.?.kv.mod_revision == tenure) return null;
-        const hash = hash_of(&.{ "tenure", run_id, node }, tenure);
-        return pass.jc.first_seen(hash, pass.ctx.clock.now_ms());
+        const run_hash = hash_of(&.{run_id}, 0);
+        return pass.jc.first_seen(run_hash, hash_of(&.{node}, tenure), pass.ctx.clock.now_ms());
     }
 
     fn past_grace(pass: *Pass, since: u64) bool {
@@ -609,22 +736,47 @@ const Pass = struct {
     }
 
     /// A run no admissible report claims: stop it when it must not start, end it once it has a
-    /// stop and nothing claimed it, and show a placement in the status.
+    /// stop and nothing claimed it, and show a placement in the status. A run whose node did
+    /// claim it, with a report that is not admissible, may be running: it is never ended as
+    /// unstarted (`judge_claimed`).
     fn judge_unclaimed(
         pass: *Pass,
         job: *const Entry(records.Job),
         run: *const Entry(records.JobRun),
         status: *const Entry(records.JobStatus),
-        any: bool,
+        claim_seen: ?*const Entry(records.JobObserved),
     ) Error!void {
-        if (run.rec.stop) |stop| {
-            if (any) return; // A claim exists: the agent reports how it ended.
-            return pass.end_unstarted(job, run, status, stop);
-        }
+        if (claim_seen) |entry| return pass.judge_claimed(job, run, status, entry);
+        if (run.rec.stop) |stop| return pass.end_unstarted(job, run, status, stop);
         if (try pass.stop_cause(job, run)) |cause| return pass.write_stop(job, run, status, cause);
         const placed = pass.world.assignment(run.rec.id) orelse return;
         if (status.rec.state != .pending) return;
         try pass.mark_placed(job, run, status, placed);
+    }
+
+    /// A claim that is not admissible (its tenure is not the node's now, the node is not ready,
+    /// or it is for another assignment) on a run not yet running: a cancel is still written, so
+    /// the agent that may hold the run stops it; the run ends `failed unreachable` when the
+    /// claim's tenure has been over for the grace, as a running run does, and never before.
+    fn judge_claimed(
+        pass: *Pass,
+        job: *const Entry(records.Job),
+        run: *const Entry(records.JobRun),
+        status: *const Entry(records.JobStatus),
+        claimed: *const Entry(records.JobObserved),
+    ) Error!void {
+        if (run.rec.stop == null and job.rec.cancel_requested != null) {
+            return pass.write_stop(job, run, status, .cancel);
+        }
+        const since = pass.tenure_ended_at(claimed.rec.node, claimed.rec.tenure, run.rec.id) orelse
+            return;
+        if (!pass.past_grace(since)) return;
+        try pass.end(job, run, status, .{
+            .ending = failed(.@"unreachable", .@"unreachable"),
+            .reason = "the node of the run was lost and did not come back within the grace",
+            .report = null,
+            .node = claimed.rec.node,
+        });
     }
 
     fn stop_cause(
@@ -667,7 +819,7 @@ const Pass = struct {
         try expect_key(ctx, &batch, &records.job_status_key(name), status.kv.mod_revision);
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "stop-job",
+            .action = "stop_job",
             .subject = .{ .kind = .job, .name = name },
             .reason = switch (cause) {
                 .cancel => "the job was cancelled before it was claimed",
@@ -697,7 +849,7 @@ const Pass = struct {
         batch.expect(placed.kv.key, placed.kv.mod_revision);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "job-placed",
+            .action = "job_placed",
             .subject = .{ .kind = .job, .name = name },
             .reason = "the run was assigned to a node",
             .cause = cause_of(.desired, &placed.kv),
@@ -748,6 +900,8 @@ const Pass = struct {
         ending: Ending,
         reason: []const u8,
         report: ?*const Entry(records.JobObserved),
+        /// The node to show when there is no report (the status of a claimed run has none yet).
+        node: ?[]const u8 = null,
     };
 
     /// The terminal status, once: compares the run, the status and the count of endings (and the
@@ -766,7 +920,7 @@ const Pass = struct {
         const status_at = try controller.key_copy(ctx, &records.job_status_key(name));
         batch.expect(status_at, status.kv.mod_revision);
         batch.expect(try controller.key_copy(ctx, &records.job_run_key(name)), run.kv.mod_revision);
-        batch.expect(records.key_job_endings, pass.world.endings_revision());
+        const counted = try pass.endings(&batch);
         var cause: records.Cause = .{
             .kind = .desired,
             .key = run.kv.key,
@@ -778,7 +932,7 @@ const Pass = struct {
         }
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "end-job",
+            .action = "end_job",
             .subject = .{ .kind = .job, .name = name },
             .reason = done.reason,
             .cause = cause,
@@ -791,16 +945,32 @@ const Pass = struct {
         next.ended_at_ms = now;
         next.decision = decided.slice();
         next.reported_at_ms = now;
+        if (done.node) |node| next.node = node;
         if (done.report) |report| {
             next.node = report.rec.node;
             next.diagnostic = report.rec.diagnostic;
             next.started_at_ms = report.rec.started_at_ms orelse next.started_at_ms;
         }
         assert(next.valid());
-        const counted: records.JobEndings = .{ .ended = pass.world.ended_count() + 1 };
         batch.put(status_at, try records.encode(ctx.arena, next, ctx.diag));
         batch.put(records.key_job_endings, try records.encode(ctx.arena, counted, ctx.diag));
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
+        pass.jc.forget_run(hash_of(&.{run.rec.id}, 0));
+    }
+
+    /// The count of endings with this one in it, read now (not with the page: another job's
+    /// ending in this step has moved it), and the compare that makes the count exact.
+    fn endings(pass: *Pass, batch: *Batch) Error!records.JobEndings {
+        const ctx = pass.ctx;
+        const got = try ctx.store.get(ctx.arena, records.key_job_endings, null, ctx.diag);
+        var ended: u64 = 0;
+        var revision: Revision = 0;
+        if (got.kv) |kv| {
+            revision = kv.mod_revision;
+            ended = (try records.read(records.JobEndings, ctx.arena, kv, ctx.diag)).ended;
+        }
+        batch.expect(records.key_job_endings, revision);
+        return .{ .ended = ended + 1 };
     }
 
     /// ZC-B0004: a report that maps to no ending. The job is left as it was; one decision says so.
@@ -811,8 +981,7 @@ const Pass = struct {
     ) Error!void {
         const ctx = pass.ctx;
         const name = job.rec.name;
-        const hash = hash_of(&.{ "unmappable", name }, entry.kv.mod_revision);
-        if (pass.jc.was_noted(hash)) return;
+        if (try has_decision(ctx, name, "hold_unmapped_ending", entry.kv.mod_revision)) return;
         const cause = try controller.format(
             ctx,
             "{s} reported an exit of kind {s} that maps to no ending",
@@ -823,7 +992,7 @@ const Pass = struct {
         batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "hold-unmapped-ending",
+            .action = "hold_unmapped_ending",
             .subject = .{ .kind = .job, .name = name },
             .reason = "the agent's report maps to no ending; the job is left as it was",
             .cause = .{ .kind = .observed, .key = entry.kv.key, .revision = entry.kv.mod_revision },
@@ -831,7 +1000,54 @@ const Pass = struct {
             .read_revision = pass.world.revision,
         }, &batch);
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
-        pass.jc.note(hash);
+    }
+
+    // ---- A report for an ended job ----
+
+    /// ZC-W0307: the node reported after the job ended. The ending stays; one decision says so,
+    /// once for each revision of the report. Only jobs that ended within `job_finished_age_ms_min`
+    /// are looked at: a report later than that finds the job deleted or about to be.
+    fn late_report(
+        pass: *Pass,
+        job: *const Entry(records.Job),
+        status: *const Entry(records.JobStatus),
+    ) Error!void {
+        const ctx = pass.ctx;
+        const name = job.rec.name;
+        const node = status.rec.node orelse return;
+        const ended_at = status.rec.ended_at_ms orelse return;
+        if (ctx.clock.now_ms() -| ended_at >= constants.job_finished_age_ms_min) return;
+        const key = records.job_observed_key(node, name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), pass.world.revision, ctx.diag);
+        const kv = got.kv orelse return;
+        if (kv.mod_revision < status.kv.mod_revision) return; // The report the ending rests on.
+        if (try has_decision(ctx, name, "drop_report", kv.mod_revision)) return;
+        const report = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
+        const how = if (status.rec.end) |ended| if (ended.cause) |c| @tagName(c) else "-" else "-";
+        const cause = try controller.format(
+            ctx,
+            "{s} reported {s} after the job ended as {s} ({s})",
+            .{ report.node, report.run, @tagName(status.rec.state), how },
+        );
+        const raw = try diagnostic_text(
+            ctx,
+            .W0307,
+            cause,
+            "nothing: the ending stands; `zcube why job` shows both",
+        );
+        var batch: Batch = .{};
+        batch.expect(kv.key, kv.mod_revision);
+        try expect_key(ctx, &batch, &records.job_status_key(name), status.kv.mod_revision);
+        _ = try controller.put_decision(ctx, &pass.jc.source, .{
+            .actor = actor,
+            .action = "drop_report",
+            .subject = .{ .kind = .job, .name = name },
+            .reason = "the job had ended; the report was not applied",
+            .cause = .{ .kind = .observed, .key = kv.key, .revision = kv.mod_revision },
+            .cause_diagnostic = raw,
+            .read_revision = pass.world.revision,
+        }, &batch);
+        _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
     }
 };
 
@@ -848,12 +1064,19 @@ fn cause_of(kind: records.CauseKind, kv: *const store.KeyValue) records.Cause {
     return .{ .kind = kind, .key = kv.key, .revision = kv.mod_revision };
 }
 
-/// True when `/decisions-by-subject/job/<name>` holds a `job-created`: the job had a run.
-fn created_before(ctx: *const Context, name: []const u8) Error!bool {
+/// True when `/decisions-by-subject/job/<name>` holds a decision of `action` whose index entry
+/// was created at `min_revision` or later: of this incarnation of the job (the job's
+/// `create_revision`) or since this revision of a record (its `mod_revision`).
+fn has_decision(
+    ctx: *const Context,
+    name: []const u8,
+    action: []const u8,
+    min_revision: Revision,
+) Error!bool {
     const prefix = records.index_prefix(.job, name);
     var after: ?[]const u8 = null;
     var at: ?Revision = null;
-    while (true) {
+    for (0..constants.decisions_per_subject_max / constants.store_list_limit_max + 2) |_| {
         const page = try ctx.store.list(ctx.arena, .{
             .prefix = prefix.slice(),
             .limit = constants.store_list_limit_max,
@@ -862,11 +1085,13 @@ fn created_before(ctx: *const Context, name: []const u8) Error!bool {
         }, ctx.diag);
         at = page.revision;
         for (page.kvs) |kv| {
+            if (kv.create_revision < min_revision) continue;
             const entry = try records.read(records.IndexEntry, ctx.arena, kv, ctx.diag);
-            if (std.mem.eql(u8, entry.action, "job-created")) return true;
+            if (std.mem.eql(u8, entry.action, action)) return true;
         }
         after = page.continue_after orelse return false;
     }
+    return false;
 }
 
 /// A diagnostic as the JSON a decision embeds (DIAGNOSTICS.md).

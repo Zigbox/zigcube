@@ -375,18 +375,20 @@ about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_byt
 (`6 * job_input_bytes_max + 16 KiB`, 409,600 bytes); every other route keeps `http_body_bytes_max`
 (64 KiB). A longer body is `413` ZC-E0108 and its cause names the limit of this route. The limit is
 decided on the decoded input, not the wire: an input within 64 KiB, with the rest of the job
-within 16 KiB as sent, is always stored. A body must arrive within `http_idle_timeout_ms`; a client
-that stalls part way is disconnected. The `state` of a `200` (same job) and of every cancel
+within 16 KiB as sent, is always stored. A body must arrive within `http_idle_timeout_ms` (10 s) of the
+request's start, so the slowest client the largest body allows is `job_request_bytes_max` over
+10 s, about 40 KB/s (40,960 bytes a second); a slower client, or one that stalls part way, is
+disconnected with no code. (`docs/decisions/2026-11-06-b1-slice-2-review-followups.md`.) The `state` of a `200` (same job) and of every cancel
 reply is the job's state now, `pending` only while it has no status.
 
 ### `GET /v1/jobs/{name}`, `GET /v1/jobs`
 
 The first answers `{revision, job, state, status}`: `job` is the spec with `env_names` (names, never
 values), `input_digest` and `input_bytes` (never the input), `cancel_requested`. `404` ZC-E0133 for
-a job that does not exist. The second takes `state=` (a job state, or `ended` for every terminal state), `label=key[=value]`, `limit=` (1 to 500,
-default 50), `at=` and `continue=`, and answers `{revision, jobs, continue}`; a filter keeps a
-subset of each store page, so a page may hold fewer than `limit` rows and `continue` may still be
-set.
+a job that does not exist. The second takes `state=` (a job state, or `ended` for every terminal state), `label=key[=value]`,
+`limit=` (1 to 500, default 50), `at=` and `continue=`, and answers `{revision, jobs, continue}`; a
+filter keeps a subset of each store page, so a page may hold fewer than `limit` rows and
+`continue` may still be set.
 
 ### `POST /v1/jobs/{name}/cancel`
 
