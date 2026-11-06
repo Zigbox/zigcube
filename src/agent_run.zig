@@ -153,8 +153,12 @@ const Shell = struct {
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
         const refusals = shell.agent.store_refusals;
+        const drops = shell.agent.pull_drops;
         const result = shell.agent.reconcile(&ctx);
         if (shell.agent.store_refusals != refusals) shell.notice_refused_summary();
+        if (shell.agent.pull_drops != drops) {
+            shell.notice_dropped_pull(shell.agent.pull_drops - drops);
+        }
         shell.save_pair(false);
         shell.notice_pair();
         // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
@@ -293,6 +297,14 @@ const Shell = struct {
         const text = "zcube-agent: zcube-server refused the node's image summary (ZC-E0504): " ++
             "{s}; replicas go on, and it will be sent again\n";
         const line = std.fmt.bufPrint(&buffer, text, .{shell.agent.store_refusal()}) catch return;
+        std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
+    }
+
+    /// A pull record was dropped unpublished (ZC-W0504): its statistics are lost, and a smoke
+    /// that waits for it would otherwise wait in silence (issue #93).
+    fn notice_dropped_pull(shell: *Shell, count: u32) void {
+        var buffer: [320]u8 = undefined;
+        const line = dropped_pull_line(&buffer, count, shell.agent.pull_drop()) orelse return;
         std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
     }
 
@@ -539,6 +551,9 @@ pub const Swarm = struct {
             .zigbox_store = zigbox_root,
             .zigbox_chunk_bytes = swarm.chunk_bytes_test,
             .verbose = config.verbose,
+            // A passing test step that writes to stderr is reported by the build runner as
+            // `failed command: ...` (docs/STYLE.md); the product's stderr is unchanged.
+            .quiet = @import("builtin").is_test,
             .corrupt_chunks = test_fault(io, config.state_dir, "peer-corrupt"),
         }) catch {
             gpa.destroy(server);
@@ -792,4 +807,22 @@ test "Swarm finds the Zigbox store from the environment, making it if absent" {
     var opened: zigbox_fetch.Opened = .{};
     try opened.open(std.testing.allocator, root); // It is a store that opens as existing.
     opened.close();
+}
+
+/// The ZC-W0504 line for `count` dropped pull records, the last described by `last`.
+fn dropped_pull_line(buffer: []u8, count: u32, last: []const u8) ?[]const u8 {
+    const text = "zcube-agent: ZC-W0504: {d} pull record(s) not stored, the last: {s}; " ++
+        "the replicas are not affected\n";
+    return std.fmt.bufPrint(buffer, text, .{ count, last }) catch null;
+}
+
+test "the dropped pull record line names the count, the container and the server's refusal" {
+    var buffer: [320]u8 = undefined;
+    const line = dropped_pull_line(&buffer, 2, "container web-1: zcube-server refused it").?;
+    const want = "zcube-agent: ZC-W0504: 2 pull record(s) not stored, the last: " ++
+        "container web-1: zcube-server refused it; the replicas are not affected\n";
+    try std.testing.expectEqualStrings(want, line);
+    // A reason too long for the line is no line, never a crash.
+    var small: [16]u8 = undefined;
+    try std.testing.expect(dropped_pull_line(&small, 1, "x") == null);
 }

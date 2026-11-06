@@ -9,6 +9,7 @@
 #   demo_c1       demo-c1 on SQLite and on Postgres
 #   zigbox_smoke  the Zigbox runtime on a real host (QEMU/KVM)
 #   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
+#   mtls_interop  mtls-interop (stock openssl and JDK servers)
 #
 # Environment: EVENT (github.event_name), HEAD_REF (the PR's head branch), LABELS (the PR's labels,
 # space separated). See docs/decisions/2026-11-04-ci-affected-demos.md.
@@ -19,7 +20,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 zigbox_smoke demo_c2)
+jobs=(store demo_c0 demo_c1 zigbox_smoke demo_c2 mtls_interop)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -52,6 +53,8 @@ classify() {
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
     src/zigbox_*) want_one zigbox_smoke; want_one demo_c2; return ;;
+    # The mTLS interop harness and its Java server.
+    src/mtls_interop.zig | ops/mtls-interop/*) want_one mtls_interop; return ;;
     # The smoke's own files.
     ops/zigbox-smoke/*) want_one zigbox_smoke; return ;;
     # The store suites' own files (the backends themselves are the server and run everything).

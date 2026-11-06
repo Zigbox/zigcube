@@ -68,7 +68,7 @@ These arrive with the scaffold; keep this list current as they land.
   `pg_dev stop` / `pg_dev up` (`zig build pg-stop`, `pg-up`) or with `ZCUBE_DEMO_PG_STOP` / `ZCUBE_DEMO_PG_START`.
   `docs/demos/c0.md` says what it asserts. Not `zig build sim-c0`, which is a simulation.
 - `zig build check [-Dcheck-user=<user>|-]` runs every gate a slice must pass and ends in one line,
-  `check: PASS <commit> (build test tidy errors-site wasm-check wasm-test console-wasm store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth, test as tester)`
+  `check: PASS <commit> (build test tidy errors-site wasm-check wasm-test console-wasm mtls-teeth store:memory,sqlite sim-c0 sim-cluster sim-teeth sim-c1 sim-swarm sim-swarm-teeth, test as tester)`
   or `check: FAIL <commit> (what failed)`. The gates are build-step dependencies; then
   `src/testing/check.zig` runs the Postgres suite (only when `ZCUBE_TEST_POSTGRES` is set), `sim-c0` and
   `sim-cluster` (40 operations) each with a fresh seed (printed as `sim-c0: seed N`, `sim-cluster: seed N` first), `sim-teeth`, `sim-swarm` (100 operations, fresh seed, printed as `sim-swarm: seed N`), `sim-swarm-teeth` and, as root, `zig build test` as `tester` in a scratch
@@ -80,6 +80,8 @@ These arrive with the scaffold; keep this list current as they land.
   restart and `zcube why node`, the partition test, local mode. About 35 s; uses the Postgres like
   `test-store`. `docs/demos/c1.md` says what it asserts. Not `sim-cluster`.
 - `zig build swarm-smoke` (`src/swarm_smoke.zig`) runs `zcube-server` and three `zcube-agent`s with `FakeRuntime` and a fake registry (one chunk of at least 1 MiB; node 3's registry link is black-holed): the first image is fetched from the registry, the second from a peer, a corrupting peer is struck (ZC-W0601), and the third replica starts with the registry unreachable. `swarm-smoke-teeth` runs it against `zcube-agent` built with verification skipped and passes only if the smoke fails. About 30 s; not in `check`; not a demo. A fetch's stderr is `<container dir>/fetch.log`; `zcube-agent --registry HOST:PORT` (needs `--images-dir`) enables it. `docs/agent.md`.
+- `zig build mtls-interop` (`src/mtls_interop.zig`, `ops/mtls-interop/InteropServer.java`) runs the TLS client of `tls_conn.zig` against stock servers, `openssl s_server` and a JDK 21 `SSLServerSocket` (compiled with `javac` per run; `ZCUBE_JAVA_HOME` names the JDK), with certificates of the Zigcube PKI: accepted and refused client certificates (chain, expiry, name, allow-list), TLS 1.2 refused, the identity extension read back by both servers, SSE and bulk streams, KeyUpdate. It fails, not skips, without `openssl`, `setpriv` (util-linux) or a JDK 21 (`docs/decisions/2026-11-06-interop-needs-setpriv.md`). A couple of minutes; not in `check`; not a demo. `docs/decisions/2026-11-05-interop-tools-are-test-only.md`.
+- `zig build mtls-teeth` runs the mTLS tests named `teeth:` (each skipped security check must be caught); it is in `check`, and `wasm-check` runs `src/mtls_smoke.zig` in the WASM module. `docs/mtls.md`.
 - `zig build demo-cN` runs milestone N's demo.
 
 ## Working as the implementer

@@ -649,6 +649,12 @@ pub const tls_records_per_key_max: u64 = 1 << 24;
 pub const tls_records_per_key_slack: u64 = 1;
 /// Key updates one direction accepts in a connection; a peer that updates without end is refused.
 pub const tls_key_updates_per_connection_max: u32 = 1 << 16;
+/// One deadline for a whole TLS handshake, from the first byte sent to the client's last flight
+/// (`tls_conn.zig` enforces it; a server that answers a byte a second still ends here).
+pub const tls_handshake_timeout_ms: u32 = 10_000;
+/// How long a refused connection gets to send its alert before it is dropped: a courtesy to the
+/// server, never worth holding a slot for.
+pub const tls_alert_flush_ms: u32 = 1_000;
 
 comptime {
     assert(tls_record_plaintext_bytes_max == 16384);
@@ -708,6 +714,8 @@ comptime {
     assert(tls_handshake_flight_bytes_max >= 2 * tls_handshake_message_bytes_max);
     assert(tls_handshake_flight_bytes_max < tls_record_plaintext_bytes_max);
     assert(tls_change_cipher_spec_records_max == 1);
+    assert(tls_alert_flush_ms < tls_handshake_timeout_ms);
+    assert(tls_handshake_timeout_ms < std.math.maxInt(i32)); // `poll` takes an i32.
     assert(tls_server_name_bytes_max <= 255);
     assert(tls_output_bytes_max >= tls_client_hello_bytes_max);
     assert(tls_output_bytes_max >= 6 + 5 + 4 + 32 + 1 + 16);

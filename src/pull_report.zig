@@ -31,23 +31,23 @@ pub fn tally(blobs: []const Blob) Tally {
 }
 
 /// Writes `record` to `path` through a temporary file and a rename, so the agent never reads half
-/// of it. False if it could not be written: the statistics are lost, nothing else.
+/// of it. An error if it could not be written (the caller says which): the statistics are lost,
+/// nothing else.
 pub fn write(
     allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     record: records.Pull,
-) bool {
+) !void {
     assert(path.len > 0);
     var text: std.Io.Writer.Allocating = .init(allocator);
     defer text.deinit();
-    std.json.Stringify.value(record, .{}, &text.writer) catch return false;
+    std.json.Stringify.value(record, .{}, &text.writer) catch |err| return err;
     var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const temporary = std.fmt.bufPrint(&name_buffer, "{s}.tmp", .{path}) catch return false;
+    const temporary = std.fmt.bufPrint(&name_buffer, "{s}.tmp", .{path}) catch |err| return err;
     const dir = std.Io.Dir.cwd();
-    dir.writeFile(io, .{ .sub_path = temporary, .data = text.written() }) catch return false;
-    dir.rename(temporary, dir, path, io) catch return false;
-    return true;
+    dir.writeFile(io, .{ .sub_path = temporary, .data = text.written() }) catch |err| return err;
+    dir.rename(temporary, dir, path, io) catch |err| return err;
 }
 
 const testing = std.testing;
@@ -74,7 +74,7 @@ test "write leaves a pull record that reads back, and no temporary file" {
         cwd[0..length], tmp.sub_path,
     });
     const record: records.Pull = .{ .node = "n1", .tree = "b3:ab", .registry_bytes = 42 };
-    try testing.expect(write(testing.allocator, testing.io, path, record));
+    try write(testing.allocator, testing.io, path, record);
     const text = try tmp.dir.readFileAlloc(
         testing.io,
         "pull.json",
@@ -86,5 +86,8 @@ test "write leaves a pull record that reads back, and no temporary file" {
     defer parsed.deinit();
     try testing.expectEqual(@as(u64, 42), parsed.value.registry_bytes);
     try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "pull.json.tmp", .{}));
-    try testing.expect(!write(testing.allocator, testing.io, "/nonexistent-dir/pull.json", record));
+    try testing.expectError(
+        error.FileNotFound,
+        write(testing.allocator, testing.io, "/nonexistent-dir/pull.json", record),
+    );
 }
