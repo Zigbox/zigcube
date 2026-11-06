@@ -352,6 +352,38 @@ test "a client that goes quiet is closed by the watchdog, not kept for ever" {
     try testing.expect(waited_ms >= earliest);
 }
 
+test "a client that stalls half way through a large body is closed, and frees its slot" {
+    // Goal: the body read is bounded like the head (REVIEW.md: every socket read has a deadline).
+    // Method: announce a 409,600-byte body to POST /v1/jobs, send 1,000 bytes and stop; the
+    // watchdog must close the connection within the idle timeout plus a few watchdog periods.
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    const server = try start_server(io, config_for(.memory, false));
+    defer server.stop();
+    var stream = try server.address().connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buffer: [2048]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    try writer.interface.print(
+        "POST /v1/jobs HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\n\r\n",
+        .{constants.job_request_bytes_max},
+    );
+    try writer.interface.splatByteAll('a', 1000);
+    try writer.interface.flush();
+    var tries: u32 = 0;
+    while (server.connections() == 0) : (tries += 1) {
+        try testing.expect(tries < 500);
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const limit_ms = constants.http_idle_timeout_ms + 3 * constants.http_watchdog_ms;
+    var waited_ms: u32 = 0;
+    while (server.connections() > 0) : (waited_ms += 50) {
+        try testing.expect(waited_ms <= limit_ms + 2000);
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+}
+
 test "a held watch ends when a key under its prefix changes, and times out empty otherwise" {
     // Goal: the long poll of docs/api.md through the real shell. Method: hold a watch on
     // /services/ for 5 s on one thread and apply a service from another; the answer arrives with

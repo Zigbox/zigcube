@@ -205,7 +205,7 @@ fn prune_subject(
     assert(kvs.len > 0);
     var drop: [constants.store_list_limit_max]bool = @splat(false);
     const newest = entry_time(kvs[kvs.len - 1].key, subject.prefix.len);
-    const standing = standing_of(work.snapshot, subject, newest, work.now_ms);
+    const standing = try standing_of(ctx, work, subject, newest);
     mark_drops(kvs, subject.prefix.len, standing, work.now_ms, drop[0..kvs.len]);
     if (standing == .live) try spare_pinned(ctx, kvs, subject, work, drop[0..kvs.len]);
     var batch: Batch = .{};
@@ -254,9 +254,9 @@ const Standing = enum {
     gone,
 };
 
-fn standing_of(snapshot: *const Snapshot, subject: Subject, newest: u64, now_ms: u64) Standing {
-    if (exists(snapshot, subject)) return .live;
-    if (age_ms(now_ms, newest) > constants.decision_gone_age_ms_max) return .gone;
+fn standing_of(ctx: *const Context, work: PageWork, subject: Subject, newest: u64) Error!Standing {
+    if (try exists(ctx, work, subject)) return .live;
+    if (age_ms(work.now_ms, newest) > constants.decision_gone_age_ms_max) return .gone;
     return .kept_a_day;
 }
 
@@ -295,7 +295,8 @@ fn age_ms(now_ms: u64, at_ms: u64) u64 {
     return if (now_ms > at_ms) now_ms - at_ms else 0;
 }
 
-fn exists(snapshot: *const Snapshot, subject: Subject) bool {
+fn exists(ctx: *const Context, work: PageWork, subject: Subject) Error!bool {
+    const snapshot = work.snapshot;
     switch (subject.kind) {
         .service => return snapshot.service_of(subject.name) != null,
         .replica => {
@@ -310,10 +311,14 @@ fn exists(snapshot: *const Snapshot, subject: Subject) bool {
             }
             return false;
         },
-        // The snapshot holds no jobs, and a job's chain is short (`decisions_per_subject_max` is
-        // far more than a job needs): never claim it gone, so a live job's chain is not cut as
-        // an orphan's.
-        .job => return true,
+        // The snapshot holds no jobs: read `/jobs/<name>` at the pass's revision. A job that is
+        // gone is a deleted subject (its decisions stay a day, then go). Live jobs are not
+        // roots of the pinned set, so job subjects never count toward `retention_pinned_max`.
+        .job => {
+            const key = records.job_key(subject.name);
+            const got = try ctx.store.get(ctx.arena, key.slice(), work.revision, ctx.diag);
+            return got.kv != null;
+        },
     }
 }
 
@@ -763,4 +768,49 @@ test "a pass that cannot pin everything drops nothing from live subjects" {
     fixture.diag.reset();
     try fixture.prune_once(&snapshot);
     try testing.expectEqual(@as(usize, 200), try fixture.count(records.prefix_index));
+}
+
+test "job subjects follow /jobs/<name>: a live job keeps its newest, a removed job's go in a day" {
+    // Goal: job decisions are neither pinned for ever nor a reason to stop pruning. Method: more
+    // job subjects than the pin bound (set to 2), a live job with more decisions than the budget,
+    // and a job whose record is gone. The pass must not fail safe; the live job is cut to the
+    // budget and the gone job's decisions go once their newest is over a day old.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const ctx = fixture.context();
+    const jobs = [_][]const u8{ "alive-a", "alive-b", "alive-c", "alive-d" };
+    for (jobs) |name| {
+        for (0..2) |_| _ = try fixture.decide(.{ .kind = .job, .name = name, .age = 1000 });
+        var batch: Batch = .{};
+        const key = records.job_key(name);
+        batch.put(try controller.key_copy(&ctx, &key), "x");
+        _ = try controller.commit(&ctx, .api, &batch);
+    }
+    const total = constants.decisions_per_subject_max + 5;
+    for (0..total) |index| {
+        _ = try fixture.decide(.{ .kind = .job, .name = "alive-e", .age = 600_000 - 1000 * index });
+    }
+    {
+        var batch: Batch = .{};
+        const key = records.job_key("alive-e");
+        batch.put(try controller.key_copy(&ctx, &key), "x");
+        _ = try controller.commit(&ctx, .api, &batch);
+    }
+    _ = try fixture.decide(.{
+        .kind = .job,
+        .name = "removed",
+        .age = constants.decision_gone_age_ms_max + 1,
+    });
+    var cursor: Cursor = .{ .pins_max = 2 };
+    try fixture.prune_with(&empty_snapshot, &cursor);
+    const removed = records.index_prefix(.job, "removed");
+    const busy = records.index_prefix(.job, "alive-e");
+    const quiet = records.index_prefix(.job, "alive-a");
+    try testing.expectEqual(@as(usize, 0), try fixture.count(removed.slice()));
+    try testing.expectEqual(
+        @as(usize, constants.decisions_per_subject_max),
+        try fixture.count(busy.slice()),
+    );
+    try testing.expectEqual(@as(usize, 2), try fixture.count(quiet.slice()));
 }
