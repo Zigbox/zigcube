@@ -527,6 +527,9 @@ const Work = struct {
             .epoch = subject.epoch,
             .phase = .claiming,
             .grace_ms = run.grace_ms,
+            // Bounds the input fetch's retries: `begin` re-arms it with the start.
+            .boot_id = ctx.boot_id,
+            .deadline_mono_ms = ctx.mono_ms() +| run.deadline_ms,
         };
         try write_record(ctx, work.state, &record);
         const claimed = try work.report_claim(subject, entry);
@@ -558,9 +561,19 @@ const Work = struct {
             // comes back, and the other runs of this pass are not held back.
             else => {
                 ctx.diag.reset();
-                const later = ctx.mono_ms() +| input_retry_ms;
-                work.agent.jobs_wake_mono_ms = @min(work.agent.jobs_wake_mono_ms, later);
-                return;
+                const mono = ctx.mono_ms();
+                if (record.deadline_mono_ms) |at| {
+                    // Past the run's own deadline nothing has started: report it as not
+                    // started (the server ends it `failed deadline`). Another boot's
+                    // deadline is not comparable and is armed again below.
+                    const this_boot = std.mem.eql(u8, record.boot_id, ctx.boot_id);
+                    if (this_boot and mono >= at) return work.not_started(subject, record);
+                    if (this_boot) return work.retry_input(at);
+                }
+                record.boot_id = ctx.boot_id;
+                record.deadline_mono_ms = mono +| run.deadline_ms;
+                try write_record(ctx, work.state, &record);
+                return work.retry_input(record.deadline_mono_ms.?);
             },
         };
         record.phase = .claimed;
@@ -570,6 +583,13 @@ const Work = struct {
         try write_record(ctx, work.state, &record);
         try work.start(subject, record, run, input);
     }
+
+    /// Wake for another fetch, but not later than the deadline that bounds the retries.
+    fn retry_input(work: *Work, deadline: u64) void {
+        const later = @min(work.ctx.mono_ms() +| input_retry_ms, deadline);
+        work.agent.jobs_wake_mono_ms = @min(work.agent.jobs_wake_mono_ms, later);
+    }
+
 
     fn report_claim(
         work: *Work,
@@ -856,7 +876,7 @@ pub fn raise_input(diag: *Diag, run: []const u8, problem: InputProblem) void {
     diag.raise(.E0523);
     switch (problem) {
         .absent => diag.cause("{s} names an input by digest and the server holds none", .{run}),
-        .mismatch => diag.cause("the input held for {s} does not match its digest", .{run}),
+        .mismatch => diag.cause("the input held for {s} {s}", .{ run, records.input_mismatch_phrase }),
     }
     diag.fix(.{ .sentence = "report it with the diagnostic bundle; submit the job again" });
 }
