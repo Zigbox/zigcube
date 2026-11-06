@@ -590,7 +590,6 @@ const Work = struct {
         work.agent.jobs_wake_mono_ms = @min(work.agent.jobs_wake_mono_ms, later);
     }
 
-
     fn report_claim(
         work: *Work,
         subject: Subject,
@@ -876,7 +875,9 @@ pub fn raise_input(diag: *Diag, run: []const u8, problem: InputProblem) void {
     diag.raise(.E0523);
     switch (problem) {
         .absent => diag.cause("{s} names an input by digest and the server holds none", .{run}),
-        .mismatch => diag.cause("the input held for {s} {s}", .{ run, records.input_mismatch_phrase }),
+        .mismatch => diag.cause("the input held for {s} {s}", .{
+            run, records.input_mismatch_phrase,
+        }),
     }
     diag.fix(.{ .sentence = "report it with the diagnostic bundle; submit the job again" });
 }
