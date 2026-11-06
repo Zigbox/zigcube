@@ -362,10 +362,11 @@ other: `job_created` (the run and its pending status exist; the rule "a run is c
 rests on it, judged per incarnation by the index entry's `create_revision`), `job_placed`,
 `job_running`, `stop_job`, `end_job`, `hold_contradictory_job` (ZC-E0307), `hold_unmapped_ending`
 (ZC-B0004) and `drop_report` (ZC-W0307: a report that arrived after the job ended, which changes
-nothing). A decision that holds or drops is not repeated for the same record revision. (`mark_replica_lost` for a
-replica whose node was lost points at the node's `mark_lost` instead, and the `replace_replica`
-it provokes at it, so `why` on the replacement, a new id, reaches the lease.) A decision with a
-service as subject is indexed under `/decisions-by-subject/service/<name>/<id>` like any other.
+nothing). A decision that holds or drops is not repeated for the same record revision.
+(`mark_replica_lost` for a replica whose node was lost points at the node's `mark_lost` instead, and
+the `replace_replica` it provokes at it, so `why` on the replacement, a new id, reaches the lease.)
+A decision with a service as subject is indexed under `/decisions-by-subject/service/<name>/<id>`
+like any other.
 
 ## `/decisions-by-subject/<kind>/<name>/<id>`: the index for `zcube why`
 

@@ -1081,14 +1081,30 @@ test "a run is released when its status is terminal or gone, and not before" {
     try fixture.expect_on("a-job", null);
     try fixture.expect_on("b-job", "n1");
     const ctx = fixture.context();
-    // A status alone missing is the job controller's contradiction, not a job that is gone: the
-    // workload may be live, so its node stays booked (review of PR 112).
+    // A live job (its `/jobs/` record present) with its status, or its status and run, missing is
+    // the job controller's contradiction, not a job that is gone: the workload may be live, so its
+    // node stays booked (review of PR 112).
+    const record: records.Job = .{
+        .name = "b",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .deadline_ms = 60 * 1000,
+        .submit_by_ms = 1,
+        .created_at_ms = 1,
+    };
+    try fixture.put(.api, records.job_key("b").slice(), record);
     const no_status = [_]store.Op{.{ .delete = records.job_status_key("b").slice() }};
     _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &no_status }, &fixture.diag);
     try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
     try fixture.expect_on("b-job", "n1");
     const no_run = [_]store.Op{.{ .delete = records.job_run_key("b").slice() }};
     _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &no_run }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("b-job", "n1");
+    try testing.expectEqual(@as(u32, 1), (try fixture.allocation("n1")).count);
+    // Only when the job itself is gone does the node come free.
+    const no_job = [_]store.Op{.{ .delete = records.job_key("b").slice() }};
+    _ = try writers.txn(ctx.store, .api, .{ .on_success = &no_job }, &fixture.diag);
     try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
     try fixture.expect_on("b-job", null);
     try testing.expectEqual(@as(u32, 0), (try fixture.allocation("n1")).count);
