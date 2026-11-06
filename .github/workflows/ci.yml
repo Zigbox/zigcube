@@ -53,6 +53,7 @@ jobs:
       demo_c1: ${{ steps.pick.outputs.demo_c1 || 'true' }}
       zigbox_smoke: ${{ steps.pick.outputs.zigbox_smoke || 'true' }}
       demo_c2: ${{ steps.pick.outputs.demo_c2 || 'true' }}
+      mtls_interop: ${{ steps.pick.outputs.mtls_interop || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -499,4 +500,32 @@ jobs:
           path: |
             demo-c2.txt
             demo-c2-transcript.txt
+          if-no-files-found: warn
+
+  # Stock servers (openssl s_server, a JDK 21 SSLServerSocket) against the mTLS client. Test-only
+  # tools: docs/decisions/2026-11-05-interop-tools-are-test-only.md.
+  mtls-interop:
+    name: mtls-interop (openssl, JDK 21)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.mtls_interop == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - name: mtls-interop
+        shell: bash
+        run: |
+          # The runner image ships JDK 21 and sets JAVA_HOME_21_X64; the harness fails on another.
+          : "${JAVA_HOME_21_X64:?the runner image has no JDK 21}"
+          export ZCUBE_JAVA_HOME="$JAVA_HOME_21_X64"
+          openssl version
+          "$ZCUBE_JAVA_HOME/bin/java" -version
+          zig build mtls-interop --summary all 2>&1 | tee mtls-interop.txt
+      - name: Keep the output
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mtls-interop-output
+          path: mtls-interop.txt
           if-no-files-found: warn
