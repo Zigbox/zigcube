@@ -192,7 +192,7 @@ pub fn write_all(io: std.Io, fd: std.posix.fd_t, bytes: []const u8, end_ms: u64)
 }
 
 /// Polls `fd` for `events` until `end_ms`: `Timeout` once the deadline has passed.
-fn wait_ready(io: std.Io, fd: std.posix.fd_t, events: i16, end_ms: u64) Error!void {
+pub fn wait_ready(io: std.Io, fd: std.posix.fd_t, events: i16, end_ms: u64) Error!void {
     if (boot_ms(io) >= end_ms) return error.Timeout;
     var wait = [_]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
     const ready = std.posix.poll(&wait, left_ms(io, end_ms)) catch return error.Io;
