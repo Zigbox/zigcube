@@ -584,6 +584,12 @@ fn observed_step(
             // The node controller reacted to a node's registration, not to a replica's report.
             const name = key[records.prefix_nodes.len..];
             text = try controller.format(ctx, "node {s} registered ({s})", .{ name, key });
+        } else if (std.mem.startsWith(u8, key, records.prefix_job_observed)) {
+            const seen = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
+            text = try controller.format(ctx, "{s} on {s}: {s}", .{
+                seen.run, seen.node, @tagName(seen.status),
+            });
+            if (seen.diagnostic) |raw| diagnostic = raw;
         } else {
             const observed = try records.read(records.Observed, ctx.arena, kv, ctx.diag);
             const phrase = try observed_phrase(ctx, &observed);
@@ -645,6 +651,18 @@ fn desired_step(ctx: *const Context, steps: *std.ArrayList(Step), last: Fetched)
                     job.deadline_ms,
                     if (job.cancel_requested != null) ", cancel requested" else "",
                 });
+            } else if (std.mem.startsWith(u8, key, records.prefix_job_runs)) {
+                const run = try records.read(records.JobRun, ctx.arena, kv, ctx.diag);
+                text = try controller.format(ctx, "run {s} of job {s} was created: " ++
+                    "deadline {d} ms{s}", .{
+                    run.id,
+                    run.job,
+                    run.deadline_ms,
+                    if (run.stop != null) ", stopped" else "",
+                });
+            } else if (!std.mem.startsWith(u8, key, records.prefix_services)) {
+                // A placement or a node's claim of a job: the key itself is the cause.
+                text = try controller.format(ctx, "{s} exists", .{key});
             } else {
                 const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
                 text = try controller.format(ctx, "service {s} was applied by {s} " ++
