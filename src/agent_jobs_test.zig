@@ -324,3 +324,24 @@ test "a fence is recorded as the cause and reported under the next tenure" {
     try testing.expectEqual(@as(?records.StopCause, .fence), seen.stop_cause);
     try testing.expectEqual(rig.world.agent.tenure, seen.tenure);
 }
+
+test "an oom or a pid limit ends the run with that kind, and no cause" {
+    // Goal: the runtime's faults reach the job's observation unchanged (the fake runtime's
+    // `faults/<run id>` files are these injections by name). Method: inject each, step, read.
+    const faults = [_]struct { sim_runtime.Fault, records.ExitKind }{
+        .{ .oom, .oom },
+        .{ .pid_limit, .pid_limit },
+    };
+    for (faults) |case| {
+        var rig = try Rig.start();
+        defer rig.stop();
+        _ = try rig.assign(60_000);
+        rig.step();
+        try rig.world.sim.inject(run_id, case[0]);
+        rig.step();
+        const seen = (try rig.observed()).?;
+        try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+        try testing.expectEqual(case[1], seen.exit.?.kind);
+        try testing.expectEqual(@as(?records.StopCause, null), seen.stop_cause);
+    }
+}
