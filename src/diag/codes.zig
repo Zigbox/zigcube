@@ -1664,17 +1664,20 @@ pub const registry = [_]Entry{
         .explanation =
         \\The client was told to present a certificate and the server did not ask
         \\for one, or the server refused the one presented (the alert names why:
-        \\bad_certificate, certificate_expired, unknown_ca, certificate_required),
-        \\or the request cannot be answered (it does not list Ed25519), or the
-        \\signer holding the key failed. The connection is closed; a refusal arrives
-        \\after the client's own handshake is done, so data written before the
-        \\alert was read was not accepted.
+        \\bad_certificate, certificate_expired, unknown_ca, certificate_required).
+        \\A client that sends an empty Certificate (it has no certificate, or the
+        \\request does not list Ed25519) and is refused by the server is this too,
+        \\and so is a client that must authenticate facing a request without
+        \\Ed25519. The connection is closed; a refusal arrives after the client's
+        \\own handshake is done, so data written before the alert was read was
+        \\not accepted.
         \\
         \\A server that never asks cannot learn which workload is calling, so a
         \\connection that must prove identity stops. Check that the server is
         \\configured to require client certificates and trusts the cluster CA;
         \\a refused certificate is expired, issued by another CA, or for a
-        \\different workload than the server allows.
+        \\different workload than the server allows. A signer that fails is a
+        \\different error (ZC-E0820).
         ,
     },
     .{
@@ -1697,14 +1700,20 @@ pub const registry = [_]Entry{
         .code = .E0816,
         .severity = .@"error",
         .blame = .external,
-        .summary = "a TLS connection ended without close_notify",
+        .summary = "a TLS connection ended or stalled without close_notify",
         .explanation =
         \\The peer's side of the connection ended before it sent close_notify, so the
         \\data received may be cut short. Mid-handshake this means the peer hung up
         \\before the handshake finished.
         \\
+        \\The connection also ends this way when the peer stays connected and goes
+        \\quiet: a handshake, or the answer to a KeyUpdate, did not finish in time
+        \\because the peer stopped reading or answering. A black hole, an overloaded
+        \\server or a middlebox that drops packets looks like this.
+        \\
         \\Treat what arrived as incomplete and retry the request. A peer that
-        \\crashes, or a network that resets the connection, ends this way.
+        \\crashes, or a network that resets the connection, ends this way; for a
+        \\stall, check that the server is reachable and keeping up.
         ,
     },
     .{
@@ -1866,7 +1875,9 @@ comptime {
     assert(registry.len == fields.len);
     assert(fields.len <= std.math.maxInt(u8));
     assert(prefix.len + tag_bytes <= constants.diag_code_bytes_max);
-    @setEvalBranchQuota(400_000);
+    // The check walks every byte of every summary and explanation (about 4 branches a byte).
+    @setEvalBranchQuota(registry.len * (constants.diag_explanation_bytes_max +
+        constants.diag_summary_bytes_max) * 8);
     for (registry, fields, 0..) |item, name, index| {
         assert(@backingInt(item.code) == index);
         assert(std.mem.eql(u8, @tagName(item.code), name));

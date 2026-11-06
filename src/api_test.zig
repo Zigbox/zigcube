@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const api_mod = @import("api.zig");
+const agent_state = @import("agent_state.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
@@ -798,6 +799,114 @@ test "the agent publishes the pull records its fetches left, and removes every f
     for (names) |name| {
         try testing.expectError(error.Absent, files.read(ctx.arena, name));
     }
+}
+
+/// The agent's files with `remove` failing as a host refusing it does; everything else passes
+/// through to the simulated files.
+const FailingRemove = struct {
+    inner: agent_state.AgentState,
+    removes: u32 = 0,
+
+    const vtable: agent_state.AgentState.VTable = .{
+        .put_atomic = put_atomic,
+        .append = append,
+        .read = read,
+        .remove = remove,
+        .list = list,
+    };
+
+    fn interface(self: *FailingRemove) agent_state.AgentState {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *FailingRemove {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn put_atomic(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return from(context).inner.put_atomic(name, data);
+    }
+
+    fn append(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return from(context).inner.append(name, data);
+    }
+
+    fn read(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        name: []const u8,
+    ) agent_state.Error![]const u8 {
+        return from(context).inner.read(arena, name);
+    }
+
+    fn remove(context: *anyopaque, name: []const u8) agent_state.Error!void {
+        _ = name;
+        from(context).removes += 1;
+        return error.Io;
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        prefix: []const u8,
+    ) agent_state.Error![]const []const u8 {
+        return from(context).inner.list(arena, prefix);
+    }
+};
+
+test "a pull record whose file cannot be removed is not counted as dropped, in any step" {
+    // Goal: ZC-W0504's count is of records dropped, and a record is dropped only once its file is
+    // gone (else each retried step would count it again). Method: a record for another node, every
+    // remove failing; two steps both fail with the state-file code, `pull_drops` stays 0 and no
+    // text is noted, though the remove was tried both times.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const files = rig.world.files.interface();
+    const foreign = "{\"v\":1,\"node\":\"node2\",\"tree\":\"b3:51aa9c03\"}";
+    try files.put_atomic("containers/hello-2/pull.json", foreign);
+    var failing: FailingRemove = .{ .inner = files };
+    rig.world.state_override = failing.interface();
+    for (0..2) |_| {
+        const stepped = rig.world.agent_step();
+        try testing.expect(stepped.failed != null);
+        try testing.expectEqual(@as(u32, 0), rig.world.agent.pull_drops);
+        try testing.expectEqual(@as(usize, 0), rig.world.agent.pull_drop().len);
+        rig.world.advance(2000);
+    }
+    try testing.expect(failing.removes >= 2);
+    // Once the host lets the remove through, the record is dropped and counted once.
+    rig.world.state_override = null;
+    rig.world.advance(2000);
+    _ = rig.world.agent_step();
+    try testing.expectEqual(@as(u32, 1), rig.world.agent.pull_drops);
+}
+
+test "a pull record the server refuses puts the server's cause into the drop text" {
+    // Goal: ZC-W0504 names why a record was dropped. Method: a good record, a store that refuses
+    // every write under /pulls/ with ZC-E0504 and a known cause; `pull_drop_text` is filled with a
+    // known byte first, so a text that is not rewritten (or not cut at its length) shows.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    rig.world.advance(2000);
+    const files = rig.world.files.interface();
+    const good =
+        \\{"v":1,"node":"node1","tree":"b3:51aa9c03","registry_bytes":7,"finished_at_ms":9}
+    ;
+    try files.put_atomic("containers/hello-1/pull.json", good);
+    @memset(&rig.world.agent.pull_drop_text, 0xAA);
+    rig.world.switched.refuse_put_prefix = records.prefix_pulls;
+    const stepped = rig.world.agent_step();
+    try testing.expect(stepped.failed == null);
+    try testing.expectEqual(@as(u32, 1), rig.world.agent.pull_drops);
+    const text = rig.world.agent.pull_drop();
+    try testing.expect(std.mem.startsWith(u8, text, "container hello-1"));
+    try testing.expect(std.mem.indexOf(u8, text, "the server refused the write") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, text, 0xAA) == null);
+    const gone = files.read(rig.parsed.allocator(), "containers/hello-1/pull.json");
+    try testing.expectError(error.Absent, gone);
 }
 
 test "a pull retention pass that fails is recorded and does not fail the controller step" {

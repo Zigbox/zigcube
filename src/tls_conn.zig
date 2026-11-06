@@ -164,9 +164,11 @@ pub const Conn = struct {
 
     /// Reads application data into `out` and returns how many bytes: at least one, and never
     /// more than one record. 0 is the server's close_notify, repeated for as long as asked. A
-    /// `Timeout` leaves the connection as it was: nothing was consumed, and the call may be
-    /// repeated. A send made on the read's behalf that runs out of time is `Refused`, not
-    /// `Timeout`: the connection is over.
+    /// `Timeout` leaves the connection as it was: no application data was consumed (a KeyUpdate
+    /// may have been, and answered), and the call may be repeated. A send made on the read's
+    /// behalf that runs out of time is `Refused`, not `Timeout`: the connection is over. When
+    /// the read answers a KeyUpdate it may return up to `tls_alert_flush_ms` after `end_ms`, so
+    /// a caller that derives a deadline from `end_ms` budgets for that.
     pub fn read(conn: *Conn, out: []u8, end_ms: u64, diag: *Diag) Error!usize {
         assert(out.len > 0);
         switch (conn.phase) {

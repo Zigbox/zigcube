@@ -52,6 +52,11 @@ pub const Faults = struct {
     /// value picks how and where (see `damage_request`). The record around it stays valid, so
     /// what fails is the request's own parse.
     request_damage: u32 = 0,
+    /// Damages one of EncryptedExtensions, Certificate, CertificateVerify and Finished (not
+    /// zero): the value picks which, how and where (see `damage_message`). The message is
+    /// damaged before it is sealed and enters the transcript as damaged, so the record, the
+    /// MAC and the transcript are all valid and what fails is the message's own content.
+    message_damage: u32 = 0,
 };
 
 /// Asks the client for a certificate and checks what it sends.
@@ -215,7 +220,7 @@ pub const Peer = struct {
             out[used..],
             &scratch,
             &length,
-            &encrypted_extensions,
+            self.damaged(0, &encrypted_extensions),
             !faults.skip_encrypted_extensions_in_transcript,
         );
         if (faults.certificate_request) {
@@ -233,17 +238,26 @@ pub const Peer = struct {
             out[used..],
             &scratch,
             &length,
-            self.certificate_message(&scratch),
+            self.damaged(1, self.certificate_message(&scratch)),
             true,
         );
-        used += self.message(out[used..], &scratch, &length, self.verify_message(&scratch), true);
-        used += self.message(out[used..], &scratch, &length, self.finished_message(&scratch), true);
+        const verify = self.damaged(2, self.verify_message(&scratch));
+        used += self.message(out[used..], &scratch, &length, verify, true);
+        const finished = self.damaged(3, self.finished_message(&scratch));
+        used += self.message(out[used..], &scratch, &length, finished, true);
         if (!faults.record_per_message) used += self.flush(out[used..], scratch[0..length]);
         self.finished_hash = self.transcript.hash();
         const secrets = self.secrets.to_application(&self.finished_hash);
         self.write = schedule.Direction.init(&secrets.server);
         self.client_application_secret = secrets.client;
         return used;
+    }
+
+    /// `bytes` as it is, or damaged when `Faults.message_damage` picks message number `which`.
+    fn damaged(self: *Peer, which: u32, bytes: []const u8) []const u8 {
+        const damage = self.config.faults.message_damage;
+        if (damage == 0 or damage % 4 != which) return bytes;
+        return damage_message(bytes, damage);
     }
 
     /// Adds one message to the transcript and either seals it alone or holds it for `flush`.
@@ -459,6 +473,34 @@ pub const Peer = struct {
 };
 
 var request_buffer: [512]u8 = undefined;
+var damage_buffer: [constants.tls_handshake_message_bytes_max + 1]u8 = undefined;
+
+/// A handshake message with its content damaged and its length field made to match: the last
+/// body byte gone, one byte more, one body byte flipped, or no body. `damage / 4 % 4` picks
+/// how. The flip reads its position from `damage / 16` and its mask from `damage / 64` (so the
+/// two overlap in bits); the extra byte is `damage / 16`; the other two read nothing more. The
+/// result is always different from `bytes`.
+fn damage_message(bytes: []const u8, damage: u32) []const u8 {
+    assert(bytes.len >= 4 + 1);
+    assert(bytes.len <= constants.tls_handshake_message_bytes_max);
+    const buffer = &damage_buffer;
+    @memcpy(buffer[0..bytes.len], bytes);
+    var length = bytes.len;
+    switch ((damage / 4) % 4) {
+        0 => length -= 1,
+        1 => {
+            buffer[length] = @truncate(damage / 16);
+            length += 1;
+        },
+        2 => {
+            const flip: u8 = 1 + @as(u8, @truncate(damage / 64)) % 255;
+            buffer[4 + (damage / 16) % (bytes.len - 4)] ^= flip;
+        },
+        else => length = 4,
+    }
+    std.mem.writeInt(u24, buffer[1..4], @intCast(length - 4), .big);
+    return buffer[0..length];
+}
 
 /// CertificateRequest (RFC 8446 section 4.3.2): the context and the extensions the config names.
 fn request_message(auth: *const ClientAuth, damage: u32) []const u8 {

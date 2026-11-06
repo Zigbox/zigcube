@@ -128,8 +128,9 @@ pub const Server = struct {
     /// Strangers shut down to make room for a newcomer (`evict_oldest`).
     evictions: std.atomic.Value(u32) = .init(0),
 
-    /// Set when the Zigbox store is read with the one-id map (ZBX-W0201 was said); for tests.
-    outside_fallback: bool = false,
+    /// The code said when the Zigbox store is read with the one-id map (ZBX-W0201), else null;
+    /// for tests.
+    outside_warning: @FieldType(zigbox.diag.Diag, "code") = null,
 
     const OutsideMap = zigbox_fetch.OutsideMap;
 
@@ -190,7 +191,7 @@ pub const Server = struct {
             warning.while_("choosing the id map to read the Zigbox store with", .{});
             warning.cause("only objects owned by container root can be served to peers; " ++
                 "see zbx doctor (ZBX-E0105) for the subordinate id ranges and helpers", .{});
-            server.outside_fallback = true;
+            server.outside_warning = warning.code;
             if (!server.config.quiet) show_foreign(io, &warning);
         }
         return outside.map;
@@ -1526,13 +1527,15 @@ test "an agent configured for Zigbox only serves its store's tree to a peer fetc
     try agent.init();
     defer agent.deinit();
     try std.testing.expect(!agent.swarm.has_store);
-    // ZBX-W0201 is said (and the flag set) exactly when this host maps one id only; the agent
-    // starts the server quiet in a test, so the flag is how the test sees the warning.
+    // ZBX-W0201 is said (and its code kept) exactly when this host maps one id only; the agent
+    // starts the server quiet in a test, so the kept code is how the test sees the warning.
     {
         const facts = try gpa.create(zigbox.Facts);
         defer gpa.destroy(facts);
         const expected = zigbox_fetch.outside_owners(facts).fallback;
-        try std.testing.expectEqual(expected, agent.swarm.server.?.outside_fallback);
+        const said = agent.swarm.server.?.outside_warning;
+        try std.testing.expectEqual(expected, said != null);
+        if (expected) try std.testing.expect(said.? == .W0201);
     }
     // The node's summary comes from the Zigbox store the agent opened: it lists the tree.
     var arena_state = std.heap.ArenaAllocator.init(gpa);

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0816 · Zigcube</title>
-<meta name="description" content="a TLS connection ended without close_notify">
+<meta name="description" content="a TLS connection ended or stalled without close_notify">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0816.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,11 +73,12 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0816</h1>
-<p class="summary">a TLS connection ended without close_notify</p>
+<p class="summary">a TLS connection ended or stalled without close_notify</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>The peer's side of the connection ended before it sent close_notify, so the data received may be cut short. Mid-handshake this means the peer hung up before the handshake finished.</p>
-<p>Treat what arrived as incomplete and retry the request. A peer that crashes, or a network that resets the connection, ends this way.</p>
+<p>The connection also ends this way when the peer stays connected and goes quiet: a handshake, or the answer to a KeyUpdate, did not finish in time because the peer stopped reading or answering. A black hole, an overloaded server or a middlebox that drops packets looks like this.</p>
+<p>Treat what arrived as incomplete and retry the request. A peer that crashes, or a network that resets the connection, ends this way; for a stall, check that the server is reachable and keeping up.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0816</pre>

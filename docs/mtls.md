@@ -140,8 +140,11 @@ Rules the code holds to, each with a test:
   and its size. A CertificateRequest that lists many `certificate_authorities` can pass it, and a
   server of that kind is refused; raising the limit is a change to `constants.zig`.
 - **Leniency in the context.** The client Certificate echoes whatever context the request
-  carried, non-empty included, as RFC 8446 section 4.4.2 says; the server's own Certificate
-  (in the first flight) must have an empty context and a non-empty one is refused.
+  carried, non-empty included. This is a deliberate leniency: RFC 8446 section 4.3.2 says the
+  context SHALL be zero length in a request sent during the handshake, and a strict client
+  would refuse it. The client accepts and echoes it so a peer that sends one still completes
+  (the test peer does); the echo is what section 4.4.2 asks of a response. The server's own
+  Certificate (in the first flight) must have an empty context and a non-empty one is refused.
 
 Tests: `tls_client_test.zig` (client authentication in all piece sizes, refusals, the server's
 alerts, a failing signer (ZC-E0820) and five teeth tests for it; `tls_wire_test.zig`, tables for `parse_certificate_request`; success at several piece sizes, refusals, pinning, record faults and
@@ -217,7 +220,7 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
 | ZC-E0814 | the client certificate was not asked for though required, could not be answered, or was refused by the server (an empty or absent Certificate answered by a refusal is this too) |
 | ZC-E0820 | the signer holding the client certificate's key did not sign |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
-| ZC-E0816 | the connection ended without close_notify, or before the handshake finished |
+| ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time |
 | ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
 
