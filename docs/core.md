@@ -332,11 +332,8 @@ two by hand, which is what a replay line carries (with the concrete nodes, `--pr
 `--heal-at=`), so a replay draws nothing. An explicit `<ops>` keeps the seed-picked node count,
 the 10 s ttl and 100 % replicas. A failing seed prints `  profile:` and `  shape:` lines after
 its `  step:` line; the fleet's parser ignores them. The `auto` range summary reads
-`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 8,000 ms
-until issue #78 (a healed cluster fences again and again at ttls of about 4,500 ms and under, and a
-crash-heavy run at 5,959 ms still fails at `end` with a busy-loop verdict) is fixed
-(`docs/decisions/2026-11-05-fleet-ttl-floor.md`); a ttl given by hand is accepted at any value in
-range, but one at or under about 4,500 ms may not finish in reasonable time. Every draw has its
+`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 8,000 ms, which is also the shortest ttl the server admits
+(`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
 own generator (the seed xor a salt); the
 decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.
 **Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
