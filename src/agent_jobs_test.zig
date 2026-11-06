@@ -182,7 +182,8 @@ test "a claim in the store without a start record is never started again" {
         .status = .claimed,
         .reported_at_ms = rig.world.now_ms(),
     };
-    _ = try rig.put(.agent, records.job_observed_key(sim_world.node_name, job_name).slice(), claimed);
+    const key = records.job_observed_key(sim_world.node_name, job_name);
+    _ = try rig.put(.{ .agent = sim_world.node_name }, key.slice(), claimed);
     rig.step();
     try testing.expect(!rig.running());
     const seen = (try rig.observed()).?;
