@@ -1199,8 +1199,8 @@ fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     });
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{
-        "--seeds",                "1..3",                "100",
-        "1",                      "--lease-ttl-ms=4000", "--expect-fail",
+        "--seeds",                              "1..3",                "100",
+        "1",                                    "--lease-ttl-ms=4000", "--expect-fail",
         "--expect-symptom=agents kept fencing",
     });
     const help = "Run the simulator with the old renewal rule at ttl 4000; it must fail";

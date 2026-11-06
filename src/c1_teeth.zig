@@ -33,5 +33,5 @@ pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
 /// (`fencing.zig`; must break `fencing_settles`, run by hand at a ttl below 5,000 ms).
 pub const old_renewal_rule = declared("c1_teeth_old_renewal_rule");
 
-pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge or
-    stale_observation or locality_before_spread;
+pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
+    skew_beyond_bound or wedge or stale_observation or locality_before_spread;
