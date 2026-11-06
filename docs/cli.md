@@ -18,6 +18,12 @@ zcube [options] stats pull [node]       what pulls moved, by source (registry, p
 zcube [options] check allocations       every node's allocation record against its assignments
 zcube [options] repair allocations <node> [--confirm]
                                         rewrite a node's record from its assignments
+zcube [options] job run <name> --image <digest> [--env K=V] [--input-file F --input-env VAR]
+                [--deadline 10m] [--submit-within 10m] [--label k=v] --command <word>...
+zcube [options] job get <name> [--wait]  a job's state and ending; --wait waits for the ending
+zcube [options] job list [--state S] [--label k=v]
+zcube [options] job cancel <name>        stop a job
+zcube [options] job watch [--from REV]   one line per ending, as they happen
 zcube [options] explain <code>          explain a diagnostic code, offline
 zcube [options] bundle --last           the evidence for the last failure
 zcube [options] bundle <kind> <name>    the evidence for a service, replica or node
@@ -194,6 +200,38 @@ read only part of the records`). A node name is percent-encoded in the request. 
 `src/cli_stats.zig`; tests there and in
 `src/cli_test.zig` (against a live server).
 
+## job (B1 slice 7)
+
+`job run` submits a one-shot job (`POST /v1/jobs`, [api.md](api.md)). `--command` must be last: it
+ends the options and everything after it is the job's command, word for word. `--env K=V` may
+repeat; `--input-file F` (UTF-8, at most 64 KiB) is the job's input and `--input-env VAR` names the
+variable it reaches the job in. `--deadline` and `--submit-within` take `30s`, `10m`, `2h`;
+`--submit-within` becomes an absolute `submit_by` from the clock of the machine running `zcube`.
+
+**Env values and the input are never printed.** `job get` shows env by name and the input as "N
+bytes, given as VAR"; the failure record and bundles keep `--env K=...` and read
+`/v1/job-status/<name>`, never `/v1/jobs/<name>`; JSON output carries the same names, not values.
+
+`job get --wait` asks again once a second until the job has ended, then exits with a code of its own:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | exited with code 0 |
+| `10` | exited otherwise (a code or a signal) |
+| `11` | failed (deadline, lost node, out of memory, ...) |
+| `12` | cancelled |
+| `1`, `2`, `3`, `70` | the command itself failed, as everywhere |
+
+`job list` prints NAME, STATE, NODE and END (`wide` adds IMAGE, LABELS, DEADLINE); `no jobs` when
+none match. `--state` is a job state or `ended`. `job watch` prints one line per ending
+(`etl  exited (code 0)  node1`; `--output json`: `{"name","status"}`), and `--from REV` resumes
+after a revision. If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the
+ended jobs, skips those it has already printed (by name and epoch) and goes on from the list's
+revision. The dedupe is a ring of 1,024 keys, so a relist of more endings than that may print an
+ending twice (at least once, not exactly once); a list of more than 1,024 pages is `ZC-E0103`.
+
+`job logs` is not here: slice 8 is cut.
+
 ## explain
 
 `zcube explain E0201` (also `ZC-E0201`, in any letter case) prints the registry's long explanation,
@@ -210,7 +248,8 @@ placeholder runtime codes of [runtime-codes.md](runtime-codes.md). The same text
 | `--output json` | the result as JSON | one JSON object per diagnostic, one per line |
 
 Exit codes follow DIAGNOSTICS.md and the blame of the **first** diagnostic: `0` ok, `1` your input,
-`2` your environment, `3` an external service (the store), `70` a bug. A warning (`ZC-W0119`) does not
+`2` your environment, `3` an external service (the store), `70` a bug. `job get --wait` adds `10`,
+`11` and `12` for a job that ended (see [job](#job-b1-slice-7)). A warning (`ZC-W0119`) does not
 change the exit code.
 
 JSON on standard output, for `--output json`:
@@ -222,6 +261,8 @@ JSON on standard output, for `--output json`:
 | `get nodes` | `{"kind":"nodes","items":[{"name","status","status_tenure","tenure","lease":{"id","ttl_ms","remaining_ms"},"capacity":{"cpu_millis","memory_bytes"},"allocated":{"cpu_millis","memory_bytes"},"count","last_heard_ms_ago","address","agent_version"}]}` (`status`, `status_tenure`, `tenure`, `lease`, `capacity`, `last_heard_ms_ago` are null when unknown) |
 | `why` | the server's body of `GET /v1/why`, unchanged |
 | `apply`, `delete` | the server's answer (`action`, `change`, `revision`, `decision`, ...), unchanged |
+| `job get`, `job list` | the server's body, with env values and the input left out |
+| `job watch` | one object per ending, per line: `{"name","status"}` |
 | `explain` | `{"code","severity","blame","summary","explanation","exit_code"}` |
 | `bundle` | `{"path","redacted","manifest"}` |
 
@@ -393,7 +434,9 @@ the address published for peers; it is required when `--peer-listen` names `0.0.
   Zigbox's fuzzer); a failure prints the seed, and `ZCUBE_FUZZ_SEED=<n>` replays it.
 - **End to end** (`src/cli_test.zig`): a live server on SQLite, a simulated agent, and the command
   line in-process: apply, get, why, scale, delete, a declined apply, a dry run, JSON output, an
-  unreachable server, bundles.
+  unreachable server, bundles. Jobs (slice 7): run, `get --wait`, cancel, list and `watch --from`
+  against the live server (a cancelled job that never ran needs no agent), and that no env value or
+  input appears in any output; a scripted transport walks the 410 relist and its dedupe.
 
 ## Known gaps
 

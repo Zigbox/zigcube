@@ -1,4 +1,4 @@
-request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+request  r-0000001  POST /v1/jobs  400
 error[ZC-E0130]: a job is not valid
   cause  deadline_ms is 0; a job needs a deadline between 1 ms and 24 hours
   reqid  r-0000001

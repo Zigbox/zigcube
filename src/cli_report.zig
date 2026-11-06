@@ -38,6 +38,9 @@ pub const Report = struct {
     subject: ?cli_args.Subject,
     /// The store revision the failing answer was read at, if it said.
     revision: ?u64,
+    /// The exit code of a command that did not fail but has more to say than 0 (`zcube job get
+    /// --wait`). Only read when nothing failed.
+    outcome: u8,
 
     /// Initialises in place: a report is several kilobytes.
     pub fn reset(report: *Report) void {
@@ -47,6 +50,7 @@ pub const Report = struct {
         report.request_id = .{};
         report.subject = null;
         report.revision = null;
+        report.outcome = constants.exit_ok;
         assert(report.diag.code == null);
         assert(report.count == 0);
     }

@@ -76,6 +76,22 @@ pub const Client = struct {
         body: []const u8,
         report: *Report,
     ) Error!Reply {
+        const reply = try client.attempt(method, path, body, report);
+        if (reply.status >= 200 and reply.status < 300) return reply;
+        try relay_failure_body(client.env.arena, reply, report);
+        return error.Failed;
+    }
+
+    /// One request whose reply of any status is returned, for a caller that has a use for a
+    /// refusal (`zcube job watch` answers a 410 by listing). Only a request that got no reply
+    /// is `error.Failed`; a reply it decides to fail on goes to `fail`.
+    pub fn attempt(
+        client: *Client,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+        report: *Report,
+    ) Error!Reply {
         assert(path.len > 0);
         assert(path[0] == '/');
         var id: cli_report.RequestId = .{};
@@ -83,7 +99,14 @@ pub const Client = struct {
         report.request_id = id;
         const reply = try client.exchange(method, path, body, id.slice(), report);
         client.record(reply.request_id, method, path, reply.status);
-        if (reply.status >= 200 and reply.status < 300) return reply;
+        return reply;
+    }
+
+    /// Makes a reply `attempt` returned the failure of the command: what the server said is
+    /// relayed to `report`, as `send` does.
+    pub fn fail(client: *Client, reply: Reply, report: *Report) Error {
+        const success = reply.status >= 200 and reply.status < 300;
+        assert(!success);
         try relay_failure_body(client.env.arena, reply, report);
         return error.Failed;
     }
@@ -150,8 +173,9 @@ pub const Client = struct {
             return unreachable_server(client, report, connect_reason(err));
         };
         defer stream.close(io);
-        // A service file is cut at `service_file_bytes_max`, so its JSON is far under the limit.
-        assert(body.len <= constants.api_request_bytes_max);
+        // A service file is cut at `service_file_bytes_max`, so its JSON is far under the limit;
+        // a job with an input is the one body that may be larger (`job_request_bytes_max`).
+        assert(body.len <= constants.job_request_bytes_max);
         var head: [head_bytes_max]u8 = undefined;
         const line: RequestLine = .{
             .method = method,
