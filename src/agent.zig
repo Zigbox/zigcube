@@ -39,6 +39,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
+const agent_jobs = @import("agent_jobs.zig");
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -98,7 +99,7 @@ pub const Context = struct {
         return clock.now_ms();
     }
 
-    fn as_controller(ctx: *const Context) controller.Context {
+    pub fn as_controller(ctx: *const Context) controller.Context {
         return .{ .store = ctx.store, .clock = ctx.clock, .arena = ctx.arena, .diag = ctx.diag };
     }
 };
@@ -183,6 +184,8 @@ pub const Agent = struct {
     /// The first cause of the last counted refusal, for the shell to say.
     store_refusal_text: [store_refusal_text_bytes]u8,
     store_refusal_len: u8,
+    /// When the job pass next needs to run (a run's deadline), monotonic; maxInt if never.
+    jobs_wake_mono_ms: u64,
 
     const store_refusal_text_bytes = 160;
 
@@ -209,6 +212,7 @@ pub const Agent = struct {
         agent.stops_count = 0;
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
+        agent.jobs_wake_mono_ms = maxInt(u64);
     }
 
     /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is
@@ -273,6 +277,7 @@ pub const Agent = struct {
         };
         try pass.load();
         try pass.replicas();
+        acted += try agent_jobs.pass(agent, ctx, listings, pass.given);
         try pass.orphan_containers();
         try pass.orphan_records();
         acted += try pass.flush();
@@ -301,6 +306,9 @@ pub const Agent = struct {
         }
         for (agent.stops[0..agent.stops_count]) |stop| {
             if (stop.deadline_ms > now and stop.deadline_ms < wake) wake = stop.deadline_ms;
+        }
+        if (agent.jobs_wake_mono_ms != maxInt(u64)) {
+            wake = @min(wake, now + (agent.jobs_wake_mono_ms -| mono));
         }
         return @max(wake, now);
     }
@@ -549,7 +557,7 @@ pub const Agent = struct {
     }
 
     /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.
-    fn begin_fence(agent: *Agent, ctx: *const Context, nominal_ms: u64) Error!void {
+    pub fn begin_fence(agent: *Agent, ctx: *const Context, nominal_ms: u64) Error!void {
         if (agent.fence.active) return;
         return agent.start_fence(ctx, fencing.kill_at_ms(nominal_ms));
     }
@@ -581,6 +589,7 @@ pub const Agent = struct {
             if (label_value(listing.labels, runtime.label_replica) == null) continue;
             if (!is_running(listing)) continue;
             running += 1;
+            if (!agent.fence.asked) try agent_jobs.note_fence(ctx, listing);
             if (fault_ignore_stop) continue;
             if (!kill and agent.fence.asked) continue;
             const diag = if (failed == null) ctx.diag else &spare;
@@ -638,6 +647,33 @@ pub const Agent = struct {
         agent.stops_count = kept;
     }
 
+    /// Asks for `listing`'s container to stop, once; a later call kills it if it is still
+    /// running after `grace_ms`.
+    pub fn stop_listing(
+        agent: *Agent,
+        ctx: *const Context,
+        listing: *const runtime.Listing,
+        grace_ms: u32,
+    ) Error!void {
+        assert(is_running(listing));
+        const now = ctx.clock.now_ms();
+        const name = listing.handle.name();
+        if (fault_ignore_stop) return;
+        if (agent.pending_stop(name)) |stop| {
+            if (now < stop.deadline_ms) return;
+            try ctx.runtime.stop(listing.handle, 0, ctx.diag);
+            return;
+        }
+        try ctx.runtime.stop(listing.handle, grace_ms, ctx.diag);
+        if (agent.stops_count == constants.agent_stops_max) return;
+        agent.stops[agent.stops_count] = .{
+            .handle = listing.handle,
+            .deadline_ms = now + grace_ms,
+        };
+        agent.stops_count += 1;
+        assert(agent.pending_stop(name) != null);
+    }
+
     fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
         for (agent.stops[0..agent.stops_count]) |*stop| {
             if (std.mem.eql(u8, stop.handle.name(), name)) return stop;
@@ -667,6 +703,7 @@ const Pass = struct {
     ctx: *const Context,
     listings: []const runtime.Listing,
     mine: []const controller.Entry(records.Replica) = &.{},
+    given: []const controller.Entry(records.Assigned) = &.{},
     observed: []const controller.Entry(records.Observed) = &.{},
     writes: std.ArrayList(Write) = .empty,
     node_key: records.Key = undefined,
@@ -701,6 +738,7 @@ const Pass = struct {
             mine.append(ctx.arena, item) catch return failures.no_memory(ctx.diag);
         }
         pass.mine = mine.items;
+        pass.given = given.items;
         const prefix = records.observed_prefix(pass.agent.config.node);
         const seen = try controller.list_all(
             records.Observed,
@@ -730,6 +768,11 @@ const Pass = struct {
     fn is_desired(pass: *const Pass, id: []const u8) bool {
         for (pass.mine) |item| {
             if (std.mem.eql(u8, item.rec.id, id)) return true;
+        }
+        for (pass.given) |item| {
+            if (records.assigned_is_job(&item.rec) and std.mem.eql(u8, item.rec.replica, id)) {
+                return true;
+            }
         }
         return false;
     }
@@ -808,24 +851,7 @@ const Pass = struct {
     /// Asks for `listing`'s container to stop, once; a later step kills it if it is still
     /// running after its grace period.
     fn stop_once(pass: *Pass, listing: *const runtime.Listing) Error!void {
-        assert(is_running(listing));
-        const ctx = pass.ctx;
-        const now = ctx.clock.now_ms();
-        const name = listing.handle.name();
-        if (fault_ignore_stop) return;
-        if (pass.agent.pending_stop(name)) |stop| {
-            if (now < stop.deadline_ms) return;
-            try ctx.runtime.stop(listing.handle, 0, ctx.diag);
-            return;
-        }
-        try ctx.runtime.stop(listing.handle, constants.stop_grace_ms, ctx.diag);
-        if (pass.agent.stops_count == constants.agent_stops_max) return;
-        pass.agent.stops[pass.agent.stops_count] = .{
-            .handle = listing.handle,
-            .deadline_ms = now + constants.stop_grace_ms,
-        };
-        pass.agent.stops_count += 1;
-        assert(pass.agent.pending_stop(name) != null);
+        return pass.agent.stop_listing(pass.ctx, listing, constants.stop_grace_ms);
     }
 
     /// Writes the observed record for a container the runtime has, if it differs from the
@@ -1045,7 +1071,7 @@ fn state_failed(ctx: *const Context, err: agent_state.Error, operation: []const 
     return agent_records.state_failed(ctx.diag, mapped, operation);
 }
 
-fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
+pub fn label_value(labels: []const runtime.Label, key: []const u8) ?[]const u8 {
     for (labels) |label| {
         if (std.mem.eql(u8, label.key, key)) return label.value;
     }
@@ -1073,7 +1099,7 @@ fn is_this_replica(
     return std.mem.eql(u8, text, created_text(&buffer, item.kv.create_revision));
 }
 
-fn find_listing_by_replica(
+pub fn find_listing_by_replica(
     listings: []const runtime.Listing,
     id: []const u8,
 ) ?*const runtime.Listing {
@@ -1094,7 +1120,7 @@ fn find_listing_by_name(
     return null;
 }
 
-fn is_running(listing: ?*const runtime.Listing) bool {
+pub fn is_running(listing: ?*const runtime.Listing) bool {
     const found = listing orelse return false;
     return switch (found.status) {
         .starting, .running => true,
