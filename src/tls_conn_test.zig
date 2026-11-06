@@ -847,11 +847,12 @@ fn full_update_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try conn.open(&options, &diag);
     try fill_socket(fd);
     var out: [16]u8 = undefined;
-    // The answer cannot leave: the write keys have moved on, so this is the end of the connection.
-    try std.testing.expectError(error.Timeout, conn.read(&out, end_in(io, 200), &diag));
+    // The answer cannot leave: the write keys have moved on, so this is the end of the connection,
+    // and the call that finds out says so, with a diagnostic, instead of `Timeout`.
+    try std.testing.expectError(error.Refused, conn.read(&out, end_in(io, 200), &diag));
+    try expect_code(&diag, .E0816);
     try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 200), &diag));
     try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
-    try std.testing.expect(diag.code == null);
 }
 
 test "a KeyUpdate answer that times out ends the connection" {
@@ -890,4 +891,38 @@ test "a close_notify whose reply cannot be sent still ends the stream" {
     var f: Fixture = undefined;
     try f.init(std.testing.io, .{});
     try run(full_bye_body, full_bye_client, &f);
+}
+
+fn seal_fail_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
+    var conn: Conn = undefined;
+    defer conn.deinit();
+    var diag = new_diag();
+    const options = f.options(io, fd);
+    try conn.open(&options, &diag);
+    // The write keys are at their record limit and cannot move on again.
+    conn.client.write.sequence = constants.tls_records_per_key_max;
+    conn.client.write.updates = constants.tls_key_updates_per_connection_max;
+    try std.testing.expectError(error.Refused, conn.write("secret", end_in(io, 200), &diag));
+    try expect_code(&diag, .E0815);
+    // The bytes are gone, not queued, and the natural cleanup does not trip an assert.
+    try std.testing.expectEqual(@as(u32, 0), conn.plain_length);
+    try std.testing.expect(std.mem.allEqual(u8, conn.plain[0..6], 0));
+    try conn.close(end_in(io, 200), &diag);
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+}
+
+test "a seal that fails drops what was queued, so close afterwards is safe" {
+    // Goal: `close` after a `Refused` write never panics. Method: the write keys cannot move on
+    // (ZC-E0815), a write is refused, then the caller closes.
+    var f: Fixture = undefined;
+    try f.init(std.testing.io, .{});
+    try run(idle_body, seal_fail_client, &f);
+}
+
+test "the answer to a KeyUpdate gets a budget of its own when the read's deadline is spent" {
+    // Goal: a deadline that ticks by between the read and the answer does not skip the send.
+    const flush: u64 = constants.tls_alert_flush_ms;
+    try std.testing.expectEqual(@as(u64, 1000 + flush), tls_conn.reply_end_ms(1000, 1000));
+    try std.testing.expectEqual(@as(u64, 1000 + flush), tls_conn.reply_end_ms(1000, 900));
+    try std.testing.expectEqual(@as(u64, 9000), tls_conn.reply_end_ms(1000, 9000));
 }

@@ -18,7 +18,11 @@
 //!   - `Refused`: the connection failed and `diag` holds the one coded diagnostic.
 //!   - `Closed`: the connection is over, or was ended by an earlier failure; nothing is raised.
 //!   - `Timeout`: the caller's deadline passed. For `read` the connection is intact and the call
-//!     may be repeated; for a write the record may be half sent, so the connection is over.
+//!     may be repeated. For `write` and `flush` the record may be half sent, so the connection is
+//!     over and every later call answers `Closed`.
+//!   A `read` that must send (the answer to a KeyUpdate) and cannot in time does not return
+//!   `Timeout`: its keys have moved on, so the connection is over and the call says `Refused`
+//!   with ZC-E0816 in `diag`.
 //!
 //! The cuts, recorded in docs/decisions/2026-11-05-tls-conn.md: no new diagnostic (a transport
 //! that breaks is ZC-E0816, a handshake that runs out of time is ZC-E0816 too); `close` does not
@@ -53,6 +57,12 @@ pub const Options = struct {
     client_auth: tls_client.ClientAuth = .none,
     handshake_timeout_ms: u32 = constants.tls_handshake_timeout_ms,
 };
+
+/// The deadline for the answer to a KeyUpdate: the read's, but never less than
+/// `tls_alert_flush_ms` from now, so the answer gets at least one send attempt.
+pub fn reply_end_ms(now_ms: u64, end_ms: u64) u64 {
+    return @max(end_ms, now_ms + constants.tls_alert_flush_ms);
+}
 
 const plaintext_max: u32 = constants.tls_record_plaintext_bytes_max;
 const sealed_max: u32 = tls_client.Client.application_bytes_max(plaintext_max);
@@ -154,7 +164,9 @@ pub const Conn = struct {
 
     /// Reads application data into `out` and returns how many bytes: at least one, and never
     /// more than one record. 0 is the server's close_notify, repeated for as long as asked. A
-    /// `Timeout` leaves the connection as it was.
+    /// `Timeout` leaves the connection as it was: nothing was consumed, and the call may be
+    /// repeated. A send made on the read's behalf that runs out of time is `Refused`, not
+    /// `Timeout`: the connection is over.
     pub fn read(conn: *Conn, out: []u8, end_ms: u64, diag: *Diag) Error!usize {
         assert(out.len > 0);
         switch (conn.phase) {
@@ -177,13 +189,14 @@ pub const Conn = struct {
                 // either way: a failure to send it changes nothing, and `phase` must say so, or
                 // a repeated read would ask a closed client for more input.
                 conn.phase = .peer_closed;
-                conn.push(conn.client.output(), end_ms) catch {}; // The peer need not hear it.
-                conn.client.drain();
+                conn.say_goodbye(end_ms);
                 return 0;
             }
             // The answer to a KeyUpdate: the write keys have moved on, so a record that is not
-            // whole on the wire cannot be taken back. A timeout here ends the connection.
-            try conn.send_output(end_ms, diag, .write);
+            // whole on the wire cannot be taken back. It has a budget of its own, so a read
+            // deadline that ticks by now does not kill a healthy connection, and a timeout
+            // here ends the connection.
+            try conn.send_output(reply_end_ms(peer_stream.boot_ms(conn.io), end_ms), diag, .reply);
             switch (step.event) {
                 .none => {},
                 .data => |data| if (data.len > 0) {
@@ -234,12 +247,14 @@ pub const Conn = struct {
 
     /// Flushes, then sends close_notify and ends the connection. It does not wait for the
     /// server's: the client has stopped reading by then, and a slot is not worth holding for a
-    /// goodbye. A peer that is already gone costs nothing: that failure is dropped.
+    /// goodbye. A peer that is already gone costs nothing: that failure is dropped. Nothing is
+    /// queued once the connection is over, even after a failed seal (see `send_record`).
     pub fn close(conn: *Conn, end_ms: u64, diag: *Diag) Error!void {
         switch (conn.phase) {
             .open => {},
             .peer_closed, .shut, .broken => {
-                // `write` sends every byte before it returns, so nothing queued can be lost here.
+                // `write` sends every byte before it returns, and `send_record` empties `plain`
+                // even when the seal fails, so nothing is queued here.
                 assert(conn.plain_length == 0);
                 return;
             },
@@ -249,7 +264,14 @@ pub const Conn = struct {
         conn.client.close_notify();
         conn.phase = .shut;
         // Not `send_output`: a failure here must not raise a diagnostic for a close that worked.
-        conn.push(conn.client.output(), end_ms) catch {}; // The peer need not hear a goodbye.
+        conn.say_goodbye(end_ms);
+    }
+
+    /// Sends the client's pending close_notify (the reply to the peer's, or our own) if it can
+    /// be done within `tls_alert_flush_ms` and the caller's deadline. The peer need not hear it.
+    fn say_goodbye(conn: *Conn, end_ms: u64) void {
+        const limit = peer_stream.boot_ms(conn.io) + constants.tls_alert_flush_ms;
+        conn.push(conn.client.output(), @min(end_ms, limit)) catch {};
         conn.client.drain();
     }
 
@@ -265,15 +287,21 @@ pub const Conn = struct {
         assert(conn.plain_length > 0);
         assert(conn.phase == .open);
         const plain = conn.plain[0..conn.plain_length];
-        const sealed = conn.client.seal_application(plain, &conn.sealed, diag) catch |err|
+        const sealed = conn.client.seal_application(plain, &conn.sealed, diag) catch |err| {
+            // The bytes can never be sent now: drop them, so a `close` after the refusal finds
+            // nothing queued.
+            std.crypto.secureZero(u8, plain);
+            conn.plain_length = 0;
             return conn.refused(err);
+        };
         conn.plain_length = 0;
         conn.push(sealed, end_ms) catch |err| return conn.wire_failure(err, diag, .write);
     }
 
     // ---- Failures -----------------------------------------------------------------------------
 
-    const Where = union(enum) { handshake: u32, read, write };
+    /// `reply` is a send made for a read (a KeyUpdate answer): fatal on timeout, like `write`.
+    const Where = union(enum) { handshake: u32, read, write, reply };
 
     /// The client refused (its diagnostic is raised, an alert may wait): say goodbye if it can
     /// be done at once, and end the connection.
@@ -300,6 +328,7 @@ pub const Conn = struct {
                     conn.phase = .broken;
                     return error.Timeout;
                 },
+                .reply => return conn.reply_timeout(diag),
                 .handshake => |timeout_ms| return conn.handshake_timeout(diag, timeout_ms),
             },
             error.Ended => {},
@@ -312,6 +341,25 @@ pub const Conn = struct {
             error.Refused => {},
         }
         if (conn.errno != .SUCCESS) diag.context("os", "{s}", .{@tagName(conn.errno)});
+        return error.Refused;
+    }
+
+    /// The answer to the server's KeyUpdate could not be sent in time. The write keys have
+    /// moved on, so the connection is over; the caller learns it here, not at the next call.
+    fn reply_timeout(conn: *Conn, diag: *Diag) Error {
+        conn.phase = .broken;
+        diag.raise(.E0816);
+        diag.cause("the answer to the server's KeyUpdate was not sent within {d} ms", .{
+            constants.tls_alert_flush_ms,
+        });
+        var buffer: [constants.tls_server_name_bytes_max + 160]u8 = undefined;
+        const name = conn.client.name[0..conn.client.name_length];
+        const sentence = std.fmt.bufPrint(
+            &buffer,
+            "Check that the server at {s} reads promptly, then reconnect.",
+            .{name},
+        ) catch unreachable; // The buffer holds the longest name and the sentence.
+        diag.fix(.{ .sentence = sentence });
         return error.Refused;
     }
 
