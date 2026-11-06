@@ -342,6 +342,8 @@ fn start_java(h: *Harness, spec: ServerSpec) !Server {
     const scratch = h.scratch.allocator();
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(scratch, h.java);
+    // A client that drops TCP without close_notify must fail `close_clean`, not read as clean.
+    try argv.append(scratch, "-Dcom.sun.net.ssl.requireCloseNotify=true");
     if (spec.key_limit) try argv.appendSlice(scratch, &.{
         try std.fmt.allocPrint(scratch, "-Djava.security.properties={s}", .{h.path("jdk.props")}),
         "-Djavax.net.debug=ssl:handshake",
@@ -937,8 +939,25 @@ fn make_work_dir(h: *Harness) !void {
 
 /// The files the servers read, and the compiled Java.
 fn prepare(h: *Harness, source: []const u8) !void {
+    try find_setpriv(h);
     try find_java(h, source);
     try pki_files(h);
+}
+
+/// `setpriv` (util-linux) ties each server's life to the harness's (`spawn`); without it the
+/// first case would fail with a spawn error that names nothing.
+fn find_setpriv(h: *Harness) !void {
+    const result = std.process.run(h.arena.allocator(), h.io, .{
+        .argv = &.{ "setpriv", "--version" },
+        .timeout = tool_timeout,
+    }) catch {
+        h.say("FAILED: `setpriv` (util-linux) is not installed; the harness needs it", .{});
+        return error.NoSetpriv;
+    };
+    if (!result.term.success()) {
+        h.say("FAILED: `setpriv --version` did not succeed; the harness needs util-linux", .{});
+        return error.NoSetpriv;
+    }
 }
 
 fn find_java(h: *Harness, source: []const u8) !void {

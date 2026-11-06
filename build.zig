@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
     add_mtls_interop_step(b, shared_options);
+    add_mtls_teeth_step(b, shared_options);
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
     add_bench_watch_step(b, shared_options);
@@ -339,6 +340,24 @@ fn add_swarm_smoke_steps(b: *std.Build, options: ExecutablesOptions, built: Buil
     teeth.expectExitCode(4); // swarm_smoke.exit_unverified: the plan took a bad chunk.
     const teeth_help = "swarm-smoke with the fetch plan's test-only fault on; it must fail";
     b.step("swarm-smoke-teeth", teeth_help).dependOn(&teeth.step);
+}
+
+/// `zig build mtls-teeth`: the tests named `teeth:` of the mTLS files (src/mtls_teeth.zig). Each
+/// switches one check off and passes only if the matching test then fails.
+fn add_mtls_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
+    const tests = b.addTest(.{
+        .filters = &.{"teeth:"},
+        .test_runner = .{ .path = b.path("src/mtls_teeth_runner.zig"), .mode = .simple },
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mtls_teeth.zig"),
+            .target = options.target,
+            .optimize = options.optimize,
+            .imports = &.{.{ .name = "zigbox", .module = options.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(tests);
+    b.step("mtls-teeth", "Run the mTLS teeth tests: each skipped check must be caught")
+        .dependOn(&run.step);
 }
 
 /// `zig build mtls-interop` (src/mtls_interop.zig): the mTLS client against `openssl s_server` and
@@ -1412,9 +1431,9 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",      "tidy",         "errors-site-check",
-        "wasm-check",         "wasm-test", "console-wasm", "check-store-memory",
-        "check-store-sqlite",
+        "install",            "test",       "tidy",         "errors-site-check",
+        "wasm-check",         "wasm-test",  "console-wasm", "check-store-memory",
+        "check-store-sqlite", "mtls-teeth",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);
