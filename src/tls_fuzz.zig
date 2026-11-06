@@ -435,7 +435,7 @@ fn run_once(seed: u64, refused: *bool) !bool {
     const answer = world.peer.respond(hello, &world.flight);
     world.sent_length = 0;
     // A damaged message gets no record-level mutation either: it must be what refuses the run.
-    const kind: Mutation = if (world.message_damaged or random.uintLessThan(u8, 3) == 0)
+    const kind: Mutation = if (world.message_damaged)
         .none
     else
         random.enumValue(Mutation);
@@ -443,8 +443,8 @@ fn run_once(seed: u64, refused: *bool) !bool {
     _ = try feed(world, random, world.damaged[0..length]);
     if (world.message_damaged) {
         // A valid record, MAC and transcript around a damaged message has one correct outcome.
-        // Connecting is a false connect (the teeth test turns a check off and counts those);
-        // neither connecting nor refusing is a client left waiting.
+        // A connect was already flagged by `check_connected`; with a check turned off a damaged
+        // message may connect, so only a run that did not connect must have been refused.
         if (world.client.is_connected()) {
             world.false_connect = true;
         } else {
@@ -625,9 +625,10 @@ test "teeth: the property catches a false connect that a later error hides" {
     defer tls_client.set_test_fault(.certificate_verify, false);
     var hidden: u32 = 0;
     var seed: u64 = 1;
-    while (seed <= 3000) : (seed += 1) {
+    while (seed <= 10000) : (seed += 1) {
         var refused = false;
         if (try run_once(seed, &refused) and refused) hidden += 1;
     }
-    try testing.expect(hidden > 0);
+    std.debug.print("teeth hidden={d}\n", .{hidden});
+    try testing.expect(hidden >= 8);
 }
