@@ -729,18 +729,24 @@ test "the input fetch's retries end at start_by_ms, not a full deadline after th
 test "an input that arrives after the retry bound does not start the run" {
     // The first pass at or after the bound finds the fetch working again: a start would arm a
     // full deadline on top of the wait, beyond twice deadline_ms, so the run is not started.
+    // The bound is moved into the past in the start record: the simulation steps the agent at
+    // every wake, so a pass cannot be made to land late by waiting.
     var rig = try Rig.start();
     defer rig.stop();
-    try assign_input_by(&rig, rig.world.now_ms() + 10_000);
+    try assign_input_by(&rig, rig.world.now_ms() + 60_000);
     rig.world.switched.down_get_prefix = records.prefix_job_input;
     _ = rig.world.agent_step();
-    rig.world.advance(4_000);
-    _ = rig.world.agent_step();
-    rig.world.advance(4_000);
-    _ = rig.world.agent_step();
+    var record = (try rig.start_record()).?;
+    try testing.expectEqual(agent_jobs.Phase.claiming, record.phase);
+    record.deadline_mono_ms = 1;
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, run_id);
+    // Not `fresh_arena`: it would reset the arena the record's strings live in.
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, record, .{});
+    defer testing.allocator.free(bytes);
+    try rig.world.files.interface().put_atomic(name, bytes);
     rig.world.switched.down_get_prefix = null;
-    rig.world.advance(4_000); // 12 s after the claim; the lease was renewed on the way.
-    _ = rig.world.agent_step();
+    rig.world.advance(1_000);
     _ = rig.world.agent_step();
     try testing.expect(!rig.running());
     const seen = (try rig.observed()).?;
