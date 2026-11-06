@@ -246,8 +246,8 @@ export class Jobs {
     this.later(p.place + p.start, () => {
       if (!alive()) return;
       const obs = { v: 1, run, node: p.node, tenure: 7, assignment: e.rev, status: "running", started_at_ms: e.now(), reported_at_ms: e.now() };
-      const okv = e.commit([{ put: [`/job-observed/${p.node}/${run}`, obs] }]);
-      const d = e.decision({ actor: "job-controller", action: "job_running", subject: { kind: "job", name }, reason: "the run was claimed by its node", cause: { kind: "observed", key: `/job-observed/${p.node}/${run}`, revision: okv } });
+      const okv = e.commit([{ put: [`/job-observed/${p.node}/${name}`, obs] }]);
+      const d = e.decision({ actor: "job-controller", action: "job_running", subject: { kind: "job", name }, reason: "the run was claimed by its node", cause: { kind: "observed", key: `/job-observed/${p.node}/${name}`, revision: okv } });
       const st = this.statusOf(name);
       e.commit([...d.ops, { put: [`/job-status/${name}`, { ...st, state: "running", tenure: 7, started_at_ms: e.now(), decision: d.id, reported_at_ms: e.now() }] }]);
       note(d.id);
@@ -314,8 +314,8 @@ export class Jobs {
       const rec = { v: 1, run: `${name}-job`, node, tenure: st.tenure || 7, assignment: st.epoch || e.rev, status: "stopped", exit: this.exitOf(end), reported_at_ms: e.now() };
       rec.started_at_ms = st.started_at_ms;
       if (stop) rec.stop_cause = stop;
-      const rev = e.commit([{ put: [`/job-observed/${node}/${name}-job`, rec] }]);
-      cause = { kind: "observed", key: `/job-observed/${node}/${name}-job`, revision: rev };
+      const rev = e.commit([{ put: [`/job-observed/${node}/${name}`, rec] }]);
+      cause = { kind: "observed", key: `/job-observed/${node}/${name}`, revision: rev };
     }
     // The reasons are the controller's own (job_controller.zig): unclaimed runs end from their stop.
     const reason = !started && stop === "cancel" ? "the job was cancelled and the run had not started"

@@ -1287,6 +1287,7 @@ const Scene = struct {
     cites: enum { job, run, assigned, report },
     report: ?records.JobObservedStatus = null,
     exit: ?records.Exit = null,
+    diagnostic: ?[]const u8 = null,
     stop: ?records.RunStopCause = null,
     status: ?records.JobStatus = null,
 };
@@ -1324,6 +1325,7 @@ fn put_scene(world: *sim_world.World, scene: Scene) !void {
             .assignment = 1,
             .status = status,
             .exit = scene.exit,
+            .diagnostic = if (scene.diagnostic) |text| .{ .text = text } else null,
             .started_at_ms = if (status == .claimed) null else 3,
             .reported_at_ms = 4,
         };
@@ -1420,36 +1422,57 @@ test "why job: a running job ends at the agent's report" {
     try testing.expectEqualStrings("train-job on node1: running", result.steps[1].text);
 }
 
+/// The report `/job-observed/node1/train` carries the exit the ending came from.
+fn expect_report_exit(world: *sim_world.World, exit: records.Exit) !void {
+    const ctx = world.controller_context();
+    const key = records.job_observed_key("node1", "train");
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+    const seen = try records.read(records.JobObserved, ctx.arena, got.kv.?, ctx.diag);
+    try testing.expectEqual(exit.kind, seen.exit.?.kind);
+    try testing.expectEqual(exit.code, seen.exit.?.code);
+    try testing.expectEqual(exit.signal, seen.exit.?.signal);
+}
+
+fn expect_diagnostic(step: Step, want: ?[]const u8) !void {
+    if (want) |text| {
+        try testing.expectEqualStrings(text, step.diagnostic.?.text);
+    } else {
+        try testing.expect(step.diagnostic == null);
+    }
+}
+
 test "why job: an ending the agent reported ends at that report" {
+    // The step's words are the same for every exit (`{run} on {node}: stopped`); what tells the
+    // endings apart is the report the step cites and the diagnostic it carries.
     const cases = [_]struct {
         exit: records.Exit,
         end: records.JobEnd,
         state: records.JobState,
-        text: []const u8,
+        diagnostic: ?[]const u8,
     }{
         .{
             .exit = .{ .kind = .exited, .code = 0 },
             .end = .{ .kind = .exited, .code = 0 },
             .state = .exited,
-            .text = "train-job on node1: stopped",
+            .diagnostic = null,
         },
         .{
             .exit = .{ .kind = .oom },
             .end = .{ .kind = .failed, .cause = .oom },
             .state = .failed,
-            .text = "train-job on node1: stopped",
+            .diagnostic = "{\"code\":\"ZC-E0000\",\"what\":\"oom\"}",
         },
         .{
             .exit = .{ .kind = .signaled, .signal = 15 },
             .end = .{ .kind = .failed, .cause = .deadline },
             .state = .failed,
-            .text = "train-job on node1: stopped",
+            .diagnostic = "{\"code\":\"ZC-E0000\",\"what\":\"deadline\"}",
         },
         .{
             .exit = .{ .kind = .lost },
             .end = .{ .kind = .failed, .cause = .fenced },
             .state = .failed,
-            .text = "train-job on node1: stopped",
+            .diagnostic = "{\"code\":\"ZC-E0000\",\"what\":\"lost\"}",
         },
     };
     for (cases, 0..) |case, index| {
@@ -1461,6 +1484,7 @@ test "why job: an ending the agent reported ends at that report" {
             .cites = .report,
             .report = .stopped,
             .exit = case.exit,
+            .diagnostic = case.diagnostic,
             .status = .{
                 .state = case.state,
                 .node = "node1",
@@ -1472,9 +1496,42 @@ test "why job: an ending the agent reported ends at that report" {
         try testing.expect(std.mem.startsWith(u8, result.state.text, "job train: "));
         const word = result.state.text["job train: ".len..];
         try testing.expectEqualStrings(@tagName(case.state), word);
-        try testing.expectEqual(StepType.observed, result.steps[1].type);
-        try testing.expectEqualStrings(case.text, result.steps[1].text);
+        const step = result.steps[1];
+        try testing.expectEqual(StepType.observed, step.type);
+        try testing.expectEqualStrings("/job-observed/node1/train", step.key.?);
+        try testing.expectEqualStrings("train-job on node1: stopped", step.text);
+        // Last: a new controller context reuses the arena the step's slices live in.
+        try expect_diagnostic(step, case.diagnostic);
+        try expect_report_exit(world, case.exit);
     }
+}
+
+test "why job: a running job whose node is lost ends at the desired run" {
+    // Demo b1 item 4: judge_running/judge_claimed end the job `failed unreachable` with no agent
+    // report and no stop on the run; the end cites `/job-runs/<name>`.
+    const world = try new_world(38);
+    defer world.destroy();
+    const result = try scene_chain(world, .{
+        .action = "end_job",
+        .reason = "the node was lost",
+        .cites = .run,
+        .status = .{
+            .state = .failed,
+            .node = "node1",
+            .end = .{ .kind = .failed, .cause = .@"unreachable" },
+            .ended_at_ms = 6,
+            .reported_at_ms = 6,
+        },
+    });
+    try testing.expectEqualStrings("job train: failed", result.state.text);
+    try testing.expectEqual(StepType.desired, result.steps[1].type);
+    try testing.expectEqualStrings("/job-runs/train", result.steps[1].key.?);
+    try testing.expectEqualStrings(
+        "run train-job of job train was created: deadline 60000 ms",
+        result.steps[1].text,
+    );
+    // The decision above it carries the answer to "why": the reason and the action.
+    try testing.expectEqualStrings("the node was lost", result.steps[0].decision.?.reason);
 }
 
 test "why job: an ending with no agent report ends at the desired run" {

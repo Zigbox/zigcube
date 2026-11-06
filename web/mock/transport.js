@@ -178,9 +178,8 @@ export function createMockTransport(engine, faults) {
       const live = engine.get(c.key);
       const diagnostic = d.cause_diagnostic || live?.diagnostic || null;
       if (c.key.startsWith("/job-observed/")) {
-        const signalled = live?.exit?.kind === "exited" && live.exit.signal != null;
-        const exit = live?.exit ? ` (${signalled ? `exited on signal ${live.exit.signal}` : engine.exitText(live.exit)})` : "";
-        const text = live ? `run ${live.run} on ${live.node}: ${live.status}${exit}${live.stop_cause ? `, stopped for ${live.stop_cause}` : ""}` : `${c.key} as it was at revision ${c.revision}`;
+        // The words of src/why.zig `observed_step`: no exit, the report's diagnostic beside them.
+        const text = live ? `${live.run} on ${live.node}: ${live.status}` : `${c.key} as it was at revision ${c.revision}`;
         return { type: "observed", key: c.key, revision: c.revision, text, diagnostic };
       }
       const o = c.key.startsWith("/observed/") ? live : null;
