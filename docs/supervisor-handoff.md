@@ -67,20 +67,13 @@ Rules:
 
 ## State at handoff
 
-**C1 is demonstrated.**
+*As of 2026-11-06.*
 
-- Main CI run [41605325965](https://github.com/Zigbox/zigcube/actions/runs/41605325965) on 48024d6 was green.
-- README and site were updated in 21cab3a, and Pages was dispatched.
-
-**M7 has slices 1, 2, 3a and 3b-i merged.**
-
-- Slice 3b-i is zigbox#34 (a126aee). It ran as VM run 41605919986.
-- The status commit is defd2c1, and Pages was dispatched.
-- The site still shows `green:2,total:5`, "not demonstrated".
-
-**Overnight:** 12 PRs merged (Zigcube #38 #39 #37 #42 #46 #48 #50 #51; Zigbox #31 #32 #33 #34), about $122 in child sessions.
-
-**In flight:** nothing. No sessions or check-ins are scheduled.
+- **C2 mTLS is done** (#115). Follow-ups merged: #111 (TLS leftovers), #118 (mtls-teeth follow-ups).
+- **B1:** slice 3 merged (#112). Slice 4 (#116) is in review. Slice 5 follows.
+- **#93 (zigbox-smoke flake) is open.** A failing run fetched every chunk ("chunks 4313 held 0 peers 4313 registry 0") and still failed with ZC-E0601 and ZC-W0603, so the failure is after the chunk phase. #117 added phase lines to `fetch.log` (docs/decisions/2026-11-06-fetch-log-says-progress-93.md); read them on the next recurrence.
+- #114 merged. #113 is filed: a pid-reuse race in `fake_supervisor.zig`.
+- A known 14-byte SafeAllocator leak shows in the fetch log; unscheduled.
 
 ## Owner decisions (2026-11-03), not yet written into the repos
 
@@ -143,14 +136,22 @@ Record the split in `docs/briefs/M7-build.md` (slice 3 is at about line 166) and
       - New diagnostics, e.g. peer refused: bad or expired certificate.
 - **Console:** the "full on hover" behaviour against docs/console.md is still unanswered.
 
+### Later owner decisions (2026-11-05 to 2026-11-06)
+
+- ZC-E0820 confirmed. ZC-W0504 and ZC-W0603 confirmed. E0816 is extended, with no new code.
+- e523381 carries a Signed-off-by nobody asked for: leave it, noted here.
+- B1 job input wire size: option B. B1 run re-creation: option A.
+- No `--shrink` for the canary.
+- Auto-merge: the owner will set it up later; until then the supervisor merges by hand.
+
+**Waiting on the owner:** confirm ZC-E0523 (docs/decisions/2026-11-06-zc-e0523-job-input-digest.md, on #116); confirm the sim-c1 negative test moving to B1 slice 5 (docs/decisions/2026-11-06-b1-sim-c1-negative-test-moves-to-slice-5.md); auto-merge rulesets; the canary host redeploy and dry run.
+
 ## Next steps
 
-1. Mark the decided owner questions in c2.md, either through a docs PR or inside slice 5's branch.
-2. Start the **M7 3b-ii** implementer: Sonnet, from Zigbox main, with a VM check on `vm/m7-slice3b2`. Include the brief/demo-doc split edits.
-3. Start the **C2 slice 5** implementer: locality in keys and the scheduler, per O1 and O2.
-4. Brief the Zigbox slices for Z1–Z8. C2 slices 8 and 9 depend on them.
-5. Check std TLS (see O3), amend c2.md for mTLS, then C2 slice 6 (peers, mTLS, O5). Slice 7 (`/pulls`) follows. Slice 6 may need splitting (CA and issuing; then the chunk protocol over mTLS).
-6. Afterwards, M7 3b-iii, then slice 4 (demo-m7).
+1. Re-review and merge B1 slice 4 (#116), then brief B1 slice 5.
+2. Merge the review-NIT batch (branch claude/review-nits-1).
+3. Watch #93 with #117's log lines.
+4. Later: the #91 NITs, #78, C2 follow-ups, Zigbox M8 slice 1, the 14-byte leak, resolving #107's threads.
 
 ## Kept from earlier handoffs
 
