@@ -4,6 +4,7 @@
 //! passes only if every check has teeth. `zig build test` runs them too; this is the named gate.
 
 test {
+    _ = @import("peer_test.zig");
     _ = @import("tls_client_test.zig");
     _ = @import("tls_fuzz.zig");
     _ = @import("x509_fuzz.zig");
