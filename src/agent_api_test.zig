@@ -1008,3 +1008,132 @@ test "a pull under a tenure that has been replaced is ZC-E0510 and writes nothin
     try rig.refused(rig.call("POST", pulls_path, "", body), 503, "ZC-E0510");
     try testing.expectEqual(before, try rig.revision());
 }
+
+// ---- Runs (B1 slice 4) ----
+
+/// Writes `value` at `key` as `role`, and returns the revision it got.
+fn put_as(rig: *Rig, role: @import("writers.zig").Role, key: []const u8, value: anytype) !u64 {
+    const world = rig.world;
+    const arena = world.fresh_arena();
+    const bytes = try records.encode(arena, value, &world.diag);
+    const op: store.Op = .{ .put = .{ .key = key, .value = bytes } };
+    const done = try @import("writers.zig").txn(
+        world.store_handle(),
+        role,
+        .{ .on_success = &.{op} },
+        &world.diag,
+    );
+    try testing.expect(done.succeeded);
+    return done.revision;
+}
+
+const run_fixture: records.JobRun = .{
+    .id = "train-job",
+    .job = "train",
+    .image = "b3:51aa9c03",
+    .command = &.{"true"},
+    .deadline_ms = 60_000,
+    .start_by_ms = 1_000_000,
+    .created_at_ms = 0,
+};
+
+/// A run of job `train` assigned to node2; returns the run's and the assignment's revisions.
+fn assign_run(rig: *Rig) ![2]u64 {
+    const run_revision = try put_as(
+        rig,
+        .job_controller,
+        records.job_run_key("train").slice(),
+        run_fixture,
+    );
+    const assigned: records.Assigned = .{
+        .replica = "train-job",
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = "train",
+    };
+    const key = records.assigned_key("node2", "train-job");
+    const epoch = try put_as(rig, .scheduler, key.slice(), assigned);
+    return .{ run_revision, epoch };
+}
+
+fn claim_text(buffer: []u8, tenure: i64, run_revision: u64, epoch: u64) ![]const u8 {
+    const format = "{{\"tenure\":{d},\"run_revision\":{d},\"value\":{{\"v\":1," ++
+        "\"run\":\"train-job\",\"node\":\"node2\",\"tenure\":{d},\"assignment\":{d}," ++
+        "\"status\":\"claimed\",\"reported_at_ms\":2}}}}";
+    return std.fmt.bufPrint(buffer, format, .{ tenure, run_revision, tenure, epoch });
+}
+
+test "the runs of a node are listed, and a run's input is given only after its claim" {
+    // Goal: the input is the one thing a node may not read before it claims the run.
+    var rig = try Rig.start(21);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    _ = try put_as(&rig, .api, records.job_input_key("train").slice(), records.JobInput{
+        .base64 = "aGVsbG8=",
+    });
+    const listed = try rig.ok("GET", "/v1/agent/nodes/node2/runs", "", "");
+    try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
+
+    const early = rig.call("GET", "/v1/agent/nodes/node2/runs/train/input", "", "");
+    try rig.refused(early, early.status, "ZC-E0133");
+    try testing.expect(early.status != 200);
+
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    const claimed = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try testing.expect(field(claimed, "applied").bool);
+    const given = try rig.ok("GET", "/v1/agent/nodes/node2/runs/train/input", "", "");
+    try testing.expectEqualStrings("aGVsbG8=", field(field(given, "input"), "base64").string);
+
+    // Another node never gets it.
+    try rig.join("node3");
+    const other = rig.call("GET", "/v1/agent/nodes/node3/runs/train/input", "", "");
+    try testing.expect(other.status != 200);
+}
+
+test "a claim is applied once; a second, a moved run or a moved assignment is applied: false" {
+    var rig = try Rig.start(22);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    const first = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try testing.expect(field(first, "applied").bool);
+    const before = try rig.revision();
+    const second = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try testing.expect(!field(second, "applied").bool);
+    try testing.expectEqual(before, try rig.revision());
+}
+
+test "a claim of a run that moved since the agent read it is applied: false" {
+    var rig = try Rig.start(23);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    var stopped = run_fixture;
+    stopped.stop = .{ .cause = .cancel, .at_ms = 5 };
+    _ = try put_as(&rig, .job_controller, records.job_run_key("train").slice(), stopped);
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    const before = try rig.revision();
+    const answer = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try testing.expect(!field(answer, "applied").bool);
+    try testing.expectEqual(before, try rig.revision());
+}
+
+test "a job report under a tenure that has been replaced is ZC-E0510 and writes nothing" {
+    var rig = try Rig.start(24);
+    defer rig.stop();
+    try rig.join("node2");
+    const old = rig.tenure;
+    const revisions = try assign_run(&rig);
+    try rig.join("node2");
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, old, revisions[0], revisions[1]);
+    const before = try rig.revision();
+    const response = rig.call("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try rig.refused(response, 503, "ZC-E0510");
+    try testing.expectEqual(before, try rig.revision());
+}

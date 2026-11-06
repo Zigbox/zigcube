@@ -97,6 +97,7 @@ pub const Code = enum(u8) {
     E0515,
     E0521,
     E0522,
+    E0523,
     W0501,
     W0503,
     W0504,
@@ -1283,6 +1284,26 @@ pub const registry = [_]Entry{
         \\The agent does not guess: it starts nothing it cannot prove it has not
         \\started. The run is reported as lost and its job ends as failed (unknown).
         \\Check the state directory's disk and permissions.
+        ,
+    },
+    .{
+        .code = .E0523,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a run's input does not match its digest",
+        .explanation =
+        \\A job that was submitted with an input stores the input once and names it
+        \\in the run by its SHA-256 digest. The agent fetched the input after it
+        \\claimed the run and checked it against that digest. Either the server
+        \\holds no input for the run, or what it holds does not hash to the digest.
+        \\
+        \\The API wrote both the run and the input, so this is a damaged or edited
+        \\store, or a bug in Zigcube, never something the job's author did. The
+        \\agent starts nothing it cannot verify: the run ends as failed
+        \\(start_failed) and is not started again. A fetch that fails for any
+        \\other reason, such as a network error, is not this: it is tried again.
+        \\
+        \\Report it with the diagnostic bundle, then submit the job again.
         ,
     },
     .{

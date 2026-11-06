@@ -76,6 +76,7 @@ const Shell = struct {
     runtime: runtime_mod.Runtime,
     /// The state directory as `AgentState`, for the remembered server pair.
     pair_state: *@import("fake_files.zig").DirState,
+    state_dir: []const u8,
     agent: *agent_mod.Agent,
     arena: BoundedArena,
     diag: Diag,
@@ -142,6 +143,7 @@ const Shell = struct {
             .diag = &shell.diag,
             .mono = shell.boot,
             .state = shell.pair_state.interface(),
+            .state_dir = shell.state_dir,
             .boot_id = shell.boot_id,
             .images = shell.images,
             // No exchange may run past the fence: the agent moves the cap as the lease moves,
@@ -395,6 +397,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .remote = &remote,
         .runtime = backend.runtime,
         .pair_state = backend.pair_state,
+        .state_dir = config.state_dir,
         .agent = agent,
         .arena = BoundedArena.init(gpa, constants.request_arena_bytes_max),
         .diag = undefined,
