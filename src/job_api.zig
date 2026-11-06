@@ -656,6 +656,9 @@ pub const Row = struct {
     end: ?records.JobEnd = null,
     /// The placement epoch the run was claimed under: with `name`, what identifies an ending.
     epoch: ?u64 = null,
+    /// When the job reached its terminal state, as its status records it (set once, never changed):
+    /// with `name` and `epoch`, the key that tells two endings of a reused name apart.
+    ended_at_ms: ?u64 = null,
 };
 
 pub const Listing = struct {
@@ -712,6 +715,7 @@ pub fn list(ctx: *const Context, options: ListOptions) Error!Listing {
             .cancel_requested = job.cancel_requested != null,
             .end = if (status) |known| known.end else null,
             .epoch = if (status) |known| known.epoch else null,
+            .ended_at_ms = if (status) |known| known.ended_at_ms else null,
         }) catch return @import("store_failures.zig").no_memory(ctx.diag);
     }
     return .{
@@ -1080,6 +1084,26 @@ fn put_admission(rig: *Rig, admission: records.JobAdmission) !void {
     var batch: controller.Batch = .{};
     batch.put(records.key_job_admission, try records.encode(ctx.arena, admission, ctx.diag));
     _ = try controller.commit(&ctx, .api, &batch);
+}
+
+test "a list row carries ended_at_ms of an ended job, and none for a job that has not ended" {
+    // Goal: the additive row member that completes the dedupe key (docs/api.md). Method: one
+    // job ended by a status put, one without a status; the first row has the status's
+    // `ended_at_ms`, the second none; reading again later gives the same value (set once).
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    _ = try create(&ctx, &rig.source, sample("done"));
+    _ = try create(&ctx, &rig.source, sample("waiting"));
+    try put_status(&rig, "done", .exited);
+    for (0..2) |_| {
+        const listing = try list(&ctx, .{ .limit = 10, .ended = false });
+        try testing.expectEqual(@as(usize, 2), listing.rows.len);
+        try testing.expectEqualStrings("done", listing.rows[0].name);
+        try testing.expectEqual(@as(?u64, now_start), listing.rows[0].ended_at_ms);
+        try testing.expectEqual(@as(?u64, null), listing.rows[1].ended_at_ms);
+    }
 }
 
 test "cancel of an ended job changes nothing and reports the revision the status was read at" {
