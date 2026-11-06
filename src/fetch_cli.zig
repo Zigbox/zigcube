@@ -330,7 +330,7 @@ pub fn bundle_note(buffer: []u8, peer_name: []const u8, reply: PeerReply) []cons
 fn say_bundle_failed(io: std.Io, peer_name: []const u8, reply: PeerReply) void {
     var buffer: [256]u8 = undefined;
     const text = bundle_note(&buffer, peer_name, reply);
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    to_stderr(io, text);
 }
 
 /// One peer's open stream and how many requests it has carried.
@@ -591,7 +591,7 @@ fn emit(io: std.Io, diag: *const diag_mod.Diag) void {
     diag_mod.to_diagnostic(&diagnostic, diag);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
     const text = diag_mod.render(&diagnostic, .text, false, &buffer);
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    to_stderr(io, text);
 }
 
 // ---- The command ----------------------------------------------------------------------------
@@ -732,8 +732,18 @@ fn no_memory(io: std.Io, diag: *diag_mod.Diag) u8 {
     return finish(io, diag, constants.exit_environment);
 }
 
-fn note(io: std.Io, text: []const u8) void {
+/// Says `text` on stderr; there is nowhere else to say it. Silent in a unit test: a passing test
+/// step that writes to stderr is reported by the build runner as `failed command: ...`, which
+/// read like a crash (docs/STYLE.md). Nothing in `zig build check` reads the real stream: the
+/// swarm smoke (not in `check`) reads `fetch.log` for ZC-W0601 only, and ZBX-W0201 and the bundle
+/// notes are not asserted on it anywhere.
+fn to_stderr(io: std.Io, text: []const u8) void {
+    if (@import("builtin").is_test) return;
     std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+}
+
+fn note(io: std.Io, text: []const u8) void {
+    to_stderr(io, text);
 }
 
 /// The node's identity, or null when it has none or its files cannot be used; the second case
@@ -883,7 +893,7 @@ fn say_foreign(io: std.Io, collector: *const zigbox.diag.Diag) void {
     zigbox.diagnostic.from_diag(&diagnostic, collector);
     var buffer: [constants.diag_output_bytes_max]u8 = undefined;
     const text = diag_mod.render(&diagnostic, .text, false, &buffer);
-    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else to say it.
+    to_stderr(io, text);
 }
 
 fn not_single_threaded(io: std.Io, diag: *diag_mod.Diag, count: ?u32) u8 {
