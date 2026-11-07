@@ -419,7 +419,18 @@ pub const Agent = struct {
             .node_key = records.node_key(agent.config.node),
         };
         try pass.load();
-        try pass.replicas();
+        // The job pass runs even when the replica pass fails: a replica error that repeats (a
+        // runtime `start` that errors) must not withhold a cancel or a stop from a run. The
+        // replica error is the one returned, with its diagnostic intact.
+        const replicas_failed: ?Error = if (pass.replicas()) |_| null else |err| err;
+        if (replicas_failed) |err| {
+            const kept = ctx.arena.create(Diag) catch return err;
+            kept.* = ctx.diag.*;
+            ctx.diag.reset();
+            if (agent_jobs.pass(agent, ctx, listings, pass.given)) |_| {} else |_| {}
+            ctx.diag.* = kept.*;
+            return err;
+        }
         acted += try agent_jobs.pass(agent, ctx, listings, pass.given);
         try pass.orphan_containers();
         try pass.orphan_records();

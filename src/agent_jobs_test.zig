@@ -1036,6 +1036,8 @@ const FailingList = struct {
     inner: rt.Runtime,
     failing: bool = false,
     start_failing: bool = false,
+    /// How many starts it refused.
+    refused: u32 = 0,
 
     const vtable: rt.Runtime.VTable = .{
         .start = start,
@@ -1061,6 +1063,7 @@ const FailingList = struct {
     ) rt.Error!rt.StartOutcome {
         const self = from(context);
         if (self.start_failing) {
+            self.refused += 1;
             diag.raise(.E0201);
             diag.cause("the simulated runtime cannot start a container", .{});
             diag.fix(.{ .sentence = "none: a test switched it off" });
@@ -1201,6 +1204,50 @@ test "a runtime listing that fails does not fail the step before the heartbeat" 
     try testing.expectEqual(@as(?records.StopCause, .deadline), kept.stop_cause);
 }
 
+test "a cancel takes effect while a replica's start keeps failing" {
+    // Goal: RA-SHOULD1. A replica whose runtime start errors fails the replica pass at every
+    // step; the job pass must still run, or a cancel is withheld for as long as the error lasts
+    // (the heartbeat succeeds, so no fence ends it). Method: a run is running; the runtime's
+    // start then fails and a replica is assigned; the run is cancelled; steps fail with the
+    // replica's error and the run stops all the same with the cancel as its cause.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    var wrapper: FailingList = .{ .inner = world.sim.interface(), .start_failing = true };
+    world.runtime_override = wrapper.interface();
+    const replica: records.Replica = .{
+        .id = "web-1",
+        .service = "web",
+        .generation = 1,
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+    };
+    _ = try rig.put(.replica_controller, records.replica_key("web", "web-1").slice(), replica);
+    const assigned = records.assigned_replica(
+        "web-1",
+        "web",
+        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        "test",
+    );
+    const key = records.assigned_key(sim_world.node_name, "web-1");
+    _ = try rig.put(.scheduler, key.slice(), assigned);
+    try rig.ask_stop(.cancel, 60_000);
+    // No `advance`: the server's controllers would delete a replica of a service that is not
+    // there. Each step fails with the replica's error and the cancel is acted on all the same.
+    for (0..3) |_| {
+        const result = world.agent_step();
+        try testing.expect(result.failed != null);
+    }
+    try testing.expect(wrapper.refused >= 3);
+    try testing.expect(!rig.running());
+    wrapper.start_failing = false;
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
+}
+
 test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     // Goal: the review's SHOULD (PR #150): a call to the server that a run's wake falls inside
     // must get `call_inflight_min_ms`, or wakes 100 ms apart cut every 150 ms keepalive and the
@@ -1231,6 +1278,33 @@ test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(lease, world.agent.lease);
+}
+
+test "a step has one call floor, taken at its start, not one per call" {
+    // Goal: the node's clock moves inside a step (a keepalive costs time), and the floor that
+    // keeps a run's wake from cutting a call is taken once, at the step's start. Taken again after
+    // the heartbeat, a step's last calls would run 150 ms past it. Method: one run whose deadline
+    // is 300 ms after the step; a keepalive costs 150 ms; one step at the lease renewal. The cap
+    // the agent last set is the step's start plus `call_inflight_min_ms`, not that plus 150.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    const renew_in = world.agent.renew_at_ms - world.now_ms();
+    _ = try rig.assign(renew_in + 300);
+    world.advance(300);
+    world.switched.keepalive_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    world.advance(renew_in - 400);
+    world.manual.advance(100);
+    const lease = world.agent.lease;
+    const start = world.now_ms();
+    _ = world.agent_step();
+    try testing.expect(world.now_ms() > start);
+    try testing.expectEqual(start + 1_000, world.call_cap_ms);
     try testing.expectEqual(lease, world.agent.lease);
 }
 
