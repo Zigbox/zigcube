@@ -6,6 +6,8 @@
 const std = @import("std");
 const testing = std.testing;
 const agent_jobs = @import("agent_jobs.zig");
+const agent_state = @import("agent_state.zig");
+const rt = @import("runtime.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
@@ -277,6 +279,32 @@ test "the deadline stops the run on the monotonic clock, under the same boot" {
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
     try testing.expectEqual(@as(?records.StopCause, .deadline), seen.stop_cause);
     try expect_code(seen, "ZC-W0503");
+}
+
+test "the deadline stops the run while the server cannot be reached, before the fence" {
+    // Goal: pin the release review's MUST (PR #147): the agent enforces a run's deadline from
+    // its own records and clock, so a cut-off node stops the run at its deadline, not when its
+    // lease's fence comes (ttl - margin later). Method: the store goes down right after the
+    // start; past the deadline, and well before the fence, the run is stopped with the cause
+    // recorded, and the ending is reported once the store is back.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(3_000);
+    rig.step();
+    try testing.expect(rig.running());
+    rig.world.set_store_down(true);
+    rig.world.advance(2_000);
+    try testing.expect(rig.running());
+    rig.world.advance(2_000);
+    try testing.expect(!rig.running());
+    try testing.expect(!rig.world.agent.fence.active);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .deadline), kept.stop_cause);
+    rig.world.set_store_down(false);
+    rig.world.advance(2_000);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .deadline), seen.stop_cause);
 }
 
 test "a deadline of another boot is not compared: the run is stopped by the host's loss" {
@@ -904,4 +932,288 @@ test "the not_started report of an unfetchable input is a golden" {
             "ZC-E0504: the server answered 503",
         cause,
     );
+}
+
+// ---- Enforcement never fails the step (PR #150 review) ----
+
+/// The agent's files with `put_atomic` failing, as a full or broken disk does, for names that
+/// contain `poisoned` once `armed`; everything else passes through to the simulated files.
+const FailingPut = struct {
+    inner: agent_state.AgentState,
+    poisoned: []const u8,
+    armed: bool = false,
+    refused: u32 = 0,
+
+    const vtable: agent_state.AgentState.VTable = .{
+        .put_atomic = put_atomic,
+        .append = append,
+        .read = read,
+        .remove = remove,
+        .list = list,
+    };
+
+    fn interface(self: *FailingPut) agent_state.AgentState {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *FailingPut {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn put_atomic(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        const self = from(context);
+        if (self.armed and std.mem.indexOf(u8, name, self.poisoned) != null) {
+            self.refused += 1;
+            return error.Io;
+        }
+        return self.inner.put_atomic(name, data);
+    }
+
+    fn append(context: *anyopaque, name: []const u8, data: []const u8) agent_state.Error!void {
+        return from(context).inner.append(name, data);
+    }
+
+    fn read(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        name: []const u8,
+    ) agent_state.Error![]const u8 {
+        return from(context).inner.read(arena, name);
+    }
+
+    fn remove(context: *anyopaque, name: []const u8) agent_state.Error!void {
+        return from(context).inner.remove(name);
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        prefix: []const u8,
+    ) agent_state.Error![]const []const u8 {
+        return from(context).inner.list(arena, prefix);
+    }
+};
+
+/// The simulated runtime with `list` failing while `failing` is set.
+const FailingList = struct {
+    inner: rt.Runtime,
+    failing: bool = false,
+
+    const vtable: rt.Runtime.VTable = .{
+        .start = start,
+        .stop = stop,
+        .signal = signal,
+        .inspect = inspect,
+        .list = list,
+        .events = events,
+    };
+
+    fn interface(self: *FailingList) rt.Runtime {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    fn from(context: *anyopaque) *FailingList {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn start(
+        context: *anyopaque,
+        spec: *const rt.Spec,
+        diag: *diag_mod.Diag,
+    ) rt.Error!rt.StartOutcome {
+        const inner = from(context).inner;
+        return inner.vtable.start(inner.context, spec, diag);
+    }
+
+    fn stop(
+        context: *anyopaque,
+        handle: rt.Handle,
+        grace_ms: u32,
+        diag: *diag_mod.Diag,
+    ) rt.Error!void {
+        const inner = from(context).inner;
+        return inner.vtable.stop(inner.context, handle, grace_ms, diag);
+    }
+
+    fn signal(
+        context: *anyopaque,
+        handle: rt.Handle,
+        number: u8,
+        diag: *diag_mod.Diag,
+    ) rt.Error!void {
+        const inner = from(context).inner;
+        return inner.vtable.signal(inner.context, handle, number, diag);
+    }
+
+    fn inspect(
+        context: *anyopaque,
+        handle: rt.Handle,
+        diag: *diag_mod.Diag,
+    ) rt.Error!rt.Status {
+        const inner = from(context).inner;
+        return inner.vtable.inspect(inner.context, handle, diag);
+    }
+
+    fn list(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        diag: *diag_mod.Diag,
+    ) rt.Error![]const rt.Listing {
+        const self = from(context);
+        if (self.failing) {
+            diag.raise(.E0201);
+            diag.cause("the simulated runtime cannot list its containers", .{});
+            diag.fix(.{ .sentence = "none: a test switched it off" });
+            return error.RuntimeFailed;
+        }
+        return self.inner.vtable.list(self.inner.context, arena, diag);
+    }
+
+    fn events(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        timeout_ms: u32,
+        diag: *diag_mod.Diag,
+    ) rt.Error![]const rt.StatusChange {
+        const inner = from(context).inner;
+        return inner.vtable.events(inner.context, arena, timeout_ms, diag);
+    }
+};
+
+/// A second job's run, beside `assign`'s: `job`, `id` and its deadline.
+fn assign_other(rig: *Rig, job: []const u8, id: []const u8, deadline_ms: u64) !void {
+    var run = rig.run_record(null, deadline_ms);
+    run.id = id;
+    run.job = job;
+    _ = try rig.put(.job_controller, records.job_run_key(job).slice(), run);
+    const assigned: records.Assigned = .{
+        .replica = id,
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = job,
+    };
+    const key = records.assigned_key(sim_world.node_name, id);
+    _ = try rig.put(.scheduler, key.slice(), assigned);
+}
+
+test "a run's unwritable start record neither fences the node nor holds back another run" {
+    // Goal: pin the review's MUST (PR #150): a failure in one run's enforcement (its record's
+    // write) must not fail the step before the heartbeat, or the node is fenced for one run's
+    // trouble and the runs after it in the listing are never stopped. Method: two runs, the
+    // first with the earlier deadline and a state directory that refuses every write of its
+    // record; 40 s pass, well past the ttl. The lease is kept and no fence falls; the first run
+    // is stopped all the same (the cause is only in memory), and so is the other at its deadline
+    // with its cause recorded; the failure was noted.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(3_000);
+    try assign_other(&rig, "other", "other-job", 4_000);
+    world.advance(500);
+    try testing.expectEqual(@as(u32, 2), world.sim.running_count());
+    var failing: FailingPut = .{ .inner = world.files.interface(), .poisoned = run_id };
+    world.state_override = failing.interface();
+    failing.armed = true;
+    const lease = world.agent.lease;
+    world.advance(40_000);
+    try testing.expect(failing.refused > 0);
+    try testing.expect(world.agent.enforce_failures > 0);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expect(!world.agent.fence.active);
+    try testing.expectEqual(lease, world.agent.lease);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    failing.armed = false;
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, "other-job");
+    const bytes = try world.files.interface().read(world.fresh_arena(), name);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"deadline\"") != null);
+}
+
+test "a runtime listing that fails does not fail the step before the heartbeat" {
+    // Goal: the review's SHOULD (PR #150), decided: a node that cannot list its containers skips
+    // enforcement for the step and keeps its lease, as it did before enforcement moved ahead of
+    // the heartbeat. Method: the runtime's list fails for 40 s, well past the ttl: no fence, the
+    // lease is the one it had, the failure is noted; once the list works the overdue run is
+    // stopped for its deadline.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(3_000);
+    world.advance(500);
+    try testing.expect(rig.running());
+    var wrapper: FailingList = .{ .inner = world.sim.interface() };
+    world.runtime_override = wrapper.interface();
+    wrapper.failing = true;
+    const lease = world.agent.lease;
+    world.advance(40_000);
+    try testing.expect(world.agent.enforce_failures > 0);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(lease, world.agent.lease);
+    try testing.expect(rig.running());
+    wrapper.failing = false;
+    world.advance(2_000);
+    try testing.expect(!rig.running());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .deadline), kept.stop_cause);
+}
+
+test "run wakes closer together than a heartbeat do not cut the heartbeat" {
+    // Goal: the review's SHOULD (PR #150): a call to the server that a run's wake falls inside
+    // must get `call_inflight_min_ms`, or wakes 100 ms apart cut every 150 ms keepalive and the
+    // lease starves. Method: eight runs whose deadlines are 100 ms apart and span the moment the
+    // lease is renewed; a keepalive costs 150 ms of the clock and is cut by the cap the agent
+    // sets, as a real exchange is. No keepalive is cut and the lease is the same afterwards.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    const names = [_][]const u8{
+        "wake0", "wake1", "wake2", "wake3", "wake4", "wake5", "wake6", "wake7",
+    };
+    const ids = [_][]const u8{
+        "wake0-job", "wake1-job", "wake2-job", "wake3-job",
+        "wake4-job", "wake5-job", "wake6-job", "wake7-job",
+    };
+    const first = (world.agent.renew_at_ms - world.now_ms()) - 300;
+    for (names, ids, 0..) |job, id, i| try assign_other(&rig, job, id, first + 100 * i);
+    world.switched.keepalive_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    const lease = world.agent.lease;
+    world.advance(300);
+    try testing.expectEqual(@as(u32, 8), world.sim.running_count());
+    world.advance(first + 1_500);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(lease, world.agent.lease);
+}
+
+test "an agent with no runs never cuts a call before its fence" {
+    // Goal: demo-c1 (PR #150, CI run 42355098100) runs no jobs, so no run's wake may cap a
+    // call: the cap is the fence and nothing else, at every moment. Method: no run is assigned;
+    // keepalives cost 150 ms of the clock and are cut by the cap the agent sets. Over three
+    // lease terms no call is cut, the cap equals the fence at each step, and the lease holds.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    world.switched.keepalive_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    const lease = world.agent.lease;
+    var elapsed: u64 = 0;
+    while (elapsed < 24_000) : (elapsed += 250) {
+        world.advance(250);
+        const mono = world.now_ms();
+        try testing.expectEqual(
+            world.agent.fence_at_ms() orelse std.math.maxInt(u64),
+            world.agent.calls_deadline_ms(mono),
+        );
+    }
+    try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(lease, world.agent.lease);
 }

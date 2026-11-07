@@ -1153,11 +1153,15 @@ fn io_cap(request: Request) u64 {
     return request.timeout_ms orelse constants.agent_io_timeout_ms;
 }
 
-/// The deadline of a call has passed before it was made: nothing is sent.
+/// The deadline of a call has passed before it was made: nothing is sent. The deadline is the
+/// fence's, or a run's deadline or kill, which the agent acts on before it calls again.
 fn fence_due(diag: *Diag) store.Error {
     assert(diag.code == null);
     diag.raise(.E0503);
-    diag.cause("the agent did not call zcube-server: its lease's fence deadline has come", .{});
+    diag.cause(
+        "the agent did not call zcube-server: its lease's fence, or a run's deadline, has come",
+        .{},
+    );
     diag.fix(.{
         .sentence = "make zcube-server reachable from the node; the agent fences meanwhile",
     });

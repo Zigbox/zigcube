@@ -52,6 +52,16 @@ const Clock = @import("clock.zig").Clock;
 
 const root = @import("root");
 
+/// How long a call to the server is left to run at least when a run's wake falls inside it
+/// (`Agent.calls_deadline_ms`). Internal: the relation to the grace is asserted below.
+const call_inflight_min_ms: u32 = 1_000;
+
+comptime {
+    // Enforcement may run this late; a default grace must stay much longer.
+    assert(call_inflight_min_ms * 4 <= constants.stop_grace_ms);
+    assert(call_inflight_min_ms > constants.fence_poll_ms);
+}
+
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const Diagnostic = diag_mod.Diagnostic;
@@ -155,6 +165,9 @@ const PendingStop = struct {
     handle: runtime.Handle,
     /// The container is killed at the next step after this time if it is still running.
     deadline_ms: u64,
+    /// The `Agent.steps` value of the step that killed it, so the step's other passes over the
+    /// same listing do not kill it again (each kill waits for the runtime).
+    killed_step: u64 = std.math.maxInt(u64),
 };
 
 pub const Agent = struct {
@@ -188,6 +201,19 @@ pub const Agent = struct {
     store_refusal_len: u8,
     /// When the job pass next needs to run (a run's deadline), monotonic; maxInt if never.
     jobs_wake_mono_ms: u64,
+    /// When a run's deadline or the kill after its grace next falls, monotonic, as the step's
+    /// server-free look at the runs found it (`agent_jobs.enforce_deadlines`); maxInt if never.
+    /// Like the fence, it caps every pause, wait and call, so a cut-off server never holds a
+    /// run's stop back.
+    deadline_wake_mono_ms: u64,
+    /// Failures of the server-free enforcement that the step went on after (one run's record or
+    /// stop, the runtime's listing): counted, with the last one's code and cause, for the shell
+    /// to say. Enforcement never fails the step, so the heartbeat always runs.
+    enforce_failures: u32,
+    /// Steps begun, so a stop can say which step killed it.
+    steps: u64,
+    enforce_failure_text: [enforce_failure_text_bytes]u8,
+    enforce_failure_len: u8,
     /// The last failure to fetch a run's input that said nothing about the input (the server or
     /// the link): which run (a hash of its id) and what it said. In memory only; it names the
     /// cause when the run ends `not_started`.
@@ -202,6 +228,7 @@ pub const Agent = struct {
 
     const store_refusal_text_bytes = 160;
     const pull_drop_text_bytes = 200;
+    const enforce_failure_text_bytes = 200;
     const input_failure_text_bytes = 160;
 
     /// What the last counted summary refusal said (empty if none).
@@ -210,6 +237,24 @@ pub const Agent = struct {
     }
 
     /// The container and reason of the last dropped pull record (empty if none).
+    pub fn enforce_failure(agent: *const Agent) []const u8 {
+        return agent.enforce_failure_text[0..agent.enforce_failure_len];
+    }
+
+    /// Notes the diagnostic in `ctx.diag` as one that enforcement went on after, and clears it:
+    /// the step's own failures are those after the heartbeat. `what` says which work failed.
+    pub fn note_enforce_failure(agent: *Agent, ctx: *const Context, what: []const u8) void {
+        const code = ctx.diag.code orelse return;
+        var writer: std.Io.Writer = .fixed(&agent.enforce_failure_text);
+        // A text too long for the buffer is cut: the line is a hint, never a failure.
+        writer.print("{s} (ZC-{s}): {s}", .{
+            what, @tagName(code), ctx.diag.last_cause() orelse "no cause given",
+        }) catch {};
+        agent.enforce_failure_len = @intCast(writer.end);
+        agent.enforce_failures += 1;
+        ctx.diag.reset();
+    }
+
     pub fn pull_drop(agent: *const Agent) []const u8 {
         return agent.pull_drop_text[0..agent.pull_drop_len];
     }
@@ -243,6 +288,10 @@ pub const Agent = struct {
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
         agent.jobs_wake_mono_ms = maxInt(u64);
+        agent.deadline_wake_mono_ms = maxInt(u64);
+        agent.enforce_failures = 0;
+        agent.enforce_failure_len = 0;
+        agent.steps = 0;
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
     }
@@ -281,21 +330,44 @@ pub const Agent = struct {
         return @intCast(@min(at -| mono_now, maxInt(u32)));
     }
 
-    /// How long a wait for a replica change may hold the server: `slice_ms`, or less if the
-    /// fence (or a fence's kill) falls sooner, and at least 1.
-    pub fn watch_hold_ms(agent: *const Agent, mono_now: u64, slice_ms: u32) u32 {
-        const capped = @min(slice_ms, constants.api_watch_timeout_ms_max);
-        return @max(1, @min(capped, agent.fence_in_ms(mono_now)));
+    /// How long the agent may go without a step: until the fence (`fence_in_ms`), or a run's
+    /// deadline or kill if one falls sooner. Every pause and wait is cut to it, so a server that
+    /// cannot be reached never holds back a stop the agent can make alone.
+    pub fn act_in_ms(agent: *const Agent, mono_now: u64) u32 {
+        const fence = agent.fence_in_ms(mono_now);
+        if (agent.deadline_wake_mono_ms == maxInt(u64)) return fence;
+        // A wake that is due (a step failed before it got there) is retried at the fence's poll.
+        const left = agent.deadline_wake_mono_ms -| mono_now;
+        const wait = if (left == 0) constants.fence_poll_ms else @min(left, maxInt(u32));
+        return @min(fence, @as(u32, @intCast(wait)));
     }
 
-    /// Tells the caller by when every call to the server must end: the fence.
+    /// By when every call to the server must end, monotonic: the fence, or a run's deadline or
+    /// kill if one falls sooner (`maxInt` if neither). A run's wake never cuts a call that has
+    /// been in flight less than `call_inflight_min_ms`: wakes closer together than a heartbeat
+    /// would otherwise cut every one and starve the lease. Enforcement then runs at most that
+    /// late, which is inside the grace. Called as a call begins (`mono_now`).
+    pub fn calls_deadline_ms(agent: *const Agent, mono_now: u64) u64 {
+        const wake = @max(agent.deadline_wake_mono_ms, mono_now +| call_inflight_min_ms);
+        return @min(agent.fence_at_ms() orelse maxInt(u64), wake);
+    }
+
+    /// How long a wait for a replica change may hold the server: `slice_ms`, or less if the
+    /// fence (or a fence's kill) or a run's deadline or kill falls sooner, and at least 1.
+    pub fn watch_hold_ms(agent: *const Agent, mono_now: u64, slice_ms: u32) u32 {
+        const capped = @min(slice_ms, constants.api_watch_timeout_ms_max);
+        return @max(1, @min(capped, agent.act_in_ms(mono_now)));
+    }
+
+    /// Tells the caller by when every call to the server must end (`calls_deadline_ms`).
     fn cap_calls(agent: *const Agent, ctx: *const Context) void {
         const deadline = ctx.deadline orelse return;
-        deadline.set_fn(deadline.context, agent.fence_at_ms() orelse maxInt(u64));
+        deadline.set_fn(deadline.context, agent.calls_deadline_ms(ctx.mono_ms()));
     }
 
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
         assert(ctx.diag.code == null);
+        agent.steps += 1;
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
         // The fence comes first and needs no server: an agent cut off from everything still stops.
@@ -304,6 +376,19 @@ pub const Agent = struct {
             if (mono >= at) try agent.begin_fence(ctx, at);
         }
         if (agent.fence.active) return agent.fence_step(ctx, now);
+        // So do the runs' deadlines: a run is stopped at its deadline and killed after its grace
+        // from the start records and this node's clock, before any call that may fail or hang.
+        // A listing that fails skips enforcement for this step and fails the step only after the
+        // heartbeat, as before enforcement moved: a node that cannot list its containers keeps
+        // its lease (docs/decisions/2026-11-07-agent-enforces-deadline-offline.md).
+        var listed: ?[]const runtime.Listing = null;
+        if (ctx.runtime.list(ctx.arena, ctx.diag)) |found| {
+            listed = found;
+            agent_jobs.enforce_deadlines(agent, ctx, found);
+        } else |_| {
+            agent.deadline_wake_mono_ms = maxInt(u64);
+            agent.note_enforce_failure(ctx, "list the containers to enforce run deadlines");
+        }
         agent.cap_calls(ctx);
         var acted: u32 = 0;
         switch (try agent.heartbeat(ctx)) {
@@ -313,7 +398,7 @@ pub const Agent = struct {
         }
         // A grant or a keepalive moves the fence: the calls that follow are capped by the new one.
         agent.cap_calls(ctx);
-        const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
+        const listings = listed orelse try ctx.runtime.list(ctx.arena, ctx.diag);
         try agent.publish_store(ctx, listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
         var pass: Pass = .{
@@ -356,6 +441,9 @@ pub const Agent = struct {
         }
         if (agent.jobs_wake_mono_ms != maxInt(u64)) {
             wake = @min(wake, now + (agent.jobs_wake_mono_ms -| mono));
+        }
+        if (agent.deadline_wake_mono_ms != maxInt(u64)) {
+            wake = @min(wake, now + (agent.deadline_wake_mono_ms -| mono));
         }
         return @max(wake, now);
     }
@@ -754,7 +842,9 @@ pub const Agent = struct {
         if (fault_ignore_stop) return;
         if (agent.pending_stop(name)) |stop| {
             if (now < stop.deadline_ms) return;
+            if (stop.killed_step == agent.steps) return;
             try ctx.runtime.stop(listing.handle, 0, ctx.diag);
+            stop.killed_step = agent.steps;
             return;
         }
         try ctx.runtime.stop(listing.handle, grace_ms, ctx.diag);
@@ -767,7 +857,7 @@ pub const Agent = struct {
         assert(agent.pending_stop(name) != null);
     }
 
-    fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
+    pub fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
         for (agent.stops[0..agent.stops_count]) |*stop| {
             if (std.mem.eql(u8, stop.handle.name(), name)) return stop;
         }
