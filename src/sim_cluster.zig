@@ -95,6 +95,8 @@ const cluster_up_ms_min: u64 = 120_000;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
 const steps_per_minute_max: u64 = 200;
+/// How often a node may fence in the healed phase: 240 s long, against about 240 for the bug.
+const fences_after_heal_per_node_max: u32 = 4;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -398,6 +400,8 @@ const Node = struct {
     cut_mark_ms: u64,
     /// Times the agent fenced itself, over the whole run (all agent lives).
     fences: u32,
+    /// `fences` when the heal began.
+    fences_at_heal: u32,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -886,6 +890,7 @@ pub const Cluster = struct {
         node.link_cut_total_ms = 0;
         node.cut_mark_ms = c.manual.ms;
         node.fences = 0;
+        node.fences_at_heal = 0;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -1053,8 +1058,10 @@ pub const Cluster = struct {
         }
     }
 
-    /// J4's client, once per poll: it is killed now and then, away for less than a minute (the
-    /// store has not compacted past it) or for minutes (it has), and resumes from its revision.
+    /// J4's client, once per poll: it is killed now and then, away for less than a minute or for
+    /// minutes, and resumes from its revision. The simulation compacts to the head every 60 s,
+    /// so even a short absence can end in a 410 (relist and dedupe); the real keep window is
+    /// not simulated, and a plain in-window resume is the rarer path here.
     fn watch_client(c: *Cluster) void {
         const w = &c.jobs_watch;
         const now = c.manual.ms;
@@ -2276,29 +2283,22 @@ fn track_jobs(c: *Cluster) Failure!void {
     c.jobs.watch_count = count;
 }
 
-/// Takes the node's totals at the moments the bounds start to count them (every tick, wedged or
-/// not): J8's link at the fence's reach before the run's deadline (a cut earlier than that was
-/// mended by the time the deadline came, and the fence is the agent's way of enforcing it only
-/// for a cut that spans it), its wedged time at the deadline, and J6's at the run's stop.
 fn note_marks(
     c: *const Cluster,
     run: records.JobRun,
     node: *const Node,
     watch: *sim_jobs.Watch,
 ) void {
-    const age = c.manual.ms - watch.first_seen_ms;
-    const reach = c.api.lease_ttl_ms -| constants.fence_margin_ms;
-    if (!watch.link_marked and age >= run.deadline_ms -| reach) {
-        watch.link_marked = true;
-        watch.link_base_ms = node.link_cut_total_ms;
-    }
-    if (!watch.wedge_marked and age >= run.deadline_ms) {
-        watch.wedge_marked = true;
-        watch.wedged_base_ms = node.wedged_total_ms;
-    }
-    if (run.stop != null and watch.stop_wedged_base_ms == null) {
-        watch.stop_wedged_base_ms = node.wedged_total_ms;
-    }
+    const stopped = run.stop != null;
+    sim_jobs.note_marks(
+        watch,
+        c.manual.ms,
+        run.deadline_ms,
+        stopped,
+        c.api.lease_ttl_ms,
+        node.wedged_total_ms,
+        node.link_cut_total_ms,
+    );
 }
 
 fn judge_job_container(
@@ -2311,10 +2311,7 @@ fn judge_job_container(
 ) Failure!void {
     const now = c.manual.ms;
     const run = found orelse return;
-    const cut: sim_jobs.Cut = .{
-        .wedged_ms = node.wedged_total_ms - watch.wedged_base_ms,
-        .link = node.link_cut_total_ms > watch.link_base_ms,
-    };
+    const cut = sim_jobs.cut_since(watch, node.wedged_total_ms, node.link_cut_total_ms);
     const granularity = tick_ms + 2 * check_interval_ms;
     const bound = sim_jobs.deadline_bound_ms(
         run.deadline_ms,
@@ -2389,6 +2386,7 @@ fn heal(c: *Cluster) void {
     for (c.nodes) |node| {
         node.partitioned_until_ms = null;
         node.frozen_until_ms = null;
+        node.fences_at_heal = node.fences;
     }
 }
 
@@ -2745,6 +2743,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.report.failed) return error.StepFailed;
         c.enter("convergence");
         try converged(c);
+        try fencing_settles(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
@@ -2783,6 +2782,23 @@ fn busiest_node_rate(c: *const Cluster) u64 {
         busiest = @max(busiest, @as(u64, node.all_steps) * 60_000 / node.all_up_ms);
     }
     return busiest;
+}
+
+fn total_fences(c: *const Cluster) u32 {
+    var fences: u32 = 0;
+    for (c.nodes) |node| fences += node.fences;
+    return fences;
+}
+
+/// A healed cluster stops fencing (issue #78): once the faults have ended, a node may still
+/// fence for a lease it lost, and again for one that ran out while its renewal waited out a
+/// back-off, but not once a second for the rest of the run. Each node gets
+/// `fences_after_heal_per_node_max`.
+fn fencing_settles(c: *Cluster) Failure!void {
+    var worst: u32 = 0;
+    for (c.nodes) |node| worst = @max(worst, node.fences - node.fences_at_heal);
+    try check(c, worst <= fences_after_heal_per_node_max, "agents kept fencing after the " ++
+        "cluster healed (a lease renewal that cannot beat its fence)");
 }
 
 /// An agent that never sleeps (a wake time that is always now) passes every other check and
@@ -2890,8 +2906,7 @@ fn print_summary(c: *Cluster) void {
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
         total.parked,    total.delivered_late,   total.partitioned,
     });
-    var fences: u32 = 0;
-    for (c.nodes) |node| fences += node.fences;
+    const fences = total_fences(c);
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
     report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
         "counted otherwise)\n", .{

@@ -27,6 +27,7 @@ const codes = @import("diag/codes.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const fencing = @import("fencing.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
 const testpeer = @import("tls_testpeer.zig");
@@ -718,8 +719,7 @@ fn peer_bad_tree(diag: *diag_mod.Diag) void { // fetch_worker.zig
 }
 
 fn bad_lease(diag: *diag_mod.Diag) void { // server_config.zig
-    const cause = "lease time to live 30000 ms needs a fence margin of 4000 ms; it is 3000 ms";
-    sample(diag, .E0121, &.{cause}, "shorten --lease-ttl-ms, or leave the fencing constants alone");
+    fencing.raise_problem(diag, 4_000, .ttl_too_short);
 }
 
 fn tenure_ended(diag: *diag_mod.Diag) void { // agent_api.zig

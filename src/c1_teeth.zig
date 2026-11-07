@@ -1,7 +1,8 @@
 //! The test-only switches of the `sim-c1` negative tests (docs/authority.md §4, docs/core.md "The
 //! cluster simulation"). Each is a constant that only a program's root file can switch on, by
-//! declaring `pub const <name> = true;`: the roots that do are `src/sim_c1_teeth_*_main.zig`, which
-//! only the `sim-c1-teeth` build step compiles. Every shipped program, test and the WASM core has
+//! declaring `pub const <name> = true;`: the roots that do are `src/sim_c1_teeth_*_main.zig`.
+//! The `sim-c1-teeth*` steps compile all but `oldrule`, which only `sim-fencing-teeth` compiles.
+//! Every shipped program, test and the WASM core has
 //! another root, so for them each is false; `zcube_server.zig` and `zcube_agent.zig` assert that
 //! at compile time.
 
@@ -29,6 +30,10 @@ pub const stale_observation = declared("c1_teeth_stale_observation");
 /// invariant of `sim-cluster`).
 pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
 
+/// The agent renews every `ttl / 3` again, and the shortest ttl is lifted to the margin
+/// (`fencing.zig`; must break `fencing_settles`, run by hand at a ttl below 5,000 ms).
+pub const old_renewal_rule = declared("c1_teeth_old_renewal_rule");
+
 /// The agent starts a run whose container already exited (must break J2 and J7).
 pub const job_restart = declared("c1_teeth_job_restart");
 /// The agent starts a run before its claim commits (must break J7).
@@ -51,6 +56,7 @@ pub const job_deadline_late_ms: u64 = if (job_deadline_late) 9_000 else 0;
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");
 
-pub const any = skip_allocation_compare or skip_readiness_compare or skew_beyond_bound or wedge or
-    stale_observation or locality_before_spread or job_restart or job_claim or job_double or
-    job_rewrite or job_cancel or job_deadline or job_deadline_late or job_gap;
+pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
+    skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
+    job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
+    job_gap;

@@ -110,14 +110,9 @@ pub const long_share_denominator: u32 = 10;
 /// deadline (measured, docs/decisions/2026-11-04-fleet-profiles-and-shapes.md).
 pub const cost_max: u32 = 5_000;
 
-/// The shortest ttl a shape draws. The agent fences `fence_margin_ms` (3 s) before the lease ends,
-/// and the simulation measured that a ttl of 4,500 ms and under makes a healed one-node cluster
-/// fence about once a second for ever, so a 100-operation run does not finish in two minutes
-/// (`sim_cluster 3 100 1 --lease-ttl-ms=4000`). Issue #78 is that bug, and above 4,500 it still
-/// shows: seed 86 `crash_heavy` with ttl 5959 fails at `end` with a busy-loop verdict. Until #78
-/// is fixed the floor is 8,000 so the fleet does not file its known symptom
-/// (docs/decisions/2026-11-05-fleet-ttl-floor.md); it drops back when #78 closes. The allowed
-/// range is wider (`--lease-ttl-ms` takes any ttl in it by hand); the draw stays above the floor.
+/// The shortest ttl a shape draws, and the shortest `fencing.inequality_problem` admits (owner,
+/// 2026-11-06: 3,000 ms of margin plus `fence_window_min_ms`): the drawn and the admitted
+/// ranges agree (docs/decisions/2026-11-06-renewal-before-fence.md).
 pub const lease_ttl_ms_min: u32 = 8000;
 /// The longest ttl `fencing.inequality_problem` allows with the shipped margin.
 pub const lease_ttl_ms_max: u32 = constants.lease_ttl_ms;

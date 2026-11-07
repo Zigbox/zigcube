@@ -69,6 +69,10 @@ check $PR x "" "src/store_postgres.zig" TTTTTTTT
 check $PR x "" "src/store.zig" TTTTTTTT
 check $PR x "" "src/core.zig" TTTTTTTT
 check $PR x "" "src/c1_teeth.zig" TTTTTTTT
+# The sim job (which runs sim-fencing-teeth) runs on `code`: a change to the fencing arithmetic
+# runs everything, one to the simulator alone runs the code jobs.
+check $PR x "" "src/fencing.zig" TTTTTTTT
+check $PR x "" "src/sim_cluster.zig src/sim_c1_teeth_oldrule_main.zig" TFFFFFFF
 check $PR x "" "src/testing/fault_proxy.zig" TTTTTTTT
 check $PR x "" "src/brand_new_file.zig" TTTTTTTT
 check $PR x "" "newdir/file.txt" TTTTTTTT

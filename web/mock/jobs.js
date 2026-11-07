@@ -8,7 +8,8 @@
 // that fits gets the scheduler's `place_run` and then the controller's `job_placed`; one that
 // does not gets `hold_pending`. A run that was never claimed has a `stop_job` decision and ends
 // from its stop (`not_started` -> `failed deadline`, `unreachable` -> `failed not_started`,
-// `cancel` -> `cancelled`); a claimed run ends as its agent reported (`end_job`).
+// `cancel` -> `cancelled`); a claimed run ends as its agent reported (`end_job`, citing the report; with no report it cites
+// the desired `/job-runs/<name>`, and the `stop_job` is not a link of that chain).
 //
 // Not modelled: retries, relay, placement (ZC-E0130 by name, as the server), the admission window
 // beyond `jobs_max`, log output (cut from B1), node loss (a plan may end `unreachable` directly).
@@ -155,6 +156,8 @@ export class Jobs {
       const row = { name: job.name, image: job.image, state, labels: job.labels, created_at_ms: job.created_at_ms, deadline_ms: job.deadline_ms, cancel_requested: !!job.cancel_requested };
       if (st?.node) row.node = st.node;
       if (st?.end) row.end = st.end;
+      if (st?.epoch != null) row.epoch = st.epoch;
+      if (st?.ended_at_ms != null) row.ended_at_ms = st.ended_at_ms;
       jobs.push(row);
     }
     return { revision: this.engine.rev, jobs, continue: page.more ? page.last.slice("/jobs/".length) : null };
@@ -245,8 +248,8 @@ export class Jobs {
     this.later(p.place + p.start, () => {
       if (!alive()) return;
       const obs = { v: 1, run, node: p.node, tenure: 7, assignment: e.rev, status: "running", started_at_ms: e.now(), reported_at_ms: e.now() };
-      const okv = e.commit([{ put: [`/job-observed/${p.node}/${run}`, obs] }]);
-      const d = e.decision({ actor: "job-controller", action: "job_running", subject: { kind: "job", name }, reason: "the run was claimed by its node", cause: { kind: "observed", key: `/job-observed/${p.node}/${run}`, revision: okv } });
+      const okv = e.commit([{ put: [`/job-observed/${p.node}/${name}`, obs] }]);
+      const d = e.decision({ actor: "job-controller", action: "job_running", subject: { kind: "job", name }, reason: "the run was claimed by its node", cause: { kind: "observed", key: `/job-observed/${p.node}/${name}`, revision: okv } });
       const st = this.statusOf(name);
       e.commit([...d.ops, { put: [`/job-status/${name}`, { ...st, state: "running", tenure: 7, started_at_ms: e.now(), decision: d.id, reported_at_ms: e.now() }] }]);
       note(d.id);
@@ -305,13 +308,16 @@ export class Jobs {
     const p = this.plans.get(name);
     const node = st.node || null;
     const started = !!st.started_at_ms;
-    let cause = { kind: "decision", id: after };
+    // Without an agent report the end cites the desired run, as `Pass.end` does (job_controller.zig);
+    // the `stop_job` before it is a decision of its own, not a link of this chain.
+    const runKv = e.getKv(`/job-runs/${name}`);
+    let cause = { kind: "desired", key: runKv.key, revision: runKv.mod_revision };
     if (node && started && stop !== "unreachable") { // the agent's last report: the evidence the end rests on
       const rec = { v: 1, run: `${name}-job`, node, tenure: st.tenure || 7, assignment: st.epoch || e.rev, status: "stopped", exit: this.exitOf(end), reported_at_ms: e.now() };
       rec.started_at_ms = st.started_at_ms;
       if (stop) rec.stop_cause = stop;
-      const rev = e.commit([{ put: [`/job-observed/${node}/${name}-job`, rec] }]);
-      cause = { kind: "observed", key: `/job-observed/${node}/${name}-job`, revision: rev };
+      const rev = e.commit([{ put: [`/job-observed/${node}/${name}`, rec] }]);
+      cause = { kind: "observed", key: `/job-observed/${node}/${name}`, revision: rev };
     }
     // The reasons are the controller's own (job_controller.zig): unclaimed runs end from their stop.
     const reason = !started && stop === "cancel" ? "the job was cancelled and the run had not started"
