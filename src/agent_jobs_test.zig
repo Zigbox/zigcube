@@ -1189,3 +1189,31 @@ test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
     try testing.expectEqual(lease, world.agent.lease);
 }
+
+test "an agent with no runs never cuts a call before its fence" {
+    // Goal: demo-c1 (PR #150, CI run 42355098100) runs no jobs, so no run's wake may cap a
+    // call: the cap is the fence and nothing else, at every moment. Method: no run is assigned;
+    // keepalives cost 150 ms of the clock and are cut by the cap the agent sets. Over three
+    // lease terms no call is cut, the cap equals the fence at each step, and the lease holds.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    world.switched.keepalive_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    const lease = world.agent.lease;
+    var elapsed: u64 = 0;
+    while (elapsed < 24_000) : (elapsed += 250) {
+        world.advance(250);
+        const mono = world.now_ms();
+        try testing.expectEqual(
+            world.agent.fence_at_ms() orelse std.math.maxInt(u64),
+            world.agent.calls_deadline_ms(mono),
+        );
+    }
+    try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(lease, world.agent.lease);
+}
