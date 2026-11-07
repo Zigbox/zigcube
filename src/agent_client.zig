@@ -319,7 +319,10 @@ pub const RemoteStore = struct {
         diag: *Diag,
     ) store.Error!store.ListResult {
         const remote = from(context);
-        assert(options.continue_after == null); // The reply is never paged: see agent_api.zig.
+        // Only `job-observed` is paged (by run name); every other reply is whole: agent_api.zig.
+        const paged_prefix = records.job_observed_prefix(remote.node);
+        const paged = std.mem.eql(u8, options.prefix, paged_prefix.slice());
+        if (options.continue_after != null) assert(paged);
         assert(!options.reverse);
         const observed = records.observed_prefix(remote.node);
         const assigned = records.assigned_prefix(remote.node);
@@ -335,10 +338,20 @@ pub const RemoteStore = struct {
         const suffix: []const u8 = for (mapped) |entry| {
             if (std.mem.eql(u8, options.prefix, entry.prefix)) break entry.suffix;
         } else return unsupported(diag, "a list of anything but the node's records");
-        const target = try remote.path(arena, suffix, diag);
+        var target = try remote.path(arena, suffix, diag);
+        if (options.continue_after) |key| {
+            assert(std.mem.startsWith(u8, key, options.prefix));
+            const at = options.at_revision orelse
+                return unsupported(diag, "a page without its revision");
+            target = std.fmt.allocPrint(arena, "{s}?after={s}&at={d}", .{
+                target,
+                key[options.prefix.len..],
+                at,
+            }) catch return failures.no_memory(diag);
+        }
         const reply = try remote.exchange(arena, .{ .method = "GET", .target = target }, diag);
         if (reply.status != 200) return refused(arena, reply, diag);
-        const result = try list_result(arena, reply.body, options.limit, diag);
+        const result = try list_result(arena, reply.body, options.limit, paged, diag);
         if (std.mem.eql(u8, suffix, "/replicas")) remote.watch_from = result.revision + 1;
         return result;
     }
@@ -355,18 +368,24 @@ pub const RemoteStore = struct {
         arena: Allocator,
         body: []const u8,
         limit: u32,
+        paged: bool,
         diag: *Diag,
     ) store.Error!store.ListResult {
-        const Answer = struct { revision: u64, kvs: []const KvJson };
+        const Answer = struct { revision: u64, kvs: []const KvJson, more: bool = false };
         const answer = try parse(Answer, arena, body, diag);
-        if (answer.kvs.len > limit) {
+        if (answer.more and answer.kvs.len == 0) {
+            return bad(diag, "the server paged an empty reply");
+        }
+        if (answer.more and !paged) return bad(diag, "the server paged a reply that is whole");
+        // A paged reply holds a fixed page: a caller that asked for less is given the first of
+        // it, and resumes after the last one it got.
+        const kept = if (paged) @min(answer.kvs.len, limit) else answer.kvs.len;
+        const cut = kept < answer.kvs.len;
+        if (!paged and answer.kvs.len > limit) {
             return bad(diag, "the server listed more records than were asked for");
         }
-        const kvs = arena.alloc(
-            store.KeyValue,
-            answer.kvs.len,
-        ) catch return failures.no_memory(diag);
-        for (answer.kvs, kvs) |item, *slot| {
+        const kvs = arena.alloc(store.KeyValue, kept) catch return failures.no_memory(diag);
+        for (answer.kvs[0..kept], kvs) |item, *slot| {
             const invalid = "the server listed a record that is not valid";
             if (store.key_problem(item.key) != null) return bad(diag, invalid);
             if (item.mod_revision > answer.revision) return bad(diag, invalid);
@@ -380,7 +399,8 @@ pub const RemoteStore = struct {
                 .lease = item.lease,
             };
         }
-        return .{ .kvs = kvs, .revision = answer.revision, .continue_after = null };
+        const resume_after: ?[]const u8 = if (cut or answer.more) kvs[kvs.len - 1].key else null;
+        return .{ .kvs = kvs, .revision = answer.revision, .continue_after = resume_after };
     }
 
     // ---- Transactions ----
@@ -456,15 +476,20 @@ pub const RemoteStore = struct {
         };
         var tenure: u64 = 0;
         var run_revision: u64 = 0;
+        var observed_revision: u64 = 0;
         const node_key = records.node_key(remote.node);
         for (request.compares) |cmp| {
             if (std.mem.eql(u8, cmp.key, node_key.slice())) {
                 tenure = cmp.mod_revision;
             } else if (std.mem.startsWith(u8, cmp.key, records.prefix_job_runs)) {
                 run_revision = cmp.mod_revision;
-            } else if (!std.mem.startsWith(u8, cmp.key, records.prefix_job_observed) and
-                !std.mem.startsWith(u8, cmp.key, records.assigned_prefix(remote.node).slice()))
-            {
+            } else if (std.mem.startsWith(u8, cmp.key, records.prefix_job_observed)) {
+                observed_revision = cmp.mod_revision;
+            } else if (!std.mem.startsWith(
+                u8,
+                cmp.key,
+                records.assigned_prefix(remote.node).slice(),
+            )) {
                 return unsupported(diag, "a report with a compare the server cannot carry");
             }
         }
@@ -476,6 +501,10 @@ pub const RemoteStore = struct {
         json.write(tenure) catch return failures.no_memory(diag);
         json.objectField("run_revision") catch return failures.no_memory(diag);
         json.write(run_revision) catch return failures.no_memory(diag);
+        if (observed_revision != 0) { // Additive: absent unless a claim replaces a leftover.
+            json.objectField("observed_revision") catch return failures.no_memory(diag);
+            json.write(observed_revision) catch return failures.no_memory(diag);
+        }
         json.objectField("value") catch return failures.no_memory(diag);
         json.beginWriteRaw() catch return failures.no_memory(diag);
         json.writer.writeAll(put.value) catch return failures.no_memory(diag);

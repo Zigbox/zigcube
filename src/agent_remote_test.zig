@@ -720,3 +720,64 @@ test "a memory-store server that restarts has a new CA, and the agent joins it w
     try testing.expect(!std.mem.eql(u8, &old_ca, &identity.ca_public.?));
     try testing.expect(!identity.observe_ca(remote_store.ca_key_id.?));
 }
+
+test "the agent reads more than store_list_limit_max retained observations of its node" {
+    // Goal: runs are retained until their retention ends, so a node can hold up to
+    // `job_admitted_window_max` observations, far more than one list page. Method: put 600 into
+    // the server's store, then read them the way `agent_jobs.pass` does: `controller.list_all`
+    // over the agent's `RemoteStore`. Before paging, the server answered all 600 to a request
+    // for 500 and the client refused the reply (ZC-E0504), so every pass of a node failed.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const direct = rig.server.shared.store;
+    const lease = try direct.lease_grant(10_000, &diag);
+    const registered = register_op(lease.id);
+    _ = try direct.txn(.{ .on_success = &.{registered} }, &diag);
+    const total = constants.store_list_limit_max + 100;
+    for (0..total) |number| {
+        const name = try std.fmt.allocPrint(arena, "old{d:0>4}", .{number});
+        const seen: records.JobObserved = .{
+            .run = try std.fmt.allocPrint(arena, "{s}-job", .{name}),
+            .node = "node1",
+            .tenure = 1,
+            .assignment = 1,
+            .status = .stopped,
+            .exit = .{ .kind = .lost },
+            .reported_at_ms = 1,
+        };
+        const key = records.job_observed_key("node1", name);
+        const value = try records.encode(arena, seen, &diag);
+        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value } };
+        _ = try direct.txn(.{ .on_success = &.{op} }, &diag);
+    }
+    var manual: @import("clock.zig").ManualClock = .{ .ms = 1 };
+    const ctx: @import("controller.zig").Context = .{
+        .store = rig.remote.interface(),
+        .clock = manual.clock(),
+        .arena = arena,
+        .diag = &diag,
+    };
+    const prefix = records.job_observed_prefix("node1");
+    const listed = try @import("controller.zig").list_all(
+        records.JobObserved,
+        &ctx,
+        prefix.slice(),
+        null,
+        constants.job_admitted_window_max,
+    );
+    try testing.expectEqual(@as(usize, total), listed.items.len);
+    try testing.expectEqualStrings("old0000-job", listed.items[0].rec.run);
+    try testing.expectEqualStrings("old0599-job", listed.items[total - 1].rec.run);
+    // A caller that asks for less than a page gets that much and resumes after the last.
+    const small = try rig.remote.interface().list(arena, .{
+        .prefix = prefix.slice(),
+        .limit = 3,
+    }, &diag);
+    try testing.expectEqual(@as(usize, 3), small.kvs.len);
+    try testing.expectEqualStrings(small.kvs[2].key, small.continue_after.?);
+}

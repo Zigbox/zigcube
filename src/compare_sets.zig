@@ -177,6 +177,7 @@ pub fn job_claim(
     job: []const u8,
     run_revision: store.Revision,
     assignment: store.Revision,
+    observed_revision: store.Revision,
 ) void {
     assert(run_revision > 0);
     assert(assignment > 0);
@@ -185,7 +186,7 @@ pub fn job_claim(
     observed_write(set, node, tenure_revision);
     set.add(records.job_run_key(job), run_revision);
     set.add(records.assigned_key(node, run), assignment);
-    set.add(records.job_observed_key(node, job), 0);
+    set.add(records.job_observed_key(node, job), observed_revision);
 }
 
 /// An agent's observed write: its tenure is still current.
