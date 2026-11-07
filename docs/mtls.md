@@ -224,5 +224,6 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
 | ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time, or a call came after an earlier failure had ended the connection |
 | ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
+| ZC-E0821 | the operating system's secure random source failed, so no key, nonce or seed was made (the weaker `random` is never used instead) |
 
 For ZC-E0819, the fix is to give the peer a certificate issued for its role.

@@ -10,6 +10,7 @@
 //! wall clock, passed in.
 
 const std = @import("std");
+const secure_random = @import("secure_random.zig");
 const assert = std.debug.assert;
 const Ed25519 = std.crypto.sign.Ed25519;
 const client_mod = @import("agent_client.zig");
@@ -337,7 +338,7 @@ fn load_or_make_key(
     }
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
-        io.random(&seed);
+        secure_random.fill(io, &seed, diag) catch return error.Failed;
         var key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
         errdefer std.crypto.secureZero(u8, &key.secret_key.bytes); // A key that was not stored.
         try files.write_seed(io, dir, where, key_file, seed, diag);

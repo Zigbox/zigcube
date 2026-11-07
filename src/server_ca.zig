@@ -6,6 +6,7 @@
 //! says so on stderr: its agents join again. `revoked` is read once, at start.
 
 const std = @import("std");
+const secure_random = @import("secure_random.zig");
 const assert = std.debug.assert;
 const Ed25519 = std.crypto.sign.Ed25519;
 const Clock = @import("clock.zig").Clock;
@@ -238,7 +239,7 @@ fn load_or_make_key(
     }
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
-        io.random(&seed);
+        secure_random.fill(io, &seed, diag) catch return error.Failed;
         const key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
         try files.write_seed(io, dir, path, name, seed, diag);
         return key;

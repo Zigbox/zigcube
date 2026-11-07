@@ -663,7 +663,8 @@ fn timeout_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expect(took >= 200);
     try std.testing.expect(took < deadline_ms);
     var out: [4]u8 = undefined;
-    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &later));
 }
 
 test "a server that stays silent ends the handshake at its deadline" {
@@ -698,8 +699,9 @@ fn stall_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     @memset(big, 0x5a);
     try std.testing.expectError(error.Timeout, conn.write(big, end_in(io, 200), &diag));
     // A record may be half sent: the connection is over.
-    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
-    try std.testing.expect(diag.code == null);
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &later));
+    try expect_code(&later, .E0816);
 }
 
 test "a peer that stops reading ends a write in a timeout" {
@@ -730,7 +732,8 @@ fn untrusted_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectError(error.Refused, conn.open(&options, &diag));
     try expect_code(&diag, .E0810);
     var out: [4]u8 = undefined;
-    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &later));
 }
 
 test "a server certificate from another CA is refused and the alert is sent" {
@@ -856,8 +859,12 @@ fn full_update_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     // and the call that finds out says so, with a diagnostic, instead of `Timeout`.
     try std.testing.expectError(error.Refused, conn.read(&out, end_in(io, 200), &diag));
     try expect_code(&diag, .E0816);
-    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 200), &diag));
-    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 200), &later));
+    try expect_code(&later, .E0816);
+    var again = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &again));
+    try expect_code(&again, .E0816);
 }
 
 test "a KeyUpdate answer that times out ends the connection" {
@@ -913,7 +920,8 @@ fn seal_fail_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectEqual(@as(u32, 0), conn.plain_length);
     try std.testing.expect(std.mem.allEqual(u8, conn.plain[0..6], 0));
     try conn.close(end_in(io, 200), &diag);
-    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &later));
 }
 
 test "a seal that fails drops what was queued, so close afterwards is safe" {

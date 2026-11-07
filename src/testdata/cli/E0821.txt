@@ -1,0 +1,5 @@
+error[ZC-E0821]: the operating system's secure random source failed
+  cause  the operating system's secure random source failed (EntropyUnavailable)
+  fix    Check that the kernel's getrandom works here: the seccomp profile and the container sandbox must allow it.
+  more   zcube explain E0821 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0821.html

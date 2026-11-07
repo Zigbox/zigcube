@@ -34,6 +34,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const peer_stream = @import("peer_stream.zig");
+const secure_random = @import("secure_random.zig");
 const schedule = @import("tls_schedule.zig");
 const tls_client = @import("tls_client.zig");
 
@@ -114,11 +115,18 @@ pub const Conn = struct {
             .anchor = options.anchor,
             .server_name = options.server_name,
             .now_ms = peer_stream.wall_ms(io),
-            .random = peer_stream.random_seed(io),
-            .session_id = peer_stream.random_seed(io),
-            .secret = peer_stream.random_seed(io),
+            .random = undefined,
+            .session_id = undefined,
+            .secret = undefined,
             .client_auth = options.client_auth,
         };
+        inline for (.{ &config.random, &config.session_id, &config.secret }) |field| {
+            secure_random.fill(io, field, diag) catch {
+                std.crypto.secureZero(u8, &config.secret);
+                conn.phase = .broken;
+                return error.Refused;
+            };
+        }
         conn.client.init(&config);
         std.crypto.secureZero(u8, &config.secret);
         const end_ms = peer_stream.boot_ms(io) + options.handshake_timeout_ms;

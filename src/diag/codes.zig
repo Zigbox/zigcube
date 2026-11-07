@@ -125,6 +125,7 @@ pub const Code = enum(u8) {
     E0818,
     E0819,
     E0820,
+    E0821,
     B0001,
     B0002,
     B0003,
@@ -1793,6 +1794,20 @@ pub const registry = [_]Entry{
         \\process or in another. This is that signer failing, not the server or the
         \\certificate. Check that the process or device holding the key is running
         \\and reachable, then reconnect.
+        ,
+    },
+    .{
+        .code = .E0821,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the operating system's secure random source failed",
+        .explanation =
+        \\A key, a nonce or a seed was not made because the kernel's secure random
+        \\source (getrandom) returned an error. Nothing weaker is used instead, and
+        \\nothing is retried.
+        \\
+        \\Check that getrandom works where this runs: the kernel, the seccomp profile
+        \\and the container sandbox must allow it. Then run the command again.
         ,
     },
     .{

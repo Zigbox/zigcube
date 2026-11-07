@@ -35,6 +35,7 @@ const peer_serve = @import("peer_serve.zig");
 const zigbox = @import("zigbox");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_stream = @import("peer_stream.zig");
+const secure_random = @import("secure_random.zig");
 const server_listen = @import("server_listen.zig");
 
 const Diag = diag_mod.Diag;
@@ -511,6 +512,10 @@ fn serve(server: *Server, link: *Link) void {
     var stream = peer_stream.open_server(io, link.fd, &identity, handshake_end) catch |err| {
         switch (err) {
             error.Closed, error.Timeout, error.Io, error.TooBig => {},
+            error.Entropy => {
+                secure_random.raise(&diag, error.EntropyUnavailable);
+                show(io, &diag, server.config.verbose);
+            },
             else => |refusal| {
                 peer.raise(&diag, refusal, "a connecting peer");
                 show(io, &diag, server.config.verbose);
