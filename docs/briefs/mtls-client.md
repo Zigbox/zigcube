@@ -1,13 +1,13 @@
 # mTLS client: X.509 from the cluster CA and a TLS 1.3 client that presents it
 
 *Brief written 2026-11-04 for the implementer sessions that follow. Slice 0 is this file; nothing
-else is built yet. Source: the owner's B3 section (`docs/briefs/botpike-first-customer.md` on
+else is built yet. Source: the owner's B4 section (`docs/briefs/botpike-first-customer.md` on
 branch `claude/focused-noether-d3npid`), `docs/peer.md` and
 `docs/decisions/2026-11-03-peer-handshake-and-ca.md`.*
 
 ## Goal
 
-The relay (B2) must prove to a stock TLS upstream, a JVM service, which workload is calling. It
+The relay (B3) must prove to a stock TLS upstream, a JVM service, which workload is calling. It
 does so as a TLS 1.3 **client** presenting an X.509 certificate, issued by the cluster CA, that
 carries the workload's identity. This work builds the two halves that need no controller,
 scheduler or store change: an X.509 writer and strict parser, and a TLS 1.3 client that can answer
@@ -32,7 +32,7 @@ A writer and a matching parser, both bounded, for three certificate kinds:
 | --- | --- | --- | --- | --- |
 | CA (self-signed) | `zcube-ca-<16 hex of ca_key_id>` | keyCertSign (critical) | none | CA:TRUE, pathLen 0 (critical) |
 | Workload leaf (client) | the job name | digitalSignature (critical) | clientAuth | CA:FALSE |
-| Server leaf (for tests and, later, B6) | the DNS name | digitalSignature (critical) | serverAuth | CA:FALSE |
+| Server leaf (for tests and, later, B7) | the DNS name | digitalSignature (critical) | serverAuth | CA:FALSE |
 
 - **Algorithm.** Ed25519 (OID 1.3.101.112, parameters absent) in `signatureAlgorithm`, in the
   TBSCertificate's copy, and as the subject key. Nothing else is parsed: RSA, ECDSA, Ed448 and
@@ -50,11 +50,11 @@ A writer and a matching parser, both bounded, for three certificate kinds:
   INTEGER (0..2^63-1), labels SEQUENCE OF SEQUENCE { key UTF8String, value UTF8String } }`.
   Labels are sorted by key, keys unique. This is C4's identity: service, image digest,
   placement epoch (docs/decisions/2026-10-27-c4-workload-identity-binds-service-image.md), plus
-  B3's labels.
+  B4's labels.
 - **Serial.** 16 bytes, top bit clear: the first 16 bytes of SHA-256 over every other field of the TBS (kind, issuer, subject, validity, key, name, identity; changed in the follow-ups to #89, the first version hashed only the key and
   `not_before`), so the writer needs no randomness and the output is deterministic.
 - **Validity.** UTCTime to 2049, GeneralizedTime after (RFC 5280 §4.1.2.5), whole seconds, from
-  the caller's wall clock in Unix ms. A leaf lives at most `x509_leaf_ttl_ms_max`; B3 sets it to
+  the caller's wall clock in Unix ms. A leaf lives at most `x509_leaf_ttl_ms_max`; B4 sets it to
   the job's `deadline_ms` plus a small constant.
 - **The same CA key.** The CA signs the 185-byte credential (`"zcube-peer-cred-v1" 0x00 || bytes`)
   and now X.509 TBS bytes (DER, always starting `0x30`). The prefixes make the two messages
@@ -164,12 +164,12 @@ AES-GCM in the core, so the crypto is wasm-clean.
 | File | Side | wasm-clean | What |
 | --- | --- | --- | --- |
 | `src/x509.zig` | core | yes | DER writer, strict parser, verification of a certificate against a CA key. No allocation: writes into a caller's buffer, parses by offsets |
-| `src/x509_identity.zig` | core | yes | the private extension and the SPIFFE ID: encode, decode, bounds (kept apart so B3 can import it without the TLS code) |
+| `src/x509_identity.zig` | core | yes | the private extension and the SPIFFE ID: encode, decode, bounds (kept apart so B4 can import it without the TLS code) |
 | `src/peer_ca.zig` (extended) | core | yes | `issue_ca_certificate`, `issue_workload_certificate`, `issue_server_certificate` beside the existing `issue`. No new key |
 | `src/tls_schedule.zig` | core | yes | HKDF-Expand-Label, key schedule, transcript hash, record seal and open, nonce and counters |
 | `src/tls_client.zig` | core | yes | the handshake and `KeyUpdate` state machine: bytes in, bytes out, an `Event` per step, a `Diag` per refusal. No sockets |
 | `src/tls_conn.zig` | shell | no | a connected socket, deadlines by `poll` (never a blocking read; REVIEW.md), the wall clock, the random bytes; the streaming reader and writer the relay uses |
-| `src/tls_testpeer.zig` | test only | yes (tests) | a scripted TLS 1.3 *server* for the core's own tests: deterministic, derived from `tls_schedule.zig`, never built into a shipped binary, refuses to be reached from a non-test root. **It is not the TLS server B6 needs**; tidy checks it is imported only from test roots |
+| `src/tls_testpeer.zig` | test only | yes (tests) | a scripted TLS 1.3 *server* for the core's own tests: deterministic, derived from `tls_schedule.zig`, never built into a shipped binary, refuses to be reached from a non-test root. **It is not the TLS server B7 needs**; tidy checks it is imported only from test roots |
 | `src/x509_fuzz.zig`, `src/tls_fuzz.zig` | test roots | yes | the fuzzers (below) |
 | `src/mtls_interop.zig` | shell | no | the stock-server harness (below) |
 
@@ -290,14 +290,14 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
 
 ## Out of scope
 
-- The TLS **server**, and the API's mTLS (B6). `tls_testpeer.zig` exists for tests and is not a
+- The TLS **server**, and the API's mTLS (B7). `tls_testpeer.zig` exists for tests and is not a
   server a binary may link.
-- The relay itself (B2): its listener, its policy, its connection handling.
+- The relay itself (B3): its listener, its policy, its connection handling.
 - Job objects, labels' storage and the deadline (B1); this work takes labels and a lifetime as
   arguments.
 - Wiring issuance into the control plane or the agent: no API endpoint, no store key, no CLI
-  command. B3 calls `peer_ca.issue_workload_certificate`.
-- Revocation beyond the short lifetime (B3's bounded-time cancel is the relay's).
+  command. B4 calls `peer_ca.issue_workload_certificate`.
+- Revocation beyond the short lifetime (B4's bounded-time cancel is the relay's).
 - Session resumption, 0-RTT, TLS 1.2, other groups, other signature schemes, RSA or ECDSA chains,
   intermediates, OCSP, CRLs, name constraints, wildcard names.
 - Changing the 185-byte peer credential, the peer handshake or `docs/peer.md`'s rules, except the
@@ -315,7 +315,7 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
   certificate on the relay port; JDK 21 can serve one. Botpike confirmed this contract (owner,
   2026-11-04). The client API names the parameter `anchor`, not "cluster CA".
 - **Q2. ChaCha20-Poly1305.** No.
-- **Q3. External programs.** Approved, test-only. The owner's B3 acceptance requires a stock JVM
+- **Q3. External programs.** Approved, test-only. The owner's B4 acceptance requires a stock JVM
   server, which is the spec naming the programs. Slice 7 records this in a decision file:
   `openssl` and `java` run in the interop harness and its CI job only, never in a shipped binary.
 - **Q4. The private extension's OID.** The `2.25.<UUID>` arc. The UUID was generated once, in
@@ -325,7 +325,7 @@ slice 2 needs only 1; slice 6 needs 5; slice 7 needs 2 and 6.
 - **Q5. Server name form.** Support both forms, as written. Botpike's broker has a DNS name
   (`broker.botpike.com`).
 - **Q6. Core or shell for the state machine.** Core, as recommended.
-- **Q7. Who holds the leaf key.** B3's to decide; out of scope here. The interface stays as
+- **Q7. Who holds the leaf key.** B4's to decide; out of scope here. The interface stays as
   written: a public key to certify, and a sign callback.
 - **Q8. Live design doc.** Slice 1 read Zigbox `docs/SPEC.md` Part II C4 and the identity and
   trust lines of C6 (snapshot `a2ff703`). Nothing is resolved here or in code; the owner decides.
