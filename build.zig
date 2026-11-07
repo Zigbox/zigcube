@@ -1202,6 +1202,12 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J4",
         .canary_seeds = 50,
     },
+    .{
+        .name = "job_stale",
+        .root = "src/sim_c1_teeth_job_stale_main.zig",
+        .symptom = "J9",
+        .canary_seeds = 80,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).

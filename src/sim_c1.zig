@@ -157,6 +157,8 @@ pub const Tally = struct {
     /// Writes of a job's status checked for J3, and new assignments of a run checked for J5.
     job_statuses_judged: u64 = 0,
     runs_placed_judged: u64 = 0,
+    /// Stored `running` and `stopped` reports of runs checked for J9.
+    job_reports_judged: u64 = 0,
 };
 
 /// Checks one transaction about to commit against the head it will commit over (I2 and I3). The
@@ -324,6 +326,8 @@ fn job_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Fo
             .put => |put| {
                 if (std.mem.startsWith(u8, put.key, records.prefix_job_status)) {
                     if (status_rewritten(ctx, put, tally)) |found| return found;
+                } else if (std.mem.startsWith(u8, put.key, records.prefix_job_observed)) {
+                    if (report_stale(ctx, put, tally)) |found| return found;
                 } else if (std.mem.startsWith(u8, put.key, records.prefix_assigned)) {
                     if (run_reassigned(ctx, put.key, tally)) |found| return found;
                 }
@@ -335,6 +339,28 @@ fn job_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Fo
         }
     }
     return null;
+}
+
+/// J9: a `running` or `stopped` report is stored only while the assignment it ran under is the
+/// one in the store (`/assigned/<node>/<run>` at that revision), so a late report of a retired or
+/// superseded run (a reused name) is refused at write time and never stored. A claim is judged by
+/// its own compares (J2, J7).
+fn report_stale(ctx: *const Context, put: store.Put, tally: *Tally) Found {
+    const rec = std.json.parseFromSliceLeaky(records.JobObserved, ctx.arena, put.value, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        return "J9: a job observation cannot be decoded";
+    };
+    if (rec.status == .claimed) return null;
+    tally.job_reports_judged += 1;
+    const placed = records.assigned_key(rec.node, rec.run);
+    const got = ctx.store.get(ctx.arena, placed.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return "J9: an assignment cannot be read";
+    };
+    const kv = got.kv orelse return "J9: a report of a run with no assignment was stored";
+    if (kv.mod_revision == rec.assignment) return null;
+    return "J9: a report under a superseded assignment was stored";
 }
 
 fn status_rewritten(ctx: *const Context, put: store.Put, tally: *Tally) Found {

@@ -491,8 +491,9 @@ const Call = struct {
     /// One run's observation under the agent's tenure. A `claimed` one also rests on the run, as
     /// the agent read it, being unchanged (so a run with a `stop` is never claimed), on the
     /// assignment it names being the one in the store, and on there being no observation yet: a
-    /// run is claimed at most once, ever. `applied: false` says a claim's compares failed and
-    /// the tenure holds: the agent reads again.
+    /// run is claimed at most once, ever. A `running` or `stopped` one rests on the assignment it
+    /// names being the stored one, so a report of a retired or superseded run is not written.
+    /// `applied: false` says the compares failed and the tenure holds: the agent reads again.
     fn job_observed(call: Call) Failure!Reply {
         const ctx = call.ctx;
         try call.only_known();
@@ -513,7 +514,14 @@ const Call = struct {
         if (!rec.valid()) return bad_request(ctx, "value", "is not a consistent observation");
         const key = records.job_observed_key(call.node, name);
         var set: compare_sets.Set = .{};
-        compare_sets.observed_write(&set, call.node, input.tenure);
+        if (rec.status != .claimed) {
+            if (rec.assignment == 0) return bad_request(ctx, "value", "names no assignment");
+            // A report of a run that was retired or superseded is refused, not stored: its
+            // assignment is no longer the one in the store (B2, J9).
+            compare_sets.job_report(&set, call.node, input.tenure, name, rec.assignment);
+        } else {
+            compare_sets.observed_write(&set, call.node, input.tenure);
+        }
         if (rec.status == .claimed) {
             if (input.run_revision == 0) {
                 return bad_request(ctx, "run_revision", "is needed to claim a run");

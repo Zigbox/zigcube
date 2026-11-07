@@ -2934,10 +2934,10 @@ fn print_jobs(c: *Cluster) void {
         j.created, j.cancelled, j.ended, j.starts_judged, j.ledger_count, j.ledger_full,
     });
     c.report.print("jobs: worst stop {d} ms, overlap {d} ms, past deadline {d} ms; " ++
-        "status rewrites judged={d} placements judged={d}\n", .{
+        "status rewrites judged={d} placements judged={d} reports judged={d}\n", .{
         j.stop_worst_ms,               j.overlap_worst_ms,
         j.deadline_worst_ms,           c.c1_tally.job_statuses_judged,
-        c.c1_tally.runs_placed_judged,
+        c.c1_tally.runs_placed_judged, c.c1_tally.job_reports_judged,
     });
     const w = &c.jobs_watch;
     c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{

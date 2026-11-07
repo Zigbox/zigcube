@@ -953,8 +953,11 @@ const Work = struct {
         }
     }
 
-    /// Commits a report unless the store already says the same. A report rests on the tenure
-    /// alone; a refusal of it is the end of the tenure, so the agent fences.
+    /// Commits a report unless the store already says the same. A report rests on the tenure and
+    /// on the assignment it ran under still being the stored one (`compare_sets.job_report`). A
+    /// refusal is either a stale report (dropped: the run was retired or superseded) or the end
+    /// of the tenure; the agent cannot tell which, so it has the lease checked at once, and a
+    /// tenure that ended fences it there.
     fn report(work: *Work, wanted: Report) Error!void {
         const ctx = work.ctx;
         const agent = work.agent;
@@ -974,13 +977,16 @@ const Work = struct {
             .reported_at_ms = ctx.clock.now_ms(),
         };
         assert(value.valid());
-        const node_key = records.node_key(agent.config.node);
-        const tenure = ctx.arena.alloc(store_compare, 1) catch return failures.no_memory(ctx.diag);
-        tenure[0] = .{ .key = node_key.slice(), .mod_revision = agent.tenure };
-        const outcome = try work.commit(value, tenure);
-        if (outcome == .refused) {
-            try agent.begin_fence(ctx, ctx.mono_ms());
+        const set = ctx.arena.create(compare_sets.Set) catch return failures.no_memory(ctx.diag);
+        set.* = .{};
+        if (c1_teeth.job_stale) {
+            compare_sets.observed_write(set, agent.config.node, agent.tenure); // Test-only (J9).
+        } else {
+            const name = records.job_of_run(wanted.run).?;
+            compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
         }
+        const outcome = try work.commit(value, set.compares());
+        if (outcome == .refused) agent.renew_at_ms = 0; // The next heartbeat checks the lease.
     }
 
     const store_compare = @import("store.zig").Compare;
