@@ -186,8 +186,7 @@ const Shell = struct {
         shell.diag.reset();
         const mono = shell.boot.now_ms();
         const held = shell.agent.watch_hold_ms(mono, slice_ms);
-        const deadline = shell.agent.fence_at_ms() orelse std.math.maxInt(u64);
-        shell.remote.set_deadline(shell.boot, deadline);
+        shell.remote.set_deadline(shell.boot, shell.agent.calls_deadline_ms());
         const changed = shell.remote.watch_once(held, &shell.diag) catch return .failed;
         shell.notice_pair();
         if (changed) return .ended;
@@ -197,9 +196,10 @@ const Shell = struct {
         return if (events.len > 0) .ended else .timed_out;
     }
 
-    /// `ms`, or less if the fence falls sooner: the agent never sleeps through it.
+    /// `ms`, or less if the fence or a run's deadline or kill falls sooner: the agent never sleeps
+    /// through either.
     fn before_fence(shell: *Shell, ms: u32) u32 {
-        return @min(ms, shell.agent.fence_in_ms(shell.boot.now_ms()));
+        return @min(ms, shell.agent.act_in_ms(shell.boot.now_ms()));
     }
 
     /// Saves the pair if it is due; `final` (a clean stop) saves it whatever the time.

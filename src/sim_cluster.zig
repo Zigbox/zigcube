@@ -310,7 +310,7 @@ pub const Swarm = struct {
         const freeze = rate(r, 6);
         swarm.w_freeze = if (swarm.profile.freezes()) freeze else 0;
         if (swarm.profile == .crash_heavy) swarm.w_freeze = nonzero(r, freeze, 6);
-        if (c1_teeth.skew_beyond_bound) {
+        if (c1_teeth.skew_beyond_bound or c1_teeth.job_deadline_offline) {
             if (swarm.nodes > 1) swarm.w_partition = 25;
         }
         if (c1_teeth.wedge) {
@@ -326,6 +326,8 @@ pub const Swarm = struct {
         swarm.w_job_create = 3 + r.uintLessThan(u32, 5);
         swarm.w_job_cancel = 2 + r.uintLessThan(u32, 3);
         swarm.w_job_end = 2 + r.uintLessThan(u32, 4);
+        // The `job_deadline_offline` tooth needs deadlines that fall while a node is cut off.
+        if (c1_teeth.job_deadline_offline) swarm.w_job_create = 20;
     }
 
     fn print(swarm: *const Swarm, report: *Report) void {
@@ -382,9 +384,6 @@ const Node = struct {
     up_ms: u64,
     /// Whether the agent's last step worked: a step that fails says why nothing moved.
     last_ok: bool,
-    /// Whether the agent's latest call to the server failed: the link was cut, as far as it can
-    /// tell (a local runtime failure is not a cut link).
-    call_failed: bool,
     /// Since when the server has had no registration of this node (its lease ran out), while
     /// the agent was up; null while it has one. The fencing invariant's clock.
     unregistered_since_ms: ?u64,
@@ -393,10 +392,9 @@ const Node = struct {
     /// sim-c1: the last true time the agent was down, frozen, or a container ignored its stop.
     last_wedged_ms: ?u64,
     /// sim-c1, over the whole run: the true time the agent was wedged (as `wedged_now`), and the
-    /// time its link or the store was cut or its last step failed (it could not read its runs);
-    /// and the last time they were added to.
+    /// last time it was added to. A cut link or store is not wedged time: the agent enforces a
+    /// run's deadline from its own records and clock (J8).
     wedged_total_ms: u64,
-    link_cut_total_ms: u64,
     cut_mark_ms: u64,
     /// Times the agent fenced itself, over the whole run (all agent lives).
     fences: u32,
@@ -433,7 +431,6 @@ const Node = struct {
         const node: *Node = @ptrCast(@alignCast(context));
         const net = &node.cluster.net;
         const result = net.transport(node.index).call(arena, request, diag);
-        node.call_failed = if (result) |_| false else |_| true;
         node.spent_ms += net.last_call_ms;
         return result;
     }
@@ -527,16 +524,16 @@ const Node = struct {
         return wake.acted;
     }
 
-    /// The agent's calls end by the fence deadline, as the real agent's do (`agent_run.zig`);
-    /// with no lease there is no deadline.
+    /// The agent's calls end by the fence deadline, or a run's deadline or kill, as the real
+    /// agent's do (`agent_run.zig`); with no lease and no run there is no deadline.
     fn cap_calls(node: *Node, clock: Clock) void {
-        const deadline = node.agent.fence_at_ms() orelse std.math.maxInt(u64);
-        node.remote.set_deadline(clock, deadline);
+        node.remote.set_deadline(clock, node.agent.calls_deadline_ms());
     }
 
-    /// Time left to the fence, on the node's clock: a pause or a wait never runs past it.
+    /// Time left to the fence or a run's deadline or kill, on the node's clock: a pause or a
+    /// wait never runs past it.
     fn before_fence(node: *Node, ms: u32) u32 {
-        const left = node.agent.fence_in_ms(node.nclock.clock().now_ms());
+        const left = node.agent.act_in_ms(node.nclock.clock().now_ms());
         return @min(ms, @max(left, 1));
     }
 
@@ -563,12 +560,7 @@ const Node = struct {
             };
         }
         node.resume_ms = node.cluster.manual.ms + node.spent_ms;
-        if (failed) {
-            // A hold that failed backs the agent off, up to the retry maximum, before its next
-            // step: a deadline falling meanwhile waits for it, which is a cut link's delay.
-            node.link_cut_total_ms += constants.server_retry_ms_max;
-            node.loop.watch_failed();
-        } else node.loop.watch_done(ended);
+        if (failed) node.loop.watch_failed() else node.loop.watch_done(ended);
         return ended;
     }
 
@@ -882,12 +874,10 @@ pub const Cluster = struct {
         node.crashes = 0;
         node.ok_steps = 0;
         node.last_ok = true;
-        node.call_failed = false;
         node.unregistered_since_ms = null;
         node.frozen_until_ms = null;
         node.last_wedged_ms = null;
         node.wedged_total_ms = 0;
-        node.link_cut_total_ms = 0;
         node.cut_mark_ms = c.manual.ms;
         node.fences = 0;
         node.fences_at_heal = 0;
@@ -1237,9 +1227,6 @@ pub const Cluster = struct {
                 node.last_wedged_ms = c.manual.ms;
                 node.wedged_total_ms += passed;
             }
-            if (node.partitioned_until_ms != null or store_faulty(c) or node.call_failed) {
-                node.link_cut_total_ms += passed;
-            }
         }
     }
 
@@ -1315,8 +1302,12 @@ pub const Cluster = struct {
             },
         }
         c.net.set_faults(node.index, faults);
+        // The `job_deadline_offline` tooth cuts for up to the lease's ttl and beyond: a deadline
+        // that falls in the cut must still be enforced, by the agent alone.
+        const stretch: u32 = if (c1_teeth.job_deadline_offline) 4 else 1;
+        const spread = stretch * partition_ms_spread;
         node.partitioned_until_ms =
-            c.manual.ms + partition_ms_min + random.uintLessThan(u32, partition_ms_spread);
+            c.manual.ms + partition_ms_min + random.uintLessThan(u32, spread);
         c.stats.partitions += 1;
     }
 
@@ -1347,12 +1338,14 @@ pub const Cluster = struct {
         const id = c.request_id(&buffer);
         const ctx = c.controller_context();
         const long = random.uintLessThan(u32, 4) == 0;
+        // The `job_deadline_offline` tooth: deadlines that fall within the run (see `add_jobs`).
+        const spread: u32 = if (c1_teeth.job_deadline_offline) 10_000 else 40_000;
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
             .image = hello_digest,
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
             .limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 20 },
-            .deadline_ms = if (long) 600_000 else 3000 + random.uintLessThan(u32, 40_000),
+            .deadline_ms = if (long) 600_000 else 3000 + random.uintLessThan(u32, spread),
             .grace_ms = random.uintLessThan(u32, 2000),
             .submit_by_ms = c.manual.ms + 5000 + random.uintLessThan(u32, 20_000),
             .applied_by = "alex@laptop",
@@ -2236,7 +2229,7 @@ fn watch_of(c: *const Cluster, node: u32, name_hash: u64) ?sim_jobs.Watch {
 
 /// The checks that hold the running job containers to a bound, on true time, unless the node was
 /// wedged lately (as I1b: its agent down or frozen, or a container ignoring a stop; a cut link
-/// is not wedged, J8's bound has a term for it): J1 (no container runs long past its job's
+/// is not wedged, and J8's bound has no term for it): J1 (no container runs long past its job's
 /// terminal status), J6 (a run with a `stop` is not executing after the stop bound) and J8 (no
 /// run executes past its deadline and grace, with the kill and the clocks' rate error). The
 /// start ledger's verdict (J2, J7) is reported here too.
@@ -2269,7 +2262,6 @@ fn track_jobs(c: *Cluster) Failure!void {
             };
             if (watch_of(c, node.index, hash) == null) {
                 watch.wedged_base_ms = node.wedged_total_ms;
-                watch.link_base_ms = node.link_cut_total_ms;
             }
             const run = job_run_of(&ctx, job);
             if (run) |known| note_marks(c, known, node, &watch);
@@ -2295,9 +2287,7 @@ fn note_marks(
         c.manual.ms,
         run.deadline_ms,
         stopped,
-        c.api.lease_ttl_ms,
         node.wedged_total_ms,
-        node.link_cut_total_ms,
     );
 }
 
@@ -2311,15 +2301,14 @@ fn judge_job_container(
 ) Failure!void {
     const now = c.manual.ms;
     const run = found orelse return;
-    const cut = sim_jobs.cut_since(watch, node.wedged_total_ms, node.link_cut_total_ms);
+    const wedged = sim_jobs.wedged_since(watch, node.wedged_total_ms);
     const granularity = tick_ms + 2 * check_interval_ms;
     const bound = sim_jobs.deadline_bound_ms(
         run.deadline_ms,
         run.grace_ms,
         c.swarm.clock_ppm,
-        c.api.lease_ttl_ms,
         granularity,
-        cut,
+        wedged,
     );
     c.jobs.deadline_worst_ms = @max(c.jobs.deadline_worst_ms, (now - watch.first_seen_ms) -|
         (run.deadline_ms + run.grace_ms));

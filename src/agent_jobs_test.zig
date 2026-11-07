@@ -279,6 +279,32 @@ test "the deadline stops the run on the monotonic clock, under the same boot" {
     try expect_code(seen, "ZC-W0503");
 }
 
+test "the deadline stops the run while the server cannot be reached, before the fence" {
+    // Goal: pin the release review's MUST (PR #147): the agent enforces a run's deadline from
+    // its own records and clock, so a cut-off node stops the run at its deadline, not when its
+    // lease's fence comes (ttl - margin later). Method: the store goes down right after the
+    // start; past the deadline, and well before the fence, the run is stopped with the cause
+    // recorded, and the ending is reported once the store is back.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(3_000);
+    rig.step();
+    try testing.expect(rig.running());
+    rig.world.set_store_down(true);
+    rig.world.advance(2_000);
+    try testing.expect(rig.running());
+    rig.world.advance(2_000);
+    try testing.expect(!rig.running());
+    try testing.expect(!rig.world.agent.fence.active);
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(@as(?records.StopCause, .deadline), kept.stop_cause);
+    rig.world.set_store_down(false);
+    rig.world.advance(2_000);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .deadline), seen.stop_cause);
+}
+
 test "a deadline of another boot is not compared: the run is stopped by the host's loss" {
     // The monotonic clock restarts with the boot, so a deadline from an earlier boot says
     // nothing. The container is gone with the reboot, and the run ends lost, not `deadline`.

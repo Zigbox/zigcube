@@ -147,6 +147,65 @@ fn label_of(listing: *const runtime.Listing, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Stops each running run container whose deadline has come, from its start record and this
+/// node's monotonic clock alone, and kills it once its grace has passed: the deadline needs no
+/// server (docs/briefs/b1.md, "The server never decides a running job's deadline"). Runs at the
+/// start of every step, before any call, so a server that cannot be reached, a call that hangs or
+/// another run whose report keeps failing never holds a stop back; `pass` reports the ending when
+/// the server answers. Records `stop_cause: deadline` before the signal, as `pass` does. Sets
+/// `deadline_wake_mono_ms` to the next deadline or kill, which caps the step's waits and calls.
+pub fn enforce_deadlines(
+    agent: *Agent,
+    ctx: *const Context,
+    listings: []const runtime.Listing,
+) Error!void {
+    agent.deadline_wake_mono_ms = std.math.maxInt(u64);
+    if (c1_teeth.job_deadline_offline) return; // Test-only: only the pass enforces it (J8).
+    const state = ctx.state orelse return;
+    for (listings) |*listing| {
+        if (!is_running(listing)) continue;
+        if (label_of(listing, runtime.label_job) == null) continue;
+        const id = label_of(listing, runtime.label_replica) orelse continue;
+        switch (try read_record(ctx, state, id)) {
+            // No record to say when: `pass` stops it as `unknown`, with the server's word.
+            .absent, .damaged => {},
+            .record => |found| try enforce_one(agent, ctx, state, listing, found),
+        }
+    }
+}
+
+fn enforce_one(
+    agent: *Agent,
+    ctx: *const Context,
+    state: agent_state.AgentState,
+    listing: *const runtime.Listing,
+    found: StartRecord,
+) Error!void {
+    // A `claiming` record's time bounds the input fetch, not the run: its container is the
+    // pass's to judge. Another boot's time is not comparable: the run ends through the fence.
+    if (found.phase != .claimed) return;
+    if (!std.mem.eql(u8, found.boot_id, ctx.boot_id)) return;
+    const mono = ctx.mono_ms();
+    var record = found;
+    if (record.stop_cause == null) {
+        const at = record.deadline_mono_ms orelse return;
+        const due = at +| c1_teeth.job_deadline_late_ms;
+        if (c1_teeth.job_deadline) return;
+        if (mono < due) return note_deadline_wake(agent, due);
+        record.stop_cause = .deadline;
+        try write_record(ctx, state, &record);
+    }
+    // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
+    try agent.stop_listing(ctx, listing, record.grace_ms);
+    const pending = agent.pending_stop(listing.handle.name()) orelse return;
+    const now = ctx.clock.now_ms();
+    if (pending.deadline_ms > now) note_deadline_wake(agent, mono + (pending.deadline_ms - now));
+}
+
+fn note_deadline_wake(agent: *Agent, at_mono_ms: u64) void {
+    agent.deadline_wake_mono_ms = @min(agent.deadline_wake_mono_ms, at_mono_ms);
+}
+
 /// One reconcile step's work on runs. Returns how many store writes were committed.
 pub fn pass(
     agent: *Agent,

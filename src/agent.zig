@@ -188,6 +188,11 @@ pub const Agent = struct {
     store_refusal_len: u8,
     /// When the job pass next needs to run (a run's deadline), monotonic; maxInt if never.
     jobs_wake_mono_ms: u64,
+    /// When a run's deadline or the kill after its grace next falls, monotonic, as the step's
+    /// server-free look at the runs found it (`agent_jobs.enforce_deadlines`); maxInt if never.
+    /// Like the fence, it caps every pause, wait and call, so a cut-off server never holds a
+    /// run's stop back.
+    deadline_wake_mono_ms: u64,
     /// The last failure to fetch a run's input that said nothing about the input (the server or
     /// the link): which run (a hash of its id) and what it said. In memory only; it names the
     /// cause when the run ends `not_started`.
@@ -243,6 +248,7 @@ pub const Agent = struct {
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
         agent.jobs_wake_mono_ms = maxInt(u64);
+        agent.deadline_wake_mono_ms = maxInt(u64);
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
     }
@@ -281,17 +287,35 @@ pub const Agent = struct {
         return @intCast(@min(at -| mono_now, maxInt(u32)));
     }
 
-    /// How long a wait for a replica change may hold the server: `slice_ms`, or less if the
-    /// fence (or a fence's kill) falls sooner, and at least 1.
-    pub fn watch_hold_ms(agent: *const Agent, mono_now: u64, slice_ms: u32) u32 {
-        const capped = @min(slice_ms, constants.api_watch_timeout_ms_max);
-        return @max(1, @min(capped, agent.fence_in_ms(mono_now)));
+    /// How long the agent may go without a step: until the fence (`fence_in_ms`), or a run's
+    /// deadline or kill if one falls sooner. Every pause and wait is cut to it, so a server that
+    /// cannot be reached never holds back a stop the agent can make alone.
+    pub fn act_in_ms(agent: *const Agent, mono_now: u64) u32 {
+        const fence = agent.fence_in_ms(mono_now);
+        if (agent.deadline_wake_mono_ms == maxInt(u64)) return fence;
+        // A wake that is due (a step failed before it got there) is retried at the fence's poll.
+        const left = agent.deadline_wake_mono_ms -| mono_now;
+        const wait = if (left == 0) constants.fence_poll_ms else @min(left, maxInt(u32));
+        return @min(fence, @as(u32, @intCast(wait)));
     }
 
-    /// Tells the caller by when every call to the server must end: the fence.
+    /// By when every call to the server must end, monotonic: the fence, or a run's deadline or
+    /// kill if one falls sooner (`maxInt` if neither).
+    pub fn calls_deadline_ms(agent: *const Agent) u64 {
+        return @min(agent.fence_at_ms() orelse maxInt(u64), agent.deadline_wake_mono_ms);
+    }
+
+    /// How long a wait for a replica change may hold the server: `slice_ms`, or less if the
+    /// fence (or a fence's kill) or a run's deadline or kill falls sooner, and at least 1.
+    pub fn watch_hold_ms(agent: *const Agent, mono_now: u64, slice_ms: u32) u32 {
+        const capped = @min(slice_ms, constants.api_watch_timeout_ms_max);
+        return @max(1, @min(capped, agent.act_in_ms(mono_now)));
+    }
+
+    /// Tells the caller by when every call to the server must end (`calls_deadline_ms`).
     fn cap_calls(agent: *const Agent, ctx: *const Context) void {
         const deadline = ctx.deadline orelse return;
-        deadline.set_fn(deadline.context, agent.fence_at_ms() orelse maxInt(u64));
+        deadline.set_fn(deadline.context, agent.calls_deadline_ms());
     }
 
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
@@ -304,6 +328,10 @@ pub const Agent = struct {
             if (mono >= at) try agent.begin_fence(ctx, at);
         }
         if (agent.fence.active) return agent.fence_step(ctx, now);
+        // So do the runs' deadlines: a run is stopped at its deadline and killed after its grace
+        // from the start records and this node's clock, before any call that may fail or hang.
+        const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
+        try agent_jobs.enforce_deadlines(agent, ctx, listings);
         agent.cap_calls(ctx);
         var acted: u32 = 0;
         switch (try agent.heartbeat(ctx)) {
@@ -313,7 +341,6 @@ pub const Agent = struct {
         }
         // A grant or a keepalive moves the fence: the calls that follow are capped by the new one.
         agent.cap_calls(ctx);
-        const listings = try ctx.runtime.list(ctx.arena, ctx.diag);
         try agent.publish_store(ctx, listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
         var pass: Pass = .{
@@ -356,6 +383,9 @@ pub const Agent = struct {
         }
         if (agent.jobs_wake_mono_ms != maxInt(u64)) {
             wake = @min(wake, now + (agent.jobs_wake_mono_ms -| mono));
+        }
+        if (agent.deadline_wake_mono_ms != maxInt(u64)) {
+            wake = @min(wake, now + (agent.deadline_wake_mono_ms -| mono));
         }
         return @max(wake, now);
     }
@@ -767,7 +797,7 @@ pub const Agent = struct {
         assert(agent.pending_stop(name) != null);
     }
 
-    fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
+    pub fn pending_stop(agent: *Agent, name: []const u8) ?*PendingStop {
         for (agent.stops[0..agent.stops_count]) |*stop| {
             if (std.mem.eql(u8, stop.handle.name(), name)) return stop;
         }

@@ -1191,6 +1191,12 @@ const c1_teeth_roots = [_]struct {
         .canary_seeds = 50,
     },
     .{
+        .name = "job_deadline_offline",
+        .root = "src/sim_c1_teeth_job_deadline_offline_main.zig",
+        .symptom = "J8",
+        .canary_seeds = 80,
+    },
+    .{
         .name = "job_gap",
         .root = "src/sim_c1_teeth_job_gap_main.zig",
         .symptom = "J4",
@@ -1211,7 +1217,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the fourteen negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the fifteen negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1244,7 +1250,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the fourteen fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the fifteen fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
