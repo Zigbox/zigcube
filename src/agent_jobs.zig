@@ -992,7 +992,7 @@ const Work = struct {
             compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
         }
         const outcome = try work.commit(value, set.compares());
-        if (c1_teeth.job_stale and outcome == .applied) {
+        if (c1_teeth.job_stale and outcome == .applied and value.status == .stopped) {
             const bytes = try records.encode(ctx.arena, value, ctx.diag);
             if (bytes.len <= teeth_replay.bytes.len) {
                 @memcpy(teeth_replay.bytes[0..bytes.len], bytes);
@@ -1023,7 +1023,6 @@ const Work = struct {
                 _ = try work.commit(old, set.compares());
             }
         }
-        teeth_replay.len = 0;
     }
 
     const store_compare = @import("store.zig").Compare;
