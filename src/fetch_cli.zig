@@ -103,11 +103,20 @@ pub const Net = struct {
     /// Progress lines written so far.
     progress_lines: u32 = 0,
     /// Tests only: a clock the fetch reads instead of `boot_ms`, and no write to fetch.log.
-    test_clock_ms: ?*const u64 = null,
+    test_clock_ms: ?*u64 = null,
 
     fn clock_ms(net: *const Net) u64 {
         if (net.test_clock_ms) |fake| return fake.*;
         return peer_stream.boot_ms(net.io);
+    }
+
+    /// Sleeps `ms`; under a test clock it moves the clock instead.
+    fn idle(net: *Net, ms: u32) void {
+        if (net.test_clock_ms) |fake| {
+            fake.* += ms;
+            return;
+        }
+        net.io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: the caller reads again.
     }
 
     fn from(context: *anyopaque) *Net {
@@ -1281,9 +1290,9 @@ const progress_form = "zcube-agent fetch: progress: {d} ms in, {d} chunk request
     "nothing {d}\n";
 
 /// The longest progress line: the form (its placeholders counted too, so over by a little), a
-/// peer's name of `node_name_bytes_max`, and a u64 (20 digits) for each of the six numbers.
+/// peer's name of `node_name_bytes_max`, and a u64 (20 digits) for each of the seven numbers.
 pub const progress_line_bytes_max: usize = progress_form.len + constants.node_name_bytes_max +
-    6 * 20;
+    7 * 20;
 
 comptime {
     assert(progress_line_bytes_max < 512);
@@ -1448,7 +1457,7 @@ fn discover(
     const arena = arenas[0].allocator();
     // A digest no peer is asked for (not the full one, fetch_worker.zig) waits for none.
     const begun: Begun = if (parsed.digest.len == 3 + 64)
-        begin(arena, arenas[1], net, server, parsed)
+        begin(arena, arenas[1], net, HttpGetter{ .net = net, .server = server }, parsed)
     else
         read_once(arena, net, server);
     say_begun(net.io, begun);
@@ -1507,28 +1516,27 @@ fn begin(
     arena: std.mem.Allocator,
     poll: *std.heap.ArenaAllocator,
     net: *Net,
-    server: IpAddress,
+    getter: anytype,
     parsed: *const Args,
 ) Begun {
-    const getter: HttpGetter = .{ .net = net, .server = server };
     const scratch = arena.alloc(u8, discover_page_bytes_max) catch
         return .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
     const fetchers = fetching_nodes(arena, getter, scratch, parsed.digest);
-    const started = peer_stream.boot_ms(net.io);
+    const started = net.clock_ms();
     while (true) {
         _ = poll.reset(.retain_capacity);
         const stores = collect_pages(poll.allocator(), getter, scratch);
         const self = parsed.node;
         const tree = parsed.digest;
         const holds = if (stores) |listed| peer_holds(listed, self, tree) else false;
-        const now = peer_stream.boot_ms(net.io);
+        const now = net.clock_ms();
         const wait_ms = constants.fetch_peer_wait_ms;
         const decided = fetch_plan.start(self, tree, fetchers, holds, started, now, wait_ms);
         switch (decided) {
             .wait => |until| {
                 const ms: u32 = @intCast(@max(until -| now, 1));
                 net.say_progress(); // The wait can last the whole cap; say where it is (#93).
-                net.io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: read again.
+                net.idle(ms);
             },
             else => return .{
                 .stores = stores,
@@ -2154,6 +2162,56 @@ test "the fetching nodes stay as read when the same buffer serves the next reque
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("node1", nodes[0]);
     try std.testing.expectEqualStrings("node3", nodes[1]);
+}
+
+/// A server that has two fetchers of "b3:aa" and no node-store entry, whatever the path.
+const FetchersGetter = struct {
+    fn get(_: FetchersGetter, path: []const u8, out: []u8) ?[]const u8 {
+        const body: []const u8 = if (std.mem.indexOf(u8, path, "/replicas/") != null)
+            \\{"kvs":[{"key":"/replicas/app/a1","value":{"id":"a1","image":"b3:aa"}},
+            \\{"key":"/replicas/app/a2","value":{"id":"a2","image":"b3:aa"}}]}
+        else if (std.mem.indexOf(u8, path, "/assigned/") != null)
+            \\{"kvs":[{"key":"/assigned/node1/a1","value":{}},
+            \\{"key":"/assigned/node2/a2","value":{}}]}
+        else
+            return null;
+        @memcpy(out[0..body.len], body);
+        return out[0..body.len];
+    }
+};
+
+test "the O5 wait says where it is: begin writes progress lines while no peer holds the tree" {
+    // Goal: #93's case itself, a fetch silent through O5's wait; fails if `begin`'s say_progress
+    // call is deleted. Method: a fake clock that only `begin`'s pause moves, two fetchers, the
+    // one that is not elected asks, no peer ever holds the tree: it waits the whole cap and the
+    // progress lines it wrote are one per `fetch_progress_ms`.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var poll: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer poll.deinit();
+    const fetchers = [_][]const u8{ "node1", "node2" };
+    const self: []const u8 = if (fetch_plan.registry_first("node1", "b3:aa", &fetchers))
+        "node2"
+    else
+        "node1";
+    var fake: u64 = 5_000;
+    var scratch: [8]u8 = undefined;
+    var net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &.{},
+        .identity = null,
+        .reply = &scratch,
+        .test_clock_ms = &fake,
+    };
+    const parsed: Args = .{ .node = self, .digest = "b3:aa" };
+    const begun = begin(arena, &poll, &net, FetchersGetter{}, &parsed);
+    try std.testing.expect(begun.start == .waited);
+    try std.testing.expect(begun.waited_ms >= constants.fetch_peer_wait_ms);
+    const lines: u32 = constants.fetch_peer_wait_ms / constants.fetch_progress_ms;
+    try std.testing.expect(net.progress_lines >= lines - 1 and net.progress_lines <= lines + 1);
+    try std.testing.expect(net.progress_lines > 0);
 }
 
 test "a peer holds a tree when its summary lists it and it can be reached" {

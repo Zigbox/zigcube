@@ -14,7 +14,10 @@ designed fallback, and demo-c2's step 1 ("registry read once") failed
   classifies the pull records of the tree:
   - `once`: one node read the registry and every other node took bytes from peers. Passes.
   - `overran`: several nodes read the registry, exactly one of them is the elected node, its own
-    pull record spans (`finished_at_ms - started_at_ms`) at least the cap, and every other registry
+    pull record spans (`finished_at_ms - started_at_ms`) at least the cap less
+    `holding_visible_lag_ms` (2,000 ms: `agent_resync_ms` + `fetch_peer_poll_ms`; a waiter sees the tree
+    only after the elected node's next publish and its own next poll, so an elected pull a little
+    under the cap is still a correct overrun; the cap itself is unchanged), and every other registry
     reader waited the cap out. The elected node is the one whose `fetch.log` says "pulls it from
     the registry first (O5)"; a waiting reader's `fetch.log` says "no peer came to hold the tree
     in N ms" with N at least the cap. A pull record starts when the registry pull starts, after

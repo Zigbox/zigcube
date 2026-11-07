@@ -95,6 +95,11 @@ pub fn pull_on(pulls: []const Pull, node: []const u8) ?Pull {
     return null;
 }
 
+fn spans_cap(pull: Pull, cap_ms: u64) bool {
+    const span = pull.span_ms() orelse return false;
+    return span + holding_visible_lag_ms >= cap_ms;
+}
+
 /// Step 1 (O5, "registry once"): exactly one node took bytes from the registry, and every other
 /// node took none from it and some from its peers.
 pub fn registry_once(pulls: []const Pull) bool {
@@ -138,6 +143,15 @@ pub fn evidence_of(node: []const u8, log: []const u8) Evidence {
     return found;
 }
 
+/// How long after the elected node's registry pull ends a waiting node can first see the tree
+/// held: the agent publishes `/node-store/` on its next resync tick (`agent_resync_ms`), and the
+/// waiter notices it on its next poll (`fetch_peer_poll_ms`). A waiter's wait runs on its own
+/// clock from its own fetch start, and the elected pull's record spans the registry pull alone,
+/// so a correct overrun can show an elected span up to this much under the cap. Step 1 allows
+/// exactly this much; the cap itself is not changed.
+pub const holding_visible_lag_ms: u64 = @as(u64, constants.agent_resync_ms) +
+    constants.fetch_peer_poll_ms;
+
 /// How step 1 found the registry reads (docs/decisions/2026-11-07-demo-c2-registry-once-cap.md).
 pub const RegistryRead = struct {
     kind: enum {
@@ -174,7 +188,9 @@ fn evidence_for(evidence: []const Evidence, node: []const u8) ?Evidence {
 /// Step 1 (O5, "registry once"), with the wait cap `cap_ms` (`constants.fetch_peer_wait_ms`).
 /// Strict unless the nodes' own records show the cap was overrun: exactly one registry reader
 /// was elected (its fetch.log says so) and its own pull took at least `cap_ms`, and every other
-/// registry reader waited out `cap_ms` (its fetch.log says so). A pull record starts when the
+/// registry reader waited out `cap_ms` (its fetch.log says so). The elected span may fall short
+/// of the cap by `holding_visible_lag_ms` (a waiter sees the tree only after the next publish
+/// and poll). A pull record starts when the
 /// registry pull starts, after any wait, so a record's span never includes the wait, and spans
 /// say nothing about which node was elected. Missing evidence is `repeated`.
 pub fn registry_read(pulls: []const Pull, evidence: []const Evidence, cap_ms: u64) RegistryRead {
@@ -208,7 +224,7 @@ pub fn registry_read(pulls: []const Pull, evidence: []const Evidence, cap_ms: u6
     }
     const why: []const u8 = if (elected_count != 1)
         "no single elected node is recorded (election broken)"
-    else if ((elected.?.span_ms() orelse 0) < cap_ms)
+    else if (!spans_cap(elected.?, cap_ms))
         "the elected node's own pull was inside the cap, or not measured"
     else if (!others_waited)
         "a node read the registry without waiting out the cap"
@@ -478,9 +494,29 @@ test "registry_read needs the elected pull over the cap and every other node to 
     try testing.expect(registry_read(&three, &early, cap).kind == .repeated);
     early[2].waited_ms = null;
     try testing.expect(registry_read(&three, &early, cap).kind == .repeated);
-    three[1].finished_at_ms = 1000 + cap - 1; // The elected pull finished inside the cap.
+    // The elected pull finished well inside the cap, beyond the publish lag.
+    three[1].finished_at_ms = 1000 + cap - holding_visible_lag_ms - 1;
     try testing.expect(registry_read(&three, &evidence, cap).kind == .repeated);
     three[1].started_at_ms = 0; // Not measured: strict.
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .repeated);
+}
+
+test "registry_read allows the publish lag below the cap, and no more" {
+    // Goal: SHOULD 1 of the re-review: an elected pull just under the cap, waiters at cap + 40 ms,
+    // is a correct overrun; one past the allowance is a duplicate. Method: the passing case with
+    // the elected span at the edges of `holding_visible_lag_ms`.
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    var three = overrun_pulls(cap);
+    const evidence = [_]Evidence{
+        .{ .node = "node1", .elected = false, .waited_ms = cap + 40 },
+        .{ .node = "node2", .elected = true, .waited_ms = null },
+        .{ .node = "node3", .elected = false, .waited_ms = cap + 40 },
+    };
+    three[1].finished_at_ms = three[1].started_at_ms + cap - 1500;
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .overran);
+    three[1].finished_at_ms = three[1].started_at_ms + cap - holding_visible_lag_ms;
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .overran);
+    three[1].finished_at_ms -= 1;
     try testing.expect(registry_read(&three, &evidence, cap).kind == .repeated);
 }
 
