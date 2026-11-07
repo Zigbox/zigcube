@@ -45,6 +45,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const compare_sets = @import("compare_sets.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
@@ -518,7 +519,11 @@ const Call = struct {
             if (rec.assignment == 0) return bad_request(ctx, "value", "names no assignment");
             // A report of a run that was retired or superseded is refused, not stored: its
             // assignment is no longer the one in the store (B2, J9).
-            compare_sets.job_report(&set, call.node, input.tenure, name, rec.assignment);
+            if (c1_teeth.job_stale) { // Test-only (J9): the assignment is not compared.
+                compare_sets.observed_write(&set, call.node, input.tenure);
+            } else {
+                compare_sets.job_report(&set, call.node, input.tenure, name, rec.assignment);
+            }
         } else {
             compare_sets.observed_write(&set, call.node, input.tenure);
         }
