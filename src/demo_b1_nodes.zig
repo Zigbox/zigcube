@@ -21,6 +21,7 @@ pub fn adoption(demo: *Demo) !void {
     try state.wait_state(host, "adopt", "running", state.job_wait_ms);
     const index = try state.node_index(host, try state.need_job(host, "adopt"));
     const name = fleet_mod.names[index];
+    try state.wait_runs_on(demo, index, "adopt-job");
     try host.check(try state.runs_on(demo, index, "adopt-job"), "adopt-job runs on {s}", .{name});
     try demo.fleet.kill_agent(index);
     try host.check(!demo.fleet.agent_alive(index), "the agent of {s} is killed (kill -9)", .{name});
