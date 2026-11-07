@@ -985,8 +985,15 @@ const Work = struct {
         const set = ctx.arena.create(compare_sets.Set) catch return failures.no_memory(ctx.diag);
         set.* = .{};
         if (c1_teeth.job_stale) {
-            // Test-only (J9): no compare on the assignment.
+            // Test-only (J9): no compare on the assignment, and once a report of the epoch
+            // before this one is written first, as an agent returning late would.
             compare_sets.observed_write(set, agent.config.node, agent.tenure);
+            if (!teeth_stale_written and wanted.epoch > 1) {
+                teeth_stale_written = true;
+                var late = value;
+                late.assignment = wanted.epoch - 1;
+                _ = try work.commit(late, set.compares());
+            }
         } else {
             const name = records.job_of_run(wanted.run).?;
             compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
@@ -1040,6 +1047,9 @@ const Work = struct {
         return records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
     }
 };
+
+/// Test-only (`c1_teeth.job_stale`): the late report has been written.
+var teeth_stale_written = false;
 
 // ---- The diagnostics of a run (one function each, which the golden test also calls) ----
 
