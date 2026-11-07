@@ -700,8 +700,12 @@ assignment and only after it has claimed the run (its `/job-observed/<node>/<nam
 `ZC-E0133` otherwise, so an input never reaches a node that was not placed the run or that lost the
 claim. The agent checks `sha256:<hex>` over the decoded bytes against the job's `input_digest`.
 
-`job-observed` `GET` lists `/job-observed/<node>/` (at most `job_admitted_window_max`, the bound on
-retained runs); `POST` is one put of `/job-observed/<node>/<name>`:
+`job-observed` `GET` lists `/job-observed/<node>/` one page at a time: at most
+`store_list_limit_max` records, with `"more": true` when others follow, and
+`?after=<run name>&at=<revision>` resumes after that run at the revision the first page answered.
+A node can hold up to `job_admitted_window_max` (the bound on retained runs), which is never one
+reply. Upgrade the server before the agents: an older agent reads only the first page, and a newer
+agent against an older server is refused its second page. `POST` is one put of `/job-observed/<node>/<name>`:
 
 ```json
 { "tenure": 412, "run_revision": 87, "observed_revision": 0,

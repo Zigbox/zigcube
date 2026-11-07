@@ -1122,11 +1122,26 @@ test "retained runs and observations beyond jobs_max do not stop a node's run li
     }
     const listed = try rig.ok("GET", "/v1/agent/nodes/node2/runs", "", "");
     try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
-    const observed = try rig.ok("GET", "/v1/agent/nodes/node2/job-observed", "", "");
-    try testing.expectEqual(
-        @as(usize, constants.jobs_max + 1),
-        field(observed, "kvs").array.items.len,
-    );
+    // The observations come a page at a time, each page at the revision of the first.
+    var total: usize = 0;
+    var query: []const u8 = "";
+    var pages: u32 = 0;
+    while (true) : (pages += 1) {
+        const page = try rig.ok("GET", "/v1/agent/nodes/node2/job-observed", query, "");
+        const kvs = field(page, "kvs").array.items;
+        try testing.expect(kvs.len <= constants.store_list_limit_max);
+        total += kvs.len;
+        const more = page.object.get("more") orelse break;
+        if (!more.bool) break;
+        const key = kvs[kvs.len - 1].object.get("key").?.string;
+        const prefix = records.job_observed_prefix("node2");
+        query = try std.fmt.allocPrint(rig.parsed.allocator(), "after={s}&at={d}", .{
+            key[prefix.slice().len..],
+            field(page, "revision").integer,
+        });
+    }
+    try testing.expectEqual(@as(usize, constants.jobs_max + 1), total);
+    try testing.expectEqual(@as(u32, 1), pages); // 513 records: a page of 500, then 13.
 }
 
 test "a claim may replace only a leftover of an earlier job, never this job's observation" {
@@ -1149,8 +1164,44 @@ test "a claim may replace only a leftover of an earlier job, never this job's ob
     );
     const before = try rig.revision();
     const response = rig.call("POST", "/v1/agent/nodes/node2/job-observed", "", body);
-    try testing.expectEqual(@as(u16, 400), response.status);
+    try rig.refused(response, 400, "ZC-E0104");
+    try testing.expect(std.mem.indexOf(u8, response.body, "observed_revision") != null);
+    const reason = "an observation of this job's run";
+    try testing.expect(std.mem.indexOf(u8, response.body, reason) != null);
     try testing.expectEqual(before, try rig.revision());
+}
+
+test "a claim replaces a leftover observation older than the run, and says applied" {
+    // Goal: a reused job name has the old run id; the gone job's observation is a leftover.
+    var rig = try Rig.start(27);
+    defer rig.stop();
+    try rig.join("node2");
+    const leftover: records.JobObserved = .{
+        .run = "train-job",
+        .node = "node2",
+        .tenure = @intCast(rig.tenure),
+        .assignment = 1,
+        .status = .stopped,
+        .exit = .{ .kind = .lost },
+        .reported_at_ms = 1,
+    };
+    const key = records.job_observed_key("node2", "train");
+    const left = try put_as(&rig, .{ .agent = "node2" }, key.slice(), leftover);
+    const revisions = try assign_run(&rig); // The run is created after the leftover.
+    var buffer: [512]u8 = undefined;
+    const format = "{{\"tenure\":{d},\"run_revision\":{d},\"observed_revision\":{d},\"value\":" ++
+        "{{\"v\":1,\"run\":\"train-job\",\"node\":\"node2\",\"tenure\":{d}," ++
+        "\"assignment\":{d},\"status\":\"claimed\",\"reported_at_ms\":2}}}}";
+    const text = try std.fmt.bufPrint(
+        &buffer,
+        format,
+        .{ rig.tenure, revisions[0], left, rig.tenure, revisions[1] },
+    );
+    const answer = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    try testing.expect(field(answer, "applied").bool);
+    const kept = try rig.ok("GET", "/v1/agent/nodes/node2/job-observed", "", "");
+    const rec = field(kept, "kvs").array.items[0];
+    try testing.expectEqualStrings("claimed", field(field(rec, "value"), "status").string);
 }
 
 test "a damaged input value is ZC-E0523, with nothing left in the diagnostic" {
