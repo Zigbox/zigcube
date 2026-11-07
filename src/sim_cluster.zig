@@ -498,8 +498,8 @@ const Node = struct {
             .mono = clock,
             .state = node.sim.files.interface(),
             .deadline = .{
-                .context = &node.remote,
-                .set_fn = agent_client.RemoteStore.deadline_fn,
+                .context = node,
+                .set_fn = Node.deadline_set_fn,
             },
             .images = node.store_images.images(),
         };
@@ -527,7 +527,24 @@ const Node = struct {
     /// The agent's calls end by the fence deadline, or a run's deadline or kill, as the real
     /// agent's do (`agent_run.zig`); with no lease and no run there is no deadline.
     fn cap_calls(node: *Node, clock: Clock) void {
-        node.remote.set_deadline(clock, node.agent.calls_deadline_ms(clock.now_ms()));
+        node.deadline_set(node.agent.calls_deadline_ms(clock.now_ms()));
+    }
+
+    /// Caps the calls still to be made by `deadline_ms` on the node's clock. The cluster's clock
+    /// stands still during a step and a call's time is charged to `spent_ms` after it, so every
+    /// call of a step saw the time the step began and was given the whole of what was left to
+    /// the fence: one step spent 12 s under a 5.8 s window and I1b failed on a correct agent
+    /// (issue #136). A real agent's clock runs between its calls, so the time already spent is
+    /// taken off the deadline. (The clock itself cannot run: the server handles each call at the
+    /// step's start, and the agent's `sent` stamp must not be later than that.)
+    fn deadline_set(node: *Node, deadline_ms: u64) void {
+        const none = std.math.maxInt(u64);
+        node.remote.deadline_ms = if (deadline_ms == none) none else deadline_ms -| node.spent_ms;
+    }
+
+    fn deadline_set_fn(context: *anyopaque, deadline_ms: u64) void {
+        const node: *Node = @ptrCast(@alignCast(context));
+        node.deadline_set(deadline_ms);
     }
 
     /// Time left to the fence or a run's deadline or kill, on the node's clock: a pause or a
@@ -3057,4 +3074,26 @@ test "the fencing check fires on a node that runs containers long after it lost 
     c.manual.advance(1);
     try testing.expectError(error.StepFailed, track_fencing(c));
     try testing.expect(report.failed);
+}
+
+test "a step's calls are capped by what the step has already spent (issue 136)" {
+    // Goal: regression for fleet issue 136. The cluster's clock stands still during a step, so
+    // every call saw the time the step began and was capped by the whole of what was left to
+    // the fence. Method: charge a call's time to a node, as `tapped_call` does, and set a
+    // deadline as the agent does; the cap on the remote must be that much nearer, and a missing
+    // deadline stays missing.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+    defer c.destroy();
+    const node = c.nodes[0];
+    node.spent_ms = 0;
+    Node.deadline_set_fn(node, 100_000);
+    try testing.expectEqual(@as(u64, 100_000), node.remote.deadline_ms);
+    node.spent_ms = 4000;
+    Node.deadline_set_fn(node, 100_000);
+    try testing.expectEqual(@as(u64, 96_000), node.remote.deadline_ms);
+    Node.deadline_set_fn(node, 3000);
+    try testing.expectEqual(@as(u64, 0), node.remote.deadline_ms);
+    Node.deadline_set_fn(node, std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), node.remote.deadline_ms);
 }
