@@ -22,6 +22,8 @@ pub const Failed = error{DemoFailed};
 
 /// How often a wait looks, and the longest a started command may run before the demo gives up.
 pub const poll_ms: u32 = 100;
+/// A poll or a sleep longer than this is reported as a stall (`Host.report_stall`).
+pub const stall_ms: u64 = 2_000;
 pub const command_timeout_ms: u32 = 60 * 1000;
 /// The longest a single command prints, in either stream.
 pub const output_bytes_max: usize = 128 * 1024;
@@ -301,13 +303,36 @@ pub const Host = struct {
         assert(limit_ms > poll_ms);
         const started = host.now_ms();
         while (host.now_ms() - started < limit_ms) {
-            if (try check_fn(ctx, host)) {
+            const polled = host.now_ms();
+            const done = try check_fn(ctx, host);
+            host.report_stall("a poll", polled, host.now_ms(), started);
+            if (done) {
                 host.say("  waited {d} ms for " ++ what, .{host.now_ms() - started});
                 return;
             }
+            const slept = host.now_ms();
             try host.io.sleep(.fromMilliseconds(poll_ms), .awake);
+            host.report_stall("a sleep of poll_ms", slept, host.now_ms(), started);
         }
         return host.fail("timed out after {d} ms waiting for " ++ what, .{limit_ms});
+    }
+
+    /// Says so when one poll or one sleep took more than `stall_ms`. A sleep that overshoots
+    /// means the demo's own process, or the machine, did not run; a slow poll with no overshoot
+    /// means the server (or the `zcube` it was asked through) did not answer. CI's 2026-11-07
+    /// failure (docs/demos/notes/2026-11-07-demo-c1-sqlite-stall.md) could not be told apart.
+    fn report_stall(
+        host: *Host,
+        comptime what: []const u8,
+        from_ms: u64,
+        to_ms: u64,
+        wait_ms: u64,
+    ) void {
+        assert(to_ms >= from_ms);
+        if (to_ms - from_ms <= stall_ms) return;
+        host.say("  STALL: " ++ what ++ " took {d} ms, {d} ms into a wait (demo clock {d} ms)", .{
+            to_ms - from_ms, from_ms - wait_ms, from_ms,
+        });
     }
 
     /// Lets time pass, for a step that asserts that nothing happens meanwhile.
