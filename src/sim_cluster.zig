@@ -1025,7 +1025,7 @@ pub const Cluster = struct {
             c.mend_links();
             c.settle();
             if (c.c1 and c.jobs_on) c.watch_client();
-            // The wedge and cut-link totals J1, J6 and J8 judge by are kept whenever jobs are on,
+            // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
             if (c.c1 or c.jobs_on) c.note_wedged();
             if (c.c1) {
@@ -3010,7 +3010,7 @@ test "a few seeds hold every invariant, and the swarm differs between them" {
 
 test "J8 holds on a small world whose agents' steps fail, without c1" {
     // Goal: regression for the J8 release blocker. A plain run (no `c1`) once judged J8 without
-    // the wedge and cut-link allowance, because `note_wedged` ran only under `c1`, so a run
+    // the wedge allowance, because `note_wedged` ran only under `c1`, so a run
     // whose agent was backed off by failed steps looked like one that outlived its deadline.
     // Method: seed 136502595 at 40 operations failed J8 before the fix; it is small enough to run
     // on every target. The large drawn worlds that also failed (`sim_cluster <seed> auto
