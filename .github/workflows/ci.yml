@@ -472,6 +472,9 @@ jobs:
           zig build sim-c1 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
       - name: sim-c1 negative tests
         run: zig build sim-c1-teeth --summary all
+      # The positive run of the deadline-offline tooth's world: long cuts, short deadlines, fix on.
+      - name: sim-c1 offline-deadline world
+        run: zig build sim-c1-offline --summary all
       # The negative test of the healed-fencing check (docs/decisions/2026-11-06-renewal-before-fence.md):
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test

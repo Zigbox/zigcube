@@ -154,11 +154,13 @@ const Shell = struct {
         const fences = shell.agent.fences;
         const refusals = shell.agent.store_refusals;
         const drops = shell.agent.pull_drops;
+        const enforce_failures = shell.agent.enforce_failures;
         const result = shell.agent.reconcile(&ctx);
         if (shell.agent.store_refusals != refusals) shell.notice_refused_summary();
         if (shell.agent.pull_drops != drops) {
             shell.notice_dropped_pull(shell.agent.pull_drops - drops);
         }
+        if (shell.agent.enforce_failures != enforce_failures) shell.notice_enforce_failure();
         shell.save_pair(false);
         shell.notice_pair();
         // A fence is news whether or not the rest of the pass worked: the pass that ends a fence
@@ -186,7 +188,7 @@ const Shell = struct {
         shell.diag.reset();
         const mono = shell.boot.now_ms();
         const held = shell.agent.watch_hold_ms(mono, slice_ms);
-        shell.remote.set_deadline(shell.boot, shell.agent.calls_deadline_ms());
+        shell.remote.set_deadline(shell.boot, shell.agent.calls_deadline_ms(mono));
         const changed = shell.remote.watch_once(held, &shell.diag) catch return .failed;
         shell.notice_pair();
         if (changed) return .ended;
@@ -297,6 +299,19 @@ const Shell = struct {
         const text = "zcube-agent: zcube-server refused the node's image summary (ZC-E0504): " ++
             "{s}; replicas go on, and it will be sent again\n";
         const line = std.fmt.bufPrint(&buffer, text, .{shell.agent.store_refusal()}) catch return;
+        std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
+    }
+
+    /// Enforcing a run's deadline failed for one run or one listing; the step went on, so the
+    /// lease stays renewed, and the next step tries again.
+    fn notice_enforce_failure(shell: *Shell) void {
+        var buffer: [320]u8 = undefined;
+        const line = std.fmt.bufPrint(
+            &buffer,
+            "zcube-agent: could not enforce a run's deadline: {s}; the step goes on, and " ++
+                "enforcement is tried again\n",
+            .{shell.agent.enforce_failure()},
+        ) catch return;
         std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
     }
 

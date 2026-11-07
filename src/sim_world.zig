@@ -73,7 +73,18 @@ pub const SwitchedStore = struct {
     /// it may write through the world's store (the transaction then meets that write). Test-only,
     /// null in every simulation.
     before_put: ?BeforePut = null,
+    /// A keepalive takes `cost_ms` of the clock and is cut with ZC-E0503 if that passes `cap_ms`
+    /// (the cap the agent set, as a real exchange is cut); test-only, null in every simulation.
+    keepalive_cost: ?KeepaliveCost = null,
     calls: u32 = 0,
+
+    pub const KeepaliveCost = struct {
+        clock: *ManualClock,
+        cost_ms: u32,
+        cap_ms: *const u64,
+        /// Keepalives cut by the cap.
+        cut: u32 = 0,
+    };
 
     pub const BeforePut = struct {
         prefix: []const u8,
@@ -224,6 +235,16 @@ pub const SwitchedStore = struct {
     ) store.Error!store.Lease {
         const self = from(context);
         try self.gate(diag);
+        if (self.keepalive_cost) |*cost| {
+            if (cost.clock.ms + cost.cost_ms > cost.cap_ms.*) {
+                cost.cut += 1;
+                diag.raise(.E0503);
+                diag.cause("the keepalive was cut by the agent's call cap", .{});
+                diag.fix(.{ .sentence = "none: the simulated call ran out of time" });
+                return error.BackendFailed;
+            }
+            cost.clock.advance(cost.cost_ms);
+        }
         var lease = try self.inner.lease_keepalive(id, diag);
         if (self.keepalive_ttl_ms) |ttl_ms| lease.ttl_ms = ttl_ms;
         if (self.keepalive_refuse_short) {
@@ -328,6 +349,9 @@ pub const World = struct {
     dropped_before_restart: u64,
     /// The last diagnostic that failed a step, kept for the caller to render.
     last_failure: ?codes.Code,
+    /// The cap the agent last set on its calls (monotonic ms), as the shell hands it to the
+    /// client; `SwitchedStore.keepalive_cost` reads it. Unused in every simulation.
+    call_cap_ms: u64 = std.math.maxInt(u64),
     /// The host's boot id the agent sees; a test changes it to reboot the host.
     boot_id: []const u8 = "",
 
@@ -363,6 +387,7 @@ pub const World = struct {
         world.dropped_before_restart = 0;
         world.last_failure = null;
         world.boot_id = "";
+        world.call_cap_ms = std.math.maxInt(u64);
         world.runtime_override = null;
         world.state_override = null;
         world.images = null;
@@ -442,12 +467,18 @@ pub const World = struct {
             .images = world.images,
             .state = world.state_override orelse world.files.interface(),
             .boot_id = world.boot_id,
+            .deadline = .{ .context = world, .set_fn = World.set_call_cap },
         };
         world.stats.agent_steps += 1;
         const wake = world.agent.reconcile(&ctx) catch return world.failed_step(.agent);
         world.agent_due_ms = wake.at_ms;
         world.stats.transactions += wake.acted;
         return .{ .ran = true, .acted = wake.acted, .failed = null };
+    }
+
+    fn set_call_cap(context: *anyopaque, deadline_ms: u64) void {
+        const world: *World = @ptrCast(@alignCast(context));
+        world.call_cap_ms = deadline_ms;
     }
 
     const Who = enum { server, agent };

@@ -39,7 +39,18 @@ server) or the fence stops a run: the old behaviour.
 
 - `runtime.list` now comes before the heartbeat, so the step's listing is older by one call;
   `publish_store` and the pass use the same listing, as before.
-- A failure in `enforce_deadlines` (a state-directory write) fails the step before the heartbeat.
-  A persistent one ends in the fence, as any persistent failure does.
+- **Containment.** One run's failure never fails the step before the heartbeat, so it never
+  starves the lease into the fence. `enforce_deadlines` handles each run on its own: a record it
+  cannot read or a stop it cannot send is reported (ZC diagnostic, once per step in the agent's
+  log) and the next run is still enforced. If only the `stop_cause` record write fails, the
+  TERM/KILL is still sent and the cause is kept in memory.
+- **A `runtime.list` failure** before the heartbeat does not fail the step: enforcement is skipped
+  for that step (reported), the heartbeat runs, and the pass lists again as before.
+- **A run wake must not starve the lease.** `calls_deadline_ms` does not cut an in-flight call at
+  a run wake until the call has been in flight `call_inflight_min_ms` (1 s, internal; comptime
+  asserted to be at most a quarter of the stop grace and above `fence_poll_ms`). Without it,
+  wakes every ~100 ms cut every heartbeat with ZC-E0503.
+- A listing that `enforce_deadlines` already killed in a step is skipped by the pass in that step.
+- `sim-c1-offline` runs the tooth's world with the fix on (30 seeds), in CI's sim job.
 - A wake that is already due (a step failed before it got there) is retried at `fence_poll_ms`,
   not at the fence: otherwise a failed step could pause a stop for seconds.

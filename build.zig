@@ -1274,7 +1274,32 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         own.dependOn(&own_install.step);
         teeth_exes.dependOn(&own_install.step);
     }
+    add_offline_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// Seeds of `sim-c1-offline`; about 45 s.
+const offline_seeds_max = 30;
+
+/// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
+/// cuts, short deadlines) with the fix on. It passes only if no seed fails (J8 and the rest).
+fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_offline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_offline_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                            b.fmt("1..{d}", .{offline_seeds_max}),
+        b.fmt("{d}", .{c1_teeth_operations}), "--c1",
+    });
+    b.step("sim-c1-offline", "Run sim-c1 in the offline-deadline world with the fix on (J8 holds)")
+        .dependOn(&run.step);
 }
 
 /// `zig build sim-fencing-teeth`: the negative test of `fencing_settles`. The simulator with

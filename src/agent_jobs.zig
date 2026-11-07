@@ -154,11 +154,14 @@ fn label_of(listing: *const runtime.Listing, key: []const u8) ?[]const u8 {
 /// another run whose report keeps failing never holds a stop back; `pass` reports the ending when
 /// the server answers. Records `stop_cause: deadline` before the signal, as `pass` does. Sets
 /// `deadline_wake_mono_ms` to the next deadline or kill, which caps the step's waits and calls.
+/// Never fails: one run's failure (its record, its stop) is noted (`Agent.note_enforce_failure`)
+/// and the next run is looked at, so no run's trouble holds back another's stop or the
+/// heartbeat that follows (docs/decisions/2026-11-07-agent-enforces-deadline-offline.md).
 pub fn enforce_deadlines(
     agent: *Agent,
     ctx: *const Context,
     listings: []const runtime.Listing,
-) Error!void {
+) void {
     agent.deadline_wake_mono_ms = std.math.maxInt(u64);
     if (c1_teeth.job_deadline_offline) return; // Test-only: only the pass enforces it (J8).
     const state = ctx.state orelse return;
@@ -166,10 +169,14 @@ pub fn enforce_deadlines(
         if (!is_running(listing)) continue;
         if (label_of(listing, runtime.label_job) == null) continue;
         const id = label_of(listing, runtime.label_replica) orelse continue;
-        switch (try read_record(ctx, state, id)) {
+        const read = read_record(ctx, state, id) catch {
+            agent.note_enforce_failure(ctx, "read a run's start record");
+            continue;
+        };
+        switch (read) {
             // No record to say when: `pass` stops it as `unknown`, with the server's word.
             .absent, .damaged => {},
-            .record => |found| try enforce_one(agent, ctx, state, listing, found),
+            .record => |found| enforce_one(agent, ctx, state, listing, found),
         }
     }
 }
@@ -180,7 +187,7 @@ fn enforce_one(
     state: agent_state.AgentState,
     listing: *const runtime.Listing,
     found: StartRecord,
-) Error!void {
+) void {
     // A `claiming` record's time bounds the input fetch, not the run: its container is the
     // pass's to judge. Another boot's time is not comparable: the run ends through the fence.
     if (found.phase != .claimed) return;
@@ -193,10 +200,16 @@ fn enforce_one(
         if (c1_teeth.job_deadline) return;
         if (mono < due) return note_deadline_wake(agent, due);
         record.stop_cause = .deadline;
-        try write_record(ctx, state, &record);
+        // The cause is in `record` for the stop below; if the write fails the stop still goes
+        // out, and the next step finds the same deadline passed and writes it again.
+        write_record(ctx, state, &record) catch
+            agent.note_enforce_failure(ctx, "record a run's deadline");
     }
     // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
-    try agent.stop_listing(ctx, listing, record.grace_ms);
+    agent.stop_listing(ctx, listing, record.grace_ms) catch {
+        agent.note_enforce_failure(ctx, "stop a run's container");
+        return; // The next step tries again (the loop's resync), not a busy retry.
+    };
     const pending = agent.pending_stop(listing.handle.name()) orelse return;
     const now = ctx.clock.now_ms();
     if (pending.deadline_ms > now) note_deadline_wake(agent, mono + (pending.deadline_ms - now));

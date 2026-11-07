@@ -310,7 +310,7 @@ pub const Swarm = struct {
         const freeze = rate(r, 6);
         swarm.w_freeze = if (swarm.profile.freezes()) freeze else 0;
         if (swarm.profile == .crash_heavy) swarm.w_freeze = nonzero(r, freeze, 6);
-        if (c1_teeth.skew_beyond_bound or c1_teeth.job_deadline_offline) {
+        if (c1_teeth.skew_beyond_bound or c1_teeth.offline_world) {
             if (swarm.nodes > 1) swarm.w_partition = 25;
         }
         if (c1_teeth.wedge) {
@@ -327,7 +327,7 @@ pub const Swarm = struct {
         swarm.w_job_cancel = 2 + r.uintLessThan(u32, 3);
         swarm.w_job_end = 2 + r.uintLessThan(u32, 4);
         // The `job_deadline_offline` tooth needs deadlines that fall while a node is cut off.
-        if (c1_teeth.job_deadline_offline) swarm.w_job_create = 20;
+        if (c1_teeth.offline_world) swarm.w_job_create = 20;
     }
 
     fn print(swarm: *const Swarm, report: *Report) void {
@@ -527,7 +527,7 @@ const Node = struct {
     /// The agent's calls end by the fence deadline, or a run's deadline or kill, as the real
     /// agent's do (`agent_run.zig`); with no lease and no run there is no deadline.
     fn cap_calls(node: *Node, clock: Clock) void {
-        node.remote.set_deadline(clock, node.agent.calls_deadline_ms());
+        node.remote.set_deadline(clock, node.agent.calls_deadline_ms(clock.now_ms()));
     }
 
     /// Time left to the fence or a run's deadline or kill, on the node's clock: a pause or a
@@ -1306,7 +1306,7 @@ pub const Cluster = struct {
         c.net.set_faults(node.index, faults);
         // The `job_deadline_offline` tooth cuts for up to the lease's ttl and beyond: a deadline
         // that falls in the cut must still be enforced, by the agent alone.
-        const stretch: u32 = if (c1_teeth.job_deadline_offline) 4 else 1;
+        const stretch: u32 = if (c1_teeth.offline_world) 4 else 1;
         const spread = stretch * partition_ms_spread;
         node.partitioned_until_ms =
             c.manual.ms + partition_ms_min + random.uintLessThan(u32, spread);
@@ -1341,7 +1341,7 @@ pub const Cluster = struct {
         const ctx = c.controller_context();
         const long = random.uintLessThan(u32, 4) == 0;
         // The `job_deadline_offline` tooth: deadlines that fall within the run (see `add_jobs`).
-        const spread: u32 = if (c1_teeth.job_deadline_offline) 10_000 else 40_000;
+        const spread: u32 = if (c1_teeth.offline_world) 10_000 else 40_000;
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
             .image = hello_digest,

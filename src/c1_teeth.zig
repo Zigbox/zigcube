@@ -58,6 +58,10 @@ pub const job_deadline_late_ms: u64 = if (job_deadline_late) 9_000 else 0;
 /// them longer and draws more, shorter jobs under it, so that deadlines fall in the cuts.
 pub const job_deadline_offline = declared("c1_teeth_job_deadline_offline");
 
+/// Not a fault: the world of `job_deadline_offline` (long cuts, short deadlines) with the agent's
+/// own enforcement left on, for the positive run `sim-c1-offline`. Not in `any`.
+pub const offline_world = declared("c1_offline_world") or job_deadline_offline;
+
 /// The jobs watch drops the events of some endings (must break J4: a client that follows the watch
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");
