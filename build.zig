@@ -1281,6 +1281,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
 }
 
@@ -1306,6 +1307,35 @@ fn add_offline_step(b: *std.Build, sim: SimStepOptions) void {
     });
     b.step("sim-c1-offline", "Run sim-c1 in the offline-deadline world with the fix on (J8 holds)")
         .dependOn(&run.step);
+}
+
+/// Replays of sim-c1 runs that once failed, each a fixed command line; each must pass.
+const c1_regressions = [_][]const []const u8{
+    // B2 re-review: before the fix the agent re-reported runs the store refused on every pass,
+    // and a step 31 ms before a deadline ran 4.7 s, past J8's bound. The run the review named
+    // was `240 798 2 ... --heal-at=487` (43 s); 310 operations fail the same way in 8 s.
+    &.{ "240", "310", "2", "--c1", "--lease-ttl-ms=10000", "--replicas-pct=200", "--heal-at=487" },
+};
+
+/// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
+fn add_regressions_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_regressions",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const help = "Replay sim-c1 runs that once failed; each must pass";
+    const step = b.step("sim-c1-regressions", help);
+    for (c1_regressions) |args| {
+        const run = b.addRunArtifact(exe);
+        run.addArgs(args);
+        run.expectExitCode(0);
+        step.dependOn(&run.step);
+    }
 }
 
 /// `zig build sim-fencing-teeth`: the negative test of `fencing_settles`. The simulator with

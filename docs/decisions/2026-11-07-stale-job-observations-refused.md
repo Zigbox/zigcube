@@ -15,17 +15,25 @@ its own compares (run, assignment, no observation).
   the key is at another revision, same result.
 - **Answer.** `200 {"applied": false}` while the tenure holds (the shape claims already use); a
   replaced tenure is still `503` ZC-E0510. No new code, bound or default.
-- **Agent.** A refused report is dropped, not retried, and no longer fences at once: the agent
-  cannot tell stale from tenure ended, so it has its lease checked on the next heartbeat
-  (`renew_at_ms` brought forward by `agent_lease_check_ms`, one second), where a lost lease
-  fences it. A refused `stopped` report of a run that is released, or placed again at another
-  epoch, ends that run on the node: its start record is removed (`retire_if_stale`), so the
-  refusal is not repeated on every pass. A `claiming` record of an unassigned run is removed
-  too. Other writes under the tenure still fence at once.
+- **Agent.** One invariant: a run is reported until its report is acknowledged or refused, then
+  forgotten exactly once. The agent reports a run only under the assignment it reads in the same
+  pass (`report_epoch`); a run with no assignment on this node (released, or its job removed by
+  retention) is never reported, so no report can carry epoch 0. Such a run ends on the node: its
+  container is stopped and, once the container has ended or is gone, its start record is removed;
+  `enforce_deadlines` keeps working from the record until then. A refused report (the run was
+  superseded between the read and the write) is dropped, not retried and counted
+  (`job_reports_refused`); the next pass reads the assignment again and ends the run. A refusal
+  neither fences nor moves the heartbeat: the agent cannot tell stale from tenure ended, and the
+  heartbeat finds a tenure that ended on its own schedule. A `claiming` record of an unassigned
+  run is removed too. Other writes under the tenure still fence at once.
 - **Check.** sim-c1 J9 judges every stored `running` or `stopped` report; J10 (at rest) fails if
-  a start record outlives its run's assignment. Tooth `sim-c1-teeth-job_stale` drops the
-  assignment compare in the agent and in the server's handler; the stale reports arise from the
-  run's real state, with no fabricated report.
+  a start record outlives its run's assignment, and, after the cluster heals, if any node makes
+  more than `job_refusals_after_heal_per_node_max` (8) refused reports: a run that is reported
+  again and again after its refusal fails it. Tooth `sim-c1-teeth-job_stale` drops both
+  defences: the agent reports a run it no longer holds under the assignment it was started
+  under, and neither the agent nor the server's handler compares the assignment; the stale
+  reports arise from the run's real state, with no fabricated report. sim-c1 J10 and seed 240's
+  replay (`zig build sim-c1-regressions`) fail with the agent fix reverted.
 - **Upgrade.** **Agents first, then the server.** An old agent fences (TERM, then KILL, of every
   container on the node) when its report is answered `applied: false`, and it never removes the
   record of a released run, so it reports it again, is refused again and fences again, for as
