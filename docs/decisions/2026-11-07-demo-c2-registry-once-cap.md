@@ -13,17 +13,24 @@ designed fallback, and demo-c2's step 1 ("registry read once") failed
 - Step 1 stays strict, with one measured exception. `registry_read` (`src/demo_c2_check.zig`)
   classifies the pull records of the tree:
   - `once`: one node read the registry and every other node took bytes from peers. Passes.
-  - `overran`: several nodes read the registry and **every** registry pull's span
-    (`finished_at_ms - started_at_ms`) is at least the cap. The elected node is the shortest of
-    them, since a waiting node's span is its wait plus its own pull. Passes, and the transcript
-    prints the elected pull's span, the cap and why the other nodes pulled.
-  - `repeated`: several registry reads although some pull finished inside the cap, or a record
-    has no times. Fails, labelled "a duplicate pull", so a failure from an overrun is told apart
-    from a real bug. An unmeasured run is strict.
+  - `overran`: several nodes read the registry, exactly one of them is the elected node, its own
+    pull record spans (`finished_at_ms - started_at_ms`) at least the cap, and every other registry
+    reader waited the cap out. The elected node is the one whose `fetch.log` says "pulls it from
+    the registry first (O5)"; a waiting reader's `fetch.log` says "no peer came to hold the tree
+    in N ms" with N at least the cap. A pull record starts when the registry pull starts, after
+    the O5 wait (which is in the fetch, before the supervisor's pull), so a span never includes
+    a wait and cannot tell which node was elected. Both facts come from each node's own log, so
+    the VMs' clocks are never compared. Passes; the transcript names the elected node, its pull,
+    the cap and each reader's waited time.
+  - `repeated`: several registry reads without that evidence: no single elected node, an elected
+    pull inside the cap or without times, a reader that did not wait out the cap, or missing log
+    lines. Fails, labelled "a duplicate pull", so a failure from an overrun is told apart from a
+    real bug. An unmeasured run is strict.
   - `broken`: no registry read, or a node with no bytes at all. Fails.
 - #93 (zigbox-smoke `fetch.log` silent): the fetch's progress line is now time-driven. It is
   written at most every `fetch_progress_ms` (10 s) from the first clock read or sleep of the
-  fetch, not only on a peer chunk answer, and says elapsed time, chunk requests, bytes from peers
+  fetch and during O5's wait, not only on a peer chunk answer (a request in flight can delay it by
+  up to `fetch_request_timeout_ms`), and says elapsed time, chunk requests, bytes from peers
   and from the registry, the last source and the peers' non-chunk answers. No new code, limit or
   default: the constant and the line existed. The smoke's 120 s deadline is the harness's, not the
   fetch's, so no timeout code applies.

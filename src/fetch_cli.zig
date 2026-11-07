@@ -96,6 +96,15 @@ pub const Net = struct {
     began_ms: u64 = 0,
     /// `boot_ms` of the last progress line (or of `began_ms`).
     progress_ms: u64 = 0,
+    /// Progress lines written so far.
+    progress_lines: u32 = 0,
+    /// Tests only: a clock the fetch reads instead of `boot_ms`, and no write to fetch.log.
+    test_clock_ms: ?*const u64 = null,
+
+    fn clock_ms(net: *const Net) u64 {
+        if (net.test_clock_ms) |fake| return fake.*;
+        return peer_stream.boot_ms(net.io);
+    }
 
     fn from(context: *anyopaque) *Net {
         return @ptrCast(@alignCast(context));
@@ -241,10 +250,12 @@ pub const Net = struct {
 
     /// At most one line per `fetch_progress_ms` to fetch.log, from the first call on: what the
     /// chunk requests have brought, from where, and what the peers answered instead. It is called
-    /// on every chunk answer, every clock read and every sleep of the fetch, so a fetch between
-    /// two answers (waiting on O5, or on a peer) still says where it is (#93).
+    /// on every chunk answer, every clock read and every sleep of the fetch, and in O5's wait,
+    /// so a fetch between two answers still says where it is (#93). A request in flight
+    /// (`peer_get_once`, `http_get`) blocks up to `fetch_request_timeout_ms` before the next call,
+    /// so the line can lag by that much there.
     fn say_progress(net: *Net) void {
-        const now_ms = peer_stream.boot_ms(net.io);
+        const now_ms = net.clock_ms();
         if (net.began_ms == 0) {
             net.began_ms = now_ms;
             net.progress_ms = now_ms;
@@ -252,14 +263,17 @@ pub const Net = struct {
         }
         if (now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
         net.progress_ms = now_ms;
-        var buffer: [256]u8 = undefined;
-        note(net.io, progress_line(&buffer, net, now_ms - net.began_ms));
+        var buffer: [progress_line_bytes_max]u8 = undefined;
+        const line = progress_line(&buffer, net, now_ms - net.began_ms);
+        assert(line.len > 0);
+        net.progress_lines += 1;
+        if (net.test_clock_ms == null) note(net.io, line);
     }
 
     fn now(context: *anyopaque) u64 {
         const net = from(context);
         net.say_progress();
-        return peer_stream.boot_ms(net.io);
+        return net.clock_ms();
     }
 
     fn sleep(context: *anyopaque, ms: u32) void {
@@ -1244,23 +1258,36 @@ fn say_peer_answers(net: *const Net) void {
     }
 }
 
+const progress_form = "zcube-agent fetch: progress: {d} ms in, {d} chunk requests, {d} bytes " ++
+    "from peers, {d} bytes from the registry, last from {s}; answers: busy {d}, refused {d}, " ++
+    "nothing {d}\n";
+
+/// The longest progress line: the form (its placeholders counted too, so over by a little), a
+/// peer's name of `node_name_bytes_max`, and a u64 (20 digits) for each of the six numbers.
+pub const progress_line_bytes_max: usize = progress_form.len + constants.node_name_bytes_max +
+    6 * 20;
+
+comptime {
+    assert(progress_line_bytes_max < 512);
+}
+
 /// The progress line: requests made, bytes got, and the peers' answers that were not a chunk.
+/// `buffer` holds `progress_line_bytes_max`, so the line is never cut or dropped.
 pub fn progress_line(buffer: []u8, net: *const Net, elapsed_ms: u64) []const u8 {
-    var busy: u32 = 0;
-    var refused: u32 = 0;
-    var silent: u32 = 0;
+    assert(buffer.len >= progress_line_bytes_max);
+    assert(net.last_source.len <= constants.node_name_bytes_max);
+    var busy: u64 = 0;
+    var refused: u64 = 0;
+    var silent: u64 = 0;
     for (net.conns[0..net.peers.len]) |conn| {
         busy += conn.busy;
         refused += conn.refused;
         silent += conn.timeouts;
     }
-    const form = "zcube-agent fetch: progress: {d} ms in, {d} chunk requests, {d} bytes from " ++
-        "peers, {d} bytes from the registry, last from {s}; answers: busy {d}, refused {d}, " ++
-        "nothing {d}\n";
-    return std.fmt.bufPrint(buffer, form, .{
+    return std.fmt.bufPrint(buffer, progress_form, .{
         elapsed_ms,      net.chunks_asked, net.chunk_bytes, net.registry_bytes,
         net.last_source, busy,             refused,         silent,
-    }) catch buffer[0..0];
+    }) catch unreachable; // `progress_line_bytes_max` bounds every number and the name.
 }
 
 pub fn peer_answers_line(buffer: []u8, name: []const u8, conn: Conn) []const u8 {
@@ -1482,6 +1509,7 @@ fn begin(
         switch (decided) {
             .wait => |until| {
                 const ms: u32 = @intCast(@max(until -| now, 1));
+                net.say_progress(); // The wait can last the whole cap; say where it is (#93).
                 net.io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: read again.
             },
             else => return .{
@@ -1585,12 +1613,73 @@ test "the progress line counts requests, bytes and the answers that were not a c
         .registry_bytes = 512,
         .last_source = "a",
     };
-    var buffer: [256]u8 = @splat(0xaa);
+    var buffer: [progress_line_bytes_max]u8 = @splat(0xaa);
     const line = progress_line(&buffer, &net, 20_000);
     const want = "zcube-agent fetch: progress: 20000 ms in, 7 chunk requests, 4096 bytes from " ++
         "peers, 512 bytes from the registry, last from a; answers: busy 3, refused 3, " ++
         "nothing 5\n";
     try std.testing.expectEqualStrings(want, line);
+}
+
+test "the progress line fits a 63-byte name and the largest numbers" {
+    // Goal: the worst line is whole, not empty (#93: silence with no sign why). Method: every
+    // number at its type's maximum, a peer name of `node_name_bytes_max` bytes.
+    const name_bytes: [constants.node_name_bytes_max]u8 = @splat('n');
+    const name: []const u8 = &name_bytes;
+    const most = std.math.maxInt(u32);
+    var conns = [_]Conn{.{ .busy = most, .refused = most, .timeouts = most }};
+    const peers = [_]Peer{.{ .name = name, .address = try IpAddress.parse("127.0.0.1", 1) }};
+    var scratch: [8]u8 = undefined;
+    const net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &peers,
+        .identity = null,
+        .reply = &scratch,
+        .conns = &conns,
+        .chunks_asked = std.math.maxInt(u32),
+        .chunk_bytes = std.math.maxInt(u64),
+        .registry_bytes = std.math.maxInt(u64),
+        .last_source = name,
+    };
+    var buffer: [progress_line_bytes_max]u8 = @splat(0xaa);
+    const line = progress_line(&buffer, &net, std.math.maxInt(u64));
+    try std.testing.expect(line.len > 0 and line.len <= progress_line_bytes_max);
+    try std.testing.expect(std.mem.endsWith(u8, line, "nothing 4294967295\n"));
+    try std.testing.expect(std.mem.indexOf(u8, line, name) != null);
+}
+
+test "the progress line is written by the clock, with no chunk answer" {
+    // Goal: #93's change: a line every `fetch_progress_ms` from clock reads and sleeps alone.
+    // Method: a fake clock; none before the first interval, one per interval after, from `now`,
+    // from `sleep` and from `say_progress` (the O5 wait), never two in one interval.
+    var fake: u64 = 5_000;
+    var scratch: [8]u8 = undefined;
+    var net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &.{},
+        .identity = null,
+        .reply = &scratch,
+        .test_clock_ms = &fake,
+    };
+    const interval: u64 = constants.fetch_progress_ms;
+    _ = Net.now(&net); // The first call starts the interval.
+    try std.testing.expectEqual(@as(u32, 0), net.progress_lines);
+    fake += interval - 1;
+    _ = Net.now(&net);
+    try std.testing.expectEqual(@as(u32, 0), net.progress_lines);
+    fake += 1;
+    _ = Net.now(&net);
+    try std.testing.expectEqual(@as(u32, 1), net.progress_lines);
+    Net.sleep(&net, 0);
+    try std.testing.expectEqual(@as(u32, 1), net.progress_lines);
+    fake += interval;
+    Net.sleep(&net, 0);
+    try std.testing.expectEqual(@as(u32, 2), net.progress_lines);
+    fake += interval;
+    net.say_progress();
+    try std.testing.expectEqual(@as(u32, 3), net.progress_lines);
 }
 
 test "a peer that gave no bundle is named with what it answered" {

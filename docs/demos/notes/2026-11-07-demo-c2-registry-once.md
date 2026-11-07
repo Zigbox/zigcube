@@ -1,6 +1,6 @@
 # demo-c2 on 4b97e69: the registry was read three times (O5 wait shorter than the pull)
 
-Status: **diagnosed; fixed in B2 (#162): the cap stays, the check measures the elected pull** (docs/decisions/2026-11-07-demo-c2-registry-once-cap.md).
+Status: **diagnosed; fixed in B2 (#162): the cap stays, the check identifies the elected node from the nodes' own logs** (docs/decisions/2026-11-07-demo-c2-registry-once-cap.md).
 
 ## What the run shows
 
