@@ -509,10 +509,15 @@ const Work = struct {
     }
 
     fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
+        _ = record;
+        // A run with no assignment on this node has nothing to report under (B2): a report of it
+        // would be refused as stale. One under a newer assignment than its claim's is reported
+        // under the new one, the assignment the job controller admits.
+        if (!subject.assigned) return;
         var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
-            .epoch = record.epoch,
+            .epoch = subject.epoch,
             .exit = .{ .kind = .lost },
             .stop_cause = .not_started,
         };
@@ -953,8 +958,11 @@ const Work = struct {
         }
     }
 
-    /// Commits a report unless the store already says the same. A report rests on the tenure
-    /// alone; a refusal of it is the end of the tenure, so the agent fences.
+    /// Commits a report unless the store already says the same. A report rests on the tenure and
+    /// on the assignment it ran under still being the stored one (`compare_sets.job_report`). A
+    /// refusal is either a stale report (dropped: the run was retired or superseded) or the end
+    /// of the tenure; the agent cannot tell which, so it has the lease checked at once, and a
+    /// tenure that ended fences it there.
     fn report(work: *Work, wanted: Report) Error!void {
         const ctx = work.ctx;
         const agent = work.agent;
@@ -974,12 +982,26 @@ const Work = struct {
             .reported_at_ms = ctx.clock.now_ms(),
         };
         assert(value.valid());
-        const node_key = records.node_key(agent.config.node);
-        const tenure = ctx.arena.alloc(store_compare, 1) catch return failures.no_memory(ctx.diag);
-        tenure[0] = .{ .key = node_key.slice(), .mod_revision = agent.tenure };
-        const outcome = try work.commit(value, tenure);
+        const set = ctx.arena.create(compare_sets.Set) catch return failures.no_memory(ctx.diag);
+        set.* = .{};
+        if (c1_teeth.job_stale) {
+            // Test-only (J9): no compare on the assignment, and once a report of the epoch
+            // before this one is written first, as an agent returning late would.
+            compare_sets.observed_write(set, agent.config.node, agent.tenure);
+            if (!teeth_stale_written and wanted.epoch > 1) {
+                teeth_stale_written = true;
+                var late = value;
+                late.assignment = wanted.epoch - 1;
+                _ = try work.commit(late, set.compares());
+            }
+        } else {
+            const name = records.job_of_run(wanted.run).?;
+            compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
+        }
+        const outcome = try work.commit(value, set.compares());
         if (outcome == .refused) {
-            try agent.begin_fence(ctx, ctx.mono_ms());
+            // The next heartbeat is brought forward, so a lost lease fences within a second.
+            agent.renew_at_ms = @min(agent.renew_at_ms, ctx.mono_ms() + 1000);
         }
     }
 
@@ -1025,6 +1047,9 @@ const Work = struct {
         return records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
     }
 };
+
+/// Test-only (`c1_teeth.job_stale`): the late report has been written.
+var teeth_stale_written = false;
 
 // ---- The diagnostics of a run (one function each, which the golden test also calls) ----
 
