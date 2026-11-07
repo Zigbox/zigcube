@@ -1275,8 +1275,78 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    const regress_help = "Replay the seeds of the sim-fleet issues fixed in B2 slice 1";
+    const regress = b.step("sim-c1-regress", regress_help);
+    for (regress_replays) |line| {
+        const replay = b.addRunArtifact(exe);
+        replay.addArgs(line);
+        regress.dependOn(&replay.step);
+    }
     add_fencing_teeth_step(b, sim);
 }
+
+/// The replay lines of the sim-fleet issues B2 slice 1 fixed (#135, #137, #142, #143, #151) and
+/// two `slow_store` seeds that failed while it was built. Each must pass; `sim-c1-regress`.
+const regress_replays = [_][]const []const u8{
+    &.{
+        "780935350",
+        "121",
+        "3",
+        "--c1",
+        "--lease-ttl-ms=9528",
+        "--replicas-pct=200",
+        "--heal-at=193",
+    },
+    &.{
+        "316526503",
+        "132",
+        "3",
+        "--c1",
+        "--lease-ttl-ms=9925",
+        "--replicas-pct=300",
+        "--heal-at=470",
+    },
+    &.{
+        "1784779402",
+        "134",
+        "2",
+        "--profile=slow_store",
+        "--lease-ttl-ms=9132",
+        "--replicas-pct=200",
+        "--heal-at=158",
+    },
+    &.{
+        "658857015",
+        "17",
+        "1",
+        "--profile=partitions",
+        "--lease-ttl-ms=9000",
+        "--replicas-pct=100",
+        "--heal-at=41",
+    },
+    &.{
+        "1594217185",
+        "263",
+        "4",
+        "--lease-ttl-ms=9731",
+        "--replicas-pct=300",
+        "--heal-at=270",
+    },
+    &.{
+        "31",
+        "134",
+        "2",
+        "--c1",
+        "--profile=slow_store",
+    },
+    &.{
+        "102",
+        "134",
+        "2",
+        "--c1",
+        "--profile=slow_store",
+    },
+};
 
 /// Seeds of `sim-c1-offline`; about 45 s.
 const offline_seeds_max = 30;
