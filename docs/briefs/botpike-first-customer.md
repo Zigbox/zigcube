@@ -8,6 +8,11 @@ Zigcube fact below names its file; every Zigbox fact names its file or its brief
 of both at `main` on 2026-11-04 (Zigcube `2d9d511`, Zigbox `6838c87`) and the M8 brief on Zigbox's
 branch `claude/m8-brief` (PR #54). I ran nothing.
 
+**Renumbered 2026-11-07** (docs/decisions/2026-11-07-b2-scope-decisions.md): B2 is the
+hardening release after B1, so the relay and every step after it moved up by one. The relay is
+now B3, identity B4, signed images B5, placement by tenant B6 and API identity B7. Decisions,
+retros and B1's brief written before that date keep the old numbers.
+
 Botpike's side is specified in `Botpike/app`, `docs/specs/runs-on-zigcube/` (the broker, the
 runtime port, admission, and the ledger as the record). Only what Zigcube and Zigbox must provide
 is here.
@@ -41,8 +46,8 @@ Zigcube's, not Botpike's.
 
 - **Fields:** `name`, `image` (tree digest), `source`, `command`, `env`, `limits` (as
   `Runtime.Spec`, `src/runtime.zig:94`), `deadline_ms`, `retries` (Botpike always sends 0: a
-  retry would spend again), `relay` (B2, optional), `placement` (B5, optional), and `labels`:
-  client-supplied pairs that Zigcube stores, copies into the workload identity (B3) and never
+  retry would spend again), `relay` (B3, optional), `placement` (B6, optional), and `labels`:
+  client-supplied pairs that Zigcube stores, copies into the workload identity (B4) and never
   interprets (Botpike sends `run`, `org`).
 - **States:** `pending → admitted | refused → placed → running → exited | failed | cancelled`.
   `exited` carries the exit code; `failed` carries a cause from a closed set: `oom`, `pid_limit`,
@@ -75,7 +80,7 @@ Zigcube's, not Botpike's.
 - `sim-cluster` gains jobs, and the C1 checks hold for them: no job runs on two nodes at once, an
   ended job never runs again.
 
-## B2 · The relay: a workload's only route (a slice of C4)
+## B3 · The relay: a workload's only route (a slice of C4)
 
 **What.** A network mode, `relay`, for a workload that may talk to exactly one upstream, named in
 cluster configuration (never in the API, so a compromised API client cannot point a relay
@@ -96,7 +101,7 @@ On the node:
 - `zcube-agent` (or one relay process per node that it supervises) owns the far end. It knows
   which workload each connection came from **by construction**, because each workload has its
   own listener. It never reads anything the workload sends to decide who the workload is.
-- It opens a TLS connection to the upstream and presents the workload's identity (B3).
+- It opens a TLS connection to the upstream and presents the workload's identity (B4).
 - Bounds: connections per workload, bytes per connection and idle time, each a constant,
   asserted, with a coded diagnostic when hit. Streams pass through unbuffered (model replies are
   server-sent events).
@@ -124,9 +129,9 @@ reach and in every image, so it is the fallback, not the plan.
   the test proves it for this mode).
 - A request to the relay arrives at a test upstream carrying the identity of the job that sent
   it, and only that job's.
-- After the job ends, its listener is gone and its identity is refused by the upstream (B3).
+- After the job ends, its listener is gone and its identity is refused by the upstream (B4).
 
-## B3 · Workload identity on the relay (a slice of C4)
+## B4 · Workload identity on the relay (a slice of C4)
 
 **What.** The relay proves to the upstream which workload is calling. The identity is the one
 C4 already decided (docs/decisions/2026-10-27-c4-workload-identity-binds-service-image.md):
@@ -143,7 +148,7 @@ certificate.
 **Mechanism.** The relay is the TLS **client** and presents the workload's certificate (mTLS).
 The workload never holds the key. This needs a TLS 1.3 client with a client certificate; the
 pinned std has a client but no client certificates (`docs/peer.md:4`). The client side is a
-smaller piece of the in-house TLS work than the server (which B6 needs), so it can come first.
+smaller piece of the in-house TLS work than the server (which B7 needs), so it can come first.
 
 **Interim, only if the client-certificate work slips:** the relay speaks HTTP/1.1 to the
 upstream over std's TLS client (server authentication only), one request per connection, strips
@@ -162,7 +167,7 @@ key. Owner question O2 decides whether to allow the interim at all.
 - Revocation: cancelling a job ends its relay connections within a bounded time, and since the
   certificate dies with the job's deadline, a stolen certificate is worth no more than the job.
 
-## B4 · Signed images only (a slice of C6)
+## B5 · Signed images only (a slice of C6)
 
 **What.** A job starts only from an image whose signature satisfies cluster policy, checked
 twice: by `zcube-server` when the job is admitted, and by `zcube-agent` before exec, from a
@@ -185,7 +190,7 @@ through the control plane" holds unchanged.
 another tree are each refused before any process starts, at the server, and again at the agent
 when the server is bypassed (a test writes the assignment straight into the store).
 
-## B5 · Placement by tenant
+## B6 · Placement by tenant
 
 **What.** Node labels exist (accepted at registration, at most 8, `src/agent_api.zig:680`) but
 the scheduler never reads them (order: fit, spread, locality, least allocated, name;
@@ -204,7 +209,7 @@ CS3 (tenant isolation on microVMs) later lets tenants share nodes again.
 the labels, and an exclusive node never runs another tenant's job, across node loss and
 re-registration.
 
-## B6 · Who may call the API
+## B7 · Who may call the API
 
 `zcube-server`'s writes are unauthenticated (`docs/api.md:231`, `docs/agent.md`, "Known
 limits"). Botpike's app will create and cancel jobs from the internet side of a private link.
@@ -220,14 +225,14 @@ Each step is demonstrable by itself; Botpike's spec set follows the same order.
 | Step | What | Depends on |
 |---|---|---|
 | 1 | B1 Jobs | C2 shipped |
-| 2 | B2 Relay | B1; the Zigbox `--listen-fd` change |
-| 3 | B3 Identity (mTLS client side) | B2; the in-house TLS client with certificates |
-| 4 | B4 Signed images | B1; Zigbox M8 merged and released |
-| 5 | B5 Placement by tenant | B1 |
-| 6 | B6 API identity | the in-house TLS server |
+| 2 | B3 Relay | B1; the Zigbox `--listen-fd` change |
+| 3 | B4 Identity (mTLS client side) | B3; the in-house TLS client with certificates |
+| 4 | B5 Signed images | B1; Zigbox M8 merged and released |
+| 5 | B6 Placement by tenant | B1 |
+| 6 | B7 API identity | the in-house TLS server |
 
 C3 (Rollout) and C5 (Edge) wait behind these. C3's simulation-fleet slices (`c3-sim-fleet.md`)
-can run beside them, and should, since B1 and B5 change the scheduler.
+can run beside them, and should, since B1 and B6 change the scheduler.
 
 ## The demo: `demo-b1` (or folded into `demo-c8`)
 
@@ -236,7 +241,7 @@ upstream standing in for Botpike's broker:
 
 1. Submit a signed job for tenant `a` with `relay = "botpike"`. It runs on an `a` node. The
    test upstream logs one request carrying the job's identity, digest and labels.
-2. The same job's image runs the hostile tests (B2). Each refusal prints and the job exits 0.
+2. The same job's image runs the hostile tests (B3). Each refusal prints and the job exits 0.
 3. Submit an unsigned job: `refused`, with the M8 code, before any process starts.
 4. Submit a job with a 2-second deadline that sleeps: `failed, deadline`. Cancel a running job:
    `cancelled`.
@@ -247,8 +252,8 @@ upstream standing in for Botpike's broker:
 ## Owner questions
 
 - **O1. Order.** Is the order above right, ahead of C3 and C5? (Recommended: yes. Botpike cannot
-  launch runs without B1 to B5; C3 and C5 serve no customer yet.)
-- **O2. Interim identity.** Allow B3's signed-header interim if the TLS client with certificates
+  launch runs without B1 to B6; C3 and C5 serve no customer yet.)
+- **O2. Interim identity.** Allow B4's signed-header interim if the TLS client with certificates
   is not ready, or wait for mTLS? (Recommended: wait, if the client side is days away. The
   interim makes the relay parse HTTP, which mTLS avoids entirely.)
 - **O3. Tree digests for signing.** Botpike runs `zbx pull` on its own admission host, or Zigcube
@@ -258,7 +263,7 @@ upstream standing in for Botpike's broker:
 - **O5. Where nodes run.** Botpike's runs today were to run in Fly Machines (Firecracker VMs) in
   an organisation of their own. Zigbox needs unprivileged user namespaces, cgroup v2 with user
   delegation and `uidmap` (`zbx doctor`). Nobody has checked that a Fly Machine provides them.
-  Check first, with `zbx doctor` on a Fly Machine, before B2's demo is planned around them.
+  Check first, with `zbx doctor` on a Fly Machine, before B3's demo is planned around them.
 
 ## Non-goals here
 
