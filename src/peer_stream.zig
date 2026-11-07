@@ -38,7 +38,10 @@ pub fn wall_ms(io: std.Io) u64 {
 /// A secret seed from the kernel (RB-N9); no fallback. `Entropy` is for the caller to raise.
 pub fn random_seed(io: std.Io) error{Entropy}![32]u8 {
     var seed: [32]u8 = undefined;
-    io.randomSecure(&seed) catch return error.Entropy;
+    io.randomSecure(&seed) catch |err| switch (err) {
+        error.EntropyUnavailable => return error.Entropy,
+        error.Canceled => unreachable, // Handshakes are never cancelled; see secure_random.fill.
+    };
     return seed;
 }
 
@@ -278,6 +281,7 @@ test "a connected socket has Nagle off" {
 }
 
 const Ed25519 = std.crypto.sign.Ed25519;
+const secure_random = @import("secure_random.zig");
 
 fn test_identity(ca: Ed25519.KeyPair, name: []const u8, seed: u8, now: u64) !peer.Identity {
     const key = Ed25519.KeyPair.generateDeterministic(@splat(seed)) catch
@@ -314,6 +318,19 @@ const Echo = struct {
         return true;
     }
 };
+
+test "a handshake with a failing random source is Entropy and sends nothing" {
+    // Goal: RB-N9 at the caller: no ClientHello-equivalent leaves when the kernel's source fails.
+    // Method: an Io whose `randomSecure` fails; the seed is drawn before the first write.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.failing_io(std.testing.io, &vtable);
+    const ca = Ed25519.KeyPair.generateDeterministic(@splat(1)) catch unreachable; // Fixed seed.
+    var client_id = try test_identity(ca, "node1", 2, wall_ms(std.testing.io));
+    const pair = try Pair.make();
+    defer pair.close();
+    const end = boot_ms(io) + 1000;
+    try std.testing.expectError(error.Entropy, open_client(io, pair.fds[0], &client_id, "node2", end));
+}
 
 test "a message of several records crosses a handshaken stream both ways" {
     // Goal: the handshake runs over a real socket and a message longer than one record comes

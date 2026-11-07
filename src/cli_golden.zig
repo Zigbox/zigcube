@@ -618,7 +618,7 @@ fn tls_overlong_record(diag: *diag_mod.Diag) void { // tls_client.zig
 }
 
 fn entropy_failed(diag: *diag_mod.Diag) void { // secure_random.zig
-    secure_random.raise(diag, error.EntropyUnavailable);
+    secure_random.raise(diag, "the TLS key share");
 }
 
 fn tls_cut_off(diag: *diag_mod.Diag) void { // tls_client.zig

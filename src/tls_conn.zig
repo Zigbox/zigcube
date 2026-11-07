@@ -121,7 +121,7 @@ pub const Conn = struct {
             .client_auth = options.client_auth,
         };
         inline for (.{ &config.random, &config.session_id, &config.secret }) |field| {
-            secure_random.fill(io, field, diag) catch {
+            secure_random.fill(io, field, diag, "the TLS handshake secrets") catch {
                 std.crypto.secureZero(u8, &config.secret);
                 conn.phase = .broken;
                 return error.Refused;
@@ -321,8 +321,11 @@ pub const Conn = struct {
     /// has a coded line. A connection the caller closed, or the server did, raises nothing.
     fn ended(conn: *const Conn, diag: *Diag) Error {
         assert(conn.phase == .broken);
+        // A caller that kept the diagnostic of the failure that ended the connection already
+        // has the reason; a second raise would trip `Diag.raise`'s precondition.
+        if (diag.code != null) return error.Closed;
         diag.raise(.E0816);
-        diag.cause("the TLS connection already ended; the call that ended it reported why", .{});
+        diag.cause("the TLS connection already ended; an earlier call failed or timed out", .{});
         diag.fix(.{ .sentence = "Open a new connection." });
         return error.Closed;
     }

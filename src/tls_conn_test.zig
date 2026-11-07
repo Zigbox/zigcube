@@ -11,6 +11,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const peer_stream = @import("peer_stream.zig");
 const schedule = @import("tls_schedule.zig");
+const secure_random = @import("secure_random.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
 const tls_conn = @import("tls_conn.zig");
@@ -271,6 +272,31 @@ fn echo_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expect(diag.code == null);
     try std.testing.expectError(error.Closed, conn.read(&out, end, &diag));
     try std.testing.expectError(error.Closed, conn.write("x", end, &diag));
+}
+
+test "a handshake with a failing random source is Refused with ZC-E0821, then Closed" {
+    // Goal: RB-N9 at the caller: no ClientHello is built or sent, and a later call on the dead
+    // connection with the same diagnostic is Closed and keeps the first code. Method: an Io whose
+    // `randomSecure` fails and an fd that would fail any write.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.failing_io(std.testing.io, &vtable);
+    var conn: Conn = undefined;
+    defer conn.deinit();
+    var diag = new_diag();
+    const options: tls_conn.Options = .{
+        .io = io,
+        .fd = -1,
+        .anchor = @splat(0),
+        .server_name = server_name,
+    };
+    try std.testing.expectError(error.Refused, conn.open(&options, &diag));
+    try expect_code(&diag, .E0821);
+    const end = end_in(io, deadline_ms);
+    try std.testing.expectError(error.Closed, conn.write("x", end, &diag));
+    try expect_code(&diag, .E0821);
+    var fresh = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end, &fresh));
+    try expect_code(&fresh, .E0816);
 }
 
 test "a request goes out and an answer comes back, and close sends close_notify" {

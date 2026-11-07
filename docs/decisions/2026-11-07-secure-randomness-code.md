@@ -10,5 +10,15 @@ returns an error. No path falls back to the weaker generator.
 - Why a code: the failure is real (a seccomp profile that blocks `getrandom`) and the operator's
   fix is specific; no existing code fits. Alternative was cutting RB-N9 from the slice.
 - Touched: the TLS client's random, session id and key-share secret (`tls_conn.zig`), the server CA
-  and agent peer seeds, and the peer stream's seed (`peer_stream.zig`, `peer_server.zig`).
-- Tests inject `std.Io.failing` and expect E0821 and no output bytes.
+  (the state-directory key and the in-memory key of a server with no state directory) and agent
+  peer seeds, and the peer stream's seed (`peer_stream.zig`, `peer_server.zig`, and the agent's
+  fetch path, `fetch_cli.zig`, which says E0821 once and stops trying peers).
+- The cause names what was being made ("getrandom returned an error while making the CA key"), so
+  it adds to the summary. `Canceled` is not E0821: a cancelled task is not a broken kernel, and
+  nothing here cancels the tasks that make keys, so `fill` treats it as unreachable.
+- Not secret, so still `std.Io.random`: temporary-file suffixes (`peer_files.zig`,
+  `dir_images.zig`), request ids (`cli_http.zig`) and test or simulation seeds.
+- Tests use an `Io` whose `randomSecure` fails (`secure_random.failing_io`; `std.Io.failing`
+  also fails the clock): `secure_random.fill`, `server_ca.open` with no state directory,
+  `Conn.open` (Refused, E0821, then Closed on the same diagnostic), `peer_stream.open_client`
+  (Entropy) and the fetch path's `Net.stream_failed`.

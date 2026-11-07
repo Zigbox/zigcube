@@ -513,7 +513,7 @@ fn serve(server: *Server, link: *Link) void {
         switch (err) {
             error.Closed, error.Timeout, error.Io, error.TooBig => {},
             error.Entropy => {
-                secure_random.raise(&diag, error.EntropyUnavailable);
+                secure_random.raise(&diag, "the peer handshake key");
                 show(io, &diag, server.config.verbose);
             },
             else => |refusal| {

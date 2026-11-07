@@ -363,7 +363,7 @@ test "a peer that drives the write key limit is blamed, not this client (RA-S7)"
     try std.testing.expectError(error.Refused, rig.feed(rig.peer.key_update(&buffer, true), 4096));
     try rig.expect_code(.E0815);
     const cause = rig.diag.last_cause().?;
-    try std.testing.expect(std.mem.indexOf(u8, cause, "the server asked for a KeyUpdate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cause, "the write keys reached their limit") != null);
     try std.testing.expect(std.mem.indexOf(u8, cause, "this client") == null);
 }
 

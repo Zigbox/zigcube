@@ -30,6 +30,7 @@ const fetch_worker = @import("fetch_worker.zig");
 const peer = @import("peer.zig");
 const peer_serve = @import("peer_serve.zig");
 const peer_stream = @import("peer_stream.zig");
+const secure_random = @import("secure_random.zig");
 const records = @import("records.zig");
 const store_failures = @import("store_failures.zig");
 const zigbox = @import("zigbox");
@@ -65,6 +66,9 @@ pub const Net = struct {
     peers: []const Peer,
     identity: ?peer.Identity,
     reply: []u8,
+    /// The kernel's random source failed in a handshake (ZC-E0821, said once): no more peer
+    /// streams are tried, and the registry serves the fetch.
+    entropy_failed: bool = false,
     /// The tree being fetched, for the diagnostics that name it.
     digest: []const u8 = "",
     /// Counts for the log line.
@@ -331,14 +335,27 @@ pub const Net = struct {
         return net.peer_try(index, path, out, end); // The stream was idle-closed.
     }
 
+    /// A peer stream that did not open: only the kernel's random source is said (ZC-E0821),
+    /// once; every other failure is a peer that did not answer.
+    fn stream_failed(net: *Net, err: peer_stream.Error) void {
+        if (err != error.Entropy or net.entropy_failed) return;
+        net.entropy_failed = true;
+        var diag: diag_mod.Diag = undefined;
+        diag.reset();
+        secure_random.raise(&diag, "the peer handshake key");
+        emit(net.io, &diag);
+    }
+
     fn peer_try(net: *Net, index: u8, path: []const u8, out: []u8, end: u64) PeerReply {
         const identity = net.identity orelse return .timeout;
+        if (net.entropy_failed) return .timeout;
         const conn = &net.conns[index];
         if (!conn.open) {
             const who = net.peers[index];
             const fd = peer_stream.connect(net.io, who.address, end) catch return .timeout;
-            conn.stream = peer_stream.open_client(net.io, fd, &identity, who.name, end) catch {
+            conn.stream = peer_stream.open_client(net.io, fd, &identity, who.name, end) catch |err| {
                 _ = std.os.linux.close(fd);
+                net.stream_failed(err);
                 return .timeout;
             };
             conn.fd = fd;
@@ -1563,6 +1580,20 @@ test "the progress line counts requests, bytes and the answers that were not a c
     const want = "zcube-agent fetch: progress: 7 chunk requests, 4096 bytes from peers; " ++
         "answers: busy 3, refused 3, nothing 5\n";
     try std.testing.expectEqualStrings(want, line);
+}
+
+test "a peer handshake that cannot get secure randomness is said once and stops the peers" {
+    // Goal: ZC-E0821 on the fetch path, not a peer timeout. Method: a Net whose Io fails
+    // `randomSecure`; the first Entropy sets the flag, and no stream is tried after it.
+    var net: Net = undefined;
+    net.entropy_failed = false;
+    net.io = std.testing.io;
+    net.stream_failed(error.Timeout);
+    try std.testing.expect(!net.entropy_failed);
+    net.stream_failed(error.Entropy);
+    try std.testing.expect(net.entropy_failed);
+    net.identity = null;
+    try std.testing.expectEqual(PeerReply.timeout, net.peer_try(0, "/x", &.{}, 0));
 }
 
 test "a peer that gave no bundle is named with what it answered" {

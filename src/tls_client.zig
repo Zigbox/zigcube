@@ -944,7 +944,7 @@ pub const Client = struct {
         // asking drives the write limit. That is the server's doing, not this client's.
         if (self.write.updates >= constants.tls_key_updates_per_connection_max) {
             diag.raise(.E0815);
-            diag.cause("the server asked for a KeyUpdate over {d} times", .{
+            diag.cause("the write keys reached their limit of {d} updates answering KeyUpdates", .{
                 constants.tls_key_updates_per_connection_max,
             });
             self.add_fix(diag, .E0815);
