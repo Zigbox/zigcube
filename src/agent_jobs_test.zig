@@ -788,7 +788,8 @@ test "a leftover container of an earlier job of the same name is stopped, never 
     // container of that name, labelled with a created revision before any run record, then
     // assign the new job: the running one is stopped, neither is adopted, the new run starts.
     // Teeth (checked by hand, B2 slice 1): `is_stale` returning false fails this test (the old
-    // container is adopted); returning true fails the adoption tests above (the live one is stopped).
+    // container is adopted); returning true fails the adoption tests above (the live one is
+    // stopped).
     const runtime = @import("runtime.zig");
     var rig = try Rig.start();
     defer rig.stop();

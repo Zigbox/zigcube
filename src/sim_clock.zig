@@ -127,3 +127,19 @@ test "a rate change keeps the reading continuous, and a jump only goes forward" 
     truth.advance(1_000);
     try testing.expectEqual(before + 60_000 + 990, node.clock().now_ms());
 }
+
+test "time a step spends is on the node's reading before true time catches up" {
+    // Goal: a step's calls take time on the node's clock though the true clock moves after the
+    // step (#151). Method: spend 700 ms, read, then let true time pass 300 ms: no reading goes
+    // back, and the reading is the true time since the anchor once true time is past the spend.
+    var truth: ManualClock = .{};
+    var node = NodeClock.init(truth.clock(), 0, 0, rate_ppm_max_default);
+    node.spend_until(700);
+    try testing.expectEqual(@as(u64, 700), node.clock().now_ms());
+    truth.advance(300);
+    try testing.expectEqual(@as(u64, 700), node.clock().now_ms());
+    truth.advance(400);
+    try testing.expectEqual(@as(u64, 700), node.clock().now_ms());
+    truth.advance(100);
+    try testing.expectEqual(@as(u64, 800), node.clock().now_ms());
+}
