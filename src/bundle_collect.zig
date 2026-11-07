@@ -321,6 +321,8 @@ fn gather(
             try g.keys("keys/replica.json", "/replicas/{s}/{s}", .{ service_of(name), name });
         },
         .node => try g.keys("keys/node.json", "/nodes/{s}", .{name}),
+        // Not `/jobs/<name>`: it holds the environment values and the input.
+        .job => try g.keys("keys/job-status.json", "/job-status/{s}", .{name}),
     }
     try g.keys("keys/decisions.json", "/decisions-by-subject/{s}/{s}/", .{ kind, name });
     try g.keys("keys/observed.json", "/observed/", .{});

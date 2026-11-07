@@ -7,6 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const agent_jobs = @import("agent_jobs.zig");
 const constants = @import("constants.zig");
+const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -69,8 +70,8 @@ const Rig = struct {
             .image = image,
             .command = &.{"true"},
             .deadline_ms = deadline_ms,
-            .start_by_ms = 1_000_000,
-            .created_at_ms = 0,
+            .start_by_ms = sim_world.epoch_ms + 1_000_000,
+            .created_at_ms = sim_world.epoch_ms,
             .stop = stop_asked,
         };
     }
@@ -452,6 +453,48 @@ test "a claiming record of a run that is not assigned and not claimed is removed
     try testing.expectEqual(@as(?Seen, null), try rig.observed());
 }
 
+fn stop_the_run(context: *anyopaque) void {
+    const rig: *Rig = @ptrCast(@alignCast(context));
+    rig.ask_stop(.cancel, 60_000) catch unreachable; // A test: the rig's own write cannot fail.
+}
+
+test "a claim the server refuses starts nothing, and its record goes once the run is released" {
+    // The refused-claim test of review 5797621715: the run gets a `stop` after the agent read
+    // it and before its claim commits, so the claim is refused (applied: false). Nothing is
+    // started and no observation is written; the claiming record stays while the run is
+    // assigned, and is removed once the job ends and the assignment is released.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.world.switched.before_put = .{
+        .prefix = records.prefix_job_observed,
+        .context = &rig,
+        .run = stop_the_run,
+    };
+    rig.step();
+    try testing.expect(rig.world.switched.before_put == null);
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+    const kept = (try rig.start_record()).?;
+    try testing.expectEqual(agent_jobs.Phase.claiming, kept.phase);
+    // The job ends: its assignment is released.
+    const released = [_]store.Op{.{ .delete = records.assigned_key(
+        sim_world.node_name,
+        run_id,
+    ).slice() }};
+    const done = try writers.txn(
+        rig.world.store_handle(),
+        .scheduler,
+        .{ .on_success = &released },
+        &rig.world.diag,
+    );
+    try testing.expect(done.succeeded);
+    rig.step();
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+}
+
 const hello_digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
 fn assign_with_input(rig: *Rig, input_digest: []const u8, base64: ?[]const u8) !void {
@@ -642,7 +685,6 @@ test "a claim left under an older epoch is not started under the new assignment"
 test "a spec the runtime refuses is rendered with its field and its limit" {
     // Goal: ZC-E0130's cause names the field and the limit it broke, for each problem, and the
     // deadline cause says "killed" only for a SIGKILL.
-    const diag_mod = @import("diag.zig");
     const runtime = @import("runtime.zig");
     const expected = [_]struct { runtime.SpecProblem, []const u8, []const u8 }{
         .{ .bad_name, "name:", "valid container name" },
@@ -689,4 +731,97 @@ test "a run whose input fetch keeps failing ends at its deadline, not started" {
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
     try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
     try testing.expect(!rig.running());
+    // The report names why: claimed, and the input never came (principle 4).
+    try expect_code(seen, "ZC-W0503");
+}
+
+fn assign_input_by(rig: *Rig, start_by_ms: u64) !void {
+    var run = rig.run_record(null, 60_000);
+    run.input_env = "INPUT";
+    run.input_digest = hello_digest;
+    run.start_by_ms = start_by_ms;
+    _ = try rig.assign_run(run);
+    const key = records.job_input_key(job_name);
+    _ = try rig.put(.api, key.slice(), records.JobInput{ .base64 = "aGVsbG8=" });
+}
+
+test "the input fetch's retries end at start_by_ms, not a full deadline after the claim" {
+    // Q7: a job ends within twice deadline_ms of creation. The claim lands 50 s into a 60 s
+    // start window; the fetch fails for good. The run must be reported not started by the
+    // end of the window (10 s), not 60 s after the claim.
+    var rig = try Rig.start();
+    defer rig.stop();
+    try assign_input_by(&rig, rig.world.now_ms() + 10_000);
+    rig.world.switched.down_get_prefix = records.prefix_job_input;
+    _ = rig.world.agent_step();
+    try testing.expectEqual(records.JobObservedStatus.claimed, (try rig.observed()).?.status);
+    rig.world.advance(9_000);
+    _ = rig.world.agent_step();
+    try testing.expectEqual(records.JobObservedStatus.claimed, (try rig.observed()).?.status);
+    rig.world.advance(2_000); // 11 s after the claim: past start_by_ms, far from deadline_ms.
+    _ = rig.world.agent_step();
+    _ = rig.world.agent_step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
+    try expect_code(seen, "ZC-W0503");
+    try testing.expect(!rig.running());
+}
+
+test "an input that arrives after the retry bound does not start the run" {
+    // The first pass at or after the bound finds the fetch working again: a start would arm a
+    // full deadline on top of the wait, beyond twice deadline_ms, so the run is not started.
+    // The bound is moved into the past in the start record: the simulation steps the agent at
+    // every wake, so a pass cannot be made to land late by waiting.
+    var rig = try Rig.start();
+    defer rig.stop();
+    try assign_input_by(&rig, rig.world.now_ms() + 60_000);
+    rig.world.switched.down_get_prefix = records.prefix_job_input;
+    _ = rig.world.agent_step();
+    var record = (try rig.start_record()).?;
+    try testing.expectEqual(agent_jobs.Phase.claiming, record.phase);
+    record.deadline_mono_ms = 1;
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, run_id);
+    // Not `fresh_arena`: it would reset the arena the record's strings live in.
+    const bytes = try std.json.Stringify.valueAlloc(testing.allocator, record, .{});
+    defer testing.allocator.free(bytes);
+    try rig.world.files.interface().put_atomic(name, bytes);
+    rig.world.switched.down_get_prefix = null;
+    rig.world.advance(1_000);
+    _ = rig.world.agent_step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
+}
+
+test "a late run that fetches in time starts and ends within twice deadline_ms of creation" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const created = rig.world.now_ms();
+    try assign_input_by(&rig, created + 10_000);
+    rig.world.switched.down_get_prefix = records.prefix_job_input;
+    _ = rig.world.agent_step();
+    rig.world.advance(8_000);
+    rig.world.switched.down_get_prefix = null;
+    rig.step();
+    rig.step();
+    try testing.expect(rig.running());
+    rig.world.advance(61_000); // The deadline counts from the start: 8 s + 61 s < 2 x 60 s.
+    rig.step();
+    rig.step();
+    try testing.expectEqual(@as(?records.StopCause, .deadline), (try rig.observed()).?.stop_cause);
+}
+
+test "the not_started report of an unfetchable input is a golden" {
+    var collector: diag_mod.Diag = undefined;
+    collector.reset();
+    agent_jobs.raise_not_started(&collector, "train-job", "ZC-E0504: the server answered 503");
+    try testing.expect(collector.code.? == .W0503);
+    const cause = collector.causes.slice()[0].slice();
+    try testing.expectEqualStrings(
+        "train-job was claimed, but its input could not be fetched before the deadline: " ++
+            "ZC-E0504: the server answered 503",
+        cause,
+    );
 }

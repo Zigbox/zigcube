@@ -388,8 +388,28 @@ The first answers `{revision, job, state, status}`: `job` is the spec with `env_
 values), `input_digest` and `input_bytes` (never the input), `cancel_requested`. `404` ZC-E0133 for
 a job that does not exist. The second takes `state=` (a job state, or `ended` for every terminal
 state), `label=key[=value]`, `limit=` (1 to 500, default 50), `at=` and `continue=`, and answers
-`{revision, jobs, continue}`; a filter keeps a subset of each store page, so a page may hold fewer
+`{revision, jobs, continue}` (a row of a job that was placed carries the `epoch` of its run, an unplaced ending carries none; a row of an ended job carries `ended_at_ms`, the time its status recorded the ending, set once and never changed, absent while the job has not ended); a filter keeps a subset of each store page, so a page may hold fewer
 than `limit` rows and `continue` may still be set.
+
+### `GET /v1/jobs/watch`
+
+`/v1/watch` over `/job-status/`, the values decoded to job statuses: `from=` (required, at least
+1: the first revision wanted), `timeout=` (at most 25000 ms) and `label=key[=value]`. It answers
+`{revision, events}`; each event is `{type: put|delete, name, revision, status}` (`status` is
+absent on a delete). `revision` is the bookmark: pass `revision + 1` as the next `from`, also
+when `events` is empty (a batch whose events all fell to `label` still advances it). A `label`
+keeps the events of jobs that match it at the head (the job now holding the name, a reused one included) and drops deletes. `410` ZC-E0203 when `from`
+is below the compaction point, `400` ZC-E0204 when it is beyond the head. The client's contract:
+watch; on a 410, list `state=ended`, deduplicate (a row carries the `epoch` of the run it ended
+under, none for an unplaced ending, and `ended_at_ms`; an event's `status` carries the same
+members) and watch again from the list's `revision + 1`. Every ending is then seen at least once;
+handle it by its key to see it exactly once. The key is `(name, epoch)` when `epoch` is present and
+non-zero (a store revision, unique per placed ending, so it works against any server) and
+`(name, ended_at_ms)` only for an unplaced ending, where it is the only thing that tells two
+endings of a name reused after retention apart. An absent `epoch` counts as none, an absent
+`ended_at_ms` as 0 (an older server's row; it only matters for an unplaced ending)
+(`docs/decisions/2026-11-06-job-dedupe-key-adopted.md`). The name `watch`
+is reserved: `POST /v1/jobs` refuses it with ZC-E0130.
 
 ### `POST /v1/jobs/{name}/cancel`
 

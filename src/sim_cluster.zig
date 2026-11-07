@@ -53,6 +53,11 @@ const sim_node = @import("sim_node.zig");
 const sim_store = @import("sim_store.zig");
 const sim_tap = @import("sim_tap.zig");
 const sim_world = @import("sim_world.zig");
+const job_api = @import("job_api.zig");
+const runtime = @import("runtime.zig");
+const sim_jobs = @import("sim_jobs.zig");
+const sim_jobs_watch = @import("sim_jobs_watch.zig");
+const sim_runtime = @import("sim_runtime.zig");
 const store = @import("store.zig");
 const why_mod = @import("why.zig");
 const repeat = @import("test_util.zig").repeat;
@@ -90,6 +95,8 @@ const cluster_up_ms_min: u64 = 120_000;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
 const steps_per_minute_max: u64 = 200;
+/// How often a node may fence in the healed phase: 240 s long, against about 240 for the bug.
+const fences_after_heal_per_node_max: u32 = 4;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -174,6 +181,10 @@ pub const Swarm = struct {
     w_suspend: u32,
     /// sim-c1 only: an agent freezes, with its containers still running.
     w_freeze: u32 = 0,
+    /// Jobs (`Options.jobs`): a job is submitted, cancelled, or its container ends by itself.
+    w_job_create: u32 = 0,
+    w_job_cancel: u32 = 0,
+    w_job_end: u32 = 0,
 
     /// Zero a quarter of the time, else 1 to `max`.
     fn rate(random: std.Random, max: u32) u32 {
@@ -308,6 +319,15 @@ pub const Swarm = struct {
         }
     }
 
+    /// The job workload's weights, drawn apart from the base draw (as `add_c1_faults` is).
+    fn add_jobs(swarm: *Swarm, seed: u64) void {
+        var prng = std.Random.DefaultPrng.init(seed ^ 0x10b5_0b5);
+        const r = prng.random();
+        swarm.w_job_create = 3 + r.uintLessThan(u32, 5);
+        swarm.w_job_cancel = 2 + r.uintLessThan(u32, 3);
+        swarm.w_job_end = 2 + r.uintLessThan(u32, 4);
+    }
+
     fn print(swarm: *const Swarm, report: *Report) void {
         const n = swarm.net;
         report.print("swarm: nodes={d} clock_rate_ppm_max={d} ack_loss={d}\u{2030}\n", .{
@@ -362,6 +382,9 @@ const Node = struct {
     up_ms: u64,
     /// Whether the agent's last step worked: a step that fails says why nothing moved.
     last_ok: bool,
+    /// Whether the agent's latest call to the server failed: the link was cut, as far as it can
+    /// tell (a local runtime failure is not a cut link).
+    call_failed: bool,
     /// Since when the server has had no registration of this node (its lease ran out), while
     /// the agent was up; null while it has one. The fencing invariant's clock.
     unregistered_since_ms: ?u64,
@@ -369,8 +392,16 @@ const Node = struct {
     frozen_until_ms: ?u64,
     /// sim-c1: the last true time the agent was down, frozen, or a container ignored its stop.
     last_wedged_ms: ?u64,
+    /// sim-c1, over the whole run: the true time the agent was wedged (as `wedged_now`), and the
+    /// time its link or the store was cut or its last step failed (it could not read its runs);
+    /// and the last time they were added to.
+    wedged_total_ms: u64,
+    link_cut_total_ms: u64,
+    cut_mark_ms: u64,
     /// Times the agent fenced itself, over the whole run (all agent lives).
     fences: u32,
+    /// `fences` when the heal began.
+    fences_at_heal: u32,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -402,6 +433,7 @@ const Node = struct {
         const node: *Node = @ptrCast(@alignCast(context));
         const net = &node.cluster.net;
         const result = net.transport(node.index).call(arena, request, diag);
+        node.call_failed = if (result) |_| false else |_| true;
         node.spent_ms += net.last_call_ms;
         return result;
     }
@@ -531,7 +563,12 @@ const Node = struct {
             };
         }
         node.resume_ms = node.cluster.manual.ms + node.spent_ms;
-        if (failed) node.loop.watch_failed() else node.loop.watch_done(ended);
+        if (failed) {
+            // A hold that failed backs the agent off, up to the retry maximum, before its next
+            // step: a deadline falling meanwhile waits for it, which is a cut link's delay.
+            node.link_cut_total_ms += constants.server_retry_ms_max;
+            node.loop.watch_failed();
+        } else node.loop.watch_done(ended);
         return ended;
     }
 
@@ -694,6 +731,13 @@ pub const Cluster = struct {
     overlap_count: u32,
     overlap_worst_ms: u64,
     overlap_wedged_worst_ms: u64,
+    /// The job workload is on (`Options.jobs`); the ledger and trackers' state; the next number.
+    jobs_on: bool,
+    jobs: sim_jobs.State,
+    /// J4: the client that follows the job endings through the watch, and its own random stream.
+    jobs_watch: sim_jobs_watch.State,
+    watch_prng: std.Random.DefaultPrng,
+    job_next: u32,
 
     pub fn create(
         gpa: Allocator,
@@ -739,6 +783,30 @@ pub const Cluster = struct {
         c.instance_next = 1;
         c.request_next = 1;
         c.dropped_before_restart = 0;
+        c.init_trackers();
+        c.second_ms = 0;
+        c.check_ms = 0;
+        c.stats = .{};
+        c.fault_totals = null;
+        c.step = "faults";
+        c.on_step = null;
+        c.liveness = true;
+        c.report = report;
+        c.jobs_on = false;
+        c.jobs = .{};
+        c.jobs_watch = .{};
+        c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
+        c.job_next = 1;
+        c.init_c1(gpa);
+        c.server = control_plane.ControlPlane.init(c.take_instance());
+        c.server.check_i6 = true;
+        c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
+        for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
+        return c;
+    }
+
+    /// The per-tick trackers start empty.
+    fn init_trackers(c: *Cluster) void {
         c.excess = undefined;
         c.excess_count = 0;
         c.excess_last_ms = epoch_ms;
@@ -750,20 +818,6 @@ pub const Cluster = struct {
         c.checked_dropped = 0;
         c.i6_violations = 0;
         c.i7_revision = 0;
-        c.second_ms = 0;
-        c.check_ms = 0;
-        c.stats = .{};
-        c.fault_totals = null;
-        c.step = "faults";
-        c.on_step = null;
-        c.liveness = true;
-        c.report = report;
-        c.init_c1(gpa);
-        c.server = control_plane.ControlPlane.init(c.take_instance());
-        c.server.check_i6 = true;
-        c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
-        for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
-        return c;
     }
 
     /// The state sim-c1 keeps (`Options.c1` turns the checks on).
@@ -803,6 +857,8 @@ pub const Cluster = struct {
             if (skewed) skew_beyond_ppm else @max(c.swarm.clock_ppm, 1),
         );
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
+        node.sim.containers.on_start = job_started;
+        node.sim.containers.on_start_context = node;
         node.agent.init(node.config());
         // Its own generator: the store's contents must not move the cluster's stream.
         var store_prng = std.Random.DefaultPrng.init(c.seed ^ (0x5f5f0000 + index));
@@ -826,10 +882,15 @@ pub const Cluster = struct {
         node.crashes = 0;
         node.ok_steps = 0;
         node.last_ok = true;
+        node.call_failed = false;
         node.unregistered_since_ms = null;
         node.frozen_until_ms = null;
         node.last_wedged_ms = null;
+        node.wedged_total_ms = 0;
+        node.link_cut_total_ms = 0;
+        node.cut_mark_ms = c.manual.ms;
         node.fences = 0;
+        node.fences_at_heal = 0;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -973,6 +1034,7 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
+            if (c.c1 and c.jobs_on) c.watch_client();
             if (c.c1) {
                 c.note_wedged();
                 track_overlap(c) catch return;
@@ -994,6 +1056,31 @@ pub const Cluster = struct {
                 safety(c) catch return; // The report says what failed.
             }
         }
+    }
+
+    /// J4's client, once per poll: it is killed now and then, away for less than a minute or for
+    /// minutes, and resumes from its revision. The simulation compacts to the head every 60 s,
+    /// so even a short absence can end in a 410 (relist and dedupe); the real keep window is
+    /// not simulated, and a plain in-window resume is the rarer path here.
+    fn watch_client(c: *Cluster) void {
+        const w = &c.jobs_watch;
+        const now = c.manual.ms;
+        if (now < w.away_until_ms or now < w.next_poll_ms) return;
+        const random = c.watch_prng.random();
+        w.next_poll_ms = now + 1000 + random.uintLessThan(u32, 4000);
+        if (random.uintLessThan(u32, 60) == 0) {
+            const long = random.uintLessThan(u32, 4) == 0;
+            const span: u64 = if (long)
+                60_000 + random.uintLessThan(u32, 600_000)
+            else
+                1000 + random.uintLessThan(u32, 59_000);
+            w.away_until_ms = now + span;
+            w.restarts += 1;
+            return;
+        }
+        if (store_faulty(c)) return;
+        const ctx = c.controller_context();
+        sim_jobs_watch.poll(w, &c.api, &ctx);
     }
 
     fn node_named(c: *const Cluster, name: []const u8) ?*Node {
@@ -1144,7 +1231,15 @@ pub const Cluster = struct {
 
     fn note_wedged(c: *Cluster) void {
         for (c.nodes) |node| {
-            if (wedged_now(node)) node.last_wedged_ms = c.manual.ms;
+            const passed = c.manual.ms - node.cut_mark_ms;
+            node.cut_mark_ms = c.manual.ms;
+            if (wedged_now(node)) {
+                node.last_wedged_ms = c.manual.ms;
+                node.wedged_total_ms += passed;
+            }
+            if (node.partitioned_until_ms != null or store_faulty(c) or node.call_failed) {
+                node.link_cut_total_ms += passed;
+            }
         }
     }
 
@@ -1242,12 +1337,147 @@ pub const Cluster = struct {
         }
     }
 
+    fn create_job(c: *Cluster) void {
+        const random = c.prng.random();
+        var name_buffer: [16]u8 = undefined;
+        // "jb-" and a u32 fit.
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
+        c.job_next += 1;
+        var buffer: [16]u8 = undefined;
+        const id = c.request_id(&buffer);
+        const ctx = c.controller_context();
+        const long = random.uintLessThan(u32, 4) == 0;
+        _ = job_api.create(&ctx, &c.api_source, .{
+            .name = name,
+            .image = hello_digest,
+            .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
+            .limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 20 },
+            .deadline_ms = if (long) 600_000 else 3000 + random.uintLessThan(u32, 40_000),
+            .grace_ms = random.uintLessThan(u32, 2000),
+            .submit_by_ms = c.manual.ms + 5000 + random.uintLessThan(u32, 20_000),
+            .applied_by = "alex@laptop",
+            .request_id = id,
+        }) catch {
+            c.diag.reset();
+            return;
+        };
+        c.jobs.created += 1;
+    }
+
+    /// The job of a random live job container, copied into `buffer`; null if none runs. Half of
+    /// the cancels go to a running job, so that the stop reaches an agent holding a container.
+    fn live_job(c: *Cluster, buffer: []u8) ?[]const u8 {
+        var live: u32 = 0;
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                live += @intFromBool(container.phase != .stopped and job_of(container) != null);
+            }
+        }
+        if (live == 0) return null;
+        var pick = c.prng.random().uintLessThan(u32, live);
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                const job = job_of(container) orelse continue;
+                if (container.phase == .stopped) continue;
+                if (pick > 0) {
+                    pick -= 1;
+                    continue;
+                }
+                if (job.len > buffer.len) return null;
+                @memcpy(buffer[0..job.len], job);
+                return buffer[0..job.len];
+            }
+        }
+        return null;
+    }
+
+    /// A running job three times in four; else the newest job a third of the time, else any
+    /// made so far.
+    fn cancel_job(c: *Cluster) void {
+        if (c.job_next == 1) return;
+        const random = c.prng.random();
+        var name_buffer: [16]u8 = undefined;
+        const live = if (random.uintLessThan(u32, 4) != 0) c.live_job(&name_buffer) else null;
+        const name = live orelse name: {
+            const number = if (random.uintLessThan(u32, 3) == 0)
+                c.job_next - 1
+            else
+                1 + random.uintLessThan(u32, c.job_next - 1);
+            // "jb-" and a u32 fit.
+            break :name std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch unreachable;
+        };
+        var buffer: [16]u8 = undefined;
+        const id = c.request_id(&buffer);
+        const ctx = c.controller_context();
+        _ = job_api.cancel(&ctx, &c.api_source, name, "alex@laptop", id) catch {
+            c.diag.reset();
+            return;
+        };
+        c.jobs.cancelled += 1;
+    }
+
+    /// A job's container ends by itself: it exits, is killed, runs out of memory or of pids.
+    fn end_job(c: *Cluster) void {
+        var live: u32 = 0;
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                live += @intFromBool(container.phase != .stopped and job_of(container) != null);
+            }
+        }
+        if (live == 0) return;
+        const random = c.prng.random();
+        var pick = random.uintLessThan(u32, live);
+        const fault: sim_runtime.Fault = switch (random.uintLessThan(u32, 5)) {
+            0, 1 => .{ .exit = 0 },
+            2 => .{ .exit = 1 },
+            3 => .{ .signal = 9 },
+            else => .oom,
+        };
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                if (container.phase == .stopped or job_of(container) == null) continue;
+                if (pick > 0) {
+                    pick -= 1;
+                    continue;
+                }
+                node.sim.containers.inject(container.name, fault) catch return;
+                c.jobs.ended += 1;
+                return;
+            }
+        }
+    }
+
     fn pick_node(c: *Cluster) *Node {
         // A `u32` draw: the stream is the same on every target, which `usize` would not give.
         const count: u32 = @intCast(c.nodes.len);
         return c.nodes[c.prng.random().uintLessThan(u32, count)];
     }
 };
+
+/// The job a container belongs to, from its label; null for a replica's container.
+fn job_of(container: anytype) ?[]const u8 {
+    for (container.labels) |label| {
+        if (std.mem.eql(u8, label.key, runtime.label_job)) return label.value;
+    }
+    return null;
+}
+
+/// A node's runtime is about to start a container: the ledger judges it (J2, J7) against the
+/// store as committed, read beneath the faults.
+fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
+    const node: *Node = @ptrCast(@alignCast(context));
+    const c = node.cluster;
+    if (!c.jobs_on) return;
+    _ = c.tap_arena.reset(.retain_capacity);
+    c.tap_diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.tap.inner,
+        .clock = c.manual.clock(),
+        .arena = c.tap_arena.allocator(),
+        .diag = &c.tap_diag,
+    };
+    sim_jobs.note_start(&c.jobs, &ctx, node.name(), node.agent.tenure, spec);
+}
 
 /// The tap's `after`: checks the revision a call just made (`sim_c1.at_revision`).
 fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revision) void {
@@ -1264,6 +1494,9 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         .diag = &c.tap_diag,
     };
     if (request) |txn| c.recorder.record_request(&ctx, txn);
+    if (request) |txn| {
+        if (c.jobs_on) sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+    }
     if (c.c1_violation != null) return;
     if (request != null) {
         if (c.c1_pending) |found| {
@@ -1288,6 +1521,7 @@ fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
         inject(context, request);
     }
     if (c1_teeth.stale_observation) inject_reregistration(c, request);
+    if (c1_teeth.job_double) inject_run_stop(c, request);
     _ = c.tap_arena.reset(.retain_capacity);
     c.tap_diag.reset();
     const ctx: controller.Context = .{
@@ -1319,6 +1553,36 @@ fn inject(context: *anyopaque, request: store.TxnRequest) void {
             rest[0..slash],
             allocation_node_revision(c, request, rest[0..slash]),
         );
+    }
+}
+
+/// Another writer commits a run's `stop`, once, just ahead of the scheduler's first placement of a
+/// run: the compare of the run, which the negative test leaves out, would have refused it (J5).
+fn inject_run_stop(c: *Cluster, request: store.TxnRequest) void {
+    if (c.injected) return;
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_assigned)) continue;
+        const rest = put.key[records.prefix_assigned.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
+        const job = records.job_of_run(rest[slash + 1 ..]) orelse continue;
+        c.injected = true;
+        var arena = std.heap.ArenaAllocator.init(c.gpa);
+        defer arena.deinit();
+        var scratch: Diag = undefined;
+        scratch.reset();
+        const key = records.job_run_key(job);
+        const got = c.tap.inner.get(arena.allocator(), key.slice(), null, &scratch) catch return;
+        const kv = got.kv orelse return;
+        var run = records.read(records.JobRun, arena.allocator(), kv, &scratch) catch return;
+        run.stop = .{ .cause = .cancel, .at_ms = c.manual.ms };
+        const bytes = records.encode(arena.allocator(), run, &scratch) catch return;
+        const ops = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = bytes } }};
+        _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
+        return;
     }
 }
 
@@ -1502,6 +1766,9 @@ const Op = enum {
     suspend_node,
     /// sim-c1 only: an agent stops taking steps for a while, its containers keep running.
     freeze,
+    job_create,
+    job_cancel,
+    job_end,
 };
 
 /// With `faults_on` false (after the heal) the fault operations get no weight.
@@ -1512,6 +1779,7 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
         swarm.w_delete,     swarm.w_broken,        swarm.w_runtime * f,
         swarm.w_crash * f,  swarm.w_partition * f, swarm.w_outage * f,
         swarm.w_server * f, swarm.w_suspend * f,   swarm.w_freeze * f,
+        swarm.w_job_create, swarm.w_job_cancel,    swarm.w_job_end,
     };
     comptime assert(weights.len == @typeInfo(Op).@"enum".field_names.len);
     var total: u32 = 0;
@@ -1563,6 +1831,9 @@ fn operation(c: *Cluster) void {
                 node.frozen_until_ms = c.manual.ms + span;
             }
         },
+        .job_create => c.create_job(),
+        .job_cancel => c.cancel_job(),
+        .job_end => c.end_job(),
     }
     c.advance(100);
 }
@@ -1731,6 +2002,7 @@ fn safety(c: *Cluster) Failure!void {
     try invariants(c);
     try track_excess(c);
     try track_fencing(c);
+    try track_jobs(c);
 }
 
 /// I3 (docs/authority.md §3): no container runs on a node the server has given up on for longer
@@ -1873,7 +2145,7 @@ fn track_unassigned(
     var count: u32 = 0;
     for (c.nodes) |node| {
         for (node.sim.containers.containers.items) |container| {
-            if (container.phase == .stopped) continue;
+            if (container.phase == .stopped or job_of(container) != null) continue;
             if (assigned_to(replicas, homes, node.name(), container.name)) continue;
             const hash = std.hash.Wyhash.hash(0, container.name);
             var accrued = excess_accrued(c, node.index, hash);
@@ -1928,6 +2200,182 @@ fn track_starved(
     c.starved_count = count;
 }
 
+/// A run's record and its job's status, read from the store as it is.
+fn job_run_of(ctx: *const controller.Context, job: []const u8) ?records.JobRun {
+    const key = records.job_run_key(job);
+    const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
+    const kv = got.kv orelse return null;
+    return records.read(records.JobRun, ctx.arena, kv, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
+}
+
+fn job_status_of(ctx: *const controller.Context, job: []const u8) ?records.JobStatus {
+    const key = records.job_status_key(job);
+    const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
+    const kv = got.kv orelse return null;
+    return records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch {
+        ctx.diag.reset();
+        return null;
+    };
+}
+
+fn watch_of(c: *const Cluster, node: u32, name_hash: u64) ?sim_jobs.Watch {
+    for (c.jobs.watch[0..c.jobs.watch_count]) |watch| {
+        if (watch.node == node and watch.name_hash == name_hash) return watch;
+    }
+    return null;
+}
+
+/// The checks that hold the running job containers to a bound, on true time, unless the node was
+/// wedged lately (as I1b: its agent down or frozen, or a container ignoring a stop; a cut link
+/// is not wedged, J8's bound has a term for it): J1 (no container runs long past its job's
+/// terminal status), J6 (a run with a `stop` is not executing after the stop bound) and J8 (no
+/// run executes past its deadline and grace, with the kill and the clocks' rate error). The
+/// start ledger's verdict (J2, J7) is reported here too.
+fn track_jobs(c: *Cluster) Failure!void {
+    if (!c.jobs_on) return;
+    try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
+    try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
+    if (store_faulty(c)) return;
+    var scratch = std.heap.ArenaAllocator.init(c.gpa);
+    defer scratch.deinit();
+    c.diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.store_handle(),
+        .clock = c.manual.clock(),
+        .arena = scratch.allocator(),
+        .diag = &c.diag,
+    };
+    var next: [sim_jobs.watch_max]sim_jobs.Watch = undefined;
+    var count: u32 = 0;
+    for (c.nodes) |node| {
+        for (node.sim.containers.containers.items) |container| {
+            if (container.phase == .stopped) continue;
+            const job = job_of(container) orelse continue;
+            const hash = std.hash.Wyhash.hash(0, container.name);
+            var watch = watch_of(c, node.index, hash) orelse sim_jobs.Watch{
+                .node = node.index,
+                .name_hash = hash,
+                .first_seen_ms = c.manual.ms,
+                .ended_since_ms = null,
+            };
+            if (watch_of(c, node.index, hash) == null) {
+                watch.wedged_base_ms = node.wedged_total_ms;
+                watch.link_base_ms = node.link_cut_total_ms;
+            }
+            const run = job_run_of(&ctx, job);
+            if (run) |known| note_marks(c, known, node, &watch);
+            if (!c.wedged_lately(node)) try judge_job_container(c, &ctx, job, node, &watch, run);
+            if (count == sim_jobs.watch_max) continue;
+            next[count] = watch;
+            count += 1;
+        }
+    }
+    @memcpy(c.jobs.watch[0..count], next[0..count]);
+    c.jobs.watch_count = count;
+}
+
+fn note_marks(
+    c: *const Cluster,
+    run: records.JobRun,
+    node: *const Node,
+    watch: *sim_jobs.Watch,
+) void {
+    const stopped = run.stop != null;
+    sim_jobs.note_marks(
+        watch,
+        c.manual.ms,
+        run.deadline_ms,
+        stopped,
+        c.api.lease_ttl_ms,
+        node.wedged_total_ms,
+        node.link_cut_total_ms,
+    );
+}
+
+fn judge_job_container(
+    c: *Cluster,
+    ctx: *const controller.Context,
+    job: []const u8,
+    node: *const Node,
+    watch: *sim_jobs.Watch,
+    found: ?records.JobRun,
+) Failure!void {
+    const now = c.manual.ms;
+    const run = found orelse return;
+    const cut = sim_jobs.cut_since(watch, node.wedged_total_ms, node.link_cut_total_ms);
+    const granularity = tick_ms + 2 * check_interval_ms;
+    const bound = sim_jobs.deadline_bound_ms(
+        run.deadline_ms,
+        run.grace_ms,
+        c.swarm.clock_ppm,
+        c.api.lease_ttl_ms,
+        granularity,
+        cut,
+    );
+    c.jobs.deadline_worst_ms = @max(c.jobs.deadline_worst_ms, (now - watch.first_seen_ms) -|
+        (run.deadline_ms + run.grace_ms));
+    try check(c, now - watch.first_seen_ms <= bound, "J8: a run kept executing past its " ++
+        "deadline, its grace and the kill");
+    if (run.stop) |stop| {
+        const stop_bound = sim_jobs.stop_bound_ms(c.api.lease_ttl_ms, run.grace_ms, granularity);
+        const base = watch.stop_wedged_base_ms orelse node.wedged_total_ms;
+        const since = (now -| stop.at_ms) -| (node.wedged_total_ms - base);
+        c.jobs.stop_worst_ms = @max(c.jobs.stop_worst_ms, since);
+        try check(c, since <= stop_bound, "J6: a run kept executing after its stop committed, " ++
+            "past the bound");
+    }
+    const status = job_status_of(ctx, job) orelse return;
+    if (!records.job_state_terminal(status.state)) return;
+    const ended = watch.ended_since_ms orelse now;
+    watch.ended_since_ms = ended;
+    c.jobs.overlap_worst_ms = @max(c.jobs.overlap_worst_ms, now - ended);
+    try check(c, now - ended <= overlap_ms_max, "J1: a container kept executing after its " ++
+        "job reached a terminal status");
+}
+
+/// After the heal, with the world settled: no live container of an ended job, and no run still
+/// open long after the latest it could have started and run (J1, J8 at rest).
+fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    const job_runs = controller.list_all(
+        records.JobRun,
+        ctx,
+        records.prefix_job_runs,
+        null,
+        constants.jobs_max,
+    ) catch return check(c, false, "the job job_runs cannot be read");
+    for (job_runs.items) |entry| {
+        const run = &entry.rec;
+        const status = job_status_of(ctx, run.job) orelse
+            return check(c, false, "a job run has no status");
+        if (!records.job_state_terminal(status.state)) {
+            const late = run.start_by_ms + run.deadline_ms + run.grace_ms + 30_000;
+            try check(c, c.manual.ms <= late, "J8: a run is still open long after its deadline");
+            continue;
+        }
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                if (container.phase == .stopped) continue;
+                const live = job_of(container) orelse continue;
+                try check(c, !std.mem.eql(u8, live, run.job), "J1: a container of an ended " ++
+                    "job is still alive");
+            }
+        }
+    }
+    // J4: the watching client, back from any outage, has seen every ending the store committed.
+    const head = ctx.store.status(ctx.diag) catch return check(c, false, "the head is unreadable");
+    sim_jobs_watch.finish(&c.jobs_watch, &c.api, ctx, head.revision);
+    try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
+}
+
 /// Every fault off; the agents come back up as time passes. Ends the fault phase.
 fn heal(c: *Cluster) void {
     c.fault_totals = c.phase_totals();
@@ -1938,6 +2386,7 @@ fn heal(c: *Cluster) void {
     for (c.nodes) |node| {
         node.partitioned_until_ms = null;
         node.frozen_until_ms = null;
+        node.fences_at_heal = node.fences;
     }
 }
 
@@ -2003,6 +2452,7 @@ fn converged(c: *Cluster) Failure!void {
         }
     }
     try no_strays(c, &ctx, &homes);
+    if (c.jobs_on) try jobs_converged(c, &ctx);
 }
 
 /// Every container alive on any node is the container of a replica placed on that node.
@@ -2016,7 +2466,7 @@ fn no_strays(c: *Cluster, ctx: *const controller.Context, homes: *const Homes) F
     ) catch return check(c, false, "the replicas cannot be read");
     for (c.nodes) |node| {
         for (node.sim.containers.containers.items) |container| {
-            if (container.phase == .stopped) continue;
+            if (container.phase == .stopped or job_of(container) != null) continue;
             const mine = assigned_to(replicas.items, homes, node.name(), container.name);
             try check(c, mine, "a container is left behind");
         }
@@ -2166,6 +2616,9 @@ pub const Options = struct {
     lease_ttl_ms: ?u32 = null,
     /// The workload's replica counts as a percentage of the base ones. Null: 100.
     replicas_pct: ?u32 = null,
+    /// The job workload (docs/briefs/b1.md): jobs are submitted and cancelled, their containers
+    /// end, and J1 to J3 and J5 to J8 are checked (J3 and J5 under `c1`).
+    jobs: bool = true,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -2241,6 +2694,13 @@ pub fn simulate(
     });
     c.liveness = options.liveness;
     c.c1 = options.c1;
+    c.jobs_on = options.jobs;
+    if (c.jobs_on) {
+        c.swarm.add_jobs(seed);
+        report.print("jobs: on; weights create={d} cancel={d} end={d}\n", .{
+            c.swarm.w_job_create, c.swarm.w_job_cancel, c.swarm.w_job_end,
+        });
+    }
     if (c.c1) {
         c.swarm.add_c1_faults(seed);
         report.print("sim-c1: every revision checked (I1a I2 I3 I4 I6 I7), overlaps bounded " ++
@@ -2283,6 +2743,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         if (c.report.failed) return error.StepFailed;
         c.enter("convergence");
         try converged(c);
+        try fencing_settles(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
@@ -2321,6 +2782,23 @@ fn busiest_node_rate(c: *const Cluster) u64 {
         busiest = @max(busiest, @as(u64, node.all_steps) * 60_000 / node.all_up_ms);
     }
     return busiest;
+}
+
+fn total_fences(c: *const Cluster) u32 {
+    var fences: u32 = 0;
+    for (c.nodes) |node| fences += node.fences;
+    return fences;
+}
+
+/// A healed cluster stops fencing (issue #78): once the faults have ended, a node may still
+/// fence for a lease it lost, and again for one that ran out while its renewal waited out a
+/// back-off, but not once a second for the rest of the run. Each node gets
+/// `fences_after_heal_per_node_max`.
+fn fencing_settles(c: *Cluster) Failure!void {
+    var worst: u32 = 0;
+    for (c.nodes) |node| worst = @max(worst, node.fences - node.fences_at_heal);
+    try check(c, worst <= fences_after_heal_per_node_max, "agents kept fencing after the " ++
+        "cluster healed (a lease renewal that cannot beat its fence)");
 }
 
 /// An agent that never sleeps (a wake time that is always now) passes every other check and
@@ -2428,8 +2906,7 @@ fn print_summary(c: *Cluster) void {
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
         total.parked,    total.delivered_late,   total.partitioned,
     });
-    var fences: u32 = 0;
-    for (c.nodes) |node| fences += node.fences;
+    const fences = total_fences(c);
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
     report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
         "counted otherwise)\n", .{
@@ -2455,7 +2932,26 @@ fn print_summary(c: *Cluster) void {
             n.recorded, n.complete, n.truncated, n.dropped, n.keys_deleted, n.keys_changed,
         });
     }
+    if (c.jobs_on) print_jobs(c);
     report.print("world hash: {x:0>16}\n", .{world_hash(c)});
+}
+
+fn print_jobs(c: *Cluster) void {
+    const j = &c.jobs;
+    c.report.print("jobs: created={d} cancelled={d} ended={d}; starts judged={d} ledger={d} " ++
+        "unjudged={d}\n", .{
+        j.created, j.cancelled, j.ended, j.starts_judged, j.ledger_count, j.ledger_full,
+    });
+    c.report.print("jobs: worst stop {d} ms, overlap {d} ms, past deadline {d} ms; " ++
+        "status rewrites judged={d} placements judged={d}\n", .{
+        j.stop_worst_ms,               j.overlap_worst_ms,
+        j.deadline_worst_ms,           c.c1_tally.job_statuses_judged,
+        c.c1_tally.runs_placed_judged,
+    });
+    const w = &c.jobs_watch;
+    c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{
+        w.truth_count, w.handled_count, w.watches, w.relists, w.restarts,
+    });
 }
 
 fn print_phases(c: *Cluster) void {

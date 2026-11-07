@@ -17,7 +17,7 @@ export function createMockTransport(engine, faults) {
     return reply(status, { request_id: requestId, diagnostics }, requestId);
   }
 
-  async function request(method, url, { signal } = {}) {
+  async function request(method, url, { signal, body } = {}) {
     const requestId = engine.newRequestId();
     await sleep(LATENCY_MS[0] + Math.random() * (LATENCY_MS[1] - LATENCY_MS[0]));
     if (faults.apiDown) throw new TypeError("Failed to fetch");
@@ -25,6 +25,7 @@ export function createMockTransport(engine, faults) {
     const u = new URL(url, "http://mock.local");
     const q = u.searchParams;
     const path = u.pathname;
+    let m;
     try {
       if (path === "/v1/status") return reply(200, status(), requestId);
       if (!engine.storeUp) return fail(503, [engine.storeDiagnostic()], requestId);
@@ -35,15 +36,25 @@ export function createMockTransport(engine, faults) {
         const pulls = engine.pullList(q.get("node"), limit);
         return reply(200, { pulls, skipped: 0, matched: engine.pullList(q.get("node"), 500).length, truncated: false, revision: engine.rev }, requestId);
       }
+      if (path === "/v1/jobs") {
+        if (method === "POST") { const r = engine.jobs.submit(body ?? {}); return reply(r.status, r.body, requestId); }
+        return reply(200, engine.jobs.list(q), requestId);
+      }
+      m = path.match(/^\/v1\/jobs\/([\w-]+)(\/cancel)?$/);
+      // `/v1/jobs/watch` is the watch stream's route, not a job named "watch"; a job is read with GET only.
+      if (m && m[1] !== "watch" && (m[2] ? method === "POST" : method === "GET")) {
+        if (m[2]) { const r = engine.jobs.cancel(m[1], body?.applied_by); return reply(r.status, r.body, requestId); }
+        return reply(200, engine.jobs.get(m[1]), requestId);
+      }
       if (path === "/v1/leases") return reply(200, leases(), requestId);
       if (path === "/v1/watch") return await watch(q, signal, requestId);
       if (path === "/v1/codes") return reply(200, { codes: CODES.map(({ code, severity, blame, summary }) => ({ code, severity, blame, summary })) }, requestId);
-      let m = path.match(/^\/v1\/explain\/([\w-]+)$/);
+      m = path.match(/^\/v1\/explain\/([\w-]+)$/);
       if (m) {
         const found = CODES.find(c => c.code === m[1]);
         return found ? reply(200, found, requestId) : fail(404, [diagNotFound(`code ${m[1]}`)], requestId);
       }
-      m = path.match(/^\/v1\/why\/(service|replica|node)\/([\w.-]+)$/);
+      m = path.match(/^\/v1\/why\/(service|replica|node|job)\/([\w.-]+)$/);
       if (m) return reply(200, why(m[1], m[2], q.get("decision")), requestId);
       return fail(404, [diagNotFound(`route ${path}`)], requestId);
     } catch (e) {
@@ -166,10 +177,28 @@ export function createMockTransport(engine, faults) {
     if (c.kind === "observed") {
       const live = engine.get(c.key);
       const diagnostic = d.cause_diagnostic || live?.diagnostic || null;
+      if (c.key.startsWith("/job-observed/")) {
+        // The words of src/why.zig `observed_step`: no exit, the report's diagnostic beside them.
+        const text = live ? `${live.run} on ${live.node}: ${live.status}` : `${c.key} as it was at revision ${c.revision}`;
+        return { type: "observed", key: c.key, revision: c.revision, text, diagnostic };
+      }
       const o = c.key.startsWith("/observed/") ? live : null;
       if (c.key.startsWith("/nodes/")) return { type: "observed", key: c.key, revision: c.revision, text: `node ${c.key.split("/").pop()} registered under lease ${engine.getKv(c.key)?.lease ?? "?"} (revision ${c.revision})`, diagnostic: null };
       const text = o ? `${o.replica} on ${o.node}: ${o.status}${o.exit ? " (" + engine.exitText(o.exit) + ")" : ""}` : `${c.key} as it was at revision ${c.revision}`;
       return { type: "observed", key: c.key, revision: c.revision, text, diagnostic };
+    }
+    if (c.kind === "desired" && c.key.startsWith("/jobs/")) {
+      const j = engine.get(c.key);
+      const text = j ? `job ${j.name} was submitted by ${j.applied_by || "someone"}: deadline ${j.deadline_ms} ms${j.cancel_requested ? ", cancel requested" : ""}` : `submit of ${c.key} (revision ${c.revision})`;
+      return { type: "desired", key: c.key, revision: c.revision, text, applied_by: j?.applied_by || null, request_id: null };
+    }
+    if (c.kind === "desired" && (c.key.startsWith("/job-runs/") || c.key.startsWith("/assigned/"))) {
+      // The words of src/why.zig `desired_step`, which reads a run and an assignment as what they
+      // are (docs/decisions/2026-11-06-why-job-desired-keys.md). The mock reads the record now.
+      const v = engine.getKv(c.key)?.value;
+      const text = c.key.startsWith("/assigned/") ? `${c.key} exists`
+        : `run ${v?.id ?? c.key.split("/").pop()} of job ${v?.job ?? "?"} was created: deadline ${v?.deadline_ms ?? 0} ms${v?.stop ? ", stopped" : ""}`;
+      return { type: "desired", key: c.key, revision: c.revision, text, applied_by: null, request_id: null };
     }
     if (c.kind === "desired") {
       const kv = engine.getKv(c.key);
@@ -198,6 +227,15 @@ export function createMockTransport(engine, faults) {
       const o = engine.observedOf(r);
       const st = !r.node ? "unscheduled" : !o ? `pending on ${r.node}` : o.status === "stopped" ? `${engine.exitText(o.exit)} on ${r.node}` : `${o.status} on ${r.node}`;
       return { exists: true, health: o?.status === "running" ? "healthy" : o?.status === "stopped" ? "failing" : "degraded", text: `replica ${name}: ${st}` };
+    }
+    if (kind === "job") {
+      const j = engine.get(`/jobs/${name}`);
+      if (!j) return { exists: false, health: "gone", text: `job ${name}: removed` };
+      const st = engine.jobs.statusOf(name);
+      const ended = engine.jobs.ended(name);
+      const health = !ended ? "healthy" : st.state === "exited" && st.end.code === 0 ? "healthy" : "failing";
+      const text = !st ? `job ${name}: pending, ${j.cancel_requested ? "cancel requested" : "not yet placed"}` : `job ${name}: ${st.state}`;
+      return { exists: true, health, text };
     }
     const n = engine.get(`/nodes/${name}`);
     if (!n) return { exists: false, health: "gone", text: `node ${name}: not registered` };

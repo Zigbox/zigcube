@@ -77,3 +77,20 @@ pub fn observed(ctx: *const Context, record: *const records.Observed) controller
         .exit = record.exit, // The object keys.md documents: {"kind":"signaled","signal":9}.
     });
 }
+
+/// A job run's report as the decision read it: its status and exit, not the diagnostic, which the
+/// decision copies on its own (`cause_diagnostic`).
+pub fn job_observed(
+    ctx: *const Context,
+    record: *const records.JobObserved,
+) controller.Error!records.Raw {
+    return render(ctx, .{
+        .run = record.run,
+        .node = record.node,
+        .assignment = record.assignment,
+        .tenure = record.tenure,
+        .status = @tagName(record.status),
+        .exit = record.exit,
+        .stop_cause = if (record.stop_cause) |cause| @tagName(cause) else null,
+    });
+}

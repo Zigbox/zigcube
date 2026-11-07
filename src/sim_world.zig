@@ -24,6 +24,7 @@ const control_plane = @import("control_plane.zig");
 const runtime = @import("runtime.zig");
 const runtime_mod = runtime;
 const sim_runtime = @import("sim_runtime.zig");
+const fencing = @import("fencing.zig");
 const store = @import("store.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 const MemoryStore = @import("store_memory.zig").MemoryStore;
@@ -58,10 +59,27 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A keepalive is answered with this ttl in place of the lease's own, as an older server run
+    /// with a short `--lease-ttl-ms` does; test-only, null in every simulation.
+    keepalive_ttl_ms: ?u32 = null,
+    /// With `keepalive_ttl_ms`: the keepalive is refused with ZC-E0121 when the ttl is too short,
+    /// as `RemoteStore` refuses a reply it cannot fence under; test-only, false in every
+    /// simulation.
+    keepalive_refuse_short: bool = false,
     /// A get of a key under this prefix fails as a server that cannot be reached does (ZC-E0201);
     /// test-only, null in every simulation.
     down_get_prefix: ?[]const u8 = null,
+    /// Runs once, just before the first transaction that puts a key under `prefix` is applied;
+    /// it may write through the world's store (the transaction then meets that write). Test-only,
+    /// null in every simulation.
+    before_put: ?BeforePut = null,
     calls: u32 = 0,
+
+    pub const BeforePut = struct {
+        prefix: []const u8,
+        context: *anyopaque,
+        run: *const fn (context: *anyopaque) void,
+    };
 
     const vtable: store.Store.VTable = .{
         .status = status,
@@ -171,6 +189,15 @@ pub const SwitchedStore = struct {
                 return error.BackendFailed;
             }
         }
+        if (self.before_put) |hook| {
+            for (request.on_success) |op| {
+                if (op != .put) continue;
+                if (!std.mem.startsWith(u8, op.put.key, hook.prefix)) continue;
+                self.before_put = null;
+                hook.run(hook.context);
+                break;
+            }
+        }
         return self.inner.txn(request, diag);
     }
 
@@ -197,7 +224,15 @@ pub const SwitchedStore = struct {
     ) store.Error!store.Lease {
         const self = from(context);
         try self.gate(diag);
-        return self.inner.lease_keepalive(id, diag);
+        var lease = try self.inner.lease_keepalive(id, diag);
+        if (self.keepalive_ttl_ms) |ttl_ms| lease.ttl_ms = ttl_ms;
+        if (self.keepalive_refuse_short) {
+            if (fencing.inequality_problem(lease.ttl_ms)) |problem| {
+                fencing.raise_problem(diag, lease.ttl_ms, problem);
+                return error.BackendFailed;
+            }
+        }
+        return lease;
     }
 
     fn lease_revoke(

@@ -535,8 +535,10 @@ test "a damaged input is told from an absent one, and neither is a fault of the 
     // endpoint; the absent one reads as no value, the damaged one as a value that does not decode.
     const prefix = "{\"diagnostics\":[{\"code\":\"ZC-E0523\",\"summary\":\"s\",\"causes\":[\"";
     const absent = prefix ++ "train-job names an input by digest and the server holds none\"]}]}";
-    const damaged = prefix ++ "the input held for train-job " ++ records.input_mismatch_phrase ++
-        "\"]}]}";
+    // The literal, not the constant: the phrase is wire protocol, and a reworded constant must
+    // fail here and in agent_api_test.zig, not move with the tests.
+    try testing.expectEqualStrings("does not match its digest", records.input_mismatch_phrase);
+    const damaged = prefix ++ "the input held for train-job does not match its digest\"]}]}";
     const bodies = [_][]const u8{ absent, damaged };
     var rig: Rig = undefined;
     rig.init(&bodies);
@@ -551,4 +553,18 @@ test "a damaged input is told from an absent one, and neither is a fault of the 
     const kv = second.kv orelse return error.TestExpectedEqual;
     const decoded = records.read(records.JobInput, arena, kv, &rig.diag);
     try testing.expect(std.meta.isError(decoded));
+}
+
+test "a keepalive answered with a ttl the agent cannot fence under is ZC-E0121" {
+    // Goal: RemoteStore refuses a short ttl from the server, as `heartbeat` relies on.
+    var rig: Rig = undefined;
+    const body = "{\"lease\":{\"id\":7,\"ttl_ms\":4000},\"chain\":{\"revision\":5," ++
+        "\"hash\":\"" ++ hash_a ++ "\"}}";
+    const bodies = [_][]const u8{body};
+    rig.init(&bodies);
+    defer rig.deinit();
+    rig.diag.reset();
+    const remote = rig.remote.interface();
+    try testing.expectError(error.BackendFailed, remote.lease_keepalive(7, &rig.diag));
+    try testing.expectEqual(.E0121, rig.diag.code.?);
 }

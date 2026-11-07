@@ -188,6 +188,12 @@ pub const Agent = struct {
     store_refusal_len: u8,
     /// When the job pass next needs to run (a run's deadline), monotonic; maxInt if never.
     jobs_wake_mono_ms: u64,
+    /// The last failure to fetch a run's input that said nothing about the input (the server or
+    /// the link): which run (a hash of its id) and what it said. In memory only; it names the
+    /// cause when the run ends `not_started`.
+    input_failure_run: u64,
+    input_failure_text: [input_failure_text_bytes]u8,
+    input_failure_len: u8,
     /// Pull records dropped unpublished (ZC-W0504), and the last one's container and reason, for
     /// the shell to say: a dropped record is statistics lost, and it must not be silent.
     pull_drops: u32,
@@ -196,6 +202,7 @@ pub const Agent = struct {
 
     const store_refusal_text_bytes = 160;
     const pull_drop_text_bytes = 200;
+    const input_failure_text_bytes = 160;
 
     /// What the last counted summary refusal said (empty if none).
     pub fn store_refusal(agent: *const Agent) []const u8 {
@@ -236,6 +243,23 @@ pub const Agent = struct {
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
         agent.jobs_wake_mono_ms = maxInt(u64);
+        agent.input_failure_run = 0;
+        agent.input_failure_len = 0;
+    }
+
+    /// Keeps what the last failed input fetch of `run` said.
+    pub fn note_input_failure(agent: *Agent, run: []const u8, text: []const u8) void {
+        const len = @min(text.len, agent.input_failure_text.len);
+        @memcpy(agent.input_failure_text[0..len], text[0..len]);
+        agent.input_failure_len = @intCast(len);
+        agent.input_failure_run = std.hash.Wyhash.hash(0, run);
+    }
+
+    /// What the last failed input fetch of `run` said, if it was this run's.
+    pub fn input_failure(agent: *const Agent, run: []const u8) ?[]const u8 {
+        if (agent.input_failure_len == 0) return null;
+        if (agent.input_failure_run != std.hash.Wyhash.hash(0, run)) return null;
+        return agent.input_failure_text[0..agent.input_failure_len];
     }
 
     /// When the fence falls, on the monotonic clock; null if the agent holds no lease or is
@@ -509,6 +533,13 @@ pub const Agent = struct {
                 try agent.acknowledged(ctx, sent, granted.ttl_ms);
                 return .idle;
             } else |err| {
+                if (err == error.BackendFailed and ctx.diag.code == .E0121) {
+                    // The server renewed under a ttl the agent cannot fence in time (the client
+                    // refuses it): as in `acknowledged`, fence at once and fail the step with
+                    // the diagnostic kept.
+                    try agent.begin_fence(ctx, sent);
+                    return err;
+                }
                 if (err != error.LeaseNotFound) return err;
                 // The lease has ended, so the server will take the node for lost: stop at once.
                 ctx.diag.reset();
@@ -539,12 +570,23 @@ pub const Agent = struct {
     /// The server acknowledged a request sent at `sent`: the lease runs `ttl_ms` from then at
     /// the least. The state is kept after it is held, so a failure to keep it leaves an older
     /// `s` in the file, which fences earlier, never later.
+    ///
+    /// The ttl comes from the server, so it is checked, not asserted. One the agent cannot fence
+    /// in time (an older server run with `--lease-ttl-ms` under 8,000) is refused with ZC-E0121:
+    /// the agent fences at once, since it cannot promise to stop in time under that lease, and
+    /// the step fails; it does not renew under it and it does not crash. It registers again
+    /// when its containers are dead, is granted the same ttl and refuses it again, so a node
+    /// under such a server runs nothing and says why on every pass.
     fn acknowledged(agent: *Agent, ctx: *const Context, sent: u64, ttl_ms: u32) Error!void {
         assert(agent.lease != store.lease_none);
-        assert(fencing.inequality_problem(ttl_ms) == null);
+        if (fencing.inequality_problem(ttl_ms)) |problem| {
+            try agent.begin_fence(ctx, sent);
+            fencing.raise_problem(ctx.diag, ttl_ms, problem);
+            return error.BackendFailed;
+        }
         agent.lease_ttl_ms = ttl_ms;
         agent.sent_ms = sent;
-        agent.renew_at_ms = sent + @divFloor(ttl_ms, 3);
+        agent.renew_at_ms = sent + fencing.renew_after_ms(ttl_ms);
         try agent.persist(ctx);
     }
 
@@ -592,6 +634,11 @@ pub const Agent = struct {
             const kept = if (same_boot and parsed.kill_at_ms > 0) parsed.kill_at_ms else kill_at;
             return agent.start_fence(ctx, @min(kept, kill_at));
         }
+        // A lease file written under a ttl below the bound (by an agent before this rule, against
+        // a server run with a ttl under 8,000 ms) is unusable: the node fences, and the agent
+        // registers again. That is the upgrade note of
+        // docs/decisions/2026-11-06-renewal-before-fence.md: raise the server's ttl and let every
+        // agent renew under it before upgrading any.
         const usable = parsed.lease != store.lease_none and parsed.tenure > 0 and
             fencing.inequality_problem(parsed.ttl_ms) == null and same_boot;
         if (!usable) return agent.begin_fence(ctx, mono);
@@ -599,7 +646,7 @@ pub const Agent = struct {
         agent.tenure = parsed.tenure;
         agent.lease_ttl_ms = parsed.ttl_ms;
         agent.sent_ms = parsed.sent_ms;
-        agent.renew_at_ms = parsed.sent_ms + @divFloor(parsed.ttl_ms, 3);
+        agent.renew_at_ms = parsed.sent_ms + fencing.renew_after_ms(parsed.ttl_ms);
     }
 
     /// Starts the fence: `nominal_ms` is when it should have begun, on the monotonic clock.

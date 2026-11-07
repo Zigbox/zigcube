@@ -7,7 +7,7 @@ client and model, and the first two are the product:
 | --- | --- | --- |
 | **Live server** | open the page `zcube-server` serves at `/` (or `/console/`) | the real server, on the same origin |
 | **Simulation** | `?sim=c0` | the **real control-plane core compiled to WebAssembly**, in the browser, over a memory store and the simulated runtime, on virtual time (`web/sim/`, `src/console_wasm.zig`) |
-| **Mock** | `?mock=c1` | a JavaScript model of the proposed API (`web/mock/`). It remains only for **C1** (several nodes, failover), because the core has no C1 yet; the UI says "mock" |
+| **Mock** | `?mock=c1`, `?mock=b1` | a JavaScript model of the proposed API (`web/mock/`). It remains for **C1** (several nodes, failover) and **B1** (jobs in every state and ending), which the simulation does not run; the UI says "mock" |
 
 The simulation is labelled **simulated** in the header and the panel. It is a simulation: nothing
 in it is recorded, no process starts, and it is never presented as a demo that passed (`demo-c0`
@@ -110,6 +110,37 @@ checked in Node by `tools/pulls_check.mjs` against the CLI's wording. `?mock=c1`
 when a node first starts an image (the first from the registry, later ones from a peer). `?mock=c0`
 opens the simulation, whose real core answers the endpoint: empty until C2's fetch runs, which the
 simulated runtime does not.
+
+### Jobs (B1 slice 9)
+
+`#/jobs` (`g j`) lists `GET /v1/jobs`: name, state pill, how it ended (`exit 3`, `signal 9`, the
+failure cause, `cancelled`, or "cancel requested" while a cancel is pending), node, image, labels
+and age. The state filter is the server's `state=` parameter (`ended` is every terminal state), and
+a name box filters the rows on the page. When the server says more rows exist (`continue`) the
+screen says so and offers "Show the next page" (the next request carries `at` and `continue`, as the
+server requires); a filtered page can be empty while more exist, and the screen then says the page
+holds none, not that no such job exists. An empty list shows the brief's command,
+`zcube job run NAME --image DIGEST --command ...` (docs/briefs/b1.md; the CLI is slice 7 and not
+merged yet, so the command is the brief's, not one you can run today).
+
+`#/jobs/<name>` reads `GET /v1/jobs/<name>` and `GET /v1/why/job/<name>`: status (state, node,
+start, end with its cause, stop cause, a start diagnostic such as ZBX-E0410), the spec, and the
+`why` chain with the same steps and completeness line as the Why screen (`#/why/job/<name>` opens it
+full-size). **The spec never shows an environment value or the input** (owner answer 12): the
+environment is its names, and the input is its byte count, its `input_env` name and the start of
+its digest, as the server returns them. **Logs are cut from B1** (owner answer 4): the page has a
+placeholder that says so and makes no log request. A name the server does not know shows
+ZC-E0133.
+
+Job keys are not in the model's watch (it watches services, replicas, assignments, nodes, observed
+and decisions), so both Jobs screens poll every 2 s instead of waiting for `model.rev`; a job page
+stops polling one read after the job ended.
+
+**Simulation mode shows no jobs.** `src/console_wasm.zig` runs the C0 scenario and has no way to
+submit one (no `POST /v1/jobs` step in the scenario or panel), and adding it would change the
+core, which this slice does not. `?sim=c0#/jobs` therefore shows the real core's answer to
+`GET /v1/jobs`: an empty list and the `zcube job run` hint (checked in a browser). Jobs are seen
+with `?mock=b1` and with a real server.
 
 ### Why
 
@@ -296,7 +327,7 @@ web/
   sim/index.js          the host of the WebAssembly core: frames, virtual time, held watches, traps
   sim/panel.js          the simulation's dev panel
   sim/scenario.js       the seven C0 steps as the panel shows them
-  mock/                 the JavaScript mock, for C1 only: engine, fixtures, scenarios, dev panel
+  mock/                 the JavaScript mock, for C1 and B1: engine, jobs, fixtures, scenarios, dev panel
 ```
 
 `sim/zcube_console.wasm` is not in the repository: `zig build console-wasm` builds it, and
@@ -311,8 +342,11 @@ web/
   server (the module needs the `application/wasm` type; `file://` does not work because the
   browser will not fetch it), and open `/?sim=c0`. `zcube-server` also serves it at
   `/?sim=c0`.
-- **The C1 mock:** the same, with `/?mock=c1`.
-- **Check it in a browser:** `node tools/browser_check.mjs <base-url> --mode sim|server`
+- **The C1 mock:** the same, with `/?mock=c1`. **The B1 mock:** `/?mock=b1` (`&at=3` runs the three
+  steps at once and settles).
+- **Check it in a browser:** `node tools/browser_check.mjs <base-url> --mode sim|server|mock`
+  (`mock` opens `?mock=b1`: the list, the state filter, a page per ending cause, the logs
+  placeholder, no log request, and no environment value or input text on any page)
   (Playwright and the installed Chromium; a dev-time tool, not part of the build).
 
 ## The simulation, and the mock for C1
@@ -357,7 +391,22 @@ covered it. `web/mock/codes.js` (the mock's `explain` text, generated by
 
 | Scenario | Steps |
 | --- | --- |
+| `b1` (mock) | three agents join · eighteen jobs submitted that end every way (exit 0, exit 3, signal 9, oom, pid_limit, start_failed, deadline, fenced, unreachable, not_started (a node lost before any claim), unknown, never placed; placed, running, pending, and two to cancel) · cancel a running and a waiting job · `why job fit-oom` |
 | `c1` (mock) | three agents join · apply `hello` ×6, two per node · power off node3, its lease expires after 10 s, replicas are rescheduled · node3 rejoins empty · `why node node3` explains no rebalancing |
+
+**What the B1 mock does not model.** Each job follows a *plan* the scenario gives it (node, delays,
+how it ends): the mock has no scheduler or limits arithmetic for jobs. It validates a submission as
+the API says (unknown fields and retries/relay/placement: ZC-E0104/ZC-E0130; a different spec under
+a taken name: ZC-E0131; too many in flight: ZC-E0132; a `submit_by_ms` in the past: ZC-E0134) and
+never stores the input, only its length and a stand-in digest. The `hold_pending` decision it writes
+for a job that cannot be placed is the scheduler's real `hold_pending` (the reason is the scheduler's
+format, the evidence numbers are the mock's); a placement is the scheduler's `place_run` and then
+the controller's `job_placed`; a run that was never claimed has the controller's `stop_job` and ends
+from it (`not_started` -> `failed deadline`, `unreachable` -> `failed not_started`, `cancel` ->
+`cancelled`). A run that ended with no agent report has an `end_job` that cites the desired
+`/job-runs/<name>`, as the server's does: the `stop_job` before it is a decision of its own, not a
+link of that chain. The why steps for the `/job-runs/` and `/assigned/` keys use the server's words
+(`src/why.zig` `desired_step`; docs/decisions/2026-11-06-why-job-desired-keys.md).
 
 The mock's panel has Play, Step and Reset, a speed selector, the "open the matching screen"
 checkbox and faults (stop Postgres, cut the API, "Sleep + compact", freeze time).

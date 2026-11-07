@@ -27,6 +27,8 @@
 //! `--expect-fail` turns the range into the teeth test (`sim_teeth_main.zig`): it stops at the
 //! first seed that fails and exits 0 only if there was one.
 //!
+//! `--jobs=false` leaves the job workload and its checks out (J1 to J3, J5 to J8; on by default).
+//!
 //! `--c1` runs sim-c1 (docs/core.md, "sim-c1"): the per-revision checks of docs/authority.md §4.
 //! `--expect-symptom=TEXT` with `--expect-fail` makes the failure count only if it starts with
 //! TEXT; the negative tests of sim-c1 use it (`sim_c1_teeth_main.zig`).
@@ -48,9 +50,10 @@ const sim_shape = @import("sim_shape.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--trace-steps]\n       sim-cluster --seeds A..B <operations|auto> " ++
+    "[--replicas-pct=N] [--jobs=true|false] [--trace-steps]\n" ++
+    "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--expect-fail] [--trace-steps]\n";
+    "[--replicas-pct=N] [--jobs=true|false] [--expect-fail] [--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -139,6 +142,10 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.shrink = true;
     } else if (std.mem.eql(u8, arg, "--expect-fail")) {
         parsed.expect_fail = true;
+    } else if (std.mem.eql(u8, arg, "--jobs=true")) {
+        parsed.options.jobs = true;
+    } else if (std.mem.eql(u8, arg, "--jobs=false")) {
+        parsed.options.jobs = false;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
@@ -166,7 +173,7 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
 
 pub fn main(init: std.process.Init) u8 {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch return constants.exit_user;
-    var parsed = parse(args) orelse return usage(init.io);
+    var parsed = parse(args) orelse return usage(init.io, args);
     if (parsed.trace_steps) {
         trace_io = init.io;
         parsed.options.on_step = trace_step;
@@ -274,6 +281,7 @@ fn print_replay(
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c1) try out.writeAll(" --c1");
+    if (!options.jobs) try out.writeAll(" --jobs=false");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});
@@ -372,9 +380,28 @@ fn report_failure(
     try print_replay(out, seed, smallest, options, heal_at);
 }
 
-fn usage(io: std.Io) u8 {
-    std.Io.File.stderr().writeStreamingAll(io, usage_text) catch {}; // Nowhere else to report it.
+fn usage(io: std.Io, args: []const []const u8) u8 {
+    const stderr = std.Io.File.stderr();
+    if (ttl_refusal(args)) |reason| {
+        stderr.writeStreamingAll(io, reason) catch {}; // Nowhere else to report it.
+    }
+    stderr.writeStreamingAll(io, usage_text) catch {}; // Nowhere else to report it.
     return 2;
+}
+
+const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 8,000 ms is refused: an agent " ++
+    "cannot fence in time under it (ZC-E0121, issue #78)\n";
+
+/// The one-line reason for a `--lease-ttl-ms` under the bound, which `parse` refuses as any
+/// bad argument; null for every other refusal.
+fn ttl_refusal(args: []const []const u8) ?[]const u8 {
+    const flag = "--lease-ttl-ms=";
+    for (args) |arg| {
+        if (!std.mem.startsWith(u8, arg, flag)) continue;
+        const ttl = std.fmt.parseInt(u32, arg[flag.len..], 10) catch continue;
+        if (fencing.inequality_problem(ttl) != null) return ttl_refusal_text;
+    }
+    return null;
 }
 
 test "the command lines: one seed, a range, and what is refused" {
@@ -392,16 +419,19 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expectEqual(@as(u64, 9), range.last_seed);
     try std.testing.expectEqual(@as(?u32, 60), range.operations);
     const drawn = parse(&.{
-        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=5000",
+        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=8000",
     }).?;
     try std.testing.expectEqual(@as(?u32, null), drawn.operations);
     try std.testing.expect(drawn.options.profile_auto);
-    try std.testing.expectEqual(@as(?u32, 5000), drawn.options.lease_ttl_ms);
+    try std.testing.expectEqual(@as(?u32, 8000), drawn.options.lease_ttl_ms);
     const named = parse(&.{ "sim", "7", "60", "--profile=skew", "--replicas-pct=200" }).?;
     try std.testing.expect(named.options.profile == .skew and !named.options.profile_auto);
     try std.testing.expectEqual(@as(?u32, 200), named.options.replicas_pct);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--profile=nope" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=2000" }) == null);
+    const short = ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=2000" }).?;
+    try std.testing.expectEqual(ttl_refusal_text, short);
+    try std.testing.expect(ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=8000" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "0" }) == null);
     try std.testing.expectEqual(@as(?u32, null), range.options.nodes);
 

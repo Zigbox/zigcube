@@ -301,7 +301,7 @@ real processes, for the owner and for the Zigbox adapter:
 
 1. **`stop` cannot wait out a long grace in a single-threaded agent.** The contract says `stop`
    returns once the container has stopped. The agent asks with `stop_grace_ms` (5 s), and the
-   agent's lease is renewed in the same thread every third of its ttl (3.3 s of 10 s). Three
+   agent's lease is renewed in the same thread every third of its ttl (3.3 s of 10 s, `fencing.renew_after_ms`). Three
    containers that ignore `SIGTERM` would starve the lease. `FakeRuntime.stop` sends the polite
    signal and waits at most `stop_wait_ms` (500 ms); a longer grace returns with the container
    still running, and the core's pending-stop logic asks again with a grace of 0 to kill. The

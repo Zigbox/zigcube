@@ -303,8 +303,9 @@ pub const RemoteStore = struct {
         if (answer.lease.id == store.lease_none) {
             return bad(diag, "the server granted lease 0");
         }
-        if (fencing.inequality_problem(answer.lease.ttl_ms) != null) {
-            return bad(diag, "the server granted a lease too short for the agent to fence in");
+        if (fencing.inequality_problem(answer.lease.ttl_ms)) |problem| {
+            fencing.raise_problem(diag, answer.lease.ttl_ms, problem);
+            return error.BackendFailed;
         }
         return .{ .id = answer.lease.id, .ttl_ms = answer.lease.ttl_ms };
     }
@@ -700,7 +701,10 @@ pub const RemoteStore = struct {
                     return .{ .kv = null, .revision = 1 };
                 }
                 // A damaged input is not an absent one: hand over a value that does not
-                // decode, which the agent reads as a mismatch.
+                // decode, which the agent reads as a mismatch. The phrase above is wire
+                // protocol (see `records.input_mismatch_phrase`). The "null" stands for
+                // "damaged" through the `Store` interface: `records.read(JobInput)` must
+                // keep refusing it.
                 const damaged: store.KeyValue = .{
                     .key = key,
                     .value = "null",

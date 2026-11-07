@@ -1069,3 +1069,45 @@ test "a relay array filling the whole body is refused by name, without building 
     try testing.expect(std.mem.indexOf(u8, response.body, "relay") != null);
     try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
 }
+
+test "the jobs watch decodes statuses, filters by label and refuses the name watch" {
+    // Goal: api.md, "GET /v1/jobs/watch": status events with the decoded value, a label that
+    // keeps only the matching jobs, 400 for a missing `from`, and no job named `watch`.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = try job_json(&rig, "short", "b3:51aa9c03");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", body).status);
+    const ctx = rig.world.controller_context();
+    const status: records.JobStatus = .{
+        .state = .exited,
+        .epoch = 9,
+        .ended_at_ms = 1,
+        .end = .{ .kind = .exited, .code = 0 },
+        .reported_at_ms = 1,
+    };
+    var batch: controller.Batch = .{};
+    const key = records.job_status_key("short");
+    batch.put(try controller.key_copy(&ctx, &key), try records.encode(ctx.arena, status, ctx.diag));
+    _ = try controller.commit(&ctx, .job_controller, &batch);
+
+    const all = try rig.ok("/v1/jobs/watch", "from=1&timeout=0");
+    const events = field(all, "events").array.items;
+    try testing.expectEqual(@as(usize, 1), events.len);
+    try testing.expectEqualStrings("put", field(events[0], "type").string);
+    try testing.expectEqualStrings("short", field(events[0], "name").string);
+    const got = field(events[0], "status");
+    try testing.expectEqualStrings("exited", field(got, "state").string);
+    try testing.expectEqual(@as(i64, 9), field(got, "epoch").integer);
+    try testing.expectEqual(@as(i64, 1), field(got, "ended_at_ms").integer);
+    const head = field(all, "revision").integer;
+
+    // A label no job carries keeps nothing, and the bookmark still moves.
+    const none = try rig.ok("/v1/jobs/watch", "from=1&timeout=0&label=team%3Dnobody");
+    try testing.expectEqual(@as(usize, 0), field(none, "events").array.items.len);
+    try testing.expectEqual(head, field(none, "revision").integer);
+    // A revision the store has not reached is the generic watch's 400.
+    try rig.refused(rig.get("/v1/jobs/watch", "timeout=0&from=1000000"), 400, "ZC-E0204");
+    try rig.refused(rig.get("/v1/jobs/watch", "timeout=0"), 400, "ZC-E0104");
+    const named = try job_json(&rig, "watch", "b3:51aa9c03");
+    try rig.refused(post_job(&rig, "/v1/jobs", named), 400, "ZC-E0130");
+}
