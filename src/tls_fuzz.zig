@@ -14,6 +14,7 @@
 //! alert; every refusal carries a code and a cause. Seeds and replay are in `fuzz_seeds.zig`.
 
 const std = @import("std");
+const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const seeds = @import("fuzz_seeds.zig");
 const testpeer = @import("tls_testpeer.zig");
@@ -525,7 +526,7 @@ fn damaged_post_handshake(world: *World, random: std.Random, record: []u8) !void
     var message: [24]u8 = undefined;
     var length: usize = 0;
     const key_update = wire.handshake_key_update;
-    switch (random.uintLessThan(u8, 6)) {
+    switch (random.uintLessThan(u8, 7)) {
         0 => length = put_message(&message, key_update, &.{ random.int(u8), random.int(u8) }),
         1 => length = put_message(&message, key_update, &.{}),
         2 => length = put_message(&message, key_update, &.{2 + random.uintLessThan(u8, 254)}),
@@ -537,6 +538,18 @@ fn damaged_post_handshake(world: *World, random: std.Random, record: []u8) !void
             random.bytes(&body);
             const types_pick = types[random.uintLessThan(usize, types.len)];
             length = put_message(&message, types_pick, body[0..random.uintAtMost(usize, 8)]);
+        },
+        5 => {
+            // RB-S10: a declared length over the limit, the top of the u24 range included
+            // (`4 + body_length` overflowed from 0xFFFFFD). The body never follows.
+            message[0] = wire.handshake_new_session_ticket;
+            const declared: u24 = if (random.boolean())
+                std.math.maxInt(u24) - random.uintAtMost(u24, 4)
+            else
+                @as(u24, constants.tls_handshake_message_bytes_max) + 1 +
+                    random.uintLessThan(u24, 0x0F0000);
+            std.mem.writeInt(u24, message[1..4], declared, .big);
+            length = 4;
         },
         else => {
             length = put_message(&message, key_update, &.{random.uintLessThan(u8, 2)});

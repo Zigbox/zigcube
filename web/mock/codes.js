@@ -145,7 +145,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the lease settings cannot fence an agent in time",
-    "explanation": "An agent that loses contact with the server stops its containers a fixed\nmargin before its lease can run out, and the server places replacements\nonly after the lease has run out and a grace period has passed. The\nmargin must cover the time the agent needs to stop its containers, the\ndrift between the two clocks over one lease, and the time the kernel\nneeds to kill a process. These settings leave too little, so two copies\nof a replica could run at once.\n\nThe cause line names the numbers. Shorten the lease time to live, or\nleave the fencing constants as they are."
+    "explanation": "An agent that loses contact with the server stops its containers a fixed\nmargin before its lease can run out, and the server places replacements\nonly after the lease has run out and a grace period has passed. The\nmargin must cover the time the agent needs to stop its containers, the\ndrift between the two clocks over one lease, and the time the kernel\nneeds to kill a process. These settings leave too little, so two copies\nof a replica could run at once.\n\nThe cause line names the numbers. A lease time to live that is too\nlong for the margin must be shortened. One that is too short, under\n8000 ms, leaves the agent no time to renew it before it fences, so it\nmust be lengthened; the cause line names the shortest. The default is\n10000 ms. An agent that is granted a lease time to live below 8000 ms\nby an older server stops its containers and reports this code."
   },
   {
     "code": "ZC-E0122",
@@ -173,7 +173,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a job is not valid",
-    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), no command or too many words, a deadline of zero or\nabove 24 hours, a grace period above 60 seconds, env above 8 KiB, an input\nabove 64 KiB or with a NUL byte, a submit time more than an hour ahead, or\nmore labels than a job may carry.\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and relay or placement.\nAccepting a field and ignoring it would say something false about where the\njob runs.\n\nFix the field it names and submit again."
+    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead, or\nmore labels than a job may carry.\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and relay or placement.\nAccepting a field and ignoring it would say something false about where the\njob runs.\n\nFix the field it names and submit again."
   },
   {
     "code": "ZC-E0131",
@@ -663,14 +663,14 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "external",
     "summary": "a TLS record failed its checks",
-    "explanation": "A record was too long, too short, did not authenticate, or the connection\nreached the end of what its keys may protect. The connection is closed and\nthe keys are wiped.\n\nOn a healthy network this does not happen: it means bytes were changed in\ntransit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24\nrecords without updating its keys. Reconnect; if it repeats, check the path\nbetween the two machines."
+    "explanation": "A record was too long, too short, did not authenticate, or the connection\nreached the end of what its keys may protect. The connection is closed and\nthe keys are wiped.\n\nOn a healthy network this does not happen: it means bytes were changed in\ntransit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24\nrecords without updating its keys, or asked this side to update its own keys\nmore often than tls_key_updates_per_connection_max allows (each request is\nanswered with an update). Reconnect; if it repeats, check the path\nbetween the two machines."
   },
   {
     "code": "ZC-E0816",
     "severity": "error",
     "blame": "external",
     "summary": "a TLS connection ended or stalled without close_notify",
-    "explanation": "The peer's side of the connection ended before it sent close_notify, so the\ndata received may be cut short. Mid-handshake this means the peer hung up\nbefore the handshake finished.\n\nThe connection also ends this way when the peer stays connected and goes\nquiet: a handshake, or the answer to a KeyUpdate, did not finish in time\nbecause the peer stopped reading or answering. A black hole, an overloaded\nserver or a middlebox that drops packets looks like this.\n\nTreat what arrived as incomplete and retry the request. A peer that\ncrashes, or a network that resets the connection, ends this way; for a\nstall, check that the server is reachable and keeping up."
+    "explanation": "The peer's side of the connection ended before it sent close_notify, so the\ndata received may be cut short. Mid-handshake this means the peer hung up\nbefore the handshake finished.\n\nThe connection also ends this way when the peer stays connected and goes\nquiet: a handshake, or the answer to a KeyUpdate, did not finish in time\nbecause the peer stopped reading or answering. A black hole, an overloaded\nserver or a middlebox that drops packets looks like this.\n\nTreat what arrived as incomplete and retry the request. A peer that\ncrashes, or a network that resets the connection, ends this way; for a\nstall, check that the server is reachable and keeping up.\n\nA call on a connection that an earlier failure already ended raises it too,\nwith the cause \"the TLS connection already ended\"; the earlier call carried\nthe reason, and the fix is a new connection."
   },
   {
     "code": "ZC-E0817",
@@ -699,6 +699,13 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "the key behind the client certificate did not sign",
     "explanation": "The server asked for a client certificate and the client has one, but the\nsigner that holds its private key returned no signature, so the proof of\npossession (CertificateVerify) could not be made. The connection is\nclosed with an internal_error alert; nothing was accepted.\n\nThe key never enters the TLS client: it sits behind a signer, in the same\nprocess or in another. This is that signer failing, not the server or the\ncertificate. Check that the process or device holding the key is running\nand reachable, then reconnect."
+  },
+  {
+    "code": "ZC-E0821",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "the operating system's secure random source failed",
+    "explanation": "A key, a nonce or a seed was not made because the kernel's secure random\nsource (getrandom) returned an error. Nothing weaker is used instead, and\nnothing is retried.\n\nCheck that getrandom works where this runs: the kernel, the seccomp profile\nand the container sandbox must allow it. Then run the command again."
   },
   {
     "code": "ZC-B0001",

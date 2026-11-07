@@ -225,7 +225,7 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
 The same CA key also issues X.509 certificates (`docs/briefs/mtls-client.md`; the format is
 `src/x509.zig`). The credential above is **unchanged**: still 185 bytes, version 1, signed over
 `"zcube-peer-cred-v1" 0x00` and the body. No endpoint, store key, CLI command or agent uses the
-certificates yet; B3 is the first caller.
+certificates yet; B4 is the first caller.
 
 `peer_ca.Ca` (core, no file or clock of its own; the clock is the `Ca`'s `wall`) has three issuers.
 Each writes into a caller's `x509.Der` and takes its lifetime as an argument: the certificate

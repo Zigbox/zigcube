@@ -18,7 +18,8 @@ const peer = @import("peer.zig");
 
 const Session = peer.Session;
 
-pub const Error = peer.Error || error{ Closed, Timeout, TooBig, Io };
+/// `Entropy`: the OS secure random source failed (ZC-E0821; the caller raises it).
+pub const Error = peer.Error || error{ Closed, Timeout, TooBig, Io, Entropy };
 
 /// The time a call may take is `end_ms` on this clock: CLOCK_BOOTTIME in milliseconds.
 pub fn boot_ms(io: std.Io) u64 {
@@ -34,9 +35,13 @@ pub fn wall_ms(io: std.Io) u64 {
     return @intCast(ms);
 }
 
-pub fn random_seed(io: std.Io) [32]u8 {
+/// A secret seed from the kernel (RB-N9); no fallback. `Entropy` is for the caller to raise.
+pub fn random_seed(io: std.Io) error{Entropy}![32]u8 {
     var seed: [32]u8 = undefined;
-    io.random(&seed);
+    io.randomSecure(&seed) catch |err| switch (err) {
+        error.EntropyUnavailable => return error.Entropy,
+        error.Canceled => unreachable, // Handshakes are never cancelled; see secure_random.fill.
+    };
     return seed;
 }
 
@@ -120,7 +125,7 @@ pub fn open_client(
     expected_node: []const u8,
     end_ms: u64,
 ) Error!Stream {
-    var initiator = peer.Initiator.init(identity, expected_node, random_seed(io), wall_ms(io));
+    var initiator = peer.Initiator.init(identity, expected_node, try random_seed(io), wall_ms(io));
     defer initiator.deinit();
     const m1 = initiator.first();
     try write_all(io, fd, &m1, end_ms);
@@ -138,7 +143,7 @@ pub fn open_server(
     identity: *const peer.Identity,
     end_ms: u64,
 ) Error!Stream {
-    var responder = peer.Responder.init(identity, random_seed(io), wall_ms(io));
+    var responder = peer.Responder.init(identity, try random_seed(io), wall_ms(io));
     defer responder.deinit();
     var m1: [peer.m1_bytes]u8 = undefined;
     try read_exact(io, fd, &m1, end_ms);
@@ -276,6 +281,7 @@ test "a connected socket has Nagle off" {
 }
 
 const Ed25519 = std.crypto.sign.Ed25519;
+const secure_random = @import("secure_random.zig");
 
 fn test_identity(ca: Ed25519.KeyPair, name: []const u8, seed: u8, now: u64) !peer.Identity {
     const key = Ed25519.KeyPair.generateDeterministic(@splat(seed)) catch
@@ -312,6 +318,20 @@ const Echo = struct {
         return true;
     }
 };
+
+test "a handshake with a failing random source is Entropy and sends nothing" {
+    // Goal: RB-N9 at the caller: no ClientHello-equivalent leaves when the kernel's source fails.
+    // Method: an Io whose `randomSecure` fails; the seed is drawn before the first write.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.failing_io(std.testing.io, &vtable);
+    const ca = Ed25519.KeyPair.generateDeterministic(@splat(1)) catch unreachable; // Fixed seed.
+    var client_id = try test_identity(ca, "node1", 2, wall_ms(std.testing.io));
+    const pair = try Pair.make();
+    defer pair.close();
+    const end = boot_ms(io) + 1000;
+    const opened = open_client(io, pair.fds[0], &client_id, "node2", end);
+    try std.testing.expectError(error.Entropy, opened);
+}
 
 test "a message of several records crosses a handshaken stream both ways" {
     // Goal: the handshake runs over a real socket and a message longer than one record comes
