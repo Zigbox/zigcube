@@ -80,8 +80,16 @@ fn same_name(demo: *Demo) !void {
     try host.check(other.code == 1 and state.contains(other.err, "ZC-E0131"), "another " ++
         "command under the name is refused with ZC-E0131 (exit 1)", .{});
     const after = try state.need_job(host, "exit0");
+    // `revision` is the store's head when the job was read, not the job record's own: the other
+    // jobs ending and every heartbeat move it, so it is not compared (issue #155).
     try host.check(std.mem.eql(u8, after.state, "exited") and after.code == before.code and
-        after.revision == before.revision, "the job exit0 did not change", .{});
+        same_text(after.node, before.node) and same_text(after.end_kind, before.end_kind) and
+        after.retries == before.retries, "the job exit0 did not change", .{});
+}
+
+fn same_text(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// The largest revision among the three jobs of step 1: where the watcher's own bookmark stands.

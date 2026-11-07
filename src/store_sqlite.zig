@@ -236,10 +236,15 @@ const LeaseKeys = struct {
     }
 };
 
+/// A hold of the store mutex longer than this is reported on stderr.
+const mutex_hold_warn_ms: i64 = 1000;
+
 pub const SqliteStore = struct {
     io: std.Io,
     clock: Clock,
     mutex: std.Io.Mutex,
+    /// When the holder of `mutex` took it (monotonic); written and read only with it held.
+    locked_at: std.Io.Timestamp,
     db: *c.sqlite3,
     busy_ms: u32,
     path_buffer: [constants.state_path_bytes_max + 1]u8,
@@ -287,6 +292,7 @@ pub const SqliteStore = struct {
         self.io = io;
         self.clock = clock;
         self.mutex = .init;
+        self.locked_at = .zero;
         self.busy_ms = options.busy_ms;
         @memcpy(self.path_buffer[0..file_path.len], file_path);
         self.path_buffer[file_path.len] = 0;
@@ -317,10 +323,21 @@ pub const SqliteStore = struct {
 
     fn lock(self: *SqliteStore) void {
         self.mutex.lockUncancelable(self.io);
+        self.locked_at = std.Io.Clock.awake.now(self.io);
     }
 
+    /// Says on stderr when the mutex was held over `mutex_hold_warn_ms`: a store call that blocks
+    /// (an fsync, a checkpoint) stalls every request, and nothing else would name it.
     fn unlock(self: *SqliteStore) void {
+        const held_ms = self.locked_at.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
         self.mutex.unlock(self.io);
+        if (held_ms <= mutex_hold_warn_ms) return;
+        var buffer: [128]u8 = undefined;
+        const stamp = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const line = std.fmt.bufPrint(&buffer, "[{d}] sqlite store mutex held {d} ms\n", .{
+            stamp, held_ms,
+        }) catch return;
+        std.Io.File.stderr().writeStreamingAll(self.io, line) catch {}; // Nowhere else to say it.
     }
 
     fn path(self: *const SqliteStore) []const u8 {
