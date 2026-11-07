@@ -682,6 +682,86 @@ test "a claim left under an older epoch is not started under the new assignment"
     try testing.expectEqual(@as(?records.StopCause, .not_started), seen.stop_cause);
 }
 
+test "a leftover of an earlier job of the same name is not this job's claim, start or container" {
+    // Goal: run ids are `<name>-job`, so a name reused after retention shares its id with a job
+    // that is gone. Method: leave a `stopped` observation and a `claimed` start record made under
+    // an assignment older than the new job's run, then assign the new job: it is claimed and
+    // started, and the claim replaces the leftover observation.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const old_epoch: store.Revision = 1; // Before any run record of this world.
+    const left: records.JobObserved = .{
+        .run = run_id,
+        .node = sim_world.node_name,
+        .tenure = rig.world.agent.tenure,
+        .assignment = old_epoch,
+        .status = .stopped,
+        .exit = .{ .kind = .lost },
+        .reported_at_ms = rig.world.now_ms(),
+    };
+    const key = records.job_observed_key(sim_world.node_name, job_name);
+    _ = try rig.put(.{ .agent = sim_world.node_name }, key.slice(), left);
+    var buffer: [96]u8 = undefined;
+    const name = agent_jobs.record_name(&buffer, run_id);
+    const record: agent_jobs.StartRecord = .{
+        .run = run_id,
+        .epoch = old_epoch,
+        .phase = .claimed,
+    };
+    const bytes = try std.json.Stringify.valueAlloc(rig.world.fresh_arena(), record, .{});
+    try rig.world.files.interface().put_atomic(name, bytes);
+
+    const epoch = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+    try testing.expectEqual(epoch, seen.assignment);
+    const now = (try rig.start_record()).?;
+    try testing.expectEqual(epoch, now.epoch);
+}
+
+test "a leftover container of an earlier job of the same name is stopped, never adopted" {
+    // Goal: containers made under an assignment older than the run (a job of the same name that
+    // is gone) must not be adopted as this job's. Method: leave one running and one exited
+    // container of that name, labelled with a created revision before any run record, then
+    // assign the new job: the running one is stopped, neither is adopted, the new run starts.
+    const runtime = @import("runtime.zig");
+    var rig = try Rig.start();
+    defer rig.stop();
+    const sim = &rig.world.sim;
+    const labels = [_]runtime.Label{
+        .{ .key = runtime.label_replica, .value = run_id },
+        .{ .key = runtime.label_job, .value = job_name },
+        .{ .key = runtime.label_created, .value = "1" },
+    };
+    var diag: diag_mod.Diag = undefined;
+    diag.reset();
+    const old_names = [_][]const u8{ "train-job-old1", "train-job-old2" };
+    for (old_names) |name| {
+        const spec: runtime.Spec = .{
+            .name = name,
+            .image = image,
+            .command = &.{"true"},
+            .labels = &labels,
+        };
+        _ = try sim.interface().start(&spec, &diag);
+    }
+    try sim.inject(old_names[1], .{ .exit = 0 });
+    try testing.expectEqual(@as(u32, 1), sim.running_count());
+
+    const epoch = try rig.assign(60_000);
+    rig.step();
+    rig.step();
+    try testing.expect(sim.process(old_names[0]) != .alive);
+    try testing.expect(sim.process(old_names[1]) != .alive);
+    try testing.expectEqual(@as(u32, 1), sim.running_count()); // The new run alone.
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+    try testing.expectEqual(epoch, seen.assignment);
+    try testing.expectEqual(@as(?records.StopCause, null), seen.stop_cause);
+}
+
 test "a spec the runtime refuses is rendered with its field and its limit" {
     // Goal: ZC-E0130's cause names the field and the limit it broke, for each problem, and the
     // deadline cause says "killed" only for a SIGKILL.

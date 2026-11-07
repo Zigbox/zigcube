@@ -694,17 +694,28 @@ record, a delete outside `/observed/<node>/`, a key named twice, and more than 1
 ### `GET /v1/agent/nodes/{node}/runs`, `GET .../runs/{name}/input`, `GET` and `POST .../job-observed` (B1 slice 4)
 
 `runs` lists the job runs (`/job-runs/`) assigned to the node, as `{"revision", "kvs"}` like
-`replicas`; more than `agent_node_runs_max` is `ZC-E0302`. `runs/{name}/input` answers the job's `JobInput` (keys.md) only to the node that holds the run's
+`replicas`; more than `agent_node_runs_max` is `ZC-E0302`. The server reads the node's own
+assignments and then each run by its key, never every retained run of the cluster. `runs/{name}/input` answers the job's `JobInput` (keys.md) only to the node that holds the run's
 assignment and only after it has claimed the run (its `/job-observed/<node>/<name>` exists), and
 `ZC-E0133` otherwise, so an input never reaches a node that was not placed the run or that lost the
 claim. The agent checks `sha256:<hex>` over the decoded bytes against the job's `input_digest`.
 
-`job-observed` `GET` lists `/job-observed/<node>/`; `POST` is one put of
-`/job-observed/<node>/<name>`:
+`job-observed` `GET` lists `/job-observed/<node>/` one page at a time: at most
+`store_list_limit_max` records, with `"more": true` when others follow, and
+`?after=<run name>&at=<revision>` resumes after that run at the revision the first page answered.
+A node can hold up to `job_admitted_window_max` (the bound on retained runs), which is never one
+reply. Upgrade the server before the agents: an older agent reads only the first page, and a newer
+agent against an older server is refused its second page. `POST` is one put of `/job-observed/<node>/<name>`:
 
 ```json
-{ "tenure": 412, "run_revision": 87, "value": {"v": 1, "run": "batch-job", "status": "claimed"} }
+{ "tenure": 412, "run_revision": 87, "observed_revision": 0,
+  "value": {"v": 1, "run": "batch-job", "status": "claimed"} }
 ```
+
+`observed_revision` (additive, default 0) is for a claim only: the `mod_revision` of the node's
+leftover observation of an earlier job of the same name, which the claim then replaces instead of
+requiring the observation to be absent. The server refuses (`400`) a value that names an
+observation made under an assignment newer than the run's creation.
 
 The server compares the tenure, and for a claim (`status` `claimed`) also the run's `mod_revision`
 (`run_revision`), the assignment's `mod_revision` (the epoch in the record) and the absence of the

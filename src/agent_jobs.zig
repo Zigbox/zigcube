@@ -159,6 +159,7 @@ pub fn pass(
     var work: Work = .{ .agent = agent, .ctx = ctx, .state = state, .listings = listings };
     const subjects = try work.subjects(assigned);
     if (subjects.len == 0) return 0;
+
     const cctx = ctx.as_controller();
     work.runs = (try controller.list_all(
         records.JobRun,
@@ -173,7 +174,7 @@ pub fn pass(
         &cctx,
         prefix.slice(),
         null,
-        constants.jobs_max,
+        constants.job_admitted_window_max,
     )).items;
     for (subjects) |subject| {
         try work.one(subject);
@@ -241,26 +242,75 @@ const Work = struct {
         return null;
     }
 
-    fn seen_of(work: *const Work, id: []const u8) ?*const records.JobObserved {
+    fn observed_entry(work: *const Work, id: []const u8) ?*const Entry(records.JobObserved) {
         for (work.observed) |*entry| {
-            if (std.mem.eql(u8, entry.rec.run, id)) return &entry.rec;
+            if (std.mem.eql(u8, entry.rec.run, id)) return entry;
         }
         return null;
     }
 
+    /// The node's observation of the run, unless it belongs to an earlier job of the same name.
+    fn seen_of(work: *const Work, id: []const u8) ?*const records.JobObserved {
+        const entry = work.observed_entry(id) orelse return null;
+        if (work.is_stale_epoch(id, entry.rec.assignment)) return null;
+        return &entry.rec;
+    }
+
+    /// The revision of the leftover observation of an earlier job of this subject's name, if
+    /// there is one: what a claim has to replace.
+    fn stale_observation(work: *const Work, subject: Subject) ?u64 {
+        const entry = work.observed_entry(subject.id) orelse return null;
+        if (!work.is_stale_epoch(subject.id, entry.rec.assignment)) return null;
+        return entry.kv.mod_revision;
+    }
+
+    /// True if `epoch`, an assignment revision some record or container remembers, is older than
+    /// the run being served. A run id is `<name>-job`, so a name reused after retention has the
+    /// old id; the job's `/job-runs` record is created once, for the job's whole life, and every
+    /// assignment of that job (and so every claim, start record and container) is later than
+    /// it. A re-assignment of the same job is not stale: its claim must stay one claim.
+    fn is_stale_epoch(work: *const Work, id: []const u8, epoch: u64) bool {
+        const entry = work.run_of(id) orelse return false;
+        return epoch < entry.kv.create_revision;
+    }
+
+    /// The run's container. For a run that is assigned, only one made under this assignment:
+    /// a container of an earlier job of the same name is `stale_listing`.
     fn listing_of(work: *const Work, id: []const u8) ?*const runtime.Listing {
         for (work.listings) |*listing| {
             const value = label_of(listing, runtime.label_replica) orelse continue;
-            if (std.mem.eql(u8, value, id)) return listing;
+            if (!std.mem.eql(u8, value, id)) continue;
+            if (work.is_stale(listing, id)) continue;
+            return listing;
         }
         return null;
+    }
+
+    fn is_stale(work: *const Work, listing: *const runtime.Listing, id: []const u8) bool {
+        const made = label_of(listing, runtime.label_created) orelse return false;
+        const epoch = std.fmt.parseInt(u64, made, 10) catch return false;
+        return work.is_stale_epoch(id, epoch);
+    }
+
+    /// Stops the containers of earlier jobs of this run's name that are still running.
+    fn stop_stale(work: *Work, id: []const u8) Error!void {
+        for (work.listings) |*listing| {
+            const value = label_of(listing, runtime.label_replica) orelse continue;
+            if (!std.mem.eql(u8, value, id) or !work.is_stale(listing, id)) continue;
+            if (is_running(listing)) try work.stop(listing, 0);
+        }
     }
 
     // ---- One run ----
 
     fn one(work: *Work, subject: Subject) Error!void {
         const ctx = work.ctx;
-        const found = try read_record(ctx, work.state, subject.id);
+        try work.stop_stale(subject.id);
+        var found = try read_record(ctx, work.state, subject.id);
+        // A start record of an earlier job of this name: nothing of this one was started.
+        if (found == .record and work.is_stale_epoch(subject.id, found.record.epoch)) {
+            found = .absent;
+        }
         const listing = work.listing_of(subject.id);
         const seen = work.seen_of(subject.id);
         const run = work.run_of(subject.id);
@@ -659,6 +709,9 @@ const Work = struct {
     ) Error!bool {
         const ctx = work.ctx;
         const agent = work.agent;
+        // A leftover observation of an earlier job of this name (another assignment epoch) is
+        // replaced by the claim; one of this assignment would make the claim refuse.
+        const replaces = work.stale_observation(subject) orelse 0;
         const claimed = records.JobObserved{
             .run = subject.id,
             .node = agent.config.node,
@@ -676,6 +729,7 @@ const Work = struct {
             subject.name,
             entry.kv.mod_revision,
             subject.epoch,
+            replaces,
         );
         return switch (try work.commit(claimed, set.compares())) {
             .applied => true,
