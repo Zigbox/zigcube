@@ -6,6 +6,7 @@
 const std = @import("std");
 const testing = std.testing;
 const constants = @import("constants.zig");
+const control_plane = @import("control_plane.zig");
 const controller = @import("controller.zig");
 const job_controller = @import("job_controller.zig");
 const records = @import("records.zig");
@@ -695,4 +696,35 @@ test "an unmappable report is held once and does not pin the job: a cancel still
     const stop = (try f.read_run("train")).?.stop orelse return error.TestUnexpectedResult;
     try testing.expectEqual(records.RunStopCause.cancel, stop.cause);
     try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unmapped_ending"));
+}
+
+test "no two controllers of any instance share a decision source" {
+    // Goal: RB-N6. Method: every instance a server can be given, five sources each; a source seen
+    // twice would let two roles write the same decision id in one millisecond.
+    var seen = try testing.allocator.alloc(bool, 1 << 16);
+    defer testing.allocator.free(seen);
+    @memset(seen, false);
+    var instance: u32 = 1;
+    while (instance <= constants.controller_instance_max) : (instance += 1) {
+        const plane = control_plane.ControlPlane.init(@intCast(instance));
+        const sources = [_]u16{
+            plane.nodes.source.instance,
+            plane.replicas.source.instance,
+            plane.scheduler.source.instance,
+            plane.auditor.source.instance,
+            plane.jobs.source.instance,
+        };
+        for (sources) |source| {
+            try testing.expect(!seen[source]);
+            seen[source] = true;
+        }
+    }
+}
+
+test "the instance a server takes from its clock is one every controller can use" {
+    var second: u64 = 0;
+    while (second < 3 * constants.controller_instance_max) : (second += 7) {
+        const instance = control_plane.ControlPlane.instance_from(second * 1000);
+        try testing.expect(instance >= 1 and instance <= constants.controller_instance_max);
+    }
 }

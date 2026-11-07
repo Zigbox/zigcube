@@ -102,10 +102,11 @@ pub const JobController = struct {
     /// reads the jobs' window anyway, and a failed pass never fails its step.
     retention: job_retention.Cursor = .{},
 
-    /// Decision ids of the controllers are `instance*4 + role`; this one takes the top quarter
-    /// of the numbers, which the others never reach for the instances a shell hands out.
+    /// Decision ids of the controllers are `instance*4 + role`, under 0x8000 for the instances a
+    /// shell hands out (`constants.controller_instance_max`); this one takes the top half.
     pub fn init(instance: u16) JobController {
-        return .{ .source = .{ .instance = 0xC000 +% (instance & 0x3fff) } };
+        assert(instance <= constants.controller_instance_max);
+        return .{ .source = .{ .instance = 0x8000 | instance } };
     }
 
     pub fn reconcile(jc: *JobController, ctx: *const Context) Error!Wakeup {
