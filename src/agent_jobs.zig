@@ -985,16 +985,45 @@ const Work = struct {
         const set = ctx.arena.create(compare_sets.Set) catch return failures.no_memory(ctx.diag);
         set.* = .{};
         if (c1_teeth.job_stale) {
-            compare_sets.observed_write(set, agent.config.node, agent.tenure); // Test-only (J9).
+            try work.replay_previous(); // Test-only (J9): a late report of an earlier run.
+            compare_sets.observed_write(set, agent.config.node, agent.tenure);
         } else {
             const name = records.job_of_run(wanted.run).?;
             compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
         }
         const outcome = try work.commit(value, set.compares());
+        if (c1_teeth.job_stale and outcome == .applied) {
+            const bytes = try records.encode(ctx.arena, value, ctx.diag);
+            if (bytes.len <= teeth_replay.bytes.len) {
+                @memcpy(teeth_replay.bytes[0..bytes.len], bytes);
+                teeth_replay.len = bytes.len;
+            }
+        }
         if (outcome == .refused) {
             // The next heartbeat is brought forward, so a lost lease fences within a second.
             agent.renew_at_ms = @min(agent.renew_at_ms, ctx.mono_ms() + 1000);
         }
+    }
+
+    /// Test-only (`c1_teeth.job_stale`, must break J9): the agent writes its previous report
+    /// again, with the tenure as the only compare, as an old agent returning late would. The
+    /// run it names may be retired or placed again by now.
+    fn replay_previous(work: *Work) Error!void {
+        const ctx = work.ctx;
+        const text = teeth_replay.bytes[0..teeth_replay.len];
+        if (teeth_replay.len > 0) {
+            const old = std.json.parseFromSliceLeaky(records.JobObserved, ctx.arena, text, .{
+                .ignore_unknown_fields = true,
+            }) catch return;
+            if (old.tenure == work.agent.tenure) {
+                const set = ctx.arena.create(compare_sets.Set) catch
+                    return failures.no_memory(ctx.diag);
+                set.* = .{};
+                compare_sets.observed_write(set, work.agent.config.node, work.agent.tenure);
+                _ = try work.commit(old, set.compares());
+            }
+        }
+        teeth_replay.len = 0;
     }
 
     const store_compare = @import("store.zig").Compare;
@@ -1039,6 +1068,9 @@ const Work = struct {
         return records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
     }
 };
+
+/// Test-only (`c1_teeth.job_stale`): the encoded report `replay_previous` writes again.
+var teeth_replay: struct { bytes: [1024]u8 = undefined, len: usize = 0 } = .{};
 
 // ---- The diagnostics of a run (one function each, which the golden test also calls) ----
 
