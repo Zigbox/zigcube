@@ -1303,7 +1303,8 @@ test "a report of a retired or superseded run is applied: false and writes nothi
     _ = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", claim);
     // The assignment it ran under: stored.
     const live = try report_text(&buffer, rig.tenure, revisions[1], "running");
-    try testing.expect(field(try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", live), "applied").bool);
+    const stored = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", live);
+    try testing.expect(field(stored, "applied").bool);
     // Superseded: the run is placed again, under a newer assignment.
     const assigned: records.Assigned = .{
         .replica = "train-job",
