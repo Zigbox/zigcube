@@ -89,7 +89,12 @@ pub const Net = struct {
     /// a fetch that is slow and one that is stuck wrote the same, nothing).
     chunks_asked: u32 = 0,
     chunk_bytes: u64 = 0,
-    /// `boot_ms` of the last progress line, 0 before the first.
+    /// Bytes the registry brought, and where the last chunk came from (the progress line).
+    registry_bytes: u64 = 0,
+    last_source: []const u8 = "none",
+    /// `boot_ms` of the first call to `say_progress` (0 before it): the line's elapsed time.
+    began_ms: u64 = 0,
+    /// `boot_ms` of the last progress line (or of `began_ms`).
     progress_ms: u64 = 0,
 
     fn from(context: *anyopaque) *Net {
@@ -160,7 +165,13 @@ pub const Net = struct {
                 const path = std.fmt.bufPrint(&target, "/chunks/{x}", .{&ref.hash}) catch
                     return .refused;
                 const address = net.registry orelse return .refused;
-                return switch (net.http_get(address, path, out)) {
+                const reply = net.http_get(address, path, out);
+                if (reply == .bytes) {
+                    net.registry_bytes += reply.bytes.len;
+                    net.last_source = "registry";
+                }
+                net.say_progress();
+                return switch (reply) {
                     .bytes => |bytes| .{ .bytes = bytes },
                     .refused => .refused,
                     .timeout, .busy => .timeout,
@@ -172,7 +183,10 @@ pub const Net = struct {
                     return .refused;
                 const reply = net.peer_get(index, path, out);
                 net.chunks_asked += 1;
-                if (reply == .bytes) net.chunk_bytes += reply.bytes.len;
+                if (reply == .bytes) {
+                    net.chunk_bytes += reply.bytes.len;
+                    net.last_source = net.peers[index].name;
+                }
                 net.say_progress();
                 return switch (reply) {
                     .bytes => |bytes| .{ .bytes = bytes },
@@ -183,7 +197,7 @@ pub const Net = struct {
         }
     }
 
-    /// One line per phase change; the first progress line is written on the first chunk answer.
+    /// One line per phase change.
     fn phase(
         context: *anyopaque,
         which: fetch_worker.Phase,
@@ -225,22 +239,31 @@ pub const Net = struct {
         note(net.io, text);
     }
 
-    /// At most one line per `fetch_progress_ms` to fetch.log: what the chunk requests have
-    /// brought and what the peers answered instead.
+    /// At most one line per `fetch_progress_ms` to fetch.log, from the first call on: what the
+    /// chunk requests have brought, from where, and what the peers answered instead. It is called
+    /// on every chunk answer, every clock read and every sleep of the fetch, so a fetch between
+    /// two answers (waiting on O5, or on a peer) still says where it is (#93).
     fn say_progress(net: *Net) void {
         const now_ms = peer_stream.boot_ms(net.io);
-        const first = net.progress_ms == 0;
-        if (!first and now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
+        if (net.began_ms == 0) {
+            net.began_ms = now_ms;
+            net.progress_ms = now_ms;
+            return;
+        }
+        if (now_ms -| net.progress_ms < constants.fetch_progress_ms) return;
         net.progress_ms = now_ms;
         var buffer: [256]u8 = undefined;
-        note(net.io, progress_line(&buffer, net));
+        note(net.io, progress_line(&buffer, net, now_ms - net.began_ms));
     }
 
     fn now(context: *anyopaque) u64 {
-        return peer_stream.boot_ms(from(context).io);
+        const net = from(context);
+        net.say_progress();
+        return peer_stream.boot_ms(net.io);
     }
 
     fn sleep(context: *anyopaque, ms: u32) void {
+        from(context).say_progress();
         from(context).io.sleep(.fromMilliseconds(ms), .awake) catch {}; // Cancelled: the loop ends.
     }
 
@@ -1222,7 +1245,7 @@ fn say_peer_answers(net: *const Net) void {
 }
 
 /// The progress line: requests made, bytes got, and the peers' answers that were not a chunk.
-pub fn progress_line(buffer: []u8, net: *const Net) []const u8 {
+pub fn progress_line(buffer: []u8, net: *const Net, elapsed_ms: u64) []const u8 {
     var busy: u32 = 0;
     var refused: u32 = 0;
     var silent: u32 = 0;
@@ -1231,10 +1254,12 @@ pub fn progress_line(buffer: []u8, net: *const Net) []const u8 {
         refused += conn.refused;
         silent += conn.timeouts;
     }
-    const form = "zcube-agent fetch: progress: {d} chunk requests, {d} bytes from peers; " ++
-        "answers: busy {d}, refused {d}, nothing {d}\n";
+    const form = "zcube-agent fetch: progress: {d} ms in, {d} chunk requests, {d} bytes from " ++
+        "peers, {d} bytes from the registry, last from {s}; answers: busy {d}, refused {d}, " ++
+        "nothing {d}\n";
     return std.fmt.bufPrint(buffer, form, .{
-        net.chunks_asked, net.chunk_bytes, busy, refused, silent,
+        elapsed_ms,      net.chunks_asked, net.chunk_bytes, net.registry_bytes,
+        net.last_source, busy,             refused,         silent,
     }) catch buffer[0..0];
 }
 
@@ -1557,11 +1582,14 @@ test "the progress line counts requests, bytes and the answers that were not a c
         .conns = &conns,
         .chunks_asked = 7,
         .chunk_bytes = 4096,
+        .registry_bytes = 512,
+        .last_source = "a",
     };
     var buffer: [256]u8 = @splat(0xaa);
-    const line = progress_line(&buffer, &net);
-    const want = "zcube-agent fetch: progress: 7 chunk requests, 4096 bytes from peers; " ++
-        "answers: busy 3, refused 3, nothing 5\n";
+    const line = progress_line(&buffer, &net, 20_000);
+    const want = "zcube-agent fetch: progress: 20000 ms in, 7 chunk requests, 4096 bytes from " ++
+        "peers, 512 bytes from the registry, last from a; answers: busy 3, refused 3, " ++
+        "nothing 5\n";
     try std.testing.expectEqualStrings(want, line);
 }
 

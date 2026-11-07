@@ -5,6 +5,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const constants = @import("constants.zig");
+
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
 
@@ -16,6 +18,15 @@ pub const Pull = struct {
     peer_bytes: u64,
     cached_bytes: u64,
     bad_peers: []const []const u8,
+    /// The agent's clock around the pull; 0 when the record has none (not measured).
+    started_at_ms: u64 = 0,
+    finished_at_ms: u64 = 0,
+
+    /// How long the record says the pull took, null when it was not measured.
+    pub fn span_ms(pull: Pull) ?u64 {
+        if (pull.started_at_ms == 0 or pull.finished_at_ms < pull.started_at_ms) return null;
+        return pull.finished_at_ms - pull.started_at_ms;
+    }
 
     pub fn has_bad_peer(pull: Pull, peer: []const u8) bool {
         for (pull.bad_peers) |name| {
@@ -72,6 +83,8 @@ fn pull_from(arena: Allocator, item: Json) Error!Pull {
         .peer_bytes = peer_sum,
         .cached_bytes = number(item, "cached_bytes") orelse return error.BadJson,
         .bad_peers = names,
+        .started_at_ms = number(item, "started_at_ms") orelse 0,
+        .finished_at_ms = number(item, "finished_at_ms") orelse 0,
     };
 }
 
@@ -94,6 +107,58 @@ pub fn registry_once(pulls: []const Pull) bool {
         }
     }
     return from_registry == 1;
+}
+
+/// How step 1 found the registry reads (docs/decisions/2026-11-07-demo-c2-registry-once-cap.md).
+pub const RegistryRead = struct {
+    kind: enum {
+        /// One node read the registry, and every other node got the tree from peers.
+        once,
+        /// Several nodes read it, and every one of those pulls took at least the O5 wait cap:
+        /// the elected pull outlasted the wait, so the others fell back to the registry as
+        /// designed. Allowed, and said as such.
+        overran,
+        /// Several nodes read it although the elected pull finished inside the cap (or no
+        /// pull was measured): a duplicate pull, the bug the check exists to catch.
+        repeated,
+        /// No node read the registry, or a node that did not took nothing from peers.
+        broken,
+    },
+    /// The shortest span among the nodes that read the registry (0: none or not measured).
+    shortest_ms: u64 = 0,
+
+    pub fn passes(read: RegistryRead) bool {
+        return read.kind == .once or read.kind == .overran;
+    }
+};
+
+/// Step 1 (O5, "registry once"), with the wait cap `cap_ms` (`constants.fetch_peer_wait_ms`).
+/// Strict unless the pulls themselves show the cap was overrun: the elected node's pull, the
+/// shortest of the registry pulls (a waiting node's span is its wait plus its own pull), took at
+/// least `cap_ms`. Without that measurement, more than one registry read is `repeated`.
+pub fn registry_read(pulls: []const Pull, cap_ms: u64) RegistryRead {
+    var from_registry: u32 = 0;
+    var shortest: ?u64 = null;
+    var measured = true;
+    for (pulls) |pull| {
+        if (pull.registry_bytes == 0) {
+            if (pull.peer_bytes == 0) return .{ .kind = .broken };
+            continue;
+        }
+        from_registry += 1;
+        const span = pull.span_ms() orelse {
+            measured = false;
+            continue;
+        };
+        shortest = if (shortest) |held| @min(held, span) else span;
+    }
+    if (from_registry == 0) return .{ .kind = .broken };
+    if (from_registry == 1) return .{ .kind = .once, .shortest_ms = shortest orelse 0 };
+    const overran = measured and shortest.? >= cap_ms;
+    return .{
+        .kind = if (overran) .overran else .repeated,
+        .shortest_ms = if (measured) shortest.? else 0,
+    };
 }
 
 /// Step 2: what a node transferred, from the registry and its peers together.
@@ -263,6 +328,37 @@ test "registry_once fails when a second node pulled from the registry or took no
     try testing.expect(!registry_once(&empty));
     var none = [_]Pull{ base, base };
     try testing.expect(!registry_once(&none));
+}
+
+test "registry_read tells a slow elected pull from a duplicate pull" {
+    // Goal: three registry reads pass only when the elected (shortest) pull took the cap or more;
+    // inside the cap, or unmeasured, they stay a failure. Method: spans set on the records.
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    const base: Pull = .{
+        .node = "node1",
+        .tree = "b3:af",
+        .registry_bytes = 10,
+        .peer_bytes = 0,
+        .cached_bytes = 0,
+        .bad_peers = &.{},
+        .started_at_ms = 1000,
+        .finished_at_ms = 1000 + cap + 5000,
+    };
+    var three = [_]Pull{ base, base, base };
+    three[0].finished_at_ms = 1000 + cap + 5587; // The elected pull: 35.6 s on a slow runner.
+    const slow = registry_read(&three, cap);
+    try testing.expect(slow.kind == .overran and slow.passes());
+    try testing.expectEqual(cap + 5000, slow.shortest_ms);
+    three[1].finished_at_ms = 1000 + cap - 1; // A pull inside the cap, and still two more.
+    try testing.expect(registry_read(&three, cap).kind == .repeated);
+    three[1].started_at_ms = 0; // Not measured: strict.
+    try testing.expect(!registry_read(&three, cap).passes());
+    var one = [_]Pull{ base, base };
+    one[1].registry_bytes = 0;
+    one[1].peer_bytes = 3;
+    try testing.expect(registry_read(&one, cap).kind == .once);
+    one[1].peer_bytes = 0;
+    try testing.expect(registry_read(&one, cap).kind == .broken);
 }
 
 test "pulls_of refuses a reply without the envelope" {
