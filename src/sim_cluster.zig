@@ -436,6 +436,14 @@ const Node = struct {
         diag: *Diag,
     ) agent_client.Error!agent_client.Reply {
         const node: *Node = @ptrCast(@alignCast(context));
+        // A dead agent sends nothing, even if the step it died in has more stages to run.
+        if (node.sim.crashed or node.sim.files.crashed) {
+            assert(diag.code == null);
+            diag.raise(.E0503);
+            diag.cause("the simulated agent crashed: it sends nothing", .{});
+            diag.fix(.{ .sentence = "start the agent again" });
+            return error.Unreachable;
+        }
         const net = &node.cluster.net;
         const result = net.transport(node.index).call(arena, request, diag);
         node.spent_ms += net.last_call_ms;
@@ -493,8 +501,13 @@ const Node = struct {
     }
 
     fn started_true_of(node: *const Node, hash: u64) ?u64 {
-        for (node.started_true) |entry| {
-            if (entry.hash == hash and entry.ms != 0) return entry.ms;
+        // Newest first: a name reused later is the start that counts. A slot never written has
+        // hash 0, which no name has (`job_started` asserts it).
+        const len: u8 = node.started_true.len;
+        for (0..len) |back| {
+            const slot = (node.started_next -% 1 -% @as(u8, @intCast(back))) % len;
+            const entry = node.started_true[slot];
+            if (entry.hash != 0 and entry.hash == hash) return entry.ms;
         }
         return null;
     }
@@ -1480,8 +1493,10 @@ fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
     const node: *Node = @ptrCast(@alignCast(context));
     const c = node.cluster;
     if (!c.jobs_on) return;
+    const hash = std.hash.Wyhash.hash(0, spec.name);
+    assert(hash != 0);
     node.started_true[node.started_next % node.started_true.len] = .{
-        .hash = std.hash.Wyhash.hash(0, spec.name),
+        .hash = hash,
         .ms = @max(c.manual.ms, node.nclock.busy_until_true_ms),
     };
     node.started_next +%= 1;

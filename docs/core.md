@@ -420,7 +420,12 @@ if the transaction then commits, because a failed compare is the store doing its
   this. The agent runs
   every stage of a step even when one fails (a replica whose start errors, the job pass), so a
   replica error that repeats does not withhold a cancel, a stop or a later replica; the first
-  error is the step's, the others are counted.
+  error is the step's, the others are counted. A simulated agent that has died sends nothing in
+  the rest of its step (seed 1272 failed self-fencing before this: the job pass wrote after the
+  crash). Known open: plain seeds 1384 and 1612 of `auto --profile=auto` fail self-fencing at a
+  lease ttl of 10,000 ms with this branch's `spend_until` and pass on main; a step can run past
+  the cap on its calls (the step-overrun that #171 addresses), and this branch does not work
+  around it.
   The clocks are never restarted. A node that was wedged (its agent down or frozen, or a
   container ignoring a stop) is not judged until `wedge_memory_ms` after, and its wedged time is
   added to the J6 and J8 bounds (in J8, only the time wedged after the deadline). J8 gives a cut
