@@ -1098,6 +1098,7 @@ test "the jobs watch decodes statuses, filters by label and refuses the name wat
     const got = field(events[0], "status");
     try testing.expectEqualStrings("exited", field(got, "state").string);
     try testing.expectEqual(@as(i64, 9), field(got, "epoch").integer);
+    try testing.expectEqual(@as(i64, 1), field(got, "ended_at_ms").integer);
     const head = field(all, "revision").integer;
 
     // A label no job carries keeps nothing, and the bookmark still moves.
