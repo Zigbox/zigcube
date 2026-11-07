@@ -211,13 +211,7 @@ pub fn read_world(ctx: *const Context) Error!World {
     const replicas = try list(rec.Replica, ctx, rec.prefix_replicas, null, con.replicas_max);
     const at = replicas.revision;
     const assigned = try list(rec.Assigned, ctx, rec.prefix_assigned, at, con.assigned_max);
-    const job_statuses = try list(
-        rec.JobStatus,
-        ctx,
-        rec.prefix_job_status,
-        at,
-        con.job_admitted_window_max,
-    );
+    const job_statuses = try read_job_statuses(ctx, at, assigned.items);
     const nodes = try list(rec.Node, ctx, rec.prefix_nodes, at, con.nodes_max);
     const statuses = try list(rec.NodeStatus, ctx, rec.prefix_node_status, at, con.nodes_max);
     const allocations = try list(rec.Allocation, ctx, rec.prefix_allocations, at, con.nodes_max);
@@ -247,12 +241,59 @@ pub fn read_world(ctx: *const Context) Error!World {
         .desired = .empty,
         .summaries_skipped = summaries_skipped,
     };
-    world.job_statuses = job_statuses.items;
+    world.job_statuses = job_statuses;
     try index_replicas(ctx, &world);
     try index_jobs(ctx, &world);
     try index_assigned(ctx, &world, assigned.items);
     return world;
 }
+
+/// Pages `/job-status/` and keeps what a pass can use: a status that is not terminal (it may be
+/// placed or held) and a status whose run is still assigned (it may be released). An ended job
+/// whose run holds nothing needs no entry, so ended statuses beyond `job_admitted_window_max`
+/// (retention lags) do not stop the scheduler; kept statuses are bounded by that constant.
+fn read_job_statuses(
+    ctx: *const Context,
+    at: Revision,
+    assigned: []const Entry(records.Assigned),
+) Error![]const Entry(records.JobStatus) {
+    var held: std.StringHashMapUnmanaged(void) = .empty;
+    for (assigned) |entry| {
+        if (entry.rec.job == null) continue;
+        const job = records.job_of_run(entry.rec.replica) orelse continue;
+        held.put(ctx.arena, job, {}) catch return failures.no_memory(ctx.diag);
+    }
+    var kept: std.ArrayList(Entry(records.JobStatus)) = .empty;
+    var after: ?[]const u8 = null;
+    for (0..status_pages_max) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = records.prefix_job_status,
+            .at_revision = at,
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, ctx.diag);
+        for (page.kvs) |kv| {
+            const rec = try records.read(records.JobStatus, ctx.arena, kv, ctx.diag);
+            const name = kv.key[records.prefix_job_status.len..];
+            if (records.job_state_terminal(rec.state) and !held.contains(name)) continue;
+            if (kept.items.len >= constants.job_admitted_window_max) {
+                return controller.too_many(
+                    ctx,
+                    records.prefix_job_status,
+                    constants.job_admitted_window_max,
+                );
+            }
+            kept.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
+                return failures.no_memory(ctx.diag);
+        }
+        after = page.continue_after orelse return kept.items;
+    }
+    return controller.too_many(ctx, records.prefix_job_status, status_pages_max);
+}
+
+/// Pages of `/job-status/` one pass reads at most (ZC-E0302 past it): far more than retention
+/// leaves, so it is a stop for a runaway store, not a limit.
+const status_pages_max: u32 = 1024;
 
 /// The per-node records a view is made from.
 const Sources = struct {

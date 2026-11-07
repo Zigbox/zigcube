@@ -1172,3 +1172,21 @@ test "a run on a node with no record is released when its job is over" {
     try testing.expectEqual(@as(usize, 1), try fixture.count("release_run"));
     try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
 }
+
+test "more than job_admitted_window_max ended statuses do not stop the scheduler" {
+    // Goal: RA-S4/RB-S6. Method: retention may lag, so ended statuses can outnumber the window;
+    // a pending job must still be placed, and the scan reads them in pages.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    var index: u32 = 0;
+    while (index < constants.job_admitted_window_max + 10) : (index += 1) {
+        var name: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "e{d}", .{index});
+        try fixture.job_state(text, .exited);
+    }
+    try fixture.job("live", 500, .pending);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("live-job", "n1");
+}
