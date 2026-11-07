@@ -509,10 +509,15 @@ const Work = struct {
     }
 
     fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
+        _ = record;
+        // A run with no assignment on this node has nothing to report under (B2): a report of it
+        // would be refused as stale. One under a newer assignment than its claim's is reported
+        // under the new one, the assignment the job controller admits.
+        if (!subject.assigned) return;
         var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
-            .epoch = record.epoch,
+            .epoch = subject.epoch,
             .exit = .{ .kind = .lost },
             .stop_cause = .not_started,
         };
@@ -986,7 +991,10 @@ const Work = struct {
             compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
         }
         const outcome = try work.commit(value, set.compares());
-        if (outcome == .refused) agent.renew_at_ms = 0; // The next heartbeat checks the lease.
+        if (outcome == .refused) {
+            // The next heartbeat is brought forward, so a lost lease fences within a second.
+            agent.renew_at_ms = @min(agent.renew_at_ms, ctx.mono_ms() + 1000);
+        }
     }
 
     const store_compare = @import("store.zig").Compare;
