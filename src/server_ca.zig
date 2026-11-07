@@ -412,6 +412,31 @@ test "a memory CA with a failing random source is ZC-E0821, not a weaker key" {
     try std.testing.expectEqual(@import("diag/codes.zig").Code.E0821, diag.code.?);
 }
 
+test "a cancelled task is Canceled with no diagnostic, in memory and on a first start" {
+    // Goal: a cancel while the CA key is drawn is passed on, not a diagnostic and not a panic in
+    // the caller. Method: an Io whose `randomSecure` is cancelled, no directory, then a new one.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.canceled_io(std.testing.io, &vtable);
+    var clock = FixedClock{};
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    const gpa = std.testing.allocator;
+    const quiet: Options = .{ .quiet = true };
+    try std.testing.expectError(
+        error.Canceled,
+        open(&ca, gpa, io, null, clock.clock(), quiet, &diag),
+    );
+    try std.testing.expect(diag.code == null);
+    var dir = try TestDir.make(std.testing.io);
+    defer dir.tmp.cleanup();
+    try std.testing.expectError(
+        error.Canceled,
+        open(&ca, gpa, io, dir.path(), clock.clock(), quiet, &diag),
+    );
+    try std.testing.expect(diag.code == null);
+}
+
 test "a memory CA is made again each time and says nothing when quiet" {
     // Goal: the memory store's CA. Method: two opens with no directory give two keys.
     const io = std.testing.io;

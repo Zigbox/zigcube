@@ -519,8 +519,16 @@ fn check_banned_patterns(report: *Report, line: u32, path: []const u8, code: []c
     assert(line > 0);
     assert(code.len <= line_view_bytes_max);
     if (std.mem.indexOf(u8, code, "@cImport") != null) report.add(line, .banned_c_import);
-    if (secret_randomness_allowed(path)) return;
-    for (secret_randomness_patterns) |pattern| {
+    if (!std.mem.eql(u8, path, "src/secure_random.zig")) {
+        for (secret_randomness_patterns) |pattern| {
+            if (std.mem.indexOf(u8, code, pattern) != null) {
+                report.add(line, .secret_randomness);
+                return;
+            }
+        }
+    }
+    if (io_random_allowed(path)) return;
+    for (io_random_patterns) |pattern| {
         if (std.mem.indexOf(u8, code, pattern) != null) {
             report.add(line, .secret_randomness);
             return;
@@ -530,18 +538,32 @@ fn check_banned_patterns(report: *Report, line: u32, path: []const u8, code: []c
 
 /// Ways to draw a secret from somewhere other than `secure_random.zig`. `KeyPair.generate(` is
 /// the std call that seeds from `std.crypto.random` (a generator in the process with a fallback);
-/// `generateDeterministic(` does not match, because the `(` must follow `generate`. This cannot
-/// see `io.random` on a secret; that one is for review.
+/// `generateDeterministic(` does not match, because the `(` must follow `generate`. Only
+/// `secure_random.zig` may use these. An alias of `KeyPair` or of `std.crypto` is left to review.
 const secret_randomness_patterns = [_][]const u8{
     "KeyPair.generate(",
     "crypto.random",
     "randomSecure(",
 };
 
-/// The one file that asks the kernel, and `random_seed`, which does the same for a handshake.
-fn secret_randomness_allowed(path: []const u8) bool {
-    return std.mem.eql(u8, path, "src/secure_random.zig") or
-        std.mem.eql(u8, path, "src/peer_stream.zig");
+/// `std.Io`'s `random` seeds from a generator that falls back to a weaker source, so it is no
+/// source of secrets. It stays for things that are not secret; the files that use it are below.
+const io_random_patterns = [_][]const u8{
+    "io.random(",
+    "Io.random(",
+};
+
+/// Files that may call `io.random`, none for a secret: `cli_http.zig` makes a request id suffix,
+/// `dir_images.zig` and `peer_files.zig` a temporary file name, `fuzz_seeds.zig`,
+/// `store_faults.zig` and `src/testing/` draw the seeds of test runs.
+fn io_random_allowed(path: []const u8) bool {
+    return std.mem.eql(u8, path, "src/cli_http.zig") or
+        std.mem.eql(u8, path, "src/dir_images.zig") or
+        std.mem.eql(u8, path, "src/peer_files.zig") or
+        std.mem.eql(u8, path, "src/store_faults.zig") or
+        std.mem.eql(u8, path, "src/fuzz_seeds.zig") or
+        std.mem.startsWith(u8, path, "src/testing/") or
+        std.mem.eql(u8, path, "src/secure_random.zig");
 }
 
 fn check_unreachable_comment(
@@ -951,6 +973,12 @@ test "secrets are drawn only in secure_random.zig (RB-N9)" {
         \\try io.randomSecure(&seed);
         \\const c = Ed25519.KeyPair.generateDeterministic(seed);
         \\const d = "KeyPair.generate("; // KeyPair.generate(
+        \\const e = prng.random().int(u8);
+        \\
+    ;
+    const io_source =
+        \\env.io.random(&id);
+        \\std.Io.random(io, &name);
         \\
     ;
     var report: Report = .{};
@@ -964,7 +992,17 @@ test "secrets are drawn only in secure_random.zig (RB-N9)" {
     try testing.expectEqual(@as(u32, 0), report.total());
     report = .{};
     check_source(&report, "src/peer_stream.zig", source);
-    try testing.expectEqual(@as(u32, 0), report.total());
+    try testing.expectEqual(@as(u32, 3), report.total()); // No file but secure_random.zig.
+    report = .{};
+    check_source(&report, "src/server_ca.zig", io_source);
+    try testing.expect(report.contains(.secret_randomness, 1));
+    try testing.expect(report.contains(.secret_randomness, 2));
+    try testing.expectEqual(@as(u32, 2), report.total());
+    for ([_][]const u8{ "src/cli_http.zig", "src/dir_images.zig" }) |path| {
+        report = .{};
+        check_source(&report, path, io_source);
+        try testing.expectEqual(@as(u32, 0), report.total());
+    }
 }
 
 test "catch unreachable needs a comment on the line or the line above" {

@@ -30,6 +30,17 @@ pub fn fill(io: std.Io, out: []u8, diag: *Diag, what: []const u8) Error!void {
     };
 }
 
+/// A secret seed from the kernel (RB-N9); no fallback. `Entropy` is for the caller to raise
+/// (`raise`); `Canceled` is not an entropy failure (see `Error`).
+pub fn random_seed(io: std.Io) error{ Entropy, Canceled }![32]u8 {
+    var seed: [32]u8 = undefined;
+    io.randomSecure(&seed) catch |err| switch (err) {
+        error.EntropyUnavailable => return error.Entropy,
+        error.Canceled => return error.Canceled,
+    };
+    return seed;
+}
+
 /// Raises ZC-E0821: `getrandom` failed while making `what`.
 pub fn raise(diag: *Diag, what: []const u8) void {
     diag.raise(.E0821);
@@ -48,6 +59,19 @@ pub fn failing_io(base: std.Io, vtable: *std.Io.VTable) std.Io {
     return .{ .userdata = base.userdata, .vtable = vtable };
 }
 
+/// For tests of callers: `base` with a `randomSecure` that reports the task as cancelled.
+/// `vtable` is the copy the result points to, so it must outlive the result.
+pub fn canceled_io(base: std.Io, vtable: *std.Io.VTable) std.Io {
+    vtable.* = base.vtable.*;
+    vtable.randomSecure = canceled_random_secure;
+    return .{ .userdata = base.userdata, .vtable = vtable };
+}
+
+/// `randomSecure` of an `Io` whose task was cancelled.
+fn canceled_random_secure(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+    return error.Canceled;
+}
+
 test "a failing random source is ZC-E0821, and the buffer is left alone" {
     var diag: Diag = undefined;
     diag.reset();
@@ -58,16 +82,9 @@ test "a failing random source is ZC-E0821, and the buffer is left alone" {
     try std.testing.expectEqual(@as(u8, 0xAB), out[15]);
 }
 
-/// An `Io` whose `randomSecure` reports the task as cancelled.
-fn canceled_random_secure(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
-    return error.Canceled;
-}
-
 test "a cancelled task is Canceled, not ZC-E0821, and the buffer is left alone" {
     var vtable: std.Io.VTable = undefined;
-    var io = failing_io(std.testing.io, &vtable);
-    vtable.randomSecure = canceled_random_secure;
-    io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const io = canceled_io(std.testing.io, &vtable);
     var diag: Diag = undefined;
     diag.reset();
     var out: [16]u8 = @splat(0xAB);

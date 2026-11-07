@@ -209,7 +209,7 @@ pub const Peer = struct {
 
     /// Reads `peer.cred` and `ca.pub`. A pair that does not belong to this key and node is
     /// not an error: it is ignored, and the agent joins again at once.
-    fn load_stored(self: *Peer, diag: *Diag) Error!void {
+    fn load_stored(self: *Peer, diag: *Diag) files.Error!void {
         var ca_buffer: [128]u8 = undefined;
         var credential_buffer: [512]u8 = undefined;
         const io, const dir, const where = .{ self.io, self.dir, self.where };
@@ -259,7 +259,7 @@ pub fn load_identity(
     state_dir: []const u8,
     node: []const u8,
     diag: *Diag,
-) Error!?peer.Identity {
+) files.Error!?peer.Identity {
     assert(diag.code == null);
     const dir = std.Io.Dir.cwd().openDir(io, state_dir, .{}) catch return null;
     defer dir.close(io);
@@ -363,6 +363,24 @@ const TestState = struct {
         return state.path_buffer[0..state.path_length];
     }
 };
+
+test "a cancelled task on a first start is Canceled with no diagnostic and no key file" {
+    // Goal: the node key is drawn on a first start; a cancel there is passed on. Method: an Io
+    // whose `randomSecure` is cancelled and an empty state directory.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.canceled_io(std.testing.io, &vtable);
+    var state: TestState = undefined;
+    try state.make(std.testing.io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    try std.testing.expectError(error.Canceled, Peer.open(io, state.path(), "node1", &diag));
+    try std.testing.expect(diag.code == null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        state.tmp.dir.access(std.testing.io, key_file, .{}),
+    );
+}
 
 /// Opens a Peer in `state`, gives it a pair from the CA made of `ca_seed`, and closes it.
 fn store_pair(state: *const TestState, node: []const u8, ca_seed: u8) !void {

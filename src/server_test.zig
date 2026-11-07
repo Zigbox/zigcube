@@ -508,6 +508,26 @@ test "a port in use, and a store that is not there, are coded start-up failures"
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0201), diag.code);
 }
 
+test "a server started in a cancelled task is Canceled with no diagnostic, and leaves nothing" {
+    // Goal: a cancel while the CA key is drawn is passed to `zcube-server`, which stops quietly;
+    // before, `open_ca` asserted a diagnostic and panicked. Method: the server's `Io` with a
+    // `randomSecure` that is cancelled, a memory store; the test allocator checks for leaks.
+    var test_io: TestIo = undefined;
+    const base = test_io.start();
+    defer test_io.stop();
+    var vtable: std.Io.VTable = undefined;
+    const io = @import("secure_random.zig").canceled_io(base, &vtable);
+    var diag: Diag = undefined;
+    diag.reset();
+    const started = server_mod.Server.start(testing.allocator, io, config_for(.memory, false), .{
+        .version = "0.0.0-test",
+        .report_failures = false,
+        .log_requests = false,
+    }, &diag);
+    try testing.expectError(error.Canceled, started);
+    try testing.expect(diag.code == null);
+}
+
 // ---- Restart safety (HANDOFF C0 acceptance) -----------------------------------------------------
 
 /// The part of the cluster that is not the server: a simulated node agent over the same store,

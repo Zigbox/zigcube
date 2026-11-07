@@ -153,13 +153,6 @@ test "the X.509 tests are in this root" {
     _ = @import("x509_foreign_test.zig");
 }
 
-test "the TLS client tests are in this root" {
-    // Goal: the client handshake runs under WASI too. Method: import its tests; the scripted
-    // server they use is a test fixture and is imported only here.
-    _ = @import("tls_client_test.zig");
-    _ = @import("tls_wire_test.zig");
-}
-
 test "the TLS key schedule and record layer tests are in this root" {
     // Goal: the schedule and the record protection run under WASI too (32-bit, single thread).
     // Method: import their tests; they use no file, clock or environment.
@@ -171,6 +164,11 @@ test {
     // The controllers' tests run under WASI too: they use only the memory store, a manual clock
     // and the testing allocator.
 
+    // The TLS client's tests run under WASI too. They are imported here, not in a named test,
+    // because a `-Dtest-filter` on a TLS test name hides tests inside a named one. The scripted
+    // server they use is a fixture and is imported only here.
+    _ = @import("tls_client_test.zig");
+    _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("job_controller_test.zig");

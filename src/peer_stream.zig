@@ -36,16 +36,6 @@ pub fn wall_ms(io: std.Io) u64 {
     return @intCast(ms);
 }
 
-/// A secret seed from the kernel (RB-N9); no fallback. `Entropy` is for the caller to raise.
-pub fn random_seed(io: std.Io) error{ Entropy, Canceled }![32]u8 {
-    var seed: [32]u8 = undefined;
-    io.randomSecure(&seed) catch |err| switch (err) {
-        error.EntropyUnavailable => return error.Entropy,
-        error.Canceled => return error.Canceled, // Not an Entropy failure; see secure_random.Error.
-    };
-    return seed;
-}
-
 /// An open, authenticated stream. `fd` stays the caller's to close.
 pub const Stream = struct {
     io: std.Io,
@@ -126,7 +116,8 @@ pub fn open_client(
     expected_node: []const u8,
     end_ms: u64,
 ) Error!Stream {
-    var initiator = peer.Initiator.init(identity, expected_node, try random_seed(io), wall_ms(io));
+    const seed = try secure_random.random_seed(io);
+    var initiator = peer.Initiator.init(identity, expected_node, seed, wall_ms(io));
     defer initiator.deinit();
     const m1 = initiator.first();
     try write_all(io, fd, &m1, end_ms);
@@ -144,7 +135,8 @@ pub fn open_server(
     identity: *const peer.Identity,
     end_ms: u64,
 ) Error!Stream {
-    var responder = peer.Responder.init(identity, try random_seed(io), wall_ms(io));
+    const seed = try secure_random.random_seed(io);
+    var responder = peer.Responder.init(identity, seed, wall_ms(io));
     defer responder.deinit();
     var m1: [peer.m1_bytes]u8 = undefined;
     try read_exact(io, fd, &m1, end_ms);

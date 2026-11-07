@@ -385,8 +385,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
     load_pair(gpa, &remote, backend.pair_state, config.state_dir, server, &diag) catch
         return fail(io, &diag, config.verbose);
-    var peer_identity = agent_peer.Peer.open(io, config.state_dir, config.node, &diag) catch
-        return fail(io, &diag, config.verbose);
+    var peer_identity = switch (open_peer(io, config, &diag)) {
+        .opened => |opened| opened,
+        .exit => |code| return code,
+    };
     defer peer_identity.close();
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
@@ -630,6 +632,24 @@ fn fail_start(io: std.Io, diag: *Diag, verbose: bool, what: []const u8) u8 {
     return fail(io, diag, verbose);
 }
 
+/// The node's peer identity, or the exit code to stop with: a failure is printed and exits with
+/// its blame's code; a cancelled task (the key is drawn on a first start) exits quietly, because
+/// it is no failure and `diag` is empty.
+fn open_peer(io: std.Io, config: config_mod.Config, diag: *Diag) union(enum) {
+    opened: agent_peer.Peer,
+    exit: u8,
+} {
+    const opened = agent_peer.Peer.open(io, config.state_dir, config.node, diag) catch |err|
+        switch (err) {
+            error.Canceled => {
+                assert(diag.code == null);
+                return .{ .exit = constants.exit_ok };
+            },
+            error.Failed => return .{ .exit = fail(io, diag, config.verbose) },
+        };
+    return .{ .opened = opened };
+}
+
 /// Prints the diagnostic and returns the exit code its blame decides.
 pub fn fail(io: std.Io, diag: *const Diag, verbose: bool) u8 {
     assert(diag.code != null);
@@ -789,6 +809,34 @@ const Backend = struct {
 };
 
 // ---- Tests ------------------------------------------------------------------------------------
+
+test "a cancelled task while the node key is made exits quietly, with no diagnostic" {
+    // Goal: the agent's first start draws the node key; a cancel there is no failure and must not
+    // reach `fail`, which asserts a diagnostic. Method: an Io whose `randomSecure` is cancelled,
+    // an empty state directory, and the exit code `run` would return.
+    var vtable: std.Io.VTable = undefined;
+    const io = @import("secure_random.zig").canceled_io(std.testing.io, &vtable);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [constants.state_path_bytes_max]u8 = undefined;
+    const length = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const config: config_mod.Config = .{
+        .runtime = .fake,
+        .pulls = &.{},
+        .node = "node1",
+        .server = try std.Io.net.IpAddress.parse("127.0.0.1", 4000),
+        .state_dir = path_buffer[0..length],
+        .images = &.{},
+        .capacity = .{ .cpu_millis = 1, .memory_bytes = 1 },
+        .address = "",
+        .verbose = false,
+    };
+    var diag: Diag = undefined;
+    diag.reset();
+    const got = open_peer(io, config, &diag);
+    try std.testing.expectEqual(constants.exit_ok, got.exit);
+    try std.testing.expect(diag.code == null);
+}
 
 test "the store the agent reports from: the chunk directory, else Zigbox's, else the fake's" {
     // Goal: `Shell.images` is the store the node really holds (slice 8). Method: `node_images`
