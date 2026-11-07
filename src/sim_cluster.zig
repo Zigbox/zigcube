@@ -3024,26 +3024,14 @@ test "J8 holds on a small world whose agents' steps fail, without c1" {
     // the wedge and cut-link allowance, because `note_wedged` ran only under `c1`, so a run
     // whose agent was backed off by failed steps looked like one that outlived its deadline.
     // Method: seed 136502595 at 40 operations failed J8 before the fix; it is small enough to run
-    // on every target.
+    // on every target. The large drawn worlds that also failed (`sim_cluster <seed> auto
+    // --profile=auto` for seeds 130, 4026630699808099468, 8059167289430031834 and 148) ran 30
+    // minutes under WASI in this test, 62 s natively for seed 148 alone, and no native test
+    // target runs this file's tests, so they are not repeated here; the fleet draws such worlds.
     var report: Report = undefined;
     simulate(testing.allocator, 136502595, 40, .{}, &report);
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
     try testing.expect(!report.failed);
-}
-
-test "J8 holds on drawn worlds whose agents' steps fail, without c1" {
-    // Goal: the same regression on worlds as `sim_cluster <seed> auto --profile=auto` draws them.
-    // Method: replay the seeds that failed J8 before the fix. They are large and take minutes
-    // under WASI (seed 148, which also failed, took 62 s natively and is left out), so only
-    // native targets run them; the small test above covers wasm.
-    if (@import("builtin").target.cpu.arch.isWasm()) return error.SkipZigTest;
-    var report: Report = undefined;
-    for ([_]u64{ 4026630699808099468, 8059167289430031834, 130 }) |seed| {
-        const drawn = plan(seed, null, .{ .profile_auto = true });
-        simulate(testing.allocator, seed, drawn.operations, drawn.options, &report);
-        if (report.failed) std.debug.print("{s}\n", .{report.text()});
-        try testing.expect(!report.failed);
-    }
 }
 
 test "a node count can be asked for" {
