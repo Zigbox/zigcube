@@ -1012,10 +1012,12 @@ const Work = struct {
         const ctx = work.ctx;
         const text = teeth_replay.bytes[0..teeth_replay.len];
         if (teeth_replay.len > 0) {
-            const old = std.json.parseFromSliceLeaky(records.JobObserved, ctx.arena, text, .{
+            const old_read = std.json.parseFromSliceLeaky(records.JobObserved, ctx.arena, text, .{
                 .ignore_unknown_fields = true,
             }) catch return;
-            if (old.tenure == work.agent.tenure) {
+            var old = old_read;
+            if (old.tenure == work.agent.tenure and old.assignment > 1) {
+                old.assignment -= 1; // The epoch before the one the run was placed under.
                 const set = ctx.arena.create(compare_sets.Set) catch
                     return failures.no_memory(ctx.diag);
                 set.* = .{};
