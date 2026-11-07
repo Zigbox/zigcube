@@ -17,9 +17,9 @@ its own compares (run, assignment, no observation).
   replaced tenure is still `503` ZC-E0510. No new code, bound or default.
 - **Agent.** A refused report is dropped, not retried, and no longer fences at once: the agent
   cannot tell stale from tenure ended, so it has its lease checked on the next heartbeat
-  (`renew_at_ms = 0`), where a lost lease fences it. Other writes under the tenure still fence at
+  (`renew_at_ms` brought forward to one second from now), where a lost lease fences it. Other writes under the tenure still fence at
   once.
 - **Check.** sim-c1 J9 judges every stored `running` or `stopped` report; tooth
-  `sim-c1-teeth-job_stale` drops the agent's compare.
+  `sim-c1-teeth-job_stale` drops the assignment compare in the agent and in the server's handler, and the agent writes one report of the epoch before its own first.
 - **Upgrade.** Server first, as for #148: an older server stores the stale report, which is
   harmless.
