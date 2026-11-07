@@ -84,9 +84,10 @@ fn same_name(demo: *Demo) !void {
     // jobs ending and every heartbeat move it, so it is not compared (issue #155).
     // `retries` comes from the spec, so a second run would not show in it; the run's epoch and
     // the time its ending was recorded do.
-    try host.check(std.mem.eql(u8, after.state, "exited") and after.code == before.code and
+    const unchanged = std.mem.eql(u8, after.state, "exited") and after.code == before.code and
         same_text(after.node, before.node) and same_text(after.end_kind, before.end_kind) and
-        after.epoch == before.epoch and after.ended_at_ms == before.ended_at_ms, "the job exit0 did not change (same run: epoch and ended_at_ms)", .{});
+        after.epoch == before.epoch and after.ended_at_ms == before.ended_at_ms;
+    try host.check(unchanged, "the job exit0 did not change (same epoch and ended_at_ms)", .{});
     try host.check(before.epoch != null and before.ended_at_ms != null, "the job exit0's " ++
         "status carries epoch and ended_at_ms, so the comparison above has something to see", .{});
 }
