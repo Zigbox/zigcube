@@ -665,8 +665,10 @@ fn log_request(
     }
     var buffer: [512]u8 = undefined;
     const took = shared.clock.now_ms() -| started_ms;
-    const line = std.fmt.bufPrint(&buffer, "{s} {s} {s} -> {d} ({d} ms)\n", .{
-        request_id, parsed.method, parsed.path[0..@min(parsed.path.len, 200)], status, took,
+    // The wall-clock stamp (unix ms) lets a reader place the line against the runner's own log.
+    const stamp = std.Io.Clock.real.now(shared.io).toMilliseconds();
+    const line = std.fmt.bufPrint(&buffer, "[{d}] {s} {s} {s} -> {d} ({d} ms)\n", .{
+        stamp, request_id, parsed.method, parsed.path[0..@min(parsed.path.len, 200)], status, took,
     }) catch return;
     std.Io.File.stderr().writeStreamingAll(shared.io, line) catch {}; // Nowhere else to report it.
 }

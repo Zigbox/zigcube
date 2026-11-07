@@ -40,6 +40,25 @@ fn on_term(_: std.posix.SIG) callconv(.c) void {
     if (pid > 1) _ = std.os.linux.kill(pid, .TERM);
 }
 
+/// Waits until the child `pid` has ended, without reaping it, then stops `on_term` from signalling
+/// it. The caller reaps afterwards (`child.wait`). While the zombie exists its pid cannot be
+/// reused, so a `SIGTERM` between the end and `child_pid = 0` signals the zombie, which is
+/// harmless; reaping first would leave a window in which the pid could belong to another process
+/// (issue #113).
+fn wait_ended_unreaped(pid: i32) void {
+    var info: std.os.linux.siginfo_t = undefined;
+    while (true) {
+        const flags = std.os.linux.W.EXITED | std.os.linux.W.NOWAIT;
+        const rc = std.os.linux.waitid(.PID, pid, &info, flags, null);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => break, // Not our child, or already reaped: `child.wait` reports it.
+        }
+    }
+    child_pid.store(0, .seq_cst);
+}
+
 /// Makes `pid` the child a `SIGTERM` is passed to. The handler stores the flag and then reads the
 /// pid; this stores the pid and then reads the flag, all sequentially consistent, so at least one
 /// side sees the other: a `SIGTERM` that came before the pid was published (the child already
@@ -120,8 +139,8 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
         .stderr = .{ .file = log },
     }) catch return failed(.environment, "the host refused to start the fetch");
     publish_child(child.id.?);
+    wait_ended_unreaped(child.id.?);
     const term = child.wait(io) catch return .{ .kind = .lost };
-    child_pid.store(0, .seq_cst);
     const result = fetch_ended(arena, plan.digest, term);
     if (state) |opened| settle_streak(io, opened, arena, plan.digest, result);
     return result;
@@ -231,8 +250,8 @@ fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {
     const pid: i32 = child.id.?;
     publish_child(pid);
     files.write_pid(io, dir, files.file_child, pid) catch child.kill(io);
+    wait_ended_unreaped(pid);
     const term = child.wait(io) catch return record(io, dir, .{ .kind = .lost });
-    child_pid.store(0, .seq_cst);
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     return record(io, dir, ended(io, dir, arena_state.allocator(), term));
