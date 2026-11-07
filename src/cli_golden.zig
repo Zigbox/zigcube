@@ -30,6 +30,7 @@ const failures = @import("store_failures.zig");
 const fencing = @import("fencing.zig");
 const fetch_plan = @import("fetch_plan.zig");
 const fetch_worker = @import("fetch_worker.zig");
+const secure_random = @import("secure_random.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
 const x509 = @import("x509.zig");
@@ -616,6 +617,10 @@ fn tls_overlong_record(diag: *diag_mod.Diag) void { // tls_client.zig
     tls_refused(&client, &.{ 22, 3, 3, 0x40, 0x01 }, diag);
 }
 
+fn entropy_failed(diag: *diag_mod.Diag) void { // secure_random.zig
+    secure_random.raise(diag, "the TLS key share");
+}
+
 fn tls_cut_off(diag: *diag_mod.Diag) void { // tls_client.zig
     var client: tls_client.Client = undefined;
     var hello: [1024]u8 = undefined;
@@ -906,6 +911,7 @@ const cases = [_]Case{
     relayed(.E0818, tls_retry_request),
     relayed(.E0819, x509_wrong_use),
     relayed(.E0820, tls_signer_failed),
+    relayed(.E0821, entropy_failed),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

@@ -6,6 +6,7 @@
 //! says so on stderr: its agents join again. `revoked` is read once, at start.
 
 const std = @import("std");
+const secure_random = @import("secure_random.zig");
 const assert = std.debug.assert;
 const Ed25519 = std.crypto.sign.Ed25519;
 const Clock = @import("clock.zig").Clock;
@@ -74,6 +75,17 @@ pub fn cert_name_for(key_name: []const u8, buffer: *[key_name_bytes_max]u8) []co
         unreachable; // The key name fits `key_name_bytes_max` and `.crt` is as long as `.key`.
 }
 
+/// A CA key for a server with no state directory: from the kernel only (ZC-E0821 if it fails).
+fn memory_key(io: std.Io, diag: *Diag) Error!Ed25519.KeyPair {
+    var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    // A seed that gives the identity element has a chance of about 2^-250; draw another.
+    while (true) {
+        secure_random.fill(io, &seed, diag, "the CA key") catch return error.Failed;
+        return Ed25519.KeyPair.generateDeterministic(seed) catch continue;
+    }
+}
+
 /// Fills `ca` from `state_dir` (created if needed), or makes one in memory when it is null and
 /// writes `memory_notice` to stderr unless quiet. On failure `diag` says why (ZC-E0806).
 pub fn open(
@@ -89,7 +101,7 @@ pub fn open(
     ca.wall = wall;
     ca.revoked = .{};
     const path = state_dir orelse {
-        ca.key = Ed25519.KeyPair.generate(io);
+        ca.key = try memory_key(io, diag);
         if (options.quiet) return;
         std.Io.File.stderr().writeStreamingAll(io, memory_notice) catch {}; // Nowhere else.
         return;
@@ -238,7 +250,7 @@ fn load_or_make_key(
     }
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
-        io.random(&seed);
+        secure_random.fill(io, &seed, diag, "the CA key") catch return error.Failed;
         const key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
         try files.write_seed(io, dir, path, name, seed, diag);
         return key;
@@ -376,6 +388,22 @@ test "a lost CA key is refused unless a new CA is asked for, and a loose directo
     defer loose.close(io);
     try loose.setPermissions(io, .fromMode(0o644));
     try std.testing.expectError(error.Failed, open_test(&dir, &lost, used, &diag));
+}
+
+test "a memory CA with a failing random source is ZC-E0821, not a weaker key" {
+    // Goal: RB-N9 on the no-state-dir path. Method: an Io whose `randomSecure` fails.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.failing_io(std.testing.io, &vtable);
+    var clock = FixedClock{};
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.Failed,
+        open(&ca, gpa, io, null, clock.clock(), .{ .quiet = true }, &diag),
+    );
+    try std.testing.expectEqual(@import("diag/codes.zig").Code.E0821, diag.code.?);
 }
 
 test "a memory CA is made again each time and says nothing when quiet" {

@@ -125,6 +125,7 @@ pub const Code = enum(u8) {
     E0818,
     E0819,
     E0820,
+    E0821,
     B0001,
     B0002,
     B0003,
@@ -1698,7 +1699,9 @@ pub const registry = [_]Entry{
         \\
         \\On a healthy network this does not happen: it means bytes were changed in
         \\transit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24
-        \\records without updating its keys. Reconnect; if it repeats, check the path
+        \\records without updating its keys, or asked this side to update its own keys
+        \\more often than tls_key_updates_per_connection_max allows (each request is
+        \\answered with an update). Reconnect; if it repeats, check the path
         \\between the two machines.
         ,
     },
@@ -1720,6 +1723,10 @@ pub const registry = [_]Entry{
         \\Treat what arrived as incomplete and retry the request. A peer that
         \\crashes, or a network that resets the connection, ends this way; for a
         \\stall, check that the server is reachable and keeping up.
+        \\
+        \\A call on a connection that an earlier failure already ended raises it too,
+        \\with the cause "the TLS connection already ended"; the earlier call carried
+        \\the reason, and the fix is a new connection.
         ,
     },
     .{
@@ -1787,6 +1794,20 @@ pub const registry = [_]Entry{
         \\process or in another. This is that signer failing, not the server or the
         \\certificate. Check that the process or device holding the key is running
         \\and reachable, then reconnect.
+        ,
+    },
+    .{
+        .code = .E0821,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the operating system's secure random source failed",
+        .explanation =
+        \\A key, a nonce or a seed was not made because the kernel's secure random
+        \\source (getrandom) returned an error. Nothing weaker is used instead, and
+        \\nothing is retried.
+        \\
+        \\Check that getrandom works where this runs: the kernel, the seccomp profile
+        \\and the container sandbox must allow it. Then run the command again.
         ,
     },
     .{

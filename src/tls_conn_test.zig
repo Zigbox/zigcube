@@ -11,6 +11,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const peer_stream = @import("peer_stream.zig");
 const schedule = @import("tls_schedule.zig");
+const secure_random = @import("secure_random.zig");
 const testpeer = @import("tls_testpeer.zig");
 const tls_client = @import("tls_client.zig");
 const tls_conn = @import("tls_conn.zig");
@@ -273,6 +274,31 @@ fn echo_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectError(error.Closed, conn.write("x", end, &diag));
 }
 
+test "a handshake with a failing random source is Refused with ZC-E0821, then Closed" {
+    // Goal: RB-N9 at the caller: no ClientHello is built or sent, and a later call on the dead
+    // connection with the same diagnostic is Closed and keeps the first code. Method: an Io whose
+    // `randomSecure` fails and an fd that would fail any write.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.failing_io(std.testing.io, &vtable);
+    var conn: Conn = undefined;
+    defer conn.deinit();
+    var diag = new_diag();
+    const options: tls_conn.Options = .{
+        .io = io,
+        .fd = -1,
+        .anchor = @splat(0),
+        .server_name = server_name,
+    };
+    try std.testing.expectError(error.Refused, conn.open(&options, &diag));
+    try expect_code(&diag, .E0821);
+    const end = end_in(io, deadline_ms);
+    try std.testing.expectError(error.Closed, conn.write("x", end, &diag));
+    try expect_code(&diag, .E0821);
+    var fresh = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end, &fresh));
+    try expect_code(&fresh, .E0816);
+}
+
 test "a request goes out and an answer comes back, and close sends close_notify" {
     // Goal: the whole life of a connection over a real socket: handshake, one record each way
     // and the goodbye, with no diagnostic. Method: the scripted server checks the plaintext it
@@ -531,8 +557,13 @@ fn drop_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectEqualStrings("cut", out[0..got]);
     try std.testing.expectError(error.Refused, conn.read(&out, end, &diag));
     try expect_code(&diag, .E0816);
-    try std.testing.expectError(error.Closed, conn.read(&out, end, &diag));
-    try std.testing.expectError(error.Closed, conn.write("x", end, &diag));
+    // RA-N7: a call on the dead connection is Closed, and it carries a coded line.
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end, &later));
+    try expect_code(&later, .E0816);
+    var again = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end, &again));
+    try expect_code(&again, .E0816);
 }
 
 test "a stream that ends without close_notify is ZC-E0816, never an end of data" {
@@ -658,7 +689,8 @@ fn timeout_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expect(took >= 200);
     try std.testing.expect(took < deadline_ms);
     var out: [4]u8 = undefined;
-    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &later));
 }
 
 test "a server that stays silent ends the handshake at its deadline" {
@@ -693,8 +725,9 @@ fn stall_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     @memset(big, 0x5a);
     try std.testing.expectError(error.Timeout, conn.write(big, end_in(io, 200), &diag));
     // A record may be half sent: the connection is over.
-    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
-    try std.testing.expect(diag.code == null);
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &later));
+    try expect_code(&later, .E0816);
 }
 
 test "a peer that stops reading ends a write in a timeout" {
@@ -725,7 +758,8 @@ fn untrusted_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectError(error.Refused, conn.open(&options, &diag));
     try expect_code(&diag, .E0810);
     var out: [4]u8 = undefined;
-    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 50), &later));
 }
 
 test "a server certificate from another CA is refused and the alert is sent" {
@@ -851,8 +885,12 @@ fn full_update_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     // and the call that finds out says so, with a diagnostic, instead of `Timeout`.
     try std.testing.expectError(error.Refused, conn.read(&out, end_in(io, 200), &diag));
     try expect_code(&diag, .E0816);
-    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 200), &diag));
-    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end_in(io, 200), &later));
+    try expect_code(&later, .E0816);
+    var again = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &again));
+    try expect_code(&again, .E0816);
 }
 
 test "a KeyUpdate answer that times out ends the connection" {
@@ -908,7 +946,8 @@ fn seal_fail_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectEqual(@as(u32, 0), conn.plain_length);
     try std.testing.expect(std.mem.allEqual(u8, conn.plain[0..6], 0));
     try conn.close(end_in(io, 200), &diag);
-    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &diag));
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end_in(io, 200), &later));
 }
 
 test "a seal that fails drops what was queued, so close afterwards is safe" {

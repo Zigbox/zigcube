@@ -609,7 +609,7 @@ pub const ServerRequest = struct {
     lifetime: Lifetime,
 };
 
-/// A server certificate, for tests and for B6; signed by the CA.
+/// A server certificate, for tests and for B7; signed by the CA.
 pub fn issue_server(out: *Der, ca: Ed25519.KeyPair, request: *const ServerRequest) Error!void {
     if (identity_mod.dns_problem(request.dns_name, constants.x509_dns_name_bytes_max)) {
         return error.BadDnsName;

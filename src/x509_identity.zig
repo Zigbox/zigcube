@@ -1,6 +1,6 @@
 //! What a workload certificate says about its holder: the SPIFFE ID and the private identity
 //! extension (docs/briefs/mtls-client.md, "X.509 v3"). Kept apart from `x509.zig` so that the
-//! relay's issuer (B3) can import the identity without the certificate code. Core code: no
+//! relay's issuer (B4) can import the identity without the certificate code. Core code: no
 //! allocation, no recursion, no clock.
 //!
 //! The extension's value is a DER SEQUENCE `{ version INTEGER 1, image_digest OCTET STRING (32),

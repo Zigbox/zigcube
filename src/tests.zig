@@ -96,6 +96,7 @@ comptime {
     _ = @import("pull_report.zig");
     _ = @import("fetch_backoff.zig");
     _ = @import("peer_stream.zig");
+    _ = @import("secure_random.zig");
     _ = @import("peer_server.zig");
     _ = @import("fetch_cli.zig");
     _ = @import("fetch_worker.zig");

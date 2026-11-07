@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0821]: the operating system's secure random source failed
+  cause  getrandom returned an error while making the TLS key share
+  reqid  r-0000001
+  fix    Check that the kernel's getrandom works here: the seccomp profile and the container sandbox must allow it.
+  more   zcube explain E0821
+  docs   https://zigbox.github.io/zigcube/errors/E0821.html
