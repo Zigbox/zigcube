@@ -105,6 +105,7 @@ pub const Rule = enum {
     usize_field,
     import_not_allowed,
     banned_c_import,
+    secret_randomness,
     catch_unreachable_without_comment,
     file_name_not_snake_case,
     shell_script,
@@ -122,6 +123,8 @@ pub const Rule = enum {
             .usize_field => "usize/isize in a struct field (use a sized integer)",
             .import_not_allowed => "@import outside std, builtin, build_options, C and this repo",
             .banned_c_import => "@cImport is gone in Zig 0.17 (use b.addTranslateC)",
+            .secret_randomness => "secrets come from secure_random.zig (RB-N9): no " ++
+                "KeyPair.generate, crypto.random or randomSecure here",
             .catch_unreachable_without_comment => "unreachable needs a comment saying why",
             .file_name_not_snake_case => "file name is not snake_case",
             .shell_script => "shell scripts are banned unless on the allowlist",
@@ -512,10 +515,33 @@ fn check_physical_line(report: *Report, line: u32, raw: []const u8) void {
     }
 }
 
-fn check_banned_patterns(report: *Report, line: u32, code: []const u8) void {
+fn check_banned_patterns(report: *Report, line: u32, path: []const u8, code: []const u8) void {
     assert(line > 0);
     assert(code.len <= line_view_bytes_max);
     if (std.mem.indexOf(u8, code, "@cImport") != null) report.add(line, .banned_c_import);
+    if (secret_randomness_allowed(path)) return;
+    for (secret_randomness_patterns) |pattern| {
+        if (std.mem.indexOf(u8, code, pattern) != null) {
+            report.add(line, .secret_randomness);
+            return;
+        }
+    }
+}
+
+/// Ways to draw a secret from somewhere other than `secure_random.zig`. `KeyPair.generate(` is
+/// the std call that seeds from `std.crypto.random` (a generator in the process with a fallback);
+/// `generateDeterministic(` does not match, because the `(` must follow `generate`. This cannot
+/// see `io.random` on a secret; that one is for review.
+const secret_randomness_patterns = [_][]const u8{
+    "KeyPair.generate(",
+    "crypto.random",
+    "randomSecure(",
+};
+
+/// The one file that asks the kernel, and `random_seed`, which does the same for a handshake.
+fn secret_randomness_allowed(path: []const u8) bool {
+    return std.mem.eql(u8, path, "src/secure_random.zig") or
+        std.mem.eql(u8, path, "src/peer_stream.zig");
 }
 
 fn check_unreachable_comment(
@@ -610,7 +636,7 @@ pub fn check_source(report: *Report, path: []const u8, source: []const u8) void 
         line += 1;
         check_physical_line(report, line, raw);
         const view = blank_literals(&view_storage, raw);
-        check_banned_patterns(report, line, view);
+        check_banned_patterns(report, line, path, view);
         check_compound_assertion(report, line, view);
         check_unreachable_comment(report, line, view, raw, previous);
         check_imports(report, line, path, raw, view);
@@ -913,6 +939,32 @@ test "C imports are banned; libc linking is allowed" {
     );
     try testing.expect(report.contains(.banned_c_import, 3));
     try testing.expectEqual(@as(u32, 1), report.total());
+}
+
+test "secrets are drawn only in secure_random.zig (RB-N9)" {
+    // Goal: a key made by `KeyPair.generate`, `std.crypto.random` or a raw `randomSecure` call
+    // cannot come back. Method: each in a file that may not, then in the files that may, and the
+    // deterministic call, a literal and a comment, which are fine anywhere.
+    const source =
+        \\const a = Ed25519.KeyPair.generate(io);
+        \\const b = std.crypto.random.bytes(&x);
+        \\try io.randomSecure(&seed);
+        \\const c = Ed25519.KeyPair.generateDeterministic(seed);
+        \\const d = "KeyPair.generate("; // KeyPair.generate(
+        \\
+    ;
+    var report: Report = .{};
+    check_source(&report, "src/server_ca.zig", source);
+    try testing.expect(report.contains(.secret_randomness, 1));
+    try testing.expect(report.contains(.secret_randomness, 2));
+    try testing.expect(report.contains(.secret_randomness, 3));
+    try testing.expectEqual(@as(u32, 3), report.total());
+    report = .{};
+    check_source(&report, "src/secure_random.zig", source);
+    try testing.expectEqual(@as(u32, 0), report.total());
+    report = .{};
+    check_source(&report, "src/peer_stream.zig", source);
+    try testing.expectEqual(@as(u32, 0), report.total());
 }
 
 test "catch unreachable needs a comment on the line or the line above" {

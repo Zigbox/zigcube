@@ -12,8 +12,10 @@ const diag_mod = @import("diag.zig");
 
 const Diag = diag_mod.Diag;
 
-/// The OS could not give secure randomness; `diag` holds ZC-E0821.
-pub const Error = error{Unavailable};
+/// `Unavailable`: the OS could not give secure randomness; `diag` holds ZC-E0821.
+/// `Canceled`: the task was cancelled; `diag` is untouched, because a cancelled task is not a
+/// broken kernel and must never be reported as ZC-E0821. The caller stops and passes it on.
+pub const Error = error{ Unavailable, Canceled };
 
 /// Fills `out` from the kernel, or raises ZC-E0821 and fails. `what` names the secret being made
 /// ("the TLS key share"); it goes into the cause. On failure `out` is untouched.
@@ -23,10 +25,8 @@ pub fn fill(io: std.Io, out: []u8, diag: *Diag, what: []const u8) Error!void {
             raise(diag, what);
             return error.Unavailable;
         },
-        // Not E0821: a cancelled task is not a broken kernel. Nothing in Zigcube cancels the
-        // tasks that make keys (the handshake, the CA and the identity load run to the end), so
-        // reaching this is a bug, and it stops here rather than blaming the environment.
-        error.Canceled => unreachable,
+        // Not E0821: a cancelled task is not a broken kernel (see `Error`).
+        error.Canceled => return error.Canceled,
     };
 }
 
@@ -54,6 +54,25 @@ test "a failing random source is ZC-E0821, and the buffer is left alone" {
     var out: [16]u8 = @splat(0xAB);
     try std.testing.expectError(error.Unavailable, fill(std.Io.failing, &out, &diag, "a test key"));
     try std.testing.expectEqual(@import("diag/codes.zig").Code.E0821, diag.code.?);
+    try std.testing.expectEqual(@as(u8, 0xAB), out[0]);
+    try std.testing.expectEqual(@as(u8, 0xAB), out[15]);
+}
+
+/// An `Io` whose `randomSecure` reports the task as cancelled.
+fn canceled_random_secure(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+    return error.Canceled;
+}
+
+test "a cancelled task is Canceled, not ZC-E0821, and the buffer is left alone" {
+    var vtable: std.Io.VTable = undefined;
+    var io = failing_io(std.testing.io, &vtable);
+    vtable.randomSecure = canceled_random_secure;
+    io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var diag: Diag = undefined;
+    diag.reset();
+    var out: [16]u8 = @splat(0xAB);
+    try std.testing.expectError(error.Canceled, fill(io, &out, &diag, "a test key"));
+    try std.testing.expect(diag.code == null);
     try std.testing.expectEqual(@as(u8, 0xAB), out[0]);
     try std.testing.expectEqual(@as(u8, 0xAB), out[15]);
 }

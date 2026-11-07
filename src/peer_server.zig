@@ -511,7 +511,7 @@ fn serve(server: *Server, link: *Link) void {
     const handshake_end = peer_stream.boot_ms(io) + constants.peer_handshake_ms;
     var stream = peer_stream.open_server(io, link.fd, &identity, handshake_end) catch |err| {
         switch (err) {
-            error.Closed, error.Timeout, error.Io, error.TooBig => {},
+            error.Closed, error.Timeout, error.Io, error.TooBig, error.Canceled => {},
             error.Entropy => {
                 secure_random.raise(&diag, "the peer handshake key");
                 show(io, &diag, server.config.verbose);

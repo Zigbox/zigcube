@@ -27,7 +27,7 @@ pub const key_file = "peer.key";
 pub const credential_file = "peer.cred";
 pub const ca_file = "ca.pub";
 
-pub const Error = files.Error;
+pub const Error = files.Error || error{Canceled};
 
 pub const Peer = struct {
     io: std.Io,
@@ -338,7 +338,10 @@ fn load_or_make_key(
     }
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
-        secure_random.fill(io, &seed, diag, "the node key") catch return error.Failed;
+        secure_random.fill(io, &seed, diag, "the node key") catch |err| return switch (err) {
+            error.Unavailable => error.Failed,
+            error.Canceled => error.Canceled,
+        };
         var key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
         errdefer std.crypto.secureZero(u8, &key.secret_key.bytes); // A key that was not stored.
         try files.write_seed(io, dir, where, key_file, seed, diag);

@@ -19,7 +19,8 @@ const peer = @import("peer.zig");
 const Session = peer.Session;
 
 /// `Entropy`: the OS secure random source failed (ZC-E0821; the caller raises it).
-pub const Error = peer.Error || error{ Closed, Timeout, TooBig, Io, Entropy };
+/// `Canceled`: the task was cancelled; it is never ZC-E0821.
+pub const Error = peer.Error || error{ Closed, Timeout, TooBig, Io, Entropy, Canceled };
 
 /// The time a call may take is `end_ms` on this clock: CLOCK_BOOTTIME in milliseconds.
 pub fn boot_ms(io: std.Io) u64 {
@@ -36,11 +37,11 @@ pub fn wall_ms(io: std.Io) u64 {
 }
 
 /// A secret seed from the kernel (RB-N9); no fallback. `Entropy` is for the caller to raise.
-pub fn random_seed(io: std.Io) error{Entropy}![32]u8 {
+pub fn random_seed(io: std.Io) error{ Entropy, Canceled }![32]u8 {
     var seed: [32]u8 = undefined;
     io.randomSecure(&seed) catch |err| switch (err) {
         error.EntropyUnavailable => return error.Entropy,
-        error.Canceled => unreachable, // Handshakes are never cancelled; see secure_random.fill.
+        error.Canceled => return error.Canceled, // Not an Entropy failure; see secure_random.Error.
     };
     return seed;
 }

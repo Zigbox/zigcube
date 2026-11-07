@@ -354,12 +354,28 @@ test "a handshake message over the limit is refused, and the cause names the mes
 
 test "a peer that drives the write key limit is blamed, not this client (RA-S7)" {
     // Goal: the client answers every KeyUpdate request with an update of its own, so a peer
-    // that keeps asking reaches the write limit. Method: the limit is one request away.
+    // that keeps asking reaches the write limit. Method: no counter is set. One update of the
+    // client's own, then the peer asks `max - 1` times and every answer is opened; the next
+    // request finds the write keys at the limit while the read keys are one short of it.
     var rig: Rig = undefined;
     try rig.setup(.good, .{});
     try expect_connected(&rig, 4096);
-    rig.client.write.updates = constants.tls_key_updates_per_connection_max;
+    const max = constants.tls_key_updates_per_connection_max;
+    try rig.client.send_key_update(false, &rig.diag);
+    rig.collect();
+    _ = try rig.peer.open(rig.sent[0..rig.sent_length]);
+    try rig.peer.read.rekey();
+    rig.sent_length = 0;
     var buffer: [64]u8 = undefined;
+    for (0..max - 1) |_| {
+        _ = try rig.feed(rig.peer.key_update(&buffer, true), 4096);
+        const opened = try rig.peer.open(rig.sent[0..rig.sent_length]);
+        try std.testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1, 0 }, opened.content);
+        try rig.peer.read.rekey();
+        rig.sent_length = 0;
+    }
+    try std.testing.expectEqual(max, rig.client.write.updates);
+    try std.testing.expectEqual(max - 1, rig.client.read.updates);
     try std.testing.expectError(error.Refused, rig.feed(rig.peer.key_update(&buffer, true), 4096));
     try rig.expect_code(.E0815);
     const cause = rig.diag.last_cause().?;

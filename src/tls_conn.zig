@@ -41,7 +41,7 @@ const tls_client = @import("tls_client.zig");
 const Diag = diag_mod.Diag;
 const linux = std.os.linux;
 
-pub const Error = error{ Refused, Closed, Timeout };
+pub const Error = error{ Refused, Closed, Timeout, Canceled };
 
 /// What `pull` and `push` can say; the caller turns it into an `Error` and, when it must, a
 /// diagnostic.
@@ -121,10 +121,13 @@ pub const Conn = struct {
             .client_auth = options.client_auth,
         };
         inline for (.{ &config.random, &config.session_id, &config.secret }) |field| {
-            secure_random.fill(io, field, diag, "the TLS handshake secrets") catch {
+            secure_random.fill(io, field, diag, "the TLS handshake secrets") catch |err| {
                 std.crypto.secureZero(u8, &config.secret);
                 conn.phase = .broken;
-                return error.Refused;
+                return switch (err) {
+                    error.Unavailable => error.Refused,
+                    error.Canceled => error.Canceled,
+                };
             };
         }
         conn.client.init(&config);
