@@ -175,6 +175,19 @@ pub fn runs_on(demo: *Demo, index: usize, name: []const u8) !bool {
     return false;
 }
 
+const OnNode = struct { demo: *Demo, index: usize, name: []const u8 };
+
+fn container_on(want: OnNode, _: *Host) !bool {
+    return runs_on(want.demo, want.index, want.name);
+}
+
+/// Waits (bounded by `job_wait_ms`) until a container called `name` shows on node `index`: the
+/// server reads a job `running` a moment before the node's process table lists its container.
+pub fn wait_runs_on(demo: *Demo, index: usize, comptime name: []const u8) !void {
+    const want: OnNode = .{ .demo = demo, .index = index, .name = name };
+    try demo.host.wait_for(want, container_on, name ++ " to show on its node", job_wait_ms);
+}
+
 /// How many containers run on node `index`.
 pub fn running_on(demo: *Demo, index: usize) !u32 {
     return @intCast((try demo.fleet.procs(index).running_containers()).len);

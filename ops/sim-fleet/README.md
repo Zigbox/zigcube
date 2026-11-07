@@ -29,6 +29,7 @@ One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_sw
    | `sim_c1_teeth_job_restart` | 33 of 40 (same) | 0.5 | 40 | 9.1e-13 |
    | `sim_c1_teeth_job_cancel` | 15 of 40 (same) | 0.25 | 80 | 1.0e-10 |
    | `sim_c1_teeth_job_deadline`, `_deadline_late` | 25 and 24 of 40 (same) | 0.4 | 50 | 8.1e-12 |
+   | `sim_c1_teeth_job_deadline_offline` | 11 of 40 (100 operations, `--c1`, 2026-11-07) | 0.25 | 80 | 1.0e-10 |
    | `sim_c1_teeth_job_gap` | 20 of 40 (5 of 10 in 1..10) | 0.5 | 50 | 8.9e-16 |
    | `sim_swarm_teeth` | 192 of 400 (reviewer: 51 of 101) | 0.4 | 200 | 4e-45 |
 

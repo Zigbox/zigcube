@@ -147,6 +147,78 @@ fn label_of(listing: *const runtime.Listing, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Stops each running run container whose deadline has come, from its start record and this
+/// node's monotonic clock alone, and kills it once its grace has passed: the deadline needs no
+/// server (docs/briefs/b1.md, "The server never decides a running job's deadline"). Runs at the
+/// start of every step, before any call, so a server that cannot be reached, a call that hangs or
+/// another run whose report keeps failing never holds a stop back; `pass` reports the ending when
+/// the server answers. Records `stop_cause: deadline` before the signal, as `pass` does. Sets
+/// `deadline_wake_mono_ms` to the next deadline or kill, which caps the step's waits and calls.
+/// Never fails: one run's failure (its record, its stop) is noted (`Agent.note_enforce_failure`)
+/// and the next run is looked at, so no run's trouble holds back another's stop or the
+/// heartbeat that follows (docs/decisions/2026-11-07-agent-enforces-deadline-offline.md).
+pub fn enforce_deadlines(
+    agent: *Agent,
+    ctx: *const Context,
+    listings: []const runtime.Listing,
+) void {
+    agent.deadline_wake_mono_ms = std.math.maxInt(u64);
+    if (c1_teeth.job_deadline_offline) return; // Test-only: only the pass enforces it (J8).
+    const state = ctx.state orelse return;
+    for (listings) |*listing| {
+        if (!is_running(listing)) continue;
+        if (label_of(listing, runtime.label_job) == null) continue;
+        const id = label_of(listing, runtime.label_replica) orelse continue;
+        const read = read_record(ctx, state, id) catch {
+            agent.note_enforce_failure(ctx, "read a run's start record");
+            continue;
+        };
+        switch (read) {
+            // No record to say when: `pass` stops it as `unknown`, with the server's word.
+            .absent, .damaged => {},
+            .record => |found| enforce_one(agent, ctx, state, listing, found),
+        }
+    }
+}
+
+fn enforce_one(
+    agent: *Agent,
+    ctx: *const Context,
+    state: agent_state.AgentState,
+    listing: *const runtime.Listing,
+    found: StartRecord,
+) void {
+    // A `claiming` record's time bounds the input fetch, not the run: its container is the
+    // pass's to judge. Another boot's time is not comparable: the run ends through the fence.
+    if (found.phase != .claimed) return;
+    if (!std.mem.eql(u8, found.boot_id, ctx.boot_id)) return;
+    const mono = ctx.mono_ms();
+    var record = found;
+    if (record.stop_cause == null) {
+        const at = record.deadline_mono_ms orelse return;
+        const due = at +| c1_teeth.job_deadline_late_ms;
+        if (c1_teeth.job_deadline) return;
+        if (mono < due) return note_deadline_wake(agent, due);
+        record.stop_cause = .deadline;
+        // The cause is in `record` for the stop below; if the write fails the stop still goes
+        // out, and the next step finds the same deadline passed and writes it again.
+        write_record(ctx, state, &record) catch
+            agent.note_enforce_failure(ctx, "record a run's deadline");
+    }
+    // Any recorded cause is a stop under way: send it, or the kill once the grace has passed.
+    agent.stop_listing(ctx, listing, record.grace_ms) catch {
+        agent.note_enforce_failure(ctx, "stop a run's container");
+        return; // The next step tries again (the loop's resync), not a busy retry.
+    };
+    const pending = agent.pending_stop(listing.handle.name()) orelse return;
+    const now = ctx.clock.now_ms();
+    if (pending.deadline_ms > now) note_deadline_wake(agent, mono + (pending.deadline_ms - now));
+}
+
+fn note_deadline_wake(agent: *Agent, at_mono_ms: u64) void {
+    agent.deadline_wake_mono_ms = @min(agent.deadline_wake_mono_ms, at_mono_ms);
+}
+
 /// One reconcile step's work on runs. Returns how many store writes were committed.
 pub fn pass(
     agent: *Agent,
@@ -159,6 +231,7 @@ pub fn pass(
     var work: Work = .{ .agent = agent, .ctx = ctx, .state = state, .listings = listings };
     const subjects = try work.subjects(assigned);
     if (subjects.len == 0) return 0;
+
     const cctx = ctx.as_controller();
     work.runs = (try controller.list_all(
         records.JobRun,
@@ -173,7 +246,7 @@ pub fn pass(
         &cctx,
         prefix.slice(),
         null,
-        constants.jobs_max,
+        constants.job_admitted_window_max,
     )).items;
     for (subjects) |subject| {
         try work.one(subject);
@@ -241,26 +314,75 @@ const Work = struct {
         return null;
     }
 
-    fn seen_of(work: *const Work, id: []const u8) ?*const records.JobObserved {
+    fn observed_entry(work: *const Work, id: []const u8) ?*const Entry(records.JobObserved) {
         for (work.observed) |*entry| {
-            if (std.mem.eql(u8, entry.rec.run, id)) return &entry.rec;
+            if (std.mem.eql(u8, entry.rec.run, id)) return entry;
         }
         return null;
     }
 
+    /// The node's observation of the run, unless it belongs to an earlier job of the same name.
+    fn seen_of(work: *const Work, id: []const u8) ?*const records.JobObserved {
+        const entry = work.observed_entry(id) orelse return null;
+        if (work.is_stale_epoch(id, entry.rec.assignment)) return null;
+        return &entry.rec;
+    }
+
+    /// The revision of the leftover observation of an earlier job of this subject's name, if
+    /// there is one: what a claim has to replace.
+    fn stale_observation(work: *const Work, subject: Subject) ?u64 {
+        const entry = work.observed_entry(subject.id) orelse return null;
+        if (!work.is_stale_epoch(subject.id, entry.rec.assignment)) return null;
+        return entry.kv.mod_revision;
+    }
+
+    /// True if `epoch`, an assignment revision some record or container remembers, is older than
+    /// the run being served. A run id is `<name>-job`, so a name reused after retention has the
+    /// old id; the job's `/job-runs` record is created once, for the job's whole life, and every
+    /// assignment of that job (and so every claim, start record and container) is later than
+    /// it. A re-assignment of the same job is not stale: its claim must stay one claim.
+    fn is_stale_epoch(work: *const Work, id: []const u8, epoch: u64) bool {
+        const entry = work.run_of(id) orelse return false;
+        return epoch < entry.kv.create_revision;
+    }
+
+    /// The run's container. For a run that is assigned, only one made under this assignment:
+    /// a container of an earlier job of the same name is `stale_listing`.
     fn listing_of(work: *const Work, id: []const u8) ?*const runtime.Listing {
         for (work.listings) |*listing| {
             const value = label_of(listing, runtime.label_replica) orelse continue;
-            if (std.mem.eql(u8, value, id)) return listing;
+            if (!std.mem.eql(u8, value, id)) continue;
+            if (work.is_stale(listing, id)) continue;
+            return listing;
         }
         return null;
+    }
+
+    fn is_stale(work: *const Work, listing: *const runtime.Listing, id: []const u8) bool {
+        const made = label_of(listing, runtime.label_created) orelse return false;
+        const epoch = std.fmt.parseInt(u64, made, 10) catch return false;
+        return work.is_stale_epoch(id, epoch);
+    }
+
+    /// Stops the containers of earlier jobs of this run's name that are still running.
+    fn stop_stale(work: *Work, id: []const u8) Error!void {
+        for (work.listings) |*listing| {
+            const value = label_of(listing, runtime.label_replica) orelse continue;
+            if (!std.mem.eql(u8, value, id) or !work.is_stale(listing, id)) continue;
+            if (is_running(listing)) try work.stop(listing, 0);
+        }
     }
 
     // ---- One run ----
 
     fn one(work: *Work, subject: Subject) Error!void {
         const ctx = work.ctx;
-        const found = try read_record(ctx, work.state, subject.id);
+        try work.stop_stale(subject.id);
+        var found = try read_record(ctx, work.state, subject.id);
+        // A start record of an earlier job of this name: nothing of this one was started.
+        if (found == .record and work.is_stale_epoch(subject.id, found.record.epoch)) {
+            found = .absent;
+        }
         const listing = work.listing_of(subject.id);
         const seen = work.seen_of(subject.id);
         const run = work.run_of(subject.id);
@@ -659,6 +781,9 @@ const Work = struct {
     ) Error!bool {
         const ctx = work.ctx;
         const agent = work.agent;
+        // A leftover observation of an earlier job of this name (another assignment epoch) is
+        // replaced by the claim; one of this assignment would make the claim refuse.
+        const replaces = work.stale_observation(subject) orelse 0;
         const claimed = records.JobObserved{
             .run = subject.id,
             .node = agent.config.node,
@@ -676,6 +801,7 @@ const Work = struct {
             subject.name,
             entry.kv.mod_revision,
             subject.epoch,
+            replaces,
         );
         return switch (try work.commit(claimed, set.compares())) {
             .applied => true,

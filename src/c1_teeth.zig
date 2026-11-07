@@ -52,6 +52,16 @@ pub const job_deadline = declared("c1_teeth_job_deadline");
 pub const job_deadline_late = declared("c1_teeth_job_deadline_late");
 pub const job_deadline_late_ms: u64 = if (job_deadline_late) 9_000 else 0;
 
+/// The agent does not stop a run at its deadline from its own records and clock: only its pass,
+/// which needs the server, or the fence does (must break J8: a node cut off from the server
+/// overruns the deadline by up to the lease's ttl). The simulator turns partitions up, makes
+/// them longer and draws more, shorter jobs under it, so that deadlines fall in the cuts.
+pub const job_deadline_offline = declared("c1_teeth_job_deadline_offline");
+
+/// Not a fault: the world of `job_deadline_offline` (long cuts, short deadlines) with the agent's
+/// own enforcement left on, for the positive run `sim-c1-offline`. Not in `any`.
+pub const offline_world = declared("c1_offline_world") or job_deadline_offline;
+
 /// The jobs watch drops the events of some endings (must break J4: a client that follows the watch
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");
@@ -59,4 +69,4 @@ pub const job_gap = declared("c1_teeth_job_gap");
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
-    job_gap;
+    job_deadline_offline or job_gap;

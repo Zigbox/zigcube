@@ -48,45 +48,30 @@ pub const Watch = struct {
     /// When the tracker first saw the container: the run's start on the ledger, within a tick.
     first_seen_ms: u64,
     ended_since_ms: ?u64,
-    /// The node's totals of wedged time and of cut-link time when the container was first seen.
+    /// The node's total of wedged time when the container was first seen.
     wedged_base_ms: u64 = 0,
-    link_base_ms: u64 = 0,
-    /// Whether those two were re-taken at the start of the window that matters to J8: the link's
-    /// at the fence's reach before the deadline, the wedge's at the deadline.
-    link_marked: bool = false,
+    /// Whether it was re-taken at the start of the window that matters to J8, the deadline.
     wedge_marked: bool = false,
     /// The node's total of wedged time when the run's `stop` was first seen (J6 counts only
     /// wedged time after the stop).
     stop_wedged_base_ms: ?u64 = null,
 };
 
-/// What a node's totals add up to for a watched run since the marks `note_marks` took.
-pub fn cut_since(watch: *const Watch, wedged_total_ms: u64, link_total_ms: u64) Cut {
-    return .{
-        .wedged_ms = wedged_total_ms - watch.wedged_base_ms,
-        .link = link_total_ms > watch.link_base_ms,
-    };
+/// How long a watched run's node was wedged since the mark `note_marks` took.
+pub fn wedged_since(watch: *const Watch, wedged_total_ms: u64) u64 {
+    return wedged_total_ms - watch.wedged_base_ms;
 }
 
-/// Takes the node's totals at the moments the bounds start to count them (every tick, wedged or
-/// not): J8's link at the fence's reach before the run's deadline (a cut earlier than that was
-/// mended by the time the deadline came, and the fence is the agent's way of enforcing it only
-/// for a cut that spans it), its wedged time at the deadline, and J6's at the run's stop.
+/// Takes the node's total of wedged time at the moments the bounds start to count it (every
+/// tick, wedged or not): J8's at the run's deadline, J6's at the run's stop.
 pub fn note_marks(
     watch: *Watch,
     now_ms: u64,
     deadline_ms: u64,
     stopped: bool,
-    lease_ttl_ms: u64,
     wedged_total_ms: u64,
-    link_total_ms: u64,
 ) void {
     const age = now_ms - watch.first_seen_ms;
-    const reach = lease_ttl_ms -| constants.fence_margin_ms;
-    if (!watch.link_marked and age >= deadline_ms -| reach) {
-        watch.link_marked = true;
-        watch.link_base_ms = link_total_ms;
-    }
     if (!watch.wedge_marked and age >= deadline_ms) {
         watch.wedge_marked = true;
         watch.wedged_base_ms = wedged_total_ms;
@@ -106,38 +91,23 @@ pub fn stop_bound_ms(lease_ttl_ms: u64, grace_ms: u64, granularity_ms: u64) u64 
     return @max(linked, fenced) + granularity_ms;
 }
 
-/// How much of its window a run's node could not enforce the deadline.
-pub const Cut = struct {
-    /// Time the agent was down or frozen, or a container ignored its stop, during the window.
-    wedged_ms: u64,
-    /// Whether the node's link or the store was cut at any time during the window: the agent could
-    /// not read its run, so it enforced the deadline only through the fence.
-    link: bool,
-};
-
-/// The bound of J8: the deadline, the grace, the clocks' rate error (`clock_ppm`, either way),
-/// the simulator's granularity, the kill and two resyncs for the agent to look (to stop, to
-/// kill). Only if the node was cut off during the run's window (`cut`: partitioned, the store
-/// out, a failed step or a failed watch and its back-off) the fence replaces the resync and
-/// the kill (the lease's ttl less the margin, the stop, the kill), and the time the node was
-/// wedged is added: its supervisors run on, but nobody enforces the deadline. A node that was
-/// never cut off gets no more, so a deadline enforced merely late is caught.
+/// The bound of J8: the deadline and the grace, the clocks' rate error (`clock_ppm`, either
+/// way), the simulator's granularity (`granularity_ms`: when it looks), the kill's latency and the
+/// time the node was wedged after the deadline (`wedged_ms`: its agent down or frozen, or a
+/// container ignoring its stop; the supervisors run on, but nobody enforces the deadline).
+/// Nothing for a cut link, the store being out or a failed step: the agent stops the run from
+/// its own records and clock, waking at the deadline and at the end of the grace, so a node cut
+/// off from the server gets no more time than one that is not, and neither does the fence's
+/// ttl. A deadline enforced merely late, or only through the fence, is caught.
 pub fn deadline_bound_ms(
     deadline_ms: u64,
     grace_ms: u64,
     clock_ppm: u64,
-    lease_ttl_ms: u64,
     granularity_ms: u64,
-    cut: Cut,
+    wedged_ms: u64,
 ) u64 {
     const base = deadline_ms + grace_ms;
-    // The agent looks at the run once a resync: the first look after the deadline stops it, the
-    // first look after the grace kills it.
-    const linked = constants.fence_kill_latency_ms + 2 * constants.agent_resync_ms;
-    const fenced = lease_ttl_ms - constants.fence_margin_ms + constants.fence_stop_ms +
-        constants.fence_kill_latency_ms;
-    const cut_off = cut.link or cut.wedged_ms > 0;
-    const extra = if (cut_off) @max(linked, fenced) + cut.wedged_ms else linked;
+    const extra = constants.fence_kill_latency_ms + wedged_ms;
     return base + base * clock_ppm / 1_000_000 + extra + granularity_ms;
 }
 
@@ -231,49 +201,48 @@ fn claim_problem(
 test "bounds grow with the grace and the deadline" {
     const short = stop_bound_ms(10_000, 0, 0);
     try std.testing.expect(stop_bound_ms(10_000, 60_000, 0) > short);
-    const none: Cut = .{ .wedged_ms = 0, .link = false };
-    try std.testing.expect(deadline_bound_ms(10_000, 0, 10_000, 10_000, 0, none) >
-        deadline_bound_ms(10_000, 0, 0, 10_000, 0, none));
-    const cut: Cut = .{ .wedged_ms = 0, .link = true };
-    try std.testing.expect(deadline_bound_ms(10_000, 0, 0, 10_000, 0, cut) >
-        deadline_bound_ms(10_000, 0, 0, 10_000, 0, none));
+    try std.testing.expect(deadline_bound_ms(10_000, 0, 10_000, 0, 0) >
+        deadline_bound_ms(10_000, 0, 0, 0, 0));
+    try std.testing.expect(deadline_bound_ms(10_000, 0, 0, 0, 500) >
+        deadline_bound_ms(10_000, 0, 0, 0, 0));
 }
 
-test "note_marks: wedges before the deadline and cuts before the fence's reach do not count" {
-    // Goal: pin the tightening of J6 and J8 (#127): the bases are re-taken at the start of the
-    // window that matters, not kept from first sight. A mutant that never re-takes them leaves
-    // a base of 0 and this test fails.
-    const ttl: u64 = 10_000;
+test "J8's bound has no room for the fence" {
+    // Goal: pin the release review's MUST (PR #147): the agent enforces a deadline without the
+    // server, so J8 gives a cut-off node nothing for the fence. A bound that grew back by the
+    // fence's reach would let an agent that stops a run only through the fence pass.
+    const fenced = constants.lease_ttl_ms - constants.fence_margin_ms + constants.fence_stop_ms;
     const deadline: u64 = 60_000;
-    const reach = ttl - constants.fence_margin_ms;
+    const grace: u64 = 2_000;
+    const bound = deadline_bound_ms(deadline, grace, 0, 0, 0);
+    try std.testing.expect(bound < deadline + grace + fenced);
+    try std.testing.expectEqual(deadline + grace + constants.fence_kill_latency_ms, bound);
+}
+
+test "note_marks: wedges before the deadline do not count" {
+    // Goal: pin the tightening of J6 and J8 (#127): the base is re-taken at the start of the
+    // window that matters, not kept from first sight. A mutant that never re-takes it leaves
+    // a base of 0 and this test fails.
+    const deadline: u64 = 60_000;
     var watch: Watch = .{
         .node = 0,
         .name_hash = 1,
         .first_seen_ms = 1000,
         .ended_since_ms = null,
     };
-    // 5 s of wedge and 3 s of link cut, both long before the window.
-    note_marks(&watch, 1000 + 10_000, deadline, false, ttl, 5000, 3000);
-    try std.testing.expect(!watch.link_marked and !watch.wedge_marked);
-    // At the fence's reach before the deadline: the link base is taken (3000 cut so far).
-    note_marks(&watch, 1000 + deadline - reach, deadline, false, ttl, 5000, 3000);
-    try std.testing.expect(watch.link_marked and !watch.wedge_marked);
-    try std.testing.expectEqual(@as(u64, 3000), watch.link_base_ms);
-    // Nothing since: the earlier cut and wedge are not counted.
-    var cut = cut_since(&watch, 5000, 3000);
-    try std.testing.expect(!cut.link);
-    // At the deadline: the wedge base is taken.
-    note_marks(&watch, 1000 + deadline, deadline, false, ttl, 7000, 3000);
+    // 5 s of wedge, long before the window.
+    note_marks(&watch, 1000 + 10_000, deadline, false, 5000);
+    try std.testing.expect(!watch.wedge_marked);
+    try std.testing.expectEqual(@as(u64, 5000), wedged_since(&watch, 5000));
+    // At the deadline: the wedge base is taken, and the earlier wedge no longer counts.
+    note_marks(&watch, 1000 + deadline, deadline, false, 7000);
     try std.testing.expectEqual(@as(u64, 7000), watch.wedged_base_ms);
-    cut = cut_since(&watch, 7000, 3000);
-    try std.testing.expectEqual(@as(u64, 0), cut.wedged_ms);
-    // A cut and a wedge after the marks do count.
-    cut = cut_since(&watch, 7500, 3100);
-    try std.testing.expect(cut.link);
-    try std.testing.expectEqual(@as(u64, 500), cut.wedged_ms);
+    try std.testing.expectEqual(@as(u64, 0), wedged_since(&watch, 7000));
+    // A wedge after the mark does count.
+    try std.testing.expectEqual(@as(u64, 500), wedged_since(&watch, 7500));
     // J6: the stop's base is taken once, at first sight of the stop.
-    note_marks(&watch, 1000 + deadline + 5, deadline, true, ttl, 7600, 3100);
+    note_marks(&watch, 1000 + deadline + 5, deadline, true, 7600);
     try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
-    note_marks(&watch, 1000 + deadline + 9, deadline, true, ttl, 9000, 3100);
+    note_marks(&watch, 1000 + deadline + 9, deadline, true, 9000);
     try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
 }

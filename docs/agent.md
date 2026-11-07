@@ -272,7 +272,12 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
    still `claiming` after a restart claims again (the compare says whether it won).
 3. **The deadline** is `deadline_mono_ms` on the boot clock, written before the start and compared
    only under the same `boot_id`; after a reboot the container is gone and the run ends `lost`, not
-   `deadline`.
+   `deadline`. The agent enforces it without the server: every step, before any call to
+   `zcube-server`, it lists the runtime and reads the start records (`enforce_deadlines`); a run
+   past its deadline gets `stop_cause` `deadline`, TERM, and the kill when its grace ends. The next
+   deadline or kill is a wake, and every call and backoff is capped at it as at the fence, so a cut
+   link, a hung call or a run whose report keeps failing delays no run's stop. The pass reports the
+   ending once the server answers.
 4. **`stop_cause`** (`cancel`, `deadline`, `fence`, `not_started`) is written to the start record
    before the container is signalled and reported with the exit. An exit the agent saw first
    carries none. A fence under a replaced tenure is reported under the next tenure, once it holds.
@@ -399,8 +404,9 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   itself (`std.os.linux`), `poll`s it for the connection until the call's end, and hands the
   connected socket back to `Io` in blocking mode. One deadline, the hold plus
   `agent_io_timeout_ms`, covers connect, send and every read; the client `poll`s before each read.
-  While the agent holds a lease the deadline is cut to the fence (`fence_at`): no call waits past
-  it, and a call that would start after it is not made (`ZC-E0503`, the fence goes on). It does not use a receive timeout
+  While the agent holds a lease the deadline is cut to the fence (`fence_at`), and to a run's next
+  deadline or kill: no call waits past it, and a call that would start after it is not made
+  (`ZC-E0503`; the fence, or the run's stop, goes on). It does not use a receive timeout
   on the socket, which makes the standard library's reader panic when it fires; the agent died
   with `ZC-B0001` whenever a server held a request that long (a store outage does), which slice 6c
   found. A request is small and is written at once, so a write has no timeout.
