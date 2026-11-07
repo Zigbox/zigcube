@@ -430,6 +430,8 @@ const Work = struct {
         seen: ?*const records.JobObserved,
         why: Why,
     ) Error!void {
+        // A run with no assignment here has nothing to report under: it ends on this node.
+        const epoch = report_epoch(subject, record) orelse return;
         if (seen) |existing| {
             if (existing.status == .stopped) return;
         }
@@ -437,12 +439,6 @@ const Work = struct {
             .missing, .damaged => try work.coded(.E0522, subject.id),
             .vanished => try work.coded(.E0521, subject.id),
         };
-        const epoch = if (record) |held|
-            held.epoch
-        else if (seen) |held|
-            held.assignment
-        else
-            subject.epoch;
         try work.report(.{
             .run = subject.id,
             .status = .stopped,
@@ -468,11 +464,8 @@ const Work = struct {
             if (held.status == .claimed) return work.claimed_unstarted(subject, record, held, run);
         }
         try work.lost(subject, record, seen, .vanished);
-        if (!subject.assigned) {
-            const done = work.seen_of(subject.id);
-            const ended = if (done) |held| held.status == .stopped else false;
-            if (ended) try remove_record(work.ctx, work.state, subject.id);
-        }
+        // No container: a run with no assignment here is over on this node (`report_epoch`).
+        if (!subject.assigned) try remove_record(work.ctx, work.state, subject.id);
     }
 
     /// A `claiming` record and no observation: nothing was started, because the claim comes
@@ -509,10 +502,14 @@ const Work = struct {
     }
 
     fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
+        // Nothing was started, so a run with no assignment here ends with its record. One placed
+        // again is reported under the new assignment (`report_epoch`).
+        const epoch = report_epoch(subject, record) orelse
+            return remove_record(work.ctx, work.state, subject.id);
         var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
-            .epoch = record.epoch,
+            .epoch = epoch,
             .exit = .{ .kind = .lost },
             .stop_cause = .not_started,
         };
@@ -569,7 +566,11 @@ const Work = struct {
         }
         const mono = ctx.mono_ms();
         const live = seen == null or seen.?.status != .stopped;
-        if (live and (seen == null or seen.?.status != .running)) {
+        // `running` is reported only under the assignment it was claimed under, while that is
+        // still this node's (`report_epoch`); an ending is reported under the current one.
+        const epoch_now = report_epoch(subject, current);
+        const current_epoch = if (epoch_now) |epoch| epoch == current.epoch else false;
+        if (current_epoch and live and (seen == null or seen.?.status != .running)) {
             try work.report(.{
                 .run = subject.id,
                 .status = .running,
@@ -625,16 +626,16 @@ const Work = struct {
         reason: runtime.ExitReason,
         seen: ?*const records.JobObserved,
     ) Error!void {
+        // The container has ended: a run with no assignment here is over on this node.
+        const epoch = report_epoch(subject, record) orelse
+            return remove_record(work.ctx, work.state, subject.id);
         if (seen) |existing| {
-            if (existing.status == .stopped) {
-                if (!subject.assigned) try remove_record(work.ctx, work.state, subject.id);
-                return;
-            }
+            if (existing.status == .stopped) return;
         }
         var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
-            .epoch = record.epoch,
+            .epoch = epoch,
             .stop_cause = record.stop_cause,
             .started_at_ms = record.started_at_ms,
         };
@@ -953,11 +954,30 @@ const Work = struct {
         }
     }
 
-    /// Commits a report unless the store already says the same. A report rests on the tenure
-    /// alone; a refusal of it is the end of the tenure, so the agent fences.
+    /// The assignment a report of this run is made under: its current one on this node, the only
+    /// one the store takes it under (`compare_sets.job_report`, B2). A run with no assignment
+    /// here has none: it is never reported, and it ends on this node once its container has
+    /// ended (its start record is removed; the deadline is enforced from that record until then).
+    /// So a report is refused only when the assignment or the tenure changed since this pass
+    /// read them, and a refused report is never made again for a run that is gone.
+    fn report_epoch(subject: Subject, record: ?StartRecord) ?u64 {
+        if (!subject.assigned) {
+            // Test-only (J9): the run is reported under the assignment it was started under.
+            if (c1_teeth.job_stale) if (record) |held| if (held.epoch > 0) return held.epoch;
+            return null;
+        }
+        assert(subject.epoch > 0);
+        return subject.epoch;
+    }
+
+    /// Commits a report unless the store already says the same. A report rests on the tenure and
+    /// on the assignment it names still being the stored one (`compare_sets.job_report`). A
+    /// refusal is dropped: the next pass reads the assignment again, and a tenure that ended is
+    /// found by the heartbeat on its own schedule, where a lost lease fences the agent.
     fn report(work: *Work, wanted: Report) Error!void {
         const ctx = work.ctx;
         const agent = work.agent;
+        assert(wanted.epoch > 0);
         if (work.seen_of(wanted.run)) |existing| {
             if (same(existing, wanted)) return;
         }
@@ -974,13 +994,17 @@ const Work = struct {
             .reported_at_ms = ctx.clock.now_ms(),
         };
         assert(value.valid());
-        const node_key = records.node_key(agent.config.node);
-        const tenure = ctx.arena.alloc(store_compare, 1) catch return failures.no_memory(ctx.diag);
-        tenure[0] = .{ .key = node_key.slice(), .mod_revision = agent.tenure };
-        const outcome = try work.commit(value, tenure);
-        if (outcome == .refused) {
-            try agent.begin_fence(ctx, ctx.mono_ms());
+        const set = ctx.arena.create(compare_sets.Set) catch return failures.no_memory(ctx.diag);
+        set.* = .{};
+        if (c1_teeth.job_stale) {
+            // Test-only (J9): no compare on the assignment, so a stale report lands.
+            compare_sets.observed_write(set, agent.config.node, agent.tenure);
+        } else {
+            const name = records.job_of_run(wanted.run).?;
+            compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
         }
+        const outcome = try work.commit(value, set.compares());
+        if (outcome == .refused) agent.job_reports_refused += 1;
     }
 
     const store_compare = @import("store.zig").Compare;

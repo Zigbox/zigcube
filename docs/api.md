@@ -722,6 +722,15 @@ The server compares the tenure, and for a claim (`status` `claimed`) also the ru
 observation. A claim whose compares fail while the tenure holds answers `200 {"applied": false}`
 and writes nothing: the run moved or was claimed before. A replaced tenure is `503` `ZC-E0510`.
 
+A `running` or `stopped` report also compares the assignment it names (`value.assignment`, which
+must not be 0): `/assigned/<node>/<run>` must still be at that revision. A report of a run that was
+retired (its assignment released) or superseded (placed again, or the name reused) answers
+`200 {"applied": false}` and writes nothing, so the store holds no observation the job controller
+would ignore (B2). The agent reports a run only under the assignment it read in the same pass, drops a refused
+report and ends the run on its node. An older
+server stores it; the answer shape is unchanged. An older agent fences on `applied: false`, so
+upgrade agents before the server.
+
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 
 The long poll, the provisional transport of HANDOFF. `from` is a revision (at least 1) and

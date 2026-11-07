@@ -189,6 +189,24 @@ pub fn job_claim(
     set.add(records.job_observed_key(node, job), observed_revision);
 }
 
+/// A node's `running` or `stopped` report of a run: its tenure, and the assignment it ran under
+/// still being the one in the store. A report whose run was retired (the assignment released) or
+/// superseded (a newer assignment, as when a job name is reused) is refused at write time, so
+/// the store never holds an observation the job controller would ignore (B2, J9).
+pub fn job_report(
+    set: *Set,
+    node: []const u8,
+    tenure_revision: store.Revision,
+    job: []const u8,
+    assignment: store.Revision,
+) void {
+    assert(assignment > 0);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const run = records.job_run_id(&buffer, job);
+    observed_write(set, node, tenure_revision);
+    set.add(records.assigned_key(node, run), assignment);
+}
+
 /// An agent's observed write: its tenure is still current.
 pub fn observed_write(set: *Set, node: []const u8, tenure_revision: store.Revision) void {
     assert(set.count == 0);
@@ -220,6 +238,16 @@ const node_read: NodeRead = .{
     .status_revision = 4,
     .allocation_revision = 5,
 };
+
+test "a job report compares the tenure and the assignment it ran under" {
+    var set: Set = .{};
+    job_report(&set, "n1", 3, "train", 9);
+    const compares = set.compares();
+    try testing.expectEqual(@as(usize, 2), compares.len);
+    try testing.expectEqualStrings("/nodes/n1", compares[0].key);
+    try testing.expectEqualStrings("/assigned/n1/train-job", compares[1].key);
+    try testing.expectEqual(@as(u64, 9), compares[1].mod_revision);
+}
 
 test "a placement compares the six facts of authority.md" {
     var set: Set = .{};

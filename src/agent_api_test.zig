@@ -1279,3 +1279,58 @@ test "a job report under a tenure that has been replaced is ZC-E0510 and writes 
     try rig.refused(response, 503, "ZC-E0510");
     try testing.expectEqual(before, try rig.revision());
 }
+
+fn report_text(buffer: []u8, tenure: i64, epoch: u64, status: []const u8) ![]const u8 {
+    const exit = if (std.mem.eql(u8, status, "stopped"))
+        ",\"exit\":{\"kind\":\"exited\",\"code\":0}"
+    else
+        "";
+    const format = "{{\"tenure\":{d},\"value\":{{\"v\":1,\"run\":\"train-job\"," ++
+        "\"node\":\"node2\",\"tenure\":{d},\"assignment\":{d},\"status\":\"{s}\"," ++
+        "\"reported_at_ms\":3{s}}}}}";
+    return std.fmt.bufPrint(buffer, format, .{ tenure, tenure, epoch, status, exit });
+}
+
+test "a report of a retired or superseded run is applied: false and writes nothing" {
+    // Goal: B2. A late report whose assignment is no longer the stored one is refused at write
+    // time, so the store never holds an observation the job controller would ignore.
+    var rig = try Rig.start(25);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    var buffer: [512]u8 = undefined;
+    const claim = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    _ = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", claim);
+    // The assignment it ran under: stored.
+    const live = try report_text(&buffer, rig.tenure, revisions[1], "running");
+    const stored = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", live);
+    try testing.expect(field(stored, "applied").bool);
+    // Superseded: the run is placed again, under a newer assignment.
+    const assigned: records.Assigned = .{
+        .replica = "train-job",
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = "train",
+    };
+    const key = records.assigned_key("node2", "train-job");
+    const newer = try put_as(&rig, .scheduler, key.slice(), assigned);
+    const before = try rig.revision();
+    const old = try report_text(&buffer, rig.tenure, revisions[1], "stopped");
+    const refused = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", old);
+    try testing.expect(!field(refused, "applied").bool);
+    try testing.expectEqual(before, try rig.revision());
+    // Retired: the assignment is gone.
+    const gone: store.Op = .{ .delete = key.slice() };
+    const released = try @import("writers.zig").txn(
+        rig.world.store_handle(),
+        .scheduler,
+        .{ .on_success = &.{gone} },
+        &rig.world.diag,
+    );
+    try testing.expect(released.succeeded);
+    const after = try rig.revision();
+    const late = try report_text(&buffer, rig.tenure, newer, "stopped");
+    const retired = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", late);
+    try testing.expect(!field(retired, "applied").bool);
+    try testing.expectEqual(after, try rig.revision());
+}

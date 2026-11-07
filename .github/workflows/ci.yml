@@ -475,6 +475,9 @@ jobs:
       # The positive run of the deadline-offline tooth's world: long cuts, short deadlines, fix on.
       - name: sim-c1 offline-deadline world
         run: zig build sim-c1-offline --summary all
+      # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
+      - name: sim-c1 regressions
+        run: zig build sim-c1-regressions --summary all
       # The negative test of the healed-fencing check (docs/decisions/2026-11-06-renewal-before-fence.md):
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test
