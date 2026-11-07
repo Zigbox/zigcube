@@ -1517,6 +1517,7 @@ fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
     }
     if (c1_teeth.stale_observation) inject_reregistration(c, request);
     if (c1_teeth.job_double) inject_run_stop(c, request);
+    if (c1_teeth.job_stale) inject_stale_report(c, request);
     _ = c.tap_arena.reset(.retain_capacity);
     c.tap_diag.reset();
     const ctx: controller.Context = .{
@@ -1576,6 +1577,38 @@ fn inject_run_stop(c: *Cluster, request: store.TxnRequest) void {
         run.stop = .{ .cause = .cancel, .at_ms = c.manual.ms };
         const bytes = records.encode(arena.allocator(), run, &scratch) catch return;
         const ops = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = bytes } }};
+        _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
+        return;
+    }
+}
+
+/// J9's tooth: just ahead of the first `running` or `stopped` report, once, the run's assignment
+/// is written again (a new epoch, as when a name is reused). The report was made under the old
+/// one; the compare of the assignment, which the tooth leaves out, would have refused it.
+fn inject_stale_report(c: *Cluster, request: store.TxnRequest) void {
+    if (c.injected) return;
+    for (request.on_success) |op| {
+        const put = switch (op) {
+            .put => |put| put,
+            .delete => continue,
+        };
+        if (!std.mem.startsWith(u8, put.key, records.prefix_job_observed)) continue;
+        const arena = c.tap_arena.allocator();
+        const report = std.json.parseFromSliceLeaky(records.JobObserved, arena, put.value, .{
+            .ignore_unknown_fields = true,
+        }) catch continue;
+        if (report.status == .claimed) continue;
+        const key = records.assigned_key(report.node, report.run);
+        var scratch: Diag = undefined;
+        scratch.reset();
+        const got = c.tap.inner.get(arena, key.slice(), null, &scratch) catch {
+            scratch.reset();
+            continue;
+        };
+        const kv = got.kv orelse continue;
+        c.injected = true;
+        const same: store.Put = .{ .key = kv.key, .value = kv.value, .lease = kv.lease };
+        const ops = [_]store.Op{.{ .put = same }};
         _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
         return;
     }
