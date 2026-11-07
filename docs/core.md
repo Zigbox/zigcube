@@ -412,8 +412,12 @@ if the transaction then commits, because a failed compare is the store doing its
   A node's clock moves inside a step: a call to the server costs the time it takes
   (`src/sim_clock.zig`, `spend_until`), so the agent sees time pass between its calls and the sim
   does not freeze the node's clock for a step (fleet issues #151 and #142). `zig build
-  sim-c1-regress` replays those two seeds and the other fleet seeds (#135, #137, #143, two
-  `slow_store` seeds), which pass without the change too and are kept as smoke. The agent runs
+  sim-c1-regress` replays those two seeds, three seeds that fail J8 without the next change
+  (31, 53, 102 at their auto shapes) and #135, #137 and #143, which pass without any change and
+  are kept as smoke. J8 counts from the run's true start (the sim records it when the runtime
+  starts the container), not from the tick that first saw the container: a step's true time is
+  frozen while the node's clock ran ahead inside it, and 17 of 2,000 seeds failed J8 without
+  this. The agent runs
   every stage of a step even when one fails (a replica whose start errors, the job pass), so a
   replica error that repeats does not withhold a cancel, a stop or a later replica; the first
   error is the step's, the others are counted.
