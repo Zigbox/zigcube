@@ -1035,8 +1035,10 @@ pub const Cluster = struct {
             c.mend_links();
             c.settle();
             if (c.c1 and c.jobs_on) c.watch_client();
+            // The wedge and cut-link totals J1, J6 and J8 judge by are kept whenever jobs are on,
+            // not only under c1: a plain run judges the same bounds.
+            if (c.c1 or c.jobs_on) c.note_wedged();
             if (c.c1) {
-                c.note_wedged();
                 track_overlap(c) catch return;
                 c1_check(c) catch return;
             }
@@ -3015,6 +3017,21 @@ test "a few seeds hold every invariant, and the swarm differs between them" {
         @memcpy(&swarm_lines[index], line[start..][0..80]);
     }
     try testing.expect(!std.mem.eql(u8, &swarm_lines[0], &swarm_lines[1]));
+}
+
+test "J8 holds on a small world whose agents' steps fail, without c1" {
+    // Goal: regression for the J8 release blocker. A plain run (no `c1`) once judged J8 without
+    // the wedge and cut-link allowance, because `note_wedged` ran only under `c1`, so a run
+    // whose agent was backed off by failed steps looked like one that outlived its deadline.
+    // Method: seed 136502595 at 40 operations failed J8 before the fix; it is small enough to run
+    // on every target. The large drawn worlds that also failed (`sim_cluster <seed> auto
+    // --profile=auto` for seeds 130, 4026630699808099468, 8059167289430031834 and 148) ran 30
+    // minutes under WASI in this test, 62 s natively for seed 148 alone, and no native test
+    // target runs this file's tests, so they are not repeated here; the fleet draws such worlds.
+    var report: Report = undefined;
+    simulate(testing.allocator, 136502595, 40, .{}, &report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try testing.expect(!report.failed);
 }
 
 test "a node count can be asked for" {
