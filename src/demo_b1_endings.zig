@@ -82,9 +82,13 @@ fn same_name(demo: *Demo) !void {
     const after = try state.need_job(host, "exit0");
     // `revision` is the store's head when the job was read, not the job record's own: the other
     // jobs ending and every heartbeat move it, so it is not compared (issue #155).
+    // `retries` comes from the spec, so a second run would not show in it; the run's epoch and
+    // the time its ending was recorded do.
     try host.check(std.mem.eql(u8, after.state, "exited") and after.code == before.code and
         same_text(after.node, before.node) and same_text(after.end_kind, before.end_kind) and
-        after.retries == before.retries, "the job exit0 did not change", .{});
+        after.epoch == before.epoch and after.ended_at_ms == before.ended_at_ms, "the job exit0 did not change (same run: epoch and ended_at_ms)", .{});
+    try host.check(before.epoch != null and before.ended_at_ms != null, "the job exit0's " ++
+        "status carries epoch and ended_at_ms, so the comparison above has something to see", .{});
 }
 
 fn same_text(a: ?[]const u8, b: ?[]const u8) bool {
@@ -92,7 +96,8 @@ fn same_text(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-/// The largest revision among the three jobs of step 1: where the watcher's own bookmark stands.
+/// The largest store revision the three jobs of step 1 were read at (a job's `revision` is the
+/// head when it was read, not its own): the watcher's own bookmark stands at or below it.
 fn last_ending_revision(host: *Host) !i64 {
     var largest: i64 = 0;
     for ([_][]const u8{ "exit0", "exit3", "echoin" }) |name| {

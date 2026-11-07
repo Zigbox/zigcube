@@ -237,14 +237,18 @@ const LeaseKeys = struct {
 };
 
 /// A hold of the store mutex longer than this is reported on stderr.
+/// Supervisor decision (B2 slice 5, 2026-11-07): one second. A store call is a few milliseconds,
+/// so a second is a stall; a lower mark would name the fsync of every busy minute.
 const mutex_hold_warn_ms: i64 = 1000;
 
 pub const SqliteStore = struct {
     io: std.Io,
     clock: Clock,
     mutex: std.Io.Mutex,
-    /// When the holder of `mutex` took it (monotonic); written and read only with it held.
+    /// When the holder of `mutex` took it (monotonic), and the store call that holds it; written
+    /// and read only with it held.
     locked_at: std.Io.Timestamp,
+    locked_by: []const u8,
     db: *c.sqlite3,
     busy_ms: u32,
     path_buffer: [constants.state_path_bytes_max + 1]u8,
@@ -293,6 +297,7 @@ pub const SqliteStore = struct {
         self.clock = clock;
         self.mutex = .init;
         self.locked_at = .zero;
+        self.locked_by = "";
         self.busy_ms = options.busy_ms;
         @memcpy(self.path_buffer[0..file_path.len], file_path);
         self.path_buffer[file_path.len] = 0;
@@ -321,22 +326,24 @@ pub const SqliteStore = struct {
         return @ptrCast(@alignCast(context));
     }
 
-    fn lock(self: *SqliteStore) void {
+    fn lock(self: *SqliteStore, call: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         self.locked_at = std.Io.Clock.awake.now(self.io);
+        self.locked_by = call;
     }
 
     /// Says on stderr when the mutex was held over `mutex_hold_warn_ms`: a store call that blocks
-    /// (an fsync, a checkpoint) stalls every request, and nothing else would name it.
+    /// (an fsync, a checkpoint) stalls every request, and nothing else would name it. The time is
+    /// elapsed (CLOCK_MONOTONIC), so a frozen VM counts as held; the line says "elapsed".
     fn unlock(self: *SqliteStore) void {
         const held_ms = self.locked_at.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
+        const call = self.locked_by;
         self.mutex.unlock(self.io);
         if (held_ms <= mutex_hold_warn_ms) return;
         var buffer: [128]u8 = undefined;
         const stamp = std.Io.Clock.real.now(self.io).toMilliseconds();
-        const line = std.fmt.bufPrint(&buffer, "[{d}] sqlite store mutex held {d} ms\n", .{
-            stamp, held_ms,
-        }) catch return;
+        const format = "[{d}] sqlite store {s}: {d} ms elapsed while its mutex was held\n";
+        const line = std.fmt.bufPrint(&buffer, format, .{ stamp, call, held_ms }) catch return;
         std.Io.File.stderr().writeStreamingAll(self.io, line) catch {}; // Nowhere else to say it.
     }
 
@@ -547,7 +554,7 @@ pub const SqliteStore = struct {
 
     fn hash_at_impl(context: *anyopaque, revision: Revision, diag: *Diag) Error!store.Hash {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_read(diag);
         defer self.rollback();
@@ -562,7 +569,7 @@ pub const SqliteStore = struct {
 
     fn status_impl(context: *anyopaque, diag: *Diag) Error!store.Status {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_read(diag); // The revision and its hash share a snapshot.
         defer self.rollback();
@@ -582,7 +589,7 @@ pub const SqliteStore = struct {
         diag: *Diag,
     ) Error!store.GetResult {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_read(diag);
         defer self.rollback();
@@ -633,7 +640,7 @@ pub const SqliteStore = struct {
         diag: *Diag,
     ) Error!store.ListResult {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_read(diag);
         defer self.rollback();
@@ -675,7 +682,7 @@ pub const SqliteStore = struct {
         diag: *Diag,
     ) Error!store.TxnResult {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_write(diag);
         errdefer self.rollback();
@@ -900,7 +907,7 @@ pub const SqliteStore = struct {
         diag: *Diag,
     ) Error!store.Watch {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_read(diag);
         defer self.rollback();
@@ -959,7 +966,7 @@ pub const SqliteStore = struct {
         arena: Allocator,
         diag: *Diag,
     ) Error!store.WatchBatch {
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         assert(slot.used);
         try self.begin_read(diag);
@@ -997,7 +1004,7 @@ pub const SqliteStore = struct {
 
     fn watch_close_impl(context: *anyopaque) void {
         const slot: *WatchSlot = @ptrCast(@alignCast(context));
-        slot.owner.lock();
+        slot.owner.lock(@src().fn_name);
         defer slot.owner.unlock();
         assert(slot.used);
         slot.used = false;
@@ -1007,7 +1014,7 @@ pub const SqliteStore = struct {
 
     fn lease_grant_impl(context: *anyopaque, ttl_ms: u32, diag: *Diag) Error!store.Lease {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_write(diag);
         errdefer self.rollback();
@@ -1029,7 +1036,7 @@ pub const SqliteStore = struct {
 
     fn lease_keepalive_impl(context: *anyopaque, id: LeaseId, diag: *Diag) Error!store.Lease {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_write(diag);
         errdefer self.rollback();
@@ -1046,7 +1053,7 @@ pub const SqliteStore = struct {
 
     fn lease_revoke_impl(context: *anyopaque, id: LeaseId, diag: *Diag) Error!Revision {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         return self.revoke_locked(id, diag);
     }
@@ -1103,7 +1110,7 @@ pub const SqliteStore = struct {
         diag: *Diag,
     ) Error![]const store.LeaseInfo {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         try self.begin_read(diag);
         defer self.rollback();
@@ -1157,7 +1164,7 @@ pub const SqliteStore = struct {
 
     fn expire_leases_impl(context: *anyopaque, diag: *Diag) Error!u32 {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         var expired: u32 = 0;
         // Each pass removes one lease, so the loop ends; the bound is the most leases there are.
@@ -1190,7 +1197,7 @@ pub const SqliteStore = struct {
     /// the log in bounded batches, letting other writers in between.
     fn compact_impl(context: *anyopaque, revision: Revision, diag: *Diag) Error!void {
         const self = from(context);
-        self.lock();
+        self.lock(@src().fn_name);
         defer self.unlock();
         if (!(try self.mark_compacted(revision, diag))) return;
         // Each batch deletes at least one row or ends the loop, so it ends.

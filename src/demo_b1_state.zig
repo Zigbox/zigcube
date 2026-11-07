@@ -57,6 +57,10 @@ pub const JobView = struct {
     code: ?i64,
     retries: i64,
     revision: i64,
+    /// The run's placement epoch and the time its ending was recorded (`status`): a second run
+    /// of the job, however fast, changes at least one of them. Null while the status has none.
+    epoch: ?i64,
+    ended_at_ms: ?i64,
 };
 
 fn string_of(value: ?Json) ?[]const u8 {
@@ -102,6 +106,8 @@ pub fn job_view(host: *Host, name: []const u8) !?JobView {
         .code = if (end) |fields| number_of(fields.get("code")) else null,
         .retries = number_of(spec.get("retries")) orelse return null,
         .revision = number_of(top.get("revision")) orelse return null,
+        .epoch = if (status) |fields| number_of(fields.get("epoch")) else null,
+        .ended_at_ms = if (status) |fields| number_of(fields.get("ended_at_ms")) else null,
     };
 }
 

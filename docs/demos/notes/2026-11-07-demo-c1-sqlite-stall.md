@@ -56,11 +56,15 @@ poll or sleep over 2 s, with the offset into the wait and the demo's clock. Unde
 - sleep overshoots: the demo process or the machine did not run; a runner stall.
 - slow poll alone is **ambiguous**: a freeze of the whole machine that starts while `zcube` is in
   flight looks the same as a silent server. What separates them is the server's own line
-  `sqlite store mutex held N ms` (added in B2 slice 5): present means the store blocked, absent
-  means look at the machine (`/proc/pressure/cpu`, steal time).
+  `sqlite store <call>: N ms elapsed while its mutex was held` (added in B2 slice 5): present
+  names the store call whose elapsed time passed 1 s (the store blocked, or the machine froze:
+  CLOCK_MONOTONIC counts a frozen VM, so the line alone does not tell which); absent means the
+  stall was not inside a store call. Either way look at the machine (`/proc/pressure/cpu`, steal
+  time).
 
 ## Done in B2 slice 5 (supervisor's decision, 2026-11-07)
 
-- The server stamps its request-log lines with unix ms, and logs `sqlite store mutex held N ms`
-  when a store call held the SQLite mutex over 1 s. No limit, default or code is new.
+- The server stamps its request-log lines with unix ms, and logs
+  `sqlite store <call>: N ms elapsed while its mutex was held` when a store call held the SQLite
+  mutex over 1 s. No limit, default or code is new.
 - Not done: stamps on the agents' stderr.
