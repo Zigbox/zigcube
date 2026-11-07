@@ -150,7 +150,10 @@ pub const SimNode = struct {
         diag: *Diag,
     ) runtime.Error!runtime.StartOutcome {
         const node = from(context);
-        assert(!node.crashed);
+        // As `stop_impl`: the pass goes on past a failed call (a fence outlives a failed stop,
+        // a job's start follows a failed list), so a start can follow the crash in the same
+        // step; the dead agent's call fails again and does nothing.
+        if (node.crashed) return node.dead(diag);
         if (!agent_records.has_image(node.containers.fixtures, spec.image)) {
             // Refused before anything is written, as the real agent does.
             return node.containers.interface().start(spec, diag);
@@ -614,6 +617,24 @@ test "containers outlive the agent: a restart finds them by listing" {
     try testing.expectEqual(@as(usize, 1), listing.len);
     try testing.expectEqualStrings("r1", listing[0].labels[0].value);
     try testing.expectEqual(@as(u8, 15), listing[0].status.stopped.signaled);
+}
+
+test "a start after the agent's crash fails like a stop does" {
+    // Goal: regression for #152, #156 and #158: a pass that goes on past a failed call started a
+    // container on a crashed node and tripped an assert. Method: crash the node between two
+    // calls, then start: the call fails with the crash's diagnostic and nothing is written.
+    var manual: ManualClock = .{};
+    var node: SimNode = undefined;
+    node.init(testing.allocator, manual.clock(), 3, &sim_runtime.default_fixtures);
+    defer node.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    node.crash_now(.process);
+    const spec = test_spec();
+    try testing.expectError(error.RuntimeFailed, node.interface().start(&spec, &diag));
+    try testing.expect(diag.code != null);
+    try testing.expect(node.crashed);
+    try testing.expect(!node.containers.has("web-1"));
 }
 
 test "a record whose container never started is starting, then lost" {

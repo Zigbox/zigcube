@@ -3023,6 +3023,15 @@ test "J8 holds on a small world whose agents' steps fail, without c1" {
     try testing.expect(!report.failed);
 }
 
+test "a start after the agent's crash is refused, not asserted (#158)" {
+    // Goal: regression for #152, #156 and #158 (`SimNode.start_impl` asserted the node had not
+    // crashed). Method: seed 57 at 100 operations under c1 aborted before the fix.
+    var report: Report = undefined;
+    simulate(testing.allocator, 57, 100, .{ .c1 = true }, &report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try testing.expect(!report.failed);
+}
+
 test "a node count can be asked for" {
     // Goal: -Dnodes. Method: ask for 3 and read the swarm line.
     var report: Report = undefined;
