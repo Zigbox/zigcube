@@ -879,9 +879,11 @@ const Work = struct {
             return work.cannot_start(subject, record, .{ .spec = problem });
         }
         const outcome = ctx.runtime.start(&spec, ctx.diag) catch |err| switch (err) {
-            // The runtime could not even try: the run ends here, with its own diagnostic, as
-            // a start failure; a claimed run must not wait for a later pass to guess (RB-N4).
-            error.RuntimeFailed, error.NotFound => return work.start_errored(subject, record),
+            // The runtime returned an error, which does not say that nothing runs: the
+            // supervisor may be up already (RB-N4).
+            error.RuntimeFailed, error.NotFound => |failed| {
+                return work.start_errored(subject, record, failed);
+            },
         };
         switch (outcome) {
             .started => {},
@@ -890,10 +892,14 @@ const Work = struct {
         try work.report(wanted);
     }
 
-    /// `runtime.start` returned an error with its diagnostic in `ctx.diag`: the run ends as a
-    /// start failure and says why.
-    fn start_errored(work: *Work, subject: Subject, record: StartRecord) Error!void {
+    /// `runtime.start` returned an error with its diagnostic in `ctx.diag`. If the runtime
+    /// lists no container of this run (or cannot be asked), nothing started and the run ends as
+    /// a start failure with that diagnostic. If it lists one, the run is executing: it is not
+    /// reported, the error goes to the caller with its diagnostic, the record stays `claimed`
+    /// and the next pass adopts the container through `container`, as it did before RB-N4.
+    fn start_errored(work: *Work, subject: Subject, record: StartRecord, err: Error) Error!void {
         const ctx = work.ctx;
+        if (work.container_up(subject.id)) return err;
         var finished: Diagnostic = undefined;
         diag_mod.to_diagnostic(&finished, ctx.diag);
         ctx.diag.reset();
@@ -904,6 +910,19 @@ const Work = struct {
             .exit = .{ .kind = .start_failed },
             .diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag),
         });
+    }
+
+    /// Whether the runtime lists a container named `name`, asked with a diagnostic of its own
+    /// so the start error's stays intact. A runtime that cannot list is taken to hold none
+    /// only when `start` had said so: here it is taken to hold one, so nothing is misreported.
+    fn container_up(work: *Work, name: []const u8) bool {
+        var scratch: Diag = undefined;
+        scratch.reset();
+        const listed = work.ctx.runtime.list(work.ctx.arena, &scratch) catch return true;
+        for (listed) |*listing| {
+            if (std.mem.eql(u8, listing.handle.name(), name)) return true;
+        }
+        return false;
     }
 
     const Refusal = union(enum) {

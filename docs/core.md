@@ -410,15 +410,13 @@ if the transaction then commits, because a failed compare is the store doing its
   after the tracker first saw it (the run's start on the ledger, within a tick), and after the
   heal no run is open long after its latest possible end. **J4** a client that follows the endings through `GET /v1/jobs/watch` (`src/sim_jobs_watch.zig`), is killed now and then (away for under a minute, or for minutes: the sim compacts to the head every `server_compact_ms`, so a longer outage gets the 410 and the list) and resumes from its revision, has seen every ending the store committed by the end of the run (each terminal `/job-status/` put the tap saw), and is never given an event twice. Age retention (`src/job_retention.zig`) is covered by its unit tests: the sim's runs are minutes long, far below `job_finished_age_ms_min`.
   A node's clock moves inside a step: a call to the server costs the time it takes
-  (`src/sim_clock.zig`), so the agent sees time pass between its calls and the sim does not
-  freeze the node's clock for a step. The agent takes one call floor per step, at its start
-  (`call_inflight_min_ms` after the step began), not one per call; a floor taken after each call
-  would let the last calls of a step end past the cap. J8 counts from the run's true start, not
-  from the tick that first saw the container, so a node whose clock ran ahead inside a step is
-  judged against when the container really began. `zig build sim-c1-regress` replays the seeds of
-  the fleet issues this fixed (#135, #137, #142, #143, #151) and two `slow_store` seeds. The
-  agent runs the job pass even when the replica pass fails, so a replica error that repeats
-  does not withhold a cancel or a stop from a run.
+  (`src/sim_clock.zig`, `spend_until`), so the agent sees time pass between its calls and the sim
+  does not freeze the node's clock for a step (fleet issues #151 and #142). `zig build
+  sim-c1-regress` replays those two seeds and the other fleet seeds (#135, #137, #143, two
+  `slow_store` seeds), which pass without the change too and are kept as smoke. The agent runs
+  every stage of a step even when one fails (a replica whose start errors, the job pass), so a
+  replica error that repeats does not withhold a cancel, a stop or a later replica; the first
+  error is the step's, the others are counted.
   The clocks are never restarted. A node that was wedged (its agent down or frozen, or a
   container ignoring a stop) is not judged until `wedge_memory_ms` after, and its wedged time is
   added to the J6 and J8 bounds (in J8, only the time wedged after the deadline). J8 gives a cut

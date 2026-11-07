@@ -150,7 +150,7 @@ pub const SimNode = struct {
         diag: *Diag,
     ) runtime.Error!runtime.StartOutcome {
         const node = from(context);
-        assert(!node.crashed);
+        if (node.crashed) return node.dead(diag);
         if (!agent_records.has_image(node.containers.fixtures, spec.image)) {
             // Refused before anything is written, as the real agent does.
             return node.containers.interface().start(spec, diag);

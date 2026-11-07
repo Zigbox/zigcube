@@ -1275,7 +1275,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
-    const regress_help = "Replay the seeds of the sim-fleet issues fixed in B2 slice 1";
+    const regress_help = "Replay the seeds of the sim-fleet issues of B2 slice 1";
     const regress = b.step("sim-c1-regress", regress_help);
     for (regress_replays) |line| {
         const replay = b.addRunArtifact(exe);
@@ -1285,8 +1285,10 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_fencing_teeth_step(b, sim);
 }
 
-/// The replay lines of the sim-fleet issues B2 slice 1 fixed (#135, #137, #142, #143, #151) and
-/// two `slow_store` seeds that failed while it was built. Each must pass; `sim-c1-regress`.
+/// The replay lines of the sim-fleet issues of B2 slice 1 (#135, #137, #142, #143, #151) and
+/// two `slow_store` seeds that failed while it was built. Each must pass; `sim-c1-regress`. Only
+/// #151 (J8) and #142 (J6) fail without the sim node clock's `spend_until`; the rest pass on
+/// the base too and are smoke.
 const regress_replays = [_][]const []const u8{
     &.{
         "780935350",

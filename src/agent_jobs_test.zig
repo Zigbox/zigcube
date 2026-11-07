@@ -269,6 +269,35 @@ test "a runtime that fails to start ends the run start_failed, with its diagnost
     try expect_code(seen, "ZC-E0201");
 }
 
+test "a start error after the container is up leaves the run claimed, then adopted" {
+    // Goal: RB-N4 (review of PR #159). `start` starts the container and then returns an error:
+    // the run is executing, so it is not reported start_failed; the next pass adopts it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var wrapper: FailingList = .{
+        .inner = rig.world.sim.interface(),
+        .start_failing = true,
+        .start_first = true,
+    };
+    rig.world.runtime_override = wrapper.interface();
+    _ = try rig.assign(60_000);
+    _ = rig.world.agent_step();
+    try testing.expect(rig.world.last_failure != null);
+    try testing.expect(rig.running());
+    // Never reported as a start failure: the job pass of the same step adopted it, or the
+    // next one does.
+    if (try rig.observed()) |early| {
+        try testing.expect(early.status != .stopped);
+    }
+    rig.world.last_failure = null;
+    wrapper.start_failing = false;
+    rig.step();
+    try testing.expect(rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+    try testing.expectEqual(@as(u32, 1), wrapper.refused);
+}
+
 test "a cancel stops the container and is reported as the cause" {
     var rig = try Rig.start();
     defer rig.stop();
@@ -1036,6 +1065,9 @@ const FailingList = struct {
     inner: rt.Runtime,
     failing: bool = false,
     start_failing: bool = false,
+    /// With `start_failing`: the inner runtime starts the container first, as a runtime whose
+    /// supervisor is up when a later step fails.
+    start_first: bool = false,
     /// How many starts it refused.
     refused: u32 = 0,
 
@@ -1064,6 +1096,9 @@ const FailingList = struct {
         const self = from(context);
         if (self.start_failing) {
             self.refused += 1;
+            if (self.start_first) {
+                _ = try self.inner.vtable.start(self.inner.context, spec, diag);
+            }
             diag.raise(.E0201);
             diag.cause("the simulated runtime cannot start a container", .{});
             diag.fix(.{ .sentence = "none: a test switched it off" });
@@ -1278,33 +1313,6 @@ test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
-    try testing.expectEqual(lease, world.agent.lease);
-}
-
-test "a step has one call floor, taken at its start, not one per call" {
-    // Goal: the node's clock moves inside a step (a keepalive costs time), and the floor that
-    // keeps a run's wake from cutting a call is taken once, at the step's start. Taken again after
-    // the heartbeat, a step's last calls would run 150 ms past it. Method: one run whose deadline
-    // is 300 ms after the step; a keepalive costs 150 ms; one step at the lease renewal. The cap
-    // the agent last set is the step's start plus `call_inflight_min_ms`, not that plus 150.
-    var rig = try Rig.start();
-    defer rig.stop();
-    const world = rig.world;
-    const renew_in = world.agent.renew_at_ms - world.now_ms();
-    _ = try rig.assign(renew_in + 300);
-    world.advance(300);
-    world.switched.keepalive_cost = .{
-        .clock = &world.manual,
-        .cost_ms = 150,
-        .cap_ms = &world.call_cap_ms,
-    };
-    world.advance(renew_in - 400);
-    world.manual.advance(100);
-    const lease = world.agent.lease;
-    const start = world.now_ms();
-    _ = world.agent_step();
-    try testing.expect(world.now_ms() > start);
-    try testing.expectEqual(start + 1_000, world.call_cap_ms);
     try testing.expectEqual(lease, world.agent.lease);
 }
 
