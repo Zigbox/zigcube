@@ -456,15 +456,20 @@ pub const RemoteStore = struct {
         };
         var tenure: u64 = 0;
         var run_revision: u64 = 0;
+        var observed_revision: u64 = 0;
         const node_key = records.node_key(remote.node);
         for (request.compares) |cmp| {
             if (std.mem.eql(u8, cmp.key, node_key.slice())) {
                 tenure = cmp.mod_revision;
             } else if (std.mem.startsWith(u8, cmp.key, records.prefix_job_runs)) {
                 run_revision = cmp.mod_revision;
-            } else if (!std.mem.startsWith(u8, cmp.key, records.prefix_job_observed) and
-                !std.mem.startsWith(u8, cmp.key, records.assigned_prefix(remote.node).slice()))
-            {
+            } else if (std.mem.startsWith(u8, cmp.key, records.prefix_job_observed)) {
+                observed_revision = cmp.mod_revision;
+            } else if (!std.mem.startsWith(
+                u8,
+                cmp.key,
+                records.assigned_prefix(remote.node).slice(),
+            )) {
                 return unsupported(diag, "a report with a compare the server cannot carry");
             }
         }
@@ -476,6 +481,8 @@ pub const RemoteStore = struct {
         json.write(tenure) catch return failures.no_memory(diag);
         json.objectField("run_revision") catch return failures.no_memory(diag);
         json.write(run_revision) catch return failures.no_memory(diag);
+        json.objectField("observed_revision") catch return failures.no_memory(diag);
+        json.write(observed_revision) catch return failures.no_memory(diag);
         json.objectField("value") catch return failures.no_memory(diag);
         json.beginWriteRaw() catch return failures.no_memory(diag);
         json.writer.writeAll(put.value) catch return failures.no_memory(diag);

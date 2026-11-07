@@ -408,34 +408,39 @@ const Call = struct {
         try call.require_method("GET");
         try call.only_known();
         if (call.parts.next()) |name| return call.run_input(name);
-        const all = controller.list_all(
-            records.JobRun,
-            ctx,
-            records.prefix_job_runs,
-            null,
-            constants.jobs_max,
-        ) catch return propagate(ctx);
+        // Only this node's assignments, then each run by its key: the retained runs of the whole
+        // cluster (ended jobs stay until retention) are never read.
         const given = controller.list_all(
             records.Assigned,
             ctx,
             records.assigned_prefix(call.node).slice(),
-            all.revision,
+            null,
             constants.agent_node_assigned_max,
         ) catch return propagate(ctx);
-        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        var mine: std.ArrayList(Item(records.JobRun)) = .empty;
         for (given.items) |entry| {
             if (!records.assigned_is_job(&entry.rec)) continue;
-            wanted.put(ctx.arena, entry.rec.replica, {}) catch return no_memory(ctx);
-        }
-        var mine: std.ArrayList(Item(records.JobRun)) = .empty;
-        for (all.items) |entry| {
-            if (!wanted.contains(entry.rec.id)) continue;
-            if (try call.job_ended(entry.rec.job, all.revision)) continue;
-            mine.append(ctx.arena, item_of(records.JobRun, entry)) catch return no_memory(ctx);
+            const job = entry.rec.job.?;
+            const key = records.job_run_key(job);
+            const found = ctx.store.get(ctx.arena, key.slice(), given.revision, ctx.diag) catch
+                return propagate(ctx);
+            const kv = found.kv orelse continue;
+            const run = records.read(records.JobRun, ctx.arena, kv, ctx.diag) catch
+                return propagate(ctx);
+            if (!std.mem.eql(u8, run.id, entry.rec.replica)) continue;
+            if (try call.job_ended(job, given.revision)) continue;
+            const run_entry: controller.Entry(records.JobRun) = .{ .kv = kv, .rec = run };
+            mine.append(ctx.arena, item_of(records.JobRun, run_entry)) catch
+                return no_memory(ctx);
         }
         if (mine.items.len > constants.agent_node_runs_max) return too_many_runs(ctx);
+        std.mem.sort(Item(records.JobRun), mine.items, {}, run_order);
         const pair = try call.chain();
-        return reply(ctx, .{ .revision = all.revision, .kvs = mine.items, .chain = pair });
+        return reply(ctx, .{ .revision = given.revision, .kvs = mine.items, .chain = pair });
+    }
+
+    fn run_order(_: void, first: Item(records.JobRun), second: Item(records.JobRun)) bool {
+        return std.mem.lessThan(u8, first.key, second.key);
     }
 
     /// True if the job's status is terminal. A job with no status is not ended.
@@ -513,6 +518,7 @@ const Call = struct {
             if (input.run_revision == 0) {
                 return bad_request(ctx, "run_revision", "is needed to claim a run");
             }
+            if (input.observed_revision != 0) try call.replaced_is_stale(name, input);
             set = .{};
             const assignment = rec.assignment;
             compare_sets.job_claim(
@@ -522,6 +528,7 @@ const Call = struct {
                 name,
                 input.run_revision,
                 assignment,
+                input.observed_revision,
             );
         }
         const value = records.encode(ctx.arena, rec.*, ctx.diag) catch return propagate(ctx);
@@ -535,6 +542,26 @@ const Call = struct {
         return reply(ctx, .{ .revision = result.revision, .applied = true, .chain = pair });
     }
 
+    /// A claim that replaces an observation (`observed_revision`) may replace only a leftover of
+    /// an earlier job of the same name: one made under an assignment older than the run's
+    /// creation. Anything else would let a node claim, and start, a run twice.
+    fn replaced_is_stale(call: Call, name: []const u8, input: JobObservedBody) Failure!void {
+        const ctx = call.ctx;
+        const run_key = records.job_run_key(name);
+        const run = ctx.store.get(ctx.arena, run_key.slice(), null, ctx.diag) catch
+            return propagate(ctx);
+        const run_kv = run.kv orelse return bad_request(ctx, "run_revision", "names no run");
+        const key = records.job_observed_key(call.node, name);
+        const old = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch
+            return propagate(ctx);
+        const old_kv = old.kv orelse return; // Gone: the claim's compare refuses it.
+        if (old_kv.mod_revision != input.observed_revision) return; // Moved: the same.
+        const seen = records.read(records.JobObserved, ctx.arena, old_kv, ctx.diag) catch
+            return propagate(ctx);
+        if (seen.assignment < run_kv.create_revision) return;
+        return bad_request(ctx, "observed_revision", "names an observation of this job's run");
+    }
+
     /// GET: the node's own observations of runs, as stored.
     fn job_observed_list(call: Call) Failure!Reply {
         const ctx = call.ctx;
@@ -544,7 +571,7 @@ const Call = struct {
             ctx,
             prefix.slice(),
             null,
-            constants.jobs_max,
+            constants.job_admitted_window_max,
         ) catch return propagate(ctx);
         const items = ctx.arena.alloc(Item(records.JobObserved), all.items.len) catch
             return no_memory(ctx);
@@ -871,6 +898,9 @@ const JobObservedBody = struct {
     tenure: u64 = 0,
     /// The revision of `/job-runs/<name>` the agent read: needed for a claim.
     run_revision: u64 = 0,
+    /// For a claim: the revision of the node's observation of this job name that the claim
+    /// replaces, a leftover of an earlier job of the same name; 0 (the default) means none.
+    observed_revision: u64 = 0,
     value: records.JobObserved,
 };
 

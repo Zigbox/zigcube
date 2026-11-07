@@ -1092,6 +1092,67 @@ test "the runs of a node are listed, and a run's input is given only after its c
     try testing.expect(other.status != 200);
 }
 
+test "retained runs and observations beyond jobs_max do not stop a node's run listings" {
+    // Goal: run records stay until retention, 24 h after the ending, so more than `jobs_max` of
+    // them can exist. A node's list reads its own assignments, not all of them.
+    var rig = try Rig.start(25);
+    defer rig.stop();
+    try rig.join("node2");
+    _ = try assign_run(&rig);
+    var name_buffer: [32]u8 = undefined;
+    for (0..constants.jobs_max + 1) |number| {
+        const name = try std.fmt.bufPrint(&name_buffer, "old{d}", .{number});
+        var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const id = records.job_run_id(&id_buffer, name);
+        var old = run_fixture;
+        old.id = id;
+        old.job = name;
+        _ = try put_as(&rig, .job_controller, records.job_run_key(name).slice(), old);
+        const seen: records.JobObserved = .{
+            .run = id,
+            .node = "node2",
+            .tenure = @intCast(rig.tenure),
+            .assignment = 1,
+            .status = .stopped,
+            .exit = .{ .kind = .lost },
+            .reported_at_ms = 1,
+        };
+        const key = records.job_observed_key("node2", name);
+        _ = try put_as(&rig, .{ .agent = "node2" }, key.slice(), seen);
+    }
+    const listed = try rig.ok("GET", "/v1/agent/nodes/node2/runs", "", "");
+    try testing.expectEqual(@as(usize, 1), field(listed, "kvs").array.items.len);
+    const observed = try rig.ok("GET", "/v1/agent/nodes/node2/job-observed", "", "");
+    try testing.expectEqual(
+        @as(usize, constants.jobs_max + 1),
+        field(observed, "kvs").array.items.len,
+    );
+}
+
+test "a claim may replace only a leftover of an earlier job, never this job's observation" {
+    var rig = try Rig.start(26);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    const first = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+    const claim_revision: u64 = @intCast(field(first, "revision").integer);
+    var again: [512]u8 = undefined;
+    const format = "{{\"tenure\":{d},\"run_revision\":{d},\"observed_revision\":{d},\"value\":" ++
+        "{{\"v\":1,\"run\":\"train-job\",\"node\":\"node2\",\"tenure\":{d}," ++
+        "\"assignment\":{d},\"status\":\"claimed\",\"reported_at_ms\":2}}}}";
+    const body = try std.fmt.bufPrint(
+        &again,
+        format,
+        .{ rig.tenure, revisions[0], claim_revision, rig.tenure, revisions[1] },
+    );
+    const before = try rig.revision();
+    const response = rig.call("POST", "/v1/agent/nodes/node2/job-observed", "", body);
+    try testing.expectEqual(@as(u16, 400), response.status);
+    try testing.expectEqual(before, try rig.revision());
+}
+
 test "a damaged input value is ZC-E0523, with nothing left in the diagnostic" {
     var rig = try Rig.start(23);
     defer rig.stop();
