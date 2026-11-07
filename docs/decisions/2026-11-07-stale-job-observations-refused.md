@@ -17,9 +17,18 @@ its own compares (run, assignment, no observation).
   replaced tenure is still `503` ZC-E0510. No new code, bound or default.
 - **Agent.** A refused report is dropped, not retried, and no longer fences at once: the agent
   cannot tell stale from tenure ended, so it has its lease checked on the next heartbeat
-  (`renew_at_ms` brought forward to one second from now), where a lost lease fences it. Other writes under the tenure still fence at
-  once.
-- **Check.** sim-c1 J9 judges every stored `running` or `stopped` report; tooth
-  `sim-c1-teeth-job_stale` drops the assignment compare in the agent and in the server's handler, and the agent writes one report of the epoch before its own first.
-- **Upgrade.** Server first, as for #148: an older server stores the stale report, which is
-  harmless.
+  (`renew_at_ms` brought forward by `agent_lease_check_ms`, one second), where a lost lease
+  fences it. A refused `stopped` report of a run that is released, or placed again at another
+  epoch, ends that run on the node: its start record is removed (`retire_if_stale`), so the
+  refusal is not repeated on every pass. A `claiming` record of an unassigned run is removed
+  too. Other writes under the tenure still fence at once.
+- **Check.** sim-c1 J9 judges every stored `running` or `stopped` report; J10 (at rest) fails if
+  a start record outlives its run's assignment. Tooth `sim-c1-teeth-job_stale` drops the
+  assignment compare in the agent and in the server's handler; the stale reports arise from the
+  run's real state, with no fabricated report.
+- **Upgrade.** **Agents first, then the server.** An old agent fences (TERM, then KILL, of every
+  container on the node) when its report is answered `applied: false`, and it never removes the
+  record of a released run, so it reports it again, is refused again and fences again, for as
+  long as it runs. So against a new server an old agent loops in a fence. A new agent against an
+  old server is answered `applied: true`: the old server stores the stale report, which is
+  harmless. Upgrade every agent before the server.

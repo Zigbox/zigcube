@@ -647,6 +647,39 @@ test "a running run the server no longer serves is stopped with a recorded cause
     try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), seen.stop_cause);
 }
 
+test "a run released while it runs: the refused stopped report retires its start record" {
+    // Goal (B2 review): a stopped report of a released run is refused at write time. The agent
+    // drops it and removes the run's start record, so the refusal is not repeated on every pass.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const world = rig.world;
+    const run_key = records.job_run_key(job_name);
+    const gone = [_]store.Op{ .{ .delete = run_key.slice() }, .{ .delete = records.assigned_key(
+        sim_world.node_name,
+        run_id,
+    ).slice() } };
+    const done = try writers.txn(
+        world.store_handle(),
+        .job_controller,
+        .{ .on_success = gone[0..1] },
+        &world.diag,
+    );
+    try testing.expect(done.succeeded);
+    const released = try writers.txn(
+        world.store_handle(),
+        .scheduler,
+        .{ .on_success = gone[1..2] },
+        &world.diag,
+    );
+    try testing.expect(released.succeeded);
+    for (0..5) |_| rig.step();
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
+}
+
 test "a damaged input value ends the run start_failed with ZC-E0523" {
     var rig = try Rig.start();
     defer rig.stop();

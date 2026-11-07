@@ -443,7 +443,7 @@ const Work = struct {
             held.assignment
         else
             subject.epoch;
-        try work.report(.{
+        const outcome = try work.report_outcome(.{
             .run = subject.id,
             .status = .stopped,
             .epoch = epoch,
@@ -452,6 +452,7 @@ const Work = struct {
             .diagnostic = raw,
             .started_at_ms = if (record) |held| held.started_at_ms else null,
         });
+        try work.retire_if_stale(outcome, subject, epoch);
     }
 
     /// The run has a start record and no container.
@@ -511,9 +512,9 @@ const Work = struct {
     fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
         _ = record;
         // A run with no assignment on this node has nothing to report under (B2): a report of it
-        // would be refused as stale. One under a newer assignment than its claim's is reported
-        // under the new one, the assignment the job controller admits.
-        if (!subject.assigned) return;
+        // would be refused as stale, so its record ends here. One under a newer assignment than
+        // its claim's is reported under the new one, the assignment the job controller admits.
+        if (!subject.assigned) return remove_record(work.ctx, work.state, subject.id);
         var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
@@ -654,7 +655,8 @@ const Work = struct {
             const ctx = work.ctx;
             wanted.diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
         }
-        try work.report(wanted);
+        const outcome = try work.report_outcome(wanted);
+        try work.retire_if_stale(outcome, subject, record.epoch);
     }
 
     fn stop(work: *Work, listing: *const runtime.Listing, grace_ms: u32) Error!void {
@@ -964,10 +966,23 @@ const Work = struct {
     /// of the tenure; the agent cannot tell which, so it has the lease checked at once, and a
     /// tenure that ended fences it there.
     fn report(work: *Work, wanted: Report) Error!void {
+        _ = try work.report_outcome(wanted);
+    }
+
+    /// A refused report of a run that is no longer this node's (released, or placed again at
+    /// another epoch) is the end of that run here: its start record is removed, so the refusal
+    /// is not repeated on every pass. Nothing else of the run is reported.
+    fn retire_if_stale(work: *Work, outcome: Outcome, subject: Subject, epoch: u64) Error!void {
+        if (outcome != .refused) return;
+        if (subject.assigned and subject.epoch == epoch) return;
+        try remove_record(work.ctx, work.state, subject.id);
+    }
+
+    fn report_outcome(work: *Work, wanted: Report) Error!Outcome {
         const ctx = work.ctx;
         const agent = work.agent;
         if (work.seen_of(wanted.run)) |existing| {
-            if (same(existing, wanted)) return;
+            if (same(existing, wanted)) return .applied;
         }
         const value: records.JobObserved = .{
             .run = wanted.run,
@@ -985,15 +1000,8 @@ const Work = struct {
         const set = ctx.arena.create(compare_sets.Set) catch return failures.no_memory(ctx.diag);
         set.* = .{};
         if (c1_teeth.job_stale) {
-            // Test-only (J9): no compare on the assignment, and once a report of the epoch
-            // before this one is written first, as an agent returning late would.
+            // Test-only (J9): no compare on the assignment, so a stale report lands.
             compare_sets.observed_write(set, agent.config.node, agent.tenure);
-            if (!teeth_stale_written and wanted.epoch > 1) {
-                teeth_stale_written = true;
-                var late = value;
-                late.assignment = wanted.epoch - 1;
-                _ = try work.commit(late, set.compares());
-            }
         } else {
             const name = records.job_of_run(wanted.run).?;
             compare_sets.job_report(set, agent.config.node, agent.tenure, name, wanted.epoch);
@@ -1001,8 +1009,10 @@ const Work = struct {
         const outcome = try work.commit(value, set.compares());
         if (outcome == .refused) {
             // The next heartbeat is brought forward, so a lost lease fences within a second.
-            agent.renew_at_ms = @min(agent.renew_at_ms, ctx.mono_ms() + 1000);
+            const soon = ctx.mono_ms() + constants.agent_lease_check_ms;
+            agent.renew_at_ms = @min(agent.renew_at_ms, soon);
         }
+        return outcome;
     }
 
     const store_compare = @import("store.zig").Compare;
@@ -1047,9 +1057,6 @@ const Work = struct {
         return records.diagnostic_raw(ctx.arena, &finished, ctx.diag);
     }
 };
-
-/// Test-only (`c1_teeth.job_stale`): the late report has been written.
-var teeth_stale_written = false;
 
 // ---- The diagnostics of a run (one function each, which the golden test also calls) ----
 

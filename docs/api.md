@@ -726,8 +726,9 @@ A `running` or `stopped` report also compares the assignment it names (`value.as
 must not be 0): `/assigned/<node>/<run>` must still be at that revision. A report of a run that was
 retired (its assignment released) or superseded (placed again, or the name reused) answers
 `200 {"applied": false}` and writes nothing, so the store holds no observation the job controller
-would ignore (B2). The agent drops such a report and has its lease checked. An older server stores
-it; the answer shape is unchanged.
+would ignore (B2). The agent drops such a report, ends the run on its node and has its lease checked. An older
+server stores it; the answer shape is unchanged. An older agent fences on `applied: false`, so
+upgrade agents before the server.
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

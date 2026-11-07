@@ -129,6 +129,10 @@ pub const controller_txns_per_step_max: u32 = 64;
 pub const decisions_scan_max: u32 = 16;
 /// The agent's wait between looks at the runtime when nothing wakes it sooner.
 pub const agent_resync_ms: u32 = 1000;
+
+/// A refused job report may mean the tenure ended: the next heartbeat is brought forward to
+/// at most this far from now, so a lost lease fences the agent within it (B2).
+pub const agent_lease_check_ms: u32 = 1000;
 pub const node_lease_ttl_ms: u32 = 10 * 1000;
 /// The fencing constants of docs/briefs/c1.md ("Settled here") and docs/authority.md §3. The
 /// agent stops its containers at `s + ttl - fence_margin`; the node controller declares a node

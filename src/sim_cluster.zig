@@ -43,6 +43,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 const records = @import("records.zig");
+const agent_jobs = @import("agent_jobs.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
 const why_acceptance = @import("why_acceptance.zig");
@@ -2333,6 +2334,24 @@ fn judge_job_container(
         "job reached a terminal status");
 }
 
+/// J10, at rest: no agent keeps a start record for a run whose assignment on its node is gone.
+/// A report of such a run is refused at write time (J9), and the agent must end the run locally
+/// instead of repeating the refusal on every pass (B2 review).
+fn start_records_retired(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    for (c.nodes) |node| {
+        const names = node.sim.files.interface().list(ctx.arena, agent_jobs.dir) catch
+            return check(c, false, "J10: a node's start records cannot be listed");
+        for (names) |entry| {
+            if (!std.mem.endsWith(u8, entry, ".json")) continue;
+            const run = entry[agent_jobs.dir.len .. entry.len - ".json".len];
+            const placed = records.assigned_key(node.name(), run);
+            const got = ctx.store.get(ctx.arena, placed.slice(), null, ctx.diag) catch
+                return check(c, false, "J10: an assignment cannot be read");
+            try check(c, got.kv != null, "J10: a start record outlives its run's assignment");
+        }
+    }
+}
+
 /// After the heal, with the world settled: no live container of an ended job, and no run still
 /// open long after the latest it could have started and run (J1, J8 at rest).
 fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
@@ -2444,6 +2463,7 @@ fn converged(c: *Cluster) Failure!void {
     }
     try no_strays(c, &ctx, &homes);
     if (c.jobs_on) try jobs_converged(c, &ctx);
+    if (c.jobs_on) try start_records_retired(c, &ctx);
 }
 
 /// Every container alive on any node is the container of a replica placed on that node.
