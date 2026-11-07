@@ -739,10 +739,12 @@ pub const Scheduler = struct {
             // its workload may be live, and nothing about it changes.
             return;
         }
-        if (assign.node == no_node) return;
-        const view = &world.nodes[assign.node];
-        if (view.alloc_revision == 0) return;
-        if (subtract(view, assign.requests) == null) return;
+        const orphan = assign.node == no_node;
+        if (!orphan) {
+            const view = &world.nodes[assign.node];
+            if (view.alloc_revision == 0) return;
+            if (subtract(view, assign.requests) == null) return;
+        }
         if (!pass.budget()) return;
         var cause: records.Cause = .{ .kind = .resync };
         if (status) |found| {
@@ -750,20 +752,63 @@ pub const Scheduler = struct {
             if (text.len == records.decision_id_bytes) cause = .{ .kind = .decision, .id = text };
         }
         const why = if (status == null) "its job is gone" else "its job has ended";
+        const node_name = if (orphan)
+            assigned_node_name(assign.key)
+        else
+            world.nodes[assign.node].node.rec.name;
         const fmt = "run {s} is over ({s}); its {d}m CPU and {d} MiB on {s} are released";
         const reason = try controller.format(ctx, fmt, .{
             assign.replica,
             why,
             assign.requests.cpu_millis,
             mib_of(assign.requests.memory_bytes),
-            view.node.rec.name,
+            node_name,
         });
         const as: ReleaseAs = .{
             .action = "release_run",
             .subject = .{ .kind = .job, .name = job },
             .status_revision = if (status) |found| found.kv.mod_revision else 0,
         };
-        try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
+        const decided: ReleaseWhy = .{ .cause = cause, .reason = reason };
+        if (orphan) return sc.commit_release_orphan(ctx, world, pass, index, as, decided);
+        try sc.commit_release(ctx, world, pass, index, as, decided);
+    }
+
+    /// Releases a run whose node has no record at all (no `/nodes`, status or allocation): only
+    /// the assignment is left to delete, under the compares that the node is still absent.
+    fn commit_release_orphan(
+        sc: *Scheduler,
+        ctx: *const Context,
+        world: *World,
+        pass: *Pass,
+        index: u32,
+        as: ReleaseAs,
+        why: ReleaseWhy,
+    ) Error!void {
+        const assign = world.assigns.items[index];
+        var batch: Batch = .{};
+        var set: compare_sets.Set = .{};
+        const reads: compare_sets.OrphanRead = .{
+            .node = assigned_node_name(assign.key),
+            .run = assign.replica,
+            .job = as.subject.name,
+            .assigned_revision = assign.revision,
+            .status_revision = as.status_revision.?,
+        };
+        compare_sets.release_orphan(&set, reads);
+        expect_all(&batch, &set);
+        _ = try controller.put_decision(ctx, &sc.source, .{
+            .actor = actor,
+            .action = as.action,
+            .subject = as.subject,
+            .reason = why.reason,
+            .cause = why.cause,
+        }, &batch);
+        batch.delete(assign.key);
+        _ = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
+        const gone = &world.assigns.items[index];
+        gone.live = false;
+        _ = world.assigned_by.remove(gone.replica);
     }
 
     fn job_record_exists(ctx: *const Context, world: *const World, job: []const u8) Error!bool {
@@ -885,7 +930,9 @@ pub const Scheduler = struct {
         status_index: u32,
     ) Error!void {
         const status = &world.job_statuses[status_index];
-        if (records.job_state_terminal(status.rec.state)) return;
+        // Only a pending run is placed: a job placed or running had its run claimed, and a run is
+        // never reassigned, so a node-less one is the job controller's to resolve.
+        if (status.rec.state != .pending) return;
         const job = status.kv.key[records.prefix_job_status.len..];
         if (records.name_problem(job, constants.service_name_bytes_max) != null) return;
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
@@ -1235,6 +1282,12 @@ fn world_note(view: *NodeView, allocated: Requests, count: u32, revision: Revisi
     view.allocated = allocated;
     view.count = count;
     view.alloc_revision = revision;
+}
+
+/// The node a `/assigned/<node>/<id>` key names.
+fn assigned_node_name(key: []const u8) []const u8 {
+    const rest = key[records.prefix_assigned.len..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse unreachable]; // Key shape.
 }
 
 fn forget_assign(world: *World, index: u32, allocated: Requests, revision: Revision) void {
