@@ -1583,8 +1583,8 @@ fn inject_run_stop(c: *Cluster, request: store.TxnRequest) void {
 }
 
 /// J9's tooth: just ahead of the first `running` or `stopped` report, once, the run's assignment
-/// is written again (a new epoch, as when a name is reused). The report was made under the old
-/// one; the compare of the assignment, which the tooth leaves out, would have refused it.
+/// is deleted (the run is retired). The report was made under it; the compare of the assignment,
+/// which the tooth leaves out, would have refused it.
 fn inject_stale_report(c: *Cluster, request: store.TxnRequest) void {
     if (c.injected) return;
     for (request.on_success) |op| {
@@ -1607,8 +1607,7 @@ fn inject_stale_report(c: *Cluster, request: store.TxnRequest) void {
         };
         const kv = got.kv orelse continue;
         c.injected = true;
-        const same: store.Put = .{ .key = kv.key, .value = kv.value, .lease = kv.lease };
-        const ops = [_]store.Op{.{ .put = same }};
+        const ops = [_]store.Op{.{ .delete = kv.key }};
         _ = c.tap.inner.txn(.{ .on_success = &ops }, &scratch) catch scratch.reset();
         return;
     }
