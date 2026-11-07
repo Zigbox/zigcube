@@ -1275,7 +1275,8 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
-    const regress = b.step("sim-c1-regress", "Replay the seeds of the sim-fleet issues fixed in B2 slice 1");
+    const regress_help = "Replay the seeds of the sim-fleet issues fixed in B2 slice 1";
+    const regress = b.step("sim-c1-regress", regress_help);
     for (regress_replays) |line| {
         const replay = b.addRunArtifact(exe);
         replay.addArgs(line);
