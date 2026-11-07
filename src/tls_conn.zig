@@ -16,7 +16,8 @@
 //!
 //! What a call returns:
 //!   - `Refused`: the connection failed and `diag` holds the one coded diagnostic.
-//!   - `Closed`: the connection is over, or was ended by an earlier failure; nothing is raised.
+//!   - `Closed`: the connection is over. After an earlier failure `diag` holds ZC-E0816 (the
+//!     connection already ended); after `close` or the server's close_notify nothing is raised.
 //!   - `Timeout`: the caller's deadline passed. For `read` the connection is intact and the call
 //!     may be repeated. For `write` and `flush` the record may be half sent, so the connection is
 //!     over and every later call answers `Closed`.
@@ -174,7 +175,8 @@ pub const Conn = struct {
         switch (conn.phase) {
             .open => {},
             .peer_closed => return 0,
-            .shut, .broken => return error.Closed,
+            .shut => return error.Closed,
+            .broken => return conn.ended(diag),
             .handshake => unreachable, // `open` has not returned.
         }
         if (conn.pending.len > 0) return conn.take_pending(out);
@@ -225,7 +227,7 @@ pub const Conn = struct {
     /// Seals and sends `bytes`, one record per `plaintext_max` bytes; the call ends with nothing
     /// queued. `flush` is for a caller that wrote nothing since the last call (and so a no-op).
     pub fn write(conn: *Conn, bytes: []const u8, end_ms: u64, diag: *Diag) Error!void {
-        try conn.writable();
+        try conn.writable(diag);
         var rest = bytes;
         while (rest.len > 0) {
             const space = plaintext_max - conn.plain_length;
@@ -242,7 +244,7 @@ pub const Conn = struct {
 
     /// Seals and sends what `write` has queued.
     pub fn flush(conn: *Conn, end_ms: u64, diag: *Diag) Error!void {
-        try conn.writable();
+        try conn.writable(diag);
         if (conn.plain_length > 0) try conn.send_record(end_ms, diag);
         assert(conn.plain_length == 0);
     }
@@ -277,10 +279,11 @@ pub const Conn = struct {
         conn.client.drain();
     }
 
-    fn writable(conn: *const Conn) Error!void {
+    fn writable(conn: *const Conn, diag: *Diag) Error!void {
         switch (conn.phase) {
             .open => {},
-            .peer_closed, .shut, .broken => return error.Closed,
+            .peer_closed, .shut => return error.Closed,
+            .broken => return conn.ended(diag),
             .handshake => unreachable,
         }
     }
@@ -304,6 +307,17 @@ pub const Conn = struct {
 
     /// `reply` is a send made for a read (a KeyUpdate answer): fatal on timeout, like `write`.
     const Where = union(enum) { handshake: u32, read, write, reply };
+
+    /// A call on a connection that an earlier failure ended (RA-N7). It is still `Closed`, and
+    /// `diag` now says so, so a caller that kept the first failure's reason out of its log still
+    /// has a coded line. A connection the caller closed, or the server did, raises nothing.
+    fn ended(conn: *const Conn, diag: *Diag) Error {
+        assert(conn.phase == .broken);
+        diag.raise(.E0816);
+        diag.cause("the TLS connection already ended; the call that ended it reported why", .{});
+        diag.fix(.{ .sentence = "Open a new connection." });
+        return error.Closed;
+    }
 
     /// The client refused (its diagnostic is raised, an alert may wait): say goodbye if it can
     /// be done at once, and end the connection.

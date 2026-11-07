@@ -199,7 +199,8 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   `wasm-test` runs every core module's unit tests, the TLS ones included.
 - `zig build mtls-teeth` (in `check`) runs the tests named `teeth:`: each switches one check off
   (chain signature, name, window, CertificateVerify, Finished, transcript, client-auth rules) and
-  passes only if the matching test then fails.
+  passes only if the matching test then fails. Each of these tests also runs its negative half
+  (the check on, the scenario refused), because this step does not run the plain tests.
 - `zig build mtls-interop` (not in `check`; CI job of its own) runs the client against
   `openssl s_server` and a JDK 21 server. It needs `openssl`, JDK 21 and `setpriv` (util-linux),
   and fails, not skips, without them
@@ -220,7 +221,7 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
 | ZC-E0814 | the client certificate was not asked for though required, could not be answered, or was refused by the server (an empty or absent Certificate answered by a refusal is this too) |
 | ZC-E0820 | the signer holding the client certificate's key did not sign |
 | ZC-E0815 | a TLS record could not be read: it does not authenticate, is too long, has the wrong type or came after a key limit |
-| ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time |
+| ZC-E0816 | the connection ended or stalled without close_notify, or the handshake or a KeyUpdate answer did not finish in time, or a call came after an earlier failure had ended the connection |
 | ZC-E0818 | the server needs something zcube does not offer: another version, suite, group or scheme, or a HelloRetryRequest |
 | ZC-E0819 | issued for another role, such as a client certificate where a server's is needed |
 

@@ -1698,7 +1698,9 @@ pub const registry = [_]Entry{
         \\
         \\On a healthy network this does not happen: it means bytes were changed in
         \\transit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24
-        \\records without updating its keys. Reconnect; if it repeats, check the path
+        \\records without updating its keys, or asked this side to update its own keys
+        \\more often than tls_key_updates_per_connection_max allows (each request is
+        \\answered with an update). Reconnect; if it repeats, check the path
         \\between the two machines.
         ,
     },
@@ -1720,6 +1722,10 @@ pub const registry = [_]Entry{
         \\Treat what arrived as incomplete and retry the request. A peer that
         \\crashes, or a network that resets the connection, ends this way; for a
         \\stall, check that the server is reachable and keeping up.
+        \\
+        \\A call on a connection that an earlier failure already ended raises it too,
+        \\with the cause "the TLS connection already ended"; the earlier call carried
+        \\the reason, and the fix is a new connection.
         ,
     },
     .{

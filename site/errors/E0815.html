@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>external</dd></div><div><dt>Exit code</dt><dd>3</dd></div></dl>
 <h2>What it means</h2>
 <p>A record was too long, too short, did not authenticate, or the connection reached the end of what its keys may protect. The connection is closed and the keys are wiped.</p>
-<p>On a healthy network this does not happen: it means bytes were changed in transit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24 records without updating its keys. Reconnect; if it repeats, check the path between the two machines.</p>
+<p>On a healthy network this does not happen: it means bytes were changed in transit, the peer is not speaking TLS 1.3, or a peer sent more than 2^24 records without updating its keys, or asked this side to update its own keys more often than tls_key_updates_per_connection_max allows (each request is answered with an update). Reconnect; if it repeats, check the path between the two machines.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0815</pre>

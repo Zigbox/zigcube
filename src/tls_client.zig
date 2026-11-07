@@ -535,7 +535,8 @@ pub const Client = struct {
         var event: Event = .none;
         while (self.flight_length >= 4) {
             const body_length = std.mem.readInt(u24, self.flight[1..4], .big);
-            const total = 4 + body_length;
+            // Widened first: a u24 length of 0xFFFFFD or more overflows `4 + body_length`.
+            const total: u32 = 4 + @as(u32, body_length);
             if (total > constants.tls_handshake_message_bytes_max) {
                 return self.fail(
                     diag,
@@ -938,7 +939,18 @@ pub const Client = struct {
         const requested = wire.parse_key_update(body) catch |err|
             return self.wire_failure(diag, err, "KeyUpdate");
         self.read.rekey() catch |err| return self.record_failure(diag, err);
-        if (requested) try self.send_key_update(false, diag);
+        if (!requested) return;
+        // Every request is answered with an update of our own write keys, so a peer that keeps
+        // asking drives the write limit. That is the server's doing, not this client's.
+        if (self.write.updates >= constants.tls_key_updates_per_connection_max) {
+            diag.raise(.E0815);
+            diag.cause("the server asked for a KeyUpdate over {d} times", .{
+                constants.tls_key_updates_per_connection_max,
+            });
+            self.add_fix(diag, .E0815);
+            return self.refuse(diag, record_alert(error.TooManyKeyUpdates));
+        }
+        try self.send_key_update(false, diag);
     }
 
     // ---- Failing ------------------------------------------------------------------------------

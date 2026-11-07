@@ -352,6 +352,45 @@ test "a handshake message over the limit is refused, and the cause names the mes
     try std.testing.expect(std.mem.indexOf(u8, cause, "NewSessionTicket of 5004 bytes") != null);
 }
 
+test "a peer that drives the write key limit is blamed, not this client (RA-S7)" {
+    // Goal: the client answers every KeyUpdate request with an update of its own, so a peer
+    // that keeps asking reaches the write limit. Method: the limit is one request away.
+    var rig: Rig = undefined;
+    try rig.setup(.good, .{});
+    try expect_connected(&rig, 4096);
+    rig.client.write.updates = constants.tls_key_updates_per_connection_max;
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectError(error.Refused, rig.feed(rig.peer.key_update(&buffer, true), 4096));
+    try rig.expect_code(.E0815);
+    const cause = rig.diag.last_cause().?;
+    try std.testing.expect(std.mem.indexOf(u8, cause, "the server asked for a KeyUpdate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cause, "this client") == null);
+}
+
+test "a handshake length near 2^24 is refused, not overflowed (RB-S10)" {
+    // Goal: `4 + body_length` with a u24 length overflowed for 0xFFFFFD and up, a panic in a
+    // safe build and a wrapped length in ReleaseFast. Method: each of the top lengths in a
+    // header, on a fresh connection.
+    const lengths = [_][3]u8{
+        .{ 0xFF, 0xFF, 0xFC },
+        .{ 0xFF, 0xFF, 0xFD },
+        .{ 0xFF, 0xFF, 0xFE },
+        .{ 0xFF, 0xFF, 0xFF },
+    };
+    for (lengths) |length| {
+        var rig: Rig = undefined;
+        try rig.setup(.good, .{});
+        try expect_connected(&rig, 4096);
+        var out: [64]u8 = undefined;
+        const header = [_]u8{ 4, length[0], length[1], length[2] };
+        const record = rig.peer.seal(&out, .handshake, &header);
+        try std.testing.expectError(error.Refused, rig.feed(record, 4096));
+        try rig.expect_code(.E0813);
+        const cause = rig.diag.last_cause().?;
+        try std.testing.expect(std.mem.indexOf(u8, cause, "NewSessionTicket of ") != null);
+    }
+}
+
 test "a NewSessionTicket is read past and close_notify ends the connection" {
     // Goal: no resumption is offered, so a ticket is dropped; the peer's close_notify is
     // answered and later end of input is not an error. Method: both in turn.
@@ -868,6 +907,9 @@ test "teeth: each client-auth rule, broken, is seen at the server" {
 
 test "teeth: without the required-auth check a client connects unauthenticated" {
     var rig: Rig = undefined;
+    // The negative half runs here too: `mtls-teeth` does not run the plain tests.
+    try rig.setup_auth(.good, .{}, .{ .identity = true, .require = true });
+    try std.testing.expectError(error.Refused, connect_auth(&rig, 4096));
     tls_client.set_test_fault(.required_client_auth, true);
     defer tls_client.set_test_fault(.required_client_auth, false);
     try rig.setup_auth(.good, .{}, .{ .identity = true, .require = true });
@@ -876,14 +918,18 @@ test "teeth: without the required-auth check a client connects unauthenticated" 
 
 test "teeth: without the scheme check a request without Ed25519 is answered" {
     var rig: Rig = undefined;
-    tls_client.set_test_fault(.request_scheme, true);
-    defer tls_client.set_test_fault(.request_scheme, false);
-    try rig.setup_auth(.good, .{}, .{
+    const auth: Auth = .{
         .ask = true,
         .identity = true,
         .server_requires = false,
         .schemes = &.{0x0804},
-    });
+    };
+    try rig.setup_auth(.good, .{}, auth);
+    _ = connect_auth(&rig, 4096) catch {};
+    try std.testing.expect(rig.peer.client_key == null); // Negative half: nothing was answered.
+    tls_client.set_test_fault(.request_scheme, true);
+    defer tls_client.set_test_fault(.request_scheme, false);
+    try rig.setup_auth(.good, .{}, auth);
     const flight = try connect_auth(&rig, 4096);
     try std.testing.expectEqual(testpeer.ClientFlight.ok, flight);
     try std.testing.expect(rig.peer.client_key != null);
@@ -891,11 +937,15 @@ test "teeth: without the scheme check a request without Ed25519 is answered" {
 
 test "teeth: without the refusal check an alert about the certificate is a protocol error" {
     var rig: Rig = undefined;
+    var buffer: [64]u8 = undefined;
+    try rig.setup_auth(.good, .{}, asked);
+    _ = try connect_auth(&rig, 4096);
+    try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 42), 4096));
+    try rig.expect_code(.E0814); // Negative half: the certificate alert has its own code.
     tls_client.set_test_fault(.certificate_alert, true);
     defer tls_client.set_test_fault(.certificate_alert, false);
     try rig.setup_auth(.good, .{}, asked);
     _ = try connect_auth(&rig, 4096);
-    var buffer: [64]u8 = undefined;
     try std.testing.expectError(error.Refused, rig.feed(rig.peer.alert(&buffer, 42), 4096));
     try rig.expect_code(.E0813);
 }
@@ -906,6 +956,8 @@ test "teeth: without the CertificateVerify check a forged signature connects" {
     // Goal: evidence that the check is load-bearing. Method: the refused scenario, with the
     // client's check skipped, connects.
     var rig: Rig = undefined;
+    try rig.setup(.good, .{ .bad_certificate_verify = true });
+    try std.testing.expectError(error.Refused, rig.handshake(4096)); // Negative half.
     tls_client.set_test_fault(.certificate_verify, true);
     defer tls_client.set_test_fault(.certificate_verify, false);
     try rig.setup(.good, .{ .bad_certificate_verify = true });
@@ -914,6 +966,8 @@ test "teeth: without the CertificateVerify check a forged signature connects" {
 
 test "teeth: without the Finished check a bad Finished connects" {
     var rig: Rig = undefined;
+    try rig.setup(.good, .{ .bad_finished = true });
+    try std.testing.expectError(error.Refused, rig.handshake(4096)); // Negative half.
     tls_client.set_test_fault(.finished, true);
     defer tls_client.set_test_fault(.finished, false);
     try rig.setup(.good, .{ .bad_finished = true });
@@ -939,6 +993,8 @@ test "teeth: without the pin check a damaged certificate connects" {
     // Goal: the signature check in x509 is what pins the server to the CA. Method: the
     // damaged-signature scenario, with x509's signature check skipped, connects.
     var rig: Rig = undefined;
+    try rig.setup(.tampered, .{});
+    try std.testing.expectError(error.Refused, rig.handshake(4096)); // Negative half.
     x509.set_test_fault(.signature, true);
     defer x509.set_test_fault(.signature, false);
     try rig.setup(.tampered, .{});
@@ -949,6 +1005,8 @@ test "teeth: without the name check a certificate for another name connects" {
     // Goal: evidence that the name check is what ties the server to the name dialled. Method:
     // the refused wrong-name scenario, with x509's name check skipped, connects.
     var rig: Rig = undefined;
+    try rig.setup(.wrong_name, .{});
+    try std.testing.expectError(error.Refused, rig.handshake(4096)); // Negative half.
     x509.set_test_fault(.name, true);
     defer x509.set_test_fault(.name, false);
     try rig.setup(.wrong_name, .{});
@@ -959,6 +1017,8 @@ test "teeth: without the window check an expired certificate connects" {
     // Goal: as above, for the validity window. Method: the refused expired scenario, with
     // x509's window check skipped, connects.
     var rig: Rig = undefined;
+    try rig.setup(.expired, .{});
+    try std.testing.expectError(error.Refused, rig.handshake(4096)); // Negative half.
     x509.set_test_fault(.window, true);
     defer x509.set_test_fault(.window, false);
     try rig.setup(.expired, .{});

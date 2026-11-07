@@ -531,8 +531,13 @@ fn drop_client(io: std.Io, fd: std.posix.fd_t, f: *Fixture) !void {
     try std.testing.expectEqualStrings("cut", out[0..got]);
     try std.testing.expectError(error.Refused, conn.read(&out, end, &diag));
     try expect_code(&diag, .E0816);
-    try std.testing.expectError(error.Closed, conn.read(&out, end, &diag));
-    try std.testing.expectError(error.Closed, conn.write("x", end, &diag));
+    // RA-N7: a call on the dead connection is Closed, and it carries a coded line.
+    var later = new_diag();
+    try std.testing.expectError(error.Closed, conn.read(&out, end, &later));
+    try expect_code(&later, .E0816);
+    var again = new_diag();
+    try std.testing.expectError(error.Closed, conn.write("x", end, &again));
+    try expect_code(&again, .E0816);
 }
 
 test "a stream that ends without close_notify is ZC-E0816, never an end of data" {
