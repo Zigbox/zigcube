@@ -80,11 +80,25 @@ fn same_name(demo: *Demo) !void {
     try host.check(other.code == 1 and state.contains(other.err, "ZC-E0131"), "another " ++
         "command under the name is refused with ZC-E0131 (exit 1)", .{});
     const after = try state.need_job(host, "exit0");
-    try host.check(std.mem.eql(u8, after.state, "exited") and after.code == before.code and
-        after.revision == before.revision, "the job exit0 did not change", .{});
+    // `revision` is the store's head when the job was read, not the job record's own: the other
+    // jobs ending and every heartbeat move it, so it is not compared (issue #155).
+    // `retries` comes from the spec, so a second run would not show in it; the run's epoch and
+    // the time its ending was recorded do.
+    const unchanged = std.mem.eql(u8, after.state, "exited") and after.code == before.code and
+        same_text(after.node, before.node) and same_text(after.end_kind, before.end_kind) and
+        after.epoch == before.epoch and after.ended_at_ms == before.ended_at_ms;
+    try host.check(unchanged, "the job exit0 did not change (same epoch and ended_at_ms)", .{});
+    try host.check(before.epoch != null and before.ended_at_ms != null, "the job exit0's " ++
+        "status carries epoch and ended_at_ms, so the comparison above has something to see", .{});
 }
 
-/// The largest revision among the three jobs of step 1: where the watcher's own bookmark stands.
+fn same_text(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// The largest store revision the three jobs of step 1 were read at (a job's `revision` is the
+/// head when it was read, not its own): the watcher's own bookmark stands at or below it.
 fn last_ending_revision(host: *Host) !i64 {
     var largest: i64 = 0;
     for ([_][]const u8{ "exit0", "exit3", "echoin" }) |name| {

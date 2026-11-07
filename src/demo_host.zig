@@ -318,20 +318,23 @@ pub const Host = struct {
     }
 
     /// Says so when one poll or one sleep took more than `stall_ms`. A sleep that overshoots
-    /// means the demo's own process, or the machine, did not run; a slow poll with no overshoot
-    /// means the server (or the `zcube` it was asked through) did not answer. CI's 2026-11-07
-    /// failure (docs/demos/notes/2026-11-07-demo-c1-sqlite-stall.md) could not be told apart.
+    /// means the demo's own process, or the machine, did not run. A slow poll alone is ambiguous:
+    /// a freeze of the whole machine that starts while the poll is in flight looks the same as a
+    /// silent server. The server's own "elapsed while its mutex was held" line (store_sqlite.zig,
+    /// naming the store call) says whether a store call's time covered the stall; the machine's
+    /// pressure and steal time say whether it was frozen.
+    /// CI's 2026-11-07 failure (docs/demos/notes/2026-11-07-demo-c1-sqlite-stall.md) could not be.
     fn report_stall(
         host: *Host,
         comptime what: []const u8,
         from_ms: u64,
         to_ms: u64,
-        wait_ms: u64,
+        wait_started_ms: u64,
     ) void {
         assert(to_ms >= from_ms);
         if (to_ms - from_ms <= stall_ms) return;
         host.say("  STALL: " ++ what ++ " took {d} ms, {d} ms into a wait (demo clock {d} ms)", .{
-            to_ms - from_ms, from_ms - wait_ms, from_ms,
+            to_ms - from_ms, from_ms - wait_started_ms, from_ms,
         });
     }
 

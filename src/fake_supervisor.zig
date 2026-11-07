@@ -40,6 +40,25 @@ fn on_term(_: std.posix.SIG) callconv(.c) void {
     if (pid > 1) _ = std.os.linux.kill(pid, .TERM);
 }
 
+/// Waits until the child `pid` has ended, without reaping it, then stops `on_term` from signalling
+/// it. The caller reaps afterwards (`child.wait`). While the zombie exists its pid cannot be
+/// reused, so a `SIGTERM` between the end and `child_pid = 0` signals the zombie, which is
+/// harmless; reaping first would leave a window in which the pid could belong to another process
+/// (issue #113).
+fn wait_ended_unreaped(pid: i32) void {
+    var info: std.os.linux.siginfo_t = undefined;
+    while (true) {
+        const flags = std.os.linux.W.EXITED | std.os.linux.W.NOWAIT;
+        const rc = std.os.linux.waitid(.PID, pid, &info, flags, null);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => break, // Not our child, or already reaped: `child.wait` reports it.
+        }
+    }
+    child_pid.store(0, .seq_cst);
+}
+
 /// Makes `pid` the child a `SIGTERM` is passed to. The handler stores the flag and then reads the
 /// pid; this stores the pid and then reads the flag, all sequentially consistent, so at least one
 /// side sees the other: a `SIGTERM` that came before the pid was published (the child already
@@ -48,6 +67,23 @@ fn publish_child(pid: i32) void {
     assert(pid > 1);
     child_pid.store(pid, .seq_cst);
     if (term_received.load(.seq_cst)) _ = std.os.linux.kill(pid, .TERM);
+}
+
+/// Waits for `child` to end and reaps it, in the one order that is safe (issue #113). While its
+/// zombie is unreaped its pid is still its own, so `child_pid` is cleared and `child.pid` is
+/// removed first: after the reap the number may belong to a stranger, and neither the handler
+/// nor an agent reading `child.pid` (`stop`, `signal`) may signal it then. `between` is a test
+/// hook that runs in that window.
+fn reap(
+    io: std.Io,
+    dir: ?Dir,
+    child: *std.process.Child,
+    between: ?*const fn () void,
+) std.process.Child.WaitError!std.process.Child.Term {
+    wait_ended_unreaped(child.id.?);
+    if (dir) |own| own.deleteFile(io, files.file_child) catch {}; // Absent if it was never written.
+    if (between) |hook| hook();
+    return child.wait(io);
 }
 
 pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
@@ -120,8 +156,7 @@ fn fetch_first(init: std.process.Init, dir: Dir, arena: Allocator) ?files.RunFil
         .stderr = .{ .file = log },
     }) catch return failed(.environment, "the host refused to start the fetch");
     publish_child(child.id.?);
-    const term = child.wait(io) catch return .{ .kind = .lost };
-    child_pid.store(0, .seq_cst);
+    const term = reap(io, null, &child, null) catch return .{ .kind = .lost };
     const result = fetch_ended(arena, plan.digest, term);
     if (state) |opened| settle_streak(io, opened, arena, plan.digest, result);
     return result;
@@ -230,9 +265,13 @@ fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {
     }) catch |err| return record(io, dir, spawn_failure(err));
     const pid: i32 = child.id.?;
     publish_child(pid);
-    files.write_pid(io, dir, files.file_child, pid) catch child.kill(io);
-    const term = child.wait(io) catch return record(io, dir, .{ .kind = .lost });
-    child_pid.store(0, .seq_cst);
+    // Without its pid file nobody can find the command to stop it, so it ends here, by the same
+    // reap as any other end (`child.kill` would reap first and `child.wait` then has no pid).
+    files.write_pid(io, dir, files.file_child, pid) catch {
+        _ = std.os.linux.kill(pid, .KILL);
+    };
+    const term = reap(io, dir, &child, null) catch
+        return record(io, dir, .{ .kind = .lost });
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     return record(io, dir, ended(io, dir, arena_state.allocator(), term));
@@ -310,4 +349,45 @@ test "a SIGTERM that came before the fetch's pid was published still reaches the
     defer child_pid.store(0, .seq_cst);
     const term = try child.wait(io);
     try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, term);
+}
+
+var window_pid_seen: i32 = -1;
+var window_zombie_seen: bool = false;
+
+fn observe_window() void {
+    window_pid_seen = child_pid.load(.seq_cst);
+    // A SIGTERM in the window finds nobody to pass on to.
+    on_term(.TERM);
+    var info: std.os.linux.siginfo_t = undefined;
+    const flags = std.os.linux.W.EXITED | std.os.linux.W.NOWAIT | std.os.linux.W.NOHANG;
+    const rc = std.os.linux.waitid(.ALL, 0, &info, flags, null);
+    const found = std.os.linux.errno(rc) == .SUCCESS;
+    window_zombie_seen = found and info.fields.common.first.piduid.pid != 0;
+}
+
+test "between the end of the command and its reap nothing can be signalled (issue #113)" {
+    // Goal: after the command ended and before it is reaped its pid is not `child_pid` and its
+    // `child.pid` file is gone, so a signal cannot reach a reused pid. Method: a real child that
+    // exits at once, a `child.pid` file, and a hook in the window that records `child_pid`,
+    // delivers the handler's SIGTERM and checks that the zombie is still there. Without the fix
+    // (the reap before the clear) `window_pid_seen` is the child's pid.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try files.write_pid(io, tmp.dir, files.file_child, 4242);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{"true"},
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    publish_child(child.id.?);
+    window_pid_seen = -1;
+    window_zombie_seen = false;
+    const term = try reap(io, tmp.dir, &child, observe_window);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try std.testing.expectEqual(@as(i32, 0), window_pid_seen);
+    try std.testing.expect(window_zombie_seen);
+    try std.testing.expect(!files.exists(io, tmp.dir, files.file_child));
+    term_received.store(false, .seq_cst);
 }

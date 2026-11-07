@@ -17,9 +17,11 @@ log does and does not show.
   roughly the ttl (8 s) or more.** Not at node3's agent (dead), not at the proxy (node2 is direct).
 - The build step before the demo took 2m11s on that runner, with `translate-c` at 46 s: it was
   a slow runner, but that is evidence about the build, not about the 13 s.
-- The log has **no timestamp inside the demo's output**, so it cannot tell whether the stall was
-  the server process only (a blocked fsync, a lock) or the whole machine (the demo's own sleeps
-  late too). "Runner stall" is therefore plausible, not proved.
+- The Actions log stamps every stdout line, and the demo's 13 134 ms agrees with it (kill done
+  26.52, wait printed 39.66). The server's and agents' stderr is dumped only at failure, so all
+  of it carries the stamp of the dump: it could not say when node1 and node2 fenced. The demo's
+  output cannot tell whether the stall was the server only (a blocked fsync, a lock) or the whole
+  machine. "Runner stall" is therefore plausible, not proved.
 
 ## Reproduction
 
@@ -51,11 +53,18 @@ log does and does not show.
 poll or sleep over 2 s, with the offset into the wait and the demo's clock. Under the 9 s
 `SIGSTOP` above it prints `STALL: a poll took 8538 ms`. A recurrence then reads:
 
-- slow poll, sleeps on time: the server (or `zcube`) did not answer; look at its fsync.
-- sleep overshoots too: the demo process or the machine did not run; a runner stall.
+- sleep overshoots: the demo process or the machine did not run; a runner stall.
+- slow poll alone is **ambiguous**: a freeze of the whole machine that starts while `zcube` is in
+  flight looks the same as a silent server. What separates them is the server's own line
+  `sqlite store <call>: N ms elapsed while its mutex was held` (added in B2 slice 5): present
+  names the store call whose elapsed time passed 1 s (the store blocked, or the machine froze:
+  CLOCK_MONOTONIC counts a frozen VM, so the line alone does not tell which); absent means the
+  stall was not inside a store call. Either way look at the machine (`/proc/pressure/cpu`, steal
+  time).
 
-## Proposed, not done (needs a decision: it adds a server log line / a limit)
+## Done in B2 slice 5 (supervisor's decision, 2026-11-07)
 
-- A timestamp on every line of the server's and agents' stderr that the demo echoes on failure.
-- The server logging any store call that holds the SQLite mutex for more than 1 s (cause, how
-  long, which call). That would turn "unproven" into "proved" in one recurrence.
+- The server stamps its request-log lines with unix ms, and logs
+  `sqlite store <call>: N ms elapsed while its mutex was held` when a store call held the SQLite
+  mutex over 1 s. No limit, default or code is new.
+- Not done: stamps on the agents' stderr.
