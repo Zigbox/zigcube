@@ -329,7 +329,8 @@ test "a handshake with a failing random source is Entropy and sends nothing" {
     const pair = try Pair.make();
     defer pair.close();
     const end = boot_ms(io) + 1000;
-    try std.testing.expectError(error.Entropy, open_client(io, pair.fds[0], &client_id, "node2", end));
+    const opened = open_client(io, pair.fds[0], &client_id, "node2", end);
+    try std.testing.expectError(error.Entropy, opened);
 }
 
 test "a message of several records crosses a handshaken stream both ways" {

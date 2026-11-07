@@ -353,7 +353,8 @@ pub const Net = struct {
         if (!conn.open) {
             const who = net.peers[index];
             const fd = peer_stream.connect(net.io, who.address, end) catch return .timeout;
-            conn.stream = peer_stream.open_client(net.io, fd, &identity, who.name, end) catch |err| {
+            const opened = peer_stream.open_client(net.io, fd, &identity, who.name, end);
+            conn.stream = opened catch |err| {
                 _ = std.os.linux.close(fd);
                 net.stream_failed(err);
                 return .timeout;
