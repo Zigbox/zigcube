@@ -429,10 +429,23 @@ const Node = struct {
         diag: *Diag,
     ) agent_client.Error!agent_client.Reply {
         const node: *Node = @ptrCast(@alignCast(context));
+        // A dead agent makes no call: a step that goes on past the crash (deadline enforcement
+        // swallows it) ends at its next call to the server, and nothing reaches the net (#167).
+        if (node.sim.crashed or node.sim.files.crashed) return dead_call(diag);
         const net = &node.cluster.net;
+        assert(!node.sim.crashed);
         const result = net.transport(node.index).call(arena, request, diag);
         node.spent_ms += net.last_call_ms;
         return result;
+    }
+
+    /// The call of an agent that crashed: the server never hears of it (ZC-E0503).
+    fn dead_call(diag: *Diag) agent_client.Error {
+        assert(diag.code == null);
+        diag.raise(.E0503);
+        diag.cause("the simulated agent crashed: it makes no call to zcube-server", .{});
+        diag.fix(.{ .sentence = "start the agent again" });
+        return error.Unreachable;
     }
 
     fn restart(node: *Node) void {
@@ -3030,6 +3043,18 @@ test "a start after the agent's crash is refused, not asserted (#158)" {
     simulate(testing.allocator, 57, 100, .{ .c1 = true }, &report);
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
     try testing.expect(!report.failed);
+}
+
+test "a crashed node's step makes no call to the server (#167)" {
+    // Goal: after a crash that deadline enforcement swallows, the step's heartbeat, publish and
+    // load must not reach the server (`tapped_call` refuses; it asserts nothing got through).
+    // Method: seeds whose runs crash agents mid-step, c1 and not.
+    for ([_]u64{ 57, 1, 2, 3, 4, 5, 6, 7 }) |seed| {
+        var report: Report = undefined;
+        simulate(testing.allocator, seed, 100, .{ .c1 = true }, &report);
+        if (report.failed) std.debug.print("seed {d}\n{s}\n", .{ seed, report.text() });
+        try testing.expect(!report.failed);
+    }
 }
 
 test "a node count can be asked for" {
