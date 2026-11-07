@@ -7,6 +7,7 @@
 #   store         the Postgres store suite and the store fault tests
 #   demo_c0       demo-c0 on SQLite and on Postgres
 #   demo_c1       demo-c1 on SQLite and on Postgres
+#   demo_b1       demo-b1 on SQLite and on Postgres
 #   zigbox_smoke  the Zigbox runtime on a real host (QEMU/KVM)
 #   demo_c2       demo-c2 (four VMs, KVM, GHCR images)
 #   mtls_interop  mtls-interop (stock openssl and JDK servers)
@@ -20,7 +21,7 @@
 # change that is not documentation only, so format, tidy, build and the unit tests always run.
 set -euo pipefail
 
-jobs=(store demo_c0 demo_c1 zigbox_smoke demo_c2 mtls_interop)
+jobs=(store demo_c0 demo_c1 demo_b1 zigbox_smoke demo_c2 mtls_interop)
 declare -A want=()
 
 want_all() { local j; for j in "${jobs[@]}"; do want[$j]=1; done; }
@@ -47,8 +48,12 @@ classify() {
     # The shared driver of both demos.
     src/demo_host.zig) want_all; return ;;
     # The files of one demo: that demo only (docs/demos/*.md is documentation).
+    # demo-b1 imports demo_c1_state.zig, which imports demo_c1_fleet.zig and demo_c0_state.zig.
+    src/demo_c0_state.zig) want_one demo_c0; want_one demo_c1; want_one demo_b1; return ;;
+    src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
+    src/demo_b1*.zig) want_one demo_b1; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
     # The Zigbox runtime adapter: its smoke and demo-c2, which runs it on real VMs. The C0 and C1
     # demos run FakeRuntime; a compile error in the adapter still fails the build job.
