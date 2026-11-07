@@ -677,3 +677,22 @@ test "a job added behind the cursor between steps gets its run within two more s
     _ = try f.jc.reconcile(&f.context());
     try testing.expect((try f.read_run("a")) != null);
 }
+
+test "an unmappable report is held once and does not pin the job: a cancel still stops it" {
+    // Goal: RB-S8. Method: a running run whose agent reports `stopped` with an exit that maps to
+    // no ending (an exit with neither code nor signal); the job is then cancelled. The report is
+    // held with one decision, and the cancel's stop is written all the same.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.running("train");
+    try f.report("n1", "train", .stopped, .{ .kind = .exited }, null);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unmapped_ending"));
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+    try f.job("train", 60 * 1000, true);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const stop = (try f.read_run("train")).?.stop orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(records.RunStopCause.cancel, stop.cause);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unmapped_ending"));
+}

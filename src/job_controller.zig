@@ -626,7 +626,8 @@ const Pass = struct {
     }
 
     /// An admissible report: a claim or a running report marks the run running; a stopped one ends
-    /// it. True when it acted or must stop the pass for this job (an unmappable ending).
+    /// it. True when it acted. An unmappable ending is held with a decision and returns false, so
+    /// the pass goes on to the cancel and the lost-node judgements: the job is not pinned.
     fn from_report(
         pass: *Pass,
         job: *const Entry(records.Job),
@@ -637,7 +638,7 @@ const Pass = struct {
         if (entry.rec.status == .stopped) {
             const ending = map_ending(&entry.rec) orelse {
                 try pass.unmappable(job, entry);
-                return true;
+                return false;
             };
             try pass.end(job, run, status, .{
                 .ending = ending,
