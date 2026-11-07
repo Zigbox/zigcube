@@ -206,6 +206,11 @@ pub const Agent = struct {
     /// Like the fence, it caps every pause, wait and call, so a cut-off server never holds a
     /// run's stop back.
     deadline_wake_mono_ms: u64,
+    /// The earliest a run's wake may cut a call of the current step, monotonic: the step's start
+    /// plus `call_inflight_min_ms`. One floor for the whole step, so the calls it makes one
+    /// after another (the heartbeat, then the pass) cannot each take a floor of their own and
+    /// carry enforcement a floor per call past a deadline.
+    step_floor_mono_ms: u64,
     /// Failures of the server-free enforcement that the step went on after (one run's record or
     /// stop, the runtime's listing): counted, with the last one's code and cause, for the shell
     /// to say. Enforcement never fails the step, so the heartbeat always runs.
@@ -284,6 +289,7 @@ pub const Agent = struct {
         agent.pull_drops = 0;
         agent.pull_drop_len = 0;
         agent.restored = false;
+        agent.step_floor_mono_ms = 0;
         agent.stops_count = 0;
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
@@ -348,7 +354,11 @@ pub const Agent = struct {
     /// would otherwise cut every one and starve the lease. Enforcement then runs at most that
     /// late, which is inside the grace. Called as a call begins (`mono_now`).
     pub fn calls_deadline_ms(agent: *const Agent, mono_now: u64) u64 {
-        const wake = @max(agent.deadline_wake_mono_ms, mono_now +| call_inflight_min_ms);
+        return agent.calls_deadline_from(mono_now +| call_inflight_min_ms);
+    }
+
+    fn calls_deadline_from(agent: *const Agent, floor_ms: u64) u64 {
+        const wake = @max(agent.deadline_wake_mono_ms, floor_ms);
         return @min(agent.fence_at_ms() orelse maxInt(u64), wake);
     }
 
@@ -362,7 +372,7 @@ pub const Agent = struct {
     /// Tells the caller by when every call to the server must end (`calls_deadline_ms`).
     fn cap_calls(agent: *const Agent, ctx: *const Context) void {
         const deadline = ctx.deadline orelse return;
-        deadline.set_fn(deadline.context, agent.calls_deadline_ms(ctx.mono_ms()));
+        deadline.set_fn(deadline.context, agent.calls_deadline_from(agent.step_floor_mono_ms));
     }
 
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
@@ -370,6 +380,7 @@ pub const Agent = struct {
         agent.steps += 1;
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
+        agent.step_floor_mono_ms = mono +| call_inflight_min_ms;
         // The fence comes first and needs no server: an agent cut off from everything still stops.
         try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {

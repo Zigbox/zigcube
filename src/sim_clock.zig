@@ -29,6 +29,9 @@ pub const NodeClock = struct {
     anchor_true_ms: u64,
     anchor_reading_ms: u64,
     last_reading_ms: u64,
+    /// True time the node's reading may not fall behind: a step's calls take time on the node's
+    /// own clock (`spend`), though the cluster's true clock moves only after the step.
+    busy_until_true_ms: u64 = 0,
 
     pub fn init(source: Clock, offset_ms: u64, rate_ppm: i32, rate_ppm_max: u32) NodeClock {
         assert(rate_ppm_max < million);
@@ -53,15 +56,19 @@ pub const NodeClock = struct {
         return node.read();
     }
 
+    /// The node spent time up to `true_ms` (true scale) inside a step: from now its reading
+    /// includes it, and true time catches up when the step's time has passed.
+    pub fn spend_until(node: *NodeClock, true_ms: u64) void {
+        node.busy_until_true_ms = @max(node.busy_until_true_ms, true_ms);
+    }
+
     fn read(node: *NodeClock) u64 {
-        const true_ms = node.source.now_ms();
-        assert(true_ms >= node.anchor_true_ms); // The source is monotonic.
-        const elapsed = true_ms - node.anchor_true_ms;
+        const true_ms = @max(node.source.now_ms(), node.busy_until_true_ms);
+        const elapsed = true_ms -| node.anchor_true_ms;
         const scale: u64 = @intCast(@as(i64, @intCast(million)) + node.rate_ppm);
         const reading = node.anchor_reading_ms + @divFloor(elapsed * scale, million);
-        assert(reading >= node.last_reading_ms);
-        node.last_reading_ms = reading;
-        return reading;
+        node.last_reading_ms = @max(node.last_reading_ms, reading);
+        return node.last_reading_ms;
     }
 
     /// Changes the rate error from now on; the reading stays continuous.
@@ -78,7 +85,7 @@ pub const NodeClock = struct {
 
     fn reanchor(node: *NodeClock, extra_ms: u64) void {
         const reading = node.read();
-        node.anchor_true_ms = node.source.now_ms();
+        node.anchor_true_ms = @max(node.source.now_ms(), node.busy_until_true_ms);
         node.anchor_reading_ms = reading + extra_ms;
         node.last_reading_ms = node.anchor_reading_ms;
     }

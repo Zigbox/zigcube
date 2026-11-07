@@ -236,6 +236,39 @@ test "an exit is reported with its code and no stop cause" {
     try testing.expectEqual(@as(?records.StopCause, null), seen.stop_cause);
 }
 
+test "a container that exited with no start record reports its exit, not lost" {
+    // Goal: RB-N3. The start record is gone (a lost file), the container ended with code 7: the
+    // exit is what happened, and the run is not reported `lost` (ZC-E0522).
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try rig.world.sim.inject(run_id, .{ .exit = 7 });
+    var buffer: [96]u8 = undefined;
+    try rig.world.files.interface().remove(agent_jobs.record_name(&buffer, run_id));
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(records.ExitKind.exited, seen.exit.?.kind);
+    try testing.expectEqual(@as(?u8, 7), seen.exit.?.code);
+}
+
+test "a runtime that fails to start ends the run start_failed, with its diagnostic" {
+    // Goal: RB-N4. `runtime.start` returns an error (not an outcome): the claimed run ends at
+    // once as a start failure and is not left claimed.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var wrapper: FailingList = .{ .inner = rig.world.sim.interface(), .start_failing = true };
+    rig.world.runtime_override = wrapper.interface();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
+    try expect_code(seen, "ZC-E0201");
+}
+
 test "a cancel stops the container and is reported as the cause" {
     var rig = try Rig.start();
     defer rig.stop();
@@ -754,6 +787,8 @@ test "a leftover container of an earlier job of the same name is stopped, never 
     // is gone) must not be adopted as this job's. Method: leave one running and one exited
     // container of that name, labelled with a created revision before any run record, then
     // assign the new job: the running one is stopped, neither is adopted, the new run starts.
+    // Teeth (checked by hand, B2 slice 1): `is_stale` returning false fails this test (the old
+    // container is adopted); returning true fails the adoption tests above (the live one is stopped).
     const runtime = @import("runtime.zig");
     var rig = try Rig.start();
     defer rig.stop();
@@ -994,10 +1029,12 @@ const FailingPut = struct {
     }
 };
 
-/// The simulated runtime with `list` failing while `failing` is set.
+/// The simulated runtime with `list` failing while `failing` is set, and `start` while
+/// `start_failing` is.
 const FailingList = struct {
     inner: rt.Runtime,
     failing: bool = false,
+    start_failing: bool = false,
 
     const vtable: rt.Runtime.VTable = .{
         .start = start,
@@ -1021,8 +1058,14 @@ const FailingList = struct {
         spec: *const rt.Spec,
         diag: *diag_mod.Diag,
     ) rt.Error!rt.StartOutcome {
-        const inner = from(context).inner;
-        return inner.vtable.start(inner.context, spec, diag);
+        const self = from(context);
+        if (self.start_failing) {
+            diag.raise(.E0201);
+            diag.cause("the simulated runtime cannot start a container", .{});
+            diag.fix(.{ .sentence = "none: a test switched it off" });
+            return error.RuntimeFailed;
+        }
+        return self.inner.vtable.start(self.inner.context, spec, diag);
     }
 
     fn stop(

@@ -71,7 +71,7 @@ pub fn note_marks(
     stopped: bool,
     wedged_total_ms: u64,
 ) void {
-    const age = now_ms - watch.first_seen_ms;
+    const age = now_ms -| watch.first_seen_ms;
     if (!watch.wedge_marked and age >= deadline_ms) {
         watch.wedge_marked = true;
         watch.wedged_base_ms = wedged_total_ms;
