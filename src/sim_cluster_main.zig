@@ -390,7 +390,8 @@ fn usage(io: std.Io, args: []const []const u8) u8 {
 }
 
 const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 8,000 ms is refused: an agent " ++
-    "cannot fence in time under it (ZC-E0121, issue #78)\n";
+    "cannot fence in time under it (ZC-E0121: the shortest ttl the server admits, which is also " ++
+    "the shortest a shape draws)\n";
 
 /// The one-line reason for a `--lease-ttl-ms` under the bound, which `parse` refuses as any
 /// bad argument; null for every other refusal.
