@@ -529,7 +529,11 @@ const Node = struct {
         // written none of it, and its restart would read a clock ahead of true time, stamp a
         // lease with it and fence late: an artefact of the simulator, not an agent that acts
         // past its fence (seeds 1612, 1384, 893). So the restart waits until true time has
-        // caught up with the clock; `step_once` asserts it.
+        // caught up with the clock; `step_once` asserts it. Coverage cut: a crash inside a
+        // long step (a slow store, many calls) can no longer be followed by a fast restart, so
+        // a bug that shows only then (a restored lease or deadline replayed while the old
+        // step's calls land) is out of the simulator's reach; docs/core.md, "The cluster
+        // simulation".
         const back = c.manual.ms + 200 + c.prng.random().uintLessThan(u32, 5000);
         node.restart_at_ms = @max(back, node.nclock.busy_until_true_ms + 200);
     }
@@ -608,6 +612,7 @@ const Node = struct {
     /// shrinks as a real agent's does and nothing is taken off the deadline here: once it was
     /// (issue #136, before the clock ran), and the time counted twice.
     fn deadline_set(node: *Node, deadline_ms: u64) void {
+        assert(node.remote.mono != null); // `create_node` gives the remote its clock
         node.remote.deadline_ms = deadline_ms;
     }
 
