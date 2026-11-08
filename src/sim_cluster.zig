@@ -353,6 +353,8 @@ pub const Swarm = struct {
 // ---- A node -------------------------------------------------------------------------------------
 
 /// One node: its half of the world and the agent that runs on it.
+const StartedTrue = struct { hash: u64, ms: u64 };
+
 const Node = struct {
     cluster: *Cluster,
     index: u32,
@@ -376,6 +378,11 @@ const Node = struct {
     resume_ms: u64,
     /// How long the calls of the step in progress took.
     spent_ms: u64,
+    /// The true time of this node's latest job-container starts (by name hash), newest over the
+    /// oldest: a step's true time is frozen, but a start late in it happened later than its
+    /// first tick shows, and J8 counts from the start.
+    started_true: [8]StartedTrue = @splat(.{ .hash = 0, .ms = 0 }),
+    started_next: u8 = 0,
     /// The link is cut until this true time.
     partitioned_until_ms: ?u64,
     crashes: u32,
@@ -432,6 +439,9 @@ const Node = struct {
         const net = &node.cluster.net;
         const result = net.transport(node.index).call(arena, request, diag);
         node.spent_ms += net.last_call_ms;
+        // The call took that long on the agent's clock too, so a cap on its calls (the fence,
+        // a run's deadline) is reached inside one step as it is in a real agent's.
+        node.nclock.spend_until(node.cluster.manual.ms + node.spent_ms);
         return result;
     }
 
@@ -480,6 +490,13 @@ const Node = struct {
         node.crashes += 1;
         const c = node.cluster;
         node.restart_at_ms = c.manual.ms + 200 + c.prng.random().uintLessThan(u32, 5000);
+    }
+
+    fn started_true_of(node: *const Node, hash: u64) ?u64 {
+        for (node.started_true) |entry| {
+            if (entry.hash == hash and entry.ms != 0) return entry.ms;
+        }
+        return null;
     }
 
     /// One reconcile step, reported to the loop policy. Returns the transactions it made.
@@ -1480,6 +1497,11 @@ fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
     const node: *Node = @ptrCast(@alignCast(context));
     const c = node.cluster;
     if (!c.jobs_on) return;
+    node.started_true[node.started_next % node.started_true.len] = .{
+        .hash = std.hash.Wyhash.hash(0, spec.name),
+        .ms = @max(c.manual.ms, node.nclock.busy_until_true_ms),
+    };
+    node.started_next +%= 1;
     _ = c.tap_arena.reset(.retain_capacity);
     c.tap_diag.reset();
     const ctx: controller.Context = .{
@@ -2276,7 +2298,7 @@ fn track_jobs(c: *Cluster) Failure!void {
             var watch = watch_of(c, node.index, hash) orelse sim_jobs.Watch{
                 .node = node.index,
                 .name_hash = hash,
-                .first_seen_ms = c.manual.ms,
+                .first_seen_ms = node.started_true_of(hash) orelse c.manual.ms,
                 .ended_since_ms = null,
             };
             if (watch_of(c, node.index, hash) == null) {
@@ -2329,9 +2351,9 @@ fn judge_job_container(
         granularity,
         wedged,
     );
-    c.jobs.deadline_worst_ms = @max(c.jobs.deadline_worst_ms, (now - watch.first_seen_ms) -|
+    c.jobs.deadline_worst_ms = @max(c.jobs.deadline_worst_ms, (now -| watch.first_seen_ms) -|
         (run.deadline_ms + run.grace_ms));
-    try check(c, now - watch.first_seen_ms <= bound, "J8: a run kept executing past its " ++
+    try check(c, now -| watch.first_seen_ms <= bound, "J8: a run kept executing past its " ++
         "deadline, its grace and the kill");
     if (run.stop) |stop| {
         const stop_bound = sim_jobs.stop_bound_ms(c.api.lease_ttl_ms, run.grace_ms, granularity);

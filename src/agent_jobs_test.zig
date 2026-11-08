@@ -236,6 +236,39 @@ test "an exit is reported with its code and no stop cause" {
     try testing.expectEqual(@as(?records.StopCause, null), seen.stop_cause);
 }
 
+test "a container that exited with no start record reports its exit, not lost" {
+    // Goal: RB-N3. The start record is gone (a lost file), the container ended with code 7: the
+    // exit is what happened, and the run is not reported `lost` (ZC-E0522).
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try rig.world.sim.inject(run_id, .{ .exit = 7 });
+    var buffer: [96]u8 = undefined;
+    try rig.world.files.interface().remove(agent_jobs.record_name(&buffer, run_id));
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(records.ExitKind.exited, seen.exit.?.kind);
+    try testing.expectEqual(@as(?u8, 7), seen.exit.?.code);
+}
+
+test "a runtime that fails to start ends the run start_failed, with its diagnostic" {
+    // Goal: RB-N4. `runtime.start` returns an error (not an outcome): the claimed run ends at
+    // once as a start failure and is not left claimed.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var wrapper: FailingList = .{ .inner = rig.world.sim.interface(), .start_failing = true };
+    rig.world.runtime_override = wrapper.interface();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(!rig.running());
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(records.ExitKind.start_failed, seen.exit.?.kind);
+    try expect_code(seen, "ZC-E0201");
+}
+
 test "a cancel stops the container and is reported as the cause" {
     var rig = try Rig.start();
     defer rig.stop();
@@ -754,6 +787,9 @@ test "a leftover container of an earlier job of the same name is stopped, never 
     // is gone) must not be adopted as this job's. Method: leave one running and one exited
     // container of that name, labelled with a created revision before any run record, then
     // assign the new job: the running one is stopped, neither is adopted, the new run starts.
+    // Teeth (checked by hand, B2 slice 1): `is_stale` returning false fails this test (the old
+    // container is adopted); returning true fails the adoption tests above (the live one is
+    // stopped).
     const runtime = @import("runtime.zig");
     var rig = try Rig.start();
     defer rig.stop();
@@ -994,10 +1030,14 @@ const FailingPut = struct {
     }
 };
 
-/// The simulated runtime with `list` failing while `failing` is set.
+/// The simulated runtime with `list` failing while `failing` is set, and `start` while
+/// `start_failing` is.
 const FailingList = struct {
     inner: rt.Runtime,
     failing: bool = false,
+    start_failing: bool = false,
+    /// How many starts it refused.
+    refused: u32 = 0,
 
     const vtable: rt.Runtime.VTable = .{
         .start = start,
@@ -1021,8 +1061,15 @@ const FailingList = struct {
         spec: *const rt.Spec,
         diag: *diag_mod.Diag,
     ) rt.Error!rt.StartOutcome {
-        const inner = from(context).inner;
-        return inner.vtable.start(inner.context, spec, diag);
+        const self = from(context);
+        if (self.start_failing) {
+            self.refused += 1;
+            diag.raise(.E0201);
+            diag.cause("the simulated runtime cannot start a container", .{});
+            diag.fix(.{ .sentence = "none: a test switched it off" });
+            return error.RuntimeFailed;
+        }
+        return self.inner.vtable.start(self.inner.context, spec, diag);
     }
 
     fn stop(
@@ -1157,6 +1204,50 @@ test "a runtime listing that fails does not fail the step before the heartbeat" 
     try testing.expectEqual(@as(?records.StopCause, .deadline), kept.stop_cause);
 }
 
+test "a cancel takes effect while a replica's start keeps failing" {
+    // Goal: RA-SHOULD1. A replica whose runtime start errors fails the replica pass at every
+    // step; the job pass must still run, or a cancel is withheld for as long as the error lasts
+    // (the heartbeat succeeds, so no fence ends it). Method: a run is running; the runtime's
+    // start then fails and a replica is assigned; the run is cancelled; steps fail with the
+    // replica's error and the run stops all the same with the cancel as its cause.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    var wrapper: FailingList = .{ .inner = world.sim.interface(), .start_failing = true };
+    world.runtime_override = wrapper.interface();
+    const replica: records.Replica = .{
+        .id = "web-1",
+        .service = "web",
+        .generation = 1,
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+    };
+    _ = try rig.put(.replica_controller, records.replica_key("web", "web-1").slice(), replica);
+    const assigned = records.assigned_replica(
+        "web-1",
+        "web",
+        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        "test",
+    );
+    const key = records.assigned_key(sim_world.node_name, "web-1");
+    _ = try rig.put(.scheduler, key.slice(), assigned);
+    try rig.ask_stop(.cancel, 60_000);
+    // No `advance`: the server's controllers would delete a replica of a service that is not
+    // there. Each step fails with the replica's error and the cancel is acted on all the same.
+    for (0..3) |_| {
+        const result = world.agent_step();
+        try testing.expect(result.failed != null);
+    }
+    try testing.expect(wrapper.refused >= 3);
+    try testing.expect(!rig.running());
+    wrapper.start_failing = false;
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(@as(?records.StopCause, .cancel), seen.stop_cause);
+}
+
 test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     // Goal: the review's SHOULD (PR #150): a call to the server that a run's wake falls inside
     // must get `call_inflight_min_ms`, or wakes 100 ms apart cut every 150 ms keepalive and the
@@ -1187,6 +1278,33 @@ test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    try testing.expectEqual(lease, world.agent.lease);
+}
+
+test "a step has one call floor, taken at its start, not one per call" {
+    // Goal: the node's clock moves inside a step (a keepalive costs time), and the floor that
+    // keeps a run's wake from cutting a call is taken once, at the step's start. Taken again after
+    // the heartbeat, a step's last calls would run 150 ms past it. Method: one run whose deadline
+    // is 300 ms after the step; a keepalive costs 150 ms; one step at the lease renewal. The cap
+    // the agent last set is the step's start plus `call_inflight_min_ms`, not that plus 150.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    const renew_in = world.agent.renew_at_ms - world.now_ms();
+    _ = try rig.assign(renew_in + 300);
+    world.advance(300);
+    world.switched.keepalive_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    world.advance(renew_in - 400);
+    world.manual.advance(100);
+    const lease = world.agent.lease;
+    const start = world.now_ms();
+    _ = world.agent_step();
+    try testing.expect(world.now_ms() > start);
+    try testing.expectEqual(start + 1_000, world.call_cap_ms);
     try testing.expectEqual(lease, world.agent.lease);
 }
 

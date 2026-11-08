@@ -415,9 +415,32 @@ const Work = struct {
                 // No start record to say; the run's own grace, if it is still served.
                 const grace = if (work.run_of(subject.id)) |entry| entry.rec.grace_ms else 0;
                 try work.stop(present, grace);
+            } else switch (present.status) {
+                // The container already ended and its exit is known: report that, not `lost`.
+                .stopped => |reason| return work.exited_unrecorded(subject, reason, seen),
+                .starting, .running => unreachable, // `is_running` was false.
             }
         }
         try work.lost(subject, null, seen, .missing);
+    }
+
+    /// A stopped container and no start record: its exit is the answer, with no stop cause.
+    fn exited_unrecorded(
+        work: *Work,
+        subject: Subject,
+        reason: runtime.ExitReason,
+        seen: ?*const records.JobObserved,
+    ) Error!void {
+        if (seen) |existing| {
+            if (existing.status == .stopped) return;
+        }
+        var wanted: Report = .{
+            .run = subject.id,
+            .status = .stopped,
+            .epoch = if (seen) |held| held.assignment else subject.epoch,
+        };
+        try work.apply_exit(&wanted, reason);
+        try work.report(wanted);
     }
 
     const Why = enum { missing, damaged, vanished };
@@ -855,12 +878,32 @@ const Work = struct {
         if (runtime.spec_problem(&spec)) |problem| {
             return work.cannot_start(subject, record, .{ .spec = problem });
         }
-        const outcome = try ctx.runtime.start(&spec, ctx.diag);
+        const outcome = ctx.runtime.start(&spec, ctx.diag) catch |err| switch (err) {
+            // The runtime could not even try: the run ends here, with its own diagnostic, as
+            // a start failure; a claimed run must not wait for a later pass to guess (RB-N4).
+            error.RuntimeFailed, error.NotFound => return work.start_errored(subject, record),
+        };
         switch (outcome) {
             .started => {},
             .failed => |failure| try work.apply_exit(&wanted, .{ .start_failed = failure }),
         }
         try work.report(wanted);
+    }
+
+    /// `runtime.start` returned an error with its diagnostic in `ctx.diag`: the run ends as a
+    /// start failure and says why.
+    fn start_errored(work: *Work, subject: Subject, record: StartRecord) Error!void {
+        const ctx = work.ctx;
+        var finished: Diagnostic = undefined;
+        diag_mod.to_diagnostic(&finished, ctx.diag);
+        ctx.diag.reset();
+        try work.report(.{
+            .run = subject.id,
+            .status = .stopped,
+            .epoch = record.epoch,
+            .exit = .{ .kind = .start_failed },
+            .diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag),
+        });
     }
 
     const Refusal = union(enum) {
