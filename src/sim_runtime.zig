@@ -211,6 +211,13 @@ pub const SimRuntime = struct {
         };
     }
 
+    /// The node's disk is lost with its state directory: every container, running or not, is
+    /// gone (their records were the state directory's files; the processes die with the host).
+    pub fn wipe(self: *SimRuntime) void {
+        for (self.containers.items) |container| self.free_container(container);
+        self.containers.clearRetainingCapacity();
+    }
+
     /// True if a container of that name is known, running or stopped.
     pub fn has(self: *SimRuntime, name: []const u8) bool {
         return self.find(name) != null;

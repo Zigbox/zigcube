@@ -479,6 +479,7 @@ const Node = struct {
         if (node.wipe_pending) {
             node.wipe_pending = false;
             node.sim.files.wipe();
+            node.sim.containers.wipe();
             node.cluster.stats.wipes += 1;
         }
         node.sim.restart();
