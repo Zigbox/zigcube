@@ -177,10 +177,11 @@ fn relist(state: *State, api: *api_mod.Api, ctx: *const Context) bool {
 /// then `finish` only sees it if the relist did not cover it).
 fn covered(state: *State) void {
     if (state.violation != null or state.truth_full > 0) return;
-    for (state.truth[0..state.truth_count], state.truth_revision[0..state.truth_count]) |ending, at| {
+    const count = state.truth_count;
+    for (state.truth[0..count], state.truth_revision[0..count]) |ending, at| {
         if (at > state.revision) continue;
         if (!contains(state.handled[0..state.handled_count], ending)) {
-            return fail(state, "J4: the client passed the revision of a job ending it never handled");
+            return fail(state, "J4: the client passed the revision of an ending it never handled");
         }
     }
 }

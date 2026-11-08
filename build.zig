@@ -1315,16 +1315,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
             "--expect-fail",                      b.fmt("--expect-symptom={s}", .{entry.symptom}),
         });
         teeth.dependOn(&teeth_run.step);
-        if (entry.plain_symptom) |symptom| {
-            // The same fault in a plain run: the job checks need no per-revision tap.
-            const plain_run = b.addRunArtifact(teeth_exe);
-            plain_run.addArgs(&.{
-                "--seeds",                                 b.fmt("1..{d}", .{entry.plain_seeds}),
-                b.fmt("{d}", .{c1_teeth_operations}),      "--expect-fail",
-                b.fmt("--expect-symptom={s}", .{symptom}),
-            });
-            teeth.dependOn(&plain_run.step);
-        }
+        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
         const own_install = b.addInstallArtifact(teeth_exe, .{});
@@ -1341,6 +1332,23 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     }
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
+fn add_plain_tooth(
+    b: *std.Build,
+    teeth: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    entry: anytype,
+) void {
+    const symptom = entry.plain_symptom orelse return;
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                                 b.fmt("1..{d}", .{entry.plain_seeds}),
+        b.fmt("{d}", .{c1_teeth_operations}),      "--expect-fail",
+        b.fmt("--expect-symptom={s}", .{symptom}),
+    });
+    teeth.dependOn(&run.step);
 }
 
 /// The replay lines of the sim-fleet issues of B2 slice 1 (#135, #137, #142, #143, #151) and
