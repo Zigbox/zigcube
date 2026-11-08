@@ -23,6 +23,11 @@ const NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
 const FAILURES = ["oom", "pid_limit", "start_failed", "deadline", "fenced", "unreachable", "not_started", "unknown"];
 const STOP_OF = { deadline: "deadline", fenced: "fence", unreachable: "unreachable", not_started: "not_started" };
 const SPEC_FIELDS = ["image", "source", "command", "env", "limits", "deadline_ms", "labels", "grace_ms", "input_env"];
+// The bounds of a job's `limits` (docs/api.md): those of the runtime. Outside them is ZC-E0130.
+const LIMIT_BOUNDS = { cpu_millis: [10, 1024000], memory_bytes: [4 * 1024 * 1024, 2 ** 40], pids: [1, 4194304] };
+// Pairs compare as maps (the same keys and values in any order); limits compare member by member.
+const pairsEqual = (a, b) => a.length === b.length && a.every(([k, v]) => b.some(([k2, v2]) => k === k2 && v === v2));
+const limitsEqual = (a, b) => Object.keys(LIMIT_BOUNDS).every(k => (a[k] ?? null) === (b[k] ?? null));
 const KNOWN_FIELDS = new Set(["name", "submit_by_ms", "applied_by", "input", "retries", "relay", "placement", ...SPEC_FIELDS]);
 
 const blame = (code, summary, cause, extra = {}) => ({
@@ -63,6 +68,15 @@ export class Jobs {
     if (!Number.isInteger(body.deadline_ms) || body.deadline_ms < 1 || body.deadline_ms > 86400000) throw field("deadline_ms", "must be from 1 to 86400000");
     if (!Number.isInteger(body.submit_by_ms)) throw field("submit_by_ms", "is required");
     if ((body.labels || []).length > 6) throw field("labels", "holds at most 6 labels");
+    for (const k of ["env", "labels"]) {
+      const keys = (body[k] || []).map(([name]) => name);
+      const twice = keys.find((x, i) => keys.indexOf(x) !== i);
+      if (twice !== undefined) throw field(k, `sets ${twice} twice`);
+    }
+    for (const [k, [min, max]] of Object.entries(LIMIT_BOUNDS)) {
+      const v = (body.limits || {})[k];
+      if (v != null && !(Number.isInteger(v) && v >= min && v <= max)) throw field(`limits.${k}`, `must be ${min} to ${max}, it is ${v}`);
+    }
     const spec = {
       v: 1, name, image: body.image, source: body.source || "", command: body.command, env: body.env || [],
       limits: body.limits || {}, deadline_ms: body.deadline_ms, retries: 0, labels: body.labels || [], grace_ms: body.grace_ms ?? 0,
@@ -77,7 +91,10 @@ export class Jobs {
     }
     const existing = e.get(`/jobs/${name}`);
     if (existing) {
-      const same = SPEC_FIELDS.every(k => JSON.stringify(existing[k] ?? null) === JSON.stringify(spec[k] ?? null)) && existing.input_digest === spec.input_digest;
+      const equal = {
+        env: pairsEqual, labels: pairsEqual, limits: limitsEqual,
+      };
+      const same = SPEC_FIELDS.every(k => (equal[k] ? equal[k](existing[k] || (k === "limits" ? {} : []), spec[k]) : JSON.stringify(existing[k] ?? null) === JSON.stringify(spec[k] ?? null))) && existing.input_digest === spec.input_digest;
       if (!same) throw jobError(409, blame("ZC-E0131", "a job with this name exists with another spec", `job ${name} was submitted with a different spec`, { fixes: [{ sentence: "use another name, or look at the job that has this one", command: `zcube job get ${name}` }] }));
       return { status: 200, body: this.reply("exists", name) };
     }

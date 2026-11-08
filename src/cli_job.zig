@@ -384,7 +384,7 @@ fn watch(
         // watch that runs for days holds the same memory as one that has just begun.
         // A failure ends the command and its report may point into the round's memory, so only a
         // round that succeeded frees it.
-        var round_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        var round_arena: std.heap.ArenaAllocator = .init(env.round_backing);
         var round_env = env.*;
         round_env.arena = round_arena.allocator();
         var round_client = client.*;
@@ -577,6 +577,7 @@ test "a watch that is told 410 lists the endings, skips the ones it printed, and
         .version = "0.0.0-test",
         .deterministic_ids = true,
         .job_rounds_max = 2,
+        .round_backing = testing.allocator,
         .transport = .{ .context = &script, .exchange = Script.exchange },
     };
     try testing.expectEqual(@as(u8, 0), @import("cli.zig").run(&env, &.{ "job", "watch" }));
@@ -682,6 +683,7 @@ fn big_run(
         .version = "0.0.0-test",
         .deterministic_ids = true,
         .job_rounds_max = rounds,
+        .round_backing = testing.allocator,
         .transport = .{ .context = big, .exchange = Big.exchange },
     };
     return @import("cli.zig").run(&env, words);
