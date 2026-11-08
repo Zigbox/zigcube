@@ -81,9 +81,10 @@ fn run(init: std.process.Init, config: config_mod.Config) u8 {
     diag.reset();
     const server = server_mod.Server.start(init.gpa, io, config, .{
         .version = build_options.version,
-    }, &diag) catch |err| {
-        if (err == error.OutOfMemory) return constants.exit_environment;
-        return fail(io, &diag, config.verbose);
+    }, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return constants.exit_environment,
+        error.Canceled => return constants.exit_ok, // Stopped on request: nothing to report.
+        error.StartFailed => return fail(io, &diag, config.verbose),
     };
     announce(io, server, config);
     install_signals();

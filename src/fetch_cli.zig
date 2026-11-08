@@ -834,9 +834,8 @@ fn note(io: std.Io, text: []const u8) void {
 fn identity_or_say(io: std.Io, parsed: *const Args, diag: *diag_mod.Diag) ?peer.Identity {
     assert(diag.code == null);
     const loaded = agent_peer.load_identity(io, parsed.state_dir, parsed.node, diag) catch |err| {
-        switch (err) {
-            error.Failed => assert(diag.code != null), // `Failed` always carries its diagnostic.
-        }
+        assert(err == error.Failed);
+        assert(diag.code != null); // `Failed` always carries its diagnostic.
         return null;
     };
     return loaded;
