@@ -1252,10 +1252,12 @@ const c1_teeth_roots = [_]struct {
     .{
         .name = "job_wipe",
         .root = "src/sim_c1_teeth_job_wipe_main.zig",
-        .symptom = "J2",
+        // J2 (a run id started again) or J7 (started under another tenure than its claim):
+        // both say "was started" and both are the right catch of a lost state directory.
+        .symptom = "was started",
         .canary_seeds = 250,
         .seeds = 40,
-        .plain_symptom = "J2",
+        .plain_symptom = "was started",
         .plain_seeds = 40,
     },
 };
