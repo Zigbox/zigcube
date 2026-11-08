@@ -2464,7 +2464,7 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
         ctx,
         records.prefix_job_runs,
         null,
-        constants.jobs_max,
+        constants.job_admitted_window_max,
     ) catch return check(c, false, "the job job_runs cannot be read");
     for (job_runs.items) |entry| {
         const run = &entry.rec;
