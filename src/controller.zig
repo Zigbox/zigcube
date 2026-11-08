@@ -263,7 +263,7 @@ fn list_pages_capped(
     return .{ .items = items.items, .revision = revision.? };
 }
 
-fn too_many(ctx: *const Context, prefix: []const u8, count_max: u32) error{NoCapacity} {
+pub fn too_many(ctx: *const Context, prefix: []const u8, count_max: u32) error{NoCapacity} {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0302);
     ctx.diag.cause("more than {d} records under {s}", .{ count_max, prefix });

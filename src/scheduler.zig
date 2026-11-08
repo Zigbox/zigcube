@@ -211,13 +211,7 @@ pub fn read_world(ctx: *const Context) Error!World {
     const replicas = try list(rec.Replica, ctx, rec.prefix_replicas, null, con.replicas_max);
     const at = replicas.revision;
     const assigned = try list(rec.Assigned, ctx, rec.prefix_assigned, at, con.assigned_max);
-    const job_statuses = try list(
-        rec.JobStatus,
-        ctx,
-        rec.prefix_job_status,
-        at,
-        con.job_admitted_window_max,
-    );
+    const job_statuses = try read_job_statuses(ctx, at, assigned.items);
     const nodes = try list(rec.Node, ctx, rec.prefix_nodes, at, con.nodes_max);
     const statuses = try list(rec.NodeStatus, ctx, rec.prefix_node_status, at, con.nodes_max);
     const allocations = try list(rec.Allocation, ctx, rec.prefix_allocations, at, con.nodes_max);
@@ -247,12 +241,66 @@ pub fn read_world(ctx: *const Context) Error!World {
         .desired = .empty,
         .summaries_skipped = summaries_skipped,
     };
-    world.job_statuses = job_statuses.items;
+    world.job_statuses = job_statuses;
     try index_replicas(ctx, &world);
     try index_jobs(ctx, &world);
     try index_assigned(ctx, &world, assigned.items);
     return world;
 }
+
+/// Pages `/job-status/` and keeps what a pass can use: a status that is not terminal (it may be
+/// placed or held) and a status whose run is still assigned (it may be released). An ended job
+/// whose run holds nothing needs no entry, so ended statuses beyond `job_admitted_window_max`
+/// (retention lags) do not stop the scheduler; kept statuses are bounded by that constant.
+fn read_job_statuses(
+    ctx: *const Context,
+    at: Revision,
+    assigned: []const Entry(records.Assigned),
+) Error![]const Entry(records.JobStatus) {
+    var held: std.StringHashMapUnmanaged(void) = .empty;
+    for (assigned) |entry| {
+        if (entry.rec.job == null) continue;
+        const job = records.job_of_run(entry.rec.replica) orelse continue;
+        held.put(ctx.arena, job, {}) catch return failures.no_memory(ctx.diag);
+    }
+    var kept: std.ArrayList(Entry(records.JobStatus)) = .empty;
+    var after: ?[]const u8 = null;
+    for (0..status_pages_max) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = records.prefix_job_status,
+            .at_revision = at,
+            .limit = constants.store_list_limit_max,
+            .continue_after = after,
+        }, ctx.diag);
+        for (page.kvs) |kv| {
+            // A status that does not decode (ZC-E0301/E0303) is skipped, not fatal: the job is left
+            // unplaced and unreleased, and replicas go on. The job controller holds the job with
+            // one `hold_unreadable_job` decision (it reads the same record).
+            const rec = records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch |err| {
+                if (err != error.Malformed) return err;
+                ctx.diag.reset();
+                continue;
+            };
+            const name = kv.key[records.prefix_job_status.len..];
+            if (records.job_state_terminal(rec.state) and !held.contains(name)) continue;
+            if (kept.items.len >= constants.job_admitted_window_max) {
+                return controller.too_many(
+                    ctx,
+                    records.prefix_job_status,
+                    constants.job_admitted_window_max,
+                );
+            }
+            kept.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
+                return failures.no_memory(ctx.diag);
+        }
+        after = page.continue_after orelse return kept.items;
+    }
+    return controller.too_many(ctx, records.prefix_job_status, status_pages_max);
+}
+
+/// Pages of `/job-status/` one pass reads at most (ZC-E0302 past it): far more than retention
+/// leaves, so it is a stop for a runaway store, not a limit.
+const status_pages_max: u32 = 1024;
 
 /// The per-node records a view is made from.
 const Sources = struct {
@@ -739,10 +787,12 @@ pub const Scheduler = struct {
             // its workload may be live, and nothing about it changes.
             return;
         }
-        if (assign.node == no_node) return;
-        const view = &world.nodes[assign.node];
-        if (view.alloc_revision == 0) return;
-        if (subtract(view, assign.requests) == null) return;
+        const orphan = assign.node == no_node;
+        if (!orphan) {
+            const view = &world.nodes[assign.node];
+            if (view.alloc_revision == 0) return;
+            if (subtract(view, assign.requests) == null) return;
+        }
         if (!pass.budget()) return;
         var cause: records.Cause = .{ .kind = .resync };
         if (status) |found| {
@@ -750,20 +800,63 @@ pub const Scheduler = struct {
             if (text.len == records.decision_id_bytes) cause = .{ .kind = .decision, .id = text };
         }
         const why = if (status == null) "its job is gone" else "its job has ended";
+        const node_name = if (orphan)
+            assigned_node_name(assign.key)
+        else
+            world.nodes[assign.node].node.rec.name;
         const fmt = "run {s} is over ({s}); its {d}m CPU and {d} MiB on {s} are released";
         const reason = try controller.format(ctx, fmt, .{
             assign.replica,
             why,
             assign.requests.cpu_millis,
             mib_of(assign.requests.memory_bytes),
-            view.node.rec.name,
+            node_name,
         });
         const as: ReleaseAs = .{
             .action = "release_run",
             .subject = .{ .kind = .job, .name = job },
             .status_revision = if (status) |found| found.kv.mod_revision else 0,
         };
-        try sc.commit_release(ctx, world, pass, index, as, .{ .cause = cause, .reason = reason });
+        const decided: ReleaseWhy = .{ .cause = cause, .reason = reason };
+        if (orphan) return sc.commit_release_orphan(ctx, world, pass, index, as, decided);
+        try sc.commit_release(ctx, world, pass, index, as, decided);
+    }
+
+    /// Releases a run whose node has no record at all (no `/nodes`, status or allocation): only
+    /// the assignment is left to delete, under the compares that the node is still absent.
+    fn commit_release_orphan(
+        sc: *Scheduler,
+        ctx: *const Context,
+        world: *World,
+        pass: *Pass,
+        index: u32,
+        as: ReleaseAs,
+        why: ReleaseWhy,
+    ) Error!void {
+        const assign = world.assigns.items[index];
+        var batch: Batch = .{};
+        var set: compare_sets.Set = .{};
+        const reads: compare_sets.OrphanRead = .{
+            .node = assigned_node_name(assign.key),
+            .run = assign.replica,
+            .job = as.subject.name,
+            .assigned_revision = assign.revision,
+            .status_revision = as.status_revision.?,
+        };
+        compare_sets.release_orphan(&set, reads);
+        expect_all(&batch, &set);
+        _ = try controller.put_decision(ctx, &sc.source, .{
+            .actor = actor,
+            .action = as.action,
+            .subject = as.subject,
+            .reason = why.reason,
+            .cause = why.cause,
+        }, &batch);
+        batch.delete(assign.key);
+        _ = pass.landed(try controller.commit(ctx, .scheduler, &batch)) orelse return;
+        const gone = &world.assigns.items[index];
+        gone.live = false;
+        _ = world.assigned_by.remove(gone.replica);
     }
 
     fn job_record_exists(ctx: *const Context, world: *const World, job: []const u8) Error!bool {
@@ -885,7 +978,9 @@ pub const Scheduler = struct {
         status_index: u32,
     ) Error!void {
         const status = &world.job_statuses[status_index];
-        if (records.job_state_terminal(status.rec.state)) return;
+        // Only a pending run is placed: a job placed or running had its run claimed, and a run is
+        // never reassigned, so a node-less one is the job controller's to resolve.
+        if (status.rec.state != .pending) return;
         const job = status.kv.key[records.prefix_job_status.len..];
         if (records.name_problem(job, constants.service_name_bytes_max) != null) return;
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
@@ -898,7 +993,12 @@ pub const Scheduler = struct {
         // The job controller writes the run and its status together: a status alone is its
         // contradiction to report (ZC-E0307), not a run to place.
         const run_kv = got.kv orelse return;
-        const run = try records.read(records.JobRun, ctx.arena, run_kv, ctx.diag);
+        // A run that does not decode leaves the job unplaced; the job controller holds it.
+        const run = records.read(records.JobRun, ctx.arena, run_kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            ctx.diag.reset();
+            return;
+        };
         if (run.stop != null) return;
         const need = run_requests_of(&run);
         var verdicts: [views_max]Verdict = undefined;
@@ -1235,6 +1335,12 @@ fn world_note(view: *NodeView, allocated: Requests, count: u32, revision: Revisi
     view.allocated = allocated;
     view.count = count;
     view.alloc_revision = revision;
+}
+
+/// The node a `/assigned/<node>/<id>` key names.
+fn assigned_node_name(key: []const u8) []const u8 {
+    const rest = key[records.prefix_assigned.len..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse unreachable]; // Key shape.
 }
 
 fn forget_assign(world: *World, index: u32, allocated: Requests, revision: Revision) void {

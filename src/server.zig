@@ -103,7 +103,7 @@ pub const Server = struct {
     ) Error!Server {
         const clock = backend.clock();
         const now = clock.now_ms();
-        const instance: u16 = @intCast(1 + @mod(@divFloor(now, 1000), 60_000));
+        const instance = control_plane.ControlPlane.instance_from(now);
         var plane = control_plane.ControlPlane.init(instance);
         plane.set_lost_grace(config.lost_grace_ms);
         return .{

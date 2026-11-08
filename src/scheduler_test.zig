@@ -1134,3 +1134,59 @@ test "a node takes at most jobs_per_node_max runs and the rest wait with a hold"
     try testing.expectEqual(constants.jobs_per_node_max, (try fixture.allocation("n1")).count);
     try testing.expectEqual(@as(usize, 1), try fixture.count("release_run"));
 }
+
+test "only a pending run is placed: a running job with no assignment is left alone" {
+    // Goal: RB-S12. Method: a job whose status says `running` (or `placed`) and whose assignment
+    // is gone is the job controller's to resolve; the scheduler must not give it a second node.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("ran", 500, .running);
+    try fixture.job("put", 500, .placed);
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+    try fixture.expect_on("ran-job", null);
+    try fixture.expect_on("put-job", null);
+}
+
+test "a run on a node with no record is released when its job is over" {
+    // Goal: RA-S2. Method: place a run, end its job, then delete the node's records; the
+    // assignment must go, not stay in `assigned_by` forever.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    try fixture.job("a", 500, .pending);
+    try fixture.settle();
+    try fixture.expect_on("a-job", "n1");
+    try fixture.job_state("a", .failed);
+    const ctx = fixture.context();
+    const no_alloc = [_]store.Op{.{ .delete = records.allocation_key("n1").slice() }};
+    const no_status = [_]store.Op{.{ .delete = records.node_status_key("n1").slice() }};
+    _ = try writers.txn(ctx.store, .scheduler, .{ .on_success = &no_alloc }, &fixture.diag);
+    _ = try writers.txn(ctx.store, .node_controller, .{ .on_success = &no_status }, &fixture.diag);
+    const no_node = [_]store.Op{.{ .delete = records.node_key("n1").slice() }};
+    _ = try writers.txn(ctx.store, .{ .agent = "n1" }, .{ .on_success = &no_node }, &fixture.diag);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("a-job", null);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("release_run"));
+    try testing.expectEqual(@as(u32, 0), (try fixture.step()).acted);
+}
+
+test "more than job_admitted_window_max ended statuses do not stop the scheduler" {
+    // Goal: RA-S4/RB-S6. Method: retention may lag, so ended statuses can outnumber the window;
+    // a pending job must still be placed, and the scan reads them in pages.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("n1", 4000, 8 * gib, true);
+    var index: u32 = 0;
+    while (index < constants.job_admitted_window_max + 10) : (index += 1) {
+        var name: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "e{d}", .{index});
+        try fixture.job_state(text, .exited);
+    }
+    try fixture.job("live", 500, .pending);
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try fixture.expect_on("live-job", "n1");
+}
