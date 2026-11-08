@@ -77,7 +77,11 @@ pub const job_stale = declared("c1_teeth_job_stale");
 /// refusal of every report breaks J8 first, which hides the count: a run that never ends.)
 pub const job_refused_loop = declared("c1_teeth_job_refused_loop");
 
+/// The job controller never ends a run that no node claimed by its `start_by_ms` (must break J8's
+/// second clause: "every run that is not claimed by `start_by_ms` ends failed"; B2 slice 4).
+pub const job_unclaimed = declared("c1_teeth_job_unclaimed");
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
-    job_deadline_offline or job_gap or job_stale or job_refused_loop;
+    job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed;

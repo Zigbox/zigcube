@@ -1242,6 +1242,13 @@ const c1_teeth_roots = [_]struct {
         .canary_seeds = 80,
         .plain_symptom = "J10: an agent kept making",
     },
+    .{
+        .name = "job_unclaimed",
+        .root = "src/sim_c1_teeth_job_unclaimed_main.zig",
+        .symptom = "J8: a run that no node started",
+        .canary_seeds = 80,
+        .plain_symptom = "J8: a run that no node started",
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).

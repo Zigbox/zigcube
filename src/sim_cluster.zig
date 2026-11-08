@@ -749,6 +749,8 @@ pub const Cluster = struct {
     i6_violations: u32,
     server_seen_revision: store.Revision,
     compact_due_ms: u64,
+    /// The last true time the store was unreachable (J8's second clause waits for it).
+    store_healthy_since_ms: u64,
     instance_next: u16,
     request_next: u32,
     dropped_before_restart: u64,
@@ -851,6 +853,7 @@ pub const Cluster = struct {
         c.server_due_ms = 0;
         c.server_seen_revision = 0;
         c.compact_due_ms = epoch_ms + compact_interval_ms;
+        c.store_healthy_since_ms = epoch_ms;
         c.instance_next = 1;
         c.request_next = 1;
         c.dropped_before_restart = 0;
@@ -1570,7 +1573,7 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         if (!c.jobs_on) return;
         const txn = request orelse return;
         _ = c.tap_arena.reset(.retain_capacity);
-        sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+        sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
         return;
     }
     c.c1_revisions += 1;
@@ -1585,7 +1588,9 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
     };
     if (request) |txn| c.recorder.record_request(&ctx, txn);
     if (request) |txn| {
-        if (c.jobs_on) sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+        if (c.jobs_on) {
+            sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
+        }
     }
     if (c.c1_violation != null) return;
     if (request != null) {
@@ -2334,7 +2339,10 @@ fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
     try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
-    if (store_faulty(c)) return;
+    if (store_faulty(c)) {
+        c.store_healthy_since_ms = c.manual.ms;
+        return;
+    }
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
     c.diag.reset();
@@ -2344,6 +2352,7 @@ fn track_jobs(c: *Cluster) Failure!void {
         .arena = scratch.allocator(),
         .diag = &c.diag,
     };
+    try unclaimed_ended(c, &ctx);
     var next: [sim_jobs.watch_max]sim_jobs.Watch = undefined;
     var count: u32 = 0;
     for (c.nodes) |node| {
@@ -2370,6 +2379,38 @@ fn track_jobs(c: *Cluster) Failure!void {
     }
     @memcpy(c.jobs.watch[0..count], next[0..count]);
     c.jobs.watch_count = count;
+}
+
+/// How long after its `start_by_ms` (or after the store last failed) a run that no node ever
+/// started may stay open. The job controller ends it at once on a healthy store, its pass paced
+/// by the wake it set for that time; this leaves room for a slow pass and a retried write.
+const unclaimed_ms_max: u64 = 90_000;
+
+/// J8, second clause: a run that was never started (no entry in the start ledger) is ended by
+/// the server, whatever the nodes do, once its `start_by_ms` has passed. Judged only once the
+/// store has been reachable for `unclaimed_ms_max`, and not at all when the ledger overflowed.
+fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    if (c.jobs.ledger_full > 0) return;
+    const job_runs = controller.list_all(
+        records.JobRun,
+        ctx,
+        records.prefix_job_runs,
+        null,
+        constants.jobs_max,
+    ) catch return;
+    const now = c.manual.ms;
+    for (job_runs.items) |entry| {
+        const run = &entry.rec;
+        if (now < @max(run.start_by_ms, c.store_healthy_since_ms) +| unclaimed_ms_max) continue;
+        const status = job_status_of(ctx, run.job) orelse continue;
+        if (records.job_state_terminal(status.state)) continue;
+        const hash = std.hash.Wyhash.hash(0, run.id);
+        if (std.mem.indexOfScalar(u64, c.jobs.ledger[0..c.jobs.ledger_count], hash) != null) {
+            continue;
+        }
+        try check(c, false, "J8: a run that no node started was still open long after its " ++
+            "start_by_ms");
+    }
 }
 
 fn note_marks(
