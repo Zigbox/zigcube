@@ -209,11 +209,6 @@ pub const Agent = struct {
     /// Like the fence, it caps every pause, wait and call, so a cut-off server never holds a
     /// run's stop back.
     deadline_wake_mono_ms: u64,
-    /// The earliest a run's wake may cut a call of the current step, monotonic: the step's start
-    /// plus `call_inflight_min_ms`. One floor for the whole step, so the calls it makes one
-    /// after another (the heartbeat, then the pass) cannot each take a floor of their own and
-    /// carry enforcement a floor per call past a deadline.
-    step_floor_mono_ms: u64,
     /// Failures of the server-free enforcement that the step went on after (one run's record or
     /// stop, the runtime's listing): counted, with the last one's code and cause, for the shell
     /// to say. Enforcement never fails the step, so the heartbeat always runs.
@@ -293,7 +288,6 @@ pub const Agent = struct {
         agent.pull_drops = 0;
         agent.pull_drop_len = 0;
         agent.restored = false;
-        agent.step_floor_mono_ms = 0;
         agent.stops_count = 0;
         agent.store_lease = store.lease_none;
         agent.store_hash = 0;
@@ -358,11 +352,7 @@ pub const Agent = struct {
     /// would otherwise cut every one and starve the lease. Enforcement then runs at most that
     /// late, which is inside the grace. Called as a call begins (`mono_now`).
     pub fn calls_deadline_ms(agent: *const Agent, mono_now: u64) u64 {
-        return agent.calls_deadline_from(mono_now +| call_inflight_min_ms);
-    }
-
-    fn calls_deadline_from(agent: *const Agent, floor_ms: u64) u64 {
-        const wake = @max(agent.deadline_wake_mono_ms, floor_ms);
+        const wake = @max(agent.deadline_wake_mono_ms, mono_now +| call_inflight_min_ms);
         return @min(agent.fence_at_ms() orelse maxInt(u64), wake);
     }
 
@@ -376,7 +366,37 @@ pub const Agent = struct {
     /// Tells the caller by when every call to the server must end (`calls_deadline_ms`).
     fn cap_calls(agent: *const Agent, ctx: *const Context) void {
         const deadline = ctx.deadline orelse return;
-        deadline.set_fn(deadline.context, agent.calls_deadline_from(agent.step_floor_mono_ms));
+        deadline.set_fn(deadline.context, agent.calls_deadline_ms(ctx.mono_ms()));
+    }
+
+    /// The stages of a step that follow the loading. A stage that fails does not hold the others
+    /// back: one replica whose start errors, or a job pass that fails, must not withhold a
+    /// cancel, a later replica, an orphan's stop or the flush. The first failure is the step's
+    /// error (in `kept`, with its diagnostic intact); later ones are counted and described like
+    /// the enforcement's (`note_enforce_failure`). Returns the transactions made.
+    fn stages(
+        agent: *Agent,
+        ctx: *const Context,
+        pass: *Pass,
+        listings: []const runtime.Listing,
+        kept: *Kept,
+    ) u32 {
+        var acted: u32 = 0;
+        pass.replicas(kept);
+        if (kept.stopped) return acted;
+        acted += kept.run(agent, ctx, "run the job pass", agent_jobs.pass(
+            agent,
+            ctx,
+            listings,
+            pass.given,
+        ));
+        if (kept.stopped) return acted;
+        kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
+        if (kept.stopped) return acted;
+        kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
+        if (kept.stopped) return acted;
+        acted += kept.run(agent, ctx, "flush the reports", pass.flush());
+        return acted;
     }
 
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
@@ -384,7 +404,6 @@ pub const Agent = struct {
         agent.steps += 1;
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
-        agent.step_floor_mono_ms = mono +| call_inflight_min_ms;
         // The fence comes first and needs no server: an agent cut off from everything still stops.
         try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {
@@ -423,23 +442,13 @@ pub const Agent = struct {
             .node_key = records.node_key(agent.config.node),
         };
         try pass.load();
-        // The job pass runs even when the replica pass fails: a replica error that repeats (a
-        // runtime `start` that errors) must not withhold a cancel or a stop from a run. The
-        // replica error is the one returned, with its diagnostic intact.
-        const replicas_failed: ?Error = if (pass.replicas()) |_| null else |err| err;
-        if (replicas_failed) |err| {
-            const kept = ctx.arena.create(Diag) catch return err;
-            kept.* = ctx.diag.*;
-            ctx.diag.reset();
-            if (agent_jobs.pass(agent, ctx, listings, pass.given)) |_| {} else |_| {}
-            ctx.diag.* = kept.*;
+        var kept: Kept = .{};
+        acted += agent.stages(ctx, &pass, listings, &kept);
+        agent.forget_finished_stops(listings);
+        if (kept.err) |err| {
+            kept.restore(ctx);
             return err;
         }
-        acted += try agent_jobs.pass(agent, ctx, listings, pass.given);
-        try pass.orphan_containers();
-        try pass.orphan_records();
-        acted += try pass.flush();
-        agent.forget_finished_stops(listings);
         if (agent.fence.active) return agent.fence_step(ctx, now);
         // After the replica pass: the records are statistics, so a failing publish (a server that
         // cannot be reached, a state directory that cannot be read) never holds replica work back.
@@ -907,6 +916,54 @@ fn is_leftover(
 
 const Write = struct { key: []const u8, value: ?[]const u8 };
 
+/// The first failure of a step's stages, kept while the others run: its error and a copy of its
+/// diagnostic. A later failure is counted and described on the agent, not returned.
+const Kept = struct {
+    err: ?Error = null,
+    diag: ?*Diag = null,
+    /// A failure that is not the runtime's (the server, the state directory, a crash): the
+    /// stages after it are not run, as the step would have ended there before.
+    stopped: bool = false,
+
+    fn stage(
+        kept: *Kept,
+        agent: *Agent,
+        ctx: *const Context,
+        what: []const u8,
+        result: Error!void,
+    ) void {
+        result catch |err| kept.fail(agent, ctx, what, err);
+    }
+
+    fn run(
+        kept: *Kept,
+        agent: *Agent,
+        ctx: *const Context,
+        what: []const u8,
+        result: Error!u32,
+    ) u32 {
+        return result catch |err| {
+            kept.fail(agent, ctx, what, err);
+            return 0;
+        };
+    }
+
+    fn fail(kept: *Kept, agent: *Agent, ctx: *const Context, what: []const u8, err: Error) void {
+        if (err != error.RuntimeFailed and err != error.NotFound) kept.stopped = true;
+        if (kept.err != null) return agent.note_enforce_failure(ctx, what);
+        kept.err = err;
+        // With no memory to copy the diagnostic into, the error is kept without it.
+        const copy = ctx.arena.create(Diag) catch return ctx.diag.reset();
+        copy.* = ctx.diag.*;
+        kept.diag = copy;
+        ctx.diag.reset();
+    }
+
+    fn restore(kept: *const Kept, ctx: *const Context) void {
+        if (kept.diag) |saved| ctx.diag.* = saved.*;
+    }
+};
+
 const Pass = struct {
     agent: *Agent,
     ctx: *const Context,
@@ -1001,23 +1058,25 @@ const Pass = struct {
 
     // ---- Desired replicas ----
 
-    fn replicas(pass: *Pass) Error!void {
+    fn replicas(pass: *Pass, kept: *Kept) void {
         for (pass.mine) |*item| {
-            const replica = &item.rec;
-            const listing = find_listing_by_replica(pass.listings, replica.id);
-            const seen = pass.observed_for(item);
-            if (listing) |found| {
-                if (!is_this_replica(found, item)) {
-                    try pass.replace_stale(found, item, seen);
-                    continue;
-                }
-                pass.agent.forget_stop(found.handle.name());
-                try pass.report(replica, seen, found.status);
-            } else if (seen) |record| {
-                if (record.status != .stopped) try pass.report_lost(replica, record);
-            } else {
-                try pass.start(item);
-            }
+            if (kept.stopped) break;
+            kept.stage(pass.agent, pass.ctx, "reconcile a replica", pass.reconcile_one(item));
+        }
+    }
+
+    fn reconcile_one(pass: *Pass, item: *const controller.Entry(records.Replica)) Error!void {
+        const replica = &item.rec;
+        const listing = find_listing_by_replica(pass.listings, replica.id);
+        const seen = pass.observed_for(item);
+        if (listing) |found| {
+            if (!is_this_replica(found, item)) return pass.replace_stale(found, item, seen);
+            pass.agent.forget_stop(found.handle.name());
+            try pass.report(replica, seen, found.status);
+        } else if (seen) |record| {
+            if (record.status != .stopped) try pass.report_lost(replica, record);
+        } else {
+            try pass.start(item);
         }
     }
 

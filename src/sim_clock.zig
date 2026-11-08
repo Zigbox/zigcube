@@ -64,11 +64,14 @@ pub const NodeClock = struct {
 
     fn read(node: *NodeClock) u64 {
         const true_ms = @max(node.source.now_ms(), node.busy_until_true_ms);
-        const elapsed = true_ms -| node.anchor_true_ms;
+        // The anchor is the later of the source and the spent time, and both only grow.
+        assert(true_ms >= node.anchor_true_ms);
+        const elapsed = true_ms - node.anchor_true_ms;
         const scale: u64 = @intCast(@as(i64, @intCast(million)) + node.rate_ppm);
         const reading = node.anchor_reading_ms + @divFloor(elapsed * scale, million);
-        node.last_reading_ms = @max(node.last_reading_ms, reading);
-        return node.last_reading_ms;
+        assert(reading >= node.last_reading_ms);
+        node.last_reading_ms = reading;
+        return reading;
     }
 
     /// Changes the rate error from now on; the reading stays continuous.

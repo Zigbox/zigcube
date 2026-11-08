@@ -1281,7 +1281,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
-    const regress_help = "Replay the seeds of the sim-fleet issues fixed in B2 slice 1";
+    const regress_help = "Replay the seeds of the sim-fleet issues of B2 slice 1";
     const regress = b.step("sim-c1-regress", regress_help);
     for (regress_replays) |line| {
         const replay = b.addRunArtifact(exe);
@@ -1292,8 +1292,10 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_fencing_teeth_step(b, sim);
 }
 
-/// The replay lines of the sim-fleet issues B2 slice 1 fixed (#135, #137, #142, #143, #151) and
-/// two `slow_store` seeds that failed while it was built. Each must pass; `sim-c1-regress`.
+/// The replay lines of the sim-fleet issues of B2 slice 1 (#135, #137, #142, #143, #151) and
+/// three seeds of the 2,000-seed sweep (31, 53, 102) that fail J8 without the J8 true start.
+/// Each must pass; `sim-c1-regress`. Only #151 (J8) and #142 (J6) fail without the sim node
+/// clock's `spend_until`; #135, #137 and #143 pass on the base too and are smoke.
 const regress_replays = [_][]const []const u8{
     &.{
         "780935350",
@@ -1341,17 +1343,29 @@ const regress_replays = [_][]const []const u8{
     },
     &.{
         "31",
-        "134",
-        "2",
-        "--c1",
+        "508",
+        "8",
         "--profile=slow_store",
+        "--lease-ttl-ms=9669",
+        "--replicas-pct=300",
+        "--heal-at=262",
+    },
+    &.{
+        "53",
+        "247",
+        "4",
+        "--lease-ttl-ms=9393",
+        "--replicas-pct=300",
+        "--heal-at=152",
     },
     &.{
         "102",
-        "134",
-        "2",
-        "--c1",
+        "112",
+        "1",
         "--profile=slow_store",
+        "--lease-ttl-ms=10000",
+        "--replicas-pct=100",
+        "--heal-at=99",
     },
 };
 

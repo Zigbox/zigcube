@@ -478,6 +478,9 @@ jobs:
       # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
       - name: sim-c1 regressions
         run: zig build sim-c1-regressions --summary all
+      # The fleet seeds of B2 slice 1 (#151 and #142 fail without the sim node clock's spend time).
+      - name: sim-c1 regression seeds
+        run: zig build sim-c1-regress --summary all
       # The negative test of the healed-fencing check (docs/decisions/2026-11-06-renewal-before-fence.md):
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test
