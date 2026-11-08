@@ -26,15 +26,16 @@ that class:
    clock held at that reading until true time catches up, and restores a lease stamped ahead
    of true time, so it fenced about 4 s late. A real agent that dies mid-step has written none
    of that and reads a clock that always moves. Seeds 1384 and 893 had the same restart
-   (#159's review traced all three). Fix in the sim, kept: such a crash is armed for the step
-   boundary (`arm_step`) instead of firing at once, and `step_once` asserts that a step
-   starts only once the node's clock has caught up with true time
-   (`busy_until_true_ms <= manual.ms`) or while its own step is in flight (`resume_ms`). The
-   review's alternative, `restart_at_ms = max(restart_at_ms, busy_until_true_ms + 200)` in
-   `check_crashed`, was not taken: it would stretch every crashed node's downtime, which
-   changes the world of every seed, while the `arm_step` rule changes only a crash that the
-   simulator itself placed inside a step. The assert holds under it on 1384, 1612 and 893,
-   plain and `--c1`.
+   (#159's review traced all three). Fix in the sim, kept: the restart waits until true time
+   has caught up with the node's clock (`restart_at_ms = max(restart_at_ms,
+   busy_until_true_ms + 200)` in `check_crashed`, the review's alternative), and `step_once`
+   asserts that a step starts only once it has (`busy_until_true_ms <= manual.ms`) or while
+   its own step is in flight (`resume_ms`). The first fix, arming a `crash_now` inside a
+   step's time for the step boundary (`arm_step`), fixed 1384, 1612 and 893 but not the
+   other crashes inside a step (`arm_crash`): the assert fired on seed 57 at 100 operations
+   under `--c1`. The restart rule covers every crash, so `arm_step` was dropped rather than
+   kept beside it. It lengthens only a downtime that would have ended inside the step's time.
+   The assert holds under it on 1384, 1612 and 893, plain and `--c1`.
 2. **Agent bug (seed 893, J10 "kept making job reports the store refused").** #159's
    `exited_unrecorded` reported a container that had ended with no start record under the
    epoch of the older observation (`seen.assignment`). Once the run was assigned again the
@@ -59,8 +60,8 @@ lease ttl bound, renewal fraction or code changed.
 
 `sim-c1-teeth` failed on the first #171 head: the tooth ran seeds 1..10 and none failed J8.
 Bisected on ReleaseSafe runners: #159's head fails J8 on one of the ten (seed 10); the merged
-head none; restoring the `deadline_set` subtraction alone or reverting the `arm_step` rule
-alone changes nothing; reverting the `exited_unrecorded` change makes 8 of 10 seeds fail,
+head none; restoring the `deadline_set` subtraction alone or reverting the first `arm_step` rule
+alone changes nothing (with the restart rule instead, J8 fails on seeds 13, 26, 27, 30, 40); reverting the `exited_unrecorded` change makes 8 of 10 seeds fail,
 but with J10, not J8, and J10 hides J8. So the fault is not blinded: with the agent fix, 11
 of the first 80 seeds fail J8 (first at 13) and none fails anything else. Ten seeds were a
 coin flip that any change of the draws could lose. The tooth now runs 1..40 (`seeds` in

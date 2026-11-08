@@ -515,7 +515,14 @@ const Node = struct {
         node.down = true;
         node.crashes += 1;
         const c = node.cluster;
-        node.restart_at_ms = c.manual.ms + 200 + c.prng.random().uintLessThan(u32, 5000);
+        // A step runs whole at its start, and the node's clock already includes the time its
+        // calls spent (`busy_until_true_ms`). An agent that died inside that time would have
+        // written none of it, and its restart would read a clock ahead of true time, stamp a
+        // lease with it and fence late: an artefact of the simulator, not an agent that acts
+        // past its fence (seeds 1612, 1384, 893). So the restart waits until true time has
+        // caught up with the clock; `step_once` asserts it.
+        const back = c.manual.ms + 200 + c.prng.random().uintLessThan(u32, 5000);
+        node.restart_at_ms = @max(back, node.nclock.busy_until_true_ms + 200);
     }
 
     fn started_true_of(node: *const Node, hash: u64) ?u64 {
@@ -1397,15 +1404,7 @@ pub const Cluster = struct {
         switch (random.uintLessThan(u32, 3)) {
             0 => node.sim.arm_crash(1 + random.uintLessThan(u32, 6), kind),
             1 => node.sim.arm_step(1 + random.uintLessThan(u32, 3), kind),
-            // A step runs whole at its start, and its clock reading and saved pair already
-            // include the time its calls spent: an agent that died inside that time would have
-            // written none of it. The restart would read a clock that stands still until true
-            // time catches up and restore a lease stamped ahead of true time, and fence late
-            // (seeds 1612, 893: an artefact of the simulator, not an agent that acts past its
-            // fence). So a crash inside a step's time waits for the next step boundary.
-            else => if (c.manual.ms < node.resume_ms) {
-                node.sim.arm_step(1, kind);
-            } else {
+            else => {
                 node.sim.crash_now(kind);
                 node.check_crashed();
             },
@@ -3235,20 +3234,22 @@ test "a step's calls are capped by the time it has spent, once (issue 136)" {
     try testing.expectEqual(std.math.maxInt(u64), node.remote.deadline_ms);
 }
 
-test "a crash inside a step's spent time lands at the step boundary (seeds 1612, 893)" {
-    // Goal: the restarted agent's clock never stands still. A step runs whole at its start and
-    // its clock reading and saved pair already include its spent time; a crash inside that
-    // time left the restart a frozen clock and a lease stamped ahead of true time, and it
-    // fenced late (I1b, seed 1612). Method: put a node inside a step's time and crash it.
+test "a crashed node restarts only once its clock has caught up with true time (seeds 1612, 893)" {
+    // Goal: the restarted agent never reads a clock ahead of true time. A step runs whole at its
+    // start and its clock reading and saved pair already include its spent time; a restart
+    // inside that time stamped a lease ahead of true time and fenced late (I1b, seed 1612).
+    // Method: charge a node 5 s of calls, crash it, and read when it is to restart.
     var report: Report = .{};
     const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
     defer c.destroy();
     const node = c.nodes[0];
-    node.resume_ms = c.manual.ms + 5000;
+    node.nclock.spend_until(c.manual.ms + 5000);
     for (0..40) |_| {
-        c.crash(node);
-        try testing.expect(!node.down);
-        try testing.expect(!node.sim.crashed);
+        node.sim.crashed = true;
+        node.check_crashed();
+        try testing.expect(node.down);
+        try testing.expect(node.restart_at_ms >= node.nclock.busy_until_true_ms + 200);
+        node.sim.crashed = false;
+        node.down = false;
     }
-    node.resume_ms = 0;
 }
