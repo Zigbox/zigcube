@@ -113,6 +113,12 @@ pub fn deadline_bound_ms(
     return base + base * clock_ppm / 1_000_000 + extra + granularity_ms;
 }
 
+/// How long a run executed past its deadline and its grace, net of the time its node was wedged
+/// after the deadline (`wedged_ms`, as J8 counts it): the report's "past deadline" figure.
+pub fn deadline_past_ms(age_ms: u64, deadline_ms: u64, grace_ms: u64, wedged_ms: u64) u64 {
+    return (age_ms -| (deadline_ms + grace_ms)) -| wedged_ms;
+}
+
 /// J2 and J7 for one `Runtime.start`: the run id was never started before, and a claim for this
 /// run, tenure and epoch is committed, and the run has no `stop`. `spec` of a replica is skipped.
 pub fn note_start(
@@ -207,6 +213,13 @@ test "bounds grow with the grace and the deadline" {
         deadline_bound_ms(10_000, 0, 0, 0, 0));
     try std.testing.expect(deadline_bound_ms(10_000, 0, 0, 0, 500) >
         deadline_bound_ms(10_000, 0, 0, 0, 0));
+}
+
+test "deadline_past_ms: wedged time is not past the deadline" {
+    try std.testing.expectEqual(@as(u64, 0), deadline_past_ms(5_000, 4_000, 500, 600));
+    try std.testing.expectEqual(@as(u64, 100), deadline_past_ms(5_000, 4_000, 500, 400));
+    try std.testing.expectEqual(@as(u64, 500), deadline_past_ms(5_000, 4_000, 500, 0));
+    try std.testing.expectEqual(@as(u64, 0), deadline_past_ms(3_000, 4_000, 500, 0));
 }
 
 test "J8's bound has no room for the fence" {

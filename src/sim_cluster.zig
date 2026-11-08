@@ -2410,8 +2410,12 @@ fn judge_job_container(
         granularity,
         wedged,
     );
-    c.jobs.deadline_worst_ms = @max(c.jobs.deadline_worst_ms, (now -| watch.first_seen_ms) -|
-        (run.deadline_ms + run.grace_ms));
+    c.jobs.deadline_worst_ms = @max(c.jobs.deadline_worst_ms, sim_jobs.deadline_past_ms(
+        now -| watch.first_seen_ms,
+        run.deadline_ms,
+        run.grace_ms,
+        wedged,
+    ));
     try check(c, now -| watch.first_seen_ms <= bound, "J8: a run kept executing past its " ++
         "deadline, its grace and the kill");
     if (run.stop) |stop| {
