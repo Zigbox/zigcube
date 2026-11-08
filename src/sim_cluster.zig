@@ -335,6 +335,16 @@ pub const Swarm = struct {
         swarm.w_job_end = 2 + r.uintLessThan(u32, 4);
         // The `job_deadline_offline` tooth needs deadlines that fall while a node is cut off.
         if (c1_teeth.offline_world) swarm.w_job_create = 20;
+        // The `job_evicted` tooth needs hundreds of short runs on one node: creates dominate.
+        if (c1_teeth.evict_world) {
+            swarm.w_job_create = 40;
+            swarm.w_job_end = 30;
+        }
+        // The `job_reuse` tooth needs jobs that end, are retained for an hour, and are made again.
+        if (c1_teeth.reuse_world) {
+            swarm.w_job_create = 12;
+            swarm.w_job_end = 10;
+        }
     }
 
     fn print(swarm: *const Swarm, report: *Report) void {
@@ -1419,15 +1429,20 @@ pub const Cluster = struct {
     fn create_job(c: *Cluster) void {
         const random = c.prng.random();
         var name_buffer: [16]u8 = undefined;
+        // The `job_reuse` tooth: half the creates name a job made earlier, which the store takes
+        // once retention deleted it (an hour after it ended) and refuses before.
+        const reused = c1_teeth.reuse_world and c.job_next > 1 and random.boolean();
+        const number = if (reused) 1 + random.uintLessThan(u32, c.job_next - 1) else c.job_next;
         // "jb-" and a u32 fit.
-        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
-        c.job_next += 1;
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch unreachable;
+        if (!reused) c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
         const ctx = c.controller_context();
-        const long = random.uintLessThan(u32, 4) == 0;
+        const long = random.uintLessThan(u32, 4) == 0 and !c1_teeth.reuse_world;
         // The `job_deadline_offline` tooth: deadlines that fall within the run (see `add_jobs`).
-        const spread: u32 = if (c1_teeth.offline_world) 10_000 else 40_000;
+        const short = c1_teeth.offline_world or c1_teeth.evict_world or c1_teeth.reuse_world;
+        const spread: u32 = if (c1_teeth.evict_world) 1000 else if (short) 10_000 else 40_000;
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
             .image = hello_digest,
@@ -1884,7 +1899,13 @@ fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
     switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
-        .advance => c.advance(100 + random.uintLessThan(u32, 6000)),
+        .advance => {
+            c.advance(100 + random.uintLessThan(u32, 6000));
+            // The `job_reuse` tooth: now and then the world waits out `job_finished_age_ms_min`.
+            if (c1_teeth.reuse_world and random.uintLessThan(u32, 8) == 0) {
+                c.advance(constants.job_finished_age_ms_min + 2 * 60_000);
+            }
+        },
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
         .scale => c.apply(name, hello_digest, c.replicas_for(random, 8)),
         .delete => c.delete_service(name),
@@ -1919,7 +1940,11 @@ fn operation(c: *Cluster) void {
                 node.frozen_until_ms = c.manual.ms + span;
             }
         },
-        .job_create => c.create_job(),
+        .job_create => {
+            // The `job_evicted` tooth: a burst, so that one node sees more runs than it holds.
+            const burst: u32 = if (c1_teeth.evict_world) 12 else 1;
+            for (0..burst) |_| c.create_job();
+        },
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
     }
@@ -2460,7 +2485,7 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
         ctx,
         records.prefix_job_runs,
         null,
-        constants.jobs_max,
+        constants.job_admitted_window_max,
     ) catch return check(c, false, "the job job_runs cannot be read");
     for (job_runs.items) |entry| {
         const run = &entry.rec;
@@ -2746,6 +2771,7 @@ pub const Plan = struct {
 /// counts); each knob the request set is kept. `options.profile_auto` draws the profile.
 pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
     var options = requested;
+    if (c1_teeth.evict_world) options.nodes = 1; // One node holds the runs the tooth counts.
     var shape = sim_shape.fixed_shape(1);
     // The cost cap sees the node count the request gave, if any.
     if (operations == null) shape = sim_shape.draw_shape_nodes(seed, requested.nodes);

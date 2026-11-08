@@ -1120,6 +1120,8 @@ const c1_teeth_roots = [_]struct {
     /// J8 on about one seed in seven, so ten seeds were a coin flip that any change of the
     /// draws could lose (#171: its first hit moved from seed 10 to 13).
     seeds: u32 = teeth_seeds_max,
+    /// Operations of a run; the worlds of the two teeth outside `c1_teeth_operations` need more.
+    ops: u32 = c1_teeth_operations,
 }{
     .{
         .name = "allocation",
@@ -1224,6 +1226,20 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J10: an agent kept making",
         .canary_seeds = 80,
     },
+    .{
+        .name = "job_evicted",
+        .root = "src/sim_c1_teeth_job_evicted_main.zig",
+        .symptom = "J2",
+        .canary_seeds = 40,
+        .ops = 300,
+    },
+    .{
+        .name = "job_reuse",
+        .root = "src/sim_c1_teeth_job_reuse_main.zig",
+        .symptom = "J8",
+        .canary_seeds = 40,
+        .ops = 300,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1285,9 +1301,9 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         const teeth_run = b.addRunArtifact(teeth_exe);
         teeth_run.addArgs(&.{
-            "--seeds",                            b.fmt("1..{d}", .{entry.seeds}),
-            b.fmt("{d}", .{c1_teeth_operations}), "--c1",
-            "--expect-fail",                      b.fmt("--expect-symptom={s}", .{entry.symptom}),
+            "--seeds",                  b.fmt("1..{d}", .{entry.seeds}),
+            b.fmt("{d}", .{entry.ops}), "--c1",
+            "--expect-fail",            b.fmt("--expect-symptom={s}", .{entry.symptom}),
         });
         teeth.dependOn(&teeth_run.step);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
@@ -1297,6 +1313,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    add_worlds_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -1483,6 +1500,33 @@ const regress_replays = [_][]const []const u8{
 
 /// Seeds of `sim-c1-offline`; about 45 s.
 const offline_seeds_max = 30;
+
+/// The roots of `sim-c1-worlds`: the worlds of the `job_evicted` and `job_reuse` teeth, fix on.
+const worlds = [_]struct { root: []const u8, ops: u32 }{
+    .{ .root = "src/sim_c1_evict_world_main.zig", .ops = 300 },
+    .{ .root = "src/sim_c1_reuse_world_main.zig", .ops = 300 },
+};
+
+/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5 may fail.
+fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
+    const help = "Run sim-c1 in the worlds of the evicted and reuse teeth, fix on";
+    const step = b.step("sim-c1-worlds", help);
+    for (worlds) |world| {
+        const exe = b.addExecutable(.{
+            .name = "sim_c1_world",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(world.root),
+                .target = sim.target,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{ "--seeds", "1..5", b.fmt("{d}", .{world.ops}), "--c1" });
+        run.expectExitCode(0);
+        step.dependOn(&run.step);
+    }
+}
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
 /// cuts, short deadlines) with the fix on. It passes only if no seed fails (J8 and the rest).

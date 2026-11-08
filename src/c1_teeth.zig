@@ -77,7 +77,24 @@ pub const job_stale = declared("c1_teeth_job_stale");
 /// refusal of every report breaks J8 first, which hides the count: a run that never ends.)
 pub const job_refused_loop = declared("c1_teeth_job_refused_loop");
 
+/// The agent loses a run whose container the runtime evicted at `runtime_handles_max` (the
+/// oldest stopped one goes): its start record says it was never started, and it starts the run
+/// again (must break J2). The simulator makes more than 512 short runs on one node under it.
+pub const job_evicted = declared("c1_teeth_job_evicted");
+
+/// Not a fault: the world of `job_evicted` (one node, hundreds of short runs) with the agent
+/// right, for the positive run `sim-c1-worlds`. Not in `any`.
+pub const evict_world = declared("c1_evict_world") or job_evicted;
+
+/// The agent takes the leftovers of an earlier job of the same name (a stopped container, its
+/// observation) for the run of a new job made after `job_finished_age_ms_min` (must break J8:
+/// the new run never executes and never ends). The simulator reuses names and jumps an hour.
+pub const job_reuse = declared("c1_teeth_job_reuse");
+
+/// Not a fault: the world of `job_reuse` with the agent right (`sim-c1-worlds`). Not in `any`.
+pub const reuse_world = declared("c1_reuse_world") or job_reuse;
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
-    job_deadline_offline or job_gap or job_stale or job_refused_loop;
+    job_deadline_offline or job_gap or job_stale or job_refused_loop or job_evicted or job_reuse;

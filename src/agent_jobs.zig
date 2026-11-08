@@ -342,6 +342,8 @@ const Work = struct {
     /// assignment of that job (and so every claim, start record and container) is later than
     /// it. A re-assignment of the same job is not stale: its claim must stay one claim.
     fn is_stale_epoch(work: *const Work, id: []const u8, epoch: u64) bool {
+        // Test-only (J8): a leftover of an earlier job of this name is taken for this job's.
+        if (c1_teeth.job_reuse) return false;
         const entry = work.run_of(id) orelse return false;
         return epoch < entry.kv.create_revision;
     }
@@ -484,6 +486,13 @@ const Work = struct {
             if (seen == null) return work.unclaimed(subject, run);
             const held = seen.?;
             if (held.status == .claimed) return work.claimed_unstarted(subject, record, held, run);
+        }
+        if (c1_teeth.job_evicted and record.phase != .claiming and subject.assigned) {
+            // Test-only (J2): a container the runtime evicted past `runtime_handles_max` is
+            // taken for one never started, and the run is started again.
+            if (run) |entry| if (entry.rec.stop == null) {
+                return work.start(subject, record, &entry.rec, null);
+            };
         }
         try work.lost(subject, record, seen, .vanished);
         // No container: a run with no assignment here is over on this node (`report_epoch`).
