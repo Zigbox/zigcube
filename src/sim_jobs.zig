@@ -15,8 +15,10 @@ const Context = controller.Context;
 
 /// Runs the ledger can hold. A run past it is counted, not judged (J2 stays sound for the rest).
 pub const ledger_max: u32 = 4096;
-/// Containers the trackers keep a clock for at once.
-pub const watch_max: u32 = 128;
+/// Containers the trackers keep a clock for at once: every container the runtimes of the most
+/// nodes a simulation has can hold (`sim_cluster.zig` asserts the product), so that no live job
+/// container goes unjudged for want of a slot.
+pub const watch_max: u32 = 16 * constants.runtime_handles_max;
 
 /// What a start was judged against, and the first verdict that failed.
 pub const State = struct {

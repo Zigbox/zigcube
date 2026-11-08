@@ -2322,12 +2322,14 @@ fn watch_of(c: *const Cluster, node: u32, name_hash: u64) ?sim_jobs.Watch {
     return null;
 }
 
-/// The checks that hold the running job containers to a bound, on true time, unless the node was
-/// wedged lately (as I1b: its agent down or frozen, or a container ignoring a stop; a cut link
-/// is not wedged, and J8's bound has no term for it): J1 (no container runs long past its job's
-/// terminal status), J6 (a run with a `stop` is not executing after the stop bound) and J8 (no
-/// run executes past its deadline and grace, with the kill and the clocks' rate error). The
-/// start ledger's verdict (J2, J7) is reported here too.
+/// The checks that hold the running job containers to a bound, on true time: J1 (no container
+/// runs long past its job's terminal status), J6 (a run with a `stop` is not executing after the
+/// stop bound) and J8 (no run executes past its deadline and grace, with the kill and the
+/// clocks' rate error). A wedged node (as I1b: its agent down or frozen, or a container ignoring
+/// a stop; a cut link is not wedged, and J8's bound has no term for it) is excused per check:
+/// J6 and J8 subtract the wedged time from their bounds and judge every tick, and J1 starts its
+/// clock only when the node has not been wedged lately. Every live job container has a watch
+/// (RB-N8). The start ledger's verdict (J2, J7) is reported here too.
 fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
@@ -2342,7 +2344,9 @@ fn track_jobs(c: *Cluster) Failure!void {
         .arena = scratch.allocator(),
         .diag = &c.diag,
     };
-    var next: [sim_jobs.watch_max]sim_jobs.Watch = undefined;
+    comptime assert(nodes_max * constants.runtime_handles_max <= sim_jobs.watch_max);
+    const next = scratch.allocator().alloc(sim_jobs.Watch, sim_jobs.watch_max) catch
+        return check(c, false, "the job trackers are out of memory");
     var count: u32 = 0;
     for (c.nodes) |node| {
         for (node.sim.containers.containers.items) |container| {
@@ -2360,13 +2364,14 @@ fn track_jobs(c: *Cluster) Failure!void {
             }
             const run = job_run_of(&ctx, job);
             if (run) |known| note_marks(c, known, node, &watch);
-            if (!c.wedged_lately(node)) try judge_job_container(c, &ctx, job, node, &watch, run);
-            if (count == sim_jobs.watch_max) continue;
+            try judge_job_container(c, &ctx, job, node, &watch, run);
+            assert(count < sim_jobs.watch_max); // Every container of every runtime has a slot.
             next[count] = watch;
             count += 1;
         }
     }
     @memcpy(c.jobs.watch[0..count], next[0..count]);
+    assert(count <= sim_jobs.watch_max);
     c.jobs.watch_count = count;
 }
 
@@ -2417,6 +2422,9 @@ fn judge_job_container(
         try check(c, since <= stop_bound, "J6: a run kept executing after its stop committed, " ++
             "past the bound");
     }
+    // J1's clock starts at the first look at a node that is not wedged (a stop the node missed
+    // while wedged is still being made up for); J6 and J8 above count that time out instead.
+    if (c.wedged_lately(node)) return;
     const status = job_status_of(ctx, job) orelse return;
     if (!records.job_state_terminal(status.state)) return;
     const ended = watch.ended_since_ms orelse now;
