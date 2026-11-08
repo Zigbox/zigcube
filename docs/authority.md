@@ -532,7 +532,7 @@ transaction, so it frees its `jobs_max` slot; one with a run keeps the slot
 
 **Decision actions of a job** (subject kind `job`), in snake_case: `job_created`, `job_placed`,
 `job_running`, `stop_job`, `end_job`, `hold_contradictory_job`, `hold_unmapped_ending`,
-`hold_unreadable_job` (a record that does not decode is skipped, once per record revision; B2 slice 2) and
+`hold_unreadable_job` (a record, or the node's report of the run, that does not decode is skipped, once per record revision; B2 slice 2. An unreadable report is treated as no report: a cancel writes the stop and a node lost past the grace ends the run, `failed unreachable` when running, `failed unknown` otherwise) and
 `drop_report`. The job controller's decision source is `0x8000 | instance`. "Had a run" is `job_created` *of this incarnation*: the decision's index entry
 `create_revision` is at least the job's `create_revision`, so a job deleted and created again
 under its name starts afresh. A hold or a drop is written once per revision of the record it is

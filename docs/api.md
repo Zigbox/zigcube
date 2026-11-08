@@ -437,7 +437,9 @@ endings of a name reused after retention apart. An absent `epoch` counts as none
 is reserved: `POST /v1/jobs` refuses it with ZC-E0130.
 Like `/v1/watch`, a poll that is behind the head answers at once.
 A job's `why` chain can now end in a `hold_unreadable_job` decision (B2 slice 2): the job controller skipped a
-record, run or status that did not decode, citing ZC-E0301 or ZC-E0303.
+record, run, status or node report that did not decode, citing ZC-E0301 or ZC-E0303. A report that does not
+decode holds the run only while nothing else can move it: a cancel still writes its stop, and a lost node still
+ends the run (`failed unreachable` if it was running, `failed unknown` if not).
 
 ### `POST /v1/jobs/{name}/cancel`
 

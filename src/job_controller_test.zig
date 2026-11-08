@@ -812,6 +812,64 @@ test "a report that does not decode leaves the replicas reconciling (RB-S7, clai
     try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
 }
 
+test "a running run whose report does not decode still takes a cancel and a lost node" {
+    // Goal: #175 re-review. An unreadable report holds the run (the hold decision, once) but not
+    // for ever. Method: `train` runs on n1, its report is corrupted, then the job is cancelled:
+    // the stop is written though the report is unreadable. The node is then lost: inside the grace
+    // nothing changes; past it the run ends `failed unreachable`, which the earlier code (it
+    // returned at the hold) never wrote.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.running("train");
+    try corrupt(&f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the hold decision
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+    try f.job("train", 60 * 1000, true);
+    f.manual.ms += 3600 * 1000;
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the cancel's stop
+    try testing.expectEqual(records.RunStopCause.cancel, (try f.read_run("train")).?.stop.?.cause);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // the node is alive: the run waits
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+    try f.node_status("n1", .lost);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // inside the grace
+    f.manual.ms += 1001;
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const status = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expectEqual(records.JobFailure.@"unreachable", status.end.?.cause.?);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+}
+
+test "a claimed run whose report does not decode ends failed unknown when its node is lost" {
+    // Goal: the same, for a run not yet marked running. Method: n1 claimed `train`, the claim is
+    // then corrupted. Nothing readable says whether it started, so a cancel writes the stop and
+    // the lost node ends the run `failed unknown` (RB-S8), never `cancelled` or `not started`.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.node("n1", .ready);
+    try f.job("train", 600 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.assign("n1", "train");
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // placed
+    try f.report("n1", "train", .claimed, null, null);
+    try corrupt(&f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the hold decision
+    try f.job("train", 600 * 1000, true);
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the cancel's stop
+    try testing.expect((try f.read_run("train")).?.stop != null);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // node ready: not ended as unstarted
+    try testing.expectEqual(records.JobState.placed, (try f.read_status("train")).?.state);
+    try f.node_status("n1", .lost);
+    f.manual.ms += 1001;
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const status = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expectEqual(records.JobFailure.unknown, status.end.?.cause.?);
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+}
+
 test "a late report that does not decode leaves the replicas reconciling (RB-S7)" {
     var f: Fixture = undefined;
     try f.start();
