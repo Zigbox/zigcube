@@ -728,3 +728,37 @@ test "the instance a server takes from its clock is one every controller can use
         try testing.expect(instance >= 1 and instance <= constants.controller_instance_max);
     }
 }
+
+test "a job record that does not decode is held once and the other jobs go on" {
+    // Goal: RB-S7. Method: `a` holds bytes that are no job; `b` is a healthy new job after it.
+    // The step must not fail: `b` gets its run, `a` gets one hold decision (not one per pass).
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const ctx = f.context();
+    const bad = [_]store.Op{.{ .put = .{ .key = records.job_key("a").slice(), .value = "{no" } }};
+    _ = try writers.txn(ctx.store, .api, .{ .on_success = &bad }, &f.diag);
+    try f.job("b", 60 * 1000, false);
+    _ = try f.pass();
+    try testing.expect((try f.read_run("b")) != null);
+    try testing.expect((try f.read_run("a")) == null);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
+    _ = try f.pass();
+    try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
+}
+
+test "a run record that does not decode holds its job and not the others" {
+    // Goal: RB-S7, the run record of a job. Method: `a` is a good job whose run is garbage.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("a", 60 * 1000, false);
+    try f.job("b", 60 * 1000, false);
+    const ctx = f.context();
+    const key = records.job_run_key("a");
+    const bad = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = "{no" } }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &bad }, &f.diag);
+    _ = try f.pass();
+    try testing.expect((try f.read_run("b")) != null);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
+}
