@@ -1419,6 +1419,9 @@ pub const Cluster = struct {
         var name_buffer: [16]u8 = undefined;
         // "jb-" and a u32 fit.
         const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
+        // Every 13th job asks for more cpu than any node has, so that no node ever claims it and
+        // its run must end `not_started` (J8's second clause). No draw: other worlds are unchanged.
+        const unplaceable = c.job_next % 13 == 5;
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
@@ -1430,7 +1433,10 @@ pub const Cluster = struct {
             .name = name,
             .image = hello_digest,
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
-            .limits = .{ .cpu_millis = 10, .memory_bytes = constants.job_limit_memory_bytes_min },
+            .limits = .{
+                .cpu_millis = if (unplaceable) 100_000 else 10,
+                .memory_bytes = constants.job_limit_memory_bytes_min,
+            },
             .deadline_ms = if (long) 600_000 else 3000 + random.uintLessThan(u32, spread),
             .grace_ms = random.uintLessThan(u32, 2000),
             .submit_by_ms = c.manual.ms + 5000 + random.uintLessThan(u32, 20_000),
