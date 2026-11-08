@@ -513,7 +513,6 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
     var source: controller.DecisionSource = .{ .instance = 0 };
     const bad_limits = [_]records.Limits{
         .{ .cpu_millis = 0 },
-        .{ .cpu_millis = 9 },
         .{ .cpu_millis = constants.job_limit_cpu_millis_max + 1 },
         .{ .memory_bytes = 0 },
         .{ .memory_bytes = constants.job_limit_memory_bytes_min - 1 },
@@ -562,7 +561,7 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
     try testing.expectError(error.Invalid, apply(&ctx, &source, old));
 }
 
-test "apply accepts cpu_millis 10 and memory_bytes 2^40, the literal edges of docs/api.md" {
+test "apply: cpu_millis 9 is refused, 10 and memory_bytes 2^40 are accepted (docs/api.md)" {
     try testing.expectEqual(@as(u32, 10), constants.job_limit_cpu_millis_min);
     try testing.expectEqual(@as(u64, 1 << 40), constants.job_limit_memory_bytes_max);
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -584,6 +583,9 @@ test "apply accepts cpu_millis 10 and memory_bytes 2^40, the literal edges of do
     var edge = hello;
     edge.limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 40 };
     _ = try apply(&ctx, &source, edge);
+    edge.name = "under";
+    edge.limits = .{ .cpu_millis = 9 };
+    try testing.expectError(error.Invalid, apply(&ctx, &source, edge));
 }
 
 test "apply refuses more environment variables than Zigbox runs" {
