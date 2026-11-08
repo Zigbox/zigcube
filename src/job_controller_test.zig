@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
 const control_plane = @import("control_plane.zig");
 const controller = @import("controller.zig");
@@ -679,23 +680,148 @@ test "a job added behind the cursor between steps gets its run within two more s
     try testing.expect((try f.read_run("a")) != null);
 }
 
-test "an unmappable report is held once and does not pin the job: a cancel still stops it" {
-    // Goal: RB-S8. Method: a running run whose agent reports `stopped` with an exit that maps to
-    // no ending (an exit with neither code nor signal); the job is then cancelled. The report is
-    // held with one decision, and the cancel's stop is written all the same.
+/// One pass of the whole control plane, the way the server runs it.
+fn plane_pass(f: *Fixture, plane: *control_plane.ControlPlane) !void {
+    const ctx = f.context();
+    _ = try plane.reconcile(&ctx);
+    f.manual.advance(10);
+}
+
+/// A step of the scheduler and the job controller only (no node controller to judge the test's
+/// hand-written nodes).
+fn jobs_pass(f: *Fixture, plane: *control_plane.ControlPlane) !void {
+    const ctx = f.context();
+    _ = try plane.scheduler.reconcile(&ctx);
+    const again = f.context();
+    _ = try plane.jobs.reconcile(&again);
+    f.manual.advance(10);
+}
+
+fn replica_count(f: *Fixture, service: []const u8) !usize {
+    const ctx = f.context();
+    const found = try controller.list_all(
+        records.Replica,
+        &ctx,
+        records.replicas_prefix(service).slice(),
+        null,
+        constants.replicas_max,
+    );
+    return found.items.len;
+}
+
+/// Applies a three-replica service, then runs the whole plane: all three replicas must exist
+/// after it, however the job records look (RB-S7: one corrupt record stops no one else).
+fn replicas_still_reconcile(f: *Fixture, plane: *control_plane.ControlPlane) !void {
+    var api: controller.DecisionSource = .{ .instance = 0 };
+    const ctx = f.context();
+    const result = try apply_mod.apply(&ctx, &api, .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 3,
+        .command = &.{"true"},
+        .applied_by = "alex@laptop",
+        .request_id = "r-0001a4f",
+    });
+    try testing.expect(result == .written);
+    for (0..6) |_| try plane_pass(f, plane);
+    try testing.expectEqual(@as(usize, 3), try replica_count(f, "hello"));
+}
+
+fn corrupt(f: *Fixture, role: writers.Role, key: []const u8) !void {
+    const ctx = f.context();
+    const bad = [_]store.Op{.{ .put = .{ .key = key, .value = "{no" } }};
+    _ = try writers.txn(ctx.store, role, .{ .on_success = &bad }, &f.diag);
+}
+
+test "a status that does not decode leaves the replicas reconciling (RB-S7, scheduler)" {
     var f: Fixture = undefined;
     try f.start();
     defer f.stop();
+    var plane = control_plane.ControlPlane.init(2);
+    try f.job("a", 60 * 1000, false);
+    _ = try f.pass();
+    try corrupt(&f, .job_controller, records.job_status_key("a").slice());
+    try replicas_still_reconcile(&f, &plane);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
+}
+
+test "a run that does not decode leaves the replicas reconciling (RB-S7, place_run)" {
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var plane = control_plane.ControlPlane.init(2);
+    try f.node("n1", .ready);
+    try f.job("a", 60 * 1000, false);
+    _ = try f.pass();
+    try corrupt(&f, .job_controller, records.job_run_key("a").slice());
+    try replicas_still_reconcile(&f, &plane);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
+}
+
+test "a report that does not decode leaves the replicas reconciling (RB-S7, claim)" {
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var plane = control_plane.ControlPlane.init(2);
     try f.running("train");
-    try f.report("n1", "train", .stopped, .{ .kind = .exited }, null);
+    try corrupt(&f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    try replicas_still_reconcile(&f, &plane);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+}
+
+test "a late report that does not decode leaves the replicas reconciling (RB-S7)" {
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var plane = control_plane.ControlPlane.init(2);
+    try f.running("train");
+    try f.report("n1", "train", .stopped, .{ .kind = .exited, .code = 0 }, null);
     try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(records.JobState.exited, (try f.read_status("train")).?.state);
+    try corrupt(&f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    try replicas_still_reconcile(&f, &plane);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+}
+
+test "an unmappable report is held once, and a cancel ends the job and frees its node" {
+    // Goal: RB-S8. Method: the plane places a job's run on n1 and its agent reports `stopped`
+    // with an exit that maps to no ending (neither code nor signal); the job is then cancelled.
+    // The report is held with one decision, the cancel's stop is written, the run ends `failed
+    // unknown` (the agent never reports again) and the scheduler releases its allocation.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var plane = control_plane.ControlPlane.init(2);
+    try f.node("n1", .ready);
+    try f.job("train", 60 * 1000, false);
+    for (0..3) |_| try jobs_pass(&f, &plane);
+    var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+    const id = records.job_run_id(&buffer, "train");
+    const assigned = records.assigned_key("n1", id);
+    try testing.expect(try f.revision_of(assigned.slice()) != 0);
+    try f.report("n1", "train", .claimed, null, null);
+    for (0..2) |_| try jobs_pass(&f, &plane);
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+    try f.report("n1", "train", .stopped, .{ .kind = .exited }, null);
+    for (0..2) |_| try jobs_pass(&f, &plane);
     try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unmapped_ending"));
     try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
     try f.job("train", 60 * 1000, true);
-    try testing.expectEqual(@as(u32, 1), try f.pass());
+    for (0..4) |_| try jobs_pass(&f, &plane);
     const stop = (try f.read_run("train")).?.stop orelse return error.TestUnexpectedResult;
     try testing.expectEqual(records.RunStopCause.cancel, stop.cause);
+    const ended = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, ended.state);
+    try testing.expectEqual(records.JobFailure.unknown, ended.end.?.cause.?);
     try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unmapped_ending"));
+    try testing.expectEqual(@as(u64, 0), try f.revision_of(assigned.slice()));
+    const ctx = f.context();
+    const alloc = try ctx.store.get(ctx.arena, records.allocation_key("n1").slice(), null, &f.diag);
+    if (alloc.kv) |kv| {
+        const rec = try records.read(records.Allocation, ctx.arena, kv, &f.diag);
+        try testing.expectEqual(@as(u32, 0), rec.count);
+    }
 }
 
 test "no two controllers of any instance share a decision source" {

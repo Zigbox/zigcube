@@ -672,7 +672,11 @@ const Pass = struct {
     ) Error!void {
         var live: ?*const Entry(records.JobObserved) = null;
         var fence: ?*const Entry(records.JobObserved) = null;
-        const claim_seen = try pass.claim(job.rec.name, run);
+        const claim_seen: ?*const Entry(records.JobObserved) = switch (try pass.claim(job, run)) {
+            .held => return,
+            .none => null,
+            .seen => |entry| entry,
+        };
         if (claim_seen) |entry| {
             if (pass.admissible(entry, run)) {
                 live = entry;
@@ -697,22 +701,34 @@ const Pass = struct {
     }
 
     /// What the node the run is assigned to reported of it, if anything.
+    const Claim = union(enum) {
+        none,
+        /// The report does not decode (ZC-E0301/E0303): the job is held with one decision and
+        /// left as it was, and the caller stops judging it.
+        held,
+        seen: *const Entry(records.JobObserved),
+    };
+
     fn claim(
         pass: *Pass,
-        name: []const u8,
+        job: *const Entry(records.Job),
         run: *const Entry(records.JobRun),
-    ) Error!?*const Entry(records.JobObserved) {
+    ) Error!Claim {
         const ctx = pass.ctx;
-        const placed = pass.world.assignment(run.rec.id) orelse return null;
-        const key = records.job_observed_key(assigned_node(placed.kv.key), name);
+        const placed = pass.world.assignment(run.rec.id) orelse return .none;
+        const key = records.job_observed_key(assigned_node(placed.kv.key), job.rec.name);
         const got = try ctx.store.get(ctx.arena, key.slice(), pass.world.revision, ctx.diag);
-        const kv = got.kv orelse return null;
-        const rec = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
-        if (!std.mem.eql(u8, rec.run, run.rec.id)) return null;
+        const kv = got.kv orelse return .none;
+        const rec = records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            try pass.hold_unreadable_report(job, &kv);
+            return .held;
+        };
+        if (!std.mem.eql(u8, rec.run, run.rec.id)) return .none;
         const entry = ctx.arena.create(Entry(records.JobObserved)) catch
             return failures.no_memory(ctx.diag);
         entry.* = .{ .kv = kv, .rec = rec };
-        return entry;
+        return .{ .seen = entry };
     }
 
     /// A report is admissible when it comes from the tenure the node holds now, under the epoch
@@ -733,8 +749,9 @@ const Pass = struct {
     }
 
     /// An admissible report: a claim or a running report marks the run running; a stopped one ends
-    /// it. True when it acted. An unmappable ending is held with a decision and returns false, so
-    /// the pass goes on to the cancel and the lost-node judgements: the job is not pinned.
+    /// it. True when it acted. An unmappable ending is held with a decision; with no stop yet it
+    /// returns false, so the pass goes on to write the cancel's stop, and once a stop exists the
+    /// run ends `failed unknown`: the job is not pinned.
     fn from_report(
         pass: *Pass,
         job: *const Entry(records.Job),
@@ -745,7 +762,15 @@ const Pass = struct {
         if (entry.rec.status == .stopped) {
             const ending = map_ending(&entry.rec) orelse {
                 try pass.unmappable(job, entry);
-                return false;
+                // Once a stop exists the report is the last the agent sends, so the run ends
+                // here, failed with an unknown cause, or it would never end (RB-S8).
+                const stop = run.rec.stop orelse return false;
+                try pass.end(job, run, status, .{
+                    .ending = failed(.unknown, stop_cause_of(stop.cause)),
+                    .reason = "the run was stopped and its agent's report maps to no ending",
+                    .report = entry,
+                });
+                return true;
             };
             try pass.end(job, run, status, .{
                 .ending = ending,
@@ -757,6 +782,14 @@ const Pass = struct {
         if (status.rec.state == .running) return false;
         try pass.mark_running(job, run, status, entry);
         return true;
+    }
+
+    fn stop_cause_of(cause: records.RunStopCause) records.StopCause {
+        return switch (cause) {
+            .cancel => .cancel,
+            .@"unreachable" => .@"unreachable",
+            .not_started => .not_started,
+        };
     }
 
     /// Compares what a judgement about `run` read of its placement (the read-set rule): the
@@ -1159,6 +1192,33 @@ const Pass = struct {
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
     }
 
+    /// ZC-E0301/ZC-E0303: the node's report of the job does not decode. One `hold_unreadable_job`
+    /// decision says so, once per revision of the report; the job is left as it was.
+    fn hold_unreadable_report(
+        pass: *Pass,
+        job: *const Entry(records.Job),
+        report: *const store.KeyValue,
+    ) Error!void {
+        const ctx = pass.ctx;
+        const raw = try diagnostic_of(ctx);
+        ctx.diag.reset();
+        const name = job.rec.name;
+        if (try has_decision(ctx, name, "hold_unreadable_job", report.mod_revision)) return;
+        var batch: Batch = .{};
+        batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
+        batch.expect(report.key, report.mod_revision);
+        _ = try controller.put_decision(ctx, &pass.jc.source, .{
+            .actor = actor,
+            .action = "hold_unreadable_job",
+            .subject = .{ .kind = .job, .name = name },
+            .reason = "the node's report of the job does not decode; the job is left as it was",
+            .cause = cause_of(.observed, report),
+            .cause_diagnostic = raw,
+            .read_revision = pass.world.revision,
+        }, &batch);
+        _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
+    }
+
     // ---- A report for an ended job ----
 
     /// Test-only (`c1_teeth.job_rewrite`, must break J3): a terminal status written again, once,
@@ -1194,7 +1254,10 @@ const Pass = struct {
         const kv = got.kv orelse return;
         if (kv.mod_revision < status.kv.mod_revision) return; // The report the ending rests on.
         if (try has_decision(ctx, name, "drop_report", kv.mod_revision)) return;
-        const report = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
+        const report = records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            return pass.hold_unreadable_report(job, &kv);
+        };
         const how = if (status.rec.end) |ended| if (ended.cause) |c| @tagName(c) else "-" else "-";
         const cause = try controller.format(
             ctx,

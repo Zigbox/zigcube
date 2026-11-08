@@ -273,7 +273,14 @@ fn read_job_statuses(
             .continue_after = after,
         }, ctx.diag);
         for (page.kvs) |kv| {
-            const rec = try records.read(records.JobStatus, ctx.arena, kv, ctx.diag);
+            // A status that does not decode (ZC-E0301/E0303) is skipped, not fatal: the job is left
+            // unplaced and unreleased, and replicas go on. The job controller holds the job with
+            // one `hold_unreadable_job` decision (it reads the same record).
+            const rec = records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch |err| {
+                if (err != error.Malformed) return err;
+                ctx.diag.reset();
+                continue;
+            };
             const name = kv.key[records.prefix_job_status.len..];
             if (records.job_state_terminal(rec.state) and !held.contains(name)) continue;
             if (kept.items.len >= constants.job_admitted_window_max) {
@@ -986,7 +993,12 @@ pub const Scheduler = struct {
         // The job controller writes the run and its status together: a status alone is its
         // contradiction to report (ZC-E0307), not a run to place.
         const run_kv = got.kv orelse return;
-        const run = try records.read(records.JobRun, ctx.arena, run_kv, ctx.diag);
+        // A run that does not decode leaves the job unplaced; the job controller holds it.
+        const run = records.read(records.JobRun, ctx.arena, run_kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            ctx.diag.reset();
+            return;
+        };
         if (run.stop != null) return;
         const need = run_requests_of(&run);
         var verdicts: [views_max]Verdict = undefined;
