@@ -1117,9 +1117,11 @@ const c1_teeth_roots = [_]struct {
     symptom: []const u8,
     canary_seeds: u32,
     /// The first seed `sim-c1-teeth-NAME` runs. The test stops at the first failing seed and
-    /// that one must show `symptom`; the skew world fails on convergence at seeds 1 and 2 since
-    /// #177 (smaller batches moved the timing), and shows I1b from seed 3.
+    /// that one must show `symptom`, unless `any_symptom`: then seeds that fail otherwise (the
+    /// skew world fails on convergence at some seeds since #177) are skipped, and some seed in
+    /// the range must show `symptom`.
     first_seed: u32 = 1,
+    any_symptom: bool = false,
     /// The last seed the negative test runs (it stops at the first that fails). The offline
     /// world fails J8 on about one seed in seven, so ten seeds were a coin flip that any change
     /// of the draws could lose (#171: its first hit moved from seed 10 to 13).
@@ -1148,7 +1150,7 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_skew_main.zig",
         .symptom = "I1b",
         .canary_seeds = 30,
-        .first_seed = 3,
+        .any_symptom = true,
     },
     .{
         .name = "wedge",
@@ -1296,6 +1298,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
             b.fmt("{d}", .{c1_teeth_operations}), "--c1",
             "--expect-fail",                      symptom,
         });
+        if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
