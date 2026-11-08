@@ -269,6 +269,28 @@ test "a container that exited with no start record reports its exit, not lost" {
     try testing.expectEqual(@as(?u8, 7), seen.exit.?.code);
 }
 
+test "a container that exited with no start record is reported under the current assignment" {
+    // Goal: seed 893. The run was observed running under assignment 1 and then assigned again
+    // (assignment 2); its container ended and the start record is gone. The store refuses a
+    // report that names assignment 1, and the agent made it again on every pass; the exit must
+    // be reported under the current assignment, once. Method: observe, reassign, end it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const first = try rig.assign(60_000);
+    rig.step();
+    try testing.expectEqual(first, (try rig.observed()).?.assignment);
+    const second = try rig.assign(60_000);
+    try testing.expect(second > first);
+    try rig.world.sim.inject(run_id, .{ .exit = 5 });
+    var buffer: [96]u8 = undefined;
+    try rig.world.files.interface().remove(agent_jobs.record_name(&buffer, run_id));
+    rig.step();
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(second, seen.assignment);
+    try testing.expectEqual(@as(?u8, 5), seen.exit.?.code);
+}
+
 test "a runtime that fails to start ends the run start_failed, with its diagnostic" {
     // Goal: RB-N4. `runtime.start` returns an error (not an outcome): the claimed run ends at
     // once as a start failure and is not left claimed.

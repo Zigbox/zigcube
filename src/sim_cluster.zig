@@ -535,6 +535,13 @@ const Node = struct {
         const c = node.cluster;
         _ = node.arena.reset(.retain_capacity);
         node.diag.reset();
+        // The node's clock runs ahead of true time only while the step that charged it is in
+        // flight (`resume_ms`). A step that starts after that, or on a restarted agent (which
+        // has `resume_ms` 0), reads a clock that has caught up: otherwise its stamps (`sent`)
+        // would be later than true time and it would fence late, which no real agent does
+        // (seeds 1612, 1384, 893).
+        const clock_ahead = node.nclock.busy_until_true_ms > c.manual.ms;
+        if (clock_ahead) assert(c.manual.ms < node.resume_ms);
         node.spent_ms = 0;
         const clock = node.nclock.clock();
         const ctx: agent_mod.Context = .{

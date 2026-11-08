@@ -1116,6 +1116,10 @@ const c1_teeth_roots = [_]struct {
     root: []const u8,
     symptom: []const u8,
     canary_seeds: u32,
+    /// Seeds the negative test runs (it stops at the first that fails). The offline world fails
+    /// J8 on about one seed in seven, so ten seeds were a coin flip that any change of the
+    /// draws could lose (#171: its first hit moved from seed 10 to 13).
+    seeds: u32 = teeth_seeds_max,
 }{
     .{
         .name = "allocation",
@@ -1200,6 +1204,7 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_deadline_offline_main.zig",
         .symptom = "J8",
         .canary_seeds = 80,
+        .seeds = 40,
     },
     .{
         .name = "job_gap",
@@ -1280,7 +1285,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         const teeth_run = b.addRunArtifact(teeth_exe);
         teeth_run.addArgs(&.{
-            "--seeds",                            b.fmt("1..{d}", .{teeth_seeds_max}),
+            "--seeds",                            b.fmt("1..{d}", .{entry.seeds}),
             b.fmt("{d}", .{c1_teeth_operations}), "--c1",
             "--expect-fail",                      b.fmt("--expect-symptom={s}", .{entry.symptom}),
         });
@@ -1377,6 +1382,27 @@ const regress_replays = [_][]const []const u8{
         "--lease-ttl-ms=10000",
         "--replicas-pct=100",
         "--heal-at=99",
+    },
+    // The I1b/I3 failures of #159's review (a restart that read a node clock ahead of true
+    // time): seeds 1384, 1612 and 893, plain and under C1.
+    &.{ "1612", "351", "2", "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=218" },
+    &.{ "893", "625", "8", "--lease-ttl-ms=10000", "--replicas-pct=300", "--heal-at=584" },
+    &.{
+        "1612",                 "351",
+        "2",                    "--c1",
+        "--lease-ttl-ms=10000", "--replicas-pct=100",
+        "--heal-at=218",
+    },
+    &.{ "893", "625", "8", "--c1", "--lease-ttl-ms=10000", "--replicas-pct=300", "--heal-at=584" },
+    &.{ "1384", "198", "10", "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=139" },
+    &.{
+        "1384",
+        "198",
+        "10",
+        "--c1",
+        "--lease-ttl-ms=10000",
+        "--replicas-pct=100",
+        "--heal-at=139",
     },
 };
 
