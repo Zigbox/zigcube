@@ -929,7 +929,9 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
         return failures.no_memory(diag);
     const bytes = out.toOwnedSlice() catch return failures.no_memory(diag);
     assert(bytes.len > 0);
-    if (bytes.len > constants.store_value_bytes_max) return failures.no_memory(diag);
+    if (bytes.len > constants.store_value_bytes_max) {
+        return failures.value_too_large(diag, bytes.len);
+    }
     // The API checks a job's words against its bounds, but escaping can multiply bytes (a control
     // character is six): the encoded run is what the agents' runs reply is sized by.
     const T = @TypeOf(value);
@@ -1977,4 +1979,20 @@ test "a job observation says how the run ended exactly when it stopped" {
         );
         diag.reset();
     }
+}
+
+test "a value over store_value_bytes_max says it is the value, not the request's memory" {
+    // Goal: RA-N4. Both are ZC-E0207, but the cause of an oversized record must name its size and
+    // the bound, never "the memory set aside for this request ran out".
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const text: [constants.store_value_bytes_max]u8 = @splat('a');
+    try testing.expectError(error.NoCapacity, encode(arena, JobInput{ .base64 = &text }, &diag));
+    try testing.expectEqual(codes.Code.E0207, diag.code.?);
+    const cause = diag.last_cause().?;
+    try testing.expect(std.mem.indexOf(u8, cause, "one value") != null);
+    try testing.expect(std.mem.indexOf(u8, cause, "memory") == null);
 }

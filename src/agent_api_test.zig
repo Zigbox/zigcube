@@ -14,6 +14,7 @@ const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const Diag = @import("diag.zig").Diag;
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
 
@@ -1090,6 +1091,63 @@ test "the runs of a node are listed, and a run's input is given only after its c
     try rig.join("node3");
     const other = rig.call("GET", "/v1/agent/nodes/node3/runs/train/input", "", "");
     try testing.expect(other.status != 200);
+}
+
+/// Records the revision every `get` of a request asked for.
+const GetSpy = struct {
+    var original: *const store.Store.VTable = undefined;
+    var seen: [8]?store.Revision = @splat(0);
+    var count: usize = 0;
+
+    fn get(
+        context: *anyopaque,
+        arena: std.mem.Allocator,
+        key: []const u8,
+        at_revision: ?store.Revision,
+        diag: *Diag,
+    ) store.Error!store.GetResult {
+        seen[count] = at_revision;
+        count += 1;
+        return original.get(context, arena, key, at_revision, diag);
+    }
+};
+
+test "a run's input is read at one revision" {
+    // Goal: RA-N3. The assignment, the claim and the input are three keys of one decision, so the
+    // handler reads them at the same revision. Method: spy on the revision each get asks for.
+    var rig = try Rig.start(22);
+    defer rig.stop();
+    try rig.join("node2");
+    const revisions = try assign_run(&rig);
+    _ = try put_as(&rig, .api, records.job_input_key("train").slice(), records.JobInput{
+        .base64 = "aGVsbG8=",
+    });
+    var buffer: [512]u8 = undefined;
+    const text = try claim_text(&buffer, rig.tenure, revisions[0], revisions[1]);
+    _ = try rig.ok("POST", "/v1/agent/nodes/node2/job-observed", "", text);
+
+    var ctx = rig.world.controller_context();
+    var vtable = ctx.store.vtable.*;
+    GetSpy.original = ctx.store.vtable;
+    GetSpy.count = 0;
+    vtable.get = GetSpy.get;
+    ctx.store.vtable = &vtable;
+    const response = rig.api.handle(&ctx, .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node2/runs/train/input",
+        .query = "",
+        .body = "",
+    });
+    try testing.expectEqual(@as(u16, 200), response.status);
+    var gets: usize = 0;
+    for (GetSpy.seen[0..GetSpy.count]) |at| {
+        // The input, claim and assignment gets are the ones with a revision; any other read the
+        // handler makes (the chain) is not part of the three.
+        if (at == null) continue;
+        try testing.expectEqual(GetSpy.seen[0], at);
+        gets += 1;
+    }
+    try testing.expect(gets >= 3);
 }
 
 test "retained runs and observations beyond jobs_max do not stop a node's run listings" {

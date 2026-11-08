@@ -123,6 +123,10 @@ The long-poll watch of HANDOFF. Waits up to `timeout` milliseconds (default and 
 - Same guarantees as `Watch.next`: ordered, no gaps, a revision's events never split across
   responses, an idle response still advances `revision` (the bookmark). The client resumes with
   `from = revision + 1`.
+- **A watch that is behind the head answers at once**, whatever it holds: when `from` is at or
+  below the head, the reply carries what the server read, even no events (a `prefix` that matches
+  none of the first 64 batches of 256 events), with `revision` set to the bookmark it reached; it
+  is held only when nothing is left to read up to the head. Resume with `from = revision + 1`.
 - `from` at or below the compaction point: **`410`** with the **`ZC-E0203`** diagnostic. The
   client lists again and watches from the revision the list returned.
 - `from` more than one past the current revision: `400` with `ZC-E0204`.
@@ -366,9 +370,24 @@ ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the sa
 exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
 it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job_admitted_window_max`
 creations in `job_admission_window_h` hours, `410` ZC-E0134 when `submit_by_ms` has passed,
+`400` ZC-E0104 for a body that does not parse, with a cause that says which way (a missing field, an unknown
+one, a value of the wrong type or a number out of range for its field, JSON that ends too soon, not JSON),
 `400` ZC-E0130 naming the field for everything else, including a job whose run record would take
 more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source` and `image`
 are escaped (a control character takes six bytes in JSON).
+
+- **Idempotency.** `env` and `labels` are compared as maps, in any order; a key given twice in either
+  is `400` ZC-E0130. The expiry (`submit_by_ms`) is checked after the lookup: a retry of a job that
+  exists answers `200` with it even when `submit_by_ms` has passed, and `410` ZC-E0134 is for a
+  job that does not exist.
+- **`limits`** are bounded like the runtime's: `cpu_millis` 10 to 1,024,000, `memory_bytes` 4 MiB to
+  2^40, `pids` 1 to 4,194,304; outside them is ZC-E0130 naming `limits.<member>`.
+- **The admission window** counts creations in hourly buckets, so it covers the last
+  `job_admission_window_h` hours and the current, partial one: a creation is forgotten 72 to 73 hours
+  later. A bucket ahead of the clock (the clock was stepped back) is dropped, not folded into the
+  present.
+- A record that would take more than `store_value_bytes_max` (256 KiB) once encoded is
+  `503` ZC-E0207 (its cause gives both sizes), not a memory failure.
 
 **This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
 about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
@@ -410,6 +429,9 @@ endings of a name reused after retention apart. An absent `epoch` counts as none
 `ended_at_ms` as 0 (an older server's row; it only matters for an unplaced ending)
 (`docs/decisions/2026-11-06-job-dedupe-key-adopted.md`). The name `watch`
 is reserved: `POST /v1/jobs` refuses it with ZC-E0130.
+Like `/v1/watch`, a poll that is behind the head answers at once.
+A job's `why` chain can now end in a `hold_unreadable_job` decision (B2 slice 2): the job controller skipped a
+record, run or status that did not decode, citing ZC-E0301 or ZC-E0303.
 
 ### `POST /v1/jobs/{name}/cancel`
 

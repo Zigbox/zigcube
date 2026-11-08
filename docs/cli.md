@@ -224,8 +224,11 @@ bytes, given as VAR"; the failure record and bundles keep `--env K=...` and read
 
 `job list` prints NAME, STATE, NODE and END (`wide` adds IMAGE, LABELS, DEADLINE); `no jobs` when
 none match. `--state` is a job state or `ended`. `job watch` prints one line per ending
-(`etl  exited (code 0)  node1`; `--output json`: `{"name","status"}`), and `--from REV` resumes
-after a revision. If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the
+(`etl  exited (code 0)  node1`; `--output json`: `{"name","status"}`), and `--from REV` is the
+first revision wanted. After every answer that held an ending, and every relist, `watch` writes
+`watching: resume with --from N` to stderr (stdout, `--output json` too, keeps its shape); pass that
+`N` to continue from there. Each round of the watch frees its own memory, so a watch that runs for
+days stays the size it started. `job get` shows `cancel requested by WHO` once a cancel is recorded. If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the
 ended jobs, skips those it has already printed (by name and epoch) and goes on from the list's
 revision. The dedupe holds `job_admitted_window_max` (8,192) keys, the most ended jobs the server keeps,
 so each ending prints once however often the watch relists. A relist prints every ended job

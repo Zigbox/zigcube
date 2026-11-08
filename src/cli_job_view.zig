@@ -156,8 +156,15 @@ fn write_job_inputs(writer: *Writer, job: Value) Writer.Error!void {
     }
     const labels = cli_data.array(job, "labels") orelse &.{};
     if (labels.len > 0) try write_pairs(writer, labels);
-    if (cli_data.member(job, "cancel_requested")) |flag| {
-        if (flag == .bool and flag.bool) try writer.writeAll("  cancel requested\n");
+    // The server sends the request itself, `{"at_ms","by"}`, and nothing when there was none.
+    if (cli_data.member(job, "cancel_requested")) |request| {
+        if (request == .object) {
+            try writer.writeAll("  cancel requested");
+            if (cli_data.text(request, "by")) |by| {
+                if (by.len > 0) try writer.print(" by {s}", .{by});
+            }
+            try writer.writeAll("\n");
+        }
     }
 }
 
@@ -273,7 +280,8 @@ test "a job prints its env by name and its input by size, never their values" {
         \\{"revision":9,"state":"running","job":{"name":"etl","image":"b3:aa",
         \\"command":["sh","-c","exit 3"],"env_names":["TOKEN","MODE"],"input_env":"DATA",
         \\"input_digest":"b3:bb","input_bytes":12,"labels":[["team","x"]],"deadline_ms":600000,
-        \\"cancel_requested":false},"status":{"state":"running","node":"node1","epoch":4}}
+        \\"cancel_requested":{"at_ms":5000,"by":"ann@host"}},
+        \\"status":{"state":"running","node":"node1","epoch":4}}
     );
     const text = try job_text(arena, body, "zc-1", &report);
     const want =
@@ -286,6 +294,7 @@ test "a job prints its env by name and its input by size, never their values" {
         \\  env (names only): TOKEN, MODE
         \\  input: 12 bytes, given as DATA
         \\  labels: team=x
+        \\  cancel requested by ann@host
         \\
     ;
     try testing.expectEqualStrings(want, text);

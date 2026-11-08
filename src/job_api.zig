@@ -184,6 +184,41 @@ fn validate_labels(ctx: *const Context, input: Input) Error!void {
             return refuse(ctx, "labels", "the key {s} holds '='", .{pair[0]});
         }
     }
+    for (input.labels, 0..) |pair, index| {
+        for (input.labels[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier[0], pair[0])) {
+                return refuse(ctx, "labels", "{s} is set twice", .{pair[0]});
+            }
+        }
+    }
+}
+
+fn validate_limits(ctx: *const Context, limits: records.JobLimits) Error!void {
+    if (limits.cpu_millis) |value| {
+        if (value < constants.job_limit_cpu_millis_min or
+            value > constants.job_limit_cpu_millis_max)
+        {
+            return refuse(ctx, "limits.cpu_millis", "must be {d} to {d}, it is {d}", .{
+                constants.job_limit_cpu_millis_min, constants.job_limit_cpu_millis_max, value,
+            });
+        }
+    }
+    if (limits.memory_bytes) |value| {
+        if (value < constants.job_limit_memory_bytes_min or
+            value > constants.job_limit_memory_bytes_max)
+        {
+            return refuse(ctx, "limits.memory_bytes", "must be {d} to {d}, it is {d}", .{
+                constants.job_limit_memory_bytes_min, constants.job_limit_memory_bytes_max, value,
+            });
+        }
+    }
+    if (limits.pids) |value| {
+        if (value < constants.job_limit_pids_min or value > constants.job_limit_pids_max) {
+            return refuse(ctx, "limits.pids", "must be {d} to {d}, it is {d}", .{
+                constants.job_limit_pids_min, constants.job_limit_pids_max, value,
+            });
+        }
+    }
 }
 
 fn validate_input(ctx: *const Context, input: Input) Error!void {
@@ -239,6 +274,8 @@ fn validate_times(ctx: *const Context, input: Input, now_ms: u64) Error!void {
 pub const reserved_name = "watch";
 
 /// The checks that need no store. A job that passes them is one `create` can try to admit.
+/// `submit_by_ms` having passed is not among them: it means a job that does not exist yet is too
+/// late, and a late retry of a job that does exist is a success (`create` checks it).
 pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     if (records.name_problem(input.name, constants.service_name_bytes_max) != null) {
         const problem = "must be 1 to {d} lowercase letters, digits or '-' (none at either end)";
@@ -260,12 +297,12 @@ pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     try validate_command(ctx, input);
     try validate_env(ctx, input);
     try validate_labels(ctx, input);
+    try validate_limits(ctx, input.limits);
     if (input.retries > 0) return not_built(ctx, "retries");
     if (input.relay) return not_built(ctx, "relay");
     if (input.placement) return not_built(ctx, "placement");
     try validate_times(ctx, input, now_ms);
     try validate_input(ctx, input);
-    if (now_ms > input.submit_by_ms) return expired(ctx, input.name, input.submit_by_ms, now_ms);
 }
 
 fn expired(ctx: *const Context, name: []const u8, submit_by_ms: u64, now_ms: u64) error{Refused} {
@@ -373,11 +410,16 @@ fn strings_equal(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
+/// Pairs compare as maps: the same keys with the same values, in any order. Keys are unique
+/// (`validate_env` and `validate_labels` refuse a duplicate), so equal lengths and every pair
+/// of `a` found in `b` make the sets equal.
 fn pairs_equal(a: []const records.Pair, b: []const records.Pair) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (!std.mem.eql(u8, left[0], right[0])) return false;
-        if (!std.mem.eql(u8, left[1], right[1])) return false;
+    for (a) |left| {
+        const found = for (b) |right| {
+            if (std.mem.eql(u8, left[0], right[0])) break right;
+        } else return false;
+        if (!std.mem.eql(u8, left[1], found[1])) return false;
     }
     return true;
 }
@@ -417,11 +459,14 @@ fn admit_one(
     var kept: std.ArrayList(records.HourCount) = .empty;
     for (old.hours) |entry| {
         if (entry.hour + constants.job_admission_window_h <= hour) continue;
+        // A bucket ahead of the clock is a stale write from before it stepped back: drop it, or
+        // it would sit there (and count) until the clock catches up. The create folds into the
+        // newest bucket that is left.
+        if (entry.hour > hour) continue;
         kept.append(ctx.arena, entry) catch return no_memory(ctx.diag);
     }
     const last = if (kept.items.len > 0) &kept.items[kept.items.len - 1] else null;
-    // A clock that went back folds into the newest hour, which keeps the hours ascending.
-    if (last != null and last.?.hour >= hour) {
+    if (last != null and last.?.hour == hour) {
         last.?.count += 1;
     } else {
         kept.append(ctx.arena, .{ .hour = hour, .count = 1 }) catch
@@ -434,6 +479,7 @@ fn window_count(admission: records.JobAdmission, now_ms: u64) u64 {
     const hour = now_ms / hour_ms;
     var sum: u64 = 0;
     for (admission.hours) |entry| {
+        if (entry.hour > hour) continue;
         if (entry.hour + constants.job_admission_window_h > hour) sum += entry.count;
     }
     return sum;
@@ -474,6 +520,7 @@ pub fn create(
         if (spec_equal(&old, &job)) return .{ .same = old };
         return different(ctx, input.name);
     }
+    if (now_ms > input.submit_by_ms) return expired(ctx, input.name, input.submit_by_ms, now_ms);
     return admit(ctx, source, input, job, key);
 }
 
@@ -965,6 +1012,34 @@ test "a run record over 16 KiB escaped is ZC-E0130 naming the field, never ZC-B0
     try rig.expect_code(.E0130);
 }
 
+test "limits outside the runtime's bounds are refused, naming the field" {
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const bad_limits = [_]records.JobLimits{
+        .{ .cpu_millis = 0 },
+        .{ .cpu_millis = constants.job_limit_cpu_millis_max + 1 },
+        .{ .memory_bytes = 0 },
+        .{ .memory_bytes = constants.job_limit_memory_bytes_max + 1 },
+        .{ .pids = 0 },
+        .{ .pids = constants.job_limit_pids_max + 1 },
+    };
+    for (bad_limits) |limits| {
+        var bad = sample("ok");
+        bad.limits = limits;
+        try testing.expectError(error.Refused, create(&ctx, &rig.source, bad));
+        try rig.expect_code(.E0130);
+    }
+    var good = sample("ok");
+    good.limits = .{
+        .cpu_millis = constants.job_limit_cpu_millis_min,
+        .memory_bytes = constants.job_limit_memory_bytes_max,
+        .pids = constants.job_limit_pids_max,
+    };
+    _ = try create(&ctx, &rig.source, good);
+}
+
 test "validation names the field" {
     var rig: Rig = undefined;
     try rig.start();
@@ -1164,7 +1239,7 @@ test "a cancel does not commit over a status that changed after it was read" {
     try testing.expect(retry == .finished);
 }
 
-test "the admission window drops old hours, and a clock that went back keeps them ascending" {
+test "the admission window drops old hours and hours ahead of a clock that went back" {
     var rig: Rig = undefined;
     try rig.start();
     defer rig.stop();
@@ -1189,7 +1264,8 @@ test "the admission window drops old hours, and a clock that went back keeps the
     const now = try records.read(records.JobAdmission, ctx.arena, kv, ctx.diag);
     try testing.expectEqual(@as(usize, 1), now.hours.len);
     try testing.expectEqual(@as(u32, 1), now.hours[0].count);
-    // The clock goes back an hour: the create folds into the newest hour.
+    // The clock goes back an hour: the bucket ahead of it is dropped, not folded into (RA-S5),
+    // and the create opens the bucket of the hour the clock shows.
     rig.manual.ms -= hour_ms;
     var back = sample("back");
     back.submit_by_ms = rig.manual.ms + 30_000;
@@ -1197,7 +1273,55 @@ test "the admission window drops old hours, and a clock that went back keeps the
     const kv2 = (try ctx.store.get(ctx.arena, records.key_job_admission, null, ctx.diag)).kv.?;
     const folded = try records.read(records.JobAdmission, ctx.arena, kv2, ctx.diag);
     try testing.expectEqual(@as(usize, 1), folded.hours.len);
-    try testing.expectEqual(@as(u32, 2), folded.hours[0].count);
+    try testing.expectEqual(@as(u32, 1), folded.hours[0].count);
+    try testing.expectEqual(rig.manual.ms / hour_ms, folded.hours[0].hour);
+}
+
+test "a late retry of a job that exists answers with it; a missing job is ZC-E0134" {
+    // Goal: Decisions 2 of the b2 brief (RB-S4): `submit_by_ms` having passed refuses only a job
+    // that does not exist. Method: create, pass the time, send the same spec, then a different
+    // one (ZC-E0131 still), then a new name (ZC-E0134).
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const input = sample("nightly");
+    _ = try create(&ctx, &rig.source, input);
+    rig.manual.advance(31_000);
+    try testing.expect(rig.manual.ms > input.submit_by_ms);
+    const again = try create(&ctx, &rig.source, input);
+    try testing.expectEqualStrings("nightly", again.same.name);
+    var other = input;
+    other.image = "b3:7c02aaaaaaaa";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, other));
+    try rig.expect_code(.E0131);
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, sample("missing")));
+    try rig.expect_code(.E0134);
+}
+
+test "env and labels compare as maps, and a duplicate label is refused" {
+    // Goal: Decisions 2 (RB-S9): a retry that lists env or labels in another order is the same
+    // job; a duplicate key is ZC-E0130, for labels as env already was.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("ordered");
+    input.env = &.{ .{ "A", "1" }, .{ "B", "2" } };
+    input.labels = &.{ .{ "x", "1" }, .{ "y", "2" } };
+    _ = try create(&ctx, &rig.source, input);
+    var swapped = input;
+    swapped.env = &.{ .{ "B", "2" }, .{ "A", "1" } };
+    swapped.labels = &.{ .{ "y", "2" }, .{ "x", "1" } };
+    try testing.expect((try create(&ctx, &rig.source, swapped)) == .same);
+    var changed = swapped;
+    changed.labels = &.{ .{ "y", "2" }, .{ "x", "3" } };
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, changed));
+    try rig.expect_code(.E0131);
+    var twice = sample("twice");
+    twice.labels = &.{ .{ "x", "1" }, .{ "x", "2" } };
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, twice));
+    try rig.expect_code(.E0130);
 }
 
 test "a run record of exactly job_run_bytes_max is accepted and one byte more is refused" {

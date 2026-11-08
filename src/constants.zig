@@ -965,6 +965,20 @@ pub const job_command_words_max: u32 = runtime_command_words_max;
 pub const job_input_env_bytes_max: u32 = 64;
 /// Labels of a job: `runtime_labels_max` less `zcube.replica` and `zcube.job`.
 pub const job_labels_max: u32 = runtime_labels_max - 2;
+/// The bounds of a job's `limits`, those of Zigbox's runtime (`zigbox` `constants.zig`): a value
+/// outside them would be refused when the run starts, long after the job was accepted.
+/// Mirrors Zigbox's `limit_cpu_millis_min`.
+pub const job_limit_cpu_millis_min: u32 = 10;
+/// Mirrors Zigbox's `limit_cpu_millis_max`.
+pub const job_limit_cpu_millis_max: u32 = 1_024_000;
+/// Mirrors Zigbox's `limit_memory_bytes_min`.
+pub const job_limit_memory_bytes_min: u64 = 4 * 1024 * 1024;
+/// Mirrors Zigbox's `limit_memory_bytes_max`.
+pub const job_limit_memory_bytes_max: u64 = 1 << 40;
+/// Mirrors Zigbox's `limit_pids_min`.
+pub const job_limit_pids_min: u32 = 1;
+/// Mirrors Zigbox's `limit_pids_max`.
+pub const job_limit_pids_max: u32 = 4_194_304;
 /// A deadline counts from the start; a run not claimed by its `start_by_ms` (the same length from
 /// creation) ends `failed deadline`. A job with no deadline is a service, so 0 is refused.
 pub const job_deadline_ms_max: u64 = 24 * 60 * 60 * 1000;
