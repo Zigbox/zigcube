@@ -415,9 +415,31 @@ const Work = struct {
                 // No start record to say; the run's own grace, if it is still served.
                 const grace = if (work.run_of(subject.id)) |entry| entry.rec.grace_ms else 0;
                 try work.stop(present, grace);
+            } else switch (present.status) {
+                // The container already ended and its exit is known: report that, not `lost`.
+                .stopped => |reason| return work.exited_unrecorded(subject, reason, seen),
+                .starting, .running => unreachable, // `is_running` was false.
             }
         }
         try work.lost(subject, null, seen, .missing);
+    }
+
+    /// A stopped container and no start record: its exit is the answer, with no stop cause.
+    fn exited_unrecorded(
+        work: *Work,
+        subject: Subject,
+        reason: runtime.ExitReason,
+        seen: ?*const records.JobObserved,
+    ) Error!void {
+        // Under the run's current assignment, like `lost`: the epoch of an older observation is
+        // one the store refuses once the run was assigned again, on every pass after (seed 893).
+        const epoch = report_epoch(subject, null) orelse return;
+        if (seen) |existing| {
+            if (existing.status == .stopped) return;
+        }
+        var wanted: Report = .{ .run = subject.id, .status = .stopped, .epoch = epoch };
+        try work.apply_exit(&wanted, reason);
+        try work.report(wanted);
     }
 
     const Why = enum { missing, damaged, vanished };
@@ -856,12 +878,51 @@ const Work = struct {
         if (runtime.spec_problem(&spec)) |problem| {
             return work.cannot_start(subject, record, .{ .spec = problem });
         }
-        const outcome = try ctx.runtime.start(&spec, ctx.diag);
+        const outcome = ctx.runtime.start(&spec, ctx.diag) catch |err| switch (err) {
+            // The runtime returned an error, which does not say that nothing runs: the
+            // supervisor may be up already (RB-N4).
+            error.RuntimeFailed, error.NotFound => |failed| {
+                return work.start_errored(subject, record, failed);
+            },
+        };
         switch (outcome) {
             .started => {},
             .failed => |failure| try work.apply_exit(&wanted, .{ .start_failed = failure }),
         }
         try work.report(wanted);
+    }
+
+    /// `runtime.start` returned an error with its diagnostic in `ctx.diag`. If the runtime
+    /// lists no container of this run (or cannot be asked), nothing started and the run ends as
+    /// a start failure with that diagnostic. If it lists one, the run is executing: it is not
+    /// reported, the error goes to the caller with its diagnostic, the record stays `claimed`
+    /// and the next pass adopts the container through `container`, as it did before RB-N4.
+    fn start_errored(work: *Work, subject: Subject, record: StartRecord, err: Error) Error!void {
+        const ctx = work.ctx;
+        if (work.container_up(subject.id)) return err;
+        var finished: Diagnostic = undefined;
+        diag_mod.to_diagnostic(&finished, ctx.diag);
+        ctx.diag.reset();
+        try work.report(.{
+            .run = subject.id,
+            .status = .stopped,
+            .epoch = record.epoch,
+            .exit = .{ .kind = .start_failed },
+            .diagnostic = try records.diagnostic_raw(ctx.arena, &finished, ctx.diag),
+        });
+    }
+
+    /// Whether the runtime lists a container named `name`, asked with a diagnostic of its own
+    /// so the start error's stays intact. A runtime that cannot list is taken to hold none
+    /// only when `start` had said so: here it is taken to hold one, so nothing is misreported.
+    fn container_up(work: *Work, name: []const u8) bool {
+        var scratch: Diag = undefined;
+        scratch.reset();
+        const listed = work.ctx.runtime.list(work.ctx.arena, &scratch) catch return true;
+        for (listed) |*listing| {
+            if (std.mem.eql(u8, listing.handle.name(), name)) return true;
+        }
+        return false;
     }
 
     const Refusal = union(enum) {
