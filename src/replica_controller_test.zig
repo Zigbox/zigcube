@@ -281,7 +281,8 @@ test "an applied service gets its replicas, placed on the node, each with a deci
     try testing.expectEqualStrings(expected, chain.items);
     var service_chain = try fixture.decisions(.service, "hello");
     defer service_chain.deinit(testing.allocator);
-    try testing.expectEqualStrings("apply<desired;scale_up<desired;", service_chain.items);
+    const want = "apply<desired;scale_up<desired;scale_up<desired;";
+    try testing.expectEqualStrings(want, service_chain.items);
 }
 
 test "a replica whose container was killed is replaced, and the decisions say why" {
@@ -315,7 +316,8 @@ test "a replica whose container was killed is replaced, and the decisions say wh
     try testing.expectEqualStrings("create_replica<decision;place_replica<decision;", fresh.items);
     var service = try fixture.decisions(.service, "hello");
     defer service.deinit(testing.allocator);
-    const service_chain = "apply<desired;scale_up<desired;replace_replica<decision;";
+    const service_chain =
+        "apply<desired;scale_up<desired;scale_up<desired;replace_replica<decision;";
     try testing.expectEqualStrings(service_chain, service.items);
 }
 
@@ -461,7 +463,7 @@ test "a spec change replaces every replica; deleting the service stops them all"
     try testing.expectEqual(@as(usize, 0), gone.len);
     var chain = try fixture.decisions(.service, "hello");
     defer chain.deinit(testing.allocator);
-    const tail = "delete_service<desired;scale_down<desired;";
+    const tail = "delete_service<desired;scale_down<desired;scale_down<desired;";
     try testing.expect(std.mem.endsWith(u8, chain.items, tail));
 }
 
@@ -564,7 +566,7 @@ test "a pass stops after one batch and says it has more to do" {
     try testing.expectEqual(fixture.manual.ms, first.at_ms);
     const partial = try fixture.ids("hello");
     defer Fixture.free_ids(partial);
-    try testing.expectEqual(@as(usize, 3), partial.len);
+    try testing.expectEqual(@as(usize, 2), partial.len);
     _ = try fixture.settle();
     const done = try fixture.ids("hello");
     defer Fixture.free_ids(done);
@@ -1369,10 +1371,11 @@ test "three dead replicas on three ready nodes are all replaced within the compa
     }
 }
 
-test "three failed starts held in one batch fit the compare budget" {
+test "three failed starts are held in batches that fit the compare budget" {
     // Goal: the hold batch compares each report, its assignment and its node, within the
     // budget. Method: all three replicas fail to start for a user reason on three nodes; one
-    // pass writes three holds and nothing panics, a second writes nothing.
+    // pass holds `hold_batch_max` (2, since #177) and nothing panics, the next holds the third,
+    // a third writes nothing.
     var fixture: Fixture = undefined;
     try start_spread(&fixture);
     defer fixture.stop();
@@ -1384,6 +1387,15 @@ test "three failed starts held in one batch fit the compare budget" {
     defer chain.deinit(testing.allocator);
     var holds: u32 = 0;
     var parts = std.mem.splitScalar(u8, chain.items, ';');
+    while (parts.next()) |part| {
+        if (std.mem.startsWith(u8, part, "hold_failed_replica")) holds += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), holds);
+    try testing.expect((try replica_pass(&fixture)) > 0);
+    chain.deinit(testing.allocator);
+    chain = try fixture.decisions(.service, "hello");
+    holds = 0;
+    parts = std.mem.splitScalar(u8, chain.items, ';');
     while (parts.next()) |part| {
         if (std.mem.startsWith(u8, part, "hold_failed_replica")) holds += 1;
     }

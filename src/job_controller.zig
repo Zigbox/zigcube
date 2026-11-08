@@ -74,6 +74,7 @@ const resync_ms: u64 = 30 * 1000;
 /// Runs whose node's tenure ended without a `lost` judgement of its own, with the time the
 /// controller first saw it end: one slot for each run that can be live.
 const seen_max = constants.jobs_max;
+const hold_action = "hold_contradictory_job";
 const none: u32 = std.math.maxInt(u32);
 /// Pages of jobs one step can read: the whole retention window, and a page for the end.
 const pages_max = constants.job_admitted_window_max / constants.job_controller_page_max + 2;
@@ -634,7 +635,7 @@ const Pass = struct {
     ) Error!void {
         const ctx = pass.ctx;
         const name = job.rec.name;
-        if (try has_decision(ctx, name, "hold_contradictory_job", job.kv.mod_revision)) return;
+        if (try has_decision(ctx, name, hold_action, job.kv.mod_revision)) return;
         const what = if (run == null and status == null)
             "has a job_created decision but neither a run nor a status"
         else if (run == null)
@@ -651,7 +652,7 @@ const Pass = struct {
         var batch: Batch = .{};
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "hold_contradictory_job",
+            .action = hold_action,
             .subject = .{ .kind = .job, .name = name },
             .reason = "the job's records contradict each other; nothing about it changes",
             .cause = .{ .kind = .desired, .key = job.kv.key, .revision = job.kv.mod_revision },
@@ -659,6 +660,14 @@ const Pass = struct {
             .read_revision = pass.world.revision,
         }, &batch);
         batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
+        // A job with no run never started and never will (a new run is never made, I8a), so it
+        // takes no `jobs_max` slot: the hold counts it as ended, once per incarnation of the job
+        // (an earlier hold of this incarnation, for another revision of the record, did). A job
+        // that has a run might be placed, so it keeps its slot (#177).
+        if (run == null and !try has_decision(ctx, name, hold_action, job.kv.create_revision)) {
+            const counted = try pass.endings(&batch);
+            batch.put(records.key_job_endings, try records.encode(ctx.arena, counted, ctx.diag));
+        }
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
     }
 
@@ -673,7 +682,7 @@ const Pass = struct {
         var live: ?*const Entry(records.JobObserved) = null;
         var fence: ?*const Entry(records.JobObserved) = null;
         const claim_seen: ?*const Entry(records.JobObserved) = switch (try pass.claim(job, run)) {
-            .held => return,
+            .unreadable => return pass.judge_unreadable(job, run, status),
             .none => null,
             .seen => |entry| entry,
         };
@@ -703,9 +712,10 @@ const Pass = struct {
     /// What the node the run is assigned to reported of it, if anything.
     const Claim = union(enum) {
         none,
-        /// The report does not decode (ZC-E0301/E0303): the job is held with one decision and
-        /// left as it was, and the caller stops judging it.
-        held,
+        /// The report does not decode (ZC-E0301/E0303): one decision says so, and the caller
+        /// judges the run without it (`judge_unreadable`): the report cannot move the run, but it
+        /// cannot hold back a cancel or a lost node either.
+        unreadable,
         seen: *const Entry(records.JobObserved),
     };
 
@@ -722,7 +732,7 @@ const Pass = struct {
         const rec = records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch |err| {
             if (err != error.Malformed) return err;
             try pass.hold_unreadable_report(job, &kv);
-            return .held;
+            return .unreadable;
         };
         if (!std.mem.eql(u8, rec.run, run.rec.id)) return .none;
         const entry = ctx.arena.create(Entry(records.JobObserved)) catch
@@ -953,14 +963,49 @@ const Pass = struct {
             pass.wake_at_ms = @min(pass.wake_at_ms, run.rec.start_by_ms +| 1);
             return null;
         };
-        const node = assigned_node(placed.kv.key);
-        const judged = pass.world.node_status(node) orelse return null;
-        if (judged.rec.state != .lost) return null;
-        if (pass.world.node_entry(node)) |entry| {
-            if (entry.kv.mod_revision > judged.rec.tenure) return null;
-        }
-        if (!pass.past_grace(judged.rec.at_ms)) return null;
+        if (!pass.node_lost(assigned_node(placed.kv.key))) return null;
         return .@"unreachable";
+    }
+
+    /// The node's judgement is `lost` for the tenure it still holds, and the grace is over.
+    fn node_lost(pass: *Pass, node: []const u8) bool {
+        const judged = pass.world.node_status(node) orelse return false;
+        if (judged.rec.state != .lost) return false;
+        if (pass.world.node_entry(node)) |entry| {
+            if (entry.kv.mod_revision > judged.rec.tenure) return false;
+        }
+        return pass.past_grace(judged.rec.at_ms);
+    }
+
+    /// The node's report of the run does not decode, so what it claims is not known. Nothing it
+    /// says moves the run, but the run does not wait on it: a running run is judged as ever; a
+    /// cancel, or a node lost past the grace, writes the stop; and once a stop exists and the node
+    /// is lost the run ends `failed unknown`, as a stopped report that maps to no ending does
+    /// (RB-S8): it may have started, and nothing readable says how it went. While the node is
+    /// alive the run waits for its next report, which replaces the unreadable one.
+    fn judge_unreadable(
+        pass: *Pass,
+        job: *const Entry(records.Job),
+        run: *const Entry(records.JobRun),
+        status: *const Entry(records.JobStatus),
+    ) Error!void {
+        if (status.rec.state == .running) return pass.judge_running(job, run, status);
+        const placed = pass.world.assignment(run.rec.id) orelse return;
+        const node = assigned_node(placed.kv.key);
+        const stop = run.rec.stop orelse {
+            if (job.rec.cancel_requested != null) {
+                return pass.write_stop(job, run, status, .cancel);
+            }
+            if (pass.node_lost(node)) return pass.write_stop(job, run, status, .@"unreachable");
+            return;
+        };
+        if (!pass.node_lost(node)) return;
+        try pass.end(job, run, status, .{
+            .ending = failed(.unknown, stop_cause_of(stop.cause)),
+            .reason = "the node was lost and its report of the run does not decode",
+            .report = null,
+            .node = node,
+        });
     }
 
     fn write_stop(
