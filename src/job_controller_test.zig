@@ -316,6 +316,71 @@ test "a job that has a job_created decision and no run is contradictory and neve
     try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
 }
 
+test "a held job with no run frees its jobs_max slot once, however often it is held (#177)" {
+    // Goal: a contradictory job that never had a run counts as ended, so `admitted - ended` stops
+    // charging it against `jobs_max`. Method: hold it, check the count of endings is 1; a pass
+    // again and a new revision of the job record (a second hold decision) leave it at 1.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u64, 0), try f.endings());
+    const ctx = f.context();
+    const gone = [_]store.Op{
+        .{ .delete = records.job_run_key("train").slice() },
+        .{ .delete = records.job_status_key("train").slice() },
+    };
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &f.diag);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+    try f.job("train", 61 * 1000, false); // A new revision of the record.
+    _ = try f.pass();
+    try testing.expectEqual(@as(u32, 2), try f.decisions("train", "hold_contradictory_job"));
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+}
+
+test "a held job with no run but a placed or running status keeps its jobs_max slot (#190)" {
+    // Goal: only a job that never started frees its slot. A status that says `placed` or
+    // `running` means a run may exist somewhere, so the hold must not count the job as ended.
+    // Method: for each state, create the job, delete its run, rewrite the status, hold it.
+    for ([_]records.JobState{ .placed, .running }) |state| {
+        var f: Fixture = undefined;
+        try f.start();
+        defer f.stop();
+        try f.job("train", 60 * 1000, false);
+        try testing.expectEqual(@as(u32, 1), try f.pass());
+        const ctx = f.context();
+        const gone = [_]store.Op{.{ .delete = records.job_run_key("train").slice() }};
+        _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &f.diag);
+        try f.put(.job_controller, records.job_status_key("train").slice(), records.JobStatus{
+            .state = state,
+            .reported_at_ms = f.manual.ms,
+        });
+        try testing.expectEqual(@as(u32, 1), try f.pass());
+        try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
+        try testing.expectEqual(@as(u64, 0), try f.endings());
+    }
+}
+
+test "a held job that has a run keeps its jobs_max slot (#177)" {
+    // Goal: a run without a status might still be placed, so its slot is not released.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const ctx = f.context();
+    const gone = [_]store.Op{.{ .delete = records.job_status_key("train").slice() }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &f.diag);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
+    try testing.expectEqual(@as(u64, 0), try f.endings());
+}
+
 test "a run without a status is contradictory and changes nothing" {
     var f: Fixture = undefined;
     try f.start();
@@ -768,6 +833,64 @@ test "a report that does not decode leaves the replicas reconciling (RB-S7, clai
     try replicas_still_reconcile(&f, &plane);
     try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
     try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+}
+
+test "a running run whose report does not decode still takes a cancel and a lost node" {
+    // Goal: #175 re-review. An unreadable report holds the run (the hold decision, once) but not
+    // for ever. Method: `train` runs on n1, its report is corrupted, then the job is cancelled:
+    // the stop is written though the report is unreadable. The node is then lost: inside the grace
+    // nothing changes; past it the run ends `failed unreachable`, which the earlier code (it
+    // returned at the hold) never wrote.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.running("train");
+    try corrupt(&f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the hold decision
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+    try f.job("train", 60 * 1000, true);
+    f.manual.ms += 3600 * 1000;
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the cancel's stop
+    try testing.expectEqual(records.RunStopCause.cancel, (try f.read_run("train")).?.stop.?.cause);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // the node is alive: the run waits
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+    try f.node_status("n1", .lost);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // inside the grace
+    f.manual.ms += 1001;
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const status = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expectEqual(records.JobFailure.@"unreachable", status.end.?.cause.?);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+}
+
+test "a claimed run whose report does not decode ends failed unknown when its node is lost" {
+    // Goal: the same, for a run not yet marked running. Method: n1 claimed `train`, the claim is
+    // then corrupted. Nothing readable says whether it started, so a cancel writes the stop and
+    // the lost node ends the run `failed unknown` (RB-S8), never `cancelled` or `not started`.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.node("n1", .ready);
+    try f.job("train", 600 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.assign("n1", "train");
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // placed
+    try f.report("n1", "train", .claimed, null, null);
+    try corrupt(&f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the hold decision
+    try f.job("train", 600 * 1000, true);
+    try testing.expectEqual(@as(u32, 1), try f.pass()); // the cancel's stop
+    try testing.expect((try f.read_run("train")).?.stop != null);
+    try testing.expectEqual(@as(u32, 0), try f.pass()); // node ready: not ended as unstarted
+    try testing.expectEqual(records.JobState.placed, (try f.read_status("train")).?.state);
+    try f.node_status("n1", .lost);
+    f.manual.ms += 1001;
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const status = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, status.state);
+    try testing.expectEqual(records.JobFailure.unknown, status.end.?.cause.?);
+    try testing.expectEqual(@as(u32, 0), try f.pass());
 }
 
 test "a late report that does not decode leaves the replicas reconciling (RB-S7)" {

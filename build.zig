@@ -1116,9 +1116,15 @@ const c1_teeth_roots = [_]struct {
     root: []const u8,
     symptom: []const u8,
     canary_seeds: u32,
-    /// Seeds the negative test runs (it stops at the first that fails). The offline world fails
-    /// J8 on about one seed in seven, so ten seeds were a coin flip that any change of the
-    /// draws could lose (#171: its first hit moved from seed 10 to 13).
+    /// The first seed `sim-c1-teeth-NAME` runs. The test stops at the first failing seed and
+    /// that one must show `symptom`, unless `any_symptom`: then seeds that fail otherwise (the
+    /// skew world fails on convergence at some seeds since #177) are skipped, and some seed in
+    /// the range must show `symptom`.
+    first_seed: u32 = 1,
+    any_symptom: bool = false,
+    /// The last seed the negative test runs (it stops at the first that fails). The offline
+    /// world fails J8 on about one seed in seven, so ten seeds were a coin flip that any change
+    /// of the draws could lose (#171: its first hit moved from seed 10 to 13).
     seeds: u32 = teeth_seeds_max,
     /// Operations of a run; the worlds of the two teeth outside `c1_teeth_operations` need more.
     ops: u32 = c1_teeth_operations,
@@ -1146,6 +1152,7 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_skew_main.zig",
         .symptom = "I1b",
         .canary_seeds = 30,
+        .any_symptom = true,
     },
     .{
         .name = "wedge",
@@ -1300,11 +1307,14 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
             }),
         });
         const teeth_run = b.addRunArtifact(teeth_exe);
+        const seeds = b.fmt("{d}..{d}", .{ entry.first_seed, entry.seeds });
+        const symptom = b.fmt("--expect-symptom={s}", .{entry.symptom});
         teeth_run.addArgs(&.{
-            "--seeds",                  b.fmt("1..{d}", .{entry.seeds}),
+            "--seeds",                  seeds,
             b.fmt("{d}", .{entry.ops}), "--c1",
-            "--expect-fail",            b.fmt("--expect-symptom={s}", .{entry.symptom}),
+            "--expect-fail",            symptom,
         });
+        if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);

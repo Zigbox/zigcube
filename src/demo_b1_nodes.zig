@@ -19,6 +19,7 @@ pub fn adoption(demo: *Demo) !void {
     });
     _ = try state.run_job(host, "adopt", &.{}, script);
     try state.wait_state(host, "adopt", "running", state.job_wait_ms);
+    try wait_marker(host, mark);
     const index = try state.node_index(host, try state.need_job(host, "adopt"));
     const name = fleet_mod.names[index];
     try state.wait_runs_on(demo, index, "adopt-job");
@@ -41,6 +42,20 @@ pub fn adoption(demo: *Demo) !void {
 
 const Ready = struct { index: usize };
 
+const Marker = struct { path: []const u8 };
+
+/// True once the job's command has run its `echo start >> marker`. The server reads `running` when
+/// the agent has started the supervisor, which can be before `sh` has run its first command.
+fn marker_written(want: Marker, host: *Host) !bool {
+    const text = std.Io.Dir.cwd().readFileAlloc(host.io, want.path, host.arena(), .limited(4096));
+    return state.lines_with(text catch "", "start") >= 1;
+}
+
+fn wait_marker(host: *Host, path: []const u8) !void {
+    const want: Marker = .{ .path = path };
+    try host.wait_for(want, marker_written, "the command to write its marker", state.job_wait_ms);
+}
+
 fn node_ready(want: Ready, host: *Host) !bool {
     const rows = (try state.c1.node_rows(host)) orelse return false;
     const row = state.c1.find_node(rows, fleet_mod.names[want.index]) orelse return false;
@@ -55,6 +70,7 @@ pub fn power_off(demo: *Demo) !void {
     const script = try std.fmt.allocPrint(host.arena(), "echo start >> {s}; sleep 300", .{mark});
     _ = try state.run_job(host, "doomed", &.{}, script);
     try state.wait_state(host, "doomed", "running", state.job_wait_ms);
+    try wait_marker(host, mark);
     const index = try state.node_index(host, try state.need_job(host, "doomed"));
     const other = 1 - index;
     const name = fleet_mod.names[index];

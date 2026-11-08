@@ -50,7 +50,9 @@ pub fn apply(demo: *Demo) !void {
     try expect_supervised(demo, 3);
     try decisions.expect_new(demo, "step 1", &.{
         .{ .actor = "api", .action = "apply", .count = 1 },
-        .{ .actor = "replica-controller", .action = "scale_up", .count = 1 },
+        // Three replicas take two transactions (a transaction holds two creations), so two
+        // scale_up decisions: the second counts the two that exist.
+        .{ .actor = "replica-controller", .action = "scale_up", .count = 2 },
         .{ .actor = "replica-controller", .action = "create_replica", .count = 3 },
         .{ .actor = "scheduler", .action = "place_replica", .count = 3 },
     });
@@ -323,7 +325,8 @@ fn scale_down(demo: *Demo, five: []const Pids) !void {
     try host.check(stopped == 3, "3 processes stopped on the host (their commands are gone)", .{});
     try decisions.expect_new(demo, "step 3 (down)", &.{
         .{ .actor = "api", .action = "apply", .count = 1 },
-        .{ .actor = "replica-controller", .action = "scale_down", .count = 1 },
+        // Three stops take two transactions, so two scale_down decisions (5 to 3, then 3 to 2).
+        .{ .actor = "replica-controller", .action = "scale_down", .count = 2 },
         .{ .actor = "replica-controller", .action = "stop_replica", .count = 3 },
         .{ .actor = "scheduler", .action = "release_replica", .count = 3 },
     });
