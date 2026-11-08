@@ -59,6 +59,9 @@ pub const SwitchedStore = struct {
     /// be reached does (ZC-E0201), while every other call is answered; test-only, null in every
     /// simulation.
     down_write_prefix: ?[]const u8 = null,
+    /// A transaction that puts a key under this prefix is answered as a server answers a write
+    /// under a tenure that has ended (ZC-E0510); test-only, null in every simulation.
+    tenure_ended_put_prefix: ?[]const u8 = null,
     /// A keepalive is answered with this ttl in place of the lease's own, as an older server run
     /// with a short `--lease-ttl-ms` does; test-only, null in every simulation.
     keepalive_ttl_ms: ?u32 = null,
@@ -184,6 +187,16 @@ pub const SwitchedStore = struct {
                 if (op != .put) continue;
                 if (!std.mem.startsWith(u8, op.put.key, prefix)) continue;
                 @import("agent_client.zig").raise_bad_reply(diag, "the server refused the write");
+                return error.BackendFailed;
+            }
+        }
+        if (self.tenure_ended_put_prefix) |prefix| {
+            for (request.on_success) |op| {
+                if (op != .put) continue;
+                if (!std.mem.startsWith(u8, op.put.key, prefix)) continue;
+                diag.raise(.E0510);
+                diag.cause("the simulated server ended this tenure", .{});
+                diag.fix(.{ .sentence = "the agent registers the node again" });
                 return error.BackendFailed;
             }
         }
