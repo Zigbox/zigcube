@@ -59,11 +59,11 @@ pub fn key_copy(ctx: *const Context, key: *const records.Key) Error![]const u8 {
 // ---- Transactions of bounded size ------------------------------------------------------------
 
 /// What one `put_decision` adds to a batch, at most: the decision, its index entry and its
-/// summary (`/decision-summaries/`), and the summary's compare. A second decision for the same
-/// summary in one batch adds two operations and no compare. Every batch bound that holds
-/// decisions is derived from these.
+/// summary (`/decision-summaries/`), and two compares: the decision's id is absent (#177) and the
+/// summary's revision. A second decision for the same summary in one batch adds two operations
+/// and one compare. Every batch bound that holds decisions is derived from these.
 pub const decision_ops: u32 = 3;
-pub const decision_compares: u32 = 1;
+pub const decision_compares: u32 = 2;
 
 /// Summaries one batch can hold: every one has a decision, which takes `decision_ops`.
 const summaries_max = constants.store_txn_ops_max / decision_ops;
@@ -78,7 +78,7 @@ const SummarySlot = struct {
 comptime {
     assert(summaries_max > 0);
     assert(decision_ops >= 3);
-    assert(decision_compares == 1);
+    assert(decision_compares == 2);
     assert(decision_compares * summaries_max <= constants.store_txn_compares_max);
 }
 
@@ -454,7 +454,7 @@ pub const DecisionSpec = struct {
 };
 
 /// Adds a decision, its by-subject index entry and the update of its summary to `batch` (at most
-/// `decision_ops` operations and `decision_compares` compare) and returns its id. The decision
+/// `decision_ops` operations and `decision_compares` compares) and returns its id. The decision
 /// is committed with the action it records, or not at all. The summary is read here and compared
 /// at the revision read (0: absent), so its count is exact: a concurrent writer of the same
 /// summary makes the transaction a conflict. A second decision for the same summary in one batch
@@ -498,7 +498,11 @@ pub fn put_decision(
     };
     const decision_at = records.decision_key(id.slice());
     const index_at = records.index_key(spec.subject.kind, spec.subject.name, id.slice());
-    batch.put(try key_copy(ctx, &decision_at), try records.encode(ctx.arena, decision, ctx.diag));
+    // The id must be new: a collision (same instance, millisecond and counter) would overwrite an
+    // earlier decision, which is immutable. The compare turns it into a conflict and a rerun.
+    const decision_key = try key_copy(ctx, &decision_at);
+    batch.expect(decision_key, 0);
+    batch.put(decision_key, try records.encode(ctx.arena, decision, ctx.diag));
     batch.put(try key_copy(ctx, &index_at), try records.encode(ctx.arena, entry, ctx.diag));
     try count_decision(ctx, batch, spec, &decision);
     return id;
@@ -639,9 +643,10 @@ test "a commit whose compare fails reports a conflict and writes nothing" {
     try testing.expectEqual(@as(Revision, 0), status.revision);
 }
 
-test "two decisions for one summary in a batch make one put and one compare, counted twice" {
+test "two decisions for one summary in a batch make one put and three compares, counted twice" {
     // Goal: put_decision's merge. Method: two decisions with one subject, action and kind of
-    // cause in one batch: 2 x (record, index) + one summary put, one compare; after the commit
+    // cause in one batch: 2 x (record, index) + one summary put; compares: each id absent, one
+    // summary revision; after the commit
     // the summary counts 2 and names the newer decision.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -671,7 +676,7 @@ test "two decisions for one summary in a batch make one put and one compare, cou
     manual.ms += 5;
     const newer = try put_decision(&ctx, &source, spec, &batch);
     try testing.expectEqual(@as(u32, 5), batch.ops_count);
-    try testing.expectEqual(@as(u32, 1), batch.compares_count);
+    try testing.expectEqual(@as(u32, 3), batch.compares_count);
     try testing.expectEqual(@as(u32, 1), batch.summaries_count);
     try testing.expect((try commit(&ctx, .replica_controller, &batch)) == .applied);
     const key = records.summary_key(.replica, "hello-1", "create_replica", .desired);
@@ -680,6 +685,50 @@ test "two decisions for one summary in a batch make one put and one compare, cou
     try testing.expectEqual(@as(u64, 2), summary.count);
     try testing.expectEqualStrings(newer.slice(), summary.newest);
     try testing.expectEqual(@as(u64, 1761350000128), summary.last_at_ms);
+}
+
+test "a decision id that already exists is a conflict and the old record stays (#177)" {
+    // Goal: an id collision cannot overwrite an audit record. Method: commit a decision, reset the
+    // source's counter so the next id repeats (same instance, millisecond, counter), plan another
+    // decision with different content and commit: a conflict, and the first record is unchanged.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    const first_source: DecisionSource = .{ .instance = 1 };
+    var source = first_source;
+    var batch: Batch = .{};
+    const spec: DecisionSpec = .{
+        .actor = "replica-controller",
+        .action = "create_replica",
+        .subject = .{ .kind = .replica, .name = "hello-1" },
+        .reason = "first",
+        .cause = .{ .kind = .desired, .key = "/services/hello", .revision = 1 },
+    };
+    const first = try put_decision(&ctx, &source, spec, &batch);
+    try testing.expect((try commit(&ctx, .replica_controller, &batch)) == .applied);
+    source = first_source;
+    var again: Batch = .{};
+    var other = spec;
+    other.reason = "second";
+    const second = try put_decision(&ctx, &source, other, &again);
+    try testing.expectEqualStrings(first.slice(), second.slice());
+    try testing.expect((try commit(&ctx, .replica_controller, &again)) == .conflict);
+    const key = records.decision_key(first.slice());
+    const got = try ctx.store.get(ctx.arena, key.slice(), null, &diag);
+    const record = try records.read(records.Decision, ctx.arena, got.kv.?, &diag);
+    try testing.expectEqualStrings("first", record.reason);
 }
 
 test "a summary written by another controller between plan and commit is a conflict" {

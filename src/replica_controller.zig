@@ -60,7 +60,7 @@ pub const actor = "replica-controller";
 /// Replicas one transaction creates or removes: `decision_ops` operations for the service
 /// decision, `decision_ops + 1` for each replica (its decision, and the replica record or its
 /// delete), and 1 for the counter.
-const batch_replicas_max: u32 = 3;
+const batch_replicas_max: u32 = 2;
 /// Distinct nodes whose judgement one removing transaction rests on (a lost node, or a ready one
 /// a cited report came from): each costs two compares (its status and its `/nodes` record),
 /// which a batch of `batch_replicas_max` replicas on three nodes would push past
@@ -68,7 +68,7 @@ const batch_replicas_max: u32 = 3;
 const judged_nodes_batch_max: u32 = 2;
 /// Holds one transaction writes: three compares each (the summary, the report, the assignment)
 /// and two for its node, which `store_txn_compares_max` allows for this many.
-const hold_batch_max: u32 = 3;
+const hold_batch_max: u32 = 2;
 const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{
@@ -83,8 +83,8 @@ pub const watch_prefixes = [_][]const u8{
 comptime {
     const decision = controller.decision_ops;
     assert(decision + batch_replicas_max * (decision + 1) + 1 <= constants.store_txn_ops_max);
-    // A batch of one more replica would not fit: the bound moved with the summaries.
-    assert(decision + (batch_replicas_max + 1) * (decision + 1) + 1 > constants.store_txn_ops_max);
+    // The operations no longer bind (the decision's own compare does, below): one more replica
+    // would fit them but not the compares.
     // The service, the counter and the service decision's summary; per replica its key, its
     // assignment and its decision's summary; and per lost node, once however many of its
     // replicas the batch removes, the node's status and its `/nodes` record.
@@ -96,6 +96,8 @@ comptime {
     // One more lost node would not fit, so the limit is what the store allows, not slack.
     assert(fixed + batch_replicas_max * per_replica +
         (judged_nodes_batch_max + 1) * per_judged_node > constants.store_txn_compares_max);
+    assert(fixed + (batch_replicas_max + 1) * per_replica +
+        judged_nodes_batch_max * per_judged_node > constants.store_txn_compares_max);
     assert(judged_nodes_batch_max <= batch_replicas_max);
     const per_hold = controller.decision_compares + 2 + per_judged_node;
     assert(hold_batch_max * per_hold <= constants.store_txn_compares_max);
