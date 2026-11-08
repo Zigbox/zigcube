@@ -340,7 +340,7 @@ fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Err
         readable.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
             return failures.no_memory(ctx.diag);
     }
-    var jobs: []const Entry(records.Job) = readable.items;
+    const jobs: []const Entry(records.Job) = readable.items;
     var world: World = .{
         .revision = shared.revision,
         .jobs = jobs,
