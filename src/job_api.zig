@@ -131,7 +131,7 @@ fn validate_env(ctx: *const Context, input: Input) Error!void {
         });
     }
     var bytes: usize = 0;
-    for (input.env, 0..) |pair, index| {
+    for (input.env) |pair| {
         const name = pair[0];
         if (name.len == 0) return refuse(ctx, "env", "a variable has no name", .{});
         if (has_nul(name) or has_nul(pair[1])) {
@@ -139,11 +139,6 @@ fn validate_env(ctx: *const Context, input: Input) Error!void {
         }
         if (std.mem.indexOfScalar(u8, name, '=') != null) {
             return refuse(ctx, "env", "the name {s} holds '='", .{name});
-        }
-        for (input.env[0..index]) |earlier| {
-            if (std.mem.eql(u8, earlier[0], name)) {
-                return refuse(ctx, "env", "{s} is set twice", .{name});
-            }
         }
         bytes += name.len + pair[1].len;
     }
@@ -184,57 +179,75 @@ fn validate_labels(ctx: *const Context, input: Input) Error!void {
             return refuse(ctx, "labels", "the key {s} holds '='", .{pair[0]});
         }
     }
-    for (input.labels, 0..) |pair, index| {
-        for (input.labels[0..index]) |earlier| {
+}
+
+/// What `legacy_problem` found. Jobs stored before #178 may carry any of these; a retry of one is
+/// still a retry (`create`), and anything else is refused.
+const Problem = union(enum) {
+    twice: struct { field: []const u8, name: []const u8 },
+    range: struct { field: []const u8, min: u64, max: u64, value: u64 },
+};
+
+fn range_problem(field: []const u8, value: anytype, min: u64, max: u64) ?Problem {
+    const given: u64 = value orelse return null;
+    if (given >= min and given <= max) return null;
+    return .{ .range = .{ .field = field, .min = min, .max = max, .value = given } };
+}
+
+fn repeated_key(field: []const u8, pairs: []const records.Pair) ?Problem {
+    for (pairs, 0..) |pair, index| {
+        for (pairs[0..index]) |earlier| {
             if (std.mem.eql(u8, earlier[0], pair[0])) {
-                return refuse(ctx, "labels", "{s} is set twice", .{pair[0]});
+                return .{ .twice = .{ .field = field, .name = pair[0] } };
             }
         }
     }
+    return null;
 }
 
-fn limits_in_bounds(limits: records.JobLimits) bool {
-    if (limits.cpu_millis) |value| {
-        if (value < constants.job_limit_cpu_millis_min) return false;
-        if (value > constants.job_limit_cpu_millis_max) return false;
-    }
-    if (limits.memory_bytes) |value| {
-        if (value < constants.job_limit_memory_bytes_min) return false;
-        if (value > constants.job_limit_memory_bytes_max) return false;
-    }
-    if (limits.pids) |value| {
-        if (value < constants.job_limit_pids_min) return false;
-        if (value > constants.job_limit_pids_max) return false;
-    }
-    return true;
+/// The checks that a job stored before #178 may fail: a repeated env or labels key, and limits
+/// outside their bounds. The one place that lists the bounds, so `create` and `validate` cannot
+/// disagree about whether there is a problem.
+fn legacy_problem(input: Input) ?Problem {
+    return spec_problem(input.env, input.labels, input.limits);
 }
 
-fn validate_limits(ctx: *const Context, limits: records.JobLimits) Error!void {
-    if (limits.cpu_millis) |value| {
-        if (value < constants.job_limit_cpu_millis_min or
-            value > constants.job_limit_cpu_millis_max)
-        {
-            return refuse(ctx, "limits.cpu_millis", "must be {d} to {d}, it is {d}", .{
-                constants.job_limit_cpu_millis_min, constants.job_limit_cpu_millis_max, value,
-            });
-        }
+fn spec_problem(env: []const records.Pair, labels: []const records.Pair, limits: anytype) ?Problem {
+    if (repeated_key("env", env)) |problem| return problem;
+    if (repeated_key("labels", labels)) |problem| return problem;
+    const c = constants;
+    const checks = [_]?Problem{
+        range_problem(
+            "limits.cpu_millis",
+            limits.cpu_millis,
+            c.job_limit_cpu_millis_min,
+            c.job_limit_cpu_millis_max,
+        ),
+        range_problem(
+            "limits.memory_bytes",
+            limits.memory_bytes,
+            c.job_limit_memory_bytes_min,
+            c.job_limit_memory_bytes_max,
+        ),
+        range_problem("limits.pids", limits.pids, c.job_limit_pids_min, c.job_limit_pids_max),
+    };
+    for (checks) |check| {
+        if (check) |problem| return problem;
     }
-    if (limits.memory_bytes) |value| {
-        if (value < constants.job_limit_memory_bytes_min or
-            value > constants.job_limit_memory_bytes_max)
-        {
-            return refuse(ctx, "limits.memory_bytes", "must be {d} to {d}, it is {d}", .{
-                constants.job_limit_memory_bytes_min, constants.job_limit_memory_bytes_max, value,
-            });
-        }
+    return null;
+}
+
+fn refuse_problem(ctx: *const Context, problem: Problem) error{Refused} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0130);
+    switch (problem) {
+        .twice => |twice| ctx.diag.cause("{s}: {s} is set twice", .{ twice.field, twice.name }),
+        .range => |range| ctx.diag.cause("{s}: must be {d} to {d}, it is {d}", .{
+            range.field, range.min, range.max, range.value,
+        }),
     }
-    if (limits.pids) |value| {
-        if (value < constants.job_limit_pids_min or value > constants.job_limit_pids_max) {
-            return refuse(ctx, "limits.pids", "must be {d} to {d}, it is {d}", .{
-                constants.job_limit_pids_min, constants.job_limit_pids_max, value,
-            });
-        }
-    }
+    ctx.diag.fix(.{ .sentence = "correct the field and submit the job again" });
+    return error.Refused;
 }
 
 fn validate_input(ctx: *const Context, input: Input) Error!void {
@@ -294,11 +307,11 @@ pub const reserved_name = "watch";
 /// late, and a late retry of a job that does exist is a success (`create` checks it).
 pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     try validate_shape(ctx, input, now_ms);
-    try validate_limits(ctx, input.limits);
+    if (legacy_problem(input)) |problem| return refuse_problem(ctx, problem);
 }
 
-/// Every check of `validate` but the bounds of `limits`, which `create` may skip for a retry of a
-/// job stored before they existed.
+/// Every check of `validate` but `legacy_problem`'s, which `create` skips for a retry of a job
+/// stored before they existed.
 fn validate_shape(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     if (records.name_problem(input.name, constants.service_name_bytes_max) != null) {
         const problem = "must be 1 to {d} lowercase letters, digits or '-' (none at either end)";
@@ -548,17 +561,20 @@ pub fn create(
         .applied_by = input.applied_by,
     };
     const key = records.job_key(input.name);
-    if (!limits_in_bounds(input.limits)) {
-        // A job stored before the bounds existed (#178) may carry limits outside them. Its retry
-        // is still a retry and gets the original answer; any other job, new or different, is
-        // refused for its limits as it always was.
+    if (legacy_problem(input)) |problem| {
+        // A job stored before the bounds and the duplicate-key checks (#178) may break them. Its
+        // retry is still a retry and gets the original answer; any other job, new or different,
+        // is refused for the problem as it always was. A new job never gets in this way: only a
+        // stored job that equals this one answers.
         const stored = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
         if (stored.kv) |kv| {
             const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
-            if (spec_equal(&old, &job)) return .{ .same = old };
+            // Only a stored job with a problem of its own is a legacy one; a modern job and a
+            // retry that repeats a key is a bad request, not a retry.
+            const legacy = spec_problem(old.env, old.labels, old.limits) != null;
+            if (legacy and spec_equal(&old, &job)) return .{ .same = old };
         }
-        try validate_limits(ctx, input.limits);
-        unreachable; // `limits_in_bounds` is false, so `validate_limits` refused above.
+        return refuse_problem(ctx, problem);
     }
     try check_run_size(ctx, &job);
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
@@ -1397,6 +1413,18 @@ test "a job stored before #178 is still found by its retry, whatever its keys an
     retry.limits = stored.limits;
     const again = try create(&ctx, &rig.source, retry);
     try testing.expectEqualStrings("legacy", again.same.name);
+    // Byte-identical, repeated keys and all: the lookup comes before the duplicate-key check.
+    var verbatim = retry;
+    verbatim.env = stored.env;
+    const verbatim_again = try create(&ctx, &rig.source, verbatim);
+    try testing.expectEqualStrings("legacy", verbatim_again.same.name);
+    // A new job with the same repeated keys does not get in this way.
+    var repeated = verbatim;
+    repeated.name = "repeated";
+    repeated.limits = .{};
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, repeated));
+    try testing.expect(std.mem.indexOf(u8, rig.diag.last_cause().?, "A is set twice") != null);
+    try rig.expect_code(.E0130);
     var other = retry;
     other.env = &.{.{ "A", "2" }};
     try testing.expectError(error.Refused, create(&ctx, &rig.source, other));
@@ -1405,6 +1433,63 @@ test "a job stored before #178 is still found by its retry, whatever its keys an
     fresh.name = "fresh";
     try testing.expectError(error.Refused, create(&ctx, &rig.source, fresh));
     try rig.expect_code(.E0130);
+}
+
+fn store_legacy(rig: *Rig, input: Input, mutate: *const fn (*records.Job) void) !void {
+    const ctx = rig.context();
+    _ = try create(&ctx, &rig.source, input);
+    const key = records.job_key(input.name);
+    const kv = (try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag)).kv.?;
+    var stored = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+    mutate(&stored);
+    var batch: controller.Batch = .{};
+    batch.put(key.slice(), try records.encode(ctx.arena, stored, ctx.diag));
+    _ = try controller.commit(&ctx, .api, &batch);
+    rig.manual.advance(31_000);
+}
+
+fn repeat_key(job: *records.Job) void {
+    job.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+}
+
+test "a modern job is not answered as a legacy one: a repeated-key retry is ZC-E0130" {
+    // Goal: the legacy lookup answers `same` only for a stored job with a problem of its own.
+    // Method: store a modern job with env A=1, retry with A=1 twice: 400, store unchanged.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("modern");
+    input.env = &.{.{ "A", "1" }};
+    _ = try create(&ctx, &rig.source, input);
+    const before = (try ctx.store.status(ctx.diag)).revision;
+    var retry = input;
+    retry.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, retry));
+    try rig.expect_code(.E0130);
+    try testing.expectEqual(before, (try ctx.store.status(ctx.diag)).revision);
+}
+
+test "a legacy job with only a repeated key answers its retry, and a split key is refused" {
+    // Goal: #180 edge cases. Method: store a job with a repeated key as its only problem; the
+    // verbatim retry is `same` and writes nothing; a key with two values is ZC-E0130.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("keys");
+    input.env = &.{.{ "A", "1" }};
+    try store_legacy(&rig, input, repeat_key);
+    const before = (try ctx.store.status(ctx.diag)).revision;
+    var verbatim = input;
+    verbatim.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+    try testing.expect((try create(&ctx, &rig.source, verbatim)) == .same);
+    try testing.expectEqual(before, (try ctx.store.status(ctx.diag)).revision);
+    var split = input;
+    split.env = &.{ .{ "A", "1" }, .{ "A", "2" } };
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, split));
+    try rig.expect_code(.E0130);
+    try testing.expectEqual(before, (try ctx.store.status(ctx.diag)).revision);
 }
 
 test "pairs compare as sets: a repeated pair is one pair, a key with two values is not" {
