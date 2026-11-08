@@ -663,8 +663,11 @@ const Pass = struct {
         // A job with no run never started and never will (a new run is never made, I8a), so it
         // takes no `jobs_max` slot: the hold counts it as ended, once per incarnation of the job
         // (an earlier hold of this incarnation, for another revision of the record, did). A job
-        // that has a run might be placed, so it keeps its slot (#177).
-        if (run == null and !try has_decision(ctx, name, hold_action, job.kv.create_revision)) {
+        // that has a run might be placed, so it keeps its slot (#177), and so does one whose status
+        // says `placed` or `running`: only a missing or `pending` status means it never started.
+        const never_started = run == null and
+            (status == null or status.?.rec.state == .pending);
+        if (never_started and !try has_decision(ctx, name, hold_action, job.kv.create_revision)) {
             const counted = try pass.endings(&batch);
             batch.put(records.key_job_endings, try records.encode(ctx.arena, counted, ctx.diag));
         }
@@ -1256,7 +1259,7 @@ const Pass = struct {
             .actor = actor,
             .action = "hold_unreadable_job",
             .subject = .{ .kind = .job, .name = name },
-            .reason = "the node's report of the job does not decode; the job is left as it was",
+            .reason = "its report does not decode; a cancel waits for a good one or a lost node",
             .cause = cause_of(.observed, report),
             .cause_diagnostic = raw,
             .read_revision = pass.world.revision,

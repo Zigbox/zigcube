@@ -343,6 +343,29 @@ test "a held job with no run frees its jobs_max slot once, however often it is h
     try testing.expectEqual(@as(u64, 1), try f.endings());
 }
 
+test "a held job with no run but a placed or running status keeps its jobs_max slot (#190)" {
+    // Goal: only a job that never started frees its slot. A status that says `placed` or
+    // `running` means a run may exist somewhere, so the hold must not count the job as ended.
+    // Method: for each state, create the job, delete its run, rewrite the status, hold it.
+    for ([_]records.JobState{ .placed, .running }) |state| {
+        var f: Fixture = undefined;
+        try f.start();
+        defer f.stop();
+        try f.job("train", 60 * 1000, false);
+        try testing.expectEqual(@as(u32, 1), try f.pass());
+        const ctx = f.context();
+        const gone = [_]store.Op{.{ .delete = records.job_run_key("train").slice() }};
+        _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &f.diag);
+        try f.put(.job_controller, records.job_status_key("train").slice(), records.JobStatus{
+            .state = state,
+            .reported_at_ms = f.manual.ms,
+        });
+        try testing.expectEqual(@as(u32, 1), try f.pass());
+        try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
+        try testing.expectEqual(@as(u64, 0), try f.endings());
+    }
+}
+
 test "a held job that has a run keeps its jobs_max slot (#177)" {
     // Goal: a run without a status might still be placed, so its slot is not released.
     var f: Fixture = undefined;

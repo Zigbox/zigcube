@@ -440,7 +440,7 @@ fn recovered(
 fn expect_outage_decisions(demo: *Demo, stopped: u32, tenure: u64) !void {
     // The lease ended in the outage, so the old tenure is lost (C1 slice 4) and the new one
     // ready. A transaction holds three replicas' changes with their decisions and summaries, so
-    // the replacement deletes both and creates one, and the next pass creates the other as a
+    // the replacement deletes both and creates none, and the next pass creates both as a
     // scale-up. The node controller then removes the records the old tenure left (three: hello's
     // two replicas and the failed broken-1), and the agent reports broken-1 again under the new
     // tenure, so the replica controller holds it once more.
