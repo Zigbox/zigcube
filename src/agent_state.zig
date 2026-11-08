@@ -179,6 +179,14 @@ pub const SimState = struct {
         state.settle();
     }
 
+    /// The state directory is lost: every file is gone (a disk replaced, a directory removed by
+    /// hand). Only between two lives of the agent, so it is crashed and has no write point armed.
+    pub fn wipe(state: *SimState) void {
+        assert(state.crashed);
+        for (state.files.items) |file| state.free_file(file);
+        state.files.clearRetainingCapacity();
+    }
+
     /// The agent has been started again: the files are as the crash left them.
     pub fn restart(state: *SimState) void {
         state.crashed = false;

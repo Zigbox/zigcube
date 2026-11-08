@@ -381,6 +381,9 @@ const Node = struct {
     /// The agent is dead until `restart_at_ms`.
     down: bool,
     restart_at_ms: u64,
+    /// The crash that took the agent down also lost its state directory: the restart finds none
+    /// (RB-S2 c; J2 holds across a lost state directory).
+    wipe_pending: bool = false,
     /// The agent does nothing before this true time (a call in progress, a back-off).
     resume_ms: u64,
     /// How long the calls of the step in progress took.
@@ -473,6 +476,11 @@ const Node = struct {
 
     fn restart(node: *Node) void {
         assert(node.down);
+        if (node.wipe_pending) {
+            node.wipe_pending = false;
+            node.sim.files.wipe();
+            node.cluster.stats.wipes += 1;
+        }
         node.sim.restart();
         node.agent.init(node.config());
         node.loop = agent_loop.Loop.init();
@@ -678,6 +686,9 @@ pub const Stats = struct {
     agent_failures: u32 = 0,
     transactions: u32 = 0,
     crashes_injected: u32 = 0,
+    /// Crashes that also lost the state directory (every 5th, no draw: other worlds keep their
+    /// streams).
+    wipes: u32 = 0,
     /// Calls refused because the agent that made them had crashed.
     dead_calls: u32 = 0,
     partitions: u32 = 0,
@@ -1404,6 +1415,8 @@ pub const Cluster = struct {
         const kind: @import("agent_state.zig").CrashKind =
             if (random.boolean()) .process else .host;
         c.stats.crashes_injected += 1;
+        // No draw: every 5th crash loses the state directory too.
+        if (c.stats.crashes_injected % 5 == 3) node.wipe_pending = true;
         switch (random.uintLessThan(u32, 3)) {
             0 => node.sim.arm_crash(1 + random.uintLessThan(u32, 6), kind),
             1 => node.sim.arm_step(1 + random.uintLessThan(u32, 3), kind),
@@ -3054,9 +3067,9 @@ fn print_summary(c: *Cluster) void {
     });
     report.print("busiest node: {d} steps per up-minute\n", .{busiest_node_rate(c)});
     report.print("faults: crashes={d} partitions={d} outages={d} suspends={d} " ++
-        "runtime={d} server_restarts={d} ack_lost={d}\n", .{
+        "runtime={d} server_restarts={d} ack_lost={d} wipes={d}\n", .{
         s.crashes_injected, s.partitions,      s.outages,             s.suspends,
-        s.runtime_faults,   s.server_restarts, c.ack_loss.lost_count,
+        s.runtime_faults,   s.server_restarts, c.ack_loss.lost_count, s.wipes,
     });
     report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
         s.nodes_marked_lost, s.replicas_marked_lost,
