@@ -105,3 +105,7 @@ comptime {
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
 }
+
+test {
+    _ = @import("zigbox_limits_test.zig");
+}

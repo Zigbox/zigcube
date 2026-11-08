@@ -175,6 +175,7 @@ const World = struct {
             .job_poll_ms = world.job_poll_ms,
             .job_watch_hold_ms = world.job_watch_hold_ms,
             .job_rounds_max = world.job_rounds_max,
+            .round_backing = testing.allocator,
         };
         return cli.run(&env, args);
     }
