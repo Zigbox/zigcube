@@ -62,7 +62,10 @@ pub const Plan = struct {
     unchanged: bool,
 };
 
-/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is read.
+/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is written.
+/// The shape is checked before the store is read; the bounds of `limits` after, because a limit a
+/// stored service already carries is not re-checked. With the store down, a bad limit is therefore
+/// ZC-E0201 (503), not ZC-E0104.
 pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     try validate(ctx, input);
     const key = records.service_key(input.name);
@@ -99,7 +102,8 @@ fn legacy_counter(ctx: *const Context, existing: ?records.Service) Error!?u64 {
     return next;
 }
 
-/// Applies a service. Invalid input is ZC-E0104 and nothing is read or written.
+/// Applies a service. Invalid input is ZC-E0104 and nothing is written. The bounds of `limits` are
+/// checked after the store is read (see `plan`), so with the store down a bad limit is ZC-E0201.
 pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
     const planned = try plan(ctx, input);
     if (planned.unchanged) return .unchanged;
@@ -509,6 +513,7 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
     var source: controller.DecisionSource = .{ .instance = 0 };
     const bad_limits = [_]records.Limits{
         .{ .cpu_millis = 0 },
+        .{ .cpu_millis = 9 },
         .{ .cpu_millis = constants.job_limit_cpu_millis_max + 1 },
         .{ .memory_bytes = 0 },
         .{ .memory_bytes = constants.job_limit_memory_bytes_min - 1 },
@@ -528,6 +533,11 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
         .cpu_millis = constants.job_limit_cpu_millis_max,
         .memory_bytes = constants.job_limit_memory_bytes_min,
     };
+    _ = try apply(&ctx, &source, edge);
+    // The other edges, with the literal numbers of docs/api.md: 10 millis and 2^40 bytes pass.
+    try testing.expectEqual(@as(u32, 10), constants.job_limit_cpu_millis_min);
+    try testing.expectEqual(@as(u64, 1 << 40), constants.job_limit_memory_bytes_max);
+    edge.limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 40 };
     _ = try apply(&ctx, &source, edge);
 
     // A stored out-of-bounds limit, as an earlier build wrote it.
