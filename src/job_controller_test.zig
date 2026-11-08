@@ -762,3 +762,87 @@ test "a run record that does not decode holds its job and not the others" {
     try testing.expect((try f.read_run("b")) != null);
     try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
 }
+
+// A store that applies `race_ops` just before the first transaction it is given: a change made
+// by another role between a step's read and its commit.
+var race_inner: ?store.Store = null;
+var race_ops: []const store.Op = &.{};
+
+fn race_txn(
+    context: *anyopaque,
+    request: store.TxnRequest,
+    diag: *Diag,
+) store.Error!store.TxnResult {
+    const inner = race_inner.?;
+    if (race_ops.len > 0) {
+        const ops = race_ops;
+        race_ops = &.{};
+        _ = try inner.vtable.txn(context, .{ .on_success = ops }, diag);
+    }
+    return inner.vtable.txn(context, request, diag);
+}
+
+/// One `reconcile` whose first commit is preceded by `ops`; the transactions it committed.
+fn racing(f: *Fixture, ops: []const store.Op) !u32 {
+    const ctx = f.context();
+    var table = ctx.store.vtable.*;
+    table.txn = race_txn;
+    race_inner = ctx.store;
+    race_ops = ops;
+    var racy = ctx;
+    racy.store = .{ .context = ctx.store.context, .vtable = &table };
+    const wake = try f.jc.reconcile(&racy);
+    race_inner = null;
+    race_ops = &.{};
+    return wake.acted;
+}
+
+test "a claim is not marked running when its assignment is gone by the commit (RB-S11)" {
+    // Goal: the read-set rule for mark_running. Method: a claimed run; the scheduler deletes its
+    // assignment after the step read it. The status must stay `placed`.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.node("n1", .ready);
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.assign("n1", "train");
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.report("n1", "train", .claimed, null, null);
+    const key = records.assigned_key("n1", "train-job");
+    const gone = [_]store.Op{.{ .delete = key.slice() }};
+    try testing.expectEqual(@as(u32, 0), try racing(&f, &gone));
+    try testing.expectEqual(records.JobState.placed, (try f.read_status("train")).?.state);
+    try testing.expectEqual(@as(u32, 0), try f.decisions("train", "job_running"));
+}
+
+test "a stop is not written when a report of the run appeared by the commit (RA-N6)" {
+    // Goal: the read-set rule for write_stop, which judged "no claim" from the report's absence.
+    // Method: an unclaimed placed run, a cancel, and a report written after the step read.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.node("n1", .ready);
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.assign("n1", "train");
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try f.job("train", 60 * 1000, true);
+    const key = records.job_observed_key("n1", "train");
+    const seen = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = "{}" } }};
+    try testing.expectEqual(@as(u32, 0), try racing(&f, &seen));
+    try testing.expect((try f.read_run("train")).?.stop == null);
+}
+
+test "an ending is not written when the node's judgement changed by the commit (RB-N5)" {
+    // Goal: the read-set rule for end. Method: a running run whose agent reported it stopped;
+    // the node's judgement is deleted after the step read it.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.running("train");
+    try f.report("n1", "train", .stopped, .{ .kind = .exited, .code = 0 }, null);
+    const gone = [_]store.Op{.{ .delete = records.node_status_key("n1").slice() }};
+    try testing.expectEqual(@as(u32, 0), try racing(&f, &gone));
+    try testing.expectEqual(records.JobState.running, (try f.read_status("train")).?.state);
+}

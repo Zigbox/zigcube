@@ -759,6 +759,32 @@ const Pass = struct {
         return true;
     }
 
+    /// Compares what a judgement about `run` read of its placement (the read-set rule): the
+    /// assignment, the node's record and its judgement, and, unless `report_compared`, the node's
+    /// report of the run (absent: revision 0). A run with no assignment has nothing to compare.
+    fn expect_placement(
+        pass: *Pass,
+        batch: *Batch,
+        name: []const u8,
+        run: *const Entry(records.JobRun),
+        report_compared: bool,
+    ) Error!void {
+        const ctx = pass.ctx;
+        const world = pass.world;
+        const placed = world.assignment(run.rec.id) orelse return;
+        const node = assigned_node(placed.kv.key);
+        batch.expect(placed.kv.key, placed.kv.mod_revision);
+        const node_at = if (world.node_entry(node)) |entry| entry.kv.mod_revision else 0;
+        try expect_key(ctx, batch, &records.node_key(node), node_at);
+        const judged_at = if (world.node_status(node)) |entry| entry.kv.mod_revision else 0;
+        try expect_key(ctx, batch, &records.node_status_key(node), judged_at);
+        if (report_compared) return;
+        const key = records.job_observed_key(node, name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), world.revision, ctx.diag);
+        const seen_at = if (got.kv) |kv| kv.mod_revision else 0;
+        try expect_key(ctx, batch, &key, seen_at);
+    }
+
     fn mark_running(
         pass: *Pass,
         job: *const Entry(records.Job),
@@ -773,6 +799,7 @@ const Pass = struct {
         batch.expect(status_at, status.kv.mod_revision);
         try expect_key(ctx, &batch, &records.job_run_key(job.rec.name), run.kv.mod_revision);
         batch.expect(entry.kv.key, entry.kv.mod_revision);
+        try pass.expect_placement(&batch, job.rec.name, run, true);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
             .action = "job_running",
@@ -919,6 +946,7 @@ const Pass = struct {
         batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
         batch.expect(run_at, run.kv.mod_revision);
         try expect_key(ctx, &batch, &records.job_status_key(name), status.kv.mod_revision);
+        try pass.expect_placement(&batch, name, run, false);
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
             .action = "stop_job",
@@ -1032,6 +1060,7 @@ const Pass = struct {
             batch.expect(report.kv.key, report.kv.mod_revision);
             cause = cause_of(.observed, &report.kv);
         }
+        try pass.expect_placement(&batch, name, run, done.report != null);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
             .action = "end_job",
