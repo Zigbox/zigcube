@@ -15,10 +15,10 @@ const Context = controller.Context;
 
 /// Runs the ledger can hold. A run past it is counted, not judged (J2 stays sound for the rest).
 pub const ledger_max: u32 = 4096;
-/// Containers the trackers keep a clock for at once: one per live run, and no more than
-/// `jobs_max` runs exist (RB-N8: the old 128 dropped the rest unjudged and without a word; an
-/// overflow now fails the run).
-pub const watch_max: u32 = constants.jobs_max;
+/// Containers the trackers keep a clock for at once: every container the runtimes of the most
+/// nodes a simulation has can hold (`sim_cluster.zig` asserts the product), so that no live job
+/// container goes unjudged for want of a slot, and none is dropped without a word (RB-N8).
+pub const watch_max: u32 = 16 * constants.runtime_handles_max;
 
 /// What a start was judged against, and the first verdict that failed.
 pub const State = struct {
@@ -111,6 +111,12 @@ pub fn deadline_bound_ms(
     const base = deadline_ms + grace_ms;
     const extra = constants.fence_kill_latency_ms + wedged_ms;
     return base + base * clock_ppm / 1_000_000 + extra + granularity_ms;
+}
+
+/// How long a run executed past its deadline and its grace, net of the time its node was wedged
+/// after the deadline (`wedged_ms`, as J8 counts it): the report's "past deadline" figure.
+pub fn deadline_past_ms(age_ms: u64, deadline_ms: u64, grace_ms: u64, wedged_ms: u64) u64 {
+    return (age_ms -| (deadline_ms + grace_ms)) -| wedged_ms;
 }
 
 /// J2 and J7 for one `Runtime.start`: the run id was never started before, and a claim for this
@@ -207,6 +213,13 @@ test "bounds grow with the grace and the deadline" {
         deadline_bound_ms(10_000, 0, 0, 0, 0));
     try std.testing.expect(deadline_bound_ms(10_000, 0, 0, 0, 500) >
         deadline_bound_ms(10_000, 0, 0, 0, 0));
+}
+
+test "deadline_past_ms: wedged time is not past the deadline" {
+    try std.testing.expectEqual(@as(u64, 0), deadline_past_ms(5_000, 4_000, 500, 600));
+    try std.testing.expectEqual(@as(u64, 100), deadline_past_ms(5_000, 4_000, 500, 400));
+    try std.testing.expectEqual(@as(u64, 500), deadline_past_ms(5_000, 4_000, 500, 0));
+    try std.testing.expectEqual(@as(u64, 0), deadline_past_ms(3_000, 4_000, 500, 0));
 }
 
 test "J8's bound has no room for the fence" {

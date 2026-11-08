@@ -5,7 +5,7 @@
 //! rules, and this file is the first thing it runs against.
 //!
 //! It keeps the whole history in an append-only log, as the SQL backends do (docs/store-design.md),
-//! plus a table of live keys. Lookups are linear: the point is clarity, not speed. It is
+//! plus a table of live keys kept sorted (lookups and prefix ranges are binary searches). It is
 //! single-threaded: a threaded caller wraps it in a mutex. **An allocation failure in the middle
 //! of a write (a transaction, a revoke) is not rolled back**: the call reports `NoCapacity` but
 //! the store may be half-updated, so treat it as fatal for this reference store. The tests never
@@ -191,12 +191,16 @@ pub const MemoryStore = struct {
         try self.check_readable(revision, diag);
         var found: ?Entry = null;
         if (at_revision == null) {
-            if (self.find(self.live.items, key)) |index| found = self.live.items[index];
+            if (self.find_live(key)) |index| found = self.live.items[index];
         } else {
-            // The last event for the key at or before the revision decides.
-            for (self.log.items) |entry| {
-                if (entry.mod_revision > revision) break;
-                if (std.mem.eql(u8, entry.key, key)) found = entry;
+            // The last event for the key at or before the revision decides: the log is in
+            // revision order, so look backwards from the first event past the revision.
+            var at = self.log_end_at(revision);
+            while (at > 0) {
+                at -= 1;
+                if (!std.mem.eql(u8, self.log.items[at].key, key)) continue;
+                found = self.log.items[at];
+                break;
             }
             if (found) |entry| {
                 if (entry.kind == .delete) found = null;
@@ -250,8 +254,8 @@ pub const MemoryStore = struct {
 
     /// The first `limit` + 1 live entries under the prefix after `continue_after`, in the
     /// listing's order, borrowed: only that many are held, whatever lies under the prefix. (One
-    /// more than the limit tells the caller that there is more.) Linear in the table times the
-    /// limit, like `find`: the point is clarity, not speed.
+    /// more than the limit tells the caller that there is more.) `live` is sorted, so the
+    /// prefix is a contiguous range found by binary search and the page is read from its end.
     fn select_page(
         self: *const MemoryStore,
         arena: Allocator,
@@ -260,29 +264,80 @@ pub const MemoryStore = struct {
     ) Error![]Entry {
         const want = @min(@as(usize, options.limit) +| 1, self.live.items.len);
         const top = arena.alloc(Entry, want) catch return no_memory(diag);
-        var held: usize = 0;
-        if (want == 0) return top;
-        for (self.live.items) |entry| {
-            if (!std.mem.startsWith(u8, entry.key, options.prefix)) continue;
-            if (options.continue_after) |after| {
-                const wanted: std.math.Order = if (options.reverse) .lt else .gt;
-                if (std.mem.order(u8, entry.key, after) != wanted) continue;
+        var range = self.prefix_range(options.prefix);
+        if (options.continue_after) |after| {
+            if (options.reverse) {
+                range.end = @min(range.end, self.lower_bound(after));
+            } else {
+                range.start = @max(range.start, self.upper_bound(after));
             }
-            // Where it goes among those held, in listing order.
-            var at = held;
-            while (at > 0 and precedes(options.reverse, entry.key, top[at - 1].key)) at -= 1;
-            if (at >= want) continue; // Later than all `want` held.
-            const last = @min(held, want - 1);
-            std.mem.copyBackwards(Entry, top[at + 1 .. last + 1], top[at..last]);
-            top[at] = entry;
-            held = last + 1;
+        }
+        var held: usize = 0;
+        while (held < want and range.start + held < range.end) : (held += 1) {
+            const index = if (options.reverse) range.end - 1 - held else range.start + held;
+            top[held] = self.live.items[index];
         }
         return top[0..held];
     }
 
-    fn precedes(reverse: bool, a: []const u8, b: []const u8) bool {
-        const order = std.mem.order(u8, a, b);
-        return if (reverse) order == .gt else order == .lt;
+    const Range = struct { start: usize, end: usize };
+
+    /// The index of the first log event after `revision` (the log's length if none): the log is
+    /// in revision order.
+    fn log_end_at(self: *const MemoryStore, revision: Revision) usize {
+        var low: usize = 0;
+        var high: usize = self.log.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (self.log.items[mid].mod_revision > revision) high = mid else low = mid + 1;
+        }
+        return low;
+    }
+
+    /// The first index of `live` whose key is not before `key`.
+    fn lower_bound(self: *const MemoryStore, key: []const u8) usize {
+        var low: usize = 0;
+        var high: usize = self.live.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const order = std.mem.order(u8, self.live.items[mid].key, key);
+            if (order == .lt) low = mid + 1 else high = mid;
+        }
+        return low;
+    }
+
+    /// The first index of `live` whose key is after `key`.
+    fn upper_bound(self: *const MemoryStore, key: []const u8) usize {
+        var low: usize = 0;
+        var high: usize = self.live.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const order = std.mem.order(u8, self.live.items[mid].key, key);
+            if (order == .gt) high = mid else low = mid + 1;
+        }
+        return low;
+    }
+
+    /// The indexes of `live` whose key starts with `prefix`: they are contiguous, from the first
+    /// key not before the prefix.
+    fn prefix_range(self: *const MemoryStore, prefix: []const u8) Range {
+        const start = self.lower_bound(prefix);
+        var low = start;
+        var high: usize = self.live.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const inside = std.mem.startsWith(u8, self.live.items[mid].key, prefix);
+            if (inside) low = mid + 1 else high = mid;
+        }
+        return .{ .start = start, .end = low };
+    }
+
+    /// The index of `key` in `live`, if it is there.
+    fn find_live(self: *const MemoryStore, key: []const u8) ?usize {
+        const index = self.lower_bound(key);
+        if (index == self.live.items.len) return null;
+        if (!std.mem.eql(u8, self.live.items[index].key, key)) return null;
+        return index;
     }
 
     /// The entries under `prefix` as they were at `revision`, ascending, borrowed (only the list
@@ -298,8 +353,8 @@ pub const MemoryStore = struct {
         if (revision == self.revision) {
             // The current state is the live table: no need to replay the log, which is linear in
             // its length and, with the linear `find` below, quadratic in the keys it touched.
-            for (self.live.items) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) continue;
+            const range = self.prefix_range(prefix);
+            for (self.live.items[range.start..range.end]) |entry| {
                 state.append(arena, entry) catch return no_memory(diag);
             }
         } else for (self.log.items) |entry| {
@@ -331,7 +386,7 @@ pub const MemoryStore = struct {
         const self = from(context);
         var succeeded = true;
         for (request.compares) |compare| {
-            const index = self.find(self.live.items, compare.key);
+            const index = self.find_live(compare.key);
             const current: Revision = if (index) |i| self.live.items[i].mod_revision else 0;
             if (current != compare.mod_revision) succeeded = false;
         }
@@ -342,7 +397,7 @@ pub const MemoryStore = struct {
         for (ops) |op| {
             const writes = switch (op) {
                 .put => true,
-                .delete => |key| self.find(self.live.items, key) != null,
+                .delete => |key| self.find_live(key) != null,
             };
             if (!writes) continue;
             if (!bumped) self.revision += 1;
@@ -382,7 +437,7 @@ pub const MemoryStore = struct {
             if (entry.lease == lease) count += 1;
         }
         for (ops) |op| {
-            const index = self.find(self.live.items, store.op_key(op));
+            const index = self.find_live(store.op_key(op));
             const was_on = if (index) |i| self.live.items[i].lease == lease else false;
             const now_on = switch (op) {
                 .put => |put| put.lease == lease,
@@ -397,7 +452,7 @@ pub const MemoryStore = struct {
     fn apply_put(self: *MemoryStore, put: store.Put, diag: *Diag) Error!void {
         assert(self.revision > 0);
         const value = self.gpa.dupe(u8, put.value) catch return no_memory(diag);
-        const existing = self.find(self.live.items, put.key);
+        const existing = self.find_live(put.key);
         var create_revision = self.revision;
         if (existing) |i| create_revision = self.live.items[i].create_revision;
         const key = self.gpa.dupe(u8, put.key) catch return no_memory(diag);
@@ -423,13 +478,14 @@ pub const MemoryStore = struct {
             free_entry(self.gpa, self.live.items[i]);
             self.live.items[i] = live_entry;
         } else {
-            self.live.append(self.gpa, live_entry) catch return no_memory(diag);
+            const at = self.lower_bound(put.key);
+            self.live.insert(self.gpa, at, live_entry) catch return no_memory(diag);
         }
     }
 
     fn apply_delete(self: *MemoryStore, key: []const u8, diag: *Diag) Error!void {
         assert(self.revision > 0);
-        const index = self.find(self.live.items, key).?; // Checked by the caller.
+        const index = self.find_live(key).?; // Checked by the caller.
         const old = self.live.items[index];
         const logged: Entry = .{
             .kind = .delete,
@@ -441,7 +497,7 @@ pub const MemoryStore = struct {
         };
         self.log.append(self.gpa, logged) catch return no_memory(diag);
         free_entry(self.gpa, old);
-        _ = self.live.swapRemove(index);
+        _ = self.live.orderedRemove(index);
     }
 
     // ---- Watch ---------------------------------------------------------------------------
@@ -675,9 +731,11 @@ pub const MemoryStore = struct {
         // Keep an event if it is newer than the point, or it is the latest put of its key at or
         // before it. Tombstones at or before the point say nothing a reader at or after the
         // point needs: the key is simply absent.
+        const keep = try self.compaction_keeps(revision, diag);
+        defer self.gpa.free(keep);
         var kept: usize = 0;
-        for (self.log.items, 0..) |entry, index| {
-            if (entry.mod_revision > revision or self.is_latest_put(index, revision)) {
+        for (self.log.items, keep) |entry, wanted| {
+            if (wanted) {
                 self.log.items[kept] = entry;
                 kept += 1;
             } else {
@@ -688,14 +746,26 @@ pub const MemoryStore = struct {
         self.compacted_revision = revision;
     }
 
-    fn is_latest_put(self: *const MemoryStore, index: usize, revision: Revision) bool {
-        const entry = self.log.items[index];
-        if (entry.kind != .put) return false;
-        for (self.log.items[index + 1 ..]) |later| {
-            if (later.mod_revision > revision) break;
-            if (std.mem.eql(u8, later.key, entry.key)) return false;
+    /// Which log events a compaction at `revision` keeps: those after it, and the latest put at
+    /// or before it of each key that no later event at or before it touches. One pass from the
+    /// point back to the start, with the keys seen so far.
+    fn compaction_keeps(self: *const MemoryStore, revision: Revision, diag: *Diag) Error![]bool {
+        const keep = self.gpa.alloc(bool, self.log.items.len) catch return no_memory(diag);
+        errdefer self.gpa.free(keep);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.gpa);
+        var index = self.log.items.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.log.items[index];
+            if (entry.mod_revision > revision) {
+                keep[index] = true;
+                continue;
+            }
+            const first = seen.getOrPut(self.gpa, entry.key) catch return no_memory(diag);
+            keep[index] = !first.found_existing and entry.kind == .put;
         }
-        return true;
+        return keep;
     }
 
     // ---- Helpers -------------------------------------------------------------------------

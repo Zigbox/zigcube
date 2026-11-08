@@ -20,8 +20,11 @@
   seeds 1..200: 26 plain, 26 `--c1`; drawn operations, `--profile=auto`: 25 of 200 plain, 4 of 60 `--c1`; `seeds` 100
   (about 13 hits at 100 operations); `canary_seeds` 300 (floor 0.065, miss 1.9e-9; the `--c1` rate
   is the low one).
-- **RB-N8.** `watch_max` is `constants.jobs_max` (512) and an overflow fails the run
-  (it used to drop containers unjudged). A wedged node is judged for J8 and J6, which
+- **RB-N8.** `watch_max` is `16 * runtime_handles_max`, and `sim_cluster.zig` asserts at
+  compile time that every container of every runtime has a slot, so no live job container is
+  dropped unjudged and an overflow cannot happen (merged with main's followups, which chose
+  this bound; it proves no container is unjudged, where a `jobs_max` bound needed a run-time
+  failure). A wedged node is judged for J8 and J6, which
   subtract wedged time; only J1, which has no wedge allowance, still skips it. Sweeps, seeds
   1..200 plain and `--c1`, 100 operations: 0 of 800 fail.
 - **`job_unclaimed` canary_seeds** 60 (100 operations, `--strong`: 79 of 200 plain, 92 `--c1`; drawn operations, `--profile=auto`: 108 and 106).

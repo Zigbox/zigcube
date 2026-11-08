@@ -72,6 +72,9 @@ const Args = struct {
     /// or with one of its `|`-separated alternatives ("J2: a run id|J7: a run was"),
     /// so a negative test passes only if the check it is about is the one that fired.
     expect_symptom: ?[]const u8 = null,
+    /// `--expect-symptom-any` (with `--expect-symptom`): a seed that fails with another symptom is
+    /// skipped; the run passes if some seed in the range shows the symptom, and fails if none does.
+    expect_symptom_any: bool = false,
 };
 
 /// Null if the arguments are not a valid command line.
@@ -153,6 +156,8 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.strong = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
+    } else if (std.mem.eql(u8, arg, "--expect-symptom-any")) {
+        parsed.expect_symptom_any = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
         const spec = arg["--expect-symptom=".len..];
         if (!symptom_spec.valid(spec)) return false;
@@ -304,6 +309,7 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     const out = &file_writer.interface;
     defer out.flush() catch {}; // Nowhere else to report it.
     var failures: u64 = 0;
+    var matched = false;
     var seed = parsed.first_seed;
     while (true) : (seed += 1) {
         const resolved = sim_cluster.plan(seed, parsed.operations, parsed.options);
@@ -318,6 +324,12 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
             if (parsed.expect_fail) {
                 // Caught, and that is all the teeth test asks, if it is the right check.
                 if (parsed.expect_symptom) |want| {
+                    if (parsed.expect_symptom_any and
+                        !symptom_spec.matches(symptom(report), want))
+                    {
+                        if (seed == parsed.last_seed) break;
+                        continue;
+                    }
                     if (!symptom_spec.matches(symptom(report), want)) {
                         out.print("sim-cluster: seed {d} failed, but not with \"{s}\"\n", .{
                             seed, want,
@@ -325,10 +337,17 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
                         return constants.exit_user;
                     }
                 }
+                matched = true;
                 break;
             }
         }
         if (seed == parsed.last_seed) break;
+    }
+    if (parsed.expect_fail and parsed.expect_symptom_any and !matched) {
+        out.print("sim-cluster: no seed of {d}..{d} failed with \"{s}\"\n", .{
+            parsed.first_seed, parsed.last_seed, parsed.expect_symptom orelse "",
+        }) catch return constants.exit_environment;
+        return constants.exit_user;
     }
     if (parsed.expect_fail and failures > 0) {
         out.print("sim-cluster: caught at seed {d} of {d}..{d}\n", .{
@@ -398,7 +417,8 @@ fn usage(io: std.Io, args: []const []const u8) u8 {
 }
 
 const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 8,000 ms is refused: an agent " ++
-    "cannot fence in time under it (ZC-E0121, issue #78)\n";
+    "cannot fence in time under it (ZC-E0121: the shortest ttl the server admits, which is also " ++
+    "the shortest a shape draws)\n";
 
 /// The one-line reason for a `--lease-ttl-ms` under the bound, which `parse` refuses as any
 /// bad argument; null for every other refusal.
