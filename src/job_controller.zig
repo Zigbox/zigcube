@@ -74,6 +74,7 @@ const resync_ms: u64 = 30 * 1000;
 /// Runs whose node's tenure ended without a `lost` judgement of its own, with the time the
 /// controller first saw it end: one slot for each run that can be live.
 const seen_max = constants.jobs_max;
+const hold_action = "hold_contradictory_job";
 const none: u32 = std.math.maxInt(u32);
 /// Pages of jobs one step can read: the whole retention window, and a page for the end.
 const pages_max = constants.job_admitted_window_max / constants.job_controller_page_max + 2;
@@ -634,7 +635,7 @@ const Pass = struct {
     ) Error!void {
         const ctx = pass.ctx;
         const name = job.rec.name;
-        if (try has_decision(ctx, name, "hold_contradictory_job", job.kv.mod_revision)) return;
+        if (try has_decision(ctx, name, hold_action, job.kv.mod_revision)) return;
         const what = if (run == null and status == null)
             "has a job_created decision but neither a run nor a status"
         else if (run == null)
@@ -651,7 +652,7 @@ const Pass = struct {
         var batch: Batch = .{};
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
-            .action = "hold_contradictory_job",
+            .action = hold_action,
             .subject = .{ .kind = .job, .name = name },
             .reason = "the job's records contradict each other; nothing about it changes",
             .cause = .{ .kind = .desired, .key = job.kv.key, .revision = job.kv.mod_revision },
@@ -659,6 +660,14 @@ const Pass = struct {
             .read_revision = pass.world.revision,
         }, &batch);
         batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
+        // A job with no run never started and never will (a new run is never made, I8a), so it
+        // takes no `jobs_max` slot: the hold counts it as ended, once per incarnation of the job
+        // (an earlier hold of this incarnation, for another revision of the record, did). A job
+        // that has a run might be placed, so it keeps its slot (#177).
+        if (run == null and !try has_decision(ctx, name, hold_action, job.kv.create_revision)) {
+            const counted = try pass.endings(&batch);
+            batch.put(records.key_job_endings, try records.encode(ctx.arena, counted, ctx.diag));
+        }
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
     }
 

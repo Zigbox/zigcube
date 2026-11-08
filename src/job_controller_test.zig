@@ -316,6 +316,48 @@ test "a job that has a job_created decision and no run is contradictory and neve
     try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
 }
 
+test "a held job with no run frees its jobs_max slot once, however often it is held (#177)" {
+    // Goal: a contradictory job that never had a run counts as ended, so `admitted - ended` stops
+    // charging it against `jobs_max`. Method: hold it, check the count of endings is 1; a pass
+    // again and a new revision of the job record (a second hold decision) leave it at 1.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u64, 0), try f.endings());
+    const ctx = f.context();
+    const gone = [_]store.Op{
+        .{ .delete = records.job_run_key("train").slice() },
+        .{ .delete = records.job_status_key("train").slice() },
+    };
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &f.diag);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+    try f.job("train", 61 * 1000, false); // A new revision of the record.
+    _ = try f.pass();
+    try testing.expectEqual(@as(u32, 2), try f.decisions("train", "hold_contradictory_job"));
+    try testing.expectEqual(@as(u64, 1), try f.endings());
+}
+
+test "a held job that has a run keeps its jobs_max slot (#177)" {
+    // Goal: a run without a status might still be placed, so its slot is not released.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try f.job("train", 60 * 1000, false);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const ctx = f.context();
+    const gone = [_]store.Op{.{ .delete = records.job_status_key("train").slice() }};
+    _ = try writers.txn(ctx.store, .job_controller, .{ .on_success = &gone }, &f.diag);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_contradictory_job"));
+    try testing.expectEqual(@as(u64, 0), try f.endings());
+}
+
 test "a run without a status is contradictory and changes nothing" {
     var f: Fixture = undefined;
     try f.start();

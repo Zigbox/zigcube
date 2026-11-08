@@ -45,10 +45,20 @@ pub const Cursor = struct {
     failures: u64 = 0,
     failure: diag_mod.Diag = undefined,
     /// Passes whose `/job-observed/` scan hit `observed_pages_max` and left keys unread, and the
-    /// diagnostic (ZC-E0302) of the latest. The pass still runs: it deletes each ended job's own
-    /// node's observation by key, and the rest wait for a pass that reads them.
+    /// diagnostic (ZC-E0302) of the latest. The next pass resumes where this one stopped.
     truncated: u64 = 0,
     truncation: diag_mod.Diag = undefined,
+    /// The `/job-observed/` sweep is a cycle that may span passes: `observed_after` (the last key
+    /// handled, `observed_after_len` bytes; 0: from the start) is where the next pass resumes. A
+    /// cycle that read to the end records when it began (`swept_ms`): a job is dropped only when
+    /// it was old at that time, because only then did every window of that cycle see it as old
+    /// and sweep its strays (RB-N7, #177). Until the first cycle ends nothing is dropped.
+    cycle_active: bool = false,
+    cycle_start_ms: u64 = 0,
+    swept: bool = false,
+    swept_ms: u64 = 0,
+    observed_after_len: u16 = 0,
+    observed_after: [constants.store_key_bytes_max]u8 = undefined,
 
     /// The age in force: never below `job_finished_age_ms_min`.
     pub fn age(cursor: *const Cursor) u64 {
@@ -83,14 +93,6 @@ const Ended = struct {
     input_revision: store.Revision = 0,
 };
 
-/// Every `/job-observed/<node>/<name>` key a pass read, whichever node wrote it: a node that
-/// lost the claim leaves its record behind, and it would block the name's next claim there.
-const Observed = struct {
-    keys: []const []const u8,
-    /// The scan stopped at `observed_pages_max` with keys unread.
-    truncated: bool,
-};
-
 /// One pass; returns when the next is due.
 pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
     assert(cursor.age() >= constants.job_finished_age_ms_min);
@@ -98,14 +100,7 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
     var ended: std.ArrayList(Ended) = .empty;
     try read_ended(ctx, revision, &ended);
     try mark_inputs(ctx, revision, ended.items);
-    const observed = try read_observed(ctx, revision);
-    if (observed.truncated) {
-        cursor.truncated += 1;
-        const count_max = observed_pages_max * constants.store_list_limit_max;
-        _ = controller.too_many(ctx, records.prefix_job_observed, count_max) catch {};
-        cursor.truncation = ctx.diag.*;
-        ctx.diag.reset();
-    }
+    const swept_more = try sweep_observed(ctx, cursor, revision, ended.items, now_ms);
     const Rank = struct {
         fn older(_: void, first: Ended, second: Ended) bool {
             if (first.ended_at_ms != second.ended_at_ms) {
@@ -115,16 +110,17 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
         }
     };
     std.mem.sort(Ended, ended.items, {}, Rank.older);
-    var more = false;
+    var more = swept_more;
     var dropped: u32 = 0;
     for (ended.items) |job| {
-        const old = now_ms > job.ended_at_ms and now_ms - job.ended_at_ms > cursor.age();
-        if (!old) break; // Sorted: nothing after this one is older.
+        // Old at the end of the last finished sweep, not merely now: see `Cursor.swept_ms`.
+        if (!cursor.swept) break;
+        if (!old_at(job, cursor.swept_ms, cursor.age())) break; // Sorted: the rest are younger.
         if (dropped == constants.retention_batch_pairs) {
             more = true;
             break;
         }
-        try drop_job(ctx, cursor, job, observed);
+        try drop_job(ctx, cursor, job);
         dropped += 1;
     }
     var inputs: u32 = 0;
@@ -207,12 +203,61 @@ fn mark_inputs(ctx: *const Context, revision: store.Revision, ended: []Ended) Er
 
 /// Pages of `/job-observed/` a pass reads.
 const observed_pages_max: u32 = 64;
+/// Transactions of stray deletes one pass makes before it stops and resumes next pass.
+const observed_sweep_txns_max: u32 = 16;
 
-fn read_observed(ctx: *const Context, revision: store.Revision) Error!Observed {
-    var keys: std.ArrayList([]const u8) = .empty;
+fn old_at(job: Ended, at_ms: u64, age_ms: u64) bool {
+    return at_ms > job.ended_at_ms and at_ms - job.ended_at_ms > age_ms;
+}
+
+/// Whether `key` is `/job-observed/<node>/<name>`: the name it ends in (a name holds no `/`).
+fn observed_name(key: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, key, '/') orelse return key;
+    return key[at + 1 ..];
+}
+
+fn save_resume(cursor: *Cursor, key: ?[]const u8) void {
+    const bytes = key orelse {
+        cursor.observed_after_len = 0;
+        return;
+    };
+    assert(bytes.len > 0);
+    assert(bytes.len <= cursor.observed_after.len);
+    @memcpy(cursor.observed_after[0..bytes.len], bytes);
+    cursor.observed_after_len = @intCast(bytes.len);
+}
+
+/// Reads up to `observed_pages_max` pages of `/job-observed/` from where the last pass stopped
+/// and deletes the observations of every job that was old when the cycle began, on whichever
+/// node (a node that lost the claim leaves its record behind, and it would block the name's next
+/// claim there; the job's own node's goes with the job). Each delete compares the observation's
+/// revision, so one a claim wrote after the read stays. A cycle that reaches the last key
+/// records `swept_ms`; one that does not (the page bound, or `observed_sweep_txns_max`) says so
+/// (ZC-E0302) and resumes with the next pass. Returns whether the next pass is due at once.
+fn sweep_observed(
+    ctx: *const Context,
+    cursor: *Cursor,
+    revision: store.Revision,
+    ended: []const Ended,
+    now_ms: u64,
+) Error!bool {
+    if (!cursor.cycle_active) {
+        cursor.cycle_active = true;
+        cursor.cycle_start_ms = now_ms;
+        cursor.observed_after_len = 0;
+    }
+    var by_name: std.StringHashMapUnmanaged(void) = .empty;
+    for (ended) |job| {
+        if (!old_at(job, cursor.cycle_start_ms, cursor.age())) continue;
+        by_name.put(ctx.arena, job.name, {}) catch return failures.no_memory(ctx.diag);
+    }
     var after: ?[]const u8 = null;
-    var truncated = false;
-    for (0..observed_pages_max) |at| {
+    if (cursor.observed_after_len > 0) after = cursor.observed_after[0..cursor.observed_after_len];
+    var batch: Batch = .{};
+    var txns: u32 = 0;
+    var handled: ?[]const u8 = after; // The last key the cycle has dealt with for certain.
+    var batch_last: ?[]const u8 = null;
+    for (0..observed_pages_max) |_| {
         const page = try ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_job_observed,
             .at_revision = revision,
@@ -220,58 +265,47 @@ fn read_observed(ctx: *const Context, revision: store.Revision) Error!Observed {
             .continue_after = after,
         }, ctx.diag);
         for (page.kvs) |kv| {
-            keys.append(ctx.arena, kv.key) catch return failures.no_memory(ctx.diag);
+            if (!by_name.contains(observed_name(kv.key))) continue;
+            if (batch.ops_count == constants.store_txn_ops_max) {
+                if (txns == observed_sweep_txns_max) return stop_sweep(ctx, cursor, handled);
+                _ = try controller.commit(ctx, .retention, &batch);
+                txns += 1;
+                batch = .{};
+                handled = batch_last;
+            }
+            batch.expect(kv.key, kv.mod_revision);
+            batch.delete(kv.key);
+            batch_last = kv.key;
         }
-        after = page.continue_after orelse break;
-        truncated = at + 1 == observed_pages_max;
+        after = page.continue_after orelse {
+            if (batch.ops_count > 0) _ = try controller.commit(ctx, .retention, &batch);
+            cursor.swept = true;
+            cursor.swept_ms = cursor.cycle_start_ms;
+            cursor.cycle_active = false;
+            save_resume(cursor, null);
+            return false;
+        };
+        if (batch.ops_count == 0) handled = after;
     }
-    return .{ .keys = keys.items, .truncated = truncated };
+    if (batch.ops_count > 0) _ = try controller.commit(ctx, .retention, &batch);
+    return stop_sweep(ctx, cursor, after);
 }
 
-/// Whether `key` is `/job-observed/<node>/<name>` for this name (a name holds no `/`).
-fn observed_of(key: []const u8, name: []const u8) bool {
-    const at = std.mem.lastIndexOfScalar(u8, key, '/') orelse return false;
-    return std.mem.eql(u8, key[at + 1 ..], name);
+/// The cycle stops short: next pass resumes after `last`, and the pass says so.
+fn stop_sweep(ctx: *const Context, cursor: *Cursor, last: ?[]const u8) bool {
+    cursor.truncated += 1;
+    const count_max = observed_pages_max * constants.store_list_limit_max;
+    _ = controller.too_many(ctx, records.prefix_job_observed, count_max) catch {};
+    cursor.truncation = ctx.diag.*;
+    ctx.diag.reset();
+    save_resume(cursor, last);
+    return true;
 }
 
-/// With the scan truncated, the key of the observation the job's own node wrote, when the scan
-/// did not reach it (a delete of a key that is not there is harmless). Otherwise null.
-fn unread_own(ctx: *const Context, job: Ended, observed: Observed) Error!?[]const u8 {
-    if (!observed.truncated) return null;
-    const node = job.node orelse return null;
-    const key = try arena_key(ctx, records.job_observed_key(node, job.name));
-    for (observed.keys) |read| {
-        if (std.mem.eql(u8, read, key)) return null;
-    }
-    return key;
-}
-
-/// Deletes the job's records in one transaction. A conflict (the status changed since the read)
-/// leaves the job for the next pass. Observations on any node go with it; those that do not fit
-/// the transaction go first, in transactions of their own (an observation of an ended job is
-/// never read again).
-fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended, observed: Observed) Error!void {
-    const fixed: u32 = 4;
-    var mine: u32 = 0;
-    const own = try unread_own(ctx, job, observed);
-    if (own != null) mine += 1;
-    for (observed.keys) |key| {
-        if (observed_of(key, job.name)) mine += 1;
-    }
-    const early: u32 = (fixed + mine) -| constants.store_txn_ops_max;
-    var skip: u32 = early; // The job's first `early` observations go in transactions of their own.
-    var spill: Batch = .{};
-    var spilled: u32 = 0;
-    for (observed.keys) |key| {
-        if (spilled == early) break;
-        if (!observed_of(key, job.name)) continue;
-        spill.delete(key);
-        spilled += 1;
-        if (spill.ops_count == constants.store_txn_ops_max or spilled == early) {
-            _ = try controller.commit(ctx, .retention, &spill);
-            spill = .{};
-        }
-    }
+/// Deletes the job's records in one transaction, with the observation its own node wrote (a
+/// delete of a key that is not there is harmless); the strays on other nodes went with the
+/// sweep. A conflict (the status changed since the read) leaves the job for the next pass.
+fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended) Error!void {
     var batch: Batch = .{};
     // The keys must outlive the commit below, so they live in the arena.
     batch.expect(try arena_key(ctx, records.job_status_key(job.name)), job.status_revision);
@@ -279,14 +313,8 @@ fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended, observed: Observed
     batch.delete(try arena_key(ctx, records.job_input_key(job.name)));
     batch.delete(try arena_key(ctx, records.job_run_key(job.name)));
     batch.delete(try arena_key(ctx, records.job_status_key(job.name)));
-    if (own) |key| batch.delete(key);
-    for (observed.keys) |key| {
-        if (!observed_of(key, job.name)) continue;
-        if (skip > 0) {
-            skip -= 1;
-            continue;
-        }
-        batch.delete(key);
+    if (job.node) |node| {
+        batch.delete(try arena_key(ctx, records.job_observed_key(node, job.name)));
     }
     const done = try controller.commit(ctx, .retention, &batch);
     if (done == .applied) cursor.dropped += 1;
@@ -522,13 +550,15 @@ test "observations past one transaction are all removed" {
     try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_jobs));
 }
 
-test "an observation scan cut at its page bound still frees the job's own node (RB-N7)" {
-    // Goal: past observed_pages_max pages the pass says so (ZC-E0302), and the ended job still
-    // goes whole with the observation its own node wrote, though the scan never reached it.
+test "an observation scan cut at its page bound resumes and sweeps strays past it (RB-N7)" {
+    // Goal: past observed_pages_max pages the pass says so (ZC-E0302) and the next pass resumes
+    // where it stopped; the job goes only when a whole cycle has seen it, and then with the
+    // observation its own node wrote and the stray another node left past the cut.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
     try fixture.job("late", constants.job_finished_age_ms_max + 1);
+    try fixture.put(records.job_observed_key("z9", "late").slice(), "{}"); // Past the cut.
     const keys = observed_pages_max * constants.store_list_limit_max + 1;
     for (0..keys) |at| {
         var node: [8]u8 = undefined;
@@ -537,14 +567,21 @@ test "an observation scan cut at its page bound still frees the job's own node (
     }
     const ctx = fixture.context();
     var cursor: Cursor = .{};
-    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    const first = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(fixture.manual.ms, first); // Due at once: the cycle is not done.
     try testing.expectEqual(@as(u64, 1), cursor.truncated);
     try testing.expect(cursor.truncation.code.? == .E0302);
+    try testing.expectEqual(@as(u64, 0), cursor.dropped); // No cycle has seen the job yet.
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 1), cursor.truncated); // The second pass reached the end.
     try testing.expectEqual(@as(u64, 1), cursor.dropped);
     try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_jobs));
-    const late = records.job_observed_key("n1", "late");
-    const page = try ctx.store.list(ctx.arena, .{ .prefix = late.slice(), .limit = 10 }, ctx.diag);
-    try testing.expectEqual(@as(usize, 0), page.kvs.len);
+    for ([_][]const u8{ "n1", "z9" }) |node| {
+        const late = records.job_observed_key(node, "late");
+        const list: store.ListOptions = .{ .prefix = late.slice(), .limit = 10 };
+        const page = try ctx.store.list(ctx.arena, list, ctx.diag);
+        try testing.expectEqual(@as(usize, 0), page.kvs.len);
+    }
 }
 
 test "an input delete never takes the input of a job created again" {

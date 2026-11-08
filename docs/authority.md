@@ -526,6 +526,9 @@ option A): before creating, the controller reads `/decisions-by-subject/job/<nam
 `job_created` there means the job is contradictory, whatever else is missing. This rests on the
 job controller being the only writer of runs, and on retention judging a job live by
 `/jobs/<name>` alone: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
+A contradictory job with no run also counts as ended in `/job-endings`, once, in the hold's
+transaction, so it frees its `jobs_max` slot; one with a run keeps the slot
+(`docs/decisions/2026-11-08-177-sweep-resume-and-held-job-slot.md`).
 
 **Decision actions of a job** (subject kind `job`), in snake_case: `job_created`, `job_placed`,
 `job_running`, `stop_job`, `end_job`, `hold_contradictory_job`, `hold_unmapped_ending`,
