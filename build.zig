@@ -159,6 +159,11 @@ fn add_unit_tests(b: *std.Build, unit: ExecutablesOptions, built: Built) void {
             },
         }),
     });
+    // Zigbox's `constants.zig` is not exported by its `zigbox` module, and a file cannot belong to
+    // two modules, so `src/zigbox_limits_test.zig` embeds the pinned file as text.
+    unit_tests.root_module.addAnonymousImport("zigbox_constants_text", .{
+        .root_source_file = b.dependency("zigbox", .{}).path("src/constants.zig"),
+    });
     const run = b.addRunArtifact(unit_tests);
     // The tests of the fake runtime run real processes, and the supervisor of each is the agent's
     // own executable (`zcube-agent supervise`). The build system of 0.17 knows the install prefix

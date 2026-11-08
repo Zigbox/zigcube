@@ -56,6 +56,9 @@ pub const Env = struct {
     /// How many requests `job watch` and `job get --wait` make before they stop; null means no
     /// end (the real commands run until interrupted or the job ends). Only the tests set it.
     job_rounds_max: ?u32 = null,
+    /// What the arena of one `job watch` round is built on. Only the tests set it (to the leak
+    /// checker's allocator, so a round that keeps its memory fails the test).
+    round_backing: Allocator = std.heap.page_allocator,
 
     pub fn getenv(env: *const Env, name: []const u8) ?[]const u8 {
         assert(name.len > 0);
