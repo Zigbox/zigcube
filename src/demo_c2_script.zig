@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const check = @import("demo_c2_check.zig");
+const constants = @import("constants.zig");
 const steps = @import("demo_c2_steps.zig");
 
 const Demo = steps.Demo;
@@ -55,10 +56,30 @@ fn deploy_v1(demo: *Demo) !void {
     }, steps.pulls_recorded, "v1's pull records of node1-3", steps.record_ms);
     const pulls = try demo.pulls(demo.v1_tree);
     for (pulls) |pull| steps.say_pull(demo, pull);
-    const once = check.registry_once(pulls);
-    demo.expect(once, "v1 came from the registry on one node only; the other two fetched it " ++
-        "from peers", .{});
-    if (!once) try steps.gap_evidence(demo, demo.v1_tree, 0, &.{ 0, 1, 2 });
+    const evidence = try demo.o5_evidence(&steps.first_three);
+    const read = check.registry_read(pulls, evidence, constants.fetch_peer_wait_ms);
+    steps.say_registry_readers(demo, pulls, evidence);
+    switch (read.kind) {
+        .once => demo.host.say("  registry read once, by {s} (its pull took {d} ms)", .{
+            read.elected, read.elected_ms,
+        }),
+        .overran => demo.host.say("  {s} was elected (O5) and its registry pull took {d} ms, " ++
+            "over the wait cap of {d} ms; the other nodes waited the cap out and fell back to " ++
+            "the registry as designed " ++
+            "(docs/decisions/2026-11-07-demo-c2-registry-once-cap.md)", .{
+            read.elected, read.elected_ms, constants.fetch_peer_wait_ms,
+        }),
+        .repeated => demo.host.say("  not explained by an overrun: {s}", .{read.why}),
+        .broken => {},
+    }
+    demo.expect(read.passes(), "v1 came from the registry on one node only; the other two " ++
+        "fetched it from peers{s}", .{switch (read.kind) {
+        .repeated => " (FAILED: several registry reads, and the nodes' own logs do not show " ++
+            "the elected pull outlasting the O5 cap: a duplicate pull)",
+        .overran => " (waived: the elected pull overran the O5 cap)",
+        .once, .broken => "",
+    }});
+    if (!read.passes()) try steps.gap_evidence(demo, demo.v1_tree, 0, &.{ 0, 1, 2 });
 }
 
 // ---- 2. Roll to v2: only the changed layer moves ----
