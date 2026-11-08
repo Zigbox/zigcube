@@ -30,6 +30,8 @@ count). It must fail J10's bound (`job_refusals_after_heal_per_node_max`, 8); 30
 at 100 operations do.
 Before it, no tooth reached that count: `job_stale` trips J9 and J10 at rest. The unit tests that
 fail without the fixes are in `agent_client_test.zig` (revision 0, ZC-E0510) and
-`agent_jobs_test.zig` (the fence).
+`agent_jobs_test.zig` (the fence). The revision-0 test was checked by removing its refusal from
+`RemoteStore.list_result`: it fails then. Its reply carries a chain pair, so that refusal is the
+only thing that fails it.
 
 **Upgrade.** Agent only; the wire is unchanged.

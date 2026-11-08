@@ -536,7 +536,7 @@ test "a listing with a record at revision 0 is refused, not handed to the agent"
     // Goal: network input is checked: an assignment epoch of 0 would crash the agent.
     const bodies = [_][]const u8{
         "{\"revision\":5,\"kvs\":[{\"key\":\"/replicas/hello/r1\",\"value\":{}," ++
-            "\"mod_revision\":0}]}",
+            "\"mod_revision\":0}],\"chain\":{\"revision\":5,\"hash\":\"" ++ hash_a ++ "\"}}",
     };
     var rig: Rig = undefined;
     rig.init(&bodies);
