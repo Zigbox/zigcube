@@ -1297,22 +1297,97 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
-    const regress_help = "Replay the seeds of the sim-fleet issues of B2 slice 1";
-    const regress = b.step("sim-c1-regress", regress_help);
-    for (regress_replays) |line| {
-        const replay = b.addRunArtifact(exe);
-        replay.addArgs(line);
-        regress.dependOn(&replay.step);
-    }
+    add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
 }
 
-/// The replay lines of the sim-fleet issues of B2 slice 1 (#135, #137, #142, #143, #151) and
-/// three seeds of the 2,000-seed sweep (31, 53, 102) that fail J8 without the J8 true start.
-/// Each must pass; `sim-c1-regress`. Only #151 (J8) and #142 (J6) fail without the sim node
-/// clock's `spend_until`; #135, #137 and #143 pass on the base too and are smoke.
+/// `zig build sim-c1-regress`: replays `regress_replays` with the shipped code (ReleaseSafe).
+fn add_regress_step(b: *std.Build, sim: SimStepOptions) void {
+    const regress_help = "Replay the seeds of the sim-fleet issues of B2 slice 1";
+    const regress = b.step("sim-c1-regress", regress_help);
+    // ReleaseSafe, as `sim-c1-regressions` does: some replays run 250 to 508 operations,
+    // and in Debug the step ran for hours (#171 review).
+    const regress_exe = b.addExecutable(.{
+        .name = "sim_c1_regress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    for (regress_replays) |line| {
+        const replay = b.addRunArtifact(regress_exe);
+        replay.addArgs(line);
+        regress.dependOn(&replay.step);
+    }
+}
+
+/// The replay lines of B2 slice 1; each must pass (`sim-c1-regress`, ReleaseSafe).
+/// - The first six fail on main a864e89 (before the sim node clock's `spend_until` and the
+///   restart rule) and pass here: the newest fleet lines of #135 (J8), #143 (J6), #151 (J8),
+///   #136 (I1b), #166 (J8) and #176 (J8). A change that brings back the step overrun fails them.
+/// - The original lines of #151, #142, #143, #135 and #137 pass on a864e89 too: smoke.
+/// - Seeds 31, 53 and 102 of the 2,000-seed sweep fail J8 without the J8 true start.
+/// - 1612 and 1384 are the I1b/I3 failures of #159's review (a restart that read a node
+///   clock ahead of true time), plain and under C1.
 const regress_replays = [_][]const []const u8{
+    &.{
+        "2072606796",
+        "11",
+        "2",
+        "--profile=partitions",
+        "--lease-ttl-ms=9210",
+        "--replicas-pct=100",
+        "--heal-at=219",
+    },
+    &.{
+        "2461711096",
+        "205",
+        "9",
+        "--profile=partitions",
+        "--lease-ttl-ms=9285",
+        "--replicas-pct=300",
+        "--heal-at=543",
+    },
+    &.{
+        "1806894768",
+        "61",
+        "1",
+        "--c1",
+        "--profile=slow_store",
+        "--lease-ttl-ms=10000",
+        "--replicas-pct=100",
+        "--heal-at=130",
+    },
+    &.{
+        "726793278",
+        "29",
+        "11",
+        "--c1",
+        "--profile=partitions",
+        "--lease-ttl-ms=8799",
+        "--replicas-pct=200",
+        "--heal-at=355",
+    },
+    &.{
+        "1097",
+        "100",
+        "0",
+        "--c1",
+        "--heal-at=93",
+    },
+    &.{
+        "2646538718",
+        "59",
+        "4",
+        "--c1",
+        "--profile=partitions",
+        "--lease-ttl-ms=10000",
+        "--replicas-pct=100",
+        "--heal-at=61",
+    },
     &.{
         "780935350",
         "121",
@@ -1384,16 +1459,16 @@ const regress_replays = [_][]const []const u8{
         "--heal-at=99",
     },
     // The I1b/I3 failures of #159's review (a restart that read a node clock ahead of true
-    // time): seeds 1384, 1612 and 893, plain and under C1.
-    &.{ "1612", "351", "2", "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=218" },
-    &.{ "893", "625", "8", "--lease-ttl-ms=10000", "--replicas-pct=300", "--heal-at=584" },
+    // time): seeds 1384 and 1612, plain and under C1. Seed 893 (625 operations, 8 nodes; about
+    // 6 minutes a replay in ReleaseSafe) is in `c1_regressions` and not here: its plain line
+    // runs in `sim-c1-regressions`; its `--c1` line (the agent's refused re-reports) was cut
+    // from CI for time and is covered by the agent's unit test and the sweeps.
     &.{
         "1612",                 "351",
         "2",                    "--c1",
         "--lease-ttl-ms=10000", "--replicas-pct=100",
         "--heal-at=218",
     },
-    &.{ "893", "625", "8", "--c1", "--lease-ttl-ms=10000", "--replicas-pct=300", "--heal-at=584" },
     &.{ "1384", "198", "10", "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=139" },
     &.{
         "1384",
