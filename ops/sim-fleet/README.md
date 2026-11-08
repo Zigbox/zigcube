@@ -31,6 +31,7 @@ One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_sw
    | `sim_c1_teeth_job_deadline`, `_deadline_late` | 25 and 24 of 40 (same) | 0.4 | 50 | 8.1e-12 |
    | `sim_c1_teeth_job_deadline_offline` | 11 of 40 (100 operations, `--c1`, 2026-11-07) | 0.25 | 80 | 1.0e-10 |
    | `sim_c1_teeth_job_gap` | 20 of 40 (5 of 10 in 1..10) | 0.5 | 50 | 8.9e-16 |
+   | `sim_c1_teeth_job_refused_loop` (with its symptom, J10) | 67 of 80 (drawn operations, `--profile=auto`, 2026-11-08) | 0.6 | 80 | 1.5e-32 |
    | `sim_swarm_teeth` | 192 of 400 (reviewer: 51 of 101) | 0.4 | 200 | 4e-45 |
 
    At one canary every 50 rounds, one round a minute, the fleet runs about 10,500 canaries a year (525,600 / 50), so a false miss in a year stays below about 1.1e-6 (the worst row, 1.0e-10 per run, times 10,500); rounds longer than a minute make it smaller. A filed miss is therefore a real loss of detection until shown otherwise. Change a seed count in `build.zig` (`c1_teeth_roots`, `canary_seeds_teeth`, `canary_seeds_swarm_teeth`) and in this table together. `zig build test` runs `ops/sim-fleet/test-canary.sh` (fake runners that print what the real ones print, the generated manifest and the real `sim_fleet --dry-run`) and `test-crash-record.sh`. No step on the host: the fleet follows `main` and rebuilds.

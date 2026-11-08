@@ -683,11 +683,13 @@ pub const registry = [_]Entry{
         .summary = "the store has no free capacity for this",
         .explanation =
         \\The store is full in a dimension it bounds on purpose: all watch slots
-        \\are in use, all lease slots are in use, or the memory set aside for the
-        \\request was not enough for the result.
+        \\are in use, all lease slots are in use, the memory set aside for the
+        \\request was not enough for the result, or a record would take more
+        \\bytes than the store keeps in one value (the cause gives both sizes).
         \\
-        \\Close watches that are no longer needed, or ask for smaller pages. If the
-        \\limit is too low for the fleet, raise it in the server's configuration.
+        \\Close watches that are no longer needed, or ask for smaller pages. For
+        \\an oversized record, shorten its largest field. If the limit is too low
+        \\for the fleet, raise it in the server's configuration.
         ,
     },
     .{

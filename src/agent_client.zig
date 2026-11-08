@@ -389,6 +389,9 @@ pub const RemoteStore = struct {
             const invalid = "the server listed a record that is not valid";
             if (store.key_problem(item.key) != null) return bad(diag, invalid);
             if (item.mod_revision > answer.revision) return bad(diag, invalid);
+            // Revisions start at 1: a record at 0 would be an assignment epoch of 0, which the
+            // agent never reports under.
+            if (item.mod_revision == 0) return bad(diag, invalid);
             const value = std.json.Stringify.valueAlloc(arena, item.value, .{}) catch
                 return failures.no_memory(diag);
             slot.* = .{
@@ -515,10 +518,10 @@ pub const RemoteStore = struct {
         const request_http: Request = .{ .method = "POST", .target = target, .body = body };
         const reply = try remote.exchange(arena, request_http, diag);
         if (reply.status != 200) {
+            // A report that was not applied (`applied: false`) is a result. A tenure that ended
+            // is not: it comes back as ZC-E0510, which the agent fences on at once.
             if (refusal_code(arena, reply.body)) |text| {
-                if (std.mem.eql(u8, text, "ZC-E0510")) {
-                    return .{ .succeeded = false, .revision = 0 };
-                }
+                if (std.mem.eql(u8, text, "ZC-E0510")) return tenure_ended(remote, diag);
             }
             return refused(arena, reply, diag);
         }
@@ -1145,6 +1148,17 @@ pub fn refused(arena: Allocator, reply: Reply, diag: *Diag) store.Error {
     }
     if (parsed.request_id.len > 0) diag.context("req", "{s}", .{parsed.request_id});
     diag.fix(.{ .sentence = "look at the server's log for this request, or restart the server" });
+    return error.BackendFailed;
+}
+
+/// ZC-E0510: the server says this agent's tenure on its node has ended.
+fn tenure_ended(remote: *const RemoteStore, diag: *Diag) store.Error {
+    assert(diag.code == null);
+    diag.raise(.E0510);
+    diag.cause("zcube-server says node {s} is not registered under this agent's tenure", .{
+        remote.node,
+    });
+    diag.fix(.{ .sentence = "the agent stops its containers and registers the node again" });
     return error.BackendFailed;
 }
 

@@ -1033,8 +1033,8 @@ const Work = struct {
 
     /// Commits a report unless the store already says the same. A report rests on the tenure and
     /// on the assignment it names still being the stored one (`compare_sets.job_report`). A
-    /// refusal is dropped: the next pass reads the assignment again, and a tenure that ended is
-    /// found by the heartbeat on its own schedule, where a lost lease fences the agent.
+    /// refusal is dropped: the next pass reads the assignment again. A tenure that ended is not a
+    /// refusal: the store answers ZC-E0510 and the agent fences at once (`commit`).
     fn report(work: *Work, wanted: Report) Error!void {
         const ctx = work.ctx;
         const agent = work.agent;
@@ -1046,7 +1046,12 @@ const Work = struct {
             .run = wanted.run,
             .node = agent.config.node,
             .tenure = agent.tenure,
-            .assignment = wanted.epoch,
+            // Test-only (J10): a `running` report names an assignment that is not the stored
+            // one, so the store refuses it on every pass while the run runs.
+            .assignment = if (c1_teeth.job_refused_loop and wanted.status == .running)
+                wanted.epoch + 1
+            else
+                wanted.epoch,
             .status = wanted.status,
             .exit = wanted.exit,
             .stop_cause = wanted.stop_cause,
@@ -1086,7 +1091,16 @@ const Work = struct {
         for (compares) |compare| batch.expect(compare.key, compare.mod_revision);
         const cctx = ctx.as_controller();
         const role: @import("writers.zig").Role = .{ .agent = work.agent.config.node };
-        const result = try controller.commit(&cctx, role, &batch);
+        const result = controller.commit(&cctx, role, &batch) catch |err| {
+            // The server says the tenure ended (ZC-E0510): the agent is no longer the node's, so
+            // it fences at once, as for any other write under the tenure.
+            if (err == error.BackendFailed and ctx.diag.code == .E0510) {
+                ctx.diag.reset();
+                try work.agent.begin_fence(ctx, ctx.mono_ms());
+                return .fenced;
+            }
+            return err;
+        };
         switch (result) {
             .applied => {
                 work.commits += 1;

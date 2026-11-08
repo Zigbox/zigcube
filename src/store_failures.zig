@@ -112,6 +112,18 @@ pub fn no_memory(diag: *Diag) error{NoCapacity} {
     return error.NoCapacity;
 }
 
+/// A record that encodes over `store_value_bytes_max`: the same ZC-E0207 as a request that ran
+/// out of memory, with a cause that says what happened (it is the value, not the request).
+pub fn value_too_large(diag: *Diag, bytes: usize) error{NoCapacity} {
+    assert(diag.code == null);
+    diag.raise(.E0207);
+    diag.cause("a record encodes as {d} bytes, over the {d} bytes the store keeps in one value", .{
+        bytes, constants.store_value_bytes_max,
+    });
+    diag.fix(.{ .sentence = "shorten the record's longest field, then try again" });
+    return error.NoCapacity;
+}
+
 /// The first four bytes of a chain hash in hex: enough to tell two apart in a diagnostic.
 pub const ShortHash = [8]u8;
 

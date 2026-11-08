@@ -470,9 +470,13 @@ const Call = struct {
         const claim_key = records.job_observed_key(call.node, name);
         const input_key = records.job_input_key(name);
         const keys = [_][]const u8{ assigned_key.slice(), claim_key.slice(), input_key.slice() };
+        // One revision for all three, so a claim and an input that were never there together
+        // are not read together (RA-N3).
+        const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
         var found: [keys.len]store.GetResult = undefined;
         for (keys, &found) |key, *slot| {
-            slot.* = ctx.store.get(ctx.arena, key, null, ctx.diag) catch return propagate(ctx);
+            slot.* = ctx.store.get(ctx.arena, key, head.revision, ctx.diag) catch
+                return propagate(ctx);
         }
         // Only the node the run is assigned to, and only after it claimed the run.
         if (found[0].kv == null) return no_input(ctx, name, .unassigned);
