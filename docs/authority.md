@@ -528,8 +528,9 @@ job controller being the only writer of runs, and on retention judging a job liv
 `/jobs/<name>` alone: `docs/decisions/2026-11-05-b1-controller-never-recreates-a-run.md`.
 
 **Decision actions of a job** (subject kind `job`), in snake_case: `job_created`, `job_placed`,
-`job_running`, `stop_job`, `end_job`, `hold_contradictory_job`, `hold_unmapped_ending` and
-`drop_report`. "Had a run" is `job_created` *of this incarnation*: the decision's index entry
+`job_running`, `stop_job`, `end_job`, `hold_contradictory_job`, `hold_unmapped_ending`,
+`hold_unreadable_job` (a record that does not decode is skipped, once per record revision; B2 slice 2) and
+`drop_report`. The job controller's decision source is `0x8000 | instance`. "Had a run" is `job_created` *of this incarnation*: the decision's index entry
 `create_revision` is at least the job's `create_revision`, so a job deleted and created again
 under its name starts afresh. A hold or a drop is written once per revision of the record it is
 about (the job's, the report's), judged from the store, so a restart repeats nothing.

@@ -30,7 +30,7 @@ pub fn first_three(demo: *Demo) !void {
     try host.settle("the watcher may print each ending once", state.settle_ms);
     demo.bookmark = try last_ending_revision(host);
     const seen = try read_file(host, "watch-1.txt");
-    try host.check(state.lines_with(seen, "") == 3, "the watcher printed exactly 3 lines", .{});
+    try host.check(state.ending_lines(seen) == 3, "the watcher printed exactly 3 lines", .{});
     for ([_][]const u8{ "exit0  ", "exit3  ", "echoin  " }) |prefix| {
         try host.check(state.lines_with(seen, prefix) == 1, "it printed '{s}' once", .{prefix});
     }
@@ -122,7 +122,7 @@ pub fn last_three(demo: *Demo) !void {
     try wait_lines(demo, "watch-2.txt", 3);
     try host.settle("no ending may be printed twice", state.settle_ms);
     const seen = try read_file(host, "watch-2.txt");
-    try host.check(state.lines_with(seen, "") == 3, "the restarted watcher printed 3 lines", .{});
+    try host.check(state.ending_lines(seen) == 3, "the restarted watcher printed 3 lines", .{});
     for ([_][]const u8{ "oomj  ", "dl  ", "cx  " }) |prefix| {
         try host.check(state.lines_with(seen, prefix) == 1, "it printed '{s}' once", .{prefix});
     }
@@ -201,7 +201,7 @@ const Lines = struct { file: []const u8, count: u32 };
 
 fn has_lines(want: Lines, host: *Host) !bool {
     const text = try read_file(host, want.file);
-    return state.lines_with(text, "") >= want.count;
+    return state.ending_lines(text) >= want.count;
 }
 
 fn wait_lines(demo: *Demo, file: []const u8, count: u32) !void {

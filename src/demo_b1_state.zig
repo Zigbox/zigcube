@@ -161,6 +161,17 @@ pub fn lines_with(text: []const u8, prefix: []const u8) u32 {
     return count;
 }
 
+/// The lines of a watcher's output that are endings: the command's own `watching: ...` lines
+/// (the resume line, on stderr, which the demo shares with stdout) are not.
+pub fn ending_lines(text: []const u8) u32 {
+    var count: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "watching:")) count += 1;
+    }
+    return count;
+}
+
 /// The names of the containers that run now on any node, comma separated, for the transcript.
 pub fn running_names(demo: *Demo) ![]const u8 {
     var names: std.ArrayList(u8) = .empty;

@@ -249,6 +249,46 @@ test "watch answers what is ready with a bookmark and leaves the waiting to the 
     try rig.refused(rig.get("/v1/watch", "timeout=0"), 400, "ZC-E0104");
 }
 
+test "a watch that is behind the head answers at once, however few of its events are kept" {
+    // Goal: api.md, "GET /v1/watch": an answer with no event is held only when the bookmark has
+    // reached the head. Method: enough writes under a prefix nobody watches that one call reads
+    // `watch_batches_max` full batches, keeps none and stops short of the head; the held answer
+    // was the defect (RA-S3).
+    var rig = try Rig.start(3);
+    defer rig.stop();
+    const ops_per_txn = constants.store_txn_ops_max;
+    const txns = (constants.store_watch_batch_max * 66) / ops_per_txn;
+    var keys: [ops_per_txn][24]u8 = undefined;
+    var ops: [ops_per_txn]store.Op = undefined;
+    for (0..txns) |txn_index| {
+        for (&ops, &keys, 0..) |*op, *key, index| {
+            const number = txn_index * ops_per_txn + index;
+            const text = try std.fmt.bufPrint(key, "/noise/{d}", .{number});
+            op.* = .{ .put = .{ .key = text, .value = "x" } };
+        }
+        _ = try rig.world.store_handle().txn(.{ .on_success = &ops }, &rig.world.diag);
+    }
+    const head = (try rig.world.store_handle().status(&rig.world.diag)).revision;
+    const Case = struct { path: []const u8, query: []const u8 };
+    const cases = [_]Case{
+        .{ .path = "/v1/watch", .query = "from=1&timeout=5000&prefix=/job-status/" },
+        .{ .path = "/v1/jobs/watch", .query = "from=1&timeout=5000" },
+    };
+    for (cases) |case| {
+        const behind = rig.get(case.path, case.query);
+        try testing.expectEqual(@as(u16, 200), behind.status);
+        try testing.expectEqual(@as(u32, 0), behind.hold_ms);
+        const json = try rig.json(behind);
+        const bookmark = field(json, "revision").integer;
+        try testing.expect(bookmark < head);
+    }
+    // Once the bookmark is the head, the idle answer is held again.
+    var query_buffer: [64]u8 = undefined;
+    const query = try std.fmt.bufPrint(&query_buffer, "from={d}&timeout=5000", .{head + 1});
+    try testing.expectEqual(@as(u32, 5000), rig.get("/v1/watch", query).hold_ms);
+    try testing.expectEqual(@as(u32, 5000), rig.get("/v1/jobs/watch", query).hold_ms);
+}
+
 test "leases lists the node's lease with the key it holds" {
     // Goal: api.md, "GET /v1/leases", which the Nodes screen polls for the TTL remaining.
     var rig = try Rig.start(4);
@@ -944,6 +984,31 @@ fn job_json(rig: *Rig, name: []const u8, image: []const u8) ![]const u8 {
 
 fn post_job(rig: *Rig, path: []const u8, body: []const u8) api_mod.Response {
     return rig.call(.{ .method = "POST", .path = path, .body = body });
+}
+
+test "a job body that does not parse says why, under ZC-E0104" {
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const head = "{\"name\":\"x\",\"image\":\"i\",\"command\":[\"a\"],\"deadline_ms\":1,";
+    const cases = [_]struct { body: []const u8, text: []const u8 }{
+        .{
+            .body = head ++ "\"submit_by_ms\":1,\"surprise\":1}",
+            .text = "field the API does not know",
+        },
+        .{ .body = "{\"name\":\"x\"}", .text = "required field is missing" },
+        .{ .body = head ++ "\"submit_by_ms\":\"soon\"}", .text = "wrong type, or a number" },
+        .{ .body = head ++ "\"submit_by_ms\":-1}", .text = "wrong type, or a number" },
+        .{ .body = head ++ "\"submit_by_ms\":1", .text = "ends too soon" },
+        .{ .body = "nonsense", .text = "not valid JSON" },
+    };
+    for (cases) |case| {
+        const response = post_job(&rig, "/v1/jobs", case.body);
+        try rig.refused(response, 400, "ZC-E0104");
+        if (std.mem.indexOf(u8, response.body, case.text) == null) {
+            std.debug.print("want {s} in {s}\n", .{ case.text, response.body });
+            return error.TestExpectedEqual;
+        }
+    }
 }
 
 test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why" {

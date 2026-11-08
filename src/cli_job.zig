@@ -376,25 +376,60 @@ fn watch(
     from_option: ?u64,
     report: *Report,
 ) Error!void {
-    const arena = env.arena;
     var ring: Seen = .{};
     var from: u64 = from_option orelse try head(env, client, report) + 1;
     const rounds = env.job_rounds_max orelse std.math.maxInt(u32);
     for (0..rounds) |_| {
-        const path = try std.fmt.allocPrint(
-            arena,
-            "/v1/jobs/watch?from={d}&timeout={d}",
-            .{ from, env.job_watch_hold_ms },
-        );
-        const reply = try client.attempt("GET", path, "", report);
-        if (reply.status == 410) {
-            from = try relist(env, client, options, &ring, report) + 1;
-        } else if (reply.status < 200 or reply.status >= 300) {
-            return client.fail(reply, report);
-        } else {
-            from = try print_events(env, options, &ring, reply, report) + 1;
-        }
+        // Everything one round allocates (the path, the answer, its parse) is freed with it, so a
+        // watch that runs for days holds the same memory as one that has just begun.
+        // A failure ends the command and its report may point into the round's memory, so only a
+        // round that succeeded frees it.
+        var round_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        var round_env = env.*;
+        round_env.arena = round_arena.allocator();
+        var round_client = client.*;
+        round_client.env = &round_env;
+        from = try watch_round(&round_env, &round_client, options, &ring, from, report);
+        round_client.env = env;
+        client.* = round_client;
+        round_arena.deinit();
     }
+}
+
+/// One request of the watch and what it prints; returns the revision to ask from next.
+fn watch_round(
+    env: *const Env,
+    client: *Client,
+    options: Options,
+    ring: *Seen,
+    from: u64,
+    report: *Report,
+) Error!u64 {
+    const path = try std.fmt.allocPrint(
+        env.arena,
+        "/v1/jobs/watch?from={d}&timeout={d}",
+        .{ from, env.job_watch_hold_ms },
+    );
+    const reply = try client.attempt("GET", path, "", report);
+    var next: u64 = undefined;
+    if (reply.status == 410) {
+        next = try relist(env, client, options, ring, report) + 1;
+    } else if (reply.status < 200 or reply.status >= 300) {
+        return client.fail(reply, report);
+    } else {
+        const printed = try print_events(env, options, ring, reply, report);
+        next = printed.revision + 1;
+        if (!printed.any) return next;
+    }
+    try resume_line(env, next, report);
+    return next;
+}
+
+/// Tells the user where to pick the watch up again: stderr, so the endings on stdout keep their
+/// shape (`--output json` too), after every answer that carried an ending or a relist.
+fn resume_line(env: *const Env, next: u64, report: *Report) Error!void {
+    const line = try std.fmt.allocPrint(env.arena, "watching: resume with --from {d}\n", .{next});
+    try cli_commands.emit(env, .stderr, line, report);
 }
 
 /// The store revision now.
@@ -405,23 +440,27 @@ fn head(env: *const Env, client: *Client, report: *Report) Error!u64 {
         cli_data.contract(report, reply.request_id, "has no revision");
 }
 
-/// Prints the endings in a watch answer and returns its revision, the bookmark.
+/// Prints the endings in a watch answer. `revision` is the answer's bookmark; `any` is whether
+/// the answer held events.
+const Printed = struct { revision: u64, any: bool };
+
 fn print_events(
     env: *const Env,
     options: Options,
     ring: *Seen,
     reply: cli_http.Reply,
     report: *Report,
-) Error!u64 {
+) Error!Printed {
     const body = try cli_data.parse(env.arena, reply, report);
     const revision = cli_data.number(body, "revision") orelse
         return cli_data.contract(report, reply.request_id, "has no revision");
-    for (cli_data.array(body, "events") orelse &.{}) |event| {
+    const events = cli_data.array(body, "events") orelse &.{};
+    for (events) |event| {
         const status = cli_data.member(event, "status") orelse continue;
         const name = cli_data.text(event, "name") orelse continue;
         try print_ending(env, options, ring, name, status, report);
     }
-    return revision;
+    return .{ .revision = revision, .any = events.len > 0 };
 }
 
 fn print_ending(
@@ -487,7 +526,9 @@ const Script = struct {
         _ = method;
         _ = body;
         const script: *Script = @ptrCast(@alignCast(context));
-        script.paths.append(script.arena, path) catch unreachable; // The test arena has room.
+        // The path lives in the round's memory, which the command frees: keep a copy.
+        const kept = script.arena.dupe(u8, path) catch unreachable; // The test arena has room.
+        script.paths.append(script.arena, kept) catch unreachable; // The test arena has room.
         if (std.mem.startsWith(u8, path, "/v1/jobs?limit=1")) {
             return script.reply(200, "{\"revision\":10,\"jobs\":[]}");
         }
@@ -541,7 +582,9 @@ test "a watch that is told 410 lists the endings, skips the ones it printed, and
     try testing.expectEqual(@as(u8, 0), @import("cli.zig").run(&env, &.{ "job", "watch" }));
     const expected = "a  exited (code 0)  n1\nb  failed (oom)  n2\n";
     try testing.expectEqualStrings(expected, stdout.written());
-    try testing.expectEqualStrings("", stderr.written());
+    // stderr tells where to resume: after the relist (revision 20) and after the batch (22).
+    const resumed = "watching: resume with --from 21\nwatching: resume with --from 23\n";
+    try testing.expectEqualStrings(resumed, stderr.written());
     try testing.expectEqual(@as(usize, 4), script.paths.items.len);
     try testing.expect(std.mem.startsWith(u8, script.paths.items[3], "/v1/jobs/watch?from=21&"));
 }
@@ -667,6 +710,21 @@ test "a relist of more endings than 1,024 prints each ending once, however often
         try names.put(arena, name, {});
     }
     try testing.expectEqual(@as(u32, 2000), count);
+}
+
+test "a watch of many empty answers does not grow the command's memory" {
+    // Goal: RB-S13, a long watch runs in constant memory. Method: 300 empty answers; the
+    // command's arena stays where the first request left it.
+    var server_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer server_state.deinit();
+    var env_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer env_state.deinit();
+    var big: Big = .{ .arena = server_state.allocator(), .total = 0, .gone_watches = 0 };
+    var stdout: Writer.Allocating = .init(server_state.allocator());
+    const words: []const []const u8 = &.{ "job", "watch" };
+    const code = try big_run(env_state.allocator(), &big, words, "u", 300, &stdout);
+    try testing.expectEqual(@as(u8, 0), code);
+    try testing.expect(env_state.queryCapacity() < 16 * 1024);
 }
 
 test "two unplaced endings of a reused name differ by ended_at_ms, one ending repeats" {
