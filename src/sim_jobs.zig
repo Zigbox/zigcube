@@ -15,8 +15,10 @@ const Context = controller.Context;
 
 /// Runs the ledger can hold. A run past it is counted, not judged (J2 stays sound for the rest).
 pub const ledger_max: u32 = 4096;
-/// Containers the trackers keep a clock for at once.
-pub const watch_max: u32 = 128;
+/// Containers the trackers keep a clock for at once: one per live run, and no more than
+/// `jobs_max` runs exist (RB-N8: the old 128 dropped the rest unjudged and without a word; an
+/// overflow now fails the run).
+pub const watch_max: u32 = constants.jobs_max;
 
 /// What a start was judged against, and the first verdict that failed.
 pub const State = struct {

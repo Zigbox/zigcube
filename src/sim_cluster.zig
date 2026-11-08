@@ -2396,8 +2396,9 @@ fn track_jobs(c: *Cluster) Failure!void {
             }
             const run = job_run_of(&ctx, job);
             if (run) |known| note_marks(c, known, node, &watch);
-            if (!c.wedged_lately(node)) try judge_job_container(c, &ctx, job, node, &watch, run);
-            if (count == sim_jobs.watch_max) continue;
+            try judge_job_container(c, &ctx, job, node, &watch, run);
+            try check(c, count < sim_jobs.watch_max, "sim: more live job containers than " ++
+                "`watch_max`");
             next[count] = watch;
             count += 1;
         }
@@ -2485,6 +2486,9 @@ fn judge_job_container(
         try check(c, since <= stop_bound, "J6: a run kept executing after its stop committed, " ++
             "past the bound");
     }
+    // J1 has no wedge allowance, so a node that is, or lately was, wedged is not judged for it
+    // (RB-N8: J8 and J6 above subtract the wedged time and are judged on every node).
+    if (c.wedged_lately(node)) return;
     const status = job_status_of(ctx, job) orelse return;
     if (!records.job_state_terminal(status.state)) return;
     const ended = watch.ended_since_ms orelse now;
