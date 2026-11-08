@@ -381,8 +381,8 @@ const Node = struct {
     /// The agent is dead until `restart_at_ms`.
     down: bool,
     restart_at_ms: u64,
-    /// The crash that took the agent down also lost its state directory: the restart finds none
-    /// (RB-S2 c; J2 holds across a lost state directory).
+    /// The host crash that took the agent down also lost its disk: the restart finds no state
+    /// directory and no container (RB-S2 c; J2 holds across a lost state directory).
     wipe_pending: bool = false,
     /// The agent does nothing before this true time (a call in progress, a back-off).
     resume_ms: u64,
@@ -692,8 +692,7 @@ pub const Stats = struct {
     agent_failures: u32 = 0,
     transactions: u32 = 0,
     crashes_injected: u32 = 0,
-    /// Crashes that also lost the state directory (every 5th, no draw: other worlds keep their
-    /// streams).
+    /// Host crashes that also lost the disk (`Options.strong` only; no draw).
     wipes: u32 = 0,
     /// Calls refused because the agent that made them had crashed.
     dead_calls: u32 = 0,
@@ -828,6 +827,10 @@ pub const Cluster = struct {
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
     job_next: u32,
+    /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
+    strong: bool,
+    /// The host crashes injected so far (the wipe takes every other one, from the first).
+    host_crashes: u32,
 
     pub fn create(
         gpa: Allocator,
@@ -888,6 +891,8 @@ pub const Cluster = struct {
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
+        c.strong = options.strong or c1_teeth.strong_world;
+        c.host_crashes = 0;
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
@@ -1421,8 +1426,16 @@ pub const Cluster = struct {
         const kind: @import("agent_state.zig").CrashKind =
             if (random.boolean()) .process else .host;
         c.stats.crashes_injected += 1;
-        // No draw: every 5th crash loses the state directory too.
-        if (c.stats.crashes_injected % 5 == 3) node.wipe_pending = true;
+        // No draw: with `Options.strong`, every other host crash loses the disk, state directory
+        // and containers. A `.process` crash never does: a directory removed by hand would leave
+        // containers running that this simulated node cannot list (its runtime keeps their
+        // records in that directory), which no agent can find, and J1, J8 and I1b rightly fail
+        // (about one seed in five at 100 operations; docs/core.md, "What the simulation does not
+        // cover").
+        if (c.strong and kind == .host) {
+            c.host_crashes += 1;
+            if (c.host_crashes % 2 == 1) node.wipe_pending = true;
+        }
         switch (random.uintLessThan(u32, 3)) {
             0 => node.sim.arm_crash(1 + random.uintLessThan(u32, 6), kind),
             1 => node.sim.arm_step(1 + random.uintLessThan(u32, 3), kind),
@@ -1439,8 +1452,9 @@ pub const Cluster = struct {
         // "jb-" and a u32 fit.
         const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
         // Every 13th job asks for more cpu than any node has, so that no node ever claims it and
-        // its run must end `not_started` (J8's second clause). No draw: other worlds are unchanged.
-        const unplaceable = c.job_next % 13 == 5;
+        // its run must end `not_started` (J8's second clause). No draw, and only with
+        // `Options.strong`: other worlds are unchanged.
+        const unplaceable = c.strong and c.job_next % 13 == 5;
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
@@ -2795,6 +2809,11 @@ pub const Options = struct {
     /// The job workload (docs/briefs/b1.md): jobs are submitted and cancelled, their containers
     /// end, and J1 to J3 and J5 to J8 are checked (J3 and J5 under `c1`).
     jobs: bool = true,
+    /// The stronger world of B2 slice 4: every other host crash also loses the node's disk (state
+    /// directory and containers) and every thirteenth job cannot be placed. Off, a run is the
+    /// world it was before those faults existed, bit for bit (a replay line of an older failure
+    /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
+    strong: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -2818,6 +2837,7 @@ pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
         options.profile_auto = false;
     }
     if (operations == null) {
+        options.strong = true;
         if (options.nodes == null) options.nodes = shape.nodes;
         if (options.lease_ttl_ms == null) options.lease_ttl_ms = shape.lease_ttl_ms;
         if (options.replicas_pct == null) options.replicas_pct = shape.replicas_pct;

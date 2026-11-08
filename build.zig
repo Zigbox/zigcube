@@ -1252,18 +1252,20 @@ const c1_teeth_roots = [_]struct {
     .{
         .name = "job_wipe",
         .root = "src/sim_c1_teeth_job_wipe_main.zig",
-        // J2 (a run id started again) or J7 (started under another tenure than its claim):
-        // J2 and J7 both catch a lost state directory; the symptom is a prefix match, so "J".
-        .symptom = "J",
-        .canary_seeds = 250,
-        .seeds = 40,
-        .plain_symptom = "J",
-        .plain_seeds = 40,
+        // J2 (a run id started again) or J7 (started under another tenure than its claim) and no
+        // other check: `|` separates the two alternatives (`src/symptom.zig`).
+        .symptom = job_wipe_symptom,
+        .canary_seeds = 300,
+        .seeds = 100,
+        .plain_symptom = job_wipe_symptom,
+        .plain_seeds = 100,
     },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
 const canary_seeds_teeth = 10;
+const job_wipe_symptom = "J2: a run id was started a second time|" ++
+    "J7: a run was started under another tenure";
 const canary_seeds_swarm_teeth = 200;
 /// What a failure of each of the two must start with: the check their fault breaks (the text
 /// `sim_teeth` and `sim_swarm_teeth` print, measured 2026-11-05), so a canary that fails some

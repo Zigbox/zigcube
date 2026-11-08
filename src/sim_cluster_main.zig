@@ -31,7 +31,8 @@
 //!
 //! `--c1` runs sim-c1 (docs/core.md, "sim-c1"): the per-revision checks of docs/authority.md §4.
 //! `--expect-symptom=TEXT` with `--expect-fail` makes the failure count only if it starts with
-//! TEXT; the negative tests of sim-c1 use it (`sim_c1_teeth_main.zig`).
+//! TEXT, or with one of several `|`-separated alternatives (src/symptom.zig); the negative tests
+//! of sim-c1 use it (`sim_c1_teeth_main.zig`).
 //!
 //! `--trace-steps` writes `step: <name>` to stderr, unbuffered, as each run enters a step
 //! ("faults", "healed", "convergence", "end"), so a run that panics leaves where it was: the
@@ -47,13 +48,14 @@ const constants = @import("constants.zig");
 const fencing = @import("fencing.zig");
 const sim_cluster = @import("sim_cluster.zig");
 const sim_shape = @import("sim_shape.zig");
+const symptom_spec = @import("symptom.zig");
 
 const usage_text = "usage: sim-cluster <seed> <operations|auto> [<nodes>] " ++
     "[--liveness=true|false] [--heal-at=N] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--trace-steps]\n" ++
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--trace-steps]\n" ++
     "       sim-cluster --seeds A..B <operations|auto> " ++
     "[<nodes>] [--liveness=true|false] [--shrink] [--profile=NAME|auto] [--lease-ttl-ms=N] " ++
-    "[--replicas-pct=N] [--jobs=true|false] [--expect-fail] [--trace-steps]\n";
+    "[--replicas-pct=N] [--jobs=true|false] [--strong] [--expect-fail] [--trace-steps]\n";
 
 /// What the command line asked for.
 const Args = struct {
@@ -67,6 +69,7 @@ const Args = struct {
     expect_fail: bool = false,
     trace_steps: bool = false,
     /// `--expect-symptom=TEXT` (with `--expect-fail`): the failure must start with TEXT ("I6"),
+    /// or with one of its `|`-separated alternatives ("J2: a run id|J7: a run was"),
     /// so a negative test passes only if the check it is about is the one that fired.
     expect_symptom: ?[]const u8 = null,
 };
@@ -146,10 +149,14 @@ fn parse_flag(parsed: *Args, arg: []const u8) bool {
         parsed.options.jobs = true;
     } else if (std.mem.eql(u8, arg, "--jobs=false")) {
         parsed.options.jobs = false;
+    } else if (std.mem.eql(u8, arg, "--strong")) {
+        parsed.options.strong = true;
     } else if (std.mem.eql(u8, arg, "--c1")) {
         parsed.options.c1 = true;
     } else if (std.mem.startsWith(u8, arg, "--expect-symptom=")) {
-        parsed.expect_symptom = arg["--expect-symptom=".len..];
+        const spec = arg["--expect-symptom=".len..];
+        if (!symptom_spec.valid(spec)) return false;
+        parsed.expect_symptom = spec;
     } else if (std.mem.startsWith(u8, arg, "--profile=")) {
         return parse_profile(parsed, arg["--profile=".len..]);
     } else if (std.mem.startsWith(u8, arg, "--lease-ttl-ms=")) {
@@ -282,6 +289,7 @@ fn print_replay(
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c1) try out.writeAll(" --c1");
     if (!options.jobs) try out.writeAll(" --jobs=false");
+    if (options.strong) try out.writeAll(" --strong");
     // Concrete, so the replay needs no draw: a profile or ttl the seed drew is named.
     if (options.profile != .mixed) try out.print(" --profile={s}", .{options.profile.name()});
     if (options.lease_ttl_ms) |ttl| try out.print(" --lease-ttl-ms={d}", .{ttl});
@@ -310,7 +318,7 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
             if (parsed.expect_fail) {
                 // Caught, and that is all the teeth test asks, if it is the right check.
                 if (parsed.expect_symptom) |want| {
-                    if (!std.mem.startsWith(u8, symptom(report), want)) {
+                    if (!symptom_spec.matches(symptom(report), want)) {
                         out.print("sim-cluster: seed {d} failed, but not with \"{s}\"\n", .{
                             seed, want,
                         }) catch return constants.exit_environment;
@@ -402,6 +410,17 @@ fn ttl_refusal(args: []const []const u8) ?[]const u8 {
         if (fencing.inequality_problem(ttl) != null) return ttl_refusal_text;
     }
     return null;
+}
+
+test "--expect-symptom takes |-separated alternatives and refuses an empty one" {
+    const two = parse(&.{
+        "sim", "--seeds", "1..9", "60", "--expect-fail", "--expect-symptom=J2|J7",
+    });
+    try std.testing.expectEqualStrings("J2|J7", two.?.expect_symptom.?);
+    const empty_tail = parse(&.{ "sim", "--seeds", "1..9", "60", "--expect-symptom=J2|" });
+    try std.testing.expect(empty_tail == null);
+    const empty = parse(&.{ "sim", "--seeds", "1..9", "60", "--expect-symptom=" });
+    try std.testing.expect(empty == null);
 }
 
 test "the command lines: one seed, a range, and what is refused" {

@@ -321,6 +321,19 @@ fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the te
 100 operations takes about 0.7 s natively in ReleaseSafe. The range output is what the simulation
 fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and step, so a change to
 either line's format is a change to `src/sim_fleet_issue.zig` too.
+**The strong world (B2 slice 4, `--strong`).** Two faults that older worlds never had, behind one
+option so that every replay line written before it (`c1_regressions`, `sim-c1-regress`, the
+replay commands of open `sim-fleet` issues) still runs its own world bit for bit: with `--strong`,
+every other host crash also loses the node's disk (state directory and containers; `wipes=` in the
+report), and every thirteenth job asks for more cpu than any node has, so that no node claims it
+(J8's second clause). `auto` operations and the teeth `job_wipe` and `job_unclaimed` switch it on,
+and the replay line then carries `--strong`. **What it does not cover:** a state directory removed
+by hand while the host and its containers stay up. The simulated node's runtime keeps each
+container's record in that directory, so the containers would run on with nothing that lists them;
+no agent can find such a container and J1, J8 and I1b fail on it (measured: 42 of 200 seeds at 100
+operations, plain). A real adapter keeps its containers' labels in the runtime, where the agent
+still lists them, so the case needs a runtime model that lists containers apart from the agent's
+files; that is a coverage cut, not a pass.
 **Profiles and shapes (C3 fleet 1).** `--profile=` is `mixed` (default: the world every earlier
 build drew, bit for bit), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
 the seed, weights 3 2 2 2 2). A profile other than `mixed` zeroes every fault class but its own
