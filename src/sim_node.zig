@@ -151,8 +151,9 @@ pub const SimNode = struct {
     ) runtime.Error!runtime.StartOutcome {
         const node = from(context);
         // As `stop_impl`: the pass goes on past a failed call (a fence outlives a failed stop,
-        // a job's start follows a failed list), so a start can follow the crash in the same
-        // step; the dead agent's call fails again and does nothing.
+        // and deadline enforcement goes on past a failed stop or record write), so the replica
+        // pass can start on a node whose agent died there; the dead agent's call fails again
+        // and does nothing.
         if (node.crashed) return node.dead(diag);
         if (!agent_records.has_image(node.containers.fixtures, spec.image)) {
             // Refused before anything is written, as the real agent does.
