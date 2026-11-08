@@ -184,6 +184,9 @@ pub const Agent = struct {
     fence: Fence,
     /// How many times the agent has fenced itself; the shell says so when it grows.
     fences: u32,
+    /// Job reports the store refused (B2): only a race with a new assignment or the tenure's end,
+    /// so the cluster simulation checks they stop once the world has settled (J10).
+    job_reports_refused: u64,
     restored: bool,
     stops: [constants.agent_stops_max]PendingStop,
     stops_count: u32,
@@ -283,6 +286,7 @@ pub const Agent = struct {
         agent.renew_at_ms = 0;
         agent.fence = .{};
         agent.fences = 0;
+        agent.job_reports_refused = 0;
         agent.store_refusals = 0;
         agent.store_refused = false;
         agent.store_refusal_len = 0;

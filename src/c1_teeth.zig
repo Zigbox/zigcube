@@ -66,7 +66,12 @@ pub const offline_world = declared("c1_offline_world") or job_deadline_offline;
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");
 
+/// The agent reports a run it no longer holds under the assignment it was started under, and
+/// commits without comparing that assignment (must break J9: a report of a retired or
+/// superseded run is stored).
+pub const job_stale = declared("c1_teeth_job_stale");
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
-    job_deadline_offline or job_gap;
+    job_deadline_offline or job_gap or job_stale;

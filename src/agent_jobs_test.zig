@@ -680,6 +680,98 @@ test "a running run the server no longer serves is stopped with a recorded cause
     try testing.expectEqual(@as(?records.StopCause, .@"unreachable"), seen.stop_cause);
 }
 
+test "a run released while it runs ends on the node and is never reported again" {
+    // Goal (B2 re-review MUST 1): a run released while it runs ends on this node. The agent
+    // removes its start record once the container is gone and makes no report the store would
+    // refuse, then or on any later pass, and nothing it sees moves the heartbeat forward.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const world = rig.world;
+    const run_key = records.job_run_key(job_name);
+    const gone = [_]store.Op{ .{ .delete = run_key.slice() }, .{ .delete = records.assigned_key(
+        sim_world.node_name,
+        run_id,
+    ).slice() } };
+    const done = try writers.txn(
+        world.store_handle(),
+        .job_controller,
+        .{ .on_success = gone[0..1] },
+        &world.diag,
+    );
+    try testing.expect(done.succeeded);
+    const released = try writers.txn(
+        world.store_handle(),
+        .scheduler,
+        .{ .on_success = gone[1..2] },
+        &world.diag,
+    );
+    try testing.expect(released.succeeded);
+    for (0..5) |_| rig.step();
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
+    try expect_quiet(&rig, 20);
+}
+
+/// `passes` more agent passes, each with the heartbeat pushed far away: none of them may make a
+/// report the store refuses, and none may pull the heartbeat forward. Every pass runs before
+/// either is checked, so a pass that panics is reached.
+fn expect_quiet(rig: *Rig, passes: u32) !void {
+    const far: u64 = 1 << 60;
+    var moved: u32 = 0;
+    for (0..passes) |_| {
+        rig.world.agent.renew_at_ms = far;
+        rig.step();
+        if (rig.world.agent.renew_at_ms != far) moved += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), moved);
+    try testing.expectEqual(@as(u64, 0), rig.world.agent.job_reports_refused);
+}
+
+test "a run whose job is deleted and then released while it runs is never reported" {
+    // Goal (B2 re-review MUST 2): retention removes the job, its run and its observation while
+    // the run still holds its assignment; then the scheduler releases it. The agent has no
+    // assignment to report under, so it reports nothing (before the fix it reported under
+    // epoch 0 and the write-time check's assertion panicked), and the run ends on the node.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    try testing.expect((try rig.observed()) != null);
+    const world = rig.world;
+    const job_key = records.job_key(job_name);
+    const run_key = records.job_run_key(job_name);
+    const seen_key = records.job_observed_key(sim_world.node_name, job_name);
+    const retained = [_]store.Op{
+        .{ .delete = job_key.slice() },
+        .{ .delete = run_key.slice() },
+        .{ .delete = seen_key.slice() },
+    };
+    const swept = try writers.txn(
+        world.store_handle(),
+        .retention,
+        .{ .on_success = &retained },
+        &world.diag,
+    );
+    try testing.expect(swept.succeeded);
+    const assigned_key = records.assigned_key(sim_world.node_name, run_id);
+    const release = [_]store.Op{.{ .delete = assigned_key.slice() }};
+    const released = try writers.txn(
+        world.store_handle(),
+        .scheduler,
+        .{ .on_success = &release },
+        &world.diag,
+    );
+    try testing.expect(released.succeeded);
+    try expect_quiet(&rig, 25);
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(?agent_jobs.StartRecord, null), try rig.start_record());
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+}
+
 test "a damaged input value ends the run start_failed with ZC-E0523" {
     var rig = try Rig.start();
     defer rig.stop();

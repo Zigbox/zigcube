@@ -5,6 +5,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const constants = @import("constants.zig");
+
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
 
@@ -16,6 +18,15 @@ pub const Pull = struct {
     peer_bytes: u64,
     cached_bytes: u64,
     bad_peers: []const []const u8,
+    /// The agent's clock around the pull; 0 when the record has none (not measured).
+    started_at_ms: u64 = 0,
+    finished_at_ms: u64 = 0,
+
+    /// How long the record says the pull took, null when it was not measured.
+    pub fn span_ms(pull: Pull) ?u64 {
+        if (pull.started_at_ms == 0 or pull.finished_at_ms < pull.started_at_ms) return null;
+        return pull.finished_at_ms - pull.started_at_ms;
+    }
 
     pub fn has_bad_peer(pull: Pull, peer: []const u8) bool {
         for (pull.bad_peers) |name| {
@@ -72,6 +83,8 @@ fn pull_from(arena: Allocator, item: Json) Error!Pull {
         .peer_bytes = peer_sum,
         .cached_bytes = number(item, "cached_bytes") orelse return error.BadJson,
         .bad_peers = names,
+        .started_at_ms = number(item, "started_at_ms") orelse 0,
+        .finished_at_ms = number(item, "finished_at_ms") orelse 0,
     };
 }
 
@@ -80,6 +93,11 @@ pub fn pull_on(pulls: []const Pull, node: []const u8) ?Pull {
         if (std.mem.eql(u8, pull.node, node)) return pull;
     }
     return null;
+}
+
+fn spans_cap(pull: Pull, cap_ms: u64) bool {
+    const span = pull.span_ms() orelse return false;
+    return span + holding_visible_lag_ms >= cap_ms;
 }
 
 /// Step 1 (O5, "registry once"): exactly one node took bytes from the registry, and every other
@@ -94,6 +112,130 @@ pub fn registry_once(pulls: []const Pull) bool {
         }
     }
     return from_registry == 1;
+}
+
+/// What a node's own fetch.log says about O5
+/// (docs/decisions/2026-11-07-demo-c2-registry-once-cap.md).
+/// Both facts are written by the fetch itself, so they are measured on that node's clock.
+pub const Evidence = struct {
+    node: []const u8,
+    /// The log says this node pulled the tree from the registry first (O5's election).
+    elected: bool,
+    /// The log says no peer came to hold the tree in this many ms (the node waited the cap out).
+    waited_ms: ?u64,
+};
+
+const elected_line = "pulls it from the registry first (O5)";
+const waited_line = "no peer came to hold the tree in ";
+
+/// The evidence in `log`, the lines of `guest.sh fetch-logs O5` on `node`.
+pub fn evidence_of(node: []const u8, log: []const u8) Evidence {
+    var found: Evidence = .{ .node = node, .elected = false, .waited_ms = null };
+    var lines = std.mem.splitScalar(u8, log, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, elected_line) != null) found.elected = true;
+        const at = std.mem.indexOf(u8, line, waited_line) orelse continue;
+        const digits = line[at + waited_line.len ..];
+        var end: usize = 0;
+        while (end < digits.len and std.ascii.isDigit(digits[end])) end += 1;
+        found.waited_ms = std.fmt.parseInt(u64, digits[0..end], 10) catch continue;
+    }
+    return found;
+}
+
+/// How long after the elected node's registry pull ends a waiting node can first see the tree
+/// held: the agent publishes `/node-store/` on its next resync tick (`agent_resync_ms`), and the
+/// waiter notices it on its next poll (`fetch_peer_poll_ms`). A waiter's wait runs on its own
+/// clock from its own fetch start, and the elected pull's record spans the registry pull alone,
+/// so a correct overrun can show an elected span up to this much under the cap. Step 1 allows
+/// exactly this much; the cap itself is not changed.
+pub const holding_visible_lag_ms: u64 = @as(u64, constants.agent_resync_ms) +
+    constants.fetch_peer_poll_ms;
+
+/// How step 1 found the registry reads (docs/decisions/2026-11-07-demo-c2-registry-once-cap.md).
+pub const RegistryRead = struct {
+    kind: enum {
+        /// One node read the registry, and every other node got the tree from peers.
+        once,
+        /// Several nodes read it, the elected node's own pull took at least the O5 wait cap, and
+        /// every other reader waited the cap out first: the elected pull outlasted the wait, so
+        /// the others fell back to the registry as designed. Allowed, and said as such.
+        overran,
+        /// Several nodes read it and the evidence does not show an overrun: a duplicate pull,
+        /// the bug the check exists to catch.
+        repeated,
+        /// No node read the registry, or a node that did not took nothing from peers.
+        broken,
+    },
+    /// The elected node ("" if none was found) and its own pull's span (0: not measured).
+    elected: []const u8 = "",
+    elected_ms: u64 = 0,
+    /// For `repeated`: what is missing (a sentence), else "".
+    why: []const u8 = "",
+
+    pub fn passes(read: RegistryRead) bool {
+        return read.kind == .once or read.kind == .overran;
+    }
+};
+
+fn evidence_for(evidence: []const Evidence, node: []const u8) ?Evidence {
+    for (evidence) |item| {
+        if (std.mem.eql(u8, item.node, node)) return item;
+    }
+    return null;
+}
+
+/// Step 1 (O5, "registry once"), with the wait cap `cap_ms` (`constants.fetch_peer_wait_ms`).
+/// Strict unless the nodes' own records show the cap was overrun: exactly one registry reader
+/// was elected (its fetch.log says so) and its own pull took at least `cap_ms`, and every other
+/// registry reader waited out `cap_ms` (its fetch.log says so). The elected span may fall short
+/// of the cap by `holding_visible_lag_ms` (a waiter sees the tree only after the next publish
+/// and poll). A pull record starts when the
+/// registry pull starts, after any wait, so a record's span never includes the wait, and spans
+/// say nothing about which node was elected. Missing evidence is `repeated`.
+pub fn registry_read(pulls: []const Pull, evidence: []const Evidence, cap_ms: u64) RegistryRead {
+    var from_registry: u32 = 0;
+    var elected: ?Pull = null;
+    var reader: ?Pull = null;
+    var elected_count: u32 = 0;
+    var others_waited = true;
+    for (pulls) |pull| {
+        if (pull.registry_bytes == 0) {
+            if (pull.peer_bytes == 0) return .{ .kind = .broken };
+            continue;
+        }
+        from_registry += 1;
+        reader = pull;
+        const seen = evidence_for(evidence, pull.node);
+        if (seen != null and seen.?.elected) {
+            elected = pull;
+            elected_count += 1;
+        } else if (seen == null or (seen.?.waited_ms orelse 0) < cap_ms) {
+            others_waited = false;
+        }
+    }
+    if (from_registry == 0) return .{ .kind = .broken };
+    if (from_registry == 1) {
+        return .{
+            .kind = .once,
+            .elected = reader.?.node,
+            .elected_ms = reader.?.span_ms() orelse 0,
+        };
+    }
+    const why: []const u8 = if (elected_count != 1)
+        "no single elected node is recorded (election broken)"
+    else if (!spans_cap(elected.?, cap_ms))
+        "the elected node's own pull was inside the cap, or not measured"
+    else if (!others_waited)
+        "a node read the registry without waiting out the cap"
+    else
+        "";
+    if (why.len > 0) return .{ .kind = .repeated, .why = why };
+    return .{
+        .kind = .overran,
+        .elected = elected.?.node,
+        .elected_ms = elected.?.span_ms().?,
+    };
 }
 
 /// Step 2: what a node transferred, from the registry and its peers together.
@@ -263,6 +405,135 @@ test "registry_once fails when a second node pulled from the registry or took no
     try testing.expect(!registry_once(&empty));
     var none = [_]Pull{ base, base };
     try testing.expect(!registry_once(&none));
+}
+
+test "evidence_of reads the election and the wait from a fetch.log" {
+    // Goal: the two facts the check relies on come out of the lines the fetch writes. Method:
+    // the exact lines of fetch_cli.zig's `note` calls, with a container prefix as guest.sh adds.
+    const elected = evidence_of("node2", "c1: zcube-agent fetch: no peer holds the tree yet and " ++
+        "this node pulls it from the registry first (O5); the others fetch it from here\n");
+    try testing.expect(elected.elected and elected.waited_ms == null);
+    const waited = evidence_of("node1", "c1: zcube-agent fetch: no peer came to hold the tree " ++
+        "in 30000 ms; 3 node(s) fetch it (O5)\n");
+    try testing.expect(!waited.elected);
+    try testing.expectEqual(@as(?u64, 30000), waited.waited_ms);
+    const nothing = evidence_of("node3", "");
+    try testing.expect(!nothing.elected and nothing.waited_ms == null);
+}
+
+fn overrun_pulls(cap: u64) [3]Pull {
+    const base: Pull = .{
+        .node = "node1",
+        .tree = "b3:af",
+        .registry_bytes = 10,
+        .peer_bytes = 0,
+        .cached_bytes = 0,
+        .bad_peers = &.{},
+        .started_at_ms = 1000,
+        .finished_at_ms = 1000 + cap + 5000,
+    };
+    var three = [_]Pull{ base, base, base };
+    three[1].node = "node2";
+    three[2].node = "node3";
+    return three;
+}
+
+test "registry_read passes the #162 overrun: a slow elected pull, fast fallback pulls" {
+    // Goal: the run of 4b97e69 (elected pull 35.6 s, the others waited out the cap and then
+    // pulled in less than the cap) passes. Method: node2 elected, node1 and node3 waited 30 s,
+    // their own pulls 22 s; a pull record's span holds no wait.
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    var three = overrun_pulls(cap);
+    three[1].finished_at_ms = 1000 + cap + 5587;
+    three[0].finished_at_ms = 1000 + 22_000;
+    three[2].finished_at_ms = 1000 + 22_000;
+    const evidence = [_]Evidence{
+        .{ .node = "node1", .elected = false, .waited_ms = cap + 12 },
+        .{ .node = "node2", .elected = true, .waited_ms = null },
+        .{ .node = "node3", .elected = false, .waited_ms = cap },
+    };
+    const read = registry_read(&three, &evidence, cap);
+    try testing.expect(read.kind == .overran and read.passes());
+    try testing.expectEqualStrings("node2", read.elected);
+    try testing.expectEqual(cap + 5587, read.elected_ms);
+}
+
+test "registry_read fails a duplicate pull on a slow runner" {
+    // Goal: election broken, every node pulled at once (nobody waited, nobody elected), each
+    // pull at least the cap: the old check waived this. Method: spans over the cap, no evidence.
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    const three = overrun_pulls(cap);
+    const silent = [_]Evidence{
+        .{ .node = "node1", .elected = false, .waited_ms = null },
+        .{ .node = "node2", .elected = false, .waited_ms = null },
+        .{ .node = "node3", .elected = false, .waited_ms = null },
+    };
+    const read = registry_read(&three, &silent, cap);
+    try testing.expect(read.kind == .repeated and !read.passes());
+    try testing.expect(read.why.len > 0);
+    try testing.expect(registry_read(&three, &.{}, cap).kind == .repeated); // No evidence.
+    // Two nodes claim the election: still a duplicate.
+    var both = silent;
+    both[0].elected = true;
+    both[1].elected = true;
+    try testing.expect(registry_read(&three, &both, cap).kind == .repeated);
+}
+
+test "registry_read needs the elected pull over the cap and every other node to have waited" {
+    // Goal: each remaining way to a false pass fails. Method: start from the passing case.
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    var three = overrun_pulls(cap);
+    const evidence = [_]Evidence{
+        .{ .node = "node1", .elected = false, .waited_ms = cap },
+        .{ .node = "node2", .elected = true, .waited_ms = null },
+        .{ .node = "node3", .elected = false, .waited_ms = cap },
+    };
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .overran);
+    var early = evidence; // node3 went to the registry before the cap ran out.
+    early[2].waited_ms = cap - 1;
+    try testing.expect(registry_read(&three, &early, cap).kind == .repeated);
+    early[2].waited_ms = null;
+    try testing.expect(registry_read(&three, &early, cap).kind == .repeated);
+    // The elected pull finished well inside the cap, beyond the publish lag.
+    three[1].finished_at_ms = 1000 + cap - holding_visible_lag_ms - 1;
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .repeated);
+    three[1].started_at_ms = 0; // Not measured: strict.
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .repeated);
+}
+
+test "registry_read allows the publish lag below the cap, and no more" {
+    // Goal: SHOULD 1 of the re-review: an elected pull just under the cap, waiters at cap + 40 ms,
+    // is a correct overrun; one past the allowance is a duplicate. Method: the passing case with
+    // the elected span at the edges of `holding_visible_lag_ms`.
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    var three = overrun_pulls(cap);
+    const evidence = [_]Evidence{
+        .{ .node = "node1", .elected = false, .waited_ms = cap + 40 },
+        .{ .node = "node2", .elected = true, .waited_ms = null },
+        .{ .node = "node3", .elected = false, .waited_ms = cap + 40 },
+    };
+    three[1].finished_at_ms = three[1].started_at_ms + cap - 1500;
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .overran);
+    three[1].finished_at_ms = three[1].started_at_ms + cap - holding_visible_lag_ms;
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .overran);
+    three[1].finished_at_ms -= 1;
+    try testing.expect(registry_read(&three, &evidence, cap).kind == .repeated);
+}
+
+test "registry_read: one registry reader is once; none, or a node with nothing, is broken" {
+    const cap: u64 = constants.fetch_peer_wait_ms;
+    var two = [_]Pull{ overrun_pulls(cap)[0], overrun_pulls(cap)[1] };
+    two[1].registry_bytes = 0;
+    two[1].peer_bytes = 3;
+    const once = registry_read(&two, &.{}, cap);
+    try testing.expect(once.kind == .once and once.passes());
+    try testing.expectEqualStrings("node1", once.elected);
+    two[1].peer_bytes = 0;
+    try testing.expect(registry_read(&two, &.{}, cap).kind == .broken);
+    two[0].registry_bytes = 0;
+    two[0].peer_bytes = 1;
+    two[1].peer_bytes = 1;
+    try testing.expect(registry_read(&two, &.{}, cap).kind == .broken);
 }
 
 test "pulls_of refuses a reply without the envelope" {

@@ -32,7 +32,7 @@ const pem_line_bytes = 64;
 const pem_bytes_max = pem_begin.len + pem_end.len +
     (constants.x509_cert_bytes_max + 2) / 3 * 4 + constants.x509_cert_bytes_max / 45 + 2;
 
-pub const Error = files.Error || error{OutOfMemory};
+pub const Error = files.Error || error{ OutOfMemory, Canceled };
 
 /// A CA certificate with less than this left is made again at the next start.
 const renew_ahead_ms: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -81,7 +81,10 @@ fn memory_key(io: std.Io, diag: *Diag) Error!Ed25519.KeyPair {
     defer std.crypto.secureZero(u8, &seed);
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
-        secure_random.fill(io, &seed, diag, "the CA key") catch return error.Failed;
+        secure_random.fill(io, &seed, diag, "the CA key") catch |err| return switch (err) {
+            error.Unavailable => error.Failed,
+            error.Canceled => error.Canceled,
+        };
         return Ed25519.KeyPair.generateDeterministic(seed) catch continue;
     }
 }
@@ -250,7 +253,10 @@ fn load_or_make_key(
     }
     // A seed that gives the identity element has a chance of about 2^-250; draw another.
     while (true) {
-        secure_random.fill(io, &seed, diag, "the CA key") catch return error.Failed;
+        secure_random.fill(io, &seed, diag, "the CA key") catch |err| return switch (err) {
+            error.Unavailable => error.Failed,
+            error.Canceled => error.Canceled,
+        };
         const key = Ed25519.KeyPair.generateDeterministic(seed) catch continue;
         try files.write_seed(io, dir, path, name, seed, diag);
         return key;
@@ -404,6 +410,31 @@ test "a memory CA with a failing random source is ZC-E0821, not a weaker key" {
         open(&ca, gpa, io, null, clock.clock(), .{ .quiet = true }, &diag),
     );
     try std.testing.expectEqual(@import("diag/codes.zig").Code.E0821, diag.code.?);
+}
+
+test "a cancelled task is Canceled with no diagnostic, in memory and on a first start" {
+    // Goal: a cancel while the CA key is drawn is passed on, not a diagnostic and not a panic in
+    // the caller. Method: an Io whose `randomSecure` is cancelled, no directory, then a new one.
+    var vtable: std.Io.VTable = undefined;
+    const io = secure_random.canceled_io(std.testing.io, &vtable);
+    var clock = FixedClock{};
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    const gpa = std.testing.allocator;
+    const quiet: Options = .{ .quiet = true };
+    try std.testing.expectError(
+        error.Canceled,
+        open(&ca, gpa, io, null, clock.clock(), quiet, &diag),
+    );
+    try std.testing.expect(diag.code == null);
+    var dir = try TestDir.make(std.testing.io);
+    defer dir.tmp.cleanup();
+    try std.testing.expectError(
+        error.Canceled,
+        open(&ca, gpa, io, dir.path(), clock.clock(), quiet, &diag),
+    );
+    try std.testing.expect(diag.code == null);
 }
 
 test "a memory CA is made again each time and says nothing when quiet" {

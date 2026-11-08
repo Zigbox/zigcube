@@ -43,6 +43,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 const records = @import("records.zig");
+const agent_jobs = @import("agent_jobs.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
 const why_acceptance = @import("why_acceptance.zig");
@@ -97,6 +98,10 @@ const cluster_up_ms_min: u64 = 120_000;
 const steps_per_minute_max: u64 = 200;
 /// How often a node may fence in the healed phase: 240 s long, against about 240 for the bug.
 const fences_after_heal_per_node_max: u32 = 4;
+/// How many of a node's job reports the store may refuse in the healed phase (J10). A report is
+/// made only under the run's current assignment, so one is refused only when that assignment or
+/// the tenure changed while the agent's pass ran: a few times, not on every pass (B2 review).
+const job_refusals_after_heal_per_node_max: u64 = 8;
 /// A cut link lasts this long at least, and this much longer at most: the agent's own call on a
 /// cut link takes 10 s, so a cut is already long.
 const partition_ms_min: u32 = 1000;
@@ -407,6 +412,10 @@ const Node = struct {
     fences: u32,
     /// `fences` when the heal began.
     fences_at_heal: u32,
+    /// Job reports the store refused (`Agent.job_reports_refused`), over all agent lives, and
+    /// that count when the heal began (J10).
+    job_refusals: u64,
+    job_refusals_at_heal: u64,
     /// Every agent step (failed ones too) and the virtual time with the agent up, over the
     /// whole run: the work ceiling's measure.
     all_steps: u32,
@@ -436,13 +445,26 @@ const Node = struct {
         diag: *Diag,
     ) agent_client.Error!agent_client.Reply {
         const node: *Node = @ptrCast(@alignCast(context));
+        // A dead agent makes no call: a step that goes on past the crash (deadline enforcement
+        // swallows it) ends at its next call to the server, and nothing reaches the net (#167).
+        if (node.sim.crashed or node.sim.files.crashed) return dead_call(diag);
         const net = &node.cluster.net;
+        assert(!node.sim.crashed);
         const result = net.transport(node.index).call(arena, request, diag);
         node.spent_ms += net.last_call_ms;
         // The call took that long on the agent's clock too, so a cap on its calls (the fence,
         // a run's deadline) is reached inside one step as it is in a real agent's.
         node.nclock.spend_until(node.cluster.manual.ms + node.spent_ms);
         return result;
+    }
+
+    /// The call of an agent that crashed: the server never hears of it (ZC-E0503).
+    fn dead_call(diag: *Diag) agent_client.Error {
+        assert(diag.code == null);
+        diag.raise(.E0503);
+        diag.cause("the simulated agent crashed: it makes no call to zcube-server", .{});
+        diag.fix(.{ .sentence = "start the agent again" });
+        return error.Unreachable;
     }
 
     fn restart(node: *Node) void {
@@ -524,8 +546,10 @@ const Node = struct {
         c.stats.agent_steps += 1;
         node.all_steps += 1;
         const fences_before = node.agent.fences;
+        const refusals_before = node.agent.job_reports_refused;
         const result = node.agent.reconcile(&ctx);
         node.fences += node.agent.fences - fences_before;
+        node.job_refusals += node.agent.job_reports_refused - refusals_before;
         node.resume_ms = c.manual.ms + node.spent_ms;
         if (!node.sim.crashed) node.save_pair(clock.now_ms());
         node.check_crashed();
@@ -915,6 +939,8 @@ pub const Cluster = struct {
         node.cut_mark_ms = c.manual.ms;
         node.fences = 0;
         node.fences_at_heal = 0;
+        node.job_refusals = 0;
+        node.job_refusals_at_heal = 0;
         node.up_ms = 0;
         node.all_steps = 0;
         node.all_up_ms = 0;
@@ -2372,6 +2398,24 @@ fn judge_job_container(
         "job reached a terminal status");
 }
 
+/// J10, at rest: no agent keeps a start record for a run whose assignment on its node is gone.
+/// A report of such a run is refused at write time (J9), and the agent must end the run locally
+/// instead of repeating the refusal on every pass (B2 review).
+fn start_records_retired(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    for (c.nodes) |node| {
+        const names = node.sim.files.interface().list(ctx.arena, agent_jobs.dir) catch
+            return check(c, false, "J10: a node's start records cannot be listed");
+        for (names) |entry| {
+            if (!std.mem.endsWith(u8, entry, ".json")) continue;
+            const run = entry[agent_jobs.dir.len .. entry.len - ".json".len];
+            const placed = records.assigned_key(node.name(), run);
+            const got = ctx.store.get(ctx.arena, placed.slice(), null, ctx.diag) catch
+                return check(c, false, "J10: an assignment cannot be read");
+            try check(c, got.kv != null, "J10: a start record outlives its run's assignment");
+        }
+    }
+}
+
 /// After the heal, with the world settled: no live container of an ended job, and no run still
 /// open long after the latest it could have started and run (J1, J8 at rest).
 fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
@@ -2417,6 +2461,7 @@ fn heal(c: *Cluster) void {
         node.partitioned_until_ms = null;
         node.frozen_until_ms = null;
         node.fences_at_heal = node.fences;
+        node.job_refusals_at_heal = node.job_refusals;
     }
 }
 
@@ -2483,6 +2528,7 @@ fn converged(c: *Cluster) Failure!void {
     }
     try no_strays(c, &ctx, &homes);
     if (c.jobs_on) try jobs_converged(c, &ctx);
+    if (c.jobs_on) try start_records_retired(c, &ctx);
 }
 
 /// Every container alive on any node is the container of a replica placed on that node.
@@ -2774,6 +2820,7 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
         c.enter("convergence");
         try converged(c);
         try fencing_settles(c);
+        if (c.jobs_on) try reports_settle(c);
     } else {
         c.fault_totals = c.phase_totals();
     }
@@ -2829,6 +2876,22 @@ fn fencing_settles(c: *Cluster) Failure!void {
     for (c.nodes) |node| worst = @max(worst, node.fences - node.fences_at_heal);
     try check(c, worst <= fences_after_heal_per_node_max, "agents kept fencing after the " ++
         "cluster healed (a lease renewal that cannot beat its fence)");
+}
+
+fn job_refusals(c: *const Cluster) u64 {
+    var total: u64 = 0;
+    for (c.nodes) |node| total += node.job_refusals;
+    return total;
+}
+
+/// J10, after the heal: an agent does not keep making job reports the store refuses. A report of
+/// a run that is gone (released, or placed again elsewhere) is never made; one that was made is
+/// not made again on every pass, so its refusal is no busy loop of store writes.
+fn reports_settle(c: *Cluster) Failure!void {
+    var worst: u64 = 0;
+    for (c.nodes) |node| worst = @max(worst, node.job_refusals - node.job_refusals_at_heal);
+    try check(c, worst <= job_refusals_after_heal_per_node_max, "J10: an agent kept making " ++
+        "job reports the store refused after the cluster healed");
 }
 
 /// An agent that never sleeps (a wake time that is always now) passes every other check and
@@ -2973,10 +3036,12 @@ fn print_jobs(c: *Cluster) void {
         j.created, j.cancelled, j.ended, j.starts_judged, j.ledger_count, j.ledger_full,
     });
     c.report.print("jobs: worst stop {d} ms, overlap {d} ms, past deadline {d} ms; " ++
-        "status rewrites judged={d} placements judged={d}\n", .{
+        "status rewrites judged={d} placements judged={d} reports judged={d} " ++
+        "refused={d}\n", .{
         j.stop_worst_ms,               j.overlap_worst_ms,
         j.deadline_worst_ms,           c.c1_tally.job_statuses_judged,
-        c.c1_tally.runs_placed_judged,
+        c.c1_tally.runs_placed_judged, c.c1_tally.job_reports_judged,
+        job_refusals(c),
     });
     const w = &c.jobs_watch;
     c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{
@@ -3060,6 +3125,27 @@ test "J8 holds on a small world whose agents' steps fail, without c1" {
     simulate(testing.allocator, 136502595, 40, .{}, &report);
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
     try testing.expect(!report.failed);
+}
+
+test "a start after the agent's crash is refused, not asserted (#158)" {
+    // Goal: regression for #152, #156 and #158 (`SimNode.start_impl` asserted the node had not
+    // crashed). Method: seed 57 at 100 operations under c1 aborted before the fix.
+    var report: Report = undefined;
+    simulate(testing.allocator, 57, 100, .{ .c1 = true }, &report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try testing.expect(!report.failed);
+}
+
+test "a crashed node's step makes no call to the server (#167)" {
+    // Goal: after a crash that deadline enforcement swallows, the step's heartbeat, publish and
+    // load must not reach the server (`tapped_call` refuses; it asserts nothing got through).
+    // Method: seeds whose runs crash agents mid-step, c1 and not.
+    for ([_]u64{ 57, 1, 2, 3, 4, 5, 6, 7 }) |seed| {
+        var report: Report = undefined;
+        simulate(testing.allocator, seed, 100, .{ .c1 = true }, &report);
+        if (report.failed) std.debug.print("seed {d}\n{s}\n", .{ seed, report.text() });
+        try testing.expect(!report.failed);
+    }
 }
 
 test "a node count can be asked for" {
