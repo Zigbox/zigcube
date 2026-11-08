@@ -130,6 +130,27 @@ pub fn release_run(
     assert(set.count == release_run_count);
 }
 
+/// What the release of a run on a node with no record reads.
+pub const OrphanRead = struct {
+    node: []const u8,
+    run: []const u8,
+    job: []const u8,
+    assigned_revision: store.Revision,
+    status_revision: store.Revision,
+};
+
+/// The release of a run whose node has no `/nodes`, status or allocation record: the assignment as
+/// read, the job's status as read, and the three node records still absent.
+pub fn release_orphan(set: *Set, reads: OrphanRead) void {
+    assert(set.count == 0);
+    assert(reads.assigned_revision > 0);
+    set.add(records.assigned_key(reads.node, reads.run), reads.assigned_revision);
+    set.add(records.job_status_key(reads.job), reads.status_revision);
+    set.add(records.node_key(reads.node), 0);
+    set.add(records.node_status_key(reads.node), 0);
+    set.add(records.allocation_key(reads.node), 0);
+}
+
 pub const ReleaseRead = struct {
     assigned_revision: store.Revision,
     allocation_revision: store.Revision,

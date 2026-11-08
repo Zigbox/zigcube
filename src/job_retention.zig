@@ -44,6 +44,11 @@ pub const Cursor = struct {
     failing: bool = false,
     failures: u64 = 0,
     failure: diag_mod.Diag = undefined,
+    /// Passes whose `/job-observed/` scan hit `observed_pages_max` and left keys unread, and the
+    /// diagnostic (ZC-E0302) of the latest. The pass still runs: it deletes each ended job's own
+    /// node's observation by key, and the rest wait for a pass that reads them.
+    truncated: u64 = 0,
+    truncation: diag_mod.Diag = undefined,
 
     /// The age in force: never below `job_finished_age_ms_min`.
     pub fn age(cursor: *const Cursor) u64 {
@@ -80,7 +85,11 @@ const Ended = struct {
 
 /// Every `/job-observed/<node>/<name>` key a pass read, whichever node wrote it: a node that
 /// lost the claim leaves its record behind, and it would block the name's next claim there.
-const Observed = []const []const u8;
+const Observed = struct {
+    keys: []const []const u8,
+    /// The scan stopped at `observed_pages_max` with keys unread.
+    truncated: bool,
+};
 
 /// One pass; returns when the next is due.
 pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
@@ -90,6 +99,13 @@ pub fn prune(ctx: *const Context, cursor: *Cursor, now_ms: u64) Error!u64 {
     try read_ended(ctx, revision, &ended);
     try mark_inputs(ctx, revision, ended.items);
     const observed = try read_observed(ctx, revision);
+    if (observed.truncated) {
+        cursor.truncated += 1;
+        const count_max = observed_pages_max * constants.store_list_limit_max;
+        _ = controller.too_many(ctx, records.prefix_job_observed, count_max) catch {};
+        cursor.truncation = ctx.diag.*;
+        ctx.diag.reset();
+    }
     const Rank = struct {
         fn older(_: void, first: Ended, second: Ended) bool {
             if (first.ended_at_ms != second.ended_at_ms) {
@@ -195,7 +211,8 @@ const observed_pages_max: u32 = 64;
 fn read_observed(ctx: *const Context, revision: store.Revision) Error!Observed {
     var keys: std.ArrayList([]const u8) = .empty;
     var after: ?[]const u8 = null;
-    for (0..observed_pages_max) |_| {
+    var truncated = false;
+    for (0..observed_pages_max) |at| {
         const page = try ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_job_observed,
             .at_revision = revision,
@@ -206,14 +223,27 @@ fn read_observed(ctx: *const Context, revision: store.Revision) Error!Observed {
             keys.append(ctx.arena, kv.key) catch return failures.no_memory(ctx.diag);
         }
         after = page.continue_after orelse break;
+        truncated = at + 1 == observed_pages_max;
     }
-    return keys.items;
+    return .{ .keys = keys.items, .truncated = truncated };
 }
 
 /// Whether `key` is `/job-observed/<node>/<name>` for this name (a name holds no `/`).
 fn observed_of(key: []const u8, name: []const u8) bool {
     const at = std.mem.lastIndexOfScalar(u8, key, '/') orelse return false;
     return std.mem.eql(u8, key[at + 1 ..], name);
+}
+
+/// With the scan truncated, the key of the observation the job's own node wrote, when the scan
+/// did not reach it (a delete of a key that is not there is harmless). Otherwise null.
+fn unread_own(ctx: *const Context, job: Ended, observed: Observed) Error!?[]const u8 {
+    if (!observed.truncated) return null;
+    const node = job.node orelse return null;
+    const key = try arena_key(ctx, records.job_observed_key(node, job.name));
+    for (observed.keys) |read| {
+        if (std.mem.eql(u8, read, key)) return null;
+    }
+    return key;
 }
 
 /// Deletes the job's records in one transaction. A conflict (the status changed since the read)
@@ -223,14 +253,16 @@ fn observed_of(key: []const u8, name: []const u8) bool {
 fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended, observed: Observed) Error!void {
     const fixed: u32 = 4;
     var mine: u32 = 0;
-    for (observed) |key| {
+    const own = try unread_own(ctx, job, observed);
+    if (own != null) mine += 1;
+    for (observed.keys) |key| {
         if (observed_of(key, job.name)) mine += 1;
     }
     const early: u32 = (fixed + mine) -| constants.store_txn_ops_max;
     var skip: u32 = early; // The job's first `early` observations go in transactions of their own.
     var spill: Batch = .{};
     var spilled: u32 = 0;
-    for (observed) |key| {
+    for (observed.keys) |key| {
         if (spilled == early) break;
         if (!observed_of(key, job.name)) continue;
         spill.delete(key);
@@ -247,7 +279,8 @@ fn drop_job(ctx: *const Context, cursor: *Cursor, job: Ended, observed: Observed
     batch.delete(try arena_key(ctx, records.job_input_key(job.name)));
     batch.delete(try arena_key(ctx, records.job_run_key(job.name)));
     batch.delete(try arena_key(ctx, records.job_status_key(job.name)));
-    for (observed) |key| {
+    if (own) |key| batch.delete(key);
+    for (observed.keys) |key| {
         if (!observed_of(key, job.name)) continue;
         if (skip > 0) {
             skip -= 1;
@@ -487,6 +520,31 @@ test "observations past one transaction are all removed" {
     try testing.expectEqual(@as(u64, 1), cursor.dropped);
     try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_job_observed));
     try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_jobs));
+}
+
+test "an observation scan cut at its page bound still frees the job's own node (RB-N7)" {
+    // Goal: past observed_pages_max pages the pass says so (ZC-E0302), and the ended job still
+    // goes whole with the observation its own node wrote, though the scan never reached it.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.job("late", constants.job_finished_age_ms_max + 1);
+    const keys = observed_pages_max * constants.store_list_limit_max + 1;
+    for (0..keys) |at| {
+        var node: [8]u8 = undefined;
+        const text = try std.fmt.bufPrint(&node, "a{d:0>6}", .{at});
+        try fixture.put(records.job_observed_key(text, "filler").slice(), "{}");
+    }
+    const ctx = fixture.context();
+    var cursor: Cursor = .{};
+    _ = try prune(&ctx, &cursor, fixture.manual.ms);
+    try testing.expectEqual(@as(u64, 1), cursor.truncated);
+    try testing.expect(cursor.truncation.code.? == .E0302);
+    try testing.expectEqual(@as(u64, 1), cursor.dropped);
+    try testing.expectEqual(@as(usize, 0), try fixture.count(records.prefix_jobs));
+    const late = records.job_observed_key("n1", "late");
+    const page = try ctx.store.list(ctx.arena, .{ .prefix = late.slice(), .limit = 10 }, ctx.diag);
+    try testing.expectEqual(@as(usize, 0), page.kvs.len);
 }
 
 test "an input delete never takes the input of a job created again" {

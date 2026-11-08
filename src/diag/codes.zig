@@ -194,7 +194,9 @@ pub const registry = [_]Entry{
         .explanation =
         \\The request used a method the endpoint does not accept, or a query
         \\parameter that is repeated, unknown, malformed or out of range, or a
-        \\request ID that is not 8 to 64 letters, digits and hyphens. The cause
+        \\request ID that is not 8 to 64 letters, digits and hyphens. For a
+        \\service it also covers container limits outside the runtime's bounds:
+        \\cpu_millis 10 to 1,024,000 and memory_bytes 4 MiB to 2^40. The cause
         \\line names the part at fault. Nothing was changed.
         \\
         \\The read-only API answers GET only. See docs/api.md for the parameters
