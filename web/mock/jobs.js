@@ -68,11 +68,6 @@ export class Jobs {
     if (!Number.isInteger(body.deadline_ms) || body.deadline_ms < 1 || body.deadline_ms > 86400000) throw field("deadline_ms", "must be from 1 to 86400000");
     if (!Number.isInteger(body.submit_by_ms)) throw field("submit_by_ms", "is required");
     if ((body.labels || []).length > 6) throw field("labels", "holds at most 6 labels");
-    for (const k of ["env", "labels"]) {
-      const keys = (body[k] || []).map(([name]) => name);
-      const twice = keys.find((x, i) => keys.indexOf(x) !== i);
-      if (twice !== undefined) throw field(k, `sets ${twice} twice`);
-    }
     for (const [k, [min, max]] of Object.entries(LIMIT_BOUNDS)) {
       const v = (body.limits || {})[k];
       if (v != null && !(Number.isInteger(v) && v >= min && v <= max)) throw field(`limits.${k}`, `must be ${min} to ${max}, it is ${v}`);
@@ -88,6 +83,11 @@ export class Jobs {
       spec.input_digest = digestOf(text);
       spec.input_bytes = new TextEncoder().encode(text).length;
       if (spec.input_bytes > 65536) throw field("input", "is longer than 64 KiB");
+    }
+    for (const k of ["env", "labels"]) {
+      const keys = (body[k] || []).map(([name]) => name);
+      const twice = keys.find((x, i) => keys.indexOf(x) !== i);
+      if (twice !== undefined) throw field(k, `${twice} is set twice`);
     }
     const existing = e.get(`/jobs/${name}`);
     if (existing) {

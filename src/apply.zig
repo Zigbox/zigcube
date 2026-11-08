@@ -62,7 +62,10 @@ pub const Plan = struct {
     unchanged: bool,
 };
 
-/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is read.
+/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is written.
+/// The shape is checked before the store is read; the bounds of `limits` after, because a limit a
+/// stored service already carries is not re-checked. With the store down, a bad limit is therefore
+/// ZC-E0201 or ZC-E0207 (the Postgres pool timeout; both 503), not ZC-E0104.
 pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     try validate(ctx, input);
     const key = records.service_key(input.name);
@@ -99,7 +102,8 @@ fn legacy_counter(ctx: *const Context, existing: ?records.Service) Error!?u64 {
     return next;
 }
 
-/// Applies a service. Invalid input is ZC-E0104 and nothing is read or written.
+/// Applies a service. Invalid input is ZC-E0104 and nothing is written. The bounds of `limits` are
+/// checked after the store is read (see `plan`), so with the store down a bad limit is ZC-E0201.
 pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
     const planned = try plan(ctx, input);
     if (planned.unchanged) return .unchanged;
@@ -555,6 +559,33 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
     _ = try apply(&ctx, &source, old);
     old.limits = .{ .cpu_millis = 6 };
     try testing.expectError(error.Invalid, apply(&ctx, &source, old));
+}
+
+test "apply: cpu_millis 9 is refused, 10 and memory_bytes 2^40 are accepted (docs/api.md)" {
+    try testing.expectEqual(@as(u32, 10), constants.job_limit_cpu_millis_min);
+    try testing.expectEqual(@as(u64, 1 << 40), constants.job_limit_memory_bytes_max);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    var edge = hello;
+    edge.limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 40 };
+    _ = try apply(&ctx, &source, edge);
+    edge.name = "under";
+    edge.limits = .{ .cpu_millis = 9 };
+    try testing.expectError(error.Invalid, apply(&ctx, &source, edge));
 }
 
 test "apply refuses more environment variables than Zigbox runs" {
