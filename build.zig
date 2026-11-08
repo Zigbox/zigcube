@@ -1120,6 +1120,13 @@ const c1_teeth_roots = [_]struct {
     /// J8 on about one seed in seven, so ten seeds were a coin flip that any change of the
     /// draws could lose (#171: its first hit moved from seed 10 to 13).
     seeds: u32 = teeth_seeds_max,
+    /// B2 slice 4: the symptom this tooth must make a plain run (no `--c1`) fail with, or null
+    /// when its check needs the per-revision tap (`job_double`). Measured 2026-11-08 over seeds
+    /// 1 to 40 at 100 operations: restart 36, claim 40, rewrite 39 (as J4: J3 is a `--c1` check),
+    /// cancel 13, deadline 26, deadline_late 26, deadline_offline 8, gap 23, stale 40 (as J10: J9
+    /// is a `--c1` check) and refused_loop 30 seeds fail.
+    plain_symptom: ?[]const u8 = null,
+    plain_seeds: u32 = teeth_seeds_max,
 }{
     .{
         .name = "allocation",
@@ -1162,12 +1169,14 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_restart_main.zig",
         .symptom = "J2",
         .canary_seeds = 40,
+        .plain_symptom = "J2",
     },
     .{
         .name = "job_claim",
         .root = "src/sim_c1_teeth_job_claim_main.zig",
         .symptom = "J7",
         .canary_seeds = 40,
+        .plain_symptom = "J7",
     },
     .{
         .name = "job_double",
@@ -1180,24 +1189,28 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_rewrite_main.zig",
         .symptom = "J3",
         .canary_seeds = 40,
+        .plain_symptom = "J4",
     },
     .{
         .name = "job_cancel",
         .root = "src/sim_c1_teeth_job_cancel_main.zig",
         .symptom = "J6",
         .canary_seeds = 80,
+        .plain_symptom = "J6",
     },
     .{
         .name = "job_deadline",
         .root = "src/sim_c1_teeth_job_deadline_main.zig",
         .symptom = "J8",
         .canary_seeds = 50,
+        .plain_symptom = "J8",
     },
     .{
         .name = "job_deadline_late",
         .root = "src/sim_c1_teeth_job_deadline_late_main.zig",
         .symptom = "J8",
         .canary_seeds = 50,
+        .plain_symptom = "J8",
     },
     .{
         .name = "job_deadline_offline",
@@ -1205,24 +1218,29 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J8",
         .canary_seeds = 80,
         .seeds = 40,
+        .plain_symptom = "J8",
+        .plain_seeds = 40,
     },
     .{
         .name = "job_gap",
         .root = "src/sim_c1_teeth_job_gap_main.zig",
         .symptom = "J4",
         .canary_seeds = 50,
+        .plain_symptom = "J4",
     },
     .{
         .name = "job_stale",
         .root = "src/sim_c1_teeth_job_stale_main.zig",
         .symptom = "J9",
         .canary_seeds = 80,
+        .plain_symptom = "J10",
     },
     .{
         .name = "job_refused_loop",
         .root = "src/sim_c1_teeth_job_refused_loop_main.zig",
         .symptom = "J10: an agent kept making",
         .canary_seeds = 80,
+        .plain_symptom = "J10: an agent kept making",
     },
 };
 
@@ -1290,6 +1308,16 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
             "--expect-fail",                      b.fmt("--expect-symptom={s}", .{entry.symptom}),
         });
         teeth.dependOn(&teeth_run.step);
+        if (entry.plain_symptom) |symptom| {
+            // The same fault in a plain run: the job checks need no per-revision tap.
+            const plain_run = b.addRunArtifact(teeth_exe);
+            plain_run.addArgs(&.{
+                "--seeds",                                 b.fmt("1..{d}", .{entry.plain_seeds}),
+                b.fmt("{d}", .{c1_teeth_operations}),      "--expect-fail",
+                b.fmt("--expect-symptom={s}", .{symptom}),
+            });
+            teeth.dependOn(&plain_run.step);
+        }
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
         const own_install = b.addInstallArtifact(teeth_exe, .{});

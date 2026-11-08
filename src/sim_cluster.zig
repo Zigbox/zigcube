@@ -1105,7 +1105,7 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
-            if (c.c1 and c.jobs_on) c.watch_client();
+            if (c.jobs_on) c.watch_client();
             // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
             if (c.c1 or c.jobs_on) c.note_wedged();
@@ -1565,7 +1565,14 @@ fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
 /// The tap's `after`: checks the revision a call just made (`sim_c1.at_revision`).
 fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revision) void {
     const c: *Cluster = @ptrCast(@alignCast(context));
-    if (!c.c1) return;
+    if (!c.c1) {
+        // J4 judges the endings the store committed, with or without the per-revision checks.
+        if (!c.jobs_on) return;
+        const txn = request orelse return;
+        _ = c.tap_arena.reset(.retain_capacity);
+        sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+        return;
+    }
     c.c1_revisions += 1;
     if (request) |txn| c.note_replaced(txn);
     _ = c.tap_arena.reset(.retain_capacity);
