@@ -352,6 +352,19 @@ operations: 30 of 40 mark a node lost and 27 replace replicas after the grace, w
 `lost_grace` check judges; the rest never reach it, so a change to the lost path is judged over a
 range of seeds, not one.
 
+**The fleet's per-seed budget (B2 slice 4).** A `--seeds` batch is `SIM_FLEET_BATCH` (100) seeds
+under `SIM_FLEET_BATCH_TIMEOUT` (3,600 s), so a seed has 36 s on average and a batch is lost
+(one crash record, no verdict for any of its seeds) when the batch's total passes 3,600 s. No
+single seed has a limit of its own. Measured 2026-11-08 in ReleaseSafe, `--c1 auto
+--profile=auto`, five seeds at once on four cores (so inflated): seed 44 95 s, 19 144 s, 69 154 s,
+12 247 s, 27 344 s (786 operations on 3 nodes, `partitions`). A profile of seed 27 (gdb samples,
+25) puts about 90% of the time in `MemoryStore`: `find` and `select_page` scan the whole `live`
+table, which is unsorted (`store_memory.zig`), so every `get` and `list` of the sim's store costs
+the number of live keys and a run costs about operations squared. The cost is that slow path, not
+the size of the world, so the draw (`cost_max`) is not capped. A hash index on `live` (key to
+position) would remove it; it is a change to the `Store` implementation the conformance suite
+covers, left to its own slice.
+
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations with `-Dprofile=auto` (the shape stays fixed), native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and
 `sim-swarm-teeth` ([swarm.md](swarm.md)).

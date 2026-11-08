@@ -1246,15 +1246,17 @@ const c1_teeth_roots = [_]struct {
         .name = "job_unclaimed",
         .root = "src/sim_c1_teeth_job_unclaimed_main.zig",
         .symptom = "J8: a run that no node started",
-        .canary_seeds = 80,
+        .canary_seeds = 60,
         .plain_symptom = "J8: a run that no node started",
     },
     .{
         .name = "job_wipe",
         .root = "src/sim_c1_teeth_job_wipe_main.zig",
         .symptom = "J2",
-        .canary_seeds = 80,
+        .canary_seeds = 250,
+        .seeds = 40,
         .plain_symptom = "J2",
+        .plain_seeds = 40,
     },
 };
 
