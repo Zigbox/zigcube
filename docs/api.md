@@ -379,7 +379,9 @@ are escaped (a control character takes six bytes in JSON).
 - **Idempotency.** `env` and `labels` are compared as maps, in any order; a key given twice in either
   is `400` ZC-E0130. The expiry (`submit_by_ms`) is checked after the lookup: a retry of a job that
   exists answers `200` with it even when `submit_by_ms` has passed, and `410` ZC-E0134 is for a
-  job that does not exist.
+  job that does not exist. The lookup also comes before the bounds of `limits` and the repeated-key
+  check: a retry of a job stored before those existed (#178), equal to the stored spec, answers
+  `200` (`same`) and not `400` ZC-E0130; a new job, or a different spec, is refused as above.
 - **`limits`** are bounded like the runtime's: `cpu_millis` 10 to 1,024,000, `memory_bytes` 4 MiB to
   2^40, `pids` 1 to 4,194,304; outside them is ZC-E0130 naming `limits.<member>`.
 - **The admission window** counts creations in hourly buckets, so it covers the last

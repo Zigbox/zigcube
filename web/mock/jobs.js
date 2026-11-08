@@ -71,7 +71,7 @@ export class Jobs {
     for (const k of ["env", "labels"]) {
       const keys = (body[k] || []).map(([name]) => name);
       const twice = keys.find((x, i) => keys.indexOf(x) !== i);
-      if (twice !== undefined) throw field(k, `sets ${twice} twice`);
+      if (twice !== undefined) throw field(k, `${twice} is set twice`);
     }
     for (const [k, [min, max]] of Object.entries(LIMIT_BOUNDS)) {
       const v = (body.limits || {})[k];
