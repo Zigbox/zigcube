@@ -209,9 +209,12 @@ fn repeated_key(field: []const u8, pairs: []const records.Pair) ?Problem {
 /// outside their bounds. The one place that lists the bounds, so `create` and `validate` cannot
 /// disagree about whether there is a problem.
 fn legacy_problem(input: Input) ?Problem {
-    if (repeated_key("env", input.env)) |problem| return problem;
-    if (repeated_key("labels", input.labels)) |problem| return problem;
-    const limits = input.limits;
+    return spec_problem(input.env, input.labels, input.limits);
+}
+
+fn spec_problem(env: []const records.Pair, labels: []const records.Pair, limits: anytype) ?Problem {
+    if (repeated_key("env", env)) |problem| return problem;
+    if (repeated_key("labels", labels)) |problem| return problem;
     const c = constants;
     const checks = [_]?Problem{
         range_problem(
@@ -566,7 +569,10 @@ pub fn create(
         const stored = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
         if (stored.kv) |kv| {
             const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
-            if (spec_equal(&old, &job)) return .{ .same = old };
+            // Only a stored job with a problem of its own is a legacy one; a modern job and a
+            // retry that repeats a key is a bad request, not a retry.
+            const legacy = spec_problem(old.env, old.labels, old.limits) != null;
+            if (legacy and spec_equal(&old, &job)) return .{ .same = old };
         }
         return refuse_problem(ctx, problem);
     }
@@ -1427,6 +1433,63 @@ test "a job stored before #178 is still found by its retry, whatever its keys an
     fresh.name = "fresh";
     try testing.expectError(error.Refused, create(&ctx, &rig.source, fresh));
     try rig.expect_code(.E0130);
+}
+
+fn store_legacy(rig: *Rig, input: Input, mutate: *const fn (*records.Job) void) !void {
+    const ctx = rig.context();
+    _ = try create(&ctx, &rig.source, input);
+    const key = records.job_key(input.name);
+    const kv = (try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag)).kv.?;
+    var stored = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+    mutate(&stored);
+    var batch: controller.Batch = .{};
+    batch.put(key.slice(), try records.encode(ctx.arena, stored, ctx.diag));
+    _ = try controller.commit(&ctx, .api, &batch);
+    rig.manual.advance(31_000);
+}
+
+fn repeat_key(job: *records.Job) void {
+    job.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+}
+
+test "a modern job is not answered as a legacy one: a repeated-key retry is ZC-E0130" {
+    // Goal: the legacy lookup answers `same` only for a stored job with a problem of its own.
+    // Method: store a modern job with env A=1, retry with A=1 twice: 400, store unchanged.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("modern");
+    input.env = &.{.{ "A", "1" }};
+    _ = try create(&ctx, &rig.source, input);
+    const before = (try ctx.store.status(ctx.diag)).revision;
+    var retry = input;
+    retry.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, retry));
+    try rig.expect_code(.E0130);
+    try testing.expectEqual(before, (try ctx.store.status(ctx.diag)).revision);
+}
+
+test "a legacy job with only a repeated key answers its retry, and a split key is refused" {
+    // Goal: #180 edge cases. Method: store a job with a repeated key as its only problem; the
+    // verbatim retry is `same` and writes nothing; a key with two values is ZC-E0130.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("keys");
+    input.env = &.{.{ "A", "1" }};
+    try store_legacy(&rig, input, repeat_key);
+    const before = (try ctx.store.status(ctx.diag)).revision;
+    var verbatim = input;
+    verbatim.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+    try testing.expect((try create(&ctx, &rig.source, verbatim)) == .same);
+    try testing.expectEqual(before, (try ctx.store.status(ctx.diag)).revision);
+    var split = input;
+    split.env = &.{ .{ "A", "1" }, .{ "A", "2" } };
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, split));
+    try rig.expect_code(.E0130);
+    try testing.expectEqual(before, (try ctx.store.status(ctx.diag)).revision);
 }
 
 test "pairs compare as sets: a repeated pair is one pair, a key with two values is not" {

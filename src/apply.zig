@@ -65,7 +65,7 @@ pub const Plan = struct {
 /// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is written.
 /// The shape is checked before the store is read; the bounds of `limits` after, because a limit a
 /// stored service already carries is not re-checked. With the store down, a bad limit is therefore
-/// ZC-E0201 (503), not ZC-E0104.
+/// ZC-E0201 or ZC-E0207 (the Postgres pool timeout; both 503), not ZC-E0104.
 pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     try validate(ctx, input);
     const key = records.service_key(input.name);

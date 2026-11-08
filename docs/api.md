@@ -391,8 +391,9 @@ are escaped (a control character takes six bytes in JSON).
   `job_admission_window_h` hours and the current, partial one: a creation is forgotten 72 to 73 hours
   later. A bucket ahead of the clock (the clock was stepped back) is dropped, not folded into the
   present.
-- A record that would take more than `store_value_bytes_max` (256 KiB) once encoded is
-  `503` ZC-E0207 (its cause gives both sizes), not a memory failure.
+- A job record cannot reach `store_value_bytes_max`: a run record over `job_run_bytes_max` is
+  already `400` ZC-E0130 (`check_run_size`), and the Job record holds the same fields
+  (docs/decisions/2026-11-08-zc-e0207-cut.md). ZC-E0207 stays `503` for other records (service specs).
 
 **This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
 about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
