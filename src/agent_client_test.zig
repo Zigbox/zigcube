@@ -519,15 +519,30 @@ test "a job report is one POST to job-observed, and a claim that did not apply i
     try testing.expectEqual(@as(u32, 2), rig.script.next);
 }
 
-test "a job report under an ended tenure comes back as not succeeded" {
+test "a job report under an ended tenure is ZC-E0510, which is not a refused report" {
+    // Goal: the agent can tell a tenure that ended from a report that was not applied.
     const bodies = [_][]const u8{"{\"diagnostics\":[{\"code\":\"ZC-E0510\"}]}"};
     var rig: Rig = undefined;
     rig.init(&bodies);
     defer rig.deinit();
     rig.script.status = 503;
     const compares = [_]store.Compare{.{ .key = "/nodes/node1", .mod_revision = 4 }};
-    const result = try rig.remote.interface().txn(job_claim_request(&compares), &rig.diag);
-    try testing.expect(!result.succeeded);
+    const result = rig.remote.interface().txn(job_claim_request(&compares), &rig.diag);
+    try testing.expectError(error.BackendFailed, result);
+    try testing.expectEqual(.E0510, rig.diag.code.?);
+}
+
+test "a listing with a record at revision 0 is refused, not handed to the agent" {
+    // Goal: network input is checked: an assignment epoch of 0 would crash the agent.
+    const bodies = [_][]const u8{
+        "{\"revision\":5,\"kvs\":[{\"key\":\"/replicas/hello/r1\",\"value\":{}," ++
+            "\"mod_revision\":0}],\"chain\":{\"revision\":5,\"hash\":\"" ++ hash_a ++ "\"}}",
+    };
+    var rig: Rig = undefined;
+    rig.init(&bodies);
+    defer rig.deinit();
+    try testing.expectError(error.BackendFailed, rig.list());
+    try testing.expectEqual(.E0504, rig.diag.code.?);
 }
 
 test "a damaged input is told from an absent one, and neither is a fault of the link" {
