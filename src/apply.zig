@@ -534,11 +534,6 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
         .memory_bytes = constants.job_limit_memory_bytes_min,
     };
     _ = try apply(&ctx, &source, edge);
-    // The other edges, with the literal numbers of docs/api.md: 10 millis and 2^40 bytes pass.
-    try testing.expectEqual(@as(u32, 10), constants.job_limit_cpu_millis_min);
-    try testing.expectEqual(@as(u64, 1 << 40), constants.job_limit_memory_bytes_max);
-    edge.limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 40 };
-    _ = try apply(&ctx, &source, edge);
 
     // A stored out-of-bounds limit, as an earlier build wrote it.
     var old = hello;
@@ -565,6 +560,30 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
     _ = try apply(&ctx, &source, old);
     old.limits = .{ .cpu_millis = 6 };
     try testing.expectError(error.Invalid, apply(&ctx, &source, old));
+}
+
+test "apply accepts cpu_millis 10 and memory_bytes 2^40, the literal edges of docs/api.md" {
+    try testing.expectEqual(@as(u32, 10), constants.job_limit_cpu_millis_min);
+    try testing.expectEqual(@as(u64, 1 << 40), constants.job_limit_memory_bytes_max);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    var edge = hello;
+    edge.limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 40 };
+    _ = try apply(&ctx, &source, edge);
 }
 
 test "apply refuses more environment variables than Zigbox runs" {
