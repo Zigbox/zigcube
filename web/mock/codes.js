@@ -26,7 +26,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the request can't be understood",
-    "explanation": "The request used a method the endpoint does not accept, or a query\nparameter that is repeated, unknown, malformed or out of range, or a\nrequest ID that is not 8 to 64 letters, digits and hyphens. The cause\nline names the part at fault. Nothing was changed.\n\nThe read-only API answers GET only. See docs/api.md for the parameters\nof each endpoint."
+    "explanation": "The request used a method the endpoint does not accept, or a query\nparameter that is repeated, unknown, malformed or out of range, or a\nrequest ID that is not 8 to 64 letters, digits and hyphens. For a\nservice it also covers container limits outside the runtime's bounds:\ncpu_millis 10 to 1,024,000 and memory_bytes 4 MiB to 2^40. The cause\nline names the part at fault. Nothing was changed.\n\nThe read-only API answers GET only. See docs/api.md for the parameters\nof each endpoint."
   },
   {
     "code": "ZC-E0105",
@@ -250,7 +250,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "the store has no free capacity for this",
-    "explanation": "The store is full in a dimension it bounds on purpose: all watch slots\nare in use, all lease slots are in use, or the memory set aside for the\nrequest was not enough for the result.\n\nClose watches that are no longer needed, or ask for smaller pages. If the\nlimit is too low for the fleet, raise it in the server's configuration."
+    "explanation": "The store is full in a dimension it bounds on purpose: all watch slots\nare in use, all lease slots are in use, the memory set aside for the\nrequest was not enough for the result, or a record would take more\nbytes than the store keeps in one value (the cause gives both sizes).\n\nClose watches that are no longer needed, or ask for smaller pages. For\nan oversized record, shorten its largest field. If the limit is too low\nfor the fleet, raise it in the server's configuration."
   },
   {
     "code": "ZC-E0208",
