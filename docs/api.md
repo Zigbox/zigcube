@@ -279,8 +279,11 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
   and `decision` are absent. A dry run needs the store to read the current service.
 - A write whose compare fails (someone else changed the service during the request) is read and
   planned again up to three times, then refused with `409` and the new **`ZC-E0105`**.
-- Invalid input (a bad name, no command, too many replicas, a body that is not a service) is
-  `400` and `ZC-E0104`. A store that is down is `503` and `ZC-E0201`, as everywhere.
+- Invalid input (a bad name, no command, too many replicas, container `limits` outside the
+  runtime's bounds, a body that is not a service) is `400` and `ZC-E0104`. The bounds are a job's:
+  `cpu_millis` 10 to 1,024,000 and `memory_bytes` 4 MiB to 2^40, and the cause names
+  `limits.<member>`. Limits the stored service already has are not re-checked, so applying the same
+  file again is `none`, not a refusal (docs/decisions/2026-11-08-service-apply-limits.md). A store that is down is `503` and `ZC-E0201`, as everywhere.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 
