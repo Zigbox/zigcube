@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const constants = @import("constants.zig");
 const auditor = @import("auditor.zig");
 const controller = @import("controller.zig");
 const job_controller = @import("job_controller.zig");
@@ -50,6 +51,7 @@ pub const ControlPlane = struct {
     /// controller's comes before the scheduler's, so within one millisecond a placement sorts
     /// after its creation. (Instance 0 numbers the first three as before the auditor joined.)
     pub fn init(instance: u16) ControlPlane {
+        assert(instance <= constants.controller_instance_max);
         return .{
             .nodes = node_controller.NodeController.init(instance *% 4),
             .scheduler = scheduler.Scheduler.init(instance *% 4 +% 2),
@@ -57,6 +59,13 @@ pub const ControlPlane = struct {
             .replicas = replica_controller.ReplicaController.init(instance *% 4 +% 1),
             .auditor = auditor.Auditor.init(instance *% 4 +% 3),
         };
+    }
+
+    /// The instance a server started at `now_ms` takes: 1 to `controller_instance_max`, by the
+    /// second, so a restart a second later is a different one.
+    pub fn instance_from(now_ms: u64) u16 {
+        const seconds = now_ms / 1000;
+        return @intCast(1 + seconds % constants.controller_instance_max);
     }
 
     /// How long a lost node's replicas and observed records stay before they are replaced (under

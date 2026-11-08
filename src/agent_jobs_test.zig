@@ -197,10 +197,86 @@ test "a write the server answers with ZC-E0510 fences the agent at once" {
     _ = try rig.assign(60_000);
     const prefix = records.job_observed_prefix(sim_world.node_name);
     rig.world.switched.tenure_ended_put_prefix = prefix.slice();
+    starts_seen = 0;
+    rig.world.sim.on_start = count_start;
+    try testing.expect(!rig.world.agent.fence.active);
+    rig.step();
+    // The claim is the first write and it is refused: the fence must come from it alone, with
+    // nothing started (a later `running` report would fence too and hide a missing claim fence).
+    try testing.expectEqual(@as(u32, 0), starts_seen);
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
+    try testing.expect(rig.world.agent.fence.active or rig.world.agent.fences > 0);
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(u64, 0), rig.world.agent.job_reports_refused);
+}
+
+/// Starts the simulated runtime has seen, counted by its `on_start` hook (a container the fence
+/// stopped afterwards still counts, which `running()` cannot tell).
+var starts_seen: u32 = 0;
+
+fn count_start(context: *anyopaque, spec: *const @import("runtime.zig").Spec) void {
+    _ = context;
+    _ = spec;
+    starts_seen += 1;
+}
+
+/// Arms the ZC-E0510 answer for every later write under the agent's job observations; run by
+/// the world's `before_put` hook in the claim's own transaction, so the claim lands and the
+/// next report is the first one refused.
+fn end_the_tenure(context: *anyopaque) void {
+    const rig: *Rig = @ptrCast(@alignCast(context));
+    // The world keeps the slice, so it lives in a file-level variable, not on this frame.
+    const Held = struct {
+        var prefix: @TypeOf(records.job_observed_prefix(sim_world.node_name)) = undefined;
+    };
+    Held.prefix = records.job_observed_prefix(sim_world.node_name);
+    rig.world.switched.tenure_ended_put_prefix = Held.prefix.slice();
+}
+
+test "a running report the server answers with ZC-E0510 fences the agent at once" {
+    // Goal: the same as the claim's test, for the `running` report: the claim commits, the run
+    // starts, and the report that follows meets an ended tenure. Method: the claim's own write
+    // arms the answer (`end_the_tenure`); one pass is run.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.world.switched.before_put = .{
+        .prefix = records.prefix_job_observed,
+        .context = &rig,
+        .run = end_the_tenure,
+    };
+    starts_seen = 0;
+    rig.world.sim.on_start = count_start;
+    try testing.expect(!rig.world.agent.fence.active);
+    rig.step();
+    // The claim landed (the hook ran), the run started, and the `running` report was the write
+    // that fenced.
+    try testing.expectEqual(@as(u32, 1), starts_seen);
+    try testing.expect(rig.world.switched.before_put == null);
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.claimed, seen.status);
+    try testing.expect(rig.world.agent.fence.active or rig.world.agent.fences > 0);
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(u64, 0), rig.world.agent.job_reports_refused);
+}
+
+test "an exit report the server answers with ZC-E0510 fences the agent at once" {
+    // Goal: the same, for the report of an exit. Method: the run is reported running, its
+    // container exits, the store then answers every observation write as for an ended tenure,
+    // and one pass is run: the exit report is the write that meets it.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    rig.step();
+    try testing.expect(rig.running());
+    try testing.expectEqual(records.JobObservedStatus.running, (try rig.observed()).?.status);
+    try rig.world.sim.inject(run_id, .{ .exit = 3 });
+    end_the_tenure(&rig);
     try testing.expect(!rig.world.agent.fence.active);
     rig.step();
     try testing.expect(rig.world.agent.fence.active or rig.world.agent.fences > 0);
-    try testing.expect(!rig.running());
+    // The exit was not recorded: the store still says `running`.
+    try testing.expectEqual(records.JobObservedStatus.running, (try rig.observed()).?.status);
     try testing.expectEqual(@as(u64, 0), rig.world.agent.job_reports_refused);
 }
 

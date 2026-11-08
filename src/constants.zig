@@ -199,6 +199,10 @@ pub const retention_actions_per_subject_max: u32 = 16;
 pub const retention_scratch_bytes: u32 = 1024 * 1024;
 /// Decisions that may be written by one step, so a decision id's counter cannot wrap inside one.
 pub const decision_counter_modulus: u32 = 10_000;
+/// The largest instance number a shell hands the control plane. Each controller's decision source
+/// is `instance*4 + role` (below 0x8000 up to here) and the job controller's is
+/// `0x8000 | instance`, so no two controllers of any instance share one.
+pub const controller_instance_max: u16 = 8191;
 /// The widest `at_ms` a decision id holds: 13 digits.
 pub const decision_time_ms_max: u64 = 9_999_999_999_999;
 pub const request_id_bytes_min: u32 = 8;

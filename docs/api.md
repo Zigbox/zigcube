@@ -279,8 +279,11 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
   and `decision` are absent. A dry run needs the store to read the current service.
 - A write whose compare fails (someone else changed the service during the request) is read and
   planned again up to three times, then refused with `409` and the new **`ZC-E0105`**.
-- Invalid input (a bad name, no command, too many replicas, a body that is not a service) is
-  `400` and `ZC-E0104`. A store that is down is `503` and `ZC-E0201`, as everywhere.
+- Invalid input (a bad name, no command, too many replicas, container `limits` outside the
+  runtime's bounds, a body that is not a service) is `400` and `ZC-E0104`. The bounds are a job's:
+  `cpu_millis` 10 to 1,024,000 and `memory_bytes` 4 MiB to 2^40, and the cause names
+  `limits.<member>`. Limits the stored service already has are not re-checked, so applying the same
+  file again is `none`, not a refusal (docs/decisions/2026-11-08-service-apply-limits.md). A store that is down is `503` and `ZC-E0201`, as everywhere.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 
@@ -379,15 +382,18 @@ are escaped (a control character takes six bytes in JSON).
 - **Idempotency.** `env` and `labels` are compared as maps, in any order; a key given twice in either
   is `400` ZC-E0130. The expiry (`submit_by_ms`) is checked after the lookup: a retry of a job that
   exists answers `200` with it even when `submit_by_ms` has passed, and `410` ZC-E0134 is for a
-  job that does not exist.
+  job that does not exist. The lookup also comes before the bounds of `limits` and the repeated-key
+  check: a retry of a job stored before those existed (#178), equal to the stored spec, answers
+  `200` (`same`) and not `400` ZC-E0130; a new job, or a different spec, is refused as above.
 - **`limits`** are bounded like the runtime's: `cpu_millis` 10 to 1,024,000, `memory_bytes` 4 MiB to
   2^40, `pids` 1 to 4,194,304; outside them is ZC-E0130 naming `limits.<member>`.
 - **The admission window** counts creations in hourly buckets, so it covers the last
   `job_admission_window_h` hours and the current, partial one: a creation is forgotten 72 to 73 hours
   later. A bucket ahead of the clock (the clock was stepped back) is dropped, not folded into the
   present.
-- A record that would take more than `store_value_bytes_max` (256 KiB) once encoded is
-  `503` ZC-E0207 (its cause gives both sizes), not a memory failure.
+- A job record cannot reach `store_value_bytes_max`: a run record over `job_run_bytes_max` is
+  already `400` ZC-E0130 (`check_run_size`), and the Job record holds the same fields
+  (docs/decisions/2026-11-08-zc-e0207-cut.md). ZC-E0207 stays `503` for other records (service specs).
 
 **This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
 about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`

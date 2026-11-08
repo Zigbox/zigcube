@@ -102,10 +102,11 @@ pub const JobController = struct {
     /// reads the jobs' window anyway, and a failed pass never fails its step.
     retention: job_retention.Cursor = .{},
 
-    /// Decision ids of the controllers are `instance*4 + role`; this one takes the top quarter
-    /// of the numbers, which the others never reach for the instances a shell hands out.
+    /// Decision ids of the controllers are `instance*4 + role`, under 0x8000 for the instances a
+    /// shell hands out (`constants.controller_instance_max`); this one takes the top half.
     pub fn init(instance: u16) JobController {
-        return .{ .source = .{ .instance = 0xC000 +% (instance & 0x3fff) } };
+        assert(instance <= constants.controller_instance_max);
+        return .{ .source = .{ .instance = 0x8000 | instance } };
     }
 
     pub fn reconcile(jc: *JobController, ctx: *const Context) Error!Wakeup {
@@ -136,12 +137,17 @@ pub const JobController = struct {
             const page = try read_page(&page_ctx, &shared, after_key);
             pass.ctx = &page_ctx;
             pass.world = &page.world;
+            for (page.unreadable) |*entry| {
+                if (pass.stopped or pass.txns_left == 0) break;
+                try pass.hold_unreadable(entry);
+            }
             for (page.world.jobs) |*job| {
                 if (pass.stopped or pass.txns_left == 0) break;
                 try pass.step_job(job);
                 if (!pass.stopped) after = key_of(job.kv.key);
             }
             if (pass.stopped or pass.txns_left == 0) break;
+            if (page.last) |last| after = key_of(last);
             if (!page.more) {
                 finished = true;
                 break;
@@ -254,7 +260,18 @@ const World = struct {
     }
 };
 
-const Page = struct { world: World, more: bool };
+const Page = struct {
+    world: World,
+    more: bool,
+    /// The last job key the page listed, readable or not: the next page starts after it.
+    last: ?[]const u8,
+    /// Jobs left out of the page because one of their records does not decode (ZC-E0301/E0303).
+    unreadable: []const Unreadable,
+};
+
+/// A job the pass cannot read: it is held with one decision and left as it is, and the jobs after
+/// it are judged as usual.
+const Unreadable = struct { job: Entry(records.Job), diagnostic: records.Raw };
 
 /// The node an assignment key `/assigned/<node>/<run>` names.
 fn assigned_node(key: []const u8) []const u8 {
@@ -312,11 +329,18 @@ fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Err
         .limit = constants.job_controller_page_max,
         .continue_after = after,
     }, ctx.diag);
-    const jobs = ctx.arena.alloc(Entry(records.Job), listed.kvs.len) catch
-        return failures.no_memory(ctx.diag);
-    for (listed.kvs, 0..) |kv, at| {
-        jobs[at] = .{ .kv = kv, .rec = try records.read(records.Job, ctx.arena, kv, ctx.diag) };
+    var unreadable: std.ArrayList(Unreadable) = .empty;
+    var readable: std.ArrayList(Entry(records.Job)) = .empty;
+    for (listed.kvs) |kv| {
+        const rec = records.read(records.Job, ctx.arena, kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            try note_unreadable(ctx, &unreadable, .{ .kv = kv, .rec = undefined });
+            continue;
+        };
+        readable.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
+            return failures.no_memory(ctx.diag);
     }
+    const jobs: []const Entry(records.Job) = readable.items;
     var world: World = .{
         .revision = shared.revision,
         .jobs = jobs,
@@ -329,28 +353,101 @@ fn read_page(ctx: *const Context, shared: *const Shared, after: ?[]const u8) Err
         .status_of = .empty,
         .assigned_of = shared.assigned_of,
     };
-    if (jobs.len > 0) {
-        world.runs = try read_each(records.JobRun, ctx, records.job_run_key, jobs, shared);
-        world.statuses = try read_each(
-            records.JobStatus,
-            ctx,
-            records.job_status_key,
-            jobs,
-            shared,
-        );
-        for (world.runs, 0..) |entry, at| {
-            const name = entry.kv.key[records.prefix_job_runs.len..];
-            world.run_of.put(ctx.arena, name, @intCast(at)) catch
-                return failures.no_memory(ctx.diag);
-        }
-        for (world.statuses, 0..) |entry, at| {
-            const name = entry.kv.key[records.prefix_job_status.len..];
-            world.status_of.put(ctx.arena, name, @intCast(at)) catch
-                return failures.no_memory(ctx.diag);
-        }
-    }
-    return .{ .world = world, .more = listed.continue_after != null };
+    if (jobs.len > 0) try read_records_of(ctx, shared, &world, &unreadable);
+    return .{
+        .world = world,
+        .more = listed.continue_after != null,
+        .last = if (listed.kvs.len > 0) listed.kvs[listed.kvs.len - 1].key else null,
+        .unreadable = unreadable.items,
+    };
 }
+
+/// Reads the runs and statuses of `world.jobs` into `world`; a job one of whose records does not
+/// decode is noted in `unreadable` and left out of `world` altogether.
+fn read_records_of(
+    ctx: *const Context,
+    shared: *const Shared,
+    world: *World,
+    unreadable: *std.ArrayList(Unreadable),
+) Error!void {
+    const jobs = world.jobs;
+    var dropped: std.StringHashMapUnmanaged(void) = .empty;
+    const read_runs = try read_each(records.JobRun, ctx, records.job_run_key, jobs, shared, .{
+        .unreadable = unreadable,
+        .dropped = &dropped,
+    });
+    const read_statuses = try read_each(
+        records.JobStatus,
+        ctx,
+        records.job_status_key,
+        jobs,
+        shared,
+        .{ .unreadable = unreadable, .dropped = &dropped },
+    );
+    if (dropped.count() > 0) {
+        world.jobs = try without(Entry(records.Job), ctx, jobs, records.prefix_jobs, &dropped);
+    }
+    world.runs = try without(
+        Entry(records.JobRun),
+        ctx,
+        read_runs,
+        records.prefix_job_runs,
+        &dropped,
+    );
+    world.statuses = try without(
+        Entry(records.JobStatus),
+        ctx,
+        read_statuses,
+        records.prefix_job_status,
+        &dropped,
+    );
+    for (world.runs, 0..) |entry, at| {
+        const name = entry.kv.key[records.prefix_job_runs.len..];
+        world.run_of.put(ctx.arena, name, @intCast(at)) catch
+            return failures.no_memory(ctx.diag);
+    }
+    for (world.statuses, 0..) |entry, at| {
+        const name = entry.kv.key[records.prefix_job_status.len..];
+        world.status_of.put(ctx.arena, name, @intCast(at)) catch
+            return failures.no_memory(ctx.diag);
+    }
+}
+
+/// Records `job` as unreadable with the diagnostic the failed read left in `ctx.diag`, which is
+/// cleared: a record that does not decode must not stop the jobs after it.
+fn note_unreadable(
+    ctx: *const Context,
+    list: *std.ArrayList(Unreadable),
+    job: Entry(records.Job),
+) Error!void {
+    const raw = try diagnostic_of(ctx);
+    ctx.diag.reset();
+    list.append(ctx.arena, .{ .job = job, .diagnostic = raw }) catch
+        return failures.no_memory(ctx.diag);
+}
+
+/// `items` without those whose key (after `prefix`) names a job in `dropped`.
+fn without(
+    comptime T: type,
+    ctx: *const Context,
+    items: []const T,
+    prefix: []const u8,
+    dropped: *const std.StringHashMapUnmanaged(void),
+) Error![]const T {
+    if (dropped.count() == 0) return items;
+    var kept: std.ArrayList(T) = .empty;
+    for (items) |item| {
+        if (dropped.contains(item.kv.key[prefix.len..])) continue;
+        kept.append(ctx.arena, item) catch return failures.no_memory(ctx.diag);
+    }
+    return kept.items;
+}
+
+/// Where `read_each` puts a job whose record does not decode.
+const Unreadables = struct {
+    unreadable: *std.ArrayList(Unreadable),
+    dropped: *std.StringHashMapUnmanaged(void),
+};
 
 /// The record, at the key `key_of_job` names, of each of `jobs` (a page: at most
 /// `job_controller_page_max`), read by key at the step's revision, ascending. A job with none has
@@ -363,6 +460,7 @@ fn read_each(
     comptime key_of_job: fn ([]const u8) records.Key,
     jobs: []const Entry(records.Job),
     shared: *const Shared,
+    bad: Unreadables,
 ) Error![]const Entry(T) {
     var items: std.ArrayList(Entry(T)) = .empty;
     for (jobs) |job| {
@@ -370,7 +468,16 @@ fn read_each(
         const key = key_of_job(name);
         const got = try ctx.store.get(ctx.arena, key.slice(), shared.revision, ctx.diag);
         const kv = got.kv orelse continue;
-        const rec = try records.read(T, ctx.arena, kv, ctx.diag);
+        const rec = records.read(T, ctx.arena, kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            if (bad.dropped.contains(name)) {
+                ctx.diag.reset();
+                continue;
+            }
+            try note_unreadable(ctx, bad.unreadable, job);
+            bad.dropped.put(ctx.arena, name, {}) catch return failures.no_memory(ctx.diag);
+            continue;
+        };
         items.append(ctx.arena, .{ .kv = kv, .rec = rec }) catch
             return failures.no_memory(ctx.diag);
     }
@@ -565,7 +672,11 @@ const Pass = struct {
     ) Error!void {
         var live: ?*const Entry(records.JobObserved) = null;
         var fence: ?*const Entry(records.JobObserved) = null;
-        const claim_seen = try pass.claim(job.rec.name, run);
+        const claim_seen: ?*const Entry(records.JobObserved) = switch (try pass.claim(job, run)) {
+            .held => return,
+            .none => null,
+            .seen => |entry| entry,
+        };
         if (claim_seen) |entry| {
             if (pass.admissible(entry, run)) {
                 live = entry;
@@ -590,22 +701,34 @@ const Pass = struct {
     }
 
     /// What the node the run is assigned to reported of it, if anything.
+    const Claim = union(enum) {
+        none,
+        /// The report does not decode (ZC-E0301/E0303): the job is held with one decision and
+        /// left as it was, and the caller stops judging it.
+        held,
+        seen: *const Entry(records.JobObserved),
+    };
+
     fn claim(
         pass: *Pass,
-        name: []const u8,
+        job: *const Entry(records.Job),
         run: *const Entry(records.JobRun),
-    ) Error!?*const Entry(records.JobObserved) {
+    ) Error!Claim {
         const ctx = pass.ctx;
-        const placed = pass.world.assignment(run.rec.id) orelse return null;
-        const key = records.job_observed_key(assigned_node(placed.kv.key), name);
+        const placed = pass.world.assignment(run.rec.id) orelse return .none;
+        const key = records.job_observed_key(assigned_node(placed.kv.key), job.rec.name);
         const got = try ctx.store.get(ctx.arena, key.slice(), pass.world.revision, ctx.diag);
-        const kv = got.kv orelse return null;
-        const rec = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
-        if (!std.mem.eql(u8, rec.run, run.rec.id)) return null;
+        const kv = got.kv orelse return .none;
+        const rec = records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            try pass.hold_unreadable_report(job, &kv);
+            return .held;
+        };
+        if (!std.mem.eql(u8, rec.run, run.rec.id)) return .none;
         const entry = ctx.arena.create(Entry(records.JobObserved)) catch
             return failures.no_memory(ctx.diag);
         entry.* = .{ .kv = kv, .rec = rec };
-        return entry;
+        return .{ .seen = entry };
     }
 
     /// A report is admissible when it comes from the tenure the node holds now, under the epoch
@@ -626,7 +749,9 @@ const Pass = struct {
     }
 
     /// An admissible report: a claim or a running report marks the run running; a stopped one ends
-    /// it. True when it acted or must stop the pass for this job (an unmappable ending).
+    /// it. True when it acted. An unmappable ending is held with a decision; with no stop yet it
+    /// returns false, so the pass goes on to write the cancel's stop, and once a stop exists the
+    /// run ends `failed unknown`: the job is not pinned.
     fn from_report(
         pass: *Pass,
         job: *const Entry(records.Job),
@@ -637,6 +762,14 @@ const Pass = struct {
         if (entry.rec.status == .stopped) {
             const ending = map_ending(&entry.rec) orelse {
                 try pass.unmappable(job, entry);
+                // Once a stop exists the report is the last the agent sends, so the run ends
+                // here, failed with an unknown cause, or it would never end (RB-S8).
+                const stop = run.rec.stop orelse return false;
+                try pass.end(job, run, status, .{
+                    .ending = failed(.unknown, stop_cause_of(stop.cause)),
+                    .reason = "the run was stopped and its agent's report maps to no ending",
+                    .report = entry,
+                });
                 return true;
             };
             try pass.end(job, run, status, .{
@@ -649,6 +782,40 @@ const Pass = struct {
         if (status.rec.state == .running) return false;
         try pass.mark_running(job, run, status, entry);
         return true;
+    }
+
+    fn stop_cause_of(cause: records.RunStopCause) records.StopCause {
+        return switch (cause) {
+            .cancel => .cancel,
+            .@"unreachable" => .@"unreachable",
+            .not_started => .not_started,
+        };
+    }
+
+    /// Compares what a judgement about `run` read of its placement (the read-set rule): the
+    /// assignment, the node's record and its judgement, and, unless `report_compared`, the node's
+    /// report of the run (absent: revision 0). A run with no assignment has nothing to compare.
+    fn expect_placement(
+        pass: *Pass,
+        batch: *Batch,
+        name: []const u8,
+        run: *const Entry(records.JobRun),
+        report_compared: bool,
+    ) Error!void {
+        const ctx = pass.ctx;
+        const world = pass.world;
+        const placed = world.assignment(run.rec.id) orelse return;
+        const node = assigned_node(placed.kv.key);
+        batch.expect(placed.kv.key, placed.kv.mod_revision);
+        const node_at = if (world.node_entry(node)) |entry| entry.kv.mod_revision else 0;
+        try expect_key(ctx, batch, &records.node_key(node), node_at);
+        const judged_at = if (world.node_status(node)) |entry| entry.kv.mod_revision else 0;
+        try expect_key(ctx, batch, &records.node_status_key(node), judged_at);
+        if (report_compared) return;
+        const key = records.job_observed_key(node, name);
+        const got = try ctx.store.get(ctx.arena, key.slice(), world.revision, ctx.diag);
+        const seen_at = if (got.kv) |kv| kv.mod_revision else 0;
+        try expect_key(ctx, batch, &key, seen_at);
     }
 
     fn mark_running(
@@ -665,6 +832,7 @@ const Pass = struct {
         batch.expect(status_at, status.kv.mod_revision);
         try expect_key(ctx, &batch, &records.job_run_key(job.rec.name), run.kv.mod_revision);
         batch.expect(entry.kv.key, entry.kv.mod_revision);
+        try pass.expect_placement(&batch, job.rec.name, run, true);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
             .action = "job_running",
@@ -812,6 +980,7 @@ const Pass = struct {
         batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
         batch.expect(run_at, run.kv.mod_revision);
         try expect_key(ctx, &batch, &records.job_status_key(name), status.kv.mod_revision);
+        try pass.expect_placement(&batch, name, run, false);
         _ = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
             .action = "stop_job",
@@ -925,6 +1094,7 @@ const Pass = struct {
             batch.expect(report.kv.key, report.kv.mod_revision);
             cause = cause_of(.observed, &report.kv);
         }
+        try pass.expect_placement(&batch, name, run, done.report != null);
         const decided = try controller.put_decision(ctx, &pass.jc.source, .{
             .actor = actor,
             .action = "end_job",
@@ -1002,6 +1172,54 @@ const Pass = struct {
         _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
     }
 
+    /// ZC-E0301/ZC-E0303: a job one of whose records does not decode. One decision says so, once
+    /// per revision of the job's record; the job is left as it was and the others go on.
+    fn hold_unreadable(pass: *Pass, entry: *const Unreadable) Error!void {
+        const ctx = pass.ctx;
+        const kv = entry.job.kv;
+        const name = kv.key[records.prefix_jobs.len..];
+        if (try has_decision(ctx, name, "hold_unreadable_job", kv.mod_revision)) return;
+        var batch: Batch = .{};
+        batch.expect(try controller.key_copy(ctx, &records.job_key(name)), kv.mod_revision);
+        _ = try controller.put_decision(ctx, &pass.jc.source, .{
+            .actor = actor,
+            .action = "hold_unreadable_job",
+            .subject = .{ .kind = .job, .name = name },
+            .reason = "a record of the job does not decode; the job is left as it was",
+            .cause = .{ .kind = .resync },
+            .cause_diagnostic = entry.diagnostic,
+            .read_revision = pass.world.revision,
+        }, &batch);
+        _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
+    }
+
+    /// ZC-E0301/ZC-E0303: the node's report of the job does not decode. One `hold_unreadable_job`
+    /// decision says so, once per revision of the report; the job is left as it was.
+    fn hold_unreadable_report(
+        pass: *Pass,
+        job: *const Entry(records.Job),
+        report: *const store.KeyValue,
+    ) Error!void {
+        const ctx = pass.ctx;
+        const raw = try diagnostic_of(ctx);
+        ctx.diag.reset();
+        const name = job.rec.name;
+        if (try has_decision(ctx, name, "hold_unreadable_job", report.mod_revision)) return;
+        var batch: Batch = .{};
+        batch.expect(try controller.key_copy(ctx, &records.job_key(name)), job.kv.mod_revision);
+        batch.expect(report.key, report.mod_revision);
+        _ = try controller.put_decision(ctx, &pass.jc.source, .{
+            .actor = actor,
+            .action = "hold_unreadable_job",
+            .subject = .{ .kind = .job, .name = name },
+            .reason = "the node's report of the job does not decode; the job is left as it was",
+            .cause = cause_of(.observed, report),
+            .cause_diagnostic = raw,
+            .read_revision = pass.world.revision,
+        }, &batch);
+        _ = pass.landed(try controller.commit(ctx, .job_controller, &batch)) orelse return;
+    }
+
     // ---- A report for an ended job ----
 
     /// Test-only (`c1_teeth.job_rewrite`, must break J3): a terminal status written again, once,
@@ -1037,7 +1255,10 @@ const Pass = struct {
         const kv = got.kv orelse return;
         if (kv.mod_revision < status.kv.mod_revision) return; // The report the ending rests on.
         if (try has_decision(ctx, name, "drop_report", kv.mod_revision)) return;
-        const report = try records.read(records.JobObserved, ctx.arena, kv, ctx.diag);
+        const report = records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch |err| {
+            if (err != error.Malformed) return err;
+            return pass.hold_unreadable_report(job, &kv);
+        };
         const how = if (status.rec.end) |ended| if (ended.cause) |c| @tagName(c) else "-" else "-";
         const cause = try controller.format(
             ctx,
@@ -1114,6 +1335,20 @@ fn has_decision(
 }
 
 /// A diagnostic as the JSON a decision embeds (DIAGNOSTICS.md).
+/// The diagnostic `ctx.diag` holds, as the text a decision carries.
+fn diagnostic_of(ctx: *const Context) Error!records.Raw {
+    const diagnostic = ctx.arena.create(zigbox.diagnostic.Diagnostic) catch
+        return failures.no_memory(ctx.diag);
+    diag_mod.to_diagnostic(diagnostic, ctx.diag);
+    diagnostic.docs = .{};
+    var text: std.Io.Writer.Allocating = .init(ctx.arena);
+    zigbox.diagnostic.write_json(&text.writer, diagnostic) catch
+        return failures.no_memory(ctx.diag);
+    const written = text.written();
+    assert(written.len > 1);
+    return .{ .text = written[0 .. written.len - 1] };
+}
+
 fn diagnostic_text(
     ctx: *const Context,
     comptime code: codes.Code,

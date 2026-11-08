@@ -62,13 +62,24 @@ pub const Plan = struct {
     unchanged: bool,
 };
 
-/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is read.
+/// Works out what applying `input` would do. Invalid input is ZC-E0104 and nothing is written.
+/// The shape is checked before the store is read; the bounds of `limits` after, because a limit a
+/// stored service already carries is not re-checked. With the store down, a bad limit is therefore
+/// ZC-E0201 or ZC-E0207 (the Postgres pool timeout; both 503), not ZC-E0104.
 pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     try validate(ctx, input);
     const key = records.service_key(input.name);
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
     var existing: ?records.Service = null;
     if (found.kv) |kv| existing = try records.read(records.Service, ctx.arena, kv, ctx.diag);
+    // Limits a stored service already carries are not re-checked (an apply of the same file must
+    // not start failing on a cluster that took them before this bound existed); a changed one is.
+    // docs/decisions/2026-11-08-service-apply-limits.md
+    const limits_kept = if (existing) |old|
+        records.limits_equal(old.limits, input.limits)
+    else
+        false;
+    if (!limits_kept) try validate_limits(ctx, input.limits);
     const change = try change_summary(ctx, existing, input);
     return .{
         .existing = existing,
@@ -91,7 +102,8 @@ fn legacy_counter(ctx: *const Context, existing: ?records.Service) Error!?u64 {
     return next;
 }
 
-/// Applies a service. Invalid input is ZC-E0104 and nothing is read or written.
+/// Applies a service. Invalid input is ZC-E0104 and nothing is written. The bounds of `limits` are
+/// checked after the store is read (see `plan`), so with the store down a bad limit is ZC-E0201.
 pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
     const planned = try plan(ctx, input);
     if (planned.unchanged) return .unchanged;
@@ -322,6 +334,43 @@ fn validate(ctx: *const Context, input: Input) Error!void {
     }
 }
 
+/// The bounds of a runtime container's limits, the same as a job's (`job_api.zig`).
+fn validate_limits(ctx: *const Context, limits: records.Limits) Error!void {
+    if (limits.cpu_millis) |value| {
+        if (value < constants.job_limit_cpu_millis_min or
+            value > constants.job_limit_cpu_millis_max)
+        {
+            return invalid_limit(ctx, "cpu_millis", value, .{
+                constants.job_limit_cpu_millis_min, constants.job_limit_cpu_millis_max,
+            });
+        }
+    }
+    if (limits.memory_bytes) |value| {
+        if (value < constants.job_limit_memory_bytes_min or
+            value > constants.job_limit_memory_bytes_max)
+        {
+            return invalid_limit(ctx, "memory_bytes", value, .{
+                constants.job_limit_memory_bytes_min, constants.job_limit_memory_bytes_max,
+            });
+        }
+    }
+}
+
+fn invalid_limit(
+    ctx: *const Context,
+    comptime field: []const u8,
+    value: u64,
+    bounds: [2]u64,
+) error{Invalid} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0104);
+    ctx.diag.cause("limits." ++ field ++ " must be {d} to {d}, it is {d}", .{
+        bounds[0], bounds[1], value,
+    });
+    ctx.diag.fix(.{ .sentence = "correct the service file and apply it again" });
+    return error.Invalid;
+}
+
 fn invalid(ctx: *const Context, comptime problem: []const u8) error{Invalid} {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0104);
@@ -439,6 +488,104 @@ test "invalid input is ZC-E0104 and a missing service is ZC-E0101" {
     try testing.expectEqual(@import("diag/codes.zig").Code.E0101, diag.code.?);
     diag.reset();
     try testing.expectEqual(@as(store.Revision, 0), (try ctx.store.status(&diag)).revision);
+}
+
+test "apply refuses container limits outside the runtime's bounds; a stored one is kept" {
+    // Goal: #181. Out-of-bounds cpu_millis and memory_bytes are ZC-E0104 naming the member and
+    // write nothing; the bounds themselves pass; a service stored with an out-of-bounds limit
+    // (accepted before this check) can be re-applied unchanged and with other fields changed,
+    // but not with the limit changed to another bad value.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    const bad_limits = [_]records.Limits{
+        .{ .cpu_millis = 0 },
+        .{ .cpu_millis = constants.job_limit_cpu_millis_max + 1 },
+        .{ .memory_bytes = 0 },
+        .{ .memory_bytes = constants.job_limit_memory_bytes_min - 1 },
+        .{ .memory_bytes = constants.job_limit_memory_bytes_max + 1 },
+    };
+    for (bad_limits) |limits| {
+        var bad = hello;
+        bad.limits = limits;
+        try testing.expectError(error.Invalid, apply(&ctx, &source, bad));
+        try testing.expectEqual(@import("diag/codes.zig").Code.E0104, diag.code.?);
+        diag.reset();
+    }
+    try testing.expectEqual(@as(store.Revision, 0), (try ctx.store.status(&diag)).revision);
+
+    var edge = hello;
+    edge.limits = .{
+        .cpu_millis = constants.job_limit_cpu_millis_max,
+        .memory_bytes = constants.job_limit_memory_bytes_min,
+    };
+    _ = try apply(&ctx, &source, edge);
+
+    // A stored out-of-bounds limit, as an earlier build wrote it.
+    var old = hello;
+    old.name = "old";
+    old.limits = .{ .cpu_millis = 5 };
+    const key = records.service_key("old");
+    const stored: records.Service = .{
+        .name = old.name,
+        .image = old.image,
+        .replicas = old.replicas,
+        .command = old.command,
+        .limits = old.limits,
+        .generation = 1,
+        .applied_by = old.applied_by,
+        .request_id = old.request_id,
+    };
+    const value = try records.encode(ctx.arena, stored, &diag);
+    const written = try ctx.store.txn(.{
+        .on_success = &.{.{ .put = .{ .key = key.slice(), .value = value } }},
+    }, &diag);
+    try testing.expect(written.succeeded);
+    try testing.expect((try apply(&ctx, &source, old)) == .unchanged);
+    old.replicas = 4;
+    _ = try apply(&ctx, &source, old);
+    old.limits = .{ .cpu_millis = 6 };
+    try testing.expectError(error.Invalid, apply(&ctx, &source, old));
+}
+
+test "apply: cpu_millis 9 is refused, 10 and memory_bytes 2^40 are accepted (docs/api.md)" {
+    try testing.expectEqual(@as(u32, 10), constants.job_limit_cpu_millis_min);
+    try testing.expectEqual(@as(u64, 1 << 40), constants.job_limit_memory_bytes_max);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    var edge = hello;
+    edge.limits = .{ .cpu_millis = 10, .memory_bytes = 1 << 40 };
+    _ = try apply(&ctx, &source, edge);
+    edge.name = "under";
+    edge.limits = .{ .cpu_millis = 9 };
+    try testing.expectError(error.Invalid, apply(&ctx, &source, edge));
 }
 
 test "apply refuses more environment variables than Zigbox runs" {
