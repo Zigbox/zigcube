@@ -72,7 +72,10 @@ pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     // Limits a stored service already carries are not re-checked (an apply of the same file must
     // not start failing on a cluster that took them before this bound existed); a changed one is.
     // docs/decisions/2026-11-08-service-apply-limits.md
-    const limits_kept = if (existing) |old| records.limits_equal(old.limits, input.limits) else false;
+    const limits_kept = if (existing) |old|
+        records.limits_equal(old.limits, input.limits)
+    else
+        false;
     if (!limits_kept) try validate_limits(ctx, input.limits);
     const change = try change_summary(ctx, existing, input);
     return .{
@@ -333,22 +336,33 @@ fn validate_limits(ctx: *const Context, limits: records.Limits) Error!void {
         if (value < constants.job_limit_cpu_millis_min or
             value > constants.job_limit_cpu_millis_max)
         {
-            return invalid_limit(ctx, "cpu_millis", value, constants.job_limit_cpu_millis_min, constants.job_limit_cpu_millis_max);
+            return invalid_limit(ctx, "cpu_millis", value, .{
+                constants.job_limit_cpu_millis_min, constants.job_limit_cpu_millis_max,
+            });
         }
     }
     if (limits.memory_bytes) |value| {
         if (value < constants.job_limit_memory_bytes_min or
             value > constants.job_limit_memory_bytes_max)
         {
-            return invalid_limit(ctx, "memory_bytes", value, constants.job_limit_memory_bytes_min, constants.job_limit_memory_bytes_max);
+            return invalid_limit(ctx, "memory_bytes", value, .{
+                constants.job_limit_memory_bytes_min, constants.job_limit_memory_bytes_max,
+            });
         }
     }
 }
 
-fn invalid_limit(ctx: *const Context, comptime field: []const u8, value: u64, min: u64, max: u64) error{Invalid} {
+fn invalid_limit(
+    ctx: *const Context,
+    comptime field: []const u8,
+    value: u64,
+    bounds: [2]u64,
+) error{Invalid} {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0104);
-    ctx.diag.cause("limits." ++ field ++ " must be {d} to {d}, it is {d}", .{ min, max, value });
+    ctx.diag.cause("limits." ++ field ++ " must be {d} to {d}, it is {d}", .{
+        bounds[0], bounds[1], value,
+    });
     ctx.diag.fix(.{ .sentence = "correct the service file and apply it again" });
     return error.Invalid;
 }
