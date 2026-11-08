@@ -541,3 +541,25 @@ test "a service deleted and applied again leaves no old replica running (fleet i
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
     try std.testing.expect(!report.failed);
 }
+
+test "a step's calls are capped by the time the step has already spent (fleet issue 136)" {
+    // Goal: regression for fleet issue 136, I1b failing on a correct agent. Method: replay the
+    // shrunk failure (11 nodes, partitions, ttl 8,799 ms, 200 % replicas, 29 operations healing
+    // at 355). The node's clock stood still during a step, so a step's calls each had the
+    // whole fence window and one step ran 12 s under a 5.8 s window. A pinned seed can start
+    // passing for the wrong reason when the draw changes; the lasting check is the clock test
+    // in sim_cluster.zig.
+    const gpa = std.testing.allocator;
+    const report = try gpa.create(sim_cluster.Report);
+    defer gpa.destroy(report);
+    sim_cluster.simulate(gpa, 726793278, 29, .{
+        .nodes = 11,
+        .c1 = true,
+        .profile = .partitions,
+        .lease_ttl_ms = 8799,
+        .replicas_pct = 200,
+        .heal_at = 355,
+    }, report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try std.testing.expect(!report.failed);
+}

@@ -369,6 +369,36 @@ pub const Agent = struct {
         deadline.set_fn(deadline.context, agent.calls_deadline_ms(ctx.mono_ms()));
     }
 
+    /// The stages of a step that follow the loading. A stage that fails does not hold the others
+    /// back: one replica whose start errors, or a job pass that fails, must not withhold a
+    /// cancel, a later replica, an orphan's stop or the flush. The first failure is the step's
+    /// error (in `kept`, with its diagnostic intact); later ones are counted and described like
+    /// the enforcement's (`note_enforce_failure`). Returns the transactions made.
+    fn stages(
+        agent: *Agent,
+        ctx: *const Context,
+        pass: *Pass,
+        listings: []const runtime.Listing,
+        kept: *Kept,
+    ) u32 {
+        var acted: u32 = 0;
+        pass.replicas(kept);
+        if (kept.stopped) return acted;
+        acted += kept.run(agent, ctx, "run the job pass", agent_jobs.pass(
+            agent,
+            ctx,
+            listings,
+            pass.given,
+        ));
+        if (kept.stopped) return acted;
+        kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
+        if (kept.stopped) return acted;
+        kept.stage(agent, ctx, "remove orphan records", pass.orphan_records());
+        if (kept.stopped) return acted;
+        acted += kept.run(agent, ctx, "flush the reports", pass.flush());
+        return acted;
+    }
+
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
         assert(ctx.diag.code == null);
         agent.steps += 1;
@@ -412,12 +442,13 @@ pub const Agent = struct {
             .node_key = records.node_key(agent.config.node),
         };
         try pass.load();
-        try pass.replicas();
-        acted += try agent_jobs.pass(agent, ctx, listings, pass.given);
-        try pass.orphan_containers();
-        try pass.orphan_records();
-        acted += try pass.flush();
+        var kept: Kept = .{};
+        acted += agent.stages(ctx, &pass, listings, &kept);
         agent.forget_finished_stops(listings);
+        if (kept.err) |err| {
+            kept.restore(ctx);
+            return err;
+        }
         if (agent.fence.active) return agent.fence_step(ctx, now);
         // After the replica pass: the records are statistics, so a failing publish (a server that
         // cannot be reached, a state directory that cannot be read) never holds replica work back.
@@ -885,6 +916,54 @@ fn is_leftover(
 
 const Write = struct { key: []const u8, value: ?[]const u8 };
 
+/// The first failure of a step's stages, kept while the others run: its error and a copy of its
+/// diagnostic. A later failure is counted and described on the agent, not returned.
+const Kept = struct {
+    err: ?Error = null,
+    diag: ?*Diag = null,
+    /// A failure that is not the runtime's (the server, the state directory, a crash): the
+    /// stages after it are not run, as the step would have ended there before.
+    stopped: bool = false,
+
+    fn stage(
+        kept: *Kept,
+        agent: *Agent,
+        ctx: *const Context,
+        what: []const u8,
+        result: Error!void,
+    ) void {
+        result catch |err| kept.fail(agent, ctx, what, err);
+    }
+
+    fn run(
+        kept: *Kept,
+        agent: *Agent,
+        ctx: *const Context,
+        what: []const u8,
+        result: Error!u32,
+    ) u32 {
+        return result catch |err| {
+            kept.fail(agent, ctx, what, err);
+            return 0;
+        };
+    }
+
+    fn fail(kept: *Kept, agent: *Agent, ctx: *const Context, what: []const u8, err: Error) void {
+        if (err != error.RuntimeFailed and err != error.NotFound) kept.stopped = true;
+        if (kept.err != null) return agent.note_enforce_failure(ctx, what);
+        kept.err = err;
+        // With no memory to copy the diagnostic into, the error is kept without it.
+        const copy = ctx.arena.create(Diag) catch return ctx.diag.reset();
+        copy.* = ctx.diag.*;
+        kept.diag = copy;
+        ctx.diag.reset();
+    }
+
+    fn restore(kept: *const Kept, ctx: *const Context) void {
+        if (kept.diag) |saved| ctx.diag.* = saved.*;
+    }
+};
+
 const Pass = struct {
     agent: *Agent,
     ctx: *const Context,
@@ -979,23 +1058,25 @@ const Pass = struct {
 
     // ---- Desired replicas ----
 
-    fn replicas(pass: *Pass) Error!void {
+    fn replicas(pass: *Pass, kept: *Kept) void {
         for (pass.mine) |*item| {
-            const replica = &item.rec;
-            const listing = find_listing_by_replica(pass.listings, replica.id);
-            const seen = pass.observed_for(item);
-            if (listing) |found| {
-                if (!is_this_replica(found, item)) {
-                    try pass.replace_stale(found, item, seen);
-                    continue;
-                }
-                pass.agent.forget_stop(found.handle.name());
-                try pass.report(replica, seen, found.status);
-            } else if (seen) |record| {
-                if (record.status != .stopped) try pass.report_lost(replica, record);
-            } else {
-                try pass.start(item);
-            }
+            if (kept.stopped) break;
+            kept.stage(pass.agent, pass.ctx, "reconcile a replica", pass.reconcile_one(item));
+        }
+    }
+
+    fn reconcile_one(pass: *Pass, item: *const controller.Entry(records.Replica)) Error!void {
+        const replica = &item.rec;
+        const listing = find_listing_by_replica(pass.listings, replica.id);
+        const seen = pass.observed_for(item);
+        if (listing) |found| {
+            if (!is_this_replica(found, item)) return pass.replace_stale(found, item, seen);
+            pass.agent.forget_stop(found.handle.name());
+            try pass.report(replica, seen, found.status);
+        } else if (seen) |record| {
+            if (record.status != .stopped) try pass.report_lost(replica, record);
+        } else {
+            try pass.start(item);
         }
     }
 

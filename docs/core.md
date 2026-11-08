@@ -409,6 +409,30 @@ if the transaction then commits, because a failed compare is the store doing its
   and epoch, and the run has no stop. **J8** a container runs no longer than `deadline_bound_ms`
   after the tracker first saw it (the run's start on the ledger, within a tick), and after the
   heal no run is open long after its latest possible end. **J4** a client that follows the endings through `GET /v1/jobs/watch` (`src/sim_jobs_watch.zig`), is killed now and then (away for under a minute, or for minutes: the sim compacts to the head every `server_compact_ms`, so a longer outage gets the 410 and the list) and resumes from its revision, has seen every ending the store committed by the end of the run (each terminal `/job-status/` put the tap saw), and is never given an event twice. Age retention (`src/job_retention.zig`) is covered by its unit tests: the sim's runs are minutes long, far below `job_finished_age_ms_min`.
+  A node's clock moves inside a step: a call to the server costs the time it takes
+  (`src/sim_clock.zig`, `spend_until`), so the agent sees time pass between its calls and the sim
+  does not freeze the node's clock for a step (fleet issues #151 and #142). `zig build
+  sim-c1-regress` (ReleaseSafe) replays the newest fleet lines of #135, #136, #143, #151, #166
+  and #176, which fail on main a864e89 and pass here, the original lines of #135, #137, #142,
+  #143 and #151 (smoke: they pass on a864e89 too), three seeds that fail J8 without the next
+  change (31, 53, 102 at their auto shapes) and the restart-rule seeds below. J8 counts from the run's true start (the sim records it when the runtime
+  starts the container), not from the tick that first saw the container: a step's true time is
+  frozen while the node's clock ran ahead inside it, and 17 of 2,000 seeds failed J8 without
+  this. The agent runs
+  every stage of a step even when one fails (a replica whose start errors, the job pass), so a
+  replica error that repeats does not withhold a cancel, a stop or a later replica; the first
+  error is the step's, the others are counted. A simulated agent that has died sends nothing in
+  the rest of its step (seed 1272 failed self-fencing before this: the job pass wrote after the
+  crash).
+  Restart rule (#171): a step runs whole at its start, and the node's clock already includes the
+  time its calls spent (`busy_until_true_ms`), so an agent that died inside a step has a clock
+  ahead of true time. A crashed node therefore restarts at `max(drawn downtime,
+  busy_until_true_ms + 200)`, only once true time has caught up with its clock; `step_once`
+  asserts it. Without it a restart stamped a lease from a clock ahead of true time and fenced
+  late, an artefact (seeds 1384, 1612, 893), not an agent that acts past its fence. The rule only
+  lengthens downtime, so it hides nothing in the safety direction. Coverage cut: a crash inside
+  a long step (a slow store, many calls) is no longer followed by a fast restart, so a bug that
+  shows only then is out of the simulator's reach. The lengthened downtimes are not counted.
   The clocks are never restarted. A node that was wedged (its agent down or frozen, or a
   container ignoring a stop) is not judged until `wedge_memory_ms` after, and its wedged time is
   added to the J6 and J8 bounds (in J8, only the time wedged after the deadline). J8 gives a cut
