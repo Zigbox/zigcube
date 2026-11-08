@@ -388,7 +388,7 @@ const Work = struct {
         const run = work.run_of(subject.id);
         switch (found) {
             .absent, .damaged => {
-                if (c1_teeth.job_wipe and subject.assigned and found == .absent) {
+                if (c1_teeth.job_wipe and subject.assigned and found == .absent and seen != null) {
                     // Test-only: a lost state directory is a fresh start (J2).
                     if (run) |entry| {
                         if (entry.rec.stop == null) return work.restart_fresh(subject, entry);
