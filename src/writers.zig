@@ -181,12 +181,11 @@ fn orphaning_delete(request: store.TxnRequest) ?[]const u8 {
 
 /// Whether `request` is what retention writes to remove one ended job: deletes only, of keys that
 /// all name the same job, in `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
-/// `/job-observed/<node>/` (under at most one node: a run has one claim, ever), and of every-role
-/// prefixes, with at least one job key. That spans three owners, so `foreign_key` lets it through.
+/// `/job-observed/<node>/` (under any nodes: a node that lost a claim leaves its record behind),
+/// and of every-role prefixes, with at least one job key. That spans three owners, so `foreign_key` lets it through.
 /// Pull records are not part of it: they are per node, and `foreign_key` checks them as before.
 fn retention_only(request: store.TxnRequest) bool {
     var job: ?[]const u8 = null;
-    var node: ?[]const u8 = null;
     for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
         for (ops) |op| {
             const key = switch (op) {
@@ -199,10 +198,6 @@ fn retention_only(request: store.TxnRequest) bool {
             var name = key[rule.prefix.len..];
             if (std.mem.eql(u8, rule.prefix, records.prefix_job_observed)) {
                 const slash = std.mem.indexOfScalar(u8, name, '/') orelse return false;
-                if (node) |first| {
-                    if (!std.mem.eql(u8, first, name[0..slash])) return false;
-                }
-                node = name[0..slash];
                 name = name[slash + 1 ..];
             }
             if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return false;
@@ -542,7 +537,7 @@ test "foreign_key lets one job controller or API transaction through and stops a
     try testing.expectEqualStrings("/assigned/n1/j1-job", foreign_key(request_of(&placing)).?);
 }
 
-test "retention's job transaction names one job and one node, and carries no pull records" {
+test "retention's job transaction names one job, and carries no pull records" {
     // Goal: `retention_only` lets through exactly the removal of one job's records. Method: the
     // right transaction, then each way a transaction can name more than that.
     const deletes = [_]store.Op{
@@ -554,13 +549,20 @@ test "retention's job transaction names one job and one node, and carries no pul
         .{ .delete = "/decisions/d1" },
     };
     try testing.expect(foreign_key(request_of(&deletes)) == null);
+    // RA-S6: the job's observations on two nodes (a node that lost the claim left one behind).
+    const two_nodes = [_]store.Op{
+        .{ .delete = "/jobs/a" },
+        .{ .delete = "/job-runs/a" },
+        .{ .delete = "/job-observed/n1/a" },
+        .{ .delete = "/job-observed/n2/a" },
+    };
+    try testing.expect(foreign_key(request_of(&two_nodes)) == null);
+    try testing.expect(allowed(.retention, request_of(&two_nodes)) == .allowed);
     const without_observed = [_]store.Op{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-runs/a" } };
     try testing.expect(foreign_key(request_of(&without_observed)) == null);
     const wrong = [_][]const store.Op{
         // Another job's run beside this job.
         &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-runs/b" } },
-        // The observations of two nodes: a run has one claim.
-        &.{ .{ .delete = "/job-observed/n1/a" }, .{ .delete = "/job-observed/n2/a" } },
         &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-observed/n1/b" } },
         // A pull record mixed in, or a node's pull records across nodes.
         &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/pulls/n1/b3:aa" } },
