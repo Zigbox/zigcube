@@ -197,11 +197,27 @@ test "a write the server answers with ZC-E0510 fences the agent at once" {
     _ = try rig.assign(60_000);
     const prefix = records.job_observed_prefix(sim_world.node_name);
     rig.world.switched.tenure_ended_put_prefix = prefix.slice();
+    starts_seen = 0;
+    rig.world.sim.on_start = count_start;
     try testing.expect(!rig.world.agent.fence.active);
     rig.step();
+    // The claim is the first write and it is refused: the fence must come from it alone, with
+    // nothing started (a later `running` report would fence too and hide a missing claim fence).
+    try testing.expectEqual(@as(u32, 0), starts_seen);
+    try testing.expectEqual(@as(?Seen, null), try rig.observed());
     try testing.expect(rig.world.agent.fence.active or rig.world.agent.fences > 0);
     try testing.expect(!rig.running());
     try testing.expectEqual(@as(u64, 0), rig.world.agent.job_reports_refused);
+}
+
+/// Starts the simulated runtime has seen, counted by its `on_start` hook (a container the fence
+/// stopped afterwards still counts, which `running()` cannot tell).
+var starts_seen: u32 = 0;
+
+fn count_start(context: *anyopaque, spec: *const @import("runtime.zig").Spec) void {
+    _ = context;
+    _ = spec;
+    starts_seen += 1;
 }
 
 /// Arms the ZC-E0510 answer for every later write under the agent's job observations; run by
@@ -229,9 +245,13 @@ test "a running report the server answers with ZC-E0510 fences the agent at once
         .context = &rig,
         .run = end_the_tenure,
     };
+    starts_seen = 0;
+    rig.world.sim.on_start = count_start;
     try testing.expect(!rig.world.agent.fence.active);
     rig.step();
-    // The claim landed (the hook ran) and the `running` report was the write that fenced.
+    // The claim landed (the hook ran), the run started, and the `running` report was the write
+    // that fenced.
+    try testing.expectEqual(@as(u32, 1), starts_seen);
     try testing.expect(rig.world.switched.before_put == null);
     const seen = (try rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.claimed, seen.status);
