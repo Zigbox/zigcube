@@ -182,7 +182,8 @@ fn orphaning_delete(request: store.TxnRequest) ?[]const u8 {
 /// Whether `request` is what retention writes to remove one ended job: deletes only, of keys that
 /// all name the same job, in `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
 /// `/job-observed/<node>/` (under any nodes: a node that lost a claim leaves its record behind),
-/// and of every-role prefixes, with at least one job key. That spans three owners, so `foreign_key` lets it through.
+/// and of every-role prefixes, with at least one job key. That spans three owners, so
+/// `foreign_key` lets it through.
 /// Pull records are not part of it: they are per node, and `foreign_key` checks them as before.
 fn retention_only(request: store.TxnRequest) bool {
     var job: ?[]const u8 = null;
