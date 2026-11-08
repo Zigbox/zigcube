@@ -1,6 +1,6 @@
 # zigbox-smoke on 5b1ca09: a fetch silent after it chose a peer (issue #93)
 
-Status: **undiagnosed: the logs show only two fetch.log lines, then silence.**
+Status: **undiagnosed; B2 (#162) made the progress line time-driven (every 10 s, source and bytes), so the next occurrence shows where it stops.**
 
 ## What the run shows
 

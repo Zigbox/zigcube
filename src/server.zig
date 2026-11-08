@@ -30,7 +30,9 @@ const store_verified = @import("store_verified.zig");
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 
-pub const Error = error{ StartFailed, OutOfMemory };
+/// `Canceled`: the task starting the server was cancelled while a key was drawn; `diag` is empty
+/// (a cancel is not a failure to name), nothing is left open, and the caller stops quietly.
+pub const Error = error{ StartFailed, OutOfMemory, Canceled };
 
 pub const Options = struct {
     version: []const u8,
@@ -216,10 +218,13 @@ pub const Server = struct {
                 .quiet = config.quiet,
             },
             diag,
-        ) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            assert(diag.code != null);
-            return error.StartFailed;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled, // No diagnostic: see `Error`.
+            error.Failed => {
+                assert(diag.code != null);
+                return error.StartFailed;
+            },
         };
         server.shared.api.ca = &server.ca;
     }

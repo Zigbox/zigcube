@@ -119,6 +119,18 @@ pub const Demo = struct {
         return .{ .output = output, .status = result.status };
     }
 
+    /// What the fetch.log of each of `nodes` (guest index = position) says about O5: whether the
+    /// node was elected to pull from the registry first, and how long it waited for a peer.
+    pub fn o5_evidence(demo: *Demo, nodes: []const []const u8) ![]check.Evidence {
+        const found = try demo.arena().alloc(check.Evidence, nodes.len);
+        for (found, nodes, 0..) |*item, node, index| {
+            assert(std.mem.eql(u8, vms.names[index], node));
+            const log = try demo.guest(@intCast(index), "fetch-logs 'O5'", .{});
+            item.* = check.evidence_of(node, log);
+        }
+        return found;
+    }
+
     /// `zcube -o json <args>`, parsed; not shown.
     pub fn json(demo: *Demo, args: []const []const u8) !Json {
         const argv = try demo.arena().alloc([]const u8, args.len + 2);
@@ -277,6 +289,28 @@ pub fn say_pull(demo: *Demo, pull: check.Pull) void {
     demo.host.say("  {s}: registry {d} B, peers {d} B, cached {d} B, struck {d}", .{
         pull.node, pull.registry_bytes, pull.peer_bytes, pull.cached_bytes, pull.bad_peers.len,
     });
+}
+
+/// Each registry reader's node, its own pull's span and what its fetch.log says about O5, so a
+/// miss of step 1 shows who was elected and who waited (all on that node's own clock).
+pub fn say_registry_readers(
+    demo: *Demo,
+    pulls: []const check.Pull,
+    evidence: []const check.Evidence,
+) void {
+    for (pulls) |pull| {
+        if (pull.registry_bytes == 0) continue;
+        var waited: ?u64 = null;
+        var elected = false;
+        for (evidence) |item| {
+            if (!std.mem.eql(u8, item.node, pull.node)) continue;
+            waited = item.waited_ms;
+            elected = item.elected;
+        }
+        demo.host.say("  {s} read the registry: own pull {d} ms, O5 elected {s}, waited {d} ms", .{
+            pull.node, pull.span_ms() orelse 0, if (elected) "yes" else "no", waited orelse 0,
+        });
+    }
 }
 
 pub const first_three = [_][]const u8{ "node1", "node2", "node3" };
