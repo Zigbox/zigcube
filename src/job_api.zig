@@ -193,6 +193,22 @@ fn validate_labels(ctx: *const Context, input: Input) Error!void {
     }
 }
 
+fn limits_in_bounds(limits: records.JobLimits) bool {
+    if (limits.cpu_millis) |value| {
+        if (value < constants.job_limit_cpu_millis_min) return false;
+        if (value > constants.job_limit_cpu_millis_max) return false;
+    }
+    if (limits.memory_bytes) |value| {
+        if (value < constants.job_limit_memory_bytes_min) return false;
+        if (value > constants.job_limit_memory_bytes_max) return false;
+    }
+    if (limits.pids) |value| {
+        if (value < constants.job_limit_pids_min) return false;
+        if (value > constants.job_limit_pids_max) return false;
+    }
+    return true;
+}
+
 fn validate_limits(ctx: *const Context, limits: records.JobLimits) Error!void {
     if (limits.cpu_millis) |value| {
         if (value < constants.job_limit_cpu_millis_min or
@@ -277,6 +293,13 @@ pub const reserved_name = "watch";
 /// `submit_by_ms` having passed is not among them: it means a job that does not exist yet is too
 /// late, and a late retry of a job that does exist is a success (`create` checks it).
 pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
+    try validate_shape(ctx, input, now_ms);
+    try validate_limits(ctx, input.limits);
+}
+
+/// Every check of `validate` but the bounds of `limits`, which `create` may skip for a retry of a
+/// job stored before they existed.
+fn validate_shape(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     if (records.name_problem(input.name, constants.service_name_bytes_max) != null) {
         const problem = "must be 1 to {d} lowercase letters, digits or '-' (none at either end)";
         return refuse(ctx, "name", problem, .{
@@ -297,7 +320,6 @@ pub fn validate(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     try validate_command(ctx, input);
     try validate_env(ctx, input);
     try validate_labels(ctx, input);
-    try validate_limits(ctx, input.limits);
     if (input.retries > 0) return not_built(ctx, "retries");
     if (input.relay) return not_built(ctx, "relay");
     if (input.placement) return not_built(ctx, "placement");
@@ -410,18 +432,27 @@ fn strings_equal(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-/// Pairs compare as maps: the same keys with the same values, in any order. Keys are unique
-/// (`validate_env` and `validate_labels` refuse a duplicate), so equal lengths and every pair
-/// of `a` found in `b` make the sets equal.
+/// Pairs compare as sets: every pair of each side is on the other, in any order. New jobs have
+/// unique keys (`validate_env` and `validate_labels` refuse a duplicate), but a job stored before
+/// that check may repeat one; a repeated pair is the same pair, and a key with two values on one
+/// side only is a different spec.
 fn pairs_equal(a: []const records.Pair, b: []const records.Pair) bool {
-    if (a.len != b.len) return false;
     for (a) |left| {
-        const found = for (b) |right| {
-            if (std.mem.eql(u8, left[0], right[0])) break right;
-        } else return false;
-        if (!std.mem.eql(u8, left[1], found[1])) return false;
+        if (!has_pair(b, left)) return false;
+    }
+    for (b) |right| {
+        if (!has_pair(a, right)) return false;
     }
     return true;
+}
+
+fn has_pair(pairs: []const records.Pair, wanted: records.Pair) bool {
+    for (pairs) |pair| {
+        if (std.mem.eql(u8, pair[0], wanted[0]) and std.mem.eql(u8, pair[1], wanted[1])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn too_many(ctx: *const Context, comptime format: []const u8, args: anytype) error{Refused} {
@@ -457,19 +488,23 @@ fn admit_one(
 ) controller.Error!records.JobAdmission {
     const hour = now_ms / hour_ms;
     var kept: std.ArrayList(records.HourCount) = .empty;
+    // A bucket ahead of the clock was written before the clock stepped back. Its jobs were
+    // admitted all the same, so it is relabelled as the current hour with its count (it counts
+    // against the cap now, and leaves the window with the hour it is relabelled to).
+    var ahead: u32 = 0;
     for (old.hours) |entry| {
         if (entry.hour + constants.job_admission_window_h <= hour) continue;
-        // A bucket ahead of the clock is a stale write from before it stepped back: drop it, or
-        // it would sit there (and count) until the clock catches up. The create folds into the
-        // newest bucket that is left.
-        if (entry.hour > hour) continue;
+        if (entry.hour > hour) {
+            ahead += entry.count;
+            continue;
+        }
         kept.append(ctx.arena, entry) catch return no_memory(ctx.diag);
     }
     const last = if (kept.items.len > 0) &kept.items[kept.items.len - 1] else null;
     if (last != null and last.?.hour == hour) {
-        last.?.count += 1;
+        last.?.count += ahead + 1;
     } else {
-        kept.append(ctx.arena, .{ .hour = hour, .count = 1 }) catch
+        kept.append(ctx.arena, .{ .hour = hour, .count = ahead + 1 }) catch
             return @import("store_failures.zig").no_memory(ctx.diag);
     }
     return .{ .admitted = old.admitted + 1, .hours = kept.items };
@@ -479,7 +514,7 @@ fn window_count(admission: records.JobAdmission, now_ms: u64) u64 {
     const hour = now_ms / hour_ms;
     var sum: u64 = 0;
     for (admission.hours) |entry| {
-        if (entry.hour > hour) continue;
+        // A bucket ahead of the clock counts as the current hour's (see `admit_one`).
         if (entry.hour + constants.job_admission_window_h > hour) sum += entry.count;
     }
     return sum;
@@ -492,7 +527,7 @@ pub fn create(
     input: Input,
 ) Error!CreateResult {
     const now_ms = ctx.clock.now_ms();
-    try validate(ctx, input, now_ms);
+    try validate_shape(ctx, input, now_ms);
     const digest = if (input.input) |text| try digest_of(ctx, text) else null;
     const job: records.Job = .{
         .name = input.name,
@@ -512,8 +547,20 @@ pub fn create(
         .created_at_ms = now_ms,
         .applied_by = input.applied_by,
     };
-    try check_run_size(ctx, &job);
     const key = records.job_key(input.name);
+    if (!limits_in_bounds(input.limits)) {
+        // A job stored before the bounds existed (#178) may carry limits outside them. Its retry
+        // is still a retry and gets the original answer; any other job, new or different, is
+        // refused for its limits as it always was.
+        const stored = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
+        if (stored.kv) |kv| {
+            const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+            if (spec_equal(&old, &job)) return .{ .same = old };
+        }
+        try validate_limits(ctx, input.limits);
+        unreachable; // `limits_in_bounds` is false, so `validate_limits` refused above.
+    }
+    try check_run_size(ctx, &job);
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
     if (found.kv) |kv| {
         const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
@@ -1239,7 +1286,7 @@ test "a cancel does not commit over a status that changed after it was read" {
     try testing.expect(retry == .finished);
 }
 
-test "the admission window drops old hours and hours ahead of a clock that went back" {
+test "the admission window drops old hours and relabels hours ahead of a clock that went back" {
     var rig: Rig = undefined;
     try rig.start();
     defer rig.stop();
@@ -1264,8 +1311,8 @@ test "the admission window drops old hours and hours ahead of a clock that went 
     const now = try records.read(records.JobAdmission, ctx.arena, kv, ctx.diag);
     try testing.expectEqual(@as(usize, 1), now.hours.len);
     try testing.expectEqual(@as(u32, 1), now.hours[0].count);
-    // The clock goes back an hour: the bucket ahead of it is dropped, not folded into (RA-S5),
-    // and the create opens the bucket of the hour the clock shows.
+    // The clock goes back an hour: the bucket ahead of it is relabelled as the current hour with
+    // its count (#180), so the create makes a bucket of two for the hour the clock shows.
     rig.manual.ms -= hour_ms;
     var back = sample("back");
     back.submit_by_ms = rig.manual.ms + 30_000;
@@ -1273,7 +1320,7 @@ test "the admission window drops old hours and hours ahead of a clock that went 
     const kv2 = (try ctx.store.get(ctx.arena, records.key_job_admission, null, ctx.diag)).kv.?;
     const folded = try records.read(records.JobAdmission, ctx.arena, kv2, ctx.diag);
     try testing.expectEqual(@as(usize, 1), folded.hours.len);
-    try testing.expectEqual(@as(u32, 1), folded.hours[0].count);
+    try testing.expectEqual(@as(u32, 2), folded.hours[0].count);
     try testing.expectEqual(rig.manual.ms / hour_ms, folded.hours[0].hour);
 }
 
@@ -1322,6 +1369,53 @@ test "env and labels compare as maps, and a duplicate label is refused" {
     twice.labels = &.{ .{ "x", "1" }, .{ "x", "2" } };
     try testing.expectError(error.Refused, create(&ctx, &rig.source, twice));
     try rig.expect_code(.E0130);
+}
+
+test "a job stored before #178 is still found by its retry, whatever its keys and limits" {
+    // Goal: #180. A job stored before the bounds and the duplicate-key checks may carry both.
+    // Method: create a job, rewrite its record with a cpu limit under the minimum and a repeated
+    // env pair, pass the submit time, then send the same spec (the original answer), a spec with
+    // another env value and the same limits (refused for its limits, ZC-E0130, as any new job)
+    // and the same limits on a missing name (ZC-E0130).
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    var input = sample("legacy");
+    input.env = &.{.{ "A", "1" }};
+    _ = try create(&ctx, &rig.source, input);
+    const key = records.job_key("legacy");
+    const kv = (try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag)).kv.?;
+    var stored = try records.read(records.Job, ctx.arena, kv, ctx.diag);
+    stored.limits = .{ .cpu_millis = constants.job_limit_cpu_millis_min - 1 };
+    stored.env = &.{ .{ "A", "1" }, .{ "A", "1" } };
+    var batch: controller.Batch = .{};
+    batch.put(key.slice(), try records.encode(ctx.arena, stored, ctx.diag));
+    _ = try controller.commit(&ctx, .api, &batch);
+    rig.manual.advance(31_000);
+    var retry = input;
+    retry.limits = stored.limits;
+    const again = try create(&ctx, &rig.source, retry);
+    try testing.expectEqualStrings("legacy", again.same.name);
+    var other = retry;
+    other.env = &.{.{ "A", "2" }};
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, other));
+    try rig.expect_code(.E0130);
+    var fresh = retry;
+    fresh.name = "fresh";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, fresh));
+    try rig.expect_code(.E0130);
+}
+
+test "pairs compare as sets: a repeated pair is one pair, a key with two values is not" {
+    const one = [_]records.Pair{.{ "A", "1" }};
+    const twice = [_]records.Pair{ .{ "A", "1" }, .{ "A", "1" } };
+    const split = [_]records.Pair{ .{ "A", "1" }, .{ "A", "2" } };
+    try testing.expect(pairs_equal(&twice, &one));
+    try testing.expect(pairs_equal(&one, &twice));
+    try testing.expect(!pairs_equal(&split, &one));
+    try testing.expect(!pairs_equal(&one, &split));
+    try testing.expect(pairs_equal(&.{}, &.{}));
 }
 
 test "a run record of exactly job_run_bytes_max is accepted and one byte more is refused" {
