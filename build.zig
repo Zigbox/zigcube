@@ -1385,6 +1385,11 @@ const c1_regressions = [_][]const []const u8{
     // and a step 31 ms before a deadline ran 4.7 s, past J8's bound. The run the review named
     // was `240 798 2 ... --heal-at=487` (43 s); 310 operations fail the same way in 8 s.
     &.{ "240", "310", "2", "--c1", "--lease-ttl-ms=10000", "--replicas-pct=200", "--heal-at=487" },
+    // B2 hardening (#171) after #159's node clock: seed 1612 fenced late when a crash landed
+    // inside a step's spent time (a simulator artefact), and seed 893 kept refusing the report
+    // of a container that had ended under an older assignment (an agent bug).
+    &.{ "1612", "351", "2", "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=218" },
+    &.{ "893", "625", "8", "--lease-ttl-ms=10000", "--replicas-pct=300", "--heal-at=584" },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).

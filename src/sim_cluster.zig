@@ -144,6 +144,8 @@ comptime {
 
 pub const Report = struct {
     failed: bool = false,
+    /// Calls a crashed agent's step tried to make, which the simulation refused (#167).
+    dead_calls: u32 = 0,
     bytes: [report_bytes_max]u8 = undefined,
     len: u32 = 0,
 
@@ -447,9 +449,10 @@ const Node = struct {
         const node: *Node = @ptrCast(@alignCast(context));
         // A dead agent makes no call: a step that goes on past the crash (deadline enforcement
         // swallows it) ends at its next call to the server, and nothing reaches the net (#167).
-        if (node.sim.crashed or node.sim.files.crashed) return dead_call(diag);
+        if (node.sim.crashed or node.sim.files.crashed) return node.dead_call(diag);
         const net = &node.cluster.net;
         assert(!node.sim.crashed);
+        assert(!node.sim.files.crashed);
         const result = net.transport(node.index).call(arena, request, diag);
         node.spent_ms += net.last_call_ms;
         // The call took that long on the agent's clock too, so a cap on its calls (the fence,
@@ -459,8 +462,9 @@ const Node = struct {
     }
 
     /// The call of an agent that crashed: the server never hears of it (ZC-E0503).
-    fn dead_call(diag: *Diag) agent_client.Error {
+    fn dead_call(node: *Node, diag: *Diag) agent_client.Error {
         assert(diag.code == null);
+        node.cluster.stats.dead_calls += 1;
         diag.raise(.E0503);
         diag.cause("the simulated agent crashed: it makes no call to zcube-server", .{});
         diag.fix(.{ .sentence = "start the agent again" });
@@ -571,16 +575,12 @@ const Node = struct {
         node.deadline_set(node.agent.calls_deadline_ms(clock.now_ms()));
     }
 
-    /// Caps the calls still to be made by `deadline_ms` on the node's clock. The cluster's clock
-    /// stands still during a step and a call's time is charged to `spent_ms` after it, so every
-    /// call of a step saw the time the step began and was given the whole of what was left to
-    /// the fence: one step spent 12 s under a 5.8 s window and I1b failed on a correct agent
-    /// (issue #136). A real agent's clock runs between its calls, so the time already spent is
-    /// taken off the deadline. (The clock itself cannot run: the server handles each call at the
-    /// step's start, and the agent's `sent` stamp must not be later than that.)
+    /// Caps the calls still to be made by `deadline_ms`, on the node's clock. That clock counts
+    /// the time the step's calls have spent (`tapped_call`), so the remote's left-over time
+    /// shrinks as a real agent's does and nothing is taken off the deadline here: once it was
+    /// (issue #136, before the clock ran), and the time counted twice.
     fn deadline_set(node: *Node, deadline_ms: u64) void {
-        const none = std.math.maxInt(u64);
-        node.remote.deadline_ms = if (deadline_ms == none) none else deadline_ms -| node.spent_ms;
+        node.remote.deadline_ms = deadline_ms;
     }
 
     fn deadline_set_fn(context: *anyopaque, deadline_ms: u64) void {
@@ -659,6 +659,8 @@ pub const Stats = struct {
     agent_failures: u32 = 0,
     transactions: u32 = 0,
     crashes_injected: u32 = 0,
+    /// Calls refused because the agent that made them had crashed.
+    dead_calls: u32 = 0,
     partitions: u32 = 0,
     outages: u32 = 0,
     suspends: u32 = 0,
@@ -1383,7 +1385,15 @@ pub const Cluster = struct {
         switch (random.uintLessThan(u32, 3)) {
             0 => node.sim.arm_crash(1 + random.uintLessThan(u32, 6), kind),
             1 => node.sim.arm_step(1 + random.uintLessThan(u32, 3), kind),
-            else => {
+            // A step runs whole at its start, and its clock reading and saved pair already
+            // include the time its calls spent: an agent that died inside that time would have
+            // written none of it. The restart would read a clock that stands still until true
+            // time catches up and restore a lease stamped ahead of true time, and fence late
+            // (seeds 1612, 893: an artefact of the simulator, not an agent that acts past its
+            // fence). So a crash inside a step's time waits for the next step boundary.
+            else => if (c.manual.ms < node.resume_ms) {
+                node.sim.arm_step(1, kind);
+            } else {
                 node.sim.crash_now(kind);
                 node.check_crashed();
             },
@@ -2758,6 +2768,7 @@ pub fn simulate(
         return;
     };
     defer c.destroy();
+    defer report.dead_calls = c.stats.dead_calls;
     c.on_step = options.on_step;
     c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
@@ -3139,13 +3150,14 @@ test "a start after the agent's crash is refused, not asserted (#158)" {
 test "a crashed node's step makes no call to the server (#167)" {
     // Goal: after a crash that deadline enforcement swallows, the step's heartbeat, publish and
     // load must not reach the server (`tapped_call` refuses; it asserts nothing got through).
-    // Method: seeds whose runs crash agents mid-step, c1 and not.
-    for ([_]u64{ 57, 1, 2, 3, 4, 5, 6, 7 }) |seed| {
-        var report: Report = undefined;
-        simulate(testing.allocator, seed, 100, .{ .c1 = true }, &report);
-        if (report.failed) std.debug.print("seed {d}\n{s}\n", .{ seed, report.text() });
-        try testing.expect(!report.failed);
-    }
+    // Method: a run that crashes an agent mid-step; it counts the calls the gate refused and the
+    // test fails if there were none, so a change of the draws cannot leave it passing without
+    // reaching the gate. Seed 57 at 100 operations under c1 did when this was written.
+    var report: Report = undefined;
+    simulate(testing.allocator, 57, 100, .{ .c1 = true }, &report);
+    if (report.failed) std.debug.print("{s}\n", .{report.text()});
+    try testing.expect(!report.failed);
+    try testing.expect(report.dead_calls > 0);
 }
 
 test "a node count can be asked for" {
@@ -3184,24 +3196,45 @@ test "the fencing check fires on a node that runs containers long after it lost 
     try testing.expect(report.failed);
 }
 
-test "a step's calls are capped by what the step has already spent (issue 136)" {
-    // Goal: regression for fleet issue 136. The cluster's clock stands still during a step, so
-    // every call saw the time the step began and was capped by the whole of what was left to
-    // the fence. Method: charge a call's time to a node, as `tapped_call` does, and set a
-    // deadline as the agent does; the cap on the remote must be that much nearer, and a missing
-    // deadline stays missing.
+test "a step's calls are capped by the time it has spent, once (issue 136)" {
+    // Goal: the fence cap on a step's calls counts the step's spent time exactly once. The
+    // cluster's clock stands still during a step (#136: every call had the whole window), so
+    // the node's clock runs by the calls' time (`spend_until`) and the remote compares the
+    // deadline with it; the deadline is handed on as it is. Method: spend 4 s as `tapped_call`
+    // does, set a deadline 5 s ahead as the agent does; the call has about 1 s left, not 0
+    // (which a second subtraction of the 4 s would give), and a missing deadline stays missing.
     var report: Report = .{};
     const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
     defer c.destroy();
     const node = c.nodes[0];
-    node.spent_ms = 0;
-    Node.deadline_set_fn(node, 100_000);
-    try testing.expectEqual(@as(u64, 100_000), node.remote.deadline_ms);
+    const clock = node.nclock.clock();
+    node.remote.set_deadline(clock, std.math.maxInt(u64));
+    const start = clock.now_ms();
     node.spent_ms = 4000;
-    Node.deadline_set_fn(node, 100_000);
-    try testing.expectEqual(@as(u64, 96_000), node.remote.deadline_ms);
-    Node.deadline_set_fn(node, 3000);
-    try testing.expectEqual(@as(u64, 0), node.remote.deadline_ms);
+    node.nclock.spend_until(c.manual.ms + node.spent_ms);
+    Node.deadline_set_fn(node, start + 5000);
+    try testing.expectEqual(start + 5000, node.remote.deadline_ms);
+    const left = node.remote.deadline_ms -| clock.now_ms();
+    try testing.expect(left > 900); // The node's clock has a rate error of its own.
+    try testing.expect(left <= 1000);
     Node.deadline_set_fn(node, std.math.maxInt(u64));
-    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), node.remote.deadline_ms);
+    try testing.expectEqual(std.math.maxInt(u64), node.remote.deadline_ms);
+}
+
+test "a crash inside a step's spent time lands at the step boundary (seeds 1612, 893)" {
+    // Goal: the restarted agent's clock never stands still. A step runs whole at its start and
+    // its clock reading and saved pair already include its spent time; a crash inside that
+    // time left the restart a frozen clock and a lease stamped ahead of true time, and it
+    // fenced late (I1b, seed 1612). Method: put a node inside a step's time and crash it.
+    var report: Report = .{};
+    const c = try Cluster.create(testing.allocator, 7, .{ .nodes = 1 }, &report);
+    defer c.destroy();
+    const node = c.nodes[0];
+    node.resume_ms = c.manual.ms + 5000;
+    for (0..40) |_| {
+        c.crash(node);
+        try testing.expect(!node.down);
+        try testing.expect(!node.sim.crashed);
+    }
+    node.resume_ms = 0;
 }

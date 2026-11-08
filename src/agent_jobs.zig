@@ -431,14 +431,13 @@ const Work = struct {
         reason: runtime.ExitReason,
         seen: ?*const records.JobObserved,
     ) Error!void {
+        // Under the run's current assignment, like `lost`: the epoch of an older observation is
+        // one the store refuses once the run was assigned again, on every pass after (seed 893).
+        const epoch = report_epoch(subject, null) orelse return;
         if (seen) |existing| {
             if (existing.status == .stopped) return;
         }
-        var wanted: Report = .{
-            .run = subject.id,
-            .status = .stopped,
-            .epoch = if (seen) |held| held.assignment else subject.epoch,
-        };
+        var wanted: Report = .{ .run = subject.id, .status = .stopped, .epoch = epoch };
         try work.apply_exit(&wanted, reason);
         try work.report(wanted);
     }
