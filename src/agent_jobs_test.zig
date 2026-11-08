@@ -188,6 +188,22 @@ test "a run is claimed, then started, and reported running under the tenure" {
     try testing.expect(record.deadline_mono_ms != null);
 }
 
+test "a write the server answers with ZC-E0510 fences the agent at once" {
+    // Goal: a tenure that ended is told from a refusal (#172): the agent fences on the answer
+    // itself, not when the heartbeat finds out. Method: the store answers every write under the
+    // agent's job observations as a server does for a replaced tenure, and one pass is run.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(60_000);
+    const prefix = records.job_observed_prefix(sim_world.node_name);
+    rig.world.switched.tenure_ended_put_prefix = prefix.slice();
+    try testing.expect(!rig.world.agent.fence.active);
+    rig.step();
+    try testing.expect(rig.world.agent.fence.active or rig.world.agent.fences > 0);
+    try testing.expect(!rig.running());
+    try testing.expectEqual(@as(u64, 0), rig.world.agent.job_reports_refused);
+}
+
 test "a run whose server record asks for a stop is never claimed" {
     var rig = try Rig.start();
     defer rig.stop();

@@ -71,7 +71,13 @@ pub const job_gap = declared("c1_teeth_job_gap");
 /// superseded run is stored).
 pub const job_stale = declared("c1_teeth_job_stale");
 
+/// The agent's `running` job reports name an assignment that is not the stored one, so the store
+/// refuses each one and the agent, which still holds the run unreported, makes it again on every
+/// pass. Must break J10 (`reports_settle`): the bound on refused reports after the heal. (A
+/// refusal of every report breaks J8 first, which hides the count: a run that never ends.)
+pub const job_refused_loop = declared("c1_teeth_job_refused_loop");
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
-    job_deadline_offline or job_gap or job_stale;
+    job_deadline_offline or job_gap or job_stale or job_refused_loop;

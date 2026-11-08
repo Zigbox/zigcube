@@ -494,8 +494,7 @@ fn job_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!job_
     }
     const parsed = std.json.parseFromSliceLeaky(JobBody, ctx.arena, body, .{}) catch |err| {
         if (err == error.OutOfMemory) return no_memory(ctx);
-        const problem = "is not a job: it needs name, image, command, deadline_ms, submit_by_ms";
-        return bad_request(ctx, "body", problem);
+        return bad_request(ctx, "body", job_parse_problem(err));
     };
     try check_applied_by(ctx, parsed.applied_by);
     return .{
@@ -516,6 +515,26 @@ fn job_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!job_
         .placement = parsed.placement != null,
         .applied_by = parsed.applied_by,
         .request_id = id,
+    };
+}
+
+/// What was wrong with a job body, by the parser's own error: a missing field, an unknown one, a
+/// value of the wrong type or a body that is not JSON each get a sentence of their own.
+fn job_parse_problem(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingField => "is not a job: a required field is missing " ++
+            "(name, image, command, deadline_ms, submit_by_ms)",
+        error.UnknownField => "is not a job: it has a field the API does not know",
+        error.DuplicateField => "is not a job: a field is given twice",
+        error.UnexpectedToken,
+        error.InvalidEnumTag,
+        error.InvalidCharacter,
+        error.Overflow,
+        error.InvalidNumber,
+        => "is not a job: a field has the wrong type, or a number is negative, " ++
+            "fractional or too large for it",
+        error.UnexpectedEndOfInput => "is not complete JSON: it ends too soon",
+        else => "is not valid JSON",
     };
 }
 
@@ -1136,7 +1155,8 @@ const Call = struct {
         }
         try out.end_array();
         try out.end_object();
-        return call.held(try out.finish(), @intCast(read.events.len), prefixes, timeout_ms);
+        const events: u32 = @intCast(read.events.len); // At most 64 batches of 256 events.
+        return call.held(try out.finish(), events, read.bookmark, head, prefixes, timeout_ms);
     }
 
     const WatchRead = struct { events: []const store.Event, bookmark: store.Revision };
@@ -1162,16 +1182,21 @@ const Call = struct {
         return .{ .events = events.items, .bookmark = bookmark };
     }
 
-    /// An answer with no event is held until a change under `prefixes` or the timeout.
+    /// An answer with no event is held until a change under `prefixes` or the timeout, but only
+    /// when the bookmark has reached `head`: a watch that is still behind (the read stops after
+    /// `watch_batches_max` batches, and a prefix or label may drop them all) answers at once, so
+    /// the client comes back from the new bookmark instead of waiting for an unrelated write.
     fn held(
         call: Call,
         reply_in: Reply,
         events: u32,
+        bookmark: store.Revision,
+        head: store.Revision,
         prefixes: []const []const u8,
         timeout_ms: u32,
     ) Reply {
         var reply = reply_in;
-        if (events == 0 and call.hold and timeout_ms > 0) {
+        if (events == 0 and bookmark >= head and call.hold and timeout_ms > 0) {
             reply.hold_ms = timeout_ms;
             reply.hold_prefixes = prefixes;
         }
@@ -1208,7 +1233,14 @@ const Call = struct {
         try out.member("revision", read.bookmark);
         try out.member("events", events);
         try out.end_object();
-        return call.held(try out.finish(), @intCast(events.len), prefixes, @intCast(timeout));
+        return call.held(
+            try out.finish(),
+            @intCast(events.len), // At most 64 batches of 256 events.
+            read.bookmark,
+            head.revision,
+            prefixes,
+            @intCast(timeout),
+        );
     }
 
     // ---- /v1/leases ----
