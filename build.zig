@@ -1602,7 +1602,7 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
     const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted and job_reuse worlds");
     for (worlds) |root| {
         const exe = b.addExecutable(.{
-            .name = "sim_c1_world",
+            .name = std.fs.path.stem(root),
             .root_module = b.createModule(.{
                 .root_source_file = b.path(root),
                 .target = sim.target,
@@ -1610,6 +1610,7 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
                 .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
             }),
         });
+        step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         const run = b.addRunArtifact(exe);
         run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
         run.expectExitCode(0);
