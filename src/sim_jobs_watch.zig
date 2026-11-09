@@ -23,6 +23,8 @@ pub const Ending = struct { name_hash: u64, epoch: u64, ended_at_ms: u64 };
 pub const State = struct {
     /// What the store committed: every terminal status put, once.
     truth: [endings_max]Ending = undefined,
+    /// The revision each truth entry committed at.
+    truth_revision: [endings_max]store.Revision = undefined,
     truth_count: u32 = 0,
     truth_full: u32 = 0,
     /// What the client handled, with the revision it resumes from (0: never started).
@@ -66,7 +68,12 @@ fn contains(list: []const Ending, ending: Ending) bool {
 }
 
 /// The tap saw `request` commit: its terminal status puts are the endings.
-pub fn note_commit(state: *State, request: store.TxnRequest, arena: std.mem.Allocator) void {
+pub fn note_commit(
+    state: *State,
+    request: store.TxnRequest,
+    revision: store.Revision,
+    arena: std.mem.Allocator,
+) void {
     for (request.on_success) |op| {
         const put = switch (op) {
             .put => |put| put,
@@ -85,6 +92,7 @@ pub fn note_commit(state: *State, request: store.TxnRequest, arena: std.mem.Allo
         if (contains(state.truth[0..state.truth_count], ending)) continue;
         if (state.truth_count < endings_max) {
             state.truth[state.truth_count] = ending;
+            state.truth_revision[state.truth_count] = revision;
             state.truth_count += 1;
         } else {
             state.truth_full += 1;
@@ -163,8 +171,28 @@ fn relist(state: *State, api: *api_mod.Api, ctx: *const Context) bool {
     return false;
 }
 
+/// Mid-run: every ending committed at or before the revision the client holds has been handled,
+/// whether or not the run has reached its end. The 60 s compaction turns a long outage into a
+/// 410 and a relist, which would otherwise hide an event the watch dropped until `finish` (and
+/// then `finish` only sees it if the relist did not cover it).
+fn covered(state: *State) void {
+    if (state.violation != null or state.truth_full > 0) return;
+    const count = state.truth_count;
+    for (state.truth[0..count], state.truth_revision[0..count]) |ending, at| {
+        if (at > state.revision) continue;
+        if (!contains(state.handled[0..state.handled_count], ending)) {
+            return fail(state, "J4: the client passed the revision of an ending it never handled");
+        }
+    }
+}
+
 /// One poll of the client: a watch from the revision it holds, or the list after a 410.
 pub fn poll(state: *State, api: *api_mod.Api, ctx: *const Context) void {
+    poll_once(state, api, ctx);
+    covered(state);
+}
+
+fn poll_once(state: *State, api: *api_mod.Api, ctx: *const Context) void {
     if (state.violation != null) return;
     if (state.revision == 0) {
         _ = relist(state, api, ctx);

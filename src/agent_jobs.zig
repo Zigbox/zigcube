@@ -388,6 +388,12 @@ const Work = struct {
         const run = work.run_of(subject.id);
         switch (found) {
             .absent, .damaged => {
+                if (c1_teeth.job_wipe and subject.assigned and found == .absent and seen != null) {
+                    // Test-only: a lost state directory is a fresh start (J2).
+                    if (run) |entry| {
+                        if (entry.rec.stop == null) return work.restart_fresh(subject, entry);
+                    }
+                }
                 if (listing == null and seen == null and subject.assigned) {
                     if (found == .damaged) return work.lost(subject, null, seen, .damaged);
                     if (run) |entry| return work.claim(subject, entry);
@@ -681,6 +687,25 @@ const Work = struct {
     }
 
     // ---- Claim, then start ----
+
+    /// Test-only (`job_wipe`): the run is started again, whatever the node already did with it.
+    fn restart_fresh(
+        work: *Work,
+        subject: Subject,
+        entry: *const Entry(records.JobRun),
+    ) Error!void {
+        const ctx = work.ctx;
+        const record: StartRecord = .{
+            .run = subject.id,
+            .epoch = subject.epoch,
+            .phase = .claimed,
+            .grace_ms = entry.rec.grace_ms,
+            .boot_id = ctx.boot_id,
+            .deadline_mono_ms = ctx.mono_ms() +| fetch_bound_ms(ctx, &entry.rec),
+        };
+        try write_record(ctx, work.state, &record);
+        try work.begin(subject, entry, record);
+    }
 
     fn claim(
         work: *Work,

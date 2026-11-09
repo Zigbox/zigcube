@@ -17,7 +17,7 @@ const Context = controller.Context;
 pub const ledger_max: u32 = 4096;
 /// Containers the trackers keep a clock for at once: every container the runtimes of the most
 /// nodes a simulation has can hold (`sim_cluster.zig` asserts the product), so that no live job
-/// container goes unjudged for want of a slot.
+/// container goes unjudged for want of a slot, and none is dropped without a word (RB-N8).
 pub const watch_max: u32 = 16 * constants.runtime_handles_max;
 
 /// What a start was judged against, and the first verdict that failed.

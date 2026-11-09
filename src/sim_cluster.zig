@@ -381,6 +381,9 @@ const Node = struct {
     /// The agent is dead until `restart_at_ms`.
     down: bool,
     restart_at_ms: u64,
+    /// The host crash that took the agent down also lost its disk: the restart finds no state
+    /// directory and no container (RB-S2 c; J2 holds across a lost state directory).
+    wipe_pending: bool = false,
     /// The agent does nothing before this true time (a call in progress, a back-off).
     resume_ms: u64,
     /// How long the calls of the step in progress took.
@@ -473,6 +476,12 @@ const Node = struct {
 
     fn restart(node: *Node) void {
         assert(node.down);
+        if (node.wipe_pending) {
+            node.wipe_pending = false;
+            node.sim.files.wipe();
+            node.sim.containers.wipe();
+            node.cluster.stats.wipes += 1;
+        }
         node.sim.restart();
         node.agent.init(node.config());
         node.loop = agent_loop.Loop.init();
@@ -683,6 +692,8 @@ pub const Stats = struct {
     agent_failures: u32 = 0,
     transactions: u32 = 0,
     crashes_injected: u32 = 0,
+    /// Host crashes that also lost the disk (`Options.strong` only; no draw).
+    wipes: u32 = 0,
     /// Calls refused because the agent that made them had crashed.
     dead_calls: u32 = 0,
     partitions: u32 = 0,
@@ -754,6 +765,8 @@ pub const Cluster = struct {
     i6_violations: u32,
     server_seen_revision: store.Revision,
     compact_due_ms: u64,
+    /// The last true time the store was unreachable (J8's second clause waits for it).
+    store_healthy_since_ms: u64,
     instance_next: u16,
     request_next: u32,
     dropped_before_restart: u64,
@@ -814,6 +827,10 @@ pub const Cluster = struct {
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
     job_next: u32,
+    /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
+    strong: bool,
+    /// The host crashes injected so far (the wipe takes every other one, from the first).
+    host_crashes: u32,
 
     pub fn create(
         gpa: Allocator,
@@ -856,6 +873,7 @@ pub const Cluster = struct {
         c.server_due_ms = 0;
         c.server_seen_revision = 0;
         c.compact_due_ms = epoch_ms + compact_interval_ms;
+        c.store_healthy_since_ms = epoch_ms;
         c.instance_next = 1;
         c.request_next = 1;
         c.dropped_before_restart = 0;
@@ -873,6 +891,8 @@ pub const Cluster = struct {
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
+        c.strong = options.strong or c1_teeth.strong_world;
+        c.host_crashes = 0;
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
@@ -1110,7 +1130,7 @@ pub const Cluster = struct {
             c.net.tick(c.manual.ms);
             c.mend_links();
             c.settle();
-            if (c.c1 and c.jobs_on) c.watch_client();
+            if (c.jobs_on) c.watch_client();
             // The wedge totals J1, J6 and J8 judge by are kept whenever jobs are on,
             // not only under c1: a plain run judges the same bounds.
             if (c.c1 or c.jobs_on) c.note_wedged();
@@ -1406,6 +1426,16 @@ pub const Cluster = struct {
         const kind: @import("agent_state.zig").CrashKind =
             if (random.boolean()) .process else .host;
         c.stats.crashes_injected += 1;
+        // No draw: with `Options.strong`, every other host crash loses the disk, state directory
+        // and containers. A `.process` crash never does: a directory removed by hand would leave
+        // containers running that this simulated node cannot list (its runtime keeps their
+        // records in that directory), which no agent can find, and J1, J8 and I1b rightly fail
+        // (about one seed in five at 100 operations; docs/core.md, "What the simulation does not
+        // cover").
+        if (c.strong and kind == .host) {
+            c.host_crashes += 1;
+            if (c.host_crashes % 2 == 1) node.wipe_pending = true;
+        }
         switch (random.uintLessThan(u32, 3)) {
             0 => node.sim.arm_crash(1 + random.uintLessThan(u32, 6), kind),
             1 => node.sim.arm_step(1 + random.uintLessThan(u32, 3), kind),
@@ -1421,6 +1451,10 @@ pub const Cluster = struct {
         var name_buffer: [16]u8 = undefined;
         // "jb-" and a u32 fit.
         const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
+        // Every 13th job asks for more cpu than any node has, so that no node ever claims it and
+        // its run must end `not_started` (J8's second clause). No draw, and only with
+        // `Options.strong`: other worlds are unchanged.
+        const unplaceable = c.strong and c.job_next % 13 == 5;
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
@@ -1432,7 +1466,10 @@ pub const Cluster = struct {
             .name = name,
             .image = hello_digest,
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
-            .limits = .{ .cpu_millis = 10, .memory_bytes = constants.job_limit_memory_bytes_min },
+            .limits = .{
+                .cpu_millis = if (unplaceable) 100_000 else 10,
+                .memory_bytes = constants.job_limit_memory_bytes_min,
+            },
             .deadline_ms = if (long) 600_000 else 3000 + random.uintLessThan(u32, spread),
             .grace_ms = random.uintLessThan(u32, 2000),
             .submit_by_ms = c.manual.ms + 5000 + random.uintLessThan(u32, 20_000),
@@ -1570,7 +1607,14 @@ fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
 /// The tap's `after`: checks the revision a call just made (`sim_c1.at_revision`).
 fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revision) void {
     const c: *Cluster = @ptrCast(@alignCast(context));
-    if (!c.c1) return;
+    if (!c.c1) {
+        // J4 judges the endings the store committed, with or without the per-revision checks.
+        if (!c.jobs_on) return;
+        const txn = request orelse return;
+        _ = c.tap_arena.reset(.retain_capacity);
+        sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
+        return;
+    }
     c.c1_revisions += 1;
     if (request) |txn| c.note_replaced(txn);
     _ = c.tap_arena.reset(.retain_capacity);
@@ -1583,7 +1627,9 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
     };
     if (request) |txn| c.recorder.record_request(&ctx, txn);
     if (request) |txn| {
-        if (c.jobs_on) sim_jobs_watch.note_commit(&c.jobs_watch, txn, c.tap_arena.allocator());
+        if (c.jobs_on) {
+            sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
+        }
     }
     if (c.c1_violation != null) return;
     if (request != null) {
@@ -2334,7 +2380,10 @@ fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
     try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
-    if (store_faulty(c)) return;
+    if (store_faulty(c)) {
+        c.store_healthy_since_ms = c.manual.ms;
+        return;
+    }
     var scratch = std.heap.ArenaAllocator.init(c.gpa);
     defer scratch.deinit();
     c.diag.reset();
@@ -2344,6 +2393,7 @@ fn track_jobs(c: *Cluster) Failure!void {
         .arena = scratch.allocator(),
         .diag = &c.diag,
     };
+    try unclaimed_ended(c, &ctx);
     comptime assert(nodes_max * constants.runtime_handles_max <= sim_jobs.watch_max);
     const next = scratch.allocator().alloc(sim_jobs.Watch, sim_jobs.watch_max) catch
         return check(c, false, "the job trackers are out of memory");
@@ -2373,6 +2423,38 @@ fn track_jobs(c: *Cluster) Failure!void {
     @memcpy(c.jobs.watch[0..count], next[0..count]);
     assert(count <= sim_jobs.watch_max);
     c.jobs.watch_count = count;
+}
+
+/// How long after its `start_by_ms` (or after the store last failed) a run that no node ever
+/// started may stay open. The job controller ends it at once on a healthy store, its pass paced
+/// by the wake it set for that time; this leaves room for a slow pass and a retried write.
+const unclaimed_ms_max: u64 = 90_000;
+
+/// J8, second clause: a run that was never started (no entry in the start ledger) is ended by
+/// the server, whatever the nodes do, once its `start_by_ms` has passed. Judged only once the
+/// store has been reachable for `unclaimed_ms_max`, and not at all when the ledger overflowed.
+fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    if (c.jobs.ledger_full > 0) return;
+    const job_runs = controller.list_all(
+        records.JobRun,
+        ctx,
+        records.prefix_job_runs,
+        null,
+        constants.jobs_max,
+    ) catch return;
+    const now = c.manual.ms;
+    for (job_runs.items) |entry| {
+        const run = &entry.rec;
+        if (now < @max(run.start_by_ms, c.store_healthy_since_ms) +| unclaimed_ms_max) continue;
+        const status = job_status_of(ctx, run.job) orelse continue;
+        if (records.job_state_terminal(status.state)) continue;
+        const hash = std.hash.Wyhash.hash(0, run.id);
+        if (std.mem.indexOfScalar(u64, c.jobs.ledger[0..c.jobs.ledger_count], hash) != null) {
+            continue;
+        }
+        try check(c, false, "J8: a run that no node started was still open long after its " ++
+            "start_by_ms");
+    }
 }
 
 fn note_marks(
@@ -2426,8 +2508,8 @@ fn judge_job_container(
         try check(c, since <= stop_bound, "J6: a run kept executing after its stop committed, " ++
             "past the bound");
     }
-    // J1's clock starts at the first look at a node that is not wedged (a stop the node missed
-    // while wedged is still being made up for); J6 and J8 above count that time out instead.
+    // J1 has no wedge allowance, so a node that is, or lately was, wedged is not judged for it
+    // (RB-N8: J6 and J8 above count the wedged time out and are judged on every node).
     if (c.wedged_lately(node)) return;
     const status = job_status_of(ctx, job) orelse return;
     if (!records.job_state_terminal(status.state)) return;
@@ -2735,6 +2817,11 @@ pub const Options = struct {
     /// The job workload (docs/briefs/b1.md): jobs are submitted and cancelled, their containers
     /// end, and J1 to J3 and J5 to J8 are checked (J3 and J5 under `c1`).
     jobs: bool = true,
+    /// The stronger world of B2 slice 4: every other host crash also loses the node's disk (state
+    /// directory and containers) and every thirteenth job cannot be placed. Off, a run is the
+    /// world it was before those faults existed, bit for bit (a replay line of an older failure
+    /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
+    strong: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -2758,6 +2845,7 @@ pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
         options.profile_auto = false;
     }
     if (operations == null) {
+        options.strong = true;
         if (options.nodes == null) options.nodes = shape.nodes;
         if (options.lease_ttl_ms == null) options.lease_ttl_ms = shape.lease_ttl_ms;
         if (options.replicas_pct == null) options.replicas_pct = shape.replicas_pct;
@@ -3017,9 +3105,9 @@ fn print_summary(c: *Cluster) void {
     });
     report.print("busiest node: {d} steps per up-minute\n", .{busiest_node_rate(c)});
     report.print("faults: crashes={d} partitions={d} outages={d} suspends={d} " ++
-        "runtime={d} server_restarts={d} ack_lost={d}\n", .{
+        "runtime={d} server_restarts={d} ack_lost={d} wipes={d}\n", .{
         s.crashes_injected, s.partitions,      s.outages,             s.suspends,
-        s.runtime_faults,   s.server_restarts, c.ack_loss.lost_count,
+        s.runtime_faults,   s.server_restarts, c.ack_loss.lost_count, s.wipes,
     });
     report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
         s.nodes_marked_lost, s.replicas_marked_lost,
