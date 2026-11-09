@@ -745,6 +745,58 @@ test "a job added behind the cursor between steps gets its run within two more s
     try testing.expect((try f.read_run("a")) != null);
 }
 
+/// Readies a cancelled `train` whose step commits twice (`hold_unreadable_report` or
+/// `unmappable`, then the cancel's stop) behind 63 new jobs that take one commit each, so the
+/// step starts with one transaction left.
+fn double_commit_at_budget_edge(f: *Fixture, unreadable: bool) !void {
+    try f.running("train");
+    if (unreadable) {
+        try corrupt(f, .{ .agent = "n1" }, records.job_observed_key("n1", "train").slice());
+    } else {
+        try f.report("n1", "train", .stopped, .{ .kind = .exited }, null);
+    }
+    try f.job("train", 60 * 1000, true);
+    const before = constants.controller_txns_per_step_max - 1;
+    for (0..before) |at| {
+        var name: [3]u8 = undefined;
+        _ = std.fmt.bufPrint(&name, "a{d:0>2}", .{at}) catch unreachable; // 3 bytes hold a00..a62.
+        try f.job(&name, 60 * 1000, false);
+    }
+    // The hold lands with the last transaction; the stop waits for the next step, which starts
+    // at once at `train` and does not repeat the hold.
+    const first = try f.jc.reconcile(&f.context());
+    try testing.expectEqual(constants.controller_txns_per_step_max, first.acted);
+    try testing.expect(first.at_ms <= f.manual.ms);
+    try testing.expect((try f.read_run("train")).?.stop == null);
+    _ = try f.pass();
+    const stop = (try f.read_run("train")).?.stop orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(records.RunStopCause.cancel, stop.cause);
+    try testing.expectEqual(@as(u32, 0), try f.pass());
+}
+
+test "a step that commits twice with one transaction left stops the step (B2 M1, unreadable)" {
+    // Goal: B2 release review B, M1. A report that does not decode is held, and the cancel's
+    // stop is written in the same step. With one transaction left the second commit underflowed
+    // `txns_left` and panicked the server; now the step stops at the job and the next one ends it.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try double_commit_at_budget_edge(&f, true);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unreadable_job"));
+}
+
+test "a step that commits twice with one transaction left stops the step (B2 M1, unmappable)" {
+    // Goal: the same for a report whose exit maps to no ending: the hold, then the cancel's stop.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    try double_commit_at_budget_edge(&f, false);
+    try testing.expectEqual(@as(u32, 1), try f.decisions("train", "hold_unmapped_ending"));
+    const ended = (try f.read_status("train")).?;
+    try testing.expectEqual(records.JobState.failed, ended.state);
+    try testing.expectEqual(records.JobFailure.unknown, ended.end.?.cause.?);
+}
+
 /// One pass of the whole control plane, the way the server runs it.
 fn plane_pass(f: *Fixture, plane: *control_plane.ControlPlane) !void {
     const ctx = f.context();

@@ -543,9 +543,23 @@ const Pass = struct {
     stopped: bool = false,
     wake_at_ms: u64,
 
+    /// True when the pass may commit again. A step that commits twice (a hold, then the stop
+    /// or the ending the job is due: `claim`'s unreadable report, `unmappable`, the `job_rewrite`
+    /// tooth) asks before its second commit. With nothing left, or after a conflict, the pass
+    /// stops at the job, so the cursor stays before it and the next step, run at once, judges it
+    /// again; the hold is not repeated there (`has_decision`), so that step commits once.
+    fn may_commit(pass: *Pass) bool {
+        if (pass.stopped) return false;
+        if (pass.txns_left > 0) return true;
+        pass.stopped = true;
+        pass.more = true;
+        return false;
+    }
+
     fn landed(pass: *Pass, done: controller.Commit) ?Revision {
         switch (done) {
             .applied => |revision| {
+                assert(pass.txns_left > 0); // Every commit is within the step's budget.
                 pass.acted += 1;
                 pass.txns_left -= 1;
                 return revision;
@@ -565,7 +579,10 @@ const Pass = struct {
         if (run == null and status == null) return pass.create(job);
         if (run == null or status == null) return pass.contradict(job, run, status);
         if (records.job_state_terminal(status.?.rec.state)) {
-            if (c1_teeth.job_rewrite) try pass.rewrite(status.?);
+            if (c1_teeth.job_rewrite) {
+                try pass.rewrite(status.?);
+                if (!pass.may_commit()) return;
+            }
             return pass.late_report(job, status.?);
         }
         try pass.advance(job, run.?, status.?);
@@ -685,7 +702,10 @@ const Pass = struct {
         var live: ?*const Entry(records.JobObserved) = null;
         var fence: ?*const Entry(records.JobObserved) = null;
         const claim_seen: ?*const Entry(records.JobObserved) = switch (try pass.claim(job, run)) {
-            .unreadable => return pass.judge_unreadable(job, run, status),
+            .unreadable => {
+                if (!pass.may_commit()) return;
+                return pass.judge_unreadable(job, run, status);
+            },
             .none => null,
             .seen => |entry| entry,
         };
@@ -775,6 +795,7 @@ const Pass = struct {
         if (entry.rec.status == .stopped) {
             const ending = map_ending(&entry.rec) orelse {
                 try pass.unmappable(job, entry);
+                if (!pass.may_commit()) return true;
                 // Once a stop exists the report is the last the agent sends, so the run ends
                 // here, failed with an unknown cause, or it would never end (RB-S8).
                 const stop = run.rec.stop orelse return false;
