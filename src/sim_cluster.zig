@@ -1957,7 +1957,9 @@ fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
     switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
-        .advance => c.advance(100 + random.uintLessThan(u32, 6000)),
+        .advance => {
+            c.advance(100 + random.uintLessThan(u32, 6000));
+        },
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
         .scale => c.apply(name, hello_digest, c.replicas_for(random, 8)),
         .delete => c.delete_service(name),
@@ -2471,10 +2473,12 @@ fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
         ctx,
         records.prefix_job_runs,
         null,
-        constants.jobs_max,
+        constants.job_admitted_window_max,
     ) catch {
-        ctx.diag.reset(); // A list the store refused, or more runs than fit: nothing to judge.
-        return;
+        // Judged only while the store is healthy (`track_jobs`), so a refusal, or more runs than
+        // the admission window holds, is a failure, not a skip (RB-N8: past 512 runs).
+        ctx.diag.reset();
+        return check(c, false, "J8: the runs of the second clause cannot be read");
     };
     const now = c.manual.ms;
     for (job_runs.items) |entry| {

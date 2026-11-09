@@ -479,6 +479,9 @@ jobs:
       # One node, bursts of short jobs (#198): J8 must hold on a correct agent.
       - name: sim-c1 burst world
         run: zig build sim-c1-burst --summary all
+      # The job_evicted tooth's world (burst, strong, more than 512 runs), fix on.
+      - name: sim-c1 worlds
+        run: zig build sim-c1-worlds --summary all
       # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
       - name: sim-c1 regressions
         run: zig build sim-c1-regressions --summary all

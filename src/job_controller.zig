@@ -126,7 +126,12 @@ pub const JobController = struct {
         var arena_state = std.heap.ArenaAllocator.init(ctx.arena);
         defer arena_state.deinit();
         var finished = false;
-        for (0..pages_max) |_| {
+        // Test-only (`c1_teeth.job_evicted`): a sweep stops after `jobs_max` jobs and restarts.
+        const sweep_pages = if (c1_teeth.job_evicted)
+            constants.jobs_max / constants.job_controller_page_max
+        else
+            pages_max;
+        for (0..sweep_pages) |_| {
             _ = arena_state.reset(.retain_capacity);
             const page_ctx: Context = .{
                 .store = ctx.store,
@@ -154,6 +159,7 @@ pub const JobController = struct {
                 break;
             }
         }
+        if (c1_teeth.job_evicted and !pass.stopped and pass.txns_left > 0) finished = true;
         jc.cursor = if (finished) null else after;
         if (now >= jc.retention.due_ms) {
             jc.retention.due_ms = job_retention.prune_or_back_off(ctx, &jc.retention, now);
