@@ -44,6 +44,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const fencing = @import("fencing.zig");
 const sim_cluster = @import("sim_cluster.zig");
@@ -288,8 +289,11 @@ fn print_replay(
     options: sim_cluster.Options,
     heal_at: ?u32,
 ) !void {
-    try out.print("  replay: zig-out/bin/sim_cluster {d} {d} {d}", .{
-        seed, operations, options.nodes orelse 0,
+    // The burst world is a comptime flag of its own runner, so its replay names that runner
+    // (`sim-c1-burst` builds it; #202).
+    const runner = if (c1_teeth.burst_world) "sim_c1_burst" else "sim_cluster";
+    try out.print("  replay: zig-out/bin/{s} {d} {d} {d}", .{
+        runner, seed, operations, options.nodes orelse 0,
     });
     if (!options.liveness) try out.writeAll(" --liveness=false");
     if (options.c1) try out.writeAll(" --c1");

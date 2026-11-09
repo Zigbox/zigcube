@@ -209,6 +209,9 @@ pub const Agent = struct {
     /// Like the fence, it caps every pause, wait and call, so a cut-off server never holds a
     /// run's stop back.
     deadline_wake_mono_ms: u64,
+    /// The cap the step last gave its calls (`cap_calls`), monotonic; maxInt if none. A run that
+    /// starts mid-step may only lower it (`arm_run_deadline`).
+    calls_cap_mono_ms: u64,
     /// Failures of the server-free enforcement that the step went on after (one run's record or
     /// stop, the runtime's listing): counted, with the last one's code and cause, for the shell
     /// to say. Enforcement never fails the step, so the heartbeat always runs.
@@ -293,6 +296,7 @@ pub const Agent = struct {
         agent.store_hash = 0;
         agent.jobs_wake_mono_ms = maxInt(u64);
         agent.deadline_wake_mono_ms = maxInt(u64);
+        agent.calls_cap_mono_ms = maxInt(u64);
         agent.enforce_failures = 0;
         agent.enforce_failure_len = 0;
         agent.steps = 0;
@@ -364,9 +368,24 @@ pub const Agent = struct {
     }
 
     /// Tells the caller by when every call to the server must end (`calls_deadline_ms`).
-    fn cap_calls(agent: *const Agent, ctx: *const Context) void {
+    fn cap_calls(agent: *Agent, ctx: *const Context) void {
         const deadline = ctx.deadline orelse return;
-        deadline.set_fn(deadline.context, agent.calls_deadline_ms(ctx.mono_ms()));
+        agent.calls_cap_mono_ms = agent.calls_deadline_ms(ctx.mono_ms());
+        deadline.set_fn(deadline.context, agent.calls_cap_mono_ms);
+    }
+
+    /// A run started in the middle of a step, which `enforce_deadlines` at the step's start did
+    /// not see: its deadline (`at_mono_ms`) becomes a wake, and the calls the step still makes
+    /// end by it, so a hung call or a long run of slow ones never keeps the run executing until
+    /// the step ends (#202). It only lowers the cap: `calls_deadline_ms` never cuts a call
+    /// short of `call_inflight_min_ms`, and giving that again at every start would let a burst of
+    /// starts extend the step without end.
+    pub fn arm_run_deadline(agent: *Agent, ctx: *const Context, at_mono_ms: u64) void {
+        agent.deadline_wake_mono_ms = @min(agent.deadline_wake_mono_ms, at_mono_ms);
+        const deadline = ctx.deadline orelse return;
+        const cap = agent.calls_deadline_ms(ctx.mono_ms());
+        agent.calls_cap_mono_ms = @min(agent.calls_cap_mono_ms, cap);
+        deadline.set_fn(deadline.context, agent.calls_cap_mono_ms);
     }
 
     /// The stages of a step that follow the loading. A stage that fails does not hold the others
