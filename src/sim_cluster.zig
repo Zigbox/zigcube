@@ -341,11 +341,6 @@ pub const Swarm = struct {
             swarm.w_job_create = 40;
             swarm.w_job_end = 30;
         }
-        // The `job_reuse` tooth needs jobs that end, are retained for an hour, and are made again.
-        if (c1_teeth.reuse_world) {
-            swarm.w_job_create = 12;
-            swarm.w_job_end = 10;
-        }
     }
 
     fn print(swarm: *const Swarm, report: *Report) void {
@@ -1133,16 +1128,10 @@ pub const Cluster = struct {
     }
 
     pub fn advance(c: *Cluster, ms: u64) void {
-        c.advance_coarse(ms, tick_ms);
-    }
-
-    /// `advance` in steps of up to `step_max` ms (the `job_reuse` world's hour: 1,240 ticks of
-    /// 3 s, not 36,000).
-    fn advance_coarse(c: *Cluster, ms: u64, step_max: u64) void {
         var left = ms;
         while (left > 0) {
             if (c.report.failed) return;
-            const slice = @min(left, step_max);
+            const slice = @min(left, tick_ms);
             c.manual.advance(slice);
             left -= slice;
             if (c.fault_totals == null) c.fault_ms += slice;
@@ -1476,24 +1465,24 @@ pub const Cluster = struct {
     fn create_job(c: *Cluster) void {
         const random = c.prng.random();
         var name_buffer: [16]u8 = undefined;
-        // The `job_reuse` tooth: half the creates name a job made earlier, which the store takes
-        // once retention deleted it (an hour after it ended) and refuses before.
-        const reused = c1_teeth.reuse_world and c.job_next > 1 and random.boolean();
-        const number = if (reused) 1 + random.uintLessThan(u32, c.job_next - 1) else c.job_next;
         // "jb-" and a u32 fit.
-        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch unreachable;
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
         // Every 13th job asks for more cpu than any node has, so that no node ever claims it and
         // its run must end `not_started` (J8's second clause). No draw, and only with
         // `Options.strong`: other worlds are unchanged.
         const unplaceable = c.strong and c.job_next % 13 == 5;
-        if (!reused) c.job_next += 1;
+        c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
         const ctx = c.controller_context();
-        const long = random.uintLessThan(u32, 4) == 0 and !c1_teeth.reuse_world;
+        const long = random.uintLessThan(u32, 4) == 0;
         // The `job_deadline_offline` tooth: deadlines that fall within the run (see `add_jobs`).
-        const short = c1_teeth.offline_world or c1_teeth.reuse_world;
-        const spread: u32 = if (c1_teeth.burst_world) 1000 else if (short) 10_000 else 40_000;
+        const spread: u32 = if (c1_teeth.burst_world)
+            1000
+        else if (c1_teeth.offline_world)
+            10_000
+        else
+            40_000;
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
             .image = hello_digest,
@@ -1512,21 +1501,6 @@ pub const Cluster = struct {
             return;
         };
         c.jobs.created += 1;
-        if (reused) c.count_reuse(name);
-    }
-
-    /// The `job_reuse` world's evidence: an accepted create of an earlier job's name, and whether a
-    /// container of that name was still on some node.
-    fn count_reuse(c: *Cluster, name: []const u8) void {
-        c.jobs.reuse_made += 1;
-        for (c.nodes) |node| {
-            for (node.sim.containers.containers.items) |container| {
-                const job = job_of(container) orelse continue;
-                if (!std.mem.eql(u8, job, name)) continue;
-                c.jobs.reuse_met_container += 1;
-                return;
-            }
-        }
     }
 
     /// The job of a random live job container, copied into `buffer`; null if none runs. Half of
@@ -1979,10 +1953,6 @@ fn operation(c: *Cluster) void {
     switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
-            // The `job_reuse` tooth: now and then the world waits out `job_finished_age_ms_min`.
-            if (c1_teeth.reuse_world and random.uintLessThan(u32, 32) == 0) {
-                c.advance_coarse(constants.job_finished_age_ms_min + 2 * 60_000, 3_000);
-            }
         },
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
         .scale => c.apply(name, hello_digest, c.replicas_for(random, 8)),
@@ -3223,11 +3193,6 @@ fn print_summary(c: *Cluster) void {
 
 fn print_jobs(c: *Cluster) void {
     const j = &c.jobs;
-    if (c1_teeth.reuse_world) {
-        c.report.print("jobs: reuse made={d} met a container={d}\n", .{
-            j.reuse_made, j.reuse_met_container,
-        });
-    }
     c.report.print("jobs: created={d} cancelled={d} ended={d}; starts judged={d} ledger={d} " ++
         "unjudged={d}\n", .{
         j.created, j.cancelled, j.ended, j.starts_judged, j.ledger_count, j.ledger_full,

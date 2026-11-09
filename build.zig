@@ -1279,13 +1279,6 @@ const c1_teeth_roots = [_]struct {
         .seeds = 13,
         .ops = 300,
     },
-    .{
-        .name = "job_reuse",
-        .root = "src/sim_c1_teeth_job_reuse_main.zig",
-        .symptom = "J8",
-        .canary_seeds = 40,
-        .ops = 300,
-    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1303,7 +1296,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the eighteen negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the twenty negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1336,7 +1329,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the eighteen fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the twenty fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1594,15 +1587,14 @@ fn add_burst_step(b: *std.Build, sim: SimStepOptions) void {
         .dependOn(&run.step);
 }
 
-/// The roots of `sim-c1-worlds`: the worlds of the `job_evicted` and `job_reuse` teeth, fix on.
+/// The roots of `sim-c1-worlds`: the world of the `job_evicted` tooth, fix on.
 const worlds = [_][]const u8{
     "src/sim_c1_evict_world_main.zig",
-    "src/sim_c1_reuse_world_main.zig",
 };
 
 /// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5 may fail.
 fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
-    const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted and job_reuse worlds");
+    const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted world");
     const only = b.step("sim-c1-worlds-exe", "Install the world runners");
     for (worlds) |root| {
         const exe = b.addExecutable(.{

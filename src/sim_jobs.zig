@@ -26,10 +26,6 @@ pub const State = struct {
     ledger: [ledger_max]u64 = undefined,
     ledger_count: u32 = 0,
     ledger_full: u32 = 0,
-    /// The `job_reuse` world's evidence: creates that took an earlier job's name and were
-    /// accepted, and of those, how many met a container of that name on some node.
-    reuse_made: u32 = 0,
-    reuse_met_container: u32 = 0,
     /// The first of J2 and J7 to fail; the cluster's safety check reports it.
     violation: ?[]const u8 = null,
     /// Starts judged against a committed claim (J7).
