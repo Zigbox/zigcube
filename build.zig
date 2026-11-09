@@ -1307,6 +1307,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         teeth_exes.dependOn(&own_install.step);
     }
     add_offline_step(b, sim);
+    add_burst_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -1493,6 +1494,29 @@ const regress_replays = [_][]const []const u8{
 
 /// Seeds of `sim-c1-offline`; about 45 s.
 const offline_seeds_max = 30;
+
+/// Seeds of `sim-c1-burst`: seed 2 at 300 operations failed J8 on a correct agent (#198) when the
+/// simulator's record of job starts was too short; about 25 s a seed.
+const burst_seeds = "1..2";
+
+/// `zig build sim-c1-burst`: the burst world (one node, bursts of 12 short jobs; #198) with the
+/// agent right: no seed may fail. With `Node.started_true` back at 8 entries seed 2 fails J8.
+fn add_burst_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_burst",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_burst_world_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", burst_seeds, "300", "--c1" });
+    run.expectExitCode(0);
+    b.step("sim-c1-burst", "Run sim-c1 in the burst world (#198): J8 must hold")
+        .dependOn(&run.step);
+}
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
 /// cuts, short deadlines) with the fix on. It passes only if no seed fails (J8 and the rest).

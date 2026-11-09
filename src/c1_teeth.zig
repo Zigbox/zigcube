@@ -62,6 +62,12 @@ pub const job_deadline_offline = declared("c1_teeth_job_deadline_offline");
 /// own enforcement left on, for the positive run `sim-c1-offline`. Not in `any`.
 pub const offline_world = declared("c1_offline_world") or job_deadline_offline;
 
+/// Not a fault: a world of one node and bursts of short jobs, with the agent right, for the
+/// regression `sim-c1-burst` (issue #198). One step starts dozens of runs there, which the
+/// simulator once stamped as started at the wrong time (J8 failed on a correct agent). Not in
+/// `any`.
+pub const burst_world = declared("c1_burst_world");
+
 /// The jobs watch drops the events of some endings (must break J4: a client that follows the watch
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");
