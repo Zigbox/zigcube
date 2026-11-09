@@ -2466,7 +2466,10 @@ fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
         records.prefix_job_runs,
         null,
         constants.jobs_max,
-    ) catch return;
+    ) catch {
+        ctx.diag.reset(); // A list the store refused, or more runs than fit: nothing to judge.
+        return;
+    };
     const now = c.manual.ms;
     for (job_runs.items) |entry| {
         const run = &entry.rec;
