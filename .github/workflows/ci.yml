@@ -443,7 +443,7 @@ jobs:
       - name: Console module (browser), checked in Node
         run: zig build console-wasm --summary all
 
-  # Simulations, not demo-c0 (docs/core.md). This job, `sim-teeth` and `sim-worlds` are one set,
+  # Simulations, not demo-c0 (docs/core.md). This job, `sim-c1-teeth` and `sim-worlds` are one set,
   # split to run side by side. The same seed runs natively and in WASM and the reports must agree
   # byte for byte. Seed 1 always, and one seed per CI run, printed here.
   sim:
@@ -485,7 +485,7 @@ jobs:
 
   # The sim-c1 negative tests (about 22 minutes), apart from the other simulations so that no job
   # nears its timeout (docs/decisions/2026-11-09-sim-job-split.md).
-  sim-teeth:
+  sim-c1-teeth:
     name: simulations (sim-c1 negative tests)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
@@ -496,7 +496,7 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - uses: ./.github/actions/zig-cache
         with:
-          name: sim-teeth
+          name: sim-c1-teeth
       - name: sim-c1 negative tests
         run: zig build sim-c1-teeth --summary all
 

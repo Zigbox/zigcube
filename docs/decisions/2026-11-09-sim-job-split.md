@@ -23,11 +23,27 @@ about 2 min of it checkout, Zig and cache):
 |---|---|---|
 | `simulations (sim-c0, sim-c1)` (`sim`) | the four seed runs, regressions, regression seeds, fencing | about 12 min |
 | `simulations (sim-c1 worlds)` (`sim-worlds`) | offline, burst, worlds | about 16 min |
-| `simulations (sim-c1 negative tests)` (`sim-teeth`) | `sim-c1-teeth` | about 24 min |
+| `simulations (sim-c1 negative tests)` (`sim-c1-teeth`) | `sim-c1-teeth` | about 24 min |
 
 `sim-c1-teeth` stays one step: it also runs each tooth's plain run, which the per-tooth steps
-(`sim-c1-teeth-NAME`) leave out, so splitting it would need a `build.zig` change. It has about 6
-minutes of room under the new timeout; a further tooth should go in a split of that step.
+(`sim-c1-teeth-NAME`) leave out, so splitting it would need a `build.zig` change. A further tooth
+should go in a split of that step.
+
+The job was called `sim-teeth` when this was written; it is `sim-c1-teeth` now (the job key, its
+cache entry and its comment). The `zig build sim-teeth` step, which is the sim-c0/sim-cluster
+teeth build, is a different thing and keeps its name.
+
+Measured, CI run 42681840689 (B2.1 slice 1, before the rename), each job's wall time:
+
+| job | measured | estimate above |
+|---|---|---|
+| `simulations (sim-c0, sim-c1)` (`sim`) | 7 min 45 s | about 12 min |
+| `simulations (sim-c1 worlds)` (`sim-worlds`) | 19 min 22 s | about 16 min |
+| `simulations (sim-c1 negative tests)` (`sim-c1-teeth`) | 20 min 25 s | about 24 min |
+
+`sim-worlds` came in about 3 minutes over its estimate. B2.1 slice 5 widens that world, so it is
+the job to watch: it has about 10 minutes of room under its 30-minute timeout, and the next widening
+should split it again before it nears the limit. `sim-c1-teeth` has about 9.5 minutes of room.
 
 `.github/ci-changes.sh` is unchanged: all three jobs run on `code`, as `sim` did. Each job has its
-own cache entry (`sim`, `sim-worlds`, `sim-teeth`).
+own cache entry (`sim`, `sim-worlds`, `sim-c1-teeth`).
