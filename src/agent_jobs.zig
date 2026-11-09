@@ -342,6 +342,8 @@ const Work = struct {
     /// assignment of that job (and so every claim, start record and container) is later than
     /// it. A re-assignment of the same job is not stale: its claim must stay one claim.
     fn is_stale_epoch(work: *const Work, id: []const u8, epoch: u64) bool {
+        // Test-only (J8): a leftover of an earlier job of this name is taken for this job's.
+        if (c1_teeth.job_reuse) return false;
         const entry = work.run_of(id) orelse return false;
         return epoch < entry.kv.create_revision;
     }

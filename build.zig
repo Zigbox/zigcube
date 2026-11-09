@@ -1133,6 +1133,8 @@ const c1_teeth_roots = [_]struct {
     /// is a `--c1` check) and refused_loop 30 seeds fail.
     plain_symptom: ?[]const u8 = null,
     plain_seeds: u32 = teeth_seeds_max,
+    /// Operations of a run; the worlds of the two teeth outside `c1_teeth_operations` need more.
+    ops: u32 = c1_teeth_operations,
 }{
     .{
         .name = "allocation",
@@ -1267,6 +1269,13 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = job_wipe_symptom,
         .plain_seeds = 100,
     },
+    .{
+        .name = "job_reuse",
+        .root = "src/sim_c1_teeth_job_reuse_main.zig",
+        .symptom = "J8",
+        .canary_seeds = 40,
+        .ops = 300,
+    },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
@@ -1332,9 +1341,9 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         const seeds = b.fmt("{d}..{d}", .{ entry.first_seed, entry.seeds });
         const symptom = b.fmt("--expect-symptom={s}", .{entry.symptom});
         teeth_run.addArgs(&.{
-            "--seeds",                            seeds,
-            b.fmt("{d}", .{c1_teeth_operations}), "--c1",
-            "--expect-fail",                      symptom,
+            "--seeds",                  seeds,
+            b.fmt("{d}", .{entry.ops}), "--c1",
+            "--expect-fail",            symptom,
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
@@ -1347,6 +1356,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     }
     add_offline_step(b, sim);
     add_burst_step(b, sim);
+    add_worlds_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -1572,6 +1582,26 @@ fn add_burst_step(b: *std.Build, sim: SimStepOptions) void {
     run.expectExitCode(0);
     b.step("sim-c1-burst", "Run sim-c1 in the burst world (#198): J8 must hold")
         .dependOn(&run.step);
+}
+
+/// The root of `sim-c1-worlds`: the world of the `job_reuse` tooth with the agent right.
+const reuse_world_root = "src/sim_c1_reuse_world_main.zig";
+
+/// `zig build sim-c1-worlds`: the positive run of that world; no seed of 1 to 5 may fail.
+fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_world",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(reuse_world_root),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
+    run.expectExitCode(0);
+    b.step("sim-c1-worlds", "Run sim-c1 in the job_reuse world, fix on").dependOn(&run.step);
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
