@@ -1512,6 +1512,21 @@ pub const Cluster = struct {
             return;
         };
         c.jobs.created += 1;
+        if (reused) c.count_reuse(name);
+    }
+
+    /// The `job_reuse` world's evidence: an accepted create of an earlier job's name, and whether a
+    /// container of that name was still on some node.
+    fn count_reuse(c: *Cluster, name: []const u8) void {
+        c.jobs.reuse_made += 1;
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                const job = job_of(container) orelse continue;
+                if (!std.mem.eql(u8, job, name)) continue;
+                c.jobs.reuse_met_container += 1;
+                return;
+            }
+        }
     }
 
     /// The job of a random live job container, copied into `buffer`; null if none runs. Half of
@@ -3208,6 +3223,11 @@ fn print_summary(c: *Cluster) void {
 
 fn print_jobs(c: *Cluster) void {
     const j = &c.jobs;
+    if (c1_teeth.reuse_world) {
+        c.report.print("jobs: reuse made={d} met a container={d}\n", .{
+            j.reuse_made, j.reuse_met_container,
+        });
+    }
     c.report.print("jobs: created={d} cancelled={d} ended={d}; starts judged={d} ledger={d} " ++
         "unjudged={d}\n", .{
         j.created, j.cancelled, j.ended, j.starts_judged, j.ledger_count, j.ledger_full,

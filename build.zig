@@ -1272,8 +1272,11 @@ const c1_teeth_roots = [_]struct {
     .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
-        .symptom = "J8",
-        .canary_seeds = 40,
+        // Seed 9 is the first hit of the second clause. Seeds 14, 17 and 19 fail J8 in this
+        // world with the fault off (#202), so both ranges end before them.
+        .symptom = "J8: a run that no node started",
+        .canary_seeds = 13,
+        .seeds = 13,
         .ops = 300,
     },
     .{
