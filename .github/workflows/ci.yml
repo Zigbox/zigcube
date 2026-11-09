@@ -443,13 +443,14 @@ jobs:
       - name: Console module (browser), checked in Node
         run: zig build console-wasm --summary all
 
-  # Simulations, not demo-c0 (docs/core.md). The same seed runs natively and in WASM and the
-  # reports must agree byte for byte. Seed 1 always, and one seed per CI run, printed here.
+  # Simulations, not demo-c0 (docs/core.md). This job, `sim-teeth` and `sim-worlds` are one set,
+  # split to run side by side. The same seed runs natively and in WASM and the reports must agree
+  # byte for byte. Seed 1 always, and one seed per CI run, printed here.
   sim:
     name: simulations (sim-c0, sim-c1)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -464,24 +465,13 @@ jobs:
           echo "seed ${{ github.run_id }}"
           zig build sim-c0 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
       # sim-c1 (docs/core.md, "sim-c1"): docs/authority.md §4's invariants after every revision, §5's
-      # evidence test over every decision, native against WASM. The negative tests must fire.
+      # evidence test over every decision, native against WASM.
       - name: sim-c1, native and WASM, seed 1
         run: zig build sim-c1 --summary all
       - name: sim-c1, native and WASM, seed of this run
         run: |
           echo "seed ${{ github.run_id }}"
           zig build sim-c1 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
-      - name: sim-c1 negative tests
-        run: zig build sim-c1-teeth --summary all
-      # The positive run of the deadline-offline tooth's world: long cuts, short deadlines, fix on.
-      - name: sim-c1 offline-deadline world
-        run: zig build sim-c1-offline --summary all
-      # One node, bursts of short jobs (#198): J8 must hold on a correct agent.
-      - name: sim-c1 burst world
-        run: zig build sim-c1-burst --summary all
-      # The job_evicted tooth's world (burst, strong, more than 512 runs), fix on.
-      - name: sim-c1 worlds
-        run: zig build sim-c1-worlds --summary all
       # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
       - name: sim-c1 regressions
         run: zig build sim-c1-regressions --summary all
@@ -492,6 +482,46 @@ jobs:
       # the old ttl / 3 renewal rule must fail it.
       - name: Fencing negative test
         run: zig build sim-fencing-teeth --summary all
+
+  # The sim-c1 negative tests (about 22 minutes), apart from the other simulations so that no job
+  # nears its timeout (docs/decisions/2026-11-09-sim-job-split.md).
+  sim-teeth:
+    name: simulations (sim-c1 negative tests)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: sim-teeth
+      - name: sim-c1 negative tests
+        run: zig build sim-c1-teeth --summary all
+
+  # The offline-deadline, burst and evicted worlds, with the fix on (about 14 minutes).
+  sim-worlds:
+    name: simulations (sim-c1 worlds)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-zig
+      - uses: ./.github/actions/zig-cache
+        with:
+          name: sim-worlds
+      # The positive run of the deadline-offline tooth's world: long cuts, short deadlines, fix on.
+      - name: sim-c1 offline-deadline world
+        run: zig build sim-c1-offline --summary all
+      # One node, bursts of short jobs (#198): J8 must hold on a correct agent.
+      - name: sim-c1 burst world
+        run: zig build sim-c1-burst --summary all
+      # The job_evicted tooth's world (burst, strong, more than 512 runs), fix on.
+      - name: sim-c1 worlds
+        run: zig build sim-c1-worlds --summary all
 
   # The Zigbox runtime on a real host (C2 slice 1, docs/demos/c2.md): zcube-server, zcube-agent
   # --runtime zigbox and real containers from a pulled Alpine image, in the Ubuntu 24.04 guest of
