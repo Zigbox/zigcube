@@ -62,11 +62,21 @@ pub const job_deadline_offline = declared("c1_teeth_job_deadline_offline");
 /// own enforcement left on, for the positive run `sim-c1-offline`. Not in `any`.
 pub const offline_world = declared("c1_offline_world") or job_deadline_offline;
 
+/// The job controller judges only the first `jobs_max` jobs of the admission window: each sweep
+/// stops after that many and starts over, so a job past the 512th is never ended, even an
+/// unplaceable one (must break J8's second clause past 512 runs; B2 slice 4, RB-N8). The
+/// simulator makes more than 512 jobs in the burst world, with unplaceable ones (`strong`).
+pub const job_evicted = declared("c1_teeth_job_evicted");
+
+/// Not a fault: the world of `job_evicted` (burst world, `strong`) with the controller right, for
+/// the positive run `sim-c1-worlds`. Not in `any`.
+pub const evict_world = declared("c1_evict_world") or job_evicted;
+
 /// Not a fault: a world of one node and bursts of short jobs, with the agent right, for the
 /// regression `sim-c1-burst` (issue #198). One step starts dozens of runs there, which the
 /// simulator once stamped as started at the wrong time (J8 failed on a correct agent). Not in
 /// `any`.
-pub const burst_world = declared("c1_burst_world");
+pub const burst_world = declared("c1_burst_world") or evict_world;
 
 /// The jobs watch drops the events of some endings (must break J4: a client that follows the watch
 /// misses an ending it never hears of).
@@ -93,7 +103,7 @@ pub const job_unclaimed = declared("c1_teeth_job_unclaimed");
 pub const job_wipe = declared("c1_teeth_job_wipe");
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs).
-pub const strong_world = job_unclaimed or job_wipe;
+pub const strong_world = job_unclaimed or job_wipe or evict_world;
 
 /// The agent takes the leftovers of an earlier job of the same name (a stopped container, its
 /// observation) for the run of a new job made after `job_finished_age_ms_min` (must break J8:
@@ -107,4 +117,4 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_reuse;
+    job_wipe or job_reuse or job_evicted;

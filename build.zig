@@ -1270,6 +1270,13 @@ const c1_teeth_roots = [_]struct {
         .plain_seeds = 100,
     },
     .{
+        .name = "job_evicted",
+        .root = "src/sim_c1_teeth_job_evicted_main.zig",
+        .symptom = "J8",
+        .canary_seeds = 40,
+        .ops = 300,
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         .symptom = "J8",
@@ -1584,24 +1591,30 @@ fn add_burst_step(b: *std.Build, sim: SimStepOptions) void {
         .dependOn(&run.step);
 }
 
-/// The root of `sim-c1-worlds`: the world of the `job_reuse` tooth with the agent right.
-const reuse_world_root = "src/sim_c1_reuse_world_main.zig";
+/// The roots of `sim-c1-worlds`: the worlds of the `job_evicted` and `job_reuse` teeth, fix on.
+const worlds = [_][]const u8{
+    "src/sim_c1_evict_world_main.zig",
+    "src/sim_c1_reuse_world_main.zig",
+};
 
-/// `zig build sim-c1-worlds`: the positive run of that world; no seed of 1 to 5 may fail.
+/// `zig build sim-c1-worlds`: the positive runs of those worlds; no seed of 1 to 5 may fail.
 fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
-    const exe = b.addExecutable(.{
-        .name = "sim_c1_world",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path(reuse_world_root),
-            .target = sim.target,
-            .optimize = .ReleaseSafe,
-            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
-        }),
-    });
-    const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
-    run.expectExitCode(0);
-    b.step("sim-c1-worlds", "Run sim-c1 in the job_reuse world, fix on").dependOn(&run.step);
+    const step = b.step("sim-c1-worlds", "Run sim-c1 in the job_evicted and job_reuse worlds");
+    for (worlds) |root| {
+        const exe = b.addExecutable(.{
+            .name = "sim_c1_world",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(root),
+                .target = sim.target,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{ "--seeds", "1..5", "300", "--c1" });
+        run.expectExitCode(0);
+        step.dependOn(&run.step);
+    }
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long

@@ -2476,10 +2476,12 @@ fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
         ctx,
         records.prefix_job_runs,
         null,
-        constants.jobs_max,
+        constants.job_admitted_window_max,
     ) catch {
-        ctx.diag.reset(); // A list the store refused, or more runs than fit: nothing to judge.
-        return;
+        // Judged only while the store is healthy (`track_jobs`), so a refusal, or more runs than
+        // the admission window holds, is a failure, not a skip (RB-N8: past 512 runs).
+        ctx.diag.reset();
+        return check(c, false, "J8: the runs of the second clause cannot be read");
     };
     const now = c.manual.ms;
     for (job_runs.items) |entry| {
