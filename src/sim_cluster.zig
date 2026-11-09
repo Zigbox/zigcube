@@ -1959,8 +1959,8 @@ fn operation(c: *Cluster) void {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
             // The `job_reuse` tooth: now and then the world waits out `job_finished_age_ms_min`.
-            if (c1_teeth.reuse_world and random.uintLessThan(u32, 8) == 0) {
-                c.advance(constants.job_finished_age_ms_min + 2 * 60_000);
+            if (c1_teeth.reuse_world and random.uintLessThan(u32, 32) == 0) {
+                c.advance_coarse(constants.job_finished_age_ms_min + 2 * 60_000, 60_000);
             }
         },
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
