@@ -1133,10 +1133,16 @@ pub const Cluster = struct {
     }
 
     pub fn advance(c: *Cluster, ms: u64) void {
+        c.advance_coarse(ms, tick_ms);
+    }
+
+    /// `advance` in steps of up to `step_max` ms (the `job_reuse` world's hour: 1,240 ticks of
+    /// 3 s, not 36,000).
+    fn advance_coarse(c: *Cluster, ms: u64, step_max: u64) void {
         var left = ms;
         while (left > 0) {
             if (c.report.failed) return;
-            const slice = @min(left, tick_ms);
+            const slice = @min(left, step_max);
             c.manual.advance(slice);
             left -= slice;
             if (c.fault_totals == null) c.fault_ms += slice;
@@ -1960,7 +1966,7 @@ fn operation(c: *Cluster) void {
             c.advance(100 + random.uintLessThan(u32, 6000));
             // The `job_reuse` tooth: now and then the world waits out `job_finished_age_ms_min`.
             if (c1_teeth.reuse_world and random.uintLessThan(u32, 32) == 0) {
-                c.advance_coarse(constants.job_finished_age_ms_min + 2 * 60_000, 60_000);
+                c.advance_coarse(constants.job_finished_age_ms_min + 2 * 60_000, 3_000);
             }
         },
         .apply => c.apply(name, images[random.uintLessThan(u32, 2)], c.replicas_for(random, 5)),
