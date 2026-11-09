@@ -487,7 +487,7 @@ the images and advertises it as `/node-store/<node>`).  The job teeth (`sim-c1-t
 agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
 that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
 agent that ignores a cancel breaks J6; one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
-`sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seeds 1..32, whose only hit is seed 32 since #202 was fixed. switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
+`sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 32, the only hit in 1..60 since #202 was fixed (the fleet canary runs 1..32). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

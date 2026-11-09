@@ -1273,10 +1273,12 @@ const c1_teeth_roots = [_]struct {
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
         // With #202 fixed (agents arm a run's deadline when it starts), seeds 1..60 hit the
-        // second clause only on seed 32, so both ranges end there. A sparse tooth: widening its
+        // second clause only on seed 32, so both ranges end there, and CI's run starts there
+        // (1..31 pass and cost CI's sim job about 15 minutes). A sparse tooth: widening its
         // world so more seeds hit is B3 work. Seeds 14, 17 and 19 pass with the fault off.
         .symptom = "J8: a run that no node started",
         .canary_seeds = 32,
+        .first_seed = 32,
         .seeds = 32,
         .ops = 300,
     },
