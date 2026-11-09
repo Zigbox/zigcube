@@ -5,6 +5,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const symptom_spec = @import("symptom.zig");
+
+test {
+    _ = symptom_spec; // its tests run with this file's
+}
 
 /// The producers a round runs (ops/sim-fleet/README.md): `sim_cluster --seeds A..B <ops> --shrink`,
 /// the same with `--c1`, and `sim_swarm --seeds A..B <ops> --shrink`. The kind is part of a
@@ -313,7 +318,7 @@ pub fn canary_verdict(
         checks += 1;
         if (first_check == null) first_check = own;
         const symptom = canary.symptom orelse "";
-        if (std.mem.startsWith(u8, failure.check, symptom)) symptom_seen = true;
+        if (symptom.len == 0 or symptom_spec.matches(failure.check, symptom)) symptom_seen = true;
     }
     // Seeds that ran to their end: every seed but those kept above.
     const ran = batch.seeds - kept.items.len;

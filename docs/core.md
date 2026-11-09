@@ -321,6 +321,19 @@ fault-on runner (`zig-out/bin/sim_teeth`, same flags) to try shrinking on the te
 100 operations takes about 0.7 s natively in ReleaseSafe. The range output is what the simulation
 fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and step, so a change to
 either line's format is a change to `src/sim_fleet_issue.zig` too.
+**The strong world (B2 slice 4, `--strong`).** Two faults that older worlds never had, behind one
+option so that every replay line written before it (`c1_regressions`, `sim-c1-regress`, the
+replay commands of open `sim-fleet` issues) still runs its own world bit for bit: with `--strong`,
+every other host crash also loses the node's disk (state directory and containers; `wipes=` in the
+report), and every thirteenth job asks for more cpu than any node has, so that no node claims it
+(J8's second clause). `auto` operations and the teeth `job_wipe` and `job_unclaimed` switch it on,
+and the replay line then carries `--strong`. **What it does not cover:** a state directory removed
+by hand while the host and its containers stay up. The simulated node's runtime keeps each
+container's record in that directory, so the containers would run on with nothing that lists them;
+no agent can find such a container and J1, J8 and I1b fail on it (measured: 42 of 200 seeds at 100
+operations, plain). A real adapter keeps its containers' labels in the runtime, where the agent
+still lists them, so the case needs a runtime model that lists containers apart from the agent's
+files; that is a coverage cut, not a pass.
 **Profiles and shapes (C3 fleet 1).** `--profile=` is `mixed` (default: the world every earlier
 build drew, bit for bit), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
 the seed, weights 3 2 2 2 2). A profile other than `mixed` zeroes every fault class but its own
@@ -351,6 +364,19 @@ lease; the crashes, suspends and store outages the seeds also draw do. Seeds 1 t
 operations: 30 of 40 mark a node lost and 27 replace replicas after the grace, which the
 `lost_grace` check judges; the rest never reach it, so a change to the lost path is judged over a
 range of seeds, not one.
+
+**The fleet's per-seed budget (B2 slice 4).** A `--seeds` batch is `SIM_FLEET_BATCH` (100) seeds
+under `SIM_FLEET_BATCH_TIMEOUT` (3,600 s), so a seed has 36 s on average and a batch is lost
+(one crash record, no verdict for any of its seeds) when the batch's total passes 3,600 s. No
+single seed has a limit of its own. Measured 2026-11-08 in ReleaseSafe, `--c1 auto
+--profile=auto`, five seeds at once on four cores (so inflated): seed 44 95 s, 19 144 s, 69 154 s,
+12 247 s, 27 344 s (786 operations on 3 nodes, `partitions`). A profile of seed 27 (gdb samples,
+25) puts about 90% of the time in `MemoryStore`: `find` and `select_page` scan the whole `live`
+table, which is unsorted (`store_memory.zig`), so every `get` and `list` of the sim's store costs
+the number of live keys and a run costs about operations squared. The cost is that slow path, not
+the size of the world, so the draw (`cost_max`) is not capped. A hash index on `live` (key to
+position) would remove it; it is a change to the `Store` implementation the conformance suite
+covers, left to its own slice.
 
 `zig build check` runs `sim-cluster` on a fresh seed (printed as `sim-cluster: seed N`) at 40
 operations with `-Dprofile=auto` (the shape stays fixed), native against WASM, and `sim-teeth`; then `sim-swarm` (100 operations) and

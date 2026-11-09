@@ -1126,6 +1126,13 @@ const c1_teeth_roots = [_]struct {
     /// world fails J8 on about one seed in seven, so ten seeds were a coin flip that any change
     /// of the draws could lose (#171: its first hit moved from seed 10 to 13).
     seeds: u32 = teeth_seeds_max,
+    /// B2 slice 4: the symptom this tooth must make a plain run (no `--c1`) fail with, or null
+    /// when its check needs the per-revision tap (`job_double`). Measured 2026-11-08 over seeds
+    /// 1 to 40 at 100 operations: restart 36, claim 40, rewrite 39 (as J4: J3 is a `--c1` check),
+    /// cancel 13, deadline 26, deadline_late 26, deadline_offline 8, gap 23, stale 40 (as J10: J9
+    /// is a `--c1` check) and refused_loop 30 seeds fail.
+    plain_symptom: ?[]const u8 = null,
+    plain_seeds: u32 = teeth_seeds_max,
 }{
     .{
         .name = "allocation",
@@ -1169,12 +1176,14 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_restart_main.zig",
         .symptom = "J2",
         .canary_seeds = 40,
+        .plain_symptom = "J2",
     },
     .{
         .name = "job_claim",
         .root = "src/sim_c1_teeth_job_claim_main.zig",
         .symptom = "J7",
         .canary_seeds = 40,
+        .plain_symptom = "J7",
     },
     .{
         .name = "job_double",
@@ -1187,24 +1196,28 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_rewrite_main.zig",
         .symptom = "J3",
         .canary_seeds = 40,
+        .plain_symptom = "J4",
     },
     .{
         .name = "job_cancel",
         .root = "src/sim_c1_teeth_job_cancel_main.zig",
         .symptom = "J6",
         .canary_seeds = 80,
+        .plain_symptom = "J6",
     },
     .{
         .name = "job_deadline",
         .root = "src/sim_c1_teeth_job_deadline_main.zig",
         .symptom = "J8",
         .canary_seeds = 50,
+        .plain_symptom = "J8",
     },
     .{
         .name = "job_deadline_late",
         .root = "src/sim_c1_teeth_job_deadline_late_main.zig",
         .symptom = "J8",
         .canary_seeds = 50,
+        .plain_symptom = "J8",
     },
     .{
         .name = "job_deadline_offline",
@@ -1212,29 +1225,54 @@ const c1_teeth_roots = [_]struct {
         .symptom = "J8",
         .canary_seeds = 80,
         .seeds = 40,
+        .plain_symptom = "J8",
+        .plain_seeds = 40,
     },
     .{
         .name = "job_gap",
         .root = "src/sim_c1_teeth_job_gap_main.zig",
         .symptom = "J4",
         .canary_seeds = 50,
+        .plain_symptom = "J4",
     },
     .{
         .name = "job_stale",
         .root = "src/sim_c1_teeth_job_stale_main.zig",
         .symptom = "J9",
         .canary_seeds = 80,
+        .plain_symptom = "J10",
     },
     .{
         .name = "job_refused_loop",
         .root = "src/sim_c1_teeth_job_refused_loop_main.zig",
         .symptom = "J10: an agent kept making",
         .canary_seeds = 80,
+        .plain_symptom = "J10: an agent kept making",
+    },
+    .{
+        .name = "job_unclaimed",
+        .root = "src/sim_c1_teeth_job_unclaimed_main.zig",
+        .symptom = "J8: a run that no node started",
+        .canary_seeds = 60,
+        .plain_symptom = "J8: a run that no node started",
+    },
+    .{
+        .name = "job_wipe",
+        .root = "src/sim_c1_teeth_job_wipe_main.zig",
+        // J2 (a run id started again) or J7 (started under another tenure than its claim) and no
+        // other check: `|` separates the two alternatives (`src/symptom.zig`).
+        .symptom = job_wipe_symptom,
+        .canary_seeds = 300,
+        .seeds = 100,
+        .plain_symptom = job_wipe_symptom,
+        .plain_seeds = 100,
     },
 };
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
 const canary_seeds_teeth = 10;
+const job_wipe_symptom = "J2: a run id was started a second time|" ++
+    "J7: a run was started under another tenure";
 const canary_seeds_swarm_teeth = 200;
 /// What a failure of each of the two must start with: the check their fault breaks (the text
 /// `sim_teeth` and `sim_swarm_teeth` print, measured 2026-11-05), so a canary that fails some
@@ -1246,7 +1284,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the seventeen negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the eighteen negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1279,7 +1317,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the seventeen fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the eighteen fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1300,6 +1338,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         });
         if (entry.any_symptom) teeth_run.addArg("--expect-symptom-any");
         teeth.dependOn(&teeth_run.step);
+        add_plain_tooth(b, teeth, teeth_exe, entry);
         const own = b.step(b.fmt("sim-c1-teeth-{s}", .{entry.name}), "One sim-c1 negative test");
         own.dependOn(&teeth_run.step);
         const own_install = b.addInstallArtifact(teeth_exe, .{});
@@ -1311,6 +1350,23 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
+fn add_plain_tooth(
+    b: *std.Build,
+    teeth: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    entry: anytype,
+) void {
+    const symptom = entry.plain_symptom orelse return;
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{
+        "--seeds",                                 b.fmt("1..{d}", .{entry.plain_seeds}),
+        b.fmt("{d}", .{c1_teeth_operations}),      "--expect-fail",
+        b.fmt("--expect-symptom={s}", .{symptom}),
+    });
+    teeth.dependOn(&run.step);
 }
 
 /// `zig build sim-c1-regress`: replays `regress_replays` with the shipped code (ReleaseSafe).
