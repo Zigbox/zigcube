@@ -961,7 +961,8 @@ const Pass = struct {
     ) Error!?records.RunStopCause {
         if (job.rec.cancel_requested != null) return .cancel;
         const now = pass.ctx.clock.now_ms();
-        if (now > run.rec.start_by_ms) return .not_started;
+        // Test-only (`c1_teeth.job_unclaimed`): a run nobody claimed is never ended (J8).
+        if (!c1_teeth.job_unclaimed and now > run.rec.start_by_ms) return .not_started;
         const placed = pass.world.assignment(run.rec.id) orelse {
             pass.wake_at_ms = @min(pass.wake_at_ms, run.rec.start_by_ms +| 1);
             return null;

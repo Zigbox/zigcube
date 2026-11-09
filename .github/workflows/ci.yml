@@ -476,6 +476,9 @@ jobs:
       # The positive run of the deadline-offline tooth's world: long cuts, short deadlines, fix on.
       - name: sim-c1 offline-deadline world
         run: zig build sim-c1-offline --summary all
+      # One node, bursts of short jobs (#198): J8 must hold on a correct agent.
+      - name: sim-c1 burst world
+        run: zig build sim-c1-burst --summary all
       # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
       - name: sim-c1 regressions
         run: zig build sim-c1-regressions --summary all

@@ -340,11 +340,6 @@ pub const MemoryStore = struct {
         return index;
     }
 
-    fn precedes(reverse: bool, a: []const u8, b: []const u8) bool {
-        const order = std.mem.order(u8, a, b);
-        return if (reverse) order == .gt else order == .lt;
-    }
-
     /// The entries under `prefix` as they were at `revision`, ascending, borrowed (only the list
     /// itself is in `arena`).
     fn snapshot(

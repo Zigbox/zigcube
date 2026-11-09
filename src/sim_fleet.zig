@@ -2,7 +2,7 @@
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
 //!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
-//!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT]]
+//!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
 //!                      < one run kind's output of a round
 //!
 //! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
@@ -32,13 +32,15 @@ const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const issue = @import("sim_fleet_issue.zig");
+const symptom_spec = @import("symptom.zig");
 const state_file = @import("sim_fleet_state.zig");
 const github_api = @import("sim_fleet_github.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
     "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]\n" ++
-    "                        [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT]]\n" ++
+    "                        [--canary RUNNER --canary-seeds A..B\n" ++
+    "                         [--expect-symptom TEXT[|TEXT]]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
     "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
     "--shrink` (sim-swarm), concatenated; with --canary, the fault-on RUNNER's run of that\n" ++
@@ -394,7 +396,7 @@ fn canary_of(args: Args) error{BadCanary}!?issue.Canary {
     const first = std.fmt.parseInt(u64, seeds[0..dots], 10) catch return error.BadCanary;
     const last = std.fmt.parseInt(u64, seeds[dots + 2 ..], 10) catch return error.BadCanary;
     if (last < first) return error.BadCanary;
-    if (args.symptom) |symptom| if (symptom.len == 0) return error.BadCanary;
+    if (args.symptom) |symptom| if (!symptom_spec.valid(symptom)) return error.BadCanary;
     return .{
         .runner = runner,
         .kind = args.kind,
@@ -1148,6 +1150,29 @@ test "a canary that caught its fault files nothing; a miss and a wrong symptom a
     try std.testing.expectEqual(@as(u32, 0), again.filed);
     try std.testing.expectEqual(@as(u32, 1), again.throttled);
     try std.testing.expectEqual(@as(usize, 2), fake.issues.items.len);
+}
+
+test "a canary's symptom may name alternatives; a failure of another check is a wrong symptom" {
+    // Goal: `--expect-symptom A|B` accepts a failure that starts with A or with B and no other.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const wrong = try issue.parse(arena, canary_wedge.kind, canary_wedge_wrong);
+    const caught = try issue.parse(arena, canary_wedge.kind, canary_wedge_caught);
+    var canary = canary_wedge;
+    canary.symptom = "I6: an allocation disagrees|I1b: a replaced";
+    const wrong_v = try issue.canary_verdict(arena, canary, wrong);
+    try std.testing.expectEqual(issue.Verdict.caught, wrong_v.verdict);
+    const caught_v = try issue.canary_verdict(arena, canary, caught);
+    try std.testing.expectEqual(issue.Verdict.caught, caught_v.verdict);
+    canary.symptom = "I3|I1b: a replaced";
+    const other_v = try issue.canary_verdict(arena, canary, wrong);
+    try std.testing.expectEqual(issue.Verdict.wrong_symptom, other_v.verdict);
+    // An empty alternative is refused, not read as "anything".
+    const bad = [_][]const u8{ "sim_fleet", "ingest", "--commit", "c", "--state", "s" } ++
+        [_][]const u8{ "--dry-run", "--kind", "sim-c1", "--canary", "r" } ++
+        [_][]const u8{ "--canary-seeds", "5..9", "--expect-symptom", "I3|" };
+    try std.testing.expect(parse_args(&bad) == null);
 }
 
 test "a canary held by GitHub is not counted, is not filed, and ends as CanaryHeld" {

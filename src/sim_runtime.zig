@@ -211,6 +211,13 @@ pub const SimRuntime = struct {
         };
     }
 
+    /// The node's disk is lost with its state directory: every container, running or not, is
+    /// gone (their records were the state directory's files; the processes die with the host).
+    pub fn wipe(self: *SimRuntime) void {
+        for (self.containers.items) |container| self.free_container(container);
+        self.containers.clearRetainingCapacity();
+    }
+
     /// True if a container of that name is known, running or stopped.
     pub fn has(self: *SimRuntime, name: []const u8) bool {
         return self.find(name) != null;
@@ -680,6 +687,37 @@ test "faults end a container the way a real one ends, and list says how" {
     const changes = try rt.events(arena_state.allocator(), 0, &diag);
     try testing.expectEqual(@as(usize, 5), changes.len);
     try testing.expectEqual(@as(usize, 0), (try rt.events(arena_state.allocator(), 0, &diag)).len);
+}
+
+test "a wipe removes every container, running or stopped, and a name can be started again" {
+    // Goal: `wipe` is the lost disk: nothing is listed, nothing is known by name, the events of
+    // the lost containers are not replayed as new ones, and the node starts fresh containers.
+    // Method: one running and one stopped container, wipe, list, start the same name again.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 1, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    const running = labels_of.one("a-1");
+    const stopped = labels_of.one("a-2");
+    _ = try rt.start(&spec_for("a-1", "b3:51aa9c03", &running), &diag);
+    _ = try rt.start(&spec_for("a-2", "b3:51aa9c03", &stopped), &diag);
+    try sim.inject("a-2", .{ .exit = 0 });
+    try testing.expectEqual(@as(u32, 1), sim.running_count());
+
+    sim.wipe();
+    try testing.expectEqual(@as(u32, 0), sim.running_count());
+    try testing.expect(!sim.has("a-1"));
+    try testing.expect(!sim.has("a-2"));
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(@as(usize, 0), (try rt.list(arena_state.allocator(), &diag)).len);
+    // Wiping an empty runtime is fine, and the name is free.
+    sim.wipe();
+    _ = try rt.start(&spec_for("a-1", "b3:51aa9c03", &running), &diag);
+    try testing.expectEqual(@as(u32, 1), sim.running_count());
 }
 
 test "a signal never waits: TERM is ignored by a slow container, KILL ends it" {

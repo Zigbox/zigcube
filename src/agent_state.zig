@@ -179,6 +179,14 @@ pub const SimState = struct {
         state.settle();
     }
 
+    /// The state directory is lost: every file is gone (a disk replaced, a directory removed by
+    /// hand). Only between two lives of the agent, so it is crashed and has no write point armed.
+    pub fn wipe(state: *SimState) void {
+        assert(state.crashed);
+        for (state.files.items) |file| state.free_file(file);
+        state.files.clearRetainingCapacity();
+    }
+
     /// The agent has been started again: the files are as the crash left them.
     pub fn restart(state: *SimState) void {
         state.crashed = false;
@@ -403,6 +411,36 @@ test "a put is whole, an append can lose its tail, and a stray temporary file is
     try testing.expectEqualStrings("defgh"[0 .. kept.len - 3], kept[3..]);
     try agent.remove("log");
     try testing.expectError(error.Absent, agent.remove("log"));
+}
+
+test "a wiped state directory reads as a first start, durable files included" {
+    // Goal: `wipe` loses everything, synced or not (unlike a host crash, which keeps the synced
+    // prefix). Method: a put and an append, both durable; crash, wipe, restart: every file is
+    // absent, the listing is empty, and the state is usable again. (The precondition, a crashed
+    // state, is an assert and cannot be tested.)
+    var state = SimState.init(testing.allocator, 3);
+    defer state.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const agent = state.interface();
+    try agent.put_atomic("containers/a/spec.json", "one");
+    try agent.put_atomic("log", "base;");
+    try agent.append("log", "a;");
+    state.crash_now(.process); // A process crash keeps every byte...
+    state.wipe(); // ...and a wipe still takes it.
+    try testing.expectError(error.Crashed, agent.read(arena, "log"));
+    state.restart();
+    try testing.expectError(error.Absent, agent.read(arena, "containers/a/spec.json"));
+    try testing.expectError(error.Absent, agent.read(arena, "log"));
+    try testing.expectEqual(@as(usize, 0), (try agent.list(arena, "containers/")).len);
+    try agent.put_atomic("log", "again");
+    try testing.expectEqualStrings("again", try agent.read(arena, "log"));
+    // Wiping an already empty state is fine too.
+    state.crash_now(.host);
+    state.wipe();
+    state.restart();
+    try testing.expectError(error.Absent, agent.read(arena, "log"));
 }
 
 test "list shows a subdirectory once, as its name and a slash" {
