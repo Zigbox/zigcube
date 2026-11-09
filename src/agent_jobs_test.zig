@@ -457,6 +457,26 @@ test "the deadline stops the run on the monotonic clock, under the same boot" {
     try expect_code(seen, "ZC-W0503");
 }
 
+test "a run started in a step arms its deadline wake before the step's later calls (#202)" {
+    // Goal: J8 failed in the burst world (seeds 14 and 17): a run started late in a step whose
+    // remaining calls hung (a cut link, 7 s) kept executing until the step ended, past its
+    // deadline and grace, because only the start of a step looked at the runs' deadlines.
+    // Method: one step claims and starts a run with a 5 s deadline; its start record carries the
+    // deadline, and by the time the step returns the agent's wake is that deadline, so the calls
+    // the same step still makes are capped by it (`calls_deadline_ms`) and the next wait is cut.
+    var rig = try Rig.start();
+    defer rig.stop();
+    _ = try rig.assign(5_000);
+    rig.step();
+    try testing.expect(rig.running());
+    const record = (try rig.start_record()).?;
+    const world = rig.world;
+    try testing.expectEqual(record.deadline_mono_ms.?, world.agent.deadline_wake_mono_ms);
+    const mono = world.now_ms();
+    try testing.expect(world.agent.act_in_ms(mono) <= 5_000);
+    try testing.expect(world.agent.calls_deadline_ms(mono) <= mono + 5_000 + 1_000);
+}
+
 test "the deadline stops the run while the server cannot be reached, before the fence" {
     // Goal: pin the release review's MUST (PR #147): the agent enforces a run's deadline from
     // its own records and clock, so a cut-off node stops the run at its deadline, not when its

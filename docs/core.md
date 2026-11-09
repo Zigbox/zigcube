@@ -263,7 +263,7 @@ workload, and the run prints them first. A report therefore says which world it 
 invariants read over the whole store (every decision has a reason and a cause that exists; `why`
 terminates and ends in a cause); no container lives longer than 120 s of reachable time on a node
 that no replica assigns it to; a placed replica of a good image is running on its node within 24 s
-of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime)
+of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime; 300 in the burst world, whose bursts of short jobs legitimately take more steps, #202)
 and the cluster does not starve (5 successful agent steps per minute of uptime over all nodes
 together, checked when they were up 120 s in the fault phase). With
 **liveness mode**, the default, the faults run for the first `H` operations, `H` drawn from the seed
@@ -326,7 +326,7 @@ option so that every replay line written before it (`c1_regressions`, `sim-c1-re
 replay commands of open `sim-fleet` issues) still runs its own world bit for bit: with `--strong`,
 every other host crash also loses the node's disk (state directory and containers; `wipes=` in the
 report), and every thirteenth job asks for more cpu than any node has, so that no node claims it
-(J8's second clause). `auto` operations and the teeth `job_wipe` and `job_unclaimed` switch it on,
+(J8's second clause). `auto` operations and the teeth `job_wipe`, `job_unclaimed` and `job_evicted` switch it on,
 and the replay line then carries `--strong`. **What it does not cover:** a state directory removed
 by hand while the host and its containers stay up. The simulated node's runtime keeps each
 container's record in that directory, so the containers would run on with nothing that lists them;
@@ -483,11 +483,11 @@ breaks I7; a node that registers again between a controller's read of a report a
 commit (as if the tenure were not compared) breaks I3; a scheduler that ranks locality ahead of
 spread breaks L1 (C2 slice 5: each placement is no worse on spread, among the nodes that fit, than an order of fit and
 spread alone would choose, `scheduler.placement_problem`; every node holds a seed-chosen subset of
-the images and advertises it as `/node-store/<node>`).  The nine job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|deadline_offline|gap`): an
+the images and advertises it as `/node-store/<node>`).  The job teeth (`sim-c1-teeth-job_restart|claim|double|rewrite|cancel|deadline|deadline_late|deadline_offline|gap`, and the later `stale|refused_loop|unclaimed|wipe|evicted`): an
 agent that starts a stopped run again breaks J2; one that skips its claim breaks J7; a scheduler
 that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
 agent that ignores a cancel breaks J6; one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
-switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
+`sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 32, the only hit in 1..60 since #202 was fixed (the fleet canary runs 1..32). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

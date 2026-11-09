@@ -795,6 +795,10 @@ const Work = struct {
         record.started_at_ms = ctx.clock.now_ms();
         record.deadline_mono_ms = ctx.mono_ms() +| run.deadline_ms;
         try write_record(ctx, work.state, &record);
+        // The step began before this run did, so `enforce_deadlines` did not see it: arm its
+        // wake and cap the calls that follow in this step (a hung report, a cut link, or many
+        // slow ones) at its deadline (#202).
+        work.agent.arm_run_deadline(ctx, record.deadline_mono_ms.?);
         try work.start(subject, record, run, input);
     }
 
