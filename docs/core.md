@@ -263,7 +263,7 @@ workload, and the run prints them first. A report therefore says which world it 
 invariants read over the whole store (every decision has a reason and a cause that exists; `why`
 terminates and ends in a cause); no container lives longer than 120 s of reachable time on a node
 that no replica assigns it to; a placed replica of a good image is running on its node within 24 s
-of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime)
+of reachable, working time; no node's agent works in a busy loop (200 steps per minute of uptime; 300 in the burst world, whose bursts of short jobs legitimately take more steps, #202)
 and the cluster does not starve (5 successful agent steps per minute of uptime over all nodes
 together, checked when they were up 120 s in the fault phase). With
 **liveness mode**, the default, the faults run for the first `H` operations, `H` drawn from the seed

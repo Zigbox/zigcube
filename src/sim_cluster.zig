@@ -95,7 +95,13 @@ const ok_steps_per_minute_min: u64 = 5;
 const cluster_up_ms_min: u64 = 120_000;
 /// No node's agent may take more steps than this per minute it was up, over the run. Set from
 /// the busiest node over seeds 1 to 300 at 100 operations (docs/DECISIONS.md).
-const steps_per_minute_max: u64 = 200;
+///
+/// The burst world (one node, bursts of 12 jobs of 3 s to 4 s deadlines, #202) turns runs over
+/// several times faster and the agent steps at each deadline and kill, so its ceiling is 300:
+/// seeds 14 and 17 run 214 to 220 steps a minute there, and every one is a wake for a deadline,
+/// a kill or the next burst's work. An agent that never sleeps wakes every `fence_poll_ms`
+/// (100 ms), 600 steps a minute or more, so 300 still tells it apart.
+const steps_per_minute_max: u64 = if (c1_teeth.burst_world) 300 else 200;
 /// How often a node may fence in the healed phase: 240 s long, against about 240 for the bug.
 const fences_after_heal_per_node_max: u32 = 4;
 /// How many of a node's job reports the store may refuse in the healed phase (J10). A report is

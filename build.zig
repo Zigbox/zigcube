@@ -1551,9 +1551,13 @@ const regress_replays = [_][]const []const u8{
 /// Seeds of `sim-c1-offline`; about 45 s.
 const offline_seeds_max = 30;
 
-/// Seeds of `sim-c1-burst`: seed 2 at 300 operations failed J8 on a correct agent (#198) when the
-/// simulator's record of job starts was too short; about 25 s a seed.
-const burst_seeds = "1..2";
+/// Seed ranges of `sim-c1-burst`, one process each so the build runs them in parallel: seed 2 at
+/// 300 operations failed J8 on a correct agent (#198) when the simulator's record of job starts
+/// was too short, and seeds 14 and 17 when the agent left a run started late in a step with no
+/// deadline wake (#202); seed 21 caught the first form of that fix. A seed takes about 165 s
+/// alone (measured), so 1..20 (about 55 CPU minutes) does not fit CI's budget: the seeds that
+/// once failed run, one process each. Seeds 1..60 were swept by hand for #202 (0 of 60 failed).
+const burst_seed_ranges = [_][]const u8{ "1..2", "14..14", "17..17", "21..21" };
 
 /// `zig build sim-c1-burst`: the burst world (one node, bursts of 12 short jobs; #198) with the
 /// agent right: no seed may fail. With `Node.started_true` back at 8 entries seed 2 fails J8.
@@ -1567,11 +1571,13 @@ fn add_burst_step(b: *std.Build, sim: SimStepOptions) void {
             .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
         }),
     });
-    const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ "--seeds", burst_seeds, "300", "--c1" });
-    run.expectExitCode(0);
-    b.step("sim-c1-burst", "Run sim-c1 in the burst world (#198): J8 must hold")
-        .dependOn(&run.step);
+    const step = b.step("sim-c1-burst", "Run sim-c1 in the burst world (#198, #202): J8 must hold");
+    for (burst_seed_ranges) |range| {
+        const run = b.addRunArtifact(exe);
+        run.addArgs(&.{ "--seeds", range, "300", "--c1" });
+        run.expectExitCode(0);
+        step.dependOn(&run.step);
+    }
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long
