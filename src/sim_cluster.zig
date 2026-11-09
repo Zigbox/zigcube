@@ -335,6 +335,12 @@ pub const Swarm = struct {
         swarm.w_job_end = 2 + r.uintLessThan(u32, 4);
         // The `job_deadline_offline` tooth needs deadlines that fall while a node is cut off.
         if (c1_teeth.offline_world) swarm.w_job_create = 20;
+        // The burst world (#198): creates dominate, and bursts of them start dozens of runs in
+        // one step of one node.
+        if (c1_teeth.burst_world) {
+            swarm.w_job_create = 40;
+            swarm.w_job_end = 30;
+        }
     }
 
     fn print(swarm: *const Swarm, report: *Report) void {
@@ -361,6 +367,16 @@ pub const Swarm = struct {
 
 /// One node: its half of the world and the agent that runs on it.
 const StartedTrue = struct { hash: u64, ms: u64 };
+
+/// How many starts a node remembers: more than the runs it holds, so that one step's burst of
+/// starts (up to `jobs_per_node_max`, and its retries) cannot push one out before J8 has seen
+/// its container. With a ring of 8 the burst world lost the entries, and J8 counted from the
+/// first tick that showed the container instead of its start, up to a whole step earlier (#198).
+const started_true_max = 4 * constants.jobs_per_node_max;
+comptime {
+    // `started_next` wraps at a multiple of the ring.
+    assert((std.math.maxInt(u16) + 1) % started_true_max == 0);
+}
 
 const Node = struct {
     cluster: *Cluster,
@@ -391,8 +407,8 @@ const Node = struct {
     /// The true time of this node's latest job-container starts (by name hash), newest over the
     /// oldest: a step's true time is frozen, but a start late in it happened later than its
     /// first tick shows, and J8 counts from the start.
-    started_true: [8]StartedTrue = @splat(.{ .hash = 0, .ms = 0 }),
-    started_next: u8 = 0,
+    started_true: [started_true_max]StartedTrue = @splat(.{ .hash = 0, .ms = 0 }),
+    started_next: u16 = 0,
     /// The link is cut until this true time.
     partitioned_until_ms: ?u64,
     crashes: u32,
@@ -541,9 +557,9 @@ const Node = struct {
     fn started_true_of(node: *const Node, hash: u64) ?u64 {
         // Newest first: a name reused later is the start that counts. A slot never written has
         // hash 0, which no name has (`job_started` asserts it).
-        const len: u8 = node.started_true.len;
+        const len: u16 = started_true_max;
         for (0..len) |back| {
-            const slot = (node.started_next -% 1 -% @as(u8, @intCast(back))) % len;
+            const slot = (node.started_next -% 1 -% @as(u16, @intCast(back))) % len;
             const entry = node.started_true[slot];
             if (entry.hash != 0 and entry.hash == hash) return entry.ms;
         }
@@ -1461,7 +1477,12 @@ pub const Cluster = struct {
         const ctx = c.controller_context();
         const long = random.uintLessThan(u32, 4) == 0;
         // The `job_deadline_offline` tooth: deadlines that fall within the run (see `add_jobs`).
-        const spread: u32 = if (c1_teeth.offline_world) 10_000 else 40_000;
+        const spread: u32 = if (c1_teeth.burst_world)
+            1000
+        else if (c1_teeth.offline_world)
+            10_000
+        else
+            40_000;
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
             .image = hello_digest,
@@ -1965,7 +1986,11 @@ fn operation(c: *Cluster) void {
                 node.frozen_until_ms = c.manual.ms + span;
             }
         },
-        .job_create => c.create_job(),
+        .job_create => {
+            // The burst world (#198): a burst, so that one node starts dozens of runs in a step.
+            const burst: u32 = if (c1_teeth.burst_world) 12 else 1;
+            for (0..burst) |_| c.create_job();
+        },
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
     }
@@ -2441,7 +2466,10 @@ fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
         records.prefix_job_runs,
         null,
         constants.jobs_max,
-    ) catch return;
+    ) catch {
+        ctx.diag.reset(); // A list the store refused, or more runs than fit: nothing to judge.
+        return;
+    };
     const now = c.manual.ms;
     for (job_runs.items) |entry| {
         const run = &entry.rec;
@@ -2837,6 +2865,7 @@ pub const Plan = struct {
 /// counts); each knob the request set is kept. `options.profile_auto` draws the profile.
 pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
     var options = requested;
+    if (c1_teeth.burst_world) options.nodes = 1; // One node takes every burst.
     var shape = sim_shape.fixed_shape(1);
     // The cost cap sees the node count the request gave, if any.
     if (operations == null) shape = sim_shape.draw_shape_nodes(seed, requested.nodes);
