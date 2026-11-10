@@ -591,7 +591,7 @@ test "a crash at every write point leaves records a restart reads" {
     // asserted so the loop cannot silently stop covering a case.
     var counts: Counts = .{};
     for ([_]agent_state.CrashKind{ .process, .host }) |kind| {
-        for (1..9) |point| {
+        for (1..11) |point| {
             for (0..64) |seed| {
                 var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
                 defer arena_state.deinit();
