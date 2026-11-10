@@ -138,6 +138,8 @@ const overlap_ms_max: u64 = constants.lost_grace_ms + constants.fence_kill_laten
 const wedge_memory_ms: u64 = constants.node_lease_ttl_ms + constants.fence_stop_ms;
 
 const hello_digest = "b3:51aa9c03";
+/// The relay table of the simulated server (B3): jobs of the `strong` world may name it.
+const sim_relays = [_]records.JobRelay{.{ .name = "sim-relay", .address = "127.0.0.1:9" }};
 const next_digest = "b3:9d20c4f1";
 const broken_digest = "b3:00ff" ++ repeat('0', 55).* ++ "e1";
 const fixtures = [_][]const u8{ hello_digest, next_digest };
@@ -1477,6 +1479,8 @@ pub const Cluster = struct {
         // its run must end `not_started` (J8's second clause). No draw, and only with
         // `Options.strong`: other worlds are unchanged.
         const unplaceable = c.strong and c.job_next % 13 == 5;
+        // Every 7th job names the relay (B3 slice 3). No draw, and only with `Options.strong`.
+        const relayed = c.strong and c.job_next % 7 == 3;
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
@@ -1500,6 +1504,8 @@ pub const Cluster = struct {
             .deadline_ms = if (long) 600_000 else 3000 + random.uintLessThan(u32, spread),
             .grace_ms = random.uintLessThan(u32, 2000),
             .submit_by_ms = c.manual.ms + 5000 + random.uintLessThan(u32, 20_000),
+            .relay = if (relayed) sim_relays[0].name else null,
+            .relays = &sim_relays,
             .applied_by = "alex@laptop",
             .request_id = id,
         }) catch {
@@ -2413,6 +2419,7 @@ fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
     try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
+    try track_relays(c);
     if (store_faulty(c)) {
         c.store_healthy_since_ms = c.manual.ms;
         return;
@@ -2556,6 +2563,32 @@ fn judge_job_container(
     c.jobs.overlap_worst_ms = @max(c.jobs.overlap_worst_ms, now - ended);
     try check(c, now - ended <= overlap_ms_max, "J1: a container kept executing after its " ++
         "job reached a terminal status");
+}
+
+/// B3's relay check (R1 to R3): a job's relay listener is open only while its run runs on that
+/// node. Opened at start (R3: a running relayed job has one), closed by every ending before the
+/// ending can be reported (R1: none stays open on a stopped or forgotten container) and never two
+/// for one run (R2, across the nodes). Judged on every tick, store faults or not: the listeners
+/// are the runtime's, not the store's.
+fn track_relays(c: *Cluster) Failure!void {
+    for (c.nodes) |node| {
+        try check(c, node.sim.containers.relay_problem() == null,
+            node.sim.containers.relay_problem() orelse "");
+    }
+    for (c.nodes, 0..) |node, index| {
+        for (node.sim.containers.containers.items) |container| {
+            if (!container.relay_open) continue;
+            // The same run's listener on this node's other containers cannot be (names are
+            // unique); on another node, it is a second listener for one run.
+            for (c.nodes[index + 1 ..]) |other| {
+                for (other.sim.containers.containers.items) |twin| {
+                    if (!twin.relay_open) continue;
+                    try check(c, !std.mem.eql(u8, container.name, twin.name),
+                        "R2: two relay listeners are open for one run");
+                }
+            }
+        }
+    }
 }
 
 /// J10, at rest: no agent keeps a start record for a run whose assignment on its node is gone.
@@ -3215,6 +3248,19 @@ fn print_jobs(c: *Cluster) void {
     c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{
         w.truth_count, w.handled_count, w.watches, w.relists, w.restarts,
     });
+    if (c.strong) {
+        var opened: u32 = 0;
+        var closed: u32 = 0;
+        var open_now: u32 = 0;
+        for (c.nodes) |node| {
+            opened += node.sim.containers.relays_opened;
+            closed += node.sim.containers.relays_closed;
+            open_now += node.sim.containers.relay_open_count();
+        }
+        c.report.print("jobs: relays opened={d} closed={d} open at the end={d}\n", .{
+            opened, closed, open_now,
+        });
+    }
 }
 
 fn print_phases(c: *Cluster) void {
