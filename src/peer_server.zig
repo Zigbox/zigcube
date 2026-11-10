@@ -883,8 +883,13 @@ test "silent connections from one source hold a few links, and an honest peer is
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    try io.sleep(.fromMilliseconds(200), .awake);
     const pending = constants.peer_handshakes_pending_per_source_max;
+    // The server accepts the connections some time after the client's connect returns, which
+    // on a loaded host can exceed a fixed pause: wait until the admitted ones are busy and the
+    // refusal is shown, then pause so that a link admitted beyond the bound would show (#205).
+    try wait_busy(io, &rig.server, pending);
+    try wait_refusal(io, &rig.server);
+    try io.sleep(.fromMilliseconds(200), .awake);
     try std.testing.expectEqual(pending, busy_links(&rig.server));
     // Three refused connections are one streak: ZC-E0808 was shown once, not three times.
     try std.testing.expectEqual(@as(u32, 1), rig.server.refusals_shown);
@@ -1085,6 +1090,15 @@ fn wait_no_strangers(io: std.Io, server: *const Server) !void {
         if (strangers == 0) return;
         if (peer_stream.boot_ms(io) >= deadline) return error.LinksNeverSettled;
         try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Polls until the server has shown its first refusal (ZC-E0808), up to a deadline.
+fn wait_refusal(io: std.Io, server: *const Server) !void {
+    const deadline = peer_stream.boot_ms(io) + 5000;
+    while (@atomicLoad(u32, &server.refusals_shown, .acquire) == 0) {
+        if (peer_stream.boot_ms(io) >= deadline) return error.NoRefusal;
+        try io.sleep(.fromMilliseconds(5), .awake);
     }
 }
 
@@ -1377,6 +1391,9 @@ test "a peer that stops reading mid-chunk frees its link and slot within peer_re
     comptime assert(requests * constants.swarm_chunk_bytes > 32 * 1024 * 1024);
     for (0..requests) |_| try stream.send(path, end);
     const sent = peer_stream.boot_ms(io);
+    // The server task takes the slot when it has read the first request, which a loaded host
+    // can delay past the pause: wait for the slot, then hold the pause (#205).
+    try wait_slots(io, &rig.server, 1);
     try io.sleep(.fromMilliseconds(1000), .awake);
     try std.testing.expectEqual(@as(u32, 1), busy_links(&rig.server)); // Stuck sending.
     try std.testing.expectEqual(@as(u32, 1), busy_slots(&rig.server));
