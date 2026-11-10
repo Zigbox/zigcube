@@ -92,6 +92,8 @@ const Container = struct {
     phase: Phase,
     pid: u32,
     started_at_ms: u64,
+    /// When it stopped, for tests that say when (`ended_at_ms`); 0 while it runs.
+    ended_at_ms: u64 = 0,
     ignores_stop: bool,
 };
 
@@ -223,6 +225,19 @@ pub const SimRuntime = struct {
         return self.find(name) != null;
     }
 
+    /// The clock reading when the named container started; null if unknown.
+    pub fn started_at_ms(self: *SimRuntime, name: []const u8) ?u64 {
+        const container = self.find(name) orelse return null;
+        return container.started_at_ms;
+    }
+
+    /// The clock reading when the named container stopped; null if unknown or still running.
+    pub fn ended_at_ms(self: *SimRuntime, name: []const u8) ?u64 {
+        const container = self.find(name) orelse return null;
+        if (container.phase != .stopped) return null;
+        return container.ended_at_ms;
+    }
+
     /// Containers that have not stopped.
     pub fn running_count(self: *const SimRuntime) u32 {
         var count: u32 = 0;
@@ -267,6 +282,7 @@ pub const SimRuntime = struct {
     fn end(self: *SimRuntime, container: *Container, ended: Ended) void {
         assert(container.phase != .stopped);
         container.phase = .{ .stopped = ended };
+        container.ended_at_ms = self.clock.now_ms();
         self.record(.{ .handle = runtime.Handle.init(container.name), .ended = ended });
     }
 

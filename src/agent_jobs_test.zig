@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const agent_mod = @import("agent.zig");
 const agent_jobs = @import("agent_jobs.zig");
 const agent_state = @import("agent_state.zig");
 const rt = @import("runtime.zig");
@@ -1290,6 +1291,9 @@ const FailingPut = struct {
 const FailingList = struct {
     inner: rt.Runtime,
     failing: bool = false,
+    /// With `agent`: `list` fails only while the agent's before-call hook runs.
+    fail_in_hook: bool = false,
+    agent: ?*const agent_mod.Agent = null,
     start_failing: bool = false,
     /// With `start_failing`: the inner runtime starts the container first, as a runtime whose
     /// supervisor is up when a later step fails.
@@ -1368,7 +1372,8 @@ const FailingList = struct {
         diag: *diag_mod.Diag,
     ) rt.Error![]const rt.Listing {
         const self = from(context);
-        if (self.failing) {
+        const in_hook = self.fail_in_hook and self.agent.?.in_before_call;
+        if (self.failing or in_hook) {
             diag.raise(.E0201);
             diag.cause("the simulated runtime cannot list its containers", .{});
             diag.fix(.{ .sentence = "none: a test switched it off" });
@@ -1570,6 +1575,55 @@ test "each call of a step gets its own floor when a run's wake is near" {
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     try testing.expectEqual(@as(u32, 0), world.switched.call_cost.?.cut);
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
+    // When, not only whether: a run whose deadline falls during a step is stopped before the
+    // step's next call, so at most one call (150 ms) and a tick past its deadline. Without the
+    // enforcement in `Agent.before_call` it waits for the next step, a whole step later.
+    for (ids, 0..) |id, i| {
+        const started = world.sim.started_at_ms(id).?;
+        const ended = world.sim.ended_at_ms(id).?;
+        const deadline = started + (first + 100 * i);
+        try testing.expect(ended >= deadline);
+        try testing.expect(ended <= deadline + 150 + sim_world.tick_ms);
+    }
+}
+
+test "a listing that fails mid-step leaves the run's wake due and is counted once" {
+    // Goal: review of PR #212 (SHOULD). If the container listing fails in `before_call`, the
+    // wake must not drop to "never" (that would cap the rest of the step at the fence only,
+    // past J8's lateness bound): it stays due, each call gets one floor and tries the listing
+    // again, and the failure is counted once per step. Method: a run whose deadline falls
+    // while a step's calls cost 150 ms each; the listing fails only inside the hook. After the
+    // step the wake is still due and one failure is counted, however many calls retried.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    _ = try rig.assign(1_000);
+    world.advance(300);
+    try testing.expect(rig.running());
+    var wrapper: FailingList = .{
+        .inner = world.sim.interface(),
+        .fail_in_hook = true,
+        .agent = world.agent,
+    };
+    world.runtime_override = wrapper.interface();
+    const deadline = world.sim.started_at_ms(run_id).? + 1_000;
+    // Without call costs a step takes no clock time: advance to just short of the deadline
+    // with the ordinary steps, then make the step's calls cross it.
+    while (world.now_ms() + 250 < deadline) world.advance(50);
+    world.switched.call_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    const before = world.agent.enforce_failures;
+    _ = world.agent_step();
+    world.switched.call_cost = null;
+    try testing.expect(world.now_ms() > deadline);
+    try testing.expectEqual(before + 1, world.agent.enforce_failures);
+    try testing.expect(world.agent.deadline_wake_mono_ms != std.math.maxInt(u64));
+    world.runtime_override = null;
+    rig.step();
+    try testing.expect(!rig.running());
 }
 
 test "an agent with no runs never cuts a call before its fence" {
