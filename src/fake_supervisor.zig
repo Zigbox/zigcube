@@ -283,8 +283,8 @@ fn supervise(
 const RelayOpening = union(enum) { opened: *Relay, failed: files.RunFile };
 
 /// Opens the relay's listener and tells the command where it is (`ZCUBE_RELAY`, and the
-/// `relay.port` file for the agent and for tests). A failure is ZC-E0702: the job must not run
-/// without the route it was promised.
+/// `relay.port` file for the agent and for tests). A failure is ZC-E0702, its cause naming the
+/// step: the job must not run without the route it was promised.
 fn open_relay(
     init: std.process.Init,
     dir: Dir,
@@ -292,31 +292,39 @@ fn open_relay(
     upstream: []const u8,
     environ: *std.process.Environ.Map,
 ) RelayOpening {
-    const unlistened = failed(.environment, "ZC-E0702: the relay could not listen");
     const target = relay_module.Upstream.parse(upstream) orelse {
-        const cause = "ZC-E0702: the relay's address is not HOST:PORT";
-        return .{ .failed = failed(.environment, cause) };
+        return relay_failed("the relay's address is not HOST:PORT");
     };
     const log_path = std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{
         dir_path, files.file_relay_log,
-    }, 0) catch return .{ .failed = unlistened };
+    }, 0) catch return relay_failed("there was no memory for the relay's log path");
     defer init.gpa.free(log_path);
-    const relay = Relay.open(init.gpa, init.io, target, log_path) catch
-        return .{ .failed = unlistened };
+    const relay = Relay.open(init.gpa, init.io, target, log_path) catch |err| {
+        return relay_failed(switch (err) {
+            error.SocketFailed => "the socket for the relay could not be made",
+            error.BindFailed => "the relay could not bind 127.0.0.1",
+            error.ListenFailed => "the relay could not listen on 127.0.0.1",
+            error.OutOfMemory => "there was no memory for the relay",
+        });
+    };
     var text: [64]u8 = undefined;
     const address = std.fmt.bufPrint(&text, "http://127.0.0.1:{d}", .{relay.port}) catch
         unreachable; // 64 bytes hold a port.
     environ.put(constants.relay_env_name, address) catch {
         relay.stop();
-        return .{ .failed = unlistened };
+        return relay_failed("the relay's address could not be put in the environment");
     };
     const port = std.fmt.bufPrint(&text, "{d}\n", .{relay.port}) catch
         unreachable; // 64 bytes hold a port and a newline.
     files.write_atomic(init.io, dir, files.file_relay_port, port) catch {
         relay.stop();
-        return .{ .failed = unlistened };
+        return relay_failed("relay.port could not be written");
     };
     return .{ .opened = relay };
+}
+
+fn relay_failed(cause: []const u8) RelayOpening {
+    return .{ .failed = failed(.relay, cause) };
 }
 
 /// Spawns the command, starts the relay (the supervisor is single-threaded until the command has

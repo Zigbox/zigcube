@@ -48,6 +48,21 @@ pub const Upstream = struct {
     }
 };
 
+/// The three bounds a connection lives under. Production uses the constants; a test shrinks them
+/// so that each exit path can be reached (they are never larger than the constants).
+pub const Limits = struct {
+    connect_timeout_ms: u32 = constants.relay_connect_timeout_ms,
+    idle_ms: u32 = constants.relay_idle_ms,
+    bytes_max: u64 = constants.relay_connection_bytes_max,
+
+    fn valid(limits: Limits) bool {
+        return limits.connect_timeout_ms > 0 and
+            limits.connect_timeout_ms <= constants.relay_connect_timeout_ms and
+            limits.idle_ms > 0 and limits.idle_ms <= constants.relay_idle_ms and
+            limits.bytes_max > 0 and limits.bytes_max <= constants.relay_connection_bytes_max;
+    }
+};
+
 pub const Counts = struct { accepted: u32 = 0, refused_over_limit: u32 = 0, log_dropped: u32 = 0 };
 
 const Slot = struct {
@@ -70,6 +85,9 @@ pub const Relay = struct {
     acceptor: ?std.Thread = null,
     slots: [constants.relay_connections_max]Slot = undefined,
     counts: Counts = .{},
+    /// Set before `run`.
+    limits: Limits = .{},
+    accept_failed: bool = false,
 
     pub const OpenError = error{ SocketFailed, BindFailed, ListenFailed, OutOfMemory };
 
@@ -107,6 +125,7 @@ pub const Relay = struct {
     /// Starts accepting.
     pub fn run(relay: *Relay) !void {
         assert(relay.acceptor == null);
+        assert(relay.limits.valid());
         relay.acceptor = try std.Thread.spawn(.{}, accept_loop, .{relay});
     }
 
@@ -129,8 +148,19 @@ pub const Relay = struct {
             };
             if (linux.poll(&fds, 1, constants.relay_poll_ms) == 0) continue;
             const accepted = linux.accept4(relay.listener, null, null, nonblock_cloexec);
-            if (linux.errno(accepted) != .SUCCESS) continue;
-            relay.admit(@intCast(accepted));
+            switch (linux.errno(accepted)) {
+                .SUCCESS => relay.admit(@intCast(accepted)),
+                .AGAIN, .INTR, .CONNABORTED => {},
+                else => |errno| {
+                    // Out of descriptors, most likely: the connection stays in the backlog and
+                    // the listener stays readable, so wait instead of spinning, and say so once.
+                    if (!relay.accept_failed) {
+                        relay.accept_failed = true;
+                        relay.note(.E0705, "accept failed: {s}", .{@tagName(errno)});
+                    }
+                    sleep_ms(constants.relay_poll_ms);
+                },
+            }
         }
         for (&relay.slots) |*slot| {
             if (slot.thread) |thread| thread.join();
@@ -201,9 +231,9 @@ fn serve(slot: *Slot) void {
     switch (copy_both_ways(relay, slot.client, upstream)) {
         .clean, .stopped => {},
         .byte_bound => relay.note(.W0702, "a connection reached {d} bytes in one direction", .{
-            constants.relay_connection_bytes_max,
+            relay.limits.bytes_max,
         }),
-        .idle => relay.note(.W0702, "a connection was idle for {d} ms", .{constants.relay_idle_ms}),
+        .idle => relay.note(.W0702, "a connection was idle for {d} ms", .{relay.limits.idle_ms}),
         .failed => relay.note(.E0705, "a read or write failed in the middle of a connection", .{}),
     }
 }
@@ -220,9 +250,12 @@ fn connect_upstream(relay: *Relay) ?fd_t {
         switch (err) {
             error.Stopped => {},
             error.TimedOut => relay.note(.E0704, "{s}:{d} did not answer in {d} ms", .{
-                upstream.host, upstream.port, constants.relay_connect_timeout_ms,
+                upstream.host, upstream.port, relay.limits.connect_timeout_ms,
             }),
-            error.Refused => relay.note(.E0701, "{s}:{d} refused the connection", .{
+            error.Refused => relay.note(.E0701, "{s}:{d} could not be connected to", .{
+                upstream.host, upstream.port,
+            }),
+            error.Local => relay.note(.E0705, "this node could not make a connection to {s}:{d}", .{
                 upstream.host, upstream.port,
             }),
         }
@@ -233,7 +266,7 @@ fn connect_upstream(relay: *Relay) ?fd_t {
     return connected;
 }
 
-const ConnectError = error{ Stopped, TimedOut, Refused };
+const ConnectError = error{ Stopped, TimedOut, Refused, Local };
 
 /// An IPv4 literal is connected here, in slices of `relay_poll_ms`, so that `stop` need not wait
 /// for a black-holed route; any other address goes through `std.Io`.
@@ -250,7 +283,7 @@ fn connect_address(relay: *Relay, address: std.Io.net.IpAddress, port: u16) Conn
 
 fn connect_ip4(relay: *Relay, bytes: [4]u8, port: u16) ConnectError!fd_t {
     const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | nonblock_cloexec, 0);
-    if (linux.errno(made) != .SUCCESS) return error.Refused;
+    if (linux.errno(made) != .SUCCESS) return error.Local;
     const fd: fd_t = @intCast(made);
     errdefer _ = linux.close(fd);
     const address: linux.sockaddr.in = .{
@@ -265,7 +298,7 @@ fn connect_ip4(relay: *Relay, bytes: [4]u8, port: u16) ConnectError!fd_t {
     const started = monotonic_ms();
     while (true) {
         if (relay.stopping.load(.acquire)) return error.Stopped;
-        if (monotonic_ms() - started >= constants.relay_connect_timeout_ms) return error.TimedOut;
+        if (monotonic_ms() - started >= relay.limits.connect_timeout_ms) return error.TimedOut;
         var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
         if (linux.poll(&fds, 1, constants.relay_poll_ms) == 0) continue;
         var failed: c_int = 0;
@@ -278,45 +311,98 @@ fn connect_ip4(relay: *Relay, bytes: [4]u8, port: u16) ConnectError!fd_t {
 }
 
 fn connect_name(relay: *Relay, upstream: Upstream) ConnectError!fd_t {
-    const name = std.Io.net.HostName.init(upstream.host) catch return error.Refused;
-    const stream = name.connect(relay.io, upstream.port, io_options()) catch |err| {
+    const name = std.Io.net.HostName.init(upstream.host) catch return error.Local;
+    const stream = name.connect(relay.io, upstream.port, io_options(relay.limits)) catch |err| {
         return if (err == error.Timeout) error.TimedOut else error.Refused;
     };
     return stream.socket.handle;
 }
 
 fn connect_io(relay: *Relay, address: std.Io.net.IpAddress) ConnectError!fd_t {
-    const stream = address.connect(relay.io, io_options()) catch |err| {
+    const stream = address.connect(relay.io, io_options(relay.limits)) catch |err| {
         return if (err == error.Timeout) error.TimedOut else error.Refused;
     };
     return stream.socket.handle;
 }
 
-fn io_options() std.Io.net.IpAddress.ConnectOptions {
+fn io_options(limits: Limits) std.Io.net.IpAddress.ConnectOptions {
     return .{ .mode = .stream, .timeout = .{ .duration = .{
-        .raw = .fromMilliseconds(constants.relay_connect_timeout_ms),
+        .raw = .fromMilliseconds(limits.connect_timeout_ms),
         .clock = .awake,
     } } };
 }
 
 /// One direction: its buffer and its two ends. `shut` is set once the sink has been told the
 /// source ended.
-const Lane = struct { pipe: Pipe = .{}, source: fd_t, sink: fd_t, shut: bool = false };
+pub const Lane = struct {
+    pipe: Pipe,
+    source: fd_t,
+    sink: fd_t,
+    shut: bool = false,
 
-const Step = enum { quiet, moved, failed };
+    pub fn init(source: fd_t, sink: fd_t, bytes_max: u64) Lane {
+        return .{ .pipe = .{ .limit = bytes_max }, .source = source, .sink = sink };
+    }
+};
+
+pub const Step = enum { quiet, moved, failed };
+
+/// What one read or write did.
+pub const Moved = union(enum) { count: usize, again, failed };
+
+/// The calls the copy makes on a socket, so that `relay_fuzz.zig` can put short counts, would-block
+/// and failures under it.
+const Sys = struct {
+    const shutdown_wrong_end = false;
+
+    fn read(_: Sys, fd: fd_t, buffer: []u8) Moved {
+        const got = linux.read(fd, buffer.ptr, buffer.len);
+        return switch (linux.errno(got)) {
+            .SUCCESS => .{ .count = got },
+            .AGAIN, .INTR => .again,
+            else => .failed,
+        };
+    }
+
+    fn write(_: Sys, fd: fd_t, bytes: []const u8) Moved {
+        const sent = linux.sendto(fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, null, 0);
+        return switch (linux.errno(sent)) {
+            .SUCCESS => .{ .count = sent },
+            .AGAIN, .INTR => .again,
+            else => .failed,
+        };
+    }
+
+    fn shutdown_write(_: Sys, fd: fd_t) void {
+        _ = linux.shutdown(fd, linux.SHUT.WR);
+    }
+};
+
+pub const Round = enum { quiet, moved, failed, byte_bound, clean };
+
+/// One pass over both lanes: what moved, and whether the copy is over.
+pub fn round(sys: anytype, inbound: *Lane, outbound: *Lane) Round {
+    const first = step(sys, inbound);
+    const second = step(sys, outbound);
+    if (first == .failed or second == .failed) return .failed;
+    if (inbound.pipe.exhausted() or outbound.pipe.exhausted()) return .byte_bound;
+    if (inbound.pipe.finished() and outbound.pipe.finished()) return .clean;
+    return if (first == .moved or second == .moved) .moved else .quiet;
+}
 
 fn copy_both_ways(relay: *Relay, client: fd_t, upstream: fd_t) Ending {
-    var inbound: Lane = .{ .source = client, .sink = upstream };
-    var outbound: Lane = .{ .source = upstream, .sink = client };
+    var inbound = Lane.init(client, upstream, relay.limits.bytes_max);
+    var outbound = Lane.init(upstream, client, relay.limits.bytes_max);
     var last_progress = monotonic_ms();
     while (!relay.stopping.load(.acquire)) {
-        const first = step(&inbound);
-        const second = step(&outbound);
-        if (first == .failed or second == .failed) return .failed;
-        if (first == .moved or second == .moved) last_progress = monotonic_ms();
-        if (inbound.pipe.exhausted() or outbound.pipe.exhausted()) return .byte_bound;
-        if (inbound.pipe.finished() and outbound.pipe.finished()) return .clean;
-        if (monotonic_ms() - last_progress >= constants.relay_idle_ms) return .idle;
+        switch (round(Sys{}, &inbound, &outbound)) {
+            .failed => return .failed,
+            .byte_bound => return .byte_bound,
+            .clean => return .clean,
+            .moved => last_progress = monotonic_ms(),
+            .quiet => {},
+        }
+        if (monotonic_ms() - last_progress >= relay.limits.idle_ms) return .idle;
         wait(&inbound, &outbound);
     }
     return .stopped;
@@ -324,46 +410,44 @@ fn copy_both_ways(relay: *Relay, client: fd_t, upstream: fd_t) Ending {
 
 /// Writes what waits, reads if the buffer is empty, writes what came; passes the source's end on
 /// to the sink once everything before it is written.
-fn step(lane: *Lane) Step {
+fn step(sys: anytype, lane: *Lane) Step {
     var result: Step = .quiet;
     var turn: u8 = 0;
     while (turn < 3) : (turn += 1) {
-        const outcome = if (turn == 1) read_some(lane) else write_some(lane);
+        const outcome = if (turn == 1) read_some(sys, lane) else write_some(sys, lane);
         if (outcome == .failed) return .failed;
         if (outcome == .moved) result = .moved;
     }
     if (lane.pipe.finished() and !lane.shut) {
-        _ = linux.shutdown(lane.sink, linux.SHUT.WR);
+        // `shutdown_wrong_end` is true only in the fuzzer's faulty `Sys` (its teeth).
+        sys.shutdown_write(if (@TypeOf(sys).shutdown_wrong_end) lane.source else lane.sink);
         lane.shut = true;
     }
     return result;
 }
 
-fn read_some(lane: *Lane) Step {
+fn read_some(sys: anytype, lane: *Lane) Step {
     if (!lane.pipe.wants_read()) return .quiet;
     const into = lane.pipe.read_into();
-    const got = linux.read(lane.source, into.ptr, into.len);
-    switch (linux.errno(got)) {
-        .SUCCESS => {
+    switch (sys.read(lane.source, into)) {
+        .count => |got| {
             lane.pipe.fed(got);
             return .moved;
         },
-        .AGAIN, .INTR => return .quiet,
-        else => return .failed,
+        .again => return .quiet,
+        .failed => return .failed,
     }
 }
 
-fn write_some(lane: *Lane) Step {
+fn write_some(sys: anytype, lane: *Lane) Step {
     if (!lane.pipe.wants_write()) return .quiet;
-    const from = lane.pipe.write_from();
-    const sent = linux.sendto(lane.sink, from.ptr, from.len, linux.MSG.NOSIGNAL, null, 0);
-    switch (linux.errno(sent)) {
-        .SUCCESS => {
+    switch (sys.write(lane.sink, lane.pipe.write_from())) {
+        .count => |sent| {
             lane.pipe.drained(sent);
             return .moved;
         },
-        .AGAIN, .INTR => return .quiet,
-        else => return .failed,
+        .again => return .quiet,
+        .failed => return .failed,
     }
 }
 
@@ -388,6 +472,10 @@ fn wait(inbound: *const Lane, outbound: *const Lane) void {
 pub const Bound = struct { fd: fd_t, port: u16 };
 
 fn listen_loopback() error{ SocketFailed, BindFailed, ListenFailed }!Bound {
+    return listen_loopback_backlog(16);
+}
+
+fn listen_loopback_backlog(backlog: u32) error{ SocketFailed, BindFailed, ListenFailed }!Bound {
     const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | nonblock_cloexec, 0);
     if (linux.errno(made) != .SUCCESS) return error.SocketFailed;
     const fd: fd_t = @intCast(made);
@@ -398,7 +486,7 @@ fn listen_loopback() error{ SocketFailed, BindFailed, ListenFailed }!Bound {
     };
     const size: linux.socklen_t = @sizeOf(linux.sockaddr.in);
     if (linux.errno(linux.bind(fd, @ptrCast(&address), size)) != .SUCCESS) return error.BindFailed;
-    if (linux.errno(linux.listen(fd, 16)) != .SUCCESS) return error.ListenFailed;
+    if (linux.errno(linux.listen(fd, backlog)) != .SUCCESS) return error.ListenFailed;
     var length = size;
     if (linux.errno(linux.getsockname(fd, @ptrCast(&address), &length)) != .SUCCESS) {
         return error.BindFailed;
@@ -415,6 +503,11 @@ fn set_nonblocking(fd: fd_t) void {
     const flags = linux.fcntl(fd, linux.F.GETFL, 0);
     const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
     _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+}
+
+fn sleep_ms(ms: u32) void {
+    const nap: linux.timespec = .{ .sec = 0, .nsec = @as(isize, ms) * ns_per_ms };
+    _ = linux.nanosleep(&nap, null);
 }
 
 fn monotonic_ms() u64 {
@@ -501,6 +594,10 @@ const Rig = struct {
     relay: *Relay,
 
     fn start(upstream_port: u16) !Rig {
+        return start_with(upstream_port, "127.0.0.1", .{});
+    }
+
+    fn start_with(upstream_port: u16, host: []const u8, limits: Limits) !Rig {
         var rig: Rig = undefined;
         rig.tmp = testing.tmpDir(.{});
         errdefer rig.tmp.cleanup();
@@ -510,8 +607,9 @@ const Rig = struct {
             path[0..length],
         }, 0);
         errdefer testing.allocator.free(rig.log_path);
-        const upstream: Upstream = .{ .host = "127.0.0.1", .port = upstream_port };
+        const upstream: Upstream = .{ .host = host, .port = upstream_port };
         rig.relay = try Relay.open(testing.allocator, testing.io, upstream, rig.log_path);
+        rig.relay.limits = limits;
         try rig.relay.run();
         return rig;
     }
@@ -601,4 +699,85 @@ test "an upstream address is HOST:PORT" {
     try testing.expect(Upstream.parse("nohost") == null);
     try testing.expect(Upstream.parse(":80") == null);
     try testing.expect(Upstream.parse("a:0") == null);
+}
+
+test "a connection idle past its limit is closed and logged (ZC-W0702)" {
+    // Goal: the idle bound's exit path. Method: shrink it to 200 ms, connect, say nothing; the
+    // relay closes the job's end and the log has the line.
+    const echo = try Echo.start();
+    defer echo.stop();
+    var rig = try Rig.start_with(echo.bound.port, "127.0.0.1", .{ .idle_ms = 200 });
+    const fd = try dial(rig.relay.port);
+    defer _ = linux.close(fd);
+    var buffer: [8]u8 = undefined;
+    try testing.expectEqual(@as(?usize, 0), receive(fd, &buffer, 5000));
+    const log = try rig.finish();
+    defer testing.allocator.free(log);
+    try testing.expect(std.mem.startsWith(u8, log, "ZC-W0702 "));
+    try testing.expect(std.mem.find(u8, log, "idle for 200 ms") != null);
+}
+
+test "a connection that reaches its byte limit is closed and logged (ZC-W0702)" {
+    // Goal: the byte bound's exit path through the real loop. Method: a limit of 4 KiB; the job
+    // sends 6000 bytes; at most 4096 come back and the connection then ends.
+    const echo = try Echo.start();
+    defer echo.stop();
+    var rig = try Rig.start_with(echo.bound.port, "127.0.0.1", .{ .bytes_max = 4096 });
+    const fd = try dial(rig.relay.port);
+    defer _ = linux.close(fd);
+    var chunk: [1000]u8 = @splat('x');
+    for (0..6) |_| _ = linux.write(fd, &chunk, chunk.len);
+    var buffer: [1024]u8 = undefined;
+    var total: usize = 0;
+    while (receive(fd, &buffer, 5000)) |got| {
+        if (got == 0) break;
+        total += got;
+    } else return error.NeverEnded;
+    try testing.expect(total <= 4096);
+    const log = try rig.finish();
+    defer testing.allocator.free(log);
+    try testing.expect(std.mem.find(u8, log, "ZC-W0702 ") != null);
+    try testing.expect(std.mem.find(u8, log, "reached 4096 bytes") != null);
+}
+
+test "an upstream that does not answer is ZC-E0704 after the connect timeout" {
+    // Goal: the connect bound's exit path. Method: an upstream listener with no backlog that never
+    // accepts, its queue filled; the next connect hangs, and the relay gives up at 300 ms.
+    const silent = try listen_loopback_backlog(0);
+    defer _ = linux.close(silent.fd);
+    var fillers: [4]fd_t = undefined;
+    var filled: usize = 0;
+    defer for (fillers[0..filled]) |fd| {
+        _ = linux.close(fd);
+    };
+    for (&fillers) |*fd| {
+        fd.* = try dial_nonblocking(silent.port);
+        filled += 1;
+    }
+    var rig = try Rig.start_with(silent.port, "127.0.0.1", .{ .connect_timeout_ms = 300 });
+    const fd = try dial(rig.relay.port);
+    defer _ = linux.close(fd);
+    var buffer: [8]u8 = undefined;
+    try testing.expectEqual(@as(?usize, 0), receive(fd, &buffer, 5000));
+    const log = try rig.finish();
+    defer testing.allocator.free(log);
+    try testing.expect(std.mem.startsWith(u8, log, "ZC-E0704 "));
+}
+
+fn dial_nonblocking(port: u16) !fd_t {
+    const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | nonblock_cloexec, 0);
+    if (linux.errno(made) != .SUCCESS) return error.SocketFailed;
+    const fd: fd_t = @intCast(made);
+    const address: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    _ = linux.connect(fd, &address, @sizeOf(linux.sockaddr.in));
+    return fd;
+}
+
+test "limits are never above the constants" {
+    try testing.expect((Limits{}).valid());
+    try testing.expect(!(Limits{ .idle_ms = constants.relay_idle_ms + 1 }).valid());
+    try testing.expect(!(Limits{ .bytes_max = 0 }).valid());
 }

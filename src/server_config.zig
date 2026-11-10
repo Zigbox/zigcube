@@ -418,7 +418,7 @@ pub fn relay_address_problem(address: []const u8) ?[]const u8 {
     const port = std.fmt.parseInt(u16, address[colon + 1 ..], 10) catch
         return "has a port that is not a number from 1 to 65535";
     if (port == 0) return "has a port that is not a number from 1 to 65535";
-    if (colon == 0) return "has no host";
+    if (std.mem.trim(u8, address[0..colon], "[]").len == 0) return "has no host";
     for (address[0..colon]) |byte| {
         const plain = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-';
         const ip6 = byte == ':' or byte == '[' or byte == ']';

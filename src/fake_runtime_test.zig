@@ -763,11 +763,12 @@ const relay_module = @import("relay.zig");
 /// A relayed container whose upstream is `echo`'s port; its supervisor's relay port is read from
 /// `relay.port`.
 fn launch_relayed(rig: *Rig, name: []const u8, echo: *relay_module.Echo) !runtime.Handle {
-    var script: [constants.state_path_bytes_max + 80]u8 = undefined;
+    var script: [3 * constants.state_path_bytes_max + 120]u8 = undefined;
     const text = try std.fmt.bufPrint(
         &script,
-        "echo \"$ZCUBE_RELAY\" > {s}/relay.env; while true; do sleep 1; done",
-        .{rig.path},
+        "echo \"$ZCUBE_RELAY\" > {s}/relay.env.tmp && mv {s}/relay.env.tmp {s}/relay.env;" ++
+            " while true; do sleep 1; done",
+        .{ rig.path, rig.path, rig.path },
     );
     var upstream: [32]u8 = undefined;
     const address = try std.fmt.bufPrint(&upstream, "127.0.0.1:{d}", .{echo.bound.port});
@@ -883,4 +884,28 @@ test "a restarted agent adopts a relayed container, and its relay still works" {
     try rig.fake.interface().stop(handle, 2000, &local);
     _ = try rig.wait_stopped(handle);
     try expect_closed(port);
+}
+
+test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC-E0507" {
+    // Goal: the relay's own failure has its own code and fix (review of #208). Method: a spec
+    // whose relay address the supervisor cannot parse; the outcome and the stopped record are
+    // E0702 with a cause that names the step, and nothing was started.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = "relay-bad" }};
+    const value: runtime.Spec = .{
+        .name = "relay-bad",
+        .image = "b3:51aa9c03",
+        .command = &forever,
+        .relay = "[]:80",
+        .labels = &labels,
+    };
+    var local: Diag = undefined;
+    local.reset();
+    const outcome = try rig.fake.interface().start(&value, &local);
+    try testing.expectEqualStrings("ZC-E0702", outcome.failed.code.slice());
+    const cause = outcome.failed.causes.slice()[0].slice();
+    try testing.expect(std.mem.find(u8, cause, "HOST:PORT") != null);
+    const now = try rig.status(runtime.Handle.init("relay-bad"));
+    try testing.expectEqualStrings("ZC-E0702", now.stopped.start_failed.code.slice());
 }

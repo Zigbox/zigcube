@@ -96,7 +96,7 @@ pub const SpecFile = struct {
 pub const RunKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
 
 /// Whose fault a start that failed was, so that the agent can blame correctly.
-pub const Blame = enum { user, environment, fetch };
+pub const Blame = enum { user, environment, fetch, relay };
 
 /// `run.json`.
 pub const RunFile = struct {
@@ -305,7 +305,8 @@ fn exit_reason(name: []const u8, run: RunFile) runtime.ExitReason {
     };
 }
 
-/// ZC-E0508 (the user's command) or ZC-E0507 (the host), as the supervisor recorded.
+/// ZC-E0601 (the fetch), ZC-E0702 (the relay), ZC-E0508 (the user's command) or ZC-E0507 (the
+/// host), as the supervisor recorded.
 pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
@@ -314,6 +315,11 @@ pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
         collector.raise(.E0601);
         collector.cause("{s}", .{cause});
         const sentence = "check the registry is reachable from this node and the digest was pushed";
+        collector.fix(.{ .sentence = sentence });
+    } else if ((run.blame orelse .environment) == .relay) {
+        collector.raise(.E0702);
+        collector.cause("{s}", .{cause});
+        const sentence = "free file descriptors on the node and submit the job again";
         collector.fix(.{ .sentence = sentence });
     } else if ((run.blame orelse .environment) == .user) {
         collector.raise(.E0508);
