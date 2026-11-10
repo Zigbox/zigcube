@@ -846,7 +846,8 @@ test "a relay's listener is closed when the command is killed, stopped, or its s
 
     const killed = try launch_relayed(rig, "relay-k", echo);
     const killed_port = try relay_port_of(rig, "relay-k");
-    std.posix.kill(try rig.pid_of("relay-k", fake_files.file_child), .KILL) catch unreachable;
+    const command = try rig.pid_of("relay-k", fake_files.file_child);
+    std.posix.kill(command, .KILL) catch unreachable; // It is running: its port was read.
     _ = try rig.wait_stopped(killed);
     try expect_closed(killed_port);
 
@@ -860,7 +861,8 @@ test "a relay's listener is closed when the command is killed, stopped, or its s
     const lost = try launch_relayed(rig, "relay-l", echo);
     const lost_port = try relay_port_of(rig, "relay-l");
     try expect_echo(lost_port);
-    std.posix.kill(try rig.pid_of("relay-l", fake_files.file_supervisor), .KILL) catch unreachable;
+    const supervisor = try rig.pid_of("relay-l", fake_files.file_supervisor);
+    std.posix.kill(supervisor, .KILL) catch unreachable; // It is running: it echoed.
     _ = try rig.wait_stopped(lost);
     try expect_closed(lost_port);
 }

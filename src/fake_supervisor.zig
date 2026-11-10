@@ -293,8 +293,10 @@ fn open_relay(
     environ: *std.process.Environ.Map,
 ) RelayOpening {
     const unlistened = failed(.environment, "ZC-E0702: the relay could not listen");
-    const target = relay_module.Upstream.parse(upstream) orelse
-        return .{ .failed = failed(.environment, "ZC-E0702: the relay's address is not HOST:PORT") };
+    const target = relay_module.Upstream.parse(upstream) orelse {
+        const cause = "ZC-E0702: the relay's address is not HOST:PORT";
+        return .{ .failed = failed(.environment, cause) };
+    };
     const log_path = std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{
         dir_path, files.file_relay_log,
     }, 0) catch return .{ .failed = unlistened };
@@ -308,7 +310,8 @@ fn open_relay(
         relay.stop();
         return .{ .failed = unlistened };
     };
-    const port = std.fmt.bufPrint(&text, "{d}\n", .{relay.port}) catch unreachable;
+    const port = std.fmt.bufPrint(&text, "{d}\n", .{relay.port}) catch
+        unreachable; // 64 bytes hold a port and a newline.
     files.write_atomic(init.io, dir, files.file_relay_port, port) catch {
         relay.stop();
         return .{ .failed = unlistened };
