@@ -16,7 +16,7 @@
 //!
 //! What it records: `relay.log` in the container's directory, one coded line per event, at most
 //! `relay_log_bytes_max` bytes (the rest are counted and dropped). It is not yet shown by
-//! `zcube why job`.
+//! `zcube why job` (docs/demos/b3.md).
 
 const std = @import("std");
 const assert = std.debug.assert;
