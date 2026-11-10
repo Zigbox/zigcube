@@ -385,7 +385,7 @@ fn wait(inbound: *const Lane, outbound: *const Lane) void {
 
 // ---- Sockets -----------------------------------------------------------------------------------
 
-const Bound = struct { fd: fd_t, port: u16 };
+pub const Bound = struct { fd: fd_t, port: u16 };
 
 fn listen_loopback() error{ SocketFailed, BindFailed, ListenFailed }!Bound {
     const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | nonblock_cloexec, 0);
@@ -429,12 +429,12 @@ const testing = std.testing;
 
 /// A test upstream: accepts connections on a loopback port and echoes what it reads, until told
 /// to stop. A connection closes when its peer does.
-const Echo = struct {
+pub const Echo = struct {
     bound: Bound,
     stopping: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
-    fn start() !*Echo {
+    pub fn start() !*Echo {
         const echo = try testing.allocator.create(Echo);
         echo.* = .{ .bound = try listen_loopback() };
         echo.thread = try std.Thread.spawn(.{}, run, .{echo});
@@ -463,7 +463,7 @@ const Echo = struct {
         for (peers[0..count]) |peer| _ = linux.close(peer);
     }
 
-    fn stop(echo: *Echo) void {
+    pub fn stop(echo: *Echo) void {
         echo.stopping.store(true, .release);
         echo.thread.?.join();
         _ = linux.close(echo.bound.fd);
@@ -472,7 +472,7 @@ const Echo = struct {
 };
 
 /// A blocking connection to the relay, as the job would make.
-fn dial(port: u16) !fd_t {
+pub fn dial(port: u16) !fd_t {
     const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(made) != .SUCCESS) return error.SocketFailed;
     const fd: fd_t = @intCast(made);
@@ -488,7 +488,7 @@ fn dial(port: u16) !fd_t {
 }
 
 /// Reads at most `buffer.len` bytes, waiting up to `ms`: the count, 0 for an end, null for none.
-fn receive(fd: fd_t, buffer: []u8, ms: i32) ?usize {
+pub fn receive(fd: fd_t, buffer: []u8, ms: i32) ?usize {
     var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
     if (linux.poll(&fds, 1, ms) == 0) return null;
     const got = linux.read(fd, buffer.ptr, buffer.len);

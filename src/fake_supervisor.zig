@@ -4,7 +4,8 @@
 //! HANDOFF's recorded exception (principle 1) is that each container runs under a small
 //! supervisor, because only a container's parent can collect its exit status across an agent
 //! restart, and `zbx`'s `start` needs a single-threaded caller. This is that process for the fake
-//! runtime. It is single-threaded; it is the command's parent; it starts its own session and
+//! runtime. It is single-threaded until the command is spawned, and then only a job's relay
+//! (`relay.zig`) adds threads; it is the command's parent; it starts its own session and
 //! process group, so a restarted or killed agent leaves it alone; and it writes how the command
 //! ended to `run.json`, which is what the agent reads, whenever it next looks.
 //!
@@ -23,6 +24,8 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const files = @import("fake_files.zig");
 const backoff = @import("fetch_backoff.zig");
+const relay_module = @import("relay.zig");
+const Relay = relay_module.Relay;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -117,7 +120,7 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
         const failure = after_fetch(fetch_first(init, dir, arena));
         if (failure) |over| return record(io, dir, over);
     }
-    return supervise(init, dir, &spec);
+    return supervise(init, dir, dir_path, &spec);
 }
 
 /// What ends the container after its fetch: the fetch's failure if it failed, a stop if this
@@ -246,7 +249,12 @@ fn fetch_exit(arena: Allocator, digest: []const u8, code: u8) files.RunFile {
     return failed(.fetch, "the fetch crashed; see fetch.log");
 }
 
-fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {
+fn supervise(
+    init: std.process.Init,
+    dir: Dir,
+    dir_path: []const u8,
+    spec: *const files.SpecFile,
+) u8 {
     const io = init.io;
     var environ = init.environ_map.clone(init.gpa) catch return constants.exit_environment;
     defer environ.deinit();
@@ -256,25 +264,90 @@ fn supervise(init: std.process.Init, dir: Dir, spec: *const files.SpecFile) u8 {
         }
         environ.put(pair[0], pair[1]) catch return constants.exit_environment;
     }
+    // The listener exists before the command does (its address is in the command's environment)
+    // and is closed, with every connection, before the ending is recorded: `stop` returns only
+    // when no thread of the relay is left.
+    var relay: ?*Relay = null;
+    if (spec.relay) |upstream| {
+        switch (open_relay(init, dir, dir_path, upstream, &environ)) {
+            .opened => |opened| relay = opened,
+            .failed => |over| return record(io, dir, over),
+        }
+    }
+    const ending = run_command(init, dir, spec, &environ, relay);
+    if (relay) |open| open.stop();
+    const over = ending orelse return constants.exit_environment;
+    return record(io, dir, over);
+}
+
+const RelayOpening = union(enum) { opened: *Relay, failed: files.RunFile };
+
+/// Opens the relay's listener and tells the command where it is (`ZCUBE_RELAY`, and the
+/// `relay.port` file for the agent and for tests). A failure is ZC-E0702: the job must not run
+/// without the route it was promised.
+fn open_relay(
+    init: std.process.Init,
+    dir: Dir,
+    dir_path: []const u8,
+    upstream: []const u8,
+    environ: *std.process.Environ.Map,
+) RelayOpening {
+    const unlistened = failed(.environment, "ZC-E0702: the relay could not listen");
+    const target = relay_module.Upstream.parse(upstream) orelse
+        return .{ .failed = failed(.environment, "ZC-E0702: the relay's address is not HOST:PORT") };
+    const log_path = std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{
+        dir_path, files.file_relay_log,
+    }, 0) catch return .{ .failed = unlistened };
+    defer init.gpa.free(log_path);
+    const relay = Relay.open(init.gpa, init.io, target, log_path) catch
+        return .{ .failed = unlistened };
+    var text: [64]u8 = undefined;
+    const address = std.fmt.bufPrint(&text, "http://127.0.0.1:{d}", .{relay.port}) catch
+        unreachable; // 64 bytes hold a port.
+    environ.put(constants.relay_env_name, address) catch {
+        relay.stop();
+        return .{ .failed = unlistened };
+    };
+    const port = std.fmt.bufPrint(&text, "{d}\n", .{relay.port}) catch unreachable;
+    files.write_atomic(init.io, dir, files.file_relay_port, port) catch {
+        relay.stop();
+        return .{ .failed = unlistened };
+    };
+    return .{ .opened = relay };
+}
+
+/// Spawns the command, starts the relay (the supervisor is single-threaded until the command has
+/// been spawned) and waits for the command; how it ended, or null if the supervisor itself broke.
+fn run_command(
+    init: std.process.Init,
+    dir: Dir,
+    spec: *const files.SpecFile,
+    environ: *std.process.Environ.Map,
+    relay: ?*Relay,
+) ?files.RunFile {
+    const io = init.io;
     var child = std.process.spawn(io, .{
         .argv = spec.command,
-        .environ_map = &environ,
+        .environ_map = environ,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch |err| return record(io, dir, spawn_failure(err));
+    }) catch |err| return spawn_failure(err);
     const pid: i32 = child.id.?;
     publish_child(pid);
+    if (relay) |open| open.run() catch {
+        // Without a relay thread the command has a listener nobody serves: end it.
+        _ = std.os.linux.kill(pid, .KILL);
+    };
     // Without its pid file nobody can find the command to stop it, so it ends here, by the same
     // reap as any other end (`child.kill` would reap first and `child.wait` then has no pid).
     files.write_pid(io, dir, files.file_child, pid) catch {
         _ = std.os.linux.kill(pid, .KILL);
     };
-    const term = reap(io, dir, &child, null) catch
-        return record(io, dir, .{ .kind = .lost });
+    const term = reap(io, dir, &child, null) catch return .{ .kind = .lost };
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
-    return record(io, dir, ended(io, dir, arena_state.allocator(), term));
+    return ended(io, dir, arena_state.allocator(), term);
 }
 
 /// How the command ended, as `run.json` says it. A kill by `SIGKILL` that a test fault announced

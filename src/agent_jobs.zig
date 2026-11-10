@@ -895,6 +895,7 @@ const Work = struct {
             .name = subject.id,
             .image = run.image,
             .source = run.source,
+            .relay = if (run.relay) |relay| relay.address else "",
             .command = run.command,
             .env = env,
             .limits = .{

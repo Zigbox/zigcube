@@ -52,6 +52,10 @@ pub const file_forced = "forced";
 /// `argv` (`zcube-agent fetch ...`) after recording its pid and before the command.
 pub const file_fetch = "fetch.json";
 pub const file_fetch_log = "fetch.log";
+/// B3 slice 2: the port of the container's relay (written by its supervisor, one decimal number)
+/// and the relay's log of coded events.
+pub const file_relay_port = "relay.port";
+pub const file_relay_log = "relay.log";
 /// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
 /// the agent publishes under `/pulls/` and then removes.
 pub const file_pull = "pull.json";
@@ -83,6 +87,9 @@ pub const SpecFile = struct {
     command: []const []const u8,
     env: []const Pair = &.{},
     labels: []const Pair = &.{},
+    /// The relay's upstream (`HOST:PORT`) if the container has one: its supervisor listens on a
+    /// loopback port of its own and tells the command in `ZCUBE_RELAY`.
+    relay: ?[]const u8 = null,
     started_at_ms: u64,
 };
 
@@ -137,7 +144,8 @@ pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!vo
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
     const files = [_][]const u8{
-        file_run, file_child, file_supervisor, file_forced, file_fetch, file_fetch_log,
+        file_run,        file_child,     file_supervisor, file_forced, file_fetch, file_fetch_log,
+        file_relay_port, file_relay_log,
     };
     for (files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {

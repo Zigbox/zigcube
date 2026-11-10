@@ -171,6 +171,7 @@ pub const ZigboxRuntime = struct {
     ) runtime.Error!runtime.StartOutcome {
         const self = from(context);
         self.reap();
+        if (spec.relay.len > 0) return .{ .failed = relay_unserved(spec) };
         if (map.refusal(spec)) |reason| return .{ .failed = refusal_diagnostic(reason, spec) };
         const spec_file = self.launch_spec(spec);
         launch.write_spec(self.io, self.root, &spec_file) catch
@@ -636,6 +637,20 @@ fn pending_listing(
 // ---- Diagnostics -------------------------------------------------------------------------------
 
 /// Why Zigcube refused a spec Zigbox would have refused too, blamed on the service's author.
+/// ZC-E0703: this adapter has no way yet to give a container a relay, so a job that names one
+/// ends as a start failure instead of running without its route.
+fn relay_unserved(spec: *const runtime.Spec) Diagnostic {
+    var collector: Diag = undefined;
+    collector.reset();
+    collector.raise(.E0703);
+    collector.cause("this runtime cannot give a container a relay", .{});
+    collector.fix(.{ .sentence = "run the job on a node whose agent has relay support" });
+    collector.while_("starting container {s}", .{spec.name});
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
+}
+
 fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
