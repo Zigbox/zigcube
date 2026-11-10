@@ -1626,6 +1626,44 @@ test "a listing that fails mid-step leaves the run's wake due and is counted onc
     try testing.expect(!rig.running());
 }
 
+test "a run's reported cause is the one its start record holds, whenever the deadline falls" {
+    // Goal: review of PR #212 (SHOULD). The pass reads a run's start record, then reports
+    // `running` (store calls, which enforce a deadline that comes due), then may record a
+    // cause from its own copy; `running` re-reads the record after the report so a cause the
+    // hook recorded is kept. Method: the run is started by one step (its `running` is
+    // reported by the next), the server then asks to cancel it, and the next step's calls
+    // (150 ms) cross the run's deadline at a different point in each run of the sweep. In
+    // every run the cause reported is the cause the start record holds, and a run stopped
+    // at its deadline (not before) says so. The sweep does not reach the lost update itself
+    // (the report has one call and the record is read just before it): the test keeps the
+    // property, the re-read is its guard.
+    var checked: u32 = 0;
+    var deadline_ms: u64 = 100;
+    while (deadline_ms <= 1_000) : (deadline_ms += 50) {
+        var rig = try Rig.start();
+        defer rig.stop();
+        const world = rig.world;
+        _ = try rig.assign(deadline_ms);
+        world.switched.call_cost = .{
+            .clock = &world.manual,
+            .cost_ms = 150,
+            .cap_ms = &world.call_cap_ms,
+        };
+        _ = world.agent_step();
+        if (!rig.running()) continue;
+        try rig.ask_stop(.cancel, deadline_ms);
+        _ = world.agent_step();
+        world.switched.call_cost = null;
+        _ = world.agent_step();
+        const record = (try rig.start_record()) orelse continue;
+        const seen = (try rig.observed()) orelse continue;
+        if (seen.status != .stopped) continue;
+        try testing.expectEqual(record.stop_cause, seen.stop_cause);
+        checked += 1;
+    }
+    try testing.expect(checked > 0);
+}
+
 test "an agent with no runs never cuts a call before its fence" {
     // Goal: demo-c1 (PR #150, CI run 42355098100) runs no jobs, so no run's wake may cap a
     // call: the cap is the fence and nothing else, at every moment. Method: no run is assigned;
