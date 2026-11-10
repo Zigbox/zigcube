@@ -326,8 +326,8 @@ option so that every replay line written before it (`c1_regressions`, `sim-c1-re
 replay commands of open `sim-fleet` issues) still runs its own world bit for bit: with `--strong`,
 every other host crash also loses the node's disk (state directory and containers; `wipes=` in the
 report), and every thirteenth job asks for more cpu than any node has, so that no node claims it
-(J8's second clause), and every seventh job names a relay (no draw; B3 slice 3: the simulated runtime opens a listener at
-start and closes it on every ending, `jobs: relays opened=.. closed=..` in the report, and R1 to R3 judge it, below). `auto` operations and the teeth `job_wipe`, `job_unclaimed` and `job_evicted` switch it on,
+(J8's second clause), and every third job names a relay (no draw; B3 slice 3: the simulated runtime opens a listener at
+start and closes it on every ending, `jobs: relays opened=.. closed=..` in the report, and R1 to R3 judge it, below). `auto` operations and the teeth `job_wipe`, `job_unclaimed`, `job_evicted`, `relay_leak` and `relay_dropped` switch it on,
 and the replay line then carries `--strong`. **What it does not cover:** a state directory removed
 by hand while the host and its containers stay up. The simulated node's runtime keeps each
 container's record in that directory, so the containers would run on with nothing that lists them;
@@ -495,8 +495,8 @@ agent that ignores a cancel breaks J6; one that ignores the deadline, enforces i
 start, closed by every ending (exit, signal, stop, deadline, a lost supervisor), gone with a wiped disk;
 an agent restart keeps it with the container. Three checks, judged on every tick by every run with jobs:
 **R1** no listener is open on a stopped container, or was left open on one the runtime forgot (evicted
-or replaced; sticky), so a relay is closed before its ending can be reported; **R2** no two listeners
-are open for one run (across nodes); **R3** a running relayed container has its listener open. Only
+or replaced; sticky), so a relay is closed before its ending can be reported; **R2** (a restatement of J2 and R1 for listeners keyed by run id; no tooth of its own) no two listeners
+are open for one run (across nodes); **R3** (also: a started job's spec carries the relay the job asked for, judged against the job's name, not the spec's own field; `relay_dropped` blanks it and must fail R3) a running relayed container has its listener open. Only
 the `strong` world makes relayed jobs, so a run without `--strong` is its old world bit for bit.
 `sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `strong`) leaves the listener open at
 the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.

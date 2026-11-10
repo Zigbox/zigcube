@@ -851,6 +851,8 @@ pub const Cluster = struct {
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
     job_next: u32,
+    /// A started job's spec lacked (or wrongly carried) its relay (R3; sticky).
+    relay_spec_wrong: bool = false,
     /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
     strong: bool,
     /// The host crashes injected so far (the wipe takes every other one, from the first).
@@ -1480,7 +1482,7 @@ pub const Cluster = struct {
         // `Options.strong`: other worlds are unchanged.
         const unplaceable = c.strong and c.job_next % 13 == 5;
         // Every 7th job names the relay (B3 slice 3). No draw, and only with `Options.strong`.
-        const relayed = c.strong and c.job_next % 7 == 3;
+        const relayed = c.strong and job_relayed(c.job_next);
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
@@ -1605,6 +1607,17 @@ pub const Cluster = struct {
     }
 };
 
+/// Whether the `strong` world's job number `n` names the relay (every third; no draw).
+fn job_relayed(n: u32) bool {
+    return n % 3 == 1;
+}
+
+/// The job number of a name made by `create_job` ("jb-N"); null for any other name.
+fn job_number(name: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, name, "jb-")) return null;
+    return std.fmt.parseInt(u32, name["jb-".len..], 10) catch null;
+}
+
 /// The job a container belongs to, from its label; null for a replica's container.
 fn job_of(container: anytype) ?[]const u8 {
     for (container.labels) |label| {
@@ -1619,6 +1632,14 @@ fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
     const node: *Node = @ptrCast(@alignCast(context));
     const c = node.cluster;
     if (!c.jobs_on) return;
+    // R3: the spec the agent built carries the relay the job asked for, resolved, and no other.
+    if (job_of(spec)) |job| {
+        const want: []const u8 = if (c.strong and job_relayed(job_number(job) orelse 0))
+            sim_relays[0].address
+        else
+            "";
+        if (!std.mem.eql(u8, spec.relay, want)) c.relay_spec_wrong = true;
+    }
     const hash = std.hash.Wyhash.hash(0, spec.name);
     assert(hash != 0);
     node.started_true[node.started_next % node.started_true.len] = .{
@@ -2571,6 +2592,7 @@ fn judge_job_container(
 /// for one run (R2, across the nodes). Judged on every tick, store faults or not: the listeners
 /// are the runtime's, not the store's.
 fn track_relays(c: *Cluster) Failure!void {
+    try check(c, !c.relay_spec_wrong, "R3: a job's spec lacks the relay the job asked for");
     for (c.nodes) |node| {
         const found = node.sim.containers.relay_problem();
         try check(c, found == null, found orelse "");
@@ -2578,7 +2600,9 @@ fn track_relays(c: *Cluster) Failure!void {
     for (c.nodes, 0..) |node, index| {
         for (node.sim.containers.containers.items) |container| {
             if (!container.relay_open) continue;
-            // The same run's listener on this node's other containers cannot be (names are
+            // R2 restates J2 and R1 (names are run ids; R1 closes every stopped container's
+            // listener, J2 forbids a run on two nodes): it guards a listener keyed by anything
+            // else. The same run's listener on this node's other containers cannot be (names are
             // unique); on another node, it is a second listener for one run.
             for (c.nodes[index + 1 ..]) |other| {
                 for (other.sim.containers.containers.items) |twin| {
@@ -3252,13 +3276,16 @@ fn print_jobs(c: *Cluster) void {
         var opened: u32 = 0;
         var closed: u32 = 0;
         var open_now: u32 = 0;
+        var by: [4]u32 = .{ 0, 0, 0, 0 };
         for (c.nodes) |node| {
+            for (&by, node.sim.containers.relays_closed_by) |*sum, n| sum.* += n;
             opened += node.sim.containers.relays_opened;
             closed += node.sim.containers.relays_closed;
             open_now += node.sim.containers.relay_open_count();
         }
-        c.report.print("jobs: relays opened={d} closed={d} open at the end={d}\n", .{
-            opened, closed, open_now,
+        c.report.print("jobs: relays opened={d} closed={d} open at the end={d} " ++
+            "(closed by exit={d} signal={d} other={d} wipe={d})\n", .{
+            opened, closed, open_now, by[0], by[1], by[2], by[3],
         });
     }
 }

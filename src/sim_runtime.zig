@@ -124,6 +124,9 @@ pub const SimRuntime = struct {
     /// Listeners opened and closed so far (the report's tally of the relay model).
     relays_opened: u32 = 0,
     relays_closed: u32 = 0,
+    /// The same closes by how the container's life ended: exited, signaled, other (oom, pid limit,
+    /// lost supervisor), wiped with its host.
+    relays_closed_by: [4]u32 = .{ 0, 0, 0, 0 },
     /// Set when a container was forgotten (evicted or replaced) with its listener still open: a
     /// listener nobody can close any more. Sticky, so that eviction cannot hide the leak.
     relay_forgotten: bool = false,
@@ -228,6 +231,7 @@ pub const SimRuntime = struct {
     pub fn wipe(self: *SimRuntime) void {
         // The listeners die with the host.
         self.relays_closed += self.relay_open_count();
+        self.relays_closed_by[3] += self.relay_open_count();
         for (self.containers.items) |container| self.free_container(container);
         self.containers.clearRetainingCapacity();
     }
@@ -310,6 +314,12 @@ pub const SimRuntime = struct {
         if (container.relay_open and !c1_teeth.relay_leak) {
             container.relay_open = false;
             self.relays_closed += 1;
+            const kind: usize = switch (ended) {
+                .exited => 0,
+                .signaled => 1,
+                else => 2,
+            };
+            self.relays_closed_by[kind] += 1;
         }
         self.record(.{ .handle = runtime.Handle.init(container.name), .ended = ended });
     }

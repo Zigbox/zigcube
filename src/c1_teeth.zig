@@ -107,12 +107,16 @@ pub const job_wipe = declared("c1_teeth_job_wipe");
 /// in the `strong` world.
 pub const relay_leak = declared("c1_teeth_relay_leak");
 
+/// The agent builds a relayed job's spec without its relay (must break R3: a started job's spec
+/// carries the relay the job asked for; B3 slice 3). Needs the `strong` world's relayed jobs.
+pub const relay_dropped = declared("c1_teeth_relay_dropped");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
-pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak;
+pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or relay_leak;
+    job_wipe or job_evicted or relay_leak or relay_dropped;

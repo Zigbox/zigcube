@@ -1279,6 +1279,15 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "R1",
     },
     .{
+        .name = "relay_dropped",
+        .root = "src/sim_c1_teeth_relay_dropped_main.zig",
+        // R3 (a started job's spec lacks its relay); relayed jobs exist only in the strong world,
+        // which the tooth switches on. Plain runs (no `--c1`) judge R3 too.
+        .symptom = "R3",
+        .canary_seeds = 20,
+        .plain_symptom = "R3",
+    },
+    .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
         // With #202 fixed (agents arm a run's deadline when it starts), seeds 1..60 hit the
