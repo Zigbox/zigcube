@@ -7,6 +7,9 @@
 //!     .listen = "127.0.0.1:7070",
 //!     .store = "sqlite:/var/lib/zcube/store.db", // or "postgres:host=db user=zcube", or "memory"
 //!     .create_store = false, // true on the first start: a mistyped path is an error otherwise
+//!     // The upstreams a job's `relay` may name (docs/briefs/b3.md): at most `relays_max`. A job
+//!     // names one; it never gives an address.
+//!     .relays = .{ .botpike = .{ .address = "broker.botpike.com:8443" } },
 //! }
 //! ```
 
@@ -70,12 +73,33 @@ pub const Config = struct {
     lease_ttl_ms: u32 = constants.lease_ttl_ms,
     /// How long after a node is marked lost its replicas are moved (docs/authority.md §3).
     lost_grace_ms: u32 = constants.lost_grace_ms,
+    /// The relays a job may name, in the file's order; none by default.
+    relays: []const Relay = &.{},
 };
 
 pub const Command = union(enum) { run: Config, version, help };
 
-/// What a ZON file may set. Unknown fields are refused.
+/// One relay: the name a job gives and the `host:port` the node agent connects to for it.
+pub const Relay = struct {
+    name: []const u8,
+    address: []const u8,
+};
+
+/// What a ZON file holds: the settings `Fields` reads, and the relays, whose names are the
+/// file's own and so are read from the syntax tree.
 const File = struct {
+    listen: ?[]const u8 = null,
+    store: ?[]const u8 = null,
+    create_store: ?bool = null,
+    lease_ttl_ms: ?u32 = null,
+    lost_grace_ms: ?u32 = null,
+    state_dir: ?[]const u8 = null,
+    relays: []const Relay = &.{},
+};
+
+/// What a ZON file may set apart from `relays`. Unknown fields are refused (`parse_zon` checks
+/// the names itself, because it parses these with the relays left out).
+const Fields = struct {
     listen: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
@@ -126,6 +150,7 @@ fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
         .new_ca = flags.new_ca,
         .lease_ttl_ms = try lease_ttl_of(flags.lease_ttl_ms orelse file.lease_ttl_ms, diag),
         .lost_grace_ms = try lost_grace_of(flags.lost_grace_ms orelse file.lost_grace_ms, diag),
+        .relays = try relays_valid(file.relays, diag),
     };
 }
 
@@ -235,21 +260,190 @@ fn read_file(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!
 }
 
 pub fn parse_zon(arena: Allocator, source: [:0]const u8, name: []const u8, diag: *Diag) Error!File {
+    var ast = try parse_tree(arena, source, name, diag);
+    defer ast.deinit(arena);
+    var zoir = std.zig.ZonGen.generate(arena, ast, .{ .parse_str_lits = true }) catch
+        return error.OutOfMemory;
+    defer zoir.deinit(arena);
+    const shape = "{s} is not a valid server configuration (.listen, .store, .create_store)";
+    if (zoir.hasCompileErrors()) {
+        return bad(diag, shape, .{name}, "see zcube-server --help for the settings");
+    }
+    // The typed parse below ignores unknown fields, because it must not see `relays`: so the
+    // names are checked here, and a typo is still refused.
+    const relays = try relays_of(arena, &zoir, name, diag);
     var zon_diag: std.zon.parse.Diagnostics = undefined;
-    return std.zon.parse.fromSlice(File, .{
-        .gpa = arena,
+    const fields = std.zon.parse.fromZoir(Fields, .{
         .arena = arena,
-        .source = source,
+        .ast = &ast,
+        .zoir = &zoir,
         .diagnostics = &zon_diag,
+        .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ParseZon => bad(
-            diag,
-            "{s} is not a valid server configuration (.listen, .store, .create_store)",
-            .{name},
-            "see zcube-server --help for the settings",
-        ),
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => return bad(diag, shape, .{name}, "see zcube-server --help"),
     };
+    var file: File = .{ .relays = relays };
+    inline for (@typeInfo(Fields).@"struct".field_names) |field| {
+        @field(file, field) = @field(fields, field);
+    }
+    return file;
+}
+
+fn parse_tree(
+    arena: Allocator,
+    source: [:0]const u8,
+    name: []const u8,
+    diag: *Diag,
+) Error!std.zig.Ast {
+    const ast = std.zig.Ast.parse(arena, source, .{ .mode = .zon }) catch return error.OutOfMemory;
+    if (ast.errors.len == 0) return ast;
+    var owned = ast;
+    owned.deinit(arena);
+    const shape = "{s} is not a valid server configuration (.listen, .store, .create_store)";
+    return bad(diag, shape, .{name}, "see zcube-server --help for the settings");
+}
+
+const known_settings = [_][]const u8{
+    "listen", "store", "create_store", "lease_ttl_ms", "lost_grace_ms", "state_dir", "relays",
+};
+
+/// The relays of the file's root struct, after its field names are checked. A relay is
+/// `.name = .{ .address = "host:port" }`; anything else in it is ZC-E0106 naming the relay.
+fn relays_of(
+    arena: Allocator,
+    zoir: *const std.zig.Zoir,
+    file_name: []const u8,
+    diag: *Diag,
+) Error![]const Relay {
+    const root = std.zig.Zoir.Node.Index.root.get(zoir);
+    const names, const values = switch (root) {
+        .struct_literal => |literal| .{ literal.names, literal.vals },
+        .empty_literal => return &.{},
+        else => return bad(diag, "{s} is not a struct of settings", .{file_name}, "see --help"),
+    };
+    var found: ?std.zig.Zoir.Node.Index = null;
+    for (names, 0..) |setting, index| {
+        const text = setting.get(zoir);
+        const known = for (known_settings) |candidate| {
+            if (std.mem.eql(u8, text, candidate)) break true;
+        } else false;
+        if (!known) {
+            const reason = "{s} sets .{s}, which is not a zcube-server setting";
+            return bad(diag, reason, .{ file_name, text }, "see zcube-server --help");
+        }
+        if (std.mem.eql(u8, text, "relays")) found = values.at(@intCast(index));
+    }
+    const node = found orelse return &.{};
+    return relay_list(arena, zoir, node, diag);
+}
+
+fn relay_list(
+    arena: Allocator,
+    zoir: *const std.zig.Zoir,
+    node: std.zig.Zoir.Node.Index,
+    diag: *Diag,
+) Error![]const Relay {
+    const names, const values = switch (node.get(zoir)) {
+        .struct_literal => |literal| .{ literal.names, literal.vals },
+        .empty_literal => return &.{},
+        else => return bad(diag, "relays is not a struct of relays", .{}, relay_fix),
+    };
+    // Checked before anything is read, so a file with a hundred relays is refused by its count.
+    if (names.len > constants.relays_max) {
+        return bad(diag, "relays names {d} relays, over the limit of {d}", .{
+            names.len, constants.relays_max,
+        }, "name at most " ++ relays_max_text ++ " relays");
+    }
+    const list = arena.alloc(Relay, names.len) catch return error.OutOfMemory;
+    for (names, list, 0..) |name_node, *slot, index| {
+        // The Zoir is freed when `parse_zon` returns, so the text is copied out of it.
+        const name = arena.dupe(u8, name_node.get(zoir)) catch return error.OutOfMemory;
+        const address = try relay_address(zoir, values.at(@intCast(index)), name, diag);
+        const kept = arena.dupe(u8, address) catch return error.OutOfMemory;
+        slot.* = .{ .name = name, .address = kept };
+        if (relay_name_problem(name)) |problem| {
+            return bad(diag, "relay {s}: the name {s}", .{ name, problem }, relay_fix);
+        }
+    }
+    return list;
+}
+
+const relays_max_text = "8";
+const relay_fix = "write it as .relays = .{ .name = .{ .address = \"host:port\" } }";
+
+fn relay_address(
+    zoir: *const std.zig.Zoir,
+    node: std.zig.Zoir.Node.Index,
+    name: []const u8,
+    diag: *Diag,
+) Error![]const u8 {
+    const fields = switch (node.get(zoir)) {
+        .struct_literal => |literal| literal,
+        else => return bad(diag, "relay {s} is not .{{ .address = ... }}", .{name}, relay_fix),
+    };
+    if (fields.names.len != 1) {
+        return bad(diag, "relay {s} must have an .address and nothing else", .{name}, relay_fix);
+    }
+    if (!std.mem.eql(u8, fields.names[0].get(zoir), "address")) {
+        return bad(diag, "relay {s} must have an .address and nothing else", .{name}, relay_fix);
+    }
+    return switch (fields.vals.at(0).get(zoir)) {
+        .string_literal => |text| text,
+        else => bad(diag, "relay {s}: .address is not a string", .{name}, relay_fix),
+    };
+}
+
+/// A relay name is what a job writes: lowercase letters, digits and '-', not at either end.
+pub fn relay_name_problem(name: []const u8) ?[]const u8 {
+    if (name.len == 0 or name.len > constants.relay_name_bytes_max) {
+        return "must be 1 to 32 bytes";
+    }
+    for (name, 0..) |byte, index| {
+        const letter = byte >= 'a' and byte <= 'z';
+        const digit = byte >= '0' and byte <= '9';
+        const hyphen = byte == '-' and index > 0 and index + 1 < name.len;
+        if (!(letter or digit or hyphen)) {
+            return "must be lowercase letters, digits and '-' (none at either end)";
+        }
+    }
+    return null;
+}
+
+/// An upstream is `host:port`: a name or an IP address, and a port from 1 to 65535. The
+/// connection is plain TCP in B3 (docs/briefs/b3.md), so nothing else is part of it.
+pub fn relay_address_problem(address: []const u8) ?[]const u8 {
+    if (address.len == 0 or address.len > constants.relay_address_bytes_max) {
+        return "must be 1 to 256 bytes";
+    }
+    const colon = std.mem.findScalarLast(u8, address, ':') orelse return "has no port";
+    const port = std.fmt.parseInt(u16, address[colon + 1 ..], 10) catch
+        return "has a port that is not a number from 1 to 65535";
+    if (port == 0) return "has a port that is not a number from 1 to 65535";
+    if (colon == 0) return "has no host";
+    for (address[0..colon]) |byte| {
+        const plain = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-';
+        const ip6 = byte == ':' or byte == '[' or byte == ']';
+        if (!(plain or ip6)) return "has a host with a character a host name cannot have";
+    }
+    return null;
+}
+
+/// The relays after a second look at what the file said: no name twice, and each address one
+/// the agent can connect to.
+fn relays_valid(relays: []const Relay, diag: *Diag) Error![]const Relay {
+    assert(relays.len <= constants.relays_max);
+    for (relays, 0..) |relay, index| {
+        for (relays[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.name, relay.name)) {
+                return bad(diag, "relay {s} is given twice", .{relay.name}, relay_fix);
+            }
+        }
+        if (relay_address_problem(relay.address)) |problem| {
+            return bad(diag, "relay {s}: the address {s}", .{ relay.name, problem }, relay_fix);
+        }
+    }
+    return relays;
 }
 
 // ---- Settings -----------------------------------------------------------------------------------
@@ -428,4 +622,49 @@ test "the lost grace is a flag, a file setting, and refused over an hour" {
     try testing.expectEqual(constants.lost_grace_ms_max, at_limit.lost_grace_ms); // Exactly 1 h.
     const over = constants.lost_grace_ms_max + 1;
     try expect_bad(merge(.{ .lost_grace_ms = over }, .{}, &diag), &diag);
+}
+
+test "relays are a table of names and addresses; every malformed entry is ZC-E0106" {
+    // Goal: the `relays` setting of the brief's config form. Method: a good table parses and
+    // merges; each way to get an entry wrong, and a ninth relay, is refused.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const good = ".{ .relays = .{ .botpike = .{ .address = \"broker.botpike.com:8443\" }," ++
+        " .b2 = .{ .address = \"127.0.0.1:9\" } } }";
+    const file = try parse_zon(arena, good, "server.zon", &diag);
+    const config = try merge(.{}, file, &diag);
+    try testing.expectEqual(@as(usize, 2), config.relays.len);
+    try testing.expectEqualStrings("botpike", config.relays[0].name);
+    try testing.expectEqualStrings("broker.botpike.com:8443", config.relays[0].address);
+    const none = try merge(.{}, try parse_zon(arena, ".{}", "server.zon", &diag), &diag);
+    try testing.expectEqual(@as(usize, 0), none.relays.len);
+
+    const bad_files = [_][:0]const u8{
+        ".{ .relays = .{ .x = .{ .address = \"a:1\", .extra = 1 } } }",
+        ".{ .relays = .{ .x = .{} } }",
+        ".{ .relays = .{ .x = .{ .address = \"no-port\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"a:0\" } } }",
+        ".{ .relays = .{ .x = .{ .address = \"\" } } }",
+        ".{ .relays = 3 }",
+        ".{ .relays = .{ .x = 3 } }",
+        ".{ .relays = .{ .@\"a b\" = .{ .address = \"a:1\" } } }",
+        ".{ .relays = .{ .a = .{ .address = \"a:1\" }, .a = .{ .address = \"b:1\" } } }",
+        ".{ .relays = .{ .r0 = .{ .address = \"h:1\" }, .r1 = .{ .address = \"h:1\" }," ++
+            " .r2 = .{ .address = \"h:1\" }, .r3 = .{ .address = \"h:1\" }," ++
+            " .r4 = .{ .address = \"h:1\" }, .r5 = .{ .address = \"h:1\" }," ++
+            " .r6 = .{ .address = \"h:1\" }, .r7 = .{ .address = \"h:1\" }," ++
+            " .r8 = .{ .address = \"h:1\" } } }",
+    };
+    for (bad_files) |source| {
+        diag.reset();
+        const parsed = parse_zon(arena, source, "server.zon", &diag) catch {
+            try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
+            continue;
+        };
+        diag.reset();
+        try expect_bad(merge(.{}, parsed, &diag), &diag);
+    }
 }

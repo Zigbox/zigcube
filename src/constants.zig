@@ -1057,3 +1057,41 @@ comptime {
     // record holds at most `job_admission_window_h + 1` of them (`admission_valid`).
     assert((job_admission_window_h + 1) * 49 + 256 < store_value_bytes_max);
 }
+
+// ---- The relay (docs/briefs/b3.md, slice 2) ------------------------------------------------------
+
+/// Relays a server's configuration may name (`relays` in the ZON file).
+pub const relays_max: u32 = 8;
+/// A relay's name: a job names it, and it is a ZON field name.
+pub const relay_name_bytes_max: u32 = 32;
+/// A relay's upstream, `host:port`.
+pub const relay_address_bytes_max: u32 = 256;
+/// The environment variable that tells a job where its relay listens.
+pub const relay_env_name = "ZCUBE_RELAY";
+/// The port a job's relay listens on, on its own loopback (the real runtime; the fake runtime
+/// listens on an ephemeral host port, because it makes no namespace).
+pub const relay_port: u16 = 8080;
+/// Open connections through one job's relay; a further one is closed and counted (ZC-W0701).
+pub const relay_connections_max: u32 = 16;
+/// Bytes copied in each direction of one connection; the connection ends at the bound (ZC-W0702).
+pub const relay_connection_bytes_max: u64 = 1024 * 1024 * 1024;
+/// A connection that carries no byte in either direction for this long is closed (ZC-W0702).
+pub const relay_idle_ms: u32 = 300_000;
+/// The upstream connect gives up after this long (ZC-E0704).
+pub const relay_connect_timeout_ms: u32 = 10_000;
+/// One direction's copy buffer.
+pub const relay_buffer_bytes: u32 = 16 * 1024;
+/// How often the relay's loop looks at its stop flag when nothing else wakes it.
+pub const relay_poll_ms: u32 = 50;
+/// The relay's own log in the container directory (`relay.log`): at most this many bytes.
+pub const relay_log_bytes_max: u32 = 8 * 1024;
+
+comptime {
+    assert(relays_max > 0);
+    assert(relay_name_bytes_max + relay_address_bytes_max < config_bytes_max);
+    assert(relay_connections_max > 0);
+    assert(relay_connect_timeout_ms < relay_idle_ms);
+    assert(relay_poll_ms < relay_connect_timeout_ms);
+    assert(relay_connection_bytes_max > relay_buffer_bytes);
+    assert(relay_port >= 1024); // The job is unprivileged, and so is the listener.
+}
