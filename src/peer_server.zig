@@ -1207,13 +1207,20 @@ test "authenticated links are never evicted, and a stranger too young to evict i
     for (&idle, 0..) |*client, at| client.* = try Idle.open(&rig, @intCast(100 + at), address);
     defer for (&idle) |*client| client.close();
     var silent: [constants.peer_handshakes_max - 2]std.posix.fd_t = undefined;
+    const before = peer_stream.boot_ms(io);
     for (&silent, 0..) |*fd, at| fd.* = try connect_from(io, @intCast(2 + at), address);
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    const since = peer_stream.boot_ms(io);
+    // `before` precedes every connect, so no stranger is older than `before`: check (a) bounds the
+    // age by it.
+    // `started_ms` is stamped at accept, which can lag the connect on a loaded host, and an idle
+    // client's task may not have moved its link to `.authenticated` yet (a stranger can be
+    // evicted): wait for both, then read `since`, so every stranger is at least that old (#205).
     try wait_busy(io, &rig.server, constants.peer_handshakes_max);
-    try std.testing.expect(peer_stream.boot_ms(io) - since < constants.peer_handshake_evict_min_ms);
+    try wait_authenticated(io, &rig.server, idle.len);
+    const since = peer_stream.boot_ms(io);
+    try std.testing.expect(since - before < constants.peer_handshake_evict_min_ms);
     try std.testing.expect(std.meta.isError(expect_served(&rig, address)));
     try std.testing.expectEqual(@as(u32, 0), rig.server.evictions.load(.monotonic));
     try age_strangers(io, since);
