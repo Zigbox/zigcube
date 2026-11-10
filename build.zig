@@ -1210,24 +1210,24 @@ const c1_teeth_roots = [_]struct {
     .{
         .name = "job_deadline",
         .root = "src/sim_c1_teeth_job_deadline_main.zig",
-        .symptom = "J8",
+        .symptom = job_deadline_symptom,
         .canary_seeds = 50,
-        .plain_symptom = "J8",
+        .plain_symptom = job_deadline_symptom,
     },
     .{
         .name = "job_deadline_late",
         .root = "src/sim_c1_teeth_job_deadline_late_main.zig",
-        .symptom = "J8",
+        .symptom = job_deadline_symptom,
         .canary_seeds = 50,
-        .plain_symptom = "J8",
+        .plain_symptom = job_deadline_symptom,
     },
     .{
         .name = "job_deadline_offline",
         .root = "src/sim_c1_teeth_job_deadline_offline_main.zig",
-        .symptom = "J8",
+        .symptom = job_deadline_symptom,
         .canary_seeds = 80,
         .seeds = 40,
-        .plain_symptom = "J8",
+        .plain_symptom = job_deadline_symptom,
         .plain_seeds = 40,
     },
     .{
@@ -1270,6 +1270,14 @@ const c1_teeth_roots = [_]struct {
         .plain_seeds = 100,
     },
     .{
+        .name = "job_ledger_small",
+        .root = "src/sim_c1_teeth_job_ledger_small_main.zig",
+        .symptom = "J8: the start ledger is full (16 runs)",
+        .canary_seeds = 10,
+        .plain_symptom = "J8: the start ledger is full (16 runs)",
+        .ops = 400,
+    },
+    .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
         // With #202 fixed (agents arm a run's deadline when it starts), seeds 1..60 hit the
@@ -1286,6 +1294,8 @@ const c1_teeth_roots = [_]struct {
 
 /// The fleet's canary runs of the two runners outside `c1_teeth_roots` (see there).
 const canary_seeds_teeth = 10;
+const job_deadline_symptom = "J8: a run kept executing past its deadline|" ++
+    "J8: a run is still open long after its deadline";
 const job_wipe_symptom = "J2: a run id was started a second time|" ++
     "J7: a run was started under another tenure";
 const canary_seeds_swarm_teeth = 200;

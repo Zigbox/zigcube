@@ -6,17 +6,20 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
+const symptom = @import("symptom.zig");
 
 const Context = controller.Context;
 
 /// Runs the ledger can hold. A run past it is counted, and the cluster simulation then fails the
 /// run (`ledger_problem`): J2 and J8's second clause read the whole ledger, so a full one would
 /// leave them judging less than they claim.
-pub const ledger_max: u32 = 4096;
+pub const ledger_max: u32 =
+    if (c1_teeth.job_ledger_small) c1_teeth.job_ledger_small_max else 4096;
 /// Containers the trackers keep a clock for at once: every container the runtimes of the most
 /// nodes a simulation has can hold (`sim_cluster.zig` asserts the product), so that no live job
 /// container goes unjudged for want of a slot, and none is dropped without a word (RB-N8).
@@ -165,8 +168,8 @@ fn ledger_add(state: *State, hash: u64) void {
 /// so the run fails, loudly, rather than passing with less checked.
 pub fn ledger_problem(state: *const State) ?[]const u8 {
     if (state.ledger_full == 0) return null;
-    return "J8: the start ledger is full (ledger_max runs), so J2 and J8's second clause " ++
-        "cannot judge every run";
+    return std.fmt.comptimePrint("J8: the start ledger is full ({d} runs), so J2 and J8's " ++
+        "second clause cannot judge every run", .{ledger_max});
 }
 
 fn fail(state: *State, found: []const u8) void {
@@ -284,9 +287,21 @@ test "a full start ledger is a failure, not a skip" {
     while (hash < ledger_max) : (hash += 1) ledger_add(&state, hash);
     try std.testing.expectEqual(ledger_max, state.ledger_count);
     try std.testing.expect(ledger_problem(&state) == null);
+    // Every run past the bound is counted, none is stored, and the problem stays.
     ledger_add(&state, ledger_max);
-    try std.testing.expectEqual(@as(u32, 1), state.ledger_full);
+    ledger_add(&state, ledger_max + 1);
+    try std.testing.expectEqual(@as(u32, 2), state.ledger_full);
+    try std.testing.expectEqual(ledger_max, state.ledger_count);
+    try std.testing.expectEqual(@as(u64, ledger_max - 1), state.ledger[ledger_max - 1]);
     const found = ledger_problem(&state) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, found, "ledger") != null);
-    try std.testing.expect(std.mem.startsWith(u8, found, "J8"));
+    const expected = std.fmt.comptimePrint(
+        "J8: the start ledger is full ({d} runs)",
+        .{ledger_max},
+    );
+    try std.testing.expect(std.mem.startsWith(u8, found, expected));
+    // The deadline teeth's symptoms do not accept it; the ledger tooth's does.
+    const deadline = "J8: a run kept executing past its deadline|" ++
+        "J8: a run is still open long after its deadline";
+    try std.testing.expect(!symptom.matches(found, deadline));
+    try std.testing.expect(symptom.matches(found, "J8: the start ledger is full"));
 }
