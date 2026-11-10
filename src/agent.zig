@@ -121,6 +121,14 @@ pub const Context = struct {
 pub const Deadline = struct {
     context: *anyopaque,
     set_fn: *const fn (context: *anyopaque, deadline_ms: u64) void,
+    /// Receives the function to run before each call to the server (null clears it), so that
+    /// the floor of `call_inflight_min_ms` is per call: the agent enforces the runs' deadlines
+    /// and gives the cap again before every call. Null where nothing waits on a call.
+    hook_fn: ?*const fn (
+        context: *anyopaque,
+        hook_context: ?*anyopaque,
+        hook: ?*const fn (hook_context: *anyopaque) void,
+    ) void = null,
 };
 
 pub const Config = struct {
@@ -212,6 +220,8 @@ pub const Agent = struct {
     /// The cap the step last gave its calls (`cap_calls`), monotonic; maxInt if none. A run that
     /// starts mid-step may only lower it (`arm_run_deadline`).
     calls_cap_mono_ms: u64,
+    /// The step in progress, for `before_call`; null between steps.
+    calls_ctx: ?*const Context,
     /// Failures of the server-free enforcement that the step went on after (one run's record or
     /// stop, the runtime's listing): counted, with the last one's code and cause, for the shell
     /// to say. Enforcement never fails the step, so the heartbeat always runs.
@@ -297,6 +307,7 @@ pub const Agent = struct {
         agent.jobs_wake_mono_ms = maxInt(u64);
         agent.deadline_wake_mono_ms = maxInt(u64);
         agent.calls_cap_mono_ms = maxInt(u64);
+        agent.calls_ctx = null;
         agent.enforce_failures = 0;
         agent.enforce_failure_len = 0;
         agent.steps = 0;
@@ -372,6 +383,31 @@ pub const Agent = struct {
         const deadline = ctx.deadline orelse return;
         agent.calls_cap_mono_ms = agent.calls_deadline_ms(ctx.mono_ms());
         deadline.set_fn(deadline.context, agent.calls_cap_mono_ms);
+        if (deadline.hook_fn) |set| set(deadline.context, agent, before_call);
+    }
+
+    /// Runs before every call of a step (`Deadline.hook_fn`): if a run's deadline or kill has
+    /// come while the step's earlier calls were in flight, it is enforced now, from the records
+    /// and the clock alone, and the call gets its own `call_inflight_min_ms`. So the floor is per
+    /// call and a run is enforced at most one call late, not a whole step late (#142).
+    fn before_call(context: *anyopaque) void {
+        const agent: *Agent = @ptrCast(@alignCast(context));
+        const step = agent.calls_ctx orelse return;
+        const mono = step.mono_ms();
+        if (agent.deadline_wake_mono_ms <= mono) {
+            // Its own diagnostic: the step's may hold a failure kept for the step's result.
+            var diag: Diag = undefined;
+            diag.reset();
+            var local = step.*;
+            local.diag = &diag;
+            if (local.runtime.list(local.arena, &diag)) |found| {
+                agent_jobs.enforce_deadlines(agent, &local, found);
+            } else |_| {
+                agent.deadline_wake_mono_ms = maxInt(u64);
+                agent.note_enforce_failure(&local, "list the containers to enforce run deadlines");
+            }
+        }
+        agent.cap_calls(step);
     }
 
     /// A run started in the middle of a step, which `enforce_deadlines` at the step's start did
@@ -421,6 +457,8 @@ pub const Agent = struct {
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
         assert(ctx.diag.code == null);
         agent.steps += 1;
+        agent.calls_ctx = ctx;
+        defer agent.calls_ctx = null;
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
         // The fence comes first and needs no server: an agent cut off from everything still stops.

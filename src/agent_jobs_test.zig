@@ -1542,6 +1542,36 @@ test "run wakes closer together than a heartbeat do not cut the heartbeat" {
     try testing.expectEqual(lease, world.agent.lease);
 }
 
+test "each call of a step gets its own floor when a run's wake is near" {
+    // Goal: #142 (J6 seed 102): `calls_deadline_ms` gives a call `call_inflight_min_ms` past a
+    // run's wake, but the cap was set once per step, so all of a step's reads shared one floor
+    // and the later ones were cut step after step. Method: eight runs with deadlines 100 ms
+    // apart keep a wake within the floor of every step; every call costs 150 ms of the clock,
+    // so a step's calls together take far more than the floor. The agent gives the cap again
+    // before each call, so none is cut, the lease holds and every run is stopped.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    const names = [_][]const u8{
+        "floor0", "floor1", "floor2", "floor3", "floor4", "floor5", "floor6", "floor7",
+    };
+    const ids = [_][]const u8{
+        "floor0-job", "floor1-job", "floor2-job", "floor3-job",
+        "floor4-job", "floor5-job", "floor6-job", "floor7-job",
+    };
+    const first = (world.agent.renew_at_ms - world.now_ms()) - 300;
+    for (names, ids, 0..) |job, id, i| try assign_other(&rig, job, id, first + 100 * i);
+    world.switched.call_cost = .{
+        .clock = &world.manual,
+        .cost_ms = 150,
+        .cap_ms = &world.call_cap_ms,
+    };
+    world.advance(first + 5_000);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    try testing.expectEqual(@as(u32, 0), world.switched.call_cost.?.cut);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+}
+
 test "an agent with no runs never cuts a call before its fence" {
     // Goal: demo-c1 (PR #150, CI run 42355098100) runs no jobs, so no run's wake may cap a
     // call: the cap is the fence and nothing else, at every moment. Method: no run is assigned;

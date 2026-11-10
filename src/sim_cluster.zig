@@ -597,6 +597,7 @@ const Node = struct {
             .deadline = .{
                 .context = node,
                 .set_fn = Node.deadline_set_fn,
+                .hook_fn = Node.deadline_hook_fn,
             },
             .images = node.store_images.images(),
         };
@@ -636,6 +637,16 @@ const Node = struct {
     fn deadline_set(node: *Node, deadline_ms: u64) void {
         assert(node.remote.mono != null); // `create_node` gives the remote its clock
         node.remote.deadline_ms = deadline_ms;
+    }
+
+    fn deadline_hook_fn(
+        context: *anyopaque,
+        hook_context: ?*anyopaque,
+        hook: ?*const fn (hook_context: *anyopaque) void,
+    ) void {
+        const node: *Node = @ptrCast(@alignCast(context));
+        node.remote.before_context = hook_context;
+        node.remote.before_fn = hook;
     }
 
     fn deadline_set_fn(context: *anyopaque, deadline_ms: u64) void {
