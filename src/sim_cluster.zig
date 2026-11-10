@@ -2572,8 +2572,7 @@ fn judge_job_container(
 /// are the runtime's, not the store's.
 fn track_relays(c: *Cluster) Failure!void {
     for (c.nodes) |node| {
-        try check(c, node.sim.containers.relay_problem() == null,
-            node.sim.containers.relay_problem() orelse "");
+        try check(c, node.sim.containers.relay_problem() == null, node.sim.containers.relay_problem() orelse "");
     }
     for (c.nodes, 0..) |node, index| {
         for (node.sim.containers.containers.items) |container| {
@@ -2583,8 +2582,7 @@ fn track_relays(c: *Cluster) Failure!void {
             for (c.nodes[index + 1 ..]) |other| {
                 for (other.sim.containers.containers.items) |twin| {
                     if (!twin.relay_open) continue;
-                    try check(c, !std.mem.eql(u8, container.name, twin.name),
-                        "R2: two relay listeners are open for one run");
+                    try check(c, !std.mem.eql(u8, container.name, twin.name), "R2: two relay listeners are open for one run");
                 }
             }
         }

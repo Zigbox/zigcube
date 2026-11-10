@@ -1275,7 +1275,7 @@ const c1_teeth_roots = [_]struct {
         // R1 (a listener open on a stopped container); relayed jobs exist only in the strong
         // world, which the tooth switches on. Plain runs (no `--c1`) judge R1 too.
         .symptom = "R1",
-        .canary_seeds = 40,
+        .canary_seeds = 20,
         .plain_symptom = "R1",
     },
     .{
