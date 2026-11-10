@@ -1481,7 +1481,8 @@ pub const Cluster = struct {
         // its run must end `not_started` (J8's second clause). No draw, and only with
         // `Options.strong`: other worlds are unchanged.
         const unplaceable = c.strong and c.job_next % 13 == 5;
-        // Every 7th job names the relay (B3 slice 3). No draw, and only with `Options.strong`.
+        // Every third job (job numbers 1, 4, 7, ...; `job_relayed`) names the relay (B3 slice 3).
+        // No draw, and only with `Options.strong`.
         const relayed = c.strong and job_relayed(c.job_next);
         c.job_next += 1;
         var buffer: [16]u8 = undefined;
