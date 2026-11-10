@@ -284,6 +284,30 @@ is one pass of `reconcile`, after the replicas. It wants a run when the node hol
 5. **Adoption.** After `kill -9` the new agent lists the runtime, reads the start records, and adopts
    a `claimed` run without a second start.
 
+### A run's relay (B3 slice 2)
+
+A run whose record has a `relay` starts with one: `Runtime.Spec.relay` is the upstream `HOST:PORT`
+(additive; empty for none). On the fake runtime the supervisor (`src/fake_supervisor.zig`) calls
+`Relay.open` (`src/relay.zig`) **before** it spawns the command, so it is still single-threaded at
+the fork: a loopback listener on a port the host picks, `relay.port` and `ZCUBE_RELAY` in the
+command's environment. It cannot listen: the run ends as a start failure, ZC-E0702. After the spawn
+`run` starts an acceptor thread, one thread per connection (16 at most), each copying both ways
+through two `relay_pump.zig` pipes (one buffer of `relay_buffer_bytes`; a read is asked for only
+when the buffer is empty, so a slow side holds the other; an end of input is passed on with
+`shutdown(WR)`). `relay.log` (at most `relay_log_bytes_max`) holds the diagnostics, which are
+ZC-E0701, E0704, E0705, W0701 and W0702.
+
+The listener belongs to the supervisor, which outlives the agent, so an agent restart changes
+nothing and the adopting agent finds the relay as it was. The supervisor closes it, and every
+connection, when the command ends, however it ends (a stop, the deadline, a cancel); `kill -9` of
+the supervisor kills the process and the kernel closes the listener. `agent-smoke` runs one relayed
+job against an upstream of its own and asserts the port refuses connections after the job's end.
+The real adapter (`zigbox_runtime.zig`) refuses a spec with a relay: ZC-E0703, a start failure.
+
+Known limits: an upstream that is not an IPv4 literal is connected through `std.Io`, which cannot
+be interrupted, so stopping a relay whose upstream name is black-holed can wait up to
+`relay_connect_timeout_ms` (10 s); IPv4 literals poll and stop at once.
+
 The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
 
 ## What survives what
