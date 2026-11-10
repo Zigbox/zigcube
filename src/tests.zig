@@ -82,6 +82,9 @@ test {
 comptime {
     _ = @import("peer_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only, which this root is.
     _ = @import("x509_fuzz.zig"); // The same: the WASI core root has no such environment.
+    _ = @import("relay_pump.zig");
+    _ = @import("relay_fuzz.zig");
+    _ = @import("relay.zig");
     _ = @import("tls_fuzz.zig"); // The same.
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
     _ = @import("tls_conn_test.zig");
