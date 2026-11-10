@@ -80,10 +80,7 @@ pub const Config = struct {
 pub const Command = union(enum) { run: Config, version, help };
 
 /// One relay: the name a job gives and the `host:port` the node agent connects to for it.
-pub const Relay = struct {
-    name: []const u8,
-    address: []const u8,
-};
+pub const Relay = @import("records.zig").JobRelay;
 
 /// What a ZON file holds: the settings `Fields` reads, and the relays, whose names are the
 /// file's own and so are read from the syntax tree.

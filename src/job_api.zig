@@ -44,8 +44,12 @@ pub const Input = struct {
     input: ?[]const u8 = null,
     input_env: ?[]const u8 = null,
     submit_by_ms: u64,
-    /// The request named a `relay` or a `placement`: refused, they are not built yet.
-    relay: bool = false,
+    /// The name of a relay the job asks for (B3). It is looked up in `relays`; a name that is not
+    /// there is ZC-E0130. A job never gives an address.
+    relay: ?[]const u8 = null,
+    /// The server's relay table, from its configuration: what `relay` is resolved against.
+    relays: []const records.JobRelay = &.{},
+    /// The request named a `placement`: refused, it is not built yet.
     placement: bool = false,
     applied_by: []const u8,
     request_id: []const u8,
@@ -115,6 +119,30 @@ fn validate_command(ctx: *const Context, input: Input) Error!void {
     if (words[0].len == 0) return refuse(ctx, "command", "the first word is empty", .{});
     for (words) |word| {
         if (has_nul(word)) return refuse(ctx, "command", "a word holds a NUL byte", .{});
+    }
+}
+
+/// The relay a job names, as the table of the server's configuration has it.
+fn resolve_relay(input: Input) ?records.JobRelay {
+    const name = input.relay orelse return null;
+    for (input.relays) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
+}
+
+fn validate_relay(ctx: *const Context, input: Input) Error!void {
+    for (input.env) |pair| {
+        if (std.mem.eql(u8, pair[0], constants.relay_env_name)) {
+            return refuse(ctx, "env", "{s} is set by the relay, a job cannot set it", .{
+                constants.relay_env_name,
+            });
+        }
+    }
+    const name = input.relay orelse return;
+    if (name.len == 0) return refuse(ctx, "relay", "must be the name of a relay, a string", .{});
+    if (resolve_relay(input) == null) {
+        return refuse(ctx, "relay", "'{s}' is not a relay this server configures", .{name});
     }
 }
 
@@ -334,7 +362,7 @@ fn validate_shape(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     try validate_env(ctx, input);
     try validate_labels(ctx, input);
     if (input.retries > 0) return not_built(ctx, "retries");
-    if (input.relay) return not_built(ctx, "relay");
+    try validate_relay(ctx, input);
     if (input.placement) return not_built(ctx, "placement");
     try validate_times(ctx, input, now_ms);
     try validate_input(ctx, input);
@@ -379,6 +407,7 @@ pub fn run_of(job: *const records.Job, id: []const u8) records.JobRun {
         .input_env = job.input_env,
         .input_digest = job.input_digest,
         .input_bytes = job.input_bytes,
+        .relay = job.relay,
         .start_by_ms = job.created_at_ms + job.deadline_ms,
         .created_at_ms = job.created_at_ms,
         .stop = .{ .cause = .not_started, .at_ms = std.math.maxInt(u64) },
@@ -429,6 +458,9 @@ fn spec_equal(old: *const records.Job, new: *const records.Job) bool {
     if (old.deadline_ms != new.deadline_ms or old.retries != new.retries) return false;
     if (old.grace_ms != new.grace_ms) return false;
     if (!optional_equal(old.input_env, new.input_env)) return false;
+    const old_relay: ?[]const u8 = if (old.relay) |r| r.name else null;
+    const new_relay: ?[]const u8 = if (new.relay) |r| r.name else null;
+    if (!optional_equal(old_relay, new_relay)) return false;
     return optional_equal(old.input_digest, new.input_digest);
 }
 
@@ -556,6 +588,7 @@ pub fn create(
         .input_env = input.input_env,
         .input_digest = digest,
         .input_bytes = if (input.input) |text| text.len else null,
+        .relay = resolve_relay(input),
         .submit_by_ms = input.submit_by_ms,
         .created_at_ms = now_ms,
         .applied_by = input.applied_by,

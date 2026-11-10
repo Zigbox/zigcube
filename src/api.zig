@@ -99,6 +99,9 @@ pub const Api = struct {
     /// The ttl of the leases the agent endpoints grant. `server_config.zig` refuses a value an
     /// agent cannot fence in time for (ZC-E0121).
     lease_ttl_ms: u32 = constants.lease_ttl_ms,
+    /// The relays the server's configuration names (B3): what a job's `relay` is resolved against
+    /// at admission. The memory behind it outlives the server.
+    relays: []const records.JobRelay = &.{},
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
     /// The server's guard against a store that went backwards, for
@@ -367,6 +370,24 @@ fn check_applied_by(ctx: *const Context, text: []const u8) Failure!void {
     }
 }
 
+/// The `relay` of a job body: a string, or anything else, which is skipped (never built, like
+/// `Present`) and refused by name in `job_api` as an empty relay name.
+const RelayField = struct {
+    name: ?[]const u8 = null,
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !RelayField {
+        if (try source.peekNextTokenType() != .string) {
+            try source.skipValue();
+            return .{};
+        }
+        return .{ .name = try std.json.innerParse([]const u8, allocator, source, options) };
+    }
+};
+
 /// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
 /// 409,600-byte array of zeros takes about 37 times that in the arena.
 const Present = struct {
@@ -382,8 +403,9 @@ const Present = struct {
     }
 };
 
-/// The body of `POST /v1/jobs`: a job as JSON. `relay` and `placement` are parsed so that they
-/// can be refused by name (not built yet), not as unknown fields.
+/// The body of `POST /v1/jobs`: a job as JSON. `relay` is the name of a relay of the server's
+/// configuration (B3); `placement` is parsed so that it can be refused by name (not built yet),
+/// not as an unknown field.
 const JobBody = struct {
     name: []const u8,
     image: []const u8,
@@ -398,7 +420,7 @@ const JobBody = struct {
     input: ?[]const u8 = null,
     input_env: ?[]const u8 = null,
     submit_by_ms: u64,
-    relay: ?Present = null,
+    relay: ?RelayField = null,
     placement: ?Present = null,
     applied_by: []const u8 = anonymous,
 };
@@ -421,6 +443,8 @@ const JobSpec = struct {
     input_env: ?[]const u8,
     input_digest: ?[]const u8,
     input_bytes: ?u64,
+    /// The name of the relay the job asked for; absent when it asked for none.
+    relay: ?[]const u8,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8,
@@ -441,6 +465,7 @@ const JobSpec = struct {
             .input_env = job.input_env,
             .input_digest = job.input_digest,
             .input_bytes = job.input_bytes,
+            .relay = if (job.relay) |relay| relay.name else null,
             .submit_by_ms = job.submit_by_ms,
             .created_at_ms = job.created_at_ms,
             .applied_by = job.applied_by,
@@ -483,7 +508,12 @@ fn job_conflict(ctx: *const Context, name: []const u8) Failure {
     return error.Failed;
 }
 
-fn job_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!job_api.Input {
+fn job_input(
+    ctx: *const Context,
+    relays: []const records.JobRelay,
+    body: []const u8,
+    id: []const u8,
+) Failure!job_api.Input {
     if (body.len == 0) return bad_request(ctx, "body", "is required: the job as JSON");
     if (body.len > constants.job_request_bytes_max) {
         const problem = std.fmt.comptimePrint(
@@ -511,7 +541,9 @@ fn job_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!job_
         .input = parsed.input,
         .input_env = parsed.input_env,
         .submit_by_ms = parsed.submit_by_ms,
-        .relay = parsed.relay != null,
+        // A relay that is not a string becomes the empty name, which `job_api` refuses.
+        .relay = if (parsed.relay) |field| field.name orelse "" else null,
+        .relays = relays,
         .placement = parsed.placement != null,
         .applied_by = parsed.applied_by,
         .request_id = id,
@@ -1509,7 +1541,7 @@ const Call = struct {
 
     fn job_create(call: Call, body: []const u8, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
-        const input = try job_input(ctx, body, id);
+        const input = try job_input(ctx, call.api.relays, body, id);
         for (0..apply_attempts_max) |_| {
             const result = job_api.create(ctx, &call.api.source, input) catch
                 return propagate(ctx);

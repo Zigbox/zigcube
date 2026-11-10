@@ -119,6 +119,7 @@ pub const Server = struct {
                     .version = options.version,
                     .backend = config.store.backend(),
                     .lease_ttl_ms = config.lease_ttl_ms,
+                    .relays = config.relays,
                     .started_at_ms = now,
                     // The low 32 bits of the start time in milliseconds, never 0: a restart
                     // is later, so its ids differ from the last start's.

@@ -1176,3 +1176,42 @@ test "the jobs watch decodes statuses, filters by label and refuses the name wat
     const named = try job_json(&rig, "watch", "b3:51aa9c03");
     try rig.refused(post_job(&rig, "/v1/jobs", named), 400, "ZC-E0130");
 }
+
+/// A job body with the given extra members (JSON text, starting with a comma or empty).
+fn relay_body(rig: *Rig, name: []const u8, extra: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(rig.parsed.allocator(),
+        \\{{"name":"{s}","image":"b3:51aa9c03","command":["true"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d}{s}}}
+    , .{ name, rig.world.now_ms() + 30_000, extra });
+}
+
+test "a job names a relay the server configures; any other name or an env override is refused" {
+    // Goal: B3 admission. A configured name is admitted, shown by name and keeps the address out
+    // of the spec view; an unknown name, a non-string, and a job that sets ZCUBE_RELAY itself
+    // are ZC-E0130 naming the field.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const table = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    rig.api.relays = &table;
+    const good = try relay_body(&rig, "r1", ",\"relay\":\"botpike\"");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", good).status);
+    const got = rig.call(.{ .method = "GET", .path = "/v1/jobs/r1" });
+    try testing.expect(std.mem.indexOf(u8, got.body, "\"relay\":\"botpike\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got.body, "127.0.0.1") == null);
+
+    const cases = [_]struct { extra: []const u8, field: []const u8 }{
+        .{ .extra = ",\"relay\":\"nope\"", .field = "relay" },
+        .{ .extra = ",\"relay\":3", .field = "relay" },
+        .{ .extra = ",\"relay\":\"botpike\",\"env\":[[\"ZCUBE_RELAY\",\"x\"]]", .field = "env" },
+        .{ .extra = ",\"env\":[[\"ZCUBE_RELAY\",\"x\"]]", .field = "env" },
+    };
+    for (cases, 0..) |case, index| {
+        var name: [8]u8 = undefined;
+        const text = try std.fmt.bufPrint(&name, "bad{d}", .{index});
+        const response = post_job(&rig, "/v1/jobs", try relay_body(&rig, text, case.extra));
+        try rig.refused(response, 400, "ZC-E0130");
+        try testing.expect(std.mem.indexOf(u8, response.body, case.field) != null);
+    }
+}
