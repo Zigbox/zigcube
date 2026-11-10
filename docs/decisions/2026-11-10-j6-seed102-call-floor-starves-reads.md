@@ -1,6 +1,6 @@
 # J6 seed 102: the per-step call floor starves the agent's reads (#142, reopened)
 
-Status: diagnosis only; the fix needs the supervisor's choice (below). No code changed.
+Status: fixed with option 1 (supervisor's choice); see "Fix" at the end.
 
 Replay (main e1e9bc0): `sim_cluster 102 112 1 --c1 --strong --profile=slow_store --lease-ttl-ms=10000 --replicas-pct=100 --heal-at=99`
 fails J6 at 133142 ms: stop committed at 120416, run still executing 12726 ms later (bound 12000).
@@ -32,3 +32,18 @@ floor was sized for (#198, #202).
 2. Stop reads first: fetch `runs` before the replica loads so a cancel is seen within the first
    budget. Smaller, but only reorders the starvation.
 3. Widen J6's bound: not recommended (the stop really is unread, not slow by design).
+
+## Fix (option 1)
+`Agent.Deadline` gets an optional `hook_fn`; `cap_calls` registers `Agent.before_call` through it
+and `RemoteStore.exchange` runs it before every call (`Context` of the step is kept in
+`Agent.calls_ctx` for the step's length). `before_call`, if a run's wake (deadline or kill) is
+due, lists the containers and runs `enforce_deadlines` with a diagnostic of its own (the step's
+may hold a kept failure), then gives the call `calls_deadline_ms(now)`: the 1000 ms floor is per
+call, and a run is enforced at most one call late. `call_inflight_min_ms` (1000), its assertions
+against the grace and fence poll, and J6 and J8's bounds are unchanged. A wake that is not yet
+due costs only the re-cap (no listing), so a quiet step makes no extra runtime calls.
+The simulator (`sim_cluster.zig`) and the test world (`sim_world.zig`) wire the same hook.
+
+Tests: `each call of a step gets its own floor when a run's wake is near` (eight runs 100 ms
+apart, every agent call costs 150 ms of the clock: no call is cut; with the hook disabled, 4
+are). The replay line is in `c1_regressions`; seed 102 now stops its run within 2700 ms.
