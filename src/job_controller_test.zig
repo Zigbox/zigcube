@@ -295,6 +295,28 @@ test "a job gets its run and a pending status once, with a job_created decision"
     try testing.expectEqual(@as(u32, 0), try f.pass());
 }
 
+test "a job's resolved relay is carried into its run" {
+    // Goal: the assignment names the relay the job asked for (B3 slice 2). Method: a job with a
+    // relay, one pass, and the run it made.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    const value: records.Job = .{
+        .name = "ask",
+        .image = "b3:51aa9c03",
+        .command = &.{"true"},
+        .deadline_ms = 60 * 1000,
+        .submit_by_ms = f.manual.ms,
+        .created_at_ms = f.manual.ms,
+        .relay = .{ .name = "echo", .address = "127.0.0.1:9" },
+    };
+    try f.put(.api, records.job_key("ask").slice(), value);
+    try testing.expectEqual(@as(u32, 1), try f.pass());
+    const relay = (try f.read_run("ask")).?.relay.?;
+    try testing.expectEqualStrings("echo", relay.name);
+    try testing.expectEqualStrings("127.0.0.1:9", relay.address);
+}
+
 test "a job that has a job_created decision and no run is contradictory and never started" {
     var f: Fixture = undefined;
     try f.start();
