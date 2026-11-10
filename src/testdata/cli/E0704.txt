@@ -1,0 +1,5 @@
+error[ZC-E0704]: a relay's upstream did not answer in time
+  cause  the upstream 10.0.0.5:8080 of relay llm did not answer in 10000 ms
+  fix    check the route from this node to the upstream
+  more   zcube explain E0704 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0704.html

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0703]: this agent's build cannot serve a job's relay
+  cause  the job asks for relay llm; this agent has no relay support
+  reqid  r-0000001
+  fix    run the job on a node whose agent supports relays
+  more   zcube explain E0703
+  docs   https://zigbox.github.io/zigcube/errors/E0703.html

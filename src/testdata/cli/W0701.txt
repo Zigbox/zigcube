@@ -1,0 +1,5 @@
+warning[ZC-W0701]: a job's relay is at its connection limit
+  cause  relay llm has 16 connections open; a seventeenth was closed
+  fix    reuse connections or close them when done
+  more   zcube explain W0701 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0701.html

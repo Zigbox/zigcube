@@ -4,7 +4,7 @@
 //!
 //! ```
 //! zcube job run NAME --image DIGEST [--env K=V]... [--input-file F --input-env VAR]
-//!     [--deadline 10m] [--submit-within 10m] [--label k=v]... --command WORD...
+//!     [--relay NAME] [--deadline 10m] [--submit-within 10m] [--label k=v]... --command WORD...
 //! zcube job get NAME [--wait]
 //! zcube job list [--state S] [--label k=v]
 //! zcube job cancel NAME
@@ -60,6 +60,8 @@ pub const Run = struct {
     labels: Bounded(Pair, constants.job_labels_max) = .{},
     input_file: ?[]const u8 = null,
     input_env: ?[]const u8 = null,
+    /// The name of a relay the server's configuration defines (B3).
+    relay: ?[]const u8 = null,
     deadline_ms: u64 = deadline_default_ms,
     submit_within_ms: u64 = submit_within_default_ms,
 };
@@ -270,6 +272,8 @@ fn run_flag(run: *Run, flag: []const u8, cursor: *Cursor, diag: *Diag) Error!voi
         run.input_file = try cursor.value(diag, flag, "a file");
     } else if (std.mem.eql(u8, flag, "--input-env")) {
         run.input_env = try cursor.value(diag, flag, "a variable name");
+    } else if (std.mem.eql(u8, flag, "--relay")) {
+        run.relay = try cursor.value(diag, flag, "a relay name");
     } else if (std.mem.eql(u8, flag, "--deadline")) {
         run.deadline_ms = try duration_value(cursor, diag, flag);
     } else if (std.mem.eql(u8, flag, "--submit-within")) {
@@ -362,8 +366,9 @@ test "job run: every flag, the command takes the rest of the line" {
         "--env",        "A=1",       "--env",           "B=x=y",
         "--input-file", "in.txt",    "--input-env",     "PAYLOAD",
         "--deadline",   "90s",       "--submit-within", "45m",
-        "--label",      "team=data", "--command",       "sh",
-        "-c",           "--image",   "exit 3",
+        "--label",      "team=data", "--relay",         "llm",
+        "--command",    "sh",        "-c",              "--image",
+        "exit 3",
     });
     const run = job.run;
     try testing.expectEqualStrings("etl", run.name);
@@ -380,6 +385,8 @@ test "job run: every flag, the command takes the rest of the line" {
     try testing.expectEqualStrings("--image", run.command.slice()[2]);
 
     const plain = (try parse_words(&.{ "run", "x", "--image", "d", "--command", "true" })).run;
+    try testing.expectEqualStrings("llm", run.relay.?);
+    try testing.expect(plain.relay == null);
     try testing.expectEqual(deadline_default_ms, plain.deadline_ms);
     try testing.expectEqual(submit_within_default_ms, plain.submit_within_ms);
 }

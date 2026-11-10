@@ -275,6 +275,42 @@ fn job_invalid(diag: *diag_mod.Diag) void { // api.zig
     sample(diag, .E0130, &.{cause}, "set deadline_ms and submit the job again");
 }
 
+fn relay_refused(diag: *diag_mod.Diag) void { // relay.zig
+    const cause = "the upstream 10.0.0.5:8080 of relay llm refused the connection";
+    const fix = "start the upstream, or correct the relay's address in `relays`";
+    sample(diag, .E0701, &.{cause}, fix);
+}
+
+fn relay_not_listening(diag: *diag_mod.Diag) void { // fake_supervisor.zig
+    const cause = "listen on 127.0.0.1 failed: ProcessFdQuotaExceeded";
+    sample(diag, .E0702, &.{cause}, "free file descriptors on the node and submit the job again");
+}
+
+fn relay_unserved(diag: *diag_mod.Diag) void { // zigbox_runtime.zig
+    const cause = "the job asks for relay llm; this agent has no relay support";
+    sample(diag, .E0703, &.{cause}, "run the job on a node whose agent supports relays");
+}
+
+fn relay_timeout(diag: *diag_mod.Diag) void { // relay.zig
+    const cause = "the upstream 10.0.0.5:8080 of relay llm did not answer in 10000 ms";
+    sample(diag, .E0704, &.{cause}, "check the route from this node to the upstream");
+}
+
+fn relay_broken(diag: *diag_mod.Diag) void { // relay.zig
+    const cause = "a connection through relay llm failed in a write: ConnectionResetByPeer";
+    sample(diag, .E0705, &.{cause}, "none needed for a reset; check the network if it repeats");
+}
+
+fn relay_full(diag: *diag_mod.Diag) void { // relay.zig
+    const cause = "relay llm has 16 connections open; a seventeenth was closed";
+    sample(diag, .W0701, &.{cause}, "reuse connections or close them when done");
+}
+
+fn relay_bound(diag: *diag_mod.Diag) void { // relay.zig
+    const cause = "a connection through relay llm was idle for 300000 ms and was closed";
+    sample(diag, .W0702, &.{cause}, "open a new connection to go on");
+}
+
 fn job_differs(diag: *diag_mod.Diag) void { // api.zig
     const cause = "a job named train-7 exists and differs from this one in: command";
     sample(diag, .E0131, &.{cause}, "use another name, or submit exactly the job that exists");
@@ -920,6 +956,13 @@ const cases = [_]Case{
     relayed(.B0003, accounting_bug),
     relayed(.B0004, job_end_unmapped),
     relayed(.B0005, run_too_large),
+    relayed(.E0701, relay_refused),
+    relayed(.E0702, relay_not_listening),
+    relayed(.E0703, relay_unserved),
+    relayed(.E0704, relay_timeout),
+    relayed(.E0705, relay_broken),
+    relayed(.W0701, relay_full),
+    relayed(.W0702, relay_bound),
 };
 
 const repair_node1: []const []const u8 = &.{ "repair", "allocations", "node1" };

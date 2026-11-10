@@ -1,0 +1,5 @@
+error[ZC-E0701]: a relay's upstream refused a connection
+  cause  the upstream 10.0.0.5:8080 of relay llm refused the connection
+  fix    start the upstream, or correct the relay's address in `relays`
+  more   zcube explain E0701 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0701.html

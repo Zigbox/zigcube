@@ -529,9 +529,12 @@ pub const registry = [_]Entry{
         \\more labels than a job may carry.
         \\
         \\Two fields are refused because they are not built yet, and the cause says
-        \\so: retries above 0 (a job runs at most once), and relay or placement.
-        \\Accepting a field and ignoring it would say something false about where the
-        \\job runs.
+        \\so: retries above 0 (a job runs at most once), and placement. Accepting a
+        \\field and ignoring it would say something false about where the job runs.
+        \\
+        \\A relay must be the name of one of the relays in the server's `relays`
+        \\setting; an unknown name is refused, and a job may not set ZCUBE_RELAY in
+        \\its own env, because the relay's supervisor sets it.
         \\
         \\Fix the field it names and submit again.
         ,
