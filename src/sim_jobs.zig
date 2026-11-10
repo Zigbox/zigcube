@@ -13,7 +13,9 @@ const runtime = @import("runtime.zig");
 
 const Context = controller.Context;
 
-/// Runs the ledger can hold. A run past it is counted, not judged (J2 stays sound for the rest).
+/// Runs the ledger can hold. A run past it is counted, and the cluster simulation then fails the
+/// run (`ledger_problem`): J2 and J8's second clause read the whole ledger, so a full one would
+/// leave them judging less than they claim.
 pub const ledger_max: u32 = 4096;
 /// Containers the trackers keep a clock for at once: every container the runtimes of the most
 /// nodes a simulation has can hold (`sim_cluster.zig` asserts the product), so that no live job
@@ -134,12 +136,7 @@ pub fn note_start(
     for (state.ledger[0..state.ledger_count]) |seen| {
         if (seen == hash) return fail(state, "J2: a run id was started a second time");
     }
-    if (state.ledger_count < ledger_max) {
-        state.ledger[state.ledger_count] = hash;
-        state.ledger_count += 1;
-    } else {
-        state.ledger_full += 1;
-    }
+    ledger_add(state, hash);
     if (claim_problem(ctx, node, tenure, job, spec)) |found| return fail(state, found);
     const run_at = records.job_run_key(job);
     const got = ctx.store.get(ctx.arena, run_at.slice(), null, ctx.diag) catch {
@@ -152,6 +149,24 @@ pub fn note_start(
         return fail(state, "J7: a run cannot be decoded");
     };
     if (run.stop != null) return fail(state, "J7: a run was started after its stop committed");
+}
+
+/// Records a started run's hash, or counts it as unjudged when the ledger is full.
+fn ledger_add(state: *State, hash: u64) void {
+    if (state.ledger_count < ledger_max) {
+        state.ledger[state.ledger_count] = hash;
+        state.ledger_count += 1;
+    } else {
+        state.ledger_full += 1;
+    }
+}
+
+/// The failure a full ledger is: J2 and J8's second clause cannot judge a run it has no room for,
+/// so the run fails, loudly, rather than passing with less checked.
+pub fn ledger_problem(state: *const State) ?[]const u8 {
+    if (state.ledger_full == 0) return null;
+    return "J8: the start ledger is full (ledger_max runs), so J2 and J8's second clause " ++
+        "cannot judge every run";
 }
 
 fn fail(state: *State, found: []const u8) void {
@@ -260,4 +275,18 @@ test "note_marks: wedges before the deadline do not count" {
     try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
     note_marks(&watch, 1000 + deadline + 9, deadline, true, 9000);
     try std.testing.expectEqual(@as(?u64, 7600), watch.stop_wedged_base_ms);
+}
+
+test "a full start ledger is a failure, not a skip" {
+    var state: State = .{};
+    try std.testing.expect(ledger_problem(&state) == null);
+    var hash: u64 = 0;
+    while (hash < ledger_max) : (hash += 1) ledger_add(&state, hash);
+    try std.testing.expectEqual(ledger_max, state.ledger_count);
+    try std.testing.expect(ledger_problem(&state) == null);
+    ledger_add(&state, ledger_max);
+    try std.testing.expectEqual(@as(u32, 1), state.ledger_full);
+    const found = ledger_problem(&state) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, found, "ledger") != null);
+    try std.testing.expect(std.mem.startsWith(u8, found, "J8"));
 }
