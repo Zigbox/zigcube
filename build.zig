@@ -1389,7 +1389,7 @@ fn add_plain_tooth(
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{
         "--seeds",                                 b.fmt("1..{d}", .{entry.plain_seeds}),
-        b.fmt("{d}", .{c1_teeth_operations}),      "--expect-fail",
+        b.fmt("{d}", .{entry.ops}),                "--expect-fail",
         b.fmt("--expect-symptom={s}", .{symptom}),
     });
     teeth.dependOn(&run.step);
