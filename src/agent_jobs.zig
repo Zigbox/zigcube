@@ -895,7 +895,7 @@ const Work = struct {
             .name = subject.id,
             .image = run.image,
             .source = run.source,
-            .relay = if (run.relay) |relay| (if (c1_teeth.relay_dropped) "" else relay.address) else "",
+            .relay = relay_address(run),
             .command = run.command,
             .env = env,
             .limits = .{
@@ -1253,4 +1253,11 @@ fn is_running(listing: *const runtime.Listing) bool {
         .starting, .running => true,
         .stopped => false,
     };
+}
+
+/// The upstream a run's spec carries; empty if it has no relay (`relay_dropped` is the test-only
+/// fault that leaves it out).
+fn relay_address(run: anytype) []const u8 {
+    if (c1_teeth.relay_dropped) return "";
+    return if (run.relay) |relay| relay.address else "";
 }
