@@ -1058,7 +1058,7 @@ comptime {
     assert((job_admission_window_h + 1) * 49 + 256 < store_value_bytes_max);
 }
 
-// ---- The relay (docs/briefs/b3.md, slice 2) ------------------------------------------------------
+// ---- The relay (docs/briefs/b3.md, slice 2) ---------------------------------------------
 
 /// Relays a server's configuration may name (`relays` in the ZON file).
 pub const relays_max: u32 = 8;
