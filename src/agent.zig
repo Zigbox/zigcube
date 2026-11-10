@@ -417,7 +417,8 @@ pub const Agent = struct {
                 // once per step.
                 if (agent.list_noted_step != agent.steps) {
                     agent.list_noted_step = agent.steps;
-                    agent.note_enforce_failure(&local, "list the containers to enforce run deadlines");
+                    const what = "list the containers to enforce run deadlines";
+                    agent.note_enforce_failure(&local, what);
                 } else diag.reset();
             }
         }
