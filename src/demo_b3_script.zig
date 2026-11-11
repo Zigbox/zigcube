@@ -4,7 +4,7 @@
 //!   1. start: the server with the relay `botpike`, one guest with the agent and a test upstream;
 //!   2. a bystander job with a relay of its own runs on the node, so the hostile job has "another
 //!      job's relay" to aim at;
-//!   3. the hostile job runs: it reaches the world on seven counts, and the upstream (which it
+//!   3. the hostile job runs: it reaches the world on eight counts, and the upstream (which it
 //!      reaches through its relay) logs what it saw: every one must read `failed`;
 //!   4. the node: no relay listens in its namespace, no relay failure is logged, the job exits 0.
 
@@ -28,7 +28,7 @@ const bystander = "bystander";
 
 /// The checks of the hostile job, as the job names them in its report. Each reads `failed`.
 const checks = [_][]const u8{
-    "internet", "node", "metadata", "server", "upstream_direct", "dns", "raw",
+    "internet", "node", "metadata", "server", "upstream_direct", "other_relay", "dns", "raw",
 };
 
 /// What the job runs (`python -c`). It tries each route out, then reports through its relay:
@@ -67,6 +67,7 @@ const hostile_python =
     \\    ("metadata", tcp("169.254.169.254", 80)),
     \\    ("server", tcp(os.environ["SERVER_HOST"], int(os.environ["SERVER_PORT"]))),
     \\    ("upstream_direct", tcp("127.0.0.1", 9090)),
+    \\    ("other_relay", tcp(node, 8080)),
     \\    ("dns", dns()),
     \\    ("raw", raw()),
     \\]
@@ -166,7 +167,7 @@ fn bystander_runs(demo: *Demo) !void {
 
 fn hostile_runs(demo: *Demo) !void {
     const host = demo.host;
-    host.section("2. The hostile job: seven ways out, one way through the relay");
+    host.section("2. The hostile job: eight ways out, one way through the relay");
     const addr_text = try demo.guest(0, "node-addr", .{});
     const node_addr = std.mem.trim(u8, addr_text, " \r\n");
     const node_env = try std.fmt.allocPrint(demo.arena(), "NODE_ADDR={s}", .{node_addr});

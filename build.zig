@@ -679,6 +679,9 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
             },
         }),
     });
+    // demo-b3 runs only on KVM hosts, so `check` compiles it (no run) to catch what a comptime
+    // assert or a type error in it would otherwise show only in CI's demo-b3 job.
+    b.step("demo-b3-build", "Compile demo-b3 without running it").dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -2043,7 +2046,7 @@ fn add_check_step(b: *std.Build) void {
     const gates = [_][]const u8{
         "install",            "test",       "tidy",         "errors-site-check",
         "wasm-check",         "wasm-test",  "console-wasm", "check-store-memory",
-        "check-store-sqlite", "mtls-teeth",
+        "check-store-sqlite", "mtls-teeth", "demo-b3-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);
