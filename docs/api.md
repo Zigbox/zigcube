@@ -475,8 +475,10 @@ for an idempotent resubmission includes the relay name (not the address).
 Bounds, per job: `relay_connections_max` = 16 connections (a 17th is closed, ZC-W0701),
 `relay_connection_bytes_max` = 1 GiB each way and `relay_idle_ms` = 300,000 (ZC-W0702),
 `relay_connect_timeout_ms` = 10,000 (ZC-E0704). An upstream that refuses is ZC-E0701, a connection
-that fails in the middle ZC-E0705. A supervisor that cannot listen ends the run as a start failure
-(ZC-E0702); an agent whose build cannot serve a relay does the same with ZC-E0703 (none does
+that fails in the middle ZC-E0705. On the fake runtime a supervisor that cannot listen ends the run as a start failure
+(ZC-E0702). On `--runtime zigbox` the container has already started when the relay fails, so it is
+killed and the job ends as killed by signal 9; the reason, ZC-E0702 with its cause, is in the
+container's `relay.log` only (decisions/2026-11-11-b3-relay-failure-ends-as-signal.md). An agent whose build cannot serve a relay does the same with ZC-E0703 (none does
 today: `--runtime zigbox` serves it since B3 slice 4). The codes are written to `relay.log` in the container's directory on the node; they
 are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstream is B4.
 
