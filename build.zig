@@ -2044,8 +2044,8 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",       "tidy",         "errors-site-check",
-        "wasm-check",         "wasm-test",  "console-wasm", "check-store-memory",
+        "install",            "test",       "tidy",          "errors-site-check",
+        "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
         "check-store-sqlite", "mtls-teeth", "demo-b3-build",
     };
     for (gates) |name| {
