@@ -390,8 +390,8 @@ are escaped (a control character takes six bytes in JSON).
   2^40, `pids` 1 to 4,194,304; outside them is ZC-E0130 naming `limits.<member>`.
 - **The admission window** counts creations in hourly buckets, so it covers the last
   `job_admission_window_h` hours and the current, partial one: a creation is forgotten 72 to 73 hours
-  later. A bucket ahead of the clock (the clock was stepped back) is dropped, not folded into the
-  present.
+  later. A bucket ahead of the clock (the clock was stepped back) is relabelled as the current hour with
+  its count, so it still counts against the cap and leaves the window with that hour.
 - A job record cannot reach `store_value_bytes_max`: a run record over `job_run_bytes_max` is
   already `400` ZC-E0130 (`check_run_size`), and the Job record holds the same fields
   (docs/decisions/2026-11-08-zc-e0207-cut.md). ZC-E0207 stays `503` for other records (service specs).

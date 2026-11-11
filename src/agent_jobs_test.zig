@@ -1442,6 +1442,31 @@ test "a run's unwritable start record neither fences the node nor holds back ano
     try testing.expect(std.mem.indexOf(u8, bytes, "\"deadline\"") != null);
 }
 
+test "a run whose step fails does not hold back the runs after it in the same pass (#205)" {
+    // Goal: the release reviews' SHOULD (RA, RB): one job's failing step (here its start record
+    // cannot be written) must not abort the pass, or every later job on the node is starved of
+    // its claim, start, cancel and report. Method: two runs; "other-job" sorts before
+    // "train-job", and its record refuses every write. Within the 2 s the test advances,
+    // "train-job" is claimed and started all the same, the failure is noted, and the node is not
+    // fenced.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const world = rig.world;
+    var failing: FailingPut = .{ .inner = world.files.interface(), .poisoned = "other-job" };
+    world.state_override = failing.interface();
+    failing.armed = true;
+    try assign_other(&rig, "other", "other-job", 60_000);
+    _ = try rig.assign(60_000);
+    world.advance(2_000);
+    try testing.expect(failing.refused > 0);
+    try testing.expect(world.agent.enforce_failures > 0 or world.last_failure != null);
+    try testing.expect(!world.agent.fence.active);
+    try testing.expectEqual(@as(u32, 1), world.sim.running_count());
+    try testing.expect(world.sim.has(run_id));
+    const seen = (try rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+}
+
 test "a runtime listing that fails does not fail the step before the heartbeat" {
     // Goal: the review's SHOULD (PR #150), decided: a node that cannot list its containers skips
     // enforcement for the step and keeps its lease, as it did before enforcement moved ahead of

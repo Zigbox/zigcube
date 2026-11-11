@@ -1410,7 +1410,6 @@ fn has_decision(
     return true;
 }
 
-/// A diagnostic as the JSON a decision embeds (DIAGNOSTICS.md).
 /// The diagnostic `ctx.diag` holds, as the text a decision carries.
 fn diagnostic_of(ctx: *const Context) Error!records.Raw {
     const diagnostic = ctx.arena.create(zigbox.diagnostic.Diagnostic) catch

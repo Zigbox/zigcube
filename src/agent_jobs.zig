@@ -225,6 +225,7 @@ pub fn pass(
     ctx: *const Context,
     listings: []const runtime.Listing,
     assigned: []const Entry(records.Assigned),
+    kept: *agent_mod.Kept,
 ) Error!u32 {
     agent.jobs_wake_mono_ms = std.math.maxInt(u64);
     const state = ctx.state orelse return 0;
@@ -248,8 +249,11 @@ pub fn pass(
         null,
         constants.job_admitted_window_max,
     )).items;
+    // One run's failing step must not starve the runs after it (#205): like a replica's, it is
+    // kept and the next run is looked at; only a failure that is not the runtime's ends the pass.
     for (subjects) |subject| {
-        try work.one(subject);
+        if (kept.stopped) break;
+        kept.stage(agent, ctx, "reconcile a run", work.one(subject));
         if (agent.fence.active) break;
     }
     return work.commits;
@@ -933,10 +937,11 @@ const Work = struct {
     }
 
     /// `runtime.start` returned an error with its diagnostic in `ctx.diag`. If the runtime
-    /// lists no container of this run (or cannot be asked), nothing started and the run ends as
-    /// a start failure with that diagnostic. If it lists one, the run is executing: it is not
-    /// reported, the error goes to the caller with its diagnostic, the record stays `claimed`
-    /// and the next pass adopts the container through `container`, as it did before RB-N4.
+    /// lists no container of this run, nothing started and the run ends as a start failure with
+    /// that diagnostic. If it lists one, or cannot be asked (`container_up` is then true), the
+    /// run is executing: it is not reported, the error goes to the caller with its diagnostic,
+    /// the record stays `claimed` and the next pass adopts the container through `container`,
+    /// as it did before RB-N4.
     fn start_errored(work: *Work, subject: Subject, record: StartRecord, err: Error) Error!void {
         const ctx = work.ctx;
         if (work.container_up(subject.id)) return err;
