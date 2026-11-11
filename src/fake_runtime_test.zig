@@ -755,3 +755,157 @@ fn boot_now_ms() u64 {
     assert(ms >= 0);
     return @intCast(ms);
 }
+
+// ---- B3 slice 2: the relay ----------------------------------------------------------------------
+
+const relay_module = @import("relay.zig");
+
+/// A relayed container whose upstream is `echo`'s port; its supervisor's relay port is read from
+/// `relay.port`.
+fn launch_relayed(rig: *Rig, name: []const u8, echo: *relay_module.Echo) !runtime.Handle {
+    var script: [3 * constants.state_path_bytes_max + 120]u8 = undefined;
+    const text = try std.fmt.bufPrint(
+        &script,
+        "echo \"$ZCUBE_RELAY\" > {s}/relay.env.tmp && mv {s}/relay.env.tmp {s}/relay.env;" ++
+            " while true; do sleep 1; done",
+        .{ rig.path, rig.path, rig.path },
+    );
+    var upstream: [32]u8 = undefined;
+    const address = try std.fmt.bufPrint(&upstream, "127.0.0.1:{d}", .{echo.bound.port});
+    const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = name }};
+    const value: runtime.Spec = .{
+        .name = name,
+        .image = "b3:51aa9c03",
+        .command = &.{ "sh", "-c", text },
+        .relay = address,
+        .labels = &labels,
+    };
+    var local: Diag = undefined;
+    local.reset();
+    const outcome = try rig.fake.interface().start(&value, &local);
+    return outcome.started;
+}
+
+fn relay_port_of(rig: *Rig, name: []const u8) !u16 {
+    const dir = try rig.fake.containers.openDir(testing.io, name, .{});
+    defer dir.close(testing.io);
+    var buffer: [32]u8 = undefined;
+    const text = try dir.readFile(testing.io, fake_files.file_relay_port, &buffer);
+    return std.fmt.parseInt(u16, std.mem.trim(u8, text, "\n "), 10);
+}
+
+fn expect_echo(port: u16) !void {
+    const fd = try relay_module.dial(port);
+    defer _ = std.os.linux.close(fd);
+    _ = std.os.linux.write(fd, "ping", 4);
+    var buffer: [8]u8 = undefined;
+    try testing.expectEqual(@as(?usize, 4), relay_module.receive(fd, &buffer, 2000));
+    try testing.expectEqualStrings("ping", buffer[0..4]);
+}
+
+fn expect_closed(port: u16) !void {
+    for (0..300) |_| {
+        const fd = relay_module.dial(port) catch return;
+        _ = std.os.linux.close(fd);
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.StillListening;
+}
+
+test "a relayed container is told its relay, which reaches the upstream and nothing else" {
+    // Goal: B3 slice 2's route. Method: the command records ZCUBE_RELAY; a connection to the
+    // port in it is echoed by the upstream (the test's echo server).
+    var rig = try Rig.start();
+    defer rig.stop();
+    const echo = try relay_module.Echo.start();
+    defer echo.stop();
+    _ = try launch_relayed(rig, "relay-1", echo);
+    const port = try relay_port_of(rig, "relay-1");
+    var buffer: [64]u8 = undefined;
+    var wanted: [64]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&wanted, "http://127.0.0.1:{d}\n", .{port});
+    var written: []const u8 = "";
+    for (0..300) |_| {
+        written = rig.tmp.dir.readFile(testing.io, "relay.env", &buffer) catch {
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+            continue;
+        };
+        break;
+    }
+    try testing.expectEqualStrings(expected, written);
+    try expect_echo(port);
+}
+
+test "a relay's listener is closed when the command is killed, stopped, or its supervisor dies" {
+    // Goal: no ending leaves a route open. Method: three relayed containers, each ended another
+    // way; after each is reported stopped, nothing listens on its port.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const echo = try relay_module.Echo.start();
+    defer echo.stop();
+    var local: Diag = undefined;
+
+    const killed = try launch_relayed(rig, "relay-k", echo);
+    const killed_port = try relay_port_of(rig, "relay-k");
+    const command = try rig.pid_of("relay-k", fake_files.file_child);
+    std.posix.kill(command, .KILL) catch unreachable; // It is running: its port was read.
+    _ = try rig.wait_stopped(killed);
+    try expect_closed(killed_port);
+
+    const stopped = try launch_relayed(rig, "relay-s", echo);
+    const stopped_port = try relay_port_of(rig, "relay-s");
+    local.reset();
+    try rig.fake.interface().stop(stopped, 2000, &local);
+    _ = try rig.wait_stopped(stopped);
+    try expect_closed(stopped_port);
+
+    const lost = try launch_relayed(rig, "relay-l", echo);
+    const lost_port = try relay_port_of(rig, "relay-l");
+    try expect_echo(lost_port);
+    const supervisor = try rig.pid_of("relay-l", fake_files.file_supervisor);
+    std.posix.kill(supervisor, .KILL) catch unreachable; // It is running: it echoed.
+    _ = try rig.wait_stopped(lost);
+    try expect_closed(lost_port);
+}
+
+test "a restarted agent adopts a relayed container, and its relay still works" {
+    // Goal: the relay lives in the supervisor, which outlives the agent. Method: restart the
+    // runtime, then use the same port, then end the container.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const echo = try relay_module.Echo.start();
+    defer echo.stop();
+    const handle = try launch_relayed(rig, "relay-a", echo);
+    const port = try relay_port_of(rig, "relay-a");
+    try rig.restart();
+    try expect_echo(port);
+    var local: Diag = undefined;
+    local.reset();
+    try rig.fake.interface().stop(handle, 2000, &local);
+    _ = try rig.wait_stopped(handle);
+    try expect_closed(port);
+}
+
+test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC-E0507" {
+    // Goal: the relay's own failure has its own code and fix (review of #208). Method: a spec
+    // whose relay address the supervisor cannot parse; the outcome and the stopped record are
+    // E0702 with a cause that names the step, and nothing was started.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const labels = [_]runtime.Label{.{ .key = runtime.label_replica, .value = "relay-bad" }};
+    const value: runtime.Spec = .{
+        .name = "relay-bad",
+        .image = "b3:51aa9c03",
+        .command = &forever,
+        .relay = "[]:80",
+        .labels = &labels,
+    };
+    var local: Diag = undefined;
+    local.reset();
+    const outcome = try rig.fake.interface().start(&value, &local);
+    try testing.expectEqualStrings("ZC-E0702", outcome.failed.code.slice());
+    const cause = outcome.failed.causes.slice()[0].slice();
+    try testing.expect(std.mem.find(u8, cause, "HOST:PORT") != null);
+    const now = try rig.status(runtime.Handle.init("relay-bad"));
+    try testing.expectEqualStrings("ZC-E0702", now.stopped.start_failed.code.slice());
+}

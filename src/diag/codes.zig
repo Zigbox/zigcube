@@ -105,6 +105,13 @@ pub const Code = enum(u8) {
     W0601,
     W0602,
     W0603,
+    E0701,
+    E0702,
+    E0703,
+    E0704,
+    E0705,
+    W0701,
+    W0702,
     E0801,
     E0802,
     E0803,
@@ -522,9 +529,12 @@ pub const registry = [_]Entry{
         \\more labels than a job may carry.
         \\
         \\Two fields are refused because they are not built yet, and the cause says
-        \\so: retries above 0 (a job runs at most once), and relay or placement.
-        \\Accepting a field and ignoring it would say something false about where the
-        \\job runs.
+        \\so: retries above 0 (a job runs at most once), and placement. Accepting a
+        \\field and ignoring it would say something false about where the job runs.
+        \\
+        \\A relay must be the name of one of the relays in the server's `relays`
+        \\setting; an unknown name is refused, and a job may not set ZCUBE_RELAY in
+        \\its own env, because the relay's supervisor sets it.
         \\
         \\Fix the field it names and submit again.
         ,
@@ -1429,6 +1439,115 @@ pub const registry = [_]Entry{
         \\code of this node's disk or memory failing). If the replica did not
         \\start, the pull's own diagnostic follows it. If it repeats on every
         \\start, check the peers and the network between them.
+        ,
+    },
+    .{
+        .code = .E0701,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a relay's upstream refused a connection",
+        .explanation =
+        \\A job's relay accepted a connection from the job and tried to connect to
+        \\its upstream, the address the server's configuration names for that relay,
+        \\and the connection was refused or reset, or the address could not be
+        \\reached. The job's connection was closed. Other connections through the
+        \\relay are not affected.
+        \\
+        \\Check that the upstream is running and that this node can reach it: the
+        \\relay connects from the node, not from inside the job. Correct the relay's
+        \\address in the server's `relays` setting if it is wrong; jobs submitted
+        \\afterwards use the new address, and a job already running keeps the one it
+        \\started with.
+        ,
+    },
+    .{
+        .code = .E0702,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a job's relay could not listen",
+        .explanation =
+        \\The supervisor of a job could not open the listener a relay needs, so the
+        \\job did not start: it ended as a start failure, because a job that expects a
+        \\relay and finds none would run without the route it was promised. The cause
+        \\line says which step failed (the socket, the bind, the listen).
+        \\
+        \\On the fake runtime the listener is a loopback port the host picks; the host
+        \\may be out of file descriptors or sockets. Check `ulimit -n` and the node's
+        \\load, then submit the job again.
+        ,
+    },
+    .{
+        .code = .E0703,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "this agent's build cannot serve a job's relay",
+        .explanation =
+        \\An assignment names a relay and this node's agent cannot give the job one:
+        \\its runtime has no way to hand a container a listener yet. The job ended as
+        \\a start failure instead of running without its relay.
+        \\
+        \\Run the job on nodes whose agent has relay support, or upgrade this agent to
+        \\the release that carries it. The agent and the server are upgraded
+        \\together: the agent first, then the server.
+        ,
+    },
+    .{
+        .code = .E0704,
+        .severity = .@"error",
+        .blame = .external,
+        .summary = "a relay's upstream did not answer in time",
+        .explanation =
+        \\A job's relay tried to connect to its upstream and nothing answered within
+        \\10 seconds. The job's connection was closed. A black-holed route, a
+        \\firewall that drops packets or a host that is down all look like this.
+        \\
+        \\Check the route from this node to the upstream named in the server's
+        \\`relays` setting. The job may connect again; each attempt waits the same
+        \\10 seconds and takes one of the job's 16 connection slots meanwhile.
+        ,
+    },
+    .{
+        .code = .E0705,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a relayed connection failed in the middle",
+        .explanation =
+        \\A connection through a job's relay was open and then a read or a write on
+        \\it failed: the peer reset it, or the host refused the call. Both ends were
+        \\closed. Bytes already copied were delivered; nothing is retried, because
+        \\the relay cannot know which request the bytes belonged to.
+        \\
+        \\A reset by the job or the upstream is ordinary and needs no action. If it
+        \\repeats on every connection, check the node's network and the upstream.
+        ,
+    },
+    .{
+        .code = .W0701,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a job's relay is at its connection limit",
+        .explanation =
+        \\A job opened a seventeenth connection through its relay while sixteen were
+        \\open. The new connection was closed at once and counted; the open ones are
+        \\not affected. The limit is per job and fixed.
+        \\
+        \\The job should reuse connections or close them when it is done with them.
+        \\A connection that sits idle holds its slot for up to five minutes.
+        ,
+    },
+    .{
+        .code = .W0702,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a relayed connection reached its byte or idle bound",
+        .explanation =
+        \\A connection through a job's relay was closed by the relay itself: it had
+        \\carried 1 GiB in one direction, or neither side had sent a byte for five
+        \\minutes. The cause line says which. The job's other connections are not
+        \\affected.
+        \\
+        \\Open a new connection to go on. A job that needs a connection quiet for
+        \\longer than five minutes should send something now and then.
         ,
     },
     .{

@@ -99,7 +99,8 @@ pub const help_text =
     \\  stats pull [node]            the recorded image pulls: bytes by source, time, struck peers
     \\  repair allocations <node>    show the repair of a node's accounting; --confirm writes it
     \\  job run <name> --image <digest> [--env K=V] [--input-file F --input-env VAR]
-    \\      [--deadline 10m] [--submit-within 10m] [--label k=v] --command <word>...
+    \\      [--relay NAME] [--deadline 10m] [--submit-within 10m] [--label k=v]
+    \\      --command <word>...
     \\                               run a command in an image once, to its end
     \\  job get <name> [--wait]      a job's state and ending; --wait waits for the ending
     \\  job list [--state S] [--label k=v]

@@ -621,6 +621,7 @@ const Pass = struct {
             .input_env = spec.input_env,
             .input_digest = spec.input_digest,
             .input_bytes = spec.input_bytes,
+            .relay = spec.relay,
             .start_by_ms = spec.created_at_ms +| spec.deadline_ms,
             .created_at_ms = now,
         };

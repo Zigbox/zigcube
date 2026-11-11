@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0705]: a relayed connection failed in the middle
+  cause  a connection through relay llm failed in a write: ConnectionResetByPeer
+  reqid  r-0000001
+  fix    none needed for a reset; check the network if it repeats
+  more   zcube explain E0705
+  docs   https://zigbox.github.io/zigcube/errors/E0705.html

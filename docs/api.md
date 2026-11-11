@@ -367,8 +367,9 @@ shared network.
 
 The body is the job as JSON: `name`, `image`, `command`, `deadline_ms`, `submit_by_ms` (required),
 `source`, `env` (`[["NAME","value"]]`), `limits`, `labels`, `grace_ms`, `input` (UTF-8 text, at most
-64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`. `retries` above 0,
-`relay` and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
+64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`, `relay` (B3: the name of a relay in the
+server's `relays` setting, see "Relays" below). `retries` above 0
+and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
 ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the same spec already
 exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
 it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job_admitted_window_max`
@@ -455,6 +456,39 @@ the job's chain of decisions.
 | `ZC-E0132` | user | too many jobs | `429` |
 | `ZC-E0133` | user | no such job | `404` |
 | `ZC-E0134` | user | `submit_by_ms` has passed | `410` |
+
+### Relays (B3 slice 2)
+
+A job that sets `"relay":"botpike"` runs with one route out: a listener on its own loopback, which
+the node's supervisor serves for that job alone and forwards to the upstream the **server's
+configuration** names (`relays` in the ZON file, at most `relays_max` = 8, each `.name = .{ .address
+= "HOST:PORT" }`; a bad entry is ZC-E0106). The job never gives an address. The job reaches the
+listener at `ZCUBE_RELAY` (`http://127.0.0.1:<port>`).
+
+Admission refuses, `400` ZC-E0130 naming the field: `relay` that is not a non-empty string, a name
+the server's configuration does not have, and an `env` that sets `ZCUBE_RELAY` (the relay owns it).
+The relay is resolved once, at admission: the job record holds the name and the address the
+configuration gave then, so a later edit of the configuration changes jobs submitted afterwards and
+no job already admitted. `GET /v1/jobs/{name}` shows `relay` as the name only. The spec comparison
+for an idempotent resubmission includes the relay name (not the address).
+
+Bounds, per job: `relay_connections_max` = 16 connections (a 17th is closed, ZC-W0701),
+`relay_connection_bytes_max` = 1 GiB each way and `relay_idle_ms` = 300,000 (ZC-W0702),
+`relay_connect_timeout_ms` = 10,000 (ZC-E0704). An upstream that refuses is ZC-E0701, a connection
+that fails in the middle ZC-E0705. A supervisor that cannot listen ends the run as a start failure
+(ZC-E0702); an agent whose runtime cannot serve a relay (`--runtime zigbox` today) does the same
+with ZC-E0703. The codes are written to `relay.log` in the container's directory on the node; they
+are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstream is B4.
+
+| Code | Blame | Summary |
+| --- | --- | --- |
+| `ZC-E0701` | external | the upstream refused a connection |
+| `ZC-E0702` | environment | the relay could not listen |
+| `ZC-E0703` | environment | the agent's build cannot serve a relay |
+| `ZC-E0704` | external | the upstream did not answer in time |
+| `ZC-E0705` | environment | a relayed connection failed in the middle |
+| `ZC-W0701` | user | the job is at its connection limit |
+| `ZC-W0702` | user | a connection reached its byte or idle bound |
 
 ## New diagnostic codes this needs
 

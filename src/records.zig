@@ -262,6 +262,11 @@ pub const JobLimits = struct {
 
 pub const JobCancel = struct { at_ms: u64, by: []const u8 = "" };
 
+/// The relay a job asked for, resolved at admission from the server's configuration (B3): the
+/// name the job wrote and the upstream address the configuration gave it then. A job never
+/// carries an address of its own choosing.
+pub const JobRelay = struct { name: []const u8, address: []const u8 };
+
 /// The desired state of a job: the immutable spec, and the one mutable member, `cancel_requested`.
 /// The input is never here, only its digest and size (`/job-input/<name>` holds it).
 pub const Job = struct {
@@ -280,6 +285,8 @@ pub const Job = struct {
     input_env: ?[]const u8 = null,
     input_digest: ?[]const u8 = null,
     input_bytes: ?u64 = null,
+    /// B3: absent on every job stored before it (additive, same version).
+    relay: ?JobRelay = null,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8 = "",
@@ -333,6 +340,8 @@ pub const JobRun = struct {
     input_env: ?[]const u8 = null,
     input_digest: ?[]const u8 = null,
     input_bytes: ?u64 = null,
+    /// B3: the resolved relay of the job, absent when it asked for none.
+    relay: ?JobRelay = null,
     start_by_ms: u64,
     created_at_ms: u64,
     stop: ?RunStop = null,

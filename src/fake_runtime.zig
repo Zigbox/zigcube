@@ -276,6 +276,7 @@ pub const FakeRuntime = struct {
             .command = spec.command,
             .env = Pairs.env[0..spec.env.len],
             .labels = Pairs.labels[0..spec.labels.len],
+            .relay = if (spec.relay.len > 0) spec.relay else null,
             .started_at_ms = self.clock.now_ms(),
         };
     }

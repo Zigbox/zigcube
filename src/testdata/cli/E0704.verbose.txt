@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  502
+error[ZC-E0704]: a relay's upstream did not answer in time
+  cause  the upstream 10.0.0.5:8080 of relay llm did not answer in 10000 ms
+  reqid  r-0000001
+  fix    check the route from this node to the upstream
+  more   zcube explain E0704
+  docs   https://zigbox.github.io/zigcube/errors/E0704.html

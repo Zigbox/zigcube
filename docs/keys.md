@@ -485,7 +485,9 @@ name rule (48 bytes).
 ```
 
 The spec is immutable. `cancel_requested` is the one member that changes (set once). The input is
-never here, only its digest and size. `retries` is 0 (a larger value is `ZC-E0130`). At most
+never here, only its digest and size. `retries` is 0 (a larger value is `ZC-E0130`).
+`relay` (B3, optional, additive at the same version) is `{"name":"botpike","address":"HOST:PORT"}`:
+the name the job asked for and the address the server's configuration gave it at admission. At most
 `job_labels_max` (6) labels, `job_command_words_max` (64) command words, `env` of at most
 `job_env_bytes_max` (8 KiB). Written with its `/job-input/` and `/job-admission` in one transaction.
 
@@ -508,7 +510,8 @@ status, which compares it. Neither is deleted.
 ### `/job-runs/<name>`: the run (job controller)
 
 `{"v":1,"id":"train-7-job","job":"train-7",` the spec's `image`, `source`, `command`, `env`,
-`limits`, `deadline_ms`, `grace_ms`, `labels`, `input_env`, `input_digest`, `input_bytes`,
+`limits`, `deadline_ms`, `grace_ms`, `labels`, `input_env`, `input_digest`, `input_bytes`, `relay`
+(B3, as in the job),
 `"start_by_ms":…,"created_at_ms":…,"stop":{"cause":"cancel","at_ms":…}}`. At most
 `job_run_bytes_max` (16 KiB). Created once, with its status. `stop` is set at most once and never
 removed; its `cause` is `cancel`, `unreachable` or `not_started`. From the revision of the `stop`,
@@ -545,7 +548,9 @@ Admissible under the three conditions of authority.md §3.
 
 `Assigned` version 2 adds `job` (the job name); a run's `service` is empty, and a replica's
 assignment is still written as version 1. Every reader of `service` treats an assignment with a
-`job` as belonging to no service. The epoch is the key's `mod_revision`, as for a replica.
+`job` as belonging to no service. The epoch is the key's `mod_revision`, as for a replica. The
+agent reads the run's `relay` (B3) from the run record it already fetches for the claim; the
+assignment itself carries no address.
 
 ## Compare sets
 

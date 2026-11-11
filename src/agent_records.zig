@@ -52,6 +52,10 @@ pub const file_forced = "forced";
 /// `argv` (`zcube-agent fetch ...`) after recording its pid and before the command.
 pub const file_fetch = "fetch.json";
 pub const file_fetch_log = "fetch.log";
+/// B3 slice 2: the port of the container's relay (written by its supervisor, one decimal number)
+/// and the relay's log of coded events.
+pub const file_relay_port = "relay.port";
+pub const file_relay_log = "relay.log";
 /// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
 /// the agent publishes under `/pulls/` and then removes.
 pub const file_pull = "pull.json";
@@ -83,13 +87,16 @@ pub const SpecFile = struct {
     command: []const []const u8,
     env: []const Pair = &.{},
     labels: []const Pair = &.{},
+    /// The relay's upstream (`HOST:PORT`) if the container has one: its supervisor listens on a
+    /// loopback port of its own and tells the command in `ZCUBE_RELAY`.
+    relay: ?[]const u8 = null,
     started_at_ms: u64,
 };
 
 pub const RunKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
 
 /// Whose fault a start that failed was, so that the agent can blame correctly.
-pub const Blame = enum { user, environment, fetch };
+pub const Blame = enum { user, environment, fetch, relay };
 
 /// `run.json`.
 pub const RunFile = struct {
@@ -137,7 +144,8 @@ pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!vo
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
     const files = [_][]const u8{
-        file_run, file_child, file_supervisor, file_forced, file_fetch, file_fetch_log,
+        file_run,        file_child,     file_supervisor, file_forced, file_fetch, file_fetch_log,
+        file_relay_port, file_relay_log,
     };
     for (files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {
@@ -297,7 +305,8 @@ fn exit_reason(name: []const u8, run: RunFile) runtime.ExitReason {
     };
 }
 
-/// ZC-E0508 (the user's command) or ZC-E0507 (the host), as the supervisor recorded.
+/// ZC-E0601 (the fetch), ZC-E0702 (the relay), ZC-E0508 (the user's command) or ZC-E0507 (the
+/// host), as the supervisor recorded.
 pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();
@@ -306,6 +315,11 @@ pub fn start_failure(name: []const u8, run: RunFile) Diagnostic {
         collector.raise(.E0601);
         collector.cause("{s}", .{cause});
         const sentence = "check the registry is reachable from this node and the digest was pushed";
+        collector.fix(.{ .sentence = sentence });
+    } else if ((run.blame orelse .environment) == .relay) {
+        collector.raise(.E0702);
+        collector.cause("{s}", .{cause});
+        const sentence = "free file descriptors on the node and submit the job again";
         collector.fix(.{ .sentence = sentence });
     } else if ((run.blame orelse .environment) == .user) {
         collector.raise(.E0508);
@@ -583,7 +597,7 @@ test "a crash at every write point leaves records a restart reads" {
     // asserted so the loop cannot silently stop covering a case.
     var counts: Counts = .{};
     for ([_]agent_state.CrashKind{ .process, .host }) |kind| {
-        for (1..9) |point| {
+        for (1..11) |point| {
             for (0..64) |seed| {
                 var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
                 defer arena_state.deinit();

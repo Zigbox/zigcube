@@ -9,7 +9,10 @@
 //!   3. restart the agent: the same processes run, no duplicate was started;
 //!   4. restart the server: nothing changes;
 //!   5. apply a digest that is not in the fixtures: the replica is held, and the observed state
-//!      carries the `ZBX-E0410` diagnostic.
+//!      carries the `ZBX-E0410` diagnostic;
+//!   6. a job, claimed, adopted after `kill -9` of the agent, ended with its exit code;
+//!   7. a relayed job (B3 slice 2): its command reaches an upstream of this program through
+//!      `ZCUBE_RELAY`, and the relay's port refuses connections once the job has ended.
 //!
 //! Every process it starts is killed at the end, whatever happened (`Smoke.cleanup`). It prints
 //! to stdout only, one line per step, because the build runner counts any stderr as a failure; a
@@ -49,6 +52,8 @@ const Smoke = struct {
     work: []const u8,
     state: []const u8,
     port: u16,
+    /// The relay's upstream: `Upstream` below answers on it for the whole run.
+    upstream_port: u16 = 0,
     server: ?std.process.Child = null,
     agent: ?std.process.Child = null,
     server_starts: u32 = 0,
@@ -107,7 +112,17 @@ const Smoke = struct {
         const listen = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{smoke.port});
         const store = try std.fmt.allocPrint(arena, "sqlite:{s}/store.db", .{smoke.work});
         const log = try std.fmt.allocPrint(arena, "server-{d}.log", .{smoke.server_starts});
+        const config = try smoke.work_file("server.zon");
+        try std.Io.Dir.cwd().writeFile(smoke.io, .{
+            .sub_path = config,
+            .data = try std.fmt.allocPrint(
+                arena,
+                ".{{ .relays = .{{ .echo = .{{ .address = \"127.0.0.1:{d}\" }} }} }}\n",
+                .{smoke.upstream_port},
+            ),
+        });
         const args = [_][]const u8{
+            "--config",       config,
             "--listen",       listen,
             "--store",        store,
             "--create-store", "--quiet",
@@ -275,6 +290,18 @@ const Smoke = struct {
         _ = smoke.procs().kill_supervisor_groups();
     }
 
+    /// What the relays logged, for a failed relayed job: `cat` of every container's relay.log.
+    fn dump_relay_logs(smoke: *Smoke) void {
+        const script_text = std.fmt.allocPrint(
+            smoke.arena.allocator(),
+            "cat {0s}/relay-url; find {0s} -name 'relay*' -o -name '*.log' | head -20",
+            .{smoke.state},
+        ) catch return;
+        const argv = [_][]const u8{ "sh", "-c", script_text };
+        var child = std.process.spawn(smoke.io, .{ .argv = &argv, .stdin = .ignore }) catch return;
+        _ = child.wait(smoke.io) catch {}; // A diagnostic aid only.
+    }
+
     fn dump_logs(smoke: *Smoke) void {
         const arena = smoke.arena.allocator();
         for ([_][]const u8{ "server", "agent" }) |kind| {
@@ -319,6 +346,7 @@ fn script(smoke: *Smoke) !void {
     try step_restart_server(smoke);
     try step_unknown_digest(smoke);
     try step_job(smoke);
+    try step_relay_job(smoke);
 }
 
 const three_run = struct {
@@ -688,6 +716,115 @@ fn step_job(smoke: *Smoke) !void {
     smoke.say("job: claimed, run once, adopted after kill -9 of the agent, exit 7 recorded", .{});
 }
 
+// ---- A relayed job ------------------------------------------------------------------------------
+
+const linux = std.os.linux;
+
+/// The relay's upstream: a thread that accepts connections on a loopback port and answers the
+/// first bytes of each with `echo:` and them, then closes. Polling, so `stop` never waits on it.
+const Upstream = struct {
+    fd: i32,
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn run(upstream: *Upstream) void {
+        while (!upstream.stopping.load(.acquire)) {
+            if (wait_readable(upstream.fd, 50) == 0) continue;
+            const accepted = linux.accept4(upstream.fd, null, null, linux.SOCK.CLOEXEC);
+            if (linux.errno(accepted) != .SUCCESS) continue;
+            const peer: i32 = @intCast(accepted);
+            defer _ = linux.close(peer);
+            var reply: [72]u8 = undefined;
+            @memcpy(reply[0..5], "echo:");
+            if (wait_readable(peer, 5000) == 0) continue;
+            const got = linux.read(peer, reply[5..].ptr, 64);
+            if (linux.errno(got) != .SUCCESS or got == 0) continue;
+            _ = linux.write(peer, &reply, 5 + got);
+        }
+    }
+};
+
+fn wait_readable(fd: i32, ms: i32) usize {
+    var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    const ready = linux.poll(&fds, 1, ms);
+    return if (linux.errno(ready) == .SUCCESS) ready else 0;
+}
+
+fn connectable(port: u16) bool {
+    const made = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(made) != .SUCCESS) return false;
+    const fd: i32 = @intCast(made);
+    defer _ = linux.close(fd);
+    const address: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    return linux.errno(linux.connect(fd, &address, @sizeOf(linux.sockaddr.in))) == .SUCCESS;
+}
+
+const relay_job_name = "relayed";
+
+const relay_job_exited = struct {
+    fn check(s: *Smoke) !bool {
+        return std.mem.eql(u8, (try job_now(s, relay_job_name)).state, "exited");
+    }
+};
+
+/// A job that names the relay `echo`: its command connects to `ZCUBE_RELAY`, sends `hi`, and
+/// writes the answer to a file. The upstream's answer must come back through the relay, and the
+/// relay's port must refuse connections once the job has ended.
+fn step_relay_job(smoke: *Smoke) !void {
+    const arena = smoke.arena.allocator();
+    const stamp: u64 = @intCast(std.Io.Clock.real.now(smoke.io).toMilliseconds());
+    const script_text = std.fmt.allocPrint(
+        arena,
+        "echo \\\"$ZCUBE_RELAY\\\" > {0s}/relay-url; p=${{ZCUBE_RELAY##*:}}; " ++
+            "exec 3<>/dev/tcp/127.0.0.1/$p; echo hi >&3; read -r line <&3; " ++
+            "echo \\\"$line\\\" > {0s}/relay-answer",
+        .{smoke.work},
+    ) catch return error.OutOfMemory;
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"name\":\"{s}\",\"image\":\"b3:51aa9c03\",\"deadline_ms\":60000," ++
+            "\"submit_by_ms\":{d},\"relay\":\"echo\"," ++
+            "\"command\":[\"bash\",\"-c\",\"{s}\"]}}",
+        .{ relay_job_name, stamp + 60_000, script_text },
+    );
+    const reply = try smoke.call("POST", "/v1/jobs", body);
+    try smoke.expect(reply.status == 201, "POST /v1/jobs (relay) answered {d}: {s}", .{
+        reply.status, reply.body,
+    });
+    try smoke.wait_until("the relayed job to exit", relay_job_exited.check, wait_ms_default);
+    const now = try job_now(smoke, relay_job_name);
+    try smoke.expect(now.code == 0, "the relayed job exited with {any}, expected 0", .{now.code});
+    const answer = std.Io.Dir.cwd().readFileAlloc(
+        smoke.io,
+        try smoke.work_file("relay-answer"),
+        arena,
+        .limited(256),
+    ) catch "";
+    if (!std.mem.eql(u8, std.mem.trim(u8, answer, "\n"), "echo:hi")) {
+        smoke.say("upstream port {d}", .{smoke.upstream_port});
+        smoke.dump_relay_logs();
+    }
+    try smoke.expect(
+        std.mem.eql(u8, std.mem.trim(u8, answer, "\n"), "echo:hi"),
+        "the relayed job read \"{s}\", expected \"echo:hi\"",
+        .{answer},
+    );
+    const url = std.Io.Dir.cwd().readFileAlloc(
+        smoke.io,
+        try smoke.work_file("relay-url"),
+        arena,
+        .limited(256),
+    ) catch "";
+    const colon = std.mem.lastIndexOfScalar(u8, std.mem.trim(u8, url, "\n"), ':') orelse 0;
+    const port = std.fmt.parseInt(u16, std.mem.trim(u8, url[colon + 1 ..], "\n"), 10) catch 0;
+    try smoke.expect(port != 0, "ZCUBE_RELAY was \"{s}\"", .{url});
+    try smoke.expect(!connectable(port), "the relay at port {d} still listens", .{port});
+    smoke.say("relayed job: ZCUBE_RELAY reached the upstream (echo:hi), port {d} closed", .{port});
+}
+
 /// A port the system is not using now: bind port 0, read it, let go.
 fn free_port(io: std.Io) !u16 {
     const any = try net.IpAddress.parse("127.0.0.1", 0);
@@ -736,6 +873,16 @@ fn run(smoke: *Smoke) u8 {
     smoke.port = free_port(smoke.io) catch return 2;
     defer std.Io.Dir.cwd().deleteTree(smoke.io, smoke.work) catch {}; // Best effort: it is in /tmp.
     defer smoke.cleanup();
+    const loopback = net.IpAddress.parse("127.0.0.1", 0) catch return 2;
+    var listener = loopback.listen(smoke.io, .{}) catch return 2;
+    defer listener.deinit(smoke.io);
+    smoke.upstream_port = listener.socket.address.getPort();
+    var upstream: Upstream = .{ .fd = listener.socket.handle };
+    upstream.thread = std.Thread.spawn(.{}, Upstream.run, .{&upstream}) catch return 2;
+    defer {
+        upstream.stopping.store(true, .release);
+        upstream.thread.?.join();
+    }
     script(smoke) catch |err| {
         if (!smoke.failed) smoke.say("FAILED: {s}", .{@errorName(err)});
         smoke.dump_logs();

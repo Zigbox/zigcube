@@ -135,6 +135,10 @@ fn write_body(
         try writer.writeAll(",\"input_env\":");
         try string(spec.input_env orelse "", .{}, writer);
     }
+    if (spec.relay) |name| {
+        try writer.writeAll(",\"relay\":");
+        try string(name, .{}, writer);
+    }
     try writer.writeAll(",\"applied_by\":");
     try string(try cli_commands.applied_by(env), .{}, writer);
     try writer.writeByte('}');

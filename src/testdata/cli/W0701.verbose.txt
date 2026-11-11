@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+warning[ZC-W0701]: a job's relay is at its connection limit
+  cause  relay llm has 16 connections open; a seventeenth was closed
+  reqid  r-0000001
+  fix    reuse connections or close them when done
+  more   zcube explain W0701
+  docs   https://zigbox.github.io/zigcube/errors/W0701.html

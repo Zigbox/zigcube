@@ -19,7 +19,8 @@ zcube [options] check allocations       every node's allocation record against i
 zcube [options] repair allocations <node> [--confirm]
                                         rewrite a node's record from its assignments
 zcube [options] job run <name> --image <digest> [--env K=V] [--input-file F --input-env VAR]
-                [--deadline 10m] [--submit-within 10m] [--label k=v] --command <word>...
+                [--relay NAME] [--deadline 10m] [--submit-within 10m] [--label k=v]
+                --command <word>...
 zcube [options] job get <name> [--wait]  a job's state and ending; --wait waits for the ending
 zcube [options] job list [--state S] [--label k=v]
 zcube [options] job cancel <name>        stop a job
@@ -205,7 +206,8 @@ read only part of the records`). A node name is percent-encoded in the request. 
 `job run` submits a one-shot job (`POST /v1/jobs`, [api.md](api.md)). `--command` must be last: it
 ends the options and everything after it is the job's command, word for word. `--env K=V` may
 repeat; `--input-file F` (UTF-8, at most 64 KiB) is the job's input and `--input-env VAR` names the
-variable it reaches the job in. `--deadline` and `--submit-within` take `30s`, `10m`, `2h`;
+variable it reaches the job in. `--relay NAME` asks for the named relay from the server's
+configuration: the job reaches that upstream through `ZCUBE_RELAY` (B3, [api.md](api.md)). `--deadline` and `--submit-within` take `30s`, `10m`, `2h`;
 `--submit-within` becomes an absolute `submit_by` from the clock of the machine running `zcube`.
 
 **Env values and the input are never printed.** `job get` shows env by name and the input as "N

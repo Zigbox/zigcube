@@ -1,0 +1,5 @@
+warning[ZC-W0702]: a relayed connection reached its byte or idle bound
+  cause  a connection through relay llm was idle for 300000 ms and was closed
+  fix    open a new connection to go on
+  more   zcube explain W0702 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0702.html
