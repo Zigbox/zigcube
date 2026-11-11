@@ -884,6 +884,47 @@ test "a status that does not decode leaves the replicas reconciling (RB-S7, sche
     try testing.expectEqual(@as(u32, 1), try f.decisions("a", "hold_unreadable_job"));
 }
 
+test "a job pass that fails still lets the replica controller reconcile (RB-S2)" {
+    // Goal: RB-S2. One corrupt entry of a job's decision index fails `has_decision`, which no
+    // per-record guard covers; the job pass then errors on every step, and it ran before the
+    // replicas' controller, which never ran. Method: a job with an unreadable status (so its hold
+    // is looked up) and a corrupt index entry beside it; a three-replica service applied; whole
+    // plane steps (each returns the job pass's error) must still create the three replicas, and
+    // the error must still reach the caller.
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var plane = control_plane.ControlPlane.init(2);
+    try f.job("a", 60 * 1000, false);
+    _ = try f.pass();
+    try corrupt(&f, .job_controller, records.job_status_key("a").slice());
+    var bad_key: [records.index_prefix(.job, "a").slice().len + 3]u8 = undefined;
+    @memcpy(bad_key[0..bad_key.len - 3], records.index_prefix(.job, "a").slice());
+    @memcpy(bad_key[bad_key.len - 3 ..], "zzz");
+    try corrupt(&f, .job_controller, &bad_key);
+    var api: controller.DecisionSource = .{ .instance = 0 };
+    const ctx = f.context();
+    _ = try apply_mod.apply(&ctx, &api, .{
+        .name = "hello",
+        .image = "b3:51aa9c03",
+        .replicas = 3,
+        .command = &.{"true"},
+        .applied_by = "alex@laptop",
+        .request_id = "r-0001a4f",
+    });
+    var failed: u32 = 0;
+    for (0..6) |_| {
+        const again = f.context();
+        _ = plane.reconcile(&again) catch {
+            failed += 1;
+            f.diag.reset();
+        };
+        f.manual.advance(10);
+    }
+    try testing.expect(failed > 0);
+    try testing.expectEqual(@as(usize, 3), try replica_count(&f, "hello"));
+}
+
 test "a run that does not decode leaves the replicas reconciling (RB-S7, place_run)" {
     var f: Fixture = undefined;
     try f.start();
