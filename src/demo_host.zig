@@ -40,6 +40,8 @@ pub const Config = struct {
     lost_grace_ms: ?[]const u8 = null,
     /// The server's `--lease-ttl-ms`, as text; null leaves the server's default.
     lease_ttl_ms: ?[]const u8 = null,
+    /// The server's `--config FILE` (a ZON file, for `.relays`); null passes none.
+    server_config: ?[]const u8 = null,
 };
 
 /// What a `zcube` command did: its exit code (255 if a signal ended it) and both streams.
@@ -161,6 +163,9 @@ pub const Host = struct {
         }
         if (host.config.lease_ttl_ms) |ttl| {
             try args.appendSlice(arena_allocator, &.{ "--lease-ttl-ms", ttl });
+        }
+        if (host.config.server_config) |path| {
+            try args.appendSlice(arena_allocator, &.{ "--config", path });
         }
         host.server = try host.spawn(host.config.server_exe, args.items, log);
         const ready = struct {

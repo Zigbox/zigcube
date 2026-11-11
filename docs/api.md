@@ -476,8 +476,8 @@ Bounds, per job: `relay_connections_max` = 16 connections (a 17th is closed, ZC-
 `relay_connection_bytes_max` = 1 GiB each way and `relay_idle_ms` = 300,000 (ZC-W0702),
 `relay_connect_timeout_ms` = 10,000 (ZC-E0704). An upstream that refuses is ZC-E0701, a connection
 that fails in the middle ZC-E0705. A supervisor that cannot listen ends the run as a start failure
-(ZC-E0702); an agent whose runtime cannot serve a relay (`--runtime zigbox` today) does the same
-with ZC-E0703. The codes are written to `relay.log` in the container's directory on the node; they
+(ZC-E0702); an agent whose build cannot serve a relay does the same with ZC-E0703 (none does
+today: `--runtime zigbox` serves it since B3 slice 4). The codes are written to `relay.log` in the container's directory on the node; they
 are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstream is B4.
 
 | Code | Blame | Summary |

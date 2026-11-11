@@ -66,6 +66,8 @@ pub const Guests = struct {
     user_data: [count][vm.limits.user_data_bytes_max]u8 = undefined,
     meta_data: [count][vm.limits.meta_data_bytes_max]u8 = undefined,
     out: *std.Io.Writer,
+    /// How many of the guests the demo boots, the first ones (demo-b3 boots one).
+    limit: u8 = count,
 
     /// Boots all four guests at once, then provisions each and copies the files in.
     /// `bodies` are the files of `uploads`, in order; they must outlive the guests.
@@ -80,7 +82,7 @@ pub const Guests = struct {
         }
         const accel = try vm.accel.choose("auto", vm.accel.kvm_usable(init.io));
         const base = try vm.image.ensure_pin(init, cache_dir, guests.out, vm.image.ubuntu_noble);
-        for (0..count) |index| {
+        for (0..guests.limit) |index| {
             guests.overlays[index] = try std.fmt.allocPrint(
                 arena,
                 cache_dir ++ "/overlay-demo-c2-{d}.qcow2",
@@ -106,7 +108,7 @@ pub const Guests = struct {
             guests.started[index] = true;
         }
         try guests.wait_booted();
-        for (0..count) |index| try guests.prepare(index);
+        for (0..guests.limit) |index| try guests.prepare(index);
     }
 
     /// Pumps every guest until each console shows cloud-init's ready marker, so the four boot
@@ -115,12 +117,12 @@ pub const Guests = struct {
         const deadline = vm.now_ms() + @as(u64, vm.limits.boot_timeout_kvm_s) * 1000 * 2;
         while (vm.now_ms() < deadline) {
             var ready: u32 = 0;
-            for (&guests.sessions) |*session| {
+            for (guests.sessions[0..guests.limit]) |*session| {
                 const text = session.console[0..session.console_len];
                 if (std.mem.indexOf(u8, text, vm.cloud_init.ready_marker) != null) ready += 1;
                 if (session.qemu_exited) return error.QemuExited;
             }
-            if (ready == count) return;
+            if (ready == guests.limit) return;
             try guests.pump_all(50);
         }
         return error.BootTimeout;

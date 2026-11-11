@@ -64,6 +64,9 @@ const shell_allowlist = [_][]const u8{
     // it starts and restarts the agent as `cube`, writes the test fault, greps fetch logs and,
     // as root, adds the nft rule of step 3 and records the failing `curl`.
     "ops/demo-c2/guest.sh",
+    // demo-b3's guest half (docs/demos/b3.md), for the same reason: it starts the agent and a test
+    // upstream as root and reads logs and listeners.
+    "ops/demo-b3/guest.sh",
     // The owner's one-off recipe for demo-c2's two GHCR images (ops/demo-c2-images): it runs on
     // the owner's machine with docker and a registry login, never in a build or test, and is a
     // list of `docker buildx` calls; the build has no docker to drive from Zig.
