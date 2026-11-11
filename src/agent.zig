@@ -458,6 +458,7 @@ pub const Agent = struct {
             ctx,
             listings,
             pass.given,
+            kept,
         ));
         if (kept.stopped) return acted;
         kept.stage(agent, ctx, "stop orphan containers", pass.orphan_containers());
@@ -989,14 +990,14 @@ const Write = struct { key: []const u8, value: ?[]const u8 };
 
 /// The first failure of a step's stages, kept while the others run: its error and a copy of its
 /// diagnostic. A later failure is counted and described on the agent, not returned.
-const Kept = struct {
+pub const Kept = struct {
     err: ?Error = null,
     diag: ?*Diag = null,
     /// A failure that is not the runtime's (the server, the state directory, a crash): the
     /// stages after it are not run, as the step would have ended there before.
     stopped: bool = false,
 
-    fn stage(
+    pub fn stage(
         kept: *Kept,
         agent: *Agent,
         ctx: *const Context,

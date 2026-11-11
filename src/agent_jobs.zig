@@ -225,6 +225,7 @@ pub fn pass(
     ctx: *const Context,
     listings: []const runtime.Listing,
     assigned: []const Entry(records.Assigned),
+    kept: *agent_mod.Kept,
 ) Error!u32 {
     agent.jobs_wake_mono_ms = std.math.maxInt(u64);
     const state = ctx.state orelse return 0;
@@ -248,8 +249,11 @@ pub fn pass(
         null,
         constants.job_admitted_window_max,
     )).items;
+    // One run's failing step must not starve the runs after it (#205): like a replica's, it is
+    // kept and the next run is looked at; only a failure that is not the runtime's ends the pass.
     for (subjects) |subject| {
-        try work.one(subject);
+        if (kept.stopped) break;
+        kept.stage(agent, ctx, "reconcile a run", work.one(subject));
         if (agent.fence.active) break;
     }
     return work.commits;
