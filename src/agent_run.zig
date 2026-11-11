@@ -148,7 +148,11 @@ const Shell = struct {
             .images = shell.images,
             // No exchange may run past the fence: the agent moves the cap as the lease moves,
             // before its first call and after a grant or keepalive.
-            .deadline = .{ .context = shell.remote, .set_fn = remote_mod.RemoteStore.deadline_fn },
+            .deadline = .{
+                .context = shell.remote,
+                .set_fn = remote_mod.RemoteStore.deadline_fn,
+                .hook_fn = remote_mod.RemoteStore.hook_fn,
+            },
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;

@@ -79,6 +79,14 @@ pub const SwitchedStore = struct {
     /// A keepalive takes `cost_ms` of the clock and is cut with ZC-E0503 if that passes `cap_ms`
     /// (the cap the agent set, as a real exchange is cut); test-only, null in every simulation.
     keepalive_cost: ?KeepaliveCost = null,
+    /// Every call takes `cost_ms` of the clock and is cut with ZC-E0503 if that passes the cap,
+    /// after the agent's before-call hook has run; test-only, null in every simulation.
+    call_cost: ?KeepaliveCost = null,
+    /// True while the agent's step runs: `call_cost` costs the agent's calls only.
+    in_agent_step: bool = false,
+    /// The agent's before-call hook (`agent.Deadline.hook_fn`).
+    before_context: ?*anyopaque = null,
+    before_fn: ?*const fn (context: *anyopaque) void = null,
     calls: u32 = 0,
 
     pub const KeepaliveCost = struct {
@@ -129,6 +137,17 @@ pub const SwitchedStore = struct {
             }
         }
         self.calls += 1;
+        if (self.before_fn) |before| before(self.before_context.?);
+        if (self.call_cost) |*cost| if (self.in_agent_step) {
+            if (cost.clock.ms + cost.cost_ms > cost.cap_ms.*) {
+                cost.cut += 1;
+                diag.raise(.E0503);
+                diag.cause("the call was cut by the agent's call cap", .{});
+                diag.fix(.{ .sentence = "none: the simulated call ran out of time" });
+                return error.BackendFailed;
+            }
+            cost.clock.advance(cost.cost_ms);
+        };
         if (!self.down) return;
         assert(diag.code == null);
         diag.raise(.E0201);
@@ -480,13 +499,30 @@ pub const World = struct {
             .images = world.images,
             .state = world.state_override orelse world.files.interface(),
             .boot_id = world.boot_id,
-            .deadline = .{ .context = world, .set_fn = World.set_call_cap },
+            .deadline = .{
+                .context = world,
+                .set_fn = World.set_call_cap,
+                .hook_fn = World.set_call_hook,
+            },
         };
         world.stats.agent_steps += 1;
-        const wake = world.agent.reconcile(&ctx) catch return world.failed_step(.agent);
+        world.switched.in_agent_step = true;
+        const result = world.agent.reconcile(&ctx);
+        world.switched.in_agent_step = false;
+        const wake = result catch return world.failed_step(.agent);
         world.agent_due_ms = wake.at_ms;
         world.stats.transactions += wake.acted;
         return .{ .ran = true, .acted = wake.acted, .failed = null };
+    }
+
+    fn set_call_hook(
+        context: *anyopaque,
+        hook_context: ?*anyopaque,
+        hook: ?*const fn (hook_context: *anyopaque) void,
+    ) void {
+        const world: *World = @ptrCast(@alignCast(context));
+        world.switched.before_context = hook_context;
+        world.switched.before_fn = hook;
     }
 
     fn set_call_cap(context: *anyopaque, deadline_ms: u64) void {

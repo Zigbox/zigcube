@@ -607,6 +607,16 @@ const Work = struct {
             });
         }
         if (current.stop_cause == null) {
+            // The report above is a store call, which enforces a deadline that came due during
+            // it (`Agent.before_call`): take that cause instead of overwriting it.
+            switch (try read_record(ctx, work.state, subject.id)) {
+                .record => |fresh| if (fresh.stop_cause != null) {
+                    current = fresh;
+                },
+                .absent, .damaged => {},
+            }
+        }
+        if (current.stop_cause == null) {
             // A run the server no longer serves ended while this node was cut off: the only
             // reason it stops serving a running run is `unreachable`.
             current.stop_cause = work.cause_to_stop(current, run, mono) orelse

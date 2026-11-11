@@ -57,6 +57,10 @@ pub const Config = struct {
     corrupt_chunks: bool = false,
     /// Tests: ZC-E0808 is counted (`Server.refusals_shown`) but not written to stderr.
     quiet: bool = false,
+    /// Tests: how long an authenticated link waits for its next request. A test that holds many
+    /// links must outlast its own slow clients, which the real bound need not (a loaded host took
+    /// longer than `peer_idle_ms` to open 32 handshakes, #205).
+    idle_ms: u32 = constants.peer_idle_ms,
 };
 
 /// What a connection task owns from accept to its end; no buffers.
@@ -527,21 +531,23 @@ fn serve(server: *Server, link: *Link) void {
     // Lost to an evictor: the link is being shut down, so end (the fd is closed below).
     if (link.state.cmpxchgStrong(.stranger, .authenticated, .acq_rel, .acquire) != null) return;
     const slot = claim_slot(server, node_key(stream.peer_name())) orelse
-        return tell_busy(&stream);
+        return tell_busy(&stream, server.config.idle_ms);
     defer release_slot(slot);
     var count: u32 = 0;
     while (count < constants.peer_connection_requests_max) : (count += 1) {
         if (server.stopping.load(.acquire)) return;
-        if (!one_request(&stream, slot, server.config.corrupt_chunks)) return;
+        if (!one_request(&stream, slot, server.config.corrupt_chunks, server.config.idle_ms)) {
+            return;
+        }
     }
 }
 
 /// Every serving slot is taken: answers the authenticated peer's first request with 503 (an
 /// empty body) so that it knows the server is busy rather than gone, and ends the connection.
-fn tell_busy(stream: *peer_stream.Stream) void {
+fn tell_busy(stream: *peer_stream.Stream, idle_ms: u32) void {
     var request: [1024]u8 = undefined;
     const io = stream.io;
-    _ = stream.recv(&request, peer_stream.boot_ms(io) + constants.peer_idle_ms) catch return;
+    _ = stream.recv(&request, peer_stream.boot_ms(io) + idle_ms) catch return;
     var head: [reply_head_bytes]u8 = @splat(0);
     std.mem.writeInt(u16, head[0..2], peer_serve.status_busy, .big);
     const end = peer_stream.boot_ms(io) + constants.peer_reply_ms;
@@ -550,10 +556,15 @@ fn tell_busy(stream: *peer_stream.Stream) void {
 }
 
 /// Reads one request and answers it. False when the connection should end.
-fn one_request(stream: *peer_stream.Stream, slot: *Slot, corrupt_chunks: bool) bool {
+fn one_request(
+    stream: *peer_stream.Stream,
+    slot: *Slot,
+    corrupt_chunks: bool,
+    idle_ms: u32,
+) bool {
     var request: [1024]u8 = undefined;
     const io = stream.io;
-    const text = stream.recv(&request, peer_stream.boot_ms(io) + constants.peer_idle_ms) catch
+    const text = stream.recv(&request, peer_stream.boot_ms(io) + idle_ms) catch
         return false;
     var lines = std.mem.splitScalar(u8, text, '\n');
     const first = lines.next() orelse return false;
@@ -630,6 +641,8 @@ const Rig = struct {
     /// corrupted on the way out.
     zigbox_root: ?[]const u8 = null,
     corrupt: bool = false,
+    /// The server's `idle_ms`.
+    idle_ms: u32 = constants.peer_idle_ms,
     /// Serve through the agent's own wiring (`agent_run.Swarm`), configured for Zigbox only: no
     /// `images_dir`, the store named by `zigbox_root`.
     via_agent: bool = false,
@@ -692,6 +705,7 @@ const Rig = struct {
             .zigbox_chunk_bytes = if (rig.zigbox_root != null) 8 else 0,
             .corrupt_chunks = rig.corrupt,
             .quiet = true,
+            .idle_ms = rig.idle_ms,
         });
     }
 
@@ -869,8 +883,13 @@ test "silent connections from one source hold a few links, and an honest peer is
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    try io.sleep(.fromMilliseconds(200), .awake);
     const pending = constants.peer_handshakes_pending_per_source_max;
+    // The server accepts the connections some time after the client's connect returns, which
+    // on a loaded host can exceed a fixed pause: wait until the admitted ones are busy and the
+    // refusal is shown, then pause so that a link admitted beyond the bound would show (#205).
+    try wait_busy(io, &rig.server, pending);
+    try wait_refusal(io, &rig.server);
+    try io.sleep(.fromMilliseconds(200), .awake);
     try std.testing.expectEqual(pending, busy_links(&rig.server));
     // Three refused connections are one streak: ZC-E0808 was shown once, not three times.
     try std.testing.expectEqual(@as(u32, 1), rig.server.refusals_shown);
@@ -1040,6 +1059,63 @@ fn wait_busy(io: std.Io, server: *const Server, want: u32) !void {
     }
 }
 
+/// Polls until `want` links are authenticated, up to a deadline. A client's handshake returns
+/// before its server task has moved the link to `.authenticated`, so a test that depends on the
+/// state waits for it rather than for the client.
+fn wait_authenticated(io: std.Io, server: *const Server, want: u32) !void {
+    const deadline = peer_stream.boot_ms(io) + 5000;
+    while (true) {
+        var authenticated: u32 = 0;
+        for (&server.links) |*link| {
+            if (!link.busy.load(.acquire)) continue;
+            if (link.state.load(.acquire) == .authenticated) authenticated += 1;
+        }
+        if (authenticated == want) return;
+        if (peer_stream.boot_ms(io) >= deadline) return error.LinksNeverAuthenticated;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+/// Polls until no link is in its handshake (every busy link is authenticated), up to a deadline.
+/// `admit` counts a link whose task has not yet reached `.authenticated` as pending, whether or
+/// not its client has returned, so a test that connects again at once must wait for this.
+fn wait_no_strangers(io: std.Io, server: *const Server) !void {
+    const deadline = peer_stream.boot_ms(io) + 5000;
+    while (true) {
+        var strangers: u32 = 0;
+        for (&server.links) |*link| {
+            if (!link.busy.load(.acquire)) continue;
+            if (link.state.load(.acquire) != .authenticated) strangers += 1;
+        }
+        if (strangers == 0) return;
+        if (peer_stream.boot_ms(io) >= deadline) return error.LinksNeverSettled;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Polls until the server has shown its first refusal (ZC-E0808), up to a deadline.
+fn wait_refusal(io: std.Io, server: *const Server) !void {
+    const deadline = peer_stream.boot_ms(io) + 5000;
+    while (@atomicLoad(u32, &server.refusals_shown, .acquire) == 0) {
+        if (peer_stream.boot_ms(io) >= deadline) return error.NoRefusal;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+/// Polls until `want` serving slots are taken, up to a deadline.
+fn wait_slots(io: std.Io, server: *const Server, want: usize) !void {
+    const deadline = peer_stream.boot_ms(io) + 5000;
+    while (true) {
+        var taken: usize = 0;
+        for (&server.slots) |*slot| {
+            if (slot.busy.load(.acquire)) taken += 1;
+        }
+        if (taken == want) return;
+        if (peer_stream.boot_ms(io) >= deadline) return error.SlotsNeverTaken;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
 /// Sleeps until every connection admitted so far is `peer_handshake_evict_min_ms` old.
 fn age_strangers(io: std.Io, since_ms: u64) !void {
     const due = since_ms + constants.peer_handshake_evict_min_ms + 50;
@@ -1064,6 +1140,9 @@ fn rig_identity_named(rig: *Rig, name: []const u8) !peer.Identity {
 fn test_name(buffer: *[16]u8, n: u32) []const u8 {
     return std.fmt.bufPrint(buffer, "peer{d}", .{n}) catch unreachable; // 16 bytes hold a u32.
 }
+
+/// The idle wait of a test that holds links open while many handshakes run (`Config.idle_ms`).
+const test_idle_ms: u32 = 60 * 1000;
 
 /// A client that handshakes from 127.0.0.`octet` and then sits idle.
 const Idle = struct {
@@ -1118,8 +1197,11 @@ test "silent connections taking every link do not lock out an honest peer" {
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    const since = peer_stream.boot_ms(io);
+    // `started_ms` is stamped when the server accepts, which can lag the client's connect on a
+    // loaded host: read the clock only after every link is busy, so every stranger is at least
+    // as old as `since` (#205: taken before, a late accept left a stranger too young to evict).
     try wait_busy(io, &rig.server, constants.peer_handshakes_max);
+    const since = peer_stream.boot_ms(io);
     try age_strangers(io, since);
     try expect_served(&rig, address);
     try std.testing.expectEqual(@as(u32, 1), rig.server.evictions.load(.monotonic));
@@ -1131,7 +1213,7 @@ test "authenticated links are never evicted, and a stranger too young to evict i
     // nothing is evicted. (b) After the minimum age it evicts a stranger and is served, and the
     // two authenticated clients can still make a request.
     const io = std.testing.io;
-    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined, .idle_ms = test_idle_ms };
     try rig.init();
     defer rig.deinit();
     const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
@@ -1139,13 +1221,20 @@ test "authenticated links are never evicted, and a stranger too young to evict i
     for (&idle, 0..) |*client, at| client.* = try Idle.open(&rig, @intCast(100 + at), address);
     defer for (&idle) |*client| client.close();
     var silent: [constants.peer_handshakes_max - 2]std.posix.fd_t = undefined;
+    const before = peer_stream.boot_ms(io);
     for (&silent, 0..) |*fd, at| fd.* = try connect_from(io, @intCast(2 + at), address);
     defer for (silent) |fd| {
         _ = std.os.linux.close(fd);
     };
-    const since = peer_stream.boot_ms(io);
+    // `before` precedes every connect, so no stranger is older than `before`: check (a) bounds the
+    // age by it.
+    // `started_ms` is stamped at accept, which can lag the connect on a loaded host, and an idle
+    // client's task may not have moved its link to `.authenticated` yet (a stranger can be
+    // evicted): wait for both, then read `since`, so every stranger is at least that old (#205).
     try wait_busy(io, &rig.server, constants.peer_handshakes_max);
-    try std.testing.expect(peer_stream.boot_ms(io) - since < constants.peer_handshake_evict_min_ms);
+    try wait_authenticated(io, &rig.server, idle.len);
+    const since = peer_stream.boot_ms(io);
+    try std.testing.expect(since - before < constants.peer_handshake_evict_min_ms);
     try std.testing.expect(std.meta.isError(expect_served(&rig, address)));
     try std.testing.expectEqual(@as(u32, 0), rig.server.evictions.load(.monotonic));
     try age_strangers(io, since);
@@ -1156,17 +1245,29 @@ test "authenticated links are never evicted, and a stranger too young to evict i
 
 test "a newcomer is closed when every link is authenticated" {
     // Goal: review S3. Method: `peer_handshakes_max` clients handshake from sources of their own
-    // and sit idle; one more connection is closed without being served, nothing is evicted, and
-    // the clients that hold serving slots still get their chunk.
+    // and sit idle, and every link is aged past `peer_handshake_evict_min_ms`; one more connection
+    // is closed without being served, nothing is evicted, and the clients that hold serving
+    // slots still get their chunk. Aged, so that only the authenticated state protects a link.
     const io = std.testing.io;
-    var rig: Rig = .{ .tmp = undefined, .ca = undefined };
+    var rig: Rig = .{ .tmp = undefined, .ca = undefined, .idle_ms = test_idle_ms };
     try rig.init();
     defer rig.deinit();
     const address = try net.IpAddress.parse("127.0.0.1", rig.server.port());
     var idle: [constants.peer_handshakes_max]Idle = undefined;
-    for (&idle, 0..) |*client, at| client.* = try Idle.open(&rig, @intCast(2 + at), address);
-    defer for (&idle) |*client| client.close();
-    try wait_busy(io, &rig.server, constants.peer_handshakes_max);
+    var opened: usize = 0;
+    defer for (idle[0..opened]) |*client| client.close();
+    // The first `peer_connections_max` clients must be the ones that hold the serving slots. A
+    // server task claims its slot some time after its client's handshake returns, so the test
+    // waits for each claim before opening the next client (#205: under load a later client's
+    // task claimed first and the first client was answered busy).
+    while (opened < idle.len) : (opened += 1) {
+        const octet: u8 = @intCast(2 + opened);
+        idle[opened] = try Idle.open(&rig, octet, address);
+        if (opened < constants.peer_connections_max) try wait_slots(io, &rig.server, opened + 1);
+    }
+    // Every link has started by now, so each is at least as old as `since` after the wait.
+    try wait_authenticated(io, &rig.server, constants.peer_handshakes_max);
+    try age_strangers(io, peer_stream.boot_ms(io));
     try std.testing.expect(std.meta.isError(expect_served(&rig, address)));
     try std.testing.expectEqual(@as(u32, 0), rig.server.evictions.load(.monotonic));
     for (idle[0..constants.peer_connections_max]) |*client| {
@@ -1290,6 +1391,9 @@ test "a peer that stops reading mid-chunk frees its link and slot within peer_re
     comptime assert(requests * constants.swarm_chunk_bytes > 32 * 1024 * 1024);
     for (0..requests) |_| try stream.send(path, end);
     const sent = peer_stream.boot_ms(io);
+    // The server task takes the slot when it has read the first request, which a loaded host
+    // can delay past the pause: wait for the slot, then hold the pause (#205).
+    try wait_slots(io, &rig.server, 1);
     try io.sleep(.fromMilliseconds(1000), .awake);
     try std.testing.expectEqual(@as(u32, 1), busy_links(&rig.server)); // Stuck sending.
     try std.testing.expectEqual(@as(u32, 1), busy_slots(&rig.server));
@@ -1378,6 +1482,9 @@ test "many handshakes from one address by different node names succeed" {
         if (future.await(io)) done += 1;
     }
     try std.testing.expectEqual(pending, done);
+    // The server tasks of those handshakes may not have reached `.authenticated` yet, and `admit`
+    // counts such a link as pending; with the next connections that could be a ninth (#205).
+    try wait_no_strangers(io, &rig.server);
     const in_a_row = 40;
     comptime assert(in_a_row + pending <= constants.peer_handshakes_per_source_max);
     for (0..in_a_row) |at| {
@@ -1386,6 +1493,9 @@ test "many handshakes from one address by different node names succeed" {
         const fd = try peer_stream.connect(io, address, peer_stream.boot_ms(io) + 5000);
         defer _ = std.os.linux.close(fd);
         try std.testing.expect(Handshake.run(io, fd, &identity));
+        // This test is about the window bound, not the pending bound: let the server task of
+        // this handshake settle so that lagging ones do not pile up to the pending bound.
+        try wait_no_strangers(io, &rig.server);
     }
     try std.testing.expectEqual(@as(u32, 0), rig.server.refusals_shown);
 }
