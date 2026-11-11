@@ -60,6 +60,9 @@ pub const Spec = struct {
     cpu_millis: ?u32 = null,
     memory_bytes: ?u64 = null,
     pids: ?u32 = null,
+    /// `HOST:PORT` of the job's one relay upstream; empty: none. The supervisor asks Zigbox for a
+    /// listener on the container's loopback and relays it there (B3 slice 4, `relay.zig`).
+    relay: []const u8 = "",
     /// `host.time_now()` (seconds) when the agent decided to start it: a Zigbox record older than
     /// this belongs to an earlier container of the same name.
     launched: u64,

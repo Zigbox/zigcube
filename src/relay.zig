@@ -99,10 +99,41 @@ pub const Relay = struct {
         upstream: Upstream,
         log_path: [:0]const u8,
     ) OpenError!*Relay {
-        const relay = try gpa.create(Relay);
-        errdefer gpa.destroy(relay);
         const bound = try listen_loopback();
         errdefer _ = linux.close(bound.fd);
+        return construct(gpa, io, upstream, bound, log_path);
+    }
+
+    /// Takes over a listener someone else made: the one Zigbox's `listen` gives a container with
+    /// no network, made inside the container's own network namespace (B3 slice 4). The relay owns
+    /// `fd` from here, also on failure. `port` is the container's port (`relay_port`).
+    pub fn adopt(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        upstream: Upstream,
+        fd: fd_t,
+        port: u16,
+        log_path: [:0]const u8,
+    ) error{OutOfMemory}!*Relay {
+        assert(fd >= 0);
+        assert(port > 0);
+        set_nonblocking(fd); // The accept loop polls first, but must never block in accept4.
+        const closing = linux.fcntl(fd, linux.F.SETFD, linux.FD_CLOEXEC);
+        assert(linux.errno(closing) == .SUCCESS);
+        return construct(gpa, io, upstream, .{ .fd = fd, .port = port }, log_path) catch |err| {
+            _ = linux.close(fd);
+            return err;
+        };
+    }
+
+    fn construct(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        upstream: Upstream,
+        bound: Bound,
+        log_path: [:0]const u8,
+    ) error{OutOfMemory}!*Relay {
+        const relay = try gpa.create(Relay);
         const flags: linux.O = .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
