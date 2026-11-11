@@ -700,7 +700,8 @@ test "a relay that cannot be served is written to relay.log after what is there 
     const log = try std.fmt.bufPrintSentinel(&full, "{s}/relay.log", .{path[0..length]}, 0);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "relay.log", .data = "earlier line\n" });
     append_relay_failure(log, "the container gave no listener");
-    const text = try tmp.dir.readFileAlloc(std.testing.io, "relay.log", std.testing.allocator, .limited(4096));
+    const limit: std.Io.Limit = .limited(4096);
+    const text = try tmp.dir.readFileAlloc(std.testing.io, "relay.log", std.testing.allocator, limit);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("earlier line\n" ++
         "ZC-E0702 the relay could not be served: the container gave no listener\n", text);
