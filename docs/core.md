@@ -323,7 +323,7 @@ fleet reads (`ops/sim-fleet/README.md`): it files a failure by its check and ste
 either line's format is a change to `src/sim_fleet_issue.zig` too.
 **The strong world (B2 slice 4, `--strong`).** Two faults that older worlds never had, behind one
 option so that every replay line written before it (`c1_regressions`, `sim-c1-regress`, the
-replay commands of open `sim-fleet` issues) still runs its own world bit for bit: with `--strong`,
+replay commands of open `sim-fleet` issues) draws the same numbers as before (`--strong` adds no draws without it; B2's other changes to the simulated world, the spend rule, restart timing and job memory, alter every world, so a pre-B2 replay line runs a different world and a "passes on replay" close of an old issue needs a cause, not the replay alone): with `--strong`,
 every other host crash also loses the node's disk (state directory and containers; `wipes=` in the
 report), and every thirteenth job asks for more cpu than any node has, so that no node claims it
 (J8's second clause), and every third job names a relay (no draw; B3 slice 3: the simulated runtime opens a listener at
@@ -335,8 +335,8 @@ no agent can find such a container and J1, J8 and I1b fail on it (measured: 42 o
 operations, plain). A real adapter keeps its containers' labels in the runtime, where the agent
 still lists them, so the case needs a runtime model that lists containers apart from the agent's
 files; that is a coverage cut, not a pass.
-**Profiles and shapes (C3 fleet 1).** `--profile=` is `mixed` (default: the world every earlier
-build drew, bit for bit), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
+**Profiles and shapes (C3 fleet 1).** `--profile=` is `mixed` (default: the draws every earlier
+build made), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
 the seed, weights 3 2 2 2 2). A profile other than `mixed` zeroes every fault class but its own
 and forces its own on. `<ops>` = `auto` (`-Dauto-shape` in `zig build`) draws the run's size from
 the seed as well: nodes 1 to 16, lease ttl 8,000 to 10,000 ms (the shipped 10 s 40 % of the time),
@@ -497,7 +497,7 @@ an agent restart keeps it with the container. Three checks, judged on every tick
 **R1** no listener is open on a stopped container, or was left open on one the runtime forgot (evicted
 or replaced; sticky), so a relay is closed before its ending can be reported; **R2** (a restatement of J2 and R1 for listeners keyed by run id; no tooth of its own) no two listeners
 are open for one run (across nodes); **R3** (also: a started job's spec carries the relay the job asked for, judged against the job's name, not the spec's own field; `relay_dropped` blanks it and must fail R3) a running relayed container has its listener open. Only
-the `strong` world makes relayed jobs, so a run without `--strong` is its old world bit for bit.
+the `strong` world makes relayed jobs, so a run without `--strong` makes no relayed jobs and draws as before.
 `sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `strong`) leaves the listener open at
 the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.
 

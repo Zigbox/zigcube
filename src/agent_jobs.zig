@@ -937,8 +937,8 @@ const Work = struct {
     }
 
     /// `runtime.start` returned an error with its diagnostic in `ctx.diag`. If the runtime
-    /// lists no container of this run (or cannot be asked), nothing started and the run ends as
-    /// a start failure with that diagnostic. If it lists one, the run is executing: it is not
+    /// lists no container of this run, nothing started and the run ends as a start failure with
+    /// that diagnostic. If it lists one, or cannot be asked (`container_up` is then true), the run is executing: it is not
     /// reported, the error goes to the caller with its diagnostic, the record stays `claimed`
     /// and the next pass adopts the container through `container`, as it did before RB-N4.
     fn start_errored(work: *Work, subject: Subject, record: StartRecord, err: Error) Error!void {
