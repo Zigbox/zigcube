@@ -102,16 +102,26 @@ pub const job_unclaimed = declared("c1_teeth_job_unclaimed");
 /// break J2: a run id is started at most once, ever; B2 slice 4, RB-S2 c).
 pub const job_wipe = declared("c1_teeth_job_wipe");
 
+/// The simulated runtime leaves a job's relay listener open when the container ends (must break R1:
+/// a relay is open only while its run runs on that node; B3 slice 3). Relayed jobs are made only
+/// in the `strong` world.
+pub const relay_leak = declared("c1_teeth_relay_leak");
+
+/// The agent builds a relayed job's spec without its relay (must break R3: a started job's spec
+/// carries the relay the job asked for; B3 slice 3). Needs the `strong` world's relayed jobs.
+pub const relay_dropped = declared("c1_teeth_relay_dropped");
+
 /// The job start ledger holds `job_ledger_small_max` runs, not 4096 (must break J8: a full ledger
 /// fails the run instead of leaving J2 and J8's second clause judging less than they claim).
 pub const job_ledger_small = declared("c1_teeth_job_ledger_small");
 pub const job_ledger_small_max: u32 = 16;
 
-/// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs).
-pub const strong_world = job_unclaimed or job_wipe or evict_world;
+/// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
+/// jobs).
+pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped;

@@ -46,6 +46,7 @@ const constants = @import("constants.zig");
 const Clock = @import("clock.zig").Clock;
 const diag_mod = @import("diag.zig");
 const runtime = @import("runtime.zig");
+const c1_teeth = @import("c1_teeth.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -95,6 +96,11 @@ const Container = struct {
     /// When it stopped, for tests that say when (`ended_at_ms`); 0 while it runs.
     ended_at_ms: u64 = 0,
     ignores_stop: bool,
+    /// The spec named a relay (B3): the container's listener is opened at start.
+    relay_wanted: bool = false,
+    /// The listener of the container's relay is open. Opened at start, closed by every ending
+    /// (`end`) and gone with the container when its node's disk is wiped (the host died).
+    relay_open: bool = false,
 };
 
 const Change = struct {
@@ -117,6 +123,15 @@ pub const SimRuntime = struct {
     /// simulation sets it to keep a ledger of starts (sim-c1's J2 and J7).
     on_start: ?*const fn (context: *anyopaque, spec: *const runtime.Spec) void = null,
     on_start_context: *anyopaque = undefined,
+    /// Listeners opened and closed so far (the report's tally of the relay model).
+    relays_opened: u32 = 0,
+    relays_closed: u32 = 0,
+    /// The same closes by how the container's life ended: exited, signaled, other (oom, pid limit,
+    /// lost supervisor), wiped with its host.
+    relays_closed_by: [4]u32 = .{ 0, 0, 0, 0 },
+    /// Set when a container was forgotten (evicted or replaced) with its listener still open: a
+    /// listener nobody can close any more. Sticky, so that eviction cannot hide the leak.
+    relay_forgotten: bool = false,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -216,6 +231,9 @@ pub const SimRuntime = struct {
     /// The node's disk is lost with its state directory: every container, running or not, is
     /// gone (their records were the state directory's files; the processes die with the host).
     pub fn wipe(self: *SimRuntime) void {
+        // The listeners die with the host.
+        self.relays_closed += self.relay_open_count();
+        self.relays_closed_by[3] += self.relay_open_count();
         for (self.containers.items) |container| self.free_container(container);
         self.containers.clearRetainingCapacity();
     }
@@ -245,6 +263,30 @@ pub const SimRuntime = struct {
             if (container.phase != .stopped) count += 1;
         }
         return count;
+    }
+
+    /// Listeners that are open now.
+    pub fn relay_open_count(self: *const SimRuntime) u32 {
+        var count: u32 = 0;
+        for (self.containers.items) |container| count += @intFromBool(container.relay_open);
+        return count;
+    }
+
+    /// What is wrong with the relay listeners, if anything (B3, check R1 to R3): a listener open
+    /// on a container that has stopped or was forgotten, or a running container whose relay is
+    /// not open.
+    pub fn relay_problem(self: *const SimRuntime) ?[]const u8 {
+        if (self.relay_forgotten) return "R1: a relay listener outlived its container's record";
+        for (self.containers.items) |container| {
+            const ended = container.phase == .stopped;
+            if (ended and container.relay_open) {
+                return "R1: a relay listener stayed open after its run ended";
+            }
+            if (!ended and container.relay_wanted and !container.relay_open) {
+                return "R3: a running job has no relay listener";
+            }
+        }
+        return null;
     }
 
     // ---- Internals ----
@@ -283,6 +325,18 @@ pub const SimRuntime = struct {
         assert(container.phase != .stopped);
         container.phase = .{ .stopped = ended };
         container.ended_at_ms = self.clock.now_ms();
+        // Every ending closes the relay's listener: exit, signal, cancel, deadline, a lost
+        // supervisor. (`relay_leak` is the test-only fault that leaves it open.)
+        if (container.relay_open and !c1_teeth.relay_leak) {
+            container.relay_open = false;
+            self.relays_closed += 1;
+            const kind: usize = switch (ended) {
+                .exited => 0,
+                .signaled => 1,
+                else => 2,
+            };
+            self.relays_closed_by[kind] += 1;
+        }
         self.record(.{ .handle = runtime.Handle.init(container.name), .ended = ended });
     }
 
@@ -378,6 +432,7 @@ pub const SimRuntime = struct {
             self.free_container(container);
             return no_memory(diag);
         };
+        self.relays_opened += @intFromBool(spec.relay.len > 0);
         return .{ .started = runtime.Handle.init(spec.name) };
     }
 
@@ -413,10 +468,13 @@ pub const SimRuntime = struct {
             .pid = pid,
             .started_at_ms = self.clock.now_ms(),
             .ignores_stop = false,
+            .relay_wanted = spec.relay.len > 0,
+            .relay_open = spec.relay.len > 0,
         };
     }
 
     fn remove(self: *SimRuntime, container: *Container) void {
+        if (container.relay_open) self.relay_forgotten = true;
         const index = container - self.containers.items.ptr;
         self.free_container(container.*);
         _ = self.containers.orderedRemove(index);
@@ -853,4 +911,63 @@ test "a listing stays valid after a later start evicts the container it describe
     _ = try rt.start(&spec_for("extra-1", "b3:51aa9c03", &extra), &diag);
     try testing.expectEqualStrings(runtime.label_replica, listed[0].labels[0].key);
     try testing.expectEqualStrings("c-0", listed[0].labels[0].value);
+}
+
+test "a relay's listener is open while its container runs and closed by every ending" {
+    // Goal: the model of B3 slice 3: opened at start, closed by every ending (exit, signal, a
+    // stop, a lost supervisor), gone with a wiped disk, and `relay_problem` silent throughout.
+    // Method: five relayed containers and one without, end four ways, look after each.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 3, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    const names = [_][]const u8{ "r-1", "r-2", "r-3", "r-4", "r-5", "plain" };
+    for (names) |name| {
+        const labels = labels_of.one(name);
+        var spec = spec_for(name, "b3:51aa9c03", &labels);
+        if (!std.mem.eql(u8, name, "plain")) spec.relay = "127.0.0.1:9";
+        _ = try rt.start(&spec, &diag);
+    }
+    try testing.expectEqual(@as(u32, 5), sim.relay_open_count());
+    try testing.expect(sim.relay_problem() == null);
+    try sim.inject("r-1", .{ .exit = 0 });
+    try sim.inject("r-2", .supervisor_died);
+    try rt.stop(runtime.Handle.init("r-3"), 0, &diag);
+    try rt.signal(runtime.Handle.init("r-4"), runtime.signal_kill, &diag);
+    try testing.expectEqual(@as(u32, 1), sim.relay_open_count());
+    try testing.expect(sim.relay_problem() == null);
+    try testing.expectEqual(@as(u32, 5), sim.relays_opened);
+    try testing.expectEqual(@as(u32, 4), sim.relays_closed);
+    sim.wipe();
+    try testing.expectEqual(@as(u32, 0), sim.relay_open_count());
+    try testing.expectEqual(@as(u32, 5), sim.relays_closed);
+}
+
+test "a listener left open on a stopped or forgotten container is a problem" {
+    // Goal: the check's teeth at the unit level. Method: open a listener by hand on a stopped
+    // container (what the `relay_leak` tooth does), see R1; forget one, see the sticky R1; and a
+    // running relayed container with its listener closed is R3.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 3, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    const labels = labels_of.one("r-1");
+    var spec = spec_for("r-1", "b3:51aa9c03", &labels);
+    spec.relay = "127.0.0.1:9";
+    _ = try rt.start(&spec, &diag);
+    sim.containers.items[0].relay_open = false;
+    try testing.expect(std.mem.startsWith(u8, sim.relay_problem().?, "R3"));
+    sim.containers.items[0].relay_open = true;
+    try sim.inject("r-1", .{ .exit = 0 });
+    sim.containers.items[0].relay_open = true; // The leak.
+    try testing.expect(std.mem.startsWith(u8, sim.relay_problem().?, "R1"));
+    sim.evict("r-1");
+    try testing.expect(sim.relay_forgotten);
+    try testing.expect(std.mem.startsWith(u8, sim.relay_problem().?, "R1"));
 }
