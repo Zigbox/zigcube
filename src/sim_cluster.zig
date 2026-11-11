@@ -871,8 +871,10 @@ pub const Cluster = struct {
     reuse_jumps: u32,
     reuse_made: u32,
     reuse_met: u32,
-    reuse_pick_exited: bool = false,
-    /// A job started's spec lacked (or wrongly carried) its relay (R3; sticky).
+    /// True while `retention_jump` runs retention: I4 lets its sweep span nodes
+    /// (`writers.foreign_key`).
+    retention_running: bool = false,
+    /// A started job's spec lacked (or wrongly carried) its relay (R3; sticky).
     relay_spec_wrong: bool = false,
     /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
     strong: bool,
@@ -1518,6 +1520,8 @@ pub const Cluster = struct {
         c.jobs_watch.away_until_ms = 0;
         const head = c.store_handle().status(&c.diag) catch return;
         sim_jobs_watch.finish(&c.jobs_watch, &c.api, &c.controller_context(), head.revision);
+        c.retention_running = true;
+        defer c.retention_running = false;
         const gap = constants.job_finished_age_ms_min - 60_000;
         const now = c.manual.ms +| gap;
         for (0..2) |_| {
@@ -1553,7 +1557,6 @@ pub const Cluster = struct {
                 if (c.prng.random().uintLessThan(u32, seen) == 0) chosen = number;
             }
         }
-        c.reuse_pick_exited = chosen != 0;
         if (chosen != 0) return chosen;
         return 1 + c.prng.random().uintLessThan(u32, c.job_next - 1);
     }
@@ -1805,7 +1808,7 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
             return;
         }
     }
-    if (sim_c1.at_revision(&ctx, request)) |found| {
+    if (sim_c1.at_revision(&ctx, request, c.retention_running)) |found| {
         c.c1_violation = found;
         c.c1_violation_revision = revision;
     }

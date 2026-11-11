@@ -38,7 +38,9 @@ This supersedes `2026-11-09-b2-ships-without-job-reuse.md`, which is left as wri
 
 1. **A model gap in I4** (`writers.zig`). Retention's sweep of stray `/job-observed/` keys deletes
    in batches across nodes and jobs; `retention_only` rejected it. Retention had never run in the
-   simulation. `observed_sweep_only` accepts a delete-only request on that prefix (with a test).
+   simulation. `foreign_key` accepts a delete-only request on that prefix (`observed_sweep_only`) only while
+   `Cluster.retention_jump` runs retention (`retention_running`, passed to the I4 tap), so the same
+   batch outside retention is still refused (a test for both).
 2. **J4's client and a clock jump.** The jump stands for an hour in zero time; the J4 client, which
    is never away that long, missed endings retention then deleted. `retention_jump` lets the client
    catch up first (`sim_jobs_watch.finish`). A real client away for more than the retention age

@@ -111,9 +111,12 @@ pub fn allowed(role: Role, request: store.TxnRequest) Verdict {
 /// I4 as the simulator sees it, without knowing who wrote: a transaction is one role's, so its
 /// puts and deletes may not span the keys of two exclusive owners (every-role prefixes are
 /// anyone's), may not touch a key under no prefix, and an agent's keys name one node. Returns the
-/// first key that breaks this, or null.
-pub fn foreign_key(request: store.TxnRequest) ?[]const u8 {
+/// first key that breaks this, or null. `retention_running` is true only while the simulator runs
+/// retention's own sweep (`Cluster.retention_jump`): the sweep's cross-node batch of stray
+/// `/job-observed/` deletes is then let through; outside it that batch is a foreign write.
+pub fn foreign_key(request: store.TxnRequest, retention_running: bool) ?[]const u8 {
     if (orphaning_delete(request)) |key| return key;
+    if (retention_running and observed_sweep_only(request)) return null;
     if (retention_only(request)) return null;
     var owner: ?Owner = null;
     var node: ?[]const u8 = null;
@@ -186,7 +189,6 @@ fn orphaning_delete(request: store.TxnRequest) ?[]const u8 {
 /// `foreign_key` lets it through.
 /// Pull records are not part of it: they are per node, and `foreign_key` checks them as before.
 fn retention_only(request: store.TxnRequest) bool {
-    if (observed_sweep_only(request)) return true;
     var job: ?[]const u8 = null;
     for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
         for (ops) |op| {
@@ -468,15 +470,16 @@ test "the node controller removes observed records and writes none" {
 
 test "foreign_key finds a transaction that no single role could have written" {
     const ok = [_]store.Op{ put_op("/services/hello"), put_op("/decisions/d1") };
-    try testing.expect(foreign_key(request_of(&ok)) == null);
+    try testing.expect(foreign_key(request_of(&ok), false) == null);
     const mixed = [_]store.Op{ put_op("/services/hello"), put_op("/assigned/n1/hello-1") };
-    try testing.expectEqualStrings("/assigned/n1/hello-1", foreign_key(request_of(&mixed)).?);
+    const found = foreign_key(request_of(&mixed), false);
+    try testing.expectEqualStrings("/assigned/n1/hello-1", found.?);
     const nowhere = [_]store.Op{put_op("/nowhere/x")};
-    try testing.expectEqualStrings("/nowhere/x", foreign_key(request_of(&nowhere)).?);
+    try testing.expectEqualStrings("/nowhere/x", foreign_key(request_of(&nowhere), false).?);
     const two_nodes = [_]store.Op{ put_op("/nodes/n1"), put_op("/observed/n2/c1") };
-    try testing.expectEqualStrings("/observed/n2/c1", foreign_key(request_of(&two_nodes)).?);
+    try testing.expectEqualStrings("/observed/n2/c1", foreign_key(request_of(&two_nodes), false).?);
     const own = [_]store.Op{ put_op("/nodes/n1"), put_op("/observed/n1/c1") };
-    try testing.expect(foreign_key(request_of(&own)) == null);
+    try testing.expect(foreign_key(request_of(&own), false) == null);
 }
 
 test "jobs: one writer per prefix, the job controller never touches placement" {
@@ -525,7 +528,7 @@ test "retention deletes ended jobs' records and never writes them" {
     for (keys, &deletes) |key, *op| op.* = .{ .delete = key };
     const all = request_of(&deletes);
     try testing.expect(allowed(.retention, all) == .allowed);
-    try testing.expect(foreign_key(all) == null);
+    try testing.expect(foreign_key(all, false) == null);
     for (keys) |key| {
         try testing.expect(allowed(.retention, request_of(&.{put_op(key)})) == .refused);
         try testing.expect(allowed(.scheduler, request_of(&.{.{ .delete = key }})) == .refused);
@@ -537,26 +540,27 @@ test "retention deletes ended jobs' records and never writes them" {
     }
     // A transaction that writes, or that deletes a key retention may not, is still foreign.
     const mixed = [_]store.Op{ .{ .delete = "/jobs/j1" }, put_op("/job-status/j1") };
-    try testing.expectEqualStrings("/job-status/j1", foreign_key(request_of(&mixed)).?);
+    try testing.expectEqualStrings("/job-status/j1", foreign_key(request_of(&mixed), false).?);
     const stray = [_]store.Op{ .{ .delete = "/jobs/j1" }, .{ .delete = "/assigned/n1/j1-job" } };
-    try testing.expectEqualStrings("/assigned/n1/j1-job", foreign_key(request_of(&stray)).?);
+    try testing.expectEqualStrings("/assigned/n1/j1-job", foreign_key(request_of(&stray), false).?);
 }
 
 test "foreign_key lets one job controller or API transaction through and stops a mixed one" {
     const controller = [_]store.Op{ put_op("/job-runs/j1"), put_op("/job-status/j1") };
-    try testing.expect(foreign_key(request_of(&controller)) == null);
+    try testing.expect(foreign_key(request_of(&controller), false) == null);
     const ending = [_]store.Op{
         put_op("/job-status/j1"), put_op("/job-endings"), put_op("/decisions/d1"),
     };
-    try testing.expect(foreign_key(request_of(&ending)) == null);
+    try testing.expect(foreign_key(request_of(&ending), false) == null);
     const create = [_]store.Op{
         put_op("/jobs/j1"), put_op("/job-input/j1"), put_op("/job-admission"),
     };
-    try testing.expect(foreign_key(request_of(&create)) == null);
+    try testing.expect(foreign_key(request_of(&create), false) == null);
     const mixed = [_]store.Op{ put_op("/jobs/j1"), put_op("/job-runs/j1") };
-    try testing.expectEqualStrings("/job-runs/j1", foreign_key(request_of(&mixed)).?);
+    try testing.expectEqualStrings("/job-runs/j1", foreign_key(request_of(&mixed), false).?);
     const placing = [_]store.Op{ put_op("/job-status/j1"), put_op("/assigned/n1/j1-job") };
-    try testing.expectEqualStrings("/assigned/n1/j1-job", foreign_key(request_of(&placing)).?);
+    const placed = foreign_key(request_of(&placing), false);
+    try testing.expectEqualStrings("/assigned/n1/j1-job", placed.?);
 }
 
 test "retention's sweep of stray observations may span nodes and jobs, and only deletes" {
@@ -566,7 +570,10 @@ test "retention's sweep of stray observations may span nodes and jobs, and only 
         .{ .delete = "/job-observed/n1/a" },
         .{ .delete = "/job-observed/n2/b" },
     };
-    try testing.expect(foreign_key(request_of(&sweep)) == null);
+    try testing.expect(foreign_key(request_of(&sweep), true) == null);
+    // The same batch outside retention's run is a foreign write (I4): a node's tenure may not
+    // delete another node's claim.
+    try testing.expect(foreign_key(request_of(&sweep), false) != null);
     try testing.expect(allowed(.retention, request_of(&sweep)) == .allowed);
     const wrong = [_][]const store.Op{
         &.{ .{ .delete = "/job-observed/n1/a" }, .{ .delete = "/job-runs/b" } },
@@ -575,7 +582,7 @@ test "retention's sweep of stray observations may span nodes and jobs, and only 
             .{ .put = .{ .key = "/job-observed/n2/b", .value = "" } },
         },
     };
-    for (wrong) |ops| try testing.expect(foreign_key(request_of(ops)) != null);
+    for (wrong) |ops| try testing.expect(foreign_key(request_of(ops), true) != null);
 }
 
 test "retention's job transaction names one job, and carries no pull records" {
@@ -589,7 +596,7 @@ test "retention's job transaction names one job, and carries no pull records" {
         .{ .delete = "/job-observed/n1/a" },
         .{ .delete = "/decisions/d1" },
     };
-    try testing.expect(foreign_key(request_of(&deletes)) == null);
+    try testing.expect(foreign_key(request_of(&deletes), false) == null);
     // RA-S6: the job's observations on two nodes (a node that lost the claim left one behind).
     const two_nodes = [_]store.Op{
         .{ .delete = "/jobs/a" },
@@ -597,10 +604,10 @@ test "retention's job transaction names one job, and carries no pull records" {
         .{ .delete = "/job-observed/n1/a" },
         .{ .delete = "/job-observed/n2/a" },
     };
-    try testing.expect(foreign_key(request_of(&two_nodes)) == null);
+    try testing.expect(foreign_key(request_of(&two_nodes), false) == null);
     try testing.expect(allowed(.retention, request_of(&two_nodes)) == .allowed);
     const without_observed = [_]store.Op{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-runs/a" } };
-    try testing.expect(foreign_key(request_of(&without_observed)) == null);
+    try testing.expect(foreign_key(request_of(&without_observed), false) == null);
     const wrong = [_][]const store.Op{
         // Another job's run beside this job.
         &.{ .{ .delete = "/jobs/a" }, .{ .delete = "/job-runs/b" } },
@@ -612,7 +619,7 @@ test "retention's job transaction names one job, and carries no pull records" {
         &.{ .{ .delete = "/jobs/a/b" }, .{ .delete = "/job-runs/a" } },
         &.{ .{ .delete = "/job-observed/n1" }, .{ .delete = "/jobs/a" } },
     };
-    for (wrong) |ops| try testing.expect(foreign_key(request_of(ops)) != null);
+    for (wrong) |ops| try testing.expect(foreign_key(request_of(ops), false) != null);
     // One owner's transactions (the API's) pass `foreign_key` on their own; retention's rule must
     // still refuse them: no name, and an aggregate.
     const not_retention = [_][]const store.Op{
@@ -622,7 +629,7 @@ test "retention's job transaction names one job, and carries no pull records" {
     for (not_retention) |ops| try testing.expect(!retention_only(request_of(ops)));
     // One node's pull records on their own are one owner, as before jobs.
     const pulls = [_]store.Op{ .{ .delete = "/pulls/n1/b3:aa" }, .{ .delete = "/pulls/n1/b3:bb" } };
-    try testing.expect(foreign_key(request_of(&pulls)) == null);
+    try testing.expect(foreign_key(request_of(&pulls), false) == null);
     // The run or the status without the spec would leave a job that is run again (I8a); the
     // input alone (deleted at the ending) is fine.
     const orphaning = [_][]const store.Op{
@@ -631,7 +638,7 @@ test "retention's job transaction names one job, and carries no pull records" {
         &.{ .{ .delete = "/job-status/a" }, .{ .delete = "/job-input/a" } },
     };
     for (orphaning) |ops| {
-        try testing.expect(foreign_key(request_of(ops)) != null);
+        try testing.expect(foreign_key(request_of(ops), false) != null);
         try testing.expect(allowed(.retention, request_of(ops)) == .refused);
     }
     const whole = [_]store.Op{ .{ .delete = "/job-runs/a" }, .{ .delete = "/jobs/a" } };
@@ -640,7 +647,7 @@ test "retention's job transaction names one job, and carries no pull records" {
     try testing.expect(retention_only(request_of(&input_only)));
     // A job record with a put is never retention's.
     const with_put = [_]store.Op{ .{ .delete = "/jobs/a" }, put_op("/job-runs/a") };
-    try testing.expect(foreign_key(request_of(&with_put)) != null);
+    try testing.expect(foreign_key(request_of(&with_put), false) != null);
 }
 
 test "the two job aggregates are exact keys, not prefixes" {
@@ -654,7 +661,7 @@ test "the two job aggregates are exact keys, not prefixes" {
             const verdict = allowed(role, request_of(&.{put_op(key)}));
             try testing.expectEqualStrings("nobody", verdict.refused.owner);
         }
-        try testing.expectEqualStrings(key, foreign_key(request_of(&.{put_op(key)})).?);
+        try testing.expectEqualStrings(key, foreign_key(request_of(&.{put_op(key)}), false).?);
     }
     try testing.expect(rule_for("/job-admission") != null);
     try testing.expect(rule_for("/job-endings") != null);
