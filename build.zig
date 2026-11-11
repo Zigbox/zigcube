@@ -679,9 +679,6 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
             },
         }),
     });
-    // demo-b3 runs only on KVM hosts, so `check` compiles it (no run) to catch what a comptime
-    // assert or a type error in it would otherwise show only in CI's demo-b3 job.
-    b.step("demo-b3-build", "Compile demo-b3 without running it").dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
@@ -717,6 +714,23 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
             },
         }),
     });
+    // demo-b3 runs only on KVM hosts, so `check` compiles it (no run) and runs the tests of its
+    // script (the job's command line must fit the CLI's argument limit): what a comptime assert,
+    // a type error or an over-long argument would otherwise show only in CI's demo-b3 job.
+    const script_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b3_script.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+            },
+        }),
+    });
+    const build_step = b.step("demo-b3-build", "Compile demo-b3 and test its script, no run");
+    build_step.dependOn(&exe.step);
+    build_step.dependOn(&b.addRunArtifact(script_tests).step);
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const constants = @import("constants.zig");
 const state = @import("demo_b1_state.zig");
 const steps = @import("demo_c2_steps.zig");
 const vms = @import("demo_c2_vms.zig");
@@ -35,51 +36,40 @@ const checks = [_][]const u8{
 /// `GET /report?<check>=<failed|REACHED>&...`, which the test upstream logs, and answers
 /// `upstream-ok`. Exit 0 only if every check failed and the answer came through.
 const hostile_python =
-    \\import os, socket, sys, urllib.request
-    \\def tcp(host, port):
-    \\    s = socket.socket()
-    \\    s.settimeout(3)
-    \\    try:
-    \\        s.connect((host, port))
-    \\        return "REACHED"
-    \\    except Exception:
-    \\        return "failed"
-    \\    finally:
-    \\        s.close()
-    \\def dns():
-    \\    try:
-    \\        socket.getaddrinfo("example.com", 443)
-    \\        return "REACHED"
-    \\    except Exception:
-    \\        return "failed"
-    \\def raw():
-    \\    try:
-    \\        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-    \\        s.settimeout(3)
-    \\        s.sendto(b"\x08\x00\xf7\xff\x00\x00\x00\x00", ("1.1.1.1", 0))
-    \\        return "REACHED"
-    \\    except Exception:
-    \\        return "failed"
-    \\node = os.environ["NODE_ADDR"]
-    \\got = [
-    \\    ("internet", tcp("1.1.1.1", 443)),
-    \\    ("node", tcp(node, 22)),
-    \\    ("metadata", tcp("169.254.169.254", 80)),
-    \\    ("server", tcp(os.environ["SERVER_HOST"], int(os.environ["SERVER_PORT"]))),
-    \\    ("upstream_direct", tcp("127.0.0.1", 9090)),
-    \\    ("other_relay", tcp(node, 8080)),
-    \\    ("dns", dns()),
-    \\    ("raw", raw()),
+    \\import os, socket as k, sys, urllib.request as u
+    \\def t(f):
+    \\ try:
+    \\  f()
+    \\  return "REACHED"
+    \\ except Exception:
+    \\  return "failed"
+    \\def c(h, p):
+    \\ s = k.socket()
+    \\ s.settimeout(3)
+    \\ s.connect((h, p))
+    \\def r():
+    \\ s = k.socket(k.AF_INET, k.SOCK_RAW, k.IPPROTO_ICMP)
+    \\ s.sendto(b"\x08\x00\xf7\xff\x00\x00\x00\x00", ("1.1.1.1", 0))
+    \\e = os.environ
+    \\n = e["NODE_ADDR"]
+    \\g = [
+    \\ ("internet", t(lambda: c("1.1.1.1", 443))),
+    \\ ("node", t(lambda: c(n, 22))),
+    \\ ("metadata", t(lambda: c("169.254.169.254", 80))),
+    \\ ("server", t(lambda: c(e["SERVER_HOST"], int(e["SERVER_PORT"])))),
+    \\ ("upstream_direct", t(lambda: c("127.0.0.1", 9090))),
+    \\ ("other_relay", t(lambda: c(n, 8080))),
+    \\ ("dns", t(lambda: k.getaddrinfo("example.com", 443))),
+    \\ ("raw", t(r)),
     \\]
-    \\query = "&".join(k + "=" + v for k, v in got)
     \\try:
-    \\    url = os.environ["ZCUBE_RELAY"] + "/report?" + query
-    \\    body = urllib.request.urlopen(url, timeout=15).read()
+    \\ q = "&".join(a + "=" + v for a, v in g)
+    \\ b = u.urlopen(e["ZCUBE_RELAY"] + "/report?" + q, timeout=15).read()
     \\except Exception:
-    \\    sys.exit(12)
-    \\if body != b"upstream-ok":
-    \\    sys.exit(11)
-    \\sys.exit(10 if any(v != "failed" for k, v in got) else 0)
+    \\ sys.exit(12)
+    \\if b != b"upstream-ok":
+    \\ sys.exit(11)
+    \\sys.exit(10 if any(v != "failed" for a, v in g) else 0)
 ;
 
 pub fn run(demo: *Demo) !void {
@@ -226,4 +216,10 @@ fn summary(demo: *Demo) !void {
 
 comptime {
     assert(checks.len == 8);
+}
+
+// The CLI refuses an argument over `cli_arg_bytes_max` (ZC-E0111): a demo that runs a job with
+// a script longer than that fails only in CI, on a KVM host. This fails `zig build check`.
+test "the hostile script fits one command-line argument" {
+    try std.testing.expect(hostile_python.len <= constants.cli_arg_bytes_max);
 }
