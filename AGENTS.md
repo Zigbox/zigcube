@@ -155,6 +155,8 @@ in this file or `docs/decisions/` in the same PR.
 
 - Develop on the branch you were given and commit in small, meaningful steps, signed off (`git commit -s`, DCO). Licence is Apache 2.0; there is no CLA.
 - Never report an unpushed commit as pushed.
+- **Push your work about every 10 minutes** (owner, 2026-11-10), with `git push -u origin <branch>`, to your own session branch, even when it is unfinished: the container is ephemeral, and unpushed commits are lost when it is reclaimed or reset. Never push to `main` or to another session's branch.
+- **Do not open a pull request until the work is ready:** gates pass on the final commit and the report is written.
 - CI runs only on pull requests and on `main`, never on a plain branch push. When a change needs CI, open a PR (or push to an open one); don't push just to trigger CI, and batch small follow-ups into one push. Actions time is limited.
 - On a pull request CI runs only the jobs a change's paths can affect (`.github/ci-changes.sh`, table-tested in `.github/ci-changes-test.sh`; [docs/decisions/2026-11-04-ci-speed.md](docs/decisions/2026-11-04-ci-speed.md)). A path no rule names, a push to `main`, a `claude/release-*` pull request and a pull request labelled `full-ci` run everything. If you are unsure, add `full-ci`. Add a row to the table test when you add a rule.
 - A change that touches only documentation (every changed path is a `.md` file outside `web/` and `src/`, or lies under `site/` outside `site/errors/`) skips CI's jobs, as the `changes` job in `ci.yml` decides. That does not change when a commit may carry `[skip ci]`.

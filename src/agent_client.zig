@@ -142,6 +142,9 @@ pub const RemoteStore = struct {
     /// fence): a request's I/O timeout is capped by what is left. No clock, no cap.
     mono: ?Clock = null,
     deadline_ms: u64 = std.math.maxInt(u64),
+    /// Run before every exchange, if set (`Deadline.hook_fn`): it may move `deadline_ms`.
+    before_context: ?*anyopaque = null,
+    before_fn: ?*const fn (context: *anyopaque) void = null,
     /// The highest pair an answer carried (or the file held): never lowered.
     known: ?Pair = null,
     /// What the file is known to hold, and when it was written (`save`).
@@ -193,6 +196,17 @@ pub const RemoteStore = struct {
         const remote = from(context);
         assert(remote.mono != null);
         remote.deadline_ms = deadline_ms;
+    }
+
+    /// The agent's `Deadline.hook_fn` for this store.
+    pub fn hook_fn(
+        context: *anyopaque,
+        hook_context: ?*anyopaque,
+        hook: ?*const fn (hook_context: *anyopaque) void,
+    ) void {
+        const remote = from(context);
+        remote.before_context = hook_context;
+        remote.before_fn = hook;
     }
 
     pub fn interface(remote: *RemoteStore) store.Store {
@@ -824,6 +838,7 @@ pub const RemoteStore = struct {
         diag: *Diag,
     ) store.Error!Reply {
         var sent = request;
+        if (remote.before_fn) |before| before(remote.before_context.?);
         if (remote.mono) |clock| {
             // The hold and the I/O after it together end by the deadline; a hold takes at most
             // half of what is left, so that a reply has time to come.
