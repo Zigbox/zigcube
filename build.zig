@@ -1311,8 +1311,8 @@ const c1_teeth_roots = [_]struct {
         // longer aborts the pass) shifted the world, then seed 186 (1..2000 searched up to the
         // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md). CI's run ends
         // there, and the fleet canary runs seed 186 alone at 300 operations (fresh seeds at
-        // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth: widening its world so more seeds hit
-        // is B3 work. Seed 186 passes with the fault off.
+        // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth:
+        // widening its world so more seeds hit is B3 work. Seed 186 passes with the fault off.
         .symptom = "J8: a run that no node started",
         .canary_seeds = 1,
         .canary_first = 186,
