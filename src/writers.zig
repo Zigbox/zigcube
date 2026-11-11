@@ -186,6 +186,7 @@ fn orphaning_delete(request: store.TxnRequest) ?[]const u8 {
 /// `foreign_key` lets it through.
 /// Pull records are not part of it: they are per node, and `foreign_key` checks them as before.
 fn retention_only(request: store.TxnRequest) bool {
+    if (observed_sweep_only(request)) return true;
     var job: ?[]const u8 = null;
     for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
         for (ops) |op| {
@@ -209,6 +210,25 @@ fn retention_only(request: store.TxnRequest) bool {
         }
     }
     return job != null;
+}
+
+/// Whether `request` is a batch of retention's sweep of stray `/job-observed/` records: deletes
+/// only, of those keys only, for any jobs and nodes (the sweep batches up to a transaction's
+/// worth of strays in key order, so one batch spans nodes and jobs; `job_retention.sweep_observed`).
+/// It was never exercised in the simulator before B2.1 slice 4 made retention run there.
+fn observed_sweep_only(request: store.TxnRequest) bool {
+    var count: u32 = 0;
+    for ([_][]const store.Op{ request.on_success, request.on_failure }) |ops| {
+        for (ops) |op| {
+            const key = switch (op) {
+                .put => return false,
+                .delete => |key| key,
+            };
+            if (!std.mem.startsWith(u8, key, records.prefix_job_observed)) return false;
+            count += 1;
+        }
+    }
+    return count > 0;
 }
 
 fn rule_for(key: []const u8) ?Rule {
@@ -536,6 +556,22 @@ test "foreign_key lets one job controller or API transaction through and stops a
     try testing.expectEqualStrings("/job-runs/j1", foreign_key(request_of(&mixed)).?);
     const placing = [_]store.Op{ put_op("/job-status/j1"), put_op("/assigned/n1/j1-job") };
     try testing.expectEqualStrings("/assigned/n1/j1-job", foreign_key(request_of(&placing)).?);
+}
+
+test "retention's sweep of stray observations may span nodes and jobs, and only deletes" {
+    // Goal: `observed_sweep_only` admits a batch of `/job-observed/` deletes (the sweep's), and
+    // nothing wider. Method: a batch over two nodes and two jobs, then batches that are not one.
+    const sweep = [_]store.Op{
+        .{ .delete = "/job-observed/n1/a" },
+        .{ .delete = "/job-observed/n2/b" },
+    };
+    try testing.expect(foreign_key(request_of(&sweep)) == null);
+    try testing.expect(allowed(.retention, request_of(&sweep)) == .allowed);
+    const wrong = [_][]const store.Op{
+        &.{ .{ .delete = "/job-observed/n1/a" }, .{ .delete = "/job-runs/b" } },
+        &.{ .{ .delete = "/job-observed/n1/a" }, .{ .put = .{ .key = "/job-observed/n2/b", .value = "" } } },
+    };
+    for (wrong) |ops| try testing.expect(foreign_key(request_of(ops)) != null);
 }
 
 test "retention's job transaction names one job, and carries no pull records" {

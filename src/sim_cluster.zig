@@ -55,6 +55,7 @@ const sim_store = @import("sim_store.zig");
 const sim_tap = @import("sim_tap.zig");
 const sim_world = @import("sim_world.zig");
 const job_api = @import("job_api.zig");
+const job_retention = @import("job_retention.zig");
 const runtime = @import("runtime.zig");
 const sim_jobs = @import("sim_jobs.zig");
 const sim_jobs_watch = @import("sim_jobs_watch.zig");
@@ -862,7 +863,15 @@ pub const Cluster = struct {
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
     job_next: u32,
-    /// A started job's spec lacked (or wrongly carried) its relay (R3; sticky).
+    /// The reuse world (B2.1 slice 4): retention run by a jump of time, so that a name is reused
+    /// while a container of its earlier incarnation still stands. Its counters: jumps made,
+    /// creates of a name made before, and those that found a container of that name on a node.
+    reuse_cursor: job_retention.Cursor,
+    reuse_ops: u32,
+    reuse_jumps: u32,
+    reuse_made: u32,
+    reuse_met: u32,
+    /// A job started's spec lacked (or wrongly carried) its relay (R3; sticky).
     relay_spec_wrong: bool = false,
     /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
     strong: bool,
@@ -928,6 +937,11 @@ pub const Cluster = struct {
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
+        c.reuse_cursor = .{ .age_ms = constants.job_finished_age_ms_min };
+        c.reuse_ops = 0;
+        c.reuse_jumps = 0;
+        c.reuse_made = 0;
+        c.reuse_met = 0;
         c.strong = options.strong or c1_teeth.strong_world;
         c.host_crashes = 0;
         c.init_c1(gpa);
@@ -1484,18 +1498,67 @@ pub const Cluster = struct {
     }
 
     fn create_job(c: *Cluster) void {
+        _ = c.create_job_as(c.job_next);
+    }
+
+    /// The reuse world's seam: the store's retention runs as if an hour had passed, without
+    /// ticking an agent. Two passes (the first ends a sweep cycle, the second deletes what was
+    /// old when it began); jobs that ended in the last minute stay.
+    fn retention_jump(c: *Cluster) void {
+        if (store_faulty(c)) return;
+        const gap = constants.job_finished_age_ms_min - 60_000;
+        const now = c.manual.ms +| gap;
+        for (0..2) |_| {
+            var scratch = std.heap.ArenaAllocator.init(c.gpa);
+            defer scratch.deinit();
+            c.diag.reset();
+            const ctx: controller.Context = .{
+                .store = c.store_handle(),
+                .clock = c.manual.clock(),
+                .arena = scratch.allocator(),
+                .diag = &c.diag,
+            };
+            _ = job_retention.prune_or_back_off(&ctx, &c.reuse_cursor, now);
+        }
+        c.reuse_jumps += 1;
+    }
+
+    /// A create of a name used before: the older incarnation was deleted by retention, or the
+    /// create is refused (the name is taken; false). Counts when it met a container of that name.
+    fn reuse_job(c: *Cluster) bool {
+        if (c.job_next == 1) return false;
+        const number = 1 + c.prng.random().uintLessThan(u32, c.job_next - 1);
+        var name_buffer: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch unreachable;
+        if (!c.create_job_as(number)) return false;
+        c.reuse_made += 1;
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                const job = job_of(container) orelse continue;
+                if (std.mem.eql(u8, job, name)) {
+                    c.reuse_met += 1;
+                    return true;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Creates job `number`; false if the create was refused.
+    fn create_job_as(c: *Cluster, number: u32) bool {
         const random = c.prng.random();
         var name_buffer: [16]u8 = undefined;
         // "jb-" and a u32 fit.
-        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{c.job_next}) catch unreachable;
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch unreachable;
         // Every 13th job asks for more cpu than any node has, so that no node ever claims it and
         // its run must end `not_started` (J8's second clause). No draw, and only with
         // `Options.strong`: other worlds are unchanged.
-        const unplaceable = c.strong and c.job_next % 13 == 5;
+        const fresh = number == c.job_next;
+        const unplaceable = c.strong and number % 13 == 5;
         // Every third job (job numbers 1, 4, 7, ...; `job_relayed`) names the relay (B3 slice 3).
         // No draw, and only with `Options.strong`.
-        const relayed = c.strong and job_relayed(c.job_next);
-        c.job_next += 1;
+        const relayed = c.strong and job_relayed(number);
+        if (fresh) c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
         const ctx = c.controller_context();
@@ -1524,9 +1587,10 @@ pub const Cluster = struct {
             .request_id = id,
         }) catch {
             c.diag.reset();
-            return;
+            return false;
         };
         c.jobs.created += 1;
+        return true;
     }
 
     /// The job of a random live job container, copied into `buffer`; null if none runs. Half of
@@ -2037,6 +2101,14 @@ fn operation(c: *Cluster) void {
             // The burst world (#198): a burst, so that one node starts dozens of runs in a step.
             const burst: u32 = if (c1_teeth.burst_world) 12 else 1;
             for (0..burst) |_| c.create_job();
+            if (c1_teeth.reuse_world) {
+                c.reuse_ops += 1;
+                if (c.reuse_ops % 6 == 0) c.retention_jump();
+                // A few tries: most names are still held by their job, and are refused.
+                if (c.reuse_ops % 6 == 2) for (0..8) |_| {
+                    if (c.reuse_job()) break;
+                };
+            }
         },
         .job_cancel => c.cancel_job(),
         .job_end => c.end_job(),
@@ -2469,6 +2541,7 @@ fn track_jobs(c: *Cluster) Failure!void {
         .diag = &c.diag,
     };
     try unclaimed_ended(c, &ctx);
+    if (c1_teeth.reuse_world) try started_ended(c, &ctx);
     comptime assert(nodes_max * constants.runtime_handles_max <= sim_jobs.watch_max);
     const next = scratch.allocator().alloc(sim_jobs.Watch, sim_jobs.watch_max) catch
         return check(c, false, "the job trackers are out of memory");
@@ -2529,12 +2602,40 @@ fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
         if (now < @max(run.start_by_ms, c.store_healthy_since_ms) +| unclaimed_ms_max) continue;
         const status = job_status_of(ctx, run.job) orelse continue;
         if (records.job_state_terminal(status.state)) continue;
-        const hash = std.hash.Wyhash.hash(0, run.id);
+        const hash = sim_jobs.run_hash(run.id, entry.kv.create_revision);
         if (std.mem.indexOfScalar(u64, c.jobs.ledger[0..c.jobs.ledger_count], hash) != null) {
             continue;
         }
         try check(c, false, "J8: a run that no node started was still open long after its " ++
             "start_by_ms");
+    }
+}
+
+/// J11 (the reuse world): a run whose status says it `exited` was started by some node, in its
+/// own incarnation (`running` may be reported ahead of the start, and is not judged). A container left by an older run of the same name,
+/// taken for this one, makes a run that ended without a start.
+fn started_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    assert(c.jobs.ledger_full == 0);
+    const job_runs = controller.list_all(
+        records.JobRun,
+        ctx,
+        records.prefix_job_runs,
+        null,
+        constants.job_admitted_window_max,
+    ) catch {
+        ctx.diag.reset();
+        return check(c, false, "J11: the runs cannot be read");
+    };
+    for (job_runs.items) |entry| {
+        const run = &entry.rec;
+        const status = job_status_of(ctx, run.job) orelse continue;
+        if (status.state != .exited) continue;
+        if (status.node == null) continue;
+        const hash = sim_jobs.run_hash(run.id, entry.kv.create_revision);
+        if (std.mem.indexOfScalar(u64, c.jobs.ledger[0..c.jobs.ledger_count], hash) != null) {
+            continue;
+        }
+        try check(c, false, "J11: a run exited that no node started");
     }
 }
 
@@ -3287,6 +3388,12 @@ fn print_jobs(c: *Cluster) void {
     c.report.print("jobs: watch endings={d} handled={d} watches={d} relists={d} restarts={d}\n", .{
         w.truth_count, w.handled_count, w.watches, w.relists, w.restarts,
     });
+    if (c1_teeth.reuse_world) {
+        c.report.print("jobs: reuse jumps={d} dropped={d} reused creates={d} met a " ++
+            "container={d}\n", .{
+            c.reuse_jumps, c.reuse_cursor.dropped, c.reuse_made, c.reuse_met,
+        });
+    }
     if (c.strong) {
         var opened: u32 = 0;
         var closed: u32 = 0;
