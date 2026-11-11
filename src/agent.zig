@@ -121,6 +121,14 @@ pub const Context = struct {
 pub const Deadline = struct {
     context: *anyopaque,
     set_fn: *const fn (context: *anyopaque, deadline_ms: u64) void,
+    /// Receives the function to run before each call to the server (null clears it), so that
+    /// the floor of `call_inflight_min_ms` is per call: the agent enforces the runs' deadlines
+    /// and gives the cap again before every call. Null where nothing waits on a call.
+    hook_fn: ?*const fn (
+        context: *anyopaque,
+        hook_context: ?*anyopaque,
+        hook: ?*const fn (hook_context: *anyopaque) void,
+    ) void = null,
 };
 
 pub const Config = struct {
@@ -212,6 +220,12 @@ pub const Agent = struct {
     /// The cap the step last gave its calls (`cap_calls`), monotonic; maxInt if none. A run that
     /// starts mid-step may only lower it (`arm_run_deadline`).
     calls_cap_mono_ms: u64,
+    /// The step in progress, for `before_call`; null between steps.
+    calls_ctx: ?*const Context,
+    /// True while `before_call` runs: the hook must not re-enter itself.
+    in_before_call: bool,
+    /// The step whose failed listing in `before_call` was last counted (once per step).
+    list_noted_step: u64,
     /// Failures of the server-free enforcement that the step went on after (one run's record or
     /// stop, the runtime's listing): counted, with the last one's code and cause, for the shell
     /// to say. Enforcement never fails the step, so the heartbeat always runs.
@@ -297,6 +311,9 @@ pub const Agent = struct {
         agent.jobs_wake_mono_ms = maxInt(u64);
         agent.deadline_wake_mono_ms = maxInt(u64);
         agent.calls_cap_mono_ms = maxInt(u64);
+        agent.calls_ctx = null;
+        agent.in_before_call = false;
+        agent.list_noted_step = 0;
         agent.enforce_failures = 0;
         agent.enforce_failure_len = 0;
         agent.steps = 0;
@@ -372,14 +389,47 @@ pub const Agent = struct {
         const deadline = ctx.deadline orelse return;
         agent.calls_cap_mono_ms = agent.calls_deadline_ms(ctx.mono_ms());
         deadline.set_fn(deadline.context, agent.calls_cap_mono_ms);
+        if (deadline.hook_fn) |set| set(deadline.context, agent, before_call);
+    }
+
+    /// Runs before every call of a step (`Deadline.hook_fn`): if a run's deadline or kill has
+    /// come while the step's earlier calls were in flight, it is enforced now, from the records
+    /// and the clock alone, and the call gets its own `call_inflight_min_ms`. So the floor is per
+    /// call and a run is enforced at most one call late, not a whole step late (#142).
+    fn before_call(context: *anyopaque) void {
+        const agent: *Agent = @ptrCast(@alignCast(context));
+        const step = agent.calls_ctx orelse return;
+        assert(!agent.in_before_call);
+        agent.in_before_call = true;
+        defer agent.in_before_call = false;
+        const mono = step.mono_ms();
+        if (agent.deadline_wake_mono_ms <= mono) {
+            // Its own diagnostic: the step's may hold a failure kept for the step's result.
+            var diag: Diag = undefined;
+            diag.reset();
+            var local = step.*;
+            local.diag = &diag;
+            if (local.runtime.list(local.arena, &diag)) |found| {
+                agent_jobs.enforce_deadlines(agent, &local, found);
+            } else |_| {
+                // The wake stays due, so this call gets one floor and the next call lists again:
+                // a failed listing never uncaps the rest of the step (J8's lateness). Counted
+                // once per step.
+                if (agent.list_noted_step != agent.steps) {
+                    agent.list_noted_step = agent.steps;
+                    const what = "list the containers to enforce run deadlines";
+                    agent.note_enforce_failure(&local, what);
+                } else diag.reset();
+            }
+        }
+        agent.cap_calls(step);
     }
 
     /// A run started in the middle of a step, which `enforce_deadlines` at the step's start did
     /// not see: its deadline (`at_mono_ms`) becomes a wake, and the calls the step still makes
     /// end by it, so a hung call or a long run of slow ones never keeps the run executing until
-    /// the step ends (#202). It only lowers the cap: `calls_deadline_ms` never cuts a call
-    /// short of `call_inflight_min_ms`, and giving that again at every start would let a burst of
-    /// starts extend the step without end.
+    /// the step ends (#202). It only lowers the cap; `before_call` gives each call its own
+    /// `call_inflight_min_ms` again, after enforcing any run that has come due.
     pub fn arm_run_deadline(agent: *Agent, ctx: *const Context, at_mono_ms: u64) void {
         agent.deadline_wake_mono_ms = @min(agent.deadline_wake_mono_ms, at_mono_ms);
         const deadline = ctx.deadline orelse return;
@@ -421,6 +471,8 @@ pub const Agent = struct {
     pub fn reconcile(agent: *Agent, ctx: *const Context) Error!Wakeup {
         assert(ctx.diag.code == null);
         agent.steps += 1;
+        agent.calls_ctx = ctx;
+        defer agent.calls_ctx = null;
         const now = ctx.clock.now_ms();
         const mono = ctx.mono_ms();
         // The fence comes first and needs no server: an agent cut off from everything still stops.
