@@ -1446,8 +1446,9 @@ test "a run whose step fails does not hold back the runs after it in the same pa
     // Goal: the release reviews' SHOULD (RA, RB): one job's failing step (here its start record
     // cannot be written) must not abort the pass, or every later job on the node is starved of
     // its claim, start, cancel and report. Method: two runs; "other-job" sorts before
-    // "train-job", and its record refuses every write. One agent step: "train-job" is claimed
-    // and started all the same, the failure is noted, and the node is not fenced.
+    // "train-job", and its record refuses every write. Within the 2 s the test advances,
+    // "train-job" is claimed and started all the same, the failure is noted, and the node is not
+    // fenced.
     var rig = try Rig.start();
     defer rig.stop();
     const world = rig.world;
