@@ -899,7 +899,7 @@ test "a job pass that fails still lets the replica controller reconcile (RB-S2)"
     _ = try f.pass();
     try corrupt(&f, .job_controller, records.job_status_key("a").slice());
     var bad_key: [records.index_prefix(.job, "a").slice().len + 3]u8 = undefined;
-    @memcpy(bad_key[0..bad_key.len - 3], records.index_prefix(.job, "a").slice());
+    @memcpy(bad_key[0 .. bad_key.len - 3], records.index_prefix(.job, "a").slice());
     @memcpy(bad_key[bad_key.len - 3 ..], "zzz");
     try corrupt(&f, .job_controller, &bad_key);
     var api: controller.DecisionSource = .{ .instance = 0 };
