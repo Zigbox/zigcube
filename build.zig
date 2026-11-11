@@ -1056,8 +1056,12 @@ fn canary_manifest(b: *std.Build) []const u8 {
         canary_seeds_teeth, canary_symptom_teeth,
     });
     for (c1_teeth_roots) |entry| {
-        text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {d} {s}\n", .{
-            text, entry.name, entry.canary_seeds, entry.symptom,
+        const seeds = if (entry.canary_first) |first|
+            b.fmt("{d}+{d}@{d}", .{ first, entry.canary_seeds, entry.ops })
+        else
+            b.fmt("{d}", .{entry.canary_seeds});
+        text = b.fmt("{s}sim_c1_teeth_{s} sim-c1 {s} {s}\n", .{
+            text, entry.name, seeds, entry.symptom,
         });
     }
     return b.fmt("{s}sim_swarm_teeth sim-swarm {d} {s}\n", .{
@@ -1116,6 +1120,10 @@ const c1_teeth_roots = [_]struct {
     root: []const u8,
     symptom: []const u8,
     canary_seeds: u32,
+    /// A sparse tooth's canary runs `canary_seeds` seeds from this one at `ops` operations and
+    /// the runner's default profile (manifest `FIRST+COUNT@OPS`), not fresh seeds at drawn
+    /// operations: ops/sim-fleet/README.md.
+    canary_first: ?u32 = null,
     /// The first seed `sim-c1-teeth-NAME` runs. The test stops at the first failing seed and
     /// that one must show `symptom`, unless `any_symptom`: then seeds that fail otherwise (the
     /// skew world fails on convergence at some seeds since #177) are skipped, and some seed in
@@ -1308,14 +1316,18 @@ const c1_teeth_roots = [_]struct {
     .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
-        // With #202 fixed (agents arm a run's deadline when it starts), seeds 1..60 hit the
-        // second clause only on seed 32, so both ranges end there, and CI's run starts there
-        // (1..31 pass and cost CI's sim job about 15 minutes). A sparse tooth: widening its
-        // world so more seeds hit is B3 work. Seeds 14, 17 and 19 pass with the fault off.
+        // With #202 fixed (agents arm a run's deadline when it starts), the second clause is hit
+        // by about one seed in a hundred: seed 32 until B2.1 slice 6 (#205: a failing step no
+        // longer aborts the pass) shifted the world, then seed 186 (1..2000 searched up to the
+        // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md). CI's run ends
+        // there, and the fleet canary runs seed 186 alone at 300 operations (fresh seeds at
+        // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth:
+        // widening its world so more seeds hit is B3 work. Seed 186 passes with the fault off.
         .symptom = "J8: a run that no node started",
-        .canary_seeds = 32,
-        .first_seed = 32,
-        .seeds = 32,
+        .canary_seeds = 1,
+        .canary_first = 186,
+        .first_seed = 186,
+        .seeds = 186,
         .ops = 300,
     },
 };

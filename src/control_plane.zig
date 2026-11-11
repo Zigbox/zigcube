@@ -83,8 +83,24 @@ pub const ControlPlane = struct {
         const second = try plane.scheduler.reconcile(ctx);
         if (plane.check_i6) plane.mismatch = try scheduler.find_mismatch(ctx);
         const audited = try plane.auditor.reconcile(ctx);
-        const jobs = try plane.jobs.reconcile(ctx);
+        // A job pass that fails (a corrupt record no guard covers) must not stop the replicas'
+        // controller (RB-S2): its error and diagnostic are kept, the replicas run, and the job
+        // pass's error is what the caller gets.
+        var job_diag: @TypeOf(ctx.diag.*) = undefined;
+        var job_error: ?Error = null;
+        var jobs: Wakeup = undefined;
+        if (plane.jobs.reconcile(ctx)) |woken| {
+            jobs = woken;
+        } else |err| {
+            job_error = err;
+            job_diag = ctx.diag.*;
+            ctx.diag.reset();
+        }
         const third = try plane.replicas.reconcile(ctx);
+        if (job_error) |err| {
+            ctx.diag.* = job_diag;
+            return err;
+        }
         return .{
             .at_ms = @min(
                 @min(@min(first.at_ms, second.at_ms), @min(audited.at_ms, third.at_ms)),

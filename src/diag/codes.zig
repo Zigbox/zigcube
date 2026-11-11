@@ -525,8 +525,10 @@ pub const registry = [_]Entry{
         \\either end), or the name `watch`, which /v1/jobs/watch reserves, no
         \\command or too many words, a deadline of zero or above 24 hours, a grace
         \\period above 60 seconds, env above 8 KiB, an input above 64 KiB or with a
-        \\NUL byte, a submit time more than an hour ahead, or
-        \\more labels than a job may carry.
+        \\NUL byte, a submit time more than an hour ahead,
+        \\more labels than a job may carry, a label or env key given twice, or a
+        \\`limits` member outside its range (`cpu_millis` 10 to 1,024,000,
+        \\`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).
         \\
         \\Two fields are refused because they are not built yet, and the cause says
         \\so: retries above 0 (a job runs at most once), and placement. Accepting a
