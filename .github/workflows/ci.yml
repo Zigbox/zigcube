@@ -1,7 +1,8 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
 # installed from a verified tarball (.github/actions/setup-zig). The other shell lines are the
-# changes job (.github/ci-changes.sh decides what runs), the pg_dropcluster line after installing postgresql-16 (apt installs go through .github/actions/install-apt), the Postgres 16 check that sets the SQLite
-# ZCUBE_PG_BIN, and the docker lines of the Postgres demos job that
+# changes job (.github/ci-changes.sh decides what runs), the Postgres 16 check and
+# pg_dropcluster steps (apt installs go through .github/actions/install-apt), and the docker
+# lines of the Postgres demos job that
 # names its service container. The wasm and simulations jobs use the Node that the runner image
 # carries.
 #
