@@ -1655,6 +1655,14 @@ const c1_regressions = [_][]const []const u8{
     // of a container that had ended under an older assignment (an agent bug).
     &.{ "1612", "351", "2", "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=218" },
     &.{ "893", "625", "8", "--lease-ttl-ms=10000", "--replicas-pct=300", "--heal-at=584" },
+    // #142 reopened (J6 seed 102): the call floor was one budget per step, so a slow store and
+    // short-grace runs starved every read and the committed stop was never seen. The floor is
+    // per call now (`Agent.before_call`); the stop is read within 2.7 s.
+    &.{
+        "102",                  "112",                "1",
+        "--c1",                 "--strong",           "--profile=slow_store",
+        "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=99",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
