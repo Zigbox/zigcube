@@ -30,7 +30,8 @@ sim-worlds 30, zigbox-smoke 20, demo-c2 25, mtls-interop 10, pages 10).
 ## Teeth count
 
 AGENTS.md's "seventeen teeth" matches `c1_teeth_roots` in build.zig: 23 roots, six earlier ones
-(allocation, readiness, stale, skew, wedge, locality) and the 17 job and relay teeth listed. No change.
+(allocation, readiness, stale, skew, wedge, locality) and the 17 job and relay teeth listed.
+No change.
 
 ## Numbers
 
