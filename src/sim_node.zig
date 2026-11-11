@@ -18,6 +18,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const agent_records = @import("agent_records.zig");
 const agent_state = @import("agent_state.zig");
+const c1_teeth = @import("c1_teeth.zig");
 const Clock = @import("clock.zig").Clock;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
@@ -311,6 +312,7 @@ pub const SimNode = struct {
             for (record.spec.labels, labels) |pair, *slot| {
                 slot.* = .{ .key = pair[0], .value = pair[1] };
             }
+            if (c1_teeth.job_reuse) lie_about_created(labels);
             listings.append(arena, .{
                 .handle = runtime.Handle.init(record.name),
                 .labels = labels,
@@ -319,6 +321,20 @@ pub const SimNode = struct {
         }
         std.mem.sort(runtime.Listing, listings.items, {}, listing_less);
         return listings.items;
+    }
+
+    /// Test-only (`c1_teeth.job_reuse`): a job container's `zcube.created` label reads as the
+    /// newest epoch there is, so no run's create revision is ever later than it and a container
+    /// of an earlier job of the same name is taken for the new one's.
+    fn lie_about_created(labels: []runtime.Label) void {
+        var is_job = false;
+        for (labels) |label| is_job = is_job or std.mem.eql(u8, label.key, runtime.label_job);
+        if (!is_job) return;
+        for (labels) |*label| {
+            if (std.mem.eql(u8, label.key, runtime.label_created)) {
+                label.value = std.fmt.comptimePrint("{d}", .{std.math.maxInt(u64)});
+            }
+        }
     }
 
     fn listing_less(_: void, first: runtime.Listing, second: runtime.Listing) bool {

@@ -871,6 +871,7 @@ pub const Cluster = struct {
     reuse_jumps: u32,
     reuse_made: u32,
     reuse_met: u32,
+    reuse_pick_exited: bool = false,
     /// A job started's spec lacked (or wrongly carried) its relay (R3; sticky).
     relay_spec_wrong: bool = false,
     /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
@@ -937,11 +938,7 @@ pub const Cluster = struct {
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
         c.job_next = 1;
-        c.reuse_cursor = .{ .age_ms = constants.job_finished_age_ms_min };
-        c.reuse_ops = 0;
-        c.reuse_jumps = 0;
-        c.reuse_made = 0;
-        c.reuse_met = 0;
+        c.init_reuse();
         c.strong = options.strong or c1_teeth.strong_world;
         c.host_crashes = 0;
         c.init_c1(gpa);
@@ -950,6 +947,15 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The reuse world's cursor and counters start empty.
+    fn init_reuse(c: *Cluster) void {
+        c.reuse_cursor = .{ .age_ms = constants.job_finished_age_ms_min };
+        c.reuse_ops = 0;
+        c.reuse_jumps = 0;
+        c.reuse_made = 0;
+        c.reuse_met = 0;
     }
 
     /// The per-tick trackers start empty.
@@ -1506,6 +1512,12 @@ pub const Cluster = struct {
     /// old when it began); jobs that ended in the last minute stay.
     fn retention_jump(c: *Cluster) void {
         if (store_faulty(c)) return;
+        // The jump stands for an hour in which the J4 client, which is never away that long,
+        // would have polled: it catches up first, or retention would delete endings it had no
+        // time to see (a property of the jump, not of the server).
+        c.jobs_watch.away_until_ms = 0;
+        const head = c.store_handle().status(&c.diag) catch return;
+        sim_jobs_watch.finish(&c.jobs_watch, &c.api, &c.controller_context(), head.revision);
         const gap = constants.job_finished_age_ms_min - 60_000;
         const now = c.manual.ms +| gap;
         for (0..2) |_| {
@@ -1523,13 +1535,37 @@ pub const Cluster = struct {
         c.reuse_jumps += 1;
     }
 
+    /// The job to reuse: one whose container stopped with an exit code (the stale container a
+    /// run of the same name could take for its own), else a random one.
+    fn reuse_pick(c: *Cluster) u32 {
+        assert(c.job_next > 1);
+        var seen: u32 = 0;
+        var chosen: u32 = 0;
+        for (c.nodes) |node| {
+            for (node.sim.containers.containers.items) |container| {
+                const job = job_of(container) orelse continue;
+                if (container.phase != .stopped) continue;
+                if (container.phase.stopped != .exited) continue;
+                if (!std.mem.startsWith(u8, job, "jb-")) continue;
+                const number = std.fmt.parseInt(u32, job[3..], 10) catch continue;
+                if (number == 0 or number >= c.job_next) continue;
+                seen += 1;
+                if (c.prng.random().uintLessThan(u32, seen) == 0) chosen = number;
+            }
+        }
+        c.reuse_pick_exited = chosen != 0;
+        if (chosen != 0) return chosen;
+        return 1 + c.prng.random().uintLessThan(u32, c.job_next - 1);
+    }
+
     /// A create of a name used before: the older incarnation was deleted by retention, or the
     /// create is refused (the name is taken; false). Counts when it met a container of that name.
     fn reuse_job(c: *Cluster) bool {
         if (c.job_next == 1) return false;
-        const number = 1 + c.prng.random().uintLessThan(u32, c.job_next - 1);
+        const number = c.reuse_pick();
         var name_buffer: [16]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch unreachable;
+        const name = std.fmt.bufPrint(&name_buffer, "jb-{d}", .{number}) catch
+            unreachable; // "jb-" and a u32 fit.
         if (!c.create_job_as(number)) return false;
         c.reuse_made += 1;
         for (c.nodes) |node| {
@@ -2103,11 +2139,17 @@ fn operation(c: *Cluster) void {
             for (0..burst) |_| c.create_job();
             if (c1_teeth.reuse_world) {
                 c.reuse_ops += 1;
-                if (c.reuse_ops % 6 == 0) c.retention_jump();
+                // Reuse follows the jump at once: no agent step lies between, so a container of
+                // the deleted incarnation still stands when its name is made again.
+                if (c.reuse_ops % 3 == 0) c.retention_jump();
                 // A few tries: most names are still held by their job, and are refused.
-                if (c.reuse_ops % 6 == 2) for (0..8) |_| {
-                    if (c.reuse_job()) break;
-                };
+                if (c.reuse_ops % 3 == 0) {
+                    var made: u32 = 0;
+                    for (0..16) |_| {
+                        if (c.reuse_job()) made += 1;
+                        if (made == 4) break;
+                    }
+                }
             }
         },
         .job_cancel => c.cancel_job(),
@@ -2611,9 +2653,22 @@ fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
     }
 }
 
-/// J11 (the reuse world): a run whose status says it `exited` was started by some node, in its
-/// own incarnation (`running` may be reported ahead of the start, and is not judged). A container left by an older run of the same name,
-/// taken for this one, makes a run that ended without a start.
+/// J11 (the reuse world): a run whose status is `exited`, or failed by memory or process limit,
+/// is an ending only a real container has, so some node started the run in its own incarnation.
+/// A container left by an older run of the same name, taken for this one, makes a run that
+/// ended without a start. `running` may be reported ahead of the start, and a `failed deadline`
+/// can follow a start record whose container was never made: neither is judged.
+fn ran_to_an_end(status: records.JobStatus) bool {
+    return switch (status.state) {
+        .exited => true,
+        .failed => if ((status.end orelse return false).cause) |cause|
+            cause == .oom or cause == .pid_limit
+        else
+            false,
+        .pending, .placed, .running, .cancelled => false,
+    };
+}
+
 fn started_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
     assert(c.jobs.ledger_full == 0);
     const job_runs = controller.list_all(
@@ -2629,13 +2684,13 @@ fn started_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
     for (job_runs.items) |entry| {
         const run = &entry.rec;
         const status = job_status_of(ctx, run.job) orelse continue;
-        if (status.state != .exited) continue;
+        if (!ran_to_an_end(status)) continue;
         if (status.node == null) continue;
         const hash = sim_jobs.run_hash(run.id, entry.kv.create_revision);
         if (std.mem.indexOfScalar(u64, c.jobs.ledger[0..c.jobs.ledger_count], hash) != null) {
             continue;
         }
-        try check(c, false, "J11: a run exited that no node started");
+        try check(c, false, "J11: a run ended after running that no node started");
     }
 }
 

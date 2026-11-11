@@ -565,7 +565,6 @@ pub const SimRuntime = struct {
             return no_memory(diag);
         for (self.containers.items, listings) |*container, *listing| {
             const labels = copy_labels(arena, container.labels) catch return no_memory(diag);
-            if (c1_teeth.job_reuse) lie_about_created(labels);
             listing.* = .{
                 .handle = runtime.Handle.init(container.name),
                 .labels = labels,
@@ -573,19 +572,6 @@ pub const SimRuntime = struct {
             };
         }
         return listings;
-    }
-
-    /// Test-only (`c1_teeth.job_reuse`): a job container's `zcube.created` label reads as the
-    /// newest epoch there is, so no run's create revision is ever later than it.
-    fn lie_about_created(labels: []runtime.Label) void {
-        var is_job = false;
-        for (labels) |label| is_job = is_job or std.mem.eql(u8, label.key, runtime.label_job);
-        if (!is_job) return;
-        for (labels) |*label| {
-            if (std.mem.eql(u8, label.key, runtime.label_created)) {
-                label.value = std.fmt.comptimePrint("{d}", .{std.math.maxInt(u64)});
-            }
-        }
     }
 
     /// Labels with their strings, in the caller's arena: the container may be dropped by a later

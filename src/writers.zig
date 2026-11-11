@@ -214,7 +214,8 @@ fn retention_only(request: store.TxnRequest) bool {
 
 /// Whether `request` is a batch of retention's sweep of stray `/job-observed/` records: deletes
 /// only, of those keys only, for any jobs and nodes (the sweep batches up to a transaction's
-/// worth of strays in key order, so one batch spans nodes and jobs; `job_retention.sweep_observed`).
+/// worth of strays in key order, so one batch spans nodes and jobs;
+/// `job_retention.sweep_observed`).
 /// It was never exercised in the simulator before B2.1 slice 4 made retention run there.
 fn observed_sweep_only(request: store.TxnRequest) bool {
     var count: u32 = 0;
@@ -569,7 +570,10 @@ test "retention's sweep of stray observations may span nodes and jobs, and only 
     try testing.expect(allowed(.retention, request_of(&sweep)) == .allowed);
     const wrong = [_][]const store.Op{
         &.{ .{ .delete = "/job-observed/n1/a" }, .{ .delete = "/job-runs/b" } },
-        &.{ .{ .delete = "/job-observed/n1/a" }, .{ .put = .{ .key = "/job-observed/n2/b", .value = "" } } },
+        &.{
+            .{ .delete = "/job-observed/n1/a" },
+            .{ .put = .{ .key = "/job-observed/n2/b", .value = "" } },
+        },
     };
     for (wrong) |ops| try testing.expect(foreign_key(request_of(ops)) != null);
 }

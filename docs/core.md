@@ -489,6 +489,24 @@ agent that starts a stopped run again breaks J2; one that skips its claim breaks
 that leaves the run's compare out of a placement, with a `stop` committed between its read and its commit, breaks J5; a controller that rewrites a terminal status breaks J3; an
 agent that ignores a cancel breaks J6; one that ignores the deadline, enforces it 9 s late, or enforces it only when it can reach the server (with cuts of up to 33 s and short deadlines turned up, so that deadlines fall in them), breaks J8; a jobs watch that drops the events of some endings breaks J4. Their
 `sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 32, the only hit in 1..60 since #202 was fixed (the fleet canary runs 1..32). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
+
+`sim-c1-teeth-job_reuse` (B2.1 slice 4): the reuse world. A store-side retention jump
+(`Cluster.retention_jump`; it ticks no agent, and first lets the J4 client catch up, since the
+jump stands for an hour that client would have polled in) runs `job_retention.prune` twice on a
+clock moved past the retention age, every third `job_create` operation; creates then name deleted
+jobs, preferring one whose node still holds a stopped container that exited. The run id is
+`<name>-job`, so a reused name meets that container: the agent's stale-epoch rule must not take it
+for the new run's. The ledger of starts is keyed by incarnation (the run's `/job-runs` create
+revision) in this world, and J11 fails a run whose status is `exited` (or failed by `oom` or
+`pid_limit`: endings only a real container has) that no node started in its own incarnation.
+`running` (reported ahead of the start) and `failed deadline` (a start record whose step aborted
+before `runtime.start`) are not judged. The tooth makes the simulated node's listing
+(`sim_node.zig`) report every job container's `zcube.created` as the newest epoch; the agent is
+unchanged. `sim-c1-reuse` is the world with the agent right (seeds 1..60, 300 operations). Opening
+the world exposed that J-model gap: retention's sweep of stray `/job-observed/` keys spans nodes
+and jobs, which I4's `retention_only` rejected; `writers.zig` accepts a delete-only request on
+that prefix. The report adds `jobs: reuse jumps=.. dropped=.. reused creates=.. met a container=..`
+in this world only; every other world is unchanged bit for bit. `docs/decisions/2026-11-11-job-reuse-tooth.md`.
 `zcube-agent` assert at compile time that none is on.
 
 **Relays (B3 slice 3).** `SimRuntime` models the listener of a job's relay (`Spec.relay`): open from the
