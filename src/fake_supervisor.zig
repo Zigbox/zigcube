@@ -436,6 +436,8 @@ test "a SIGTERM that came before the fetch's pid was published still reaches the
 }
 
 var window_pid_seen: i32 = -1;
+/// The test's child, whose zombie the window's hook looks for (`child_pid` is clear by then).
+var window_child_pid: i32 = 0;
 var window_zombie_seen: bool = false;
 
 fn observe_window() void {
@@ -444,7 +446,7 @@ fn observe_window() void {
     on_term(.TERM);
     var info: std.os.linux.siginfo_t = undefined;
     const flags = std.os.linux.W.EXITED | std.os.linux.W.NOWAIT | std.os.linux.W.NOHANG;
-    const rc = std.os.linux.waitid(.ALL, 0, &info, flags, null);
+    const rc = std.os.linux.waitid(.PID, window_child_pid, &info, flags, null);
     const found = std.os.linux.errno(rc) == .SUCCESS;
     window_zombie_seen = found and info.fields.common.first.piduid.pid != 0;
 }
@@ -466,6 +468,8 @@ test "between the end of the command and its reap nothing can be signalled (issu
         .stderr = .ignore,
     });
     publish_child(child.id.?);
+    window_child_pid = child.id.?;
+    defer term_received.store(false, .release); // The hook's SIGTERM sets it.
     window_pid_seen = -1;
     window_zombie_seen = false;
     const term = try reap(io, tmp.dir, &child, observe_window);

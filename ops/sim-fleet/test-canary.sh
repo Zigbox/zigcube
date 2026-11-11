@@ -96,7 +96,10 @@ while read -r runner kind seeds symptom; do
     fake "$runner" "$kind" "$symptom"
     runners="$runners $runner"
     count=$((count + 1))
-    case "$seeds" in '' | *[!0-9]*) case_name=manifest; fail "bad seeds for $runner" ;; esac
+    case "$seeds" in
+    [0-9]*+[0-9]*@[0-9]*) ;;
+    '' | *[!0-9]*) case_name=manifest; fail "bad seeds for $runner" ;;
+    esac
 done <"$manifest"
 case_name=manifest
 [ "$count" -ge 8 ] || fail "only $count canaries in $manifest"

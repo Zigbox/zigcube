@@ -227,7 +227,7 @@ bytes, given as VAR"; the failure record and bundles keep `--env K=...` and read
 `job list` prints NAME, STATE, NODE and END (`wide` adds IMAGE, LABELS, DEADLINE); `no jobs` when
 none match. `--state` is a job state or `ended`. `job watch` prints one line per ending
 (`etl  exited (code 0)  node1`; `--output json`: `{"name","status"}`), and `--from REV` is the
-first revision wanted. After every answer that held an ending, and every relist, `watch` writes
+first revision wanted. After every answer that held a status, and every relist, `watch` writes
 `watching: resume with --from N` to stderr (stdout, `--output json` too, keeps its shape); pass that
 `N` to continue from there. Each round of the watch frees its own memory, so a watch that runs for
 days stays the size it started. `job get` shows `cancel requested by WHO` once a cancel is recorded. If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the

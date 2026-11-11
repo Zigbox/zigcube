@@ -186,6 +186,11 @@ kind_exe() {
 kind_flags() {
     profile=$SIM_FLEET_PROFILE
     if [ "$1" = sim-canary ]; then profile=auto; fi
+    if [ "$1" = sim-canary ] && [ -n "$canary_ops" ]; then
+        # A fixed range runs the world its tooth was found in: the runner's default profile.
+        echo "--c1"
+        return 0
+    fi
     case "$(kind_sim "$1")" in
     sim-c1) echo "--c1 --profile=$profile" ;;
     *) echo "--profile=$profile" ;;
@@ -199,7 +204,9 @@ kind_shrink() {
 }
 
 kind_ops() {
-    if [ "$1" = sim-canary ]; then echo auto; else echo "$SIM_FLEET_OPS"; fi
+    if [ "$1" = sim-canary ] && [ -n "$canary_ops" ]; then
+        echo "$canary_ops"
+    elif [ "$1" = sim-canary ]; then echo auto; else echo "$SIM_FLEET_OPS"; fi
 }
 
 # The summary line's operations, as the producers print it: `N operations`, or for a drawn size
@@ -296,6 +303,8 @@ run_round() {
 # canary this round), canary_kind, canary_seeds and canary_symptom.
 canary_pick() {
     canary_runner=""
+    canary_first=""
+    canary_ops=""
     if [ "$SIM_FLEET_CANARY_ONE_IN" -eq 0 ]; then return 0; fi
     due=$(number_in "$STATE/canary-due")
     due=$((due + 1))
@@ -317,6 +326,17 @@ canary_pick() {
     canary_kind=${rest%% *}
     rest=${rest#* }
     canary_seeds=${rest%% *}
+    # `FIRST+COUNT@OPS`: a sparse tooth's fixed range (build.zig, `canary_first`).
+    canary_first=""
+    canary_ops=""
+    case "$canary_seeds" in
+    *+*@*)
+        canary_ops=${canary_seeds#*@}
+        canary_first=${canary_seeds%%+*}
+        canary_seeds=${canary_seeds#*+}
+        canary_seeds=${canary_seeds%%@*}
+        ;;
+    esac
     canary_symptom=${rest#* }
     if [ "$canary_symptom" = - ]; then canary_symptom=""; fi
     if [ ! -x "$bin/$canary_runner" ]; then
@@ -365,10 +385,10 @@ canary_blind() {
     {
         printf 'seed %s: CRASHED: not run in %s tries\n' "$base" "$tries"
         printf '  step: canary\n'
-        printf '  replay: zig-out/bin/%s --seeds %s..%s auto %s\n' "$canary_runner" "$base" \
-            "$last" "$(kind_flags sim-canary)"
-        printf '%s: seeds %s..%s, drawn operations: 1 of 1 failed\n' \
-            "$(kind_prefix sim-canary)" "$base" "$base"
+        printf '  replay: zig-out/bin/%s --seeds %s..%s %s %s\n' "$canary_runner" "$base" \
+            "$last" "$(kind_ops sim-canary)" "$(kind_flags sim-canary)"
+        printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' \
+            "$(kind_prefix sim-canary)" "$base" "$base" "$(ops_phrase sim-canary)"
     } >"$round/blind-sim-canary"
     log "canary $canary_runner could not run in $tries tries: recording a blind spot"
     ingest sim-canary "$round/blind-sim-canary" "$base..$last" || true
@@ -446,14 +466,15 @@ canary_record() {
     esac
     printf 'seed %s: %s\n' "$base" "$verdict"
     printf '  step: %s\n' "$where"
-    printf '  replay: zig-out/bin/%s --seeds %s..%s auto %s\n' "$canary_runner" "$base" \
-        "$last" "$(kind_flags sim-canary)"
-    printf '%s: seeds %s..%s, drawn operations: 1 of 1 failed\n' "$(kind_prefix sim-canary)" \
-        "$base" "$base"
+    printf '  replay: zig-out/bin/%s --seeds %s..%s %s %s\n' "$canary_runner" "$base" \
+        "$last" "$(kind_ops sim-canary)" "$(kind_flags sim-canary)"
+    printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' "$(kind_prefix sim-canary)" \
+        "$base" "$base" "$(ops_phrase sim-canary)"
 }
 
 start_worker() {
     base=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+    if [ "$2" = sim-canary ] && [ -n "$canary_first" ]; then base=$canary_first; fi
     echo "$base" >"$round/base-$1"
     echo "$2" >"$round/kind-$1"
     exe=$(kind_exe "$2")
