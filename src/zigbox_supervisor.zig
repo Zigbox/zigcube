@@ -701,7 +701,8 @@ test "a relay that cannot be served is written to relay.log after what is there 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "relay.log", .data = "earlier line\n" });
     append_relay_failure(log, "the container gave no listener");
     const limit: std.Io.Limit = .limited(4096);
-    const text = try tmp.dir.readFileAlloc(std.testing.io, "relay.log", std.testing.allocator, limit);
+    const io = std.testing.io;
+    const text = try tmp.dir.readFileAlloc(io, "relay.log", std.testing.allocator, limit);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("earlier line\n" ++
         "ZC-E0702 the relay could not be served: the container gave no listener\n", text);
