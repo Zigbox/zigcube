@@ -599,6 +599,7 @@ const Node = struct {
             .deadline = .{
                 .context = node,
                 .set_fn = Node.deadline_set_fn,
+                .hook_fn = Node.deadline_hook_fn,
             },
             .images = node.store_images.images(),
         };
@@ -638,6 +639,16 @@ const Node = struct {
     fn deadline_set(node: *Node, deadline_ms: u64) void {
         assert(node.remote.mono != null); // `create_node` gives the remote its clock
         node.remote.deadline_ms = deadline_ms;
+    }
+
+    fn deadline_hook_fn(
+        context: *anyopaque,
+        hook_context: ?*anyopaque,
+        hook: ?*const fn (hook_context: *anyopaque) void,
+    ) void {
+        const node: *Node = @ptrCast(@alignCast(context));
+        node.remote.before_context = hook_context;
+        node.remote.before_fn = hook;
     }
 
     fn deadline_set_fn(context: *anyopaque, deadline_ms: u64) void {
@@ -2442,6 +2453,8 @@ fn track_jobs(c: *Cluster) Failure!void {
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
     try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
     try track_relays(c);
+    const ledger_found = sim_jobs.ledger_problem(&c.jobs);
+    try check(c, ledger_found == null, ledger_found orelse "");
     if (store_faulty(c)) {
         c.store_healthy_since_ms = c.manual.ms;
         return;
@@ -2494,9 +2507,10 @@ const unclaimed_ms_max: u64 = 90_000;
 
 /// J8, second clause: a run that was never started (no entry in the start ledger) is ended by
 /// the server, whatever the nodes do, once its `start_by_ms` has passed. Judged only once the
-/// store has been reachable for `unclaimed_ms_max`, and not at all when the ledger overflowed.
+/// store has been reachable for `unclaimed_ms_max`. A full ledger fails the run in `track_jobs`
+/// first, so the ledger read here is whole.
 fn unclaimed_ended(c: *Cluster, ctx: *const controller.Context) Failure!void {
-    if (c.jobs.ledger_full > 0) return;
+    assert(c.jobs.ledger_full == 0);
     const job_runs = controller.list_all(
         records.JobRun,
         ctx,

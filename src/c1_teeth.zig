@@ -111,6 +111,11 @@ pub const relay_leak = declared("c1_teeth_relay_leak");
 /// carries the relay the job asked for; B3 slice 3). Needs the `strong` world's relayed jobs.
 pub const relay_dropped = declared("c1_teeth_relay_dropped");
 
+/// The job start ledger holds `job_ledger_small_max` runs, not 4096 (must break J8: a full ledger
+/// fails the run instead of leaving J2 and J8's second clause judging less than they claim).
+pub const job_ledger_small = declared("c1_teeth_job_ledger_small");
+pub const job_ledger_small_max: u32 = 16;
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
@@ -119,4 +124,4 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or relay_leak or relay_dropped;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped;
