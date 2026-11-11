@@ -164,9 +164,9 @@ footer .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 
 <script>// ===== Site data: update the milestone entries as work lands. =====
 const SITE = {
-  updated: "2026-11-05",
+  updated: "2026-11-11",
   sisterUrl: "../zigbox/", // Zigbox site
-  stage: "Pre-alpha · C2 shipped",
+  stage: "Pre-alpha · B2 shipped",
 };
 // status: "done" | "wip" | "plan"
 // When a milestone ships: status "done", slices {green, total, note}, recorded {url, date} linking the
@@ -186,6 +186,10 @@ const MILESTONES = [
    demo:[["$","zcube apply --yes python-app.zon"],["","  waited 69810 ms for 3 replicas of v1 running"],["","  node2: registry 43273982 B, peers 0 B, cached 0 B, struck 0"],["","  ok: v1 came from the registry on one node only; the other two fetched it from peers"],["","  node1: registry 0 B, peers 516 B, cached 115407369 B, struck 0"],["","  ok: node1 transferred 516 B for v2 (at most 1048576)"],["","  node3: registry 0 B, peers 7783900 B, cached 3144 B, struck 1"],["","  ok: node3 took every byte from peers, none from a registry"],["","alpine-box-3: warning[ZC-W0601]: a peer sent a chunk that does not match its hash"],["","  ok: python-warm's replica is on node1, a node that holds v2, not on the empty node4"],["","  ok: node4 fetched v2 from peers alone"],["$","zcube stats pull"],["","NODE   TREE                REGISTRY  PEERS  CACHED  TOOK   BAD PEERS"],["","node4  b3:7a91b50803ab...  0B        110Mi  0B      39.4s  -"],["","node3  b3:2e478596e56b...  0B        7Mi    3Ki     1.7s   node1"],["","node1  b3:2e478596e56b...  3Mi       0B     0B      2.0s   -"],["","node2  b3:7a91b50803ab...  6Ki       0B     41Mi    2.4s   -"],["","  ok: every rule of the demo held (0 missed)"]]},
   {id:"B1", name:"Jobs", status:"done", goal:"Finite jobs for Botpike: run once, deadlines and grace, cancel, adoption after a crash, and a watch on endings.",
    slices:{green:9, total:9, note:"slices reviewed and merged; slice 8 (job logs) cut"},
+  {id:"B2", name:"Hardening", status:"done", goal:"Fixes from B1's release reviews and the simulation fleet: deadlines enforced mid-step, renewal before fence, wiped disks and unplaceable jobs in the simulator.",
+    slices:{green:6, total:6, note:"Tagged b2 at 97cd643; every CI job green on it; job_reuse tooth deferred (owner)"},
+    recorded:{url:"https://github.com/Zigbox/zigcube/actions/runs/42939538049/job/130257829394", date:"2026-11-11"},
+    demo:[["$","zig build sim-fencing-teeth"],["","seed 1: FAILED: agents kept fencing after the cluster healed (a lease renewal that cannot beat its fence)"],["","  step: convergence"],["","  replay: zig-out/bin/sim_cluster 1 100 1 --lease-ttl-ms=4000 --heal-at=60"],["","sim-cluster: caught at seed 1 of 1..3"],["","sim-fencing-teeth success"]]},
    recorded:{url:"https://github.com/Zigbox/zigcube/actions/runs/42364827492/job/128380593368", date:"2026-11-07"},
    demo:[["$","zcube job run adopt --image b3:51aa9c03 --command sh -c 'echo start >> adopt-starts; sleep 10; exit 5'"],["","  ok: adopt-job runs on node1"],["","  ok: the agent of node1 is killed (kill -9)"],["","  ok: its job's command lives on"],["$","zcube job get adopt --wait"],["","job adopt: exited"],["","  end: exited (code 5)"],["","  ok: the restarted agent reported the ending: exited, code 5"],["","  ok: the command started once (its marker file has one line)"],["$","zcube job get doomed --wait   # node1 powered off under it"],["","job doomed: failed"],["","  end: failed (unreachable)"],["","  ok: it was read failed 7885 ms after the power-off (not before the lease ran out: at least 7000 ms)"],["","  ok: the command started once, never on the other node (its marker file has one line)"],["$","zcube why job pk5"],["","job pk5: pending"],["","  ← no node fits 500m CPU and 128 MiB: 2 of 2 nodes lack the room, 0 are excluded"],["","  ok: pk5 runs when pk4 is cancelled"],["","demo-b1 PASSED"]]},
   {id:"C3", name:"Rollout", status:"plan", goal:"Image changes roll out gradually, gated by health, and undo themselves on failure.",
