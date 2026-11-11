@@ -49,6 +49,8 @@ const shell_allowlist = [_][]const u8{
     // `sim_fleet`, and `test-crash-record.sh` feeds its crash records to `sim_fleet`.
     "ops/sim-fleet/test-canary.sh",
     "ops/sim-fleet/test-crash-record.sh",
+    // Runs demo-b3's guest.sh (a shell script already, below) against fake state directories.
+    "ops/demo-b3/test-guest.sh",
     // The demo's three-node start, stop and kill (c1-7 brief): a handful of long-lived processes
     // started side by side and killed by pid file, which is what a shell is for. Each script opens
     // with its own written reason; `down.sh` must work with nothing built.

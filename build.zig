@@ -1868,6 +1868,12 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     canary.addFileInput(b.path("ops/sim-fleet/run.sh"));
     canary.expectExitCode(0);
     test_step.dependOn(&canary.step);
+    // demo-b3's guest script reads the relay logs of the Zigbox runtime's layout and fails on none.
+    const guest = b.addSystemCommand(&.{"sh"});
+    guest.addFileArg(b.path("ops/demo-b3/test-guest.sh"));
+    guest.addFileInput(b.path("ops/demo-b3/guest.sh"));
+    guest.expectExitCode(0);
+    test_step.dependOn(&guest.step);
 }
 
 /// The seeds the teeth test runs and the most the simulator may need to catch the agent's

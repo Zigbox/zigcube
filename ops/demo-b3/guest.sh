@@ -11,7 +11,7 @@
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1.
 
 BIN=/home/cube/bin
-STATE=/root/state
+STATE=${STATE:-/root/state} # overridable for ops/demo-b3/test-guest.sh
 LOG=/root/log
 ARGS=/root/agent.args
 UPSTREAM_PORT=9090
@@ -151,19 +151,25 @@ cmd_node_addr() {
 # What listens in the guest's own network namespace: a job's relay must not.
 cmd_listeners() { ss -ltnH; }
 
+# Every job's relay.log, under the layout `--runtime zigbox` uses (<state>/zigbox/<name>/; the
+# fake runtime's `containers/` does not exist there). With none at all it fails, so a wrong path
+# cannot read as "nothing logged".
 cmd_relay_logs() {
-    for log in "$STATE"/containers/*/relay.log; do
+    found=0
+    for log in "$STATE"/zigbox/*/relay.log; do
         [ -f "$log" ] || continue
+        found=$((found + 1))
         echo "---- $log ----"
         cat "$log"
     done
-    true
+    [ "$found" -gt 0 ] || fail "no relay.log under $STATE/zigbox/: the jobs' relays left none"
+    echo "ok: $found relay.log files"
 }
 
 cmd_logs() {
     echo "---- agent.log (last 40 lines) ----"
     tail -40 "$LOG/agent.log" 2>/dev/null
-    cmd_relay_logs
+    (cmd_relay_logs) || true
     echo "---- upstream.log ----"
     cat /root/upstream.log 2>/dev/null
     echo "---- processes ----"

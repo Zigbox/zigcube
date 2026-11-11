@@ -673,6 +673,44 @@ test "a relay copies both ways to its upstream and stop closes every connection"
     try testing.expectError(error.ConnectFailed, dial(port));
 }
 
+test "an adopted listener is served, marked close-on-exec, and closed by stop" {
+    // Goal: the path `supervise-zigbox` takes (B3 slice 4). The listener comes from elsewhere
+    // (here a plain loopback one); the relay must serve it, keep it out of the job's exec, and
+    // close it on stop.
+    const echo = try Echo.start();
+    defer echo.stop();
+    const listener = try listen_loopback();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(testing.io, &path);
+    const log_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/relay.log", .{
+        path[0..length],
+    }, 0);
+    defer testing.allocator.free(log_path);
+    const upstream: Upstream = .{ .host = "127.0.0.1", .port = echo.bound.port };
+    const relay = try Relay.adopt(
+        testing.allocator,
+        testing.io,
+        upstream,
+        listener.fd,
+        listener.port,
+        log_path,
+    );
+    try testing.expectEqual(listener.port, relay.port);
+    const flags = linux.fcntl(listener.fd, linux.F.GETFD, 0);
+    try testing.expect(flags & linux.FD_CLOEXEC != 0);
+    try relay.run();
+    const fd = try dial(listener.port);
+    defer _ = linux.close(fd);
+    var buffer: [64]u8 = undefined;
+    _ = linux.write(fd, "adopted", 7);
+    try testing.expectEqual(@as(?usize, 7), receive(fd, &buffer, 2000));
+    try testing.expectEqualStrings("adopted", buffer[0..7]);
+    relay.stop();
+    try testing.expectError(error.ConnectFailed, dial(listener.port));
+}
+
 test "a relay closes the connection beyond its limit and says so (ZC-W0701)" {
     const echo = try Echo.start();
     defer echo.stop();

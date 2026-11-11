@@ -533,8 +533,10 @@ fn supervise(
     }
     const relay = open_relay(relay_ctx, spec, &storage.handle);
     _ = zigbox.wait(&storage.handle);
-    // The container's network namespace went with it, so nothing can reach the listener any
-    // more; this closes the supervisor's end and every relayed connection (docs/agent.md).
+    // `wait` has already written Zigbox's run record, which is how the agent learns of the
+    // ending, so the relay outlives the report by this call: Zigbox gives no hook between the
+    // reap and the record (docs/demos/b3.md). Nothing new can come in, since the container's
+    // processes are gone; this closes the supervisor's end and every relayed connection.
     if (relay) |open| open.stop();
     return constants.exit_ok;
 }
@@ -591,20 +593,30 @@ fn kill_unrelayed(
     cause: []const u8,
 ) ?*relay_module.Relay {
     var path_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
-    if (relay_log_path(&path_buffer, ctx)) |path| {
-        var line: [constants.relay_address_bytes_max]u8 = undefined;
-        const text = std.fmt.bufPrint(&line, "ZC-E0702 the relay could not be served: {s}\n", .{
-            cause,
-        }) catch "ZC-E0702 the relay could not be served\n";
-        const file = std.Io.Dir.cwd().createFile(ctx.io, path, .{ .truncate = false }) catch null;
-        if (file) |open| {
-            defer open.close(ctx.io);
-            open.writeStreamingAll(ctx.io, text) catch {}; // Nowhere else to say it.
-        }
-    }
+    if (relay_log_path(&path_buffer, ctx)) |path| append_relay_failure(path, cause);
     const kill: u8 = @intCast(@backingInt(std.posix.SIG.KILL));
     zigbox.signal(handle, kill) catch {}; // Already gone is as good.
     return null;
+}
+
+/// Appends the ZC-E0702 line and `cause` to `relay.log` (the relay's own writes append too, so an
+/// existing log is kept). Nowhere else to say it: a failure to write is dropped.
+fn append_relay_failure(path: [:0]const u8, cause: []const u8) void {
+    var line: [constants.relay_address_bytes_max]u8 = undefined;
+    const text = std.fmt.bufPrint(&line, "ZC-E0702 the relay could not be served: {s}\n", .{
+        cause,
+    }) catch "ZC-E0702 the relay could not be served\n";
+    const flags: std.os.linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    };
+    const opened = std.os.linux.open(path, flags, 0o644);
+    if (std.os.linux.errno(opened) != .SUCCESS) return;
+    const fd: std.os.linux.fd_t = @intCast(opened);
+    defer _ = std.os.linux.close(fd);
+    _ = std.os.linux.write(fd, text.ptr, text.len);
 }
 
 /// Writes `failed.json`, the last thing a supervisor that did not start a container does.
@@ -648,6 +660,51 @@ fn container_spec(arena: Allocator, spec: *const launch.Spec) ?zigbox.Spec {
 }
 
 const relay_env_value = std.fmt.comptimePrint("http://127.0.0.1:{d}", .{constants.relay_port});
+
+test "a job with a relay gets no network, one listener on the relay port and ZCUBE_RELAY" {
+    // Goal: the security-relevant mapping of `container_spec`. Without a relay the container has
+    // no listener and no `ZCUBE_RELAY`; with one it is still `network = .none`.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var spec: launch.Spec = .{
+        .name = "job-1",
+        .tree = "b3:aa",
+        .reference = "ghcr.io/o/r@sha256:00",
+        .command = &.{"true"},
+        .env = &.{.{ "K", "v" }},
+        .labels = &.{.{ "zcube.replica", "job-1" }},
+        .launched = 1,
+    };
+    const plain = container_spec(arena, &spec).?;
+    try std.testing.expect(plain.network == .none);
+    try std.testing.expect(plain.listen == null);
+    try std.testing.expectEqual(@as(usize, 1), plain.env.len);
+
+    spec.relay = "botpike:443";
+    const relayed = container_spec(arena, &spec).?;
+    try std.testing.expect(relayed.network == .none);
+    try std.testing.expectEqual(constants.relay_port, relayed.listen.?.port);
+    try std.testing.expectEqual(@as(usize, 2), relayed.env.len);
+    try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env[1].key);
+    try std.testing.expectEqualStrings(relay_env_value, relayed.env[1].value);
+    try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env_names[1]);
+}
+
+test "a relay that cannot be served is written to relay.log after what is there (ZC-E0702)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(std.testing.io, &path);
+    var full: [std.fs.max_path_bytes:0]u8 = undefined;
+    const log = try std.fmt.bufPrintSentinel(&full, "{s}/relay.log", .{path[0..length]}, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "relay.log", .data = "earlier line\n" });
+    append_relay_failure(log, "the container gave no listener");
+    const text = try tmp.dir.readFileAlloc(std.testing.io, "relay.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("earlier line\n" ++
+        "ZC-E0702 the relay could not be served: the container gave no listener\n", text);
+}
 
 test "the fetch is told where to put its pull record, and the registry and server only if known" {
     var swarm: Swarm = .{
