@@ -992,7 +992,7 @@ const Write = struct { key: []const u8, value: ?[]const u8 };
 /// diagnostic. A later failure is counted and described on the agent, not returned.
 pub const Kept = struct {
     err: ?Error = null,
-    diag: ?*Diag = null,
+    diag: ?Diag = null,
     /// A failure that is not the runtime's (the server, the state directory, a crash): the
     /// stages after it are not run, as the step would have ended there before.
     stopped: bool = false,
@@ -1024,15 +1024,14 @@ pub const Kept = struct {
         if (err != error.RuntimeFailed and err != error.NotFound) kept.stopped = true;
         if (kept.err != null) return agent.note_enforce_failure(ctx, what);
         kept.err = err;
-        // With no memory to copy the diagnostic into, the error is kept without it.
-        const copy = ctx.arena.create(Diag) catch return ctx.diag.reset();
-        copy.* = ctx.diag.*;
-        kept.diag = copy;
+        // Kept by value: a copy in the arena could fail, and the error would then reach
+        // `agent_run.fail` with no coded diagnostic (RB-S9).
+        kept.diag = ctx.diag.*;
         ctx.diag.reset();
     }
 
     fn restore(kept: *const Kept, ctx: *const Context) void {
-        if (kept.diag) |saved| ctx.diag.* = saved.*;
+        if (kept.diag) |saved| ctx.diag.* = saved;
     }
 };
 
@@ -1512,4 +1511,23 @@ test "next_wake: an overdue stop is not a wake time, a future one is (issue 96)"
     agent.stops[0].deadline_ms = now - 500;
     agent.stops_count = 2;
     try std.testing.expectEqual(now + 200, agent.next_wake(now, 0));
+}
+
+test "a kept failure keeps its diagnostic whatever the arena holds (RB-S9)" {
+    // Goal: the first failure of a step's stages reaches `agent_run.fail` with its code even when
+    // the arena has no room, which used to drop it. Method: a context whose arena always fails
+    // (`fail` touches only `diag` for a first failure), then `restore`.
+    var diag: Diag = undefined;
+    diag.reset();
+    diag.raise(.E0502);
+    diag.cause("the runtime failed", .{});
+    var ctx: Context = undefined;
+    ctx.diag = &diag;
+    ctx.arena = std.testing.failing_allocator;
+    var kept: Kept = .{};
+    var agent: Agent = undefined;
+    kept.fail(&agent, &ctx, "a stage", error.RuntimeFailed);
+    try std.testing.expect(diag.code == null);
+    kept.restore(&ctx);
+    try std.testing.expectEqual(@import("diag/codes.zig").Code.E0502, diag.code.?);
 }
