@@ -1,0 +1,72 @@
+name: Install apt packages
+description: >
+  Install Ubuntu packages on a GitHub runner without depending on the runner's
+  Azure mirror. Rewrites apt sources to the public archive, fails fast on a dead
+  mirror, and caches the downloaded .deb files so a warm cache needs no network.
+
+# Why this exists (2026-11-11): the runners' apt sources point at
+# azure.archive.ubuntu.com. When the runner cannot resolve that name, every
+# fetch of a .deb tries it first ("Temporary failure resolving
+# 'azure.archive.ubuntu.com'"), even for URLs on security.ubuntu.com, and each
+# job hangs ~15 minutes before apt exits 100. Jobs that install nothing new pass.
+inputs:
+  packages:
+    description: Space-separated package names.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore the .deb cache
+      id: cache
+      # Keyed on the package list and the runner image, so a new image (new
+      # package versions) misses and refetches.
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/zbx-debs
+        key: debs-${{ runner.os }}-${{ env.ImageVersion }}-${{ inputs.packages }}
+    - name: Install
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        debs="$HOME/.cache/zbx-debs"
+        mkdir -p "$debs"
+
+        # Warm cache: install straight from the saved closure, no network.
+        if [ "$CACHE_HIT" = "true" ] && ls "$debs"/*.deb >/dev/null 2>&1; then
+          echo "install-apt: cache hit, installing from $debs"
+          sudo dpkg -i "$debs"/*.deb
+          exit 0
+        fi
+
+        # Cold cache. Point every Ubuntu source at the public archive instead
+        # of the Azure mirror (also drops mirror+file: lists that name it).
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+          [ -f "$f" ] || continue
+          sudo sed -i -E \
+            -e 's#(mirror\+file:/etc/apt/apt-mirrors\.txt|https?://azure\.archive\.ubuntu\.com/ubuntu/?)#http://archive.ubuntu.com/ubuntu/#g' \
+            -e 's#https?://security\.ubuntu\.com/ubuntu/?#http://security.ubuntu.com/ubuntu/#g' "$f"
+        done
+        sudo rm -f /etc/apt/apt-mirrors.txt
+
+        # Fail fast with a clear message if the archive is unreachable, instead
+        # of hanging in apt for 15 minutes.
+        for h in archive.ubuntu.com security.ubuntu.com; do
+          if ! timeout 20 curl -fsSI --connect-timeout 10 "http://$h/ubuntu/dists/noble/Release" >/dev/null; then
+            echo "::error::install-apt: cannot reach $h; the Ubuntu mirrors are down or DNS fails on this runner. Re-run later."
+            exit 1
+          fi
+        done
+
+        # Short timeouts and few retries; the whole step is also capped.
+        opts=(-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+              -o Acquire::Retries=2 -o Dir::Cache::archives="$debs")
+        mkdir -p "$debs/partial"
+        timeout 300 sudo apt-get "${opts[@]}" update
+        # shellcheck disable=SC2086
+        timeout 600 sudo apt-get "${opts[@]}" install -y --no-install-recommends $PACKAGES
+        # Leave only readable .deb files for actions/cache to archive.
+        sudo rm -rf "$debs/partial" "$debs/lock"
+        sudo chmod -R a+rX "$debs"

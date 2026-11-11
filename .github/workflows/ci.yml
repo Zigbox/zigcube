@@ -1,7 +1,8 @@
 # Zigcube CI. Every action is pinned to a full commit SHA (the tag is in the comment); Zig is
 # installed from a verified tarball (.github/actions/setup-zig). The other shell lines are the
-# changes job (.github/ci-changes.sh decides what runs), the apt-get line that installs the SQLite
-# and libpq development files the tests link, and the docker lines of the Postgres demos job that
+# changes job (.github/ci-changes.sh decides what runs), the Postgres 16 check and
+# pg_dropcluster steps (apt installs go through .github/actions/install-apt), and the docker
+# lines of the Postgres demos job that
 # names its service container. The wasm and simulations jobs use the Node that the runner image
 # carries.
 #
@@ -111,7 +112,9 @@ jobs:
         run: zig build tidy
       # Before the build: zcube-server links both client libraries.
       - name: SQLite and libpq development files
-        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: Build the three executables
         run: zig build
       - name: Unit and snapshot tests
@@ -166,7 +169,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files
-        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: Store conformance (postgres), three draws
         run: |
           for run in 1 2 3; do
@@ -206,15 +211,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files
-        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: Postgres 16 programs for the failover pair
+        id: pg16
         run: |
-          if [ ! -x /usr/lib/postgresql/16/bin/pg_ctl ]; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends postgresql-16
-            # The package starts a cluster of its own on 5432, the service container's port.
-            sudo pg_dropcluster --stop 16 main || true
-          fi
+          if [ -x /usr/lib/postgresql/16/bin/pg_ctl ]; then echo need=false >> "${GITHUB_OUTPUT}"; else echo need=true >> "${GITHUB_OUTPUT}"; fi
+      - name: Install postgresql-16
+        if: ${{ steps.pg16.outputs.need == 'true' }}
+        uses: ./.github/actions/install-apt
+        with:
+          packages: postgresql-16
+      - name: Drop the package's own cluster, export the programs
+        run: |
+          # The package starts a cluster of its own on 5432, the service container's port.
+          if [ "${{ steps.pg16.outputs.need }}" = "true" ]; then sudo pg_dropcluster --stop 16 main || true; fi
           echo "ZCUBE_PG_BIN=/usr/lib/postgresql/16/bin" >> "${GITHUB_ENV}"
       - name: Store faults (postgres, then the failover runs)
         run: zig build test-store-faults -Dbackend=postgres -Dpostgres="${ZCUBE_TEST_POSTGRES}" --summary all
@@ -239,7 +251,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files
-        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: Build the three executables once
         run: zig build
       - name: demo-c0 on SQLite
@@ -292,7 +306,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files
-        run: sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev
       - name: Name the Postgres container
         run: |
           container="$(docker ps --quiet --filter publish=5432)"
@@ -447,9 +463,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files, QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -489,9 +505,9 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-zig
       - name: SQLite and libpq development files, QEMU
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
+        uses: ./.github/actions/install-apt
+        with:
+          packages: libsqlite3-dev libpq-dev qemu-system-x86 qemu-utils
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
