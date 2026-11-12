@@ -42,6 +42,7 @@ const Revision = store.Revision;
 const Wakeup = controller.Wakeup;
 
 pub const actor = "scheduler";
+
 /// The scheduler wakes on any change to what it reads. This is only the fallback if a wake-up
 /// was missed, not a polling loop: a pass that finds nothing to do writes nothing.
 pub const resync_ms: u64 = 30 * 1000;
@@ -114,6 +115,10 @@ pub const Reason = enum {
     jobs_full,
     /// The node already holds `runtime_handles_max` assignments in all.
     handles_full,
+    /// B6: the job's `placement.require` names a label the node does not carry.
+    missing_label,
+    /// B6: the node is `exclusive` to a label value the job's `require` does not name.
+    exclusive,
     /// A move to the node the replica is already on.
     same_node,
 };
@@ -462,7 +467,12 @@ fn add_assign(ctx: *const Context, world: *World, assign: Assign) Error!void {
 
 /// Whether `view` can take a replica needing `need`, and if not, why. The order is the order a
 /// reader fixes first: readiness, then findings, then capacity.
-fn judge(view: *const NodeView, need: Requests, is_run: bool) Verdict {
+fn judge(
+    view: *const NodeView,
+    need: Requests,
+    is_run: bool,
+    require: []const records.Pair,
+) Verdict {
     const status = view.status orelse return .{ .reason = .no_status };
     switch (status.state) {
         .lost => return .{ .reason = .lost },
@@ -471,6 +481,9 @@ fn judge(view: *const NodeView, need: Requests, is_run: bool) Verdict {
     }
     if (status.tenure != view.node.kv.mod_revision) return .{ .reason = .older_tenure };
     if (view.audit_open) return .{ .reason = .audit_open };
+    // B6: the placement filter comes before fit, so a node that cannot take the job at all is
+    // never "short" for it.
+    if (placement_refusal(view.node.rec.labels, require)) |reason| return .{ .reason = reason };
     if (view.count >= constants.runtime_handles_max) return .{ .reason = .handles_full };
     if (is_run and view.jobs >= constants.jobs_per_node_max) return .{ .reason = .jobs_full };
     const capacity = view.node.rec.capacity;
@@ -485,6 +498,35 @@ fn judge(view: *const NodeView, need: Requests, is_run: bool) Verdict {
         std.math.maxInt(u64);
     if (cpu_by == 0 and memory_by == 0) return .{ .reason = .fits };
     return .{ .reason = .short, .cpu_by = cpu_by, .memory_by = memory_by };
+}
+
+/// The `K` of the first `exclusive=K` label of a node that `require` does not satisfy: the job
+/// must name `K` with the node's own value of `K`. A node whose `exclusive` names a key it does not
+/// carry (registration refuses it, but a record written another way may) takes nothing.
+fn exclusive_key(labels: []const []const u8, require: []const records.Pair) ?[]const u8 {
+    for (labels) |label| {
+        const at = std.mem.indexOfScalar(u8, label, '=') orelse continue;
+        if (!std.mem.eql(u8, label[0..at], records.exclusive_label)) continue;
+        const key = label[at + 1 ..];
+        const own = records.node_label_value(labels, key) orelse return key;
+        for (require) |pair| {
+            if (std.mem.eql(u8, pair[0], key) and std.mem.eql(u8, pair[1], own)) break;
+        } else return key;
+    }
+    return null;
+}
+
+/// B6's filter: why a node is not a candidate for a job that requires `require`, or null if it is
+/// one. The node must carry every pair, and, for each key it is exclusive to, the job must name it
+/// with the node's value. A pair the node lacks is named before exclusivity: a job that wants
+/// `tenant=acme` is told no node has it, not that one is another tenant's.
+fn placement_refusal(labels: []const []const u8, require: []const records.Pair) ?Reason {
+    for (require) |pair| {
+        const own = records.node_label_value(labels, pair[0]) orelse return .missing_label;
+        if (!std.mem.eql(u8, own, pair[1])) return .missing_label;
+    }
+    if (exclusive_key(labels, require) != null) return .exclusive;
+    return null;
 }
 
 /// Replicas of `service` assigned to each node.
@@ -627,6 +669,8 @@ const Held = struct {
     revision: Revision,
     status_key: ?[]const u8 = null,
     status_revision: Revision = 0,
+    /// A run's `placement.require`, which the hold's reason names when it is why nothing fits.
+    require: []const records.Pair = &.{},
 };
 
 /// The run a placement is for, as read.
@@ -921,7 +965,7 @@ pub const Scheduler = struct {
         const need = requests_of(&replica.rec);
         var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];
-        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need, false);
+        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need, false, &.{});
         const chosen = choose(world, replica.rec.service, replica.rec.image, judged) orelse {
             const subject: Held = .{
                 .kind = .replica,
@@ -1003,7 +1047,10 @@ pub const Scheduler = struct {
         const need = run_requests_of(&run);
         var verdicts: [views_max]Verdict = undefined;
         const judged = verdicts[0..world.nodes.len];
-        for (world.nodes, judged) |*view, *verdict| verdict.* = judge(view, need, true);
+        const require: []const records.Pair = if (run.placement) |wanted| wanted.require else &.{};
+        for (world.nodes, judged) |*view, *verdict| {
+            verdict.* = judge(view, need, true, require);
+        }
         const chosen = choose(world, "", run.image, judged) orelse {
             const subject: Held = .{
                 .kind = .job,
@@ -1013,6 +1060,7 @@ pub const Scheduler = struct {
                 .revision = run_kv.mod_revision,
                 .status_key = status.kv.key,
                 .status_revision = status.kv.mod_revision,
+                .require = require,
             };
             return sc.hold(ctx, world, pass, subject, need, judged);
         };
@@ -1135,7 +1183,7 @@ pub const Scheduler = struct {
         batch.expect(subject.key, subject.revision);
         if (subject.status_key) |status_key| batch.expect(status_key, subject.status_revision);
         const evidence = try evidence_of(ctx, world, need, verdicts);
-        const reason = try hold_reason(ctx, world, need, verdicts);
+        const reason = try hold_reason(ctx, world, need, verdicts, subject.require);
         _ = try controller.put_decision(ctx, &sc.source, .{
             .actor = actor,
             .action = "hold_pending",
@@ -1224,7 +1272,7 @@ pub const Scheduler = struct {
         if (from.node == to_node) return .{ .refused = .{ .reason = .same_node } };
         const need = from.requests;
         const target = &world.nodes[to_node];
-        const verdict = judge(target, need, false);
+        const verdict = judge(target, need, false, &.{});
         if (verdict.reason != .fits) return .{ .refused = verdict };
         if (from.node == no_node) return .{ .refused = .{ .reason = .unaccounted } };
         const source = &world.nodes[from.node];
@@ -1491,17 +1539,61 @@ fn hold_reason(
     world: *const World,
     need: Requests,
     verdicts: []const Verdict,
+    require: []const records.Pair,
 ) Error![]const u8 {
     var short: u32 = 0;
+    var placement: u32 = 0;
+    var capacity: u32 = 0;
     for (verdicts) |verdict| {
-        if (verdict.reason == .short) short += 1;
+        switch (verdict.reason) {
+            .short => short += 1,
+            .missing_label, .exclusive => placement += 1,
+            .over_capacity, .jobs_full, .handles_full => capacity += 1,
+            else => {},
+        }
+    }
+    // Nothing that is ready passes the placement filter: that, not the room, is why it waits.
+    if (placement > 0 and short + capacity == 0) {
+        return placement_reason(ctx, world, verdicts, require);
     }
     const total: u32 = @intCast(world.nodes.len);
     const excluded = total - short;
+    if (placement > 0) {
+        return controller.format(ctx, "no node fits {d}m CPU and {d} MiB: {d} of {d} nodes " ++
+            "lack the room, {d} are excluded, {d} of them by the placement of the job", .{
+            need.cpu_millis, mib_of(need.memory_bytes), short, total, excluded, placement,
+        });
+    }
     return controller.format(ctx, "no node fits {d}m CPU and {d} MiB: {d} of {d} nodes lack " ++
         "the room, {d} are excluded", .{
         need.cpu_millis, mib_of(need.memory_bytes), short, total, excluded,
     });
+}
+
+/// B6's pending reason: a ready node that is exclusive to something else is named first, since it
+/// is the closest to a home; else what the job requires, which no ready node carries.
+fn placement_reason(
+    ctx: *const Context,
+    world: *const World,
+    verdicts: []const Verdict,
+    require: []const records.Pair,
+) Error![]const u8 {
+    for (verdicts, world.nodes) |verdict, view| {
+        if (verdict.reason != .exclusive) continue;
+        const labels = view.node.rec.labels;
+        const key = exclusive_key(labels, require).?;
+        return controller.format(ctx, "{s} is exclusive to {s}={s}", .{
+            view.node.rec.name, key, records.node_label_value(labels, key) orelse "(no value)",
+        });
+    }
+    assert(require.len > 0);
+    var text: std.ArrayList(u8) = .empty;
+    for (require, 0..) |pair, at| {
+        const comma: []const u8 = if (at == 0) "" else ", ";
+        const piece = try controller.format(ctx, "{s}{s}={s}", .{ comma, pair[0], pair[1] });
+        text.appendSlice(ctx.arena, piece) catch return failures.no_memory(ctx.diag);
+    }
+    return controller.format(ctx, "no ready node has {s}", .{text.items});
 }
 
 /// What a hold says apart from its numbers: what the replica needs, and per node why it is
@@ -1523,7 +1615,7 @@ fn shape_of(world: *const World, need: Requests, verdicts: []const Verdict) u64 
 const exclusions = [_]Reason{
     .unknown_node, .lost,       .fenced,        .no_status,
     .older_tenure, .audit_open, .over_capacity, .jobs_full,
-    .handles_full,
+    .handles_full, .missing_label, .exclusive,
 };
 
 /// Room kept free in the evidence for the closing brackets and the `omitted` count.
@@ -1697,9 +1789,9 @@ pub fn placement_problem(
         service_counts(&world, world.replicas[index].rec.service, counts[0..world.nodes.len]);
         // Whether the node still fits at the head is I6's and I7's to say (a placement whose
         // compare was skipped lands on a node that changed): L1 judges only a placement that does.
-        if (judge(&world.nodes[at], need, false).reason != .fits) continue;
+        if (judge(&world.nodes[at], need, false, &.{}).reason != .fits) continue;
         for (world.nodes, 0..) |*view, other| {
-            if (judge(view, need, false).reason != .fits) continue;
+            if (judge(view, need, false, &.{}).reason != .fits) continue;
             // A rival that changed after the scheduler read the world was judged on what the
             // scheduler saw, not on this: a lost race is not a wrong choice.
             if (changed_since(view, read_revision)) continue;

@@ -294,6 +294,9 @@ const Call = struct {
         try check_text(ctx, "address", input.address, node_text_bytes_max);
         if (input.labels.len > node_labels_max) return bad_request(ctx, "labels", "has too many");
         for (input.labels) |label| try check_text(ctx, "labels", label, node_text_bytes_max);
+        if (records.node_labels_problem(input.labels)) |problem| {
+            return bad_request(ctx, "labels", problem);
+        }
         const node: records.Node = .{
             .name = call.node,
             .agent_version = input.agent_version,
