@@ -164,14 +164,36 @@ pub const ZigboxRuntime = struct {
 
     // ---- start ----
 
+    /// A start that does not end well is logged on the agent's stderr as one line with its code,
+    /// whoever sees the outcome later (DIAGNOSTICS.md): the job's report carries it too, but a
+    /// bare `start_failed` in the store must never be the only trace.
     fn start_impl(
         context: *anyopaque,
         spec: *const runtime.Spec,
         diag: *Diag,
     ) runtime.Error!runtime.StartOutcome {
         const self = from(context);
+        const outcome = start_inner(self, spec, diag) catch |err| {
+            if (diag.code != null) {
+                var failure: Diagnostic = undefined;
+                diag_mod.to_diagnostic(&failure, diag);
+                launch.log_start_failure(self.io, spec.name, &failure);
+            }
+            return err;
+        };
+        switch (outcome) {
+            .failed => |*failure| launch.log_start_failure(self.io, spec.name, failure),
+            .started => {},
+        }
+        return outcome;
+    }
+
+    fn start_inner(
+        self: *ZigboxRuntime,
+        spec: *const runtime.Spec,
+        diag: *Diag,
+    ) runtime.Error!runtime.StartOutcome {
         self.reap();
-        if (spec.relay.len > 0) return .{ .failed = relay_unserved(spec) };
         if (map.refusal(spec)) |reason| return .{ .failed = refusal_diagnostic(reason, spec) };
         const spec_file = self.launch_spec(spec);
         launch.write_spec(self.io, self.root, &spec_file) catch
@@ -200,6 +222,7 @@ pub const ZigboxRuntime = struct {
             .cpu_millis = spec.limits.cpu_millis,
             .memory_bytes = spec.limits.memory_bytes,
             .pids = spec.limits.pids,
+            .relay = spec.relay,
             .launched = self.host.time_now(),
         };
     }
@@ -240,7 +263,9 @@ pub const ZigboxRuntime = struct {
             .argv = &.{ self.options.supervisor_exe, "supervise-zigbox", path },
             .stdin = .ignore,
             .stdout = .ignore,
-            .stderr = .ignore,
+            // The agent's own: a start that fails after the agent stopped waiting (a pull that
+            // took long) still leaves its one line in the agent's log.
+            .stderr = .inherit,
         }) catch return supervisor_failed(diag, name);
         self.children[self.children_count] = child.id.?;
         self.children_count += 1;
@@ -637,20 +662,6 @@ fn pending_listing(
 // ---- Diagnostics -------------------------------------------------------------------------------
 
 /// Why Zigcube refused a spec Zigbox would have refused too, blamed on the service's author.
-/// ZC-E0703: this adapter has no way yet to give a container a relay, so a job that names one
-/// ends as a start failure instead of running without its route.
-fn relay_unserved(spec: *const runtime.Spec) Diagnostic {
-    var collector: Diag = undefined;
-    collector.reset();
-    collector.raise(.E0703);
-    collector.cause("this runtime cannot give a container a relay", .{});
-    collector.fix(.{ .sentence = "run the job on a node whose agent has relay support" });
-    collector.while_("starting container {s}", .{spec.name});
-    var out: Diagnostic = undefined;
-    diag_mod.to_diagnostic(&out, &collector);
-    return out;
-}
-
 fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic {
     var collector: Diag = undefined;
     collector.reset();

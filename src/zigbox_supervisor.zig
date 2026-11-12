@@ -25,6 +25,7 @@ const image = @import("zigbox_image.zig");
 const launch = @import("zigbox_launch.zig");
 const pull_report = @import("pull_report.zig");
 const records = @import("records.zig");
+const relay_module = @import("relay.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -53,6 +54,10 @@ const Storage = struct {
 /// list that is too long reaches `pull` and is refused there, by Zigbox, not quietly ignored.
 const mirrors_bytes_max: u32 = 4096;
 
+/// The lock the supervisors of one node take turns pulling under: `pull.lock` in `<state>/zigbox/`,
+/// the parent of every container's directory. The agent's scan of that directory skips files.
+const pull_lock_path = "../pull.lock";
+
 /// The start and pull steps over real Zigbox, for `zigbox_image.start_with_image`.
 const Real = struct {
     host: zigbox.host.Host,
@@ -62,11 +67,42 @@ const Real = struct {
     swarm: ?Swarm = null,
     /// "b3:" and 64 hex digits (Zigbox's store_digest_text_bytes, not exported).
     tree_text: [67]u8 = undefined,
+    /// The node's pull lock (`pull_lock_path`, relative to the container's directory), and the
+    /// file that holds it while a pull is going on.
+    lock_io: std.Io,
+    lock_dir: Dir,
+    lock_file: ?std.Io.File = null,
 
     fn steps(self: *Real) image.Steps {
         const asks: ?*const fn (context: *anyopaque) image.Fetched =
             if (self.swarm != null) fetch else null;
-        return .{ .context = self, .start = start, .pull = pull, .fetch = asks };
+        return .{
+            .context = self,
+            .start = start,
+            .pull = pull,
+            .fetch = asks,
+            .enter_pull = enter_pull,
+            .leave_pull = leave_pull,
+        };
+    }
+
+    /// Waits for the lock the supervisors of this node share. Zigbox's store has one writer: two
+    /// first pulls of one image at once end in ZBX-E0417 for one of them (the blob the other is
+    /// moving into the cache is gone). The kernel gives the lock back if this process dies. A
+    /// lock that can't be taken is not fatal: the pull goes on without it, as before.
+    fn enter_pull(context: *anyopaque) void {
+        const self: *Real = @ptrCast(@alignCast(context));
+        assert(self.lock_file == null);
+        self.lock_file = self.lock_dir.createFile(self.lock_io, pull_lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+        }) catch null;
+    }
+
+    fn leave_pull(context: *anyopaque) void {
+        const self: *Real = @ptrCast(@alignCast(context));
+        if (self.lock_file) |file| file.close(self.lock_io);
+        self.lock_file = null;
     }
 
     /// Runs `zcube-agent fetch` against the node's store. Its diagnostics go to
@@ -480,15 +516,27 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     const spec = launch.read_spec(io, dir, arena_state.allocator()) catch
-        return constants.exit_environment;
+        return environment_failure(
+            io,
+            dir,
+            std.fs.path.basename(dir_path),
+            "read its launch record",
+        );
     const storage = std.heap.page_allocator.create(Storage) catch return constants.exit_environment;
     storage.network_memory.init();
     var real: HostReal = .{
         .environ = init.minimal.environ,
         .network_memory = &storage.network_memory,
     };
-    return supervise(io, dir, real.interface(), storage, &spec, arena_state.allocator());
+    // The relay's threads connect upstream with `init.io`, after the start: the single-threaded
+    // `io` above is for the namespace work only.
+    const relay_ctx: RelayContext = .{ .gpa = init.gpa, .io = init.io, .dir_path = dir_path };
+    return supervise(io, dir, real.interface(), storage, &spec, arena_state.allocator(), relay_ctx);
 }
+
+/// What the job's relay needs that the start does not: memory, an `Io` for the upstream
+/// connections, and where `relay.log` goes.
+const RelayContext = struct { gpa: Allocator, io: std.Io, dir_path: []const u8 };
 
 fn supervise(
     io: std.Io,
@@ -497,15 +545,24 @@ fn supervise(
     storage: *Storage,
     spec: *const launch.Spec,
     arena: Allocator,
+    relay_ctx: RelayContext,
 ) u8 {
-    const container = container_spec(arena, spec) orelse return constants.exit_environment;
+    const name = std.fs.path.basename(relay_ctx.dir_path);
+    const container = container_spec(arena, spec) orelse
+        return environment_failure(io, dir, name, "set aside memory for its spec");
     var status: [4096]u8 = undefined;
     const count = if (host.read_file("/proc/self/status", &status)) |text|
         image.threads_in(text)
     else |_|
         null;
-    if (count != 1) return record_failure(io, dir, &image.not_single_threaded(count));
-    var real: Real = .{ .host = host, .storage = storage, .spec = &container };
+    if (count != 1) return record_failure(io, dir, name, &image.not_single_threaded(count));
+    var real: Real = .{
+        .host = host,
+        .storage = storage,
+        .spec = &container,
+        .lock_io = io,
+        .lock_dir = dir,
+    };
     if (spec.fetch) |fetch| {
         if (launch.manifest_of(spec.reference)) |manifest| {
             real.swarm = .{
@@ -520,26 +577,133 @@ fn supervise(
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {
         .started => if (real.swarm) |swarm| say_no_fetch(swarm, trace.fetched, trace.pulled),
-        .failed => |diagnostic| return record_failure(io, dir, &diagnostic),
+        .failed => |diagnostic| return record_failure(io, dir, name, &diagnostic),
     }
+    const relay = open_relay(relay_ctx, spec, &storage.handle);
     _ = zigbox.wait(&storage.handle);
+    // `wait` has already written Zigbox's run record, which is how the agent learns of the
+    // ending, so the relay outlives the report by this call: Zigbox gives no hook between the
+    // reap and the record (docs/demos/b3.md). Nothing new can come in, since the container's
+    // processes are gone; this closes the supervisor's end and every relayed connection.
+    if (relay) |open| open.stop();
     return constants.exit_ok;
 }
 
+/// A job that names a relay: takes the listener Zigbox made in the container's namespace and
+/// serves it. Null for a job without one, or when the relay could not be served: the container
+/// is then killed (it would hold a listener nobody answers) and `relay.log` says why (ZC-E0702).
+fn open_relay(
+    ctx: RelayContext,
+    spec: *const launch.Spec,
+    handle: *zigbox.Handle,
+) ?*relay_module.Relay {
+    if (spec.relay.len == 0) return null;
+    assert(handle.status == .running);
+    assert(handle.listen != null); // `container_spec` asked for it, so the run made it.
+    const taken = handle.session.take_listener() orelse
+        return kill_unrelayed(ctx, handle, "the container gave no listener");
+    const listener: std.os.linux.fd_t = @intCast(taken);
+    const upstream = relay_module.Upstream.parse(spec.relay) orelse {
+        _ = std.os.linux.close(listener);
+        return kill_unrelayed(ctx, handle, "the relay's address is not HOST:PORT");
+    };
+    var path_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
+    const log_path = relay_log_path(&path_buffer, ctx) orelse {
+        _ = std.os.linux.close(listener);
+        return kill_unrelayed(ctx, handle, "the path of relay.log is too long");
+    };
+    const relay = relay_module.Relay.adopt(
+        ctx.gpa,
+        ctx.io,
+        upstream,
+        listener,
+        constants.relay_port,
+        log_path,
+    ) catch return kill_unrelayed(ctx, handle, "there was no memory for the relay");
+    relay.run() catch {
+        relay.stop();
+        return kill_unrelayed(ctx, handle, "the relay's thread could not start");
+    };
+    return relay;
+}
+
+fn relay_log_path(buffer: *[std.fs.max_path_bytes:0]u8, ctx: RelayContext) ?[:0]const u8 {
+    return std.fmt.bufPrintSentinel(buffer, "{s}/{s}", .{
+        ctx.dir_path, agent_records.file_relay_log,
+    }, 0) catch null;
+}
+
+/// Ends a container whose relay cannot be served, after writing ZC-E0702 and `cause` to
+/// `relay.log`. Always null, for `open_relay` to return.
+fn kill_unrelayed(
+    ctx: RelayContext,
+    handle: *zigbox.Handle,
+    cause: []const u8,
+) ?*relay_module.Relay {
+    var path_buffer: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (relay_log_path(&path_buffer, ctx)) |path| append_relay_failure(path, cause);
+    const kill: u8 = @intCast(@backingInt(std.posix.SIG.KILL));
+    zigbox.signal(handle, kill) catch {}; // Already gone is as good.
+    return null;
+}
+
+/// Appends the ZC-E0702 line and `cause` to `relay.log` (the relay's own writes append too, so an
+/// existing log is kept). Nowhere else to say it: a failure to write is dropped.
+fn append_relay_failure(path: [:0]const u8, cause: []const u8) void {
+    var line: [constants.relay_address_bytes_max]u8 = undefined;
+    const text = std.fmt.bufPrint(&line, "ZC-E0702 the relay could not be served: {s}\n", .{
+        cause,
+    }) catch "ZC-E0702 the relay could not be served\n";
+    const flags: std.os.linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    };
+    const opened = std.os.linux.open(path, flags, 0o644);
+    if (std.os.linux.errno(opened) != .SUCCESS) return;
+    const fd: std.os.linux.fd_t = @intCast(opened);
+    defer _ = std.os.linux.close(fd);
+    _ = std.os.linux.write(fd, text.ptr, text.len);
+}
+
 /// Writes `failed.json`, the last thing a supervisor that did not start a container does.
-fn record_failure(io: std.Io, dir: Dir, diagnostic: *const Diagnostic) u8 {
+fn record_failure(io: std.Io, dir: Dir, name: []const u8, diagnostic: *const Diagnostic) u8 {
+    // The agent's stderr, which this process inherits: the one line a failed start leaves in its
+    // log, whenever the start fails (the agent has stopped waiting by the time a pull ends).
+    launch.log_start_failure(io, name, diagnostic);
     launch.write_failed(io, dir, diagnostic) catch return constants.exit_environment;
     return constants.exit_ok;
+}
+
+/// A supervisor that cannot even begin says so in `failed.json` (ZC-E0502): without it the agent
+/// finds a launch that ended with no word, and the run reads `lost` or a bare `start_failed`.
+fn environment_failure(io: std.Io, dir: Dir, name: []const u8, operation: []const u8) u8 {
+    var collector: diag_mod.Diag = undefined;
+    collector.reset();
+    collector.raise(.E0502);
+    collector.cause("the supervisor can't {s}", .{operation});
+    collector.fix(.{ .sentence = "check the agent's state directory and the host's limits" });
+    var finished: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&finished, &collector);
+    _ = record_failure(io, dir, name, &finished);
+    return constants.exit_environment;
 }
 
 /// Zigbox's spec for the launch: the tree, the command, the environment and labels, the limits.
 /// Everything borrows from `spec` and `arena`. Null if memory ran out.
 fn container_spec(arena: Allocator, spec: *const launch.Spec) ?zigbox.Spec {
-    const env = arena.alloc(zigbox.Label, spec.env.len) catch return null;
-    const names = arena.alloc([]const u8, spec.env.len) catch return null;
-    for (spec.env, env, names) |pair, *label, *name| {
+    // A relayed job also gets `ZCUBE_RELAY`; the server refused a job that set it (ZC-E0130).
+    const extra: usize = if (spec.relay.len > 0) 1 else 0;
+    const env = arena.alloc(zigbox.Label, spec.env.len + extra) catch return null;
+    const names = arena.alloc([]const u8, spec.env.len + extra) catch return null;
+    for (spec.env, env[0..spec.env.len], names[0..spec.env.len]) |pair, *label, *name| {
         label.* = .{ .key = pair[0], .value = pair[1] };
         name.* = pair[0];
+    }
+    if (extra == 1) {
+        env[spec.env.len] = .{ .key = constants.relay_env_name, .value = relay_env_value };
+        names[spec.env.len] = constants.relay_env_name;
     }
     const labels = arena.alloc(zigbox.Label, spec.labels.len) catch return null;
     for (spec.labels, labels) |pair, *label| label.* = .{ .key = pair[0], .value = pair[1] };
@@ -555,7 +719,58 @@ fn container_spec(arena: Allocator, spec: *const launch.Spec) ?zigbox.Spec {
             .pids = spec.pids,
             .cpu_millis = spec.cpu_millis,
         },
+        .network = .none,
+        .listen = if (spec.relay.len > 0) .{ .port = constants.relay_port } else null,
     };
+}
+
+const relay_env_value = std.fmt.comptimePrint("http://127.0.0.1:{d}", .{constants.relay_port});
+
+test "a job with a relay gets no network, one listener on the relay port and ZCUBE_RELAY" {
+    // Goal: the security-relevant mapping of `container_spec`. Without a relay the container has
+    // no listener and no `ZCUBE_RELAY`; with one it is still `network = .none`.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var spec: launch.Spec = .{
+        .name = "job-1",
+        .tree = "b3:aa",
+        .reference = "ghcr.io/o/r@sha256:00",
+        .command = &.{"true"},
+        .env = &.{.{ "K", "v" }},
+        .labels = &.{.{ "zcube.replica", "job-1" }},
+        .launched = 1,
+    };
+    const plain = container_spec(arena, &spec).?;
+    try std.testing.expect(plain.network == .none);
+    try std.testing.expect(plain.listen == null);
+    try std.testing.expectEqual(@as(usize, 1), plain.env.len);
+
+    spec.relay = "botpike:443";
+    const relayed = container_spec(arena, &spec).?;
+    try std.testing.expect(relayed.network == .none);
+    try std.testing.expectEqual(constants.relay_port, relayed.listen.?.port);
+    try std.testing.expectEqual(@as(usize, 2), relayed.env.len);
+    try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env[1].key);
+    try std.testing.expectEqualStrings(relay_env_value, relayed.env[1].value);
+    try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env_names[1]);
+}
+
+test "a relay that cannot be served is written to relay.log after what is there (ZC-E0702)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(std.testing.io, &path);
+    var full: [std.fs.max_path_bytes:0]u8 = undefined;
+    const log = try std.fmt.bufPrintSentinel(&full, "{s}/relay.log", .{path[0..length]}, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "relay.log", .data = "earlier line\n" });
+    append_relay_failure(log, "the container gave no listener");
+    const limit: std.Io.Limit = .limited(4096);
+    const io = std.testing.io;
+    const text = try tmp.dir.readFileAlloc(io, "relay.log", std.testing.allocator, limit);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("earlier line\n" ++
+        "ZC-E0702 the relay could not be served: the container gave no listener\n", text);
 }
 
 test "the fetch is told where to put its pull record, and the registry and server only if known" {
