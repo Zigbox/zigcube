@@ -21,6 +21,7 @@
 //! so the replica of a deleted service is placed and then released.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const c1_teeth = @import("c1_teeth.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -521,12 +522,25 @@ fn exclusive_key(labels: []const []const u8, require: []const records.Pair) ?[]c
 /// with the node's value. A pair the node lacks is named before exclusivity: a job that wants
 /// `tenant=acme` is told no node has it, not that one is another tenant's.
 fn placement_refusal(labels: []const []const u8, require: []const records.Pair) ?Reason {
+    if (builtin.is_test and test_weakened == .no_filter) return null;
     for (require) |pair| {
         const own = records.node_label_value(labels, pair[0]) orelse return .missing_label;
         if (!std.mem.eql(u8, own, pair[1])) return .missing_label;
     }
+    if (builtin.is_test and test_weakened == .no_exclusive) return null;
     if (exclusive_key(labels, require) != null) return .exclusive;
     return null;
+}
+
+/// A weakening of the placement filter for the tests' teeth: each test of the filter reruns with
+/// one rule skipped and must then see the wrong placement. Read only when `builtin.is_test`.
+pub const TestWeakened = enum { none, no_filter, no_exclusive };
+var test_weakened: TestWeakened = .none;
+
+/// Sets the weakening; the tests' teeth call it, and nothing else may (it asserts a test build).
+pub fn weaken_for_test(weakened: TestWeakened) void {
+    assert(builtin.is_test);
+    test_weakened = weakened;
 }
 
 /// Replicas of `service` assigned to each node.
@@ -1613,8 +1627,8 @@ fn shape_of(world: *const World, need: Requests, verdicts: []const Verdict) u64 
 }
 
 const exclusions = [_]Reason{
-    .unknown_node, .lost,       .fenced,        .no_status,
-    .older_tenure, .audit_open, .over_capacity, .jobs_full,
+    .unknown_node, .lost,          .fenced,        .no_status,
+    .older_tenure, .audit_open,    .over_capacity, .jobs_full,
     .handles_full, .missing_label, .exclusive,
 };
 

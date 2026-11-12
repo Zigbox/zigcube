@@ -295,7 +295,8 @@ pub const Placement = struct {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
         var require: []const Pair = &.{};
         while (true) {
-            const name = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const limit = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, limit);
             switch (name) {
                 .object_end => return .{ .require = require },
                 .string, .allocated_string => |text| {
@@ -316,7 +317,8 @@ pub const Placement = struct {
         if (.object_begin != try source.next()) return error.UnexpectedToken;
         var pairs: std.ArrayList(Pair) = .empty;
         while (true) {
-            const name = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+            const limit = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, limit);
             const key = switch (name) {
                 .object_end => return pairs.items,
                 .string, .allocated_string => |text| text,

@@ -78,8 +78,21 @@ const Fixture = struct {
 
     /// Registers a node and, if `ready`, marks it ready for that tenure.
     fn node(self: *Fixture, name: []const u8, cpu: u32, memory: u64, ready: bool) !void {
+        try self.node_labelled(name, cpu, memory, ready, &.{});
+    }
+
+    /// `node` with labels (`key=value` words, and `exclusive=key`).
+    fn node_labelled(
+        self: *Fixture,
+        name: []const u8,
+        cpu: u32,
+        memory: u64,
+        ready: bool,
+        labels: []const []const u8,
+    ) !void {
         const value: records.Node = .{
             .name = name,
+            .labels = labels,
             .capacity = .{ .cpu_millis = cpu, .memory_bytes = memory },
         };
         try self.put(.{ .agent = name }, records.node_key(name).slice(), value);
@@ -118,6 +131,17 @@ const Fixture = struct {
 
     /// Writes a job's run and its status, as the job controller would.
     fn job(self: *Fixture, name: []const u8, cpu: ?u32, state: records.JobState) !void {
+        try self.job_requiring(name, cpu, state, &.{});
+    }
+
+    /// `job` whose placement requires `require`.
+    fn job_requiring(
+        self: *Fixture,
+        name: []const u8,
+        cpu: ?u32,
+        state: records.JobState,
+        require: []const records.Pair,
+    ) !void {
         var buffer: [constants.job_run_id_bytes_max]u8 = undefined;
         const run: records.JobRun = .{
             .id = records.job_run_id(&buffer, name),
@@ -128,6 +152,7 @@ const Fixture = struct {
             .deadline_ms = 60 * 1000,
             .start_by_ms = self.manual.ms + 60 * 1000,
             .created_at_ms = self.manual.ms,
+            .placement = if (require.len == 0) null else .{ .require = require },
         };
         try self.put(.job_controller, records.job_run_key(name).slice(), run);
         try self.job_state(name, state);
@@ -1189,4 +1214,127 @@ test "more than job_admitted_window_max ended statuses do not stop the scheduler
     try fixture.job("live", 500, .pending);
     try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
     try fixture.expect_on("live-job", "n1");
+}
+
+/// `expect_on` without the printed diff: a teeth run fails on purpose and must stay quiet.
+fn lands(fixture: *Fixture, id: []const u8, want: ?[]const u8) !void {
+    const got = try fixture.assigned_to(id);
+    defer if (got) |g| testing.allocator.free(g);
+    const same = if (got) |g| (if (want) |w| std.mem.eql(u8, g, w) else false) else want == null;
+    if (!same) return error.WrongPlacement;
+}
+
+const acme: []const records.Pair = &.{.{ "tenant", "acme" }};
+
+/// Runs `body` with the filter intact, then again with `weakened`, expecting `body` to fail:
+/// the teeth of a placement test.
+fn with_teeth(weakened: scheduler.TestWeakened, body: *const fn () anyerror!void) !void {
+    try body();
+    scheduler.weaken_for_test(weakened);
+    defer scheduler.weaken_for_test(.none);
+    if (body()) |_| return error.TeethMissed else |_| {}
+}
+
+fn require_matches() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("a-plain", 4000, 8 * gib, true);
+    try fixture.node_labelled("z-acme", 4000, 8 * gib, true, &.{"tenant=acme"});
+    try fixture.job_requiring("train", 500, .pending, acme);
+    try fixture.settle();
+    try lands(&fixture, "train-job", "z-acme");
+}
+
+test "placement.require: a job lands on the node that carries every pair" {
+    try with_teeth(.no_filter, require_matches);
+}
+
+fn require_matches_none() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node("plain", 4000, 8 * gib, true);
+    try fixture.node_labelled("other", 4000, 8 * gib, true, &.{"tenant=beta"});
+    try fixture.job_requiring("train", 500, .pending, acme);
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+    const held = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(held);
+    if (held.len != 1) return error.WrongPlacement;
+    const reason = held[0].reason;
+    if (std.mem.indexOf(u8, reason, "no ready node has tenant=acme") == null) {
+        return error.WrongPlacement;
+    }
+}
+
+test "placement.require: no node matches, so the job stays pending with the reason" {
+    try with_teeth(.no_filter, require_matches_none);
+}
+
+fn exclusive_own_tenant() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.job_requiring("train", 500, .pending, acme);
+    try fixture.settle();
+    try lands(&fixture, "train-job", "x1");
+}
+
+test "an exclusive node takes a job of its own tenant" {
+    // Its teeth are the three refusals below: a filter that refused everything would fail here.
+    try exclusive_own_tenant();
+}
+
+fn exclusive_no_require() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.job("train", 500, .pending);
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+    const held = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(held);
+    const reason = held[0].reason;
+    if (std.mem.indexOf(u8, reason, "x1 is exclusive to tenant=acme") == null) {
+        return error.WrongPlacement;
+    }
+}
+
+test "an exclusive node refuses a job with no require" {
+    try with_teeth(.no_exclusive, exclusive_no_require);
+}
+
+fn exclusive_other_tenant() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    const labels: []const []const u8 = &.{ "tenant=acme", "tier=gold", "exclusive=tenant" };
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, labels);
+    try fixture.job_requiring("train", 500, .pending, &.{.{ "tier", "gold" }});
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+}
+
+test "an exclusive node refuses a job of another tenant" {
+    try with_teeth(.no_exclusive, exclusive_other_tenant);
+}
+
+fn service_avoids_exclusive() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.replica("web", "web-1", 100, gib);
+    try fixture.settle();
+    try lands(&fixture, "web-1", null);
+    try fixture.node("plain", 4000, 8 * gib, true);
+    try fixture.settle();
+    try lands(&fixture, "web-1", "plain");
+}
+
+test "a service never lands on an exclusive node" {
+    try with_teeth(.no_exclusive, service_avoids_exclusive);
 }
