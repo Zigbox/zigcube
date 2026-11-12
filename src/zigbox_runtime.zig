@@ -164,12 +164,35 @@ pub const ZigboxRuntime = struct {
 
     // ---- start ----
 
+    /// A start that does not end well is logged on the agent's stderr as one line with its code,
+    /// whoever sees the outcome later (DIAGNOSTICS.md): the job's report carries it too, but a
+    /// bare `start_failed` in the store must never be the only trace.
     fn start_impl(
         context: *anyopaque,
         spec: *const runtime.Spec,
         diag: *Diag,
     ) runtime.Error!runtime.StartOutcome {
         const self = from(context);
+        const outcome = start_inner(self, spec, diag) catch |err| {
+            if (diag.code != null) {
+                var failure: Diagnostic = undefined;
+                diag_mod.to_diagnostic(&failure, diag);
+                log_start_failure(self.io, spec.name, &failure);
+            }
+            return err;
+        };
+        switch (outcome) {
+            .failed => |*failure| log_start_failure(self.io, spec.name, failure),
+            .started => {},
+        }
+        return outcome;
+    }
+
+    fn start_inner(
+        self: *ZigboxRuntime,
+        spec: *const runtime.Spec,
+        diag: *Diag,
+    ) runtime.Error!runtime.StartOutcome {
         self.reap();
         if (map.refusal(spec)) |reason| return .{ .failed = refusal_diagnostic(reason, spec) };
         const spec_file = self.launch_spec(spec);
@@ -632,6 +655,20 @@ fn pending_listing(
         },
     }
     return listing;
+}
+
+/// `zcube-agent: container NAME did not start: CODE summary: last cause`, one line on stderr.
+fn log_start_failure(io: std.Io, name: []const u8, failure: *const Diagnostic) void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("zcube-agent: container {s} did not start: {s} {s}", .{
+        name, failure.code.slice(), failure.summary.slice(),
+    }) catch {};
+    const causes = failure.causes.slice();
+    if (causes.len > 0) writer.print(": {s}", .{causes[causes.len - 1].slice()}) catch {};
+    if (writer.end == buffer.len) writer.end -= 1; // A cut line still ends in a newline.
+    writer.writeByte('\n') catch {};
+    std.Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
 }
 
 // ---- Diagnostics -------------------------------------------------------------------------------

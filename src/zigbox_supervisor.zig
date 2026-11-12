@@ -481,7 +481,7 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     const spec = launch.read_spec(io, dir, arena_state.allocator()) catch
-        return constants.exit_environment;
+        return environment_failure(io, dir, "read its launch record");
     const storage = std.heap.page_allocator.create(Storage) catch return constants.exit_environment;
     storage.network_memory.init();
     var real: HostReal = .{
@@ -507,7 +507,8 @@ fn supervise(
     arena: Allocator,
     relay_ctx: RelayContext,
 ) u8 {
-    const container = container_spec(arena, spec) orelse return constants.exit_environment;
+    const container = container_spec(arena, spec) orelse
+        return environment_failure(io, dir, "set aside memory for its spec");
     var status: [4096]u8 = undefined;
     const count = if (host.read_file("/proc/self/status", &status)) |text|
         image.threads_in(text)
@@ -623,6 +624,20 @@ fn append_relay_failure(path: [:0]const u8, cause: []const u8) void {
 fn record_failure(io: std.Io, dir: Dir, diagnostic: *const Diagnostic) u8 {
     launch.write_failed(io, dir, diagnostic) catch return constants.exit_environment;
     return constants.exit_ok;
+}
+
+/// A supervisor that cannot even begin says so in `failed.json` (ZC-E0502): without it the agent
+/// finds a launch that ended with no word, and the run reads `lost` or a bare `start_failed`.
+fn environment_failure(io: std.Io, dir: Dir, operation: []const u8) u8 {
+    var collector: diag_mod.Diag = undefined;
+    collector.reset();
+    collector.raise(.E0502);
+    collector.cause("the supervisor can't {s}", .{operation});
+    collector.fix(.{ .sentence = "check the agent's state directory and the host's limits" });
+    var finished: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&finished, &collector);
+    _ = record_failure(io, dir, &finished);
+    return constants.exit_environment;
 }
 
 /// Zigbox's spec for the launch: the tree, the command, the environment and labels, the limits.
