@@ -1357,6 +1357,16 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "R3",
     },
     .{
+        .name = "job_reuse",
+        .root = "src/sim_c1_teeth_job_reuse_main.zig",
+        // J11 (a run that exited without a node starting it); the reuse world
+        // exists only with the tooth or `sim-c1-reuse`. Plain runs judge J11 too.
+        .symptom = "J11",
+        .canary_seeds = 60,
+        .plain_symptom = "J11",
+        .ops = 300,
+    },
+    .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
         // With #202 fixed (agents arm a run's deadline when it starts), the second clause is hit
@@ -1456,6 +1466,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_offline_step(b, sim);
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
+    add_reuse_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -1714,6 +1725,31 @@ fn add_worlds_step(b: *std.Build, sim: SimStepOptions) void {
         run.expectExitCode(0);
         step.dependOn(&run.step);
     }
+}
+
+/// The seeds of `sim-c1-reuse` (B2.1 slice 4): the hit rate of the reuse world is measured over
+/// them (docs/decisions/2026-11-11-job-reuse-tooth.md).
+const reuse_seeds_max = 60;
+
+/// `zig build sim-c1-reuse`: the world of the `job_reuse` tooth with the agent right; no seed of
+/// 1 to `reuse_seeds_max` may fail. `sim-c1-reuse-exe` installs the runner.
+fn add_reuse_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_reuse_world",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_c1_reuse_world_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    b.step("sim-c1-reuse-exe", "Install the reuse world's runner")
+        .dependOn(&b.addInstallArtifact(exe, .{}).step);
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{reuse_seeds_max}), "300", "--c1" });
+    run.expectExitCode(0);
+    b.step("sim-c1-reuse", "Run sim-c1 in the job_reuse world with the agent right (J11 holds)")
+        .dependOn(&run.step);
 }
 
 /// `zig build sim-c1-offline`: the positive run of the `job_deadline_offline` tooth's world (long

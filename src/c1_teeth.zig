@@ -116,6 +116,21 @@ pub const relay_dropped = declared("c1_teeth_relay_dropped");
 pub const job_ledger_small = declared("c1_teeth_job_ledger_small");
 pub const job_ledger_small_max: u32 = 16;
 
+/// The simulated runtime reports every job container as made under an assignment newer than any
+/// run's creation, as an agent that did not compare a leftover's epoch with the run's create
+/// revision (`is_stale_epoch`, `agent_jobs.zig`) would read it: an agent that meets the stopped
+/// container of an earlier job of the same name adopts it, and the new job ends with the old
+/// job's exit and never starts (must break J11 in the reuse world; B2.1 slice 4, RB-N8). The
+/// fault is in the runtime's listing, not in the agent, so that this slice leaves `agent_jobs.zig`
+/// alone.
+pub const job_reuse = declared("c1_teeth_job_reuse");
+
+/// Not a fault: the reuse world, with the agent right, for the positive run `sim-c1-reuse`. Job
+/// names are reused: a store-side retention jump (`Cluster.retention_jump`, which ticks no agent)
+/// deletes ended jobs, and some creates then name a deleted job, so that a node's stopped
+/// container of the earlier job meets the new one. Not in `any`.
+pub const reuse_world = declared("c1_reuse_world") or job_reuse;
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
@@ -124,4 +139,4 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;

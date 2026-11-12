@@ -135,7 +135,7 @@ pub fn note_start(
 ) void {
     const job = job_label(spec.labels) orelse return;
     state.starts_judged += 1;
-    const hash = std.hash.Wyhash.hash(0, spec.name);
+    const hash = run_hash(spec.name, run_incarnation(ctx, job));
     for (state.ledger[0..state.ledger_count]) |seen| {
         if (seen == hash) return fail(state, "J2: a run id was started a second time");
     }
@@ -152,6 +152,29 @@ pub fn note_start(
         return fail(state, "J7: a run cannot be decoded");
     };
     if (run.stop != null) return fail(state, "J7: a run was started after its stop committed");
+}
+
+/// The ledger's key for a run: its id, and in the reuse world (`c1_teeth.reuse_world`) the create
+/// revision of its `/job-runs` record too, since a name reused after retention is a new job with
+/// the old run id, and J2 holds a job's run to one start, not the name to one start for ever.
+/// Other worlds hash the id alone, as before.
+pub fn run_hash(id: []const u8, incarnation: u64) u64 {
+    const hash = std.hash.Wyhash.hash(if (c1_teeth.reuse_world) incarnation else 0, id);
+    assert(hash != 0);
+    return hash;
+}
+
+/// The create revision of `job`'s run record: 0 if it cannot be read (J7 then fails the start),
+/// and always 0 outside the reuse world, which reads nothing here.
+fn run_incarnation(ctx: *const Context, job: []const u8) u64 {
+    if (!c1_teeth.reuse_world) return 0;
+    const key = records.job_run_key(job);
+    const got = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
+        ctx.diag.reset();
+        return 0;
+    };
+    const kv = got.kv orelse return 0;
+    return kv.create_revision;
 }
 
 /// Records a started run's hash, or counts it as unjudged when the ledger is full.

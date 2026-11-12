@@ -443,6 +443,9 @@ jobs:
       # The job_evicted tooth's world (burst, strong, more than 512 runs), fix on.
       - name: sim-c1 worlds
         run: zig build sim-c1-worlds --summary all
+      # The job_reuse tooth's world (retention jumps, names reused over stopped containers), agent right.
+      - name: sim-c1 reuse world
+        run: zig build sim-c1-reuse --summary all
 
   # The Zigbox runtime on a real host (C2 slice 1, docs/demos/c2.md): zcube-server, zcube-agent
   # --runtime zigbox and real containers from a pulled Alpine image, in the Ubuntu 24.04 guest of

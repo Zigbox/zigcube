@@ -23,9 +23,13 @@ pub const Found = ?[]const u8;
 
 /// Runs every check that one committed transaction calls for. `request` is null for a revision
 /// that came from a lease (an expiry deletes a node's registration): nothing is placed by it.
-pub fn at_revision(ctx: *const Context, request: ?store.TxnRequest) Found {
+pub fn at_revision(
+    ctx: *const Context,
+    request: ?store.TxnRequest,
+    retention_running: bool,
+) Found {
     const txn = request orelse return null;
-    if (writers.foreign_key(txn)) |_| {
+    if (writers.foreign_key(txn, retention_running)) |_| {
         return "I4: a transaction wrote keys that no single writer role owns";
     }
     if (!touches(txn, records.prefix_assigned) and !touches(txn, records.prefix_allocations)) {
