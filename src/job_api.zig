@@ -302,6 +302,11 @@ fn validate_input(ctx: *const Context, input: Input) Error!void {
             constants.job_input_env_bytes_max,
         });
     }
+    if (std.mem.eql(u8, variable, constants.relay_env_name)) {
+        return refuse(ctx, "input_env", "{s} is set by the relay, a job cannot set it", .{
+            constants.relay_env_name,
+        });
+    }
     for (input.env) |pair| {
         if (std.mem.eql(u8, pair[0], variable)) {
             return refuse(ctx, "input_env", "{s} is also set in env", .{variable});

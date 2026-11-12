@@ -1206,6 +1206,12 @@ test "a job names a relay the server configures; any other name or an env overri
         .{ .extra = ",\"relay\":3", .field = "relay" },
         .{ .extra = ",\"relay\":\"botpike\",\"env\":[[\"ZCUBE_RELAY\",\"x\"]]", .field = "env" },
         .{ .extra = ",\"env\":[[\"ZCUBE_RELAY\",\"x\"]]", .field = "env" },
+        // The input is given in a variable too: it must not be the relay's, relayed or not.
+        .{
+            .extra = ",\"relay\":\"botpike\",\"input\":\"x\",\"input_env\":\"ZCUBE_RELAY\"",
+            .field = "input_env",
+        },
+        .{ .extra = ",\"input\":\"x\",\"input_env\":\"ZCUBE_RELAY\"", .field = "input_env" },
     };
     for (cases, 0..) |case, index| {
         var name: [8]u8 = undefined;

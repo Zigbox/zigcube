@@ -1,5 +1,5 @@
 error[ZC-E0702]: a job's relay could not listen
   cause  listen on 127.0.0.1 failed: ProcessFdQuotaExceeded
-  fix    free file descriptors on the node and submit the job again
+  fix    check the step in the cause: free file descriptors on the node, or correct the relay's address in the server's `relays` setting, then submit the job again
   more   zcube explain E0702 · rerun with --verbose for the full cause chain
   docs   https://zigbox.github.io/zigcube/errors/E0702.html
