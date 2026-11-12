@@ -162,6 +162,11 @@ and then removes the observed record.
   "capacity": {"cpu_millis": 4000, "memory_bytes": 8589934592}, "labels": [] }
 ```
 
+`labels` are words: `key=value` is a label a job's `placement.require` can name, and
+`exclusive=K` reserves the node: it takes only a job whose `require` names `K` with the node's own
+value of `K`, and never a service's replica. At registration an `exclusive=K` must name a key `K`
+the node carries exactly once, else `ZC-E0104` (B6).
+
 Written by the agent with `lease` set to the lease it keeps alive. When the lease ends the key
 is deleted by the store, and that delete event is how lost nodes are detected (C1). The key's
 `mod_revision` at registration is the node's **tenure revision** (`authority.md` section 3). Capacity is
@@ -486,6 +491,8 @@ name rule (48 bytes).
 
 The spec is immutable. `cancel_requested` is the one member that changes (set once). The input is
 never here, only its digest and size. `retries` is 0 (a larger value is `ZC-E0130`).
+`placement` (B6, optional, additive at the same version) is `{"require":{"tenant":"acme"}}`, at most
+`job_require_max` (4) pairs; an empty `require` is stored as no `placement`.
 `relay` (B3, optional, additive at the same version) is `{"name":"botpike","address":"HOST:PORT"}`:
 the name the job asked for and the address the server's configuration gave it at admission. At most
 `job_labels_max` (6) labels, `job_command_words_max` (64) command words, `env` of at most
@@ -511,7 +518,7 @@ status, which compares it. Neither is deleted.
 
 `{"v":1,"id":"train-7-job","job":"train-7",` the spec's `image`, `source`, `command`, `env`,
 `limits`, `deadline_ms`, `grace_ms`, `labels`, `input_env`, `input_digest`, `input_bytes`, `relay`
-(B3, as in the job),
+(B3, as in the job), `placement` (B6, as in the job),
 `"start_by_ms":…,"created_at_ms":…,"stop":{"cause":"cancel","at_ms":…}}`. At most
 `job_run_bytes_max` (16 KiB). Created once, with its status. `stop` is set at most once and never
 removed; its `cause` is `cancel`, `unreachable` or `not_started`. From the revision of the `stop`,

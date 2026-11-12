@@ -369,8 +369,12 @@ The body is the job as JSON: `name`, `image`, `command`, `deadline_ms`, `submit_
 `source`, `env` (`[["NAME","value"]]`), `limits`, `labels`, `grace_ms`, `input` (UTF-8 text, at most
 64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`, `relay` (B3: the name of a relay in the
 server's `relays` setting, see "Relays" below). `retries` above 0
-and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
-ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the same spec already
+is refused by name (ZC-E0130, not built yet); an unknown field is `400`
+ZC-E0104. `placement` (B6) is `{"require": {"key": "value"}}`: at most `job_require_max` (4) pairs,
+keys and values as a label's; the job runs only on a ready node that carries every pair as a
+`key=value` node label. A wrong shape, an unknown member, a repeated key or a pair over the bounds
+is ZC-E0130 naming `placement`; an empty `require` is the same job as none. A service (`POST
+/v1/apply`) has no `placement` (an unknown field, ZC-E0104), so it never lands on an exclusive node. Answers `201` for a new job, `200` when a job of that name with the same spec already
 exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
 it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job_admitted_window_max`
 creations in `job_admission_window_h` hours, `410` ZC-E0134 when `submit_by_ms` has passed,
