@@ -530,9 +530,13 @@ pub const registry = [_]Entry{
         \\`limits` member outside its range (`cpu_millis` 10 to 1,024,000,
         \\`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).
         \\
-        \\Two fields are refused because they are not built yet, and the cause says
-        \\so: retries above 0 (a job runs at most once), and placement. Accepting a
-        \\field and ignoring it would say something false about where the job runs.
+        \\Retries above 0 are refused because they are not built yet, and the cause
+        \\says so (a job runs at most once). Accepting a field and ignoring it would
+        \\say something false about what the job does.
+        \\
+        \\A `placement` must be `{"require": {"key": "value"}}` with at most 4 pairs,
+        \\each key and value within a label's bounds, no key twice and no other
+        \\member; the cause names what is wrong.
         \\
         \\A relay must be the name of one of the relays in the server's `relays`
         \\setting; an unknown name is refused, and a job may not set ZCUBE_RELAY in

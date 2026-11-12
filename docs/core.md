@@ -106,6 +106,13 @@ capacity fits the replica's resolved requests (its limits, else 250m CPU and 128
 placing decision says), the fewest replicas of the service first. A replica no node fits waits,
 unplaced, with no decision; `why` says "waiting for a node".
 
+B6 puts a filter ahead of fit: among the ready nodes, one is a candidate only if it carries every
+`placement.require` pair of the run as a `key=value` label and, for each `exclusive=K` label it
+has, the run's `require` names `K` with the node's value. The order is readiness, then that filter,
+then fit, spread, locality, least allocated, name. A run no node passes waits with the hold reason
+"no ready node has tenant=acme" (or "<node> is exclusive to tenant=acme"); a replica carries no
+`require`, so it never passes an exclusive node. Only the run's hold reason names the filter.
+
 ## What the simulation proves
 
 `zig build sim-c0 [-Dseed=N] [-Dops=N]` runs `sim_c0.zig` natively and as WebAssembly, for one

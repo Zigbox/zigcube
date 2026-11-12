@@ -213,6 +213,33 @@ test "a lease that has ended is ZC-E0205, for a keepalive and for a registration
     try rig.refused(rig.call("POST", keepalive, "", ""), 503, "ZC-E0205");
 }
 
+test "registration refuses an exclusive label that names a key the node does not carry once" {
+    // Goal: B6's exclusive check. Method: register with `exclusive=tenant` and no tenant label,
+    // with two, then with exactly one; only the last is accepted, and the first two write nothing.
+    var rig = try Rig.start(2);
+    defer rig.stop();
+    const lease = try rig.grant("node2");
+    const before = try rig.revision();
+    var buffer: [768]u8 = undefined;
+    const head = "{{\"lease\":{d},\"capacity\":{{\"cpu_millis\":4000," ++
+        "\"memory_bytes\":8589934592}},";
+    const cases = [_][]const u8{
+        "\"labels\":[\"exclusive=tenant\"]}}",
+        "\"labels\":[\"tenant=a\",\"tenant=b\",\"exclusive=tenant\"]}}",
+    };
+    inline for (cases) |tail| {
+        const body = try std.fmt.bufPrint(&buffer, head ++ tail, .{lease});
+        try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", body), 400, "ZC-E0104");
+    }
+    try testing.expectEqual(before, try rig.revision());
+    const good = try std.fmt.bufPrint(
+        &buffer,
+        head ++ "\"labels\":[\"tenant=a\",\"exclusive=tenant\"]}}",
+        .{lease},
+    );
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", good);
+}
+
 test "a request the endpoints cannot understand is ZC-E0104 or ZC-E0101 and writes nothing" {
     // Goal: the negative space of the routes and bodies. Method: one malformed request per rule,
     // and check that the store's revision did not move.
