@@ -218,6 +218,8 @@ const Problem = union(enum) {
     range: struct { field: []const u8, min: u64, max: u64, value: u64 },
     /// A relayed job's labels that its certificate refuses (B4); `bytes` is their total size.
     cert_labels: struct { why: x509_identity.Error, bytes: u32 },
+    /// A relayed job whose image is not a full `b3:` digest, which its certificate must attest.
+    cert_image: []const u8,
 };
 
 fn range_problem(field: []const u8, value: anytype, min: u64, max: u64) ?Problem {
@@ -241,10 +243,12 @@ fn repeated_key(field: []const u8, pairs: []const records.Pair) ?Problem {
 /// outside their bounds. The one place that lists the bounds, so `create` and `validate` cannot
 /// disagree about whether there is a problem.
 fn legacy_problem(input: Input) ?Problem {
-    return spec_problem(input.env, input.labels, input.limits, input.relay != null);
+    const relayed = input.relay != null;
+    return spec_problem(input.image, input.env, input.labels, input.limits, relayed);
 }
 
 fn spec_problem(
+    image: []const u8,
     env: []const records.Pair,
     labels: []const records.Pair,
     limits: anytype,
@@ -254,6 +258,7 @@ fn spec_problem(
     if (repeated_key("labels", labels)) |problem| return problem;
     // The relay's certificate carries every label (B4): the labels must fit it, by its own rules.
     if (relayed) {
+        if (job_cert.image_digest(image) == null) return .{ .cert_image = image };
         if (job_cert.labels_problem(labels)) |why| {
             var bytes: u32 = 0;
             for (labels) |pair| bytes += @intCast(pair[0].len + pair[1].len);
@@ -290,6 +295,10 @@ fn refuse_problem(ctx: *const Context, problem: Problem) error{Refused} {
         .range => |range| ctx.diag.cause("{s}: must be {d} to {d}, it is {d}", .{
             range.field, range.min, range.max, range.value,
         }),
+        .cert_image => |image| ctx.diag.cause(
+            "image: a relayed job's image must be 'b3:' and 64 lowercase hex digits, it is {s}",
+            .{image},
+        ),
         .cert_labels => |unfit| switch (unfit.why) {
             error.LabelsTooLarge => ctx.diag.cause(
                 "labels: a relayed job's keys and values take {d} bytes, at most {d}",
@@ -637,7 +646,14 @@ pub fn create(
             const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
             // Only a stored job with a problem of its own is a legacy one; a modern job and a
             // retry that repeats a key is a bad request, not a retry.
-            const legacy = spec_problem(old.env, old.labels, old.limits, old.relay != null) != null;
+            const relayed = old.relay != null;
+            const legacy = spec_problem(
+                old.image,
+                old.env,
+                old.labels,
+                old.limits,
+                relayed,
+            ) != null;
             if (legacy and spec_equal(&old, &job)) return .{ .same = old };
         }
         return refuse_problem(ctx, problem);
@@ -1068,6 +1084,10 @@ const Rig = struct {
     }
 };
 
+const full_digest = "b3:" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
+
 fn sample(name: []const u8) Input {
     return .{
         .name = name,
@@ -1166,6 +1186,7 @@ test "a relayed job's labels must fit a certificate; a job without a relay may c
     var relayed = sample("relayed");
     relayed.labels = &labels;
     relayed.relay = "botpike";
+    relayed.image = full_digest;
     relayed.relays = &relays;
     try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
     try testing.expectEqual(Code.E0130, rig.diag.code.?);
@@ -1201,6 +1222,7 @@ test "a relayed job's labels must be ones its certificate takes: characters, not
         var relayed = sample("relayed");
         relayed.labels = labels;
         relayed.relay = "botpike";
+        relayed.image = full_digest;
         relayed.relays = &relays;
         try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
         try testing.expect(std.mem.startsWith(u8, rig.diag.last_cause().?, "labels: "));
@@ -1209,6 +1231,39 @@ test "a relayed job's labels must be ones its certificate takes: characters, not
         plain.labels = labels;
         _ = try create(&ctx, &rig.source, plain);
     }
+}
+
+test "a relayed job's image must be a full lowercase b3 digest; a plain job may name any" {
+    // Goal: B4 review MUST. Method: a short digest, an uppercase one, a wrong length and a tag are
+    // each refused with ZC-E0130 naming `image` when the job has a relay, and admitted without
+    // one; the full lowercase digest is admitted.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    const upper = "b3:" ++ "ABABABABABABABAB" ++ "ABABABABABABABAB" ++
+        "ABABABABABABABAB" ++ "ABABABABABABABAB";
+    const short = full_digest[0 .. full_digest.len - 1];
+    const bad = [_][]const u8{ "b3:51aa9c03", upper, short, "latest", "sha256:ab" };
+    const names = [_][]const u8{ "plain-a", "plain-b", "plain-c", "plain-d", "plain-e" };
+    for (bad, names) |image, name| {
+        var relayed = sample("relayed");
+        relayed.image = image;
+        relayed.relay = "botpike";
+        relayed.relays = &relays;
+        try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
+        try testing.expect(std.mem.startsWith(u8, rig.diag.last_cause().?, "image: "));
+        try rig.expect_code(.E0130);
+        var plain = sample(name);
+        plain.image = image;
+        _ = try create(&ctx, &rig.source, plain);
+    }
+    var good = sample("relayed");
+    good.image = full_digest;
+    good.relay = "botpike";
+    good.relays = &relays;
+    _ = try create(&ctx, &rig.source, good);
 }
 
 test "the retry of a relayed job stored with labels a certificate refuses still answers" {
@@ -1222,6 +1277,7 @@ test "the retry of a relayed job stored with labels a certificate refuses still 
     const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
     var input = sample("old");
     input.relay = "botpike";
+    input.image = full_digest;
     input.relays = &relays;
     try store_legacy(&rig, input, spaced_key);
     var retry = input;

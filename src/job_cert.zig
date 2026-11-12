@@ -135,13 +135,26 @@ pub fn decide(
     return subject;
 }
 
-/// Whether the job's pinned image, "b3:" and 64 hex digits, is the digest the node attests. A
-/// pin of another form (a fixture name) is no digest at all, so it never matches.
-fn image_is(image: []const u8, digest: [32]u8) bool {
-    if (!std.mem.startsWith(u8, image, "b3:")) return false;
+/// The 32-byte digest a job's pinned image names, if it names one: "b3:" and 64 lowercase hex
+/// digits. Uppercase is refused, so one digest has one spelling. Admission of a relayed job and
+/// issuance both use this, so a job that is admitted can be attested.
+pub fn image_digest(image: []const u8) ?[32]u8 {
+    if (!std.mem.startsWith(u8, image, "b3:")) return null;
+    const hex = image["b3:".len..];
+    if (hex.len != 64) return null;
+    for (hex) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return null;
+    }
     var pinned: [32]u8 = undefined;
-    const bytes = std.fmt.hexToBytes(&pinned, image["b3:".len..]) catch return false;
-    return bytes.len == pinned.len and std.mem.eql(u8, &pinned, &digest);
+    _ = std.fmt.hexToBytes(&pinned, hex) catch return null;
+    return pinned;
+}
+
+/// Whether the job's pinned image is the digest the node attests. A pin of another form is no
+/// digest at all, so it never matches.
+fn image_is(image: []const u8, digest: [32]u8) bool {
+    const pinned = image_digest(image) orelse return false;
+    return std.mem.eql(u8, &pinned, &digest);
 }
 
 fn epoch_current(
@@ -361,4 +374,25 @@ test "labels_problem is the certificate's rule: a space in a key, a tab or bad U
     var case: Case = .{};
     case.job.labels = &.{.{ "my key", "ok" }};
     try testing.expectError(error.labels, case.run());
+}
+
+test "image_digest takes 'b3:' and 64 lowercase hex digits and nothing else" {
+    // Goal: B4 review MUST, one spelling per digest. Method: short, long, uppercase, mixed case,
+    // a tag and the wrong prefix are no digest; the full lowercase one decodes.
+    const low = "0a0a0a0a0a0a0a0a" ++ "0a0a0a0a0a0a0a0a" ++
+        "0a0a0a0a0a0a0a0a" ++ "0a0a0a0a0a0a0a0a";
+    const full = "b3:" ++ low;
+    try testing.expectEqual(@as(u8, 0x0a), image_digest(full).?[31]);
+    const none = [_][]const u8{
+        "",
+        "b3:",
+        "b3:51aa9c03",
+        full ++ "0",
+        full[0 .. full.len - 1],
+        "b3:" ++ "0A0A0A0A0A0A0A0A" ++ low[16..],
+        full[0 .. full.len - 1] ++ "A",
+        "sha256:" ++ low,
+        "latest",
+    };
+    for (none) |image| try testing.expectEqual(@as(?[32]u8, null), image_digest(image));
 }
