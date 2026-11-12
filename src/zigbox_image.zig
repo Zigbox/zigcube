@@ -30,6 +30,11 @@ pub const Steps = struct {
     /// Asks the swarm for the tree (the peers, `zcube-agent fetch`). Null: the node has no peers
     /// to ask (no server, or no manifest to hold them to).
     fetch: ?*const fn (context: *anyopaque) Fetched = null,
+    /// Takes the node's pull lock, waiting for it, and `leave_pull` gives it back. Zigbox's store
+    /// has one writer and two pulls of one image race on its blob cache (ZBX-E0417), so the
+    /// supervisors of one node take turns. Null: nothing else shares the store.
+    enter_pull: ?*const fn (context: *anyopaque) void = null,
+    leave_pull: ?*const fn (context: *anyopaque) void = null,
 };
 
 /// What the swarm fetch left behind.
@@ -69,6 +74,15 @@ pub fn start_with_image(
     if (steps.start(steps.context, &collector)) |_| {
         return .started;
     } else |_| {}
+    // The tree is missing. From here the store is written: one supervisor at a time, and the
+    // one that waited tries again first, because the one before it may have brought the tree.
+    const guarded = collector.code == .E0410 and steps.enter_pull != null;
+    if (guarded) steps.enter_pull.?(steps.context);
+    defer if (guarded) steps.leave_pull.?(steps.context);
+    if (guarded) {
+        collector.reset();
+        if (steps.start(steps.context, &collector)) |_| return .started else |_| {}
+    }
     if (collector.code == .E0410) {
         if (steps.fetch) |fetch| switch (fetch(steps.context)) {
             .in_store => {
@@ -185,13 +199,43 @@ const Script = struct {
     /// What the swarm fetch answers; null: the node has no peers to ask.
     fetch_answer: ?Fetched = null,
     fetches: u32 = 0,
+    /// How many of the first starts fail with `first_start`.
+    first_count: u32 = 1,
+    /// Whether the steps have a pull lock, and how it was used.
+    locked: bool = false,
+    held: bool = false,
+    entered: u32 = 0,
+    left: u32 = 0,
+    /// The pull happened while the lock was held.
+    pulled_held: bool = false,
 
     fn steps(script: *Script) Steps {
         const asks: ?*const fn (context: *anyopaque) Fetched = if (script.fetch_answer != null)
             fetch
         else
             null;
-        return .{ .context = script, .start = start, .pull = pull, .fetch = asks };
+        return .{
+            .context = script,
+            .start = start,
+            .pull = pull,
+            .fetch = asks,
+            .enter_pull = if (script.locked) enter else null,
+            .leave_pull = if (script.locked) leave else null,
+        };
+    }
+
+    fn enter(context: *anyopaque) void {
+        const script: *Script = @ptrCast(@alignCast(context));
+        assert(!script.held);
+        script.held = true;
+        script.entered += 1;
+    }
+
+    fn leave(context: *anyopaque) void {
+        const script: *Script = @ptrCast(@alignCast(context));
+        assert(script.held);
+        script.held = false;
+        script.left += 1;
     }
 
     fn fetch(context: *anyopaque) Fetched {
@@ -203,7 +247,8 @@ const Script = struct {
     fn start(context: *anyopaque, diag: *zigbox.diag.Diag) error{StartFailed}!void {
         const script: *Script = @ptrCast(@alignCast(context));
         script.starts += 1;
-        const code = if (script.starts == 1) script.first_start else script.later_start;
+        const failing = script.starts <= script.first_count;
+        const code = if (failing) script.first_start else script.later_start;
         const failure = code orelse return;
         diag.raise(failure);
         return error.StartFailed;
@@ -217,6 +262,7 @@ const Script = struct {
         const script: *Script = @ptrCast(@alignCast(context));
         assert(reference.len > 0);
         script.pulls += 1;
+        script.pulled_held = script.held;
         if (script.pull_code) |failure| {
             diag.raise(failure);
             return error.Failed;
@@ -416,4 +462,65 @@ test "a fetch that outlived its kill fails the start with ZC-E0515, and nothing 
     try testing.expectEqual(@as(u32, 1), script.starts);
     try testing.expect(!trace.fetched);
     try testing.expect(!trace.pulled);
+}
+
+test "a pull is made under the node's lock, after a start that waited for it" {
+    var script: Script = .{
+        .first_start = .E0410,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+        .first_count = 2,
+        .locked = true,
+    };
+    const outcome, const trace = run(&script, true);
+    try testing.expect(outcome == .started);
+    try testing.expect(trace.pulled);
+    try testing.expect(script.pulled_held);
+    try testing.expectEqual(@as(u32, 3), script.starts);
+    try testing.expectEqual(@as(u32, 1), script.entered);
+    try testing.expectEqual(@as(u32, 1), script.left);
+}
+
+test "a tree the supervisor before brought is started after the wait, and not pulled" {
+    var script: Script = .{
+        .first_start = .E0410,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+        .locked = true,
+    };
+    const outcome, const trace = run(&script, true);
+    try testing.expect(outcome == .started);
+    try testing.expectEqual(@as(u32, 2), script.starts);
+    try testing.expectEqual(@as(u32, 0), script.pulls);
+    try testing.expect(!trace.pulled);
+    try testing.expectEqual(@as(u32, 1), script.left);
+}
+
+test "a tree in the store takes no lock" {
+    var script: Script = .{
+        .first_start = null,
+        .later_start = null,
+        .pull_code = null,
+        .produces = locked,
+        .locked = true,
+    };
+    const outcome, _ = run(&script, true);
+    try testing.expect(outcome == .started);
+    try testing.expectEqual(@as(u32, 0), script.entered);
+}
+
+test "the lock is given back when the pull fails" {
+    var script: Script = .{
+        .first_start = .E0410,
+        .later_start = null,
+        .pull_code = .E0417,
+        .produces = locked,
+        .first_count = 2,
+        .locked = true,
+    };
+    const outcome, _ = run(&script, true);
+    try testing.expectEqualStrings("ZBX-E0417", outcome.failed.code.slice());
+    try testing.expectEqual(@as(u32, 1), script.left);
 }

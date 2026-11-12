@@ -230,7 +230,7 @@ none match. `--state` is a job state or `ended`. `job watch` prints one line per
 first revision wanted. After every answer that held a status, and every relist, `watch` writes
 `watching: resume with --from N` to stderr (stdout, `--output json` too, keeps its shape); pass that
 `N` to continue from there. Each round of the watch frees its own memory, so a watch that runs for
-days stays the size it started. `job get` shows `cancel requested by WHO` once a cancel is recorded. If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the
+days stays the size it started. `job get` shows `cancel requested by WHO` once a cancel is recorded. A job that ended `failed (start_failed)` carries the diagnostic of the start, and `job get` prints it after the `end:` line as `  why: CODE summary: last cause` (without it the ending says nothing about the start). If the server answers `ZC-E0203` (that revision was compacted), `watch` lists the
 ended jobs, skips those it has already printed (by name and epoch) and goes on from the list's
 revision. The dedupe holds `job_admitted_window_max` (8,192) keys, the most ended jobs the server keeps,
 so each ending prints once however often the watch relists. A relist prints every ended job

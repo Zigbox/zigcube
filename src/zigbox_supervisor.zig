@@ -54,6 +54,10 @@ const Storage = struct {
 /// list that is too long reaches `pull` and is refused there, by Zigbox, not quietly ignored.
 const mirrors_bytes_max: u32 = 4096;
 
+/// The lock the supervisors of one node take turns pulling under: `pull.lock` in `<state>/zigbox/`,
+/// the parent of every container's directory. The agent's scan of that directory skips files.
+const pull_lock_path = "../pull.lock";
+
 /// The start and pull steps over real Zigbox, for `zigbox_image.start_with_image`.
 const Real = struct {
     host: zigbox.host.Host,
@@ -63,11 +67,42 @@ const Real = struct {
     swarm: ?Swarm = null,
     /// "b3:" and 64 hex digits (Zigbox's store_digest_text_bytes, not exported).
     tree_text: [67]u8 = undefined,
+    /// The node's pull lock (`pull_lock_path`, relative to the container's directory), and the
+    /// file that holds it while a pull is going on.
+    lock_io: std.Io,
+    lock_dir: Dir,
+    lock_file: ?std.Io.File = null,
 
     fn steps(self: *Real) image.Steps {
         const asks: ?*const fn (context: *anyopaque) image.Fetched =
             if (self.swarm != null) fetch else null;
-        return .{ .context = self, .start = start, .pull = pull, .fetch = asks };
+        return .{
+            .context = self,
+            .start = start,
+            .pull = pull,
+            .fetch = asks,
+            .enter_pull = enter_pull,
+            .leave_pull = leave_pull,
+        };
+    }
+
+    /// Waits for the lock the supervisors of this node share. Zigbox's store has one writer: two
+    /// first pulls of one image at once end in ZBX-E0417 for one of them (the blob the other is
+    /// moving into the cache is gone). The kernel gives the lock back if this process dies. A
+    /// lock that can't be taken is not fatal: the pull goes on without it, as before.
+    fn enter_pull(context: *anyopaque) void {
+        const self: *Real = @ptrCast(@alignCast(context));
+        assert(self.lock_file == null);
+        self.lock_file = self.lock_dir.createFile(self.lock_io, pull_lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+        }) catch null;
+    }
+
+    fn leave_pull(context: *anyopaque) void {
+        const self: *Real = @ptrCast(@alignCast(context));
+        if (self.lock_file) |file| file.close(self.lock_io);
+        self.lock_file = null;
     }
 
     /// Runs `zcube-agent fetch` against the node's store. Its diagnostics go to
@@ -481,7 +516,12 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
     defer arena_state.deinit();
     const spec = launch.read_spec(io, dir, arena_state.allocator()) catch
-        return environment_failure(io, dir, "read its launch record");
+        return environment_failure(
+            io,
+            dir,
+            std.fs.path.basename(dir_path),
+            "read its launch record",
+        );
     const storage = std.heap.page_allocator.create(Storage) catch return constants.exit_environment;
     storage.network_memory.init();
     var real: HostReal = .{
@@ -507,15 +547,22 @@ fn supervise(
     arena: Allocator,
     relay_ctx: RelayContext,
 ) u8 {
+    const name = std.fs.path.basename(relay_ctx.dir_path);
     const container = container_spec(arena, spec) orelse
-        return environment_failure(io, dir, "set aside memory for its spec");
+        return environment_failure(io, dir, name, "set aside memory for its spec");
     var status: [4096]u8 = undefined;
     const count = if (host.read_file("/proc/self/status", &status)) |text|
         image.threads_in(text)
     else |_|
         null;
-    if (count != 1) return record_failure(io, dir, &image.not_single_threaded(count));
-    var real: Real = .{ .host = host, .storage = storage, .spec = &container };
+    if (count != 1) return record_failure(io, dir, name, &image.not_single_threaded(count));
+    var real: Real = .{
+        .host = host,
+        .storage = storage,
+        .spec = &container,
+        .lock_io = io,
+        .lock_dir = dir,
+    };
     if (spec.fetch) |fetch| {
         if (launch.manifest_of(spec.reference)) |manifest| {
             real.swarm = .{
@@ -530,7 +577,7 @@ fn supervise(
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {
         .started => if (real.swarm) |swarm| say_no_fetch(swarm, trace.fetched, trace.pulled),
-        .failed => |diagnostic| return record_failure(io, dir, &diagnostic),
+        .failed => |diagnostic| return record_failure(io, dir, name, &diagnostic),
     }
     const relay = open_relay(relay_ctx, spec, &storage.handle);
     _ = zigbox.wait(&storage.handle);
@@ -621,14 +668,17 @@ fn append_relay_failure(path: [:0]const u8, cause: []const u8) void {
 }
 
 /// Writes `failed.json`, the last thing a supervisor that did not start a container does.
-fn record_failure(io: std.Io, dir: Dir, diagnostic: *const Diagnostic) u8 {
+fn record_failure(io: std.Io, dir: Dir, name: []const u8, diagnostic: *const Diagnostic) u8 {
+    // The agent's stderr, which this process inherits: the one line a failed start leaves in its
+    // log, whenever the start fails (the agent has stopped waiting by the time a pull ends).
+    launch.log_start_failure(io, name, diagnostic);
     launch.write_failed(io, dir, diagnostic) catch return constants.exit_environment;
     return constants.exit_ok;
 }
 
 /// A supervisor that cannot even begin says so in `failed.json` (ZC-E0502): without it the agent
 /// finds a launch that ended with no word, and the run reads `lost` or a bare `start_failed`.
-fn environment_failure(io: std.Io, dir: Dir, operation: []const u8) u8 {
+fn environment_failure(io: std.Io, dir: Dir, name: []const u8, operation: []const u8) u8 {
     var collector: diag_mod.Diag = undefined;
     collector.reset();
     collector.raise(.E0502);
@@ -636,7 +686,7 @@ fn environment_failure(io: std.Io, dir: Dir, operation: []const u8) u8 {
     collector.fix(.{ .sentence = "check the agent's state directory and the host's limits" });
     var finished: Diagnostic = undefined;
     diag_mod.to_diagnostic(&finished, &collector);
-    _ = record_failure(io, dir, &finished);
+    _ = record_failure(io, dir, name, &finished);
     return constants.exit_environment;
 }
 

@@ -177,12 +177,12 @@ pub const ZigboxRuntime = struct {
             if (diag.code != null) {
                 var failure: Diagnostic = undefined;
                 diag_mod.to_diagnostic(&failure, diag);
-                log_start_failure(self.io, spec.name, &failure);
+                launch.log_start_failure(self.io, spec.name, &failure);
             }
             return err;
         };
         switch (outcome) {
-            .failed => |*failure| log_start_failure(self.io, spec.name, failure),
+            .failed => |*failure| launch.log_start_failure(self.io, spec.name, failure),
             .started => {},
         }
         return outcome;
@@ -263,7 +263,9 @@ pub const ZigboxRuntime = struct {
             .argv = &.{ self.options.supervisor_exe, "supervise-zigbox", path },
             .stdin = .ignore,
             .stdout = .ignore,
-            .stderr = .ignore,
+            // The agent's own: a start that fails after the agent stopped waiting (a pull that
+            // took long) still leaves its one line in the agent's log.
+            .stderr = .inherit,
         }) catch return supervisor_failed(diag, name);
         self.children[self.children_count] = child.id.?;
         self.children_count += 1;
@@ -655,20 +657,6 @@ fn pending_listing(
         },
     }
     return listing;
-}
-
-/// `zcube-agent: container NAME did not start: CODE summary: last cause`, one line on stderr.
-fn log_start_failure(io: std.Io, name: []const u8, failure: *const Diagnostic) void {
-    var buffer: [512]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    writer.print("zcube-agent: container {s} did not start: {s} {s}", .{
-        name, failure.code.slice(), failure.summary.slice(),
-    }) catch {};
-    const causes = failure.causes.slice();
-    if (causes.len > 0) writer.print(": {s}", .{causes[causes.len - 1].slice()}) catch {};
-    if (writer.end == buffer.len) writer.end -= 1; // A cut line still ends in a newline.
-    writer.writeByte('\n') catch {};
-    std.Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
 }
 
 // ---- Diagnostics -------------------------------------------------------------------------------

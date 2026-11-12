@@ -154,6 +154,20 @@ pub fn parse_failed(out: *Diagnostic, line: []const u8) bool {
     return out.code.len > 0;
 }
 
+/// `zcube-agent: container NAME did not start: CODE summary: last cause`, one line on stderr.
+pub fn log_start_failure(io: std.Io, name: []const u8, failure: *const Diagnostic) void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("zcube-agent: container {s} did not start: {s} {s}", .{
+        name, failure.code.slice(), failure.summary.slice(),
+    }) catch {};
+    const causes = failure.causes.slice();
+    if (causes.len > 0) writer.print(": {s}", .{causes[causes.len - 1].slice()}) catch {};
+    if (writer.end == buffer.len) writer.end -= 1; // A cut line still ends in a newline.
+    writer.writeByte('\n') catch {};
+    std.Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
+}
+
 // ---- Tests -----------------------------------------------------------------------------------
 
 const testing = std.testing;
