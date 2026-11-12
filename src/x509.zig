@@ -570,7 +570,10 @@ pub fn issue_ca(out: *Der, ca: Ed25519.KeyPair, lifetime: Lifetime) Error!void {
 
 pub const WorkloadRequest = struct {
     cluster: []const u8,
-    service: []const u8,
+    /// Which kind of workload: a service or a run of a job (B4).
+    path: identity_mod.Path = .service,
+    /// The service or job name: the last part of the SPIFFE ID, and the subject's commonName.
+    name: []const u8,
     /// The workload's public key: the caller holds the private half (it signs `CertificateVerify`).
     subject_key: [32]u8,
     identity: Identity,
@@ -580,7 +583,12 @@ pub const WorkloadRequest = struct {
 /// A client certificate for a workload, signed by the CA.
 pub fn issue_workload(out: *Der, ca: Ed25519.KeyPair, request: *const WorkloadRequest) Error!void {
     var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
-    const uri = try identity_mod.spiffe_write(&uri_buffer, request.cluster, request.service);
+    const uri = try identity_mod.spiffe_write(
+        &uri_buffer,
+        request.cluster,
+        request.path,
+        request.name,
+    );
     var identity_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
     var identity_writer = der.Writer.init(&identity_buffer);
     try identity_mod.encode(&identity_writer, &request.identity);
@@ -592,7 +600,7 @@ pub fn issue_workload(out: *Der, ca: Ed25519.KeyPair, request: *const WorkloadRe
         .kind = .workload,
         .serial = &serial,
         .issuer_cn = &issuer,
-        .subject_cn = request.service,
+        .subject_cn = request.name,
         .not_before_s = seconds[0],
         .not_after_s = seconds[1],
         .public_key = request.subject_key,
@@ -1007,7 +1015,7 @@ fn read_san(bytes: []const u8, value: Span, kind: Kind) Error!Span {
 }
 
 /// The names fit the kind: the issuer is always a CA name; the subject is the CA's own name, the
-/// service in the SPIFFE ID, or the DNS name.
+/// service or job in the SPIFFE ID, or the DNS name.
 fn check_names(bytes: []const u8, parsed: *const Parsed, detail: *Detail) Error!void {
     const issuer = parsed.issuer_cn.of(bytes);
     const subject = parsed.subject_cn.of(bytes);
@@ -1021,7 +1029,7 @@ fn check_names(bytes: []const u8, parsed: *const Parsed, detail: *Detail) Error!
         .workload => {
             // `read_san` already parsed this name with the same function, so it cannot fail here.
             const spiffe = identity_mod.spiffe_parse(parsed.name.of(bytes)) catch unreachable;
-            if (!std.mem.eql(u8, spiffe.service, subject)) return error.BadName;
+            if (!std.mem.eql(u8, spiffe.name, subject)) return error.BadName;
         },
         .server => {
             if (!std.mem.eql(u8, parsed.name.of(bytes), subject)) return error.BadName;
@@ -1349,8 +1357,9 @@ pub fn reason(err: Error) []const u8 {
         error.LabelsNotSorted => "label keys are not sorted and unique",
         error.BadLabel => "a label has a byte or a character that is not allowed",
         error.BadCluster => "the cluster name is not a lowercase DNS name",
-        error.BadServiceName => "the service name is not a valid name",
-        error.BadSpiffe => "the SPIFFE ID is not spiffe://<cluster>/service/<name>",
+        error.BadServiceName => "the service or job name is not a valid name",
+        error.BadSpiffe => "the SPIFFE ID is not spiffe://<cluster>/service/<name>" ++
+            " or spiffe://<cluster>/job/<name>",
         error.BadDnsName => "the DNS name is not lowercase, has a wildcard or an all-digit label",
         error.IssueLifetime => "the lifetime is empty, over the bound or out of range",
     };

@@ -144,6 +144,13 @@ fn validate_relay(ctx: *const Context, input: Input) Error!void {
     if (resolve_relay(input) == null) {
         return refuse(ctx, "relay", "'{s}' is not a relay this server configures", .{name});
     }
+    // The relay's certificate carries every label (B4), and a certificate holds only so many.
+    var label_bytes: usize = 0;
+    for (input.labels) |pair| label_bytes += pair[0].len + pair[1].len;
+    if (label_bytes > constants.x509_labels_bytes_max) {
+        const problem = "a relayed job's keys and values take {d} bytes, at most {d}";
+        return refuse(ctx, "labels", problem, .{ label_bytes, constants.x509_labels_bytes_max });
+    }
 }
 
 fn validate_env(ctx: *const Context, input: Input) Error!void {
@@ -1111,6 +1118,47 @@ test "a run record over 16 KiB escaped is ZC-E0130 naming the field, never ZC-B0
     input.env = &.{.{ "A", bytes }};
     try testing.expectError(error.Refused, create(&ctx, &rig.source, input));
     try rig.expect_code(.E0130);
+}
+
+fn repeat(comptime byte: u8, comptime count: usize) *const [count]u8 {
+    const filled: [count]u8 = @splat(byte);
+    return &filled;
+}
+
+test "a relayed job's labels must fit a certificate; a job without a relay may carry more" {
+    // Goal: B4's label bound (ZC-E0130 naming `labels` and 256). Method: 6 labels of 26 + 18 bytes
+    // is 264 bytes: refused with a relay, accepted without; 256 bytes exactly is accepted.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    const key = repeat('k', 26);
+    const long = repeat('v', 18);
+    const labels = [_]records.Pair{
+        .{ key ++ "0", long }, .{ key ++ "1", long }, .{ key ++ "2", long },
+        .{ key ++ "3", long }, .{ key ++ "4", long }, .{ key ++ "5", long },
+    };
+    var plain = sample("plain");
+    plain.labels = &labels;
+    _ = try create(&ctx, &rig.source, plain);
+    var relayed = sample("relayed");
+    relayed.labels = &labels;
+    relayed.relay = "botpike";
+    relayed.relays = &relays;
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
+    try testing.expectEqual(Code.E0130, rig.diag.code.?);
+    const cause = rig.diag.last_cause().?;
+    try testing.expect(std.mem.startsWith(u8, cause, "labels: "));
+    try testing.expect(std.mem.indexOf(u8, cause, "at most 256") != null);
+    rig.diag.reset();
+    // 256 bytes exactly: 4 labels of 64 bytes each.
+    const fits = [_]records.Pair{
+        .{ repeat('a', 32), repeat('x', 32) }, .{ repeat('b', 32), repeat('x', 32) },
+        .{ repeat('c', 32), repeat('x', 32) }, .{ repeat('d', 32), repeat('x', 32) },
+    };
+    relayed.labels = &fits;
+    _ = try create(&ctx, &rig.source, relayed);
 }
 
 test "limits outside the runtime's bounds are refused, naming the field" {
