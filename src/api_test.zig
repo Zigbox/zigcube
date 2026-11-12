@@ -1011,6 +1011,65 @@ test "a job body that does not parse says why, under ZC-E0104" {
     }
 }
 
+/// A job body named `name` whose last members are `tail` (the closing brace included).
+fn job_with(rig: *Rig, name: []const u8, tail: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        rig.parsed.allocator(),
+        "{{\"name\":\"{s}\",\"image\":\"b3:51aa9c03\",\"command\":[\"true\"]," ++
+            "\"deadline_ms\":1000,\"submit_by_ms\":{d},{s}",
+        .{ name, rig.world.now_ms() + 30_000, tail },
+    );
+}
+
+test "a job's placement.require is stored, checked, and refused by name when it is wrong" {
+    // Goal: B6's field. Method: a good require is created and read back, the same body is
+    // idempotent, another require is a 409, an empty require equals none, and each malformed
+    // require is ZC-E0130 naming `placement`.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const good = try job_with(&rig, "p", "\"placement\":{\"require\":{\"tenant\":\"acme\"}}}");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", good).status);
+    const got = try rig.json(rig.get("/v1/jobs/p", ""));
+    const stored = field(field(field(got, "job"), "placement"), "require");
+    try testing.expectEqualStrings("acme", field(stored, "tenant").string);
+    const other = try job_with(&rig, "p", "\"placement\":{\"require\":{\"tenant\":\"beta\"}}}");
+    try rig.refused(post_job(&rig, "/v1/jobs", other), 409, "ZC-E0131");
+
+    const five = "{\"a\":\"1\",\"b\":\"1\",\"c\":\"1\",\"d\":\"1\",\"e\":\"1\"}";
+    const bad = [_][]const u8{
+        "\"placement\":{\"require\":[1]}}",
+        "\"placement\":{\"prefer\":{}}}",
+        "\"placement\":{\"require\":{\"a\":1}}}",
+        "\"placement\":{\"require\":{\"a\":\"1\",\"a\":\"2\"}}}",
+        "\"placement\":{\"require\":" ++ five ++ "}}",
+        "\"placement\":{\"require\":{\"\":\"1\"}}}",
+        "\"placement\":{\"require\":{\"a=b\":\"1\"}}}",
+    };
+    for (bad, 0..) |tail, index| {
+        var name: [8]u8 = undefined;
+        const body = try job_with(&rig, try std.fmt.bufPrint(&name, "b{d}", .{index}), tail);
+        const response = post_job(&rig, "/v1/jobs", body);
+        try rig.refused(response, 400, "ZC-E0130");
+        try testing.expect(std.mem.indexOf(u8, response.body, "placement") != null);
+    }
+    // An empty require is no placement: the same job with and without it is one job.
+    const plain = try job_with(&rig, "e", "\"labels\":[]}");
+    const empty = try job_with(&rig, "e", "\"placement\":{\"require\":{}}}");
+    try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", plain).status);
+    try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", empty).status);
+}
+
+test "a service apply refuses placement: it is a job's field" {
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const body = "{\"name\":\"web\",\"image\":\"b3:51aa9c03\",\"replicas\":1," ++
+        "\"command\":[\"true\"]," ++
+        "\"placement\":{\"require\":{\"tenant\":\"acme\"}}}";
+    const response = rig.call(.{ .method = "POST", .path = "/v1/apply", .body = body });
+    try rig.refused(response, 400, "ZC-E0104");
+}
+
 test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why" {
     // Goal: the status table of the b1 brief and the secrecy of env values and the input.
     var rig = try Rig.start(1);
