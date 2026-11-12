@@ -581,6 +581,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     add_demo_c1_step(b, step_options, transcript);
     add_demo_b1_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
+    add_demo_b3_step(b, step_options, transcript);
 }
 
 /// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
@@ -694,6 +695,58 @@ fn add_demo_c2_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run SPEC's C2 demo for real in four QEMU guests (needs ZCUBE_REAL_HOST=1)";
     b.step("demo-c2", help).dependOn(&run.step);
+}
+
+/// `zig build demo-b3 [-Dtranscript=FILE]`: B3's demo, run for real (src/demo_b3.zig): the server
+/// on the host with one relay, one QEMU guest with `zcube-agent --runtime zigbox`, a relayed job
+/// that tries to reach the world. Skips unless `ZCUBE_REAL_HOST=1`.
+fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const exe = b.addExecutable(.{
+        .name = "demo_b3",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b3.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+            },
+        }),
+    });
+    // demo-b3 runs only on KVM hosts, so `check` compiles it (no run) and runs the tests of its
+    // script (the job's command line must fit the CLI's argument limit): what a comptime assert,
+    // a type error or an over-long argument would otherwise show only in CI's demo-b3 job.
+    const script_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b3_script.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+            },
+        }),
+    });
+    const build_step = b.step("demo-b3-build", "Compile demo-b3 and test its script, no run");
+    build_step.dependOn(&exe.step);
+    build_step.dependOn(&b.addRunArtifact(script_tests).step);
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addFileArg(stripped(b, built.agent));
+    run.addArg("--zbx");
+    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+    run.addArg("--guest-script");
+    run.addFileArg(b.path("ops/demo-b3/guest.sh"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run B3's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
+    b.step("demo-b3", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.
@@ -1844,6 +1897,12 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     canary.addFileInput(b.path("ops/sim-fleet/run.sh"));
     canary.expectExitCode(0);
     test_step.dependOn(&canary.step);
+    // demo-b3's guest script reads the relay logs of the Zigbox runtime's layout and fails on none.
+    const guest = b.addSystemCommand(&.{"sh"});
+    guest.addFileArg(b.path("ops/demo-b3/test-guest.sh"));
+    guest.addFileInput(b.path("ops/demo-b3/guest.sh"));
+    guest.expectExitCode(0);
+    test_step.dependOn(&guest.step);
 }
 
 /// The seeds the teeth test runs and the most the simulator may need to catch the agent's
@@ -1999,9 +2058,9 @@ fn add_check_step(b: *std.Build) void {
     run.addArgs(&.{ b.graph.zig_exe, user });
     run.has_side_effects = true;
     const gates = [_][]const u8{
-        "install",            "test",       "tidy",         "errors-site-check",
-        "wasm-check",         "wasm-test",  "console-wasm", "check-store-memory",
-        "check-store-sqlite", "mtls-teeth",
+        "install",            "test",       "tidy",          "errors-site-check",
+        "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
+        "check-store-sqlite", "mtls-teeth", "demo-b3-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);

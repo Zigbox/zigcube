@@ -60,6 +60,9 @@ pub const Spec = struct {
     cpu_millis: ?u32 = null,
     memory_bytes: ?u64 = null,
     pids: ?u32 = null,
+    /// `HOST:PORT` of the job's one relay upstream; empty: none. The supervisor asks Zigbox for a
+    /// listener on the container's loopback and relays it there (B3 slice 4, `relay.zig`).
+    relay: []const u8 = "",
     /// `host.time_now()` (seconds) when the agent decided to start it: a Zigbox record older than
     /// this belongs to an earlier container of the same name.
     launched: u64,
@@ -149,6 +152,20 @@ pub fn write_failed(io: std.Io, dir: Dir, diagnostic: *const Diagnostic) files.W
 pub fn parse_failed(out: *Diagnostic, line: []const u8) bool {
     zigbox.diagnostic.parse_json(out, std.mem.trim(u8, line, "\n ")) catch return false;
     return out.code.len > 0;
+}
+
+/// `zcube-agent: container NAME did not start: CODE summary: last cause`, one line on stderr.
+pub fn log_start_failure(io: std.Io, name: []const u8, failure: *const Diagnostic) void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("zcube-agent: container {s} did not start: {s} {s}", .{
+        name, failure.code.slice(), failure.summary.slice(),
+    }) catch {};
+    const causes = failure.causes.slice();
+    if (causes.len > 0) writer.print(": {s}", .{causes[causes.len - 1].slice()}) catch {};
+    if (writer.end == buffer.len) writer.end -= 1; // A cut line still ends in a newline.
+    writer.writeByte('\n') catch {};
+    std.Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
 }
 
 // ---- Tests -----------------------------------------------------------------------------------

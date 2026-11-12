@@ -109,7 +109,7 @@ pub const Spec = struct {
     /// The upstream (`HOST:PORT`) of the one relay this container may reach, resolved by the
     /// server from the job's relay name; empty if the container has none. A runtime that cannot
     /// give a container a relay refuses a spec that names one (ZC-E0703) rather than start it
-    /// without. (B3 slice 2.)
+    /// without (none does since slice 4). (B3 slice 2.)
     relay: []const u8 = "",
     /// Must include `label_replica`.
     labels: []const Label,

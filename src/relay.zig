@@ -99,10 +99,41 @@ pub const Relay = struct {
         upstream: Upstream,
         log_path: [:0]const u8,
     ) OpenError!*Relay {
-        const relay = try gpa.create(Relay);
-        errdefer gpa.destroy(relay);
         const bound = try listen_loopback();
         errdefer _ = linux.close(bound.fd);
+        return construct(gpa, io, upstream, bound, log_path);
+    }
+
+    /// Takes over a listener someone else made: the one Zigbox's `listen` gives a container with
+    /// no network, made inside the container's own network namespace (B3 slice 4). The relay owns
+    /// `fd` from here, also on failure. `port` is the container's port (`relay_port`).
+    pub fn adopt(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        upstream: Upstream,
+        fd: fd_t,
+        port: u16,
+        log_path: [:0]const u8,
+    ) error{OutOfMemory}!*Relay {
+        assert(fd >= 0);
+        assert(port > 0);
+        set_nonblocking(fd); // The accept loop polls first, but must never block in accept4.
+        const closing = linux.fcntl(fd, linux.F.SETFD, linux.FD_CLOEXEC);
+        assert(linux.errno(closing) == .SUCCESS);
+        return construct(gpa, io, upstream, .{ .fd = fd, .port = port }, log_path) catch |err| {
+            _ = linux.close(fd);
+            return err;
+        };
+    }
+
+    fn construct(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        upstream: Upstream,
+        bound: Bound,
+        log_path: [:0]const u8,
+    ) error{OutOfMemory}!*Relay {
+        const relay = try gpa.create(Relay);
         const flags: linux.O = .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -640,6 +671,44 @@ test "a relay copies both ways to its upstream and stop closes every connection"
     // The relay is gone: its connection reads an end, and nothing listens on its port.
     try testing.expectEqual(@as(?usize, 0), receive(fd, &buffer, 2000));
     try testing.expectError(error.ConnectFailed, dial(port));
+}
+
+test "an adopted listener is served, marked close-on-exec, and closed by stop" {
+    // Goal: the path `supervise-zigbox` takes (B3 slice 4). The listener comes from elsewhere
+    // (here a plain loopback one); the relay must serve it, keep it out of the job's exec, and
+    // close it on stop.
+    const echo = try Echo.start();
+    defer echo.stop();
+    const listener = try listen_loopback();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(testing.io, &path);
+    const log_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/relay.log", .{
+        path[0..length],
+    }, 0);
+    defer testing.allocator.free(log_path);
+    const upstream: Upstream = .{ .host = "127.0.0.1", .port = echo.bound.port };
+    const relay = try Relay.adopt(
+        testing.allocator,
+        testing.io,
+        upstream,
+        listener.fd,
+        listener.port,
+        log_path,
+    );
+    try testing.expectEqual(listener.port, relay.port);
+    const flags = linux.fcntl(listener.fd, linux.F.GETFD, 0);
+    try testing.expect(flags & linux.FD_CLOEXEC != 0);
+    try relay.run();
+    const fd = try dial(listener.port);
+    defer _ = linux.close(fd);
+    var buffer: [64]u8 = undefined;
+    _ = linux.write(fd, "adopted", 7);
+    try testing.expectEqual(@as(?usize, 7), receive(fd, &buffer, 2000));
+    try testing.expectEqualStrings("adopted", buffer[0..7]);
+    relay.stop();
+    try testing.expectError(error.ConnectFailed, dial(listener.port));
 }
 
 test "a relay closes the connection beyond its limit and says so (ZC-W0701)" {

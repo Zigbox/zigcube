@@ -302,7 +302,15 @@ nothing and the adopting agent finds the relay as it was. The supervisor closes 
 connection, when the command ends, however it ends (a stop, the deadline, a cancel); `kill -9` of
 the supervisor kills the process and the kernel closes the listener. `agent-smoke` runs one relayed
 job against an upstream of its own and asserts the port refuses connections after the job's end.
-The real adapter (`zigbox_runtime.zig`) refuses a spec with a relay: ZC-E0703, a start failure.
+The real adapter (B3 slice 4) serves a relay too, inside the container's namespace. `supervise-zigbox`
+starts the container with `network = .none` and Zigbox's `listen` (`.{ .port = 8080 }`, M8b): Zigbox
+makes a TCP listener on the container's own loopback and hands its descriptor back
+(`handle.session.take_listener()`). The supervisor adopts it (`Relay.adopt`, `src/relay.zig`) and
+runs the relay on threads it starts only after the container has started, so the fork stays
+single-threaded. The command finds `ZCUBE_RELAY=http://127.0.0.1:8080`, the one route out. The
+relay stops when `zigbox.wait` returns, which is after Zigbox wrote the run record (docs/demos/b3.md).
+A container whose listener cannot be taken is killed and `relay.log` says ZC-E0702 (the job then
+ends as killed by signal 9, not as a start failure; docs/demos/b3.md). ZC-E0703 stays registered for a build that has no relay support; no adapter raises it.
 
 Known limits: an upstream that is not an IPv4 literal is connected through `std.Io`, which cannot
 be interrupted, so stopping a relay whose upstream name is black-holed can wait up to

@@ -124,6 +124,7 @@ fn write_job(
     var fixed = Writer.fixed(&scratch);
     try write_end(&fixed, cli_data.member(known, "end"));
     if (fixed.buffered().len > 0) try writer.print("  end: {s}\n", .{fixed.buffered()});
+    try write_why(writer, known);
     if (cli_data.text(job, "image")) |image| try writer.print("  image: {s}\n", .{image});
     try writer.writeAll("  command:");
     for (cli_data.array(job, "command") orelse &.{}) |word| {
@@ -136,6 +137,20 @@ fn write_job(
         try writer.print("  deadline: {d} s\n", .{ms / 1000});
     }
     try write_job_inputs(writer, job);
+}
+
+/// Why the run ended, when the agent recorded a diagnostic with the end (a start that failed):
+/// its code, its summary and its last cause, on one line.
+fn write_why(writer: *Writer, status: Value) Writer.Error!void {
+    const diagnostic = cli_data.member(status, "diagnostic") orelse return;
+    const code = cli_data.text(diagnostic, "code") orelse return;
+    try writer.print("  why: {s}", .{code});
+    if (cli_data.text(diagnostic, "summary")) |summary| try writer.print(" {s}", .{summary});
+    const causes = cli_data.array(diagnostic, "causes") orelse &.{};
+    if (causes.len > 0 and causes[causes.len - 1] == .string) {
+        try writer.print(": {s}", .{causes[causes.len - 1].string});
+    }
+    try writer.writeByte('\n');
 }
 
 fn write_end(writer: *Writer, end: ?Value) Writer.Error!void {
@@ -266,6 +281,25 @@ test "an ending reads as a word, and --wait's exit code follows it" {
     try testing.expectEqualStrings("exited (signal 9)", try end_text(arena, killed));
     try testing.expectEqualStrings("failed (deadline)", try end_text(arena, late));
     try testing.expectEqualStrings("", try end_text(arena, null));
+}
+
+test "a job that failed to start says why: the code, the summary and the last cause" {
+    // Goal: a bare `start_failed` is a defect. Method: a body whose status carries a diagnostic.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var report: cli_report.Report = undefined;
+    report.reset();
+    const body = try parse_json(arena,
+        \\{"revision":9,"state":"failed","job":{"name":"etl","image":"b3:aa","command":["x"]},
+        \\"status":{"state":"failed","node":"node1","end":{"kind":"failed","cause":"start_failed"},
+        \\"diagnostic":{"code":"ZC-E0502","summary":"the host refused the container",
+        \\"causes":["first","the supervisor can't read its launch record"]}}}
+    );
+    const text = try job_text(arena, body, "zc-1", &report);
+    const want = "  why: ZC-E0502 the host refused the container: " ++
+        "the supervisor can't read its launch record\n";
+    try testing.expect(std.mem.indexOf(u8, text, want) != null);
 }
 
 test "a job prints its env by name and its input by size, never their values" {
