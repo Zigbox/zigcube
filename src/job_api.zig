@@ -21,6 +21,8 @@ const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
+const job_cert = @import("job_cert.zig");
+const x509_identity = @import("x509_identity.zig");
 const apply_mod = @import("apply.zig");
 
 const Context = controller.Context;
@@ -144,13 +146,6 @@ fn validate_relay(ctx: *const Context, input: Input) Error!void {
     if (resolve_relay(input) == null) {
         return refuse(ctx, "relay", "'{s}' is not a relay this server configures", .{name});
     }
-    // The relay's certificate carries every label (B4), and a certificate holds only so many.
-    var label_bytes: usize = 0;
-    for (input.labels) |pair| label_bytes += pair[0].len + pair[1].len;
-    if (label_bytes > constants.x509_labels_bytes_max) {
-        const problem = "a relayed job's keys and values take {d} bytes, at most {d}";
-        return refuse(ctx, "labels", problem, .{ label_bytes, constants.x509_labels_bytes_max });
-    }
 }
 
 fn validate_env(ctx: *const Context, input: Input) Error!void {
@@ -221,6 +216,8 @@ fn validate_labels(ctx: *const Context, input: Input) Error!void {
 const Problem = union(enum) {
     twice: struct { field: []const u8, name: []const u8 },
     range: struct { field: []const u8, min: u64, max: u64, value: u64 },
+    /// A relayed job's labels that its certificate refuses (B4); `bytes` is their total size.
+    cert_labels: struct { why: x509_identity.Error, bytes: u32 },
 };
 
 fn range_problem(field: []const u8, value: anytype, min: u64, max: u64) ?Problem {
@@ -244,12 +241,25 @@ fn repeated_key(field: []const u8, pairs: []const records.Pair) ?Problem {
 /// outside their bounds. The one place that lists the bounds, so `create` and `validate` cannot
 /// disagree about whether there is a problem.
 fn legacy_problem(input: Input) ?Problem {
-    return spec_problem(input.env, input.labels, input.limits);
+    return spec_problem(input.env, input.labels, input.limits, input.relay != null);
 }
 
-fn spec_problem(env: []const records.Pair, labels: []const records.Pair, limits: anytype) ?Problem {
+fn spec_problem(
+    env: []const records.Pair,
+    labels: []const records.Pair,
+    limits: anytype,
+    relayed: bool,
+) ?Problem {
     if (repeated_key("env", env)) |problem| return problem;
     if (repeated_key("labels", labels)) |problem| return problem;
+    // The relay's certificate carries every label (B4): the labels must fit it, by its own rules.
+    if (relayed) {
+        if (job_cert.labels_problem(labels)) |why| {
+            var bytes: u32 = 0;
+            for (labels) |pair| bytes += @intCast(pair[0].len + pair[1].len);
+            return .{ .cert_labels = .{ .why = why, .bytes = bytes } };
+        }
+    }
     const c = constants;
     const checks = [_]?Problem{
         range_problem(
@@ -280,6 +290,17 @@ fn refuse_problem(ctx: *const Context, problem: Problem) error{Refused} {
         .range => |range| ctx.diag.cause("{s}: must be {d} to {d}, it is {d}", .{
             range.field, range.min, range.max, range.value,
         }),
+        .cert_labels => |unfit| switch (unfit.why) {
+            error.LabelsTooLarge => ctx.diag.cause(
+                "labels: a relayed job's keys and values take {d} bytes, at most {d}",
+                .{ unfit.bytes, constants.x509_labels_bytes_max },
+            ),
+            else => ctx.diag.cause(
+                "labels: a relayed job's labels do not fit its certificate ({s}): keys are " ++
+                    "printable ASCII without spaces, values are UTF-8 without control characters",
+                .{@errorName(unfit.why)},
+            ),
+        },
     }
     ctx.diag.fix(.{ .sentence = "correct the field and submit the job again" });
     return error.Refused;
@@ -616,7 +637,7 @@ pub fn create(
             const old = try records.read(records.Job, ctx.arena, kv, ctx.diag);
             // Only a stored job with a problem of its own is a legacy one; a modern job and a
             // retry that repeats a key is a bad request, not a retry.
-            const legacy = spec_problem(old.env, old.labels, old.limits) != null;
+            const legacy = spec_problem(old.env, old.labels, old.limits, old.relay != null) != null;
             if (legacy and spec_equal(&old, &job)) return .{ .same = old };
         }
         return refuse_problem(ctx, problem);
@@ -1159,6 +1180,61 @@ test "a relayed job's labels must fit a certificate; a job without a relay may c
     };
     relayed.labels = &fits;
     _ = try create(&ctx, &rig.source, relayed);
+}
+
+test "a relayed job's labels must be ones its certificate takes: characters, not only size" {
+    // Goal: B4 review MUST. Method: a space in a key, a tab in a value and a value that is not
+    // UTF-8 are each refused with ZC-E0130 naming `labels` when the job has a relay, and admitted
+    // without one (nothing is issued for it).
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    const bad = [_][1]records.Pair{
+        .{.{ "my key", "ok" }},
+        .{.{ "k", "a\tb" }},
+        .{.{ "k", "\xff\xfe" }},
+    };
+    const names = [_][]const u8{ "plain-a", "plain-b", "plain-c" };
+    for (&bad, names) |*labels, name| {
+        var relayed = sample("relayed");
+        relayed.labels = labels;
+        relayed.relay = "botpike";
+        relayed.relays = &relays;
+        try testing.expectError(error.Refused, create(&ctx, &rig.source, relayed));
+        try testing.expect(std.mem.startsWith(u8, rig.diag.last_cause().?, "labels: "));
+        try rig.expect_code(.E0130);
+        var plain = sample(name);
+        plain.labels = labels;
+        _ = try create(&ctx, &rig.source, plain);
+    }
+}
+
+test "the retry of a relayed job stored with labels a certificate refuses still answers" {
+    // Goal: B4 review SHOULD. Method: store a relayed job, rewrite its labels to ones the
+    // certificate refuses (as B3 admitted), pass the submit time, send the same spec: the stored
+    // job answers; a new job of those labels is refused.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const ctx = rig.context();
+    const relays = [_]records.JobRelay{.{ .name = "botpike", .address = "127.0.0.1:9" }};
+    var input = sample("old");
+    input.relay = "botpike";
+    input.relays = &relays;
+    try store_legacy(&rig, input, spaced_key);
+    var retry = input;
+    retry.labels = &.{.{ "my key", "ok" }};
+    const again = try create(&ctx, &rig.source, retry);
+    try testing.expectEqualStrings("old", again.same.name);
+    retry.name = "new";
+    try testing.expectError(error.Refused, create(&ctx, &rig.source, retry));
+    try rig.expect_code(.E0130);
+}
+
+fn spaced_key(job: *records.Job) void {
+    job.labels = &.{.{ "my key", "ok" }};
 }
 
 test "limits outside the runtime's bounds are refused, naming the field" {

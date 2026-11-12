@@ -19,8 +19,11 @@ const x509 = @import("x509.zig");
 pub const Refusal = error{
     /// The job has no relay: it gets no certificate.
     no_relay,
-    /// The run has ended (its status is terminal, or its claim is `stopped`).
+    /// The run has ended (its status is terminal, or its claim is `stopped`), or its owner has
+    /// asked for it to be cancelled.
     run_ended,
+    /// The ask's image digest is not the one the job pins.
+    wrong_image,
     /// No node has claimed the run.
     no_claim,
     /// The asking node is not the node that claimed it.
@@ -38,7 +41,8 @@ pub const Refusal = error{
 pub fn reason(refusal: Refusal) []const u8 {
     return switch (refusal) {
         error.no_relay => "the job has no relay",
-        error.run_ended => "the run has ended",
+        error.run_ended => "the run has ended or is being cancelled",
+        error.wrong_image => "the image is not the one the job pins",
         error.no_claim => "no node has claimed the run",
         error.wrong_node => "the run was claimed by another node",
         error.stale_epoch => "the placement epoch is not the run's current one",
@@ -78,8 +82,8 @@ pub const Subject = struct {
 };
 
 /// Test-only faults for the teeth tests, as in `x509.zig`: each skips one check.
-pub const TestFault = enum { relay, ended, node, epoch, lifetime };
-var faults: [5]bool = @splat(false);
+pub const TestFault = enum { relay, ended, node, epoch, lifetime, image };
+var faults: [6]bool = @splat(false);
 
 pub fn set_test_fault(fault: TestFault, on: bool) void {
     if (builtin.is_test) faults[@backingInt(fault)] = on;
@@ -105,6 +109,9 @@ pub fn decide(
 ) Refusal!Subject {
     if (job.relay == null and !skipped(.relay)) return error.no_relay;
     if (records.job_state_terminal(status.state) and !skipped(.ended)) return error.run_ended;
+    // The owner has said the run must stop: no new identity for it, whatever the status says yet.
+    if (job.cancel_requested != null and !skipped(.ended)) return error.run_ended;
+    if (!skipped(.image) and !image_is(job.image, ask.image_digest)) return error.wrong_image;
     const held = claim orelse return error.no_claim;
     if (held.status == .stopped and !skipped(.ended)) return error.run_ended;
     if (!std.mem.eql(u8, held.node, ask.node) and !skipped(.node)) return error.wrong_node;
@@ -128,6 +135,15 @@ pub fn decide(
     return subject;
 }
 
+/// Whether the job's pinned image, "b3:" and 64 hex digits, is the digest the node attests. A
+/// pin of another form (a fixture name) is no digest at all, so it never matches.
+fn image_is(image: []const u8, digest: [32]u8) bool {
+    if (!std.mem.startsWith(u8, image, "b3:")) return false;
+    var pinned: [32]u8 = undefined;
+    const bytes = std.fmt.hexToBytes(&pinned, image["b3:".len..]) catch return false;
+    return bytes.len == pinned.len and std.mem.eql(u8, &pinned, &digest);
+}
+
 fn epoch_current(
     held: records.JobObserved,
     status: records.JobStatus,
@@ -142,14 +158,28 @@ fn epoch_current(
 }
 
 fn sort_labels(job: records.Job, subject: *Subject) Refusal!void {
-    if (job.labels.len > subject.labels.len) return error.labels;
-    for (job.labels, 0..) |pair, index| {
-        subject.labels[index] = .{ .key = pair[0], .value = pair[1] };
-    }
-    const count = job.labels.len;
-    std.mem.sort(identity.Label, subject.labels[0..count], {}, label_less);
-    subject.labels_len = @intCast(count);
-    identity.validate(subject.labels[0..count]) catch return error.labels;
+    subject.labels_len = sorted_labels(job.labels, &subject.labels) catch return error.labels;
+}
+
+/// The job's labels sorted by key into `out`, checked by the extension's own rules. The one
+/// place those rules are applied to a job: issuance and admission (`job_api`) both call it.
+fn sorted_labels(
+    pairs: []const records.Pair,
+    out: *[constants.x509_labels_max]identity.Label,
+) identity.Error!u32 {
+    if (pairs.len > out.len) return error.TooManyLabels;
+    for (pairs, 0..) |pair, index| out[index] = .{ .key = pair[0], .value = pair[1] };
+    std.mem.sort(identity.Label, out[0..pairs.len], {}, label_less);
+    try identity.validate(out[0..pairs.len]);
+    return @intCast(pairs.len);
+}
+
+/// What the certificate would refuse in a job's labels, or null if it takes them. Admission asks
+/// this of a relayed job, so a job whose certificate can never be issued is not admitted.
+pub fn labels_problem(pairs: []const records.Pair) ?identity.Error {
+    var out: [constants.x509_labels_max]identity.Label = undefined;
+    _ = sorted_labels(pairs, &out) catch |err| return err;
+    return null;
 }
 
 fn label_less(_: void, a: identity.Label, b: identity.Label) bool {
@@ -173,7 +203,7 @@ const window_ms: u64 = 60_000 + 10_000 + constants.workload_cert_slack_ms;
 const Case = struct {
     job: records.Job = .{
         .name = "nightly-7",
-        .image = "img",
+        .image = "b3:0101010101010101010101010101010101010101010101010101010101010101",
         .command = &.{"run"},
         .deadline_ms = 60_000,
         .grace_ms = 10_000,
@@ -245,6 +275,21 @@ test "teeth: an ended run gets nothing, by status or by a stopped claim" {
     try teeth(.ended, by_claim, error.run_ended);
 }
 
+test "teeth: a run whose cancel was requested gets nothing" {
+    var case: Case = .{};
+    case.job.cancel_requested = .{ .at_ms = now_ms - 1, .by = "me" };
+    try teeth(.ended, case, error.run_ended);
+}
+
+test "teeth: an image other than the pinned digest gets nothing" {
+    var case: Case = .{};
+    case.ask.image_digest = @splat(2);
+    try teeth(.image, case, error.wrong_image);
+    case = .{};
+    case.job.image = "fixture";
+    try testing.expectError(error.wrong_image, case.run());
+}
+
 test "no claim, no certificate" {
     try testing.expectError(error.no_claim, (Case{ .claim = null }).run());
 }
@@ -303,5 +348,17 @@ test "a start in the future (a fast agent clock) counts as now" {
 test "labels that do not fit are refused" {
     var case: Case = .{};
     case.job.labels = &.{ .{ "a", repeat('x', 200) }, .{ "b", repeat('y', 100) } };
+    try testing.expectError(error.labels, case.run());
+}
+
+test "labels_problem is the certificate's rule: a space in a key, a tab or bad UTF-8 in a value" {
+    const Err = ?identity.Error;
+    try testing.expectEqual(@as(Err, null), labels_problem(&.{ .{ "b", "1" }, .{ "a", "2" } }));
+    const bad: Err = error.BadLabel;
+    try testing.expectEqual(bad, labels_problem(&.{.{ "my key", "ok" }}));
+    try testing.expectEqual(bad, labels_problem(&.{.{ "k", "a\tb" }}));
+    try testing.expectEqual(bad, labels_problem(&.{.{ "k", "\xff" }}));
+    var case: Case = .{};
+    case.job.labels = &.{.{ "my key", "ok" }};
     try testing.expectError(error.labels, case.run());
 }
