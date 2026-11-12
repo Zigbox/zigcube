@@ -538,9 +538,18 @@ pub const TestWeakened = enum { none, no_filter, no_exclusive };
 var test_weakened: TestWeakened = .none;
 
 /// Sets the weakening; the tests' teeth call it, and nothing else may (it asserts a test build).
+/// Every caller must pair it with `defer weaken_for_test(.none)`; `with_teeth` checks none is left
+/// on. A scoped switch would need the weakening threaded through every `judge` call site,
+/// which is not cheap, so the test-only global stays.
 pub fn weaken_for_test(weakened: TestWeakened) void {
     assert(builtin.is_test);
     test_weakened = weakened;
+}
+
+/// True when no weakening is on (test builds only).
+pub fn test_weakened_none() bool {
+    assert(builtin.is_test);
+    return test_weakened == .none;
 }
 
 /// Replicas of `service` assigned to each node.

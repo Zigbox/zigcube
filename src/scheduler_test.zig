@@ -1229,10 +1229,13 @@ const acme: []const records.Pair = &.{.{ "tenant", "acme" }};
 /// Runs `body` with the filter intact, then again with `weakened`, expecting `body` to fail:
 /// the teeth of a placement test.
 fn with_teeth(weakened: scheduler.TestWeakened, body: *const fn () anyerror!void) !void {
+    try testing.expect(scheduler.test_weakened_none());
     try body();
     scheduler.weaken_for_test(weakened);
     defer scheduler.weaken_for_test(.none);
-    if (body()) |_| return error.TeethMissed else |_| {}
+    if (body()) |_| return error.TeethMissed else |err| {
+        if (err != error.WrongPlacement) return err;
+    }
 }
 
 fn require_matches() !void {
@@ -1318,8 +1321,28 @@ fn exclusive_other_tenant() !void {
     try lands(&fixture, "train-job", null);
 }
 
-test "an exclusive node refuses a job of another tenant" {
+test "an exclusive node refuses a job whose require omits the exclusive key" {
     try with_teeth(.no_exclusive, exclusive_other_tenant);
+}
+
+fn exclusive_foreign_tenant() !void {
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    try fixture.node_labelled("x1", 4000, 8 * gib, true, &.{ "tenant=acme", "exclusive=tenant" });
+    try fixture.job_requiring("train", 500, .pending, &.{.{ "tenant", "beta" }});
+    try fixture.settle();
+    try lands(&fixture, "train-job", null);
+    const held = try fixture.decisions("hold_pending");
+    defer testing.allocator.free(held);
+    // The require check comes first: the reason names the missing label, not the exclusivity.
+    if (std.mem.indexOf(u8, held[0].reason, "no ready node has tenant=beta") == null) {
+        return error.WrongPlacement;
+    }
+}
+
+test "an exclusive node refuses a job of another tenant" {
+    try with_teeth(.no_filter, exclusive_foreign_tenant);
 }
 
 fn service_avoids_exclusive() !void {

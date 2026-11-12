@@ -395,6 +395,7 @@ const RelayField = struct {
 const PlacementField = struct {
     require: []const records.Pair = &.{},
     problem: ?[]const u8 = null,
+    seen_require: bool = false,
 
     pub fn jsonParse(
         allocator: std.mem.Allocator,
@@ -415,6 +416,10 @@ const PlacementField = struct {
                 .object_end => return field,
                 .string, .allocated_string => |text| {
                     if (std.mem.eql(u8, text, "require")) {
+                        if (field.seen_require) {
+                            field.problem = field.problem orelse "names require twice";
+                        }
+                        field.seen_require = true;
                         try field.read_require(allocator, source, options);
                     } else {
                         try source.skipValue();

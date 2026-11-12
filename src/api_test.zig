@@ -1039,6 +1039,8 @@ test "a job's placement.require is stored, checked, and refused by name when it 
     const five = "{\"a\":\"1\",\"b\":\"1\",\"c\":\"1\",\"d\":\"1\",\"e\":\"1\"}";
     const bad = [_][]const u8{
         "\"placement\":{\"require\":[1]}}",
+        "\"placement\":{\"require\":{\"tenant\":\"acme\"},\"require\":{}}}",
+        "\"placement\":{\"require\":{},\"require\":{\"tenant\":\"acme\"}}}",
         "\"placement\":{\"prefer\":{}}}",
         "\"placement\":{\"require\":{\"a\":1}}}",
         "\"placement\":{\"require\":{\"a\":\"1\",\"a\":\"2\"}}}",
