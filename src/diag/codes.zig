@@ -1468,14 +1468,19 @@ pub const registry = [_]Entry{
         .blame = .environment,
         .summary = "a job's relay could not listen",
         .explanation =
-        \\The supervisor of a job could not open the listener a relay needs, so the
-        \\job did not start: it ended as a start failure, because a job that expects a
-        \\relay and finds none would run without the route it was promised. The cause
-        \\line says which step failed (the socket, the bind, the listen).
+        \\The supervisor of a job could not set up the relay the job asked for, so the
+        \\job does not run without the route it was promised. The cause line says
+        \\which step failed (the socket, the bind, the listen, the relay's address).
         \\
-        \\On the fake runtime the listener is a loopback port the host picks; the host
-        \\may be out of file descriptors or sockets. Check `ulimit -n` and the node's
-        \\load, then submit the job again.
+        \\On the fake runtime the job is not started and ends as a start failure. On
+        \\the real runtime the container has already started, so the supervisor kills
+        \\it: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in
+        \\the job's `relay.log`.
+        \\
+        \\If the cause is a socket or file descriptor error, the host may be out of
+        \\descriptors: check `ulimit -n` and the node's load. If it names the relay's
+        \\address, correct the relay's address in the server's `relays` setting. Then
+        \\submit the job again.
         ,
     },
     .{

@@ -651,9 +651,9 @@ fn kill_unrelayed(
 /// existing log is kept). Nowhere else to say it: a failure to write is dropped.
 fn append_relay_failure(path: [:0]const u8, cause: []const u8) void {
     var line: [constants.relay_address_bytes_max]u8 = undefined;
-    const text = std.fmt.bufPrint(&line, "ZC-E0702 the relay could not be served: {s}\n", .{
+    const text = std.fmt.bufPrint(&line, "ZC-E0702 a job's relay could not listen: {s}\n", .{
         cause,
-    }) catch "ZC-E0702 the relay could not be served\n";
+    }) catch "ZC-E0702 a job's relay could not listen\n";
     const flags: std.os.linux.O = .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
@@ -770,7 +770,7 @@ test "a relay that cannot be served is written to relay.log after what is there 
     const text = try tmp.dir.readFileAlloc(io, "relay.log", std.testing.allocator, limit);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("earlier line\n" ++
-        "ZC-E0702 the relay could not be served: the container gave no listener\n", text);
+        "ZC-E0702 a job's relay could not listen: the container gave no listener\n", text);
 }
 
 test "the fetch is told where to put its pull record, and the registry and server only if known" {
