@@ -148,7 +148,7 @@ fn sort_labels(job: records.Job, subject: *Subject) Refusal!void {
     }
     const count = job.labels.len;
     std.mem.sort(identity.Label, subject.labels[0..count], {}, label_less);
-    subject.labels_len = count;
+    subject.labels_len = @intCast(count);
     identity.validate(subject.labels[0..count]) catch return error.labels;
 }
 
