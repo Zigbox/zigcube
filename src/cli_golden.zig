@@ -19,6 +19,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const agent_jobs = @import("agent_jobs.zig");
+const agent_records = @import("agent_records.zig");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
 const cli_local = @import("cli_local.zig");
@@ -283,7 +284,7 @@ fn relay_refused(diag: *diag_mod.Diag) void { // relay.zig
 
 fn relay_not_listening(diag: *diag_mod.Diag) void { // fake_supervisor.zig
     const cause = "listen on 127.0.0.1 failed: ProcessFdQuotaExceeded";
-    sample(diag, .E0702, &.{cause}, "free file descriptors on the node and submit the job again");
+    sample(diag, .E0702, &.{cause}, agent_records.fix_e0702);
 }
 
 fn relay_unserved(diag: *diag_mod.Diag) void { // zigbox_runtime.zig

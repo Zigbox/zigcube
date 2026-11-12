@@ -76,8 +76,9 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a job's relay could not listen</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>The supervisor of a job could not open the listener a relay needs, so the job did not start: it ended as a start failure, because a job that expects a relay and finds none would run without the route it was promised. The cause line says which step failed (the socket, the bind, the listen).</p>
-<p>On the fake runtime the listener is a loopback port the host picks; the host may be out of file descriptors or sockets. Check `ulimit -n` and the node's load, then submit the job again.</p>
+<p>The supervisor of a job could not set up the relay the job asked for, so the job does not run without the route it was promised. The cause line says which step failed (the socket, the bind, the listen, the relay's address).</p>
+<p>On the fake runtime the job is not started and ends as a start failure. On the real runtime the container has already started, so the supervisor kills it: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in the job's `relay.log`.</p>
+<p>If the cause is a socket or file descriptor error, the host may be out of descriptors: check `ulimit -n` and the node's load. If it names the relay's address, correct the relay's address in the server's `relays` setting. Then submit the job again.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0702</pre>
