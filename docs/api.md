@@ -654,6 +654,13 @@ Registers the node: the server writes `/nodes/<node>` on the lease, in the recor
 `lease` and `capacity` are required, and both capacity numbers must be above 0. Answer
 `{"revision": 431}`. A lease that is not the store's is `ZC-E0205`.
 
+`replaces` (optional, #237) is the tenure the agent believes it holds: the `mod_revision` of
+`/nodes/<node>` its last registration answered, or 0 for none. When it is given, the write is
+compared against that revision, and a registration for a tenure that is no longer current (an
+earlier attempt landed late, after a newer one) is `ZC-E0510` and moves nothing. Without it (an
+older agent) nothing is compared; upgrade the server first. A keepalive of a lease the node's key
+is not on is `ZC-E0205` (the lease is an orphan: the agent grants again and registers again).
+
 ### `PUT /v1/agent/nodes/{node}/store` (C2 slice 5)
 
 Writes the node's image summary, `/node-store/<node>` of keys.md, bound to the node's lease. The body

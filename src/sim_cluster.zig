@@ -909,6 +909,7 @@ pub const Cluster = struct {
         c.ack_loss = .init(c.tap.interface(), seed ^ 0xac4, c.swarm.ack_loss_per_mille);
         c.switched = .{ .inner = c.ack_loss.interface() };
         c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
+        c.net.late_registration = true;
         c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
         if (options.lease_ttl_ms) |ttl_ms| {
             assert(fencing.inequality_problem(ttl_ms) == null);
@@ -3392,11 +3393,14 @@ fn print_summary(c: *Cluster) void {
         total.parked += link.parked;
         total.delivered_late += link.delivered_late;
         total.partitioned += link.partitioned;
+        total.late_registrations += link.late_registrations;
+        total.late_registrations_landed += link.late_registrations_landed;
     }
     report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} " ++
-        "parked={d} delivered_late={d} partitioned={d}\n", .{
+        "parked={d} delivered_late={d} partitioned={d} late_registrations={d} landed={d}\n", .{
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
         total.parked,    total.delivered_late,   total.partitioned,
+        total.late_registrations, total.late_registrations_landed,
     });
     const fences = total_fences(c);
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});

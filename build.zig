@@ -1357,6 +1357,15 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "R3",
     },
     .{
+        .name = "register_unchecked",
+        .root = "src/sim_c1_teeth_register_unchecked_main.zig",
+        // I1b (a replica kept executing next to its replacement) or the node left lost: the
+        // orphan lease expires, the node is marked lost, and its replicas never come back.
+        .symptom = "I1b|agents kept fencing|a placed replica has no running container",
+        .canary_seeds = 40,
+        .any_symptom = true,
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world

@@ -29,6 +29,13 @@
 //!   does. A liveness bound after a heal must therefore allow `reorder_delay_ms_max` for the
 //!   stragglers.
 //!
+//! **A late registration** (`late_registration`, the cluster switches it on): after a registration
+//! the server accepted, the network delivers one more, as an earlier attempt of the same agent
+//! that was still in flight (the agent restarted, or lost its connection, between its attempts):
+//! the same registration but for a lease of its own, granted before the agent's newer one and
+//! still alive, and naming the same tenure it replaces. A server that registers the node on
+//! it puts the key on a lease nobody renews (#237). It draws nothing from the seed.
+//!
 //! Duplicate and reorder act on requests only: a duplicated or late reply is read once by a
 //! synchronous caller and can change nothing, so the model leaves it out.
 //!
@@ -90,6 +97,9 @@ pub const Stats = struct {
     parked: u32 = 0,
     delivered_late: u32 = 0,
     partitioned: u32 = 0,
+    /// Late registrations delivered (`late_registration`), and those the server accepted.
+    late_registrations: u32 = 0,
+    late_registrations_landed: u32 = 0,
 };
 
 const Parked = struct {
@@ -122,6 +132,8 @@ pub const SimNet = struct {
     now_ms: u64,
     /// Parked requests so far, to order those due together.
     parked_total: u64,
+    /// Deliver a late registration after each registration the server accepts (see above).
+    late_registration: bool,
 
     const Port = struct { net: *SimNet, node: u32 };
 
@@ -137,6 +149,7 @@ pub const SimNet = struct {
             .last_call_ms = 0,
             .now_ms = 0,
             .parked_total = 0,
+            .late_registration = false,
         };
         for (&net.ports, 0..) |*port, node| port.* = .{ .net = net, .node = @intCast(node) };
     }
@@ -274,6 +287,10 @@ pub const SimNet = struct {
             _ = net.hand_over(port.node, request);
         }
         defer if (kept) |bytes| net.gpa.free(bytes);
+        if (net.late_registration and first.status == 200 and is_registration(request)) {
+            if (kept == null) kept = net.gpa.dupe(u8, first.body) catch return error.OutOfMemory;
+            net.deliver_late_registration(port.node, request);
+        }
         const reply_body = kept orelse first.body;
         // The server has acted. Nothing below can undo it.
         elapsed_ms += net.delay(faults.reply.delay_ms_max);
@@ -286,6 +303,37 @@ pub const SimNet = struct {
         net.last_call_ms = elapsed_ms;
         const body = arena.dupe(u8, reply_body) catch return error.OutOfMemory;
         return .{ .status = first.status, .body = body };
+    }
+
+    /// The registration the agent sent, delivered again for a lease granted just before it (the
+    /// earlier attempt's): an alive lease, the same body otherwise.
+    fn deliver_late_registration(net: *SimNet, node: u32, request: client.Request) void {
+        // Each hand-over resets `scratch`, so what is built here lives in memory of its own.
+        var arena_state = std.heap.ArenaAllocator.init(net.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const prefix = "{\"lease\":";
+        if (!std.mem.startsWith(u8, request.body, prefix)) return;
+        const path_end = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
+        const lease_target = std.mem.concat(arena, u8, &.{
+            request.target[0..path_end], "/lease",
+        }) catch return;
+        const grant: client.Request = .{ .method = "POST", .target = lease_target, .body = "{}" };
+        const granted = net.hand_over(node, grant);
+        if (granted.status != 200) return;
+        const Granted = struct { lease: struct { id: u64 } };
+        const parsed = std.json.parseFromSliceLeaky(Granted, arena, granted.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return;
+        var end: usize = prefix.len;
+        while (end < request.body.len and std.ascii.isDigit(request.body[end])) end += 1;
+        const body = std.fmt.allocPrint(arena, "{s}{d}{s}", .{
+            prefix, parsed.lease.id, request.body[end..],
+        }) catch return;
+        const put: client.Request = .{ .method = "PUT", .target = request.target, .body = body };
+        const late = net.hand_over(node, put);
+        net.links[node].stats.late_registrations += 1;
+        if (late.status == 200) net.links[node].stats.late_registrations_landed += 1;
     }
 
     /// The request reaches the server; its reply is in `scratch` until the next hand-over.
@@ -354,6 +402,15 @@ pub const SimNet = struct {
         return false;
     }
 };
+
+/// `PUT /v1/agent/nodes/{node}`: a node's registration (the summary and the lease have more path).
+fn is_registration(request: client.Request) bool {
+    const base = "/v1/agent/nodes/";
+    if (!std.mem.eql(u8, request.method, "PUT")) return false;
+    if (!std.mem.startsWith(u8, request.target, base)) return false;
+    const path_end = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
+    return std.mem.indexOfScalarPos(u8, request.target[0..path_end], base.len, '/') == null;
+}
 
 const testing = std.testing;
 
