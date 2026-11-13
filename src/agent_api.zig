@@ -1313,6 +1313,9 @@ fn refused_certificate(ctx: *const Context, name: []const u8, refusal: job_cert.
         name, job_cert.reason(refusal),
     });
     ctx.diag.fix(.{ .sentence = "none needed if the run lost its claim" });
+    // No claim yet, or a claim not yet reported running: the run may still get there, so the
+    // agent asks again (503) rather than marking it refused (docs/api.md).
+    ctx.diag.settling = refusal == error.no_claim or refusal == error.not_started;
     return error.Failed;
 }
 

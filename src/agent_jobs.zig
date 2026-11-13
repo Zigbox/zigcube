@@ -609,6 +609,9 @@ const Work = struct {
                 .epoch = current.epoch,
                 .started_at_ms = current.started_at_ms,
             });
+        } else if (seen) |held| {
+            // Reported by an earlier pass or process: the run's certificate may be asked for.
+            if (held.status == .running) work.agent.note_running_reported(subject.id);
         }
         if (current.stop_cause == null) {
             // The report above is a store call, which enforces a deadline that came due during
@@ -1089,6 +1092,7 @@ const Work = struct {
         const agent = work.agent;
         assert(wanted.epoch > 0);
         if (work.seen_of(wanted.run)) |existing| {
+            if (existing.status == .running) agent.note_running_reported(wanted.run);
             if (same(existing, wanted)) return;
         }
         const value: records.JobObserved = .{
@@ -1120,6 +1124,9 @@ const Work = struct {
         }
         const outcome = try work.commit(value, set.compares());
         if (outcome == .refused) agent.job_reports_refused += 1;
+        if (outcome == .applied and wanted.status == .running) {
+            agent.note_running_reported(wanted.run);
+        }
     }
 
     const store_compare = @import("store.zig").Compare;

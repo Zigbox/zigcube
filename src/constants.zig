@@ -559,6 +559,11 @@ pub const peer_join_request_bytes_max: u32 = 512;
 pub const peer_join_retry_ms: u32 = 5 * 1000;
 /// One join call waits this long at most (less near the lease's fence).
 pub const peer_join_timeout_ms: u32 = 3 * 1000;
+/// Relayed runs' certificates asked for in one step of the agent's loop (B4 slice 2). With
+/// `relay_cert_step_ms_max` it bounds how long the step can hold back a keepalive.
+pub const relay_cert_asks_per_step_max: u32 = 8;
+/// All the asks of one step together take at most this long (and never past the fence).
+pub const relay_cert_step_ms_max: u32 = peer_join_timeout_ms;
 /// Handshakes the peer server starts for one source address in one window; the next is refused.
 /// It bounds unauthenticated public-key work (a few hundred microseconds each), and is sized for
 /// a whole cluster behind one NAT address: every fetch connection to this server carries
@@ -776,6 +781,9 @@ comptime {
     // 256 names of the longest length, a newline each, fit the file bound.
     assert(peer_revoked_max * (node_name_bytes_max + 1) <= peer_file_bytes_max);
     assert(peer_join_timeout_ms < agent_io_timeout_ms);
+    assert(relay_cert_asks_per_step_max > 0);
+    assert(relay_cert_asks_per_step_max <= agent_node_runs_max);
+    assert(relay_cert_step_ms_max <= peer_join_timeout_ms);
 }
 
 comptime {

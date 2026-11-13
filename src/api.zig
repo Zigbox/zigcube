@@ -659,8 +659,10 @@ fn error_response(ctx: *const Context, request_id: []const u8) Response {
     var diagnostic: Diagnostic = undefined;
     diag_mod.to_diagnostic(&diagnostic, ctx.diag);
     const body = error_body(ctx, request_id, &diagnostic) catch "{\"diagnostics\":[]}";
+    // A refusal that rests on state still settling is one to retry (B4, ZC-E0706).
+    if (ctx.diag.settling) assert(diagnostic.blame == .environment);
     return .{
-        .status = status_for(code, diagnostic.blame),
+        .status = if (ctx.diag.settling) 503 else status_for(code, diagnostic.blame),
         .request_id = request_id,
         .body = body,
     };
@@ -680,7 +682,8 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
             return 400;
         },
         .environment => {
-            // A refused certificate rests on the run's claim, which is not the asker's (B4).
+            // A refused certificate rests on the run's claim, which is not the asker's (B4);
+            // one that rests on a claim still settling is 503 (`Diag.settling`).
             if (code == .E0706) return 409;
             return 503;
         },

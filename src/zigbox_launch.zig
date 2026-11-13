@@ -63,6 +63,12 @@ pub const Spec = struct {
     /// `HOST:PORT` of the job's one relay upstream; empty: none. The supervisor asks Zigbox for a
     /// listener on the container's loopback and relays it there (B3 slice 4, `relay.zig`).
     relay: []const u8 = "",
+    /// The upstream's TLS server name (B4); empty for B3's plain upstream. The zigbox
+    /// supervisor does not speak TLS to a relay until B4 slice 4, so it refuses any relay that
+    /// names one rather than connect in plaintext (fail closed, #228).
+    relay_server_name: []const u8 = "",
+    /// A Debug build's test-only plain upstream (`relay_tls.plain_allowed`).
+    relay_plain: bool = false,
     /// `host.time_now()` (seconds) when the agent decided to start it: a Zigbox record older than
     /// this belongs to an earlier container of the same name.
     launched: u64,

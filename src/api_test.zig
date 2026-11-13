@@ -1230,6 +1230,8 @@ const x509 = @import("x509.zig");
 
 /// Writes `r1`'s assignment to node1, its claim and status as running under that epoch, as the
 /// scheduler and the agent would; returns the epoch.
+/// Places run r1 on node1 with the status `status_state`; its claim is `running` (started now)
+/// when the status is `running` or terminal, else `claimed` with no start yet.
 fn place_relayed_run(rig: *Rig, status_state: records.JobState) !u64 {
     var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
     const id = records.job_run_id(&id_buffer, "r1");
@@ -1242,26 +1244,28 @@ fn place_relayed_run(rig: *Rig, status_state: records.JobState) !u64 {
     );
     const epoch: u64 = @intCast(placed.revision);
     const arena = rig.parsed.allocator();
-    const started = rig.world.now_ms();
     const terminal = records.job_state_terminal(status_state);
+    const begun = terminal or status_state == .running;
+    const started: ?u64 = if (begun) rig.world.now_ms() else null;
+    const now = rig.world.now_ms();
     const status = try std.json.Stringify.valueAlloc(arena, records.JobStatus{
         .state = status_state,
         .node = "node1",
         .epoch = epoch,
         .tenure = 1,
         .started_at_ms = started,
-        .ended_at_ms = if (terminal) started else null,
+        .ended_at_ms = if (terminal) now else null,
         .end = if (terminal) .{ .kind = .cancelled } else null,
-        .reported_at_ms = started,
+        .reported_at_ms = now,
     }, .{});
     const observed = try std.json.Stringify.valueAlloc(arena, records.JobObserved{
         .run = id,
         .node = "node1",
         .tenure = 1,
         .assignment = epoch,
-        .status = .running,
+        .status = if (begun) .running else .claimed,
         .started_at_ms = started,
-        .reported_at_ms = started,
+        .reported_at_ms = now,
     }, .{});
     const status_key = records.job_status_key("r1");
     const claim_key = records.job_observed_key("node1", "r1");
@@ -1303,11 +1307,16 @@ test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to an
     const extra = ",\"relay\":\"botpike\",\"labels\":[[\"team\",\"x\"]]";
     const good = try relay_body(&rig, "r1", extra);
     try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
-    const epoch = try place_relayed_run(&rig, .running);
     const digest = relay_image["b3:".len..];
     const run_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9)))
         .public_key.toBytes();
     const path = "/v1/agent/nodes/node1/runs/r1/certificate";
+    // Claimed, not yet reported running: still settling, so 503 (the agent asks again), not a
+    // refusal for good.
+    const claimed = try place_relayed_run(&rig, .placed);
+    const early = try certificate_body(&rig, claimed, digest, run_key);
+    try rig.refused(post_job(&rig, path, early), 503, "ZC-E0706");
+    const epoch = try place_relayed_run(&rig, .running);
     const ok = post_job(&rig, path, try certificate_body(&rig, epoch, digest, run_key));
     if (ok.status != 200) std.debug.print("{s}\n", .{ok.body});
     try testing.expectEqual(@as(u16, 200), ok.status);
@@ -1324,7 +1333,8 @@ test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to an
 
     const other = try certificate_body(&rig, epoch, digest, run_key);
     const node2 = "/v1/agent/nodes/node2/runs/r1/certificate";
-    try rig.refused(post_job(&rig, node2, other), 409, "ZC-E0706");
+    // node2 has no claim of its own: settling as far as the server can tell, so 503.
+    try rig.refused(post_job(&rig, node2, other), 503, "ZC-E0706");
     const stale = try certificate_body(&rig, epoch - 1, digest, run_key);
     try rig.refused(post_job(&rig, path, stale), 409, "ZC-E0706");
     const zeros: [64]u8 = @splat('0');

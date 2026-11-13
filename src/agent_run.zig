@@ -94,6 +94,8 @@ const Shell = struct {
     peer_transport: remote_mod.client.Transport,
     /// Relayed runs' certificates (B4): asked for before every pass and watch.
     relay_certs: agent_relay_certs.Asker,
+    /// When the current `relay_step` must be done, on the boot clock.
+    relay_step_end_ms: u64 = 0,
 
     /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
     /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
@@ -134,17 +136,25 @@ const Shell = struct {
     }
 
     /// Asks for the certificates relayed runs wait for. A failure is shown once per streak; the
-    /// relay of a run without one ends its connections at `relay_connect_timeout_ms`.
+    /// relay of a run without one ends its connections at `relay_connect_timeout_ms`. The whole
+    /// step takes at most `relay_cert_step_ms_max` and never runs past the fence: each ask's
+    /// timeout is recomputed before it is made (`relay_left`), so a slow server cannot hold back
+    /// the keepalive.
     fn relay_step(shell: *Shell) void {
-        const timeout_ms = shell.before_fence(constants.peer_join_timeout_ms);
-        if (timeout_ms == 0) return;
+        if (shell.before_fence(constants.relay_cert_step_ms_max) == 0) return;
+        shell.relay_step_end_ms = shell.boot.now_ms() +| constants.relay_cert_step_ms_max;
         shell.arena.reset();
         shell.diag.reset();
         const certs = &shell.relay_certs;
         const state = shell.pair_state.interface();
         const arena = shell.arena.allocator();
         const now_ms = shell.clock.now_ms();
-        switch (certs.step(state, shell.peer_transport, arena, now_ms, timeout_ms, &shell.diag)) {
+        const host: agent_relay_certs.Host = .{
+            .context = shell,
+            .left_fn = relay_left,
+            .reported_fn = relay_reported,
+        };
+        switch (certs.step(state, shell.peer_transport, arena, now_ms, host, &shell.diag)) {
             .idle, .asked => {},
             .failed => if (!certs.reported) {
                 certs.reported = true;
@@ -152,6 +162,17 @@ const Shell = struct {
             },
         }
         shell.diag.reset();
+    }
+
+    fn relay_left(context: *anyopaque) u32 {
+        const shell: *Shell = @ptrCast(@alignCast(context));
+        const left = shell.relay_step_end_ms -| shell.boot.now_ms();
+        return shell.before_fence(@intCast(@min(left, constants.relay_cert_step_ms_max)));
+    }
+
+    fn relay_reported(context: *anyopaque, run_id: []const u8) bool {
+        const shell: *Shell = @ptrCast(@alignCast(context));
+        return shell.agent.running_reported_known(run_id);
     }
 
     /// One step of the core, with what the policy says to tell the person.
