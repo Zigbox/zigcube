@@ -1314,6 +1314,7 @@ const scope_rows = [_]ScopeRow{
     // Another node's keys: node1's agent may not write or read them.
     .{ .method = "PUT", .path = "/v1/agent/nodes/node2", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/lease", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/credential", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = scope_none },
     .{
@@ -1324,15 +1325,25 @@ const scope_rows = [_]ScopeRow{
     },
 };
 
+fn node2_owns(path: []const u8) bool {
+    const own = "/v1/agent/nodes/node2";
+    if (!std.mem.startsWith(u8, path, own)) return false;
+    return path.len == own.len or path[own.len] == '/';
+}
+
 test "scopes: every endpoint as an agent, a jobs client and an admin client (B7)" {
+    // node2 may call only its own node's paths: node1's lease, credential, reports and watch
+    // are refused to it (docs/decisions/2026-11-13-node-cert-bootstrap.md).
     var rig = try Rig.start(91);
     defer rig.stop();
     const node1: api_mod.Caller = .{ .node = "node1" };
+    const node2: api_mod.Caller = .{ .node = "node2" };
     const app: api_mod.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
     const ops: api_mod.Caller = .{ .client = .{ .name = "ops", .scope = .admin } };
     for (scope_rows) |row| {
         const cases = [_]struct { caller: api_mod.Caller, allowed: bool }{
             .{ .caller = node1, .allowed = row.allowed.node1 },
+            .{ .caller = node2, .allowed = node2_owns(row.path) },
             .{ .caller = app, .allowed = row.allowed.jobs },
             .{ .caller = ops, .allowed = true },
         };
