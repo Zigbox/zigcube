@@ -28,6 +28,8 @@ pub const listen_default = "127.0.0.1:7070";
 pub const usage =
     \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
     \\                    [--new-ca] [--verbose] [--quiet]
+    \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--config FILE]
+    \\                    [--store SPEC] [--state-dir DIR]
     \\       zcube-server --version | --help
     \\
     \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
@@ -44,6 +46,11 @@ pub const usage =
     \\                    then joins again); the key file is in the state directory
     \\  --verbose         show the internal message of a bug, and every request
     \\  --quiet           log only failures
+    \\
+    \\ca issue-client signs a client certificate with the store's CA (on the server host; the
+    \\server need not run): NAME.key and NAME.crt, mode 0600, in --out (default: the working
+    \\directory). --scope is what the client may do: jobs, or admin. A name in the revoked file
+    \\is refused.
     \\
     \\Writes to the API are unauthenticated: listen on a loopback or private address.
     \\
@@ -78,7 +85,18 @@ pub const Config = struct {
     relays: []const Relay = &.{},
 };
 
-pub const Command = union(enum) { run: Config, version, help };
+pub const Command = union(enum) { run: Config, ca_issue_client: IssueClient, version, help };
+
+/// `zcube-server ca issue-client NAME --scope jobs|admin`: the store settings find the CA key
+/// (`config`), and the files are written in `out_dir`.
+pub const IssueClient = struct {
+    config: Config,
+    name: []const u8,
+    scope: Scope,
+    out_dir: []const u8 = ".",
+};
+
+pub const Scope = @import("x509.zig").Scope;
 
 /// One relay: the name a job gives and the `host:port` the node agent connects to for it.
 pub const Relay = @import("records.zig").JobRelay;
@@ -127,12 +145,55 @@ pub const Error = error{ BadConfig, OutOfMemory };
 /// Reads the flags and the file they name, merges them (flags win), and checks every setting.
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "ca")) return load_ca(arena, io, args, diag);
     const flags = try parse_flags(args, diag);
     if (flags.version) return .version;
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
     return .{ .run = try merge(flags, file, diag) };
+}
+
+/// `ca issue-client NAME --scope S [--out DIR]` and the store flags of a run.
+fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
+    assert(std.mem.eql(u8, args[0], "ca"));
+    if (args.len < 2 or !std.mem.eql(u8, args[1], "issue-client")) {
+        const problem = "zcube-server ca has one command, issue-client";
+        return bad(diag, problem, .{}, "run it with --help");
+    }
+    if (args.len < 3 or std.mem.startsWith(u8, args[2], "-")) {
+        return bad(diag, "ca issue-client needs a client name", .{}, "run it with --help");
+    }
+    var request: IssueClient = .{ .config = undefined, .name = args[2], .scope = undefined };
+    var scope: ?Scope = null;
+    var rest: std.ArrayList([]const u8) = .empty;
+    var index: usize = 3;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--scope")) {
+            const text = try value_of(args, &index, diag);
+            scope = std.meta.stringToEnum(Scope, text) orelse {
+                const problem = "--scope is jobs or admin, not {s}";
+                return bad(diag, problem, .{text}, "run it with --help");
+            };
+        } else if (std.mem.eql(u8, args[index], "--out")) {
+            request.out_dir = try value_of(args, &index, diag);
+        } else {
+            try rest.append(arena, args[index]);
+        }
+    }
+    request.scope = scope orelse {
+        return bad(diag, "ca issue-client needs --scope jobs or --scope admin", .{}, "add one");
+    };
+    const flags = try parse_flags(rest.items, diag);
+    if (flags.version or flags.help) return if (flags.version) .version else .help;
+    if (flags.new_ca or flags.create_store) {
+        const problem = "ca issue-client signs with the CA a server already made";
+        return bad(diag, problem, .{}, "leave out --new-ca and --create-store");
+    }
+    var file: File = .{};
+    if (flags.config) |path| file = try read_file(arena, io, path, diag);
+    request.config = try merge(flags, file, diag);
+    return .{ .ca_issue_client = request };
 }
 
 fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
@@ -580,6 +641,45 @@ test "flags win over the file, unknown flags and settings are refused" {
     try expect_bad(parse_zon(arena, ".{ .listn = \"x\" }", "server.zon", &diag), &diag);
     diag.reset();
     try expect_bad(parse_zon(arena, "this is not zon", "server.zon", &diag), &diag);
+}
+
+test "ca issue-client takes a name, a scope and an output directory, and refuses the rest" {
+    // Goal: the subcommand's parsing. Method: a full command and its defaults, then a missing
+    // name, a missing or unknown scope, an unknown subcommand and --new-ca, each ZC-E0106.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var diag: Diag = undefined;
+    diag.reset();
+    const full = [_][]const u8{
+        "ca", "issue-client", "ops-1", "--store", "sqlite:/a", "--scope", "jobs", "--out", "/o",
+    };
+    const command = (try load(arena, io, &full, &diag)).ca_issue_client;
+    try testing.expectEqualStrings("ops-1", command.name);
+    try testing.expectEqual(Scope.jobs, command.scope);
+    try testing.expectEqualStrings("/o", command.out_dir);
+    try testing.expectEqualStrings("/a", command.config.store.sqlite);
+    const short = [_][]const u8{ "ca", "issue-client", "ops-1", "--scope", "admin" };
+    const plain = (try load(arena, io, &short, &diag)).ca_issue_client;
+    try testing.expectEqualStrings(".", plain.out_dir);
+    try testing.expectEqual(Scope.admin, plain.scope);
+
+    const refusals = [_][]const []const u8{
+        &.{ "ca", "issue-client" },
+        &.{ "ca", "issue-client", "--scope", "jobs" },
+        &.{ "ca", "issue-client", "ops-1" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "root" },
+        &.{ "ca", "issue-client", "ops-1", "--scope" },
+        &.{ "ca", "revoke", "ops-1" },
+        &.{"ca"},
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--new-ca" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--bogus" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(load(arena, io, args, &diag), &diag);
+    }
 }
 
 test "a lease ttl an agent cannot fence in time is ZC-E0121" {

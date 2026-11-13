@@ -1501,7 +1501,7 @@ fn kind_text(kind: Kind) []const u8 {
 }
 
 /// RFC 3339 in UTC, to the second: `2023-11-14T22:13:20Z`. Times past year 9999 print as 9999.
-fn format_time(buffer: *[20]u8, ms: u64) []const u8 {
+pub fn format_time(buffer: *[20]u8, ms: u64) []const u8 {
     const civil = civil_from_seconds(@min(ms / 1000, seconds_max));
     const printed = std.fmt.bufPrint(buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second,

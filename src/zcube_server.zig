@@ -12,6 +12,8 @@ const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const server_mod = @import("server.zig");
+const issue_client_mod = @import("server_issue_client.zig");
+const x509 = @import("x509.zig");
 
 const Diag = diag_mod.Diag;
 
@@ -67,7 +69,33 @@ pub fn main(init: std.process.Init) u8 {
         .version => return say(init.io, "zcube-server " ++ build_options.version ++ "\n"),
         .help => return say(init.io, config_mod.usage),
         .run => |config| return run(init, config),
+        .ca_issue_client => |request| return issue_client(init, &request),
     }
+}
+
+/// `zcube-server ca issue-client`: writes the files and says where, or prints the diagnostic.
+fn issue_client(init: std.process.Init, request: *const config_mod.IssueClient) u8 {
+    var diag: Diag = undefined;
+    diag.reset();
+    const issued = issue_client_mod.issue(init.gpa, init.io, request, &diag) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => constants.exit_environment,
+            error.Canceled => constants.exit_ok,
+            error.Failed => fail(init.io, &diag, request.config.verbose),
+        };
+    };
+    var until_buffer: [20]u8 = undefined;
+    var buffer: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s}.key and {s}.crt in {s} " ++
+        "(client {s}, scope {s}, until {s})\n", .{
+        request.name,
+        request.name,
+        request.out_dir,
+        request.name,
+        request.scope.text(),
+        x509.format_time(&until_buffer, issued.not_after_ms),
+    }) catch return say(init.io, "zcube-server: wrote the client's key and certificate\n");
+    return say(init.io, line);
 }
 
 fn run(init: std.process.Init, config: config_mod.Config) u8 {
