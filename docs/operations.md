@@ -23,17 +23,22 @@ version 3 (`docs/keys.md`); the store schema does not change. Every record is wr
 oldest version that holds its members, so until a service carries `health` or a non-default
 `rollout`, nothing new is written that an older build cannot read.
 
-1. **Upgrade the servers first, then the agents.** A server of this release reads every older
-   record (`src/testdata/b3_store.txt`), and an older agent reads the replicas it is served as long
-   as they carry no `health`.
-2. **Apply no service with `health` or `rollout` until every server and agent is upgraded.**
-   An older server or agent refuses a version 4 service or replica, and an older server a version
-   3 observation, with `ZC-E0303`, naming the key and both versions.
-3. **History starts at the upgrade.** A service applied before it has no `/history/` record.
+1. **Stop every older server, then start the servers of this release.** Do not run both against
+   one store, even for a moment: an older server writes no history (its applies leave a gap, its
+   deletes leave the old records, item 5), and an agent of this release that reports a health
+   verdict to it is refused with a plain `ZC-E0104` (400: its observation endpoint takes no
+   member it does not know), not `ZC-E0303`. A server of this release reads every older record
+   (`src/testdata/b3_store.txt`), a C2 agent's version 2 observation included.
+2. **Then upgrade the agents, one at a time if you like.** An older agent keeps working against
+   this release as long as no replica it is served carries `health`.
+3. **Apply no service with `health` or a non-default `rollout` until every agent is upgraded.**
+   Either writes the service at version 4, and `health` its replicas too; an older agent refuses
+   a version 4 replica with `ZC-E0303`, naming the key and both versions.
+4. **History starts at the upgrade.** A service applied before it has no `/history/` record.
    The first apply after the upgrade that raises its generation records the generation it ran
    too, copied from the service record (`applied_at_ms` 0, not known), so that apply can be
    rolled back; nothing older can.
-4. A downgrade is safe only while no record is at a new version. An older server leaves
+5. A downgrade is safe only while no record is at a new version. An older server leaves
    `/history/` and `/rollouts/` alone and writes no history, so after an upgrade back:
    - a service the older server **deleted** (and perhaps applied again) has the deleted service's
      history left behind. None of it is offered for a rollback, and the next apply of the name by
@@ -41,7 +46,7 @@ oldest version that holds its members, so until a service carries `health` or a 
    - a service the older server **changed** has a gap: the generations it applied have no
      record. Nothing from before the gap is offered for a rollback (it predates the downgrade),
      and the next apply deletes it. Until that apply, `zcube rollback` has nothing to go back to;
-     that apply records the generation the older server left running, as in item 3.
+     that apply records the generation the older server left running, as in item 4.
    Records that do not fit in that apply's transaction are deleted by the following ones and are
    never offered meanwhile (docs/keys.md, `/history`).
 

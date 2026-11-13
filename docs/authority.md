@@ -72,7 +72,7 @@ the layout.
 | `/job-runs/<name>`, `/job-status/<name>`, `/job-endings` | job controller | B1 (§7): the run, how it is going and how it ended, the aggregate of endings | until retention |
 | `/job-observed/<node>/<name>` | that node's agent | B1 (§7): a run's claim and what the agent saw | until retention |
 | `/history/<svc>/<generation>` | API, in the apply's transaction | C3: what one generation ran; **immutable**; at most 16 per service (`docs/keys.md`) | until compacted or the service is deleted |
-| `/rollouts/<svc>` | rollout controller (C3) | C3: one rollout's phase and the budget the replica controller obeys | a retention period after `complete` |
+| `/rollouts/<svc>` | rollout controller (C3) | C3: one rollout's phase and the budget the replica controller obeys | a retention period after `complete`; at once when its service is deleted or is another incarnation (`service_created`, docs/keys.md) |
 | `/replicas/<svc>/<id>` | replica controller | desired replica: spec and generation; **no placement** | until the replica is retired |
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |

@@ -199,7 +199,7 @@ known). So after an upgrade the first new generation can always be rolled back t
 ## `/rollouts/<service>`: a rollout in progress (C3 slice 7; defined in slice 5)
 
 ```json
-{ "v": 1, "service": "hello", "from": 6, "to": 7, "phase": "progressing",
+{ "v": 1, "service": "hello", "service_created": 40, "from": 6, "to": 7, "phase": "progressing",
   "started_at_ms": 1761350000123, "deadline_at_ms": 1761350600123, "next_at_ms": 1761350005123,
   "ready_new": 1, "retired_old": 1, "budget": {"start": 1, "retire": 0},
   "cause_decision": "1761350000123-api0-0001" }
@@ -210,6 +210,14 @@ Written only by the rollout controller (role `rollout_controller`), one per serv
 replicas the replica controller may start now and how many old ones it may retire; the replica
 controller stays the only writer of `/replicas/`. `next_at_ms` is when the controller looks again
 without a store change (`min_ready_ms`). Deleted a retention period after `complete`.
+
+**Whose rollout it is.** `service_created` is the `create_revision` of the `/services/<service>`
+key the rollout was started for. Deleting a service does not delete its rollout: the API is not
+a writer of `/rollouts/` (authority.md, one writer per prefix). A rollout whose service is gone,
+or whose `service_created` is not the service key's `create_revision` (the service was deleted
+and applied again, and its generations restarted at 1), is no rollout of that service
+(`records.rollout_of`): every reader treats it as absent, and the rollout controller deletes it
+the next time it looks at the service (C3 slice 7).
 
 ## `/replicas/<service>/<id>`: desired replica
 

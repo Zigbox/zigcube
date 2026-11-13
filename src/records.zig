@@ -757,6 +757,10 @@ pub const RolloutBudget = struct {
 pub const Rollout = struct {
     v: u32 = 1,
     service: []const u8,
+    /// The `create_revision` of the service key the rollout was started for. A service deleted
+    /// and applied again is another service (its generations restart at 1): a rollout of the old
+    /// one is not its rollout (`rollout_of`).
+    service_created: u64,
     from: u64,
     to: u64,
     phase: RolloutPhase,
@@ -770,6 +774,17 @@ pub const Rollout = struct {
     /// The decision that started or last moved the rollout.
     cause_decision: []const u8 = "",
 };
+
+/// Whether `rollout` is the rollout of the service whose key was created at
+/// `service_create_revision` (null: no service). The API leaves `/rollouts/` alone when it deletes
+/// a service (authority.md: the rollout controller is the prefix's one writer), so a rollout left
+/// from a deleted service, or from one deleted and applied again, is not this service's: every
+/// reader treats it as absent and the rollout controller deletes it.
+pub fn rollout_of(rollout: *const Rollout, service_create_revision: ?u64) bool {
+    const created = service_create_revision orelse return false;
+    assert(created > 0);
+    return rollout.service_created == created;
+}
 
 /// Whether `replica` runs what `service` asks for now: the image, `source`, command, `env`,
 /// `limits` and `health`, the inputs that bump a service's `generation`. The generation alone
@@ -1819,6 +1834,7 @@ test "C3: history and rollout records encode and read back" {
 
     const rollout: Rollout = .{
         .service = "hello",
+        .service_created = 40,
         .from = 6,
         .to = 7,
         .phase = .progressing,
@@ -1833,6 +1849,10 @@ test "C3: history and rollout records encode and read back" {
     const rollout_back = try read(Rollout, arena, kv_of("/rollouts/hello", rollout_bytes), &diag);
     try testing.expectEqual(RolloutPhase.progressing, rollout_back.phase);
     try testing.expectEqual(@as(u32, 1), rollout_back.budget.start);
+    // A rollout belongs to one incarnation of its service: not to one created again, nor to none.
+    try testing.expect(rollout_of(&rollout_back, 40));
+    try testing.expect(!rollout_of(&rollout_back, 41));
+    try testing.expect(!rollout_of(&rollout_back, null));
 }
 
 test "C3: a history key names one generation, in decimal, with no leading zero" {
