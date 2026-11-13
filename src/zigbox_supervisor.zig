@@ -534,6 +534,77 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     return supervise(io, dir, real.interface(), storage, &spec, arena_state.allocator(), relay_ctx);
 }
 
+/// Puts a job's signatures into the node's Zigbox store before the start (B5), so that a node
+/// whose own Zigbox policy asks for them (`/etc/zbx/policy.zon`) finds them when `zigbox.start`
+/// gates the tree. The agent judged them against its `--trust-policy` already; Zigbox refuses
+/// the whole bundle if a line does not verify or is not about the tree. Null when there is
+/// nothing to import or it was imported; otherwise Zigbox's ZBX-E0909, and nothing is started.
+fn import_signatures(
+    host: zigbox.host.Host,
+    spec: *const launch.Spec,
+    arena: Allocator,
+) ?Diagnostic {
+    if (spec.signatures.len == 0) return null;
+    var collector: zigbox.diag.Diag = undefined;
+    collector.reset();
+    const tree = zigbox.store.Digest.parse(spec.tree) orelse
+        return import_refused(&collector, "the job's image is not a tree digest");
+    var store: zigbox.store.Store = undefined;
+    if (!zigbox.store.Store.locate(&store, host)) {
+        return import_refused(&collector, "the node has no Zigbox store (no XDG_DATA_HOME, HOME)");
+    }
+    _ = zigbox.store.open.check(&store, .create, &collector) catch {
+        var out: Diagnostic = undefined;
+        zigbox.diagnostic.from_diag(&out, &collector);
+        return out;
+    };
+    var bytes: usize = 0;
+    for (spec.signatures) |line| bytes += line.len + 1;
+    const text = arena.alloc(u8, bytes) catch
+        return import_refused(&collector, "there was no memory for the bundle");
+    var at: usize = 0;
+    for (spec.signatures) |line| {
+        @memcpy(text[at..][0..line.len], line);
+        text[at + line.len] = '\n';
+        at += line.len + 1;
+    }
+    const memory = std.heap.page_allocator.create(zigbox.store.trust_peer.Memory) catch
+        return import_refused(&collector, "there was no memory for the bundle");
+    defer std.heap.page_allocator.destroy(memory);
+    var failure: zigbox.store.trust_peer.Failure = undefined;
+    _ = zigbox.store.import_trust(&store, memory, text, tree, &failure) catch
+        return import_refused(&collector, refusal_words(failure.refusal));
+    return null;
+}
+
+/// Zigbox's refusals of `import_trust`, in the words of `zbx trust import` (its `trust_refused`,
+/// which Zigbox does not export).
+fn refusal_words(refusal: zigbox.store.trust_peer.Refusal) []const u8 {
+    return switch (refusal) {
+        .malformed => "a line is not an envelope, its signature does not verify, or its " ++
+            "statement is not about the job's tree",
+        .newer => "a statement is of a form from a newer zbx",
+        .too_large => "the signatures are longer than any record the store keeps",
+        .tree_full => "the tree would hold more signatures than the store keeps for one tree",
+        .store_full => "the store holds signatures for as many trees as it keeps",
+        .busy => "another process holds the store's lock",
+        .store_failed, .unreadable, .write_failed => "the store could not be read or written",
+        .local_unusable => "the tree's record in the store is damaged or of a newer zbx",
+        .no_record => unreachable, // Only an export says it.
+    };
+}
+
+/// ZBX-E0909, Zigbox's code for a bundle of signatures the store would not take, with `cause`.
+fn import_refused(collector: *zigbox.diag.Diag, cause: []const u8) Diagnostic {
+    collector.raise(.E0909);
+    collector.while_("importing the job's signatures into the node's Zigbox store", .{});
+    collector.cause("{s}", .{cause});
+    collector.fix(.{ .sentence = "check the job's signatures with zbx trust import on the node" });
+    var out: Diagnostic = undefined;
+    zigbox.diagnostic.from_diag(&out, collector);
+    return out;
+}
+
 /// What the job's relay needs that the start does not: memory, an `Io` for the upstream
 /// connections, and where `relay.log` goes.
 const RelayContext = struct { gpa: Allocator, io: std.Io, dir_path: []const u8 };
@@ -573,6 +644,9 @@ fn supervise(
                 .manifest = manifest,
             };
         }
+    }
+    if (import_signatures(host, spec, arena)) |diagnostic| {
+        return record_failure(io, dir, name, &diagnostic);
     }
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {

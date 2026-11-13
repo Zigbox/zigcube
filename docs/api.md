@@ -174,7 +174,8 @@ terminal.
   each after the chain: `replace_replica (observed): 142 times since 2025-10-24 23:13:20Z`.
 - `why node`'s `state.text` names the judgement and the load:
   `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
-  8.0Gi memory in use`; a node with no `/node-status` is `registered, not yet judged`, one whose
+  8.0Gi memory in use; checks no job signatures (no --trust-policy)` (B5: or `checks job signatures
+  against <path>`); a node with no `/node-status` is `registered, not yet judged`, one whose
   status is for an earlier tenure says so, and one that is not registered says `not registered`
   and, if a status remains, `last judged <state> (tenure N)`. The `note` step is added when the
   node is `ready` for its current tenure and holds fewer replicas than another registered node:
@@ -492,8 +493,21 @@ not judged again: they are placed and run as they are, and a resubmission of one
 answers `200` without being judged, which does not mean the policy accepted it. The file is read
 once at start, so a key removed from it still counts until the server restarts, and a stored job
 signed by that key still runs. When turning the policy on or tightening it, drain or cancel the
-jobs already stored (`GET /v1/jobs?state=pending`, `POST /v1/jobs/{name}/cancel`). Until the
-node's own check lands (B5 slice 2), admission is the only check.
+jobs already stored (`GET /v1/jobs?state=pending`, `POST /v1/jobs/{name}/cancel`).
+
+**The node's own check (B5 slice 2).** An agent started with `--trust-policy FILE` (`docs/agent.md`)
+judges every run with the same `verdict.judge` before anything of it starts: no input is fetched,
+no supervisor or container is made. The file is the node's own: the API cannot name, change or
+switch it off, and the server's policy does not reach it. A run no trusted line of the node's policy
+covers ends with the new ending **`refused`**: the agent reports `exit {"kind":"refused"}` with
+`ZBX-E0905` (or `ZBX-E0906`) and its cause, the job controller ends the job `failed` with cause
+`refused` and that diagnostic, and the run is never retried and never placed on another node. A job
+stored before a policy changed, or written to the store around the API, is refused here. The watch
+shows the ending like any other (`/job-status/<name>`); `zcube why job` says `failed, refused by
+<node>'s trust policy` and its chain carries the diagnostic. The node publishes the path it checks
+against in `/nodes/<node>`'s `trust_policy`; `zcube why node` ends its state line with `checks job
+signatures against <path>`, or `checks no job signatures (no --trust-policy)` for an agent without
+one, which checks nothing.
 
 ### Relays (B3 slice 2)
 

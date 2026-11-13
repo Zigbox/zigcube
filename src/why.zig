@@ -207,8 +207,19 @@ fn job_state(ctx: *const Context, name: []const u8) Error!State {
         .health = health,
         .desired = if (ended) 0 else 1,
         .running = if (status.state == .running) 1 else 0,
-        .text = try controller.format(ctx, "job {s}: {s}", .{ name, @tagName(status.state) }),
+        .text = try controller.format(ctx, "job {s}: {s}{s}", .{
+            name, @tagName(status.state), try refused_phrase(ctx, &status),
+        }),
     };
+}
+
+/// ", refused by node2's trust policy" when the run ended refused (B5), else "": the cause and
+/// its fix are in the chain, from the run's diagnostic.
+fn refused_phrase(ctx: *const Context, status: *const records.JobStatus) Error![]const u8 {
+    const end = status.end orelse return "";
+    if (end.cause != .refused) return "";
+    const node = status.node orelse "a node";
+    return controller.format(ctx, ", refused by {s}'s trust policy", .{node});
 }
 
 fn service_state(
@@ -315,7 +326,7 @@ fn node_state(
             .desired = 1,
             .running = 1,
             .text = try controller.format(ctx, "node {s}: {s}, lease {d} with {d} {s} " ++
-                "assigned, {d}m of {d}m CPU and {s} of {s} memory in use", .{
+                "assigned, {d}m of {d}m CPU and {s} of {s} memory in use; {s}", .{
                 name,
                 verdict,
                 node.kv.lease,
@@ -325,6 +336,7 @@ fn node_state(
                 node.rec.capacity.cpu_millis,
                 try bytes_text(ctx, load.memory_bytes),
                 try bytes_text(ctx, node.rec.capacity.memory_bytes),
+                try trust_phrase(ctx, &node.rec),
             }),
         };
     }
@@ -377,6 +389,13 @@ fn node_judgement(ctx: *const Context, name: []const u8) Error!?records.NodeStat
     const got = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
     const kv = got.kv orelse return null;
     return try records.read(records.NodeStatus, ctx.arena, kv, ctx.diag);
+}
+
+/// What the node checks before it starts a job's run (B5): the policy the agent named at
+/// registration, or nothing.
+fn trust_phrase(ctx: *const Context, node: *const records.Node) Error![]const u8 {
+    if (node.trust_policy.len == 0) return "checks no job signatures (no --trust-policy)";
+    return controller.format(ctx, "checks job signatures against {s}", .{node.trust_policy});
 }
 
 /// "ready (tenure 22)", "registered, not yet judged", or a judgement for an earlier tenure.
@@ -1021,7 +1040,8 @@ test "why node states its load and its judgement, and notes that nothing is reba
     const before = try why(&ctx, .{ .kind = .node, .name = "node1" }, null);
     try testing.expectEqualStrings(
         "node node1: ready (tenure 1), lease 1 with 0 replicas assigned, " ++
-            "0m of 4000m CPU and 0B of 8.0Gi memory in use",
+            "0m of 4000m CPU and 0B of 8.0Gi memory in use; " ++
+            "checks no job signatures (no --trust-policy)",
         before.state.text,
     );
     const assigned = records.assigned_replica(

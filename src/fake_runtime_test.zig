@@ -20,6 +20,11 @@ const fake_files = @import("fake_files.zig");
 const fake_runtime = @import("fake_runtime.zig");
 const runtime = @import("runtime.zig");
 const fetch_backoff = @import("fetch_backoff.zig");
+const job_trust = @import("job_trust.zig");
+const records = @import("records.zig");
+const sim_world = @import("sim_world.zig");
+const trust_fixture = @import("job_trust_fixture.zig");
+const writers = @import("writers.zig");
 
 const Diag = diag_mod.Diag;
 const net = std.Io.net;
@@ -37,6 +42,8 @@ const Rig = struct {
     arena: std.heap.ArenaAllocator,
     /// How the runtime fetches an image it lacks; null: it does not (`ZBX-E0410`).
     fetch: ?fake_runtime.Fetch,
+    /// The images the runtime has.
+    images: []const []const u8 = &fixtures,
 
     /// Skips the test when the supervisor's executable cannot be found.
     fn start() !*Rig {
@@ -53,6 +60,7 @@ const Rig = struct {
         rig.clock_source = .{ .io = testing.io };
         rig.exe = exe;
         rig.fetch = null;
+        rig.images = &fixtures;
         rig.arena = .init(testing.allocator);
         rig.fake = try testing.allocator.create(fake_runtime.FakeRuntime);
         errdefer testing.allocator.destroy(rig.fake);
@@ -67,7 +75,7 @@ const Rig = struct {
             .gpa = testing.allocator,
             .state_dir = rig.path,
             .supervisor_exe = rig.exe,
-            .fixtures = &fixtures,
+            .fixtures = rig.images,
             .fetch = rig.fetch,
         }, &diag) catch |err| {
             if (diag.code) |code| std.debug.print("init: {s}\n", .{@tagName(code)});
@@ -908,4 +916,116 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
     try testing.expect(std.mem.find(u8, cause, "HOST:PORT") != null);
     const now = try rig.status(runtime.Handle.init("relay-bad"));
     try testing.expectEqualStrings("ZC-E0702", now.stopped.start_failed.code.slice());
+}
+
+// ---- The node's trust policy over real processes (B5 slice 2) ---------------------------------
+
+const trust_job = "signed";
+const trust_run = "signed-job";
+
+/// Writes the run and its assignment straight into the world's store (around the server's
+/// admission check), then runs the agent three times over the fake runtime.
+fn assign_trust_run(
+    world: *sim_world.World,
+    run_image: []const u8,
+    signatures: ?[]const []const u8,
+) !void {
+    const run: records.JobRun = .{
+        .id = trust_run,
+        .job = trust_job,
+        .image = run_image,
+        .command = &forever,
+        .deadline_ms = 600_000,
+        .start_by_ms = sim_world.epoch_ms + 1_000_000,
+        .created_at_ms = sim_world.epoch_ms,
+        .signatures = signatures,
+    };
+    const assigned: records.Assigned = .{
+        .replica = trust_run,
+        .requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
+        .reason = "test",
+        .job = trust_job,
+    };
+    const arena = world.fresh_arena();
+    const run_key = records.job_run_key(trust_job);
+    const assigned_key = records.assigned_key(sim_world.node_name, trust_run);
+    const ops = [_]@import("store.zig").Op{
+        .{ .put = .{
+            .key = run_key.slice(),
+            .value = try records.encode(arena, run, &world.diag),
+        } },
+    };
+    const store = world.store_handle();
+    var done = try writers.txn(store, .job_controller, .{ .on_success = &ops }, &world.diag);
+    try testing.expect(done.succeeded);
+    const placed = [_]@import("store.zig").Op{.{ .put = .{
+        .key = assigned_key.slice(),
+        .value = try records.encode(world.fresh_arena(), assigned, &world.diag),
+    } }};
+    done = try writers.txn(store, .scheduler, .{ .on_success = &placed }, &world.diag);
+    try testing.expect(done.succeeded);
+    for (0..3) |_| {
+        _ = world.agent_step();
+        try testing.expect(world.last_failure == null);
+    }
+}
+
+/// The exit kind the agent reported for the run, or null if none.
+fn trust_exit(world: *sim_world.World) !?records.ExitKind {
+    const arena = world.fresh_arena();
+    const key = records.job_observed_key(sim_world.node_name, trust_job);
+    const got = try world.store_handle().get(arena, key.slice(), null, &world.diag);
+    const kv = got.kv orelse return null;
+    const value = try records.read(records.JobObserved, arena, kv, &world.diag);
+    const exit = value.exit orelse return null;
+    return exit.kind;
+}
+
+/// Nothing of the run exists on the host: no container the runtime lists, no directory.
+fn expect_nothing_started(rig: *Rig) !void {
+    var local: Diag = undefined;
+    local.reset();
+    const listings = try rig.fake.interface().list(rig.arena.allocator(), &local);
+    try testing.expectEqual(@as(usize, 0), listings.len);
+    const opened = rig.fake.containers.openDir(testing.io, trust_run, .{});
+    try testing.expectError(error.FileNotFound, opened);
+}
+
+test "a refused run spawns no supervisor; the same run, signed, starts one" {
+    // Goal: B5's node check over real processes: a run the node's policy refuses is refused
+    // before the runtime is asked, so no supervisor process or container directory is made.
+    // Method: an agent with a policy that asks for key 1's signature, over `FakeRuntime` (whose
+    // fixtures hold the run's tree, so only the check stops it); the run is written straight into
+    // the store with no signature, then again in a fresh world with key 1's.
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    try fixture.trust_keys(&.{1}, true);
+    var config: job_trust.Trust = fixture.config();
+    var image_buffer: [67]u8 = undefined;
+    const images = [_][]const u8{trust_fixture.image(&image_buffer, 0x31)};
+    var rig = try Rig.start();
+    defer rig.stop();
+    rig.images = &images;
+    try rig.restart();
+    {
+        const world = try sim_world.World.create(testing.allocator, 5, &images);
+        defer world.destroy();
+        world.advance(2_000);
+        world.agent.config.trust = &config;
+        world.runtime_override = rig.fake.interface();
+        try assign_trust_run(world, images[0], null);
+        try testing.expectEqual(@as(?records.ExitKind, .refused), try trust_exit(world));
+        try expect_nothing_started(rig);
+    }
+    const line = try fixture.sign_tree(testing.allocator, 1, 0x31);
+    defer testing.allocator.free(line);
+    const world = try sim_world.World.create(testing.allocator, 5, &images);
+    defer world.destroy();
+    world.advance(2_000);
+    world.agent.config.trust = &config;
+    world.runtime_override = rig.fake.interface();
+    try assign_trust_run(world, images[0], &.{line});
+    try testing.expectEqual(@as(?records.ExitKind, null), try trust_exit(world));
+    const dir = try rig.fake.containers.openDir(testing.io, trust_run, .{});
+    dir.close(testing.io);
 }

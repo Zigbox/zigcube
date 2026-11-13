@@ -12,7 +12,9 @@
 //!      carries the `ZBX-E0410` diagnostic;
 //!   6. a job, claimed, adopted after `kill -9` of the agent, ended with its exit code;
 //!   7. a relayed job (B3 slice 2): its command reaches an upstream of this program through
-//!      `ZCUBE_RELAY`, and the relay's port refuses connections once the job has ended.
+//!      `ZCUBE_RELAY`, and the relay's port refuses connections once the job has ended;
+//!   8. the agent restarted with `--trust-policy` (B5 slice 2): an unsigned job is refused before
+//!      its command starts (`failed`, cause `refused`), and a job signed by the trusted key runs.
 //!
 //! Every process it starts is killed at the end, whatever happened (`Smoke.cleanup`). It prints
 //! to stdout only, one line per step, because the build runner counts any stderr as a failure; a
@@ -58,6 +60,8 @@ const Smoke = struct {
     agent: ?std.process.Child = null,
     server_starts: u32 = 0,
     agent_starts: u32 = 0,
+    /// The agent's `--trust-policy`, once the trust step sets one.
+    trust_policy: ?[]const u8 = null,
     failed: bool = false,
 
     fn work_file(smoke: *Smoke, name: []const u8) ![]const u8 {
@@ -149,8 +153,10 @@ const Smoke = struct {
             "--cpu-millis",   "4000",
             "--memory-bytes", "8589934592",
             "--images",       smoke.images,
+            "--trust-policy", smoke.trust_policy orelse "",
         };
-        smoke.agent = try smoke.spawn(smoke.agent_exe, &args, log);
+        const used = if (smoke.trust_policy == null) args.len - 2 else args.len;
+        smoke.agent = try smoke.spawn(smoke.agent_exe, args[0..used], log);
     }
 
     /// SIGTERM, then wait: a clean stop is exit 0.
@@ -347,6 +353,7 @@ fn script(smoke: *Smoke) !void {
     try step_unknown_digest(smoke);
     try step_job(smoke);
     try step_relay_job(smoke);
+    try step_trust_jobs(smoke);
 }
 
 const three_run = struct {
@@ -823,6 +830,147 @@ fn step_relay_job(smoke: *Smoke) !void {
     try smoke.expect(port != 0, "ZCUBE_RELAY was \"{s}\"", .{url});
     try smoke.expect(!connectable(port), "the relay at port {d} still listens", .{port});
     smoke.say("relayed job: ZCUBE_RELAY reached the upstream (echo:hi), port {d} closed", .{port});
+}
+
+// ---- The node's trust policy (B5 slice 2) -------------------------------------------------------
+
+const trust_fixture = @import("job_trust_fixture.zig");
+
+/// The tree the signed job runs: `b3:` and 64 hex digits, which a signature can name.
+const signed_tree: u8 = 0x5a;
+
+fn job_ended(smoke: *Smoke, name: []const u8) !bool {
+    const state = (try job_now(smoke, name)).state;
+    return std.mem.eql(u8, state, "exited") or std.mem.eql(u8, state, "failed");
+}
+
+const unsigned_ended = struct {
+    fn check(s: *Smoke) !bool {
+        return job_ended(s, "unsigned");
+    }
+};
+
+const signed_ended = struct {
+    fn check(s: *Smoke) !bool {
+        return job_ended(s, "signed");
+    }
+};
+
+const node_has_policy = struct {
+    fn check(s: *Smoke) !bool {
+        const reply = try s.call("GET", "/v1/list?prefix=/nodes/", "");
+        return std.mem.indexOf(u8, reply.body, s.trust_policy.?) != null;
+    }
+};
+
+/// The cause of a failed job's ending, or "" when it has none.
+fn job_cause(smoke: *Smoke, name: []const u8) ![]const u8 {
+    const arena = smoke.arena.allocator();
+    const path = try std.fmt.allocPrint(arena, "/v1/jobs/{s}", .{name});
+    const reply = try smoke.call("GET", path, "");
+    const value = try std.json.parseFromSliceLeaky(Json, arena, reply.body, .{});
+    const status = value.object.get("status") orelse return "";
+    if (status != .object) return "";
+    const end = status.object.get("end") orelse return "";
+    if (end != .object) return "";
+    const cause = end.object.get("cause") orelse return "";
+    return if (cause == .string) cause.string else "";
+}
+
+/// Writes the agent's images (the fixture's two and the signed tree) and a policy that trusts
+/// key 1 and asks for a signature, then restarts the agent with `--trust-policy`.
+fn restart_with_policy(smoke: *Smoke, signed_image: []const u8) !void {
+    const arena = smoke.arena.allocator();
+    const images = try smoke.work_file("images.zon");
+    try std.Io.Dir.cwd().writeFile(smoke.io, .{
+        .sub_path = images,
+        .data = try std.fmt.allocPrint(
+            arena,
+            ".{{ .images = .{{ \"b3:51aa9c03\", \"b3:9d20c4f1\", \"{s}\" }} }}\n",
+            .{signed_image},
+        ),
+    });
+    const policy = try smoke.work_file("trust.zon");
+    const public = trust_fixture.public_text(1);
+    try std.Io.Dir.cwd().writeFile(smoke.io, .{
+        .sub_path = policy,
+        .data = try std.fmt.allocPrint(
+            arena,
+            ".{{ .version = 1, .keys = .{{ .{{ .name = \"smoke\", .public = \"{s}\" }} }}, " ++
+                ".require_signature = true }}\n",
+            .{&public},
+        ),
+    });
+    smoke.images = images;
+    smoke.trust_policy = policy;
+    try smoke.stop(&smoke.agent, "the agent");
+    try smoke.start_agent();
+    try smoke.wait_until("the node to name its trust policy", node_has_policy.check, wait_ms_default);
+}
+
+fn post_trust_job(
+    smoke: *Smoke,
+    name: []const u8,
+    image: []const u8,
+    signatures: []const u8,
+) !void {
+    const arena = smoke.arena.allocator();
+    const stamp: u64 = @intCast(std.Io.Clock.real.now(smoke.io).toMilliseconds());
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"name\":\"{0s}\",\"image\":\"{1s}\",\"deadline_ms\":60000," ++
+            "\"submit_by_ms\":{2d},\"signatures\":[{3s}],\"command\":[\"sh\",\"-c\"," ++
+            "\"echo {0s} >> {4s}/trust-starts\"]}}",
+        .{ name, image, stamp + 60_000, signatures, smoke.work },
+    );
+    const reply = try smoke.call("POST", "/v1/jobs", body);
+    try smoke.expect(reply.status == 201, "POST /v1/jobs ({s}) answered {d}: {s}", .{
+        name, reply.status, reply.body,
+    });
+}
+
+/// The agent restarted with a policy: an unsigned job is refused before anything starts, ending
+/// `failed` with cause `refused`; the same image signed by the trusted key runs and exits 0.
+fn step_trust_jobs(smoke: *Smoke) !void {
+    const arena = smoke.arena.allocator();
+    var image_buffer: [67]u8 = undefined;
+    const signed_image = trust_fixture.image(&image_buffer, signed_tree);
+    try restart_with_policy(smoke, signed_image);
+
+    try post_trust_job(smoke, "unsigned", signed_image, "");
+    try smoke.wait_until("the unsigned job to end", unsigned_ended.check, wait_ms_default);
+    const refused = try job_now(smoke, "unsigned");
+    const cause = try job_cause(smoke, "unsigned");
+    try smoke.expect(
+        std.mem.eql(u8, refused.state, "failed") and std.mem.eql(u8, cause, "refused"),
+        "the unsigned job ended {s} ({s}), expected failed (refused)",
+        .{ refused.state, cause },
+    );
+
+    var fixture = try trust_fixture.Fixture.init(smoke.gpa);
+    defer fixture.deinit(smoke.gpa);
+    const line = try fixture.sign_tree(arena, 1, signed_tree);
+    const quoted = try std.json.Stringify.valueAlloc(arena, line, .{});
+    try post_trust_job(smoke, "signed", signed_image, quoted);
+    try smoke.wait_until("the signed job to end", signed_ended.check, wait_ms_default);
+    const signed = try job_now(smoke, "signed");
+    try smoke.expect(
+        std.mem.eql(u8, signed.state, "exited") and signed.code == 0,
+        "the signed job ended {s} with {any}, expected exited with 0",
+        .{ signed.state, signed.code },
+    );
+    const starts = std.Io.Dir.cwd().readFileAlloc(
+        smoke.io,
+        try smoke.work_file("trust-starts"),
+        arena,
+        .limited(256),
+    ) catch "";
+    try smoke.expect(
+        std.mem.eql(u8, starts, "signed\n"),
+        "the trust jobs' commands wrote \"{s}\", expected only the signed job's",
+        .{starts},
+    );
+    smoke.say("trust policy: an unsigned job refused (nothing started), a signed job exit 0", .{});
 }
 
 /// A port the system is not using now: bind port 0, read it, let go.

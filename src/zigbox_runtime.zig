@@ -223,6 +223,7 @@ pub const ZigboxRuntime = struct {
             .memory_bytes = spec.limits.memory_bytes,
             .pids = spec.limits.pids,
             .relay = spec.relay,
+            .signatures = spec.signatures,
             .launched = self.host.time_now(),
         };
     }

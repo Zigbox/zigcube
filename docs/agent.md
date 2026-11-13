@@ -318,6 +318,33 @@ be interrupted, so stopping a relay whose upstream name is black-holed can wait 
 
 The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a run by its id.
 
+### The node's trust policy (B5 slice 2)
+
+`zcube-agent --trust-policy FILE` (ZON key `trust_policy`) names the node's own Zigbox trust policy
+(`docs/api.md`, "Signatures"). The agent reads it once at start through `src/trust_file.zig`, the
+reader the server uses too: a regular file, owned by root or by the agent's own user, writable by
+neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 and the agent does
+not start. No API call names, changes or switches the node's policy off; the node record carries its
+path (`trust_policy`) so `zcube why node` can say which file it checks against. An agent without the
+flag checks nothing, and `zcube why node` says so ("checks no job signatures (no --trust-policy)").
+
+The check is the last thing before a start, after the deadline and before the input is fetched
+(`refused_by_trust` in `src/agent_jobs.zig`): `job_trust.judge_run` takes the run record's
+`signatures` and image (and `source`, when it has one) and calls Zigbox's `verdict.judge` with the
+node's policy. A run it refuses is never started: no supervisor, no container directory, no input
+fetched. The agent reports it as an exit of kind `refused` with the ZBX-E0905 or ZBX-E0906 diagnostic
+and its cause, and the job controller ends the job `failed`, cause `refused`. It is never retried and
+never placed on another node, and it counts as an ending like any other (J1 to J11). The server's
+own check (slice 1) refuses such a job at `POST`; the node's check catches what reaches the store
+without it, which `src/agent_jobs_test.zig` (over the simulated runtime) and
+`src/fake_runtime_test.zig` (over real processes) write straight into the store.
+
+With `--runtime zigbox` an admitted run's envelopes also go to the node's Zigbox store: the
+supervisor calls `zigbox.store.import_trust` with the run's lines and its tree before
+`start_with_image`, so Zigbox's own gate sees what Zigcube saw. Zigbox refuses a bundle whole; a
+refused import is ZBX-E0909 in the container's failure record and the run ends as a start failure.
+The fake and simulated runtimes ignore the envelopes.
+
 ## What survives what
 
 | Event | Containers | The agent's work |

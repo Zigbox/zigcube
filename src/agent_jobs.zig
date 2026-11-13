@@ -941,6 +941,7 @@ const Work = struct {
             .image = run.image,
             .source = run.source,
             .relay = relay_address(run),
+            .signatures = run.signatures orelse &.{},
             .command = run.command,
             .env = env,
             .limits = .{

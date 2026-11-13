@@ -159,8 +159,13 @@ and then removes the observed record.
 
 ```json
 { "v": 1, "name": "node1", "agent_version": "0.0.0", "address": "10.0.0.5:7070",
-  "capacity": {"cpu_millis": 4000, "memory_bytes": 8589934592}, "labels": [] }
+  "capacity": {"cpu_millis": 4000, "memory_bytes": 8589934592}, "labels": [],
+  "trust_policy": "/etc/zcube/trust.zon" }
 ```
+
+`trust_policy` (B5 slice 2, optional, empty when absent) is the path of the policy the agent judges
+every run against before it starts it (`--trust-policy`); empty means the node checks nothing.
+It is for people (`zcube why node`); no one acts on it.
 
 Written by the agent with `lease` set to the lease it keeps alive. When the lease ends the key
 is deleted by the store, and that delete event is how lost nodes are detected (C1). The key's
@@ -249,7 +254,9 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
 - `status` is `starting`, `running` or `stopped`.
 - `exit` is present when `stopped`: `{"kind": "exited", "code": 0}`, `{"kind": "signaled",
   "signal": 9}`, `{"kind": "oom"}`, `{"kind": "pid_limit"}`, `{"kind": "start_failed"}`,
-  `{"kind": "lost"}`: the runtime's `ExitReason`.
+  `{"kind": "lost"}`: the runtime's `ExitReason`; and `{"kind": "refused"}` (B5 slice 2, jobs only):
+  the node's trust policy refused the run, nothing was started, and `diagnostic` is the
+  `ZBX-E0905` (or `ZBX-E0906`).
 - **`diagnostic` is where an observed-state diagnostic lives.** It is a complete diagnostic in
   the JSON shape of DIAGNOSTICS.md (the `Diagnostic` of `src/diagnostic.zig`), embedded in the
   record that it explains. Present for `start_failed` (the runtime's own, possibly `ZBX-`),
@@ -545,7 +552,8 @@ nothing places or claims the run. `start_by_ms` is creation plus `deadline_ms` o
   `cancelled`. A terminal status is written once and never changes (I8a).
 - `end` is present exactly when the state is terminal, with `ended_at_ms`. `exited` carries exactly
   one of `code` and `signal`; `failed` carries `cause`, one of `oom`, `pid_limit`, `start_failed`,
-  `deadline`, `fenced`, `unreachable`, `not_started`, `unknown`; `cancelled` carries nothing. A
+  `deadline`, `fenced`, `unreachable`, `not_started`, `refused` (B5 slice 2: the node's trust policy
+  refused the run; never retried or placed again), `unknown`; `cancelled` carries nothing. A
   record that breaks this is `ZC-E0301` on read.
 - `stop_cause` (`cancel`, `deadline`, `fence`, `not_started`, `unreachable`): why the agent stopped
   the run, when it did. The ending follows it, never the exit alone.

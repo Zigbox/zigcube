@@ -20,7 +20,7 @@ export const JOBS_MAX = 512;
 const NAME_MAX = 48;
 const LONG_MS = 30000;
 const NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
-const FAILURES = ["oom", "pid_limit", "start_failed", "deadline", "fenced", "unreachable", "not_started", "unknown"];
+const FAILURES = ["oom", "pid_limit", "start_failed", "deadline", "fenced", "unreachable", "not_started", "refused", "unknown"];
 const STOP_OF = { deadline: "deadline", fenced: "fence", unreachable: "unreachable", not_started: "not_started" };
 const SPEC_FIELDS = ["image", "source", "command", "env", "limits", "deadline_ms", "labels", "grace_ms", "input_env"];
 // The bounds of a job's `limits` (docs/api.md): those of the runtime. Outside them is ZC-E0130.
@@ -315,7 +315,7 @@ export class Jobs {
 
   exitOf(end) {
     if (end.kind === "exited") return { kind: "exited", ...(end.signal != null ? { signal: end.signal } : { code: end.code }) };
-    if (end.kind === "failed") return { kind: ({ oom: "oom", pid_limit: "pid_limit", start_failed: "start_failed" })[end.cause] || (end.cause === "unknown" ? "lost" : "signaled"), ...(["deadline", "fenced"].includes(end.cause) ? { signal: 15 } : {}) };
+    if (end.kind === "failed") return { kind: ({ oom: "oom", pid_limit: "pid_limit", start_failed: "start_failed", refused: "refused" })[end.cause] || (end.cause === "unknown" ? "lost" : "signaled"), ...(["deadline", "fenced"].includes(end.cause) ? { signal: 15 } : {}) };
     return { kind: "signaled", signal: 15 };
   }
 
