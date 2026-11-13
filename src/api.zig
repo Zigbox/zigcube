@@ -586,6 +586,19 @@ fn conflict(ctx: *const Context, name: []const u8) Failure {
     return error.Failed;
 }
 
+/// ZC-E0105 for a delete: the history goes first, in transactions of its own (`delete_all`), so
+/// a delete that lost the race may already have removed some of it, and that stays removed.
+fn conflict_on_delete(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0105);
+    ctx.diag.cause("service {s} was changed by someone else during the request", .{name});
+    ctx.diag.cause("the service was not deleted, but generations of its history the delete had " ++
+        "already removed stay removed (a rollback to one is ZC-E0128)", .{});
+    const sentence = "look at it as it is now, then delete it again if you still mean to";
+    ctx.diag.fix_with(sentence, "zcube get service {s}", .{name});
+    return error.Failed;
+}
+
 /// A reply for a request the shell refuses before it reaches `handle` (too large, too many
 /// connections): the failure already raised on `ctx.diag`, with the shell's own status.
 pub fn refusal(ctx: *const Context, request_id: []const u8, status: u16) Response {
@@ -1521,7 +1534,7 @@ const Call = struct {
                 .conflict => {},
             }
         }
-        return conflict(ctx, name);
+        return conflict_on_delete(ctx, name);
     }
 
     // ---- /v1/jobs ----
