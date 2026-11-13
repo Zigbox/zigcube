@@ -81,16 +81,26 @@ pub fn main(init: std.process.Init) u8 {
     };
     // Only guest 1 boots, and it forwards its peer port: a free host port, unused by the demo.
     guests.peer_ports[0] = demo_host.free_port(init.io, @as(u64, host.port) * 31 + 1) catch
-        return 2;
+        return abandon(&host);
     var demo: steps.Demo = .{
         .host = &host,
         .guests = &guests,
-        .server = std.fmt.allocPrint(host.arena(), "10.0.2.2:{d}", .{host.port}) catch return 2,
+        .server = std.fmt.allocPrint(host.arena(), "10.0.2.2:{d}", .{host.port}) catch
+            return abandon(&host),
     };
     return run(&demo, init, options);
 }
 
-/// Sets up the demo's directory, the CLI's environment and the transcript file.
+/// Undoes `prepare` when the demo cannot start: its directory and the transcript file.
+fn abandon(host: *Host) u8 {
+    std.debug.print("demo-b5: setup failed after its directory was made\n", .{});
+    if (host.transcript) |file| file.close(host.io);
+    std.Io.Dir.cwd().deleteTree(host.io, host.work) catch {}; // Best effort: it is in /tmp.
+    return 2;
+}
+
+/// Sets up the demo's directory, the CLI's environment and the transcript file; on an error it
+/// leaves no directory behind.
 fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
     const stamp: u64 = @intCast(std.Io.Clock.real.now(init.io).toMilliseconds());
     host.* = .{
@@ -118,6 +128,7 @@ fn prepare(host: *Host, init: std.process.Init, options: Options) !void {
         base, std.os.linux.getpid(), stamp,
     });
     host.state = try std.fmt.allocPrint(arena, "{s}/state", .{host.work});
+    errdefer cwd.deleteTree(init.io, host.work) catch {}; // Best effort: it is in /tmp.
     try cwd.createDirPath(init.io, host.state);
     try cwd.createDirPath(init.io, try host.path_in_work("home"));
     try host.cli_environ.put("PATH", init.environ_map.get("PATH") orelse "/usr/bin:/bin");

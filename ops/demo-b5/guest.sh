@@ -7,18 +7,20 @@
 # pulled images and two keys, `release` (trusted) and `stranger` (trusted by no policy).
 #
 # Commands:  guest.sh setup-root | pull <reference> | key-new <name> | sign <key> <tree>
-#            guest.sh export <tree> | policy <public key> | images <tree> <reference> ...
+#            guest.sh export <tree> | policy <public key> | kept <container> <tree>
+#            guest.sh images <tree> <reference> ...
 #            guest.sh agent <node> <server host:port> | containers | logs
 #
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1.
 
 BIN=${BIN:-/home/cube/bin}
 STATE=${STATE:-/root/state}
-LOG=/root/log
+LOG=${LOG:-/root/log}
 ARGS=/root/agent.args
 IMAGES=/root/images.zon
 POLICY=${POLICY:-/root/trust.zon}
 SIGNER=${SIGNER:-/root/signer}
+NODE_POLICY=${NODE_POLICY:-${XDG_CONFIG_HOME:-/root/.config}/zbx/policy.zon}
 ROOT_RANGE=200000:65536
 
 export HOME=/root
@@ -95,7 +97,8 @@ cmd_export() {
     signer trust export "$1" >"$SIGNER.lines" 2>"$SIGNER.err" ||
         fail "zbx trust export $1: $(tail -5 "$SIGNER.err")"
     count=0
-    while IFS= read -r line; do
+    # `|| [ -n "$line" ]`: a last line without a newline is still a line.
+    while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || continue
         count=$((count + 1))
         echo "line $line"
@@ -104,14 +107,39 @@ cmd_export() {
     ok "$count line(s) for $1"
 }
 
-# The node's own trust policy: the one key, a signature required. Root's file, mode 0644.
+# The node's own trust policy: the one key, a signature required. Root's file, mode 0644. The same
+# policy is also the node's Zigbox policy (`$NODE_POLICY`, where the agent's zbx looks: the user's
+# `zbx/policy.zon` under the agent's environment), so the agent puts a job's signatures into the
+# node's Zigbox store before the start (`import_signatures`) and `kept` can see them there. The
+# signer's zbx has a config directory of its own and does not read it.
 cmd_policy() {
     [ $# -eq 1 ] || fail "usage: guest.sh policy <public key>"
     key='.{ .name = "release", .public = "'"$1"'" }'
     printf '.{ .version = 1, .keys = .{ %s }, .require_signature = true }\n' "$key" >"$POLICY" ||
         fail "write $POLICY"
-    chmod 0644 "$POLICY"
-    ok "$POLICY trusts $1 and requires a signature"
+    chmod 0644 "$POLICY" || fail "chmod 0644 $POLICY"
+    mkdir -p "$(dirname "$NODE_POLICY")" || fail "mkdir $(dirname "$NODE_POLICY")"
+    cp "$POLICY" "$NODE_POLICY" || fail "copy $POLICY to $NODE_POLICY"
+    chmod 0644 "$NODE_POLICY" || fail "chmod 0644 $NODE_POLICY"
+    ok "$POLICY and $NODE_POLICY trust $1 and require a signature"
+}
+
+# Whether the agent kept a job's signatures in the node's Zigbox store: no "were not kept" line
+# in its log (ZBX-E0909, the start goes on without them), and the node's own `zbx trust export`
+# of the tree, as the agent's environment finds the store, prints at least one line.
+cmd_kept() {
+    [ $# -eq 2 ] || fail "usage: guest.sh kept <container> <tree>"
+    if grep "container $1: its signatures were not kept" "$LOG/agent.log" >"$LOG/kept.err"; then
+        fail "the agent did not keep $1's signatures: $(tail -1 "$LOG/kept.err")"
+    fi
+    "$BIN/zbx" trust export "$2" >"$LOG/kept.out" 2>"$LOG/kept.err" ||
+        fail "the node's zbx trust export $2: $(tail -5 "$LOG/kept.err")"
+    count=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] && count=$((count + 1))
+    done <"$LOG/kept.out"
+    [ "$count" -gt 0 ] || fail "the node's Zigbox store holds no signature for $2"
+    ok "the node's Zigbox store holds $count line(s) for $2; no 'not kept' line for $1"
 }
 
 # Tells the agent where to pull each tree from (a job names an image by its tree digest only).
@@ -122,7 +150,7 @@ cmd_images() {
         entries="$entries .{ .digest = \"$1\", .reference = \"$2\" },"
         shift 2
     done
-    printf '.{ .images = .{%s } }\n' "$entries" >"$IMAGES"
+    printf '.{ .images = .{%s } }\n' "$entries" >"$IMAGES" || fail "write $IMAGES"
     ok "$IMAGES:$entries"
 }
 
@@ -174,6 +202,7 @@ main() {
         sign) cmd_sign "$@" ;;
         export) cmd_export "$@" ;;
         policy) cmd_policy "$@" ;;
+        kept) cmd_kept "$@" ;;
         images) cmd_images "$@" ;;
         agent) cmd_agent "$@" ;;
         containers) cmd_containers ;;

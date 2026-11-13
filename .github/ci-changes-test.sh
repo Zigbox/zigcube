@@ -94,6 +94,7 @@ check $PR x "" "src/demo_b3_script.zig ops/demo-b3/guest.sh" TFFFFFFFTF
 check $PR x "" "src/demo_b5.zig src/demo_b5_script.zig ops/demo-b5/guest.sh" TFFFFFFFFT
 check $PR x "" "docs/demos/b5.md" FFFFFFFFFF
 check $PR x "" "src/demo_c2_vms.zig" TFFFFFTFTT
+check $PR x "" "src/demo_c2_check.zig" TFFFFFTFTT
 check $PR x "" "src/demo_b1_state.zig" TFFFTFFFTT
 check $PR x "" "src/relay.zig" TFFFFTTFTT
 check $PR x "" "docs/demos/b3.md" FFFFFFFFFF

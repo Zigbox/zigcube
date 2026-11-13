@@ -263,6 +263,16 @@ fn signed_runs(demo: *Demo, signed: Signed) !void {
     demo.expect(ran, "the signed job ran and exited 0 (state {s}, code {?d})", .{
         view.state, view.code,
     });
+    // The guest's node has a Zigbox policy that checks (`guest.sh policy`), so the agent put the
+    // job's signatures into the node's Zigbox store before the start; one it could not keep
+    // (ZBX-E0909, logged, the start goes on) fails the demo.
+    const container = "signed" ++ records.job_run_suffix;
+    const arguments = try std.fmt.allocPrint(demo.arena(), "kept {s} {s}", .{
+        container, demo.v1_tree,
+    });
+    const kept = try demo.guest_run(0, arguments);
+    demo.expect(kept.status == 0, "the agent kept the signed job's signatures in the node's " ++
+        "Zigbox store (no ZBX-E0909 line; the node's `zbx trust export` lists them)", .{});
 }
 
 // ---- 4. Refused at the server ----
@@ -319,10 +329,10 @@ fn refused_at_agent(demo: *Demo, refused: []const Refused) !void {
         const said = if (ended.diagnostic) |value| inject.refusal_says(value, words) else false;
         const refused_here = std.mem.eql(u8, view.state, "failed") and
             std.mem.eql(u8, ended.cause, "refused") and said;
+        const got = if (ended.diagnostic == null) "none" else if (said) "as wanted" else "another";
         demo.expect(refused_here, "{s} ({s}) is refused at the agent: failed, cause refused, " ++
             "ZBX-E0905 saying \"{s}\" (got {s}, {s}, diagnostic {s})", .{
-            job.name,                                                                       job.why, words, view.state, ended.cause,
-            if (ended.diagnostic == null) "none" else if (said) "as wanted" else "another",
+            job.name, job.why, words, view.state, ended.cause, got,
         });
     }
     const containers = try demo.guest(0, "containers", .{});

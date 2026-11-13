@@ -175,7 +175,8 @@ test "each refusal says its own case's words and no other's" {
         };
         const raw = try records.diagnostic_raw(arena, refusal, &diag);
         const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.text, .{});
-        const body = try std.fmt.allocPrint(arena, "{{\"request_id\":\"r\",\"diagnostics\":[{s}]}}", .{
+        const format = "{{\"request_id\":\"r\",\"diagnostics\":[{s}]}}";
+        const body = try std.fmt.allocPrint(arena, format, .{
             raw.text,
         });
         for (std.enums.values(Refused)) |other| {

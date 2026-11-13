@@ -1,0 +1,3 @@
+error[ZBX-E0909]: a trust bundle was refused
+  cause  the store has no signature for that tree
+  fix    sign the tree, or import a bundle for it

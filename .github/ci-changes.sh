@@ -55,10 +55,10 @@ classify() {
     src/demo_c1_state.zig | src/demo_c1_fleet.zig) want_one demo_c1; want_one demo_b1; want_one demo_b3; want_one demo_b5; return ;;
     src/demo_c0*.zig) want_one demo_c0; return ;;
     src/demo_c1*.zig) want_one demo_c1; return ;;
-    # demo-b3 and demo-b5 import demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig and demo_c2_vms.zig (their rig).
+    # demo-b3 and demo-b5 import demo_b1_state.zig (so demo_b1_fleet.zig, demo_c1_state.zig and what they import), and demo_c2_steps.zig, demo_c2_vms.zig and demo_c2_check.zig (their rig; demo_c2_steps.zig imports demo_c2_check.zig).
     src/demo_b1_state.zig | src/demo_b1_fleet.zig) want_one demo_b1; want_one demo_b3; want_one demo_b5; return ;;
     src/demo_b1*.zig) want_one demo_b1; return ;;
-    src/demo_c2_steps.zig | src/demo_c2_vms.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
+    src/demo_c2_steps.zig | src/demo_c2_vms.zig | src/demo_c2_check.zig) want_one demo_c2; want_one demo_b3; want_one demo_b5; return ;;
     src/demo_c2*.zig | ops/demo-c2/*) want_one demo_c2; return ;;
     src/demo_b3*.zig | ops/demo-b3/*) want_one demo_b3; return ;;
     src/demo_b5*.zig | ops/demo-b5/*) want_one demo_b5; return ;;

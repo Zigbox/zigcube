@@ -1085,14 +1085,12 @@ fn step_trust_bypass(smoke: *Smoke) !void {
         const cause = try job_cause(smoke, job.name);
         const diagnostic = try job_diagnostic(smoke, job.name);
         const said = if (diagnostic) |value| inject.refusal_says(value, case.words()) else false;
+        const got = if (diagnostic == null) "none" else if (said) "as wanted" else "another";
         try smoke.expect(
             std.mem.eql(u8, now.state, "failed") and std.mem.eql(u8, cause, "refused") and said,
             "{s} ended {s} ({s}, diagnostic {s}), expected failed (refused) with ZBX-E0905 " ++
                 "saying \"{s}\"",
-            .{
-                job.name,                                                                 now.state,    cause,
-                if (diagnostic == null) "none" else if (said) "as wanted" else "another", case.words(),
-            },
+            .{ job.name, now.state, cause, got, case.words() },
         );
     }
     const starts = std.Io.Dir.cwd().readFileAlloc(
