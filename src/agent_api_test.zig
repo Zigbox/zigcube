@@ -148,6 +148,13 @@ fn register_text(buffer: []u8, lease: i64) ![]const u8 {
     return std.fmt.bufPrint(buffer, format, .{lease});
 }
 
+/// A registration that names the tenure it replaces (0: none).
+fn register_replacing(buffer: []u8, lease: i64, replaces: i64) ![]const u8 {
+    const format = "{{\"lease\":{d},\"replaces\":{d},\"capacity\":{{\"cpu_millis\":4000," ++
+        "\"memory_bytes\":8589934592}}}}";
+    return std.fmt.bufPrint(buffer, format, .{ lease, replaces });
+}
+
 fn keepalive_path(buffer: []u8, lease: i64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "/v1/agent/nodes/node2/lease/{d}/keepalive", .{lease});
 }
@@ -193,6 +200,59 @@ test "a node takes a lease, registers on it and renews it" {
     const renewed = try rig.ok("POST", keepalive, "", "");
     try testing.expectEqual(lease, field(field(renewed, "lease"), "id").integer);
     try testing.expectEqual(@as(i64, 10000), field(field(renewed, "lease"), "ttl_ms").integer);
+}
+
+test "a registration overtaken by a newer one is ZC-E0510 and moves nothing (#237)" {
+    // Goal: a registration PUT that lands after the agent's newer one cannot take the node key
+    // onto its own, abandoned lease. Method: register on L1 (replacing nothing), then on L2
+    // (replacing L1's tenure), then deliver L1's PUT again: it names no tenure, the key is L2's.
+    var rig = try Rig.start(4);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const early = try register_replacing(&buffer, first, 0);
+    const tenure = field(try rig.ok("PUT", "/v1/agent/nodes/node2", "", early), "revision").integer;
+    const newer = try register_replacing(&buffer, second, tenure);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", newer);
+    const before = try rig.revision();
+
+    const late = try register_replacing(&buffer, first, 0);
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", late), 503, "ZC-E0510");
+    try testing.expectEqual(before, try rig.revision());
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
+    try testing.expectEqual(second, field(field(listed, "kvs").array.items[0], "lease").integer);
+
+    // The stale tenure is refused too; and the stored record carries no `replaces`.
+    const old = try register_replacing(&buffer, first, tenure);
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", old), 503, "ZC-E0510");
+    const node = field(field(listed, "kvs").array.items[0], "value");
+    try testing.expect(node.object.get("replaces") == null);
+
+    // A key that is gone (its lease ended) is filled by a registration that names any tenure,
+    // and one that names nothing (an older agent) is not compared.
+    rig.world.advance(11_000);
+    const third = try rig.grant("node2");
+    const again = try register_replacing(&buffer, third, tenure);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", again);
+    const fourth = try rig.grant("node2");
+    const plain = try register_text(&buffer, fourth);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", plain);
+}
+
+test "a keepalive of a lease the node's key is not on is ZC-E0205 (#237)" {
+    // Goal: an agent whose key moved to another lease must fence, not keep renewing. Method: two
+    // leases, the key on the second; renew the first.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const body = try register_text(&buffer, second);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    var path: [96]u8 = undefined;
+    try rig.refused(rig.call("POST", try keepalive_path(&path, first), "", ""), 503, "ZC-E0205");
+    _ = try rig.ok("POST", try keepalive_path(&path, second), "", "");
 }
 
 test "a lease that has ended is ZC-E0205, for a keepalive and for a registration" {

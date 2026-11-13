@@ -460,6 +460,9 @@ pub const RemoteStore = struct {
             // The tenure ended (I2): a transaction whose compare failed, as in any store.
             if (refusal_code(arena, reply.body)) |text| {
                 if (std.mem.eql(u8, text, "ZC-E0510")) {
+                    // A registration that names a tenure the node has moved past is refused, not
+                    // a compare that failed: the agent has no tenure of its own to fence yet.
+                    if (registering) return tenure_ended(remote, diag);
                     return .{ .succeeded = false, .revision = 0 };
                 }
             }
@@ -581,6 +584,7 @@ pub const RemoteStore = struct {
             .agent_version = node.agent_version,
             .address = node.address,
             .labels = node.labels,
+            .replaces = node.replaces,
         }, diag);
         const target = try remote.path(arena, "", diag);
         return .{ .method = "PUT", .target = target, .body = body };

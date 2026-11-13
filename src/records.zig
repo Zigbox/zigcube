@@ -632,6 +632,13 @@ pub const Node = struct {
     address: []const u8 = "",
     capacity: Requests,
     labels: []const []const u8 = &.{},
+    /// Only in what an agent sends, never in a stored record (the server drops it): the tenure
+    /// (`mod_revision` of `/nodes/<node>`) the agent last held, 0 if it holds none. The server
+    /// registers the node only if the key is absent or still at that revision, so a registration
+    /// that was overtaken by a newer one (a restart, a cut connection) cannot land late and move
+    /// the key onto a lease nobody renews (docs/authority.md §3, issue #237). Absent: the agent
+    /// predates the rule, and the registration is not compared.
+    replaces: ?u64 = null,
 };
 
 /// One tree a node holds completely, as its summary advertises it (docs/swarm.md): the tree's

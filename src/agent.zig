@@ -183,6 +183,10 @@ pub const Agent = struct {
     lease: store.LeaseId,
     /// The lease's ttl as the server granted it; 0 with no lease.
     lease_ttl_ms: u32,
+    /// The tenure the agent last held, kept when the lease is forgotten: the next registration
+    /// names it as the one it replaces, so that a late registration of an earlier attempt is
+    /// refused (#237). 0 before the first registration of this process or its kept state.
+    last_tenure: u64,
     /// The revision of the node's registration: the agent's tenure. 0 with no lease.
     tenure: store.Revision,
     /// `s`: when the last acknowledged keepalive (or the grant) was sent, monotonic.
@@ -294,6 +298,7 @@ pub const Agent = struct {
         agent.lease = store.lease_none;
         agent.lease_ttl_ms = 0;
         agent.tenure = 0;
+        agent.last_tenure = 0;
         agent.sent_ms = 0;
         agent.renew_at_ms = 0;
         agent.fence = .{};
@@ -748,6 +753,7 @@ pub const Agent = struct {
             .agent_version = agent.config.agent_version,
             .address = agent.config.address,
             .capacity = agent.config.capacity,
+            .replaces = agent.last_tenure,
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);
@@ -758,6 +764,7 @@ pub const Agent = struct {
         assert(done.revision > 0);
         agent.lease = lease.id;
         agent.tenure = done.revision;
+        agent.last_tenure = done.revision;
         try agent.acknowledged(ctx, sent, lease.ttl_ms);
         return .acted;
     }
@@ -822,6 +829,9 @@ pub const Agent = struct {
         };
         const parsed = std.json.parseFromSliceLeaky(LeaseFile, ctx.arena, text, .{}) catch
             return agent.begin_fence(ctx, mono);
+        // Whatever the file says of the lease, its tenure is the one the next registration
+        // replaces (an old file without it names none).
+        agent.last_tenure = parsed.tenure;
         const same_boot = std.mem.eql(u8, parsed.boot_id, ctx.boot_id) and parsed.sent_ms <= mono;
         if (parsed.fencing) {
             // The kill stays where the previous run put it, if its clock is still this one.
