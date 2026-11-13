@@ -582,6 +582,7 @@ fn add_demo_step(b: *std.Build, step_options: DemoStepOptions) void {
     add_demo_b1_step(b, step_options, transcript);
     add_demo_c2_step(b, step_options, transcript);
     add_demo_b3_step(b, step_options, transcript);
+    add_demo_b5_step(b, step_options, transcript);
 }
 
 /// `zig build demo-c1 -Dbackend=sqlite|postgres [-Dtranscript=FILE]`: HANDOFF's C1 demo, run for
@@ -747,6 +748,62 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     if (transcript) |path| run.addArgs(&.{ "--transcript", path });
     const help = "Run B3's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
     b.step("demo-b3", help).dependOn(&run.step);
+}
+
+/// `zig build demo-b5 [-Dtranscript=FILE]`: B5's demo, run for real (src/demo_b5.zig): the server
+/// on the host with a trust policy, one QEMU guest with `zcube-agent --runtime zigbox
+/// --trust-policy` where jobs are signed with `zbx sign`; unsigned, untrusted and other-tree jobs
+/// refused at the server and again at the agent. Skips unless `ZCUBE_REAL_HOST=1`.
+fn add_demo_b5_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[]const u8) void {
+    const zigbox = b.dependency("zigbox", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+    const exe = b.addExecutable(.{
+        .name = "demo_b5",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b5.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    // demo-b5 runs only on KVM hosts, so `check` compiles it (no run) and runs the tests of its
+    // script: what a comptime assert or a type error would otherwise show only in CI's demo-b5 job.
+    const script_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/demo_b5_script.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "zigbox", .module = step_options.zigbox },
+                .{ .name = "zigbox_vm", .module = b.dependency("zigbox", .{}).module("zigbox_vm") },
+                .{ .name = "sqlite_c", .module = step_options.sqlite },
+                .{ .name = "libpq_c", .module = step_options.libpq },
+            },
+        }),
+    });
+    const build_step = b.step("demo-b5-build", "Compile demo-b5 and test its script, no run");
+    build_step.dependOn(&exe.step);
+    build_step.dependOn(&b.addRunArtifact(script_tests).step);
+    const run = b.addRunArtifact(exe);
+    run.has_side_effects = true;
+    const built = step_options.built;
+    run.addArg("--zcube");
+    run.addArtifactArg(built.cli);
+    run.addArg("--server");
+    run.addArtifactArg(built.server);
+    run.addArg("--agent");
+    run.addFileArg(stripped(b, built.agent));
+    run.addArg("--zbx");
+    run.addFileArg(stripped(b, zigbox.artifact("zbx")));
+    run.addArg("--guest-script");
+    run.addFileArg(b.path("ops/demo-b5/guest.sh"));
+    if (transcript) |path| run.addArgs(&.{ "--transcript", path });
+    const help = "Run B5's demo for real in a QEMU guest (needs ZCUBE_REAL_HOST=1)";
+    b.step("demo-b5", help).dependOn(&run.step);
 }
 
 /// The settings of the Postgres the demo runs against, and the commands that stop and start it.
@@ -2148,7 +2205,7 @@ fn add_check_step(b: *std.Build) void {
     const gates = [_][]const u8{
         "install",            "test",       "tidy",          "errors-site-check",
         "wasm-check",         "wasm-test",  "console-wasm",  "check-store-memory",
-        "check-store-sqlite", "mtls-teeth", "demo-b3-build",
+        "check-store-sqlite", "mtls-teeth", "demo-b3-build", "demo-b5-build",
     };
     for (gates) |name| {
         const gate = b.top_level_steps.get(name) orelse @panic(name);
