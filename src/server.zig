@@ -26,6 +26,7 @@ const peer_ca = @import("peer_ca.zig");
 const server_ca = @import("server_ca.zig");
 const RealClock = @import("server_store.zig").RealClock;
 const store_verified = @import("store_verified.zig");
+const job_trust = @import("job_trust.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -56,6 +57,9 @@ pub const Server = struct {
     /// The CA key's file for this store and whether the store has run here before (`guard`).
     ca_name_buffer: [server_ca.key_name_bytes_max]u8 = undefined,
     ca_name_length: u8 = 0,
+    /// The trust policy `POST /v1/jobs` checks (B5), when the configuration names one; its
+    /// scratch (about 4 MiB) is allocated only then.
+    trust: ?job_trust.Trust = null,
     has_history: bool = false,
     /// Unix milliseconds, for the credentials the CA signs.
     wall: RealClock,
@@ -84,6 +88,12 @@ pub const Server = struct {
         const server = try gpa.create(Server);
         errdefer gpa.destroy(server);
         server.* = try init_value(gpa, io, backend, config, options);
+        if (config.trust) |trust| {
+            const scratch = try gpa.create(job_trust.Scratch);
+            server.trust = .{ .policy = trust.policy, .path = trust.path, .scratch = scratch };
+            server.shared.api.trust = &server.trust.?;
+        }
+        errdefer if (server.trust) |trust| gpa.destroy(trust.scratch);
         try server.guard(config, diag);
         errdefer server.unguard();
         try server.open_ca(config, diag);
@@ -373,6 +383,7 @@ pub const Server = struct {
         }
         server.unguard();
         server.backend.close();
+        if (server.trust) |trust| gpa.destroy(trust.scratch);
         gpa.destroy(server);
     }
 

@@ -487,7 +487,10 @@ name rule (48 bytes).
 The spec is immutable. `cancel_requested` is the one member that changes (set once). The input is
 never here, only its digest and size. `retries` is 0 (a larger value is `ZC-E0130`).
 `relay` (B3, optional, additive at the same version) is `{"name":"botpike","address":"HOST:PORT"}`:
-the name the job asked for and the address the server's configuration gave it at admission. At most
+the name the job asked for and the address the server's configuration gave it at admission.
+`signatures` (B5, optional, additive at the same version) is an array of at most
+`job_signatures_max` (4) DSSE envelopes, each 1 to `job_signature_bytes_max` (2048) bytes of
+printable ASCII (one line of `zbx trust export`), as submitted; absent when the job has none. At most
 `job_labels_max` (6) labels, `job_command_words_max` (64) command words, `env` of at most
 `job_env_bytes_max` (8 KiB). Written with its `/job-input/` and `/job-admission` in one transaction.
 
@@ -511,7 +514,7 @@ status, which compares it. Neither is deleted.
 
 `{"v":1,"id":"train-7-job","job":"train-7",` the spec's `image`, `source`, `command`, `env`,
 `limits`, `deadline_ms`, `grace_ms`, `labels`, `input_env`, `input_digest`, `input_bytes`, `relay`
-(B3, as in the job),
+(B3, as in the job), `signatures` (B5, as in the job),
 `"start_by_ms":…,"created_at_ms":…,"stop":{"cause":"cancel","at_ms":…}}`. At most
 `job_run_bytes_max` (16 KiB). Created once, with its status. `stop` is set at most once and never
 removed; its `cause` is `cancel`, `unreachable` or `not_started`. From the revision of the `stop`,

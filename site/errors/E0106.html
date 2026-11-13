@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">the server's configuration can't be used</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>zcube-server read its configuration file and flags and found a setting it cannot use: a file that is not valid ZON, an unknown setting, a store that is not memory, sqlite:&lt;path&gt; or postgres:&lt;settings&gt;, or a listen address that is not host:port. The cause line names the setting.</p>
+<p>zcube-server read its configuration file and flags and found a setting it cannot use: a file that is not valid ZON, an unknown setting, a store that is not memory, sqlite:&lt;path&gt; or postgres:&lt;settings&gt;, a listen address that is not host:port, or a `trust` entry whose policy file cannot be read or is not a policy zbx reads (the cause names its line, column and what is wrong). The cause line names the setting.</p>
 <p>Nothing was started. Correct the setting and start the server again.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

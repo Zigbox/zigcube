@@ -354,7 +354,7 @@ test "a client that goes quiet is closed by the watchdog, not kept for ever" {
 
 test "a client that stalls half way through a large body is closed, and frees its slot" {
     // Goal: the body read is bounded like the head (REVIEW.md: every socket read has a deadline).
-    // Method: announce a 409,600-byte body to POST /v1/jobs, send 1,000 bytes and stop; the
+    // Method: announce a 425,984-byte body to POST /v1/jobs, send 1,000 bytes and stop; the
     // watchdog must close the connection within the idle timeout plus a few watchdog periods.
     var test_io: TestIo = undefined;
     const io = test_io.start();
@@ -1065,11 +1065,11 @@ test "POST /v1/jobs takes the worst-case input over the wire; every other body s
     const too_big = try send(io, address, "POST", "/v1/jobs", huge);
     defer too_big.free();
     try expect_diagnostic(too_big, 413, "ZC-E0108");
-    try testing.expect(std.mem.indexOf(u8, too_big.body, "409600") != null);
+    try testing.expect(std.mem.indexOf(u8, too_big.body, "425984") != null);
 
     const apply_body = huge[0 .. constants.http_body_bytes_max + 1];
     const small = try send(io, address, "POST", "/v1/apply", apply_body);
     defer small.free();
     try expect_diagnostic(small, 413, "ZC-E0108");
-    try testing.expect(std.mem.indexOf(u8, small.body, "409600") == null);
+    try testing.expect(std.mem.indexOf(u8, small.body, "425984") == null);
 }

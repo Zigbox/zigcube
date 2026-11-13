@@ -148,7 +148,8 @@ pub fn admit(
     };
     if (fault_on(.subject_from_signature)) subject = subject_of_first(scratch) orelse subject;
     const report = &scratch.report;
-    const signed = trust.verdict.judge(&scratch.work, config.policy, &scratch.record, subject, report);
+    const work = &scratch.work;
+    const signed = trust.verdict.judge(work, config.policy, &scratch.record, subject, report);
     if (fault_on(.count_any_line) and report.count > 0) return .admitted;
     if (!signed) return .{ .refused = try refusal(config, arena, job, .unsigned) };
     if (!trust.verdict.provenance_met(config.policy, report)) {
@@ -445,14 +446,17 @@ test "the refusal names each line and the fixes, as Zigbox's run gate does" {
         "b3:0707070707070707070707070707070707070707070707070707070707070707 counts"));
     const stranger_key = fixture_mod.public_text(stranger_seed);
     var wanted: [128]u8 = undefined;
-    const first = try std.fmt.bufPrint(&wanted, "signed by {s}: the policy does not list that key", .{
+    const unlisted = "signed by {s}: the policy does not list that key";
+    const first = try std.fmt.bufPrint(&wanted, unlisted, .{
         stranger_key[0 .. trust.key.public_prefix.len + 16],
     });
     try testing.expectEqualStrings(first, causes[1].slice());
-    try testing.expectEqualStrings("signed by 'key-1': it is about another tree", causes[2].slice());
+    const third = "signed by 'key-1': it is about another tree";
+    try testing.expectEqualStrings(third, causes[2].slice());
     try testing.expectEqualStrings("policy", refused.pairs.slice()[1].key_slice());
-    try testing.expectEqualStrings("zbx sign b3:07070707070707070707070707070707070707070707070707" ++
-        "07070707070707", refused.fixes.slice()[0].command.slice());
+    const sign = "zbx sign b3:0707070707070707070707070707070707070707" ++
+        "070707070707070707070707";
+    try testing.expectEqualStrings(sign, refused.fixes.slice()[0].command.slice());
 }
 
 test "shape: at most four envelopes of 1 to 2048 printable bytes" {
@@ -460,15 +464,18 @@ test "shape: at most four envelopes of 1 to 2048 printable bytes" {
     const four = [_][]const u8{ "a", "b", "c", "d" };
     try testing.expectEqual(@as(?[]const u8, null), shape_problem(&buffer, &four));
     const five = four ++ [_][]const u8{"e"};
-    try testing.expectEqualStrings("at most 4 envelopes, there are 5", shape_problem(&buffer, &five).?);
+    const too_many = shape_problem(&buffer, &five).?;
+    try testing.expectEqualStrings("at most 4 envelopes, there are 5", too_many);
     const long: [constants.job_signature_bytes_max + 1]u8 = @splat('a');
     try testing.expectEqualStrings(
         "envelope 1 must be 1 to 2048 bytes, it is 2049",
         shape_problem(&buffer, &.{&long}).?,
     );
-    try testing.expect(shape_problem(&buffer, &.{long[0..constants.job_signature_bytes_max]}) == null);
+    const at_bound = long[0..constants.job_signature_bytes_max];
+    try testing.expect(shape_problem(&buffer, &.{at_bound}) == null);
     try testing.expect(shape_problem(&buffer, &.{""}) != null);
-    try testing.expect(std.mem.indexOf(u8, shape_problem(&buffer, &.{"a\nb"}).?, "one line") != null);
+    const two_lines = shape_problem(&buffer, &.{"a\nb"}).?;
+    try testing.expect(std.mem.indexOf(u8, two_lines, "one line") != null);
 }
 
 test "a signed envelope fits the job's bounds with room to spare" {

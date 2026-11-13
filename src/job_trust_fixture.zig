@@ -74,7 +74,8 @@ pub const Fixture = struct {
 
     /// The configuration `admit` takes.
     pub fn config(fixture: *Fixture) job_trust.Trust {
-        return .{ .policy = fixture.policy, .path = "/etc/zcube/trust.zon", .scratch = fixture.scratch };
+        const path = "/etc/zcube/trust.zon";
+        return .{ .policy = fixture.policy, .path = path, .scratch = fixture.scratch };
     }
 
     /// One line of `zbx trust export`: `statement` signed by the key of `seed`, copied into

@@ -393,7 +393,7 @@ const RelayField = struct {
 };
 
 /// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
-/// 409,600-byte array of zeros takes about 37 times that in the arena.
+/// 425,984-byte array of zeros takes about 37 times that in the arena.
 const Present = struct {
     pub fn jsonParse(
         allocator: std.mem.Allocator,

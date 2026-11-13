@@ -12,6 +12,11 @@
 //! **Idempotency.** The same spec under the same name is a no-op that returns the job; a
 //! different one is ZC-E0131. The compare covers the spec fields only, never `created_at_ms`,
 //! `applied_by`, `submit_by_ms` or `cancel_requested`.
+//!
+//! **Signatures (B5).** Their shape is checked with the rest of the body; under the server's
+//! trust policy, a new job is judged (`job_trust.admit`) after the lookup and the expiry and
+//! before admission writes anything, so a refused job (`refused`, ZBX-E0905) leaves no trace and a
+//! retry of a stored job keeps the answer it had.
 
 const std = @import("std");
 const assert = std.debug.assert;

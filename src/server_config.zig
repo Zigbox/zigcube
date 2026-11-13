@@ -10,6 +10,9 @@
 //!     // The upstreams a job's `relay` may name (docs/briefs/b3.md): at most `relays_max`. A job
 //!     // names one; it never gives an address.
 //!     .relays = .{ .botpike = .{ .address = "broker.botpike.com:8443" } },
+//!     // The Zigbox policy file `POST /v1/jobs` checks a job's signatures against (docs/briefs/
+//!     // b5.md), read once at start; without it nothing is checked.
+//!     .trust = .{ .policy = "/etc/zcube/trust.zon" },
 //! }
 //! ```
 
@@ -18,6 +21,7 @@ const fencing = @import("fencing.zig");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const zigbox = @import("zigbox");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -30,8 +34,9 @@ pub const usage =
     \\                    [--new-ca] [--verbose] [--quiet]
     \\       zcube-server --version | --help
     \\
-    \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
-    \\                    (the upstreams a job's relay may name)
+    \\  --config FILE     a ZON file with .listen, .store, .create_store, .relays (the
+    \\                    upstreams a job's relay may name) and .trust = .{ .policy = FILE }
+    \\                    (the Zigbox policy file a job's signatures are checked against)
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
@@ -76,7 +81,17 @@ pub const Config = struct {
     lost_grace_ms: u32 = constants.lost_grace_ms,
     /// The relays a job may name, in the file's order; none by default.
     relays: []const Relay = &.{},
+    /// The policy a new job's signatures are checked against (B5); null checks nothing.
+    trust: ?Trust = null,
 };
+
+/// The `trust` entry, its policy file read and parsed at start.
+pub const Trust = struct {
+    path: []const u8,
+    policy: *const Policy,
+};
+
+pub const Policy = zigbox.trust.policy.Policy;
 
 pub const Command = union(enum) { run: Config, version, help };
 
@@ -92,8 +107,12 @@ const File = struct {
     lease_ttl_ms: ?u32 = null,
     lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    trust: ?TrustField = null,
     relays: []const Relay = &.{},
 };
+
+/// `.trust = .{ .policy = "<path>" }`; its field names are checked in `relays_of`.
+const TrustField = struct { policy: []const u8 };
 
 /// What a ZON file may set apart from `relays`. Unknown fields are refused (`parse_zon` checks
 /// the names itself, because it parses these with the relays left out).
@@ -104,6 +123,7 @@ const Fields = struct {
     lease_ttl_ms: ?u32 = null,
     lost_grace_ms: ?u32 = null,
     state_dir: ?[]const u8 = null,
+    trust: ?TrustField = null,
 };
 
 /// The flags as typed, before they are merged over the file.
@@ -132,7 +152,9 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
-    return .{ .run = try merge(flags, file, diag) };
+    var config = try merge(flags, file, diag);
+    if (file.trust) |entry| config.trust = try read_policy(arena, io, entry.policy, diag);
+    return .{ .run = config };
 }
 
 fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
@@ -235,6 +257,47 @@ fn number_of(comptime T: type, args: []const []const u8, index: *usize, diag: *D
         bad(diag, "{s} needs a whole number, not {s}", .{ flag, text }, "run it with --help");
 }
 
+// ---- The trust policy --------------------------------------------------------------------------
+
+/// Reads and parses the policy file of the `trust` entry, once, at start. Any problem is
+/// ZC-E0106 naming the file, and a policy Zigbox refuses names its line, column and kind.
+fn read_policy(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!Trust {
+    if (path.len == 0 or path.len > constants.config_path_bytes_max) {
+        return bad(diag, "trust.policy must be a path of 1 to 1024 bytes", .{}, policy_fix);
+    }
+    // A file of exactly the bound is allowed: the limit refuses one that reaches it.
+    const limit: std.Io.Limit = .limited(zigbox.trust.limits.policy_bytes_max + 1);
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StreamTooLong => bad(diag, "the trust policy {s} is larger than {d} bytes", .{
+                path, zigbox.trust.limits.policy_bytes_max,
+            }, "trim it"),
+            else => bad(diag, "can't read the trust policy {s}", .{path}, policy_fix),
+        };
+    };
+    return policy_of(arena, source, path, diag);
+}
+
+fn policy_of(arena: Allocator, source: []const u8, path: []const u8, diag: *Diag) Error!Trust {
+    const policy = try arena.create(Policy);
+    if (zigbox.trust.policy.parse(source, policy)) |problem| {
+        const detail = problem.detail_text();
+        return bad(diag, "the trust policy {s} is not a policy zbx reads: {t} at {d}:{d}{s}{s}", .{
+            path,
+            problem.kind,
+            problem.line,
+            problem.column,
+            if (detail.len > 0) " near " else "",
+            detail,
+        }, "check it with zbx trust policy check, or fix the line it names");
+    }
+    return .{ .path = path, .policy = policy };
+}
+
+const policy_fix = "write it as .trust = .{ .policy = \"/etc/zcube/trust.zon\" }, naming a" ++
+    " readable Zigbox policy file";
+
 // ---- The file -----------------------------------------------------------------------------------
 
 fn read_file(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!File {
@@ -303,7 +366,8 @@ fn parse_tree(
 }
 
 const known_settings = [_][]const u8{
-    "listen", "store", "create_store", "lease_ttl_ms", "lost_grace_ms", "state_dir", "relays",
+    "listen",    "store",  "create_store", "lease_ttl_ms", "lost_grace_ms",
+    "state_dir", "relays", "trust",
 };
 
 /// The relays of the file's root struct, after its field names are checked. A relay is
@@ -331,9 +395,25 @@ fn relays_of(
             return bad(diag, reason, .{ file_name, text }, "see zcube-server --help");
         }
         if (std.mem.eql(u8, text, "relays")) found = values.at(@intCast(index));
+        if (std.mem.eql(u8, text, "trust")) try trust_names(zoir, values.at(@intCast(index)), diag);
     }
     const node = found orelse return &.{};
     return relay_list(arena, zoir, node, diag);
+}
+
+/// The typed parse ignores unknown fields, so the `trust` entry's names are checked here: it is
+/// `.{ .policy = "<path>" }` and nothing else.
+fn trust_names(zoir: *const std.zig.Zoir, node: std.zig.Zoir.Node.Index, diag: *Diag) Error!void {
+    const names = switch (node.get(zoir)) {
+        .struct_literal => |literal| literal.names,
+        else => return bad(diag, "trust is not .{{ .policy = \"<path>\" }}", .{}, policy_fix),
+    };
+    for (names) |name| {
+        const text = name.get(zoir);
+        if (!std.mem.eql(u8, text, "policy")) {
+            return bad(diag, "trust sets .{s}, which is not a trust setting", .{text}, policy_fix);
+        }
+    }
 }
 
 fn relay_list(
@@ -665,4 +745,55 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
         diag.reset();
         try expect_bad(merge(.{}, parsed, &diag), &diag);
     }
+}
+
+test "trust names a policy file; a bad entry or a policy zbx refuses is ZC-E0106" {
+    // Goal: the `trust` setting of B5. Method: the entry parses, a good policy is read and its
+    // key is trusted; a typo in the entry, a missing file and each kind of bad policy are
+    // refused with ZC-E0106 naming the file.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const file = try parse_zon(arena, ".{ .trust = .{ .policy = \"p.zon\" } }", "s.zon", &diag);
+    try testing.expectEqualStrings("p.zon", file.trust.?.policy);
+    const none = try parse_zon(arena, ".{}", "s.zon", &diag);
+    try testing.expect(none.trust == null);
+    try testing.expect((try merge(.{}, none, &diag)).trust == null);
+
+    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
+    var policy_buffer: [256]u8 = undefined;
+    const good = try std.fmt.bufPrint(&policy_buffer, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    const trust = try policy_of(arena, good, "p.zon", &diag);
+    try testing.expect(trust.policy.checks());
+    try testing.expectEqualStrings("p.zon", trust.path);
+
+    const bad_files = [_][:0]const u8{
+        ".{ .trust = .{ .policy = \"p.zon\", .polcy = \"q\" } }",
+        ".{ .trust = \"p.zon\" }",
+        ".{ .trust = .{} }",
+        ".{ .trusts = .{ .policy = \"p.zon\" } }",
+    };
+    for (bad_files) |source| {
+        diag.reset();
+        try expect_bad(parse_zon(arena, source, "s.zon", &diag), &diag);
+    }
+    const bad_policies = [_][]const u8{
+        "",
+        ".{ .keys = .{} }",
+        ".{ .version = 1, .keys = .{ .{ .name = \"k\", .public = \"nope\" } } }",
+        ".{ .version = 9, .keys = .{} }",
+        ".{ .version = 1, .keys = .{}, .extra = true }",
+    };
+    for (bad_policies) |source| {
+        diag.reset();
+        try expect_bad(policy_of(arena, source, "p.zon", &diag), &diag);
+    }
+    diag.reset();
+    const missing = read_policy(arena, testing.io, "/nonexistent/zcube-trust.zon", &diag);
+    try expect_bad(missing, &diag);
+    diag.reset();
+    try expect_bad(read_policy(arena, testing.io, "", &diag), &diag);
 }
