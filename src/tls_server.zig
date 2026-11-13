@@ -50,6 +50,8 @@ pub const Config = struct {
     identity: Identity,
     /// The kind of certificate a client must present.
     client_kind: x509.Kind = .workload,
+    /// A second kind the server also takes (B7: the API takes a node's and a client's).
+    client_kind_also: ?x509.Kind = null,
 };
 
 /// The client the handshake authenticated.
@@ -57,6 +59,8 @@ pub const Peer = struct {
     kind: x509.Kind,
     /// The certificate's SPIFFE URI (a workload) or DNS name.
     name: []const u8,
+    /// A client certificate's scope; null for every other kind.
+    scope: ?x509.Scope,
 };
 
 const peer_name_bytes_max: u32 =
@@ -128,6 +132,7 @@ pub const Server = struct {
     secret: [32]u8,
     public_key: [32]u8,
     client_kind: x509.Kind,
+    client_kind_also: ?x509.Kind,
     identity: [constants.tls_chain_certificates_max][constants.x509_cert_bytes_max]u8,
     identity_lengths: [constants.tls_chain_certificates_max]u32,
     identity_count: u32,
@@ -144,6 +149,7 @@ pub const Server = struct {
     peer_kind: x509.Kind,
     peer_name: [peer_name_bytes_max]u8,
     peer_name_length: u32,
+    peer_scope: ?x509.Scope,
     authenticated: bool,
     record: [schedule.sealed_bytes_max]u8,
     record_length: u32,
@@ -165,6 +171,8 @@ pub const Server = struct {
         self.secret = config.secret;
         self.public_key = X25519.recoverPublicKey(config.secret);
         self.client_kind = config.client_kind;
+        self.client_kind_also = config.client_kind_also;
+        if (config.client_kind_also) |also| assert(also != config.client_kind);
         self.identity_lengths = @splat(0);
         for (certificates, 0..) |certificate, index| {
             assert(certificate.len > 0);
@@ -182,6 +190,7 @@ pub const Server = struct {
         self.leaf_key = @splat(0);
         self.peer_kind = config.client_kind;
         self.peer_name_length = 0;
+        self.peer_scope = null;
         self.authenticated = false;
         self.record_length = 0;
         self.record_total = 0;
@@ -210,7 +219,11 @@ pub const Server = struct {
     pub fn peer(self: *const Server) ?Peer {
         if (self.state != .connected) return null;
         if (!self.authenticated) return null;
-        return .{ .kind = self.peer_kind, .name = self.peer_name[0..self.peer_name_length] };
+        return .{
+            .kind = self.peer_kind,
+            .name = self.peer_name[0..self.peer_name_length],
+            .scope = self.peer_scope,
+        };
     }
 
     /// How many more bytes complete the record being read: 0 once the connection is over.
@@ -691,6 +704,7 @@ pub const Server = struct {
         @memcpy(self.peer_name[0..name.len], name);
         self.peer_name_length = @intCast(name.len);
         self.peer_kind = parsed.kind;
+        self.peer_scope = if (parsed.kind == .client) parsed.scope(chain.leaf) else null;
         if (!fault_on(.transcript_client_auth)) self.transcript.add(message);
         self.state = .wait_certificate_verify;
     }
@@ -702,7 +716,8 @@ pub const Server = struct {
         leaf: []const u8,
         detail: *x509.Detail,
     ) x509.Error!x509.Parsed {
-        const expect: x509.Expect = .{ .kind = self.client_kind, .name = null };
+        const kind = self.expected_kind(leaf);
+        const expect: x509.Expect = .{ .kind = kind, .name = null };
         const now = self.now_ms;
         const parsed = x509.verify_detailed(leaf, self.anchor, now, expect, detail) catch |err| {
             if (fault_on(.client_chain)) return x509.parse(leaf);
@@ -710,9 +725,18 @@ pub const Server = struct {
             return err;
         };
         if (!fault_on(.client_kind)) {
-            if (!fault_on(.client_chain)) assert(parsed.kind == self.client_kind);
+            if (!fault_on(.client_chain)) assert(parsed.kind == kind);
         }
         return parsed;
+    }
+
+    /// The kind the leaf is checked against: the second kind when it parses as that kind, else
+    /// the first (so a certificate of neither is refused as the wrong use of the first).
+    fn expected_kind(self: *const Server, leaf: []const u8) x509.Kind {
+        const also = self.client_kind_also orelse return self.client_kind;
+        const parsed = x509.parse(leaf) catch return self.client_kind;
+        if (parsed.kind == also) return also;
+        return self.client_kind;
     }
 
     fn fail_no_certificate(self: *Server, diag: *Diag) Error {
