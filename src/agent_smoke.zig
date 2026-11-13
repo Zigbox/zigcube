@@ -1054,7 +1054,7 @@ fn bypass_at_server(smoke: *Smoke, jobs: []const inject.Job) !void {
         try smoke.expect(
             reply.status == 403 and inject.body_refuses(arena, reply.body, case.words()),
             "POST /v1/jobs {s} answered {d}, expected 403 with ZBX-E0905 saying \"{s}\": {s}",
-            .{ job.name, reply.status, case.words(), reply.body },
+            .{ job.name, reply.status, case.words(), reply.body[0..@min(reply.body.len, 300)] },
         );
         const after = try job_now(smoke, job.name);
         try smoke.expect(after.state.len == 0, "the refused {s} was stored", .{job.name});
