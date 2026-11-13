@@ -12,6 +12,11 @@
 //! **Idempotency.** The same spec under the same name is a no-op that returns the job; a
 //! different one is ZC-E0131. The compare covers the spec fields only, never `created_at_ms`,
 //! `applied_by`, `submit_by_ms` or `cancel_requested`.
+//!
+//! **Signatures (B5).** Their shape is checked with the rest of the body; under the server's
+//! trust policy, a new job is judged (`job_trust.admit`) after the lookup and the expiry and
+//! before admission writes anything, so a refused job (`refused`, ZBX-E0905) leaves no trace and a
+//! retry of a stored job keeps the answer it had.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -22,6 +27,7 @@ const evidence = @import("evidence.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 const apply_mod = @import("apply.zig");
+const job_trust = @import("job_trust.zig");
 
 const Context = controller.Context;
 
@@ -49,6 +55,10 @@ pub const Input = struct {
     relay: ?[]const u8 = null,
     /// The server's relay table, from its configuration: what `relay` is resolved against.
     relays: []const records.JobRelay = &.{},
+    /// The job's signatures (B5): DSSE envelopes, each one line of `zbx trust export`.
+    signatures: []const []const u8 = &.{},
+    /// The server's trust policy, from its configuration: null checks nothing (`job_trust.zig`).
+    trust: ?*const job_trust.Trust = null,
     /// The request named a `placement`: refused, it is not built yet.
     placement: bool = false,
     applied_by: []const u8,
@@ -68,6 +78,9 @@ pub const CreateResult = union(enum) {
     same: records.Job,
     /// The admission record or the name changed while this was made; nothing was written.
     conflict,
+    /// No signature the server's policy trusts covers the job (B5): ZBX-E0905 or E0906, in the
+    /// arena. Nothing was written; the API answers 403.
+    refused: *const job_trust.Diagnostic,
 };
 
 fn no_memory(diag: *@import("diag.zig").Diag) controller.Error {
@@ -368,6 +381,10 @@ fn validate_shape(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     try validate_labels(ctx, input);
     if (input.retries > 0) return not_built(ctx, "retries");
     try validate_relay(ctx, input);
+    var problem_buffer: [job_trust.problem_bytes_max]u8 = undefined;
+    if (job_trust.shape_problem(&problem_buffer, input.signatures)) |problem| {
+        return refuse(ctx, "signatures", "{s}", .{problem});
+    }
     if (input.placement) return not_built(ctx, "placement");
     try validate_times(ctx, input, now_ms);
     try validate_input(ctx, input);
@@ -413,6 +430,7 @@ pub fn run_of(job: *const records.Job, id: []const u8) records.JobRun {
         .input_digest = job.input_digest,
         .input_bytes = job.input_bytes,
         .relay = job.relay,
+        .signatures = job.signatures,
         .start_by_ms = job.created_at_ms + job.deadline_ms,
         .created_at_ms = job.created_at_ms,
         .stop = .{ .cause = .not_started, .at_ms = std.math.maxInt(u64) },
@@ -433,6 +451,7 @@ fn check_run_size(ctx: *const Context, job: *const records.Job) Error!void {
         .{ .name = "labels", .bytes = try json_bytes(ctx, job.labels) },
         .{ .name = "source", .bytes = try json_bytes(ctx, job.source) },
         .{ .name = "image", .bytes = try json_bytes(ctx, job.image) },
+        .{ .name = "signatures", .bytes = try json_bytes(ctx, job.signatures) },
     };
     var biggest = members[0];
     for (members[1..]) |member| {
@@ -466,6 +485,7 @@ fn spec_equal(old: *const records.Job, new: *const records.Job) bool {
     const old_relay: ?[]const u8 = if (old.relay) |r| r.name else null;
     const new_relay: ?[]const u8 = if (new.relay) |r| r.name else null;
     if (!optional_equal(old_relay, new_relay)) return false;
+    if (!strings_equal(old.signatures orelse &.{}, new.signatures orelse &.{})) return false;
     return optional_equal(old.input_digest, new.input_digest);
 }
 
@@ -594,6 +614,8 @@ pub fn create(
         .input_digest = digest,
         .input_bytes = if (input.input) |text| text.len else null,
         .relay = resolve_relay(input),
+        // Absent when there are none, so a job without them encodes as before B5.
+        .signatures = if (input.signatures.len > 0) input.signatures else null,
         .submit_by_ms = input.submit_by_ms,
         .created_at_ms = now_ms,
         .applied_by = input.applied_by,
@@ -622,6 +644,20 @@ pub fn create(
         return different(ctx, input.name);
     }
     if (now_ms > input.submit_by_ms) return expired(ctx, input.name, input.submit_by_ms, now_ms);
+    // Only a job that would be created is judged: a retry of one that exists keeps its answer.
+    if (input.trust) |config| {
+        const admission = job_trust.admit(config, ctx.arena, .{
+            .image = input.image,
+            .source = input.source,
+            .signatures = input.signatures,
+        }) catch return no_memory(ctx.diag);
+        switch (admission) {
+            .admitted => {},
+            .malformed => |number| return refuse(ctx, "signatures", "envelope {d} is not a " ++
+                "DSSE envelope zbx reads (one line of zbx trust export)", .{number}),
+            .refused => |diagnostic| return .{ .refused = diagnostic },
+        }
+    }
     return admit(ctx, source, input, job, key);
 }
 

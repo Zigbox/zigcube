@@ -962,8 +962,16 @@ pub const job_input_bytes_max: u32 = 64 * 1024;
 /// The body of `POST /v1/jobs` only; every other route keeps `api_request_bytes_max`. Six times
 /// the input (every byte a control character escaped as `\u00XX`) plus 16 KiB for the other
 /// fields, so every input that meets `job_input_bytes_max` is accepted however the client escapes
-/// it (docs/decisions/2026-11-05-b1-job-input-wire-size-answer.md, option B).
-pub const job_request_bytes_max: u32 = 6 * job_input_bytes_max + 16 * 1024;
+/// it (docs/decisions/2026-11-05-b1-job-input-wire-size-answer.md, option B), plus twice the
+/// signatures (B5: an envelope is printable ASCII, so escaping at most doubles it).
+pub const job_request_bytes_max: u32 =
+    6 * job_input_bytes_max + 16 * 1024 + 2 * job_signatures_max * job_signature_bytes_max;
+/// The signatures of a job (B5): DSSE envelopes, each one line of `zbx trust export`. Stricter
+/// than Zigbox's own bounds (`zigbox.trust.limits`, checked in `job_trust.zig`): an envelope
+/// with a provenance statement is larger than this, and a job carries tree and manifest
+/// signatures only (docs/decisions/2026-11-13-b5-signature-bounds.md).
+pub const job_signatures_max: u32 = 4;
+pub const job_signature_bytes_max: u32 = 2048;
 pub const job_command_words_max: u32 = runtime_command_words_max;
 /// The name of the variable a job's input is given in (`input_env`).
 pub const job_input_env_bytes_max: u32 = 64;

@@ -35,6 +35,7 @@ const codes = @import("diag/codes.zig");
 const agent_api = @import("agent_api.zig");
 const apply_mod = @import("apply.zig");
 const job_api = @import("job_api.zig");
+const job_trust = @import("job_trust.zig");
 const constants = @import("constants.zig");
 const accounting = @import("allocations.zig");
 const controller = @import("controller.zig");
@@ -102,6 +103,9 @@ pub const Api = struct {
     /// The relays the server's configuration names (B3): what a job's `relay` is resolved against
     /// at admission. The memory behind it outlives the server.
     relays: []const records.JobRelay = &.{},
+    /// The trust policy of the server's configuration (B5), checked at `POST /v1/jobs`; null
+    /// checks nothing. Its scratch is used by one write at a time.
+    trust: ?*const job_trust.Trust = null,
     /// Names the decisions the write endpoints record. Its instance number is the shell's.
     source: controller.DecisionSource = .{ .instance = 0 },
     /// The server's guard against a store that went backwards, for
@@ -389,7 +393,7 @@ const RelayField = struct {
 };
 
 /// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
-/// 409,600-byte array of zeros takes about 37 times that in the arena.
+/// 425,984-byte array of zeros takes about 37 times that in the arena.
 const Present = struct {
     pub fn jsonParse(
         allocator: std.mem.Allocator,
@@ -421,6 +425,7 @@ const JobBody = struct {
     input_env: ?[]const u8 = null,
     submit_by_ms: u64,
     relay: ?RelayField = null,
+    signatures: []const []const u8 = &.{},
     placement: ?Present = null,
     applied_by: []const u8 = anonymous,
 };
@@ -445,6 +450,8 @@ const JobSpec = struct {
     input_bytes: ?u64,
     /// The name of the relay the job asked for; absent when it asked for none.
     relay: ?[]const u8,
+    /// The job's signatures (B5), as submitted; empty when it has none.
+    signatures: []const []const u8,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8,
@@ -466,6 +473,7 @@ const JobSpec = struct {
             .input_digest = job.input_digest,
             .input_bytes = job.input_bytes,
             .relay = if (job.relay) |relay| relay.name else null,
+            .signatures = job.signatures orelse &.{},
             .submit_by_ms = job.submit_by_ms,
             .created_at_ms = job.created_at_ms,
             .applied_by = job.applied_by,
@@ -500,6 +508,17 @@ fn job_reply(ctx: *const Context, status: u16, reply: JobReply) Failure!Reply {
     return done;
 }
 
+/// A job no trusted signature covers (B5): 403 with Zigbox's diagnostic, ZBX-E0905 or E0906, in
+/// the body every error has.
+fn refused_reply(ctx: *const Context, id: []const u8, diagnostic: *const Diagnostic) Failure!Reply {
+    assert(std.mem.startsWith(u8, diagnostic.code.slice(), "ZBX-E09"));
+    // The body drops the diagnostic's `docs`, so it writes a copy in the request's arena.
+    const copy = ctx.arena.create(Diagnostic) catch return no_memory(ctx);
+    copy.* = diagnostic.*;
+    const body = error_body(ctx, id, copy) catch return no_memory(ctx);
+    return .{ .status = 403, .body = body };
+}
+
 fn job_conflict(ctx: *const Context, name: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0105);
@@ -510,7 +529,7 @@ fn job_conflict(ctx: *const Context, name: []const u8) Failure {
 
 fn job_input(
     ctx: *const Context,
-    relays: []const records.JobRelay,
+    api: *const Api,
     body: []const u8,
     id: []const u8,
 ) Failure!job_api.Input {
@@ -543,7 +562,9 @@ fn job_input(
         .submit_by_ms = parsed.submit_by_ms,
         // A relay that is not a string becomes the empty name, which `job_api` refuses.
         .relay = if (parsed.relay) |field| field.name orelse "" else null,
-        .relays = relays,
+        .relays = api.relays,
+        .signatures = parsed.signatures,
+        .trust = api.trust,
         .placement = parsed.placement != null,
         .applied_by = parsed.applied_by,
         .request_id = id,
@@ -1541,7 +1562,7 @@ const Call = struct {
 
     fn job_create(call: Call, body: []const u8, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
-        const input = try job_input(ctx, call.api.relays, body, id);
+        const input = try job_input(ctx, call.api, body, id);
         for (0..apply_attempts_max) |_| {
             const result = job_api.create(ctx, &call.api.source, input) catch
                 return propagate(ctx);
@@ -1561,6 +1582,7 @@ const Call = struct {
                     .state = job_api.current_state(ctx, old.name) catch return propagate(ctx),
                 }),
                 .conflict => {},
+                .refused => |diagnostic| return refused_reply(ctx, id, diagnostic),
             }
         }
         return job_conflict(ctx, input.name);

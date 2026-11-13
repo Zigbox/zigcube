@@ -231,8 +231,13 @@ pub const registry = [_]Entry{
         .explanation =
         \\zcube-server read its configuration file and flags and found a setting
         \\it cannot use: a file that is not valid ZON, an unknown setting, a store
-        \\that is not memory, sqlite:<path> or postgres:<settings>, or a listen
-        \\address that is not host:port. The cause line names the setting.
+        \\that is not memory, sqlite:<path> or postgres:<settings>, a listen
+        \\address that is not host:port, or a `trust` entry whose policy file
+        \\cannot be read, is not a policy zbx reads (the cause names its line,
+        \\column and what is wrong), or could be rewritten by someone other than
+        \\root or the server's user (it must be a regular file owned by one of
+        \\them, writable by neither group nor others). The cause line names the
+        \\setting.
         \\
         \\Nothing was started. Correct the setting and start the server again.
         ,
@@ -537,6 +542,11 @@ pub const registry = [_]Entry{
         \\A relay must be the name of one of the relays in the server's `relays`
         \\setting; an unknown name is refused, and a job may not set ZCUBE_RELAY in
         \\its own env, because the relay's supervisor sets it.
+        \\
+        \\`signatures` holds at most 4 envelopes, each 1 to 2048 bytes of printable
+        \\ASCII: one line of `zbx trust export` each. Under the server's trust
+        \\policy, a line zbx cannot read as a DSSE envelope is refused too; a job
+        \\no trusted line covers is ZBX-E0905, not this code.
         \\
         \\Fix the field it names and submit again.
         ,

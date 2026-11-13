@@ -368,7 +368,8 @@ shared network.
 The body is the job as JSON: `name`, `image`, `command`, `deadline_ms`, `submit_by_ms` (required),
 `source`, `env` (`[["NAME","value"]]`), `limits`, `labels`, `grace_ms`, `input` (UTF-8 text, at most
 64 KiB decoded) with `input_env` (the variable it is given in), `applied_by`, `relay` (B3: the name of a relay in the
-server's `relays` setting, see "Relays" below). `retries` above 0
+server's `relays` setting, see "Relays" below), `signatures` (B5: an array of DSSE envelopes, each
+the text of one line of `zbx trust export <tree>`; see "Signatures" below). `retries` above 0
 and `placement` are refused by name (ZC-E0130, not built yet); an unknown field is `400`
 ZC-E0104. Answers `201` for a new job, `200` when a job of that name with the same spec already
 exists (spec fields only: `submit_by_ms` and `applied_by` are not compared), `409` ZC-E0131 when
@@ -376,9 +377,11 @@ it exists with another spec, `429` ZC-E0132 at `jobs_max` jobs in flight or `job
 creations in `job_admission_window_h` hours, `410` ZC-E0134 when `submit_by_ms` has passed,
 `400` ZC-E0104 for a body that does not parse, with a cause that says which way (a missing field, an unknown
 one, a value of the wrong type or a number out of range for its field, JSON that ends too soon, not JSON),
+`403` ZBX-E0905 when the server's trust policy finds no trusted signature for the job (B5, below),
 `400` ZC-E0130 naming the field for everything else, including a job whose run record would take
-more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source` and `image`
-are escaped (a control character takes six bytes in JSON).
+more than `job_run_bytes_max` (16 KiB) once its `command`, `env`, `labels`, `source`, `image` and
+`signatures` are escaped (a control character takes six bytes in JSON, and each quote in an
+envelope two).
 
 - **Idempotency.** `env` and `labels` are compared as maps, in any order; a key given twice in either
   is `400` ZC-E0130. The expiry (`submit_by_ms`) is checked after the lookup: a retry of a job that
@@ -398,12 +401,13 @@ are escaped (a control character takes six bytes in JSON).
 
 **This is the one route whose body may exceed 64 KiB.** A 64 KiB input of control characters is
 about 384 KiB of JSON, so `POST /v1/jobs` takes a body of up to `job_request_bytes_max`
-(`6 * job_input_bytes_max + 16 KiB`, 409,600 bytes); every other route keeps `http_body_bytes_max`
+(`6 * job_input_bytes_max + 16 KiB` plus twice the largest `signatures`, `2 * 4 * 2048`: 425,984
+bytes); every other route keeps `http_body_bytes_max`
 (64 KiB). A longer body is `413` ZC-E0108 and its cause names the limit of this route. The limit is
 decided on the decoded input, not the wire: an input within 64 KiB, with the rest of the job
 within 16 KiB as sent, is always stored. A body must arrive within `http_idle_timeout_ms` (10 s) of
 the request's start, so the slowest client the largest body allows is `job_request_bytes_max` over
-10 s, about 40 KB/s (40,960 bytes a second); a slower client, or one that stalls part way, is
+10 s, about 42 KB/s (42,598 bytes a second); a slower client, or one that stalls part way, is
 disconnected with no code. (`docs/decisions/2026-11-06-b1-slice-2-review-followups.md`.) The
 `state` of a `200` (same job) and of every cancel reply is the job's state now, `pending` only while
 it has no status.
@@ -456,6 +460,40 @@ the job's chain of decisions.
 | `ZC-E0132` | user | too many jobs | `429` |
 | `ZC-E0133` | user | no such job | `404` |
 | `ZC-E0134` | user | `submit_by_ms` has passed | `410` |
+| `ZBX-E0905` | user | no trusted signature covers the job (B5) | `403` |
+| `ZBX-E0906` | user | the policy's provenance requirement is not met (B5) | `403` |
+
+### Signatures (B5 slice 1)
+
+A job may carry `signatures`: at most `job_signatures_max` (4) DSSE envelopes, each 1 to
+`job_signature_bytes_max` (2048) bytes of printable ASCII, the text of one line of `zbx trust export
+<tree>`. Outside those bounds is `400` ZC-E0130 naming `signatures`, with or without a policy. They
+are kept with the job and its run (`docs/keys.md`), count toward `job_run_bytes_max`, are shown by
+`GET /v1/jobs/{name}` as submitted, and are part of the spec an idempotent resubmission compares. No
+registry is asked for signatures, and no field names a key or changes trust.
+
+The server checks them only when its configuration has `trust = .{ .policy = "<path>" }`, a Zigbox
+policy file (the format of `/etc/zbx/policy.zon`) read once at start; a file that cannot be read or
+parsed stops the server with ZC-E0106, and so does one that anyone but root or the server's own
+user could rewrite: the file must be a regular file owned by root or by that user, with neither
+group nor others allowed to write it (Zigbox's rule for its system policy; a policy others can
+rewrite gates nothing). With no `trust` entry, or a policy that asks for nothing,
+nothing is checked. Under a policy that asks for a signature, a new job (not a retry of a stored one)
+is judged with Zigbox's `verdict.judge` before anything is written. The subject is the job's `image`,
+which must then be a tree (`b3:` and 64 hex digits), and, when the job has a `source`, the manifest
+digest that `source` is pinned to: a tree-only signature counts for any job of the tree, a
+manifest-bound one only for a job pulled from that manifest. A job no trusted line covers is `403`
+with Zigbox's `ZBX-E0905`, its cause listing each line and why it does not count (`ZBX-E0906` when
+the policy's provenance requirement is not met); nothing is created. Under a policy, a line Zigbox
+cannot read as an envelope is `400` ZC-E0130 naming it.
+
+The policy judges admission only. Jobs stored before the policy was set, or before it changed, are
+not judged again: they are placed and run as they are, and a resubmission of one with the same spec
+answers `200` without being judged, which does not mean the policy accepted it. The file is read
+once at start, so a key removed from it still counts until the server restarts, and a stored job
+signed by that key still runs. When turning the policy on or tightening it, drain or cancel the
+jobs already stored (`GET /v1/jobs?state=pending`, `POST /v1/jobs/{name}/cancel`). Until the
+node's own check lands (B5 slice 2), admission is the only check.
 
 ### Relays (B3 slice 2)
 
