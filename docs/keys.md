@@ -188,6 +188,11 @@ next apply that writes history, as far as its transaction has room (the rest by 
 is never offered meanwhile. So a rollback cannot restore a deleted service's spec, nor one from
 before a downgrade.
 
+**Seeding.** When the service's own generation has no record of its own (a service applied
+before C3, or last applied by an older build), the apply that writes the next generation also
+writes one for it, copied from the service record as stored, with `applied_at_ms` 0 (not
+known). So after an upgrade the first new generation can always be rolled back to the one before.
+
 `env` values are secrets here as in the service: the API never sends them to a read-only token
 (docs/api.md item 8).
 

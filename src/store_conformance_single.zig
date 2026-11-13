@@ -1659,22 +1659,36 @@ test "history: what an older build left is never offered and the next apply drop
     try testing.expectEqual(@as(u64, 3), try history_apply(&ctx, &source, "b3:00000013"));
 
     // (2) Deleted and applied again by an older build, at generations the old records also
-    // have: none of them is usable, and this build's next apply drops them.
+    // have: none of them is usable, and this build's next apply drops them and seeds the
+    // generation the older build left running from the service record.
     try older_build_delete(&ctx);
     try older_build_write(&ctx, 1, "b3:0000000a");
     try older_build_write(&ctx, 2, "b3:0000000b");
     try testing.expectEqual(@as(usize, 0), (try usable_generations(&ctx)).len);
     try testing.expectEqual(@as(u64, 3), try history_apply(&ctx, &source, "b3:0000000c"));
-    try testing.expectEqualSlices(u64, &.{3}, try usable_generations(&ctx));
-    try testing.expectEqual(@as(usize, 1), (try history.stored(&ctx, "hello")).len);
+    try testing.expectEqualSlices(u64, &.{ 2, 3 }, try usable_generations(&ctx));
+    try testing.expectEqual(@as(usize, 2), (try history.stored(&ctx, "hello")).len);
+    try expect_seed(&ctx, 2, "b3:0000000b");
 
-    // (3) A downgrade that applied generations: what came before the gap is dropped.
+    // (3) A downgrade that applied generations: what came before the gap is dropped, and the
+    // generation the older build applied last is seeded.
     try testing.expectEqual(@as(u64, 4), try history_apply(&ctx, &source, "b3:0000000d"));
     try older_build_write(&ctx, 5, "b3:0000000e");
     try testing.expectEqual(@as(usize, 0), (try usable_generations(&ctx)).len);
     try testing.expectEqual(@as(u64, 6), try history_apply(&ctx, &source, "b3:0000000f"));
-    try testing.expectEqualSlices(u64, &.{6}, try usable_generations(&ctx));
-    try testing.expectEqual(@as(usize, 1), (try history.stored(&ctx, "hello")).len);
+    try testing.expectEqualSlices(u64, &.{ 5, 6 }, try usable_generations(&ctx));
+    try testing.expectEqual(@as(usize, 2), (try history.stored(&ctx, "hello")).len);
+    try expect_seed(&ctx, 5, "b3:0000000e");
+}
+
+/// The history record at `generation` is a seed: the spec of `image`, applied at an unknown time.
+fn expect_seed(ctx: *const controller.Context, generation: u64, image: []const u8) !void {
+    const key = records.history_key("hello", generation);
+    const kv = (try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag)).kv.?;
+    const record = try records.read(records.History, ctx.arena, kv, ctx.diag);
+    try testing.expectEqualStrings(image, record.image);
+    try testing.expectEqual(@as(u64, 0), record.applied_at_ms);
+    try testing.expectEqual(records.HistoryReason.apply, record.reason);
 }
 
 /// A version 2 observation as a C2 agent wrote it, from `src/testdata/b3_store.txt`.

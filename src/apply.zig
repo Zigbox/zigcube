@@ -141,10 +141,18 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         true;
     if (new_generation) {
         const record = records.history_of(&service, ctx.clock.now_ms());
-        const owner: ?history.Owner = if (planned.existing) |old| .{
-            .create_revision = planned.create_revision,
-            .generation = old.generation,
-        } else null;
+        var seed: records.History = undefined;
+        var owner: ?history.Owner = null;
+        if (planned.existing) |*old| {
+            // When the old generation was applied is not stored: its seed says 0, unknown. A
+            // record no build writes, generation 0, has nothing to seed.
+            if (old.generation > 0) seed = records.history_of(old, 0);
+            owner = .{
+                .create_revision = planned.create_revision,
+                .generation = old.generation,
+                .seed = if (old.generation > 0) &seed else null,
+            };
+        }
         try history.put(ctx, &batch, &record, owner);
     }
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{

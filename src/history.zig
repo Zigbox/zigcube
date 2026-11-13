@@ -18,8 +18,15 @@ pub const Error = controller.Error;
 pub const Stored = struct { generation: u64, key: []const u8, mod_revision: store.Revision };
 
 /// The service a history belongs to, as stored now: its key's `create_revision` and the generation
-/// it runs.
-pub const Owner = struct { create_revision: store.Revision, generation: u64 };
+/// it runs. `seed` is the record of that generation, built from the stored service, which `put`
+/// writes when the generation has no usable record: a service applied before C3 (or by an older
+/// build after a downgrade) has none, and without it the first rollback after the upgrade would
+/// have nothing to go back to.
+pub const Owner = struct {
+    create_revision: store.Revision,
+    generation: u64,
+    seed: ?*const records.History = null,
+};
 
 /// The history keys of `service`, ascending by generation (keys sort bytewise, so "10" comes
 /// before "2": they are sorted here). A key under the prefix that names no generation is left
@@ -104,12 +111,16 @@ fn is_usable(entry: Stored, owner: Owner, low: ?u64) bool {
     return entry.generation >= from and entry.generation <= owner.generation;
 }
 
-/// Adds `record` to `batch`, deletes every stored record `usable` would not give `owner` (all of
-/// them for a new service, `owner` null), then the oldest usable generations so that at most
+/// Adds `record` to `batch`, and `owner.seed` when the owner's own generation has no usable
+/// record; deletes every stored record `usable` would not give `owner` (all of them for a new
+/// service, `owner` null), then the oldest usable generations so that at most
 /// `history_generations_max` remain once it commits. A record stored at the same generation is
 /// replaced, not counted twice. Deletes beyond the batch's room are left for the next apply: the
 /// cap is a bound on growth, the newest generations are never the ones dropped, and `usable`
 /// never offers a record that is left over.
+///
+/// Every writer of `/history/` puts its records in a batch that expects the service key at the
+/// revision it read (`apply` does), so that `owner` is still the service the records join.
 pub fn put(
     ctx: *const Context,
     batch: *controller.Batch,
@@ -125,9 +136,11 @@ pub fn put(
     const key_copy = try controller.key_copy(ctx, &key);
     batch.put(key_copy, try records.encode(ctx.arena, record.*, ctx.diag));
     const low = if (owner) |service| usable_low(existing, service) else null;
-    var kept: u32 = 1;
+    const seeded = if (owner != null and low == null) try put_seed(ctx, batch, owner.?) else null;
+    var kept: u32 = if (seeded == null) 1 else 2;
     for (existing) |entry| {
         if (entry.generation == record.generation) continue; // Replaced by the put.
+        if (seeded == entry.generation) continue; // Replaced by the seed.
         if (owner != null and is_usable(entry, owner.?, low)) {
             kept += 1;
             continue;
@@ -143,6 +156,17 @@ pub fn put(
         batch.delete(entry.key);
         excess -= 1;
     }
+}
+
+/// Puts `owner.seed`, if any, and returns its generation.
+fn put_seed(ctx: *const Context, batch: *controller.Batch, owner: Owner) Error!?u64 {
+    const seed = owner.seed orelse return null;
+    assert(seed.generation == owner.generation);
+    assert(batch.has_room(1));
+    const key = records.history_key(seed.service, seed.generation);
+    const key_copy = try controller.key_copy(ctx, &key);
+    batch.put(key_copy, try records.encode(ctx.arena, seed.*, ctx.diag));
+    return seed.generation;
 }
 
 /// Whether `batch` can take one more delete and still the decision the caller adds after it.
