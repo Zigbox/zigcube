@@ -72,6 +72,7 @@ pub const modules = .{
     @import("sim_runtime.zig"),
     @import("sim_store.zig"),
     @import("sim_tap.zig"),
+    @import("sim_trust.zig"),
     @import("sim_world.zig"),
     @import("store.zig"),
     @import("store_failures.zig"),

@@ -171,6 +171,12 @@ for runner in sim_c1_teeth_wedge sim_swarm_teeth; do
 done
 [ "$(kind_shrink sim-c1)" = --shrink ] || fail "a worker of another kind lost --shrink"
 
+# The sim-c1 workers run the signed world (B5 slice 3); a canary of kind sim-c1 does not.
+case_name="signed"
+[ "$(kind_flags sim-c1)" = "--c1 --signed --profile=auto" ] || fail "sim-c1 lost --signed"
+flags=$(canary_kind=sim-c1 canary_ops="" && kind_flags sim-canary)
+[ "$flags" = "--c1 --profile=auto" ] || fail "a canary of kind sim-c1 ran with: $flags"
+
 # A hang is filed as a crash without the seed or the replay in its text (they are in the log);
 # a memory kill is the host's: NOT RUN, counted, never filed, tried again, then given up on.
 case_name="hang"

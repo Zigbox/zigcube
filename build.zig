@@ -1367,6 +1367,16 @@ const c1_teeth_roots = [_]struct {
         .ops = 300,
     },
     .{
+        .name = "job_untrusted",
+        .root = "src/sim_c1_teeth_job_untrusted_main.zig",
+        // J12 (a run started that its node's trust policy refuses); signed jobs and node
+        // policies exist only in the signed world, which the tooth switches on. Plain runs (no
+        // `--c1`) judge J12 too.
+        .symptom = "J12",
+        .canary_seeds = 10,
+        .plain_symptom = "J12",
+    },
+    .{
         .name = "job_evicted",
         .root = "src/sim_c1_teeth_job_evicted_main.zig",
         // With #202 fixed (agents arm a run's deadline when it starts), the second clause is hit
@@ -1402,7 +1412,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 23 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 24 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1417,25 +1427,13 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     b.step("sim-c1-exe", "Install the native sim-c1 runner (sim_cluster --c1)")
         .dependOn(&install.step);
     const nodes = b.option(u32, "c1-nodes", "Nodes of sim-c1 (default: the seed picks)") orelse 0;
-    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
-    const ops_text = ops_argument(b, sim);
     const nodes_text = b.fmt("{d}", .{if (sim.auto_shape) 0 else nodes});
-    const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
-    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
-    const native_report = run.captureStdOut(.{});
     const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");
-    for (v8_modes) |mode| {
-        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
-        node.addFileArg(b.path("tools/wasm_check.mjs"));
-        node.addArg("--sim-c1");
-        node.addFileArg(sim.library.getEmittedBin());
-        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
-        node.addFileArg(native_report);
-        step.dependOn(&node.step);
-    }
+    // The seed twice: as it always ran, and in B5's trust world (`--signed`, J12).
+    add_c1_comparison(b, sim, exe, step, nodes_text, false);
+    add_c1_comparison(b, sim, exe, step, nodes_text, true);
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 23 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 24 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),
@@ -1467,9 +1465,39 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
+    add_signed_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
+}
+
+/// One sim-c1 seed run natively and under both V8 compilers as WASM, the reports compared byte
+/// for byte; `signed` adds `--signed` to both.
+fn add_c1_comparison(
+    b: *std.Build,
+    sim: SimStepOptions,
+    exe: *std.Build.Step.Compile,
+    step: *std.Build.Step,
+    nodes_text: []const u8,
+    signed: bool,
+) void {
+    const seed_text = b.fmt("{d}", .{sim.seed orelse 1});
+    const ops_text = ops_argument(b, sim);
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
+    run.addArg(b.fmt("--profile={s}", .{sim.profile}));
+    if (signed) run.addArg("--signed");
+    const native_report = run.captureStdOut(.{});
+    for (v8_modes) |mode| {
+        const node = b.addSystemCommand(&.{ "node", "--no-warnings", mode });
+        node.addFileArg(b.path("tools/wasm_check.mjs"));
+        node.addArg("--sim-c1");
+        node.addFileArg(sim.library.getEmittedBin());
+        node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
+        node.addFileArg(native_report);
+        if (signed) node.addArg("--signed");
+        step.dependOn(&node.step);
+    }
 }
 
 /// The same fault in a plain run (no `--c1`): the job checks need no per-revision tap.
@@ -1749,6 +1777,29 @@ fn add_reuse_step(b: *std.Build, sim: SimStepOptions) void {
     run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{reuse_seeds_max}), "300", "--c1" });
     run.expectExitCode(0);
     b.step("sim-c1-reuse", "Run sim-c1 in the job_reuse world with the agent right (J11 holds)")
+        .dependOn(&run.step);
+}
+
+/// The seeds of `sim-c1-signed` (B5 slice 3).
+const signed_seeds_max = 20;
+
+/// `zig build sim-c1-signed`: B5's trust world (`--signed`: signed jobs, node policies, J12) at
+/// shapes and profiles drawn from the seed; no seed of 1 to `signed_seeds_max` may fail.
+fn add_signed_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_signed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{signed_seeds_max}), "auto", "--c1" });
+    run.addArgs(&.{ "--signed", "--profile=auto" });
+    run.expectExitCode(0);
+    b.step("sim-c1-signed", "Run sim-c1 in the signed-jobs world, 20 seeds (J12 holds)")
         .dependOn(&run.step);
 }
 

@@ -53,6 +53,7 @@ const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
 const sim_store = @import("sim_store.zig");
 const sim_tap = @import("sim_tap.zig");
+const sim_trust = @import("sim_trust.zig");
 const sim_world = @import("sim_world.zig");
 const job_api = @import("job_api.zig");
 const job_retention = @import("job_retention.zig");
@@ -144,6 +145,8 @@ const sim_relays = [_]records.JobRelay{.{ .name = "sim-relay", .address = "127.0
 const next_digest = "b3:9d20c4f1";
 const broken_digest = "b3:00ff" ++ repeat('0', 55).* ++ "e1";
 const fixtures = [_][]const u8{ hello_digest, next_digest };
+/// The signed world's nodes also hold its jobs' image, a tree (`sim_trust.image`).
+const signed_fixtures = [_][]const u8{ hello_digest, next_digest, sim_trust.image };
 const images = [_][]const u8{ hello_digest, next_digest, broken_digest };
 const service_names = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
 
@@ -163,7 +166,7 @@ pub const Report = struct {
         return report.bytes[0..report.len];
     }
 
-    fn print(report: *Report, comptime format: []const u8, args: anytype) void {
+    pub fn print(report: *Report, comptime format: []const u8, args: anytype) void {
         var writer = std.Io.Writer.fixed(report.bytes[report.len..]);
         writer.print(format, args) catch {}; // What does not fit is dropped.
         report.len += @intCast(writer.buffered().len);
@@ -460,6 +463,7 @@ const Node = struct {
             .node = node.name(),
             .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
             .address = "10.0.0.5:7070",
+            .trust = if (node.cluster.trust) |world| world.config_of(node.index) else null,
         };
     }
 
@@ -880,6 +884,8 @@ pub const Cluster = struct {
     strong: bool,
     /// The host crashes injected so far (the wipe takes every other one, from the first).
     host_crashes: u32,
+    /// `Options.signed` (or the `job_untrusted` tooth): signed jobs, node policies and J12.
+    trust: ?*sim_trust.World,
 
     pub fn create(
         gpa: Allocator,
@@ -943,12 +949,23 @@ pub const Cluster = struct {
         c.init_reuse();
         c.strong = options.strong or c1_teeth.strong_world;
         c.host_crashes = 0;
+        try c.init_trust(gpa, seed, options.signed or c1_teeth.signed_world);
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// B5's trust world (`Options.signed`): keys, policies and signed jobs drawn from the seed.
+    fn init_trust(c: *Cluster, gpa: Allocator, seed: u64, signed: bool) Allocator.Error!void {
+        c.trust = null;
+        if (!signed) return;
+        const world = try gpa.create(sim_trust.World);
+        errdefer gpa.destroy(world);
+        try world.init(gpa, seed, c.swarm.nodes);
+        c.trust = world;
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -1011,19 +1028,20 @@ pub const Cluster = struct {
             if (skewed) -skew_ppm else ppm,
             if (skewed) skew_beyond_ppm else @max(c.swarm.clock_ppm, 1),
         );
-        node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
+        const held: []const []const u8 = if (c.trust == null) &fixtures else &signed_fixtures;
+        node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, held);
         node.sim.containers.on_start = job_started;
         node.sim.containers.on_start_context = node;
         node.agent.init(node.config());
         // Its own generator: the store's contents must not move the cluster's stream.
         var store_prng = std.Random.DefaultPrng.init(c.seed ^ (0x5f5f0000 + index));
-        var held: usize = 0;
+        var stored: usize = 0;
         for (images) |digest| {
             if (!store_prng.random().boolean()) continue;
-            node.store_digests[held] = digest;
-            held += 1;
+            node.store_digests[stored] = digest;
+            stored += 1;
         }
-        node.store_images = .{ .digests = node.store_digests[0..held] };
+        node.store_images = .{ .digests = node.store_digests[0..stored] };
         node.loop = agent_loop.Loop.init();
         node.remote = agent_client.RemoteStore.init(c.gpa, node.transport(), node.name());
         node.diag.reset();
@@ -1069,6 +1087,10 @@ pub const Cluster = struct {
             gpa.destroy(node);
         }
         gpa.free(c.nodes);
+        if (c.trust) |world| {
+            world.deinit(gpa);
+            gpa.destroy(world);
+        }
         c.net.deinit();
         c.tap_arena.deinit();
         c.recorder.deinit();
@@ -1609,9 +1631,16 @@ pub const Cluster = struct {
             10_000
         else
             40_000;
+        // The signed world: the job's image is a tree, and its lines a function of its number.
+        var lines_buffer: [sim_trust.lines_max][]const u8 = undefined;
+        const lines: []const []const u8 = if (c.trust) |world|
+            world.lines_of(number, &lines_buffer)
+        else
+            &.{};
         _ = job_api.create(&ctx, &c.api_source, .{
             .name = name,
-            .image = hello_digest,
+            .image = if (c.trust == null) hello_digest else sim_trust.image,
+            .signatures = lines,
             .command = &.{ "sh", "-c", "while true; do sleep 1; done" },
             .limits = .{
                 .cpu_millis = if (unplaceable) 100_000 else 10,
@@ -1754,6 +1783,10 @@ fn job_started(context: *anyopaque, spec: *const runtime.Spec) void {
         else
             "";
         if (!std.mem.eql(u8, spec.relay, want)) c.relay_spec_wrong = true;
+        // J12: the node's policy admits the run it starts.
+        if (c.trust) |world| {
+            if (job_number(job)) |number| world.note_start(node.index, number);
+        }
     }
     const hash = std.hash.Wyhash.hash(0, spec.name);
     assert(hash != 0);
@@ -1782,6 +1815,7 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
         const txn = request orelse return;
         _ = c.tap_arena.reset(.retain_capacity);
         sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
+        if (c.trust) |world| world.note_commit(txn, c.tap_arena.allocator());
         return;
     }
     c.c1_revisions += 1;
@@ -1798,6 +1832,7 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
     if (request) |txn| {
         if (c.jobs_on) {
             sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
+            if (c.trust) |world| world.note_commit(txn, c.tap_arena.allocator());
         }
     }
     if (c.c1_violation != null) return;
@@ -2569,6 +2604,10 @@ fn track_jobs(c: *Cluster) Failure!void {
     if (!c.jobs_on) return;
     try check(c, c.jobs.violation == null, c.jobs.violation orelse "");
     try check(c, c.jobs_watch.violation == null, c.jobs_watch.violation orelse "");
+    if (c.trust) |world| {
+        const found = world.problem();
+        try check(c, found == null, found orelse "");
+    }
     try track_relays(c);
     const ledger_found = sim_jobs.ledger_problem(&c.jobs);
     try check(c, ledger_found == null, ledger_found orelse "");
@@ -2825,6 +2864,12 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
             const late = run.start_by_ms + run.deadline_ms + run.grace_ms + 30_000;
             try check(c, c.manual.ms <= late, "J8: a run is still open long after its deadline");
             continue;
+        }
+        if (c.trust) |world| {
+            if (job_number(run.job)) |number| {
+                const found = world.judge_at_rest(number, status);
+                try check(c, found == null, found orelse "");
+            }
         }
         for (c.nodes) |node| {
             for (node.sim.containers.containers.items) |container| {
@@ -3091,6 +3136,10 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// B5 slice 3: jobs carry signatures from a seeded set of keys, each node runs under a trust
+    /// policy of its own, and J12 is checked (`sim_trust.zig`). Off, a run is the world it was
+    /// before B5, bit for bit. The fleet's sim-c1 kind asks for it (`--signed`).
+    signed: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3452,6 +3501,7 @@ fn print_jobs(c: *Cluster) void {
             c.reuse_jumps, c.reuse_cursor.dropped, c.reuse_made, c.reuse_met,
         });
     }
+    if (c.trust) |world| world.print(c.report);
     if (c.strong) {
         var opened: u32 = 0;
         var closed: u32 = 0;

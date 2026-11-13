@@ -830,6 +830,7 @@ const Work = struct {
         run: *const records.JobRun,
     ) Error!bool {
         const trust = work.agent.config.trust orelse return false;
+        if (c1_teeth.job_untrusted) return false; // Test-only: the node judges nothing (J12).
         const ctx = work.ctx;
         const judged = job_trust.judge_run(trust, ctx.arena, .{
             .image = run.image,

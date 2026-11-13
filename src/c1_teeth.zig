@@ -135,8 +135,17 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
 
+/// The agent starts every run its node's trust policy refuses: `refused_by_trust` judges
+/// nothing (must break J12: no run its node's policy refuses ever starts; B5 slice 3). Needs the
+/// signed world (`Options.signed`).
+pub const job_untrusted = declared("c1_teeth_job_untrusted");
+
+/// The teeth whose fault needs the signed world.
+pub const signed_world = job_untrusted;
+
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
+    job_untrusted;
