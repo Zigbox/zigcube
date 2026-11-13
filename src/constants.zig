@@ -139,9 +139,11 @@ pub const fence_stop_ms: u32 = 2000;
 /// The bound on the difference of two hosts' clock rates, in parts per thousand (1 %).
 pub const clock_skew_per_mille: u32 = 10;
 /// The latest an agent's step may begin after the time it was due to fence or to kill, on its own
-/// clock (authority.md §3, assumption 4; #238 finding 4). An agent that finds itself later than
-/// this fences at once, so a lag counts against the margin only up to the bound. 500 ms is half
-/// of `agent_resync_ms`: a host that stalls its agent longer is not one the margin can promise for.
+/// clock (authority.md §3, assumption 4; #238 finding 4). This is an assumption about the host,
+/// not something the agent enforces: only lag on the KILL step adds overlap, and a KILL step that
+/// begins late sends KILL late by all of it. The agent detects a lag past the bound (it kills at
+/// once, counts `lag_kills` and says so) but cannot undo it. 500 ms is half of
+/// `agent_resync_ms`: a host that stalls its agent longer is not one the margin can promise for.
 pub const agent_step_lag_max_ms: u32 = 500;
 /// The most the store's clock may step forward at once (authority.md §3, assumption 3; #238
 /// finding 3). Lease deadlines are absolute values on the store's clock, so a forward step ends

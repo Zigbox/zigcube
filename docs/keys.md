@@ -180,8 +180,10 @@ beside `/nodes/<node>` and at the same revision, but **not** bound to the lease,
 node controller compares it with the tenure `/node-status/<node>` judged: a newer one is a tenure
 that ended unjudged, which it marks `lost` with a grace of its own (`authority.md` §3). A
 placement on the strength of an absent `/nodes/<node>` compares this key at the revision it read.
-The body carries nothing a reader needs; the revision is the fact. Lifetime: until the node is
-removed, like `/node-status/<node>`.
+The body carries nothing a reader needs; the revision is the fact. Lifetime: permanent, like
+`/node-status/<node>`: nothing removes a node yet, so no role deletes either key. Both are listed
+with a cap of `nodes_max` (64), so a cluster that has seen more distinct node names than that
+fails its controller passes with ZC-E0302; this gap predates `/node-tenure/` (#238 review).
 
 ## `/node-store/<node>`: what the node holds of the image trees (C2 slice 5)
 

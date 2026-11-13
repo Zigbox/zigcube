@@ -156,6 +156,7 @@ const Shell = struct {
         };
         const before = shell.agent.lease;
         const fences = shell.agent.fences;
+        const lag_kills = shell.agent.lag_kills;
         const refusals = shell.agent.store_refusals;
         const drops = shell.agent.pull_drops;
         const enforce_failures = shell.agent.enforce_failures;
@@ -171,6 +172,7 @@ const Shell = struct {
         // goes on to register again, which fails while the server cannot write.
         const fenced = shell.agent.fences != fences;
         if (fenced) shell.notice_fence(before);
+        if (shell.agent.lag_kills != lag_kills) shell.notice_lag_kill();
         const wake = result catch {
             const outcome: loop_mod.Outcome = .{ .failed = shell.diag.code };
             const report = shell.policy.step_done(shell.clock.now_ms(), outcome);
@@ -325,6 +327,14 @@ const Shell = struct {
         var buffer: [320]u8 = undefined;
         const line = dropped_pull_line(&buffer, count, shell.agent.pull_drop()) orelse return;
         std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {};
+    }
+
+    /// A fence step began later than the step lag authority.md §3 assumes (#238): its
+    /// containers were killed at once. Only detected: the lag already ate into the margin.
+    fn notice_lag_kill(shell: *Shell) void {
+        var buffer: [200]u8 = undefined;
+        const line = lag_kill_line(&buffer, shell.agent.lag_last_ms) orelse return;
+        std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
     }
 
     /// The agent fenced itself (ZC-W0501): its containers were stopped, and it registers again.
@@ -900,6 +910,21 @@ test "Swarm finds the Zigbox store from the environment, making it if absent" {
 }
 
 /// The ZC-W0504 line for `count` dropped pull records, the last described by `last`.
+fn lag_kill_line(buffer: []u8, lag_ms: u64) ?[]const u8 {
+    const text = "zcube-agent: a fence step began {d} ms late, past the {d} ms lag the lease " ++
+        "margin allows; the containers were killed at once (authority.md section 3)\n";
+    return std.fmt.bufPrint(buffer, text, .{ lag_ms, constants.agent_step_lag_max_ms }) catch
+        null;
+}
+
+test "the lag kill line names the lag and the bound" {
+    var buffer: [200]u8 = undefined;
+    const line = lag_kill_line(&buffer, 812).?;
+    const want = "zcube-agent: a fence step began 812 ms late, past the 500 ms lag the lease " ++
+        "margin allows; the containers were killed at once (authority.md section 3)\n";
+    try std.testing.expectEqualStrings(want, line);
+}
+
 fn dropped_pull_line(buffer: []u8, count: u32, last: []const u8) ?[]const u8 {
     const text = "zcube-agent: ZC-W0504: {d} pull record(s) not stored, the last: {s}; " ++
         "the replicas are not affected\n";

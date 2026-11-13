@@ -56,9 +56,19 @@ alternative:
 
 Either way, the change is user-visible. A server configured with `--lease-ttl-ms` between 8,000
 and 8,999 is refused at start with ZC-E0121, and an agent granted such a ttl by an older server
-fences and reports ZC-E0121. **Upgrade order:** raise the server's ttl to 9,000 ms or more (old
-binaries accept it), let every agent renew under it, then upgrade. The demo's
-`--lease-ttl-ms 8000` became 9000.
+fences and reports ZC-E0121. The demo's `--lease-ttl-ms 8000` became 9000. The supervisor kept
+the 9,000 ms floor (`2026-11-13-ttl-floor-9000.md`, which supersedes the 8,000 ms floor of
+`2026-11-06-renewal-before-fence.md`).
+
+**Upgrade order:**
+
+1. Raise any ttl below 9,000 ms to 9,000 or more. Old binaries accept it; let every agent renew
+   under it.
+2. Upgrade the server. From here every registration writes `/node-tenure/<node>`, old agents'
+   included, so finding 2 is closed for the whole cluster.
+3. Upgrade the agents. Until a node's agent is upgraded it fences at `ttl - 3 s` without the
+   step-lag check, so findings 3 and 4 stay open on that node: the new inequality, with its
+   step-lag and clock-step terms, holds only for upgraded agents.
 
 ## Finding 2: a `/node-tenure/<node>` key (a new key, flagged)
 
@@ -101,10 +111,28 @@ dangerous unless it makes the agent late for the fence.
 - Each such step adds one to `Agent.lag_kills`. Later polls of a fence that has already sent
   KILL are not late for anything and are not counted.
 
-A lag within the bound is the margin's to absorb. A longer lag is caught at the first step that
-runs, which is late by the stall itself; a stall longer than the margin is the wedged node of
+A lag within the bound is the margin's to absorb. A longer lag is only detected: only lag on the
+KILL step adds overlap, and a KILL step that begins late has already spent its lag, so the bound
+is an assumption about the host, like the clock-step bound, which the agent cannot enforce. The
+shell logs each lag kill with the lag against the bound, and the cluster simulation reports
+`lag_kills=` beside `fences:`; a stall longer than the margin is the wedged node of
 authority.md §3. The model's other suggestion, a KILL timer that does not wait for a reconcile
 step, was not part of (a) and is not built.
+
+## Two pinned regressions that no longer replay their worlds
+
+Two pinned runs had ttls the new floor refuses, and now replay at 9,000 ms: the busy-loop test
+of `sim_cluster_main.zig` (8,516 ms) and fleet issue 136's test and `c1_regressions` line
+(8,799 ms). At 9,000 ms with the 4 s margin these are other worlds, so they pass without showing
+that the old bugs stay fixed. Re-proving each against its reverted fix, or shrinking new seeds
+at an admitted ttl, was not done in #238's review pass (it needs each original fix reverted and
+a fresh shrink, more than the review asked of this branch). What guards them instead:
+
+- issue 136: `sim_cluster.zig`'s test "a step's calls are capped by the time it has spent,
+  once", which does not depend on a seed;
+- the busy-loop stop: no test independent of the seed. It is left to the work ceiling
+  (`work_under_ceiling`, `steps_per_minute_max`) that every cluster simulation run checks, and
+  a follow-up should pin a new seed.
 
 ## Two teeth whose worlds moved
 

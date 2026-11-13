@@ -6,8 +6,9 @@
 //! server declares the node lost once the lease has run out and places replacements
 //! `lost_grace_ms` after that. The margin must cover the stop, the clock-rate difference between
 //! the two hosts over one ttl, the kernel's delivery of SIGKILL, how late an agent's step may be
-//! (`agent_step_lag_max_ms`, which the agent enforces by fencing at once past it) and how far
-//! the store's clock may step forward (`store_clock_step_max_ms`, an assumption about the host).
+//! (`agent_step_lag_max_ms`, an assumption about the host that the agent detects but cannot
+//! enforce) and how far the store's clock may step forward in total within one ttl
+//! (`store_clock_step_max_ms`, also an assumption about the host).
 
 const std = @import("std");
 const assert = std.debug.assert;

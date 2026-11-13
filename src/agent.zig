@@ -198,6 +198,10 @@ pub const Agent = struct {
     /// was due (#238, finding 4): each one killed at once. The margin covers a lag up to the
     /// bound; past it the agent cannot promise its kill comes in time, so it does not wait.
     lag_kills: u32,
+    /// How late the last of those steps began, past the time it was due; the shell names it
+    /// against the bound when `lag_kills` grows, since the bound is an assumption the agent
+    /// can only detect, not enforce.
+    lag_last_ms: u64,
     /// Job reports the store refused (B2): only a race with a new assignment or the tenure's end,
     /// so the cluster simulation checks they stop once the world has settled (J10).
     job_reports_refused: u64,
@@ -305,6 +309,7 @@ pub const Agent = struct {
         agent.fence = .{};
         agent.fences = 0;
         agent.lag_kills = 0;
+        agent.lag_last_ms = 0;
         agent.job_reports_refused = 0;
         agent.store_refusals = 0;
         agent.store_refused = false;
@@ -487,10 +492,12 @@ pub const Agent = struct {
         try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {
             if (mono >= at) try agent.begin_fence(ctx, at);
-            if (mono > at + constants.agent_step_lag_max_ms) try agent.kill_now(ctx, mono);
+            if (mono > at + constants.agent_step_lag_max_ms) try agent.kill_now(ctx, mono, at);
         } else if (agent.fence.active) {
             const late = mono > agent.fence.kill_at_ms + constants.agent_step_lag_max_ms;
-            if (late and !agent.fence.killing) try agent.kill_now(ctx, mono);
+            if (late and !agent.fence.killing) {
+                try agent.kill_now(ctx, mono, agent.fence.kill_at_ms);
+            }
         }
         if (agent.fence.active) return agent.fence_step(ctx, now);
         // So do the runs' deadlines: a run is stopped at its deadline and killed after its grace
@@ -864,9 +871,11 @@ pub const Agent = struct {
     /// This step began more than `agent_step_lag_max_ms` after the fence (or its kill) was due:
     /// the lag the margin allows is spent, so the fence kills now, not at its nominal time.
     /// Counted once per step that finds it (#238, finding 4; authority.md §3).
-    fn kill_now(agent: *Agent, ctx: *const Context, mono: u64) Error!void {
+    fn kill_now(agent: *Agent, ctx: *const Context, mono: u64, due: u64) Error!void {
         assert(agent.fence.active);
+        assert(mono > due);
         agent.lag_kills += 1;
+        agent.lag_last_ms = mono - due;
         if (agent.fence.kill_at_ms <= mono) return;
         agent.fence.kill_at_ms = mono;
         try agent.persist(ctx);

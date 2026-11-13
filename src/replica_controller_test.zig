@@ -597,6 +597,9 @@ const MovingStore = struct {
     key: []const u8,
     /// What is written to `key` just before the armed commit.
     value: []const u8 = "{\"v\":1,\"next\":99}",
+    /// A second key written in the same transaction, as a registration writes `/nodes` and
+    /// `/node-tenure` together.
+    also: ?store.Put = null,
     armed: bool = true,
     fired: bool = false,
 
@@ -657,8 +660,13 @@ const MovingStore = struct {
         if (self.armed) {
             self.armed = false;
             self.fired = true;
-            const op: store.Op = .{ .put = .{ .key = self.key, .value = self.value } };
-            _ = try self.inner.vtable.txn(self.inner.context, .{ .on_success = &.{op} }, diag);
+            const ops = [_]store.Op{
+                .{ .put = .{ .key = self.key, .value = self.value } },
+                .{ .put = self.also orelse .{ .key = self.key, .value = self.value } },
+            };
+            const count: usize = if (self.also == null) 1 else 2;
+            const moved: store.TxnRequest = .{ .on_success = ops[0..count] };
+            _ = try self.inner.vtable.txn(self.inner.context, moved, diag);
         }
         return self.inner.vtable.txn(self.inner.context, request, diag);
     }
@@ -1266,9 +1274,10 @@ test "the replacement off a lost node fails when the node's status moved" {
 }
 
 test "the replacement off a lost node fails when the node registers again before the commit" {
-    // Goal: `/nodes/<node>` (absent) is in the read set of the replacement (review M1).
-    // Method: the agent's record is put back just before the commit, after the plan saw the
-    // node unregistered; the transaction fails its compare and nothing is replaced.
+    // Goal: the node's registration (absent) is in the read set of the replacement (review M1).
+    // Method: the node registers again just before the commit, after the plan saw it
+    // unregistered (`/nodes` and `/node-tenure` in one transaction, as the agent API writes
+    // them); the transaction fails its compare and nothing is replaced.
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -1281,10 +1290,16 @@ test "the replacement off a lost node fails when the node registers again before
     const registered = try ctx.store.get(ctx.arena, key.slice(), null, &fixture.diag);
     try lose(&fixture, "node1");
     fixture.manual.ms += constants.lost_grace_ms;
+    const tenure: records.NodeTenure = .{ .node = "node1" };
+    const tenure_key = records.node_tenure_key("node1");
     var moving: MovingStore = .{
         .inner = fixture.memory.interface(),
         .key = key.slice(),
         .value = registered.kv.?.value,
+        .also = .{
+            .key = tenure_key.slice(),
+            .value = try records.encode(ctx.arena, tenure, &fixture.diag),
+        },
     };
     ctx.store = moving.interface();
     const wake = try fixture.plane.replicas.reconcile(&ctx);

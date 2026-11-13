@@ -273,15 +273,16 @@ The agent has finished stopping before any replacement is placed, provided that:
   - `skew` bounds the difference between the two hosts' clock **rates**;
   - `step lag` (`agent_step_lag_max_ms`, 500 ms) bounds how late an agent's step may run after
     the time it was due to fence or to kill;
-  - `clock step` (`store_clock_step_max_ms`, 500 ms) bounds a single forward step of the store's
-    clock. Lease deadlines are absolute values on that clock, so a forward step of `d` ends every
+  - `clock step` (`store_clock_step_max_ms`, 500 ms) bounds the total of the forward steps of
+    the store's clock within any one ttl. Lease deadlines are absolute values on that clock, so a forward step of `d` ends every
     lease `d` early; apart from such steps, absolute clock values do not matter.
-- The agent process is alive and scheduled, and the step-lag bound holds: the agent measures how
-  late each step is against the fence and kill times it set at the end of the step before, and
-  past the bound it fences at once (and, already fencing, kills at once). A lag up to the bound
-  is in the margin; a longer one is caught at the next step, which is late by the stall itself.
-  A stall that outlasts the margin is the wedged node below.
-- The store host's clock never steps forward by more than the bound at once (chronyd and ntpd
+- The agent process is alive and scheduled, and the step-lag bound holds. This is an assumption
+  about the host: the agent only detects a lag. It measures how late each step is against the
+  fence and kill times it set at the end of the step before, and past the bound it fences at once
+  (and, already fencing, kills at once), counts it and logs it. Only lag on the KILL step adds
+  overlap, and a late KILL step has already spent its lag, so killing at once cannot win back
+  what lies past the bound. A stall that outlasts the margin is the wedged node below.
+- The store host's clock never steps forward by more than the bound in total within one ttl (chronyd and ntpd
   slew below 500 ms by default and step above it; `makestep` set wider, or a manual `date -s`,
   breaks it). Backward steps only lengthen leases. This is an assumption about the host, which
   nothing checks.
@@ -289,7 +290,7 @@ The agent has finished stopping before any replacement is placed, provided that:
 
 Constants (the C1 brief, and #238 for the last two terms): `ttl` 10 s, `fence_stop_ms` 2 s,
 `skew` 1 %, kill latency 0.9 s, step lag 0.5 s, clock step 0.5 s, `fence_margin` 4 s (3 s before
-#238; failover is 1 s longer), `lost_grace_ms` 1 s. With `fence_window_min_ms` 5 s the shortest
+#238: a cut-off node fences 1 s earlier; failover time is unchanged), `lost_grace_ms` 1 s. With `fence_window_min_ms` 5 s the shortest
 ttl the server admits is 9 s (ZC-E0121), and the default 10 s is also the longest: its skew uses
 the last 100 ms (docs/decisions/2026-11-13-238-authority-repairs.md).
 

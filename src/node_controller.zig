@@ -43,7 +43,8 @@ pub const resync_ms: u64 = 30 * 1000;
 pub const watch_prefixes = [_][]const u8{ records.prefix_nodes, records.prefix_node_status };
 
 /// Nodes one transaction marks: 1 operation and 2 compares each, plus two decisions' (a new
-/// tenure after a lease that ran out records the old tenure's `mark_lost` beside `mark_ready`).
+/// tenure after a lease that ran out records the old tenure's `mark_lost` beside `mark_ready`),
+/// or 3 compares and one decision's for a tenure that ended unjudged (#238: `/node-tenure` too).
 const batch_nodes_max: u32 = 2;
 /// Observed records one transaction removes: the rest of the transaction is its one decision.
 pub const observed_removals_per_txn: u32 = constants.store_txn_ops_max - controller.decision_ops;
@@ -61,6 +62,8 @@ comptime {
     assert(batch_nodes_max * (1 + 2 * controller.decision_ops) <= constants.store_txn_ops_max);
     const compares_per_node = 2 + 2 * controller.decision_compares;
     assert(batch_nodes_max * compares_per_node <= constants.store_txn_compares_max);
+    const compares_per_lost_node = 3 + controller.decision_compares;
+    assert(batch_nodes_max * compares_per_lost_node <= constants.store_txn_compares_max);
     assert(observed_removals_per_txn > 0);
     assert(observed_stale_per_txn > 0);
     assert(observed_stale_per_txn + 2 + controller.decision_compares <=
