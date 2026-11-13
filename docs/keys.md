@@ -141,14 +141,17 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 
 - `health` (absent: no check) is a command the agent runs in the container: `command` is 1 to 64
   argv words, the first not empty; `interval_ms` and `timeout_ms` are above 0 and `timeout_ms` is
-  at most `interval_ms`; failures in the first `start_period_ms` do not count; the thresholds are
-  at least 1. C3 has command checks only (owner, 2026-11-05). A change of `health` is a change of
+  at most `interval_ms`; failures in the first `start_period_ms` do not count; `interval_ms` and
+  `start_period_ms` are at most an hour (`health_interval_ms_max`); the thresholds are at least 1,
+  and each times `interval_ms` is at most a day (`health_verdict_ms_max`). C3 has command checks
+  only (owner, 2026-11-05). A change of `health` is a change of
   what a replica runs: it bumps `generation` and the summary says `health changed`. Otherwise
   ZC-E0125.
 - `rollout` (absent: the default above, which applies to every service, owner 2026-11-05) is how
   a new generation replaces the old. `strategy` is `rolling` or `recreate`; `max_surge` and
   `max_unavailable` are at most 128, not both 0 for `rolling`; `min_ready_ms` <
-  `ready_timeout_ms` <= `progress_deadline_ms`; `on_failure` is `rollback` or `pause`. Otherwise
+  `ready_timeout_ms` <= `progress_deadline_ms` <= a day (`rollout_deadline_ms_max`); `grace_ms`
+  is at most a minute (`rollout_grace_ms_max`); `on_failure` is `rollback` or `pause`. Otherwise
   ZC-E0126. A policy equal to the default is stored as absent, so the service stays version 3.
   A change of `rollout` alone does not bump `generation` (summary `rollout changed`): it says how
   replicas are replaced, not what they run.
