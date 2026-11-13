@@ -313,7 +313,7 @@ run_round() {
 # A run that died, or never started, is recorded as the producers' crashes are (sf_record). The
 # host has no KVM and nothing here needs it.
 store_faults_day() {
-    if [ "$SIM_FLEET_STORE_FAULTS" -eq 0 ]; then return 0; fi
+    if [ "${SIM_FLEET_STORE_FAULTS:-0}" -eq 0 ]; then return 0; fi
     today=$(date -u +%Y-%m-%d)
     if [ "$(cat "$STATE/store-faults-day" 2>/dev/null || true)" = "$today" ]; then return 0; fi
     if ! git checkout --quiet --detach "$built"; then

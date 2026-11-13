@@ -997,8 +997,12 @@ test "parse_args wants a commit and a state, and a repo and token unless dry" {
         "--repo", "a/b",    "--tracker", "9", "--token-file", "t",
     });
     try std.testing.expectEqual(@as(?u32, 9), real.?.tracker);
-    const other = parse_args(&.{
+    const faults = parse_args(&.{
         "f", "ingest", "--commit", "c", "--state", "s", "--dry-run", "--kind", "store-faults",
+    });
+    try std.testing.expectEqualStrings("store-faults", faults.?.kind);
+    const other = parse_args(&.{
+        "f", "ingest", "--commit", "c", "--state", "s", "--dry-run", "--kind", "bogus",
     });
     try std.testing.expect(other == null);
     try std.testing.expect(parse_args(&.{ "f", "ingest", "--bogus", "1" }) == null);
