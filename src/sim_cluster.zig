@@ -3565,7 +3565,7 @@ test "a start after the agent's crash is refused, not asserted (#158)" {
     // Goal: regression for #152, #156 and #158 (`SimNode.start_impl` asserted the node had not
     // crashed). Method: seed 57 at 100 operations under c1 aborted before the fix.
     var report: Report = undefined;
-    simulate(testing.allocator, 2, 100, .{ .c1 = true }, &report);
+    simulate(testing.allocator, 57, 100, .{ .c1 = true }, &report);
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
     try testing.expect(!report.failed);
 }
@@ -3575,7 +3575,8 @@ test "a crashed node's step makes no call to the server (#167)" {
     // load must not reach the server (`tapped_call` refuses; it asserts nothing got through).
     // Method: a run that crashes an agent mid-step; it counts the calls the gate refused and the
     // test fails if there were none, so a change of the draws cannot leave it passing without
-    // reaching the gate. Seed 2 at 100 operations under c1 does (57 did until #237 added late registrations).
+    // reaching the gate. Seed 2 at 100 operations under c1 does (57 did until #237 added the
+    // late registrations).
     var report: Report = undefined;
     simulate(testing.allocator, 2, 100, .{ .c1 = true }, &report);
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
