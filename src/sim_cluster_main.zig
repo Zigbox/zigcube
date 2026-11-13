@@ -420,7 +420,7 @@ fn usage(io: std.Io, args: []const []const u8) u8 {
     return 2;
 }
 
-const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 8,000 ms is refused: an agent " ++
+const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 9,000 ms is refused: an agent " ++
     "cannot fence in time under it (ZC-E0121: the shortest ttl the server admits, which is also " ++
     "the shortest a shape draws)\n";
 
@@ -462,11 +462,11 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expectEqual(@as(u64, 9), range.last_seed);
     try std.testing.expectEqual(@as(?u32, 60), range.operations);
     const drawn = parse(&.{
-        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=8000",
+        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=9000",
     }).?;
     try std.testing.expectEqual(@as(?u32, null), drawn.operations);
     try std.testing.expect(drawn.options.profile_auto);
-    try std.testing.expectEqual(@as(?u32, 8000), drawn.options.lease_ttl_ms);
+    try std.testing.expectEqual(@as(?u32, 9000), drawn.options.lease_ttl_ms);
     const named = parse(&.{ "sim", "7", "60", "--profile=skew", "--replicas-pct=200" }).?;
     try std.testing.expect(named.options.profile == .skew and !named.options.profile_auto);
     try std.testing.expectEqual(@as(?u32, 200), named.options.replicas_pct);
@@ -474,7 +474,7 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=2000" }) == null);
     const short = ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=2000" }).?;
     try std.testing.expectEqual(ttl_refusal_text, short);
-    try std.testing.expect(ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=8000" }) == null);
+    try std.testing.expect(ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=9000" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "0" }) == null);
     try std.testing.expectEqual(@as(?u32, null), range.options.nodes);
 
@@ -530,7 +530,8 @@ test "a stop past its grace over a record that never started does not make a bus
     // record was written and the agent crashed before the start, so the runtime says `starting`
     // until `fake_start_timeout_ms`) stayed pending; once its grace passed the agent's next wake
     // was always now, about 200 steps in 10 s, over the busy-loop ceiling. Method: the shrunk
-    // run that failed, pinned (2 nodes, crash_heavy, ttl 8,516 ms, 200 % replicas, heal at 72).
+    // run that failed, pinned (2 nodes, crash_heavy, ttl 8,516 ms (9,000 since #238), 200 %
+    // replicas, heal at 72).
     const gpa = std.testing.allocator;
     const report = try gpa.create(sim_cluster.Report);
     defer gpa.destroy(report);
@@ -538,7 +539,7 @@ test "a stop past its grace over a record that never started does not make a bus
         .nodes = 2,
         .c1 = true,
         .profile = .crash_heavy,
-        .lease_ttl_ms = 8516,
+        .lease_ttl_ms = 9000,
         .replicas_pct = 200,
         .heal_at = 72,
     };
@@ -587,11 +588,11 @@ test "a service deleted and applied again leaves no old replica running (fleet i
 
 test "a step's calls are capped by the time the step has already spent (fleet issue 136)" {
     // Goal: regression for fleet issue 136, I1b failing on a correct agent. Method: replay the
-    // shrunk failure (11 nodes, partitions, ttl 8,799 ms, 200 % replicas, 29 operations healing
-    // at 355). The node's clock stood still during a step, so a step's calls each had the
-    // whole fence window and one step ran 12 s under a 5.8 s window. A pinned seed can start
-    // passing for the wrong reason when the draw changes; the lasting check is the clock test
-    // in sim_cluster.zig.
+    // shrunk failure (11 nodes, partitions, ttl 8,799 ms (9,000 since #238), 200 % replicas, 29
+    // operations healing at 355). The node's clock stood still during a step, so a step's calls
+    // each had the whole fence window and one step ran 12 s under a 5.8 s window. A pinned seed
+    // can start passing for the wrong reason when the draw changes; the lasting check is the
+    // clock test in sim_cluster.zig.
     const gpa = std.testing.allocator;
     const report = try gpa.create(sim_cluster.Report);
     defer gpa.destroy(report);
@@ -599,7 +600,7 @@ test "a step's calls are capped by the time the step has already spent (fleet is
         .nodes = 11,
         .c1 = true,
         .profile = .partitions,
-        .lease_ttl_ms = 8799,
+        .lease_ttl_ms = 9000,
         .replicas_pct = 200,
         .heal_at = 355,
     }, report);

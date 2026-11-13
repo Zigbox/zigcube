@@ -31,12 +31,20 @@ const Error = controller.Error;
 const Wakeup = controller.Wakeup;
 
 pub const actor = "node-controller";
+
+/// What a pass read, at one revision.
+const Read = struct {
+    nodes: []const Entry(records.Node),
+    statuses: []const Entry(records.NodeStatus),
+    tenures: []const Entry(records.NodeTenure),
+};
 pub const resync_ms: u64 = 30 * 1000;
 
 pub const watch_prefixes = [_][]const u8{ records.prefix_nodes, records.prefix_node_status };
 
 /// Nodes one transaction marks: 1 operation and 2 compares each, plus two decisions' (a new
-/// tenure after a lease that ran out records the old tenure's `mark_lost` beside `mark_ready`).
+/// tenure after a lease that ran out records the old tenure's `mark_lost` beside `mark_ready`),
+/// or 3 compares and one decision's for a tenure that ended unjudged (#238: `/node-tenure` too).
 const batch_nodes_max: u32 = 2;
 /// Observed records one transaction removes: the rest of the transaction is its one decision.
 pub const observed_removals_per_txn: u32 = constants.store_txn_ops_max - controller.decision_ops;
@@ -54,6 +62,8 @@ comptime {
     assert(batch_nodes_max * (1 + 2 * controller.decision_ops) <= constants.store_txn_ops_max);
     const compares_per_node = 2 + 2 * controller.decision_compares;
     assert(batch_nodes_max * compares_per_node <= constants.store_txn_compares_max);
+    const compares_per_lost_node = 3 + controller.decision_compares;
+    assert(batch_nodes_max * compares_per_lost_node <= constants.store_txn_compares_max);
     assert(observed_removals_per_txn > 0);
     assert(observed_stale_per_txn > 0);
     assert(observed_stale_per_txn + 2 + controller.decision_compares <=
@@ -112,11 +122,22 @@ pub const NodeController = struct {
             nodes.revision,
             constants.nodes_max,
         );
+        const tenures = try controller.list_all(
+            records.NodeTenure,
+            ctx,
+            records.prefix_node_tenure,
+            nodes.revision,
+            constants.nodes_max,
+        );
         var acted: u32 = 0;
-        var more = try nc.judge(ctx, nodes.items, statuses.items, &acted);
+        var more = try nc.judge(ctx, nodes.items, statuses.items, tenures.items, &acted);
         var grace_at: u64 = std.math.maxInt(u64);
         if (!more) {
-            more = try nc.remove_observed(ctx, nodes.items, statuses.items, &acted, &grace_at);
+            more = try nc.remove_observed(ctx, .{
+                .nodes = nodes.items,
+                .statuses = statuses.items,
+                .tenures = tenures.items,
+            }, &acted, &grace_at);
         }
         const sample_at = try nc.sample_leases(ctx, nodes.items, statuses.items);
         const wake_at = if (more) now else @min(now + resync_ms, @min(sample_at, grace_at));
@@ -124,13 +145,16 @@ pub const NodeController = struct {
         return .{ .at_ms = wake_at, .prefixes = &watch_prefixes, .acted = acted };
     }
 
-    /// Marks ready the nodes with no status for their tenure and lost the ready nodes whose
-    /// record is gone, a batch at a time. Returns whether there may be more to do.
+    /// Marks ready the nodes with no status for their tenure, and lost the nodes whose record is
+    /// gone while their status is `ready` or judged a tenure older than `/node-tenure/<node>`
+    /// (a tenure this controller never saw: it registered and its lease ran out between two
+    /// passes, #238), a batch at a time. Returns whether there may be more to do.
     fn judge(
         nc: *NodeController,
         ctx: *const Context,
         nodes: []const Entry(records.Node),
         statuses: []const Entry(records.NodeStatus),
+        tenures: []const Entry(records.NodeTenure),
         acted: *u32,
     ) Error!bool {
         var more = false;
@@ -154,14 +178,15 @@ pub const NodeController = struct {
             batched += 1;
         }
         for (statuses) |*status| {
-            if (status.rec.state != .ready) continue;
             const name = status.kv.key[records.prefix_node_status.len..];
             if (node_of(nodes, name) != null) continue;
+            const newer = controller.newer_tenure(tenures, name, status.rec.tenure);
+            if (status.rec.state != .ready and newer == null) continue;
             if (batched == batch_nodes_max) {
                 more = true;
                 break;
             }
-            try nc.mark_lost(ctx, &batch, name, status);
+            try nc.mark_lost(ctx, &batch, name, status, newer);
             batched += 1;
         }
         if (batched == 0) return more;
@@ -214,27 +239,33 @@ pub const NodeController = struct {
     }
 
     /// The node's record is gone: its lease ran out (authority.md §3). The status becomes `lost`
-    /// for the tenure it judged, compared with the record still absent and the status as read.
+    /// for the newest tenure, compared with the record still absent and the status as read: the
+    /// tenure it judged, or `newer` (`/node-tenure/<node>`), one it never judged. A `lost` record
+    /// is written per tenure, `at_ms` now, so the grace counts from each expiry (#238).
     fn mark_lost(
         nc: *NodeController,
         ctx: *const Context,
         batch: *Batch,
         name: []const u8,
         status: *const Entry(records.NodeStatus),
+        newer: ?*const Entry(records.NodeTenure),
     ) Error!void {
-        assert(status.rec.state == .ready);
+        if (newer == null) assert(status.rec.state == .ready);
         const node_key = records.node_key(name);
         const node_bytes = try controller.key_copy(ctx, &node_key);
-        const lease = try nc.lease_of(ctx, name, status);
-        const id = try nc.lost_decision(ctx, batch, name, status, lease);
+        const tenure = if (newer) |found| found.kv.mod_revision else status.rec.tenure;
+        assert(tenure >= status.rec.tenure);
+        const lease = try nc.lease_of(ctx, name, tenure);
+        const id = try nc.lost_decision(ctx, batch, name, tenure, lease);
         const value: records.NodeStatus = .{
             .state = .lost,
-            .tenure = status.rec.tenure,
+            .tenure = tenure,
             .at_ms = ctx.clock.now_ms(),
             .decision = id.slice(),
         };
         batch.expect(node_bytes, 0);
         batch.expect(status.kv.key, status.kv.mod_revision);
+        if (newer) |found| batch.expect(found.kv.key, found.kv.mod_revision);
         batch.put(status.kv.key, try records.encode(ctx.arena, value, ctx.diag));
     }
 
@@ -255,39 +286,39 @@ pub const NodeController = struct {
         // A lease that cannot be named (no memo, and the tenure's revision is compacted) is not in
         // `leases` either: that is how an ended lease looks, and deciding otherwise would make
         // the decision depend on when compaction ran. It is cited as lease 0.
-        const lease = try nc.lease_of(ctx, name, status);
+        const lease = try nc.lease_of(ctx, name, status.rec.tenure);
         if (lease != store.lease_none) {
             if (lease_info(leases, lease)) |info| {
                 if (info.remaining_ms > 0) return;
             }
         }
-        _ = try nc.lost_decision(ctx, batch, name, status, lease);
+        _ = try nc.lost_decision(ctx, batch, name, status.rec.tenure, lease);
     }
 
-    /// The lease of the tenure `status` judged: remembered, else read at the tenure revision.
+    /// The lease of `tenure`: remembered, else read at the tenure revision.
     fn lease_of(
         nc: *const NodeController,
         ctx: *const Context,
         name: []const u8,
-        status: *const Entry(records.NodeStatus),
+        tenure: u64,
     ) Error!store.LeaseId {
-        if (nc.memo_of(name, status.rec.tenure)) |found| return found.lease;
+        if (nc.memo_of(name, tenure)) |found| return found.lease;
         const node_key = records.node_key(name);
-        return lease_at_tenure(ctx, &node_key, status);
+        return lease_at_tenure(ctx, &node_key, tenure);
     }
 
-    /// The `mark_lost` decision for the tenure `status` judged, cause `lease_expired`.
+    /// The `mark_lost` decision for `tenure`, cause `lease_expired`.
     fn lost_decision(
         nc: *NodeController,
         ctx: *const Context,
         batch: *Batch,
         name: []const u8,
-        status: *const Entry(records.NodeStatus),
+        tenure: u64,
         lease: store.LeaseId,
     ) Error!records.DecisionId {
         const node_key = records.node_key(name);
         const node_bytes = try controller.key_copy(ctx, &node_key);
-        const memo = nc.memo_of(name, status.rec.tenure);
+        const memo = nc.memo_of(name, tenure);
         const ttl_ms: u64 = if (memo) |found| found.ttl_ms else constants.node_lease_ttl_ms;
         const now = ctx.clock.now_ms();
         const reason = if (memo) |found|
@@ -300,13 +331,14 @@ pub const NodeController = struct {
                 "restarted and the record of its tenure is compacted) and is not running", .{name})
         else
             try controller.format(ctx, "node {s} is lost: its lease {d} ran out; when the " ++
-                "server last heard from it is unknown (the server restarted)", .{ name, lease });
+                "server last heard from it is unknown (the server restarted, or never saw this " ++
+                "tenure)", .{ name, lease });
         const evidence = if (memo) |found|
             try controller.format(ctx, "{{\"tenure\":{d},\"lease\":{d},\"ttl_ms\":{d}," ++
-                "\"last_heard_ms\":{d}}}", .{ status.rec.tenure, lease, ttl_ms, found.heard_ms })
+                "\"last_heard_ms\":{d}}}", .{ tenure, lease, ttl_ms, found.heard_ms })
         else
             try controller.format(ctx, "{{\"tenure\":{d},\"lease\":{d},\"ttl_ms\":{d}," ++
-                "\"last_heard_ms\":null}}", .{ status.rec.tenure, lease, ttl_ms });
+                "\"last_heard_ms\":null}}", .{ tenure, lease, ttl_ms });
         return controller.put_decision(ctx, &nc.source, .{
             .actor = actor,
             .action = "mark_lost",
@@ -315,7 +347,7 @@ pub const NodeController = struct {
             .cause = .{
                 .kind = .lease_expired,
                 .key = node_bytes,
-                .revision = status.rec.tenure,
+                .revision = tenure,
                 .lease = lease,
                 .ttl_ms = ttl_ms,
             },
@@ -385,16 +417,19 @@ pub const NodeController = struct {
     fn remove_observed(
         nc: *NodeController,
         ctx: *const Context,
-        nodes: []const Entry(records.Node),
-        statuses: []const Entry(records.NodeStatus),
+        read: Read,
         acted: *u32,
         grace_at: *u64,
     ) Error!bool {
         const now = ctx.clock.now_ms();
+        const nodes = read.nodes;
+        const statuses = read.statuses;
         for (statuses) |*status| {
             if (status.rec.state != .lost) continue;
             const name = status.kv.key[records.prefix_node_status.len..];
             if (node_of(nodes, name) != null) continue;
+            // A newer tenure ended unseen: `judge` marks it lost first, and the grace runs anew.
+            if (controller.newer_tenure(read.tenures, name, status.rec.tenure) != null) continue;
             const due = status.rec.at_ms +| nc.lost_grace_ms;
             if (now < due) {
                 grace_at.* = @min(grace_at.*, due);
@@ -560,10 +595,10 @@ fn lease_info(leases: []const store.LeaseInfo, id: store.LeaseId) ?*const store.
 fn lease_at_tenure(
     ctx: *const Context,
     node_key: *const records.Key,
-    status: *const Entry(records.NodeStatus),
+    tenure: u64,
 ) Error!store.LeaseId {
-    assert(status.rec.tenure > 0);
-    const got = ctx.store.get(ctx.arena, node_key.slice(), status.rec.tenure, ctx.diag) catch |err|
+    assert(tenure > 0);
+    const got = ctx.store.get(ctx.arena, node_key.slice(), tenure, ctx.diag) catch |err|
         switch (err) {
             error.Compacted => {
                 ctx.diag.reset();
@@ -666,7 +701,12 @@ const Fixture = struct {
         const bytes = try records.encode(ctx.arena, node, &self.diag);
         const key = records.node_key(name);
         const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes, .lease = lease.id } };
-        _ = try writers.txn(ctx.store, .{ .agent = name }, .{ .on_success = &.{op} }, &self.diag);
+        // The tenure record on no lease, in the same transaction, as the agent endpoint writes.
+        const tenure_key = records.node_tenure_key(name);
+        const tenure_rec = records.NodeTenure{ .node = name };
+        const tenure = try records.encode(ctx.arena, tenure_rec, &self.diag);
+        const ops = [_]store.Op{ op, .{ .put = .{ .key = tenure_key.slice(), .value = tenure } } };
+        _ = try writers.txn(ctx.store, .{ .agent = name }, .{ .on_success = &ops }, &self.diag);
         return lease.id;
     }
 
@@ -879,6 +919,48 @@ test "a lost node is judged without memory after a restart, and ready again when
     const ready = (try fixture.status("n1")).?;
     try testing.expectEqual(records.NodeState.ready, ready.rec.state);
     try testing.expect(ready.rec.tenure > lost.rec.tenure);
+}
+
+test "a tenure that ends before it is judged is lost on its own, with a grace of its own" {
+    // Goal: #238 finding 2, the lost grace counts from each expiry. Method: n1 is lost (tenure
+    // T1), the grace passes, n1 registers again (T2) and its lease runs out before the controller
+    // runs. The next pass writes `lost` for T2 at the time of that pass, not the T1 record, and
+    // the observed records are kept until T2's own grace has passed. Fails before the fix: the
+    // status stays `lost` for T1, whose grace is long over, and the records go at once.
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    _ = try fixture.register_leased("n1", 1000);
+    _ = try fixture.step();
+    fixture.manual.ms += 1001;
+    _ = try fixture.memory.interface().expire_leases(&fixture.diag);
+    _ = try fixture.step();
+    const first = (try fixture.status("n1")).?;
+    try testing.expectEqual(records.NodeState.lost, first.rec.state);
+    fixture.manual.ms += constants.lost_grace_ms + 1;
+    _ = try fixture.register_leased("n1", 1000);
+    const second_tenure = try fixture.node_revision("n1");
+    try fixture.observe("n1", "hello-1");
+    fixture.manual.ms += 1001;
+    _ = try fixture.memory.interface().expire_leases(&fixture.diag);
+    const ended_at = fixture.manual.ms;
+    const pass = try fixture.step();
+    try testing.expectEqual(@as(u32, 1), pass.acted);
+    const second = (try fixture.status("n1")).?;
+    try testing.expectEqual(records.NodeState.lost, second.rec.state);
+    try testing.expectEqual(second_tenure, second.rec.tenure);
+    try testing.expectEqual(ended_at, second.rec.at_ms);
+    const decided = try fixture.decision(second.rec.decision);
+    try testing.expectEqualStrings("mark_lost", decided.action);
+    try testing.expectEqual(second_tenure, decided.cause.revision.?);
+    // Inside T2's grace the observed record stays; the pass wakes at its end.
+    const waiting = try fixture.step();
+    try testing.expectEqual(@as(u32, 0), waiting.acted);
+    try testing.expectEqual(@as(usize, 1), try fixture.count("/observed/n1/"));
+    try testing.expectEqual(ended_at + constants.lost_grace_ms, waiting.at_ms);
+    fixture.manual.ms = ended_at + constants.lost_grace_ms;
+    try testing.expectEqual(@as(u32, 1), (try fixture.step()).acted);
+    try testing.expectEqual(@as(usize, 0), try fixture.count("/observed/n1/"));
 }
 
 test "a lost node's observed records are removed a page at a time; a live node's are kept" {

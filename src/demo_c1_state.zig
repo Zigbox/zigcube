@@ -21,9 +21,10 @@ pub const hello_image = c0.hello_image;
 
 /// The lease timeout the server is started with (`--lease-ttl-ms`): shorter than the default 10 s,
 /// which shows that it is configurable and shortens the run. The inequality of authority.md §3
-/// holds for it: `fence_margin` 3000 >= `fence_stop` 2000 + ttl * 1% + kill latency 900.
-pub const ttl_ms: u32 = 8_000;
-pub const ttl_text = "8000";
+/// holds for it: `fence_margin` 4000 >= `fence_stop` 2000 + ttl * 1% + kill latency 900 + step
+/// lag 500 + clock step 500, and it is the shortest the server admits (#238).
+pub const ttl_ms: u32 = 9_000;
+pub const ttl_text = "9000";
 /// Where the agent's last container is dead, at the latest, relative to the server's expiry of
 /// its lease. The agent fences at `s + ttl - fence_margin`, `s` the send time of the last
 /// keepalive the server acknowledged, and the server's expiry is that receipt plus `ttl`, so the

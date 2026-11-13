@@ -138,13 +138,30 @@ pub const lease_ttl_ms: u32 = node_lease_ttl_ms;
 pub const fence_stop_ms: u32 = 2000;
 /// The bound on the difference of two hosts' clock rates, in parts per thousand (1 %).
 pub const clock_skew_per_mille: u32 = 10;
-pub const fence_margin_ms: u32 = 3000;
+/// The latest an agent's step may begin after the time it was due to fence or to kill, on its own
+/// clock (authority.md §3, assumption 4; #238 finding 4). This is an assumption about the host,
+/// not something the agent enforces: only lag on the KILL step adds overlap, and a KILL step that
+/// begins late sends KILL late by all of it. The agent detects a lag past the bound (it kills at
+/// once, counts `lag_kills` and says so) but cannot undo it. 500 ms is half of
+/// `agent_resync_ms`: a host that stalls its agent longer is not one the margin can promise for.
+pub const agent_step_lag_max_ms: u32 = 500;
+/// The most the store's clock may step forward at once (authority.md §3, assumption 3; #238
+/// finding 3). Lease deadlines are absolute values on the store's clock, so a forward step ends
+/// every lease early by its size. 500 ms is the default threshold above which `chronyd` and
+/// `ntpd` step rather than slew; a store host configured to step further breaks the promise.
+pub const store_clock_step_max_ms: u32 = 500;
+/// The stop, the skew at the longest ttl the default allows (10,000 ms: 100), the kill latency,
+/// the step lag and the clock step: 2,000 + 100 + 900 + 500 + 500 (`fencing.margin_needed_ms`).
+/// The last two came with #238 and moved the margin from 3,000 (docs/decisions/
+/// 2026-11-13-238-authority-repairs.md).
+pub const fence_margin_ms: u32 = 4000;
 /// The least time a lease must leave between its last acknowledged keepalive and the fence
 /// (`ttl - fence_margin`): room for a renewal to be sent, answered and recorded. With less the
 /// agent renews on every pass and still fences (issue #78: `--lease-ttl-ms=3001` never settles).
-/// 5,000 makes the shortest admitted ttl 8,000 ms, the shortest the simulator draws (owner,
-/// 2026-11-06): the admitted and the drawn ranges agree. The renewal falls at a third of the
-/// ttl, at least 2,334 ms before the fence, for the pass, the round trip and the commit.
+/// 5,000 makes the shortest admitted ttl 9,000 ms (8,000 before #238 moved the margin), the
+/// shortest the simulator draws (owner, 2026-11-06): the admitted and the drawn ranges agree. The
+/// renewal falls at a third of the ttl, at least 2,000 ms before the fence, for the pass, the
+/// round trip and the commit.
 pub const fence_window_min_ms: u32 = 5000;
 /// The time `fencing.renew_after_ms` leaves between a renewal due and the fence, at the least.
 pub const renew_slack_min_ms: u32 = 1000;

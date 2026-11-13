@@ -61,6 +61,7 @@ pub const prefix_allocations = "/allocations/";
 pub const prefix_audit_allocations = "/audit/allocations/";
 pub const prefix_node_status = "/node-status/";
 pub const prefix_node_store = "/node-store/";
+pub const prefix_node_tenure = "/node-tenure/";
 pub const prefix_pulls = "/pulls/";
 pub const prefix_summaries = "/decision-summaries/";
 pub const prefix_replica_numbers = "/replica-numbers/";
@@ -169,6 +170,12 @@ pub fn node_key(name: []const u8) Key {
 pub fn node_store_key(name: []const u8) Key {
     assert(name_problem(name, constants.node_name_bytes_max) == null);
     return Key.build(&.{ prefix_node_store, name });
+}
+
+/// `/node-tenure/<node>`: the node's newest registration, kept after its lease ends (#238).
+pub fn node_tenure_key(name: []const u8) Key {
+    assert(name_problem(name, constants.node_name_bytes_max) == null);
+    return Key.build(&.{ prefix_node_tenure, name });
 }
 
 /// `/pulls/<node>/<tree>`: the record of the last pull of a tree on a node.
@@ -814,6 +821,13 @@ pub const NodeStatus = struct {
     tenure: u64,
     at_ms: u64,
     decision: []const u8,
+};
+
+/// `/node-tenure/<node>`, written with `/nodes/<node>` in the registration's transaction but on
+/// no lease: its `mod_revision` is the newest tenure, which outlives the lease (keys.md, #238).
+pub const NodeTenure = struct {
+    v: u32 = 1,
+    node: []const u8,
 };
 
 /// A count over immutable decisions; never a cause.

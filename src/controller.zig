@@ -282,6 +282,8 @@ pub const Snapshot = struct {
     assigned: []const Entry(records.Assigned) = &.{},
     /// The node controller's judgements (`/node-status/`), at the same revision.
     statuses: []const Entry(records.NodeStatus) = &.{},
+    /// The nodes' newest tenures (`/node-tenure/`), at the same revision (#238).
+    tenures: []const Entry(records.NodeTenure) = &.{},
     /// Replica id to the node it is assigned to.
     node_by_replica: std.StringHashMapUnmanaged([]const u8) = .empty,
 
@@ -361,6 +363,22 @@ pub const Snapshot = struct {
     }
 };
 
+/// The node's `/node-tenure` record, if it names a tenure newer than `judged`: the node registered
+/// after the status was written. Absent for a node registered before the record existed.
+pub fn newer_tenure(
+    tenures: []const Entry(records.NodeTenure),
+    node: []const u8,
+    judged: u64,
+) ?*const Entry(records.NodeTenure) {
+    const key = records.node_tenure_key(node);
+    for (tenures) |*entry| {
+        if (!std.mem.eql(u8, entry.kv.key, key.slice())) continue;
+        if (entry.kv.mod_revision > judged) return entry;
+        return null;
+    }
+    return null;
+}
+
 pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
     const services = try list_all(
         records.Service,
@@ -399,6 +417,13 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         at,
         constants.nodes_max,
     );
+    const tenures = try list_all(
+        records.NodeTenure,
+        ctx,
+        records.prefix_node_tenure,
+        at,
+        constants.nodes_max,
+    );
     var by_replica: std.StringHashMapUnmanaged([]const u8) = .empty;
     for (assigned.items) |entry| {
         const rest = entry.kv.key[records.prefix_assigned.len..];
@@ -415,6 +440,7 @@ pub fn read_snapshot(ctx: *const Context) Error!Snapshot {
         .nodes = nodes.items,
         .assigned = assigned.items,
         .statuses = statuses.items,
+        .tenures = tenures.items,
         .node_by_replica = by_replica,
     };
 }

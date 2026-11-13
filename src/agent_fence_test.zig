@@ -37,6 +37,58 @@ fn advance_to(world: *sim_world.World, at_ms: u64) void {
     if (world.now_ms() < at_ms) world.advance(at_ms - world.now_ms());
 }
 
+test "a step later than the bound past the fence kills at once (#238, finding 4)" {
+    // Goal: the margin covers a lag of `agent_step_lag_max_ms` and no more, so a step that finds
+    // itself later than that does not wait for the fence's nominal kill. Method: both containers
+    // ignore the polite stop; the agent's clock jumps past the fence plus the bound with no step
+    // between (a stalled host), then one step runs. Without the rule it signals TERM only and
+    // the containers live until fence + stop; with it they are killed in that step.
+    const world = try start(12);
+    defer world.destroy();
+    const ttl = world.agent.lease_ttl_ms;
+    try world.sim.inject("hello-1", .slow_stop);
+    try world.sim.inject("hello-2", .slow_stop);
+    world.set_store_down(true);
+    const fence_at = fencing.fence_at_ms(world.agent.sent_ms, ttl);
+    advance_to(world, fence_at - sim_world.tick_ms);
+    try testing.expect(!world.agent.fence.active);
+    try testing.expectEqual(@as(u32, 2), world.sim.running_count());
+
+    const late = fence_at + constants.agent_step_lag_max_ms + 1;
+    world.manual.advance(late - world.now_ms());
+    _ = world.agent_step();
+    try testing.expect(world.agent.fence.active or world.agent.fences == 1);
+    try testing.expectEqual(@as(u32, 1), world.agent.lag_kills);
+    try testing.expect(world.now_ms() < fencing.kill_at_ms(fence_at));
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+}
+
+test "a step late for the fence's kill counts once, and a lag within the bound does not" {
+    // Goal: the lag is measured against the time the step was due (the kill), not against
+    // every poll after it, and a lag up to the bound is the margin's. Method: the fence begins
+    // within the bound; the kill step comes the bound plus 1 ms late; later polls are not late.
+    const world = try start(13);
+    defer world.destroy();
+    const ttl = world.agent.lease_ttl_ms;
+    try world.sim.inject("hello-1", .slow_stop);
+    world.set_store_down(true);
+    const fence_at = fencing.fence_at_ms(world.agent.sent_ms, ttl);
+    advance_to(world, fence_at - sim_world.tick_ms);
+    world.manual.advance(fence_at + constants.agent_step_lag_max_ms - world.now_ms());
+    _ = world.agent_step();
+    try testing.expect(world.agent.fence.active);
+    try testing.expectEqual(@as(u32, 0), world.agent.lag_kills);
+    try testing.expectEqual(@as(u32, 1), world.sim.running_count());
+
+    const kill_at = world.agent.fence.kill_at_ms;
+    world.manual.advance(kill_at + constants.agent_step_lag_max_ms + 1 - world.now_ms());
+    _ = world.agent_step();
+    try testing.expectEqual(@as(u32, 1), world.agent.lag_kills);
+    world.advance(2_000);
+    try testing.expectEqual(@as(u32, 0), world.sim.running_count());
+    try testing.expectEqual(@as(u32, 1), world.agent.lag_kills);
+}
+
 test "a node cut off from the store fences at its deadline and registers again, empty" {
     // Goal: the fence comes at s + ttl - margin and not before, every container is dead by the
     // worst case, and the node comes back under a new tenure. Method: one container ignores the
@@ -70,6 +122,8 @@ test "a node cut off from the store fences at its deadline and registers again, 
     advance_to(world, fencing.worst_case_dead_ms(sent, ttl));
     try testing.expectEqual(@as(u32, 0), world.sim.running_count());
     try testing.expectEqual(@as(u32, 1), world.agent.fences);
+    // On time: no step was late, so none killed early.
+    try testing.expectEqual(@as(u32, 0), world.agent.lag_kills);
     // All of that by the time the lease the store held can end, not after.
     try testing.expect(world.now_ms() <= sent + ttl);
 

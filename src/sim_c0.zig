@@ -990,7 +990,10 @@ test "a replica that comes back to its node keeps its container and leaves no pe
     try move_first_replica(world, sim_world.node_name);
     _ = world.agent_step();
     try testing.expectEqual(@as(u32, 0), world.agent.stops_count);
-    world.manual.advance(constants.stop_grace_ms + 1000);
+    // Past the dropped stop's grace, but short of the self-fence: with no renewing step the
+    // clock may not cross `lease_ttl_ms - fence_margin_ms` (6,000 ms since #238), or the step
+    // would fence rather than sleep, which is a different scenario.
+    world.manual.advance(constants.stop_grace_ms + 500);
     _ = world.agent_step();
     try testing.expect(world.agent_due_ms > world.now_ms());
     try testing.expectEqual(@as(u32, 0), world.agent.stops_count);

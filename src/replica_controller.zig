@@ -287,8 +287,9 @@ const Run = struct {
     }
 
     /// The status of the node `replica` is placed on, if that node is lost for the tenure the
-    /// status judged (no newer `/nodes` record) and the grace has passed; before then, the step
-    /// wakes at the grace's end.
+    /// status judged (no newer `/nodes` or `/node-tenure` record) and the grace has passed;
+    /// before then, the step wakes at the grace's end. A newer tenure that ended before the node
+    /// controller judged it gets a `lost` record of its own, and the grace counts from it (#238).
     fn lost_placement(run: *Run, replica: []const u8) ?*const Entry(records.NodeStatus) {
         const node = run.snap.node_of(replica) orelse return null;
         const status = run.snap.status_of(node) orelse return null;
@@ -296,6 +297,9 @@ const Run = struct {
         if (run.snap.node_entry(node)) |entry| {
             // Registered again: the node controller judges the new tenure first.
             if (entry.kv.mod_revision > status.rec.tenure) return null;
+        }
+        if (controller.newer_tenure(run.snap.tenures, node, status.rec.tenure) != null) {
+            return null;
         }
         const due = status.rec.at_ms +| run.rc.lost_grace_ms;
         if (run.ctx.clock.now_ms() < due) {
@@ -566,8 +570,9 @@ const Run = struct {
 
     /// Compares what the judgement of a node rests on: its status at the revision read (`lost`
     /// for a removal off a lost node, `ready` for one that cites a report) and its `/nodes`
-    /// record as read (absent is revision 0). Once per node per batch: a second replica of the
-    /// node adds nothing.
+    /// record as read, or, when that is absent, its `/node-tenure` record as read (absent
+    /// too: `/node-tenure` at revision 0). Once per node per batch: a second
+    /// replica of the node adds nothing.
     fn expect_node_judged(run: *Run, batch: *Batch, node: []const u8) Error!void {
         // Test-only fault (the sim-c1-teeth-stale negative test): the node's status and
         // registration are not compared, so a report that went stale before the commit is acted on.
@@ -577,12 +582,24 @@ const Run = struct {
             if (std.mem.eql(u8, compare.key, status.kv.key)) return;
         }
         batch.expect(status.kv.key, status.kv.mod_revision);
-        const registered = run.snap.node_entry(node);
-        const key = records.node_key(node);
-        batch.expect(
-            try controller.key_copy(run.ctx, &key),
-            if (registered) |entry| entry.kv.mod_revision else 0,
-        );
+        if (run.snap.node_entry(node)) |entry| {
+            batch.expect(entry.kv.key, entry.kv.mod_revision);
+            return;
+        }
+        // Absent: `/node-tenure/<node>` as read stands for it (#238). Every registration moves
+        // it, so the compare also fails on a tenure that began and ended since the read, which
+        // `/nodes` absent at both ends would not show. Same count: one compare for the record.
+        const key = records.node_tenure_key(node);
+        for (run.snap.tenures) |*entry| {
+            if (std.mem.eql(u8, entry.kv.key, key.slice())) {
+                batch.expect(entry.kv.key, entry.kv.mod_revision);
+                return;
+            }
+        }
+        // Neither read (a node last registered before #238): `/node-tenure/<node>` at revision
+        // 0. Every registration writes it, so this also fails on a tenure that began and ended
+        // since the read; `/nodes` at revision 0 would not.
+        batch.expect(try controller.key_copy(run.ctx, &key), 0);
     }
 
     /// The decision and the delete for a replica that is to stop for a reason the service gave.

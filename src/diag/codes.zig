@@ -455,15 +455,16 @@ pub const registry = [_]Entry{
         \\margin before its lease can run out, and the server places replacements
         \\only after the lease has run out and a grace period has passed. The
         \\margin must cover the time the agent needs to stop its containers, the
-        \\drift between the two clocks over one lease, and the time the kernel
-        \\needs to kill a process. These settings leave too little, so two copies
-        \\of a replica could run at once.
+        \\drift between the two clocks over one lease, the time the kernel needs
+        \\to kill a process, how late the agent's step may run, and how far the
+        \\store's clock may step forward. These settings leave too little, so two
+        \\copies of a replica could run at once.
         \\
         \\The cause line names the numbers. A lease time to live that is too
         \\long for the margin must be shortened. One that is too short, under
-        \\8000 ms, leaves the agent no time to renew it before it fences, so it
+        \\9000 ms, leaves the agent no time to renew it before it fences, so it
         \\must be lengthened; the cause line names the shortest. The default is
-        \\10000 ms. An agent that is granted a lease time to live below 8000 ms
+        \\10000 ms. An agent that is granted a lease time to live below 9000 ms
         \\by an older server stops its containers and reports this code.
         ,
     },

@@ -339,14 +339,14 @@ files; that is a coverage cut, not a pass.
 build made), `partitions`, `skew`, `crash_heavy`, `slow_store` or `auto` (drawn from
 the seed, weights 3 2 2 2 2). A profile other than `mixed` zeroes every fault class but its own
 and forces its own on. `<ops>` = `auto` (`-Dauto-shape` in `zig build`) draws the run's size from
-the seed as well: nodes 1 to 16, lease ttl 8,000 to 10,000 ms (the shipped 10 s 40 % of the time),
+the seed as well: nodes 1 to 16, lease ttl 9,000 to 10,000 ms (the shipped 10 s 40 % of the time),
 replica counts 100 to 300 %, operations 40 to 99 / 100 to 199 / 200 to 399, one run in ten 400 to
 800, with operations times nodes at most 5,000. `--lease-ttl-ms=` and `--replicas-pct=` set those
 two by hand, which is what a replay line carries (with the concrete nodes, `--profile=` and
 `--heal-at=`), so a replay draws nothing. An explicit `<ops>` keeps the seed-picked node count,
 the 10 s ttl and 100 % replicas. A failing seed prints `  profile:` and `  shape:` lines after
 its `  step:` line; the fleet's parser ignores them. The `auto` range summary reads
-`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 8,000 ms, which is also the shortest ttl the server admits
+`sim-cluster: seeds A..B, drawn operations: F of T failed`. The drawn ttl floor is 9,000 ms, which is also the shortest ttl the server admits
 (`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
 own generator (the seed xor a salt); the
 decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.

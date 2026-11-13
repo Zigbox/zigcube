@@ -45,7 +45,7 @@ pub fn join(demo: *Demo) !void {
         demo.tenures[index] = try state.need_tenure(host, row);
     }
     try host.check(state.contains(get.out, "4000m / 8.0Gi"), "the table shows 4000m / 8.0Gi", .{});
-    try host.check(state.contains(get.out, "s/8s"), "the table shows leases of 8s", .{});
+    try host.check(state.contains(get.out, "s/9s"), "the table shows leases of 9s", .{});
 }
 
 // ---- 2 ----
@@ -194,7 +194,7 @@ fn expect_printed(demo: *Demo) !void {
     const host = demo.host;
     const why = try host.zcube(&.{ "why", "node", lost_name });
     try host.check(why.code == 0, "zcube why node {s} exits 0", .{lost_name});
-    const ttl = "(ttl 8000 ms) ran out";
+    const ttl = "(ttl 9000 ms) ran out";
     const timeout_shown = state.contains(why.out, ttl);
     try host.check(timeout_shown, "it prints the lease timeout: \"" ++ ttl ++ "\"", .{});
     const heard = "the server last heard from it ";

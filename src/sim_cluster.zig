@@ -442,6 +442,9 @@ const Node = struct {
     fences: u32,
     /// `fences` when the heal began.
     fences_at_heal: u32,
+    /// Fence steps that began past `agent_step_lag_max_ms` and killed at once (#238), over the
+    /// whole run.
+    lag_kills: u32,
     /// Job reports the store refused (`Agent.job_reports_refused`), over all agent lives, and
     /// that count when the heal began (J10).
     job_refusals: u64,
@@ -608,9 +611,11 @@ const Node = struct {
         c.stats.agent_steps += 1;
         node.all_steps += 1;
         const fences_before = node.agent.fences;
+        const lag_kills_before = node.agent.lag_kills;
         const refusals_before = node.agent.job_reports_refused;
         const result = node.agent.reconcile(&ctx);
         node.fences += node.agent.fences - fences_before;
+        node.lag_kills += node.agent.lag_kills - lag_kills_before;
         node.job_refusals += node.agent.job_reports_refused - refusals_before;
         node.resume_ms = c.manual.ms + node.spent_ms;
         if (!node.sim.crashed) node.save_pair(clock.now_ms());
@@ -1044,6 +1049,7 @@ pub const Cluster = struct {
         node.cut_mark_ms = c.manual.ms;
         node.fences = 0;
         node.fences_at_heal = 0;
+        node.lag_kills = 0;
         node.job_refusals = 0;
         node.job_refusals_at_heal = 0;
         node.up_ms = 0;
@@ -3399,7 +3405,10 @@ fn print_summary(c: *Cluster) void {
         total.parked,    total.delivered_late,   total.partitioned,
     });
     const fences = total_fences(c);
-    report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
+    var lag_kills: u32 = 0;
+    for (c.nodes) |node| lag_kills += node.lag_kills;
+    report.print("fences: {d} (agents that stopped their containers for a lease) " ++
+        "lag_kills={d}\n", .{ fences, lag_kills });
     report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
         "counted otherwise)\n", .{
         s.duplicate_seconds,
