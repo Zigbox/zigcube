@@ -26,6 +26,7 @@ pub const modules = .{
     @import("job_api.zig"),
     @import("apply.zig"),
     @import("history.zig"),
+    @import("rollout_plan.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),
     @import("node_store.zig"),

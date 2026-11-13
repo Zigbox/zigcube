@@ -89,6 +89,7 @@ comptime {
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
     _ = @import("tls_conn_test.zig");
     _ = @import("fuzz_seeds.zig");
+    _ = @import("rollout_plan_fuzz.zig"); // Reads ZCUBE_FUZZ_SEED: native only.
     _ = @import("agent.zig"); // Its tests (next_wake) otherwise ran only in the WASM core root.
     _ = @import("agent_peer.zig");
     _ = @import("peer_files.zig");
