@@ -519,4 +519,33 @@ the `strong` world makes relayed jobs, so a run without `--strong` makes no rela
 `sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `strong`) leaves the listener open at
 the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.
 
+**Certificates (B4 slice 3, `src/sim_certs.zig`).** In the `strong` world each running relayed
+container's supervisor asks for its workload certificate once a second until it has one, on any
+tick its link to the server is not cut. The issuer is `job_cert.decide` over the store as committed:
+the job, its status, and the claim and assignment of the node the status names. The issuer's `now`
+is the asking node's clock, because a run's `started_at_ms` is its node's reading and a simulated
+node's clock has an offset of its own. While the certificate is valid the container opens up to 4
+relayed connections. Its ending, or a stop, closes them. On 15 % of ticks a forged ask stands for
+O4's unauthenticated request: an earlier epoch, another node's name, another image, or a run that
+may have ended. The report adds `certs: asks=.. issued=.. refused=.. ..` and `certs: refused by ..`.
+There are three checks:
+
+- **R4.** A certificate goes only to the node holding the run's claim, at the epoch named by the
+  claim and the assignment, for a run that is assigned, started, not terminal and not reported
+  stopped. It is judged at each issue against the records the issuer read.
+- **R5.** No certificate's `not_after` passes the claim's start + `deadline_ms` + `grace_ms` +
+  `workload_cert_slack_ms`.
+- **R6.** No relayed connection is open after the node's `/job-observed` record of that run (same
+  run id and epoch) says `stopped`, nor on a container the runtime forgot. It is judged on every tick
+  and, under `--c1`, at every revision.
+
+The checker reads the records itself rather than calling `job_cert`, so it does not judge the rule
+by the rule. Its generator is its own (seeded from the run's seed), so no other draw of the world
+changes. A world with relayed jobs differs only by the clock readings and store reads the model
+makes. The teeth are `sim-c1-teeth-job_cert_stale` (the issuer skips the epoch compare and must fail
+R4 with "a certificate was issued for a stale epoch"), `job_cert_long` (`not_after` counts the slack
+twice, R5) and `relay_conn_leak` (connections are not closed at the ending, R6). All three imply
+`strong`, run with or without `--c1`, and are in the fleet's canary list.
+`docs/decisions/2026-11-13-b4-slice3-sim-certs.md`.
+
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.
