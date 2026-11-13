@@ -304,8 +304,17 @@ const Call = struct {
         const key = records.node_key(call.node);
         const value = records.encode(ctx.arena, node, ctx.diag) catch return propagate(ctx);
         const put: store.Put = .{ .key = key.slice(), .value = value, .lease = input.lease };
-        const op: store.Op = .{ .put = put };
-        const request: store.TxnRequest = .{ .on_success = &.{op} };
+        // The tenure outlives the lease (#238): a node controller that never saw this tenure
+        // still finds it after the expiry, and judges it lost from then.
+        const tenure_key = records.node_tenure_key(call.node);
+        const tenure: records.NodeTenure = .{ .node = call.node };
+        const tenure_value = records.encode(ctx.arena, tenure, ctx.diag) catch
+            return propagate(ctx);
+        const ops = [_]store.Op{
+            .{ .put = put },
+            .{ .put = .{ .key = tenure_key.slice(), .value = tenure_value } },
+        };
+        const request: store.TxnRequest = .{ .on_success = &ops };
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
