@@ -281,8 +281,11 @@ const Call = struct {
 
     /// The revision `/nodes/<node>` has now, which a registration that names the tenure it
     /// replaces must still find: 0 if the key is absent. Refuses (ZC-E0510) a key at another
-    /// revision. 0 for an agent that names nothing: it is not compared.
-    fn registration_held(call: Call, replaces: ?u64) Failure!u64 {
+    /// revision. 0 for an agent that names nothing: it is not compared. A key that is already on
+    /// the registration's own lease is the agent's earlier attempt, whose reply was lost: the
+    /// retry is accepted and replaces it (no other agent holds that lease, so nothing is
+    /// overtaken), where the tenure it names has moved only by that attempt.
+    fn registration_held(call: Call, replaces: ?u64, lease_id: store.LeaseId) Failure!u64 {
         const named = replaces orelse return 0;
         const ctx = call.ctx;
         const key = records.node_key(call.node);
@@ -291,6 +294,7 @@ const Call = struct {
         };
         const kv = found.kv orelse return 0;
         if (kv.mod_revision == named) return kv.mod_revision;
+        if (kv.lease == lease_id) return kv.mod_revision;
         // Test-only (#237): the compare is left out, as the server did before the rule.
         if (c1_teeth.register_unchecked) return kv.mod_revision;
         return tenure_moved(ctx, call.node, named);
@@ -324,7 +328,7 @@ const Call = struct {
         const op: store.Op = .{ .put = put };
         // The registration replaces the tenure it names or fills an empty key; anything else
         // is an overtaken registration (#237). The compare makes the check and the write one.
-        const held = try call.registration_held(input.replaces);
+        const held = try call.registration_held(input.replaces, input.lease);
         const compares = [_]store.Compare{.{ .key = key.slice(), .mod_revision = held }};
         const request: store.TxnRequest = .{
             .compares = if (input.replaces != null) &compares else &.{},

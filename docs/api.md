@@ -657,9 +657,23 @@ Registers the node: the server writes `/nodes/<node>` on the lease, in the recor
 `replaces` (optional, #237) is the tenure the agent believes it holds: the `mod_revision` of
 `/nodes/<node>` its last registration answered, or 0 for none. When it is given, the write is
 compared against that revision, and a registration for a tenure that is no longer current (an
-earlier attempt landed late, after a newer one) is `ZC-E0510` and moves nothing. Without it (an
-older agent) nothing is compared; upgrade the server first. A keepalive of a lease the node's key
-is not on is `ZC-E0205` (the lease is an orphan: the agent grants again and registers again).
+earlier attempt landed late, after a newer one) is `ZC-E0510` and moves nothing. A key that is
+absent is filled, and a key already on the registration's own lease is the same registration
+sent again (its reply was lost), which is accepted. A keepalive of a lease the node's key is not
+on is `ZC-E0205` (the lease is an orphan: the agent grants again and registers again).
+
+**Upgrade, in this order: the server first, then the agents.**
+
+- A new agent against an old server: the agent always sends `replaces` (0 included), and an old
+  server rejects the unknown member with a 400 on every registration, so the node never
+  registers. That is why the server goes first.
+- An old agent against a new server: it sends no `replaces`, so nothing is compared, and a late
+  registration of its own can still move the key onto a lease nobody renews. Only the new
+  keepalive check limits it: the agent learns at its next renewal (`ZC-E0205`) and fences,
+  instead of renewing for ever. **#237 is closed only once every agent is upgraded.**
+- A server refuses a registration that names a tenure the key has moved past for up to one lease
+  ttl in the worst case (a lost reply the agent retries on a new lease is the one that is
+  accepted without waiting, see the decision file). `docs/decisions/2026-11-13-register-tenure.md`.
 
 ### `PUT /v1/agent/nodes/{node}/store` (C2 slice 5)
 

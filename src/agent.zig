@@ -187,6 +187,11 @@ pub const Agent = struct {
     /// names it as the one it replaces, so that a late registration of an earlier attempt is
     /// refused (#237). 0 before the first registration of this process or its kept state.
     last_tenure: u64,
+    /// A lease granted for a registration that has not been acknowledged (its request failed or
+    /// its reply was lost): the retry registers on the same lease, which the server accepts
+    /// again, rather than on a new one the first attempt would have made it refuse (#237).
+    /// `lease_none` with none. Memory only: a restart grants a new one.
+    pending: struct { lease: store.LeaseId = store.lease_none, ttl_ms: u32 = 0, sent_ms: u64 = 0 },
     /// The revision of the node's registration: the agent's tenure. 0 with no lease.
     tenure: store.Revision,
     /// `s`: when the last acknowledged keepalive (or the grant) was sent, monotonic.
@@ -299,6 +304,7 @@ pub const Agent = struct {
         agent.lease_ttl_ms = 0;
         agent.tenure = 0;
         agent.last_tenure = 0;
+        agent.pending = .{};
         agent.sent_ms = 0;
         agent.renew_at_ms = 0;
         agent.fence = .{};
@@ -747,7 +753,11 @@ pub const Agent = struct {
                 return .fenced;
             }
         }
-        const lease = try ctx.store.lease_grant(constants.lease_ttl_ms, ctx.diag);
+        if (agent.pending.lease == store.lease_none) {
+            const granted = try ctx.store.lease_grant(constants.lease_ttl_ms, ctx.diag);
+            agent.pending = .{ .lease = granted.id, .ttl_ms = granted.ttl_ms, .sent_ms = sent };
+        }
+        const lease = agent.pending;
         const node: records.Node = .{
             .name = agent.config.node,
             .agent_version = agent.config.agent_version,
@@ -757,15 +767,22 @@ pub const Agent = struct {
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);
-        const op: store.Op = .{ .put = .{ .key = key.slice(), .value = value, .lease = lease.id } };
-        const request: store.TxnRequest = .{ .on_success = &.{op} };
-        const done = try writers.txn(ctx.store, .{ .agent = agent.config.node }, request, ctx.diag);
+        const put: store.Put = .{ .key = key.slice(), .value = value, .lease = lease.lease };
+        const request: store.TxnRequest = .{ .on_success = &.{.{ .put = put }} };
+        const role: writers.Role = .{ .agent = agent.config.node };
+        const done = writers.txn(ctx.store, role, request, ctx.diag) catch |err| {
+            // Only a request that got no answer may have landed, and its retry names the same
+            // lease; any answer, a refusal included, ends the attempt with its lease.
+            if (err != error.Unreachable) agent.pending = .{};
+            return err;
+        };
         assert(done.succeeded);
         assert(done.revision > 0);
-        agent.lease = lease.id;
+        agent.pending = .{};
+        agent.lease = lease.lease;
         agent.tenure = done.revision;
         agent.last_tenure = done.revision;
-        try agent.acknowledged(ctx, sent, lease.ttl_ms);
+        try agent.acknowledged(ctx, lease.sent_ms, lease.ttl_ms);
         return .acted;
     }
 
@@ -798,7 +815,7 @@ pub const Agent = struct {
             .lease = agent.lease,
             .ttl_ms = agent.lease_ttl_ms,
             .sent_ms = agent.sent_ms,
-            .tenure = agent.tenure,
+            .tenure = if (agent.tenure != 0) agent.tenure else agent.last_tenure,
             .boot_id = ctx.boot_id,
             .fencing = agent.fence.active,
             .kill_at_ms = agent.fence.kill_at_ms,
@@ -844,6 +861,7 @@ pub const Agent = struct {
         // registers again. That is the upgrade note of
         // docs/decisions/2026-11-06-renewal-before-fence.md: raise the server's ttl and let every
         // agent renew under it before upgrading any.
+        if (parsed.lease == store.lease_none) return; // A finished fence: only the tenure is kept.
         const usable = parsed.lease != store.lease_none and parsed.tenure > 0 and
             fencing.inequality_problem(parsed.ttl_ms) == null and same_boot;
         if (!usable) return agent.begin_fence(ctx, mono);
@@ -907,12 +925,6 @@ pub const Agent = struct {
 
     /// Every container has stopped: the lease and the tenure are over.
     fn fenced(agent: *Agent, ctx: *const Context) Error!void {
-        if (ctx.state) |state| {
-            state.remove(lease_file) catch |err| switch (err) {
-                error.Absent => {},
-                else => return state_failed(ctx, err, "forget the lease"),
-            };
-        }
         agent.lease = store.lease_none;
         agent.lease_ttl_ms = 0;
         agent.tenure = 0;
@@ -921,6 +933,9 @@ pub const Agent = struct {
         agent.stops_count = 0;
         agent.fence = .{};
         agent.fences += 1;
+        // The file keeps the tenure and no lease: a restart's first registration names it as the
+        // one it replaces, and is not refused until the old lease has expired (#237).
+        try agent.persist(ctx);
     }
 
     fn forget_finished_stops(agent: *Agent, listings: []const runtime.Listing) void {

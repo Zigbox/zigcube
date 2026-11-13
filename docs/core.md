@@ -491,13 +491,17 @@ agent that ignores a cancel breaks J6; one that ignores the deadline, enforces i
 `sim-c1-teeth-job_evicted`: a job controller that judges only the first 512 jobs of each sweep (test-only, `job_controller.zig`) never ends an unplaceable job past the 512th, which J8's second clause (read over `job_admitted_window_max` runs, and a refused list is a failure) catches in the burst world with `--strong`; seed 186 (seed 32 until B2.1 slice 6; the fleet canary runs 1..186; `docs/decisions/2026-11-11-job-evicted-tooth-sparse.md`). switches live in `src/c1_teeth.zig`, read from the test's root file; `zcube-server` and
 `zcube-agent` assert at compile time that none is on.
 
-`sim-c1-teeth-register_unchecked` (#237): the simulated network replays each successful
-registration once more, under a lease granted just before it (`SimNet.late_registration`, always on
-in the cluster simulation; `late_registrations=` in the report), as a late attempt would land. The
-server refuses it (ZC-E0510, the register PUT compares `replaces`); with the comparison and the
-keepalive's check of the lease the node key is on skipped (test-only, `c1_teeth.register_unchecked`)
-the key moves onto the orphan lease, which expires, and the node is marked lost: I1b, or the run
-fails to converge (`agents kept fencing`, `a placed replica has no running container`).
+`sim-c1-teeth-register_unchecked` (#237): with `SimNet.late_registration` on (the tooth turns it on;
+`--late-registration` and `sim-c1-late` turn it on with the fix in), the network first grants a
+lease of its own when the agent asks for one, an earlier attempt's, older than the agent's. After
+the agent's registration is accepted, a copy of it under that older lease is parked and delivered
+`lease_ttl_ms - 1000` ms later, as a late attempt would land (`late_registrations=` and `landed=` in
+the report; nothing is drawn from the seed). The server refuses it (ZC-E0510: the register PUT
+compares `replaces`). With the comparison and the keepalive's check of the lease the node key is on
+skipped (test-only, `c1_teeth.register_unchecked`) the key moves onto the older lease, which
+nobody renews and which expires: the node is marked lost and its replicas are replaced while the
+agent still runs them, I1b (22 of 40 seeds, 1..40, 100 operations, `--c1`; the others end in
+`agents kept fencing`, `a running replica was never reported`).
 
 `sim-c1-teeth-job_reuse` (B2.1 slice 4): the reuse world. A store-side retention jump
 (`Cluster.retention_jump`; it ticks no agent, and first lets the J4 client catch up, since the

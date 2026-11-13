@@ -240,6 +240,27 @@ test "a registration overtaken by a newer one is ZC-E0510 and moves nothing (#23
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", plain);
 }
 
+test "a registration retried on the same lease after a lost reply is accepted (#237)" {
+    // Goal: an agent whose registration landed but whose reply was lost retries with the same
+    // lease and the tenure it named, and must not be refused for a tenure its own attempt moved.
+    // Method: register on L1 replacing T0, register again with the same body; the key stays on
+    // L1. A registration on another lease naming T0 is still refused.
+    var rig = try Rig.start(6);
+    defer rig.stop();
+    var buffer: [512]u8 = undefined;
+    const first = try rig.grant("node2");
+    const second = try rig.grant("node2");
+    const early = try register_replacing(&buffer, first, 0);
+    const tenure = field(try rig.ok("PUT", "/v1/agent/nodes/node2", "", early), "revision").integer;
+    const body = try register_replacing(&buffer, second, tenure);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
+    try testing.expectEqual(second, field(field(listed, "kvs").array.items[0], "lease").integer);
+    const stale = try register_replacing(&buffer, first, tenure);
+    try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", stale), 503, "ZC-E0510");
+}
+
 test "a keepalive of a lease the node's key is not on is ZC-E0205 (#237)" {
     // Goal: an agent whose key moved to another lease must fence, not keep renewing. Method: two
     // leases, the key on the second; renew the first.

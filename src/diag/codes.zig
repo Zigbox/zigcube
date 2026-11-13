@@ -673,6 +673,10 @@ pub const registry = [_]Entry{
         \\
         \\A node agent that sees this has lost its place in the cluster. It stops
         \\its workloads, grants a new lease and registers again.
+        \\
+        \\The same code answers a keepalive for a lease the node's registration is
+        \\not on, and a registration made on a lease that is gone. The first means
+        \\a later registration took the node: the agent fences, as above.
         ,
     },
     .{
@@ -1188,6 +1192,11 @@ pub const registry = [_]Entry{
         \\while the node's registration is the one it made. This write named a
         \\registration that has since ended or been replaced, because the lease
         \\ran out or another registration took its place. Nothing was written.
+        \\
+        \\A registration names the tenure it replaces, and is refused the same way
+        \\when the node has been registered since: an earlier attempt that arrives
+        \\late must not take the node back onto a lease nobody renews (#237). The
+        \\agent grants a new lease and tries again once the old one has ended.
         \\
         \\The agent stops its containers, registers again and reports from the
         \\new tenure. Nothing needs doing unless this repeats: then two agents

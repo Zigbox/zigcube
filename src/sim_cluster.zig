@@ -908,13 +908,7 @@ pub const Cluster = struct {
         };
         c.ack_loss = .init(c.tap.interface(), seed ^ 0xac4, c.swarm.ack_loss_per_mille);
         c.switched = .{ .inner = c.ack_loss.interface() };
-        c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
-        c.net.late_registration = true;
-        c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
-        if (options.lease_ttl_ms) |ttl_ms| {
-            assert(fencing.inequality_problem(ttl_ms) == null);
-            c.api.lease_ttl_ms = ttl_ms;
-        }
+        c.init_net(gpa, seed, options);
         c.api_source = .{ .instance = 0 };
         c.prng = .init(seed ^ 0xc15e_7e12);
         c.diag.reset();
@@ -950,6 +944,19 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The network and the server's API: the late registration is off unless asked for, so a run
+    /// is the world it was (old replay lines), and the network knows the lease ttl.
+    fn init_net(c: *Cluster, gpa: Allocator, seed: u64, options: Options) void {
+        c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
+        c.net.late_registration = options.late_registration or c1_teeth.register_unchecked;
+        c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
+        if (options.lease_ttl_ms) |ttl_ms| {
+            assert(fencing.inequality_problem(ttl_ms) == null);
+            c.api.lease_ttl_ms = ttl_ms;
+            c.net.lease_ttl_ms = ttl_ms;
+        }
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -3092,6 +3099,9 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// The network delivers a stale registration late (`SimNet.late_registration`, #237). Off, a
+    /// run is the world it was before the fix; the `register_unchecked` tooth turns it on.
+    late_registration: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of

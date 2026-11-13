@@ -218,6 +218,18 @@ identified by that key's `mod_revision` at registration (the *tenure revision*).
 
 This is real fencing, because the store is the shared resource and it checks the token.
 
+**A registration is compared too (#237).** Registering is the one write that creates a tenure, so
+it carries the tenure it replaces (`replaces`: the `mod_revision` its agent last held, 0 for
+none) and the server writes `/nodes/<node>` in one transaction that compares the key at that
+revision (or absent). A registration that was delayed on the wire and arrives after a newer one
+finds another revision and is refused (ZC-E0510); without the compare it would move the key onto
+its own lease, which nobody renews, and the node would be lost while its agent still ran its
+replicas (I1b). A key already on the registration's own lease is the same registration sent
+again, and is accepted. The lease keepalive requires that the node's key is on the lease it
+renews, so an agent whose registration was overtaken stops renewing at once and fences (ZC-E0205).
+An older agent sends no `replaces` and is not compared; only the keepalive rule limits it.
+`docs/decisions/2026-11-13-register-tenure.md`.
+
 **Why not bind `/observed` keys to the lease.** In discussion I proposed attaching every observed
 key to the node's lease, so that expiry deletes them. The store forbids it at scale:
 `store_lease_keys_max` is 64, because a lease's keys are deleted in one revision and a watch batch
