@@ -27,3 +27,13 @@ Status: built, compiled and rehearsed piece by piece in the cloud container; **n
 
 - Open the PR (supervisor) so CI's `demo-b5` job runs; fix whatever the real VM shows.
 - README and site have no B5 rows yet; status is the supervisor's.
+
+## Merged in
+
+- `claude/b5-slice2` at dd68b92 (slice 2 fix pass), as the supervisor asked. The one conflict,
+  `src/agent_jobs.zig`: slice 2's `trust_refusal` (returns the refusal) replaced slice 3's
+  `refused_by_trust`; the `job_untrusted` tooth moved into it, and
+  `zig build sim-c1-teeth-job_untrusted` still passes (J12 caught at seed 1).
+- The guest's `--trust-policy` is absolute (`/root/trust.zon`), so slice 2's ZC-E0505 for a
+  relative path does not touch the demo; its policy requires a signature, so the agent runs
+  `zbx trust import`.
