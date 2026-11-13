@@ -122,6 +122,9 @@ pub fn code_of(err: Error) @import("diag/codes.zig").Code {
 /// New kinds go at the end: the kind's value is hashed into every serial (`serial_of`).
 pub const Kind = enum { ca, workload, server, node, client };
 
+/// A set of kinds: what a listener takes (the API takes a node's and a client's).
+pub const Kinds = std.EnumSet(Kind);
+
 pub const Scope = identity_mod.Scope;
 
 /// The SPIFFE path of a clientAuth kind.
@@ -210,6 +213,9 @@ pub const Detail = struct {
     name_found: []const u8 = "",
     kind_expected: Kind = .server,
     kind_found: Kind = .server,
+    /// Every kind the caller takes, when it takes more than `kind_expected`: the cause names
+    /// them all.
+    kinds_expected: Kinds = .empty,
 };
 
 /// A certificate in DER, built back to front: the bytes are `bytes[start..]`.
@@ -1523,12 +1529,39 @@ pub fn raise(diag: *Diag, err: Error, subject: []const u8, detail: *const Detail
             subject, detail.name_found, detail.name_expected,
         }),
         .E0817 => diag.cause("no identity for {s}: {s}", .{ subject, reason(err) }),
-        .E0819 => diag.cause("{s}'s certificate is {s}; this use needs {s}", .{
-            subject, kind_text(detail.kind_found), kind_text(detail.kind_expected),
-        }),
+        .E0819 => raise_kind(diag, subject, detail),
         else => diag.cause("{s}'s certificate was refused: {s}", .{ subject, reason(err) }),
     }
     diag.fix(.{ .sentence = fix_sentence(code), .command = fix_command(code) });
+}
+
+fn raise_kind(diag: *Diag, subject: []const u8, detail: *const Detail) void {
+    const found = kind_text(detail.kind_found);
+    if (detail.kinds_expected.count() <= 1) {
+        const expected = kind_text(detail.kind_expected);
+        diag.cause("{s}'s certificate is {s}; this use needs {s}", .{ subject, found, expected });
+        return;
+    }
+    // Five kinds of at most 24 bytes, each with a separator, fit.
+    var buffer: [160]u8 = undefined;
+    var length: u32 = 0;
+    var kinds = detail.kinds_expected;
+    var iterator = kinds.iterator();
+    var index: u32 = 0;
+    const total: u32 = @intCast(detail.kinds_expected.count());
+    while (iterator.next()) |kind| : (index += 1) {
+        const separator: []const u8 = if (index == 0) "" else if (index + 1 == total)
+            " or "
+        else
+            ", ";
+        for ([_][]const u8{ separator, kind_text(kind) }) |part| {
+            @memcpy(buffer[length..][0..part.len], part);
+            length += @intCast(part.len);
+        }
+    }
+    diag.cause("{s}'s certificate is {s}; this use needs {s}", .{
+        subject, found, buffer[0..length],
+    });
 }
 
 fn raise_shape(diag: *Diag, err: Error, subject: []const u8, detail: *const Detail) void {

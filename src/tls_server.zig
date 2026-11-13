@@ -48,10 +48,10 @@ pub const Config = struct {
     secret: [32]u8,
     /// The server's certificate (and optionally the CA's after it) and its signer.
     identity: Identity,
-    /// The kind of certificate a client must present.
-    client_kind: x509.Kind = .workload,
-    /// A second kind the server also takes (B7: the API takes a node's and a client's).
-    client_kind_also: ?x509.Kind = null,
+    /// The kinds of certificate a client may present: a workload's for a sidecar, a node's and
+    /// a client's for the API (docs/decisions/2026-11-13-api-listener-cert-kinds.md). Required:
+    /// a listener that forgot it fails to compile instead of taking a default kind.
+    client_kinds: x509.Kinds,
 };
 
 /// The client the handshake authenticated.
@@ -131,8 +131,7 @@ pub const Server = struct {
     random: [32]u8,
     secret: [32]u8,
     public_key: [32]u8,
-    client_kind: x509.Kind,
-    client_kind_also: ?x509.Kind,
+    client_kinds: x509.Kinds,
     identity: [constants.tls_chain_certificates_max][constants.x509_cert_bytes_max]u8,
     identity_lengths: [constants.tls_chain_certificates_max]u32,
     identity_count: u32,
@@ -170,9 +169,9 @@ pub const Server = struct {
         self.random = config.random;
         self.secret = config.secret;
         self.public_key = X25519.recoverPublicKey(config.secret);
-        self.client_kind = config.client_kind;
-        self.client_kind_also = config.client_kind_also;
-        if (config.client_kind_also) |also| assert(also != config.client_kind);
+        assert(config.client_kinds.count() >= 1);
+        assert(!config.client_kinds.contains(.ca));
+        self.client_kinds = config.client_kinds;
         self.identity_lengths = @splat(0);
         for (certificates, 0..) |certificate, index| {
             assert(certificate.len > 0);
@@ -188,7 +187,7 @@ pub const Server = struct {
         self.read_protected = false;
         self.ccs_dropped = 0;
         self.leaf_key = @splat(0);
-        self.peer_kind = config.client_kind;
+        self.peer_kind = first_kind(config.client_kinds);
         self.peer_name_length = 0;
         self.peer_scope = null;
         self.authenticated = false;
@@ -718,6 +717,7 @@ pub const Server = struct {
     ) x509.Error!x509.Parsed {
         const kind = self.expected_kind(leaf);
         const expect: x509.Expect = .{ .kind = kind, .name = null };
+        detail.kinds_expected = self.client_kinds;
         const now = self.now_ms;
         const parsed = x509.verify_detailed(leaf, self.anchor, now, expect, detail) catch |err| {
             if (fault_on(.client_chain)) return x509.parse(leaf);
@@ -730,13 +730,13 @@ pub const Server = struct {
         return parsed;
     }
 
-    /// The kind the leaf is checked against: the second kind when it parses as that kind, else
-    /// the first (so a certificate of neither is refused as the wrong use of the first).
+    /// The kind the leaf is checked against: its own when the server takes it, else the first
+    /// the server takes, so the check refuses it (ZC-E0819 names every kind taken). One check
+    /// against the set, not one handshake per kind.
     fn expected_kind(self: *const Server, leaf: []const u8) x509.Kind {
-        const also = self.client_kind_also orelse return self.client_kind;
-        const parsed = x509.parse(leaf) catch return self.client_kind;
-        if (parsed.kind == also) return also;
-        return self.client_kind;
+        const parsed = x509.parse(leaf) catch return first_kind(self.client_kinds);
+        if (self.client_kinds.contains(parsed.kind)) return parsed.kind;
+        return first_kind(self.client_kinds);
     }
 
     fn fail_no_certificate(self: *Server, diag: *Diag) Error {
@@ -961,6 +961,12 @@ fn server_wire_alert(err: wire.Error, message: []const u8) wire.Alert {
         }
     }
     return tls_client.wire_alert(err);
+}
+
+fn first_kind(kinds: x509.Kinds) x509.Kind {
+    var copy = kinds;
+    var iterator = copy.iterator();
+    return iterator.next().?; // `init` asserts the set is not empty.
 }
 
 fn message_name(kind: u8) []const u8 {

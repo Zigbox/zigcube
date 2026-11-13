@@ -110,8 +110,7 @@ pub const Setup = struct {
             .random = undefined,
             .secret = undefined,
             .identity = undefined,
-            .client_kind = .node,
-            .client_kind_also = .client,
+            .client_kinds = .initMany(&.{ .node, .client }),
         };
         defer std.crypto.secureZero(u8, &config.secret);
         inline for (.{ &config.random, &config.secret }) |field| {

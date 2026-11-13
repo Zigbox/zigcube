@@ -46,10 +46,10 @@ const Rig = struct {
     }
 
     fn setup_server(rig: *Rig, kind: x509.Kind) !void {
-        try rig.setup_server_also(kind, null);
+        try rig.setup_server_kinds(.initOne(kind));
     }
 
-    fn setup_server_also(rig: *Rig, kind: x509.Kind, also: ?x509.Kind) !void {
+    fn setup_server_kinds(rig: *Rig, kinds: x509.Kinds) !void {
         rig.diag.reset();
         rig.ca = try x509_test.ca_pair();
         rig.server_key = try Ed25519.KeyPair.generateDeterministic(@splat(0x21));
@@ -69,8 +69,7 @@ const Rig = struct {
                 .certificates = &rig.chain,
                 .signer = tls_server.key_pair_signer(&rig.server_key),
             },
-            .client_kind = kind,
-            .client_kind_also = also,
+            .client_kinds = kinds,
         });
         rig.sent_length = 0;
         rig.data_events = 0;
@@ -653,15 +652,15 @@ test "client_kind: a server takes a client certificate of its configured kind an
     try std.testing.expectEqual(@as(u32, 0), failures);
 }
 
-test "client_kind_also: the API's server takes a node's and a client's, with the scope" {
-    // Goal: one listener takes both kinds B7's API serves, and only those. Method: a server for
-    // `node` and also `client`; each of the four kinds presented; the two connect (the client's
-    // scope read back, a node's null), the others are refused with ZC-E0819.
+test "client_kinds: the API's server takes a node's and a client's, with the scope" {
+    // Goal: one listener takes the set of kinds B7's API serves, and only those. Method: a server
+    // for {node, client}; each of the four kinds presented; the two connect (the client's scope
+    // read back, a node's null), the others are refused with ZC-E0819 naming both kinds taken.
     const kinds = [_]x509.Kind{ .workload, .server, .node, .client };
     const chains = [_]testclient.Chain{ .good, .server_kind, .node_kind, .client_kind };
     for (kinds, chains) |presented, chain| {
         var rig: Rig = undefined;
-        try rig.setup_server_also(.node, .client);
+        try rig.setup_server_kinds(.initMany(&.{ .node, .client }));
         try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = chain } });
         const result = rig.handshake(4096);
         switch (presented) {
@@ -678,6 +677,9 @@ test "client_kind_also: the API's server takes a node's and a client's, with the
             else => {
                 try std.testing.expectError(error.Refused, result);
                 try rig.expect_code(.E0819);
+                const cause = rig.diag.last_cause().?;
+                const both = "this use needs a node certificate or a client certificate";
+                try std.testing.expect(std.mem.indexOf(u8, cause, both) != null);
             },
         }
     }

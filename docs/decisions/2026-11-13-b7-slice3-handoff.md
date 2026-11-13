@@ -17,6 +17,10 @@ Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
 - `zcube-server ca issue-node NAME` (a node bootstrap certificate) beside `ca issue-client`.
 - `zcube-agent`: the same flags or ZON keys. It presents its own `node.crt` and `peer.key` once
   it has joined (and the new one after each renewal), else `--cert`/`--key`.
+- `tls_server.Config.client_kinds` is a required set of kinds (the API takes `{node, client}`),
+  replacing `client_kind` and the `client_kind_also` this slice first added; ZC-E0819 names
+  every kind taken (`2026-11-13-api-listener-cert-kinds.md`). When slice 1's fix (573ca43,
+  `client_kind` required) merges, `client_kinds` replaces it.
 - `api_tls_client.zig` is the client side shared by both (files, the pin, one exchange).
 - Tests: `api_test.zig` "scopes: every endpoint ..." (every endpoint x node1, jobs, admin, plus
   node2's paths), `api_tls_test.zig` (real server, real certificates), config and flag tests.

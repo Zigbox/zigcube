@@ -282,8 +282,10 @@ It has no HelloRetryRequest, no PSK, no tickets and no early data.
 
 **A client certificate is always required.** Every flight carries a CertificateRequest (empty
 context, `signature_algorithms` = ed25519). The chain the client sends (at most two certificates)
-is verified against the CA for `Config.client_kind` (`workload` until slice 2 adds `node` and
-`client`). A CA-signed certificate of another kind is ZC-E0819. An empty Certificate is ZC-E0814
+is verified against the CA for the kinds in `Config.client_kinds`, a required set: `workload` for
+a sidecar, `node` and `client` for the API. The leaf is checked once, against its own kind when
+the set holds it; a CA-signed certificate of another kind is ZC-E0819, and its cause names every
+kind the listener takes (docs/decisions/2026-11-13-api-listener-cert-kinds.md). An empty Certificate is ZC-E0814
 with the `certificate_required` alert. `peer()` returns the verified kind and name.
 
 **Its rules.** These are the client's, mirrored:
