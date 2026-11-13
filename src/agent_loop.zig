@@ -58,6 +58,8 @@ pub const Loop = struct {
     retry_ms: u32,
     /// The deadline of the wait in progress (the core's `Wakeup.at_ms`).
     wake_at_ms: u64,
+    /// Whether the wait in progress may hold the server (`Wakeup.watch`).
+    watching: bool,
     last_code: ?codes.Code,
     last_report_ms: u64,
     stop_requested: bool,
@@ -69,6 +71,7 @@ pub const Loop = struct {
             .state = .stepping,
             .retry_ms = constants.server_retry_ms_min,
             .wake_at_ms = 0,
+            .watching = true,
             .last_code = null,
             .last_report_ms = 0,
             .stop_requested = false,
@@ -96,7 +99,9 @@ pub const Loop = struct {
                     return .step;
                 }
                 const left = loop.wake_at_ms - now_ms;
-                return .{ .watch_ms = @intCast(@min(left, constants.agent_watch_slice_ms)) };
+                const slice: u32 = @intCast(@min(left, constants.agent_watch_slice_ms));
+                if (!loop.watching) return .{ .pause_ms = slice };
+                return .{ .watch_ms = slice };
             },
         }
     }
@@ -118,6 +123,7 @@ pub const Loop = struct {
             .ok => |wake| {
                 loop.retry_ms = constants.server_retry_ms_min;
                 loop.wake_at_ms = wake.at_ms;
+                loop.watching = wake.watch;
                 loop.state = if (wake.acted > 0) .stepping else .waiting;
                 if (loop.last_code == null) return .none;
                 loop.last_code = null;
@@ -254,4 +260,16 @@ test "a stop request ends the loop from every state, and a lease is news only wh
     try testing.expectEqual(LeaseNews.none, lease_news(5, 5));
     try testing.expectEqual(LeaseNews.registered, lease_news(store.lease_none, 5));
     try testing.expectEqual(LeaseNews.replaced, lease_news(5, 6));
+}
+
+test "a wait that may not watch is a pause to the deadline, and never a step before it" {
+    // Goal: the fence's wait (#225). Method: an idle step with `watch` false -> pauses, each
+    // returning to the same question, until the deadline; then a step.
+    var loop = Loop.init();
+    _ = loop.next(0);
+    const fence: controller.Wakeup = .{ .at_ms = 100, .prefixes = &.{}, .acted = 0, .watch = false };
+    _ = loop.step_done(0, .{ .ok = fence });
+    try testing.expectEqual(Action{ .pause_ms = 100 }, loop.next(0));
+    try testing.expectEqual(Action{ .pause_ms = 40 }, loop.next(60));
+    try testing.expectEqual(Action.step, loop.next(100));
 }

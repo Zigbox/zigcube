@@ -1792,6 +1792,19 @@ const c1_regressions = [_][]const []const u8{
         "--c1",                 "--strong",           "--profile=slow_store",
         "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=99",
     },
+    // #225: an agent that fenced after a restart waited with a watch that answered at once (no
+    // replica list, so no revision to watch from), and stepped in a hot loop until the fence
+    // ended: 52 steps in one millisecond. A wait while fencing is a pause now (`Wakeup.watch`).
+    &.{
+        "9739923",            "114",                   "4",
+        "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=104",
+    },
+    &.{
+        "2764708423",         "69",                    "4",
+        "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=8248",
+        "--replicas-pct=300", "--heal-at=58",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
