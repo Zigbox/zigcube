@@ -776,7 +776,8 @@ test "a job with a relay gets no network, one listener on the relay port and ZCU
     try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env_names[1]);
 }
 
-test "the zigbox supervisor refuses a TLS relay and a release build's plain one (#228)" {
+test "relay plain: the zigbox supervisor refuses a TLS relay and a release build's plain one" {
+    // #228. `demo-b3-build` also runs this test in ReleaseSafe, where the plain one is refused.
     // Goal: fail closed until B4 slice 4 brings TLS here. Method: a relay naming a server name is
     // refused (never connected in plaintext), so is one that is neither TLS nor plain, and a
     // plain one only in a build that admits plain upstreams.

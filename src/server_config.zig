@@ -848,6 +848,25 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
     }
 }
 
+test "relay plain: only a Debug build's configuration may say .plain" {
+    // Goal: the plain test upstream demo-b3 relies on is never configurable in a release build.
+    // Method: the same file in each mode; `demo-b3-build` also runs this test in ReleaseSafe.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const text = ".{ .relays = .{ .botpike = .{ .address = \"127.0.0.1:9090\", .plain = true } } }";
+    const parsed = parse_zon(arena, text, "server.zon", &diag);
+    if (builtin.mode == .debug) {
+        const config = try merge(.{}, try parsed, &diag);
+        try testing.expect(config.relays[0].plain);
+    } else {
+        try testing.expectError(error.BadConfig, parsed);
+        try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0106), diag.code);
+    }
+}
+
 test "a relay's server_ca is a PEM certificate whose Ed25519 key becomes the anchor" {
     // Goal: `pem_anchor` reads the subject key of a PEM certificate in any line layout, and
     // refuses anything else. Method: a CA certificate encoded with 64- and 76-byte lines and

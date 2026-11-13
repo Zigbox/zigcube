@@ -46,11 +46,12 @@ pub fn build(b: *std.Build) void {
     };
     const built = add_executables(b, shared_options);
     add_unit_tests(b, shared_options, built);
+    const built_debug = add_debug_executables(b, shared_options);
 
     // `-Dseed=N` is one option for two steps (test-store and sim-c0), so it is declared once.
     const seed_help = "Seed for test-store (default: random) and sim-c0 (default: 1)";
     const seed = b.option(u64, "seed", seed_help);
-    add_store_and_demo_steps(b, built, seed, .{
+    add_store_and_demo_steps(b, .{ built, built_debug }, seed, .{
         .target = target,
         .optimize = optimize,
         .zigbox = zigbox_module,
@@ -90,7 +91,8 @@ const Shared = struct {
 
 /// The steps that run against a real store. `-Dbackend` and `-Dpostgres` are shared by two of
 /// them, so they are declared once, here: test-store (default memory) and demo-c0 (default sqlite).
-fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Shared) void {
+fn add_store_and_demo_steps(b: *std.Build, sets: [2]Built, seed: ?u64, shared: Shared) void {
+    const built, const built_debug = sets;
     const backend = b.option(Backend, "backend", "Store backend for test-store and demo-c0");
     const postgres = postgres_conninfo(b);
     const store_help = "Run the store conformance suite (-Dbackend=...)";
@@ -128,6 +130,7 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
     };
     add_demo_step(b, .{
         .built = built,
+        .built_debug = built_debug,
         .backend = demo_backend,
         .postgres = postgres,
         .target = shared.target,
@@ -233,6 +236,8 @@ const ExecutablesOptions = struct {
     sqlite: *std.Build.Module,
     libpq: *std.Build.Module,
     web_files: *std.Build.Module,
+    /// Whether `zig build` installs them; the Debug set demo-b3 runs is built only for it.
+    install: bool = true,
 };
 
 /// What `add_executables` made that other steps use: the server and the agent, and the steps that
@@ -244,6 +249,16 @@ const Built = struct {
     server_install: *std.Build.Step.InstallArtifact,
     agent_install: *std.Build.Step.InstallArtifact,
 };
+
+/// demo-b3's server and agent, Debug whatever `-Doptimize` says, never installed: until B4 slice 4
+/// the zigbox runtime speaks no TLS to a relay's upstream, so the demo relays to a plain test
+/// upstream, which only a Debug build serves (docs/decisions/2026-11-13-b4-slice2-fixes.md).
+fn add_debug_executables(b: *std.Build, shared_options: ExecutablesOptions) Built {
+    var debug_options = shared_options;
+    debug_options.optimize = .Debug;
+    debug_options.install = false;
+    return add_executables(b, debug_options);
+}
 
 fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built {
     const build_options = executables_options.options.createModule();
@@ -267,7 +282,7 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
         }
         const exe = b.addExecutable(.{ .name = executable.name, .root_module = module });
         const install = b.addInstallArtifact(exe, .{});
-        b.getInstallStep().dependOn(&install.step);
+        if (executables_options.install) b.getInstallStep().dependOn(&install.step);
         if (std.mem.eql(u8, executable.name, "zcube-server")) {
             built.server = exe;
             built.server_install = install;
@@ -588,6 +603,8 @@ fn add_pg_dev_steps(b: *std.Build) *std.Build.Step.Compile {
 
 const DemoStepOptions = struct {
     built: Built,
+    /// The same executables built Debug and not installed: demo-b3's server and agent.
+    built_debug: Built,
     backend: Backend,
     postgres: []const u8,
     target: std.Build.ResolvedTarget,
@@ -795,15 +812,32 @@ fn add_demo_b3_step(b: *std.Build, step_options: DemoStepOptions, transcript: ?[
     const build_step = b.step("demo-b3-build", "Compile demo-b3 and test its script, no run");
     build_step.dependOn(&exe.step);
     build_step.dependOn(&b.addRunArtifact(script_tests).step);
+    // demo-b3 runs Debug binaries for its plain test upstream until B4 slice 4; these prove, in
+    // the mode Zigcube ships, that the server refuses `.plain` and the zigbox supervisor refuses
+    // to serve it (the tests named `relay plain:`).
+    for ([_][]const u8{ "src/server_config.zig", "src/zigbox_supervisor.zig" }) |root| {
+        const release_tests = b.addTest(.{
+            .filters = &.{"relay plain:"},
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(root),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "zigbox", .module = step_options.zigbox }},
+            }),
+        });
+        build_step.dependOn(&b.addRunArtifact(release_tests).step);
+    }
     const run = b.addRunArtifact(exe);
     run.has_side_effects = true;
     const built = step_options.built;
+    // Debug server and agent until B4 slice 4: the plain test upstream (see `built_debug`).
+    const debug = step_options.built_debug;
     run.addArg("--zcube");
     run.addArtifactArg(built.cli);
     run.addArg("--server");
-    run.addArtifactArg(built.server);
+    run.addArtifactArg(debug.server);
     run.addArg("--agent");
-    run.addFileArg(stripped(b, built.agent));
+    run.addFileArg(stripped(b, debug.agent));
     run.addArg("--zbx");
     run.addFileArg(stripped(b, zigbox.artifact("zbx")));
     run.addArg("--guest-script");
