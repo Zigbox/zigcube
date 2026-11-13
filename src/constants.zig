@@ -121,6 +121,25 @@ pub const replicas_max: u32 = runtime_handles_max;
 pub const nodes_max: u32 = 64;
 /// Records one reconcile pass reads: a service holds at most this many replicas.
 pub const replicas_per_service_max: u32 = 128;
+/// Generations of a service `/history` keeps (owner,
+/// docs/decisions/2026-11-05-c3-owner-answers.md): an apply that adds one past it deletes the
+/// oldest. Rolling back to a deleted one is ZC-E0128.
+pub const history_generations_max: u32 = 16;
+/// History keys one read of a service's history takes at most. Every writer keeps
+/// `history_generations_max`; the slack covers keys a crash between transactions could leave.
+pub const history_scan_max: u32 = 64;
+/// The longest a health check may wait between runs, and its `start_period_ms`: as long as the
+/// server waits for a lost node (`lost_grace_ms_max`), the longest the cluster leaves a replica
+/// unjudged elsewhere (docs/decisions/2026-11-13-c3-health-rollout-bounds.md).
+pub const health_interval_ms_max: u32 = lost_grace_ms_max;
+/// The longest a health check's thresholds may take to settle a verdict, `threshold *
+/// interval_ms`: a day, the longest deadline a job may have (`job_deadline_ms_max`).
+pub const health_verdict_ms_max: u64 = job_deadline_ms_max;
+/// The longest `rollout.progress_deadline_ms` (which bounds `ready_timeout_ms` and
+/// `min_ready_ms` too): a day, the longest deadline a job may have.
+pub const rollout_deadline_ms_max: u32 = @intCast(job_deadline_ms_max);
+/// The longest `rollout.grace_ms` an old replica gets to stop: a job's longest stop grace.
+pub const rollout_grace_ms_max: u32 = job_grace_ms_max;
 /// Writes one controller step makes at most (each is a transaction of at most
 /// `store_txn_ops_max` operations): the step stops, says so, and runs again for the rest.
 pub const controller_txns_per_step_max: u32 = 64;
@@ -811,6 +830,13 @@ comptime {
     assert(store_watch_hole_retries_max > 0);
     assert(store_postgres_schema_bytes_max + "zcube_".len < 63); // A NOTIFY channel is a name.
     assert(replicas_per_service_max <= replicas_max);
+    // An apply's transaction: service, history, a decision and the oldest generations it drops.
+    assert(history_generations_max >= 1);
+    assert(history_scan_max <= store_list_limit_max);
+    assert(history_scan_max >= history_generations_max);
+    assert(health_interval_ms_max <= health_verdict_ms_max);
+    assert(rollout_grace_ms_max <= rollout_deadline_ms_max);
+    assert(rollout_deadline_ms_max == job_deadline_ms_max);
     assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
     assert(retention_batch_pairs * 2 <= store_txn_ops_max);
     assert(why_steps_max <= retention_pinned_max);

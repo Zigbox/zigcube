@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0516]: a replica's health check could not run
+  cause  the health check of hello-1 could not start: ZBX-E0501 the container is
+         not running
+  reqid  r-0000001
+  fix    read the runtime's code; the check runs again next interval
+  more   zcube explain E0516
+  docs   https://zigbox.github.io/zigcube/errors/E0516.html

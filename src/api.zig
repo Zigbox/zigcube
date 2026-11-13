@@ -586,6 +586,19 @@ fn conflict(ctx: *const Context, name: []const u8) Failure {
     return error.Failed;
 }
 
+/// ZC-E0105 for a delete: the history goes first, in transactions of its own (`delete_all`), so
+/// a delete that lost the race may already have removed some of it, and that stays removed.
+fn conflict_on_delete(ctx: *const Context, name: []const u8) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0105);
+    ctx.diag.cause("service {s} was changed by someone else during the request", .{name});
+    ctx.diag.cause("the service was not deleted, but generations of its history the delete had " ++
+        "already removed stay removed (a rollback to one is ZC-E0128)", .{});
+    const sentence = "look at it as it is now, then delete it again if you still mean to";
+    ctx.diag.fix_with(sentence, "zcube get service {s}", .{name});
+    return error.Failed;
+}
+
 /// A reply for a request the shell refuses before it reaches `handle` (too large, too many
 /// connections): the failure already raised on `ctx.diag`, with the shell's own status.
 pub fn refusal(ctx: *const Context, request_id: []const u8, status: u16) Response {
@@ -869,17 +882,15 @@ fn decode(ctx: *const Context, text: []const u8) Failure![]const u8 {
 
 /// Writes a key's value as JSON: parsed and written back compactly, so a value that is not JSON
 /// cannot corrupt the response (it becomes a string), and with `env` values removed for a
-/// read-only token.
+/// read-only token. The `env` of every record is redacted, whatever its prefix: a record that
+/// copies a spec (`/history/`, C3) carries the same secrets as the service, and a prefix list
+/// would leak the next one added (docs/api.md item 8).
 fn write_value(api: *const Api, out: *Out, key: []const u8, bytes: []const u8) Failure!void {
     var parsed = std.json.parseFromSliceLeaky(std.json.Value, out.ctx.arena, bytes, .{}) catch {
         return out.value(bytes);
     };
-    const secret = std.mem.startsWith(u8, key, records.prefix_services) or
-        std.mem.startsWith(u8, key, records.prefix_replicas);
-    if (api.read_only and secret) redact_env(&parsed);
-    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_jobs)) redact_env(&parsed);
+    if (api.read_only) redact_env(&parsed);
     if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_runs)) {
-        redact_env(&parsed);
         if (parsed == .object) {
             if (parsed.object.getPtr("input_digest")) |digest| digest.* = .null;
         }
@@ -1523,7 +1534,7 @@ const Call = struct {
                 .conflict => {},
             }
         }
-        return conflict(ctx, name);
+        return conflict_on_delete(ctx, name);
     }
 
     // ---- /v1/jobs ----

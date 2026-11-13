@@ -11,6 +11,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
+const history = @import("history.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 
@@ -32,6 +33,10 @@ pub const Input = struct {
     /// Who applied it and the request that did (docs/api.md item 4).
     applied_by: []const u8,
     request_id: []const u8,
+    /// The command health check (C3, docs/keys.md); a change of it is a new generation.
+    health: ?records.Health = null,
+    /// How a new generation replaces the old (C3); null, or the default, is stored as null.
+    rollout: ?records.RolloutPolicy = null,
 };
 
 pub const Result = union(enum) {
@@ -56,6 +61,8 @@ pub const Plan = struct {
     existing: ?records.Service,
     /// The stored service's `mod_revision`, or 0 for none: the compare that guards the write.
     mod_revision: store.Revision,
+    /// The stored service's `create_revision`, or 0 for none: which history records are its own.
+    create_revision: store.Revision,
     generation: u64,
     /// The one-line summary; `no_change` when `unchanged`.
     change: []const u8,
@@ -84,6 +91,7 @@ pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     return .{
         .existing = existing,
         .mod_revision = if (found.kv) |kv| kv.mod_revision else 0,
+        .create_revision = if (found.kv) |kv| kv.create_revision else 0,
         .generation = next_generation(existing, input),
         .change = change,
         .unchanged = existing != null and std.mem.eql(u8, change, no_change),
@@ -119,12 +127,34 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         .next_replica = try legacy_counter(ctx, planned.existing),
         .applied_by = input.applied_by,
         .request_id = input.request_id,
+        .health = input.health,
+        .rollout = stored_rollout(input.rollout),
     };
     const key = records.service_key(input.name);
     var batch: controller.Batch = .{};
     batch.expect(key.slice(), planned.mod_revision);
     const service_key_copy = try controller.key_copy(ctx, &key);
     batch.put(service_key_copy, try records.encode(ctx.arena, service, ctx.diag));
+    const new_generation = if (planned.existing) |old|
+        old.generation != planned.generation
+    else
+        true;
+    if (new_generation) {
+        const record = records.history_of(&service, ctx.clock.now_ms());
+        var seed: records.History = undefined;
+        var owner: ?history.Owner = null;
+        if (planned.existing) |*old| {
+            // When the old generation was applied is not stored: its seed says 0, unknown. A
+            // record no build writes, generation 0, has nothing to seed.
+            if (old.generation > 0) seed = records.history_of(old, 0);
+            owner = .{
+                .create_revision = planned.create_revision,
+                .generation = old.generation,
+                .seed = if (old.generation > 0) &seed else null,
+            };
+        }
+        try history.put(ctx, &batch, &record, owner);
+    }
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{
         input.applied_by, input.name, input.request_id,
     });
@@ -165,6 +195,9 @@ pub fn delete_service(
     const key = records.service_key(name);
     const found = try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag);
     const kv = found.kv orelse return not_found(ctx, name);
+    // The history goes first, in transactions of its own that each still find the service as it
+    // was read: no history outlives its service (docs/keys.md).
+    if (try history.delete_all(ctx, name, kv.mod_revision) == .conflict) return .conflict;
     var batch: controller.Batch = .{};
     batch.expect(key.slice(), kv.mod_revision);
     batch.delete(kv.key);
@@ -207,7 +240,17 @@ fn runs_differently(old: records.Service, input: Input) bool {
     if (!std.mem.eql(u8, old.source, input.source)) return true;
     if (!records.strings_equal(old.command, input.command)) return true;
     if (!records.pairs_equal(old.env, input.env)) return true;
+    if (!records.health_equal(old.health, input.health)) return true;
     return !records.limits_equal(old.limits, input.limits);
+}
+
+/// The rollout policy as stored: null when it is the default, so a service that sets none, or
+/// sets the default, stays a version 3 record an older release reads.
+fn stored_rollout(policy: ?records.RolloutPolicy) ?records.RolloutPolicy {
+    const given = policy orelse return null;
+    const default: records.RolloutPolicy = .{};
+    if (given.equal(default)) return null;
+    return given;
 }
 
 /// One line saying what an apply changed; never an `env` value (docs/keys.md).
@@ -239,6 +282,12 @@ fn change_summary(ctx: *const Context, existing: ?records.Service, input: Input)
     if (!records.limits_equal(old.limits, input.limits)) {
         try append_part(ctx, &text, "limits changed");
     }
+    if (!records.health_equal(old.health, input.health)) {
+        try append_part(ctx, &text, "health changed");
+    }
+    const old_rollout = old.rollout_policy();
+    const new_rollout = input.rollout orelse records.RolloutPolicy{};
+    if (!old_rollout.equal(new_rollout)) try append_part(ctx, &text, "rollout changed");
     if (text.items.len == 0) return no_change;
     return text.items;
 }
@@ -332,6 +381,106 @@ fn validate(ctx: *const Context, input: Input) Error!void {
     for (input.env) |pair| {
         if (pair[0].len == 0) return invalid(ctx, "an environment variable has no name");
     }
+    if (input.health) |health| try validate_health(ctx, health);
+    if (input.rollout) |rollout| try validate_rollout(ctx, rollout);
+}
+
+/// A command health check (C3): ZC-E0125 naming the field. The command is bounded as a
+/// command; the times nest and are bounded by `health_interval_ms_max` and
+/// `health_verdict_ms_max`.
+fn validate_health(ctx: *const Context, health: records.Health) Error!void {
+    if (health.command.len == 0 or health.command.len > constants.runtime_command_words_max) {
+        return refuse(ctx, .E0125, "health.command must have 1 to 64 words", .{});
+    }
+    if (health.command[0].len == 0) {
+        return refuse(ctx, .E0125, "health.command's first word is empty", .{});
+    }
+    if (health.interval_ms == 0) return refuse(ctx, .E0125, "health.interval_ms is 0", .{});
+    if (health.timeout_ms == 0) return refuse(ctx, .E0125, "health.timeout_ms is 0", .{});
+    if (health.timeout_ms > health.interval_ms) {
+        return refuse(ctx, .E0125, "health.timeout_ms is {d}, longer than health.interval_ms " ++
+            "({d})", .{ health.timeout_ms, health.interval_ms });
+    }
+    if (health.failure_threshold == 0) {
+        return refuse(ctx, .E0125, "health.failure_threshold is 0; it must be at least 1", .{});
+    }
+    if (health.success_threshold == 0) {
+        return refuse(ctx, .E0125, "health.success_threshold is 0; it must be at least 1", .{});
+    }
+    try validate_health_bounds(ctx, health);
+}
+
+fn validate_health_bounds(ctx: *const Context, health: records.Health) Error!void {
+    const interval_max = constants.health_interval_ms_max;
+    if (health.interval_ms > interval_max) {
+        return refuse(ctx, .E0125, "health.interval_ms is {d}; it must be at most {d}", .{
+            health.interval_ms, interval_max,
+        });
+    }
+    if (health.start_period_ms > interval_max) {
+        return refuse(ctx, .E0125, "health.start_period_ms is {d}; it must be at most {d}", .{
+            health.start_period_ms, interval_max,
+        });
+    }
+    const verdict_max = constants.health_verdict_ms_max;
+    const threshold = @max(health.failure_threshold, health.success_threshold);
+    if (@as(u64, threshold) * health.interval_ms > verdict_max) {
+        return refuse(ctx, .E0125, "health thresholds of {d} runs every {d} ms take longer " ++
+            "than {d} ms to reach a verdict", .{ threshold, health.interval_ms, verdict_max });
+    }
+}
+
+/// A rollout policy (C3): ZC-E0126 naming the field.
+fn validate_rollout(ctx: *const Context, rollout: records.RolloutPolicy) Error!void {
+    const most = constants.replicas_per_service_max;
+    if (rollout.max_surge > most) {
+        return refuse(ctx, .E0126, "rollout.max_surge is {d}; it must be at most {d}", .{
+            rollout.max_surge, most,
+        });
+    }
+    if (rollout.max_unavailable > most) {
+        return refuse(ctx, .E0126, "rollout.max_unavailable is {d}; it must be at most {d}", .{
+            rollout.max_unavailable, most,
+        });
+    }
+    if (rollout.strategy == .rolling and rollout.max_surge == 0 and rollout.max_unavailable == 0) {
+        return refuse(ctx, .E0126, "rollout.max_surge and rollout.max_unavailable are both 0, " ++
+            "so nothing can move", .{});
+    }
+    if (rollout.min_ready_ms >= rollout.ready_timeout_ms) {
+        return refuse(ctx, .E0126, "rollout.min_ready_ms ({d}) must be below " ++
+            "rollout.ready_timeout_ms ({d})", .{ rollout.min_ready_ms, rollout.ready_timeout_ms });
+    }
+    if (rollout.ready_timeout_ms > rollout.progress_deadline_ms) {
+        return refuse(ctx, .E0126, "rollout.ready_timeout_ms ({d}) must be at most " ++
+            "rollout.progress_deadline_ms ({d})", .{
+            rollout.ready_timeout_ms, rollout.progress_deadline_ms,
+        });
+    }
+    const deadline_max = constants.rollout_deadline_ms_max;
+    if (rollout.progress_deadline_ms > deadline_max) {
+        return refuse(ctx, .E0126, "rollout.progress_deadline_ms is {d}; it must be at most {d}", .{
+            rollout.progress_deadline_ms, deadline_max,
+        });
+    }
+    if (rollout.grace_ms > constants.rollout_grace_ms_max) {
+        return refuse(ctx, .E0126, "rollout.grace_ms is {d}; it must be at most {d}", .{
+            rollout.grace_ms, constants.rollout_grace_ms_max,
+        });
+    }
+}
+
+fn refuse(
+    ctx: *const Context,
+    comptime code: codes.Code,
+    comptime problem: []const u8,
+    args: anytype,
+) error{Invalid} {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(code);
+    ctx.diag.cause(problem, args);
+    ctx.diag.fix(.{ .sentence = "correct the service file and apply it again" });
+    return error.Invalid;
 }
 
 /// The bounds of a runtime container's limits, the same as a job's (`job_api.zig`).
@@ -726,3 +875,182 @@ test "a change of source bumps the generation and the summary says source" {
     const stored = try records.read(records.Service, ctx.arena, got.kv.?, &diag);
     try testing.expectEqualStrings("", stored.source);
 }
+
+const test_health: records.Health = .{
+    .command = &.{ "/bin/check", "--quick" },
+    .interval_ms = 2_000,
+    .timeout_ms = 1_000,
+    .failure_threshold = 3,
+    .success_threshold = 1,
+};
+
+fn history_generations(ctx: *const Context) ![]u64 {
+    const found = try history.stored(ctx, "hello");
+    const out = try ctx.arena.alloc(u64, found.len);
+    for (found, out) |entry, *generation| generation.* = entry.generation;
+    return out;
+}
+
+test "C3: apply writes history with a new generation only, capped, and delete removes it" {
+    // Goal: docs/keys.md `/history`: one record per generation, in the apply's transaction, at
+    // most `history_generations_max`, none left once the service is deleted. Method: create,
+    // scale (no record), change health (a record), overflow the cap, delete, re-create.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    _ = try apply(&ctx, &source, hello);
+    try testing.expectEqualSlices(u64, &.{1}, try history_generations(&ctx));
+    const first_kv = (try ctx.store.get(ctx.arena, "/history/hello/1", null, &diag)).kv.?;
+    const first = try records.read(records.History, ctx.arena, first_kv, &diag);
+    try testing.expectEqualStrings(hello.image, first.image);
+    try testing.expectEqual(manual.ms, first.applied_at_ms);
+    try testing.expectEqual(records.HistoryReason.apply, first.reason);
+
+    var scaled = hello;
+    scaled.replicas = 7;
+    _ = try apply(&ctx, &source, scaled);
+    try testing.expectEqualSlices(u64, &.{1}, try history_generations(&ctx));
+
+    var checked = scaled;
+    checked.health = test_health;
+    const health_bump = try apply(&ctx, &source, checked);
+    try testing.expectEqual(@as(u64, 2), health_bump.written.generation);
+    try testing.expectEqualStrings("health changed", health_bump.written.change);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, try history_generations(&ctx));
+
+    // A rollout policy is not what a replica runs: no new generation, no history.
+    var rolled = checked;
+    rolled.rollout = .{ .max_surge = 3 };
+    const policy = try apply(&ctx, &source, rolled);
+    try testing.expectEqual(@as(u64, 2), policy.written.generation);
+    try testing.expectEqualStrings("rollout changed", policy.written.change);
+    try testing.expectEqual(@as(usize, 2), (try history_generations(&ctx)).len);
+
+    var image_index: u32 = 0;
+    while (image_index < constants.history_generations_max + 3) : (image_index += 1) {
+        var next = rolled;
+        next.image = try std.fmt.allocPrint(ctx.arena, "b3:{x:0>8}", .{image_index});
+        manual.ms += 1;
+        _ = try apply(&ctx, &source, next);
+    }
+    const kept = try history_generations(&ctx);
+    try testing.expectEqual(@as(usize, constants.history_generations_max), kept.len);
+    const newest: u64 = 2 + constants.history_generations_max + 3;
+    try testing.expectEqual(newest, kept[kept.len - 1]);
+    try testing.expectEqual(newest - constants.history_generations_max + 1, kept[0]);
+
+    const deleted = try delete_service(&ctx, &source, "hello", "ana", "r9");
+    try testing.expect(deleted == .written);
+    try testing.expectEqual(@as(usize, 0), (try history_generations(&ctx)).len);
+    const again = try apply(&ctx, &source, hello);
+    try testing.expectEqual(@as(u64, 1), again.written.generation);
+    try testing.expectEqualSlices(u64, &.{1}, try history_generations(&ctx));
+}
+
+test "C3: a default rollout is stored as none, so the service stays version 3" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    var defaulted = hello;
+    defaulted.rollout = .{};
+    _ = try apply(&ctx, &source, defaulted);
+    const got = try ctx.store.get(ctx.arena, records.service_key("hello").slice(), null, &diag);
+    try testing.expect(std.mem.startsWith(u8, got.kv.?.value, "{\"v\":3,"));
+    try testing.expect((try apply(&ctx, &source, hello)) == .unchanged);
+}
+
+test "C3: an invalid health check is ZC-E0125 and an invalid rollout ZC-E0126" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 0 };
+    var health_cases: [9]records.Health = @splat(test_health);
+    health_cases[0].command = &.{};
+    health_cases[1].command = &.{""};
+    health_cases[2].interval_ms = 0;
+    health_cases[3].timeout_ms = 0;
+    health_cases[4].timeout_ms = test_health.interval_ms + 1;
+    health_cases[5].failure_threshold = 0;
+    health_cases[6].interval_ms = constants.health_interval_ms_max + 1;
+    health_cases[7].start_period_ms = constants.health_interval_ms_max + 1;
+    health_cases[8].interval_ms = constants.health_interval_ms_max;
+    health_cases[8].success_threshold = 25; // 25 hours to a verdict.
+    for (health_cases) |health| {
+        diag.reset();
+        var input = hello;
+        input.health = health;
+        try testing.expectError(error.Invalid, apply(&ctx, &source, input));
+        try testing.expectEqual(codes.Code.E0125, diag.code.?);
+    }
+    var rollout_cases: [7]records.RolloutPolicy = @splat(.{});
+    rollout_cases[0].max_surge = 0;
+    rollout_cases[1].max_surge = constants.replicas_per_service_max + 1;
+    rollout_cases[2].max_unavailable = constants.replicas_per_service_max + 1;
+    rollout_cases[3].min_ready_ms = rollout_cases[3].ready_timeout_ms;
+    rollout_cases[4].ready_timeout_ms = rollout_cases[4].progress_deadline_ms + 1;
+    rollout_cases[5].progress_deadline_ms = constants.rollout_deadline_ms_max + 1;
+    rollout_cases[6].grace_ms = constants.rollout_grace_ms_max + 1;
+    for (rollout_cases) |rollout| {
+        diag.reset();
+        var input = hello;
+        input.rollout = rollout;
+        try testing.expectError(error.Invalid, apply(&ctx, &source, input));
+        try testing.expectEqual(codes.Code.E0126, diag.code.?);
+    }
+    // Recreate moves without surge or unavailability: both 0 are fine there.
+    diag.reset();
+    var recreate = hello;
+    recreate.rollout = .{ .strategy = .recreate, .max_surge = 0 };
+    try testing.expect(try apply(&ctx, &source, recreate) == .written);
+    // Every bound is inclusive.
+    diag.reset();
+    var longest = hello;
+    longest.health = test_health;
+    longest.health.?.interval_ms = constants.health_interval_ms_max;
+    longest.health.?.start_period_ms = constants.health_interval_ms_max;
+    longest.health.?.failure_threshold = 24; // A day to a verdict.
+    longest.rollout = .{
+        .progress_deadline_ms = constants.rollout_deadline_ms_max,
+        .grace_ms = constants.rollout_grace_ms_max,
+    };
+    try testing.expect(try apply(&ctx, &source, longest) == .written);
+}
+
+const codes = @import("diag/codes.zig");

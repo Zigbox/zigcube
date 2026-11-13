@@ -100,6 +100,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0122.html">ZC-E0122</a></td><td>zcube local can't find or start the server or agent</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0123.html">ZC-E0123</a></td><td>the local server or agent did not come up</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0124.html">ZC-E0124</a></td><td>another zcube local command is running</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0125.html">ZC-E0125</a></td><td>a service's health check is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0126.html">ZC-E0126</a></td><td>a service's rollout policy is not valid</td><td>user</td></tr>
+<tr><td class="code"><a href="E0127.html">ZC-E0127</a></td><td>there is nothing to roll back to</td><td>user</td></tr>
+<tr><td class="code"><a href="E0128.html">ZC-E0128</a></td><td>the generation to roll back to is no longer in the history</td><td>user</td></tr>
+<tr><td class="code"><a href="E0129.html">ZC-E0129</a></td><td>the service has no rollout to pause or resume</td><td>user</td></tr>
 <tr><td class="code"><a href="E0130.html">ZC-E0130</a></td><td>a job is not valid</td><td>user</td></tr>
 <tr><td class="code"><a href="E0131.html">ZC-E0131</a></td><td>a different job already has that name</td><td>user</td></tr>
 <tr><td class="code"><a href="E0132.html">ZC-E0132</a></td><td>there are too many jobs</td><td>user</td></tr>
@@ -124,6 +129,11 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0301.html">ZC-E0301</a></td><td>a stored record can't be read</td><td>external</td></tr>
 <tr><td class="code"><a href="E0302.html">ZC-E0302</a></td><td>there is more to reconcile than one pass holds</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0303.html">ZC-E0303</a></td><td>a stored record is from a newer release</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0304.html">ZC-E0304</a></td><td>a rollout failed: a new replica did not become ready</td><td>user</td></tr>
+<tr><td class="code"><a href="E0305.html">ZC-E0305</a></td><td>a rollout stalled: a new replica cannot be placed</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0306.html">ZC-E0306</a></td><td>a rollout passed its progress deadline</td><td>user</td></tr>
+<tr><td class="code"><a href="W0304.html">ZC-W0304</a></td><td>a rollout paused itself after a failure</td><td>user</td></tr>
+<tr><td class="code"><a href="W0305.html">ZC-W0305</a></td><td>a rollout was rolled back automatically</td><td>user</td></tr>
 <tr><td class="code"><a href="E0307.html">ZC-E0307</a></td><td>a job's stored records contradict each other</td><td>external</td></tr>
 <tr><td class="code"><a href="W0307.html">ZC-W0307</a></td><td>a report for an ended job was dropped</td><td>environment</td></tr>
 <tr><td class="code"><a href="W0308.html">ZC-W0308</a></td><td>a job waits: no node can take it now</td><td>user</td></tr>
@@ -146,10 +156,12 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <tr><td class="code"><a href="E0513.html">ZC-E0513</a></td><td>this host can't run Zigbox containers</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0514.html">ZC-E0514</a></td><td>the service does not fit Zigbox's limits</td><td>user</td></tr>
 <tr><td class="code"><a href="E0515.html">ZC-E0515</a></td><td>a swarm fetch outlived its kill, so the image was not pulled</td><td>environment</td></tr>
+<tr><td class="code"><a href="E0516.html">ZC-E0516</a></td><td>a replica's health check could not run</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0521.html">ZC-E0521</a></td><td>the agent could not tell how a run ended</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0522.html">ZC-E0522</a></td><td>a run's start record is missing or damaged</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0523.html">ZC-E0523</a></td><td>a run's input does not match its digest</td><td>environment</td></tr>
 <tr><td class="code"><a href="W0501.html">ZC-W0501</a></td><td>the agent fenced itself and registered again</td><td>environment</td></tr>
+<tr><td class="code"><a href="W0502.html">ZC-W0502</a></td><td>a replica's health check timed out</td><td>user</td></tr>
 <tr><td class="code"><a href="W0503.html">ZC-W0503</a></td><td>a job reached its deadline and was stopped</td><td>user</td></tr>
 <tr><td class="code"><a href="W0504.html">ZC-W0504</a></td><td>a pull record was not stored</td><td>environment</td></tr>
 <tr><td class="code"><a href="E0601.html">ZC-E0601</a></td><td>a tree could not be fetched from any peer or the registry</td><td>external</td></tr>

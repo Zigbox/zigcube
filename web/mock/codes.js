@@ -169,11 +169,46 @@ export const ZC_CODES = [
     "explanation": "zcube local up and zcube local down take turns: each holds a lock on the\nfile lock in the local directory while it starts or stops the server and\nthe agent, so two of them never fight over the same processes. Another one\nheld the lock for longer than this one was willing to wait.\n\nWait for the other command to finish and run this one again. The lock is\nreleased when its holder ends, however it ends, so it is never stale."
   },
   {
+    "code": "ZC-E0125",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a service's health check is not valid",
+    "explanation": "The service file's `health` block describes a check that cannot run as\nwritten. A health check is a command run inside each replica's container:\nit needs 1 to 64 words with a non-empty first word, an `interval_ms` above\nzero, a `timeout_ms` above zero and no longer than the interval, and\n`failure_threshold` and `success_threshold` of at least 1. The cause line\nnames the field.\n\nNothing was applied. Correct the service file and apply it again. C3\nchecks are commands only; a TCP or HTTP check waits for a network path\ninto the container."
+  },
+  {
+    "code": "ZC-E0126",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a service's rollout policy is not valid",
+    "explanation": "The service file's `rollout` block cannot be followed. A rolling update\nmust be able to move: `max_surge` and `max_unavailable` may not both be 0,\nand neither may exceed the 128 replicas a service may have. The times must\nnest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no\nlonger than `progress_deadline_ms`. The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again; a\nservice with no `rollout` block uses the default policy, which is valid."
+  },
+  {
+    "code": "ZC-E0127",
+    "severity": "error",
+    "blame": "user",
+    "summary": "there is nothing to roll back to",
+    "explanation": "A rollback asks for a generation of the service other than the one it\nruns now, and the service's history holds none: it was created by one\napply and never changed what its replicas run, or its history was deleted\nwith an earlier service of the same name.\n\nNothing was changed. To run something else, apply the service file you\nwant; `zcube history <service>` lists the generations there are."
+  },
+  {
+    "code": "ZC-E0128",
+    "severity": "error",
+    "blame": "user",
+    "summary": "the generation to roll back to is no longer in the history",
+    "explanation": "A service keeps the 16 newest generations it was applied with; an apply\nthat adds a 17th deletes the oldest. The generation the rollback named is\nolder than that, or was never one of this service's (a service deleted\nand applied again starts at generation 1 with no history).\n\nNothing was changed. `zcube history <service>` lists the generations that\ncan be restored. To run an older one, apply its service file again."
+  },
+  {
+    "code": "ZC-E0129",
+    "severity": "error",
+    "blame": "user",
+    "summary": "the service has no rollout to pause or resume",
+    "explanation": "Pause and resume act on a rollout in progress: pause stops it starting or\nretiring replicas, resume lets it go on. This service has no rollout, or\nits rollout has already ended (complete or failed), or it is already in\nthe state asked for.\n\nNothing was changed. `zcube rollout status <service>` shows what is\nrunning."
+  },
+  {
     "code": "ZC-E0130",
     "severity": "error",
     "blame": "user",
     "summary": "a job is not valid",
-    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead, or\nmore labels than a job may carry.\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and relay or placement.\nAccepting a field and ignoring it would say something false about where the\njob runs.\n\nFix the field it names and submit again."
+    "explanation": "`zcube job run`, or a POST to /v1/jobs, named a job that cannot run as it\nstands. The cause line names the field and the limit it broke: a name that\nis not 1 to 48 bytes of lowercase letters, digits and hyphens (none at\neither end), or the name `watch`, which /v1/jobs/watch reserves, no\ncommand or too many words, a deadline of zero or above 24 hours, a grace\nperiod above 60 seconds, env above 8 KiB, an input above 64 KiB or with a\nNUL byte, a submit time more than an hour ahead,\nmore labels than a job may carry, a label or env key given twice, or a\n`limits` member outside its range (`cpu_millis` 10 to 1,024,000,\n`memory_bytes` 4 MiB to 2^40, `pids` 1 to 4,194,304).\n\nTwo fields are refused because they are not built yet, and the cause says\nso: retries above 0 (a job runs at most once), and placement. Accepting a\nfield and ignoring it would say something false about where the job runs.\n\nA relay must be the name of one of the relays in the server's `relays`\nsetting; an unknown name is refused, and a job may not set ZCUBE_RELAY in\nits own env, because the relay's supervisor sets it.\n\nFix the field it names and submit again."
   },
   {
     "code": "ZC-E0131",
@@ -337,6 +372,41 @@ export const ZC_CODES = [
     "explanation": "A value in the store carries a format version this release does not know:\na newer zcube wrote it, and this one is older. The value is not\nmalformed, so nothing was changed and nothing was skipped; this release\njust cannot say what the newer fields mean, and acting on a half-read\nrecord could undo the newer release's work.\n\nThe cause line names the key and both versions. Run the release that\nwrote the record, or upgrade this one; if you downgraded on purpose,\nrestore the store from the backup taken before the upgrade."
   },
   {
+    "code": "ZC-E0304",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a rollout failed: a new replica did not become ready",
+    "explanation": "A rollout starts replicas of the new generation a few at a time and\nretires old ones only once new ones are ready. A new replica did not\nbecome ready within `ready_timeout_ms`: it exited, was held, or its\nhealth check kept failing. The new version is at fault, not the cluster.\n\nThe cause line names the replica and what it did. With `on_failure`\nrollback (the default) the service is rolled back to the generation it\nran before; with `pause` the rollout stops where it is. Fix the release,\nthen apply it again; `zcube why replica <id>` shows its last failure."
+  },
+  {
+    "code": "ZC-E0305",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a rollout stalled: a new replica cannot be placed",
+    "explanation": "A rolling update starts each new replica before it retires an old one\n(`max_surge`), so for a while the service needs room for more replicas\nthan it has. No ready node had room for the next new replica, so the\nrollout cannot go on without breaking `max_unavailable`.\n\nThe cause line names the replica and what it needs. Add a node or free\ncapacity, or allow the rollout to retire first (`max_unavailable` above\n0); the rollout continues by itself once a replica can be placed."
+  },
+  {
+    "code": "ZC-E0306",
+    "severity": "error",
+    "blame": "user",
+    "summary": "a rollout passed its progress deadline",
+    "explanation": "A rollout must finish within `progress_deadline_ms` of its start. This\none did not: new replicas became ready too slowly, or not at all, though\nnone failed outright.\n\nWith `on_failure` rollback (the default) the service is rolled back to\nthe generation it ran before; with `pause` the rollout stops where it is.\nIf the new version is right but slow to start, raise the deadline in the\nservice file and apply it again."
+  },
+  {
+    "code": "ZC-W0304",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a rollout paused itself after a failure",
+    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304 or ZC-E0306). It stopped where it was: replicas of both\ngenerations keep running, and nothing is started or retired until you\nact.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>`, or apply a fixed release."
+  },
+  {
+    "code": "ZC-W0305",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a rollout was rolled back automatically",
+    "explanation": "The rollout of a new generation failed (ZC-E0304 or ZC-E0306) and the\nservice's rollout policy is `on_failure: rollback`, the default. The\nservice was applied again with the spec of the generation it ran before,\nas a new generation, and that rollout replaces the failed replicas.\n\nThe summary names the failing replica and the generation restored. Fix\nthe release and apply it again; a newer apply always wins over an\nautomatic rollback."
+  },
+  {
     "code": "ZC-E0307",
     "severity": "error",
     "blame": "external",
@@ -491,6 +561,13 @@ export const ZC_CODES = [
     "explanation": "A replica's image was being fetched from peers into this node's Zigbox\nstore, the fetch passed its deadline (or ended badly), and the supervisor\nkilled the fetch's whole process group with SIGKILL. A process of that\ngroup was still alive afterwards. It may still be writing the store, and\nZigbox's store takes one writer at a time, so the supervisor did not\nstart the registry pull: the replica was not started.\n\nA process that outlives SIGKILL is in uninterruptible sleep, waiting on\nthe kernel: usually a disk or a network mount that stopped answering.\nFind it (ps -eo pid,stat,wchan:32,args, state D) and the device it waits\non. The replica is started again on a later pass once it is gone."
   },
   {
+    "code": "ZC-E0516",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a replica's health check could not run",
+    "explanation": "The agent runs a replica's health check as a command inside its\ncontainer. The command could not be started there at all: the runtime\nrefused it, and its code is the cause. This says nothing about whether\nthe replica is healthy, so it counts as neither a pass nor a failure.\n\nRead the runtime's code in the cause line: a container that has just\nstopped, or a runtime that does not support running a command in a\ncontainer, are the usual reasons. If the cause is a broken contract of\nthe runtime itself, report it with the diagnostic bundle."
+  },
+  {
     "code": "ZC-E0521",
     "severity": "error",
     "blame": "environment",
@@ -517,6 +594,13 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "the agent fenced itself and registered again",
     "explanation": "The agent could not renew its lease in time, or the server said its\nlease or tenure had ended. It stopped every container, so that nothing\nruns on this node that the cluster may have placed elsewhere, then\ngranted a new lease and registered again with nothing running.\n\nThis happens when the agent was paused or cut off from the server for\nlonger than the lease time to live less the fencing margin."
+  },
+  {
+    "code": "ZC-W0502",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a replica's health check timed out",
+    "explanation": "The health check command ran in the replica's container for longer than\nthe service's `timeout_ms` and was stopped. It counts as a failed check:\n`failure_threshold` failures in a row make the replica unhealthy.\n\nThe cause line names the replica and the timeout. Make the check\ncommand faster, or raise `timeout_ms` (at most `interval_ms`) in the\nservice file and apply it again."
   },
   {
     "code": "ZC-W0503",
@@ -559,6 +643,55 @@ export const ZC_CODES = [
     "blame": "environment",
     "summary": "the swarm fetch ended without the tree",
     "explanation": "The supervisor of a replica tried to get the image's chunk tree from peers\nfirst, and that fetch ended without it: it did not start, it exited with a\nfailure, or it was killed at its deadline. The cause line says which.\nThe registry pull follows, so the replica can still start; this line\nonly explains why the peers did not supply the tree.\n\nThe fetch's own diagnostic, in the same fetch.log, names the real\nreason when it had one (ZC-E0601 for a tree no peer could give, or the\ncode of this node's disk or memory failing). If the replica did not\nstart, the pull's own diagnostic follows it. If it repeats on every\nstart, check the peers and the network between them."
+  },
+  {
+    "code": "ZC-E0701",
+    "severity": "error",
+    "blame": "external",
+    "summary": "a relay's upstream refused a connection",
+    "explanation": "A job's relay accepted a connection from the job and tried to connect to\nits upstream, the address the server's configuration names for that relay,\nand the connection was refused or reset, or the address could not be\nreached. The job's connection was closed. Other connections through the\nrelay are not affected.\n\nCheck that the upstream is running and that this node can reach it: the\nrelay connects from the node, not from inside the job. Correct the relay's\naddress in the server's `relays` setting if it is wrong; jobs submitted\nafterwards use the new address, and a job already running keeps the one it\nstarted with."
+  },
+  {
+    "code": "ZC-E0702",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a job's relay could not listen",
+    "explanation": "The supervisor of a job could not set up the relay the job asked for, so the\njob does not run without the route it was promised. The cause line says\nwhich step failed (the socket, the bind, the listen, the relay's address).\n\nOn the fake runtime the job is not started and ends as a start failure. On\nthe real runtime the container has already started, so the supervisor kills\nit: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in\nthe job's `relay.log`.\n\nIf the cause is a socket or file descriptor error, the host may be out of\ndescriptors: check `ulimit -n` and the node's load. If it names the relay's\naddress, correct the relay's address in the server's `relays` setting. Then\nsubmit the job again."
+  },
+  {
+    "code": "ZC-E0703",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "this agent's build cannot serve a job's relay",
+    "explanation": "An assignment names a relay and this node's agent cannot give the job one:\nits runtime has no way to hand a container a listener yet. The job ended as\na start failure instead of running without its relay.\n\nRun the job on nodes whose agent has relay support, or upgrade this agent to\nthe release that carries it. The agent and the server are upgraded\ntogether: the agent first, then the server."
+  },
+  {
+    "code": "ZC-E0704",
+    "severity": "error",
+    "blame": "external",
+    "summary": "a relay's upstream did not answer in time",
+    "explanation": "A job's relay tried to connect to its upstream and nothing answered within\n10 seconds. The job's connection was closed. A black-holed route, a\nfirewall that drops packets or a host that is down all look like this.\n\nCheck the route from this node to the upstream named in the server's\n`relays` setting. The job may connect again; each attempt waits the same\n10 seconds and takes one of the job's 16 connection slots meanwhile."
+  },
+  {
+    "code": "ZC-E0705",
+    "severity": "error",
+    "blame": "environment",
+    "summary": "a relayed connection failed in the middle",
+    "explanation": "A connection through a job's relay was open and then a read or a write on\nit failed: the peer reset it, or the host refused the call. Both ends were\nclosed. Bytes already copied were delivered; nothing is retried, because\nthe relay cannot know which request the bytes belonged to.\n\nA reset by the job or the upstream is ordinary and needs no action. If it\nrepeats on every connection, check the node's network and the upstream."
+  },
+  {
+    "code": "ZC-W0701",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a job's relay is at its connection limit",
+    "explanation": "A job opened a seventeenth connection through its relay while sixteen were\nopen. The new connection was closed at once and counted; the open ones are\nnot affected. The limit is per job and fixed.\n\nThe job should reuse connections or close them when it is done with them.\nA connection that sits idle holds its slot for up to five minutes."
+  },
+  {
+    "code": "ZC-W0702",
+    "severity": "warning",
+    "blame": "user",
+    "summary": "a relayed connection reached its byte or idle bound",
+    "explanation": "A connection through a job's relay was closed by the relay itself: it had\ncarried 1 GiB in one direction, or neither side had sent a byte for five\nminutes. The cause line says which. The job's other connections are not\naffected.\n\nOpen a new connection to go on. A job that needs a connection quiet for\nlonger than five minutes should send something now and then."
   },
   {
     "code": "ZC-E0801",

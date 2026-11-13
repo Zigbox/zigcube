@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+warning[ZC-W0305]: a rollout was rolled back automatically
+  cause  replica hello-31 stayed unhealthy for 40 s; hello was rolled back to
+         generation 6 as generation 8
+  reqid  r-0000001
+  fix    fix the release and apply it again
+  more   zcube explain W0305
+  docs   https://zigbox.github.io/zigcube/errors/W0305.html
