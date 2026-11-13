@@ -35,5 +35,10 @@ What an operator must do:
    (ZC-E0702, "submit it again"). Resubmit them.
 4. Release builds refuse `.plain = true`; it exists for Debug test rigs only.
 
+Order: **the server first, then the agents.** A B4 agent against a B3 server gets 404 from the
+certificate endpoint, retries every `peer_join_retry_ms` and never dials, so its relayed jobs
+reach no upstream (ZC-E0705) until the server is upgraded. A B3 agent dials plain TCP and an
+upstream that now wants TLS refuses it. Jobs without a relay are unaffected either way.
+
 Where: `src/server_config.zig`, `docs/api.md` (the endpoint), `docs/agent.md` (relay files),
 `docs/mtls.md` (issuance is unauthenticated until B7).
