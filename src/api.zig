@@ -869,17 +869,15 @@ fn decode(ctx: *const Context, text: []const u8) Failure![]const u8 {
 
 /// Writes a key's value as JSON: parsed and written back compactly, so a value that is not JSON
 /// cannot corrupt the response (it becomes a string), and with `env` values removed for a
-/// read-only token.
+/// read-only token. The `env` of every record is redacted, whatever its prefix: a record that
+/// copies a spec (`/history/`, C3) carries the same secrets as the service, and a prefix list
+/// would leak the next one added (docs/api.md item 8).
 fn write_value(api: *const Api, out: *Out, key: []const u8, bytes: []const u8) Failure!void {
     var parsed = std.json.parseFromSliceLeaky(std.json.Value, out.ctx.arena, bytes, .{}) catch {
         return out.value(bytes);
     };
-    const secret = std.mem.startsWith(u8, key, records.prefix_services) or
-        std.mem.startsWith(u8, key, records.prefix_replicas);
-    if (api.read_only and secret) redact_env(&parsed);
-    if (api.read_only and std.mem.startsWith(u8, key, records.prefix_jobs)) redact_env(&parsed);
+    if (api.read_only) redact_env(&parsed);
     if (api.read_only and std.mem.startsWith(u8, key, records.prefix_job_runs)) {
-        redact_env(&parsed);
         if (parsed == .object) {
             if (parsed.object.getPtr("input_digest")) |digest| digest.* = .null;
         }

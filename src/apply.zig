@@ -61,6 +61,8 @@ pub const Plan = struct {
     existing: ?records.Service,
     /// The stored service's `mod_revision`, or 0 for none: the compare that guards the write.
     mod_revision: store.Revision,
+    /// The stored service's `create_revision`, or 0 for none: which history records are its own.
+    create_revision: store.Revision,
     generation: u64,
     /// The one-line summary; `no_change` when `unchanged`.
     change: []const u8,
@@ -89,6 +91,7 @@ pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     return .{
         .existing = existing,
         .mod_revision = if (found.kv) |kv| kv.mod_revision else 0,
+        .create_revision = if (found.kv) |kv| kv.create_revision else 0,
         .generation = next_generation(existing, input),
         .change = change,
         .unchanged = existing != null and std.mem.eql(u8, change, no_change),
@@ -138,7 +141,11 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         true;
     if (new_generation) {
         const record = records.history_of(&service, ctx.clock.now_ms());
-        try history.put(ctx, &batch, &record);
+        const owner: ?history.Owner = if (planned.existing) |old| .{
+            .create_revision = planned.create_revision,
+            .generation = old.generation,
+        } else null;
+        try history.put(ctx, &batch, &record, owner);
     }
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{
         input.applied_by, input.name, input.request_id,
