@@ -295,6 +295,10 @@ const TestDir = struct {
 
     fn make(io: std.Io) !TestDir {
         var dir: TestDir = .{ .tmp = std.testing.tmpDir(.{}) };
+        // `tmpDir` makes the directory under the runner's umask: under 002 (a user's login
+        // umask with a private group) it is group-writable, which `check_dir` refuses. Set the
+        // mode a state directory is meant to have, so no test depends on the umask.
+        try dir.tmp.dir.setFilePermissions(io, ".", .fromMode(0o700), .{});
         dir.path_length = @intCast(try dir.tmp.dir.realPath(io, &dir.path_buffer));
         return dir;
     }
@@ -325,7 +329,13 @@ test "the CA key is made once, kept across a restart, and a bad revoked file is 
     try std.testing.expectEqualSlices(u8, &first.public(), &second.public());
     try std.testing.expectEqual(@as(u32, 0), second.revoked.count);
 
-    try dir.tmp.dir.writeFile(io, .{ .sub_path = revoked_file, .data = "# out\nnode3\n" });
+    // Made 0600 whatever the umask: `read` refuses a revoked file other users can write.
+    const secret: std.Io.Dir.CreateFileOptions = .{ .permissions = .fromMode(0o600) };
+    try dir.tmp.dir.writeFile(io, .{
+        .sub_path = revoked_file,
+        .data = "# out\nnode3\n",
+        .flags = secret,
+    });
     try open_test(&dir, &second, .{ .quiet = true }, &diag);
     try std.testing.expect(second.revoked.contains("node3"));
 
@@ -635,6 +645,23 @@ const FixedClock = struct {
         return 1_000_000;
     }
 };
+
+test "the CA tests hold under a umask of 002" {
+    // Goal: no test here depends on the runner's umask; under 002 every one of them once failed
+    // in `check_dir`. Method: set the umask to 002 (process-wide, restored on exit), make a test
+    // directory and open a CA in it.
+    const linux = std.os.linux;
+    const umask_old = linux.syscall1(.umask, 0o002);
+    defer _ = linux.syscall1(.umask, umask_old);
+    const io = std.testing.io;
+    var dir = try TestDir.make(io);
+    defer dir.tmp.cleanup();
+    var diag: Diag = undefined;
+    diag.reset();
+    var ca: peer_ca.Ca = undefined;
+    try open_test(&dir, &ca, .{ .quiet = true }, &diag);
+    try std.testing.expect(diag.code == null);
+}
 
 test "a ca.crt one byte over the longest PEM is replaced, not fatal" {
     // Goal: a file too long to be ours does not stop the server. Method: open once to make the
