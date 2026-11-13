@@ -5,15 +5,23 @@
 //! store as committed. Until B7 the request is not authenticated (O4), so anyone may ask for any
 //! run: `forge` asks as a stale epoch, another node, an ended run and another image.
 //!
-//! Three checks, each with a tooth (`c1_teeth.zig`):
+//! Four checks, each with a tooth (`c1_teeth.zig`):
 //! - R4: a certificate is issued only to the node that holds the run's claim, at the epoch the
-//!   claim, the status and the assignment name, for a run whose ending is not known. Judged at
-//!   each issue against the revision the issuer read (`job_cert_stale` breaks it).
+//!   claim, the status and the assignment name, for the image the job pins, for a run whose
+//!   ending is not known; and no forged ask gets one. Judged once, at each issue, against the
+//!   records the issuer read (`job_cert_stale` and `job_cert_image` break it).
 //! - R5: no certificate outlives the claim's start + `deadline_ms` + `grace_ms` +
-//!   `workload_cert_slack_ms` (`job_cert_long` breaks it).
+//!   `workload_cert_slack_ms`. Judged once, at each issue (`job_cert_long` breaks it).
 //! - R6: no relayed connection is open after its run's node reported the run's ending (the
-//!   node's `/job-observed` record of that run says `stopped`). Judged at every revision under
-//!   `--c1` and on every tick (`relay_conn_leak` breaks it).
+//!   node's `/job-observed` record of that run says `stopped`). Judged at every committed
+//!   revision under `--c1`, and from `safety()` (every `check_interval_ms` and after every
+//!   operation) with or without it (`relay_conn_leak` breaks it).
+//! - R7: a run's relayed connections end within `relay_cancel_ms_max` of its supervisor being
+//!   told to stop (`SimRuntime.stop_conns_problem`; from `safety()`, and sticky for a container
+//!   that ended between two checks; `relay_stop_leak` breaks it).
+//!
+//! R6 and R7 test the simulated runtime (`sim_runtime.zig`) and the agent's ordering of stop,
+//! end and report, not slice 2's relay (`relay_pump.zig`): the model's connections are counters.
 //!
 //! The checker reads the records itself and does not call `job_cert`: it would otherwise judge
 //! the rule by the rule. The model draws from its own generator, so a world's other draws are
@@ -155,6 +163,14 @@ pub fn issued_problem(
     }
     const spec = get(records.Job, ctx, records.job_key(job).slice()) orelse
         return "R4: a certificate was issued for a job with no record";
+    // The checker's own reading of the pin ("b3:" and 64 hex digits), not `job_cert`'s.
+    var pinned: [32]u8 = undefined;
+    const hex = if (std.mem.startsWith(u8, spec.rec.image, "b3:")) spec.rec.image[3..] else "";
+    const parsed = std.fmt.hexToBytes(&pinned, hex) catch
+        return "R4: a certificate was issued for a job that pins no image digest";
+    if (parsed.len != pinned.len or !std.mem.eql(u8, &subject.image_digest, &pinned)) {
+        return "R4: a certificate names another image than the job pins";
+    }
     const started = claim.rec.started_at_ms orelse
         return "R4: a certificate was issued for a run that has not started";
     const bound = started +| spec.rec.deadline_ms +| spec.rec.grace_ms +|
@@ -189,6 +205,9 @@ pub fn ask_and_judge(
             state.issued += 1;
             state.forged_issued += @intFromBool(forged);
             if (issued_problem(ctx, job, ask, &subject)) |found| state.fail(found);
+            // Every forgery that is counted names another node, an earlier epoch or another
+            // image: one the records let through is a hole the clauses above do not name.
+            if (forged) state.fail("R4: a forged ask got a certificate");
             return subject;
         },
     }
@@ -306,6 +325,11 @@ pub fn supervise(
                 .epoch = subject.placement_epoch,
                 .not_after_ms = subject.lifetime.not_after_ms,
             };
+            // Half the relayed runs ignore TERM (`slow_stop`), by a hash of the job's name and
+            // not a draw: a stop then takes the run's grace, and R7 judges that its connections
+            // closed when the stop came, not at the end. Without it no container of the cluster
+            // ever enters `.stopping`, and `relay_stop_leak` could not fail.
+            if (std.hash.Wyhash.hash(0, job) & 1 == 1) container.ignores_stop = true;
         }
     }
     forge_one(state, ctx, nodes);
@@ -446,7 +470,8 @@ test "R4 and R5 judge an issue by the records; R6 by the node's report" {
     // Pins the checker's verdicts the three teeth rely on, over a memory store: an honest ask is
     // issued and passes, a stale epoch is refused by the rule and named R4 by the checker, a
     // lifetime past the bound is R5, and open connections are R6 only once the node reported the
-    // run's ending. Method: write the records of one relayed run; ask and judge.
+    // run's ending. A subject naming another image than the job pins is R4 (the check of
+    // `job_cert_image`). Method: write the records of one relayed run; ask and judge.
     var fixture: Fixture = undefined;
     fixture.init();
     defer fixture.deinit();
@@ -480,6 +505,12 @@ test "R4 and R5 judge an issue by the records; R6 by the node's report" {
     var image = ask;
     image.image_digest = digest;
     try testing.expectEqual(Outcome{ .refused = error.wrong_image }, issue(&ctx, job, image));
+
+    var forged_image = subject;
+    forged_image.image_digest = digest;
+    const image_found = issued_problem(&ctx, job, ask, &forged_image).?;
+    const image_want = "R4: a certificate names another image than the job pins";
+    try testing.expectEqualStrings(image_want, image_found);
 
     subject.lifetime.not_after_ms += 1;
     try expect_prefix(issued_problem(&ctx, job, ask, &subject), "R5");

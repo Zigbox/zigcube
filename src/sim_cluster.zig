@@ -2827,12 +2827,15 @@ fn track_relays(c: *Cluster) Failure!void {
     }
 }
 
-/// R6 on every tick: no relayed connection is open after its node reported the run's ending,
-/// nor on a container its node forgot (`sim_certs.zig`).
+/// R6 at every check: no relayed connection is open after its node reported the run's ending,
+/// nor on a container its node forgot (`sim_certs.zig`). R7 there too: the connections of a run
+/// told to stop end within `relay_cancel_ms_max` (`SimRuntime.stop_conns_problem`).
 fn track_conns(c: *Cluster) Failure!void {
     for (c.nodes) |node| {
         const forgot = node.sim.containers.conns_forgotten;
         try check(c, !forgot, "R6: a relayed connection outlived its container");
+        const late = node.sim.containers.stop_conns_problem();
+        try check(c, late == null, late orelse "");
     }
     if (store_faulty(c)) return;
     const ctx = c.certs_context();

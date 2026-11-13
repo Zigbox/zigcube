@@ -116,7 +116,9 @@ pub fn decide(
     if (records.job_state_terminal(status.state) and !skipped(.ended)) return error.run_ended;
     // The owner has said the run must stop: no new identity for it, whatever the status says yet.
     if (job.cancel_requested != null and !skipped(.ended)) return error.run_ended;
-    if (!skipped(.image) and !image_is(job.image, ask.image_digest)) return error.wrong_image;
+    // `job_cert_image` is sim-c1's tooth for R4's image clause: the digest is not compared.
+    const compare_image = !skipped(.image) and !c1_teeth.job_cert_image;
+    if (compare_image and !image_is(job.image, ask.image_digest)) return error.wrong_image;
     const held = claim orelse return error.no_claim;
     if (held.status == .stopped and !skipped(.ended)) return error.run_ended;
     if (!std.mem.eql(u8, held.node, ask.node) and !skipped(.node)) return error.wrong_node;

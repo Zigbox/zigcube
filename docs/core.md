@@ -528,24 +528,37 @@ node's clock has an offset of its own. While the certificate is valid the contai
 relayed connections. Its ending, or a stop, closes them. On 15 % of ticks a forged ask stands for
 O4's unauthenticated request: an earlier epoch, another node's name, another image, or a run that
 may have ended. The report adds `certs: asks=.. issued=.. refused=.. ..` and `certs: refused by ..`.
-There are three checks:
+There are four checks:
 
 - **R4.** A certificate goes only to the node holding the run's claim, at the epoch named by the
-  claim and the assignment, for a run that is assigned, started, not terminal and not reported
-  stopped. It is judged at each issue against the records the issuer read.
+  claim and the assignment, for the image the job pins, for a run that is assigned, started, not
+  terminal and not reported stopped; and no forged ask gets one. It is judged once, at each issue,
+  against the records the issuer read.
 - **R5.** No certificate's `not_after` passes the claim's start + `deadline_ms` + `grace_ms` +
-  `workload_cert_slack_ms`.
+  `workload_cert_slack_ms`. It is judged once, at each issue.
 - **R6.** No relayed connection is open after the node's `/job-observed` record of that run (same
-  run id and epoch) says `stopped`, nor on a container the runtime forgot. It is judged on every tick
-  and, under `--c1`, at every revision.
+  run id and epoch) says `stopped`, nor on a container the runtime forgot. It is judged from
+  `safety()` (every `check_interval_ms` and after every operation) with or without `--c1`, and
+  under `--c1` also at every committed revision.
+- **R7.** No relayed connection stays open more than `relay_cancel_ms_max` (2 x `relay_poll_ms`,
+  100 ms) after its container was told to stop, whether it is still in its grace or has since
+  ended (a sticky flag, so a stop and its end between two checks cannot hide a late close). Judged
+  from `safety()`. Half the relayed runs ignore TERM (a hash of the job's name, no draw), so their
+  stops take the run's grace and R7 has a window to judge.
 
-The checker reads the records itself rather than calling `job_cert`, so it does not judge the rule
-by the rule. Its generator is its own (seeded from the run's seed), so no other draw of the world
-changes. A world with relayed jobs differs only by the clock readings and store reads the model
-makes. The teeth are `sim-c1-teeth-job_cert_stale` (the issuer skips the epoch compare and must fail
-R4 with "a certificate was issued for a stale epoch"), `job_cert_long` (`not_after` counts the slack
-twice, R5) and `relay_conn_leak` (connections are not closed at the ending, R6). All three imply
-`strong`, run with or without `--c1`, and are in the fleet's canary list.
-`docs/decisions/2026-11-13-b4-slice3-sim-certs.md`.
+R6 and R7 test the simulated runtime's connection counters and the agent's ordering of stop, end
+and report, not slice 2's relay (`relay_pump.zig`), whose own tests do that.
+The checker reads the records itself rather than calling `job_cert` (it parses the job's
+`b3:<hex>` digest itself), so it does not judge the rule by the rule. Its generator is its own
+(seeded from the run's seed), so no other draw of the world changes. A world with relayed jobs
+differs only by the clock readings and store reads the model makes. The teeth are
+`sim-c1-teeth-job_cert_stale` (the issuer skips the epoch compare and must fail R4 with "a
+certificate was issued for a stale epoch"), `job_cert_image` (the issuer skips the image compare;
+R4, "a certificate names another image than the job pins"), `job_cert_long` (`not_after` counts
+the slack twice, R5), `relay_conn_leak` (connections are not closed at the ending, R6) and
+`relay_stop_leak` (connections are not closed when a slow container is told to stop, R7). All five
+imply `strong`, run with or without `--c1`, and are in the fleet's canary list. A failing tooth's
+replay line names its own runner and `--strong`.
+`docs/decisions/2026-11-13-b4-slice3-sim-certs.md`, `docs/decisions/2026-11-13-b4-slice3-fixes.md`.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

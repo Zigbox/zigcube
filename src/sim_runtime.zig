@@ -109,7 +109,15 @@ const Container = struct {
     /// Relayed connections open now through the relay, each on the run's certificate. Every
     /// ending closes them with the listener (`end`).
     conns: u32 = 0,
+    /// When its supervisor was told to stop it (B4, R7), while it runs out its grace; null if it
+    /// was never told, or ended at once.
+    stop_requested_ms: ?u64 = null,
 };
+
+/// B4: a supervisor told to stop ends the run's relayed connections within this long (the brief's
+/// `relay_cancel_ms_max = 2 * relay_poll_ms`, docs/briefs/b4.md). Slice 2 brings the constant to
+/// `constants.zig`; this one goes when it does.
+pub const relay_cancel_ms_max: u64 = 2 * constants.relay_poll_ms;
 
 /// A run's certificate as its supervisor keeps it: the placement epoch it names and its end.
 pub const Cert = struct { epoch: u64, not_after_ms: u64 };
@@ -148,6 +156,10 @@ pub const SimRuntime = struct {
     conns_closed: u32 = 0,
     /// Set when a container was forgotten with relayed connections still open (R6; sticky).
     conns_forgotten: bool = false,
+    /// Set when a container ended with relayed connections still open more than
+    /// `relay_cancel_ms_max` after its stop was asked for (R7; sticky, so that a stop and its end
+    /// between two checks cannot hide the late close).
+    conns_late: bool = false,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -355,8 +367,28 @@ pub const SimRuntime = struct {
             self.relays_closed_by[kind] += 1;
         }
         // B4: the relayed connections close with the relay, before the ending can be reported.
+        if (container.conns > 0 and self.stop_overdue(container)) self.conns_late = true;
         self.close_conns(container);
         self.record(.{ .handle = runtime.Handle.init(container.name), .ended = ended });
+    }
+
+    /// Whether a container was told to stop more than `relay_cancel_ms_max` ago.
+    fn stop_overdue(self: *const SimRuntime, container: *const Container) bool {
+        const asked = container.stop_requested_ms orelse return false;
+        return self.clock.now_ms() -| asked > relay_cancel_ms_max;
+    }
+
+    /// R7 (B4): relayed connections end within `relay_cancel_ms_max` of the run's stop request.
+    /// A container still in its grace with connections open past the bound, or one that ended so
+    /// (`conns_late`), fails it.
+    pub fn stop_conns_problem(self: *const SimRuntime) ?[]const u8 {
+        const found = "R7: a relayed connection stayed open past relay_cancel_ms_max after its " ++
+            "run was told to stop";
+        if (self.conns_late) return found;
+        for (self.containers.items) |*container| {
+            if (container.conns > 0 and self.stop_overdue(container)) return found;
+        }
+        return null;
     }
 
     /// Closes a run's relayed connections (`relay_conn_leak` is the test-only fault that leaves
@@ -541,9 +573,11 @@ pub const SimRuntime = struct {
                 if (!container.ignores_stop) return self.end(container, .{ .signaled = 15 });
                 if (grace_ms == 0) return self.end(container, .{ .signaled = 9 });
                 container.phase = .{ .stopping = now + grace_ms };
+                container.stop_requested_ms = now;
                 // B4: a supervisor told to stop ends its relayed connections at once
                 // (`relay_cancel_ms_max`), before the container's grace runs out.
-                self.close_conns(container);
+                // (`relay_stop_leak` is R7's tooth: they stay open until the end.)
+                if (!c1_teeth.relay_stop_leak) self.close_conns(container);
             },
             .stopping => |deadline| {
                 if (now + grace_ms < deadline) container.phase = .{ .stopping = now + grace_ms };
@@ -1001,4 +1035,41 @@ test "a listener left open on a stopped or forgotten container is a problem" {
     sim.evict("r-1");
     try testing.expect(sim.relay_forgotten);
     try testing.expect(std.mem.startsWith(u8, sim.relay_problem().?, "R1"));
+}
+
+test "a stop closes relayed connections at once; one left open past the bound is R7" {
+    // Goal: R7 at the unit level (B4 slice 3 fixes). Method: a slow-stopping relayed container
+    // with connections is told to stop; its connections close at once and R7 stays silent. Then
+    // a second one whose connections are put back by hand after the stop (what `relay_stop_leak`
+    // does): R7 once the bound has passed, and sticky after the grace ends the container.
+    var manual: ManualClock = .{};
+    var sim: SimRuntime = undefined;
+    sim.init(testing.allocator, manual.clock(), 3, &default_fixtures);
+    defer sim.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const rt = sim.interface();
+    for ([_][]const u8{ "r-1", "r-2" }) |name| {
+        const labels = labels_of.one(name);
+        var spec = spec_for(name, "b3:51aa9c03", &labels);
+        spec.relay = "127.0.0.1:9";
+        _ = try rt.start(&spec, &diag);
+        try sim.inject(name, .slow_stop);
+    }
+    sim.containers.items[0].conns = 2;
+    try rt.stop(runtime.Handle.init("r-1"), 5000, &diag);
+    try testing.expectEqual(@as(u32, 0), sim.containers.items[0].conns);
+    manual.advance(5000);
+    try testing.expect(sim.stop_conns_problem() == null);
+
+    try rt.stop(runtime.Handle.init("r-2"), 5000, &diag);
+    sim.containers.items[1].conns = 1; // The leak.
+    manual.advance(relay_cancel_ms_max);
+    try testing.expect(sim.stop_conns_problem() == null);
+    manual.advance(1);
+    try testing.expect(std.mem.startsWith(u8, sim.stop_conns_problem().?, "R7"));
+    manual.advance(5000);
+    try testing.expect((try rt.inspect(runtime.Handle.init("r-2"), &diag)) == .stopped);
+    try testing.expect(sim.conns_late);
+    try testing.expect(std.mem.startsWith(u8, sim.stop_conns_problem().?, "R7"));
 }

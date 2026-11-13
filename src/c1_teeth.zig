@@ -124,6 +124,16 @@ pub const job_cert_long = declared("c1_teeth_job_cert_long");
 /// break R6: no relayed connection is open after its run's ending is reported; B4 slice 3).
 pub const relay_conn_leak = declared("c1_teeth_relay_conn_leak");
 
+/// The issuance rule (`job_cert.decide`) does not compare the ask's image digest with the one the
+/// job pins (must break R4's image clause: a certificate names the job's pinned image; B4 slice 3
+/// fixes). The simulator's forged asks name other images. Needs relayed jobs.
+pub const job_cert_image = declared("c1_teeth_job_cert_image");
+
+/// The simulated runtime does not close a relayed run's connections when its supervisor is told
+/// to stop, only when the container ends after its grace (must break R7: connections end within
+/// `relay_cancel_ms_max` of the stop; B4 slice 3 fixes). Needs relayed jobs.
+pub const relay_stop_leak = declared("c1_teeth_relay_stop_leak");
+
 /// The job start ledger holds `job_ledger_small_max` runs, not 4096 (must break J8: a full ledger
 /// fails the run instead of leaving J2 and J8's second clause judging less than they claim).
 pub const job_ledger_small = declared("c1_teeth_job_ledger_small");
@@ -147,11 +157,57 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
-    job_cert_stale or job_cert_long or relay_conn_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
-    job_cert_stale or job_cert_long or relay_conn_leak;
+    job_cert_stale or job_cert_long or relay_conn_leak or job_cert_image or relay_stop_leak;
+
+/// The runner a replay line names: the fault-on runner whose root switched a tooth on
+/// (`sim_c1_teeth_<name>`, as `sim-c1-teeth-exe` installs it), the burst world's own runner, or
+/// `sim_cluster`. Without it a failing tooth's replay ran the shipped code and passed.
+pub const runner: []const u8 = blk: {
+    // A tooth's root names its runner before a world's: `job_evicted` runs in the burst world.
+    for (runners) |pair| {
+        if (declared(pair[0])) break :blk pair[1];
+    }
+    if (burst_world) break :blk "sim_c1_burst";
+    break :blk "sim_cluster";
+};
+
+/// Each tooth's root switch and the runner `sim-c1-teeth-exe` installs for it.
+const runners = [_][2][]const u8{
+    .{ "c1_teeth_skip_allocation_compare", "sim_c1_teeth_allocation" },
+    .{ "c1_teeth_skip_readiness_compare", "sim_c1_teeth_readiness" },
+    .{ "c1_teeth_skew_beyond_bound", "sim_c1_teeth_skew" },
+    .{ "c1_teeth_wedge", "sim_c1_teeth_wedge" },
+    .{ "c1_teeth_stale_observation", "sim_c1_teeth_stale" },
+    .{ "c1_teeth_locality_before_spread", "sim_c1_teeth_locality" },
+    .{ "c1_teeth_old_renewal_rule", "sim_c1_teeth_oldrule" },
+    .{ "c1_teeth_job_restart", "sim_c1_teeth_job_restart" },
+    .{ "c1_teeth_job_claim", "sim_c1_teeth_job_claim" },
+    .{ "c1_teeth_job_double", "sim_c1_teeth_job_double" },
+    .{ "c1_teeth_job_rewrite", "sim_c1_teeth_job_rewrite" },
+    .{ "c1_teeth_job_cancel", "sim_c1_teeth_job_cancel" },
+    .{ "c1_teeth_job_deadline", "sim_c1_teeth_job_deadline" },
+    .{ "c1_teeth_job_deadline_late", "sim_c1_teeth_job_deadline_late" },
+    .{ "c1_teeth_job_deadline_offline", "sim_c1_teeth_job_deadline_offline" },
+    .{ "c1_teeth_job_gap", "sim_c1_teeth_job_gap" },
+    .{ "c1_teeth_job_stale", "sim_c1_teeth_job_stale" },
+    .{ "c1_teeth_job_refused_loop", "sim_c1_teeth_job_refused_loop" },
+    .{ "c1_teeth_job_unclaimed", "sim_c1_teeth_job_unclaimed" },
+    .{ "c1_teeth_job_wipe", "sim_c1_teeth_job_wipe" },
+    .{ "c1_teeth_job_evicted", "sim_c1_teeth_job_evicted" },
+    .{ "c1_teeth_job_ledger_small", "sim_c1_teeth_job_ledger_small" },
+    .{ "c1_teeth_job_reuse", "sim_c1_teeth_job_reuse" },
+    .{ "c1_teeth_relay_leak", "sim_c1_teeth_relay_leak" },
+    .{ "c1_teeth_relay_dropped", "sim_c1_teeth_relay_dropped" },
+    .{ "c1_teeth_job_cert_stale", "sim_c1_teeth_job_cert_stale" },
+    .{ "c1_teeth_job_cert_long", "sim_c1_teeth_job_cert_long" },
+    .{ "c1_teeth_relay_conn_leak", "sim_c1_teeth_relay_conn_leak" },
+    .{ "c1_teeth_job_cert_image", "sim_c1_teeth_job_cert_image" },
+    .{ "c1_teeth_relay_stop_leak", "sim_c1_teeth_relay_stop_leak" },
+};
