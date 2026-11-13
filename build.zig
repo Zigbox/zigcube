@@ -1837,7 +1837,8 @@ fn add_regressions_step(b: *std.Build, sim: SimStepOptions) void {
 /// `zig build sim-fencing-teeth`: the negative test of `fencing_settles`. The simulator with
 /// the old `ttl / 3` renewal rule and the shortest-ttl bound lifted, at a ttl of 4,000 ms (the
 /// server refuses it now), must fail with that check's symptom. Not in `c1_teeth_roots`: the
-/// fleet's canary draws no ttl by hand.
+/// fleet's canary draws no ttl by hand. Seeds 2..4: seed 1's fence loop is caught first by
+/// `converged` since fence waits became pauses (docs/decisions/2026-11-13-fencing-teeth-seeds.md).
 fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_c1_teeth_oldrule",
@@ -1850,7 +1851,7 @@ fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     });
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{
-        "--seeds",                              "1..3",                "100",
+        "--seeds",                              "2..4",                "100",
         "1",                                    "--lease-ttl-ms=4000", "--expect-fail",
         "--expect-symptom=agents kept fencing",
     });
