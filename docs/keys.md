@@ -513,10 +513,13 @@ members ignored, so an older build reads these records, but it drops what it ign
   exists, an agent with a trust policy refuses such a run although its job was signed.
 - A pre-B5 server answers a body with `signatures` `400` ZC-E0104 (unknown member).
 - A pre-B5 agent ignores the run's `signatures` and runs the job unchecked, which is safe in slice 1.
+- A slice-1 server does not know the slice-2 agent's exit kind `refused` (`/observed`) and refuses
+  that report, so a refused run is never ended; it also ignores `trust_policy` in a registration.
 
 Order: upgrade every server first, and finish the rollout before submitting signed jobs; never serve
 cancels from a server rolled back past B5; agents may be upgraded in any order until slice 2, and
-after it, before any agent is given a trust policy.
+after it, before any agent is given a trust policy. For slice 2: every server first, then the agents
+(B5 slice 2, docs/decisions/2026-11-13-b5-slice2-agent-check.md).
 
 ### `/job-input/<name>`: the input (API)
 
