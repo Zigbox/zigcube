@@ -825,6 +825,9 @@ const Call = struct {
         if (rec.tenure != tenure) {
             return bad_request(ctx, "puts", "a record does not name the tenure of the request");
         }
+        if (!records.observed_valid(rec)) {
+            return bad_request(ctx, "puts", "a replica record has the job-only exit kind refused");
+        }
         const wanted = records.observed_key(call.node, rec.replica);
         if (!std.mem.eql(u8, put.key, wanted.slice())) {
             return bad_request(ctx, "puts", "a key is not the observed key of its record");

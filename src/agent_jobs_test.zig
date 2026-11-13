@@ -1754,11 +1754,21 @@ const TrustCase = struct {
 
     /// Assigns the run with `signatures`, straight into the store, and runs a few passes.
     fn assign_and_pass(case: *TrustCase, signatures: ?[]const []const u8) !void {
+        _ = try case.assign_signed(signatures, "");
+        for (0..3) |_| case.rig.step();
+    }
+
+    /// Assigns the run with `signatures` and `source`, with no pass; returns the epoch.
+    fn assign_signed(
+        case: *TrustCase,
+        signatures: ?[]const []const u8,
+        source: []const u8,
+    ) !store.Revision {
         var run = case.rig.run_record(null, 60_000);
         run.image = case.images[0];
+        run.source = source;
         run.signatures = signatures;
-        _ = try case.rig.assign_run(run);
-        for (0..3) |_| case.rig.step();
+        return case.rig.assign_run(run);
     }
 
     /// Assigns an unsigned run straight into the store, with no pass; returns the epoch.
@@ -1900,6 +1910,62 @@ test "a refusal whose report was lost is made again, never reported not_started"
     const seen = (try stopped.rig.observed()).?;
     try testing.expectEqual(records.ExitKind.refused, seen.exit.?.kind);
     try testing.expectEqual(@as(u32, 0), starts_seen);
+}
+
+test "a signature over another tree, or bound to another manifest, is refused by the node" {
+    // Goal: the node judges what a line says, not that it verifies (B5 slice 2 review). Method: a
+    // trusted key's line over another tree; a trusted key's manifest-bound line under a run whose
+    // source pins another manifest; then the same bound line under its own source starts.
+    var other_tree: TrustCase = undefined;
+    try other_tree.start();
+    defer other_tree.stop();
+    const elsewhere = try other_tree.fixture.sign_tree(testing.allocator, 1, 0x32);
+    defer testing.allocator.free(elsewhere);
+    try other_tree.assign_and_pass(&.{elsewhere});
+    try expect_refused(&other_tree);
+
+    var other_source: TrustCase = undefined;
+    try other_source.start();
+    defer other_source.stop();
+    const bound = try other_source.fixture.sign_manifest(testing.allocator, 1, 0x31, 0x51);
+    defer testing.allocator.free(bound);
+    var source_buffer: [128]u8 = undefined;
+    const wrong = trust_fixture.source(&source_buffer, 0x52);
+    _ = try other_source.assign_signed(&.{bound}, wrong);
+    for (0..3) |_| other_source.rig.step();
+    try expect_refused(&other_source);
+
+    var own_source: TrustCase = undefined;
+    try own_source.start();
+    defer own_source.stop();
+    const right = trust_fixture.source(&source_buffer, 0x51);
+    _ = try own_source.assign_signed(&.{bound}, right);
+    for (0..3) |_| own_source.rig.step();
+    try testing.expectEqual(@as(u32, 1), starts_seen);
+}
+
+test "a claim the agent did not learn is judged before it is taken up" {
+    // Goal: `claimed_unstarted`'s start path (a claim applied, its reply lost) goes through the
+    // node's check like a fresh claim. Method: leave the state a lost reply leaves, under the
+    // current tenure; an unsigned run is refused, a signed one starts once.
+    var unsigned: TrustCase = undefined;
+    try unsigned.start();
+    defer unsigned.stop();
+    const epoch = try unsigned.assign_unsigned(false);
+    try leave_claim(&unsigned.rig, epoch, unsigned.rig.world.agent.tenure);
+    for (0..3) |_| unsigned.rig.step();
+    try expect_refused(&unsigned);
+
+    var signed: TrustCase = undefined;
+    try signed.start();
+    defer signed.stop();
+    const line = try signed.sign(1);
+    defer testing.allocator.free(line);
+    const again = try signed.assign_signed(&.{line}, "");
+    try leave_claim(&signed.rig, again, signed.rig.world.agent.tenure);
+    for (0..3) |_| signed.rig.step();
+    try testing.expectEqual(@as(u32, 1), starts_seen);
+    try testing.expect(signed.rig.running());
 }
 
 test "an agent with no trust policy checks nothing" {

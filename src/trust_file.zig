@@ -54,20 +54,15 @@ pub fn read(
             options.setting, constants.config_path_bytes_max,
         }, options.fix);
     }
+    // The path is judged before it is opened: opening a FIFO for reading blocks until a writer
+    // comes, so a FIFO must be refused unopened. The open file is judged again, in case the
+    // path was swapped in between.
+    const path_z = try arena.dupeSentinel(u8, path, 0);
+    try check_owner(owner_at(path_z), path, options, diag);
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch
         return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
     defer file.close(io);
-    const owner = owner_of(file) orelse
-        return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
-    if (owner_problem(owner, std.os.linux.geteuid())) |problem| {
-        return bad(diag, options, "the trust policy {s} {s}{s} (owner uid {d}, mode {o:0>4})", .{
-            path,
-            problem.text(),
-            if (problem == .foreign_owner) options.user else "",
-            owner.uid,
-            owner.mode & 0o7777,
-        }, options.owner_fix);
-    }
+    try check_owner(owner_of(file), path, options, diag);
     // A file of exactly the bound is allowed: the limit refuses one that reaches it.
     const limit: std.Io.Limit = .limited(zigbox.trust.limits.policy_bytes_max + 1);
     var reader = file.reader(io, &.{});
@@ -86,11 +81,33 @@ pub fn read(
 /// Who owns the policy file and its mode bits.
 pub const Owner = struct { uid: u32, mode: u32 };
 
+fn check_owner(owner_or_null: ?Owner, path: []const u8, options: Options, diag: *Diag) Error!void {
+    const owner = owner_or_null orelse
+        return bad(diag, options, "can't read the trust policy {s}", .{path}, options.fix);
+    const problem = owner_problem(owner, std.os.linux.geteuid()) orelse return;
+    return bad(diag, options, "the trust policy {s} {s}{s} (owner uid {d}, mode {o:0>4})", .{
+        path,
+        problem.text(),
+        if (problem == .foreign_owner) options.user else "",
+        owner.uid,
+        owner.mode & 0o7777,
+    }, options.owner_fix);
+}
+
 fn owner_of(file: std.Io.File) ?Owner {
+    return owner_stat(file.handle, "", std.os.linux.AT.EMPTY_PATH);
+}
+
+/// The owner of the file `path` names, following symbolic links as `openFile` does.
+fn owner_at(path: [:0]const u8) ?Owner {
+    return owner_stat(std.os.linux.AT.FDCWD, path, 0);
+}
+
+fn owner_stat(dir: std.os.linux.fd_t, path: [*:0]const u8, flags: u32) ?Owner {
     const linux = std.os.linux;
     var stat = std.mem.zeroes(linux.Statx);
     const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
-    const result = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, mask, &stat);
+    const result = linux.statx(dir, path, flags, mask, &stat);
     if (linux.errno(result) != .SUCCESS) return null;
     if (!stat.mask.MODE or !stat.mask.UID) return null;
     return .{ .uid = stat.uid, .mode = stat.mode };
@@ -199,6 +216,20 @@ test "a refusal raises the caller's code and names its setting" {
     try testing.expectError(error.BadConfig, read(arena, testing.io, "", test_options, &diag));
     const cause = diag.causes.slice()[0].slice();
     try testing.expect(std.mem.indexOf(u8, cause, "--trust-policy") != null);
+    diag.reset();
+    // A FIFO is refused without being opened, which would block until a writer came.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fifo_buffer: [128]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fifo_buffer, ".zig-cache/tmp/{s}/trust.zon", .{
+        tmp.sub_path,
+    }, 0);
+    const linux = std.os.linux;
+    const made = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
+    try testing.expectError(error.BadConfig, read(arena, testing.io, fifo, test_options, &diag));
+    const fifo_cause = diag.causes.slice()[0].slice();
+    try testing.expect(std.mem.indexOf(u8, fifo_cause, "is not a regular file") != null);
     diag.reset();
     const bad_policy = parse(arena, ".{ .keys = .{} }", "p.zon", test_options, &diag);
     try testing.expectError(error.BadConfig, bad_policy);

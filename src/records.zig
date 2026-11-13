@@ -734,6 +734,12 @@ pub const Observed = struct {
     assignment: ?u64 = null,
 };
 
+/// A replica's record never carries `refused`: only a job run is judged by the node's policy.
+pub fn observed_valid(observed: *const Observed) bool {
+    const exit = observed.exit orelse return true;
+    return exit.kind != .refused;
+}
+
 /// The placement: the scheduler's decision to run a replica on a node.
 pub const Assigned = struct {
     v: u32 = 2,
@@ -996,6 +1002,7 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    if (T == Observed and !observed_valid(&record)) return malformed(diag, kv.key, @typeName(T));
     if (T == JobStatus and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobObserved and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobAdmission and !admission_valid(record)) {
@@ -1378,6 +1385,14 @@ test "observed and decision write their versions with their new members, and rea
     const kv = kv_of("/observed/node1/hello-1", bytes);
     const back = try read(Observed, arena, kv, &diag);
     try testing.expectEqual(@as(?u64, 4), back.assignment);
+
+    // `refused` is a job's exit kind only (B5): a replica's record that holds it is malformed.
+    var refused = observed;
+    refused.status = .stopped;
+    refused.exit = .{ .kind = .refused };
+    const refused_kv = kv_of("/observed/node1/hello-1", try encode(arena, refused, &diag));
+    try testing.expectError(error.Malformed, read(Observed, arena, refused_kv, &diag));
+    diag.reset();
 
     const decision: Decision = .{
         .id = "1761350000123-0001-0007",

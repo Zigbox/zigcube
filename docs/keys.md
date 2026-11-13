@@ -260,7 +260,8 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
   "signal": 9}`, `{"kind": "oom"}`, `{"kind": "pid_limit"}`, `{"kind": "start_failed"}`,
   `{"kind": "lost"}`: the runtime's `ExitReason`; and `{"kind": "refused"}` (B5 slice 2, jobs only):
   the node's trust policy refused the run, nothing was started, and `diagnostic` is the
-  `ZBX-E0905` (or `ZBX-E0906`).
+  `ZBX-E0905` (or `ZBX-E0906`). In a replica's `/observed` record it is never valid: the agent
+  endpoint refuses such a report (ZC-E0104) and a reader takes the row as malformed (ZC-E0301).
 - **`diagnostic` is where an observed-state diagnostic lives.** It is a complete diagnostic in
   the JSON shape of DIAGNOSTICS.md (the `Diagnostic` of `src/diagnostic.zig`), embedded in the
   record that it explains. Present for `start_failed` (the runtime's own, possibly `ZBX-`),
