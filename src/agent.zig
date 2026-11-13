@@ -892,7 +892,7 @@ pub const Agent = struct {
         if (running == 0) try agent.fenced(ctx);
         const poll = now + constants.fence_poll_ms;
         const at_ms = if (running == 0) now else poll;
-        return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = 0 };
+        return .{ .at_ms = at_ms, .prefixes = &.{}, .acted = 0, .watch = false };
     }
 
     /// Every container has stopped: the lease and the tenure are over.

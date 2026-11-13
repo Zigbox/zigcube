@@ -1334,7 +1334,12 @@ const c1_teeth_roots = [_]struct {
         .name = "job_ledger_small",
         .root = "src/sim_c1_teeth_job_ledger_small_main.zig",
         .symptom = "J8: the start ledger is full (16 runs)",
-        .canary_seeds = 10,
+        // A fixed range at 400 operations, not fresh seeds at drawn ones (#236): the drawn
+        // operations (52 to 329 in the ten seeds of the miss) start 9 to 16 runs, which never
+        // fill a ledger of 16. At 400 operations 8 of seeds 1..10 fail, so 15 seeds miss a
+        // working check with probability 0.2^15 = 3e-11.
+        .canary_seeds = 15,
+        .canary_first = 1,
         .plain_symptom = "J8: the start ledger is full (16 runs)",
         .ops = 400,
     },
@@ -1372,15 +1377,16 @@ const c1_teeth_roots = [_]struct {
         // With #202 fixed (agents arm a run's deadline when it starts), the second clause is hit
         // by about one seed in a hundred: seed 32 until B2.1 slice 6 (#205: a failing step no
         // longer aborts the pass) shifted the world, then seed 186 (1..2000 searched up to the
-        // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md). CI's run ends
-        // there, and the fleet canary runs seed 186 alone at 300 operations (fresh seeds at
+        // first hit; docs/decisions/2026-11-11-job-evicted-tooth-sparse.md), then seed 241 after
+        // #225's fix (docs/decisions/2026-11-13-job-evicted-tooth-seed-241.md). CI's run ends
+        // there, and the fleet canary runs seed 241 alone at 300 operations (fresh seeds at
         // drawn operations would take hours for a one-in-a-hundred hit). A sparse tooth:
-        // widening its world so more seeds hit is B3 work. Seed 186 passes with the fault off.
+        // widening its world so more seeds hit is B3 work. Seed 241 passes with the fault off.
         .symptom = "J8: a run that no node started",
         .canary_seeds = 1,
-        .canary_first = 186,
-        .first_seed = 186,
-        .seeds = 186,
+        .canary_first = 241,
+        .first_seed = 241,
+        .seeds = 241,
         .ops = 300,
     },
 };
@@ -1792,6 +1798,19 @@ const c1_regressions = [_][]const []const u8{
         "--c1",                 "--strong",           "--profile=slow_store",
         "--lease-ttl-ms=10000", "--replicas-pct=100", "--heal-at=99",
     },
+    // #225: an agent that fenced after a restart waited with a watch that answered at once (no
+    // replica list, so no revision to watch from), and stepped in a hot loop until the fence
+    // ended: 52 steps in one millisecond. A wait while fencing is a pause now (`Wakeup.watch`).
+    &.{
+        "9739923",            "114",                   "4",
+        "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=10000",
+        "--replicas-pct=200", "--heal-at=104",
+    },
+    &.{
+        "2764708423",         "69",                    "4",
+        "--strong",           "--profile=crash_heavy", "--lease-ttl-ms=8248",
+        "--replicas-pct=300", "--heal-at=58",
+    },
 };
 
 /// `zig build sim-c1-regressions`: replays `c1_regressions` with the shipped code (ReleaseSafe).
@@ -1818,7 +1837,8 @@ fn add_regressions_step(b: *std.Build, sim: SimStepOptions) void {
 /// `zig build sim-fencing-teeth`: the negative test of `fencing_settles`. The simulator with
 /// the old `ttl / 3` renewal rule and the shortest-ttl bound lifted, at a ttl of 4,000 ms (the
 /// server refuses it now), must fail with that check's symptom. Not in `c1_teeth_roots`: the
-/// fleet's canary draws no ttl by hand.
+/// fleet's canary draws no ttl by hand. Seeds 2..4: seed 1's fence loop is caught first by
+/// `converged` since fence waits became pauses (docs/decisions/2026-11-13-fencing-teeth-seeds.md).
 fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_c1_teeth_oldrule",
@@ -1831,7 +1851,7 @@ fn add_fencing_teeth_step(b: *std.Build, sim: SimStepOptions) void {
     });
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{
-        "--seeds",                              "1..3",                "100",
+        "--seeds",                              "2..4",                "100",
         "1",                                    "--lease-ttl-ms=4000", "--expect-fail",
         "--expect-symptom=agents kept fencing",
     });
