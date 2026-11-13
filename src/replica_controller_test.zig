@@ -1310,6 +1310,130 @@ fn count_decisions(fixture: *Fixture, name: []const u8, action: []const u8) !u64
     return count;
 }
 
+/// What the agent API writes when `name` registers (#238): `/nodes/<name>` and
+/// `/node-tenure/<name>` in one transaction, so both are at the tenure's revision.
+fn register_tenured(fixture: *Fixture, name: []const u8) !void {
+    const ctx = fixture.context();
+    const node: records.Node = .{
+        .name = name,
+        .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
+    };
+    const tenure: records.NodeTenure = .{ .node = name };
+    const node_key = records.node_key(name);
+    const tenure_key = records.node_tenure_key(name);
+    const ops = [_]store.Op{
+        .{ .put = .{
+            .key = node_key.slice(),
+            .value = try records.encode(ctx.arena, node, &fixture.diag),
+        } },
+        .{ .put = .{
+            .key = tenure_key.slice(),
+            .value = try records.encode(ctx.arena, tenure, &fixture.diag),
+        } },
+    };
+    const role: writers.Role = .{ .agent = name };
+    const done = try writers.txn(ctx.store, role, .{ .on_success = &ops }, &fixture.diag);
+    try testing.expect(done.succeeded);
+}
+
+/// node1 (registered with a tenure record when `tenured`) runs hello's three replicas, node2
+/// is ready, node1 is lost for its tenure, and that tenure's grace has passed.
+fn start_lost_past_grace(fixture: *Fixture, tenured: bool) !void {
+    try fixture.start();
+    if (tenured) try register_tenured(fixture, "node1") else try fixture.register_node("node1");
+    try fixture.apply(hello);
+    _ = try fixture.settle();
+    try fixture.register_node("node2");
+    _ = try fixture.settle();
+    try lose(fixture, "node1");
+    fixture.manual.ms += constants.lost_grace_ms + 1;
+}
+
+test "a newer tenure that ended before the node controller judged it gets a grace of its own" {
+    // Goal: #238 finding 2, the replica controller's half (`newer_tenure` in `lost_placement`).
+    // Method: node1 is lost for T1 and T1's grace is long past; node1 registers as T2 and T2's
+    // lease ends before any node controller pass. A replica controller pass must not replace on
+    // T1's verdict; once the node controller judges T2 lost, the replacement waits for T2's own
+    // `lost_grace_ms`.
+    var fixture: Fixture = undefined;
+    try start_lost_past_grace(&fixture, true);
+    defer fixture.stop();
+    try register_tenured(&fixture, "node1");
+    const ctx = fixture.context();
+    const key = records.node_key("node1");
+    const op: store.Op = .{ .delete = key.slice() };
+    const role: writers.Role = .{ .agent = "node1" };
+    _ = try writers.txn(ctx.store, role, .{ .on_success = &.{op} }, &fixture.diag);
+
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const kept = try fixture.ids("hello");
+    defer Fixture.free_ids(kept);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, kept);
+
+    // The node controller judges T2: `lost` again, stamped now; the grace counts from it.
+    const judged_at = fixture.manual.ms;
+    _ = try fixture.step();
+    const status_key = records.node_status_key("node1");
+    const got = try ctx.store.get(ctx.arena, status_key.slice(), null, &fixture.diag);
+    const status = try records.read(records.NodeStatus, ctx.arena, got.kv.?, &fixture.diag);
+    try testing.expectEqual(records.NodeState.lost, status.state);
+    try testing.expectEqual(judged_at, status.at_ms);
+    fixture.manual.ms = judged_at + constants.lost_grace_ms - 1;
+    try testing.expectEqual(@as(u32, 0), (try fixture.plane.replicas.reconcile(&ctx)).acted);
+    const still = try fixture.ids("hello");
+    defer Fixture.free_ids(still);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, still);
+    fixture.manual.ms += 1;
+    _ = try fixture.settle();
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-4", "hello-5", "hello-6" }, now);
+}
+
+/// Runs one replica controller pass in which a tenure of node1 begins and ends just before the
+/// commit (`/node-tenure/node1` moves; `/nodes/node1` is absent at both ends), and checks that
+/// the pass replaced nothing.
+fn expect_tenure_between_read_and_commit(fixture: *Fixture) !void {
+    var ctx = fixture.context();
+    const tenure: records.NodeTenure = .{ .node = "node1" };
+    const key = records.node_tenure_key("node1");
+    var moving: MovingStore = .{
+        .inner = fixture.memory.interface(),
+        .key = key.slice(),
+        .value = try records.encode(ctx.arena, tenure, &fixture.diag),
+    };
+    ctx.store = moving.interface();
+    const wake = try fixture.plane.replicas.reconcile(&ctx);
+    try testing.expect(moving.fired);
+    try testing.expectEqual(@as(u32, 0), wake.acted);
+    const now = try fixture.ids("hello");
+    defer Fixture.free_ids(now);
+    try expect_ids(&.{ "hello-1", "hello-2", "hello-3" }, now);
+    const lost = try count_decisions(fixture, "hello-1", "mark_replica_lost");
+    try testing.expectEqual(@as(u64, 0), lost);
+}
+
+test "the replacement off a lost node fails when a tenure begins and ends before the commit" {
+    // Goal: `/node-tenure/<node>` as read is in the replacement's read set (#238): a
+    // registration that came and went between the snapshot and the commit leaves `/nodes`
+    // absent at both ends, so only the tenure record shows it.
+    var fixture: Fixture = undefined;
+    try start_lost_past_grace(&fixture, true);
+    defer fixture.stop();
+    try expect_tenure_between_read_and_commit(&fixture);
+}
+
+test "the replacement off a lost node with no tenure record fails when one is written" {
+    // Goal: a node last registered by a server from before #238 has no `/node-tenure` record;
+    // the replacement compares that record at revision 0, so a tenure that begins and ends
+    // before the commit still fails it.
+    var fixture: Fixture = undefined;
+    try start_lost_past_grace(&fixture, false);
+    defer fixture.stop();
+    try expect_tenure_between_read_and_commit(&fixture);
+}
+
 const node_names = [_][]const u8{ "node1", "node2", "node3" };
 
 /// Three replicas of `hello` placed on three ready nodes (the scheduler spreads them), each

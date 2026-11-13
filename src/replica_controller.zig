@@ -571,7 +571,7 @@ const Run = struct {
     /// Compares what the judgement of a node rests on: its status at the revision read (`lost`
     /// for a removal off a lost node, `ready` for one that cites a report) and its `/nodes`
     /// record as read, or, when that is absent, its `/node-tenure` record as read (absent
-    /// with no tenure record: `/nodes` at revision 0). Once per node per batch: a second
+    /// too: `/node-tenure` at revision 0). Once per node per batch: a second
     /// replica of the node adds nothing.
     fn expect_node_judged(run: *Run, batch: *Batch, node: []const u8) Error!void {
         // Test-only fault (the sim-c1-teeth-stale negative test): the node's status and
@@ -596,8 +596,10 @@ const Run = struct {
                 return;
             }
         }
-        const node_key = records.node_key(node);
-        batch.expect(try controller.key_copy(run.ctx, &node_key), 0);
+        // Neither read (a node last registered before #238): `/node-tenure/<node>` at revision
+        // 0. Every registration writes it, so this also fails on a tenure that began and ended
+        // since the read; `/nodes` at revision 0 would not.
+        batch.expect(try controller.key_copy(run.ctx, &key), 0);
     }
 
     /// The decision and the delete for a replica that is to stop for a reason the service gave.
