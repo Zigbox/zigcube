@@ -1303,6 +1303,11 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_stale_main.zig",
         .symptom = "J9",
         .canary_seeds = 80,
+        // The fault makes a run fail J9 (a stale report stored) or J10 at rest (its start record
+        // outlives the assignment, the plain symptom) first, about one seed in three J9 over 1
+        // to 80. Seed 1 was a J9 world until #238 moved it to J10 (J9 26 of 80 seeds before,
+        // 28 after): seeds that fail otherwise are skipped, and J9 must still show in 1..10.
+        .any_symptom = true,
         .plain_symptom = "J10",
     },
     .{
