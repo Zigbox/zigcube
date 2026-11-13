@@ -278,13 +278,21 @@ fn store_verdict_kind(text: []const u8) ?[]const u8 {
 }
 
 /// What a diagnostic line of a run says is wrong, or null if the line is not one: the checker's
-/// verdict by stage (`history: lost_write`), a runner's `FAILED: ...`, a failover's
-/// `failover sync: FAILED: ...`, with digits elided so one failure is one fingerprint.
+/// verdict by stage (`history: lost_write`, `watch: gap`), a client thread that stopped
+/// (`client thread stopped: BackendFailed`), a runner's `FAILED: ...`, a failover's
+/// `failover sync: FAILED: ...`, with digits elided so one failure is one fingerprint. Each
+/// cause is a check of its own: the history checker, the watch checker and a client thread
+/// failing are different bugs, so they must never share a fingerprint.
 fn store_check(arena: std.mem.Allocator, line: []const u8) error{OutOfMemory}!?[]const u8 {
-    for ([_][]const u8{ "history: ", "compaction: " }) |stage| {
+    for ([_][]const u8{ "history: ", "compaction: ", "watch: " }) |stage| {
         if (!std.mem.startsWith(u8, line, stage)) continue;
         const name = store_verdict_kind(line) orelse return try normalize_crash(arena, line);
         return try std.fmt.allocPrint(arena, "{s}{s}", .{ stage, name });
+    }
+    if (after_prefix(line, "a client thread stopped: ")) |name| {
+        return try std.fmt.allocPrint(arena, "client thread stopped: {s}", .{
+            try normalize_crash(arena, name),
+        });
     }
     if (after_prefix(line, "FAILED: ")) |text| return try normalize_crash(arena, text);
     if (after_prefix(line, "failover ")) |rest| {
@@ -294,11 +302,23 @@ fn store_check(arena: std.mem.Allocator, line: []const u8) error{OutOfMemory}!?[
     return null;
 }
 
+/// The command that runs exactly the run that failed, and nothing else: its backend, its seed
+/// and `-Dstore-faults-only` for its part. Without the part, a replay would also run the
+/// conformance suite and the parts before it with the same seed, any of which can fail first
+/// and stop the step before the failing part is reached. Postgres's own run needs the database
+/// the fleet ran it on (`zig build pg-up`); a failover run makes its own pair.
 fn store_replay(arena: std.mem.Allocator, run: StoreRun) error{OutOfMemory}![]const u8 {
+    assert(run.step.len > 0);
+    assert(run.backend.len > 0);
+    const part = after_prefix(run.step, "failover-") orelse "faults";
+    var database: []const u8 = "";
+    if (std.mem.eql(u8, part, "faults")) {
+        if (std.mem.eql(u8, run.backend, "postgres")) database = "zig build pg-up && ";
+    }
     return std.fmt.allocPrint(
         arena,
-        "zig build test-store-faults -Dbackend={s} -Dseed={d}",
-        .{ run.backend, run.seed },
+        "{s}zig build test-store-faults -Dbackend={s} -Dseed={d} -Dstore-faults-only={s}",
+        .{ database, run.backend, run.seed, part },
     );
 }
 
@@ -1182,7 +1202,8 @@ test "store-faults output parses: clean runs count, failures are filed under the
     );
     try std.testing.expectEqualStrings("failover-async", bad.failures[1].step);
     try std.testing.expectEqualStrings(
-        "git checkout abc && zig build test-store-faults -Dbackend=postgres -Dseed=7",
+        "git checkout abc && zig build test-store-faults -Dbackend=postgres -Dseed=7 " ++
+            "-Dstore-faults-only=async",
         try replay_line(arena, kind_store_faults, "abc", bad.failures[1]),
     );
     const t = try title(arena, kind_store_faults, bad.failures[0]);
@@ -1241,4 +1262,98 @@ test "store-faults fingerprints hash the kind and ignore the seed" {
         &fingerprint(kind_store_faults, bad.failures[0]),
         &fingerprint(kind_store_faults, bad.failures[1]),
     ));
+}
+
+test "store-faults replays run exactly the failing part" {
+    // Goal: every replay line names the part that failed, so that it runs that part alone with
+    // its own seed. Method: a SQLite failure, a Postgres history failure, a run that died during
+    // a failover run, and run.sh's record of a failed conformance run, each parsed.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bad = try parse(arena, kind_store_faults, store_failing);
+    try std.testing.expectEqualStrings(
+        "zig build test-store-faults -Dbackend=sqlite -Dseed=587643522279407410 " ++
+            "-Dstore-faults-only=faults",
+        bad.failures[0].replay,
+    );
+    const postgres_text =
+        "store-faults: backend=postgres seed=8 (replay: -Dseed=8)\n" ++
+        "store-faults: history: .{ .failed = .{ .kind = .lost_write, .revision = 3 } }\n" ++
+        "store-faults: FAIL seed=8 (replay: -Dseed=8)\n";
+    const postgres = try parse(arena, kind_store_faults, postgres_text);
+    try std.testing.expectEqualStrings(
+        "zig build pg-up && zig build test-store-faults -Dbackend=postgres -Dseed=8 " ++
+            "-Dstore-faults-only=faults",
+        postgres.failures[0].replay,
+    );
+    // A run that died in its failover: run.sh's crash record has no step, so the run's own
+    // step and replay stand.
+    const died_text =
+        "store-faults: backend=postgres seed=9 (replay: -Dseed=9)\n" ++
+        "store-faults: failover run: sync standby\n" ++
+        "seed 9: CRASHED: killed by SIGKILL, for memory (the kernel's out-of-memory killer)\n";
+    const died = try parse(arena, kind_store_faults, died_text);
+    try std.testing.expect(died.failures[0].crash);
+    try std.testing.expectEqualStrings("failover-sync", died.failures[0].step);
+    try std.testing.expectEqualStrings(
+        "zig build test-store-faults -Dbackend=postgres -Dseed=9 -Dstore-faults-only=sync",
+        died.failures[0].replay,
+    );
+    // run.sh's record of a failed conformance run (sf_conformance), after a run that passed.
+    const conformance_text =
+        "store-faults: backend=postgres seed=5 (replay: -Dseed=5)\n" ++
+        "store-faults: PASS\n" ++
+        "seed 5: FAILED: conformance: txn: the result's hash is the chain hash of its " ++
+        "revision\n" ++
+        "  step: conformance\n" ++
+        "  replay: zig build pg-up && zig build test-store-faults -Dbackend=postgres " ++
+        "-Dseed=5 -Dstore-faults-only=conformance\n";
+    const conformance = try parse(arena, kind_store_faults, conformance_text);
+    try std.testing.expectEqual(@as(u64, 2), conformance.seeds);
+    try std.testing.expectEqual(@as(usize, 1), conformance.failures.len);
+    try std.testing.expect(!conformance.failures[0].infra());
+    try std.testing.expectEqualStrings("conformance", conformance.failures[0].step);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        conformance.failures[0].replay,
+        "-Dseed=5 -Dstore-faults-only=conformance",
+    ));
+}
+
+test "store-faults: the watch checker and a client thread fail under fingerprints of their own" {
+    // Goal: a failure of the history checker, of the watch checker and of a client thread are
+    // three issues, never one. Method: the runner's real lines for each (`history: {any}`,
+    // `watch: {any}`, `a client thread stopped: NAME`), then its FAIL line, parsed; the checks
+    // and fingerprints must all differ, and two client errors must differ too.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const header = "store-faults: backend=sqlite seed=4 (replay: -Dseed=4)\n";
+    const fail = "store-faults: FAIL seed=4 (replay: -Dseed=4)\n";
+    const verdict = ".{ .failed = .{ .kind = .log_gap, .revision = 2 } }\n";
+    const texts = [_][]const u8{
+        header ++ "store-faults: history: " ++ verdict ++ fail,
+        header ++ "store-faults: watch: " ++ verdict ++ fail,
+        header ++ "store-faults: a client thread stopped: BackendFailed\n" ++ fail,
+        header ++ "store-faults: a client thread stopped: OutOfMemory\n" ++ fail,
+    };
+    const checks = [_][]const u8{
+        "history: log_gap",
+        "watch: log_gap",
+        "client thread stopped: BackendFailed",
+        "client thread stopped: OutOfMemory",
+    };
+    var prints: [texts.len]Fingerprint = undefined;
+    for (texts, checks, 0..) |text, check, index| {
+        const batch = try parse(arena, kind_store_faults, text);
+        try std.testing.expectEqual(@as(usize, 1), batch.failures.len);
+        try std.testing.expectEqualStrings(check, batch.failures[0].check);
+        prints[index] = fingerprint(kind_store_faults, batch.failures[0]);
+    }
+    for (prints, 0..) |left, index| {
+        for (prints[index + 1 ..]) |right| {
+            try std.testing.expect(!std.mem.eql(u8, &left, &right));
+        }
+    }
 }

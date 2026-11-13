@@ -115,8 +115,11 @@ fn add_store_and_demo_steps(b: *std.Build, built: Built, seed: ?u64, shared: Sha
     const pg_dev = add_pg_dev_steps(b);
     const failover_help = "test-store-faults on Postgres: also run the failover runs " ++
         "(default true; they need the Postgres 16 programs, as pg-up does)";
+    const only_help = "test-store-faults: run only this part (Postgres: conformance, faults, " ++
+        "sync, async; SQLite: faults), as the fleet's replay lines do (default: every part)";
     add_store_faults_step(b, store_options, .{
         .enabled = b.option(bool, "failover", failover_help) orelse true,
+        .only = b.option(FaultsPart, "store-faults-only", only_help),
         .pg_dev = pg_dev,
         .server = built.server,
     });
@@ -846,9 +849,15 @@ fn add_store_tests(
 /// Slice 10d's failover runs (`src/store_failover.zig`): a `pg_dev` pair and a real server.
 const FailoverOptions = struct {
     enabled: bool,
+    /// `-Dstore-faults-only`: one part of the step alone, with nothing before it, so that a
+    /// replay runs exactly the part that failed (the parts draw their seeds separately unless
+    /// `-Dseed` is given, and a later part runs only after the one before it passed).
+    only: ?FaultsPart,
     pg_dev: *std.Build.Step.Compile,
     server: *std.Build.Step.Compile,
 };
+
+const FaultsPart = enum { conformance, faults, sync, async };
 
 fn add_store_faults_step(
     b: *std.Build,
@@ -869,39 +878,73 @@ fn add_store_faults_step(
             },
         }),
     });
-    const run = b.addRunArtifact(exe);
-    run.has_side_effects = true;
-    run.setCwd(b.path("."));
-    switch (step_options.backend) {
-        .postgres => {
-            run.addArgs(&.{ "--backend", "postgres", "--postgres", step_options.postgres });
-            // The conformance suite's tests, through a proxy that delays and stalls but never cuts.
-            step.dependOn(&add_store_tests(b, step_options, true).step);
-        },
-        .sqlite => run.addArgs(&.{ "--backend", "sqlite" }),
-        .memory => {
-            step.dependOn(&b.addFail("test-store-faults needs -Dbackend=postgres or sqlite").step);
-            return;
-        },
+    if (step_options.backend == .memory) {
+        step.dependOn(&b.addFail("test-store-faults needs -Dbackend=postgres or sqlite").step);
+        return;
     }
-    if (step_options.seed) |seed| run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
-    step.dependOn(&run.step);
+    const only = failover.only;
+    if (step_options.backend == .sqlite) {
+        if (only) |part| {
+            if (part != .faults) {
+                step.dependOn(&b.addFail("-Dstore-faults-only on SQLite takes faults").step);
+                return;
+            }
+        }
+    }
+    if (step_options.backend == .postgres) {
+        // The conformance suite's tests, through a proxy that delays and stalls but never cuts.
+        if (only == null or only == .conformance) {
+            step.dependOn(&add_store_tests(b, step_options, true).step);
+        }
+    }
+    var before: ?*std.Build.Step = null;
+    if (only == null or only == .faults) {
+        const run = b.addRunArtifact(exe);
+        run.has_side_effects = true;
+        run.setCwd(b.path("."));
+        if (step_options.backend == .postgres) {
+            run.addArgs(&.{ "--backend", "postgres", "--postgres", step_options.postgres });
+        } else {
+            run.addArgs(&.{ "--backend", "sqlite" });
+        }
+        if (step_options.seed) |seed| run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
+        step.dependOn(&run.step);
+        before = &run.step;
+    }
     if (step_options.backend != .postgres) return;
-    if (!failover.enabled) return;
-    // One after the other, after 10c's run: each makes and removes the same pair of servers.
-    var before: *std.Build.Step = &run.step;
-    for ([_][]const u8{ "sync", "async" }) |mode| {
+    // `-Dstore-faults-only=sync|async` runs that failover run whatever `-Dfailover` says.
+    if (only == null and !failover.enabled) return;
+    add_failover_runs(b, step, exe, step_options.seed, failover, before);
+}
+
+/// Slice 10d's failover runs, one after the other and after 10c's run (`before`, when it runs):
+/// each makes and removes the same pair of servers.
+fn add_failover_runs(
+    b: *std.Build,
+    step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    seed_option: ?u64,
+    failover: FailoverOptions,
+    first: ?*std.Build.Step,
+) void {
+    const only = failover.only;
+    var before = first;
+    for ([_]FaultsPart{ .sync, .async }) |mode| {
+        if (only) |part| {
+            if (part != mode) continue;
+        }
         const failover_run = b.addRunArtifact(exe);
         failover_run.has_side_effects = true;
         failover_run.setCwd(b.path("."));
-        failover_run.addArgs(&.{ "--backend", "postgres", "--failover", mode, "--pg-dev" });
+        failover_run.addArgs(&.{ "--backend", "postgres", "--failover", @tagName(mode) });
+        failover_run.addArg("--pg-dev");
         failover_run.addArtifactArg(failover.pg_dev);
         failover_run.addArg("--server");
         failover_run.addArtifactArg(failover.server);
-        if (step_options.seed) |seed| {
+        if (seed_option) |seed| {
             failover_run.addArgs(&.{ "--seed", b.fmt("{d}", .{seed}) });
         }
-        failover_run.step.dependOn(before);
+        if (before) |previous| failover_run.step.dependOn(previous);
         before = &failover_run.step;
         step.dependOn(&failover_run.step);
     }

@@ -305,15 +305,21 @@ run_round() {
 }
 
 # `test-store-faults` (docs/briefs/c3-sim-fleet.md, item 4): the first round of each UTC day runs
-# it on the built commit, SQLite and then Postgres (which also makes its two failover runs), and
-# hands what it printed to `sim_fleet ingest --kind store-faults`, which files a failure like a
-# simulator's. It runs after the round's own work, one process at a time, and is counted once
-# the day's run is over whatever the reporter answered (a round GitHub refused is in
-# $STATE/last-failed-round-store-faults.txt, and the next day's run finds a real failure again).
-# A run that died, or never started, is recorded as the producers' crashes are (sf_record). The
-# host has no KVM and nothing here needs it.
+# it on the built commit, SQLite and then Postgres (which also makes its conformance run and its
+# two failover runs), and hands what it printed to `sim_fleet ingest --kind store-faults`, which
+# files a failure like a simulator's. It runs after the round's own work, one process at a time.
+# The day counts as done only once the reporter took its output: a report that GitHub or a
+# timeout stopped (exit 2 or 124) is kept in $STATE/store-faults-pending with its commit and day,
+# and the next round sends it again before anything else, so that day's failures are filed
+# late, never lost. Output the reporter refused (exit 1, a parser bug) is never retried, since
+# the same text gets the same answer: the day is done and the text is in
+# $STATE/last-failed-round-store-faults.txt. A run that died, or never started, is recorded as
+# the producers' crashes are (sf_record). The host has no KVM and nothing here needs it.
 store_faults_day() {
     if [ "${SIM_FLEET_STORE_FAULTS:-0}" -eq 0 ]; then return 0; fi
+    if [ -f "$STATE/store-faults-pending/output" ]; then
+        sf_send_pending || return 0
+    fi
     today=$(date -u +%Y-%m-%d)
     if [ "$(cat "$STATE/store-faults-day" 2>/dev/null || true)" = "$today" ]; then return 0; fi
     if ! git checkout --quiet --detach "$built"; then
@@ -324,14 +330,43 @@ store_faults_day() {
     : >"$round/all-store-faults"
     sf_backend sqlite >>"$round/all-store-faults"
     sf_backend postgres >>"$round/all-store-faults"
-    ingest store-faults "$round/all-store-faults" || true
-    echo "$today" >"$STATE/store-faults-day.new"
-    mv "$STATE/store-faults-day.new" "$STATE/store-faults-day"
+    pending=$STATE/store-faults-pending
+    rm -rf "$pending.new"
+    mkdir -p "$pending.new"
+    cp "$round/all-store-faults" "$pending.new/output"
+    echo "$built" >"$pending.new/commit"
+    echo "$today" >"$pending.new/day"
+    rm -rf "$pending"
+    mv "$pending.new" "$pending"
+    sf_send_pending || true
 }
 
-# Runs `zig build test-store-faults -Dbackend=$1` and prints its output, then a record of how it
-# died if it did (sf_record). Postgres is a throwaway server of the host's Postgres 16 programs
-# (`zig build pg-up`), stopped, with the failover pair, afterwards.
+# Sends the kept output of a day's run ($STATE/store-faults-pending) to the reporter under the
+# commit it ran on. On success, or on a refusal that a retry cannot change (exit 1), records its
+# day as done and forgets it; otherwise keeps it for the next round and returns 1.
+sf_send_pending() {
+    pending=$STATE/store-faults-pending
+    sf_built=$built
+    built=$(cat "$pending/commit")
+    sf_code=0
+    ingest store-faults "$pending/output" || sf_code=$?
+    built=$sf_built
+    case "$sf_code" in
+    0 | 1) ;;
+    *)
+        log "store-faults: the report of $(cat "$pending/day") was not sent (exit $sf_code);" \
+            "it is sent again next round"
+        return 1
+        ;;
+    esac
+    cp "$pending/day" "$STATE/store-faults-day.new"
+    mv "$STATE/store-faults-day.new" "$STATE/store-faults-day"
+    rm -rf "$pending"
+}
+
+# Runs `zig build test-store-faults -Dbackend=$1` and prints its output, then a record of what
+# its verdict lines do not say (sf_record). Postgres is a throwaway server of the host's
+# Postgres 16 programs (`zig build pg-up`), stopped, with the failover pair, afterwards.
 sf_backend() {
     out="$round/sf-$1"
     code=0
@@ -340,7 +375,8 @@ sf_backend() {
         export ZCUBE_PG_DIR ZCUBE_PG_PAIR_DIR
         export ZCUBE_PG_BIN="$SIM_FLEET_PG_BIN"
         if [ ! -x "$SIM_FLEET_PG_BIN/initdb" ]; then
-            log "store-faults: no Postgres 16 programs in $SIM_FLEET_PG_BIN (setup.sh installs them)" >&2
+            log "store-faults: no Postgres 16 programs in $SIM_FLEET_PG_BIN" \
+                "(setup.sh installs them)" >&2
             sf_setup postgres "no Postgres 16 programs in $SIM_FLEET_PG_BIN"
             return 0
         fi
@@ -367,31 +403,81 @@ sf_setup() {
     printf '  replay: zig build test-store-faults -Dbackend=%s\n' "$1"
 }
 
-# The record of a run of backend $1 that ended with exit code $2 and printed $3, if it ended
-# without a verdict: no result line after its last header (it died), or a non-zero exit with no
-# FAIL, ERROR or FAILED line at all (it never started: a build or a conformance test failed). The
-# message is the build's first `error:` line, else the exit code or signal.
+# The records of what a run of backend $1, which ended with exit code $2 and printed $3, failed
+# at beyond its runners' own verdicts (FAIL, ERROR, `failover M: FAILED`), which the reporter
+# reads from the output itself. A non-zero exit is always accounted for: by such a verdict, by a
+# failed conformance test (Postgres runs the store conformance suite through a proxy as part of
+# the step; sf_conformance), or else by a crash record here. The crash record ends a run that
+# printed its header and no result (it died, or timed out), at that run's step and seed; with
+# no run open it is the build's failure, at `before-run` when no run printed anything and at
+# `after-run` when every run passed and the step still failed. Its message is the first panic
+# or `error:` line, a timeout, or a kill by SIGKILL, which on this host is the kernel's
+# out-of-memory killer.
 sf_record() {
     if [ "$2" -eq 0 ]; then return 0; fi
-    last=$(grep -E '^store-faults: (backend=|PASS|FAIL seed=|ERROR |failover [a-z]+: PASS)' "$3" |
-        tail -n1)
+    results='backend=|PASS|FAIL seed=|ERROR |failover [a-z]+: (PASS|FAILED)'
+    last=$(grep -E "^store-faults: ($results)" "$3" | tail -n1)
     case "$last" in
     "store-faults: backend="*) open=1 ;;
     *) open=0 ;;
     esac
-    if [ "$open" -eq 0 ] && grep -qE '^store-faults: (FAIL seed=|ERROR )' "$3"; then return 0; fi
-    if [ "$open" -eq 0 ] && [ "$2" -eq 1 ] && [ -n "$last" ]; then return 0; fi
+    verdict=0
+    if grep -qE '^store-faults: (FAIL seed=|ERROR |failover [a-z]+: FAILED)' "$3"; then
+        verdict=1
+    fi
+    conformance=$(sf_conformance "$1" "$3")
+    if [ "$open" -eq 0 ] && [ "$verdict" -eq 1 ]; then
+        sf_print "$conformance"
+        return 0
+    fi
+    if [ "$open" -eq 0 ] && [ -n "$conformance" ]; then
+        sf_print "$conformance"
+        return 0
+    fi
     message=$(sed -n 's/^.*panic: //p; s/^error: //p' "$3" | head -n1)
-    case "$2" in
-    124) message="timed out after $SIM_FLEET_STORE_FAULTS_TIMEOUT s" ;;
-    137) message="killed (out of memory?)" ;;
-    *) if [ -z "$message" ]; then message="exit $2"; fi ;;
-    esac
-    seed=$(printf '%s\n' "$last" | sed -n 's/^store-faults: backend=[a-z]* seed=\([0-9]*\).*/\1/p')
-    printf 'seed %s: CRASHED: %s\n' "${seed:-0}" "$message"
-    if [ "$open" -eq 0 ]; then
-        printf '  step: before-run\n'
+    if [ "$2" -eq 124 ]; then
+        message="timed out after $SIM_FLEET_STORE_FAULTS_TIMEOUT s"
+    elif [ "$2" -eq 137 ] || grep -q 'terminated with signal KILL' "$3"; then
+        message="killed by SIGKILL, for memory (the kernel's out-of-memory killer)"
+    elif [ -z "$message" ]; then
+        message="exit $2"
+    fi
+    if [ "$open" -eq 1 ]; then
+        seed=$(printf '%s\n' "$last" |
+            sed -n 's/^store-faults: backend=[a-z]* seed=\([0-9]*\).*/\1/p')
+        printf 'seed %s: CRASHED: %s\n' "${seed:-0}" "$message"
+    else
+        step=before-run
+        if grep -qE '^store-faults: backend=' "$3"; then step=after-run; fi
+        printf 'seed 0: CRASHED: %s\n  step: %s\n' "$message" "$step"
         printf '  replay: zig build test-store-faults -Dbackend=%s\n' "$1"
+    fi
+    sf_print "$conformance"
+}
+
+# Prints $1 and a newline, or nothing when it is empty (a command substitution drops the last
+# newline of the text it captured).
+sf_print() {
+    if [ -n "$1" ]; then printf '%s\n' "$1"; fi
+}
+
+# One failure record for a failed conformance run in $2 (backend $1): the first failing test's
+# name as the check (the build runner prints only some of the failed tests, so a count would
+# be wrong), its seed, and the replay of that run alone. Prints nothing when no
+# conformance test failed. The test runner prints `error: 'store_conformance.test.NAME'
+# failed:`, then, indented, the harness's `store conformance: backend=B seed=N` line.
+sf_conformance() {
+    name=$(sed -n "s/^error: 'store_conformance\.test\.\(.*\)' failed:\$/\1/p" "$2" | head -n1)
+    if [ -z "$name" ]; then return 0; fi
+    seed=$(sed -n 's/^ *store conformance: backend=[a-z]* seed=\([0-9]*\).*/\1/p' "$2" | head -n1)
+    printf 'seed %s: FAILED: conformance: %s\n' "${seed:-0}" "$name"
+    printf '  step: conformance\n'
+    if [ -n "$seed" ]; then
+        printf '  replay: zig build pg-up && zig build test-store-faults -Dbackend=%s' "$1"
+        printf ' -Dseed=%s -Dstore-faults-only=conformance\n' "$seed"
+    else
+        printf '  replay: zig build pg-up && zig build test-store-faults -Dbackend=%s' "$1"
+        printf ' -Dstore-faults-only=conformance\n'
     fi
 }
 
