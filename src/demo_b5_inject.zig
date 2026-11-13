@@ -109,10 +109,20 @@ test "inject writes jobs the server's check would refuse, straight into the stor
 
     const tree = "b3:abababababababababababababababababababababababababababababababab";
     const jobs = [_]Job{
-        .{ .name = "unsigned", .image = tree, .signatures = &.{}, .command = &.{"true"},
-            .deadline_ms = 60_000 },
-        .{ .name = "stranger", .image = tree, .signatures = &.{"not an envelope the API checks"},
-            .command = &.{"true"}, .deadline_ms = 60_000 },
+        .{
+            .name = "unsigned",
+            .image = tree,
+            .signatures = &.{},
+            .command = &.{"true"},
+            .deadline_ms = 60_000,
+        },
+        .{
+            .name = "stranger",
+            .image = tree,
+            .signatures = &.{"not an envelope the API checks"},
+            .command = &.{"true"},
+            .deadline_ms = 60_000,
+        },
     };
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -130,6 +140,6 @@ test "inject writes jobs the server's check would refuse, straight into the stor
         const got = try backend.handle().get(arena_state.allocator(), key.slice(), null, &diag);
         try testing.expect(got.kv != null);
     }
-    try testing.expectError(error.NotCreated, inject(testing.allocator, testing.io, path,
-        jobs[0..1], &out.writer));
+    const again = inject(testing.allocator, testing.io, path, jobs[0..1], &out.writer);
+    try testing.expectError(error.NotCreated, again);
 }

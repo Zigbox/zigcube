@@ -91,8 +91,8 @@ fn sign(demo: *Demo) !Signed {
 /// The `tree b3:<hex>` line of `guest.sh pull`.
 fn tree_of(demo: *Demo, output: []const u8) ![]const u8 {
     const tree = try field(demo, output, "tree ");
-    try demo.host.check_quiet(tree.len == tree_length and std.mem.startsWith(u8, tree, "b3:"),
-        "a tree digest, not \"{s}\"", .{tree});
+    const ok = tree.len == tree_length and std.mem.startsWith(u8, tree, "b3:");
+    try demo.host.check_quiet(ok, "a tree digest, not \"{s}\"", .{tree});
     return tree;
 }
 
@@ -227,8 +227,10 @@ fn signed_runs(demo: *Demo, signed: Signed) !void {
     try demo.wait_hard(@as([]const u8, "signed"), has_ended, "the signed job to end", job_wait_ms);
     _ = try host.zcube(&.{ "job", "get", "signed" });
     const view = try state.need_job(host, "signed");
-    demo.expect(std.mem.eql(u8, view.state, "exited") and view.code != null and view.code.? == 0,
-        "the signed job ran and exited 0 (state {s}, code {?d})", .{ view.state, view.code });
+    const ran = std.mem.eql(u8, view.state, "exited") and view.code != null and view.code.? == 0;
+    demo.expect(ran, "the signed job ran and exited 0 (state {s}, code {?d})", .{
+        view.state, view.code,
+    });
 }
 
 // ---- 4. Refused at the server ----
@@ -266,8 +268,8 @@ fn refused_at_agent(demo: *Demo, refused: []const Refused) !void {
     };
     var out: std.Io.Writer.Allocating = .init(demo.arena());
     const store_path = host.config.store["sqlite:".len..];
-    inject.inject(host.arena_state.child_allocator, host.io, store_path, &jobs, &out.writer) catch
-        |err| {
+    const gpa = host.arena_state.child_allocator;
+    inject.inject(gpa, host.io, store_path, &jobs, &out.writer) catch |err| {
         host.say("{s}", .{out.written()});
         return host.fail("writing the jobs into {s}: {s}", .{ store_path, @errorName(err) });
     };
@@ -280,10 +282,10 @@ fn refused_at_agent(demo: *Demo, refused: []const Refused) !void {
         _ = try host.zcube(&.{ "job", "get", job.name });
         const view = try state.need_job(host, job.name);
         const cause = try end_cause(demo, job.name);
-        demo.expect(std.mem.eql(u8, view.state, "failed") and std.mem.eql(u8, cause, "refused"),
-            "{s} ({s}) is refused at the agent: failed, cause refused (got {s}, {s})", .{
-                job.name, job.why, view.state, cause,
-            });
+        const refused_here = std.mem.eql(u8, view.state, "failed") and
+            std.mem.eql(u8, cause, "refused");
+        demo.expect(refused_here, "{s} ({s}) is refused at the agent: failed, cause refused " ++
+            "(got {s}, {s})", .{ job.name, job.why, view.state, cause });
     }
     const containers = try demo.guest(0, "containers", .{});
     for (refused) |job| {

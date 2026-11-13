@@ -69,6 +69,11 @@ const shell_allowlist = [_][]const u8{
     // demo-b3's guest half (docs/demos/b3.md), for the same reason: it starts the agent and a test
     // upstream as root and reads logs and listeners.
     "ops/demo-b3/guest.sh",
+    // demo-b5's guest half (docs/demos/b5.md), for the same reason: it signs with `zbx`, writes
+    // the node's trust policy, starts the agent as root and lists the runtime's containers. Its
+    // test runs it against a fake `zbx` in `zig build test`.
+    "ops/demo-b5/guest.sh",
+    "ops/demo-b5/test-guest.sh",
     // The owner's one-off recipe for demo-c2's two GHCR images (ops/demo-c2-images): it runs on
     // the owner's machine with docker and a registry login, never in a build or test, and is a
     // list of `docker buildx` calls; the build has no docker to drive from Zig.
