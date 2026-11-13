@@ -36,6 +36,10 @@ pub const Wakeup = struct {
     prefixes: []const []const u8,
     /// Transactions this step committed. Zero on a converged system: that is idempotence.
     acted: u32,
+    /// False when the wait must be a plain pause, not a hold on the server: the agent while it
+    /// fences makes no replica list, so a watch has no revision to start from and answers "changed"
+    /// at once, which would make the loop step in a hot loop until the fence ends.
+    watch: bool = true,
 };
 
 pub const Context = struct {
