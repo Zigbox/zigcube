@@ -56,6 +56,12 @@ pub const file_fetch_log = "fetch.log";
 /// and the relay's log of coded events.
 pub const file_relay_port = "relay.port";
 pub const file_relay_log = "relay.log";
+/// The run's relay key (B4): the supervisor writes the public half with the run's job, epoch and
+/// image digest; the agent asks the server for a certificate and writes it as `relay.crt` (DER),
+/// or writes `relay.refused` when the server said ZC-E0706.
+pub const file_relay_public = "relay.pub";
+pub const file_relay_certificate = "relay.crt";
+pub const file_relay_refused = "relay.refused";
 /// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
 /// the agent publishes under `/pulls/` and then removes.
 pub const file_pull = "pull.json";
@@ -90,6 +96,10 @@ pub const SpecFile = struct {
     /// The relay's upstream (`HOST:PORT`) if the container has one: its supervisor listens on a
     /// loopback port of its own and tells the command in `ZCUBE_RELAY`.
     relay: ?[]const u8 = null,
+    /// B4: the upstream's TLS (`runtime.Spec`'s fields of the same names).
+    relay_server_name: []const u8 = "",
+    relay_server_anchor: []const u8 = "",
+    relay_plain: bool = false,
     started_at_ms: u64,
 };
 
@@ -144,8 +154,17 @@ pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!vo
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
     const files = [_][]const u8{
-        file_run,        file_child,     file_supervisor, file_forced, file_fetch, file_fetch_log,
-        file_relay_port, file_relay_log,
+        file_run,
+        file_child,
+        file_supervisor,
+        file_forced,
+        file_fetch,
+        file_fetch_log,
+        file_relay_port,
+        file_relay_log,
+        file_relay_public,
+        file_relay_certificate,
+        file_relay_refused,
     };
     for (files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {

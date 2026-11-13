@@ -26,6 +26,8 @@ const files = @import("fake_files.zig");
 const backoff = @import("fetch_backoff.zig");
 const relay_module = @import("relay.zig");
 const Relay = relay_module.Relay;
+const relay_tls = @import("relay_tls.zig");
+const secure_random = @import("secure_random.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -269,7 +271,7 @@ fn supervise(
     // when no thread of the relay is left.
     var relay: ?*Relay = null;
     if (spec.relay) |upstream| {
-        switch (open_relay(init, dir, dir_path, upstream, &environ)) {
+        switch (open_relay(init, dir, dir_path, upstream, spec, &environ)) {
             .opened => |opened| relay = opened,
             .failed => |over| return record(io, dir, over),
         }
@@ -290,11 +292,17 @@ fn open_relay(
     dir: Dir,
     dir_path: []const u8,
     upstream: []const u8,
+    spec: *const files.SpecFile,
     environ: *std.process.Environ.Map,
 ) RelayOpening {
     const target = relay_module.Upstream.parse(upstream) orelse {
         return relay_failed("the relay's address is not HOST:PORT");
     };
+    const tls = relay_tls.tls_of(spec.relay_server_name, spec.relay_server_anchor);
+    if (tls == null and !(spec.relay_plain and relay_tls.plain_allowed)) {
+        return relay_failed("the relay names no upstream server name and CA " ++
+            "(a job submitted before B4: submit it again)");
+    }
     const log_path = std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{
         dir_path, files.file_relay_log,
     }, 0) catch return relay_failed("there was no memory for the relay's log path");
@@ -307,6 +315,12 @@ fn open_relay(
             error.OutOfMemory => "there was no memory for the relay",
         });
     };
+    if (tls) |upstream_tls| {
+        if (secure_relay(init, dir, relay, upstream_tls)) |cause| {
+            relay.stop();
+            return relay_failed(cause);
+        }
+    }
     var text: [64]u8 = undefined;
     const address = std.fmt.bufPrint(&text, "http://127.0.0.1:{d}", .{relay.port}) catch
         unreachable; // 64 bytes hold a port.
@@ -321,6 +335,28 @@ fn open_relay(
         return relay_failed("relay.port could not be written");
     };
     return .{ .opened = relay };
+}
+
+/// Makes the run's key, gives it to the relay and writes its public half to `relay.pub` for the
+/// agent, which asks the server for the certificate. The key itself never leaves this process.
+fn secure_relay(
+    init: std.process.Init,
+    dir: Dir,
+    relay: *Relay,
+    tls: relay_tls.Tls,
+) ?[]const u8 {
+    var seed = secure_random.random_seed(init.io) catch
+        return "no randomness for the run's key";
+    defer std.crypto.secureZero(u8, &seed);
+    const key = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch
+        return "the run's key could not be made";
+    relay.secure(tls, key, dir.handle) catch return "there was no memory for the run's key";
+    var text: [65]u8 = undefined;
+    const public = std.fmt.bufPrint(&text, "{x}\n", .{&key.public_key.toBytes()}) catch
+        unreachable; // 64 hex digits and a newline.
+    files.write_atomic(init.io, dir, files.file_relay_public, public) catch
+        return "relay.pub could not be written";
+    return null;
 }
 
 fn relay_failed(cause: []const u8) RelayOpening {

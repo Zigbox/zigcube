@@ -778,6 +778,8 @@ fn launch_relayed(rig: *Rig, name: []const u8, echo: *relay_module.Echo) !runtim
         .image = "b3:51aa9c03",
         .command = &.{ "sh", "-c", text },
         .relay = address,
+        .relay_plain = true,
+        .network = .loopback,
         .labels = &labels,
     };
     var local: Diag = undefined;
@@ -898,6 +900,8 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
         .image = "b3:51aa9c03",
         .command = &forever,
         .relay = "[]:80",
+        .relay_plain = true,
+        .network = .loopback,
         .labels = &labels,
     };
     var local: Diag = undefined;

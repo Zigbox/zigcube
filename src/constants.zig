@@ -1089,6 +1089,10 @@ pub const relay_connect_timeout_ms: u32 = 10_000;
 pub const relay_buffer_bytes: u32 = 16 * 1024;
 /// How often the relay's loop looks at its stop flag when nothing else wakes it.
 pub const relay_poll_ms: u32 = 50;
+/// `Relay.stop` returns within this, whatever its connections wait for (a connect, a handshake
+/// record, a write): it shuts their sockets down, and every other wait is a poll of
+/// `relay_poll_ms`.
+pub const relay_cancel_ms_max: u32 = 2 * relay_poll_ms;
 /// The relay's own log in the container directory (`relay.log`): at most this many bytes.
 pub const relay_log_bytes_max: u32 = 8 * 1024;
 
@@ -1098,6 +1102,7 @@ comptime {
     assert(relay_connections_max > 0);
     assert(relay_connect_timeout_ms < relay_idle_ms);
     assert(relay_poll_ms < relay_connect_timeout_ms);
+    assert(relay_cancel_ms_max <= 100); // The brief's bound on cancelling a relay.
     assert(relay_connection_bytes_max > relay_buffer_bytes);
     assert(relay_port >= 1024); // The job is unprivileged, and so is the listener.
 }

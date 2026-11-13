@@ -910,6 +910,10 @@ const Work = struct {
             .image = run.image,
             .source = run.source,
             .relay = relay_address(run),
+            .relay_server_name = if (run.relay) |relay| relay.server_name else "",
+            .relay_server_anchor = if (run.relay) |relay| relay.server_anchor else "",
+            .relay_plain = if (run.relay) |relay| relay.plain else false,
+            .network = if (run.relay != null) .loopback else .host,
             .command = run.command,
             .env = env,
             .limits = .{
@@ -1249,6 +1253,10 @@ pub fn raise_spec(diag: *Diag, run: []const u8, problem: runtime.SpecProblem) vo
             .{ run, c.label_key_bytes_max, c.label_value_bytes_max },
         ),
         .missing_replica_label => diag.cause("labels: {s} lacks the replica label", .{run}),
+        .relay_network_open => diag.cause(
+            "network: {s} has a relay, so its network must be loopback only",
+            .{run},
+        ),
     }
     diag.fix(.{ .sentence = "submit the job again with that field corrected, and report this " ++
         "with the diagnostic bundle: the API should have refused it" });
