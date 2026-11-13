@@ -533,6 +533,13 @@ fn placement_refusal(labels: []const []const u8, require: []const records.Pair) 
     return null;
 }
 
+/// B6: whether a node with `labels` refuses a workload that requires `require` (a service
+/// replica requires nothing). The replica and job controllers ask it of a node registered again
+/// with other labels, to move work off it (P1).
+pub fn refuses(labels: []const []const u8, require: []const records.Pair) bool {
+    return placement_refusal(labels, require) != null;
+}
+
 /// A weakening of the placement filter for the tests' teeth: each test of the filter reruns with
 /// one rule skipped and must then see the wrong placement. Read only when `builtin.is_test`.
 pub const TestWeakened = enum { none, no_filter, no_exclusive };

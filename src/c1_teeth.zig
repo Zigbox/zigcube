@@ -137,16 +137,21 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// tooth switches on.
 pub const placement_exclusive = declared("c1_teeth_placement_exclusive");
 
+/// The replica and job controllers leave work on a node registered again with labels that refuse
+/// it (must break P1's second part: a hold a relabel made refused is gone within the bound; B6
+/// slice 2 fix). Needs the tenant world.
+pub const relabel_kept = declared("c1_teeth_relabel_kept");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
 
 /// The teeth whose fault needs the tenant world (`Options.tenants`).
-pub const tenant_world = placement_exclusive;
+pub const tenant_world = placement_exclusive or relabel_kept;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
     job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
-    placement_exclusive;
+    placement_exclusive or relabel_kept;

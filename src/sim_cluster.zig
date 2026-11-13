@@ -3532,6 +3532,8 @@ fn print_jobs(c: *Cluster) void {
         c.report.print("jobs: tenants relabels={d} placements judged={d}\n", .{
             c.relabels, c.c1_tally.tenancy_judged,
         });
+    }
+    if (c.strong) {
         var opened: u32 = 0;
         var closed: u32 = 0;
         var open_now: u32 = 0;
