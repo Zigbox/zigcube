@@ -49,6 +49,8 @@ const shell_allowlist = [_][]const u8{
     // `sim_fleet`, `test-crash-record.sh` feeds its crash records to `sim_fleet`, and
     // `test-bias.sh` runs its coverage feedback (bias_pick) against a fake `sim_cluster`.
     "ops/sim-fleet/test-canary.sh",
+    // Sources run.sh and runs `store_faults_day` against a fake `zig` and the built `sim_fleet`.
+    "ops/sim-fleet/test-store-faults.sh",
     "ops/sim-fleet/test-crash-record.sh",
     "ops/sim-fleet/test-bias.sh",
     // Runs demo-b3's guest.sh (a shell script already, below) against fake state directories.
