@@ -61,6 +61,8 @@ pub const Plan = struct {
     existing: ?records.Service,
     /// The stored service's `mod_revision`, or 0 for none: the compare that guards the write.
     mod_revision: store.Revision,
+    /// The stored service's `create_revision`, or 0 for none: which history records are its own.
+    create_revision: store.Revision,
     generation: u64,
     /// The one-line summary; `no_change` when `unchanged`.
     change: []const u8,
@@ -89,6 +91,7 @@ pub fn plan(ctx: *const Context, input: Input) Error!Plan {
     return .{
         .existing = existing,
         .mod_revision = if (found.kv) |kv| kv.mod_revision else 0,
+        .create_revision = if (found.kv) |kv| kv.create_revision else 0,
         .generation = next_generation(existing, input),
         .change = change,
         .unchanged = existing != null and std.mem.eql(u8, change, no_change),
@@ -138,7 +141,19 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
         true;
     if (new_generation) {
         const record = records.history_of(&service, ctx.clock.now_ms());
-        try history.put(ctx, &batch, &record);
+        var seed: records.History = undefined;
+        var owner: ?history.Owner = null;
+        if (planned.existing) |*old| {
+            // When the old generation was applied is not stored: its seed says 0, unknown. A
+            // record no build writes, generation 0, has nothing to seed.
+            if (old.generation > 0) seed = records.history_of(old, 0);
+            owner = .{
+                .create_revision = planned.create_revision,
+                .generation = old.generation,
+                .seed = if (old.generation > 0) &seed else null,
+            };
+        }
+        try history.put(ctx, &batch, &record, owner);
     }
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{
         input.applied_by, input.name, input.request_id,
@@ -370,8 +385,9 @@ fn validate(ctx: *const Context, input: Input) Error!void {
     if (input.rollout) |rollout| try validate_rollout(ctx, rollout);
 }
 
-/// A command health check (C3): ZC-E0125 naming the field. No bound is new: the command is a
-/// command's, and the times only have to nest.
+/// A command health check (C3): ZC-E0125 naming the field. The command is bounded as a
+/// command; the times nest and are bounded by `health_interval_ms_max` and
+/// `health_verdict_ms_max`.
 fn validate_health(ctx: *const Context, health: records.Health) Error!void {
     if (health.command.len == 0 or health.command.len > constants.runtime_command_words_max) {
         return refuse(ctx, .E0125, "health.command must have 1 to 64 words", .{});
@@ -390,6 +406,27 @@ fn validate_health(ctx: *const Context, health: records.Health) Error!void {
     }
     if (health.success_threshold == 0) {
         return refuse(ctx, .E0125, "health.success_threshold is 0; it must be at least 1", .{});
+    }
+    try validate_health_bounds(ctx, health);
+}
+
+fn validate_health_bounds(ctx: *const Context, health: records.Health) Error!void {
+    const interval_max = constants.health_interval_ms_max;
+    if (health.interval_ms > interval_max) {
+        return refuse(ctx, .E0125, "health.interval_ms is {d}; it must be at most {d}", .{
+            health.interval_ms, interval_max,
+        });
+    }
+    if (health.start_period_ms > interval_max) {
+        return refuse(ctx, .E0125, "health.start_period_ms is {d}; it must be at most {d}", .{
+            health.start_period_ms, interval_max,
+        });
+    }
+    const verdict_max = constants.health_verdict_ms_max;
+    const threshold = @max(health.failure_threshold, health.success_threshold);
+    if (@as(u64, threshold) * health.interval_ms > verdict_max) {
+        return refuse(ctx, .E0125, "health thresholds of {d} runs every {d} ms take longer " ++
+            "than {d} ms to reach a verdict", .{ threshold, health.interval_ms, verdict_max });
     }
 }
 
@@ -418,6 +455,17 @@ fn validate_rollout(ctx: *const Context, rollout: records.RolloutPolicy) Error!v
         return refuse(ctx, .E0126, "rollout.ready_timeout_ms ({d}) must be at most " ++
             "rollout.progress_deadline_ms ({d})", .{
             rollout.ready_timeout_ms, rollout.progress_deadline_ms,
+        });
+    }
+    const deadline_max = constants.rollout_deadline_ms_max;
+    if (rollout.progress_deadline_ms > deadline_max) {
+        return refuse(ctx, .E0126, "rollout.progress_deadline_ms is {d}; it must be at most {d}", .{
+            rollout.progress_deadline_ms, deadline_max,
+        });
+    }
+    if (rollout.grace_ms > constants.rollout_grace_ms_max) {
+        return refuse(ctx, .E0126, "rollout.grace_ms is {d}; it must be at most {d}", .{
+            rollout.grace_ms, constants.rollout_grace_ms_max,
         });
     }
 }
@@ -953,13 +1001,17 @@ test "C3: an invalid health check is ZC-E0125 and an invalid rollout ZC-E0126" {
         .diag = &diag,
     };
     var source: controller.DecisionSource = .{ .instance = 0 };
-    var health_cases: [6]records.Health = @splat(test_health);
+    var health_cases: [9]records.Health = @splat(test_health);
     health_cases[0].command = &.{};
     health_cases[1].command = &.{""};
     health_cases[2].interval_ms = 0;
     health_cases[3].timeout_ms = 0;
     health_cases[4].timeout_ms = test_health.interval_ms + 1;
     health_cases[5].failure_threshold = 0;
+    health_cases[6].interval_ms = constants.health_interval_ms_max + 1;
+    health_cases[7].start_period_ms = constants.health_interval_ms_max + 1;
+    health_cases[8].interval_ms = constants.health_interval_ms_max;
+    health_cases[8].success_threshold = 25; // 25 hours to a verdict.
     for (health_cases) |health| {
         diag.reset();
         var input = hello;
@@ -967,12 +1019,14 @@ test "C3: an invalid health check is ZC-E0125 and an invalid rollout ZC-E0126" {
         try testing.expectError(error.Invalid, apply(&ctx, &source, input));
         try testing.expectEqual(codes.Code.E0125, diag.code.?);
     }
-    var rollout_cases: [5]records.RolloutPolicy = @splat(.{});
+    var rollout_cases: [7]records.RolloutPolicy = @splat(.{});
     rollout_cases[0].max_surge = 0;
     rollout_cases[1].max_surge = constants.replicas_per_service_max + 1;
     rollout_cases[2].max_unavailable = constants.replicas_per_service_max + 1;
     rollout_cases[3].min_ready_ms = rollout_cases[3].ready_timeout_ms;
     rollout_cases[4].ready_timeout_ms = rollout_cases[4].progress_deadline_ms + 1;
+    rollout_cases[5].progress_deadline_ms = constants.rollout_deadline_ms_max + 1;
+    rollout_cases[6].grace_ms = constants.rollout_grace_ms_max + 1;
     for (rollout_cases) |rollout| {
         diag.reset();
         var input = hello;
@@ -985,6 +1039,18 @@ test "C3: an invalid health check is ZC-E0125 and an invalid rollout ZC-E0126" {
     var recreate = hello;
     recreate.rollout = .{ .strategy = .recreate, .max_surge = 0 };
     try testing.expect(try apply(&ctx, &source, recreate) == .written);
+    // Every bound is inclusive.
+    diag.reset();
+    var longest = hello;
+    longest.health = test_health;
+    longest.health.?.interval_ms = constants.health_interval_ms_max;
+    longest.health.?.start_period_ms = constants.health_interval_ms_max;
+    longest.health.?.failure_threshold = 24; // A day to a verdict.
+    longest.rollout = .{
+        .progress_deadline_ms = constants.rollout_deadline_ms_max,
+        .grace_ms = constants.rollout_grace_ms_max,
+    };
+    try testing.expect(try apply(&ctx, &source, longest) == .written);
 }
 
 const codes = @import("diag/codes.zig");

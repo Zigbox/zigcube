@@ -534,9 +534,10 @@ pub const registry = [_]Entry{
         \\The service file's `health` block describes a check that cannot run as
         \\written. A health check is a command run inside each replica's container:
         \\it needs 1 to 64 words with a non-empty first word, an `interval_ms` above
-        \\zero, a `timeout_ms` above zero and no longer than the interval, and
-        \\`failure_threshold` and `success_threshold` of at least 1. The cause line
-        \\names the field.
+        \\zero and at most an hour, a `timeout_ms` above zero and no longer than the
+        \\interval, a `start_period_ms` of at most an hour, and `failure_threshold`
+        \\and `success_threshold` of at least 1, each reaching its verdict within a
+        \\day (threshold times interval). The cause line names the field.
         \\
         \\Nothing was applied. Correct the service file and apply it again. C3
         \\checks are commands only; a TCP or HTTP check waits for a network path
@@ -553,7 +554,8 @@ pub const registry = [_]Entry{
         \\must be able to move: `max_surge` and `max_unavailable` may not both be 0,
         \\and neither may exceed the 128 replicas a service may have. The times must
         \\nest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no
-        \\longer than `progress_deadline_ms`. The cause line names the field.
+        \\longer than `progress_deadline_ms`, which is at most a day. `grace_ms` is
+        \\at most a minute. The cause line names the field.
         \\
         \\Nothing was applied. Correct the service file and apply it again; a
         \\service with no `rollout` block uses the default policy, which is valid.

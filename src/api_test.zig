@@ -185,6 +185,56 @@ test "a read-only token sees neither a job run's env values nor its input digest
     try testing.expect(std.mem.indexOf(u8, shown.body, "sha256:dd") != null);
 }
 
+test "a read-only token sees no env value of a service's history, on any read path" {
+    // Goal: docs/api.md item 8 for `/history/` (C3 slice 5): a history record copies the spec,
+    // so its `env` values are as secret as the service's. Method: apply two generations with a
+    // secret, then read through every path a read-only token has (a list of the history prefix,
+    // of one key as `zcube get` asks, of the whole store, a watch, why) and through the writer;
+    // a record under a prefix the API has no rule for is hidden too, so the next spec copy
+    // cannot leak by being left off a list. Teeth: removing the redaction fails every check.
+    var rig = try Rig.start(5);
+    defer rig.stop();
+    _ = try rig.world.apply(hello);
+    var second = hello;
+    second.image = "b3:51aa9c04";
+    second.request_id = "r-0000002";
+    _ = try rig.world.apply(second);
+    rig.world.advance(2000);
+    const unknown =
+        \\{"v":1,"env":[["K","s3cr3t"]]}
+    ;
+    const put = [_]store.Op{.{ .put = .{ .key = "/rollouts/hello", .value = unknown } }};
+    _ = try rig.world.store_handle().txn(.{ .on_success = &put }, &rig.world.diag);
+
+    const history = try rig.ok("/v1/list", "prefix=%2Fhistory%2Fhello%2F");
+    const kvs = field(history, "kvs").array.items;
+    try testing.expectEqual(@as(usize, 2), kvs.len);
+    for (kvs) |kv| {
+        const env = field(field(kv, "value"), "env").array.items[0];
+        try testing.expectEqualStrings("API_TOKEN", env.array.items[0].string);
+        try testing.expect(env.array.items[1] == .null);
+    }
+    const paths = [_][2][]const u8{
+        .{ "/v1/list", "prefix=/history/hello/1" },
+        .{ "/v1/list", "prefix=/history/" },
+        .{ "/v1/list", "prefix=/rollouts/" },
+        .{ "/v1/list", "prefix=/&limit=500" },
+        .{ "/v1/watch", "from=1&timeout=0" },
+        .{ "/v1/watch", "from=1&timeout=0&prefix=/history/" },
+        .{ "/v1/why/service/hello", "" },
+    };
+    for (paths) |path| {
+        const hidden = rig.get(path[0], path[1]);
+        try testing.expectEqual(@as(u16, 200), hidden.status);
+        try testing.expect(std.mem.indexOf(u8, hidden.body, "s3cr3t") == null);
+    }
+    rig.api.read_only = false;
+    for (paths[0..6]) |path| {
+        const shown = rig.get(path[0], path[1]);
+        try testing.expect(std.mem.indexOf(u8, shown.body, "s3cr3t") != null);
+    }
+}
+
 test "watch answers what is ready with a bookmark and leaves the waiting to the shell" {
     // Goal: api.md, "GET /v1/watch": ordered events from `from`, an idle answer that still
     // advances the bookmark, repeated prefixes, deletes with a null value, 410 and 400.

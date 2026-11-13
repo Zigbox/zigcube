@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a service's health check is not valid</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>The service file's `health` block describes a check that cannot run as written. A health check is a command run inside each replica's container: it needs 1 to 64 words with a non-empty first word, an `interval_ms` above zero, a `timeout_ms` above zero and no longer than the interval, and `failure_threshold` and `success_threshold` of at least 1. The cause line names the field.</p>
+<p>The service file's `health` block describes a check that cannot run as written. A health check is a command run inside each replica's container: it needs 1 to 64 words with a non-empty first word, an `interval_ms` above zero and at most an hour, a `timeout_ms` above zero and no longer than the interval, a `start_period_ms` of at most an hour, and `failure_threshold` and `success_threshold` of at least 1, each reaching its verdict within a day (threshold times interval). The cause line names the field.</p>
 <p>Nothing was applied. Correct the service file and apply it again. C3 checks are commands only; a TCP or HTTP check waits for a network path into the container.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

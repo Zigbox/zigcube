@@ -1564,6 +1564,133 @@ test "history: apply keeps the newest generations and delete removes them, on ev
     try testing.expectEqual(@as(usize, 0), (try history.stored(&ctx, "hello")).len);
 }
 
+/// What a build before C3 does to a service: writes the record with no history, or deletes it
+/// and leaves the history behind.
+fn older_build_write(ctx: *const controller.Context, generation: u64, image: []const u8) !void {
+    const service: records.Service = .{
+        .name = "hello",
+        .image = image,
+        .replicas = 2,
+        .command = &.{"run"},
+        .generation = generation,
+        .applied_by = "older",
+        .request_id = "r-old",
+    };
+    const key = records.service_key("hello");
+    const value = try records.encode(ctx.arena, service, ctx.diag);
+    const op = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = value } }};
+    _ = try ctx.store.txn(.{ .on_success = &op }, ctx.diag);
+}
+
+fn older_build_delete(ctx: *const controller.Context) !void {
+    const key = records.service_key("hello");
+    const op = [_]store.Op{.{ .delete = key.slice() }};
+    _ = try ctx.store.txn(.{ .on_success = &op }, ctx.diag);
+}
+
+fn history_apply(
+    ctx: *const controller.Context,
+    source: *controller.DecisionSource,
+    image: []const u8,
+) !u64 {
+    const written = try apply_mod.apply(ctx, source, .{
+        .name = "hello",
+        .image = image,
+        .replicas = 2,
+        .command = &.{"run"},
+        .applied_by = "conformance",
+        .request_id = "r-1",
+    });
+    return written.written.generation;
+}
+
+/// The generations `history.usable` offers for the service as stored now.
+fn usable_generations(ctx: *const controller.Context) ![]const u64 {
+    const key = records.service_key("hello");
+    const kv = (try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag)).kv.?;
+    const service = try records.read(records.Service, ctx.arena, kv, ctx.diag);
+    const owner: history.Owner = .{
+        .create_revision = kv.create_revision,
+        .generation = service.generation,
+    };
+    const found = try history.usable(ctx, "hello", owner);
+    const out = try ctx.arena.alloc(u64, found.len);
+    for (found, out) |entry, *generation| generation.* = entry.generation;
+    return out;
+}
+
+test "history: what an older build left is never offered and the next apply drops it" {
+    // Goal: docs/keys.md `/history`: a record is usable only if this service wrote it and no
+    // generation is missing between it and the service's own, so a rollback cannot restore a
+    // deleted service's spec, nor one from before a downgrade. Method, on every backend (the
+    // rule rests on `create_revision` and `mod_revision`): apply 1..5, then (1) an older build
+    // deletes and this build creates the service again; (2) an older build deletes it and
+    // applies it again up to generation 2, then this build applies 3; (3) an older build
+    // applies generation 5 without history, then this build applies 6.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000000 };
+    const ctx: controller.Context = .{
+        .store = (try harness.connect()).interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 5 };
+    const images = [_][]const u8{ "b3:00000001", "b3:00000002", "b3:00000003", "b3:00000004" };
+    for (images, 1..) |image, generation| {
+        try testing.expectEqual(@as(u64, generation), try history_apply(&ctx, &source, image));
+    }
+    try testing.expectEqual(@as(u64, 5), try history_apply(&ctx, &source, "b3:00000005"));
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5 }, try usable_generations(&ctx));
+
+    // (1) Deleted by an older build and created again by this one over the leftovers:
+    // generation 1's key is rewritten in place and is the new service's; the rest are dropped.
+    try older_build_delete(&ctx);
+    try testing.expectEqual(@as(u64, 1), try history_apply(&ctx, &source, "b3:00000011"));
+    try testing.expectEqual(@as(u64, 2), try history_apply(&ctx, &source, "b3:00000012"));
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, try usable_generations(&ctx));
+    try testing.expectEqual(@as(usize, 2), (try history.stored(&ctx, "hello")).len);
+    try testing.expectEqual(@as(u64, 3), try history_apply(&ctx, &source, "b3:00000013"));
+
+    // (2) Deleted and applied again by an older build, at generations the old records also
+    // have: none of them is usable, and this build's next apply drops them and seeds the
+    // generation the older build left running from the service record.
+    try older_build_delete(&ctx);
+    try older_build_write(&ctx, 1, "b3:0000000a");
+    try older_build_write(&ctx, 2, "b3:0000000b");
+    try testing.expectEqual(@as(usize, 0), (try usable_generations(&ctx)).len);
+    try testing.expectEqual(@as(u64, 3), try history_apply(&ctx, &source, "b3:0000000c"));
+    try testing.expectEqualSlices(u64, &.{ 2, 3 }, try usable_generations(&ctx));
+    try testing.expectEqual(@as(usize, 2), (try history.stored(&ctx, "hello")).len);
+    try expect_seed(&ctx, 2, "b3:0000000b");
+
+    // (3) A downgrade that applied generations: what came before the gap is dropped, and the
+    // generation the older build applied last is seeded.
+    try testing.expectEqual(@as(u64, 4), try history_apply(&ctx, &source, "b3:0000000d"));
+    try older_build_write(&ctx, 5, "b3:0000000e");
+    try testing.expectEqual(@as(usize, 0), (try usable_generations(&ctx)).len);
+    try testing.expectEqual(@as(u64, 6), try history_apply(&ctx, &source, "b3:0000000f"));
+    try testing.expectEqualSlices(u64, &.{ 5, 6 }, try usable_generations(&ctx));
+    try testing.expectEqual(@as(usize, 2), (try history.stored(&ctx, "hello")).len);
+    try expect_seed(&ctx, 5, "b3:0000000e");
+}
+
+/// The history record at `generation` is a seed: the spec of `image`, applied at an unknown time.
+fn expect_seed(ctx: *const controller.Context, generation: u64, image: []const u8) !void {
+    const key = records.history_key("hello", generation);
+    const kv = (try ctx.store.get(ctx.arena, key.slice(), null, ctx.diag)).kv.?;
+    const record = try records.read(records.History, ctx.arena, kv, ctx.diag);
+    try testing.expectEqualStrings(image, record.image);
+    try testing.expectEqual(@as(u64, 0), record.applied_at_ms);
+    try testing.expectEqual(records.HistoryReason.apply, record.reason);
+}
+
 /// A version 2 observation as a C2 agent wrote it, from `src/testdata/b3_store.txt`.
 const observed_v2_text =
     \\{"v":2,"replica":"hello-5","node":"node1","generation":2,"status":"running",
@@ -1603,7 +1730,7 @@ test "observed: version 3 round-trips, version 2 reads as health unknown, on eve
     try testing.expectEqual(records.observed_version_health, back.v);
     try testing.expectEqual(records.HealthState.unhealthy, records.observed_health(&back));
     try testing.expectEqual(@as(u32, 3), back.health_failures.?);
-    try testing.expectEqual(@as(i32, 1), back.last_probe_exit.?);
+    try testing.expectEqual(@as(u8, 1), back.last_probe_exit.?);
 
     _ = try put_one(s, &diag, "/observed/node1/hello-5", observed_v2_text);
     const old = try s.get(arena, "/observed/node1/hello-5", null, &diag);

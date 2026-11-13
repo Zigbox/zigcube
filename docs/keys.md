@@ -141,14 +141,17 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 
 - `health` (absent: no check) is a command the agent runs in the container: `command` is 1 to 64
   argv words, the first not empty; `interval_ms` and `timeout_ms` are above 0 and `timeout_ms` is
-  at most `interval_ms`; failures in the first `start_period_ms` do not count; the thresholds are
-  at least 1. C3 has command checks only (owner, 2026-11-05). A change of `health` is a change of
+  at most `interval_ms`; failures in the first `start_period_ms` do not count; `interval_ms` and
+  `start_period_ms` are at most an hour (`health_interval_ms_max`); the thresholds are at least 1,
+  and each times `interval_ms` is at most a day (`health_verdict_ms_max`). C3 has command checks
+  only (owner, 2026-11-05). A change of `health` is a change of
   what a replica runs: it bumps `generation` and the summary says `health changed`. Otherwise
   ZC-E0125.
 - `rollout` (absent: the default above, which applies to every service, owner 2026-11-05) is how
   a new generation replaces the old. `strategy` is `rolling` or `recreate`; `max_surge` and
   `max_unavailable` are at most 128, not both 0 for `rolling`; `min_ready_ms` <
-  `ready_timeout_ms` <= `progress_deadline_ms`; `on_failure` is `rollback` or `pause`. Otherwise
+  `ready_timeout_ms` <= `progress_deadline_ms` <= a day (`rollout_deadline_ms_max`); `grace_ms`
+  is at most a minute (`rollout_grace_ms_max`); `on_failure` is `rollback` or `pause`. Otherwise
   ZC-E0126. A policy equal to the default is stored as absent, so the service stays version 3.
   A change of `rollout` alone does not bump `generation` (summary `rollout changed`): it says how
   replicas are replaced, not what they run.
@@ -176,15 +179,30 @@ never changed. Users address versions by generation (owner, 2026-11-05).
 here is ZC-E0128 (owner, 2026-11-05). Deleting a service deletes its history first, in
 transactions that each expect the service at the revision the delete read, so a service that is
 gone leaves no history and a service that changed meanwhile keeps the history of its new
-generation. A stored generation above the one an apply writes belongs to an earlier service of
-the same name (a build before C3 left it behind) and that apply deletes it. `env` values are
-secrets here as in the service (the API never sends them to a
-read-only token).
+generation.
+
+**Which records are the service's own** (`history.usable`): those written at or after the
+revision that created the service key (a record's `mod_revision` against the service's
+`create_revision`), forming an unbroken run of generations that ends at the service's own. A build
+before C3 writes no history: one that deleted the service leaves the old service's records
+behind, written before the new service existed, and one that applied generations leaves a gap
+below the service's own. A rollback is offered only the run; every other record is dropped by the
+next apply that writes history, as far as its transaction has room (the rest by later ones), and
+is never offered meanwhile. So a rollback cannot restore a deleted service's spec, nor one from
+before a downgrade.
+
+**Seeding.** When the service's own generation has no record of its own (a service applied
+before C3, or last applied by an older build), the apply that writes the next generation also
+writes one for it, copied from the service record as stored, with `applied_at_ms` 0 (not
+known). So after an upgrade the first new generation can always be rolled back to the one before.
+
+`env` values are secrets here as in the service: the API never sends them to a read-only token
+(docs/api.md item 8).
 
 ## `/rollouts/<service>`: a rollout in progress (C3 slice 7; defined in slice 5)
 
 ```json
-{ "v": 1, "service": "hello", "from": 6, "to": 7, "phase": "progressing",
+{ "v": 1, "service": "hello", "service_created": 40, "from": 6, "to": 7, "phase": "progressing",
   "started_at_ms": 1761350000123, "deadline_at_ms": 1761350600123, "next_at_ms": 1761350005123,
   "ready_new": 1, "retired_old": 1, "budget": {"start": 1, "retire": 0},
   "cause_decision": "1761350000123-api0-0001" }
@@ -195,6 +213,14 @@ Written only by the rollout controller (role `rollout_controller`), one per serv
 replicas the replica controller may start now and how many old ones it may retire; the replica
 controller stays the only writer of `/replicas/`. `next_at_ms` is when the controller looks again
 without a store change (`min_ready_ms`). Deleted a retention period after `complete`.
+
+**Whose rollout it is.** `service_created` is the `create_revision` of the `/services/<service>`
+key the rollout was started for. Deleting a service does not delete its rollout: the API is not
+a writer of `/rollouts/` (authority.md, one writer per prefix). A rollout whose service is gone,
+or whose `service_created` is not the service key's `create_revision` (the service was deleted
+and applied again, and its generations restarted at 1), is no rollout of that service
+(`records.rollout_of`): every reader treats it as absent, and the rollout controller deletes it
+the next time it looks at the service (C3 slice 7).
 
 ## `/replicas/<service>/<id>`: desired replica
 
@@ -341,9 +367,11 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
   acted on, the placement epoch. A controller acts on an observation only if `tenure` and
   `assignment` are current and `/node-status/<node>` is `ready`.
 - Version 3 (C3, written from slice 9): `health` (`unknown`, `healthy`, `unhealthy`; absent for a
-  replica without a check), `health_failures` (consecutive failed probes) and `last_probe_exit`.
-  Still written on change only. An observation without them is written as version 2, and a
-  version 1 or 2 record reads as health `unknown`.
+  replica without a check), `health_failures` (consecutive failed probes) and `last_probe_exit`
+  (0 to 255, like every exit code). Still written on change only. An observation without them is
+  written as version 2, and a version 1 or 2 record reads as health `unknown`, whatever it holds.
+  The server sets `v`: the agent endpoint stores a report at the version its members need,
+  whatever `v` the agent sent, and refuses a member it does not know (`ZC-E0104`).
 
 Lifetime: until the agent or the node controller removes it. One writer per key (the node's agent), written on every status change, not on a timer, so the
 store's revision tells when the node last learned something. Written with one compare, never

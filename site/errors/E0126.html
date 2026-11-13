@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a service's rollout policy is not valid</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>The service file's `rollout` block cannot be followed. A rolling update must be able to move: `max_surge` and `max_unavailable` may not both be 0, and neither may exceed the 128 replicas a service may have. The times must nest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no longer than `progress_deadline_ms`. The cause line names the field.</p>
+<p>The service file's `rollout` block cannot be followed. A rolling update must be able to move: `max_surge` and `max_unavailable` may not both be 0, and neither may exceed the 128 replicas a service may have. The times must nest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no longer than `progress_deadline_ms`, which is at most a day. `grace_ms` is at most a minute. The cause line names the field.</p>
 <p>Nothing was applied. Correct the service file and apply it again; a service with no `rollout` block uses the default policy, which is valid.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
