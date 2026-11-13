@@ -266,8 +266,8 @@ fn too_many(diag: *diag_mod.Diag) void { // controller.zig
 }
 
 fn record_too_new(diag: *diag_mod.Diag) void { // records.zig
-    const cause = "the value at /observed/node1/hello-1 is version 3; this release reads up to " ++
-        "version 2";
+    const cause = "the value at /observed/node1/hello-1 is version 4; this release reads up to " ++
+        "version 3";
     sample(diag, .E0303, &.{cause}, "run the zcube release that wrote it, or upgrade this one");
 }
 

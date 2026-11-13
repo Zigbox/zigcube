@@ -1994,13 +1994,13 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    const observed = "{\"v\":3,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
+    const observed = "{\"v\":4,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
         "\"status\":\"running\",\"reported_at_ms\":5}";
     const kv = kv_of("/observed/node1/hello-1", observed);
     try testing.expectError(error.Malformed, read(Observed, arena, kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
     try testing.expectEqualStrings(
-        "the value at /observed/node1/hello-1 is version 3; this release reads up to version 2",
+        "the value at /observed/node1/hello-1 is version 4; this release reads up to version 3",
         diag.last_cause().?,
     );
     // Version 1 of a record that C1 has not changed is the newest there is.
