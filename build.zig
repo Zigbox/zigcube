@@ -2048,6 +2048,13 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     guest.addFileInput(b.path("ops/demo-b3/guest.sh"));
     guest.expectExitCode(0);
     test_step.dependOn(&guest.step);
+    // demo-b5's guest script prints what the host parses (keys, envelopes, containers) and lists
+    // containers only in the Zigbox runtime's layout.
+    const guest_b5 = b.addSystemCommand(&.{"sh"});
+    guest_b5.addFileArg(b.path("ops/demo-b5/test-guest.sh"));
+    guest_b5.addFileInput(b.path("ops/demo-b5/guest.sh"));
+    guest_b5.expectExitCode(0);
+    test_step.dependOn(&guest_b5.step);
 }
 
 /// The seeds the teeth test runs and the most the simulator may need to catch the agent's

@@ -17,7 +17,7 @@ STATE=${STATE:-/root/state}
 LOG=/root/log
 ARGS=/root/agent.args
 IMAGES=/root/images.zon
-POLICY=/root/trust.zon
+POLICY=${POLICY:-/root/trust.zon}
 SIGNER=${SIGNER:-/root/signer}
 ROOT_RANGE=200000:65536
 
@@ -83,7 +83,8 @@ cmd_key_new() {
 
 cmd_sign() {
     [ $# -eq 2 ] || fail "usage: guest.sh sign <key> <tree>"
-    signer sign "$2" --key "$1" >"$SIGNER.out" 2>&1 || fail "zbx sign $2 --key $1: $(tail -5 "$SIGNER.out")"
+    signer sign "$2" --key "$1" >"$SIGNER.out" 2>&1 ||
+        fail "zbx sign $2 --key $1: $(tail -5 "$SIGNER.out")"
     ok "zbx sign $2 --key $1"
 }
 
@@ -106,8 +107,9 @@ cmd_export() {
 # The node's own trust policy: the one key, a signature required. Root's file, mode 0644.
 cmd_policy() {
     [ $# -eq 1 ] || fail "usage: guest.sh policy <public key>"
-    printf '.{ .version = 1, .keys = .{ .{ .name = "release", .public = "%s" } }, .require_signature = true }\n' \
-        "$1" >"$POLICY" || fail "write $POLICY"
+    key='.{ .name = "release", .public = "'"$1"'" }'
+    printf '.{ .version = 1, .keys = .{ %s }, .require_signature = true }\n' "$key" >"$POLICY" ||
+        fail "write $POLICY"
     chmod 0644 "$POLICY"
     ok "$POLICY trusts $1 and requires a signature"
 }
@@ -140,8 +142,10 @@ cmd_agent() {
 }
 
 # The containers the Zigbox runtime made on this node, by name (its layout: <state>/zigbox/<name>/),
-# one `container <name>` line each. A refused run must have none.
+# one `container <name>` line each. A refused run must have none. No zigbox/ at all (the runtime
+# makes it when the agent starts) fails, so the demo's "no container" cannot hold for a wrong path.
 cmd_containers() {
+    [ -d "$STATE/zigbox" ] || fail "no $STATE/zigbox: not the layout of --runtime zigbox"
     for dir in "$STATE"/zigbox/*/; do
         [ -d "$dir" ] || continue
         echo "container $(basename "$dir")"
