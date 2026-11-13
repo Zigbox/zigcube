@@ -53,28 +53,45 @@ fn generation_less(_: void, a: Stored, b: Stored) bool {
 
 /// Adds `record` to `batch` and deletes the oldest generations so that at most
 /// `history_generations_max` remain once it commits. A record already stored at the same
-/// generation is replaced, not counted twice. Deletes beyond the batch's room are left for the next
-/// apply: the cap is a bound on growth, and the newest generations are never the ones dropped.
-pub fn put(ctx: *const Context, batch: *controller.Batch, record: *const records.History) Error!void {
+/// generation is replaced, not counted twice, and one above it (an earlier service's) is deleted.
+/// Deletes beyond the batch's room are left for the next apply: the cap is a bound on growth, and
+/// the newest generations are never the ones dropped.
+pub fn put(
+    ctx: *const Context,
+    batch: *controller.Batch,
+    record: *const records.History,
+) Error!void {
     assert(record.generation > 0);
     assert(batch.has_room(1));
     const existing = try stored(ctx, record.service);
     const key = records.history_key(record.service, record.generation);
     const key_copy = try controller.key_copy(ctx, &key);
     batch.put(key_copy, try records.encode(ctx.arena, record.*, ctx.diag));
+    // A generation above the one written belongs to an earlier service of the same name (a
+    // generation only grows within one, and starts at 1 again): a build before C3 deleted that
+    // service and left its history. It is stale, and goes first.
     var kept: u32 = 1;
     for (existing) |entry| {
-        if (entry.generation != record.generation) kept += 1;
+        if (entry.generation > record.generation) {
+            if (!delete_room(batch)) return;
+            batch.delete(entry.key);
+        } else if (entry.generation != record.generation) {
+            kept += 1;
+        }
     }
     var excess: u32 = kept -| constants.history_generations_max;
     for (existing) |entry| {
         if (excess == 0) break;
-        if (entry.generation == record.generation) continue;
-        // Room for the decision the caller adds after this.
-        if (!batch.has_room(1 + controller.decision_ops)) break;
+        if (entry.generation >= record.generation) continue;
+        if (!delete_room(batch)) return;
         batch.delete(entry.key);
         excess -= 1;
     }
+}
+
+/// Whether `batch` can take one more delete and still the decision the caller adds after it.
+fn delete_room(batch: *const controller.Batch) bool {
+    return batch.has_room(1 + controller.decision_ops);
 }
 
 /// Deletes every history record of `service`, in transactions that each still find the service at
@@ -160,4 +177,20 @@ test "history keeps the newest generations, in numeric order" {
     const rewrite = history_record(total);
     try put(&ctx, &again, &rewrite);
     try testing.expectEqual(@as(u32, 1), again.ops_count);
+
+    // The service is deleted by a build that leaves its history and applied again: generation 1
+    // replaces its own key and deletes every generation above it that fits, the rest next time.
+    var fresh: controller.Batch = .{};
+    const first = history_record(1);
+    try put(&ctx, &fresh, &first);
+    try testing.expect(!fresh.has_room(1 + controller.decision_ops));
+    try testing.expect(try controller.commit(&ctx, .api, &fresh) == .applied);
+    var next: controller.Batch = .{};
+    const second = history_record(2);
+    try put(&ctx, &next, &second);
+    try testing.expect(try controller.commit(&ctx, .api, &next) == .applied);
+    const now = try stored(&ctx, "hello");
+    try testing.expectEqual(@as(usize, 2), now.len);
+    try testing.expectEqual(@as(u64, 1), now[0].generation);
+    try testing.expectEqual(@as(u64, 2), now[1].generation);
 }

@@ -16,6 +16,25 @@ The only way out is a restore from a backup. There are no rolling upgrades.
 A migrated store has no hashes below the revision it was migrated at: `hash_at` there fails with
 `ZC-E0214`, which says so. That is expected, not damage.
 
+## Upgrading to C3's records (service and replica version 4, observed version 3)
+
+C3 slice 5 adds `/history/` and `/rollouts/`, service and replica version 4 and observed
+version 3 (`docs/keys.md`); the store schema does not change. Every record is written at the
+oldest version that holds its members, so until a service carries `health` or a non-default
+`rollout`, nothing new is written that an older build cannot read.
+
+1. **Upgrade the servers first, then the agents.** A server of this release reads every older
+   record (`src/testdata/b3_store.txt`), and an older agent reads the replicas it is served as long
+   as they carry no `health`.
+2. **Apply no service with `health` or `rollout` until every server and agent is upgraded.**
+   An older server or agent refuses a version 4 service or replica, and an older server a version
+   3 observation, with `ZC-E0303`, naming the key and both versions.
+3. A downgrade is safe only while no record is at a new version. `/history/` and `/rollouts/`
+   records an older server does not know are left alone by it. An older server deleting a
+   service leaves that service's history behind; when a server of this release applies the name
+   again, it deletes every generation above the one it writes (they belong to the deleted
+   service), so the old history never mixes with the new.
+
 ## Postgres high availability: the supported setup
 
 - **One primary.** Zigcube writes to one Postgres server and reads only from it. No reader

@@ -358,9 +358,9 @@ const samples = [_]struct { key: []const u8, role: Role }{
 };
 
 const every_role = [_]Role{
-    .api,                .replica_controller, .scheduler,      .node_controller,
-    .auditor,            .retention,          .job_controller, .rollout_controller,
-    .{ .agent = "n1" },  .{ .agent = "n2" },
+    .api,               .replica_controller, .scheduler,      .node_controller,
+    .auditor,           .retention,          .job_controller, .rollout_controller,
+    .{ .agent = "n1" }, .{ .agent = "n2" },
 };
 
 fn same_role(first: Role, second: Role) bool {

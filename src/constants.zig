@@ -121,8 +121,9 @@ pub const replicas_max: u32 = runtime_handles_max;
 pub const nodes_max: u32 = 64;
 /// Records one reconcile pass reads: a service holds at most this many replicas.
 pub const replicas_per_service_max: u32 = 128;
-/// Generations of a service `/history` keeps (owner, docs/decisions/2026-11-05-c3-owner-answers.md):
-/// an apply that adds one past it deletes the oldest. Rolling back to a deleted one is ZC-E0128.
+/// Generations of a service `/history` keeps (owner,
+/// docs/decisions/2026-11-05-c3-owner-answers.md): an apply that adds one past it deletes the
+/// oldest. Rolling back to a deleted one is ZC-E0128.
 pub const history_generations_max: u32 = 16;
 /// History keys one read of a service's history takes at most. Every writer keeps
 /// `history_generations_max`; the slack covers keys a crash between transactions could leave.

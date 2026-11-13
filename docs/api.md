@@ -492,6 +492,26 @@ are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstrea
 | `ZC-W0701` | user | the job is at its connection limit |
 | `ZC-W0702` | user | a connection reached its byte or idle bound |
 
+## Rollouts and history (C3; defined in slice 5, served from slice 11)
+
+Planned, not served yet: slice 5 adds the records (`docs/keys.md`: service v4, `/history/`,
+`/rollouts/`), slice 11 the endpoints. The apply body gains `health` and `rollout` in the
+shape of service v4; until then it takes neither.
+
+| Endpoint | Does | Codes |
+| --- | --- | --- |
+| `GET /v1/services/{name}/history` | the service's stored generations, newest first | `ZC-E0101` |
+| `POST /v1/services/{name}/rollback[?to=<generation>]` | applies a stored generation's spec as a new generation (`reason rollback`, `restores`); without `to`, the one before the current | `ZC-E0127` no earlier generation, `ZC-E0128` compacted, `ZC-E0105` |
+| `GET /v1/services/{name}/rollout` | the `/rollouts/` record, or `404` | `ZC-E0101` |
+| `POST /v1/services/{name}/rollout/pause`, `.../resume` | freezes or restores the rollout's budget | `ZC-E0129` no rollout to pause or resume |
+
+An apply with an invalid `health` is `400` `ZC-E0125`, an invalid `rollout` `400` `ZC-E0126`. A
+rollout's own outcomes are decisions, not answers: `ZC-E0304` (a new replica did not become
+ready), `ZC-E0305` (the surge cannot be placed), `ZC-E0306` (`progress_deadline_ms` passed),
+`ZC-W0304` (paused by `on_failure`), `ZC-W0305` (rolled back automatically). The agent's probe
+raises `ZC-E0516` (the probe could not run) and `ZC-W0502` (the probe timed out) in its
+observations.
+
 ## New diagnostic codes this needs
 
 The console has to explain its own failures. The `01xx` range is "API and CLI". Proposed, for

@@ -887,8 +887,11 @@ pub const Exit = struct {
     }
 };
 
+/// What the agent's health check last said of a replica (`Observed` version 3).
+pub const HealthState = enum { unknown, healthy, unhealthy };
+
 pub const Observed = struct {
-    v: u32 = 2,
+    v: u32 = 3,
     replica: []const u8,
     node: []const u8,
     generation: u64,
@@ -902,7 +905,25 @@ pub const Observed = struct {
     /// The `/assigned/<node>/<replica>` revision it ran under (the placement epoch). Absent in C0
     /// records.
     assignment: ?u64 = null,
+    /// Version 3: the health check's verdict, absent for a replica without one.
+    health: ?HealthState = null,
+    /// Version 3: consecutive failed probes since the last success.
+    health_failures: ?u32 = null,
+    /// Version 3: the exit code of the last probe that ran to an exit.
+    last_probe_exit: ?i32 = null,
 };
+
+/// Observations are written at the oldest version that holds their members: version 3 only with
+/// health, so a C1 or C2 server reads what an agent of this release reports for a replica without
+/// a health check (docs/keys.md, `/observed`).
+pub const observed_version_plain: u32 = 2;
+pub const observed_version_health: u32 = 3;
+
+pub fn observed_version(observed: *const Observed) u32 {
+    const health = observed.health != null or observed.health_failures != null or
+        observed.last_probe_exit != null;
+    return if (health) observed_version_health else observed_version_plain;
+}
 
 /// The placement: the scheduler's decision to run a replica on a node.
 pub const Assigned = struct {
@@ -1139,6 +1160,7 @@ fn at_oldest_version(value: anytype) @TypeOf(value) {
     var written = value;
     if (T == Service) written.v = service_version(&value);
     if (T == Replica) written.v = replica_version(&value);
+    if (T == Observed) written.v = observed_version(&value);
     return written;
 }
 
@@ -1691,7 +1713,8 @@ test "C3: services and replicas are version 4 only with health or a rollout" {
         .command = &.{"run"},
         .generation = 3,
     };
-    const plain_back = try read(Service, arena, kv_of("/s", try encode(arena, plain, &diag)), &diag);
+    const plain_bytes = try encode(arena, plain, &diag);
+    const plain_back = try read(Service, arena, kv_of("/s", plain_bytes), &diag);
     try testing.expectEqual(service_version_plain, plain_back.v);
     try testing.expect(plain_back.health == null and plain_back.rollout == null);
     try testing.expect(plain_back.rollout_policy().equal(.{}));
@@ -1729,6 +1752,32 @@ test "C3: services and replicas are version 4 only with health or a rollout" {
     // A change of health is a change of what a replica runs.
     try testing.expect(replica_runs_service(&probed_back, &checked));
     try testing.expect(!replica_runs_service(&replica, &checked));
+}
+
+test "C3: an observation is version 3 only with a health verdict" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const seen: Observed = .{
+        .replica = "hello-1",
+        .node = "n1",
+        .generation = 3,
+        .status = .running,
+        .reported_at_ms = 5,
+    };
+    try testing.expect(std.mem.startsWith(u8, try encode(arena, seen, &diag), "{\"v\":2,"));
+    var judged = seen;
+    judged.health = .unhealthy;
+    judged.health_failures = 3;
+    judged.last_probe_exit = 1;
+    const judged_bytes = try encode(arena, judged, &diag);
+    try testing.expect(std.mem.startsWith(u8, judged_bytes, "{\"v\":3,"));
+    const judged_back = try read(Observed, arena, kv_of("/o", judged_bytes), &diag);
+    try testing.expectEqual(HealthState.unhealthy, judged_back.health.?);
+    try testing.expectEqual(@as(u32, 3), judged_back.health_failures.?);
+    try testing.expectEqual(@as(i32, 1), judged_back.last_probe_exit.?);
 }
 
 test "C3: history and rollout records encode and read back" {
@@ -2043,6 +2092,7 @@ test "the version a record is written in is the version the reader accepts" {
         if (T == Assigned) value.service = "s";
         // A service or replica is written at version 4 only with a health check (`encode`).
         if (T == Service or T == Replica) value.health = test_health;
+        if (T == Observed) value.health = .healthy;
         const bytes = try encode(arena, value, &diag);
         const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
         try testing.expect(std.mem.startsWith(u8, bytes, prefix));

@@ -241,6 +241,15 @@ restarts the listing (up to 8 times, then `ZC-E0103`); a list of more than 1,024
 
 `job logs` is not here: slice 8 is cut.
 
+## rollout, history and rollback (C3; planned for slice 11)
+
+Not built yet; the records exist from C3 slice 5 (`docs/keys.md`). `zcube history <service>`
+lists the stored generations (at most 16, newest first, with who applied each and why);
+`zcube rollback <service> [--to GENERATION]` applies one of them again as a new generation (users
+address versions by generation, owner 2026-11-05); `zcube rollout status|pause|resume <service>`
+shows or steers a rollout, and `zcube get service` shows it. The codes they relay, `ZC-E0125` to
+`E0129`, are in [api.md](api.md), "Rollouts and history".
+
 ## explain
 
 `zcube explain E0201` (also `ZC-E0201`, in any letter case) prints the registry's long explanation,

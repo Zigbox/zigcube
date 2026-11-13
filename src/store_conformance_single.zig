@@ -20,6 +20,8 @@ const records = @import("records.zig");
 const scheduler = @import("scheduler.zig");
 const allocations = @import("allocations.zig");
 const auditor = @import("auditor.zig");
+const apply_mod = @import("apply.zig");
+const history = @import("history.zig");
 const ManualClock = @import("clock.zig").ManualClock;
 
 const Allocator = std.mem.Allocator;
@@ -1506,6 +1508,60 @@ test "auditor and repair: one finding on a corrupted record, the repair, and the
     try testing.expectEqual(@as(u32, 1), (try audit.reconcile(&ctx)).acted);
     try testing.expect((try rig.s.get(rig.arena, finding.slice(), null, rig.diag)).kv == null);
     try testing.expect(try allocations.repair(&ctx, &source, "n1", "r-2") == .no_finding);
+}
+
+test "history: apply keeps the newest generations and delete removes them, on every backend" {
+    // Goal: docs/keys.md `/history`: one record per generation in the apply's transaction, at
+    // most `history_generations_max`, numeric order over keys that sort bytewise ("10" < "9"),
+    // and none left once the service is deleted; a delete that read an old service revision
+    // deletes nothing. Method: apply 20 generations through `apply`, then delete twice.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000000 };
+    const ctx: controller.Context = .{
+        .store = (try harness.connect()).interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    var source: controller.DecisionSource = .{ .instance = 4 };
+    const total = constants.history_generations_max + 4;
+    var generation: u32 = 1;
+    while (generation <= total) : (generation += 1) {
+        const image = try std.fmt.allocPrint(ctx.arena, "b3:{x:0>8}", .{generation});
+        const written = try apply_mod.apply(&ctx, &source, .{
+            .name = "hello",
+            .image = image,
+            .replicas = 2,
+            .command = &.{"run"},
+            .applied_by = "conformance",
+            .request_id = "r-1",
+        });
+        try testing.expectEqual(@as(u64, generation), written.written.generation);
+        manual.ms += 1;
+    }
+    const kept = try history.stored(&ctx, "hello");
+    try testing.expectEqual(@as(usize, constants.history_generations_max), kept.len);
+    const oldest: u64 = total - constants.history_generations_max + 1;
+    try testing.expectEqual(oldest, kept[0].generation);
+    try testing.expectEqual(@as(u64, total), kept[kept.len - 1].generation);
+    const newest = try ctx.store.get(ctx.arena, kept[kept.len - 1].key, null, &diag);
+    const record = try records.read(records.History, ctx.arena, newest.kv.?, &diag);
+    try testing.expectEqualStrings("b3:00000014", record.image);
+
+    const service = records.service_key("hello");
+    const got = try ctx.store.get(ctx.arena, service.slice(), null, &diag);
+    const stale = got.kv.?.mod_revision - 1;
+    try testing.expect(try history.delete_all(&ctx, "hello", stale) == .conflict);
+    try testing.expectEqual(kept.len, (try history.stored(&ctx, "hello")).len);
+    const deleted = try apply_mod.delete_service(&ctx, &source, "hello", "conformance", "r-2");
+    try testing.expect(deleted == .written);
+    try testing.expectEqual(@as(usize, 0), (try history.stored(&ctx, "hello")).len);
 }
 
 // ---- The chain hash ----------------------------------------------------------------------------

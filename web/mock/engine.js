@@ -233,7 +233,19 @@ export class Engine {
       generation: existing ? existing.value.generation + (same ? 0 : 1) : 1,
       applied_by: actor, request_id: requestId, // proposed additions to /services/<name>, see docs/api.md
     };
-    this.commit([{ put: [key, value] }]);
+    const ops = [{ put: [key, value] }];
+    // docs/keys.md `/history/<service>/<generation>`: one record per new generation, written with
+    // the service; at most 16 per service, the lowest generation dropped in the same commit.
+    if (!existing || value.generation !== existing.value.generation) {
+      const { applied_by, request_id, name, generation, image, source, command, env, limits } = value;
+      ops.push({ put: [`/history/${name}/${generation}`, {
+        v: 1, service: name, generation, image, source, command, env, limits, health: null,
+        applied_by, request_id, applied_at_ms: this.now(), reason: "apply", restores: null,
+      }] });
+      const kept = this.list(`/history/${name}/`).kvs.map(kv => kv.value.generation).sort((a, b) => a - b);
+      while (kept.length >= 16) ops.push({ del: `/history/${name}/${kept.shift()}` });
+    }
+    this.commit(ops);
     return value;
   }
 

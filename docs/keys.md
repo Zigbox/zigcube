@@ -20,6 +20,8 @@ and deletes is that role's; a refusal is a defect, never an error.
 | --- | --- | --- |
 | `/services/<name>` | API | C0 |
 | `/replicas/<service>/<id>` | replica controller | C0 |
+| `/history/<service>/<generation>` | API | C3 slice 5 |
+| `/rollouts/<service>` | rollout controller | C3 slice 7 (defined in slice 5) |
 | `/replica-numbers/<service>` | replica controller | C1 slice 3 |
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
 | `/nodes/<node>` | that node's agent | C0 |
@@ -53,14 +55,21 @@ B1 adds an eighth role, `job_controller` (below, "Jobs"). `retention` also delet
 records of an ended job: `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` and
 `/job-observed/`, and may delete the five of one job in one transaction (one job, at most one node). It never deletes
 `/job-admission`, `/job-endings` or an assignment.
+C3 adds a ninth role, `rollout_controller`, which writes `/rollouts/<service>` and nothing else
+(below, "`/rollouts/<service>`"). `/history/` is the API's: it writes a generation's record in the
+apply's transaction and deletes a service's history before the service.
 
 ## Versions
 
 Every value has `"v"`. A reader accepts every version up to the one its release writes and
 ignores members it does not know. `Service` and `Replica` write `"v": 3` (C2 slice 2 added
-`source`); `Observed` writes `"v": 2` (it gained members in C1); `Assigned` writes `"v": 2` for a run (B1: it gained `job`) and `"v": 1` for a replica; `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
-writes `"v": 1`. Records C0 and C1 wrote still read: the fixtures in `src/testdata/c0_store.txt`
-and `c1_store.txt` were captured from real stores. A value with a **newer**
+`source`), and `"v": 4` only when they carry a member of C3 (`health`, or a service's `rollout`);
+`Observed` writes `"v": 2` (it gained members in C1), and `"v": 3` only with a health verdict
+(C3); `Assigned` writes `"v": 2` for a run (B1: it gained `job`) and `"v": 1` for a replica; `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
+writes `"v": 1`. **A record is written at the oldest version that holds its members**
+(`records.encode`), so a release before C3 still reads every service, replica and observation
+that uses nothing of C3. Records C0, C1 and B3 wrote still read: the fixtures in
+`src/testdata/c0_store.txt`, `c1_store.txt` and `b3_store.txt` were captured from real stores. A value with a **newer**
 version than the reader knows is refused with one line naming the key and both versions,
 `ZC-E0303`, never as a malformed record.
 
@@ -119,6 +128,74 @@ read-only token: it sends the names only (`"env": [["KEY", null]]` in the API's 
 value). A token that may write sees the values. Nothing outside the API, the replica copy below
 and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 
+### Version 4: `health` and `rollout` (C3 slice 5)
+
+```json
+{ "v": 4, "name": "hello", "...": "...",
+  "health": { "command": ["/bin/check"], "interval_ms": 2000, "timeout_ms": 1000,
+              "start_period_ms": 0, "failure_threshold": 3, "success_threshold": 1 },
+  "rollout": { "strategy": "rolling", "max_surge": 1, "max_unavailable": 0,
+               "min_ready_ms": 5000, "ready_timeout_ms": 120000,
+               "progress_deadline_ms": 600000, "grace_ms": 10000, "on_failure": "rollback" } }
+```
+
+- `health` (absent: no check) is a command the agent runs in the container: `command` is 1 to 64
+  argv words, the first not empty; `interval_ms` and `timeout_ms` are above 0 and `timeout_ms` is
+  at most `interval_ms`; failures in the first `start_period_ms` do not count; the thresholds are
+  at least 1. C3 has command checks only (owner, 2026-11-05). A change of `health` is a change of
+  what a replica runs: it bumps `generation` and the summary says `health changed`. Otherwise
+  ZC-E0125.
+- `rollout` (absent: the default above, which applies to every service, owner 2026-11-05) is how
+  a new generation replaces the old. `strategy` is `rolling` or `recreate`; `max_surge` and
+  `max_unavailable` are at most 128, not both 0 for `rolling`; `min_ready_ms` <
+  `ready_timeout_ms` <= `progress_deadline_ms`; `on_failure` is `rollback` or `pause`. Otherwise
+  ZC-E0126. A policy equal to the default is stored as absent, so the service stays version 3.
+  A change of `rollout` alone does not bump `generation` (summary `rollout changed`): it says how
+  replicas are replaced, not what they run.
+- A version 3 record reads as "no health, the default rollout".
+
+Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and stores them.
+
+## `/history/<service>/<generation>`: what a generation ran (C3 slice 5)
+
+```json
+{ "v": 1, "service": "hello", "generation": 7, "image": "b3:51aa9c03", "source": "",
+  "command": ["run"], "env": [["KEY", "value"]], "limits": {}, "health": null,
+  "applied_by": "alex@laptop", "request_id": "r-0001a4f", "applied_at_ms": 1761350000123,
+  "reason": "apply", "restores": null }
+```
+
+Written by the API in the transaction of every apply that creates a service or raises its
+`generation` (a scale or a change of `rollout` alone writes none), with the spec as the service
+record holds it. `<generation>` is decimal with no leading zero. `reason` is `apply`, `rollback`
+or `auto_rollback` (C3 slice 8), and `restores` is the generation a rollback copied. A record is
+never changed. Users address versions by generation (owner, 2026-11-05).
+
+**Retention:** at most `history_generations_max` (16) per service. The apply that writes the
+17th deletes the lowest generation in the same transaction; rolling back to a generation no longer
+here is ZC-E0128 (owner, 2026-11-05). Deleting a service deletes its history first, in
+transactions that each expect the service at the revision the delete read, so a service that is
+gone leaves no history and a service that changed meanwhile keeps the history of its new
+generation. A stored generation above the one an apply writes belongs to an earlier service of
+the same name (a build before C3 left it behind) and that apply deletes it. `env` values are
+secrets here as in the service (the API never sends them to a
+read-only token).
+
+## `/rollouts/<service>`: a rollout in progress (C3 slice 7; defined in slice 5)
+
+```json
+{ "v": 1, "service": "hello", "from": 6, "to": 7, "phase": "progressing",
+  "started_at_ms": 1761350000123, "deadline_at_ms": 1761350600123, "next_at_ms": 1761350005123,
+  "ready_new": 1, "retired_old": 1, "budget": {"start": 1, "retire": 0},
+  "cause_decision": "1761350000123-api0-0001" }
+```
+
+Written only by the rollout controller (role `rollout_controller`), one per service. `phase` is
+`progressing`, `paused`, `rolling_back`, `complete` or `failed`. `budget` is how many new
+replicas the replica controller may start now and how many old ones it may retire; the replica
+controller stays the only writer of `/replicas/`. `next_at_ms` is when the controller looks again
+without a store change (`min_ready_ms`). Deleted a retention period after `complete`.
+
 ## `/replicas/<service>/<id>`: desired replica
 
 `<id>` is `<service>-<n>` with `n` from `/replica-numbers/<service>` (C0: the service's
@@ -133,7 +210,8 @@ the new one. The id is also the container name and the `zcube.replica` label.
 
 Version 2 (C1 slice 3) has no `node` and no `requests`; a version 1 record still reads, with
 both ignored. Version 3 (C2 slice 2) adds `source`, copied from the service (empty when
-absent). The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
+absent). Version 4 (C3 slice 5) adds `health`, copied from the service; it is written only when
+present. The agent's endpoint (`GET /v1/agent/nodes/<node>/replicas`) serves these records
 for the replicas in `/assigned/<node>/` only; an assignment whose replica is gone is not served.
 
 The replica copies what it needs from the service at creation, so editing the service does not
@@ -262,6 +340,9 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
 - `assignment` (C1 slice 6, optional): the `mod_revision` of `/assigned/<node>/<id>` the agent
   acted on, the placement epoch. A controller acts on an observation only if `tenure` and
   `assignment` are current and `/node-status/<node>` is `ready`.
+- Version 3 (C3, written from slice 9): `health` (`unknown`, `healthy`, `unhealthy`; absent for a
+  replica without a check), `health_failures` (consecutive failed probes) and `last_probe_exit`.
+  Still written on change only. An observation without them is written as version 2.
 
 Lifetime: until the agent or the node controller removes it. One writer per key (the node's agent), written on every status change, not on a timer, so the
 store's revision tells when the node last learned something. Written with one compare, never
@@ -355,6 +436,12 @@ controller records its choices about a service's replica set with the service as
 the observed record or decision that provoked it. A decision about one replica (`create_replica`,
 `stop_replica`, `mark_replica_lost`) keeps that replica as its subject, with a `cause` that points
 at the service-level decision above it, so the two chains join.
+
+**Rollout decisions (C3).** The rollout controller writes `rollout_start`, `rollout_step`,
+`rollout_pause` and `rollout_fail` with the service as subject, and the API writes `rollback` (by
+hand or, with `reason auto_rollback`, for the controller), each with a cause, so `zcube why
+service <name>` can say "rolled back to generation 6 because replica hello-31 stayed unhealthy for
+40 s". Their codes are ZC-E0127 to E0129, E0304 to E0306, W0304 and W0305.
 
 **Job decisions (B1).** The job controller's decisions have a job as subject
 (`/decisions-by-subject/job/<name>/<id>`), and their actions are written in snake_case like every
