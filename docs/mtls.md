@@ -18,11 +18,22 @@ reads a clock (the wall time is an argument) and never uses a randomness source.
 The decision is in decisions/2026-11-04-x509-two-profiles.md.
 
 - **`cluster`** (`x509.parse`, `verify`) covers what this cluster's CA writes.
-  - There are three kinds:
+  - There are five kinds:
     - `ca`: BasicConstraints and KeyUsage.
     - `server`: BasicConstraints, KeyUsage, ExtKeyUsage serverAuth, and a SAN with one DNS name.
     - `workload`: BasicConstraints, KeyUsage, ExtKeyUsage clientAuth, a SAN with one SPIFFE ID
-      (`spiffe://<cluster>/service/<name>`), and the identity extension.
+      (`spiffe://<cluster>/service/<name>`), and the identity extension, version 1 (labels).
+    - `node` (B7): BasicConstraints, KeyUsage, ExtKeyUsage clientAuth and a SAN with
+      `spiffe://<cluster>/node/<name>`; no identity extension. The server issues it at join
+      and at each renewal, over the node's peer key and for the credential's lifetime; the
+      agent keeps it as `<state dir>/node.crt`.
+    - `client` (B7): as `node`, with `spiffe://<cluster>/client/<name>` and the identity
+      extension, version 2: `SEQUENCE { INTEGER 2, ENUMERATED scope }`, scope `jobs` (1) or
+      `admin` (2). The server needs no table of clients
+      (decisions/2026-11-13-identity-extension-v2-scope.md). `zcube-server ca issue-client
+      NAME --scope jobs|admin` writes one on the server host (below).
+  - `<cluster>` is `zc-` and 16 hex digits of SHA-256 of the CA's public key
+    (decisions/2026-11-13-cluster-name-from-ca-key.md).
   - Each kind has its extensions in a fixed order, and its bytes are exact. The issuer's CN is
     `zcube-ca-` followed by 16 hex digits.
   - A certificate parsed and then written again gives back its exact input bytes.
@@ -32,6 +43,18 @@ The decision is in decisions/2026-11-04-x509-two-profiles.md.
   - It allows any Name, a serial of up to 20 bytes, key identifiers, and extensions in any order.
   - It refuses an extension that appears twice and an unknown critical extension.
   - It requires serverAuth, a leaf (not a CA), and exactly one DNS name or SPIFFE ID.
+
+### Client certificates
+
+`zcube-server ca issue-client NAME --scope jobs|admin [--out DIR]`, given the `--store` (and
+`--state-dir`, or `--config`) the server runs with, signs a `client` certificate with that
+store's CA and writes `NAME.key` (Ed25519, PKCS#8 PEM, which openssl and the JDK read) and
+`NAME.crt` (PEM), both mode 0600, in `DIR` (default the working directory). The server need not
+run. It lives `x509_leaf_ttl_ms_max` (7 days). It never makes a CA: a store with no CA key yet
+is `ZC-E0806`, as is an existing `NAME.key` or `NAME.crt`, which it does not replace. A name in
+the server's `revoked` file is `ZC-E0807`: the file holds node and client names alike
+(decisions/2026-11-13-revoked-names-shared.md), and a revoked name stops being issued at once.
+Refusing a certificate already issued at the handshake comes with the API over TLS (slice 3).
 
 ### Validity
 
@@ -60,7 +83,7 @@ are sorted by key, with no key twice.
     keys and dates each time.
 - **`zig build x509-format`**: openssl, keytool and others read the certificates the writer
   makes. It needs those tools, so it is not in `check`.
-- **`src/x509_fuzz.zig`**: mutates good certificates of all three kinds, plus the foreign
+- **`src/x509_fuzz.zig`**: mutates good certificates of all five kinds, plus the foreign
   fixtures.
   - **Cluster profile.** Every result the parser gives must agree with an independent naive
     decoder, `src/x509_oracle.zig`. That decoder has its own TLV walker and its own checks.

@@ -624,8 +624,13 @@ answers
 
 ```json
 { "credential": "<hex, 185 bytes>", "ca_public": "<64 hex digits>",
+  "node_certificate": "<hex DER>",
   "not_before_ms": 1767225600000, "not_after_ms": 1767312000000 }
 ```
+
+`node_certificate` (B7) is the node's X.509 certificate of kind `node` (docs/mtls.md) over the
+same key, valid as long as the credential. The agent requires it: a reply without it, or with
+one for another node, key, kind or CA, is a bad reply and nothing is stored.
 
 The agent calls it again at half the credential's life. Refusals: `400` for a key that is not 64
 hex digits or not a point on the curve, or a node name that is not a node name; `ZC-E0807` for a

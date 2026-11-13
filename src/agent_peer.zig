@@ -621,7 +621,8 @@ fn issued_body(
 }
 
 /// What `issued_body_certificate` puts in the node certificate's place.
-const CertificateCase = enum { right, absent, other_node, other_key, other_ca, other_kind };
+/// `later` is a right reply issued half a day later, as at a renewal.
+const CertificateCase = enum { right, later, absent, other_node, other_key, other_ca, other_kind };
 
 fn issued_body_certificate(
     arena: Allocator,
@@ -631,8 +632,8 @@ fn issued_body_certificate(
     node_key: [32]u8,
     case: CertificateCase,
 ) ![]const u8 {
-    const not_before_ms = 1000;
-    const not_after_ms = 1000 + 86_400_000;
+    const not_before_ms: u64 = if (case == .later) 1000 + 43_200_000 else 1000;
+    const not_after_ms = not_before_ms + 86_400_000;
     const credential = peer.issue(ca, node, node_key, not_before_ms, not_after_ms);
     const bytes = peer.encode(&credential);
     const ca_public = shown_ca.public_key.toBytes();
@@ -814,4 +815,15 @@ test "a renewal that fails keeps the pair the agent has" {
     var reopened = try Peer.open(io, state.path(), "node1", &diag);
     defer reopened.close();
     try std.testing.expect(reopened.credential != null);
+    const first = agent.node_certificate.?;
+    try std.testing.expectEqualSlices(u8, first.slice(), reopened.node_certificate.?.slice());
+
+    // A renewal that succeeds replaces the node certificate with the credential, on disk too.
+    var later: Canned = .{ .status = 200, .body = try certified(arena, ca, mine, .later) };
+    try std.testing.expect(try_step(&agent, &later, now_ms, &diag));
+    const renewed = agent.node_certificate.?;
+    try std.testing.expect(!std.mem.eql(u8, first.slice(), renewed.slice()));
+    var restarted = try Peer.open(io, state.path(), "node1", &diag);
+    defer restarted.close();
+    try std.testing.expectEqualSlices(u8, renewed.slice(), restarted.node_certificate.?.slice());
 }

@@ -53,7 +53,9 @@ The control plane is the cluster CA.
 2. An agent has an Ed25519 **node key**, generated on its first run into
    `<state dir>/peer.key` (mode 0600, same format). At join it sends the public key and receives
    a signed **credential** binding that key to its node name. It stores the credential in
-   `<state dir>/peer.cred` and the CA's public key in `<state dir>/ca.pub`.
+   `<state dir>/peer.cred` and the CA's public key in `<state dir>/ca.pub`. Since B7 the same
+   answer carries a node certificate over the same key (`<state dir>/node.crt`, docs/mtls.md),
+   for the API over TLS.
 3. A peer accepts only credentials signed by the CA key it holds, inside their validity window.
 
 The join call is `POST /v1/agent/nodes/{node}/credential` (docs/api.md). Like every agent
@@ -198,7 +200,8 @@ All are `ZC-E08xx`, blame `external` except where noted, one line, naming the pe
   of its own: the credential is not a store key and is not tied to the lease's revision.
 - **Removal.** A node removed from the cluster is named in the server's `<state dir>/revoked`
   (one node name per line, `#` comments), read at start. The server refuses to issue or renew
-  for a listed name (ZC-E0807) and the node's credential lapses within a day. That is the
+  for a listed name (ZC-E0807), node certificates included; since B7 a client name listed there
+  is refused by `ca issue-client` too and the node's credential lapses within a day. That is the
   denylist: cheap, but read only at start and not a store key, because C2 has no node removal
   command to drive a store-backed list. When one exists it writes this list. A listed node whose
   credential has not yet expired is still accepted by peers until it does: **a day is the bound
