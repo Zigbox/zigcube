@@ -80,3 +80,17 @@ session continues on `claude/b4-slice2` (based on `claude/b4-slice1`, PR #233).
 - Keep slice 3 (`claude/b4-slice3`) in mind: nothing above should change `job_cert.zig`.
 
 Where: `docs/briefs/b4.md`, this branch's commits.
+
+## Finished by the second session (same day)
+
+All five items above are done on `claude/b4-slice2`. What differs from the plan:
+
+- The relay's half close is decided in docs/decisions/2026-11-13-b4-relay-tls.md: on the job's
+  end of input the relay sends close_notify and drops what the upstream sends after it.
+- "Relay stopped" reuses **ZC-E0702** (no new code); the report asks the supervisor to confirm.
+- `relay-teeth` is a build step of its own, not in `check`.
+- `docs/keys.md` is unchanged: issuance writes no store key.
+- `demo-b3`'s configuration is not updated: it names no `.cluster`, `server_name` or
+  `server_ca`, and it builds ReleaseSafe, which refuses `.plain`. It will refuse to start until
+  slice 4 gives the Zigbox runtime the TLS relay and the demo a test upstream (flagged in the
+  report; not run here, it needs KVM).

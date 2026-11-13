@@ -600,6 +600,7 @@ runs unchanged on the far side of HTTP:
 | `txn` of puts and deletes under `/observed/<node>/` | `POST /v1/agent/nodes/{node}/observed` |
 | `list(/job-runs/)`, filtered to the node's assignments (B1 slice 4) | `GET /v1/agent/nodes/{node}/runs` |
 | `get(/job-input/<name>)` | `GET /v1/agent/nodes/{node}/runs/{name}/input` |
+| (no store write: the CA signs a relayed run's key, B4) | `POST /v1/agent/nodes/{node}/runs/{name}/certificate` |
 | `list(/job-observed/<node>/)`; `txn` with one put there | `GET` / `POST /v1/agent/nodes/{node}/job-observed` |
 | (the wait between steps) | `GET /v1/agent/nodes/{node}/watch?from=&timeout=` |
 
@@ -798,6 +799,28 @@ would ignore (B2). The agent reports a run only under the assignment it read in 
 report and ends the run on its node. An older
 server stores it; the answer shape is unchanged. An older agent fences on `applied: false`, so
 upgrade agents before the server.
+
+### `POST /v1/agent/nodes/{node}/runs/{name}/certificate` (B4 slice 2)
+
+A relayed run's workload certificate. Body `{"public_key": "<64 hex>", "epoch": N,
+"image_digest": "<64 hex>"}` (the run's Ed25519 key from `relay.pub`, the placement epoch and the
+image digest the node started; at most `peer_join_request_bytes_max` bytes, no unknown fields).
+The server reads the job, its status, the run's claim and its assignment at one revision, and
+`job_cert.decide` checks that the job has a relay, the run is claimed by `{node}` and started,
+has not ended, runs the pinned image under the current epoch. Then the cluster CA signs
+`spiffe://<cluster>/job/{name}` with the digest, epoch and labels, valid until the run's last
+legitimate moment, and answers
+
+```json
+{ "certificate": "<hex DER>", "not_before_ms": 1767225600000, "not_after_ms": 1767229200000 }
+```
+
+Refusals: `404` where the server has no CA or no `.cluster` is set (there is no default trust
+domain, docs/decisions/2026-11-13-b4-cluster-setting.md); `400` for a bad job name, key, digest or
+an `epoch` of 0; **`409` ZC-E0706** for a run the node may not have a certificate for (each cause
+names which check failed). A retry cannot change a 409: the agent marks the run refused and does
+not ask again. The call writes no store key. Like every agent endpoint it is unauthenticated
+until B7 (docs/mtls.md, "Issuance").
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

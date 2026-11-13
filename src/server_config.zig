@@ -11,6 +11,8 @@
 //!     // names one; it never gives an address.
 //!     // B4: the relay connects with TLS, as the run (a certificate the cluster CA signs for
 //!     // `spiffe://<cluster>/job/<name>`), and checks the upstream's name against `server_ca`.
+//!     // `.cluster` has no default: until it is set the certificate endpoint answers 404, and a
+//!     // TLS relay without it is ZC-E0106 (docs/decisions/2026-11-13-b4-cluster-setting.md).
 //!     .cluster = "prod.example",
 //!     .relays = .{ .botpike = .{
 //!         .address = "broker.botpike.com:8443",
