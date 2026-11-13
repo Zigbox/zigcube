@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0128]: the generation to roll back to is no longer in the history
+  cause  generation 3 of hello is not in its history (it keeps generations 7 to
+         22)
+  reqid  r-0000001
+  fix    list the generations that can be restored
+  more   zcube explain E0128
+  docs   https://zigbox.github.io/zigcube/errors/E0128.html

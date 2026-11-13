@@ -1,0 +1,6 @@
+error[ZC-E0516]: a replica's health check could not run
+  cause  the health check of hello-1 could not start: ZBX-E0501 the container is
+         not running
+  fix    read the runtime's code; the check runs again next interval
+  more   zcube explain E0516 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0516.html

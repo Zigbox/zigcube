@@ -663,6 +663,7 @@ const Run = struct {
                 .env = service.rec.env,
                 .limits = service.rec.limits,
                 .source = service.rec.source,
+                .health = service.rec.health,
             };
             const key = records.replica_key(service.rec.name, id);
             const value = try records.encode(run.ctx.arena, replica, run.ctx.diag);

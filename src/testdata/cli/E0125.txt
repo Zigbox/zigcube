@@ -1,0 +1,5 @@
+error[ZC-E0125]: a service's health check is not valid
+  cause  health.timeout_ms is 5000, longer than health.interval_ms (2000)
+  fix    correct the service file and apply it again
+  more   zcube explain E0125 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0125.html

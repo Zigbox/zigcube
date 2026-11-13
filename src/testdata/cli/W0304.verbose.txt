@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+warning[ZC-W0304]: a rollout paused itself after a failure
+  cause  the rollout of hello to generation 7 failed (ZC-E0304) and paused
+         itself
+  reqid  r-0000001
+  fix    resume it, roll back, or apply a fixed release
+  more   zcube explain W0304
+  docs   https://zigbox.github.io/zigcube/errors/W0304.html
