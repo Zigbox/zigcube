@@ -1334,7 +1334,12 @@ const c1_teeth_roots = [_]struct {
         .name = "job_ledger_small",
         .root = "src/sim_c1_teeth_job_ledger_small_main.zig",
         .symptom = "J8: the start ledger is full (16 runs)",
-        .canary_seeds = 10,
+        // A fixed range at 400 operations, not fresh seeds at drawn ones (#236): the drawn
+        // operations (52 to 329 in the ten seeds of the miss) start 9 to 16 runs, which never
+        // fill a ledger of 16. At 400 operations 8 of seeds 1..10 fail, so 15 seeds miss a
+        // working check with probability 0.2^15 = 3e-11.
+        .canary_seeds = 15,
+        .canary_first = 1,
         .plain_symptom = "J8: the start ledger is full (16 runs)",
         .ops = 400,
     },
