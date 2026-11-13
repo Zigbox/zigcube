@@ -367,9 +367,11 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
   acted on, the placement epoch. A controller acts on an observation only if `tenure` and
   `assignment` are current and `/node-status/<node>` is `ready`.
 - Version 3 (C3, written from slice 9): `health` (`unknown`, `healthy`, `unhealthy`; absent for a
-  replica without a check), `health_failures` (consecutive failed probes) and `last_probe_exit`.
-  Still written on change only. An observation without them is written as version 2, and a
-  version 1 or 2 record reads as health `unknown`.
+  replica without a check), `health_failures` (consecutive failed probes) and `last_probe_exit`
+  (0 to 255, like every exit code). Still written on change only. An observation without them is
+  written as version 2, and a version 1 or 2 record reads as health `unknown`, whatever it holds.
+  The server sets `v`: the agent endpoint stores a report at the version its members need,
+  whatever `v` the agent sent, and refuses a member it does not know (`ZC-E0104`).
 
 Lifetime: until the agent or the node controller removes it. One writer per key (the node's agent), written on every status change, not on a timer, so the
 store's revision tells when the node last learned something. Written with one compare, never

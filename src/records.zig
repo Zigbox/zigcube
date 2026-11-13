@@ -924,8 +924,9 @@ pub const Observed = struct {
     health: ?HealthState = null,
     /// Version 3: consecutive failed probes since the last success.
     health_failures: ?u32 = null,
-    /// Version 3: the exit code of the last probe that ran to an exit.
-    last_probe_exit: ?i32 = null,
+    /// Version 3: the exit code of the last probe that ran to an exit, 0 to 255 like every exit
+    /// code (`Exit`): a value outside it does not parse.
+    last_probe_exit: ?u8 = null,
 };
 
 /// Observations are written at the oldest version that holds their members: version 3 only with
@@ -943,6 +944,7 @@ pub fn observed_version(observed: *const Observed) u32 {
 /// The health verdict an observation carries: `unknown` for one without a check, and for every
 /// version 1 and 2 record, which predate health checks.
 pub fn observed_health(observed: *const Observed) HealthState {
+    if (observed.v < observed_version_health) return .unknown;
     return observed.health orelse .unknown;
 }
 
@@ -1174,8 +1176,10 @@ pub fn encode(arena: Allocator, value: anytype, diag: *Diag) Error![]const u8 {
     return bytes;
 }
 
-/// A service or replica with `v` set to the oldest version that holds its members; anything else
-/// as it is.
+/// A service, replica or observation with `v` set to the oldest version that holds its members;
+/// anything else as it is. The writer owns `v`, not whoever built the value: an agent's report
+/// is parsed into an `Observed` (the endpoint refuses a member it does not know, ZC-E0104) and
+/// stored at the version its members need, whatever `v` it named.
 fn at_oldest_version(value: anytype) @TypeOf(value) {
     const T = @TypeOf(value);
     var written = value;
@@ -1798,7 +1802,23 @@ test "C3: an observation is version 3 only with a health verdict" {
     const judged_back = try read(Observed, arena, kv_of("/o", judged_bytes), &diag);
     try testing.expectEqual(HealthState.unhealthy, judged_back.health.?);
     try testing.expectEqual(@as(u32, 3), judged_back.health_failures.?);
-    try testing.expectEqual(@as(i32, 1), judged_back.last_probe_exit.?);
+    try testing.expectEqual(@as(u8, 1), judged_back.last_probe_exit.?);
+    try testing.expectEqual(HealthState.unhealthy, observed_health(&judged_back));
+    // A verdict in a record older than version 3 is not one: no build wrote it.
+    const old_text =
+        \\{"v":2,"replica":"hello-1","node":"n1","generation":3,"status":"running",
+    ++
+        \\"reported_at_ms":5,"health":"healthy"}
+    ;
+    const old_back = try read(Observed, arena, kv_of("/o", old_text), &diag);
+    try testing.expectEqual(HealthState.unknown, observed_health(&old_back));
+    // An exit code is 0 to 255.
+    const wide_text =
+        \\{"v":3,"replica":"hello-1","node":"n1","generation":3,"status":"running",
+    ++
+        \\"reported_at_ms":5,"health":"healthy","last_probe_exit":256}
+    ;
+    try testing.expectError(error.Malformed, read(Observed, arena, kv_of("/o", wide_text), &diag));
 }
 
 test "C3: history and rollout records encode and read back" {

@@ -1730,7 +1730,7 @@ test "observed: version 3 round-trips, version 2 reads as health unknown, on eve
     try testing.expectEqual(records.observed_version_health, back.v);
     try testing.expectEqual(records.HealthState.unhealthy, records.observed_health(&back));
     try testing.expectEqual(@as(u32, 3), back.health_failures.?);
-    try testing.expectEqual(@as(i32, 1), back.last_probe_exit.?);
+    try testing.expectEqual(@as(u8, 1), back.last_probe_exit.?);
 
     _ = try put_one(s, &diag, "/observed/node1/hello-5", observed_v2_text);
     const old = try s.get(arena, "/observed/node1/hello-5", null, &diag);

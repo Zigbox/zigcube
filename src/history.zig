@@ -174,31 +174,45 @@ fn delete_room(batch: *const controller.Batch) bool {
     return batch.has_room(1 + controller.decision_ops);
 }
 
-/// Deletes every history record of `service`, in transactions that each still find the service at
+/// Deletes every history key of `service`, in transactions that each still find the service at
 /// `service_mod_revision`, before the caller deletes the service. A conflict means the service
 /// changed: what was deleted stays deleted (a rollback to it is ZC-E0128) and the caller starts
-/// again from the new state.
+/// again from the new state. It reads one transaction's worth of keys at a time, not through
+/// `stored`, so a history past `history_scan_max` (left by a crash, or by keys that name no
+/// generation) never stops its service from being deleted; past `history_delete_txns_max`
+/// transactions it stops with ZC-E0302, and the next delete goes on from where it stopped.
 pub fn delete_all(
     ctx: *const Context,
     service: []const u8,
     service_mod_revision: store.Revision,
 ) Error!controller.Commit {
     assert(service_mod_revision > 0);
-    const existing = try stored(ctx, service);
+    const prefix = records.history_prefix(service);
     const service_key = records.service_key(service);
     const service_key_copy = try controller.key_copy(ctx, &service_key);
     var last: controller.Commit = .{ .applied = 0 };
-    var at: usize = 0;
-    while (at < existing.len) {
+    for (0..history_delete_txns_max) |_| {
+        const page = try ctx.store.list(ctx.arena, .{
+            .prefix = prefix.slice(),
+            .limit = constants.store_txn_ops_max,
+        }, ctx.diag);
+        if (page.kvs.len == 0) return last;
         var batch: controller.Batch = .{};
         batch.expect(service_key_copy, service_mod_revision);
-        while (at < existing.len and batch.has_room(1)) : (at += 1) {
-            batch.delete(existing[at].key);
-        }
+        for (page.kvs) |kv| batch.delete(kv.key);
         last = try controller.commit(ctx, .api, &batch);
         if (last == .conflict) return .conflict;
     }
-    return last;
+    return controller.too_many(ctx, prefix.slice(), history_delete_keys_max);
+}
+
+/// Transactions one `delete_all` makes at most: the history keys a crash or a stray key could
+/// have added beyond `history_scan_max` are deleted in a bounded number of steps.
+const history_delete_txns_max = constants.controller_txns_per_step_max;
+const history_delete_keys_max = history_delete_txns_max * constants.store_txn_ops_max;
+
+comptime {
+    assert(history_delete_keys_max >= constants.history_scan_max);
 }
 
 // ---- Tests -----------------------------------------------------------------------------------
@@ -287,4 +301,42 @@ test "history keeps the newest generations, in numeric order" {
     try testing.expectEqual(@as(usize, 2), now.len);
     try testing.expectEqual(@as(u64, 1), now[0].generation);
     try testing.expectEqual(@as(u64, 2), now[1].generation);
+}
+
+test "a history past the read bound never stops its service from being deleted" {
+    // Goal: `stored` refuses more than `history_scan_max` keys (ZC-E0302), but `delete_all` must
+    // still empty the prefix, or the service could never be deleted. Method: a service and more
+    // history keys than the bound, one naming no generation; `delete_all` leaves none.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var manual: ManualClock = .{ .ms = 1761350000123 };
+    const memory = try testing.allocator.create(MemoryStore);
+    defer testing.allocator.destroy(memory);
+    memory.init(testing.allocator, manual.clock());
+    defer memory.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    const ctx: Context = .{
+        .store = memory.interface(),
+        .clock = manual.clock(),
+        .arena = arena_state.allocator(),
+        .diag = &diag,
+    };
+    const service_put = [_]store.Op{.{ .put = .{ .key = "/services/hello", .value = "{}" } }};
+    const service_revision = (try ctx.store.txn(.{ .on_success = &service_put }, &diag)).revision;
+    const total = constants.history_scan_max + 6;
+    var generation: u64 = 1;
+    while (generation <= total) : (generation += 1) {
+        const key = records.history_key("hello", generation);
+        const op = [_]store.Op{.{ .put = .{ .key = key.slice(), .value = "{}" } }};
+        _ = try ctx.store.txn(.{ .on_success = &op }, &diag);
+    }
+    const stray = [_]store.Op{.{ .put = .{ .key = "/history/hello/x", .value = "{}" } }};
+    _ = try ctx.store.txn(.{ .on_success = &stray }, &diag);
+    try testing.expectError(error.NoCapacity, stored(&ctx, "hello"));
+    diag.reset();
+
+    try testing.expect(try delete_all(&ctx, "hello", service_revision) == .applied);
+    const left = try ctx.store.list(ctx.arena, .{ .prefix = "/history/hello/", .limit = 8 }, &diag);
+    try testing.expectEqual(@as(usize, 0), left.kvs.len);
 }
