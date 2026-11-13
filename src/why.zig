@@ -397,7 +397,7 @@ fn node_judgement(ctx: *const Context, name: []const u8) Error!?records.NodeStat
 /// the words say "registered with" and claim nothing about what the file asks.
 fn trust_phrase(ctx: *const Context, node: *const records.Node) Error![]const u8 {
     if (node.trust_policy.len == 0) {
-        return "registered without --trust-policy: no job run is judged";
+        return "registered without a --trust-policy that checks: no job run is judged";
     }
     return controller.format(ctx, "registered with --trust-policy {s}: job runs (not " ++
         "replicas) are judged under the policy the agent read at its start", .{node.trust_policy});
@@ -1046,7 +1046,7 @@ test "why node states its load and its judgement, and notes that nothing is reba
     try testing.expectEqualStrings(
         "node node1: ready (tenure 1), lease 1 with 0 replicas assigned, " ++
             "0m of 4000m CPU and 0B of 8.0Gi memory in use; " ++
-            "registered without --trust-policy: no job run is judged",
+            "registered without a --trust-policy that checks: no job run is judged",
         before.state.text,
     );
     const assigned = records.assigned_replica(

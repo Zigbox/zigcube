@@ -26,8 +26,12 @@
   bound, is reported again as `refused` and never ends `failed`, cause `deadline`.
 - **`zcube why node` claims only what the store knows**: "registered with --trust-policy <path>:
   job runs (not replicas) are judged under the policy the agent read at its start", or
-  "registered without --trust-policy: no job run is judged". The record holds the path of the
-  registration, not what the policy asks, and a restart under a live lease does not register again.
+  "registered without a --trust-policy that checks: no job run is judged". The agent publishes
+  the path only when the policy asks for a signature or a provenance (`policy.checks()`), so a
+  policy that asks for nothing registers none rather than a claim. The path must be absolute
+  (ZC-E0505 otherwise: it is published as typed). A restart under a live lease does not register
+  again, so the record can name a policy the agent no longer runs with, the dangerous direction
+  included (`docs/agent.md`, "Known limits").
 
 Tests: `src/zigbox_supervisor.zig` ("runs signed past signatures_per_tree_max ..."),
 `src/agent_jobs_test.zig` (the two refusal tests, each failing on the code before the fix),

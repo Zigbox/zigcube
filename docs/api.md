@@ -174,7 +174,8 @@ terminal.
   each after the chain: `replace_replica (observed): 142 times since 2025-10-24 23:13:20Z`.
 - `why node`'s `state.text` names the judgement and the load:
   `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
-  8.0Gi memory in use; registered without --trust-policy: no job run is judged` (B5: or
+  8.0Gi memory in use; registered without a --trust-policy that checks: no job run is judged`
+  (B5: or
   `registered with --trust-policy <path>: job runs (not replicas) are judged under the policy the
   agent read at its start`); a node with no `/node-status` is `registered, not yet judged`, one whose
   status is for an earlier tenure says so, and one that is not registered says `not registered`
@@ -508,8 +509,9 @@ shows the ending like any other (`/job-status/<name>`); `zcube why job` says `fa
 <node>'s trust policy` and its chain carries the diagnostic. The node publishes the path it registered
 with in `/nodes/<node>`'s `trust_policy`; `zcube why node` ends its state line with `registered with
 --trust-policy <path>: job runs (not replicas) are judged under the policy the agent read at its
-start`, or `registered without --trust-policy: no job run is judged`. The record carries the path,
-not what the policy asks (a policy may ask for nothing), and it is the registration's: an agent
+start`, or `registered without a --trust-policy that checks: no job run is judged`. The record
+carries the path only when the policy asks for a signature or a provenance (a policy that asks for
+nothing registers none), and it is the registration's: an agent
 restarted with another flag under a live lease keeps the old record (`docs/agent.md`).
 
 ### Relays (B3 slice 2)

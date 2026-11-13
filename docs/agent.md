@@ -326,8 +326,10 @@ reader the server uses too: a regular file, owned by root or by the agent's own 
 neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 and the agent does
 not start. No API call names, changes or switches the node's policy off; the node record carries its
 path (`trust_policy`) so `zcube why node` can say which file the agent registered with. An agent
-without the flag checks nothing, and `zcube why node` says so ("registered without --trust-policy:
-no job run is judged"). Only job runs are judged; a service's replicas carry no signatures and are
+without the flag checks nothing, and neither does one whose policy asks for no signature and no
+provenance: both register no path, and `zcube why node` says so ("registered without a
+--trust-policy that checks: no job run is judged"). The path must be absolute (it is published as
+typed); a relative one is ZC-E0505. Only job runs are judged; a service's replicas carry no signatures and are
 not. The file is read once, at the agent's start: an edit to it takes effect when the agent is
 restarted, not before. The path published is the one of the registration, and may be older than
 the flag the agent now runs with (see "Known limits").
@@ -483,8 +485,13 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
   renews on every pass: the record changes only when the lease is lost (the agent was down longer
   than the ttl, the host rebooted, or the node fenced) and the agent registers afresh. A restart
   with a changed `--trust-policy`, or after the file was edited, enforces the new policy from the
-  restart; what `zcube why node` reports can stay the old path indefinitely, and it never shows
-  what the file asks.
+  restart; what `zcube why node` reports can stay the old path indefinitely. The dangerous
+  direction is the one that removes checking: an agent restarted **without** `--trust-policy`
+  (or with a policy that asks for nothing) checks no job from that restart, while `zcube why
+  node` still says "registered with --trust-policy <path>: job runs ... are judged" for as long
+  as the lease lives. Treat `why node` as what the node registered with, never as proof that it
+  checks now; to make the record follow a removed policy, stop the agent for longer than the
+  lease ttl (the lease expires, the node is fenced and registers afresh).
   Registering again would move the tenure (the node record's revision), which fencing and job
   claims compare, so the fix is a decision for the owner, not this slice.
 - **A whole call is bounded, connect included; Linux only.** The standard library's threaded `Io`

@@ -153,8 +153,8 @@ and a last line on whether the chain reaches its cause: `completeness: complete`
 `zcube why node node3` starts from the state line, which names the judgement and the load
 (`node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
 8.0Gi memory in use; registered with --trust-policy /etc/zcube/trust.zon: job runs (not replicas)
-are judged under the policy the agent read at its start`, or `registered without --trust-policy: no
-job run is judged`), then the node's newest decision. The store holds the path the agent registered
+are judged under the policy the agent read at its start`, or `registered without a --trust-policy
+that checks: no job run is judged`, which covers a policy that asks for nothing), then the node's newest decision. The store holds the path the agent registered
 with, not what the policy asks nor a flag given at a later restart (`docs/agent.md`, "Known
 limits"), so the line claims no more. A `ready` node that holds fewer
 replicas than another gets one more line, a note and not a reading of the store: replicas already

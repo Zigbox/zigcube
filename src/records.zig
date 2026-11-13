@@ -640,7 +640,8 @@ pub const Node = struct {
     capacity: Requests,
     labels: []const []const u8 = &.{},
     /// The path of the trust policy the node's agent checks every job's signatures against
-    /// before it starts a run (`--trust-policy`, B5); empty: the agent checks nothing.
+    /// before it starts a run (`--trust-policy`, B5), published only when the policy asks for a
+    /// signature or a provenance; empty: the agent checks nothing (as of its registration).
     trust_policy: []const u8 = "",
 };
 
