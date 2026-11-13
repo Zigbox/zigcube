@@ -255,12 +255,14 @@ fn serve_tls(
     diag.reset();
     tls.conn.open(setup, raw_reader, raw_writer, &tls.head, &diag) catch {
         tls.conn.deinit();
-        return log_refusal(shared, &diag);
+        log_refusal(shared, &diag);
+        return linger_refused(shared, slot, stream, raw_reader);
     };
     defer tls.conn.deinit();
     const caller = setup.caller(&tls.conn, &diag) orelse {
         tls.conn.close();
-        return log_refusal(shared, &diag);
+        log_refusal(shared, &diag);
+        return linger_refused(shared, slot, stream, raw_reader);
     };
     serve_requests(shared, slot, &.{
         .stream = stream,
@@ -315,6 +317,16 @@ fn linger(shared: *Shared, slot: u32, transport: *const Transport) void {
     if (transport.tls) |conn| conn.close();
     transport.stream.shutdown(shared.io, .send) catch return;
     _ = transport.raw.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
+}
+
+/// A refused handshake ends as `linger` does, for the same reason: a TLS 1.3 server judges the
+/// client's certificate before it has read the client's Finished, so closing at once resets the
+/// connection, and the reset can destroy the alert that says why (a JDK client then reports a
+/// broken pipe, not the alert; `zig build mtls-interop`).
+fn linger_refused(shared: *Shared, slot: u32, stream: net.Stream, raw: *std.Io.Reader) void {
+    shared.set_state(slot, .waiting);
+    stream.shutdown(shared.io, .send) catch return;
+    _ = raw.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
 }
 
 const Closed = error{Closed};

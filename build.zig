@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     });
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
-    add_mtls_interop_step(b, shared_options);
+    add_mtls_interop_step(b, shared_options, built);
     add_mtls_teeth_step(b, shared_options);
     add_local_smoke_step(b, built);
     add_x509_format_step(b, zigbox_module);
@@ -366,9 +366,10 @@ fn add_mtls_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
 }
 
 /// `zig build mtls-interop` (src/mtls_interop.zig): the mTLS client against `openssl s_server` and
-/// a JDK 21 server. Needs OpenSSL and a JDK, so it is not in `check`; CI runs it in a job of its
-/// own. An interop check, never a demo.
-fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions) void {
+/// a JDK 21 server, and `openssl s_client` and a JDK 21 client against `zcube-server`
+/// (src/mtls_interop_server.zig). Needs OpenSSL and a JDK, so it is not in `check`; CI runs it in
+/// a job of its own. An interop check, never a demo.
+fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions, built: Built) void {
     const exe = b.addExecutable(.{
         .name = "mtls_interop",
         .root_module = b.createModule(.{
@@ -382,8 +383,10 @@ fn add_mtls_interop_step(b: *std.Build, options: ExecutablesOptions) void {
     b.getInstallStep().dependOn(&exe.step);
     const run = b.addRunArtifact(exe);
     run.addFileArg(b.path("ops/mtls-interop/InteropServer.java"));
+    run.addFileArg(b.path("ops/mtls-interop/InteropClient.java"));
+    run.addArtifactArg(built.server);
     run.has_side_effects = true;
-    const help = "Run the mTLS client against openssl s_server and a JDK 21 server (not a demo)";
+    const help = "Run the mTLS client and server against OpenSSL and a JDK 21 (not a demo)";
     b.step("mtls-interop", help).dependOn(&run.step);
 }
 
