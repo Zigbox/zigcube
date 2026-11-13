@@ -23,6 +23,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const net = std.Io.net;
+const tls_upstream = @import("smoke_tls_upstream.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const host_procs = @import("host_procs.zig");
@@ -54,6 +55,7 @@ const Smoke = struct {
     port: u16,
     /// The relay's upstream: `Upstream` below answers on it for the whole run.
     upstream_port: u16 = 0,
+    upstream: ?*Upstream = null,
     server: ?std.process.Child = null,
     agent: ?std.process.Child = null,
     server_starts: u32 = 0,
@@ -117,8 +119,13 @@ const Smoke = struct {
             .sub_path = config,
             .data = try std.fmt.allocPrint(
                 arena,
-                ".{{ .relays = .{{ .echo = .{{ .address = \"127.0.0.1:{d}\" }} }} }}\n",
-                .{smoke.upstream_port},
+                ".{{ .cluster = \"{s}\", .relays = .{{ .echo = .{{ " ++
+                    ".address = \"127.0.0.1:{d}\", .server_name = \"{s}\", " ++
+                    ".server_ca = \"{s}/upstream-ca.pem\" }} }} }}\n",
+                .{
+                    tls_upstream.cluster,     smoke.upstream_port,
+                    tls_upstream.server_name, smoke.work,
+                },
             ),
         });
         const args = [_][]const u8{
@@ -720,29 +727,10 @@ fn step_job(smoke: *Smoke) !void {
 
 const linux = std.os.linux;
 
-/// The relay's upstream: a thread that accepts connections on a loopback port and answers the
-/// first bytes of each with `echo:` and them, then closes. Polling, so `stop` never waits on it.
-const Upstream = struct {
-    fd: i32,
-    stopping: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
-
-    fn run(upstream: *Upstream) void {
-        while (!upstream.stopping.load(.acquire)) {
-            if (wait_readable(upstream.fd, 50) == 0) continue;
-            const accepted = linux.accept4(upstream.fd, null, null, linux.SOCK.CLOEXEC);
-            if (linux.errno(accepted) != .SUCCESS) continue;
-            const peer: i32 = @intCast(accepted);
-            defer _ = linux.close(peer);
-            var reply: [72]u8 = undefined;
-            @memcpy(reply[0..5], "echo:");
-            if (wait_readable(peer, 5000) == 0) continue;
-            const got = linux.read(peer, reply[5..].ptr, 64);
-            if (linux.errno(got) != .SUCCESS or got == 0) continue;
-            _ = linux.write(peer, &reply, 5 + got);
-        }
-    }
-};
+/// The relay's upstream: a TLS server of its own CA that pins the cluster CA and the job's SPIFFE
+/// ID, answers `echo:` and the first record, then closes (`smoke_tls_upstream.zig`).
+const Upstream = tls_upstream.Upstream;
+const relay_job_uri = "spiffe://" ++ tls_upstream.cluster ++ "/job/" ++ relay_job_name;
 
 fn wait_readable(fd: i32, ms: i32) usize {
     var fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
@@ -824,7 +812,26 @@ fn step_relay_job(smoke: *Smoke) !void {
     const port = std.fmt.parseInt(u16, std.mem.trim(u8, url[colon + 1 ..], "\n"), 10) catch 0;
     try smoke.expect(port != 0, "ZCUBE_RELAY was \"{s}\"", .{url});
     try smoke.expect(!connectable(port), "the relay at port {d} still listens", .{port});
-    smoke.say("relayed job: ZCUBE_RELAY reached the upstream (echo:hi), port {d} closed", .{port});
+    try check_relay_identity(smoke);
+    smoke.say("relayed job: ZCUBE_RELAY reached the TLS upstream (echo:hi) as {s}, " ++
+        "port {d} closed", .{ relay_job_uri, port });
+}
+
+/// The client certificate the upstream accepted names the job, its image and its placement.
+fn check_relay_identity(smoke: *Smoke) !void {
+    const seen = smoke.upstream.?.last();
+    try smoke.expect(seen.flight == .ok, "the upstream's handshake ended {any}", .{seen.flight});
+    const uri = seen.uri[0..seen.uri_length];
+    try smoke.expect(std.mem.eql(u8, uri, relay_job_uri), "the certificate named \"{s}\"", .{uri});
+    var digest: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, full_image["b3:".len..]) catch unreachable; // A constant.
+    try smoke.expect(
+        std.mem.eql(u8, &digest, &seen.image_digest),
+        "the certificate's image digest is {x}",
+        .{seen.image_digest},
+    );
+    const epoch = seen.placement_epoch;
+    try smoke.expect(epoch > 0, "the certificate's placement epoch is {d}", .{epoch});
 }
 
 /// A port the system is not using now: bind port 0, read it, let go.
@@ -879,7 +886,16 @@ fn run(smoke: *Smoke) u8 {
     var listener = loopback.listen(smoke.io, .{}) catch return 2;
     defer listener.deinit(smoke.io);
     smoke.upstream_port = listener.socket.address.getPort();
-    var upstream: Upstream = .{ .fd = listener.socket.handle };
+    var upstream: Upstream = .{
+        .io = smoke.io,
+        .fd = listener.socket.handle,
+        .ca_path = std.fmt.allocPrint(arena, "{s}/ca.pub", .{smoke.state}) catch return 2,
+        .job_uri = relay_job_uri,
+        .key = undefined,
+    };
+    const pem = std.fmt.allocPrint(arena, "{s}/upstream-ca.pem", .{smoke.work}) catch return 2;
+    upstream.init(pem) catch return 2;
+    smoke.upstream = &upstream;
     upstream.thread = std.Thread.spawn(.{}, Upstream.run, .{&upstream}) catch return 2;
     defer {
         upstream.stopping.store(true, .release);

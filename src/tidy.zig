@@ -648,6 +648,8 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
 fn testpeer_importer(path: []const u8) bool {
     if (std.mem.endsWith(u8, path, "_test.zig")) return true;
     if (std.mem.eql(u8, path, "src/cli_golden.zig")) return true; // A test root.
+    // agent-smoke's TLS upstream: in the smoke's executable only, never in a product.
+    if (std.mem.eql(u8, path, "src/smoke_tls_upstream.zig")) return true;
     return std.mem.eql(u8, path, "src/tls_fuzz.zig");
 }
 
