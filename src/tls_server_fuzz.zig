@@ -330,7 +330,11 @@ fn random_faults(random: std.Random, good: *bool) testclient.Faults {
         10 => faults.hello.psk_not_last = true,
         11 => faults.hello.duplicate_group = true,
         12 => faults.ccs = random.intRangeAtMost(u32, 2, 3),
-        13 => faults.ccs_byte = random.intRangeAtMost(u8, 2, 255),
+        13 => {
+            // A wrong byte matters only in a change_cipher_spec that is sent.
+            faults.ccs_byte = random.intRangeAtMost(u8, 2, 255);
+            faults.ccs = 1;
+        },
         14 => {
             faults.chain = random.enumValue(testclient.Chain);
             good.* = faults.chain == .good;
