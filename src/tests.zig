@@ -73,6 +73,9 @@ test {
 
 test {
     _ = @import("cli_test.zig");
+    _ = @import("probe_scheduler.zig");
+    _ = @import("agent_health.zig");
+    _ = @import("agent_health_test.zig");
     _ = @import("tidy.zig");
 }
 
