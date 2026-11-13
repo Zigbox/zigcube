@@ -856,13 +856,6 @@ const signed_ended = struct {
     }
 };
 
-const node_has_policy = struct {
-    fn check(s: *Smoke) !bool {
-        const reply = try s.call("GET", "/v1/list?prefix=/nodes/", "");
-        return std.mem.indexOf(u8, reply.body, s.trust_policy.?) != null;
-    }
-};
-
 /// The cause of a failed job's ending, or "" when it has none.
 fn job_cause(smoke: *Smoke, name: []const u8) ![]const u8 {
     const arena = smoke.arena.allocator();
@@ -904,8 +897,9 @@ fn restart_with_policy(smoke: *Smoke, signed_image: []const u8) !void {
     smoke.images = images;
     smoke.trust_policy = policy;
     try smoke.stop(&smoke.agent, "the agent");
+    // The restarted agent keeps its remembered lease, so the node record still holds the first
+    // registration's `trust_policy` (docs/agent.md, "Known limits"); the jobs below show the check.
     try smoke.start_agent();
-    try smoke.wait_until("the node to name its trust policy", node_has_policy.check, wait_ms_default);
 }
 
 fn post_trust_job(

@@ -165,7 +165,9 @@ and then removes the observed record.
 
 `trust_policy` (B5 slice 2, optional, empty when absent) is the path of the policy the agent judges
 every run against before it starts it (`--trust-policy`); empty means the node checks nothing.
-It is for people (`zcube why node`); no one acts on it.
+It is for people (`zcube why node`); no one acts on it. Like every member here it is the
+registration's: an agent restarted under a live lease does not register again (docs/agent.md,
+"Known limits").
 
 Written by the agent with `lease` set to the lease it keeps alive. When the lease ends the key
 is deleted by the store, and that delete event is how lost nodes are detected (C1). The key's

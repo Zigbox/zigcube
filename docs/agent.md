@@ -327,6 +327,9 @@ neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 
 not start. No API call names, changes or switches the node's policy off; the node record carries its
 path (`trust_policy`) so `zcube why node` can say which file it checks against. An agent without the
 flag checks nothing, and `zcube why node` says so ("checks no job signatures (no --trust-policy)").
+The path published is the one of the registration: an agent restarted while its remembered lease
+still lives renews that lease and does not register again, so a changed `--trust-policy` is checked
+at once but published only at the next registration (see "Known limits").
 
 The check is the last thing before a start, after the deadline and before the input is fetched
 (`refused_by_trust` in `src/agent_jobs.zig`): `job_trust.judge_run` takes the run record's
@@ -458,6 +461,12 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
 
 ## Known limits
 
+- **A restart under a live lease does not register again** (found in B5 slice 2). The agent renews
+  its remembered lease and keeps its tenure, so `/nodes/<node>` keeps the first registration's
+  `agent_version`, `capacity` and `trust_policy` until the lease ends and the agent registers
+  afresh. A changed `--trust-policy` is enforced at once; only what `zcube why node` reports lags.
+  Registering again would move the tenure (the node record's revision), which fencing and job
+  claims compare, so the fix is a decision for the owner, not this slice.
 - **A whole call is bounded, connect included; Linux only.** The standard library's threaded `Io`
   panics if `connect` is given a timeout on POSIX, so `agent_http.zig` opens a non-blocking socket
   itself (`std.os.linux`), `poll`s it for the connection until the call's end, and hands the

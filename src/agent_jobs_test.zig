@@ -1769,7 +1769,9 @@ const TrustCase = struct {
 };
 
 fn expect_refused(case: *TrustCase) !void {
-    try testing.expectEqual(@as(u32, 0), starts_seen);
+    // A plain check, not `expectEqual`: the teeth test expects this to fail, and `expectEqual`
+    // would print its miss to stderr.
+    if (starts_seen != 0) return error.TestUnexpectedResult;
     try testing.expect(!case.rig.running());
     const seen = (try case.rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
