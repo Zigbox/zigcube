@@ -25,4 +25,4 @@ the seeds per simulator of 24 hours at the 1-worker size (the numbers above), on
 commit. A hardening-only release may still be waived in writing, as b2 was.
 
 Related: `2026-11-04-c2-ships-without-fleet-soak.md`, `2026-11-07-b1-ships-without-fleet-soak.md`,
-`docs/retros/` (b2).
+`docs/retros/b2.md`.
