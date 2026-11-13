@@ -1873,6 +1873,15 @@ test "C3: history and rollout records encode and read back" {
     try testing.expectEqual(RolloutPhase.progressing, rollout_back.phase);
     try testing.expectEqual(@as(u32, 1), rollout_back.budget.start);
     try testing.expectEqual(@as(u32, 2), rollout_back.budget.retire_unready);
+    // A budget written before `retire_unready` existed (docs/keys.md's first example) reads as 0.
+    const rollout_old =
+        \\{"v":1,"service":"hello","service_created":40,"from":6,"to":7,"phase":"progressing",
+        \\"started_at_ms":10,"deadline_at_ms":600010,"budget":{"start":1,"retire":0},
+        \\"cause_decision":"0000000000000001-0000"}
+    ;
+    const rollout_old_back = try read(Rollout, arena, kv_of("/rollouts/hello", rollout_old), &diag);
+    try testing.expectEqual(@as(u32, 1), rollout_old_back.budget.start);
+    try testing.expectEqual(@as(u32, 0), rollout_old_back.budget.retire_unready);
     // A rollout belongs to one incarnation of its service: not to one created again, nor to none.
     try testing.expect(rollout_of(&rollout_back, 40));
     try testing.expect(!rollout_of(&rollout_back, 41));
