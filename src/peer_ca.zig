@@ -141,6 +141,25 @@ pub const Ca = struct {
         assert(out.slice().len <= constants.x509_cert_bytes_max);
     }
 
+    /// A relayed run's certificate (B4): `spiffe://<cluster>/job/<name>`, for exactly the
+    /// lifetime `job_cert.decide` gave. Same key rule as the workload's.
+    pub fn issue_job_certificate(
+        ca: *const Ca,
+        out: *x509.Der,
+        request: *const JobArgs,
+    ) CertificateError!void {
+        try ca.check_leaf_key(request.subject_key);
+        try x509.issue_workload(out, ca.key, &.{
+            .cluster = request.cluster,
+            .path = .job,
+            .name = request.name,
+            .subject_key = request.subject_key,
+            .identity = request.identity,
+            .lifetime = request.lifetime,
+        });
+        assert(out.slice().len <= constants.x509_cert_bytes_max);
+    }
+
     /// A server certificate for the DNS name `request.dns_name`, valid from now for
     /// `request.ttl_ms` (at most `x509_leaf_ttl_ms_max`). Same key rule as the workload's.
     pub fn issue_server_certificate(
@@ -190,6 +209,14 @@ pub const WorkloadArgs = struct {
     subject_key: [32]u8,
     identity: x509_identity.Identity,
     ttl_ms: u64,
+};
+
+pub const JobArgs = struct {
+    cluster: []const u8,
+    name: []const u8,
+    subject_key: [32]u8,
+    identity: x509_identity.Identity,
+    lifetime: x509.Lifetime,
 };
 
 pub const ServerArgs = struct {

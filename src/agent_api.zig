@@ -56,6 +56,8 @@ const text_util = @import("text.zig");
 const Context = controller.Context;
 const peer = @import("peer.zig");
 const peer_ca = @import("peer_ca.zig");
+const job_cert = @import("job_cert.zig");
+const x509 = @import("x509.zig");
 
 /// The route failed and `ctx.diag` says why. Same set as `api.zig`'s, so `try` passes it up.
 pub const Failure = error{Failed};
@@ -94,6 +96,9 @@ pub fn body_bytes_max(path: []const u8) u32 {
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse
         return constants.agent_request_bytes_max;
     if (std.mem.eql(u8, rest[slash..], "/credential")) return constants.peer_join_request_bytes_max;
+    if (std.mem.endsWith(u8, rest[slash..], "/certificate")) {
+        return constants.peer_join_request_bytes_max;
+    }
     if (!std.mem.eql(u8, rest[slash..], "/store")) return constants.agent_request_bytes_max;
     return constants.summary_request_bytes_max;
 }
@@ -107,7 +112,7 @@ pub fn route(
     hold: bool,
     lease_ttl_ms: u32,
     pair_kept: bool,
-    ca: ?*const peer_ca.Ca,
+    issuer: Issuer,
 ) Failure!Reply {
     assert(ctx.diag.code == null);
     const nodes = parts.next() orelse return no_such(ctx, "/v1/agent");
@@ -127,7 +132,8 @@ pub fn route(
         .pair_kept = pair_kept,
         .parts = parts,
         .lease_ttl_ms = lease_ttl_ms,
-        .ca = ca,
+        .ca = issuer.ca,
+        .cluster = issuer.cluster,
     };
     const what = parts.next() orelse return call.register();
     if (std.mem.eql(u8, what, "lease")) return call.lease();
@@ -143,6 +149,13 @@ pub fn route(
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
 
+/// What signs certificates: the cluster CA (null in the simulation, which has no peers: the
+/// endpoints that sign then answer 404) and the trust domain a run's certificate names.
+pub const Issuer = struct {
+    ca: ?*const peer_ca.Ca = null,
+    cluster: []const u8 = "",
+};
+
 const Call = struct {
     ctx: *const Context,
     node: []const u8,
@@ -156,6 +169,8 @@ const Call = struct {
     lease_ttl_ms: u32,
     /// The cluster CA, null where the server has none (the simulation).
     ca: ?*const peer_ca.Ca,
+    /// The trust domain of a relayed run's certificate; empty where no relay checks its upstream.
+    cluster: []const u8,
 
     fn require_method(call: Call, wanted: []const u8) Failure!void {
         if (std.mem.eql(u8, call.method, wanted)) return;
@@ -406,6 +421,11 @@ const Call = struct {
     /// is assigned to and once that node has claimed it.
     fn runs(call: Call) Failure!Reply {
         const ctx = call.ctx;
+        if (std.mem.eql(u8, call.method, "POST")) {
+            try call.only_known();
+            const name = call.parts.next() orelse return no_such(ctx, "that path");
+            return call.run_certificate(name);
+        }
         try call.require_method("GET");
         try call.only_known();
         if (call.parts.next()) |name| return call.run_input(name);
@@ -489,6 +509,107 @@ const Call = struct {
         };
         const pair = try call.chain();
         return reply(ctx, .{ .input = input, .chain = pair });
+    }
+
+    // ---- POST /v1/agent/nodes/{node}/runs/{name}/certificate (B4) ----
+
+    /// Signs a relayed run's key: `spiffe://<cluster>/job/<name>`, the image digest, placement
+    /// epoch and labels, valid until the run's last legitimate moment. `job_cert.decide` says
+    /// whether this node may have it; a refusal is ZC-E0706. Not authenticated beyond that claim
+    /// check until B7 (docs/mtls.md, threat list).
+    fn run_certificate(call: Call, name: []const u8) Failure!Reply {
+        const ctx = call.ctx;
+        const tail = call.parts.next() orelse return no_such(ctx, "that path");
+        if (!std.mem.eql(u8, tail, "certificate")) return no_such(ctx, "that path");
+        try call.no_more();
+        if (records.name_problem(name, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "name", "is not a valid job name");
+        }
+        const ca = call.ca orelse return no_such(ctx, "a run's certificate: this server has no CA");
+        if (call.cluster.len == 0) {
+            return no_such(ctx, "a run's certificate: this server names no cluster");
+        }
+        const limits: BodyLimits = .{
+            .bytes_max = constants.peer_join_request_bytes_max,
+            .ignore_unknown_fields = false,
+        };
+        const input = try parse_body_up_to(CertificateBody, ctx, call.body, limits);
+        const subject_key = try hex32(ctx, "public_key", input.public_key);
+        const digest = try hex32(ctx, "image_digest", input.image_digest);
+        if (input.epoch == 0) return bad_request(ctx, "epoch", "must not be 0");
+        const now_ms = ca.wall.now_ms();
+        const subject = try call.certificate_subject(name, .{
+            .node = call.node,
+            .epoch = input.epoch,
+            .image_digest = digest,
+            .now_ms = now_ms,
+        });
+        var der: x509.Der = undefined;
+        ca.issue_job_certificate(&der, &.{
+            .cluster = call.cluster,
+            .name = subject.name,
+            .subject_key = subject_key,
+            .identity = subject.identity_of(),
+            .lifetime = subject.lifetime,
+        }) catch |err| switch (err) {
+            error.BadKey => return bad_request(ctx, "public_key", "is not an Ed25519 public key"),
+            else => {
+                ctx.diag.raise(peer_ca.code_of(err));
+                ctx.diag.cause("the certificate for job {s} could not be made: {s}", .{
+                    name, peer_ca.reason(err),
+                });
+                return error.Failed;
+            },
+        };
+        return reply(ctx, .{
+            .certificate = std.fmt.allocPrint(ctx.arena, "{x}", .{der.slice()}) catch
+                return no_memory(ctx),
+            .not_before_ms = subject.lifetime.not_before_ms,
+            .not_after_ms = subject.lifetime.not_after_ms,
+        });
+    }
+
+    /// The job, its status, this node's claim and the run's assignment, read at one revision,
+    /// and `job_cert.decide` over them.
+    fn certificate_subject(
+        call: Call,
+        name: []const u8,
+        ask: job_cert.Ask,
+    ) Failure!job_cert.Subject {
+        const ctx = call.ctx;
+        var id_buffer: [constants.job_run_id_bytes_max]u8 = undefined;
+        const id = records.job_run_id(&id_buffer, name);
+        const job_key = records.job_key(name);
+        const status_key = records.job_status_key(name);
+        const claim_key = records.job_observed_key(call.node, name);
+        const assigned_key = records.assigned_key(call.node, id);
+        const keys = [_][]const u8{
+            job_key.slice(), status_key.slice(), claim_key.slice(), assigned_key.slice(),
+        };
+        const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
+        var found: [keys.len]store.GetResult = undefined;
+        for (keys, &found) |key, *slot| {
+            slot.* = ctx.store.get(ctx.arena, key, head.revision, ctx.diag) catch
+                return propagate(ctx);
+        }
+        const job_kv = found[0].kv orelse return refused_certificate(ctx, name, error.run_ended);
+        const job = records.read(records.Job, ctx.arena, job_kv, ctx.diag) catch
+            return propagate(ctx);
+        const status: records.JobStatus = if (found[1].kv) |kv|
+            records.read(records.JobStatus, ctx.arena, kv, ctx.diag) catch return propagate(ctx)
+        else
+            return refused_certificate(ctx, name, error.no_claim);
+        const claim: ?records.JobObserved = if (found[2].kv) |kv|
+            records.read(records.JobObserved, ctx.arena, kv, ctx.diag) catch
+                return propagate(ctx)
+        else
+            null;
+        const assignment: ?job_cert.Assignment = if (found[3].kv) |kv|
+            .{ .node = call.node, .epoch = kv.mod_revision }
+        else
+            null;
+        return job_cert.decide(job, status, claim, assignment, ask) catch |refusal|
+            refused_certificate(ctx, name, refusal);
     }
 
     // ---- POST /v1/agent/nodes/{node}/job-observed ----
@@ -926,6 +1047,17 @@ const RegisterBody = struct {
 
 const CredentialBody = struct { node_key: []const u8, lease: u64 };
 
+/// A relayed run's key, the epoch its node holds and the image digest it runs, 64 hex digits each.
+const CertificateBody = struct { public_key: []const u8, epoch: u64, image_digest: []const u8 };
+
+fn hex32(ctx: *const Context, field: []const u8, text: []const u8) Failure![32]u8 {
+    var bytes: [32]u8 = undefined;
+    if (text.len != 64) return bad_request(ctx, field, "is not 64 hex digits");
+    const problem = "is not 64 hex digits";
+    _ = std.fmt.hexToBytes(&bytes, text) catch return bad_request(ctx, field, problem);
+    return bytes;
+}
+
 const LeaseBody = struct { ttl_ms: u32 = 0 };
 
 const JobObservedBody = struct {
@@ -1170,6 +1302,17 @@ fn no_such(ctx: *const Context, path: []const u8) Failure {
     ctx.diag.raise(.E0101);
     ctx.diag.cause("the API serves nothing at {s}", .{path});
     ctx.diag.fix(.{ .sentence = "the agent's endpoints are under /v1/agent/nodes/{node}/" });
+    return error.Failed;
+}
+
+/// ZC-E0706: the server will not sign this run's key; the cause is `job_cert.reason`.
+fn refused_certificate(ctx: *const Context, name: []const u8, refusal: job_cert.Refusal) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0706);
+    ctx.diag.cause("the server refused a certificate for job {s}: {s}", .{
+        name, job_cert.reason(refusal),
+    });
+    ctx.diag.fix(.{ .sentence = "none needed if the run lost its claim" });
     return error.Failed;
 }
 
