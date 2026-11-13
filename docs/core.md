@@ -350,6 +350,21 @@ its `  step:` line; the fleet's parser ignores them. The `auto` range summary re
 (`docs/decisions/2026-11-06-renewal-before-fence.md`). Every draw has its
 own generator (the seed xor a salt); the
 decision is `docs/decisions/2026-11-04-fleet-profiles-and-shapes.md`.
+**Coverage (C3 fleet 5).** A passing report ends, after `world hash`, in `coverage:` lines, one
+per group, each `name=count`: `check.<id>` (checks evaluated through `check()`, by the id before
+its `:`, `c0` for the C0 checks; `check.revision`, `check.job_*_judged` and the like for the
+per-revision and job checks), `fault.*` (crashes, wipes, partitions, outages, suspends, runtime
+faults, server restarts, lost acks, dropped, lost, duplicated, parked and late messages), `op.*`
+(operations drawn), and `path.*` (decisions by action, fences, failed calls, nodes and replicas
+lost, jobs created, cancelled and ended, a full ledger, refused reports, watch relists and
+restarts, relays opened). The counters only read what the world already does: they add no draw
+and change no earlier line, so the report without them is a prefix of the report with them, and
+native and WASM still compare equal (`zig build sim-cluster`, `sim-c1`). At most 128 names; more
+print `coverage: dropped=N`. A failing report prints none. `--seeds` prints, before its summary,
+one line per profile run, `coverage: profile=P seeds=N name=R ...`, R the seeds that reached the
+name; `sim_fleet coverage` keeps those per commit and `sim_fleet bias` steers the fleet toward the
+least reached (`ops/sim-fleet/README.md`, item 6; the decision is
+`docs/decisions/2026-11-13-coverage-feedback.md`).
 **Crashes:** the range form flushes each failing seed's report as it is printed, so a later seed
 that panics loses no earlier one. `--trace-steps` (either form) writes `step: <name>` to stderr,
 unbuffered, as the run enters each step (`faults`, `healed`, `convergence`, `end`), so the step a

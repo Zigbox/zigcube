@@ -44,11 +44,13 @@ const shell_allowlist = [_][]const u8{
     // calls `zig build` and pipes `sim_cluster` into `sim_fleet`; the logic is Zig.
     "ops/sim-fleet/setup.sh",
     "ops/sim-fleet/run.sh",
-    // Both source run.sh to test its shell functions, which only a shell can call:
+    // Each sources run.sh to test its shell functions, which only a shell can call:
     // `test-canary.sh` runs its canary cycle against fake fault-on runners and the built
-    // `sim_fleet`, and `test-crash-record.sh` feeds its crash records to `sim_fleet`.
+    // `sim_fleet`, `test-crash-record.sh` feeds its crash records to `sim_fleet`, and
+    // `test-bias.sh` runs its coverage feedback (bias_pick) against a fake `sim_cluster`.
     "ops/sim-fleet/test-canary.sh",
     "ops/sim-fleet/test-crash-record.sh",
+    "ops/sim-fleet/test-bias.sh",
     // Runs demo-b3's guest.sh (a shell script already, below) against fake state directories.
     "ops/demo-b3/test-guest.sh",
     // The demo's three-node start, stop and kill (c1-7 brief): a handful of long-lived processes

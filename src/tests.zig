@@ -29,7 +29,6 @@ test {
     _ = @import("sim_fleet_issue.zig");
     _ = @import("sim_fleet_state.zig");
     _ = @import("sim_fleet_github.zig");
-    _ = @import("sim_fleet_coverage.zig");
     _ = @import("fake_files.zig");
     _ = @import("fake_runtime.zig");
     _ = @import("fake_supervisor.zig");
@@ -74,6 +73,7 @@ test {
 
 test {
     _ = @import("cli_test.zig");
+    _ = @import("sim_fleet_coverage.zig");
     _ = @import("tidy.zig");
 }
 

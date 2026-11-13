@@ -258,6 +258,7 @@ test "a full table drops new names and keeps counting old ones" {
     var table: Table = .{};
     var buffer: [16]u8 = undefined;
     for (0..names_max) |index| {
+        // 16 bytes hold "n.0127": the format cannot run out of room.
         table.add(std.fmt.bufPrint(&buffer, "n.{d:0>4}", .{index}) catch unreachable, 1);
     }
     table.add("n.new", 1);

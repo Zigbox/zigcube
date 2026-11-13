@@ -367,22 +367,32 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         }) catch return constants.exit_environment;
         return constants.exit_ok;
     }
-    reach.print(out) catch return constants.exit_environment;
+    print_range_summary(out, parsed, reach, failures) catch return constants.exit_environment;
+    if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
+    return if (failures == 0) constants.exit_ok else constants.exit_user;
+}
+
+/// The coverage of each profile the range ran, then the summary line the fleet's parser reads.
+fn print_range_summary(
+    out: *std.Io.Writer,
+    parsed: *const Args,
+    reach: *const sim_coverage.Reach,
+    failures: u64,
+) !void {
+    try reach.print(out);
     const total = parsed.last_seed - parsed.first_seed + 1;
     // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
     const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";
     if (parsed.operations) |operations| {
-        out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
+        try out.print("{s}: seeds {d}..{d}, {d} operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, operations, failures, total,
-        }) catch return constants.exit_environment;
+        });
     } else {
         // Not the fixed form above: the fleet's parser reads the drawn form separately.
-        out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
+        try out.print("{s}: seeds {d}..{d}, drawn operations: {d} of {d} failed\n", .{
             run_name, parsed.first_seed, parsed.last_seed, failures, total,
-        }) catch return constants.exit_environment;
+        });
     }
-    if (parsed.expect_fail) return if (failures > 0) constants.exit_ok else constants.exit_user;
-    return if (failures == 0) constants.exit_ok else constants.exit_user;
 }
 
 fn report_failure(

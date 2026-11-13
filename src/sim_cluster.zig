@@ -938,11 +938,7 @@ pub const Cluster = struct {
         c.init_trackers();
         c.second_ms = 0;
         c.check_ms = 0;
-        c.stats = .{};
-        c.check_ids = .{};
-        c.ops_drawn = @splat(0);
-        c.decision_actions = .{};
-        c.fault_totals = null;
+        c.init_counts();
         c.step = "faults";
         c.on_step = null;
         c.liveness = true;
@@ -961,6 +957,15 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The run's tallies and coverage counters start at zero.
+    fn init_counts(c: *Cluster) void {
+        c.stats = .{};
+        c.check_ids = .{};
+        c.ops_drawn = @splat(0);
+        c.decision_actions = .{};
+        c.fault_totals = null;
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -2113,7 +2118,7 @@ fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
     const op = pick_op(&c.swarm, random, c.fault_totals == null);
-    c.ops_drawn[@intFromEnum(op)] += 1;
+    c.ops_drawn[@backingInt(op)] += 1;
     switch (op) {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
@@ -3506,7 +3511,7 @@ fn record_coverage(c: *Cluster) void {
     const t = &c.report.coverage;
     c.check_ids.add_to(t);
     for (c.ops_drawn, 0..) |count, index| {
-        t.add_joined("op.", @tagName(@as(Op, @enumFromInt(index))), count);
+        t.add_joined("op.", @tagName(@as(Op, @fromBackingInt(@intCast(index)))), count);
     }
     c.decision_actions.add_to(t);
     const s = c.stats;
