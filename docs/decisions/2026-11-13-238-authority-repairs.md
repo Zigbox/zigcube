@@ -106,9 +106,27 @@ runs, which is late by the stall itself; a stall longer than the margin is the w
 authority.md §3. The model's other suggestion, a KILL timer that does not wait for a reconcile
 step, was not part of (a) and is not built.
 
+## Two teeth whose worlds moved
+
+The registration now writes one more key, and the fence falls 1 s earlier. Together these shift
+every simulated world, so two of `sim-c1-teeth`'s pinned seeds moved. The checks did not change.
+
+- **`job_stale`.** With the fault on, a run fails J9 (a stale report stored) or J10 at rest (the
+  tooth's plain symptom) first. Seed 1 was a J9 world, and now it fails J10. Over seeds 1 to 80,
+  J9 shows first on 26 seeds on the base commit and on 28 here, and no seed passes on either. The
+  tooth bites as before. Its run now sets `any_symptom`, as the skew tooth does: seeds that fail
+  otherwise are skipped, and J9 must still show on some seed in 1..10 (seed 5 here).
+- **`job_evicted`.** This sparse tooth no longer fires at seed 186
+  (`2026-11-11-job-evicted-tooth-sparse.md`). On this branch, seeds 1 to 47 pass with the fault
+  on, and seed 48 is the first hit ("J8: a run that no node started..."). With the fault off
+  (`sim_c1_evict_world_main`), seed 48 passes. The supervisor asked this branch **not** to
+  re-pin it: the fleet-blockers branch (#225) moves the same tooth and lands first, and the
+  supervisor reconciles the seed after both land. So `build.zig` still names 186, and
+  `sim-c1-teeth` fails at `job_evicted` alone on this branch.
+
 Where: docs/authority.md §2 and §3, docs/keys.md (`/node-tenure/<node>`), src/constants.zig,
 src/fencing.zig, src/agent.zig (`kill_now`), src/node_controller.zig, src/replica_controller.zig,
 src/controller.zig (`newer_tenure`), src/agent_api.zig (`register`), docs/demos/c1.md, and the
 ttl of 9,000 ms in src/sim_shape.zig, src/server_config.zig, the demo-c1 sources, the E0121
 text and testdata, and the regression lines in build.zig and src/sim_cluster_main.zig whose
-ttls (8,516 and 8,799 ms) the new bound refuses.
+ttls (8,516 and 8,799 ms) the new bound refuses, and the `job_stale` tooth's run (above).
