@@ -107,6 +107,7 @@ comptime {
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");
     _ = @import("job_api.zig");
+    _ = @import("job_cert.zig");
 }
 
 test {

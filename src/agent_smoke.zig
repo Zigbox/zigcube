@@ -763,6 +763,8 @@ fn connectable(port: u16) bool {
 }
 
 const relay_job_name = "relayed";
+/// A relayed job's image is a full digest (B4); `fixtures/images.zon` lists this one.
+const full_image = "b3:51aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c0351aa9c03";
 
 const relay_job_exited = struct {
     fn check(s: *Smoke) !bool {
@@ -785,10 +787,10 @@ fn step_relay_job(smoke: *Smoke) !void {
     ) catch return error.OutOfMemory;
     const body = try std.fmt.allocPrint(
         arena,
-        "{{\"name\":\"{s}\",\"image\":\"b3:51aa9c03\",\"deadline_ms\":60000," ++
+        "{{\"name\":\"{s}\",\"image\":\"{s}\",\"deadline_ms\":60000," ++
             "\"submit_by_ms\":{d},\"relay\":\"echo\"," ++
             "\"command\":[\"bash\",\"-c\",\"{s}\"]}}",
-        .{ relay_job_name, stamp + 60_000, script_text },
+        .{ relay_job_name, full_image, stamp + 60_000, script_text },
     );
     const reply = try smoke.call("POST", "/v1/jobs", body);
     try smoke.expect(reply.status == 201, "POST /v1/jobs (relay) answered {d}: {s}", .{

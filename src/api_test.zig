@@ -1178,12 +1178,15 @@ test "the jobs watch decodes statuses, filters by label and refuses the name wat
 }
 
 /// A job body with the given extra members (JSON text, starting with a comma or empty).
+const relay_image = "b3:" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++
+    "51aa9c03" ++ "51aa9c03" ++ "51aa9c03" ++ "51aa9c03";
+
 fn relay_body(rig: *Rig, name: []const u8, extra: []const u8) ![]const u8 {
     return std.fmt.allocPrint(rig.parsed.allocator(),
-        \\{{"name":"{s}","image":"b3:51aa9c03","command":["true"],"deadline_ms":60000,
+        \\{{"name":"{s}","image":"{s}","command":["true"],"deadline_ms":60000,
     ++
         \\"submit_by_ms":{d}{s}}}
-    , .{ name, rig.world.now_ms() + 30_000, extra });
+    , .{ name, relay_image, rig.world.now_ms() + 30_000, extra });
 }
 
 test "a job names a relay the server configures; any other name or an env override is refused" {

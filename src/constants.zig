@@ -987,6 +987,10 @@ pub const job_limit_pids_max: u32 = 4_194_304;
 /// creation) ends `failed deadline`. A job with no deadline is a service, so 0 is refused.
 pub const job_deadline_ms_max: u64 = 24 * 60 * 60 * 1000;
 pub const job_grace_ms_max: u32 = 60 * 1000;
+/// A run's certificate (docs/briefs/b4.md) expires this long after the run's deadline and grace
+/// have passed, so a job that runs to its deadline still holds a valid certificate while it is
+/// stopped.
+pub const workload_cert_slack_ms: u64 = 60 * 1000;
 /// `submit_by_ms` may be at most this far ahead of the server's clock at receipt, and a retained
 /// ended job is never younger than `job_finished_age_ms_min` when deleted, so a retried POST
 /// inside the window finds the job it created.
@@ -1041,6 +1045,8 @@ comptime {
     assert(job_run_id_bytes_max <= 63);
     assert(job_deadline_ms_max <= x509_leaf_ttl_ms_max); // A leaf of a job outlives its deadline.
     assert(job_grace_ms_max <= job_deadline_ms_max);
+    // The longest run certificate: start, deadline, grace and slack, under the leaf bound.
+    assert(job_deadline_ms_max + job_grace_ms_max + workload_cert_slack_ms < x509_leaf_ttl_ms_max);
     assert(job_submit_window_ms_max <= job_finished_age_ms_min);
     assert(job_finished_age_ms_min <= job_finished_age_ms_max);
     // 73 h: the start backstop, the deadline, retention and an hour's submit window.

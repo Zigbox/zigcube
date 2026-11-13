@@ -106,11 +106,24 @@ fn damage(random: std.Random, buffer: *[buffer_bytes]u8, length: usize) usize {
     return size;
 }
 
+/// A run's certificate under a name of random length and bytes from the job-name alphabet (the
+/// first and last byte are never '-'), so `/job/` names of every shape reach the damage below.
+fn make_job(random: std.Random, out: *x509.Der) !void {
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-";
+    var name: [constants.node_name_bytes_max]u8 = undefined;
+    const length = random.intRangeAtMost(usize, 1, name.len);
+    for (name[0..length]) |*byte| byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+    name[0] = alphabet[random.uintLessThan(usize, 26)];
+    name[length - 1] = alphabet[random.uintLessThan(usize, 26)];
+    const request = t.job_request(try t.subject_key(1), name[0..length]);
+    try x509.issue_workload(out, try t.ca_pair(), &request);
+}
+
 fn good_certificate(random: std.Random, out: *x509.Der) !x509.Kind {
     const kind = random.enumValue(x509.Kind);
     switch (kind) {
         .ca => try t.make_ca(out),
-        .workload => try t.make_workload(out),
+        .workload => if (random.boolean()) try t.make_workload(out) else try make_job(random, out),
         .server => try t.make_server(out),
     }
     return kind;
