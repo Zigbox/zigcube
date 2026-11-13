@@ -1193,10 +1193,11 @@ pub const registry = [_]Entry{
         \\registration that has since ended or been replaced, because the lease
         \\ran out or another registration took its place. Nothing was written.
         \\
-        \\A registration names the tenure it replaces, and is refused the same way
-        \\when the node has been registered since: an earlier attempt that arrives
-        \\late must not take the node back onto a lease nobody renews (#237). The
-        \\agent grants a new lease and tries again once the old one has ended.
+        \\A registration is refused the same way when the node's key is already on
+        \\a newer lease: it is an earlier attempt that arrived late, and it must
+        \\not take the node back onto a lease nobody renews (#237). The agent's
+        \\next attempt carries a newer lease and is accepted at once; there is
+        \\nothing to wait for.
         \\
         \\The agent stops its containers, registers again and reports from the
         \\new tenure. Nothing needs doing unless this repeats: then two agents

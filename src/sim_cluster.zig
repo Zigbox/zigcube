@@ -3396,6 +3396,13 @@ fn print_net(c: *Cluster) void {
     report.print("late_registrations={d} landed={d}\n", .{
         total.late_registrations, total.late_registrations_landed,
     });
+    // A late-registration run that delivered none tests nothing (the parked body no longer
+    // parses, say): fail it here, at the cause, instead of passing vacuously.
+    if (c.net.late_registration and !report.failed and total.late_registrations == 0) {
+        report.failed = true;
+        report.print("FAILED: no late registration was delivered (seed {d})\n", .{c.seed});
+        report.print("step: late registration\n", .{});
+    }
 }
 
 fn print_summary(c: *Cluster) void {

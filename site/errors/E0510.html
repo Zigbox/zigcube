@@ -77,7 +77,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
 <p>An agent writes what it observed only while it holds tenure on its node: while the node's registration is the one it made. This write named a registration that has since ended or been replaced, because the lease ran out or another registration took its place. Nothing was written.</p>
-<p>A registration names the tenure it replaces, and is refused the same way when the node has been registered since: an earlier attempt that arrives late must not take the node back onto a lease nobody renews (#237). The agent grants a new lease and tries again once the old one has ended.</p>
+<p>A registration is refused the same way when the node's key is already on a newer lease: it is an earlier attempt that arrived late, and it must not take the node back onto a lease nobody renews (#237). The agent's next attempt carries a newer lease and is accepted at once; there is nothing to wait for.</p>
 <p>The agent stops its containers, registers again and reports from the new tenure. Nothing needs doing unless this repeats: then two agents may be using one node name, or the agent is cut off for longer than the lease time to live.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

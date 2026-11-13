@@ -33,11 +33,12 @@ elsewhere (I1b).
    recorded is stale for its next compare; it is accepted by the rule, and a keepalive does not
    compare revisions. Not closed here: a late PUT that finds the key absent is accepted.
 4. **The agent keeps its tenure past a fence.** `fenced()` rewrites `lease.json` with no lease
-   and the last tenure, instead of removing it, and a restart reads the tenure back. A restart
-   after a fence therefore registers with the tenure the key still has, and is not refused until
-   the old lease expires. (Within one process the tenure is kept in memory whatever the file says;
-   across a restart only the file carries it.) A state directory that was wiped names 0 and is
-   accepted too, by rule 3.
+   and the last tenure, instead of removing it, and a restart reads the tenure back. This is not
+   needed for acceptance: a restart's registration carries a newer lease than the key's and is
+   accepted by rule 3 whatever tenure it names (a wiped state directory names 0 and is accepted
+   the same way). Keeping the tenure only lets the restart's compare name the key's revision.
+   (Within one process the tenure is kept in memory whatever the file says; across a restart only
+   the file carries it.) It is not load-bearing.
 
 ## Mixed versions
 
@@ -59,9 +60,14 @@ the agent quiet or cut off: I1b. The model draws nothing from the seed and is of
 tooth). Measured: 22 of seeds 1..40 fail I1b (100 operations, `--c1`); the others end in a
 liveness failure (`agents kept fencing`, `a running replica was never reported`), which the
 canary does not accept. The canary expects I1b over 40 seeds (a miss at p = 0.5 is 9e-13). The
-tooth skips both the compare and the keepalive check, so it shows that the pair is needed, not
-that the compare alone is. `sim-c1-late` runs the same world with the fix on: seeds 1..40 pass,
-every stale registration is refused.
+tooth skips both the compare and the keepalive check. Measured at 9c1358d over the same seeds of
+the late-registration world, patching out each half in turn: with the compare skipped (keepalive
+check kept), 40 of 40 seeds fail (19 with I1b); with the keepalive check skipped (compare kept),
+0 of 40 fail. So the compare alone fixes #237, and no simulation exercises the keepalive check:
+its only coverage is the unit test in `agent_api_test.zig`, and its purpose is to limit an old
+agent that sends no `replaces`. Weakening it leaves the tooth and `sim-c1-late` green.
+`sim-c1-late` runs the same world with the fix on: seeds 1..40 pass, every stale registration
+is refused, and a seed in which no late registration was delivered fails.
 
 ## Old replay worlds
 

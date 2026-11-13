@@ -340,8 +340,9 @@ test "lease: revoke frees its keys in one revision and reports it; unknown lease
 
 test "lease: ids only grow, revoked or reaped ones included (#237)" {
     // Goal: the registration compare (docs/authority.md) takes a lease with a smaller id for an
-    // earlier attempt, so no backend may reuse or lower an id. Method: grant, revoke, let one run
-    // out, grant again: every id is larger than every earlier one.
+    // earlier attempt, so no backend may reuse or lower an id. Method: grant, revoke one, let
+    // another run out and reap it with `expire_leases`, grant again: every id is larger than
+    // every earlier one.
     const harness = try Harness.start();
     defer harness.stop();
     errdefer harness.report_seed();
@@ -352,6 +353,7 @@ test "lease: ids only grow, revoked or reaped ones included (#237)" {
     const second = try s.lease_grant(1000, &diag);
     _ = try s.lease_revoke(second.id, &diag);
     harness.manual.advance(1500);
+    try testing.expectEqual(@as(u32, 1), try s.expire_leases(&diag));
     const third = try s.lease_grant(1000, &diag);
     try testing.expect(second.id > first.id);
     try testing.expect(third.id > second.id);

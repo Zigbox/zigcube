@@ -226,9 +226,15 @@ finds another revision, on a newer lease, and is refused (ZC-E0510); without the
 its own lease, which nobody renews, and the node would be lost while its agent still ran its
 replicas (I1b). A key on the registration's own or an older lease was written by the agent's own
 earlier attempt (a lost reply, a crash before it recorded the tenure), and the retry is accepted:
-the compare refuses only a registration older than the key's lease. **Lease ids only grow** (a
-store requirement: SQLite `AUTOINCREMENT`, a Postgres identity column, the memory counter) and a
-registration's lease is granted before it is sent. The lease keepalive requires that the node's key is on the lease it
+the compare refuses only a registration older than the key's lease. **Lease ids only grow
+within one store's history** (SQLite `AUTOINCREMENT`, a Postgres identity column, the memory
+counter; the conformance test checks one store process) and a registration's lease is granted
+before it is sent. That does not hold through an async failover that loses only lease grants
+(`VerifiedStore` sees no revision or chain-hash change, so ZC-E0215 does not halt it, and the
+promoted standby reissues those ids) nor after an operator accepts a rollback. It does not reach
+I1b: a registration in flight across such a failover is narrow, and if one lands on a reissued id
+it moves its node's key onto another node's lease, but the agent's next attempt grants a newer id
+and is accepted, which replaces the key. The bound is the agent's next step. The lease keepalive requires that the node's key is on the lease it
 renews, so an agent whose registration was overtaken stops renewing at once and fences (ZC-E0205).
 An older agent sends no `replaces` and is not compared; only the keepalive rule limits it.
 `docs/decisions/2026-11-13-register-tenure.md`.
