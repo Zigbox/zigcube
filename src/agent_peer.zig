@@ -2,11 +2,12 @@
 //! Shell code: it reads and writes the state directory and calls the server over the agent's
 //! transport.
 //!
-//! Three files in the state directory, all mode 0600: `peer.key` (the node's Ed25519 seed, made on
-//! the first run), `peer.cred` (the credential the CA signed, in hex) and `ca.pub` (the CA's public
-//! key, in hex). `step` joins when there is no valid pair and renews at half the credential's
-//! life, through `POST /v1/agent/nodes/{node}/credential`. A join that fails never stops the
-//! agent: replicas run on, and it is tried again after `peer_join_retry_ms`. Time is the node's
+//! Four files in the state directory, all mode 0600: `peer.key` (the node's Ed25519 seed, made on
+//! the first run), `peer.cred` (the credential the CA signed, in hex), `node.crt` (the node
+//! certificate over the same key, PEM, B7) and `ca.pub` (the CA's public key, in hex). `step`
+//! joins when there is no valid set and renews at half the credential's life, through
+//! `POST /v1/agent/nodes/{node}/credential`. A join that fails never stops the agent: replicas
+//! run on, and it is tried again after `peer_join_retry_ms`. Time is the node's
 //! wall clock, passed in.
 
 const std = @import("std");
@@ -18,6 +19,10 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("peer_files.zig");
 const peer = @import("peer.zig");
+const peer_ca = @import("peer_ca.zig");
+const pem = @import("pem.zig");
+const x509 = @import("x509.zig");
+const x509_identity = @import("x509_identity.zig");
 const codes = @import("diag/codes.zig");
 
 const Allocator = std.mem.Allocator;
@@ -26,6 +31,8 @@ const Diag = diag_mod.Diag;
 pub const key_file = "peer.key";
 pub const credential_file = "peer.cred";
 pub const ca_file = "ca.pub";
+/// The node certificate (B7), PEM: the same key and life as `peer.cred`, for the API's TLS.
+pub const node_certificate_file = "node.crt";
 
 pub const Error = files.Error || error{Canceled};
 
@@ -38,6 +45,8 @@ pub const Peer = struct {
     key: Ed25519.KeyPair,
     credential: ?peer.Credential = null,
     ca_public: ?[32]u8 = null,
+    /// Present exactly when `credential` is: the two are issued, stored and dropped together.
+    node_certificate: ?x509.Der = null,
     /// Wall-clock time at which the credential is renewed; 0 when there is none to keep.
     renew_at_ms: u64 = 0,
     /// A failed join is not tried again before this wall-clock time.
@@ -77,6 +86,7 @@ pub const Peer = struct {
             opened.stored_problem = true;
             opened.credential = null;
             opened.ca_public = null;
+            opened.node_certificate = null;
             opened.renew_at_ms = 0;
         };
         return opened;
@@ -94,6 +104,7 @@ pub const Peer = struct {
         if (std.mem.eql(u8, &credential.ca_key_id, &id)) return false;
         self.credential = null;
         self.ca_public = null;
+        self.node_certificate = null;
         self.renew_at_ms = 0;
         self.retry_at_ms = 0;
         return true;
@@ -168,8 +179,10 @@ pub const Peer = struct {
         if (!std.mem.eql(u8, &issued.credential.node_key, &public)) {
             return bad(diag, "the credential is for another key than the one sent");
         }
+        if (self.node_certificate_problem(&issued)) |problem| return bad(diag, problem);
         self.credential = issued.credential;
         self.ca_public = issued.ca_public;
+        self.node_certificate = issued.node_certificate;
         self.renew_at_ms = renew_time(&issued.credential);
         self.store(diag) catch |err| {
             // The pair is in memory and works; the failed write is retried at the agent's next
@@ -194,12 +207,62 @@ pub const Peer = struct {
         return error.Failed;
     }
 
-    /// Writes `ca.pub` and then `peer.cred`: the credential's presence means the pair is whole.
+    /// Tests: holds a credential and node certificate of `ca` for `[not_before_ms,
+    /// not_after_ms)`, as a join would, without a server.
+    pub fn hold_for_test(
+        self: *Peer,
+        ca: Ed25519.KeyPair,
+        not_before_ms: u64,
+        not_after_ms: u64,
+    ) !void {
+        assert(@import("builtin").is_test);
+        const public = self.key.public_key.toBytes();
+        self.credential = peer.issue(ca, self.node, public, not_before_ms, not_after_ms);
+        self.ca_public = ca.public_key.toBytes();
+        var cluster_buffer: [peer_ca.cluster_bytes]u8 = undefined;
+        var certificate: x509.Der = .{};
+        try x509.issue_node(&certificate, ca, &.{
+            .cluster = peer_ca.cluster_of(self.ca_public.?, &cluster_buffer),
+            .node = self.node,
+            .subject_key = public,
+            .lifetime = .{ .not_before_ms = not_before_ms, .not_after_ms = not_after_ms },
+        });
+        self.node_certificate = certificate;
+    }
+
+    /// The node certificate's problem, or null: it must be a node certificate of the CA's
+    /// cluster for this node and this key, valid when the credential is due for renewal. It is
+    /// checked at that time, not now, so that clock skew is the credential's to judge.
+    fn node_certificate_problem(self: *const Peer, issued: *const Issued) ?[]const u8 {
+        var cluster_buffer: [peer_ca.cluster_bytes]u8 = undefined;
+        const cluster = peer_ca.cluster_of(issued.ca_public, &cluster_buffer);
+        var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
+        const uri = x509_identity.spiffe_write(&uri_buffer, .node, cluster, self.node) catch
+            unreachable; // The node's name was checked at start, and the cluster is made valid.
+        const bytes = issued.node_certificate.slice();
+        const at_ms = renew_time(&issued.credential);
+        const parsed = x509.verify(bytes, issued.ca_public, at_ms, .{
+            .kind = .node,
+            .name = uri,
+        }) catch return "the node certificate does not verify against the CA";
+        const public = self.key.public_key.toBytes();
+        if (!std.mem.eql(u8, parsed.public_key.of(bytes), &public)) {
+            return "the node certificate is for another key than the one sent";
+        }
+        return null;
+    }
+
+    /// Writes `ca.pub`, `node.crt` and then `peer.cred`: the credential's presence means the
+    /// set is whole.
     pub fn store(self: *Peer, diag: *Diag) Error!void {
         var ca_text: [65]u8 = undefined;
         const ca_line = std.fmt.bufPrint(&ca_text, "{x}\n", .{&self.ca_public.?}) catch
             unreachable; // Sized.
         try files.write(self.io, self.dir, self.where, ca_file, ca_line, 0o600, diag);
+        var pem_text: [pem.bytes_max]u8 = undefined;
+        const certificate = pem.encode(&pem_text, .certificate, self.node_certificate.?.slice());
+        const name = node_certificate_file;
+        try files.write(self.io, self.dir, self.where, name, certificate, 0o600, diag);
         const bytes = peer.encode(&self.credential.?);
         var credential_text: [peer.credential_bytes * 2 + 1]u8 = undefined;
         const line = std.fmt.bufPrint(&credential_text, "{x}\n", .{&bytes}) catch
@@ -207,8 +270,9 @@ pub const Peer = struct {
         try files.write(self.io, self.dir, self.where, credential_file, line, 0o600, diag);
     }
 
-    /// Reads `peer.cred` and `ca.pub`. A pair that does not belong to this key and node is
-    /// not an error: it is ignored, and the agent joins again at once.
+    /// Reads `peer.cred`, `ca.pub` and `node.crt`. A set that does not belong to this key and
+    /// node, or has no node certificate (an agent from before B7), is not an error: it is
+    /// ignored, and the agent joins again at once.
     fn load_stored(self: *Peer, diag: *Diag) files.Error!void {
         var ca_buffer: [128]u8 = undefined;
         var credential_buffer: [512]u8 = undefined;
@@ -244,9 +308,28 @@ pub const Peer = struct {
         if (!std.mem.eql(u8, credential.name(), self.node)) return;
         if (!std.mem.eql(u8, &credential.node_key, &public)) return;
         if (!std.mem.eql(u8, &credential.ca_key_id, &peer.ca_key_id(ca_public))) return;
+        var issued: Issued = .{ .credential = credential, .ca_public = ca_public };
+        if (!try self.load_node_certificate(&issued, diag)) return;
         self.credential = credential;
         self.ca_public = ca_public;
+        self.node_certificate = issued.node_certificate;
         self.renew_at_ms = renew_time(&credential);
+    }
+
+    /// Reads `node.crt` into `issued`: false when it is absent or not this set's.
+    fn load_node_certificate(self: *const Peer, issued: *Issued, diag: *Diag) files.Error!bool {
+        var text_buffer: [pem.bytes_max]u8 = undefined;
+        const name = node_certificate_file;
+        const io, const dir, const where = .{ self.io, self.dir, self.where };
+        const text = try files.read(io, dir, where, name, .plain, &text_buffer, diag) orelse
+            return false;
+        var der: [constants.x509_cert_bytes_max]u8 = undefined;
+        const bytes = pem.decode(text, .certificate, &der) orelse
+            return files.unusable(diag, where, name, "parse", "it is not one PEM certificate");
+        const at = issued.node_certificate.bytes.len - bytes.len;
+        @memcpy(issued.node_certificate.bytes[at..], bytes);
+        issued.node_certificate.start = @intCast(at);
+        return self.node_certificate_problem(issued) == null;
     }
 };
 
@@ -296,10 +379,15 @@ pub fn renew_time(credential: *const peer.Credential) u64 {
     return credential.not_before_ms + @divFloor(life_ms, 2);
 }
 
-const Issued = struct { credential: peer.Credential, ca_public: [32]u8 };
+const Issued = struct {
+    credential: peer.Credential,
+    ca_public: [32]u8,
+    node_certificate: x509.Der = .{},
+};
 
 const Answer = struct {
     credential: []const u8,
+    node_certificate: []const u8,
     ca_public: []const u8,
     not_before_ms: u64 = 0,
     not_after_ms: u64 = 0,
@@ -315,7 +403,17 @@ fn parse_reply(arena: Allocator, body: []const u8) ?Issued {
     const ca_decoded = std.fmt.hexToBytes(&ca_public, answer.ca_public) catch return null;
     if (ca_decoded.len != ca_public.len) return null;
     const credential = peer.decode(&raw) catch return null;
-    return .{ .credential = credential, .ca_public = ca_public };
+    var issued: Issued = .{ .credential = credential, .ca_public = ca_public };
+    const certificate = &issued.node_certificate;
+    if (answer.node_certificate.len > certificate.bytes.len * 2) return null;
+    const at = certificate.bytes.len - answer.node_certificate.len / 2;
+    const tail = certificate.bytes[at..];
+    const decoded_certificate = std.fmt.hexToBytes(tail, answer.node_certificate) catch
+        return null;
+    if (decoded_certificate.len == 0) return null;
+    if (decoded_certificate.len != certificate.bytes.len - at) return null;
+    certificate.start = @intCast(at);
+    return issued;
 }
 
 fn bad(diag: *Diag, problem: []const u8) Error {
@@ -387,11 +485,10 @@ fn store_pair(state: *const TestState, node: []const u8, ca_seed: u8) !void {
     const io = std.testing.io;
     var diag: Diag = undefined;
     diag.reset();
-    var opened = try Peer.open(io, state.path(), "node1", &diag);
+    var opened = try Peer.open(io, state.path(), node, &diag);
     defer opened.close();
     const ca = try Ed25519.KeyPair.generateDeterministic(@splat(ca_seed));
-    opened.credential = peer.issue(ca, node, opened.key.public_key.toBytes(), 1000, 100_000);
-    opened.ca_public = ca.public_key.toBytes();
+    try opened.hold_for_test(ca, 1000, 100_000);
     try opened.store(&diag);
 }
 
@@ -460,6 +557,30 @@ test "a corrupt or loose cache file is ignored with one problem, never an error"
     defer loose.close();
     try std.testing.expect(loose.stored_problem);
     try std.testing.expect(loose.ca_public == null);
+
+    // `node.crt`: damaged is a problem, absent (an agent from before B7) or for another node is
+    // a cache that does not fit. Each way the agent holds nothing and joins again.
+    try store_pair(&state, "node1", 5);
+    try state.tmp.dir.writeFile(io, .{
+        .sub_path = node_certificate_file,
+        .data = "-----BEGIN CERTIFICATE-----\nzz\n-----END CERTIFICATE-----\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
+    diag.reset();
+    var damaged = try Peer.open(io, state.path(), "node1", &diag);
+    defer damaged.close();
+    try std.testing.expect(damaged.stored_problem);
+    try std.testing.expect(damaged.credential == null);
+    try std.testing.expect(damaged.node_certificate == null);
+
+    try store_pair(&state, "node1", 5);
+    try state.tmp.dir.deleteFile(io, node_certificate_file);
+    diag.reset();
+    var absent = try Peer.open(io, state.path(), "node1", &diag);
+    defer absent.close();
+    try std.testing.expect(!absent.stored_problem);
+    try std.testing.expect(absent.credential == null);
+    try std.testing.expect(absent.due(0));
 }
 
 /// A server that answers every call the same way and counts them.
@@ -488,7 +609,7 @@ const Canned = struct {
 };
 
 /// The body the server sends for a credential of `ca` for `node` and `node_key`, shown to the
-/// agent as signed by `shown_ca`.
+/// agent as signed by `shown_ca`, with a node certificate for the same.
 fn issued_body(
     arena: Allocator,
     ca: Ed25519.KeyPair,
@@ -496,11 +617,69 @@ fn issued_body(
     node: []const u8,
     node_key: [32]u8,
 ) ![]const u8 {
-    const credential = peer.issue(ca, node, node_key, 1000, 1000 + 86_400_000);
+    return issued_body_certificate(arena, ca, shown_ca, node, node_key, .right);
+}
+
+/// What `issued_body_certificate` puts in the node certificate's place.
+const CertificateCase = enum { right, absent, other_node, other_key, other_ca, other_kind };
+
+fn issued_body_certificate(
+    arena: Allocator,
+    ca: Ed25519.KeyPair,
+    shown_ca: Ed25519.KeyPair,
+    node: []const u8,
+    node_key: [32]u8,
+    case: CertificateCase,
+) ![]const u8 {
+    const not_before_ms = 1000;
+    const not_after_ms = 1000 + 86_400_000;
+    const credential = peer.issue(ca, node, node_key, not_before_ms, not_after_ms);
     const bytes = peer.encode(&credential);
     const ca_public = shown_ca.public_key.toBytes();
-    const text = "{{\"credential\":\"{x}\",\"ca_public\":\"{x}\"}}";
-    return std.fmt.allocPrint(arena, text, .{ &bytes, &ca_public });
+    if (case == .absent) {
+        const text = "{{\"credential\":\"{x}\",\"ca_public\":\"{x}\"}}";
+        return std.fmt.allocPrint(arena, text, .{ &bytes, &ca_public });
+    }
+    const signer = if (case == .other_ca)
+        try Ed25519.KeyPair.generateDeterministic(@splat(14))
+    else
+        ca;
+    const stranger = (try Ed25519.KeyPair.generateDeterministic(@splat(13))).public_key.toBytes();
+    var cluster_buffer: [peer_ca.cluster_bytes]u8 = undefined;
+    const cluster = peer_ca.cluster_of(ca.public_key.toBytes(), &cluster_buffer);
+    const lifetime: x509.Lifetime = .{
+        .not_before_ms = not_before_ms,
+        .not_after_ms = not_after_ms,
+    };
+    var certificate: x509.Der = .{};
+    if (case == .other_kind) {
+        try x509.issue_client(&certificate, signer, &.{
+            .cluster = cluster,
+            .client = node,
+            .scope = .admin,
+            .subject_key = node_key,
+            .lifetime = lifetime,
+        });
+    } else {
+        try x509.issue_node(&certificate, signer, &.{
+            .cluster = cluster,
+            .node = if (case == .other_node) "node9" else node,
+            .subject_key = if (case == .other_key) stranger else node_key,
+            .lifetime = lifetime,
+        });
+    }
+    const text = "{{\"credential\":\"{x}\",\"node_certificate\":\"{x}\"," ++
+        "\"ca_public\":\"{x}\"}}";
+    return std.fmt.allocPrint(arena, text, .{ &bytes, certificate.slice(), &ca_public });
+}
+
+fn certified(
+    arena: Allocator,
+    ca: Ed25519.KeyPair,
+    key: [32]u8,
+    case: CertificateCase,
+) ![]const u8 {
+    return issued_body_certificate(arena, ca, ca, "node1", key, case);
 }
 
 /// Runs one `step` against `canned`; true if it joined. Whatever failed is left in `diag`.
@@ -539,6 +718,11 @@ test "a join reply that names another key, node or CA is refused and stores noth
         // Signed by `ca`, but the reply says the CA is `other_ca`.
         .{ .name = "another CA", .body = try issued_body(arena, ca, other_ca, "node1", mine) },
         .{ .name = "not hex", .body = "{\"credential\":\"zz\",\"ca_public\":\"zz\"}" },
+        .{ .name = "no node certificate", .body = try certified(arena, ca, mine, .absent) },
+        .{ .name = "certificate: other node", .body = try certified(arena, ca, mine, .other_node) },
+        .{ .name = "certificate: other key", .body = try certified(arena, ca, mine, .other_key) },
+        .{ .name = "certificate: other CA", .body = try certified(arena, ca, mine, .other_ca) },
+        .{ .name = "certificate: client", .body = try certified(arena, ca, mine, .other_kind) },
         .{ .name = "not json", .body = "welcome" },
     };
     var now_ms: u64 = 2000;
@@ -549,6 +733,7 @@ test "a join reply that names another key, node or CA is refused and stores noth
         try std.testing.expect(diag.code != null);
         try std.testing.expect(agent.credential == null);
         try std.testing.expect(agent.ca_public == null);
+        try std.testing.expect(agent.node_certificate == null);
         try std.testing.expectEqual(now_ms + constants.peer_join_retry_ms, agent.retry_at_ms);
         try std.testing.expect(!agent.due(now_ms));
         now_ms += constants.peer_join_retry_ms;
@@ -561,6 +746,19 @@ test "a join reply that names another key, node or CA is refused and stores noth
     try std.testing.expect(try_step(&agent, &good, now_ms, &diag));
     try std.testing.expect(agent.credential != null);
     try std.testing.expect(!agent.due(now_ms));
+    // The node certificate is stored beside the credential, mode 0600, and a restart finds both.
+    const stat = try state.tmp.dir.statFile(io, node_certificate_file, .{});
+    const mode = stat.permissions.toMode() & 0o777;
+    try std.testing.expectEqual(0o600, mode);
+    diag.reset();
+    var restarted = try Peer.open(io, state.path(), "node1", &diag);
+    defer restarted.close();
+    try std.testing.expect(restarted.credential != null);
+    try std.testing.expectEqualSlices(
+        u8,
+        agent.node_certificate.?.slice(),
+        restarted.node_certificate.?.slice(),
+    );
 }
 
 test "a renewal that fails keeps the pair the agent has" {

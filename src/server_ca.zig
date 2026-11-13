@@ -14,6 +14,7 @@ const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("peer_files.zig");
 const peer_ca = @import("peer_ca.zig");
+const pem_mod = @import("pem.zig");
 const x509 = @import("x509.zig");
 
 const Allocator = std.mem.Allocator;
@@ -23,14 +24,6 @@ pub const key_file = "ca.key";
 pub const revoked_file = "revoked";
 pub const key_name_bytes_max = 64;
 pub const cert_extension = ".crt";
-
-const pem_begin = "-----BEGIN CERTIFICATE-----\n";
-const pem_end = "-----END CERTIFICATE-----\n";
-const pem_line_bytes = 64;
-/// The longest PEM file of a CA certificate: its base64 with a newline per line, and the lines
-/// around it. One more byte than the file `files.read` accepts, so that it can say "too long".
-const pem_bytes_max = pem_begin.len + pem_end.len +
-    (constants.x509_cert_bytes_max + 2) / 3 * 4 + constants.x509_cert_bytes_max / 45 + 2;
 
 pub const Error = files.Error || error{ OutOfMemory, Canceled };
 
@@ -141,13 +134,13 @@ fn ensure_certificate(
 ) Error!void {
     var name_buffer: [key_name_bytes_max]u8 = undefined;
     const name = cert_name_for(key_name, &name_buffer);
-    var text: [pem_bytes_max]u8 = undefined;
+    var text: [pem_mod.bytes_max]u8 = undefined;
     // A file too long for a certificate of ours is not ours: it is replaced, like any other text.
     const found = try files.read_bounded(io, dir, path, name, .secret, &text, diag);
     if (found == .bytes) {
         const existing = found.bytes;
         var der_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
-        if (pem_decode(existing, &der_buffer)) |bytes| {
+        if (pem_mod.decode(existing, .certificate, &der_buffer)) |bytes| {
             // Judged a month ahead, so a certificate near its end is made again while services
             // that pin it still have time to take the new file.
             const later_ms = ca.wall.now_ms() +| renew_ahead_ms;
@@ -177,52 +170,9 @@ fn write_certificate(
         diag.fix(.{ .sentence = "set the clock; the certificate is made again at the next start" });
         return error.Failed;
     };
-    var text: [pem_bytes_max]u8 = undefined;
-    const pem = pem_encode(&text, certificate.slice());
+    var text: [pem_mod.bytes_max]u8 = undefined;
+    const pem = pem_mod.encode(&text, .certificate, certificate.slice());
     return files.write(io, dir, path, name, pem, 0o600, diag);
-}
-
-/// `bytes` as one PEM CERTIFICATE block: 64 base64 characters a line, a newline after each.
-fn pem_encode(out: *[pem_bytes_max]u8, bytes: []const u8) []const u8 {
-    assert(bytes.len > 0);
-    assert(bytes.len <= constants.x509_cert_bytes_max);
-    var base64: [(constants.x509_cert_bytes_max + 2) / 3 * 4]u8 = undefined;
-    const encoded = std.base64.standard.Encoder.encode(&base64, bytes);
-    var writer: std.Io.Writer = .fixed(out);
-    writer.writeAll(pem_begin) catch unreachable; // `pem_bytes_max` holds it.
-    var at: usize = 0;
-    while (at < encoded.len) : (at += pem_line_bytes) {
-        const line = encoded[at..@min(at + pem_line_bytes, encoded.len)];
-        writer.print("{s}\n", .{line}) catch unreachable; // Sized by `pem_bytes_max`.
-    }
-    writer.writeAll(pem_end) catch unreachable; // Sized by `pem_bytes_max`.
-    return writer.buffered();
-}
-
-/// The DER inside a PEM block exactly as `pem_encode` writes it, or null: any other text
-/// (extra blocks, other line lengths, trailing bytes) is not ours and is replaced.
-fn pem_decode(text: []const u8, out: *[constants.x509_cert_bytes_max]u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, text, pem_begin)) return null;
-    if (!std.mem.endsWith(u8, text, pem_end)) return null;
-    const body = text[pem_begin.len .. text.len - pem_end.len];
-    var base64: [(constants.x509_cert_bytes_max + 2) / 3 * 4]u8 = undefined;
-    var length: usize = 0;
-    var lines = std.mem.splitScalar(u8, body, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (line.len > pem_line_bytes) return null;
-        if (length + line.len > base64.len) return null;
-        @memcpy(base64[length..][0..line.len], line);
-        length += line.len;
-    }
-    const decoded_length = std.base64.standard.Decoder.calcSizeForSlice(base64[0..length]) catch
-        return null;
-    if (decoded_length == 0) return null;
-    if (decoded_length > out.len) return null;
-    std.base64.standard.Decoder.decode(out, base64[0..length]) catch return null;
-    var again: [pem_bytes_max]u8 = undefined;
-    if (!std.mem.eql(u8, pem_encode(&again, out[0..decoded_length]), text)) return null;
-    return out[0..decoded_length];
 }
 
 fn load_or_make_key(
@@ -463,13 +413,13 @@ test "the CA certificate is a PEM file beside the key, 0600, kept, and made agai
     diag.reset();
     var ca: peer_ca.Ca = undefined;
     try open_test(&dir, &ca, .{ .quiet = true }, &diag);
-    var text: [pem_bytes_max]u8 = undefined;
+    var text: [pem_mod.bytes_max]u8 = undefined;
     const first = try dir.tmp.dir.readFile(io, "ca.crt", &text);
-    try std.testing.expect(std.mem.startsWith(u8, first, pem_begin));
-    var first_copy: [pem_bytes_max]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, first, "-----BEGIN CERTIFICATE-----\n"));
+    var first_copy: [pem_mod.bytes_max]u8 = undefined;
     @memcpy(first_copy[0..first.len], first);
     var der_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
-    const bytes = pem_decode(first_copy[0..first.len], &der_buffer).?;
+    const bytes = pem_mod.decode(first_copy[0..first.len], .certificate, &der_buffer).?;
     const parsed = try x509.verify(bytes, ca.public(), 1_000_000, .{ .kind = .ca, .name = null });
     try std.testing.expectEqual(@as(u64, 1_000_000), parsed.not_before_ms);
     {
@@ -508,7 +458,7 @@ test "the CA certificate is a PEM file beside the key, 0600, kept, and made agai
     try std.testing.expect(!std.mem.eql(u8, &old_public, &again.public()));
     const same_key = try dir.tmp.dir.readFile(io, "ca.crt", &text);
     var again_bytes: [constants.x509_cert_bytes_max]u8 = undefined;
-    const decoded = pem_decode(same_key, &again_bytes).?;
+    const decoded = pem_mod.decode(same_key, .certificate, &again_bytes).?;
     _ = try x509.verify(decoded, again.public(), 1_000_000, .{ .kind = .ca, .name = null });
 }
 
@@ -536,28 +486,6 @@ test "a CA certificate other users can read is refused, and names follow the key
         "ca-0123456789abcdef.crt",
         cert_name_for(keyed, &name_buffer),
     );
-}
-
-test "PEM text round trips only in the exact form written" {
-    // Goal: `pem_decode` accepts what `pem_encode` writes and nothing looser. Method: encode
-    // lengths around a line boundary, decode, then damage the text four ways.
-    var der_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
-    var source: [constants.x509_cert_bytes_max]u8 = undefined;
-    for (&source, 0..) |*byte, index| byte.* = @truncate(index * 7);
-    var text: [pem_bytes_max]u8 = undefined;
-    for ([_]usize{ 1, 47, 48, 49, 200, constants.x509_cert_bytes_max }) |length| {
-        const pem = pem_encode(&text, source[0..length]);
-        const back = pem_decode(pem, &der_buffer).?;
-        try std.testing.expectEqualSlices(u8, source[0..length], back);
-    }
-    const pem = pem_encode(&text, source[0..100]);
-    try std.testing.expect(pem_decode(pem[0 .. pem.len - 1], &der_buffer) == null);
-    try std.testing.expect(pem_decode(pem[1..], &der_buffer) == null);
-    var other: [pem_bytes_max]u8 = undefined;
-    @memcpy(other[0..pem.len], pem);
-    other[pem_begin.len + 3] = '!';
-    try std.testing.expect(pem_decode(other[0..pem.len], &der_buffer) == null);
-    try std.testing.expect(pem_decode("", &der_buffer) == null);
 }
 
 const NearEndClock = struct {
@@ -593,8 +521,8 @@ test "a CA certificate near its end is made again; an unmakeable one is one code
     diag.reset();
     var ca: peer_ca.Ca = undefined;
     try open_test(&dir, &ca, .{ .quiet = true }, &diag);
-    var text: [pem_bytes_max]u8 = undefined;
-    var before: [pem_bytes_max]u8 = undefined;
+    var text: [pem_mod.bytes_max]u8 = undefined;
+    var before: [pem_mod.bytes_max]u8 = undefined;
     const first = (try dir.tmp.dir.readFile(io, "ca.crt", &before)).len;
     var near = NearEndClock{};
     const options: Options = .{ .quiet = true, .first_start = false };
@@ -638,8 +566,8 @@ const FixedClock = struct {
 
 test "a ca.crt one byte over the longest PEM is replaced, not fatal" {
     // Goal: a file too long to be ours does not stop the server. Method: open once to make the
-    // file, overwrite it with `pem_bytes_max` bytes (the smallest size `read` calls too long),
-    // reopen and find the first file's bytes again.
+    // file, overwrite it with `pem_mod.bytes_max` bytes (the smallest size `read` calls too
+    // long), reopen and find the first file's bytes again.
     const io = std.testing.io;
     var dir = try TestDir.make(io);
     defer dir.tmp.cleanup();
@@ -647,11 +575,11 @@ test "a ca.crt one byte over the longest PEM is replaced, not fatal" {
     diag.reset();
     var ca: peer_ca.Ca = undefined;
     try open_test(&dir, &ca, .{ .quiet = true }, &diag);
-    var text: [pem_bytes_max]u8 = undefined;
+    var text: [pem_mod.bytes_max]u8 = undefined;
     const first = try dir.tmp.dir.readFile(io, "ca.crt", &text);
-    var first_copy: [pem_bytes_max]u8 = undefined;
+    var first_copy: [pem_mod.bytes_max]u8 = undefined;
     @memcpy(first_copy[0..first.len], first);
-    const long: [pem_bytes_max]u8 = @splat('A');
+    const long: [pem_mod.bytes_max]u8 = @splat('A');
     try dir.tmp.dir.writeFile(io, .{ .sub_path = "ca.crt", .data = &long });
     try dir.tmp.dir.setFilePermissions(io, "ca.crt", .fromMode(0o600), .{});
     var again: peer_ca.Ca = undefined;

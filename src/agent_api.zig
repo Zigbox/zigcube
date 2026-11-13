@@ -56,6 +56,7 @@ const text_util = @import("text.zig");
 const Context = controller.Context;
 const peer = @import("peer.zig");
 const peer_ca = @import("peer_ca.zig");
+const x509 = @import("x509.zig");
 
 /// The route failed and `ctx.diag` says why. Same set as `api.zig`'s, so `try` passes it up.
 pub const Failure = error{Failed};
@@ -254,10 +255,29 @@ const Call = struct {
             error.Removed => return removed(ctx, call.node),
             error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
         };
+        // The node certificate (B7) certifies the same key for the same life, so the two are
+        // renewed together. Its one check beyond `issue`'s: the key is not the CA's own.
+        var certificate: x509.Der = .{};
+        ca.issue_node_certificate(&certificate, &.{
+            .node = call.node,
+            .subject_key = node_key,
+            .ttl_ms = issued.not_after_ms - issued.not_before_ms,
+        }) catch |err| switch (err) {
+            error.Removed => return removed(ctx, call.node),
+            error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
+            else => |other| {
+                // A clock past the year 9999 and nothing else: the name and key were checked.
+                assert(ctx.diag.code == null);
+                x509.raise(ctx.diag, @errorCast(other), call.node, &.{});
+                return error.Failed;
+            },
+        };
         const bytes = peer.encode(&issued);
         const ca_public = ca.public();
         return reply(ctx, .{
             .credential = std.fmt.allocPrint(ctx.arena, "{x}", .{&bytes}) catch
+                return no_memory(ctx),
+            .node_certificate = std.fmt.allocPrint(ctx.arena, "{x}", .{certificate.slice()}) catch
                 return no_memory(ctx),
             .ca_public = std.fmt.allocPrint(ctx.arena, "{x}", .{&ca_public}) catch
                 return no_memory(ctx),

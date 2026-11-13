@@ -667,8 +667,7 @@ const Rig = struct {
         var opened = try agent_peer.Peer.open(io, rig.state(), "node2", &diag);
         defer opened.close();
         const now = peer_stream.wall_ms(io);
-        opened.credential = issue(rig.ca, "node2", opened.key.public_key.toBytes(), now);
-        opened.ca_public = rig.ca.public_key.toBytes();
+        try opened.hold_for_test(rig.ca, now - 1000, now + 100_000);
         try opened.store(&diag);
         var store = try dir_images.DirImages.open(io, std.testing.allocator, images);
         defer store.close(std.testing.allocator);
