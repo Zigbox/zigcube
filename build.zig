@@ -1371,9 +1371,10 @@ const c1_teeth_roots = [_]struct {
         .root = "src/sim_c1_teeth_job_untrusted_main.zig",
         // J12 (a run started that its node's trust policy refuses); signed jobs and node
         // policies exist only in the signed world, which the tooth switches on. Plain runs (no
-        // `--c1`) judge J12 too.
+        // `--c1`) judge J12 too. Caught by 23 of 30 seeds (drawn operations, `--profile=auto`,
+        // `--c1`, 2026-11-13): 30 seeds at a design rate of 0.6 miss with 1.2e-12.
         .symptom = "J12",
-        .canary_seeds = 10,
+        .canary_seeds = 30,
         .plain_symptom = "J12",
     },
     .{

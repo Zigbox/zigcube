@@ -99,6 +99,8 @@ pub const World = struct {
         };
         errdefer world.fixture.deinit(gpa);
         draw_keys(world);
+        var signed: usize = 0;
+        errdefer for (world.envelopes[0..signed]) |line| gpa.free(line);
         for (&world.envelopes, 0..) |*slot, index| {
             const key = world.key_seeds[index / kinds_count];
             const kind: Kind = @fromBackingInt(@intCast(index % kinds_count));
@@ -107,10 +109,15 @@ pub const World = struct {
                 .other_tree => world.fixture.sign_tree(gpa, key, other_tree_byte),
                 .manifest => world.fixture.sign_manifest(gpa, key, tree_byte, manifest_byte),
             };
+            signed += 1;
         }
         world.nodes = try gpa.alloc(NodeTrust, nodes);
+        errdefer gpa.free(world.nodes);
+        var made: usize = 0;
+        errdefer for (world.nodes[0..made]) |node| gpa.destroy(node.policy);
         for (world.nodes, 0..) |*node, index| {
             node.policy = try gpa.create(Policy);
+            made += 1;
             try draw_policy(world, node, @intCast(index));
         }
     }
@@ -386,4 +393,14 @@ test "the oracle agrees with the node's verdict" {
     }
     try std.testing.expect(admitted > 0);
     try std.testing.expect(refused > 0);
+}
+
+test "a world that runs out of memory frees what it made" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, make_and_free, .{});
+}
+
+fn make_and_free(gpa: Allocator) Allocator.Error!void {
+    var world: World = undefined;
+    try world.init(gpa, 7, 3);
+    world.deinit(gpa);
 }

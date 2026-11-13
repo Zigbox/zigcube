@@ -73,6 +73,8 @@ check $PR x "" "src/c1_teeth.zig" TTTTTTTTT
 # runs everything, one to the simulator alone runs the code jobs.
 check $PR x "" "src/fencing.zig" TTTTTTTTT
 check $PR x "" "src/sim_cluster.zig src/sim_c1_teeth_oldrule_main.zig" TFFFFFFFF
+# B5 slice 3: the trust world and its tooth are simulator files.
+check $PR x "" "src/sim_trust.zig src/sim_c1_teeth_job_untrusted_main.zig" TFFFFFFFF
 check $PR x "" "src/testing/fault_proxy.zig" TTTTTTTTT
 check $PR x "" "src/brand_new_file.zig" TTTTTTTTT
 check $PR x "" "newdir/file.txt" TTTTTTTTT
