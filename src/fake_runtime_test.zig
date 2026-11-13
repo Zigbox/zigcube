@@ -919,13 +919,13 @@ test "a health check passes by default; the fault file fails it, times it out or
     const handle = try rig.begin("probe-web", &forever);
     const check = [_][]const u8{ "curl", "-f", "http://localhost:8080/health" };
     try testing.expectEqual(@as(u8, 0), (try probe_once(rig, handle, &check, 1_000)).exited);
-    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "probe-web", .data = "unhealthy" });
+    try fault(rig, "probe-web", "unhealthy");
     try testing.expectEqual(@as(u8, 1), (try probe_once(rig, handle, &check, 1_000)).exited);
-    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "probe-web", .data = "probe_refused" });
+    try fault(rig, "probe-web", "probe_refused");
     const refused = try probe_once(rig, handle, &check, 1_000);
     try testing.expectEqualStrings("ZC-E0502", refused.refused.code.slice());
 
-    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "probe-web", .data = "probe_timeout" });
+    try fault(rig, "probe-web", "probe_timeout");
     var local: Diag = undefined;
     local.reset();
     const fake = rig.fake.interface();
@@ -945,6 +945,10 @@ test "a health check of a stopped container is refused" {
     const check = [_][]const u8{"true"};
     const result = try probe_once(rig, handle, &check, 1_000);
     try testing.expect(result == .refused);
+}
+
+fn fault(rig: *Rig, name: []const u8, word: []const u8) !void {
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = name, .data = word });
 }
 
 /// Begins a check and returns its first poll, which the fake settles at once unless the fault
