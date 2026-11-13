@@ -534,17 +534,32 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
     return supervise(io, dir, real.interface(), storage, &spec, arena_state.allocator(), relay_ctx);
 }
 
-/// Puts a job's signatures into the node's Zigbox store before the start (B5), so that a node
-/// whose own Zigbox policy asks for them (`/etc/zbx/policy.zon`) finds them when `zigbox.start`
-/// gates the tree. The agent judged them against its `--trust-policy` already; Zigbox refuses
-/// the whole bundle if a line does not verify or is not about the tree. Null when there is
-/// nothing to import or it was imported; otherwise Zigbox's ZBX-E0909, and nothing is started.
+/// What became of a job's signatures before the start. None of them stops the start: the
+/// agent's own check (`--trust-policy`) already judged the run, and `zigbox.start` as a library
+/// call runs no trust gate of its own (only `zbx run` does), so the store's copy serves `zbx` on
+/// the node (`zbx run`, `zbx trust export`), not the start.
+const Kept = union(enum) {
+    /// No signatures, or no Zigbox policy file on the node asks for any: nothing is written,
+    /// so routine runs never fill the store.
+    not_needed,
+    /// In the store now, or already there (Zigbox merges, and a line it holds is not added).
+    kept,
+    /// The store would not take them (full, busy, damaged, absent): ZBX-E0909, logged.
+    not_kept: Diagnostic,
+};
+
+/// Puts a job's signatures into the node's Zigbox store before the start (B5), when one of the
+/// node's Zigbox policy files (`/etc/zbx/policy.zon`, the user's `zbx/policy.zon`) asks anything
+/// of a run, so that `zbx` there finds them. Zigbox refuses the whole bundle if a line does not
+/// verify or is not about the tree, if the tree would hold more than
+/// `signatures_per_tree_max` lines, or if the store holds `trust_records_max` records.
 fn import_signatures(
     host: zigbox.host.Host,
     spec: *const launch.Spec,
     arena: Allocator,
-) ?Diagnostic {
-    if (spec.signatures.len == 0) return null;
+) Kept {
+    if (spec.signatures.len == 0) return .not_needed;
+    if (!node_policy_checks(host, arena)) return .not_needed;
     var collector: zigbox.diag.Diag = undefined;
     collector.reset();
     const tree = zigbox.store.Digest.parse(spec.tree) orelse
@@ -556,7 +571,7 @@ fn import_signatures(
     _ = zigbox.store.open.check(&store, .create, &collector) catch {
         var out: Diagnostic = undefined;
         zigbox.diagnostic.from_diag(&out, &collector);
-        return out;
+        return .{ .not_kept = out };
     };
     var bytes: usize = 0;
     for (spec.signatures) |line| bytes += line.len + 1;
@@ -574,7 +589,66 @@ fn import_signatures(
     var failure: zigbox.store.trust_peer.Failure = undefined;
     _ = zigbox.store.import_trust(&store, memory, text, tree, &failure) catch
         return import_refused(&collector, refusal_words(failure.refusal));
-    return null;
+    return .kept;
+}
+
+/// Whether a Zigbox policy file on the node asks anything of a run, read as Zigbox's run gate
+/// reads them (`trust/gate.zig`, not exported): through the store's filesystem, the system file
+/// and then the user's. A file that exists and cannot be read or parsed counts as asking: `zbx`
+/// refuses every run under it, and the signatures are kept for when it is put right.
+fn node_policy_checks(host: zigbox.host.Host, arena: Allocator) bool {
+    const fs = host.filesystem();
+    const buffer = arena.alloc(u8, zigbox.trust.limits.policy_bytes_max + 1) catch return true;
+    const policy = arena.create(zigbox.trust.policy.Policy) catch return true;
+    var user: [std.fs.max_path_bytes:0]u8 = undefined;
+    const paths = [2]?[:0]const u8{ policy_system_path, user_policy_path(host, &user) };
+    for (paths) |maybe| {
+        const path = maybe orelse continue;
+        const fd = fs.open_read(path) catch |err| {
+            if (err == error.NotFound) continue;
+            return true;
+        };
+        defer fs.close(fd);
+        const length = fs.read_full(fd, buffer) catch return true;
+        if (length == buffer.len) return true; // Longer than any policy: unusable.
+        if (zigbox.trust.policy.parse(buffer[0..length], policy)) |_| return true;
+        if (policy.checks()) return true;
+    }
+    return false;
+}
+
+const policy_system_path = "/etc/zbx/policy.zon";
+
+/// `<XDG_CONFIG_HOME or ~/.config>/zbx/policy.zon`, as Zigbox's gate finds it; null without a
+/// home to look in.
+fn user_policy_path(host: zigbox.host.Host, buffer: *[std.fs.max_path_bytes:0]u8) ?[:0]const u8 {
+    const limit: u32 = 1024;
+    if (host.environment("XDG_CONFIG_HOME", limit)) |config| {
+        if (config.len > 0 and config[0] == '/') {
+            const base = std.mem.trimEnd(u8, config, "/");
+            return std.fmt.bufPrintSentinel(buffer, "{s}/zbx/policy.zon", .{base}, 0) catch null;
+        }
+    }
+    const home = host.environment("HOME", limit) orelse return null;
+    if (home.len == 0 or home[0] != '/') return null;
+    const base = std.mem.trimEnd(u8, home, "/");
+    return std.fmt.bufPrintSentinel(buffer, "{s}/.config/zbx/policy.zon", .{base}, 0) catch null;
+}
+
+/// The one line a signature bundle the store would not take leaves in the agent's log (the
+/// supervisor's stderr): the start goes on.
+fn log_not_kept(io: std.Io, name: []const u8, failure: *const Diagnostic) void {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writer.print("zcube-agent: container {s}: its signatures were not kept in the node's " ++
+        "Zigbox store, and it starts: {s} {s}", .{
+        name, failure.code.slice(), failure.summary.slice(),
+    }) catch {};
+    const causes = failure.causes.slice();
+    if (causes.len > 0) writer.print(": {s}", .{causes[causes.len - 1].slice()}) catch {};
+    if (writer.end == buffer.len) writer.end -= 1; // A cut line still ends in a newline.
+    writer.writeByte('\n') catch {};
+    std.Io.File.stderr().writeStreamingAll(io, writer.buffered()) catch {};
 }
 
 /// Zigbox's refusals of `import_trust`, in the words of `zbx trust import` (its `trust_refused`,
@@ -595,14 +669,18 @@ fn refusal_words(refusal: zigbox.store.trust_peer.Refusal) []const u8 {
 }
 
 /// ZBX-E0909, Zigbox's code for a bundle of signatures the store would not take, with `cause`.
-fn import_refused(collector: *zigbox.diag.Diag, cause: []const u8) Diagnostic {
+fn import_refused(collector: *zigbox.diag.Diag, cause: []const u8) Kept {
     collector.raise(.E0909);
     collector.while_("importing the job's signatures into the node's Zigbox store", .{});
     collector.cause("{s}", .{cause});
-    collector.fix(.{ .sentence = "check the job's signatures with zbx trust import on the node" });
+    collector.fix(.{
+        .sentence = "nothing to do for the run, which starts (the agent judged it); " ++
+            "zbx on this node does not see these signatures: 'zbx trust prune' lists records " ++
+            "whose trees are gone",
+    });
     var out: Diagnostic = undefined;
     zigbox.diagnostic.from_diag(&out, collector);
-    return out;
+    return .{ .not_kept = out };
 }
 
 /// What the job's relay needs that the start does not: memory, an `Io` for the upstream
@@ -645,8 +723,9 @@ fn supervise(
             };
         }
     }
-    if (import_signatures(host, spec, arena)) |diagnostic| {
-        return record_failure(io, dir, name, &diagnostic);
+    switch (import_signatures(host, spec, arena)) {
+        .not_needed, .kept => {},
+        .not_kept => |*diagnostic| log_not_kept(io, name, diagnostic),
     }
     var trace: image.Trace = .{};
     switch (image.start_with_image(real.steps(), spec.tree, spec.reference, &trace)) {
@@ -1075,4 +1154,106 @@ test "a wait's error is read before its pid: interrupted again, any other over, 
     try std.testing.expectEqual(Verdict.exited_ok, wait_verdict(4242, pid, 0));
     try std.testing.expectEqual(Verdict.over, wait_verdict(4242, pid, 3 << 8));
     try std.testing.expectEqual(Verdict.over, wait_verdict(4243, pid, 0));
+}
+
+// ---- The job's signatures in the node's Zigbox store (B5) -------------------------------------
+
+const trust_fixture = @import("job_trust_fixture.zig");
+const HostSim = zigbox.host_sim.HostSim;
+const SimFs = zigbox.store.fs_sim.SimFs;
+
+const sim_home = [_]zigbox.host_sim.EnvironmentVariable{
+    .{ .name = "HOME", .value = "/home/alice" },
+};
+const sim_store_path = "/home/alice/.local/share/zbx/store";
+const sim_user_policy = "/home/alice/.config/zbx/policy.zon";
+
+/// A simulated node with a home and no store yet. Both are large: on the heap.
+const SimNode = struct {
+    sim: *HostSim,
+    files: *SimFs,
+
+    fn make() !SimNode {
+        const sim = try std.heap.page_allocator.create(HostSim);
+        errdefer std.heap.page_allocator.destroy(sim);
+        const fs = try std.heap.page_allocator.create(SimFs);
+        sim.init(1, &.{});
+        fs.init(1);
+        sim.store_fs = fs;
+        sim.environment_variables = &sim_home;
+        const parents = [_][]const u8{
+            "/home",                        "/home/alice",        "/home/alice/.config",
+            "/home/alice/.config/zbx",      "/home/alice/.local", "/home/alice/.local/share",
+            "/home/alice/.local/share/zbx",
+        };
+        for (parents) |parent| fs.put_dir(parent, 0o755);
+        return .{ .sim = sim, .files = fs };
+    }
+
+    fn free(node: SimNode) void {
+        std.heap.page_allocator.destroy(node.files);
+        std.heap.page_allocator.destroy(node.sim);
+    }
+};
+
+fn signed_spec(image_buffer: *[67]u8) launch.Spec {
+    return .{
+        .name = "train-0",
+        .tree = trust_fixture.image(image_buffer, 0x31),
+        .reference = "",
+        .command = &.{"true"},
+        .env = &.{},
+        .labels = &.{},
+        .launched = 100,
+    };
+}
+
+test "runs signed past signatures_per_tree_max on one tree all start; no policy writes nothing" {
+    // Goal: the import never wedges a start (B5 slice 2 review). Every freshly signed run of one
+    // tree adds a line; past `signatures_per_tree_max` the store refuses the bundle (ZBX-E0909),
+    // and the run still starts: `Kept` has no outcome that stops `supervise`, which only logs
+    // `not_kept`. A node with no Zigbox policy that asks for signatures writes nothing, so
+    // routine runs cannot fill its store. Method: a simulated node and store; ten keys sign tree
+    // 0x31; one run per key, then the first line again.
+    const gpa = std.testing.allocator;
+    var fixture = try trust_fixture.Fixture.init(gpa);
+    defer fixture.deinit(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const node = try SimNode.make();
+    defer node.free();
+    const host = node.sim.interface();
+    var image_buffer: [67]u8 = undefined;
+    var spec = signed_spec(&image_buffer);
+    const first = try fixture.sign_tree(gpa, 1, 0x31);
+    defer gpa.free(first);
+    spec.signatures = &.{first};
+    try std.testing.expect(import_signatures(host, &spec, arena) == .not_needed);
+    try std.testing.expect(node.files.kind_of(sim_store_path) == null);
+    node.files.put_file(sim_user_policy, 0o644, ".{ .version = 1, .require_signature = false }");
+    try std.testing.expect(import_signatures(host, &spec, arena) == .not_needed);
+    node.files.remove_path(sim_user_policy);
+    node.files.put_file(sim_user_policy, 0o644, ".{ .version = 1, .require_signature = true }");
+    const per_tree = zigbox.trust.limits.signatures_per_tree_max;
+    var kept: u32 = 0;
+    var not_kept: u32 = 0;
+    for (0..per_tree + 2) |index| {
+        const line = try fixture.sign_tree(gpa, @intCast(index + 1), 0x31);
+        defer gpa.free(line);
+        spec.signatures = &.{line};
+        switch (import_signatures(host, &spec, arena)) {
+            .not_needed => return error.TestUnexpectedResult,
+            .kept => kept += 1,
+            .not_kept => |diagnostic| {
+                try std.testing.expect(std.mem.endsWith(u8, diagnostic.code.slice(), "E0909"));
+                not_kept += 1;
+            },
+        }
+    }
+    try std.testing.expectEqual(per_tree, kept);
+    try std.testing.expectEqual(@as(u32, 2), not_kept);
+    // A line the full tree already holds is not added, so it is kept, not refused.
+    spec.signatures = &.{first};
+    try std.testing.expect(import_signatures(host, &spec, arena) == .kept);
 }

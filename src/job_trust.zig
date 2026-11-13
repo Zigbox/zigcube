@@ -167,6 +167,43 @@ pub fn judge_run(
     return judge_lines(config, arena, job);
 }
 
+/// The lines of `job` that count under the node's policy, copied into `arena`, in the order
+/// the record holds them (a duplicate once): the only lines the supervisor may keep in the
+/// node's Zigbox store (B5 slice 2 review). A line by a key the policy does not list, about
+/// another tree or binding, or that does not verify is left out, so lines anyone can add (the
+/// API's writes are unauthenticated) never fill the store, and Zigbox, which refuses a bundle
+/// whole, is never handed one it would refuse for them. Over the bounds, none counts.
+pub fn counted_lines(
+    config: *const Trust,
+    arena: std.mem.Allocator,
+    job: Job,
+) error{OutOfMemory}![]const []const u8 {
+    const scratch = config.scratch;
+    scratch.record.clear();
+    var problem: [problem_bytes_max]u8 = undefined;
+    if (shape_problem(&problem, job.signatures) != null) return &.{};
+    for (job.signatures) |line| {
+        _ = scratch.record.add(line) catch unreachable; // Bounded by the shape.
+    }
+    const tree = tree_of(job.image) orelse return &.{};
+    const subject: trust.verdict.Subject = .{
+        .tree = tree,
+        .binding = binding_of(job.source),
+        .derives = false,
+    };
+    const report = &scratch.report;
+    _ = trust.verdict.judge(&scratch.work, config.policy, &scratch.record, subject, report);
+    const lines = try arena.alloc([]const u8, report.counted);
+    var count: u32 = 0;
+    for (report.lines[0..report.count], 0..) |examined, index| {
+        if (examined.reason != .counts) continue;
+        lines[count] = try arena.dupe(u8, scratch.record.line(@intCast(index)));
+        count += 1;
+    }
+    assert(count == report.counted);
+    return lines;
+}
+
 /// The verdict on the lines in `config.scratch.record`: null when they satisfy the policy,
 /// else the refusal.
 fn judge_lines(
@@ -448,6 +485,37 @@ test "a good signature is accepted: tree-only for any source, manifest-bound for
     const stranger = try case.sign_tree(stranger_seed, 7);
     const lines = [_][]const u8{ stranger, tree_line };
     try testing.expectEqual(Admission.admitted, try case.judge(case.job(7, null, &lines)));
+}
+
+test "counted_lines keeps only the lines that count under the node's policy" {
+    // Goal: the supervisor is handed only lines the node's own verdict counted (B5 slice 2
+    // review), so a stranger's line, a line about another tree or another manifest, and a line
+    // that is not an envelope never reach the node's Zigbox store, and a duplicate goes once.
+    // Method: one job carrying one good line among each kind of bad one.
+    var case = try Case.init();
+    defer case.deinit();
+    const good = try case.sign_tree(trusted_seed, 7);
+    const lines = [_][]const u8{
+        try case.sign_tree(stranger_seed, 7),
+        try case.sign_tree(trusted_seed, 8),
+        try case.fixture.sign_manifest(case.arena.allocator(), trusted_seed, 7, 0x51),
+        good,
+    };
+    var config = case.fixture.config();
+    const arena = case.arena.allocator();
+    const kept = try counted_lines(&config, arena, case.job(7, 0x52, &lines));
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expectEqualStrings(good, kept[0]);
+    const twice = [_][]const u8{ good, good, "x" };
+    const once = try counted_lines(&config, arena, case.job(7, null, &twice));
+    try testing.expectEqual(@as(usize, 1), once.len);
+    // Not a tree, or no line counting: nothing is kept.
+    var job_value = case.job(7, null, &.{good});
+    job_value.image = "busybox";
+    try testing.expectEqual(@as(usize, 0), (try counted_lines(&config, arena, job_value)).len);
+    const stranger_only = [_][]const u8{lines[0]};
+    const none = try counted_lines(&config, arena, case.job(7, null, &stranger_only));
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "a policy that asks for nothing admits every job, unread" {

@@ -63,8 +63,9 @@ pub const Spec = struct {
     /// `HOST:PORT` of the job's one relay upstream; empty: none. The supervisor asks Zigbox for a
     /// listener on the container's loopback and relays it there (B3 slice 4, `relay.zig`).
     relay: []const u8 = "",
-    /// The job's DSSE envelopes (B5), one line each: the supervisor imports them into the node's
-    /// Zigbox store before the start (`zigbox.store.import_trust`). Empty: nothing to import.
+    /// The job's DSSE envelopes that counted under the node's policy (B5), one line each: the
+    /// supervisor keeps them in the node's Zigbox store before the start when the node's `zbx`
+    /// policy asks (`import_signatures`). Empty: nothing to keep.
     signatures: []const []const u8 = &.{},
     /// `host.time_now()` (seconds) when the agent decided to start it: a Zigbox record older than
     /// this belongs to an earlier container of the same name.

@@ -135,7 +135,7 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
 
-/// The agent starts every run its node's trust policy refuses: `refused_by_trust` judges
+/// The agent starts every run its node's trust policy refuses: `trust_refusal` judges
 /// nothing (must break J12: no run its node's policy refuses ever starts; B5 slice 3). Needs the
 /// signed world (`Options.signed`).
 pub const job_untrusted = declared("c1_teeth_job_untrusted");

@@ -61,8 +61,9 @@ pub const usage =
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
     \\                     peer has it (needs --images-dir)
     \\  --trust-policy FILE  this node's Zigbox trust policy: a job whose signatures it refuses is
-    \\                     never started here (ends refused, ZBX-E0905). Owned by root or the
-    \\                     agent's user, writable by no one else. Without it the node checks nothing
+    \\                     never started here (ends refused, ZBX-E0905); service replicas are not
+    \\                     checked. An absolute path, owned by root or the agent's user, writable
+    \\                     by no one else. Without it the node checks nothing
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -187,12 +188,7 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
     var config = try merge(arena, io, flags, file, diag);
     if (flags.trust_policy orelse file.trust_policy) |path| {
-        // The path is published with the node (`/nodes/<node>.trust_policy`), which holds
-        // printable ASCII only.
-        for (path) |byte| if (!text_util.is_printable(byte)) {
-            const fix = "move the policy to a path of printable ASCII";
-            return bad(diag, "the --trust-policy path is not printable ASCII", .{}, fix);
-        };
+        try check_trust_path(path, diag);
         config.trust = try trust_file.read(arena, io, path, trust_options, diag);
     }
     return .{ .run = config };
@@ -609,6 +605,19 @@ fn absolute_state_dir(
     return arena.dupe(u8, buffer[0..length]) catch error.OutOfMemory;
 }
 
+/// The path is published with the node (`/nodes/<node>.trust_policy`) as typed, so it must name
+/// the file wherever it is read: absolute, and printable ASCII (the record's text rule).
+fn check_trust_path(path: []const u8, diag: *Diag) Error!void {
+    for (path) |byte| if (!text_util.is_printable(byte)) {
+        const fix = "move the policy to a path of printable ASCII";
+        return bad(diag, "the --trust-policy path is not printable ASCII", .{}, fix);
+    };
+    if (path.len == 0 or path[0] != '/') {
+        const fix = "give the policy's absolute path: the node publishes it as typed";
+        return bad(diag, "the --trust-policy path {s} is not absolute", .{path}, fix);
+    }
+}
+
 fn bad(diag: *Diag, comptime cause: []const u8, args: anytype, fix: []const u8) Error {
     assert(diag.code == null);
     diag.raise(.E0505);
@@ -622,6 +631,19 @@ const testing = std.testing;
 fn expect_bad(result: anytype, diag: *const Diag) !void {
     try testing.expectError(error.BadConfig, result);
     try testing.expectEqual(@as(?@import("diag/codes.zig").Code, .E0505), diag.code);
+}
+
+test "a --trust-policy path is absolute and printable, or it is refused" {
+    // Goal: the published path names the file on any reader's terms (review B5 slice 2). Method:
+    // an absolute path passes; a relative one, an empty one and one with a control byte are E0505.
+    var diag: Diag = undefined;
+    diag.reset();
+    try check_trust_path("/etc/zcube/trust.zon", &diag);
+    const inputs = [_][]const u8{ "trust.zon", "./trust.zon", "", "/etc/zcube/\x07.zon" };
+    for (inputs) |input| {
+        diag.reset();
+        try expect_bad(check_trust_path(input, &diag), &diag);
+    }
 }
 
 test "the server address is an IP address and a port, and nothing else" {

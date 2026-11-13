@@ -526,19 +526,32 @@ const Work = struct {
         held: *const records.JobObserved,
         run: ?*const Entry(records.JobRun),
     ) Error!void {
-        const entry = run orelse return work.not_started(subject, record);
+        const entry = run orelse return work.not_started(subject, record, null);
         const mine = subject.assigned and held.tenure == work.agent.tenure and
             held.assignment == record.epoch and record.epoch == subject.epoch and
             entry.rec.stop == null;
         if (mine) return work.begin(subject, entry, record);
-        return work.not_started(subject, record);
+        return work.not_started(subject, record, &entry.rec);
     }
 
-    fn not_started(work: *Work, subject: Subject, record: StartRecord) Error!void {
+    /// Nothing of the run was started. A run the node's trust policy refuses is reported
+    /// `refused` here too, whatever else ended it: a refusal whose report was lost (dropped,
+    /// or the link cut) must not come back as `not_started`, which reads `failed deadline`.
+    fn not_started(
+        work: *Work,
+        subject: Subject,
+        record: StartRecord,
+        run: ?*const records.JobRun,
+    ) Error!void {
         // Nothing was started, so a run with no assignment here ends with its record. One placed
         // again is reported under the new assignment (`report_epoch`).
         const epoch = report_epoch(subject, record) orelse
             return remove_record(work.ctx, work.state, subject.id);
+        if (run) |judged| {
+            if (try work.trust_refusal(judged)) |refusal| {
+                return work.report_refused(subject.id, epoch, refusal);
+            }
+        }
         var wanted: Report = .{
             .run = subject.id,
             .status = .stopped,
@@ -773,8 +786,12 @@ const Work = struct {
         const ctx = work.ctx;
         const run = &entry.rec;
         var record = claiming;
-        if (past_bound(ctx, record)) return work.not_started(subject, record);
-        if (try work.refused_by_trust(subject, record, run)) return;
+        // The trust check comes first: a refusal is decided by the run and the node's policy
+        // alone, and a late pass must not turn it into `not_started`.
+        if (try work.trust_refusal(run)) |refusal| {
+            return work.report_refused(subject.id, record.epoch, refusal);
+        }
+        if (past_bound(ctx, record)) return work.not_started(subject, record, run);
         const input = work.input_of(subject, run) catch |err| switch (err) {
             error.InputAbsent => return work.cannot_start(subject, record, .{ .input = .absent }),
             error.InputMismatch => {
@@ -797,7 +814,7 @@ const Work = struct {
                     // keep the tenure over a reboot, that re-arm would restart the bound in
                     // full after every reboot.
                     const this_boot = std.mem.eql(u8, record.boot_id, ctx.boot_id);
-                    if (this_boot and mono >= at) return work.not_started(subject, record);
+                    if (this_boot and mono >= at) return work.not_started(subject, record, run);
                     if (this_boot) return work.retry_input(at);
                 }
                 record.boot_id = ctx.boot_id;
@@ -819,33 +836,43 @@ const Work = struct {
     }
 
     /// The node's own check (B5): with a trust policy, the run's signatures are judged before
-    /// anything of it is fetched or started, whatever the server admitted. A refused run is
-    /// reported `stopped`, exit `refused`, with ZBX-E0905 and its causes; nothing is started, so
-    /// no supervisor is spawned. The record stays `claiming` and goes once the run is unassigned,
-    /// as after any start failure. Returns whether the run was refused.
-    fn refused_by_trust(
-        work: *Work,
-        subject: Subject,
-        record: StartRecord,
-        run: *const records.JobRun,
-    ) Error!bool {
-        const trust = work.agent.config.trust orelse return false;
-        if (c1_teeth.job_untrusted) return false; // Test-only: the node judges nothing (J12).
+    /// anything of it is fetched or started, whatever the server admitted. The refusal (ZBX-E0905
+    /// and its causes), or null when the node has no policy or the policy is met.
+    fn trust_refusal(work: *Work, run: *const records.JobRun) Error!?records.Raw {
+        const trust = work.agent.config.trust orelse return null;
+        if (c1_teeth.job_untrusted) return null; // Test-only: the node judges nothing (J12).
         const ctx = work.ctx;
         const judged = job_trust.judge_run(trust, ctx.arena, .{
             .image = run.image,
             .source = run.source,
             .signatures = run.signatures orelse &.{},
         }) catch return failures.no_memory(ctx.diag);
-        const refusal = judged orelse return false;
+        const refusal = judged orelse return null;
+        return try records.diagnostic_raw(ctx.arena, refusal, ctx.diag);
+    }
+
+    /// The run's lines that counted in the node's verdict, the only ones the runtime may keep
+    /// (`job_trust.counted_lines`); none without a trust policy.
+    fn kept_signatures(work: *Work, run: *const records.JobRun) Error![]const []const u8 {
+        const trust = work.agent.config.trust orelse return &.{};
+        return job_trust.counted_lines(trust, work.ctx.arena, .{
+            .image = run.image,
+            .source = run.source,
+            .signatures = run.signatures orelse &.{},
+        }) catch return failures.no_memory(work.ctx.diag);
+    }
+
+    /// A refused run is reported `stopped`, exit `refused`; nothing is started, so no supervisor
+    /// is spawned. The record stays `claiming` and goes once the run is unassigned, as after any
+    /// start failure. A report that is lost is made again by a later pass (`not_started`).
+    fn report_refused(work: *Work, run: []const u8, epoch: u64, refusal: records.Raw) Error!void {
         try work.report(.{
-            .run = subject.id,
+            .run = run,
             .status = .stopped,
-            .epoch = record.epoch,
+            .epoch = epoch,
             .exit = .{ .kind = .refused },
-            .diagnostic = try records.diagnostic_raw(ctx.arena, refusal, ctx.diag),
+            .diagnostic = refusal,
         });
-        return true;
     }
 
     /// The retry bound of a `claiming` record has been reached on this boot: the pass is late (the
@@ -942,7 +969,7 @@ const Work = struct {
             .image = run.image,
             .source = run.source,
             .relay = relay_address(run),
-            .signatures = run.signatures orelse &.{},
+            .signatures = try work.kept_signatures(run),
             .command = run.command,
             .env = env,
             .limits = .{
