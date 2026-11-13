@@ -28,6 +28,15 @@
 //! process, as HANDOFF says. A test can end a container with `oom`, `pid_limit` or `lost` by
 //! writing the word into `<state>/faults/<name>`; the next `list` applies it.
 //!
+//! ## Health checks
+//!
+//! The command of a health check (C3) is not run: its result is scripted by the same file, read
+//! at each `probe_poll`. `unhealthy` makes it exit 1, `probe_timeout` makes it time out at its
+//! `timeout_ms`, `probe_refused` makes it `refused`; no file, or any other word, makes it exit 0.
+//! A check ends at the first poll (a timeout at the first poll after its `timeout_ms`). These
+//! words stay until the container ends, so a test can flip a container's health by rewriting
+//! the file.
+//!
 //! ## Where it differs from the contract
 //!
 //! `stop` waits for a polite stop only `fake_stop_wait_ms` and then returns with the container
@@ -90,6 +99,9 @@ const Tag = enum(u8) { starting, running, stopped };
 
 const Known = struct { handle: runtime.Handle, tag: Tag };
 
+/// A health check in flight (see "Health checks").
+const Probe = struct { handle: runtime.Handle, began_ms: u64, timeout_ms: u32 };
+
 pub const FakeRuntime = struct {
     io: std.Io,
     clock: Clock,
@@ -106,6 +118,9 @@ pub const FakeRuntime = struct {
     /// What `events` last saw, to report differences.
     known: [constants.fake_containers_max]Known,
     known_count: u32,
+    /// Health checks in flight, at most one per container.
+    probes: [constants.fake_containers_max]Probe,
+    probes_count: u32,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -114,6 +129,8 @@ pub const FakeRuntime = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .probe_begin = probe_begin_impl,
+        .probe_poll = probe_poll_impl,
     };
 
     /// Initialises in place (the tables are large): creates the directories and takes the lock.
@@ -131,6 +148,7 @@ pub const FakeRuntime = struct {
         self.options = options;
         self.children_count = 0;
         self.known_count = 0;
+        self.probes_count = 0;
         const root = Dir.openDirAbsolute(io, options.state_dir, .{}) catch
             return state_dir_failed(diag, options.state_dir, "open it");
         errdefer root.close(io);
@@ -734,6 +752,104 @@ pub const FakeRuntime = struct {
         };
     }
 
+    // ---- Health checks ----
+
+    fn probe_begin_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) runtime.Error!void {
+        assert(command.len > 0);
+        assert(timeout_ms > 0);
+        const self = from(context);
+        _ = try inspect_impl(context, handle, diag);
+        const probe: Probe = .{
+            .handle = handle,
+            .began_ms = self.clock.now_ms(),
+            .timeout_ms = timeout_ms,
+        };
+        if (self.probe_index(handle)) |index| {
+            self.probes[index] = probe;
+            return;
+        }
+        if (self.probes_count == self.probes.len) self.forget_probes();
+        if (self.probes_count == self.probes.len) {
+            return runtime_failed(diag, "track another health check");
+        }
+        self.probes[self.probes_count] = probe;
+        self.probes_count += 1;
+    }
+
+    fn probe_poll_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.ProbeResult {
+        const self = from(context);
+        const status = try inspect_impl(context, handle, diag);
+        const index = self.probe_index(handle) orelse
+            return .{ .refused = sim_runtime.probe_refused("no health check is in flight") };
+        const result = self.probe_result(self.probes[index], status);
+        if (result.final()) self.probe_drop(index);
+        return result;
+    }
+
+    fn probe_result(
+        self: *FakeRuntime,
+        probe: Probe,
+        status: runtime.Status,
+    ) runtime.ProbeResult {
+        if (status != .running) {
+            return .{ .refused = sim_runtime.probe_refused("the container is not running") };
+        }
+        var buffer: [64]u8 = undefined;
+        const word = self.fault_word(probe.handle.name(), &buffer);
+        if (std.mem.eql(u8, word, "unhealthy")) return .{ .exited = 1 };
+        if (std.mem.eql(u8, word, "probe_refused")) {
+            return .{ .refused = sim_runtime.probe_refused("the fault file refused the check") };
+        }
+        if (std.mem.eql(u8, word, "probe_timeout")) {
+            const elapsed = self.clock.now_ms() -| probe.began_ms;
+            return if (elapsed >= probe.timeout_ms) .timed_out else .running;
+        }
+        return .{ .exited = 0 };
+    }
+
+    /// The word in `<state>/faults/<name>`, trimmed; empty if there is none.
+    fn fault_word(self: *FakeRuntime, name: []const u8, buffer: []u8) []const u8 {
+        const read = self.faults.readFile(self.io, name, buffer) catch return "";
+        return std.mem.trim(u8, read, "\n ");
+    }
+
+    fn probe_index(self: *const FakeRuntime, handle: runtime.Handle) ?u32 {
+        for (self.probes[0..self.probes_count], 0..) |probe, index| {
+            if (probe.handle.eql(&handle)) return @intCast(index);
+        }
+        return null;
+    }
+
+    fn probe_drop(self: *FakeRuntime, index: u32) void {
+        assert(index < self.probes_count);
+        self.probes_count -= 1;
+        self.probes[index] = self.probes[self.probes_count];
+    }
+
+    /// Drops the checks of containers that are gone: their results can never be read.
+    fn forget_probes(self: *FakeRuntime) void {
+        var index: u32 = 0;
+        while (index < self.probes_count) {
+            const name = self.probes[index].handle.name();
+            const dir = self.containers.openDir(self.io, name, .{}) catch {
+                self.probe_drop(index);
+                continue;
+            };
+            dir.close(self.io);
+            index += 1;
+        }
+    }
+
     // ---- Zombies and faults ----
 
     /// Collects the supervisors of this process that have ended, so they do not linger as
@@ -792,6 +908,14 @@ pub const FakeRuntime = struct {
         return true;
     }
 };
+
+fn is_health_word(word: []const u8) bool {
+    const words = [_][]const u8{ "unhealthy", "probe_timeout", "probe_refused" };
+    for (words) |known| {
+        if (std.mem.eql(u8, word, known)) return true;
+    }
+    return false;
+}
 
 fn is_limit_word(word: []const u8) bool {
     if (std.mem.eql(u8, word, "oom")) return true;

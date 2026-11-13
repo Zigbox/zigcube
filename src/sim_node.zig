@@ -46,6 +46,8 @@ pub const SimNode = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .probe_begin = probe_begin_impl,
+        .probe_poll = probe_poll_impl,
     };
 
     pub fn init(
@@ -278,6 +280,46 @@ pub const SimNode = struct {
             try node.containers.interface().signal(handle, number, diag);
         }
         if (node.step()) return node.dead(diag);
+    }
+
+    /// As `signal_impl`: a dead agent begins nothing, an unknown record is `NotFound`, and a
+    /// record whose container never started has no check to run (its poll is `refused`).
+    fn probe_begin_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) runtime.Error!void {
+        const node = from(context);
+        if (node.crashed) return node.dead(diag);
+        try node.record_exists(handle, diag);
+        if (!node.containers.has(handle.name())) return;
+        try node.containers.interface().probe_begin(handle, command, timeout_ms, diag);
+    }
+
+    fn probe_poll_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.ProbeResult {
+        const node = from(context);
+        if (node.crashed) return node.dead(diag);
+        try node.record_exists(handle, diag);
+        if (!node.containers.has(handle.name())) {
+            return .{ .refused = sim_runtime.probe_refused("the container never started") };
+        }
+        return node.containers.interface().probe_poll(handle, diag);
+    }
+
+    fn record_exists(node: *SimNode, handle: runtime.Handle, diag: *Diag) runtime.Error!void {
+        var arena_state = std.heap.ArenaAllocator.init(node.files.gpa);
+        defer arena_state.deinit();
+        const state = node.files.interface();
+        const read = agent_records.read_spec(state, arena_state.allocator(), handle.name());
+        const found = read catch |err|
+            return node.state_failed(diag, err, "read the container's record");
+        if (found == null) return agent_records.not_found(diag, handle.name());
     }
 
     fn inspect_impl(

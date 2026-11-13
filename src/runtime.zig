@@ -154,6 +154,27 @@ pub const StatusChange = struct {
     status: Status,
 };
 
+/// Where a health check (C3) begun with `Runtime.probe_begin` stands. The check is the
+/// replica's `health.command`, run inside its running container; the runtime keeps at most one
+/// per container and ends it at its `timeout_ms`.
+pub const ProbeResult = union(enum) {
+    /// Still running: poll again later.
+    running,
+    /// The command ran and exited with this code: 0 passes, anything else fails.
+    exited: u8,
+    /// The command was still running at `timeout_ms` and was ended. It counts as a failed check
+    /// (ZC-W0502).
+    timed_out,
+    /// The check could not run (the container is not running, or the runtime refused the
+    /// command); the diagnostic says why. It counts as neither a pass nor a failure (ZC-E0516).
+    refused: Diagnostic,
+
+    /// True once the check has come to an end; the runtime then forgets it.
+    pub fn final(result: *const ProbeResult) bool {
+        return result.* != .running;
+    }
+};
+
 pub const Runtime = struct {
     context: *anyopaque,
     vtable: *const VTable,
@@ -184,6 +205,14 @@ pub const Runtime = struct {
             timeout_ms: u32,
             diag: *Diag,
         ) Error![]const StatusChange,
+        probe_begin: *const fn (
+            context: *anyopaque,
+            handle: Handle,
+            command: []const []const u8,
+            timeout_ms: u32,
+            diag: *Diag,
+        ) Error!void,
+        probe_poll: *const fn (context: *anyopaque, handle: Handle, diag: *Diag) Error!ProbeResult,
     };
 
     /// Starts a container and returns once its command is running, or says why it could not.
@@ -253,6 +282,47 @@ pub const Runtime = struct {
         ));
         assert(changes.len <= constants.runtime_events_batch_max);
         return changes;
+    }
+
+    /// Begins a health check: runs `command` in the container and returns at once, never
+    /// waiting for it (read the result with `probe_poll`). The runtime copies `command`, ends
+    /// the check at `timeout_ms`, and keeps at most one check per container: beginning another
+    /// abandons the one in flight, whose result is never reported (an agent that restarted
+    /// begins afresh). A container that is not running is not an error: the check's result is
+    /// `refused`. An unknown handle is `NotFound`.
+    pub fn probe_begin(
+        runtime: Runtime,
+        handle: Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) Error!void {
+        assert(diag.code == null);
+        assert(command.len > 0);
+        assert(command.len <= constants.runtime_command_words_max);
+        assert(command[0].len > 0);
+        assert(timeout_ms > 0);
+        try finish(diag, runtime.vtable.probe_begin(
+            runtime.context,
+            handle,
+            command,
+            timeout_ms,
+            diag,
+        ));
+    }
+
+    /// The state of the container's health check, without waiting. A final result is
+    /// reported once, and the check is then forgotten. Polling a container with no check in
+    /// flight (one already reported, or lost with the runtime's own process) reports `refused`.
+    /// An unknown handle is `NotFound`.
+    pub fn probe_poll(runtime: Runtime, handle: Handle, diag: *Diag) Error!ProbeResult {
+        assert(diag.code == null);
+        const result = try finish(diag, runtime.vtable.probe_poll(runtime.context, handle, diag));
+        switch (result) {
+            .refused => |failure| assert(failure.code.len > 0),
+            else => {},
+        }
+        return result;
     }
 };
 
@@ -379,6 +449,8 @@ const Refusing = struct {
         .inspect = inspect,
         .list = list,
         .events = events,
+        .probe_begin = probe_begin,
+        .probe_poll = probe_poll,
     };
 
     fn start(context: *anyopaque, spec: *const Spec, diag: *Diag) Error!StartOutcome {
@@ -436,6 +508,28 @@ const Refusing = struct {
         _ = diag;
         return &.{};
     }
+
+    fn probe_begin(
+        context: *anyopaque,
+        handle: Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) Error!void {
+        _ = context;
+        _ = handle;
+        _ = command;
+        _ = timeout_ms;
+        diag.raise(.E0501);
+        return error.NotFound;
+    }
+
+    fn probe_poll(context: *anyopaque, handle: Handle, diag: *Diag) Error!ProbeResult {
+        _ = context;
+        _ = handle;
+        diag.raise(.E0501);
+        return error.NotFound;
+    }
 };
 
 test "a failed start is an outcome carrying a diagnostic; an unknown handle is an error" {
@@ -463,6 +557,10 @@ test "a failed start is an outcome carrying a diagnostic; an unknown handle is a
     try testing.expectEqual(@as(@TypeOf(diag.code.?), .E0501), diag.code.?);
     diag.reset();
     try testing.expectError(error.NotFound, runtime.inspect(handle, &diag));
+    diag.reset();
+    try testing.expectError(error.NotFound, runtime.probe_begin(handle, &.{"true"}, 1000, &diag));
+    diag.reset();
+    try testing.expectError(error.NotFound, runtime.probe_poll(handle, &diag));
 
     diag.reset();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

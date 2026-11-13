@@ -108,6 +108,8 @@ pub const ZigboxRuntime = struct {
         .inspect = inspect_impl,
         .list = list_impl,
         .events = events_impl,
+        .probe_begin = probe_begin_impl,
+        .probe_poll = probe_poll_impl,
     };
 
     /// Initialises in place (the tables are large): opens the directories and takes the lock.
@@ -497,6 +499,32 @@ pub const ZigboxRuntime = struct {
         return result.items;
     }
 
+    // ---- health checks ----
+
+    /// Health checks over Zigbox `exec` arrive with C3 slice 10. Until then a check begins (an
+    /// unknown container is still `NotFound`) and comes to `refused`, which the agent reports as
+    /// ZC-E0516 and counts as neither a pass nor a failure.
+    fn probe_begin_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *Diag,
+    ) runtime.Error!void {
+        assert(command.len > 0);
+        assert(timeout_ms > 0);
+        _ = try inspect_impl(context, handle, diag);
+    }
+
+    fn probe_poll_impl(
+        context: *anyopaque,
+        handle: runtime.Handle,
+        diag: *Diag,
+    ) runtime.Error!runtime.ProbeResult {
+        _ = try inspect_impl(context, handle, diag);
+        return .{ .refused = probe_not_built() };
+    }
+
     // ---- events ----
 
     fn events_impl(
@@ -684,6 +712,18 @@ fn refusal_diagnostic(reason: map.Refusal, spec: *const runtime.Spec) Diagnostic
         collector.fix(.{ .sentence = "shorten it in the service file, then apply it again" });
     }
     collector.while_("starting container {s}", .{spec.name});
+    var out: Diagnostic = undefined;
+    diag_mod.to_diagnostic(&out, &collector);
+    return out;
+}
+
+/// Why a health check did not run in a Zigbox container: this build has no probe yet.
+fn probe_not_built() Diagnostic {
+    var collector: Diag = undefined;
+    collector.reset();
+    collector.raise(.E0502);
+    collector.cause("this build does not run health checks in Zigbox containers", .{});
+    collector.fix(.{ .sentence = "use a build with C3's probe over Zigbox exec" });
     var out: Diagnostic = undefined;
     diag_mod.to_diagnostic(&out, &collector);
     return out;
