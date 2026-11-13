@@ -530,7 +530,8 @@ test "a stop past its grace over a record that never started does not make a bus
     // record was written and the agent crashed before the start, so the runtime says `starting`
     // until `fake_start_timeout_ms`) stayed pending; once its grace passed the agent's next wake
     // was always now, about 200 steps in 10 s, over the busy-loop ceiling. Method: the shrunk
-    // run that failed, pinned (2 nodes, crash_heavy, ttl 8,516 ms, 200 % replicas, heal at 72).
+    // run that failed, pinned (2 nodes, crash_heavy, ttl 8,516 ms (9,000 since #238), 200 %
+    // replicas, heal at 72).
     const gpa = std.testing.allocator;
     const report = try gpa.create(sim_cluster.Report);
     defer gpa.destroy(report);
@@ -538,7 +539,7 @@ test "a stop past its grace over a record that never started does not make a bus
         .nodes = 2,
         .c1 = true,
         .profile = .crash_heavy,
-        .lease_ttl_ms = 8516,
+        .lease_ttl_ms = 9000,
         .replicas_pct = 200,
         .heal_at = 72,
     };
@@ -587,8 +588,8 @@ test "a service deleted and applied again leaves no old replica running (fleet i
 
 test "a step's calls are capped by the time the step has already spent (fleet issue 136)" {
     // Goal: regression for fleet issue 136, I1b failing on a correct agent. Method: replay the
-    // shrunk failure (11 nodes, partitions, ttl 8,799 ms, 200 % replicas, 29 operations healing
-    // at 355). The node's clock stood still during a step, so a step's calls each had the
+    // shrunk failure (11 nodes, partitions, ttl 8,799 ms (9,000 since #238), 200 % replicas, 29
+    // operations healing at 355). The node's clock stood still during a step, so a step's calls each had the
     // whole fence window and one step ran 12 s under a 5.8 s window. A pinned seed can start
     // passing for the wrong reason when the draw changes; the lasting check is the clock test
     // in sim_cluster.zig.
@@ -599,7 +600,7 @@ test "a step's calls are capped by the time the step has already spent (fleet is
         .nodes = 11,
         .c1 = true,
         .profile = .partitions,
-        .lease_ttl_ms = 8799,
+        .lease_ttl_ms = 9000,
         .replicas_pct = 200,
         .heal_at = 355,
     }, report);

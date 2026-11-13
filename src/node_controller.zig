@@ -247,7 +247,7 @@ pub const NodeController = struct {
         status: *const Entry(records.NodeStatus),
         newer: ?*const Entry(records.NodeTenure),
     ) Error!void {
-        assert(status.rec.state == .ready or newer != null);
+        if (newer == null) assert(status.rec.state == .ready);
         const node_key = records.node_key(name);
         const node_bytes = try controller.key_copy(ctx, &node_key);
         const tenure = if (newer) |found| found.kv.mod_revision else status.rec.tenure;
@@ -700,7 +700,8 @@ const Fixture = struct {
         const op: store.Op = .{ .put = .{ .key = key.slice(), .value = bytes, .lease = lease.id } };
         // The tenure record on no lease, in the same transaction, as the agent endpoint writes.
         const tenure_key = records.node_tenure_key(name);
-        const tenure = try records.encode(ctx.arena, records.NodeTenure{ .node = name }, &self.diag);
+        const tenure_rec = records.NodeTenure{ .node = name };
+        const tenure = try records.encode(ctx.arena, tenure_rec, &self.diag);
         const ops = [_]store.Op{ op, .{ .put = .{ .key = tenure_key.slice(), .value = tenure } } };
         _ = try writers.txn(ctx.store, .{ .agent = name }, .{ .on_success = &ops }, &self.diag);
         return lease.id;

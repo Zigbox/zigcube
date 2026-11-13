@@ -108,4 +108,7 @@ step, was not part of (a) and is not built.
 
 Where: docs/authority.md §2 and §3, docs/keys.md (`/node-tenure/<node>`), src/constants.zig,
 src/fencing.zig, src/agent.zig (`kill_now`), src/node_controller.zig, src/replica_controller.zig,
-src/controller.zig (`newer_tenure`), src/agent_api.zig (`register`), docs/demos/c1.md.
+src/controller.zig (`newer_tenure`), src/agent_api.zig (`register`), docs/demos/c1.md, and the
+ttl of 9,000 ms in src/sim_shape.zig, src/server_config.zig, the demo-c1 sources, the E0121
+text and testdata, and the regression lines in build.zig and src/sim_cluster_main.zig whose
+ttls (8,516 and 8,799 ms) the new bound refuses.

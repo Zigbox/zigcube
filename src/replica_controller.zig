@@ -571,8 +571,8 @@ const Run = struct {
     /// Compares what the judgement of a node rests on: its status at the revision read (`lost`
     /// for a removal off a lost node, `ready` for one that cites a report) and its `/nodes`
     /// record as read, or, when that is absent, its `/node-tenure` record as read (absent
-    /// with no tenure record: `/nodes` at revision 0). Once per node per batch: a second replica of the
-    /// node adds nothing.
+    /// with no tenure record: `/nodes` at revision 0). Once per node per batch: a second
+    /// replica of the node adds nothing.
     fn expect_node_judged(run: *Run, batch: *Batch, node: []const u8) Error!void {
         // Test-only fault (the sim-c1-teeth-stale negative test): the node's status and
         // registration are not compared, so a report that went stale before the commit is acted on.
