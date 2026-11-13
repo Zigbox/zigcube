@@ -37,6 +37,26 @@ const Dir = std.Io.Dir;
 /// The command's pid, for the signal handler, which has nowhere else to look.
 var child_pid: std.atomic.Value(i32) = .init(0);
 
+/// The relay's listener, for the `relay_stop` test fault's handler (`SIGUSR1`); -1 for none.
+var relay_listener: std.atomic.Value(i32) = .init(-1);
+
+/// The `relay_stop` fault (sent by `FakeRuntime` as `SIGUSR1`): the listener is shut down, so
+/// the relay's acceptor ends as if the relay had died, and must take the command with it.
+fn on_relay_fault(_: std.posix.SIG) callconv(.c) void {
+    const fd = relay_listener.load(.seq_cst);
+    if (fd >= 0) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+}
+
+const root = @import("root");
+
+/// The tooth of the "no relay, no workload" test (B4 slice 2): the command runs although its
+/// relay could not be opened. A constant only a root file can switch on
+/// (`zcube_agent_relay_teeth_unrelayed.zig`), which only `zig build relay-teeth` compiles.
+const fault_run_unrelayed: bool = if (@hasDecl(root, "relay_teeth_run_unrelayed"))
+    root.relay_teeth_run_unrelayed
+else
+    false;
+
 /// Set once this supervisor itself got `SIGTERM`: a fetch that ends by a signal after that was
 /// stopped; before it, the fetch crashed.
 var term_received: std.atomic.Value(bool) = .init(false);
@@ -115,6 +135,12 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
         .flags = 0,
     };
     std.posix.sigaction(.TERM, &action, null);
+    const relay_fault: std.posix.Sigaction = .{
+        .handler = .{ .handler = on_relay_fault },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.USR1, &relay_fault, null);
     const own_pid: i32 = @intCast(std.os.linux.getpid());
     files.write_pid(io, dir, files.file_supervisor, own_pid) catch
         return constants.exit_environment;
@@ -275,10 +301,12 @@ fn supervise(
     if (spec.relay) |upstream| {
         switch (open_relay(init, dir, dir_path, upstream, spec, &environ)) {
             .opened => |opened| relay = opened,
-            .failed => |over| return record(io, dir, over),
+            .failed => |over| if (!fault_run_unrelayed) return record(io, dir, over),
         }
     }
     const ending = run_command(init, dir, spec, &environ, relay);
+    // Cleared first: after `stop` the number may name another file.
+    relay_listener.store(-1, .seq_cst);
     if (relay) |open| open.stop();
     const over = ending orelse return constants.exit_environment;
     return record(io, dir, over);
@@ -297,6 +325,9 @@ fn open_relay(
     spec: *const files.SpecFile,
     environ: *std.process.Environ.Map,
 ) RelayOpening {
+    if (files.exists(init.io, dir, files.file_relay_fault)) {
+        return relay_failed("the relay could not be opened (the test fault relay_open)");
+    }
     const target = relay_module.Upstream.parse(upstream) orelse {
         return relay_failed("the relay's address is not HOST:PORT");
     };
@@ -407,6 +438,10 @@ fn run_command(
     }) catch |err| return spawn_failure(err);
     const pid: i32 = child.id.?;
     publish_child(pid);
+    if (relay) |open| {
+        open.command_pid = pid;
+        relay_listener.store(open.listener, .seq_cst);
+    }
     if (relay) |open| open.run() catch {
         // Without a relay thread the command has a listener nobody serves: end it.
         _ = std.os.linux.kill(pid, .KILL);

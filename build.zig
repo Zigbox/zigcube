@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
     });
     add_agent_smoke_step(b, built, zigbox_module);
     add_swarm_smoke_steps(b, shared_options, built);
+    add_relay_teeth_step(b, shared_options);
     add_mtls_interop_step(b, shared_options);
     add_mtls_teeth_step(b, shared_options);
     add_local_smoke_step(b, built);
@@ -300,6 +301,65 @@ fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.M
     run.has_side_effects = true;
     const help = "Run zcube-server and zcube-agent as real processes and check them (not demo-c0)";
     b.step("agent-smoke", help).dependOn(&run.step);
+}
+
+/// `zig build relay-teeth` (B4 slice 2): the two "relay fail closed" tests of
+/// src/fake_runtime_test.zig, each run against an agent with its half switched off
+/// (src/zcube_agent_relay_teeth_*.zig); each run must fail. `zig build test` runs the same tests
+/// against the real agent, where they must pass. Never cached, not in `check`.
+fn add_relay_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
+    const step = b.step("relay-teeth", "Run the relay fail-closed tests against broken agents");
+    const teeth = [_][2][]const u8{
+        .{ "outlive", "a relay that stops while the job runs" },
+        .{ "unrelayed", "a relay that cannot be opened" },
+    };
+    for (teeth) |tooth| {
+        const agent = b.addExecutable(.{
+            .name = b.fmt("zcube-agent-relay-teeth-{s}", .{tooth[0]}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(
+                    b.fmt("src/zcube_agent_relay_teeth_{s}.zig", .{tooth[0]}),
+                ),
+                .target = options.target,
+                .optimize = options.optimize,
+                .imports = &.{
+                    .{ .name = "build_options", .module = options.options.createModule() },
+                    .{ .name = "zigbox", .module = options.zigbox },
+                },
+            }),
+        });
+        const tests = b.addTest(.{
+            .filters = &.{b.fmt("relay fail closed: {s}", .{tooth[1]})},
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/fake_runtime_test.zig"),
+                .target = options.target,
+                .optimize = options.optimize,
+                .imports = &.{
+                    .{ .name = "build_options", .module = options.options.createModule() },
+                    .{ .name = "zigbox", .module = options.zigbox },
+                },
+            }),
+        });
+        // Installed beside the build's other outputs, never in `bin`: the tests find the
+        // supervisor by path (`ZCUBE_AGENT_EXE`).
+        const install = b.addInstallArtifact(agent, .{
+            .dest_dir = .{ .override = .{ .custom = "teeth" } },
+        });
+        const run = b.addRunArtifact(tests);
+        run.setCwd(b.path("."));
+        // The default prefix: `--prefix` moves the agent, not this path.
+        run.setEnvironmentVariable(
+            "ZCUBE_AGENT_EXE",
+            b.fmt("zig-out/teeth/zcube-agent-relay-teeth-{s}", .{tooth[0]}),
+        );
+        run.step.dependOn(&install.step);
+        // A test binary's run speaks the build protocol; checking its exit code needs plain
+        // stdio, where a failing test exits 1.
+        run.stdio = .{ .check = .empty };
+        run.expectExitCode(1);
+        run.has_side_effects = true;
+        step.dependOn(&run.step);
+    }
 }
 
 /// `zig build swarm-smoke` and `swarm-smoke-teeth` (src/swarm_smoke.zig): three agents, a fake

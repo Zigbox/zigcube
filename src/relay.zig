@@ -35,6 +35,16 @@ const ns_per_ms = 1_000_000;
 const nonblock_cloexec: u32 = linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC;
 const log_line_bytes_max = 256;
 
+const root = @import("root");
+
+/// The tooth of the "relay gone, workload gone" test (B4 slice 2): the relay that ends early
+/// leaves the command running. A constant only a root file can switch on
+/// (`zcube_agent_relay_teeth_outlive.zig`), which only `zig build relay-teeth` compiles.
+const fault_outlive: bool = if (@hasDecl(root, "relay_teeth_outlive"))
+    root.relay_teeth_outlive
+else
+    false;
+
 /// Where the upstream is: a host (a literal address or a name) and a port.
 pub const Upstream = struct {
     host: []const u8,
@@ -138,6 +148,9 @@ pub const Relay = struct {
     tls: ?relay_tls.Tls = null,
     credential: ?*relay_tls.Credential = null,
     dir_fd: fd_t = -1,
+    /// The command this relay serves, set before `run`; 0 for none. A run never outlives its
+    /// relay (Zigcube #228): if the acceptor ends before `stop`, it kills this process.
+    command_pid: i32 = 0,
 
     pub const OpenError = error{ SocketFailed, BindFailed, ListenFailed, OutOfMemory };
 
@@ -263,6 +276,11 @@ pub const Relay = struct {
             switch (linux.errno(accepted)) {
                 .SUCCESS => relay.admit(@intCast(accepted)),
                 .AGAIN, .INTR, .CONNABORTED => {},
+                // The listener itself is gone: no connection can be served again.
+                .INVAL, .BADF, .NOTSOCK => |errno| {
+                    relay.ended_early(@tagName(errno));
+                    break;
+                },
                 else => |errno| {
                     // Out of descriptors, most likely: the connection stays in the backlog and
                     // the listener stays readable, so wait instead of spinning, and say so once.
@@ -279,6 +297,17 @@ pub const Relay = struct {
             slot.thread = null;
         }
         _ = linux.close(relay.listener);
+    }
+
+    /// The relay stopped while its run was alive: the run goes too, and `relay.log` says why
+    /// (ZC-E0702, the listener). The supervisor then reports the run as killed by signal 9.
+    fn ended_early(relay: *Relay, cause: []const u8) void {
+        // `stop` does not touch the listener while the acceptor runs, so this is not its doing.
+        if (relay.stopping.load(.acquire)) return;
+        relay.note(.E0702, "the relay's listener stopped while the job ran ({s}): " ++
+            "the job's command was killed", .{cause});
+        if (fault_outlive) return;
+        if (relay.command_pid > 1) _ = linux.kill(relay.command_pid, .KILL);
     }
 
     fn look_for_credential(relay: *Relay) void {

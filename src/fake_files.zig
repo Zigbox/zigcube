@@ -35,6 +35,7 @@ pub const file_fetch_log = agent_records.file_fetch_log;
 pub const file_relay_port = agent_records.file_relay_port;
 pub const file_relay_log = agent_records.file_relay_log;
 pub const file_relay_public = agent_records.file_relay_public;
+pub const file_relay_fault = agent_records.file_relay_fault;
 pub const file_pull = agent_records.file_pull;
 pub const FetchFile = agent_records.FetchFile;
 

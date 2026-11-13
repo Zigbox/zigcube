@@ -62,6 +62,9 @@ pub const file_relay_log = "relay.log";
 pub const file_relay_public = "relay.pub";
 pub const file_relay_certificate = "relay.crt";
 pub const file_relay_refused = "relay.refused";
+/// A fake-runtime test fault for the relay (B4 slice 2): `open` makes the supervisor fail to
+/// open the relay. Written by `FakeRuntime.start` from `<state>/faults/<name>` = `relay_open`.
+pub const file_relay_fault = "relay.fault";
 /// Written by `zcube-agent fetch --report` when a fetch succeeds (C2 slice 7): a `records.Pull`
 /// the agent publishes under `/pulls/` and then removes.
 pub const file_pull = "pull.json";
@@ -165,6 +168,7 @@ pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!vo
         file_relay_public,
         file_relay_certificate,
         file_relay_refused,
+        file_relay_fault,
     };
     for (files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {

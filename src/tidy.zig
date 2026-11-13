@@ -618,6 +618,8 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
         return std.mem.eql(u8, importing_path, "src/agent.zig") or
             std.mem.eql(u8, importing_path, "src/c1_teeth.zig") or
             std.mem.eql(u8, importing_path, "src/fetch_plan.zig") or
+            std.mem.eql(u8, importing_path, "src/fake_supervisor.zig") or
+            std.mem.eql(u8, importing_path, "src/relay.zig") or
             std.mem.eql(u8, importing_path, "src/zcube_agent.zig");
     }
     // The scripted TLS server is a test fixture (docs/briefs/mtls-client.md): only test roots
