@@ -287,6 +287,9 @@ pub const Job = struct {
     input_bytes: ?u64 = null,
     /// B3: absent on every job stored before it (additive, same version).
     relay: ?JobRelay = null,
+    /// B5: the job's DSSE envelopes, each one line of `zbx trust export`; absent when it has none
+    /// and on every job stored before it (additive, same version).
+    signatures: ?[]const []const u8 = null,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8 = "",
@@ -342,6 +345,8 @@ pub const JobRun = struct {
     input_bytes: ?u64 = null,
     /// B3: the resolved relay of the job, absent when it asked for none.
     relay: ?JobRelay = null,
+    /// B5: the job's signatures, for the node's own check; absent when it has none.
+    signatures: ?[]const []const u8 = null,
     start_by_ms: u64,
     created_at_ms: u64,
     stop: ?RunStop = null,
