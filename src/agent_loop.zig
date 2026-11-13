@@ -267,7 +267,12 @@ test "a wait that may not watch is a pause to the deadline, and never a step bef
     // returning to the same question, until the deadline; then a step.
     var loop = Loop.init();
     _ = loop.next(0);
-    const fence: controller.Wakeup = .{ .at_ms = 100, .prefixes = &.{}, .acted = 0, .watch = false };
+    const fence: controller.Wakeup = .{
+        .at_ms = 100,
+        .prefixes = &.{},
+        .acted = 0,
+        .watch = false,
+    };
     _ = loop.step_done(0, .{ .ok = fence });
     try testing.expectEqual(Action{ .pause_ms = 100 }, loop.next(0));
     try testing.expectEqual(Action{ .pause_ms = 40 }, loop.next(60));
