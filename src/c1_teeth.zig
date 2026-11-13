@@ -133,13 +133,16 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 
 /// The scheduler's placement filter skips the `exclusive` rule, so a replica or a job of another
 /// tenant can land on an exclusive node (must break P1: no assignment breaks a node's `exclusive`
-/// or a job's `require`; B6 slice 2). Tenant labels exist only in the `strong` world.
+/// or a job's `require`; B6 slice 2). Tenant labels exist only in the tenant world, which the
+/// tooth switches on.
 pub const placement_exclusive = declared("c1_teeth_placement_exclusive");
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
-/// jobs, tenant labels).
-pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
-    placement_exclusive;
+/// jobs).
+pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
+
+/// The teeth whose fault needs the tenant world (`Options.tenants`).
+pub const tenant_world = placement_exclusive;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or

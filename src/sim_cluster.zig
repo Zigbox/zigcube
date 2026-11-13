@@ -409,7 +409,7 @@ const Node = struct {
     /// The host crash that took the agent down also lost its disk: the restart finds no state
     /// directory and no container (RB-S2 c; J2 holds across a lost state directory).
     wipe_pending: bool = false,
-    /// B6 (`Options.strong` only): the index into `tenant_sets` of the labels this node's agent is
+    /// B6 (`Options.tenants` only): the index into `tenant_sets` of the labels this node's agent is
     /// configured with. A restart may change it; the node registers it again when its lease
     /// ends, which is a new tenure.
     label_set: u8 = 0,
@@ -464,7 +464,7 @@ const Node = struct {
             .node = node.name(),
             .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
             .address = "10.0.0.5:7070",
-            .labels = if (node.cluster.strong) tenant_sets[node.label_set] else &.{},
+            .labels = if (node.cluster.tenants) tenant_sets[node.label_set] else &.{},
         };
     }
 
@@ -524,7 +524,7 @@ const Node = struct {
         // own generator: no other draw moves). The registration, and with it the labels, changes
         // only when the lease ends (a host crash fences, a long cut expires it); until then
         // the server holds the old ones, which P1 reads at each placement.
-        if (node.cluster.strong and node.cluster.label_prng.random().boolean()) {
+        if (node.cluster.tenants and node.cluster.label_prng.random().boolean()) {
             node.label_set = node.draw_label_set();
             node.cluster.relabels += 1;
         }
@@ -883,7 +883,7 @@ pub const Cluster = struct {
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
-    /// B6: draws the nodes' tenant labels (`Options.strong` only), apart from `prng` so that no
+    /// B6: draws the nodes' tenant labels (`Options.tenants` only), apart from `prng` so that no
     /// other draw of a run moves.
     label_prng: std.Random.DefaultPrng,
     /// Restarts that came back with other labels.
@@ -904,6 +904,8 @@ pub const Cluster = struct {
     relay_spec_wrong: bool = false,
     /// `Options.strong`, or a tooth that needs it (`c1_teeth.strong_world`).
     strong: bool,
+    /// B6: nodes carry tenant labels and jobs require one (`Options.tenants`, or the tooth).
+    tenants: bool,
     /// The host crashes injected so far (the wipe takes every other one, from the first).
     host_crashes: u32,
 
@@ -965,7 +967,7 @@ pub const Cluster = struct {
         c.jobs = .{};
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
-        c.init_tenants(seed);
+        c.init_tenants(seed, options.tenants);
         c.job_next = 1;
         c.init_reuse();
         c.strong = options.strong or c1_teeth.strong_world;
@@ -979,7 +981,8 @@ pub const Cluster = struct {
     }
 
     /// B6: the generator of the nodes' tenant labels, and the count of relabels.
-    fn init_tenants(c: *Cluster, seed: u64) void {
+    fn init_tenants(c: *Cluster, seed: u64, requested: bool) void {
+        c.tenants = requested or c1_teeth.tenant_world;
         c.label_prng = .init(seed ^ 0xb6b6_7e1a_9d03);
         c.relabels = 0;
     }
@@ -1045,7 +1048,7 @@ pub const Cluster = struct {
             if (skewed) skew_beyond_ppm else @max(c.swarm.clock_ppm, 1),
         );
         node.label_set = 0;
-        if (c.strong) node.label_set = node.draw_label_set();
+        if (c.tenants) node.label_set = node.draw_label_set();
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.sim.containers.on_start = job_started;
         node.sim.containers.on_start_context = node;
@@ -1304,8 +1307,8 @@ pub const Cluster = struct {
     /// A replica count up to `most`, held so that the four services together always fit the
     /// nodes' CPU (16 replicas of 250 millis on each 4000): an unplaceable replica is not a bug.
     fn replicas_for(c: *Cluster, random: std.Random, most: u32) u32 {
-        // B6: in the strong world only the nodes that are never exclusive hold a replica.
-        const usable = if (c.strong) (c.nodes.len + 1) / 2 else c.nodes.len;
+        // B6: in the tenant world only the nodes that are never exclusive hold a replica.
+        const usable = if (c.tenants) (c.nodes.len + 1) / 2 else c.nodes.len;
         const fit: u32 = @intCast(usable * 4);
         const scaled = @divFloor(most * c.swarm.replicas_pct, 100);
         return random.uintLessThan(u32, @min(scaled, fit - 1) + 1);
@@ -1634,10 +1637,10 @@ pub const Cluster = struct {
         // Every third job (job numbers 1, 4, 7, ...; `job_relayed`) names the relay (B3 slice 3).
         // No draw, and only with `Options.strong`.
         const relayed = c.strong and job_relayed(number);
-        // B6: in the strong world most jobs name a tenant (`job_tenant`; no draw).
+        // B6: in the tenant world most jobs name a tenant (`job_tenant`; no draw).
         var require_buffer: [1]records.Pair = undefined;
         var placement: ?job_api.PlacementInput = null;
-        if (c.strong) {
+        if (c.tenants) {
             if (job_tenant(number)) |tenant| {
                 require_buffer[0] = .{ "tenant", tenant };
                 placement = .{ .require = &require_buffer };
@@ -3159,6 +3162,10 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// B6 slice 2: nodes carry seeded tenant labels (some exclusive), jobs a seeded `require`, and
+    /// P1 is judged. Apart from `strong` so that the worlds of the older teeth (`job_evicted`'s
+    /// sparse seed) are unchanged; `plan` turns it on for drawn operations (`auto`).
+    tenants: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3184,6 +3191,7 @@ pub fn plan(seed: u64, operations: ?u32, requested: Options) Plan {
     }
     if (operations == null) {
         options.strong = true;
+        options.tenants = true;
         if (options.nodes == null) options.nodes = shape.nodes;
         if (options.lease_ttl_ms == null) options.lease_ttl_ms = shape.lease_ttl_ms;
         if (options.replicas_pct == null) options.replicas_pct = shape.replicas_pct;
@@ -3520,7 +3528,7 @@ fn print_jobs(c: *Cluster) void {
             c.reuse_jumps, c.reuse_cursor.dropped, c.reuse_made, c.reuse_met,
         });
     }
-    if (c.strong) {
+    if (c.tenants) {
         c.report.print("jobs: tenants relabels={d} placements judged={d}\n", .{
             c.relabels, c.c1_tally.tenancy_judged,
         });
