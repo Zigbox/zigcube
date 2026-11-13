@@ -1761,6 +1761,16 @@ const TrustCase = struct {
         for (0..3) |_| case.rig.step();
     }
 
+    /// Assigns an unsigned run straight into the store, with no pass; returns the epoch.
+    /// `start_by_now` puts the server's start backstop at the current time, so the claim's
+    /// retry bound is already reached when the run would begin.
+    fn assign_unsigned(case: *TrustCase, start_by_now: bool) !store.Revision {
+        var run = case.rig.run_record(null, 60_000);
+        run.image = case.images[0];
+        if (start_by_now) run.start_by_ms = case.rig.world.now_ms();
+        return case.rig.assign_run(run);
+    }
+
     /// A line signed by the key of `seed`; the caller frees it (the world's arena is reset by
     /// every step).
     fn sign(case: *TrustCase, seed: u8) ![]const u8 {
@@ -1814,6 +1824,44 @@ test "a run signed by a key the node does not trust is refused; one it trusts st
     try testing.expect(signed.rig.running());
     const seen = (try signed.rig.observed()).?;
     try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+}
+
+test "a refused run past its start bound is reported refused, not not_started" {
+    // Goal: the refused ending wins (B5 slice 2 review): a pass that comes late must not turn a
+    // run the node refuses into `not_started`, which the server ends `failed deadline`. Method:
+    // the run's start backstop is now, so the claim's retry bound is reached when it begins.
+    var case: TrustCase = undefined;
+    try case.start();
+    defer case.stop();
+    _ = try case.assign_unsigned(true);
+    for (0..3) |_| case.rig.step();
+    try expect_refused(&case);
+    try testing.expectEqual(@as(?records.StopCause, null), (try case.rig.observed()).?.stop_cause);
+}
+
+test "a refusal whose report was lost is made again, never reported not_started" {
+    // Goal: a refusal report that never landed (dropped, or the link cut) is not replaced by
+    // `not_started` on a later pass. Method: leave the state a lost report leaves (a `claiming`
+    // record and a claim the agent cannot start under: an earlier tenure, then a stop), which
+    // reports `not_started` for a run the node would run.
+    var stale: TrustCase = undefined;
+    try stale.start();
+    defer stale.stop();
+    const epoch = try stale.assign_unsigned(false);
+    try leave_claim(&stale.rig, epoch, stale.rig.world.agent.tenure - 1);
+    stale.rig.step();
+    try expect_refused(&stale);
+
+    var stopped: TrustCase = undefined;
+    try stopped.start();
+    defer stopped.stop();
+    const again = try stopped.assign_unsigned(false);
+    try leave_claim(&stopped.rig, again, stopped.rig.world.agent.tenure);
+    try stopped.rig.ask_stop(.cancel, 60_000);
+    stopped.rig.step();
+    const seen = (try stopped.rig.observed()).?;
+    try testing.expectEqual(records.ExitKind.refused, seen.exit.?.kind);
+    try testing.expectEqual(@as(u32, 0), starts_seen);
 }
 
 test "an agent with no trust policy checks nothing" {
