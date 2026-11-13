@@ -131,12 +131,19 @@ pub const job_reuse = declared("c1_teeth_job_reuse");
 /// container of the earlier job meets the new one. Not in `any`.
 pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 
+/// The scheduler's placement filter skips the `exclusive` rule, so a replica or a job of another
+/// tenant can land on an exclusive node (must break P1: no assignment breaks a node's `exclusive`
+/// or a job's `require`; B6 slice 2). Tenant labels exist only in the `strong` world.
+pub const placement_exclusive = declared("c1_teeth_placement_exclusive");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
-/// jobs).
-pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
+/// jobs, tenant labels).
+pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
+    placement_exclusive;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
+    placement_exclusive;

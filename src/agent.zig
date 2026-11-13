@@ -139,6 +139,8 @@ pub const Config = struct {
     /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
     peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
+    /// The node's labels, `key=value` words, sent at registration (B6; at most 8; borrowed).
+    labels: []const []const u8 = &.{},
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -748,6 +750,7 @@ pub const Agent = struct {
             .agent_version = agent.config.agent_version,
             .address = agent.config.address,
             .capacity = agent.config.capacity,
+            .labels = agent.config.labels,
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);

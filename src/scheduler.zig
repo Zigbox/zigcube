@@ -528,6 +528,7 @@ fn placement_refusal(labels: []const []const u8, require: []const records.Pair) 
         if (!std.mem.eql(u8, own, pair[1])) return .missing_label;
     }
     if (builtin.is_test and test_weakened == .no_exclusive) return null;
+    if (c1_teeth.placement_exclusive) return null;
     if (exclusive_key(labels, require) != null) return .exclusive;
     return null;
 }

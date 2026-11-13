@@ -1357,6 +1357,15 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "R3",
     },
     .{
+        .name = "placement_exclusive",
+        .root = "src/sim_c1_teeth_placement_exclusive_main.zig",
+        // P1 (an assignment against a node's `exclusive` or a job's `require`); tenant labels
+        // exist only in the strong world, which the tooth switches on. Plain runs (no `--c1`)
+        // do not judge P1: it needs the per-revision tap.
+        .symptom = "P1",
+        .canary_seeds = 20,
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world
@@ -1402,7 +1411,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 23 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 24 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1435,7 +1444,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 23 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 24 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),

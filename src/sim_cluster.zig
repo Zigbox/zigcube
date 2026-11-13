@@ -409,6 +409,10 @@ const Node = struct {
     /// The host crash that took the agent down also lost its disk: the restart finds no state
     /// directory and no container (RB-S2 c; J2 holds across a lost state directory).
     wipe_pending: bool = false,
+    /// B6 (`Options.strong` only): the index into `tenant_sets` of the labels this node's agent is
+    /// configured with. A restart may change it; the node registers it again when its lease
+    /// ends, which is a new tenure.
+    label_set: u8 = 0,
     /// The agent does nothing before this true time (a call in progress, a back-off).
     resume_ms: u64,
     /// How long the calls of the step in progress took.
@@ -460,7 +464,16 @@ const Node = struct {
             .node = node.name(),
             .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
             .address = "10.0.0.5:7070",
+            .labels = if (node.cluster.strong) tenant_sets[node.label_set] else &.{},
         };
+    }
+
+    /// The set of tenant labels a node is configured with (B6): a node of even index (the first,
+    /// the third, ...) is never exclusive, so that the services, which have no `require`, always
+    /// have nodes they may use (`replicas_for` sizes them to those).
+    fn draw_label_set(node: *Node) u8 {
+        const draw = node.cluster.label_prng.random().uintLessThan(u8, tenant_sets.len);
+        return if (node.index % 2 == 0) draw % 2 else draw;
     }
 
     /// The network as the agent sees it, with the time its calls take added up.
@@ -506,6 +519,14 @@ const Node = struct {
             node.sim.files.wipe();
             node.sim.containers.wipe();
             node.cluster.stats.wipes += 1;
+        }
+        // B6: half the restarts of the strong world come back configured with other labels (its
+        // own generator: no other draw moves). The registration, and with it the labels, changes
+        // only when the lease ends (a host crash fences, a long cut expires it); until then
+        // the server holds the old ones, which P1 reads at each placement.
+        if (node.cluster.strong and node.cluster.label_prng.random().boolean()) {
+            node.label_set = node.draw_label_set();
+            node.cluster.relabels += 1;
         }
         node.sim.restart();
         node.agent.init(node.config());
@@ -862,6 +883,11 @@ pub const Cluster = struct {
     /// J4: the client that follows the job endings through the watch, and its own random stream.
     jobs_watch: sim_jobs_watch.State,
     watch_prng: std.Random.DefaultPrng,
+    /// B6: draws the nodes' tenant labels (`Options.strong` only), apart from `prng` so that no
+    /// other draw of a run moves.
+    label_prng: std.Random.DefaultPrng,
+    /// Restarts that came back with other labels.
+    relabels: u32,
     job_next: u32,
     /// The reuse world (B2.1 slice 4): retention run by a jump of time, so that a name is reused
     /// while a container of its earlier incarnation still stands. Its counters: jumps made,
@@ -939,6 +965,7 @@ pub const Cluster = struct {
         c.jobs = .{};
         c.jobs_watch = .{};
         c.watch_prng = .init(seed ^ 0x4a34_77a7_c4e5);
+        c.init_tenants(seed);
         c.job_next = 1;
         c.init_reuse();
         c.strong = options.strong or c1_teeth.strong_world;
@@ -949,6 +976,12 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// B6: the generator of the nodes' tenant labels, and the count of relabels.
+    fn init_tenants(c: *Cluster, seed: u64) void {
+        c.label_prng = .init(seed ^ 0xb6b6_7e1a_9d03);
+        c.relabels = 0;
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -1011,6 +1044,8 @@ pub const Cluster = struct {
             if (skewed) -skew_ppm else ppm,
             if (skewed) skew_beyond_ppm else @max(c.swarm.clock_ppm, 1),
         );
+        node.label_set = 0;
+        if (c.strong) node.label_set = node.draw_label_set();
         node.sim.init(c.gpa, node.nclock.clock(), c.seed +% index, &fixtures);
         node.sim.containers.on_start = job_started;
         node.sim.containers.on_start_context = node;
@@ -1269,7 +1304,9 @@ pub const Cluster = struct {
     /// A replica count up to `most`, held so that the four services together always fit the
     /// nodes' CPU (16 replicas of 250 millis on each 4000): an unplaceable replica is not a bug.
     fn replicas_for(c: *Cluster, random: std.Random, most: u32) u32 {
-        const fit: u32 = @intCast(c.nodes.len * 4);
+        // B6: in the strong world only the nodes that are never exclusive hold a replica.
+        const usable = if (c.strong) (c.nodes.len + 1) / 2 else c.nodes.len;
+        const fit: u32 = @intCast(usable * 4);
         const scaled = @divFloor(most * c.swarm.replicas_pct, 100);
         return random.uintLessThan(u32, @min(scaled, fit - 1) + 1);
     }
@@ -1597,6 +1634,15 @@ pub const Cluster = struct {
         // Every third job (job numbers 1, 4, 7, ...; `job_relayed`) names the relay (B3 slice 3).
         // No draw, and only with `Options.strong`.
         const relayed = c.strong and job_relayed(number);
+        // B6: in the strong world most jobs name a tenant (`job_tenant`; no draw).
+        var require_buffer: [1]records.Pair = undefined;
+        var placement: ?job_api.PlacementInput = null;
+        if (c.strong) {
+            if (job_tenant(number)) |tenant| {
+                require_buffer[0] = .{ "tenant", tenant };
+                placement = .{ .require = &require_buffer };
+            }
+        }
         if (fresh) c.job_next += 1;
         var buffer: [16]u8 = undefined;
         const id = c.request_id(&buffer);
@@ -1622,6 +1668,7 @@ pub const Cluster = struct {
             .submit_by_ms = c.manual.ms + 5000 + random.uintLessThan(u32, 20_000),
             .relay = if (relayed) sim_relays[0].name else null,
             .relays = &sim_relays,
+            .placement = placement,
             .applied_by = "alex@laptop",
             .request_id = id,
         }) catch {
@@ -1721,6 +1768,27 @@ pub const Cluster = struct {
         return c.nodes[c.prng.random().uintLessThan(u32, count)];
     }
 };
+
+/// The label sets a node of the strong world may carry (B6): tenant `a` or `b`, each exclusive to
+/// its tenant or not. Two of the four are exclusive.
+const tenant_sets = [_][]const []const u8{
+    &.{"tenant=a"},
+    &.{"tenant=b"},
+    &.{ "tenant=a", "exclusive=tenant" },
+    &.{ "tenant=b", "exclusive=tenant" },
+};
+
+/// The tenant job number `n` of the strong world requires (no draw): every fourth names none (it
+/// may use only a node that is not exclusive), most name `a` or `b`, and every eleventh names a
+/// tenant no node carries (it stays pending and ends `not_started`).
+fn job_tenant(n: u32) ?[]const u8 {
+    if (n % 11 == 4) return "c";
+    return switch (n % 4) {
+        0 => null,
+        1, 3 => "a",
+        else => "b",
+    };
+}
 
 /// Whether the `strong` world's job number `n` names the relay (every third; no draw).
 fn job_relayed(n: u32) bool {
@@ -3453,6 +3521,9 @@ fn print_jobs(c: *Cluster) void {
         });
     }
     if (c.strong) {
+        c.report.print("jobs: tenants relabels={d} placements judged={d}\n", .{
+            c.relabels, c.c1_tally.tenancy_judged,
+        });
         var opened: u32 = 0;
         var closed: u32 = 0;
         var open_now: u32 = 0;
