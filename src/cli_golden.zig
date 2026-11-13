@@ -16,6 +16,7 @@
 //! E0102.txt, E0102.verbose.txt, E0102.json.txt.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const agent_jobs = @import("agent_jobs.zig");
@@ -1192,6 +1193,12 @@ fn hold_local_lock(arena: Allocator, state_root: []const u8) !std.Io.File {
     return cli_local.lock_file(testing.io, file, 0);
 }
 
+/// A `zcube local` case needs Linux: elsewhere `zcube local` refuses with ZC-E0122 before it
+/// looks at the executables (docs/macos.md), so these cases run only on Linux.
+fn runs_here(case: *const Case) bool {
+    return builtin.os.tag == .linux or case.flags.local == .off;
+}
+
 /// For a `zcube local` case: names the run's directory and returns where the executables are.
 /// Dying executables are shell scripts that exit at once, as a server that cannot start does.
 fn prepare_local(
@@ -1288,6 +1295,7 @@ test "golden: every code in default, verbose and JSON output" {
     const arena = arena_state.allocator();
     const state_root = try state_root_of(arena, &tmp);
     for (&cases) |*case| {
+        if (!runs_here(case)) continue;
         for (std.enums.values(Style)) |style| {
             const output = try run_case(arena, case, style, state_root);
             const shown = try stable(arena, output.stderr, state_root);
@@ -1371,6 +1379,7 @@ test "no raw errors: no output of any case shows a trace or a Zig error name" {
     const arena = arena_state.allocator();
     const state_root = try state_root_of(arena, &tmp);
     for (&cases) |*case| {
+        if (!runs_here(case)) continue;
         for (std.enums.values(Style)) |style| {
             const output = try run_case(arena, case, style, state_root);
             try testing.expect(!shows_trace(try stable(arena, output.stderr, state_root)));
