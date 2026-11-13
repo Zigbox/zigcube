@@ -47,7 +47,19 @@ pub const Hello = struct {
     duplicate_group: bool = false,
 };
 
-pub const Chain = enum { good, none, other_ca, expired, server_kind, three, tampered };
+/// The client's chain: `good` is a workload's; `server_kind`, `node_kind` and `client_kind` a good
+/// leaf of that kind.
+pub const Chain = enum {
+    good,
+    none,
+    other_ca,
+    expired,
+    server_kind,
+    node_kind,
+    client_kind,
+    three,
+    tampered,
+};
 pub const Verify = enum { good, omit, wrong_key, server_context, bad_scheme, flipped };
 pub const Finished = enum { good, bad, omit };
 
@@ -120,14 +132,19 @@ pub const Client = struct {
             },
             else => {},
         }
-        if (self.config.faults.chain == .server_kind) {
-            try x509.issue_server(&self.leaf, ca, &.{
+        const key = self.key.public_key.toBytes();
+        switch (self.config.faults.chain) {
+            .server_kind => try x509.issue_server(&self.leaf, ca, &.{
                 .dns_name = "client.botpike.com",
-                .subject_key = self.key.public_key.toBytes(),
+                .subject_key = key,
                 .lifetime = x509_test.window,
-            });
-        } else {
-            try x509.issue_workload(&self.leaf, signer, &request);
+            }),
+            .node_kind => try x509.issue_node(&self.leaf, ca, &x509_test.node_request(key)),
+            .client_kind => {
+                const client = x509_test.client_request(key, .jobs);
+                try x509.issue_client(&self.leaf, ca, &client);
+            },
+            else => try x509.issue_workload(&self.leaf, signer, &request),
         }
         if (self.config.faults.chain == .tampered) {
             const bytes = self.leaf.bytes[self.leaf.start..];

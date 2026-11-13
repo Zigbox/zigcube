@@ -19,6 +19,7 @@ pub const tag_integer: u8 = 0x02;
 pub const tag_bit_string: u8 = 0x03;
 pub const tag_octet_string: u8 = 0x04;
 pub const tag_oid: u8 = 0x06;
+pub const tag_enumerated: u8 = 0x0A;
 pub const tag_utf8_string: u8 = 0x0C;
 pub const tag_utc_time: u8 = 0x17;
 pub const tag_generalized_time: u8 = 0x18;

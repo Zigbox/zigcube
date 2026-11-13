@@ -6,9 +6,9 @@
 //! Two profiles (decision file 2026-11-04-x509-two-profiles.md):
 //!
 //! - `cluster`: the certificates this cluster's CA writes, and nothing more. A certificate has one
-//!   of three kinds, each with its extensions in one fixed order and its exact bytes; anything
-//!   else (a stock tool's extra extensions included) is refused. So "parse, then write again"
-//!   gives back the input, which `x509_fuzz.zig` checks.
+//!   of five kinds (`Kind`), each with its extensions in one fixed order and its exact bytes;
+//!   anything else (a stock tool's extra extensions included) is refused. So "parse, then write
+//!   again" gives back the input, which `x509_fuzz.zig` checks.
 //! - `foreign_server`: a server leaf signed directly by a pinned Ed25519 anchor of another CA
 //!   (an openssl-made one, say). Any issuer and subject Name, a serial of up to 20 bytes, key
 //!   identifiers, extensions in any order; but no extension twice, no unknown critical one, and
@@ -85,6 +85,8 @@ pub const Error = error{
     BadLabel,
     BadCluster,
     BadServiceName,
+    BadNodeName,
+    BadClientName,
     BadSpiffe,
     BadDnsName,
     /// A lifetime that is empty, over the kind's bound or outside the years 1970..9999.
@@ -105,11 +107,48 @@ pub fn code_of(err: Error) @import("diag/codes.zig").Code {
         error.NoSpace, error.TooManyLabels, error.LabelTooLong => .E0817,
         error.LabelsTooLarge, error.LabelsNotSorted, error.BadLabel => .E0817,
         error.BadCluster, error.BadServiceName, error.BadSpiffe, error.BadDnsName => .E0817,
-        error.IssueLifetime => .E0817,
+        error.BadNodeName, error.BadClientName, error.IssueLifetime => .E0817,
     };
 }
 
-pub const Kind = enum { ca, workload, server };
+/// A `cluster` certificate's kind. The leaves (docs/mtls.md, "Certificate kinds"):
+///
+/// - `workload`: clientAuth, `spiffe://<cluster>/service/<name>`, identity extension version 1.
+/// - `server`: serverAuth, one DNS name.
+/// - `node` (B7): clientAuth, `spiffe://<cluster>/node/<name>`, no identity extension.
+/// - `client` (B7): clientAuth, `spiffe://<cluster>/client/<name>`, identity extension version 2
+///   (the scope).
+///
+/// New kinds go at the end: the kind's value is hashed into every serial (`serial_of`).
+pub const Kind = enum { ca, workload, server, node, client };
+
+pub const Scope = identity_mod.Scope;
+
+/// The SPIFFE path of a clientAuth kind.
+fn path_of(kind: Kind) identity_mod.Path {
+    return switch (kind) {
+        .workload => .service,
+        .node => .node,
+        .client => .client,
+        .ca, .server => unreachable,
+    };
+}
+
+fn kind_of(path: identity_mod.Path) Kind {
+    return switch (path) {
+        .service => .workload,
+        .node => .node,
+        .client => .client,
+    };
+}
+
+/// A kind named by a SPIFFE ID rather than a DNS name.
+fn is_spiffe(kind: Kind) bool {
+    return switch (kind) {
+        .workload, .node, .client => true,
+        .ca, .server => false,
+    };
+}
 
 pub const Profile = enum {
     /// What this cluster's CA writes, byte for byte.
@@ -374,7 +413,7 @@ pub fn read_time(content: []const u8, tag: u8) Error!u64 {
 fn lifetime_bound_ms(kind: Kind) u64 {
     return switch (kind) {
         .ca => constants.x509_ca_ttl_ms_max,
-        .workload, .server => constants.x509_leaf_ttl_ms_max,
+        .workload, .server, .node, .client => constants.x509_leaf_ttl_ms_max,
     };
 }
 
@@ -392,7 +431,7 @@ const Tbs = struct {
     public_key: [32]u8,
     /// The SPIFFE URI or the DNS name; empty for a CA.
     name: []const u8,
-    /// The identity extension's value (DER); empty unless a workload.
+    /// The identity extension's value (DER); empty unless a workload or a client.
     identity: []const u8,
 };
 
@@ -435,14 +474,16 @@ fn write_extensions(writer: *der.Writer, tbs: *const Tbs) Error!void {
             try write_extension(writer, &oid_key_usage, true, &usage_ca);
             try write_extension(writer, &oid_basic_constraints, true, &basic_ca);
         },
-        .workload, .server => {
-            const is_workload = tbs.kind == .workload;
-            if (is_workload) try write_extension(writer, &oid_identity, false, tbs.identity);
+        .workload, .server, .node, .client => {
+            const has_identity = tbs.kind == .workload or tbs.kind == .client;
+            assert(has_identity == (tbs.identity.len > 0));
+            const spiffe = is_spiffe(tbs.kind);
+            if (has_identity) try write_extension(writer, &oid_identity, false, tbs.identity);
             const since = writer.mark();
-            try writer.element(if (is_workload) tag_san_uri else tag_san_dns, tbs.name);
+            try writer.element(if (spiffe) tag_san_uri else tag_san_dns, tbs.name);
             try writer.close(der.tag_sequence, since);
             try close_extension(writer, &oid_subject_alt_name, false, since);
-            const usage = if (is_workload) &usage_client else &usage_server;
+            const usage = if (spiffe) &usage_client else &usage_server;
             try write_extension(writer, &oid_ext_key_usage, true, usage);
             try write_extension(writer, &oid_key_usage, true, &usage_leaf);
             try write_extension(writer, &oid_basic_constraints, true, &basic_leaf);
@@ -579,25 +620,93 @@ pub const WorkloadRequest = struct {
 
 /// A client certificate for a workload, signed by the CA.
 pub fn issue_workload(out: *Der, ca: Ed25519.KeyPair, request: *const WorkloadRequest) Error!void {
-    var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
-    const uri = try identity_mod.spiffe_write(&uri_buffer, request.cluster, request.service);
     var identity_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
     var identity_writer = der.Writer.init(&identity_buffer);
     try identity_mod.encode(&identity_writer, &request.identity);
-    const lifetime = request.lifetime;
-    const seconds = try lifetime_seconds(.workload, lifetime.not_before_ms, lifetime.not_after_ms);
+    try issue_spiffe(out, ca, &.{
+        .kind = .workload,
+        .cluster = request.cluster,
+        .name = request.service,
+        .subject_key = request.subject_key,
+        .identity = identity_writer.written(),
+        .lifetime = request.lifetime,
+    });
+}
+
+pub const NodeRequest = struct {
+    cluster: []const u8,
+    node: []const u8,
+    /// The node's peer key (docs/peer.md): the agent holds the private half.
+    subject_key: [32]u8,
+    lifetime: Lifetime,
+};
+
+/// A node's certificate (B7), signed by the CA: what the agent presents to the API.
+pub fn issue_node(out: *Der, ca: Ed25519.KeyPair, request: *const NodeRequest) Error!void {
+    try issue_spiffe(out, ca, &.{
+        .kind = .node,
+        .cluster = request.cluster,
+        .name = request.node,
+        .subject_key = request.subject_key,
+        .identity = "",
+        .lifetime = request.lifetime,
+    });
+}
+
+pub const ClientRequest = struct {
+    cluster: []const u8,
+    client: []const u8,
+    scope: Scope,
+    subject_key: [32]u8,
+    lifetime: Lifetime,
+};
+
+/// A client's certificate (B7), signed by the CA: `zcube-server ca issue-client` writes it.
+pub fn issue_client(out: *Der, ca: Ed25519.KeyPair, request: *const ClientRequest) Error!void {
+    var identity_buffer: [16]u8 = undefined;
+    var identity_writer = der.Writer.init(&identity_buffer);
+    try identity_mod.encode_client(&identity_writer, request.scope);
+    try issue_spiffe(out, ca, &.{
+        .kind = .client,
+        .cluster = request.cluster,
+        .name = request.client,
+        .subject_key = request.subject_key,
+        .identity = identity_writer.written(),
+        .lifetime = request.lifetime,
+    });
+}
+
+/// What the three SPIFFE kinds share.
+const SpiffeLeaf = struct {
+    kind: Kind,
+    cluster: []const u8,
+    name: []const u8,
+    subject_key: [32]u8,
+    /// The identity extension's value, already encoded; empty for a node.
+    identity: []const u8,
+    lifetime: Lifetime,
+};
+
+fn issue_spiffe(out: *Der, ca: Ed25519.KeyPair, leaf: *const SpiffeLeaf) Error!void {
+    assert(is_spiffe(leaf.kind));
+    assert((leaf.kind == .node) == (leaf.identity.len == 0));
+    var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
+    const path = path_of(leaf.kind);
+    const uri = try identity_mod.spiffe_write(&uri_buffer, path, leaf.cluster, leaf.name);
+    const lifetime = leaf.lifetime;
+    const seconds = try lifetime_seconds(leaf.kind, lifetime.not_before_ms, lifetime.not_after_ms);
     var serial: [constants.x509_serial_bytes_max]u8 = undefined;
     const issuer = ca_cn(ca.public_key.toBytes());
     const tbs: Tbs = .{
-        .kind = .workload,
+        .kind = leaf.kind,
         .serial = &serial,
         .issuer_cn = &issuer,
-        .subject_cn = request.service,
+        .subject_cn = leaf.name,
         .not_before_s = seconds[0],
         .not_after_s = seconds[1],
-        .public_key = request.subject_key,
+        .public_key = leaf.subject_key,
         .name = uri,
-        .identity = identity_writer.written(),
+        .identity = leaf.identity,
     };
     serial = serial_of(&tbs);
     try write_certificate(out, &tbs, .{ .key = ca });
@@ -638,8 +747,9 @@ pub fn issue_server(out: *Der, ca: Ed25519.KeyPair, request: *const ServerReques
 /// A parsed certificate: offsets into the input, which the caller keeps alive.
 pub const Parsed = struct {
     profile: Profile,
-    /// Under `foreign_server`, the kind its extensions make it: `.ca` for basicConstraints cA or a
-    /// CA key usage, `.workload` for an extKeyUsage without serverAuth, else `.server`.
+    /// Under `cluster`, the extended key usage and the SPIFFE path say it. Under
+    /// `foreign_server`, the kind its extensions make it: `.ca` for basicConstraints cA or a CA
+    /// key usage, `.workload` for an extKeyUsage without serverAuth, else `.server`.
     kind: Kind,
     /// The signed region: the TBSCertificate with its header.
     tbs: Span,
@@ -652,14 +762,22 @@ pub const Parsed = struct {
     public_key: Span,
     not_before_ms: u64,
     not_after_ms: u64,
-    /// The SPIFFE URI (workload) or DNS name (server); empty for a CA.
+    /// The SPIFFE URI (workload, node, client) or DNS name (server); empty for a CA.
     name: Span,
-    /// The identity extension's value; empty unless a workload.
+    /// The identity extension's value; empty unless a workload or a client.
     identity: Span,
 
     pub fn text(parsed: *const Parsed, span: Span, bytes: []const u8) []const u8 {
         _ = parsed;
         return span.of(bytes);
+    }
+
+    /// A client certificate's scope. The parser already decoded the extension, so it holds.
+    pub fn scope(parsed: *const Parsed, bytes: []const u8) Scope {
+        assert(parsed.profile == .cluster);
+        assert(parsed.kind == .client);
+        // `read_extensions` refused the certificate unless this value decoded.
+        return identity_mod.decode_client(parsed.identity.of(bytes)) catch unreachable;
     }
 };
 
@@ -972,23 +1090,36 @@ fn read_extensions(bytes: []const u8, list: Span, parsed: *Parsed, detail: *Deta
     const usage = try expect_extension(bytes, &reader, &seen, .usage, true, detail);
     if (!std.mem.eql(u8, usage.of(bytes), &usage_leaf)) return error.BadExtension;
     const ext_usage = try expect_extension(bytes, &reader, &seen, .ext_usage, true, detail);
-    if (std.mem.eql(u8, ext_usage.of(bytes), &usage_client)) {
-        parsed.kind = .workload;
-    } else if (std.mem.eql(u8, ext_usage.of(bytes), &usage_server)) {
-        parsed.kind = .server;
-    } else return error.BadExtension;
+    const client_auth = std.mem.eql(u8, ext_usage.of(bytes), &usage_client);
+    const server_auth = std.mem.eql(u8, ext_usage.of(bytes), &usage_server);
+    if (!client_auth and !server_auth) return error.BadExtension;
     const san = try expect_extension(bytes, &reader, &seen, .san, false, detail);
-    parsed.name = try read_san(bytes, san, parsed.kind);
-    if (parsed.kind == .workload) {
-        const value = try expect_extension(bytes, &reader, &seen, .identity, false, detail);
-        _ = identity_mod.decode(value.of(bytes)) catch return error.BadIdentity;
-        parsed.identity = value;
+    const named = try read_san(bytes, san, client_auth);
+    parsed.name = named.name;
+    parsed.kind = named.kind;
+    assert(is_spiffe(parsed.kind) == client_auth);
+    switch (parsed.kind) {
+        .workload => {
+            const value = try expect_extension(bytes, &reader, &seen, .identity, false, detail);
+            _ = identity_mod.decode(value.of(bytes)) catch return error.BadIdentity;
+            parsed.identity = value;
+        },
+        .client => {
+            const value = try expect_extension(bytes, &reader, &seen, .identity, false, detail);
+            _ = identity_mod.decode_client(value.of(bytes)) catch return error.BadIdentity;
+            parsed.identity = value;
+        },
+        .server, .node => {},
+        .ca => unreachable,
     }
     return expect_no_more(bytes, &reader, seen, detail);
 }
 
-/// A SAN with exactly one name of the kind's type, in the kind's shape.
-fn read_san(bytes: []const u8, value: Span, kind: Kind) Error!Span {
+const Named = struct { name: Span, kind: Kind };
+
+/// A SAN with exactly one name: a SPIFFE URI for a clientAuth certificate, whose path gives the
+/// kind, else a DNS name.
+fn read_san(bytes: []const u8, value: Span, client_auth: bool) Error!Named {
     var outer = der.Reader.init(bytes, value);
     const sequence = outer.expect(der.tag_sequence) catch return error.BadSan;
     outer.finish() catch return error.BadSan;
@@ -996,18 +1127,18 @@ fn read_san(bytes: []const u8, value: Span, kind: Kind) Error!Span {
     const name = reader.next() catch return error.BadSan;
     reader.finish() catch return error.BadSan;
     const text = name.value.of(bytes);
-    if (kind == .workload) {
+    if (client_auth) {
         if (name.tag != tag_san_uri) return error.BadSan;
-        _ = identity_mod.spiffe_parse(text) catch return error.BadSan;
-    } else {
-        if (name.tag != tag_san_dns) return error.BadSan;
-        if (identity_mod.dns_problem(text, constants.x509_dns_name_bytes_max)) return error.BadSan;
+        const spiffe = identity_mod.spiffe_parse(text) catch return error.BadSan;
+        return .{ .name = name.value, .kind = kind_of(spiffe.path) };
     }
-    return name.value;
+    if (name.tag != tag_san_dns) return error.BadSan;
+    if (identity_mod.dns_problem(text, constants.x509_dns_name_bytes_max)) return error.BadSan;
+    return .{ .name = name.value, .kind = .server };
 }
 
 /// The names fit the kind: the issuer is always a CA name; the subject is the CA's own name, the
-/// service in the SPIFFE ID, or the DNS name.
+/// name at the end of the SPIFFE ID (a service, a node or a client), or the DNS name.
 fn check_names(bytes: []const u8, parsed: *const Parsed, detail: *Detail) Error!void {
     const issuer = parsed.issuer_cn.of(bytes);
     const subject = parsed.subject_cn.of(bytes);
@@ -1018,10 +1149,11 @@ fn check_names(bytes: []const u8, parsed: *const Parsed, detail: *Detail) Error!
         .ca => {
             if (!std.mem.eql(u8, issuer, subject)) return error.BadName;
         },
-        .workload => {
+        .workload, .node, .client => {
             // `read_san` already parsed this name with the same function, so it cannot fail here.
             const spiffe = identity_mod.spiffe_parse(parsed.name.of(bytes)) catch unreachable;
-            if (!std.mem.eql(u8, spiffe.service, subject)) return error.BadName;
+            assert(spiffe.path == path_of(parsed.kind));
+            if (!std.mem.eql(u8, spiffe.name, subject)) return error.BadName;
         },
         .server => {
             if (!std.mem.eql(u8, parsed.name.of(bytes), subject)) return error.BadName;
@@ -1350,7 +1482,9 @@ pub fn reason(err: Error) []const u8 {
         error.BadLabel => "a label has a byte or a character that is not allowed",
         error.BadCluster => "the cluster name is not a lowercase DNS name",
         error.BadServiceName => "the service name is not a valid name",
-        error.BadSpiffe => "the SPIFFE ID is not spiffe://<cluster>/service/<name>",
+        error.BadNodeName => "the node name is not a valid name",
+        error.BadClientName => "the client name is not a valid name",
+        error.BadSpiffe => "the SPIFFE ID is not spiffe://<cluster>/<service|node|client>/<name>",
         error.BadDnsName => "the DNS name is not lowercase, has a wildcard or an all-digit label",
         error.IssueLifetime => "the lifetime is empty, over the bound or out of range",
     };
@@ -1359,8 +1493,10 @@ pub fn reason(err: Error) []const u8 {
 fn kind_text(kind: Kind) []const u8 {
     return switch (kind) {
         .ca => "a CA certificate",
-        .workload => "a client certificate",
+        .workload => "a workload certificate",
         .server => "a server certificate",
+        .node => "a node certificate",
+        .client => "a client certificate",
     };
 }
 

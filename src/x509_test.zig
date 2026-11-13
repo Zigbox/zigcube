@@ -1,4 +1,4 @@
-//! Tests for `x509.zig`: the three certificate kinds, verification, the order of its checks, and a
+//! Tests for `x509.zig`: the five certificate kinds, verification, the order of its checks, and a
 //! table of near-miss certificates, each one edit away from a good one, with the refusal it must
 //! get. No file, clock or environment, so it runs under WASI as well (`core.zig`).
 
@@ -62,6 +62,33 @@ pub fn make_server(out: *x509.Der) !void {
         .lifetime = window,
     };
     try x509.issue_server(out, try ca_pair(), &request);
+}
+
+pub const node_uri = "spiffe://prod.example/node/node-1";
+pub const client_uri = "spiffe://prod.example/client/ops-1";
+
+pub fn node_request(key: [32]u8) x509.NodeRequest {
+    return .{ .cluster = "prod.example", .node = "node-1", .subject_key = key, .lifetime = window };
+}
+
+pub fn client_request(key: [32]u8, scope: x509.Scope) x509.ClientRequest {
+    return .{
+        .cluster = "prod.example",
+        .client = "ops-1",
+        .scope = scope,
+        .subject_key = key,
+        .lifetime = window,
+    };
+}
+
+pub fn make_node(out: *x509.Der) !void {
+    const request = node_request(try subject_key(3));
+    try x509.issue_node(out, try ca_pair(), &request);
+}
+
+pub fn make_client(out: *x509.Der) !void {
+    const request = client_request(try subject_key(4), .admin);
+    try x509.issue_client(out, try ca_pair(), &request);
 }
 
 test "the CA certificate parses, verifies against its own key and is deterministic" {
@@ -129,6 +156,66 @@ test "a server certificate names one DNS name and nothing else" {
     ));
 }
 
+test "a node certificate carries its SPIFFE ID and the peer key, and no identity" {
+    // Goal: the node kind (B7). Method: issue, verify as a node with its ID, then as a workload and
+    // under another node's ID.
+    var certificate: x509.Der = .{};
+    try make_node(&certificate);
+    const bytes = certificate.slice();
+    const ca = (try ca_pair()).public_key.toBytes();
+    const parsed = try x509.verify(bytes, ca, now, .{ .kind = .node, .name = node_uri });
+    try testing.expectEqualStrings("node-1", parsed.subject_cn.of(bytes));
+    try testing.expectEqualSlices(u8, &(try subject_key(3)), parsed.public_key.of(bytes));
+    try testing.expectEqual(@as(usize, 0), parsed.identity.of(bytes).len);
+    try testing.expectError(
+        error.WrongUse,
+        x509.verify(bytes, ca, now, .{ .kind = .workload, .name = null }),
+    );
+    try testing.expectError(error.WrongName, x509.verify(
+        bytes,
+        ca,
+        now,
+        .{ .kind = .node, .name = "spiffe://prod.example/node/node-2" },
+    ));
+}
+
+test "a client certificate carries its SPIFFE ID and its scope" {
+    // Goal: the client kind (B7) and the scope field of the identity extension. Method: issue one
+    // per scope, verify as a client, read the scope back; a client is not a node or a workload.
+    const ca_keys = try ca_pair();
+    const ca = ca_keys.public_key.toBytes();
+    for ([_]x509.Scope{ .jobs, .admin }) |scope| {
+        var certificate: x509.Der = .{};
+        const request = client_request(try subject_key(4), scope);
+        try x509.issue_client(&certificate, ca_keys, &request);
+        const bytes = certificate.slice();
+        const parsed = try x509.verify(bytes, ca, now, .{ .kind = .client, .name = client_uri });
+        try testing.expectEqualStrings("ops-1", parsed.subject_cn.of(bytes));
+        try testing.expectEqual(scope, parsed.scope(bytes));
+        for ([_]x509.Kind{ .node, .workload, .server }) |kind| {
+            try testing.expectError(
+                error.WrongUse,
+                x509.verify(bytes, ca, now, .{ .kind = kind, .name = null }),
+            );
+        }
+    }
+}
+
+test "the writer refuses bad node and client names" {
+    // Goal: the new kinds' names are checked on the way in. Method: an empty name and one with an
+    // upper-case letter for each.
+    const ca = try ca_pair();
+    var out: x509.Der = .{};
+    for ([_][]const u8{ "", "Node-1", "a/b" }) |name| {
+        var node = node_request(try subject_key(3));
+        node.node = name;
+        try testing.expectError(error.BadNodeName, x509.issue_node(&out, ca, &node));
+        var client = client_request(try subject_key(4), .jobs);
+        client.client = name;
+        try testing.expectError(error.BadClientName, x509.issue_client(&out, ca, &client));
+    }
+}
+
 test "the largest certificate the writer makes fits the size limit" {
     // Goal: `x509_cert_bytes_max` is not a guess. Method: the longest cluster and service names,
     // the largest label set `validate` allows, issued and parsed; the size is asserted with room.
@@ -164,10 +251,12 @@ test "the largest certificate the writer makes fits the size limit" {
 
 test "parse then write gives the same bytes for every kind" {
     // Goal: the accepted set is the writer's output set. Method: reencode each kind.
-    var certificates: [3]x509.Der = .{ .{}, .{}, .{} };
+    var certificates: [5]x509.Der = @splat(.{});
     try make_ca(&certificates[0]);
     try make_workload(&certificates[1]);
     try make_server(&certificates[2]);
+    try make_node(&certificates[3]);
+    try make_client(&certificates[4]);
     for (&certificates) |*certificate| {
         const bytes = certificate.slice();
         const parsed = try x509.parse(bytes);

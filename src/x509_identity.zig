@@ -1,12 +1,18 @@
-//! What a workload certificate says about its holder: the SPIFFE ID and the private identity
-//! extension (docs/briefs/mtls-client.md, "X.509 v3"). Kept apart from `x509.zig` so that the
-//! relay's issuer (B4) can import the identity without the certificate code. Core code: no
-//! allocation, no recursion, no clock.
+//! What a certificate says about its holder: the SPIFFE ID and the private identity extension
+//! (docs/briefs/mtls-client.md, "X.509 v3"; docs/briefs/b7.md). Kept apart from `x509.zig` so
+//! that the relay's issuer (B4) can import the identity without the certificate code. Core code:
+//! no allocation, no recursion, no clock.
 //!
-//! The extension's value is a DER SEQUENCE `{ version INTEGER 1, image_digest OCTET STRING (32),
-//! placement_epoch INTEGER 0..2^63-1, labels SEQUENCE OF SEQUENCE { key UTF8String, value
-//! UTF8String } }`, labels sorted by key with unique keys. Both directions check every bound, so a
-//! value the writer makes always decodes and a value that decodes always re-encodes to itself.
+//! The extension has two versions, and a certificate's kind says which it carries (decision file
+//! 2026-11-13-identity-extension-v2-scope.md):
+//!
+//! - Version 1, a workload's: a DER SEQUENCE `{ version INTEGER 1, image_digest OCTET STRING
+//!   (32), placement_epoch INTEGER 0..2^63-1, labels SEQUENCE OF SEQUENCE { key UTF8String,
+//!   value UTF8String } }`, labels sorted by key with unique keys.
+//! - Version 2, a client's: `{ version INTEGER 2, scope ENUMERATED { jobs (1), admin (2) } }`.
+//!
+//! Both directions check every bound, so a value the writer makes always decodes and a value that
+//! decodes always re-encodes to itself.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -15,7 +21,7 @@ const der = @import("x509_der.zig");
 const records = @import("records.zig");
 
 pub const Error = error{
-    /// Not the extension's DER shape, or a version other than 1.
+    /// Not the extension's DER shape, or not the version asked for.
     Malformed,
     NoSpace,
     TooManyLabels,
@@ -31,7 +37,11 @@ pub const Error = error{
     BadCluster,
     /// The service name is not a name (`records.name_problem`).
     BadServiceName,
-    /// Not `spiffe://<cluster>/service/<name>`.
+    /// The node name is not a name.
+    BadNodeName,
+    /// The client name is not a name.
+    BadClientName,
+    /// Not `spiffe://<cluster>/<service|node|client>/<name>`.
     BadSpiffe,
     /// Not a lowercase DNS name without wildcard.
     BadDnsName,
@@ -50,6 +60,29 @@ pub const Identity = struct {
 };
 
 pub const version: u8 = 1;
+/// The client form's version (B7).
+pub const version_client: u8 = 2;
+
+/// What a `client` certificate allows (docs/briefs/b7.md): `jobs` creates, reads, cancels and
+/// watches jobs and nothing else; `admin` does everything. The values are the ENUMERATED's.
+pub const Scope = enum(u8) {
+    jobs = 1,
+    admin = 2,
+
+    pub fn text(scope: Scope) []const u8 {
+        return switch (scope) {
+            .jobs => "jobs",
+            .admin => "admin",
+        };
+    }
+
+    /// The scope a word names, for `ca issue-client --scope`.
+    pub fn parse(word: []const u8) ?Scope {
+        if (std.mem.eql(u8, word, "jobs")) return .jobs;
+        if (std.mem.eql(u8, word, "admin")) return .admin;
+        return null;
+    }
+};
 
 /// The extension's OID, 2.25.192541954756406065736426278304158759968 (decision file
 /// 2026-11-04-mtls-identity-extension-oid.md), DER content bytes.
@@ -161,6 +194,37 @@ pub fn decode(bytes: []const u8) Error!Decoded {
     return decoded;
 }
 
+/// Writes a client's extension value, `{ version 2, scope }`, in front of what `writer` holds.
+pub fn encode_client(writer: *der.Writer, scope: Scope) Error!void {
+    const outer = writer.mark();
+    try writer.element(der.tag_enumerated, &.{@backingInt(scope)});
+    try writer.unsigned(version_client);
+    try writer.close(der.tag_sequence, outer);
+    assert(writer.written().len == 8);
+}
+
+/// Decodes a client's extension value: exactly `{ INTEGER 2, ENUMERATED 1|2 }`, nothing after.
+pub fn decode_client(bytes: []const u8) Error!Scope {
+    var outer = der.Reader.init(bytes, .{ .start = 0, .end = @intCast(bytes.len) });
+    const sequence = outer.expect(der.tag_sequence) catch return error.Malformed;
+    outer.finish() catch return error.Malformed;
+    var reader = der.Reader.init(bytes, sequence.value);
+    const version_element = reader.expect(der.tag_integer) catch return error.Malformed;
+    const version_bytes = version_element.value.of(bytes);
+    if (!std.mem.eql(u8, version_bytes, &.{version_client})) return error.Malformed;
+    const scope_element = reader.expect(der.tag_enumerated) catch return error.Malformed;
+    reader.finish() catch return error.Malformed;
+    const scope_bytes = scope_element.value.of(bytes);
+    if (scope_bytes.len != 1) return error.Malformed;
+    const scope: Scope = switch (scope_bytes[0]) {
+        1 => .jobs,
+        2 => .admin,
+        else => return error.Malformed,
+    };
+    assert(@backingInt(scope) == scope_bytes[0]);
+    return scope;
+}
+
 fn check_labels(decoded: *Decoded, bytes: []const u8) Error!void {
     var iterator = decoded.labels(bytes);
     var previous: ?Label = null;
@@ -210,30 +274,67 @@ fn all_digits(label: []const u8) bool {
     return true;
 }
 
-/// A workload's SPIFFE ID, `spiffe://<cluster>/service/<name>` (decision file
-/// 2026-11-04-spiffe-service-path.md): `<name>` is the service name. No other path kind is
-/// accepted; one would need its own decision.
+/// The three path kinds of a SPIFFE ID (decision file 2026-11-04-spiffe-service-path.md for
+/// `/service/`; docs/briefs/b7.md is the decision that adds `/node/` and `/client/`). No other
+/// path kind is accepted; one would need its own decision.
+pub const Path = enum {
+    /// A workload: `<name>` is the service name.
+    service,
+    /// A node's agent (B7): `<name>` is the node name.
+    node,
+    /// A client of the API (B7): `<name>` is the name `ca issue-client` was given.
+    client,
+
+    pub fn text(path: Path) []const u8 {
+        return switch (path) {
+            .service => "/service/",
+            .node => "/node/",
+            .client => "/client/",
+        };
+    }
+
+    fn name_error(path: Path) Error {
+        return switch (path) {
+            .service => error.BadServiceName,
+            .node => error.BadNodeName,
+            .client => error.BadClientName,
+        };
+    }
+};
+
+/// `spiffe://<cluster><path><name>`.
 pub const Spiffe = struct {
     cluster: []const u8,
-    service: []const u8,
+    path: Path,
+    name: []const u8,
 };
 
 const spiffe_prefix = "spiffe://";
-pub const spiffe_path = "/service/";
 
-/// `spiffe://<cluster>/service/<name>` into `buffer`.
+comptime {
+    // `x509_spiffe_bytes_max` is sized for the longest path, `/service/`.
+    for (std.enums.values(Path)) |path| assert(path.text().len <= Path.service.text().len);
+    assert(constants.x509_spiffe_bytes_max == spiffe_prefix.len +
+        constants.x509_cluster_bytes_max + Path.service.text().len +
+        constants.node_name_bytes_max);
+}
+
+/// `spiffe://<cluster><path><name>` into `buffer`.
 pub fn spiffe_write(
     buffer: *[constants.x509_spiffe_bytes_max]u8,
+    path: Path,
     cluster: []const u8,
-    service: []const u8,
+    name: []const u8,
 ) Error![]const u8 {
     if (dns_problem(cluster, constants.x509_cluster_bytes_max)) return error.BadCluster;
-    const service_problem = records.name_problem(service, constants.node_name_bytes_max);
-    if (service_problem != null) return error.BadServiceName;
-    const total = spiffe_prefix.len + cluster.len + spiffe_path.len + service.len;
+    if (records.name_problem(name, constants.node_name_bytes_max) != null) {
+        return path.name_error();
+    }
+    const path_text = path.text();
+    const total = spiffe_prefix.len + cluster.len + path_text.len + name.len;
     assert(total <= buffer.len);
     var at: usize = 0;
-    inline for (.{ spiffe_prefix, cluster, spiffe_path, service }) |part| {
+    inline for (.{ spiffe_prefix, cluster, path_text, name }) |part| {
         @memcpy(buffer[at..][0..part.len], part);
         at += part.len;
     }
@@ -247,13 +348,17 @@ pub fn spiffe_parse(uri: []const u8) Error!Spiffe {
     const rest = uri[spiffe_prefix.len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadSpiffe;
     const cluster = rest[0..slash];
-    const path = rest[slash..];
-    if (!std.mem.startsWith(u8, path, spiffe_path)) return error.BadSpiffe;
-    const service = path[spiffe_path.len..];
+    const path_and_name = rest[slash..];
+    const path: Path = for (std.enums.values(Path)) |candidate| {
+        if (std.mem.startsWith(u8, path_and_name, candidate.text())) break candidate;
+    } else return error.BadSpiffe;
+    const name = path_and_name[path.text().len..];
     if (dns_problem(cluster, constants.x509_cluster_bytes_max)) return error.BadCluster;
-    const service_problem = records.name_problem(service, constants.node_name_bytes_max);
-    if (service_problem != null) return error.BadServiceName;
-    return .{ .cluster = cluster, .service = service };
+    if (records.name_problem(name, constants.node_name_bytes_max) != null) {
+        return path.name_error();
+    }
+    assert(name.len > 0);
+    return .{ .cluster = cluster, .path = path, .name = name };
 }
 
 // ---- Tests -----------------------------------------------------------------------------------
@@ -425,18 +530,37 @@ test "decode refuses a damaged extension value" {
 }
 
 test "SPIFFE IDs and DNS names have exactly one shape" {
-    // Goal: the near misses are refused, `/service/` is the only path. Method: a table.
-    var buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
-    const uri = try spiffe_write(&buffer, "prod.example", "broker-1");
-    try testing.expectEqualStrings("spiffe://prod.example/service/broker-1", uri);
-    const parsed = try spiffe_parse(uri);
-    try testing.expectEqualStrings("prod.example", parsed.cluster);
-    try testing.expectEqualStrings("broker-1", parsed.service);
+    // Goal: the near misses are refused; `/service/`, `/node/` and `/client/` are the only paths.
+    // Method: a table, and each path kind written and parsed back.
+    var buffer: [constants.x509_spiffe_bytes_max]u8 = @splat(0xAA);
+    const good = [_]struct { path: Path, uri: []const u8 }{
+        .{ .path = .service, .uri = "spiffe://prod.example/service/broker-1" },
+        .{ .path = .node, .uri = "spiffe://prod.example/node/broker-1" },
+        .{ .path = .client, .uri = "spiffe://prod.example/client/broker-1" },
+    };
+    for (good) |case| {
+        const uri = try spiffe_write(&buffer, case.path, "prod.example", "broker-1");
+        try testing.expectEqualStrings(case.uri, uri);
+        const parsed = try spiffe_parse(uri);
+        try testing.expectEqualStrings("prod.example", parsed.cluster);
+        try testing.expectEqual(case.path, parsed.path);
+        try testing.expectEqualStrings("broker-1", parsed.name);
+    }
+    // The longest ID fits the bound exactly.
+    const cluster_long: [constants.x509_cluster_bytes_max]u8 = @splat('c');
+    const name_long: [constants.node_name_bytes_max]u8 = @splat('n');
+    const longest = try spiffe_write(&buffer, .service, &cluster_long, &name_long);
+    try testing.expectEqual(@as(usize, constants.x509_spiffe_bytes_max), longest.len);
     const bad = [_][]const u8{
         "spiffe://prod/service/",      "spiffe://prod/service/a/b",
         "spiffe://prod/service/a?x=1", "spiffe://prod/service/a#f",
         "spiffe://u@prod/service/a",   "spiffe://prod:80/service/a",
-        "spiffe://prod/job/a",         "spiffe://prod/node/a",
+        "spiffe://prod/job/a",         "spiffe://prod/nodes/a",
+        "spiffe://prod/node/",         "spiffe://prod/node/a/b",
+        "spiffe://prod/node/A",        "spiffe://prod/Node/a",
+        "spiffe://prod/client/",       "spiffe://prod/clients/a",
+        "spiffe://prod/client/a?x",    "spiffe://prod/client/a_b",
+        "spiffe://prod/node//a",       "spiffe://prod/client/node/a",
         "spiffe://prod/services/a",    "spiffe://prod/service/A",
         "spiffe://prod/service/.",     "spiffe://prod/service/..",
         "spiffe://prod//service/a",    "spiffe:///service/a",
@@ -448,8 +572,12 @@ test "SPIFFE IDs and DNS names have exactly one shape" {
         "spiffe://10.0.0.1/service/a", "spiffe://prod.2024/service/a",
     };
     for (bad) |text| try testing.expect(std.meta.isError(spiffe_parse(text)));
-    try testing.expectError(error.BadCluster, spiffe_write(&buffer, "", "a"));
-    try testing.expectError(error.BadServiceName, spiffe_write(&buffer, "prod", "a_b"));
+    try testing.expectError(error.BadCluster, spiffe_write(&buffer, .node, "", "a"));
+    try testing.expectError(error.BadServiceName, spiffe_write(&buffer, .service, "prod", "a_b"));
+    try testing.expectError(error.BadNodeName, spiffe_write(&buffer, .node, "prod", "a_b"));
+    try testing.expectError(error.BadClientName, spiffe_write(&buffer, .client, "prod", "A"));
+    try testing.expectError(error.BadNodeName, spiffe_parse("spiffe://prod/node/a.b"));
+    try testing.expectError(error.BadClientName, spiffe_parse("spiffe://prod/client/-a"));
     try testing.expect(dns_problem("*.example.com", 64));
     try testing.expect(dns_problem("192.168.0.1", 64));
     try testing.expect(dns_problem("broker.123", 64));
@@ -458,4 +586,43 @@ test "SPIFFE IDs and DNS names have exactly one shape" {
     const long_name: [65]u8 = @splat('a');
     try testing.expect(dns_problem(&long_name, 64));
     try testing.expect(!dns_problem("broker.botpike.com", 64));
+}
+
+test "the client form of the extension has exactly one encoding per scope" {
+    // Goal: version 2 carries the scope and nothing else, and the two versions never read as each
+    // other. Method: encode and decode each scope against fixed bytes; then each near miss of the
+    // eight bytes; then each version through the other's decoder.
+    const expected = [_]struct { scope: Scope, bytes: [8]u8 }{
+        .{ .scope = .jobs, .bytes = .{ 0x30, 0x06, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x01 } },
+        .{ .scope = .admin, .bytes = .{ 0x30, 0x06, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x02 } },
+    };
+    for (expected) |case| {
+        var buffer: [16]u8 = @splat(0xAA);
+        var writer = der.Writer.init(&buffer);
+        try encode_client(&writer, case.scope);
+        try testing.expectEqualSlices(u8, &case.bytes, writer.written());
+        try testing.expectEqual(case.scope, try decode_client(&case.bytes));
+        try testing.expectError(error.Malformed, decode(&case.bytes));
+        try testing.expectEqual(case.scope, Scope.parse(case.scope.text()).?);
+    }
+    try testing.expect(Scope.parse("Jobs") == null);
+    try testing.expect(Scope.parse("") == null);
+    const near = [_][]const u8{
+        &.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x0A, 0x01, 0x01 }, // version 1
+        &.{ 0x30, 0x06, 0x02, 0x01, 0x03, 0x0A, 0x01, 0x01 }, // version 3
+        &.{ 0x30, 0x06, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x00 }, // scope 0
+        &.{ 0x30, 0x06, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x03 }, // scope 3
+        &.{ 0x30, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01 }, // scope an INTEGER
+        &.{ 0x30, 0x07, 0x02, 0x01, 0x02, 0x0A, 0x02, 0x00, 0x01 }, // scope padded
+        &.{ 0x30, 0x08, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x01, 0x05, 0x00 }, // a NULL after
+        &.{ 0x30, 0x03, 0x02, 0x01, 0x02 }, // no scope
+        &.{ 0x30, 0x06, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x01, 0x00 }, // a byte after
+        &.{ 0x31, 0x06, 0x02, 0x01, 0x02, 0x0A, 0x01, 0x01 }, // a SET
+    };
+    for (near) |bytes| try testing.expectError(error.Malformed, decode_client(bytes));
+    var buffer: [512]u8 = undefined;
+    var writer = der.Writer.init(&buffer);
+    const identity: Identity = .{ .image_digest = @splat(1), .placement_epoch = 7, .labels = &.{} };
+    try encode(&writer, &identity);
+    try testing.expectError(error.Malformed, decode_client(writer.written()));
 }

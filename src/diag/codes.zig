@@ -1870,12 +1870,13 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "an identity could not be issued",
         .explanation =
-        \\A workload or server certificate was not made because its request breaks a
-        \\bound: more labels than x509_labels_max, a label key or value over its limit
-        \\or with a character that is not allowed, label keys not sorted and unique,
-        \\labels together over x509_labels_bytes_max, a cluster or service name that
-        \\does not make a SPIFFE ID spiffe://<cluster>/service/<name>, a DNS name that
-        \\is not lowercase, has a wildcard or an all-digit label, or a lifetime that
+        \\A workload, server, node or client certificate was not made because its
+        \\request breaks a bound: more labels than x509_labels_max, a label key or
+        \\value over its limit or with a character that is not allowed, label keys not
+        \\sorted and unique, labels together over x509_labels_bytes_max, a cluster,
+        \\service, node or client name that does not make a SPIFFE ID
+        \\spiffe://<cluster>/<service|node|client>/<name>, a DNS name that is not
+        \\lowercase, has a wildcard or an all-digit label, or a lifetime that
         \\is empty or over x509_leaf_ttl_ms_max (x509_ca_ttl_ms_max for a CA), or a
         \\subject key that is not a valid Ed25519 public key (off the curve, or in a
         \\small subgroup), which no honest holder has.
@@ -1906,9 +1907,11 @@ pub const registry = [_]Entry{
         .summary = "a certificate is of another kind than this use needs",
         .explanation =
         \\The certificate is genuine and well formed, but it is not for this use: a
-        \\workload's client certificate presented as a server's, a CA certificate
-        \\presented as a leaf, or, under a foreign anchor, a certificate whose
-        \\extended key usage lacks serverAuth or whose basic constraints say CA.
+        \\workload's, node's or client's certificate presented as a server's, one of
+        \\those three where another of them is needed (a workload's where the API
+        \\needs a node's or a client's), a CA certificate presented as a leaf, or,
+        \\under a foreign anchor, a certificate whose extended key usage lacks
+        \\serverAuth or whose basic constraints say CA.
         \\
         \\The cause names the kind found and the kind needed. Give the peer a
         \\certificate issued for its role: a server certificate for a server.

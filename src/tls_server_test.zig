@@ -610,6 +610,44 @@ test "a client certificate of the configured kind only is taken" {
     try std.testing.expectEqualStrings("client.botpike.com", rig.server.peer().?.name);
 }
 
+test "client_kind: a server takes a client certificate of its configured kind and no other" {
+    // Goal: the four leaf kinds a client can present (B7 adds node and client) are told apart.
+    // Method: every pair of configured and presented kind; equal pairs connect and name the peer,
+    // the others are refused with ZC-E0819 and unsupported_certificate.
+    const kinds = [_]x509.Kind{ .workload, .server, .node, .client };
+    const chains = [_]testclient.Chain{ .good, .server_kind, .node_kind, .client_kind };
+    const names = [_][]const u8{
+        x509_test.workload_uri,
+        "client.botpike.com",
+        x509_test.node_uri,
+        x509_test.client_uri,
+    };
+    var failures: u32 = 0;
+    for (kinds) |configured| {
+        for (kinds, chains, names) |presented, chain, name| {
+            var rig: Rig = undefined;
+            try rig.setup_server(configured);
+            try rig.client.init(.{ .ca = rig.ca, .faults = .{ .chain = chain } });
+            const result = rig.handshake(4096);
+            if (configured == presented) {
+                const event = try result;
+                try std.testing.expect(event == .connected);
+                try std.testing.expectEqual(presented, rig.server.peer().?.kind);
+                try std.testing.expectEqualStrings(name, rig.server.peer().?.name);
+                continue;
+            }
+            try std.testing.expectError(error.Refused, result);
+            if (rig.diag.code != Code.E0819 or rig.sent_alert() !=
+                @backingInt(wire.Alert.unsupported_certificate))
+            {
+                std.debug.print("client_kind {t} took {t}\n", .{ configured, presented });
+                failures += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), failures);
+}
+
 test "a fatal alert from the client is named, plain before its keys and sealed after" {
     var rig: Rig = undefined;
     try rig.setup(.{});

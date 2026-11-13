@@ -65,6 +65,10 @@ const World = struct {
     /// The client's knobs are all correct (or only those a server must take: no session id, no
     /// change_cipher_spec, one record per message).
     knobs_good: bool,
+    /// The one wrong knob is in the flight's change_cipher_spec records (too many, or a wrong
+    /// byte), which `flight_whole` judges from the bytes sent: a damage that cuts or mends such a
+    /// record leaves a flight the server must take.
+    knobs_ccs: bool,
     /// What the server may connect to: set before the flight is fed.
     legit: bool,
     false_connect: bool,
@@ -297,7 +301,7 @@ fn setup(world: *World, random: std.Random) !void {
     var client_secret: [32]u8 = undefined;
     random.bytes(&client_random);
     random.bytes(&client_secret);
-    const faults = random_faults(random, &world.knobs_good);
+    const faults = random_faults(random, &world.knobs_good, &world.knobs_ccs);
     try world.client.init(.{
         .ca = world.ca,
         .random = client_random,
@@ -313,7 +317,8 @@ fn setup(world: *World, random: std.Random) !void {
 
 /// The client's knobs: those a server must take drawn freely; in half the runs one more is
 /// wrong, which no server may take.
-fn random_faults(random: std.Random, good: *bool) testclient.Faults {
+fn random_faults(random: std.Random, good: *bool, ccs_only: *bool) testclient.Faults {
+    ccs_only.* = false;
     var faults: testclient.Faults = .{
         .ccs = random.uintLessThan(u32, 2),
         .one_record = random.boolean(),
@@ -338,11 +343,15 @@ fn random_faults(random: std.Random, good: *bool) testclient.Faults {
         9 => faults.hello.early_data = true,
         10 => faults.hello.psk_not_last = true,
         11 => faults.hello.duplicate_group = true,
-        12 => faults.ccs = random.intRangeAtMost(u32, 2, 3),
+        12 => {
+            faults.ccs = random.intRangeAtMost(u32, 2, 3);
+            ccs_only.* = true;
+        },
         13 => {
             // A wrong byte matters only in a change_cipher_spec that is sent.
             faults.ccs_byte = random.intRangeAtMost(u8, 2, 255);
             faults.ccs = 1;
+            ccs_only.* = true;
         },
         14 => {
             faults.chain = random.enumValue(testclient.Chain);
@@ -451,7 +460,7 @@ fn flight_stage(world: *World, random: std.Random, hello_ccs: ?u32, hello_kind: 
     const kind: Mutation = if (random.boolean()) random.enumValue(Mutation) else .none;
     const length = mutate(random, kind, flight, &world.damaged);
     const damaged = world.damaged[0..length];
-    world.legit = world.knobs_good and hello_ccs != null and
+    world.legit = (world.knobs_good or world.knobs_ccs) and hello_ccs != null and
         flight_whole(flight, damaged, hello_ccs orelse 0);
     if (length > 0) try feed(world, random, damaged);
     const whole = hello_kind == .none and kind == .none and world.knobs_good;

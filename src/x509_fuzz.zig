@@ -112,6 +112,8 @@ fn good_certificate(random: std.Random, out: *x509.Der) !x509.Kind {
         .ca => try t.make_ca(out),
         .workload => try t.make_workload(out),
         .server => try t.make_server(out),
+        .node => try t.make_node(out),
+        .client => try t.make_client(out),
     }
     return kind;
 }
