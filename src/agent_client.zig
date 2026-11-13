@@ -1133,6 +1133,15 @@ pub fn refusal_code(arena: Allocator, body: []const u8) ?[]const u8 {
     return parsed.diagnostics[0].code;
 }
 
+/// The last cause of the server's first diagnostic, if it has one.
+pub fn refusal_cause(arena: Allocator, body: []const u8) ?[]const u8 {
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+    const parsed = std.json.parseFromSliceLeaky(Refusal, arena, body, options) catch return null;
+    if (parsed.diagnostics.len == 0) return null;
+    const causes = parsed.diagnostics[0].causes;
+    return if (causes.len == 0) null else causes[causes.len - 1];
+}
+
 /// Whether any cause of the server's first diagnostic contains `phrase`.
 fn refusal_says(arena: Allocator, body: []const u8, phrase: []const u8) bool {
     const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };

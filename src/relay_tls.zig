@@ -48,6 +48,71 @@ pub fn tls_of(server_name: []const u8, anchor_hex: []const u8) ?Tls {
     return .{ .server_name = server_name, .anchor = anchor };
 }
 
+/// `relay.pub`: what the supervisor asks the agent to get signed, one line,
+/// `<key> <epoch> <digest> <job>` (the key and digest as 64 hex digits each). The supervisor
+/// takes the epoch and job from the container's `zcube.created` and `zcube.job` labels and the
+/// digest from its image: what this node attests it runs.
+pub const Request = struct {
+    key: [32]u8,
+    epoch: u64,
+    image_digest: [32]u8,
+    job: []const u8,
+
+    pub const bytes_max = 64 + 1 + 20 + 1 + 64 + 1 + constants.service_name_bytes_max + 1;
+
+    pub fn format(request: *const Request, out: *[bytes_max]u8) []const u8 {
+        assert(request.epoch > 0);
+        assert(request.job.len > 0);
+        assert(request.job.len <= constants.service_name_bytes_max);
+        return std.fmt.bufPrint(out, "{x} {d} {x} {s}\n", .{
+            &request.key, request.epoch, &request.image_digest, request.job,
+        }) catch unreachable; // `bytes_max` is the longest line.
+    }
+
+    /// The line `format` wrote, or null; `job` points into `text`.
+    pub fn parse(text: []const u8) ?Request {
+        const line = std.mem.trimEnd(u8, text, "\n");
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var request: Request = undefined;
+        const key = fields.next() orelse return null;
+        const epoch = fields.next() orelse return null;
+        const digest = fields.next() orelse return null;
+        request.job = fields.next() orelse return null;
+        if (fields.next() != null) return null;
+        if (key.len != 64 or digest.len != 64) return null;
+        _ = std.fmt.hexToBytes(&request.key, key) catch return null;
+        _ = std.fmt.hexToBytes(&request.image_digest, digest) catch return null;
+        request.epoch = std.fmt.parseInt(u64, epoch, 10) catch return null;
+        if (request.epoch == 0) return null;
+        if (request.job.len == 0) return null;
+        if (request.job.len > constants.service_name_bytes_max) return null;
+        return request;
+    }
+};
+
+test "a certificate request survives its line" {
+    const request: Request = .{
+        .key = @splat(0xAB),
+        .epoch = 42,
+        .image_digest = @splat(0x5A),
+        .job = "train-1",
+    };
+    var buffer: [Request.bytes_max]u8 = undefined;
+    const line = request.format(&buffer);
+    const back = Request.parse(line).?;
+    try std.testing.expectEqualSlices(u8, &request.key, &back.key);
+    try std.testing.expectEqual(request.epoch, back.epoch);
+    try std.testing.expectEqualSlices(u8, &request.image_digest, &back.image_digest);
+    try std.testing.expectEqualStrings(request.job, back.job);
+    for ([_][]const u8{ "", "ab 1 cd j\n", "x", line[0..64] }) |bad| {
+        try std.testing.expect(Request.parse(bad) == null);
+    }
+    var zero_epoch = buffer;
+    zero_epoch[65] = '0';
+    zero_epoch[66] = ' ';
+    try std.testing.expect(Request.parse(zero_epoch[0..line.len]) == null);
+}
+
 /// A plain-TCP upstream (B3's) is served only by a Debug build, as the server admits one only
 /// from a Debug build's configuration (`server_config.relay_plain_allowed`).
 pub const plain_allowed = @import("builtin").mode == .debug;
