@@ -257,7 +257,7 @@ pub fn forge(
             ask.node = other;
         },
         .ended => {},
-        .other_image => ask.image_digest[random.uintLessThan(usize, 32)] ^= 0x5a,
+        .other_image => ask.image_digest[random.uintLessThan(u32, 32)] ^= 0x5a,
     }
     assert(ask.epoch <= epoch);
     return ask;
@@ -326,21 +326,27 @@ fn connect(state: *State, sim: anytype, container: anytype, cert: anytype, now_m
     }
 }
 
+fn pick(random: std.Random, len: usize) u32 {
+    assert(len > 0);
+    return random.uintLessThan(u32, @intCast(len));
+}
+
 /// Now and then (`forge_per_mille` of ticks), an ask made up from a relayed container on some
 /// node: a stale epoch, another node's name, a run that may have ended, another image.
 fn forge_one(state: *State, ctx: *const controller.Context, nodes: anytype) void {
     const random = state.prng.random();
     if (random.uintLessThan(u32, 1000) >= forge_per_mille) return;
-    const node = nodes[random.uintLessThan(usize, nodes.len)];
-    const other = nodes[random.uintLessThan(usize, nodes.len)];
+    // Draws are `u32`, never `usize`: the WASM build must draw what the native one does.
+    const node = nodes[pick(random, nodes.len)];
+    const other = nodes[pick(random, nodes.len)];
     const items = node.sim.containers.containers.items;
     if (items.len == 0) return;
-    const container = items[random.uintLessThan(usize, items.len)];
+    const container = items[pick(random, items.len)];
     if (!container.relay_wanted) return;
     const job = label_of(container.labels, runtime.label_job) orelse return;
     const epoch = epoch_of(container.labels) orelse return;
     const digest = job_cert.image_digest(container.image) orelse return;
-    const forgery = random.enumValue(Forgery);
+    const forgery = random.enumValueWithIndex(Forgery, u32);
     const now_ms = node.nclock.clock().now_ms();
     const ask = forge(state, forgery, node.name(), other.name(), epoch, digest, now_ms) orelse
         return;
