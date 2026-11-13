@@ -74,6 +74,7 @@ the layout.
 | `/replicas/<svc>/<id>` | replica controller | desired replica: spec and generation; **no placement** | until the replica is retired |
 | `/assigned/<node>/<id>` | scheduler | the placement: replica id, service, the resolved `requests`, and the reason | until unassigned |
 | `/nodes/<node>` | that node's agent | registration and declared capacity | **bound to the node's lease** |
+| `/node-tenure/<node>` | that node's agent, through the agent endpoint's registration | the newest tenure: written unleased in the registration's transaction, so its `mod_revision` names the latest tenure after the lease and `/nodes/<node>` are gone (#238); in a placement's compare set when `/nodes/<node>` is absent (§3) | until the node is removed |
 | `/node-store/<node>` | that node's agent | **advisory** (C2 slice 5, owner decision O1): a summary of the image trees the node holds, for the scheduler's locality step only; never in a compare set; bound to the node's lease | **bound to the node's lease** |
 | `/pulls/<node>/<tree>` | that node's agent | **statistics** (C2 slice 7, owner decision O6): what the last pull of a tree moved, by source; no controller reads it and it is in no compare set; **not** lease-bound, so it outlives the node; the `retention` role may delete it | none |
 | `/allocations/<node>` | scheduler | authoritative accounting: the sum of the `requests` of every assignment on the node, their count, and the `/nodes/<node>` revision whose capacity it was checked against | while the node exists |
@@ -218,6 +219,17 @@ identified by that key's `mod_revision` at registration (the *tenure revision*).
 
 This is real fencing, because the store is the shared resource and it checks the token.
 
+**Every tenure is judged, and gets its own grace (#238, finding 2).** A node can lose a tenure,
+register again and lose the new one before the node controller has judged it; the server can
+also miss the new tenure's `/nodes` key entirely, when it registers and expires between two
+passes. The registration's transaction therefore also writes `/node-tenure/<node>`, unleased, at
+the same revision as `/nodes/<node>`. A `/node-tenure` revision newer than the tenure
+`/node-status/<node>` judged is a tenure that ended unjudged: the node controller writes `lost`
+for **that** tenure, at the time it sees it, and `lost_grace_ms` counts again from there. Until
+then the replica controller does not treat the node's replicas as lost on the older verdict, and
+a placement that relies on a node being absent compares `/node-tenure/<node>` at the revision it
+read, so a registration between the read and the commit fails it.
+
 **Why not bind `/observed` keys to the lease.** In discussion I proposed attaching every observed
 key to the node's lease, so that expiry deletes them. The store forbids it at scale:
 `store_lease_keys_max` is 64, because a lease's keys are deleted in one revision and a watch batch
@@ -257,13 +269,29 @@ assumptions.
 
 The agent has finished stopping before any replacement is placed, provided that:
 
-- `fence_margin ≥ fence_stop_ms + ttl × skew + kill latency`, where `skew` bounds the difference
-  between the two hosts' clock **rates**. Absolute clock values do not matter.
-- The agent process is alive and scheduled.
+- `fence_margin ≥ fence_stop_ms + ttl × skew + kill latency + step lag + clock step`, where:
+  - `skew` bounds the difference between the two hosts' clock **rates**;
+  - `step lag` (`agent_step_lag_max_ms`, 500 ms) bounds how late an agent's step may run after
+    the time it was due to fence or to kill;
+  - `clock step` (`store_clock_step_max_ms`, 500 ms) bounds a single forward step of the store's
+    clock. Lease deadlines are absolute values on that clock, so a forward step of `d` ends every
+    lease `d` early; apart from such steps, absolute clock values do not matter.
+- The agent process is alive and scheduled, and the step-lag bound holds: the agent measures how
+  late each step is against the fence and kill times it set at the end of the step before, and
+  past the bound it fences at once (and, already fencing, kills at once). A lag up to the bound
+  is in the margin; a longer one is caught at the next step, which is late by the stall itself.
+  A stall that outlasts the margin is the wedged node below.
+- The store host's clock never steps forward by more than the bound at once (chronyd and ntpd
+  slew below 500 ms by default and step above it; `makestep` set wider, or a manual `date -s`,
+  breaks it). Backward steps only lengthen leases. This is an assumption about the host, which
+  nothing checks.
 - The kernel delivers `SIGKILL` and the process exits.
 
-Proposed constants (fixed in the C1 brief): `ttl` 10 s, `fence_stop_ms` 2 s, `skew` 1 %,
-`fence_margin` 3 s, `lost_grace_ms` 1 s.
+Constants (the C1 brief, and #238 for the last two terms): `ttl` 10 s, `fence_stop_ms` 2 s,
+`skew` 1 %, kill latency 0.9 s, step lag 0.5 s, clock step 0.5 s, `fence_margin` 4 s (3 s before
+#238; failover is 1 s longer), `lost_grace_ms` 1 s. With `fence_window_min_ms` 5 s the shortest
+ttl the server admits is 9 s (ZC-E0121), and the default 10 s is also the longest: its skew uses
+the last 100 ms (docs/decisions/2026-11-13-238-authority-repairs.md).
 
 **The stated window for stateless replicas.** Two instances of one replica's *work* can run at
 once for at most `lost_grace_ms` plus kill latency, **unless the node is wedged**: the agent is

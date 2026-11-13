@@ -589,7 +589,7 @@ test "a lease ttl an agent cannot fence in time is ZC-E0121" {
     diag.reset();
     const ok = try merge(.{}, .{}, &diag);
     try testing.expectEqual(constants.lease_ttl_ms, ok.lease_ttl_ms);
-    const refused = [_]u32{ 20_000, 30_000, 3_000, 5_000, 7_999 };
+    const refused = [_]u32{ 20_000, 30_000, 3_000, 5_000, 8_000, 8_999 };
     for (refused) |ttl| {
         diag.reset();
         try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = ttl }, .{}, &diag));
@@ -597,14 +597,14 @@ test "a lease ttl an agent cannot fence in time is ZC-E0121" {
     }
     // Too short is told to lengthen, with the shortest ttl named; too long to shorten.
     diag.reset();
-    try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = 7_999 }, .{}, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "shortest ttl is 8000") != null);
+    try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = 8_999 }, .{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "shortest ttl is 9000") != null);
     diag.reset();
     try testing.expectError(error.BadConfig, merge(.{ .lease_ttl_ms = 20_000 }, .{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "needs a fence margin") != null);
     diag.reset();
-    const shortest = try merge(.{ .lease_ttl_ms = 8_000 }, .{}, &diag);
-    try testing.expectEqual(@as(u32, 8_000), shortest.lease_ttl_ms);
+    const shortest = try merge(.{ .lease_ttl_ms = 9_000 }, .{}, &diag);
+    try testing.expectEqual(@as(u32, 9_000), shortest.lease_ttl_ms);
 }
 
 test "the lost grace is a flag, a file setting, and refused over an hour" {

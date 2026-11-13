@@ -23,6 +23,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/replica-numbers/<service>` | replica controller | C1 slice 3 |
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
 | `/nodes/<node>` | that node's agent | C0 |
+| `/node-tenure/<node>` | that node's agent (the registration) | #238 |
 | `/node-store/<node>` | that node's agent | C2 slice 5 |
 | `/pulls/<node>/<tree>` | that node's agent (retention may delete) | C2 slice 7 |
 | `/allocations/<node>` | scheduler | C1 slice 3 |
@@ -39,7 +40,7 @@ The cluster CA (`ca.key`, docs/peer.md) is not a writer: it signs credentials an
 Its files, the server's `ca.key` and `revoked` and the agent's `peer.key`, `peer.cred` and
 `ca.pub`, live in the state directories, not in the store.
 
-An agent writes only `/nodes/<its node>`, `/node-store/<its node>`, `/pulls/<its node>/…`, `/observed/<its node>/…` and `/job-observed/<its node>/…`.
+An agent writes only `/nodes/<its node>`, `/node-tenure/<its node>`, `/node-store/<its node>`, `/pulls/<its node>/…`, `/observed/<its node>/…` and `/job-observed/<its node>/…`.
 The `zcube-agent fetch` process reads `/node-store/<node>` (`peer`, `filter`) to find peers, and
 writes nothing.
 One departure from `authority.md`, recorded in `docs/DECISIONS.md`: a seventh role, `retention`, deletes expired
@@ -166,6 +167,21 @@ Written by the agent with `lease` set to the lease it keeps alive. When the leas
 is deleted by the store, and that delete event is how lost nodes are detected (C1). The key's
 `mod_revision` at registration is the node's **tenure revision** (`authority.md` section 3). Capacity is
 declared by the agent's configuration (see the open questions in `docs/contracts-review.md`).
+
+## `/node-tenure/<node>`: the node's newest tenure (#238)
+
+```json
+{"v":1,"node":"node1"}
+```
+
+Written by the agent endpoint in the registration's transaction (`PUT /v1/agent/nodes/<node>`),
+beside `/nodes/<node>` and at the same revision, but **not** bound to the lease, so its
+`mod_revision` names the newest tenure after the lease has ended and `/nodes/<node>` is gone. The
+node controller compares it with the tenure `/node-status/<node>` judged: a newer one is a tenure
+that ended unjudged, which it marks `lost` with a grace of its own (`authority.md` §3). A
+placement on the strength of an absent `/nodes/<node>` compares this key at the revision it read.
+The body carries nothing a reader needs; the revision is the fact. Lifetime: until the node is
+removed, like `/node-status/<node>`.
 
 ## `/node-store/<node>`: what the node holds of the image trees (C2 slice 5)
 

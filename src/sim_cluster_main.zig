@@ -420,7 +420,7 @@ fn usage(io: std.Io, args: []const []const u8) u8 {
     return 2;
 }
 
-const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 8,000 ms is refused: an agent " ++
+const ttl_refusal_text = "sim-cluster: --lease-ttl-ms below 9,000 ms is refused: an agent " ++
     "cannot fence in time under it (ZC-E0121: the shortest ttl the server admits, which is also " ++
     "the shortest a shape draws)\n";
 
@@ -462,11 +462,11 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expectEqual(@as(u64, 9), range.last_seed);
     try std.testing.expectEqual(@as(?u32, 60), range.operations);
     const drawn = parse(&.{
-        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=8000",
+        "sim", "--seeds", "1..3", "auto", "--profile=auto", "--lease-ttl-ms=9000",
     }).?;
     try std.testing.expectEqual(@as(?u32, null), drawn.operations);
     try std.testing.expect(drawn.options.profile_auto);
-    try std.testing.expectEqual(@as(?u32, 8000), drawn.options.lease_ttl_ms);
+    try std.testing.expectEqual(@as(?u32, 9000), drawn.options.lease_ttl_ms);
     const named = parse(&.{ "sim", "7", "60", "--profile=skew", "--replicas-pct=200" }).?;
     try std.testing.expect(named.options.profile == .skew and !named.options.profile_auto);
     try std.testing.expectEqual(@as(?u32, 200), named.options.replicas_pct);
@@ -474,7 +474,7 @@ test "the command lines: one seed, a range, and what is refused" {
     try std.testing.expect(parse(&.{ "sim", "7", "60", "--lease-ttl-ms=2000" }) == null);
     const short = ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=2000" }).?;
     try std.testing.expectEqual(ttl_refusal_text, short);
-    try std.testing.expect(ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=8000" }) == null);
+    try std.testing.expect(ttl_refusal(&.{ "sim", "7", "--lease-ttl-ms=9000" }) == null);
     try std.testing.expect(parse(&.{ "sim", "7", "0" }) == null);
     try std.testing.expectEqual(@as(?u32, null), range.options.nodes);
 

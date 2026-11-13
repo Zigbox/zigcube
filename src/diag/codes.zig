@@ -461,9 +461,9 @@ pub const registry = [_]Entry{
         \\
         \\The cause line names the numbers. A lease time to live that is too
         \\long for the margin must be shortened. One that is too short, under
-        \\8000 ms, leaves the agent no time to renew it before it fences, so it
+        \\9000 ms, leaves the agent no time to renew it before it fences, so it
         \\must be lengthened; the cause line names the shortest. The default is
-        \\10000 ms. An agent that is granted a lease time to live below 8000 ms
+        \\10000 ms. An agent that is granted a lease time to live below 9000 ms
         \\by an older server stops its containers and reports this code.
         ,
     },

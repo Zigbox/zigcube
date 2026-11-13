@@ -1554,7 +1554,7 @@ const regress_replays = [_][]const []const u8{
         "11",
         "--c1",
         "--profile=partitions",
-        "--lease-ttl-ms=8799",
+        "--lease-ttl-ms=9000",
         "--replicas-pct=200",
         "--heal-at=355",
     },

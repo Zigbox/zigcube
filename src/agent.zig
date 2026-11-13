@@ -165,6 +165,8 @@ const Fence = struct {
     active: bool = false,
     asked: bool = false,
     kill_at_ms: u64 = 0,
+    /// A step has signalled KILL: later steps poll for the end and are not late for anything.
+    killing: bool = false,
 };
 
 const Beat = enum { idle, acted, fenced };
@@ -192,6 +194,10 @@ pub const Agent = struct {
     fence: Fence,
     /// How many times the agent has fenced itself; the shell says so when it grows.
     fences: u32,
+    /// Steps that began more than `agent_step_lag_max_ms` after the fence or the fence's kill
+    /// was due (#238, finding 4): each one killed at once. The margin covers a lag up to the
+    /// bound; past it the agent cannot promise its kill comes in time, so it does not wait.
+    lag_kills: u32,
     /// Job reports the store refused (B2): only a race with a new assignment or the tenure's end,
     /// so the cluster simulation checks they stop once the world has settled (J10).
     job_reports_refused: u64,
@@ -298,6 +304,7 @@ pub const Agent = struct {
         agent.renew_at_ms = 0;
         agent.fence = .{};
         agent.fences = 0;
+        agent.lag_kills = 0;
         agent.job_reports_refused = 0;
         agent.store_refusals = 0;
         agent.store_refused = false;
@@ -480,6 +487,10 @@ pub const Agent = struct {
         try agent.restore_lease(ctx);
         if (agent.fence_at_ms()) |at| {
             if (mono >= at) try agent.begin_fence(ctx, at);
+            if (mono > at + constants.agent_step_lag_max_ms) try agent.kill_now(ctx, mono);
+        } else if (agent.fence.active) {
+            const late = mono > agent.fence.kill_at_ms + constants.agent_step_lag_max_ms;
+            if (late and !agent.fence.killing) try agent.kill_now(ctx, mono);
         }
         if (agent.fence.active) return agent.fence_step(ctx, now);
         // So do the runs' deadlines: a run is stopped at its deadline and killed after its grace
@@ -767,7 +778,7 @@ pub const Agent = struct {
     /// `s` in the file, which fences earlier, never later.
     ///
     /// The ttl comes from the server, so it is checked, not asserted. One the agent cannot fence
-    /// in time (an older server run with `--lease-ttl-ms` under 8,000) is refused with ZC-E0121:
+    /// in time (an older server run with `--lease-ttl-ms` under 9,000) is refused with ZC-E0121:
     /// the agent fences at once, since it cannot promise to stop in time under that lease, and
     /// the step fails; it does not renew under it and it does not crash. It registers again
     /// when its containers are dead, is granted the same ttl and refuses it again, so a node
@@ -830,7 +841,7 @@ pub const Agent = struct {
             return agent.start_fence(ctx, @min(kept, kill_at));
         }
         // A lease file written under a ttl below the bound (by an agent before this rule, against
-        // a server run with a ttl under 8,000 ms) is unusable: the node fences, and the agent
+        // a server run with a ttl under 9,000 ms) is unusable: the node fences, and the agent
         // registers again. That is the upgrade note of
         // docs/decisions/2026-11-06-renewal-before-fence.md: raise the server's ttl and let every
         // agent renew under it before upgrading any.
@@ -848,6 +859,17 @@ pub const Agent = struct {
     pub fn begin_fence(agent: *Agent, ctx: *const Context, nominal_ms: u64) Error!void {
         if (agent.fence.active) return;
         return agent.start_fence(ctx, fencing.kill_at_ms(nominal_ms));
+    }
+
+    /// This step began more than `agent_step_lag_max_ms` after the fence (or its kill) was due:
+    /// the lag the margin allows is spent, so the fence kills now, not at its nominal time.
+    /// Counted once per step that finds it (#238, finding 4; authority.md §3).
+    fn kill_now(agent: *Agent, ctx: *const Context, mono: u64) Error!void {
+        assert(agent.fence.active);
+        agent.lag_kills += 1;
+        if (agent.fence.kill_at_ms <= mono) return;
+        agent.fence.kill_at_ms = mono;
+        try agent.persist(ctx);
     }
 
     /// The fence is on from here, and kept so: a crash before it ends finishes it on restart.
@@ -888,6 +910,7 @@ pub const Agent = struct {
             };
         }
         agent.fence.asked = true;
+        if (kill) agent.fence.killing = true;
         if (failed) |err| return err;
         if (running == 0) try agent.fenced(ctx);
         const poll = now + constants.fence_poll_ms;

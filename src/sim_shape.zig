@@ -111,9 +111,10 @@ pub const long_share_denominator: u32 = 10;
 pub const cost_max: u32 = 5_000;
 
 /// The shortest ttl a shape draws, and the shortest `fencing.inequality_problem` admits (owner,
-/// 2026-11-06: 3,000 ms of margin plus `fence_window_min_ms`): the drawn and the admitted
-/// ranges agree (docs/decisions/2026-11-06-renewal-before-fence.md).
-pub const lease_ttl_ms_min: u32 = 8000;
+/// 2026-11-06: the margin plus `fence_window_min_ms`, 9,000 ms since #238 moved the margin to
+/// 4,000): the drawn and the admitted ranges agree (docs/decisions/
+/// 2026-11-06-renewal-before-fence.md, docs/decisions/2026-11-13-238-authority-repairs.md).
+pub const lease_ttl_ms_min: u32 = 9000;
 /// The longest ttl `fencing.inequality_problem` allows with the shipped margin.
 pub const lease_ttl_ms_max: u32 = constants.lease_ttl_ms;
 pub const replicas_pct_default: u32 = 100;

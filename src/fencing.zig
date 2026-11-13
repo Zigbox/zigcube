@@ -108,8 +108,8 @@ pub fn kill_at_ms(fence_at: u64) u64 {
 /// ends, if the agent's clock runs slow by the skew bound: not before this the server may
 /// declare the node lost. Used by the tests: every container is dead before it.
 pub fn worst_case_dead_ms(sent_ms: u64, ttl_ms: u32) u64 {
-    return kill_at_ms(fence_at_ms(sent_ms, ttl_ms)) + constants.fence_kill_latency_ms +
-        skew_ms(ttl_ms);
+    return kill_at_ms(fence_at_ms(sent_ms, ttl_ms)) + constants.agent_step_lag_max_ms +
+        constants.fence_kill_latency_ms + skew_ms(ttl_ms);
 }
 
 const testing = std.testing;
@@ -144,11 +144,13 @@ test "the margin has the step lag and the clock step in it, and is used up at th
 }
 
 /// When the last container is dead, in real time after `s`, if the agent's clock runs slow by
-/// `per_mille`: the agent's own elapsed time stretches by that much, then SIGKILL takes its
-/// latency.
+/// `per_mille`: the agent's own elapsed time, the kill step's lag included, stretches by that
+/// much, then SIGKILL takes its latency; the store's clock step is added on the lease's side.
 fn real_dead_ms(ttl_ms: u32, per_mille: u32) u64 {
     const agent_ms = kill_at_ms(fence_at_ms(0, ttl_ms));
-    return (agent_ms * (1000 + per_mille) + 999) / 1000 + constants.fence_kill_latency_ms;
+    const late_ms = agent_ms + constants.agent_step_lag_max_ms;
+    return (late_ms * (1000 + per_mille) + 999) / 1000 + constants.fence_kill_latency_ms +
+        constants.store_clock_step_max_ms;
 }
 
 test "the fence and the kill come at the margin and the stop time, and beat the lease's end" {
@@ -160,12 +162,15 @@ test "the fence and the kill come at the margin and the stop time, and beat the 
     const fence = fence_at_ms(sent, ttl);
     try testing.expectEqual(sent + ttl - constants.fence_margin_ms, fence);
     try testing.expectEqual(fence + constants.fence_stop_ms, kill_at_ms(fence));
-    // The worst case the tests use is the kill, the latency and the skew after it.
+    // The worst case the tests use is the kill, the step's lag, the latency and the skew after
+    // it; the store's clock may step forward and end the lease early by its bound.
     try testing.expectEqual(
-        kill_at_ms(fence) + constants.fence_kill_latency_ms + skew_ms(ttl),
+        kill_at_ms(fence) + constants.agent_step_lag_max_ms + constants.fence_kill_latency_ms +
+            skew_ms(ttl),
         worst_case_dead_ms(sent, ttl),
     );
-    try testing.expect(worst_case_dead_ms(sent, ttl) - sent <= ttl);
+    try testing.expect(worst_case_dead_ms(sent, ttl) - sent + constants.store_clock_step_max_ms <=
+        ttl);
     // With the clock a full bound slow the last container still dies by the lease's end.
     try testing.expect(real_dead_ms(ttl, constants.clock_skew_per_mille) <= ttl);
     try testing.expect(real_dead_ms(ttl, 0) <= ttl);

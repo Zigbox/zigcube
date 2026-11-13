@@ -1,7 +1,7 @@
 request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
 error[ZC-E0121]: the lease settings cannot fence an agent in time
-  cause  a lease ttl of 4000 ms leaves under 5000 ms past the 3000 ms fence
-         margin for a renewal; the shortest ttl is 8000 ms
+  cause  a lease ttl of 4000 ms leaves under 5000 ms past the 4000 ms fence
+         margin for a renewal; the shortest ttl is 9000 ms
   reqid  r-0000001
   fix    lengthen the lease ttl to at least the shortest, or use the default of 10000
   more   zcube explain E0121
