@@ -330,9 +330,10 @@ fn exit_reason(name: []const u8, run: RunFile) runtime.ExitReason {
     };
 }
 
-/// The fix of ZC-E0702: right for either kind of cause (a descriptor, or the relay's address).
-pub const fix_e0702 = "check the step in the cause: free file descriptors on the node, " ++
-    "or correct the relay's address in the server's `relays` setting, then submit the job again";
+/// The fix of ZC-E0702: right for each kind of cause (a descriptor, the relay's address, a job
+/// from before B4).
+pub const fix_e0702 = "do what the cause names: free file descriptors on the node, correct " ++
+    "the relay in the server's `relays` setting, or resubmit a job from before B4";
 
 /// ZC-E0601 (the fetch), ZC-E0702 (the relay), ZC-E0508 (the user's command) or ZC-E0507 (the
 /// host), as the supervisor recorded.

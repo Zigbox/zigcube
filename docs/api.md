@@ -487,7 +487,7 @@ are not yet shown by `zcube why job`. The relay is plain TCP: TLS to the upstrea
 | Code | Blame | Summary |
 | --- | --- | --- |
 | `ZC-E0701` | external | the upstream refused a connection |
-| `ZC-E0702` | environment | the relay could not listen |
+| `ZC-E0702` | environment | a job's relay could not be served |
 | `ZC-E0703` | environment | the agent's build cannot serve a relay |
 | `ZC-E0704` | external | the upstream did not answer in time |
 | `ZC-E0705` | environment | a relayed connection failed in the middle |
@@ -819,7 +819,11 @@ Refusals: `404` where the server has no CA or no `.cluster` is set (there is no 
 domain, docs/decisions/2026-11-13-b4-cluster-setting.md); `400` for a bad job name, key, digest or
 an `epoch` of 0; **`409` ZC-E0706** for a run the node may not have a certificate for (each cause
 names which check failed). A retry cannot change a 409: the agent marks the run refused and does
-not ask again. The call writes no store key. Like every agent endpoint it is unauthenticated
+not ask again. Two causes are not final, so they are **`503` ZC-E0706**: no node has claimed the
+run yet (also what a node without a claim of its own sees), and the claim has not started the run
+(its `running` report has not landed). The agent asks again after `peer_join_retry_ms` and never
+marks the run refused for a 503; it asks only for runs it knows the server holds as `running`, so
+a 503 is a narrow race. The call writes no store key. Like every agent endpoint it is unauthenticated
 until B7 (docs/mtls.md, "Issuance").
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`

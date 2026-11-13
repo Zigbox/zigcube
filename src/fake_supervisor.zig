@@ -393,8 +393,10 @@ fn secure_relay(
     var seed = secure_random.random_seed(init.io) catch
         return "no randomness for the run's key";
     defer std.crypto.secureZero(u8, &seed);
-    const key = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch
+    var key = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch
         return "the run's key could not be made";
+    // `secure` keeps its own copy; this one is not left on the stack.
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key.secret_key));
     relay.secure(tls, key, dir.handle) catch return "there was no memory for the run's key";
     const request: relay_tls.Request = .{
         .key = key.public_key.toBytes(),

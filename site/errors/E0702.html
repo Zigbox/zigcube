@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0702 · Zigcube</title>
-<meta name="description" content="a job's relay could not listen">
+<meta name="description" content="a job's relay could not be served">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0702.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,12 +73,12 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0702</h1>
-<p class="summary">a job's relay could not listen</p>
+<p class="summary">a job's relay could not be served</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
-<p>The supervisor of a job could not set up the relay the job asked for, so the job does not run without the route it was promised. The cause line says which step failed (the socket, the bind, the listen, the relay's address).</p>
-<p>On the fake runtime the job is not started and ends as a start failure. On the real runtime the container has already started, so the supervisor kills it: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in the job's `relay.log`.</p>
-<p>If the cause is a socket or file descriptor error, the host may be out of descriptors: check `ulimit -n` and the node's load. If it names the relay's address, correct the relay's address in the server's `relays` setting. Then submit the job again.</p>
+<p>A job asked for a relay, and the job's supervisor could not serve it, so the job does not run without the route it was promised. The cause line says which of three things happened:</p>
+<p>- The relay could not be set up: the socket, the bind, the listen or the   relay's address failed. If the cause is a socket or file descriptor error,   the host may be out of descriptors: check `ulimit -n` and the node's load.   If it names the relay's address, correct it in the server's `relays`   setting. - The relay stopped while the job ran, and the job's command was killed with   it. Look in the node agent's log for why, around the time of the ending. - The relay cannot be served as the job names it: a job submitted before B4   carries no upstream server name and CA, a release build serves no plain   relay, and the zigbox runtime does not speak TLS to an upstream until B4   slice 4. Run the job on the fake runtime, or wait for that release.</p>
+<p>On the fake runtime a relay that cannot be set up stops the job before it starts, and it ends as a start failure. Otherwise the container has already started, so the supervisor kills it: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in the job's `relay.log`. In each case, fix what the cause names, then submit the job again.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0702</pre>

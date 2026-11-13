@@ -313,6 +313,10 @@ fn add_relay_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
         .{ "outlive", "a relay that stops while the job runs" },
         .{ "unrelayed", "a relay that cannot be opened" },
     };
+    // Always Debug: the fail-closed tests relay to a plain test upstream, which only a Debug
+    // build serves (`relay_tls.plain_allowed`). Under ReleaseSafe each test would fail on that
+    // refusal, whatever the broken agent does, and the step would pass without biting.
+    const optimize: std.builtin.OptimizeMode = .Debug;
     for (teeth) |tooth| {
         const agent = b.addExecutable(.{
             .name = b.fmt("zcube-agent-relay-teeth-{s}", .{tooth[0]}),
@@ -321,7 +325,7 @@ fn add_relay_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
                     b.fmt("src/zcube_agent_relay_teeth_{s}.zig", .{tooth[0]}),
                 ),
                 .target = options.target,
-                .optimize = options.optimize,
+                .optimize = optimize,
                 .imports = &.{
                     .{ .name = "build_options", .module = options.options.createModule() },
                     .{ .name = "zigbox", .module = options.zigbox },
@@ -333,7 +337,7 @@ fn add_relay_teeth_step(b: *std.Build, options: ExecutablesOptions) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/fake_runtime_test.zig"),
                 .target = options.target,
-                .optimize = options.optimize,
+                .optimize = optimize,
                 .imports = &.{
                     .{ .name = "build_options", .module = options.options.createModule() },
                     .{ .name = "zigbox", .module = options.zigbox },

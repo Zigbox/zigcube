@@ -300,7 +300,10 @@ test "an upstream that pins the CA and the job refuses each bad certificate" {
 
 test "without a certificate the relay sends nothing upstream" {
     // Goal: the fourth case, no certificate: when the server refused one (`relay.refused`), the
-    // relay never dials, logs ZC-E0706, and closes the job's connection.
+    // relay never dials, logs ZC-E0706, and closes the job's connection. The relay has no path
+    // that dials without a certificate, so an upstream that pins the CA never meets an empty
+    // Certificate from it; that such an upstream refuses one is `tls_client_test`'s "a client
+    // without a usable certificate says so when the server asks" (same `testpeer`, required).
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const now = peer_stream.wall_ms(testing.io);

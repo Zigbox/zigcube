@@ -78,6 +78,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <h2>What it means</h2>
 <p>A relayed job's supervisor made a key for the run, and the agent asked the server to sign it. The server signs only for the node that holds the job's current claim, at the claim's placement epoch, for an image that matches the job's, while the run has not ended. It refused: the cause says which check failed (not this node's claim, a stale epoch, the run has ended, a different image).</p>
 <p>The relay stays closed: the job's connections to it are closed without reaching the upstream, and the line is in the job's `relay.log`. This is what a run that lost its claim (the node was cut off, the job was placed elsewhere, or it was cancelled) should see, and needs no action. If it repeats for a run that is still this node's, check `zcube job status` for the claim and compare the agent's and the server's versions.</p>
+<p>Two causes are not final: no node has claimed the run yet, or the claim has not started it. The server then answers 503, not 409, and the agent asks again by itself; it marks the run refused only on a 409.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0706</pre>
