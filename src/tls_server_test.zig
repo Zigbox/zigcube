@@ -681,7 +681,8 @@ test "the client's KeyUpdates stop at the limit, and so do the server's answers"
     _ = try rig.feed(rig.client.key_update(&buffer, false), 4096); // The last one allowed.
     _ = try rig.feed(rig.client.seal(&buffer, .application_data, "x"), 4096);
     try std.testing.expectEqual(@as(u32, 1), rig.data_events);
-    try std.testing.expectError(error.Refused, rig.feed(rig.client.key_update(&buffer, false), 4096));
+    const update_false = rig.client.key_update(&buffer, false);
+    try std.testing.expectError(error.Refused, rig.feed(update_false, 4096));
     try rig.expect_code(.E0815);
     const cause = rig.diag.last_cause().?;
     try std.testing.expect(std.mem.indexOf(u8, cause, "updated its keys") != null);
@@ -689,7 +690,8 @@ test "the client's KeyUpdates stop at the limit, and so do the server's answers"
     try rig.setup(.{});
     try expect_connected(&rig, 4096);
     rig.server.write.updates = constants.tls_key_updates_per_connection_max;
-    try std.testing.expectError(error.Refused, rig.feed(rig.client.key_update(&buffer, true), 4096));
+    const update_true = rig.client.key_update(&buffer, true);
+    try std.testing.expectError(error.Refused, rig.feed(update_true, 4096));
     try rig.expect_code(.E0815);
     try std.testing.expect(std.mem.indexOf(u8, rig.diag.last_cause().?, "answering") != null);
 }
@@ -881,7 +883,8 @@ test "teeth: without the KeyUpdate limit an update past it is taken" {
     try rig.setup(.{});
     try expect_connected(&rig, 4096);
     rig.server.read.updates = constants.tls_key_updates_per_connection_max;
-    try std.testing.expectError(error.Refused, rig.feed(rig.client.key_update(&buffer, false), 4096));
+    const update_false = rig.client.key_update(&buffer, false);
+    try std.testing.expectError(error.Refused, rig.feed(update_false, 4096));
     try rig.expect_code(.E0815);
     tls_server.set_test_fault(.key_update_limit, true);
     defer tls_server.set_test_fault(.key_update_limit, false);
