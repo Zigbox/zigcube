@@ -40,8 +40,10 @@ pub const usage =
     \\                    [--new-ca] [--verbose] [--quiet]
     \\       zcube-server --version | --help
     \\
-    \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
-    \\                    (the upstreams a job's relay may name)
+    \\  --config FILE     a ZON file with .listen, .store, .create_store, .relays (the
+    \\                    upstreams a job's relay may name) and .cluster (the trust domain of
+    \\                    a relayed run's certificate, spiffe://<cluster>/job/<name>; required
+    \\                    with any TLS relay, and runs get no certificate until it is set)
     \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it

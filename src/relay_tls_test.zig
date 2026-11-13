@@ -14,6 +14,7 @@ const x509 = @import("x509.zig");
 const x509_identity = @import("x509_identity.zig");
 const x509_test = @import("x509_test.zig");
 const agent_records = @import("agent_records.zig");
+const seeds = @import("fuzz_seeds.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const linux = std.os.linux;
@@ -46,6 +47,9 @@ const Upstream = struct {
     echoed: u32 = 0,
     /// Accept, then never answer: for the cancel bound.
     silent: bool = false,
+    /// For the fuzzer: each echo goes back as records of random sizes, each written in random
+    /// pieces with pauses, so the relay meets half records and several records per read.
+    fragments: ?std.Random = null,
     accepted: bool = false,
 
     fn init(up: *Upstream, cluster_ca: [32]u8, now_ms: u64) !void {
@@ -127,13 +131,35 @@ const Upstream = struct {
         while (true) {
             const opened = try peer.open(try read_record(io, fd, &buffer));
             if (opened.content_type != .application_data) return; // close_notify
-            var sealed: [constants.tls_record_ciphertext_bytes_max + 5]u8 = undefined;
-            const record = peer.application(&sealed, opened.content);
-            try peer_stream.write_all(io, fd, record, end_in(io));
+            try echo(up, &peer, fd, opened.content);
             up.echoed += @intCast(opened.content.len);
         }
     }
 };
+
+fn echo(up: *Upstream, peer: *testpeer.Peer, fd: fd_t, content: []const u8) !void {
+    const io = testing.io;
+    var sealed: [constants.tls_record_ciphertext_bytes_max + 5]u8 = undefined;
+    const random = up.fragments orelse {
+        try peer_stream.write_all(io, fd, peer.application(&sealed, content), end_in(io));
+        return;
+    };
+    var done: usize = 0;
+    while (done < content.len) {
+        const take = random.intRangeAtMost(usize, 1, content.len - done);
+        const record = peer.application(&sealed, content[done..][0..take]);
+        done += take;
+        var sent: usize = 0;
+        while (sent < record.len) {
+            const piece = random.intRangeAtMost(usize, 1, record.len - sent);
+            try peer_stream.write_all(io, fd, record[sent..][0..piece], end_in(io));
+            sent += piece;
+            if (random.boolean()) {
+                try io.sleep(.fromMicroseconds(random.uintLessThan(u32, 300)), .awake);
+            }
+        }
+    }
+}
 
 fn end_in(io: std.Io) u64 {
     return peer_stream.boot_ms(io) + deadline_ms;
@@ -355,4 +381,79 @@ fn monotonic_ms() u64 {
     var now: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &now);
     return @as(u64, @intCast(now.sec)) * 1000 + @as(u64, @intCast(now.nsec)) / 1_000_000;
+}
+
+// ---- Fuzz: the copy loop over TLS records ----------------------------------------------------
+
+const fuzz_bytes_max = 3 * constants.relay_buffer_bytes;
+
+/// One seeded run: the job writes a random stream in random chunks and reads the echo in random
+/// short reads; the upstream answers in records of random sizes, written in random pieces. The
+/// job must get back exactly what it sent, in order.
+fn tls_copy_once(seed: u64) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const now = peer_stream.wall_ms(testing.io);
+    const ca = try x509_test.ca_pair();
+    var up: Upstream = undefined;
+    try up.init(ca.public_key.toBytes(), now);
+    var upstream_prng = std.Random.DefaultPrng.init(seed ^ 0x9E3779B97F4A7C15);
+    up.fragments = upstream_prng.random();
+    try up.start();
+    defer up.join();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const relay = try open_relay(&up, tmp.dir, try log_path(&path, &tmp));
+    defer relay.stop();
+    var certificate: x509.Der = .{};
+    try issue(&certificate, relay.credential.?.key, now, .none);
+    try put_file(tmp.dir, agent_records.file_relay_certificate, certificate.slice());
+    try relay.run();
+    var sent: [fuzz_bytes_max]u8 = undefined;
+    random.bytes(&sent);
+    const length = random.intRangeAtMost(usize, 1, sent.len);
+    const fd = try relay_module.dial(relay.port);
+    defer _ = linux.close(fd);
+    // A small receive buffer and pauses in reading push back on the relay, so its writes to the
+    // job come up short and it stops reading upstream meanwhile. (`pending` stays empty here: a
+    // lane reads only into an empty buffer of `relay_buffer_bytes`, which holds any record, so
+    // bytes are kept back only at the byte bound, which the relay's own tests cover.)
+    const small: i32 = 1;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, std.mem.asBytes(&small), 4);
+    var got: [fuzz_bytes_max]u8 = undefined;
+    var written: usize = 0;
+    var read: usize = 0;
+    const end = end_in(testing.io);
+    while (read < length) {
+        if (peer_stream.boot_ms(testing.io) > end) return error.Timeout;
+        if (written < length) {
+            const chunk = random.intRangeAtMost(usize, 1, @min(length - written, 3000));
+            const flags = linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT;
+            const moved = linux.sendto(fd, sent[written..].ptr, chunk, flags, null, 0);
+            switch (linux.errno(moved)) {
+                .SUCCESS => written += moved,
+                .AGAIN => {},
+                else => return error.WriteFailed,
+            }
+        }
+        if (random.uintLessThan(u8, 4) == 0) {
+            try testing.io.sleep(.fromMilliseconds(random.uintLessThan(u32, 4)), .awake);
+            continue;
+        }
+        const want = random.intRangeAtMost(usize, 1, 700);
+        const count = receive(fd, got[read..][0..@min(want, got.len - read)], 20) orelse continue;
+        if (count == 0) return error.EndedEarly;
+        read += count;
+    }
+    if (!std.mem.eql(u8, sent[0..length], got[0..length])) return error.WrongBytes;
+}
+
+test "fuzz: the copy loop over TLS records split and fragmented at random moves every byte" {
+    // Goal: the TLS side of the copy loop (a record half here, several records per read, short
+    // writes toward the job) loses, repeats and reorders nothing. About 2 s an iteration;
+    // `ZCUBE_FUZZ_ITERATIONS` runs more (fuzz_seeds.zig). Method:
+    // the real relay and `tls_conn` against the scripted upstream on loopback; random stream
+    // lengths, chunks and short reads; records of random sizes in random pieces with pauses.
+    try seeds.run("relay tls copy fuzz", 4, tls_copy_once);
 }
