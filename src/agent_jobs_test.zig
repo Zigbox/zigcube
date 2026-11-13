@@ -1308,6 +1308,8 @@ const FailingList = struct {
         .inspect = inspect,
         .list = list,
         .events = events,
+        .probe_begin = probe_begin,
+        .probe_poll = probe_poll,
     };
 
     fn interface(self: *FailingList) rt.Runtime {
@@ -1390,6 +1392,26 @@ const FailingList = struct {
     ) rt.Error![]const rt.StatusChange {
         const inner = from(context).inner;
         return inner.vtable.events(inner.context, arena, timeout_ms, diag);
+    }
+
+    fn probe_begin(
+        context: *anyopaque,
+        handle: rt.Handle,
+        command: []const []const u8,
+        timeout_ms: u32,
+        diag: *diag_mod.Diag,
+    ) rt.Error!void {
+        const inner = from(context).inner;
+        return inner.vtable.probe_begin(inner.context, handle, command, timeout_ms, diag);
+    }
+
+    fn probe_poll(
+        context: *anyopaque,
+        handle: rt.Handle,
+        diag: *diag_mod.Diag,
+    ) rt.Error!rt.ProbeResult {
+        const inner = from(context).inner;
+        return inner.vtable.probe_poll(inner.context, handle, diag);
     }
 };
 

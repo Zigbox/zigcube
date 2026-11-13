@@ -909,3 +909,55 @@ test "a relay that cannot be set up is ZC-E0702, not the host's start failure ZC
     const now = try rig.status(runtime.Handle.init("relay-bad"));
     try testing.expectEqualStrings("ZC-E0702", now.stopped.start_failed.code.slice());
 }
+
+test "a health check passes by default; the fault file fails it, times it out or refuses it" {
+    // Goal: the fake's health-check hooks (C3 slice 9). Method: begin a check on a running
+    // container under each fault word and poll it: no word exits 0, `unhealthy` exits 1,
+    // `probe_timeout` runs until its timeout_ms and then times out, `probe_refused` is refused.
+    var rig = try Rig.start();
+    defer rig.stop();
+    const handle = try rig.begin("probe-web", &forever);
+    const check = [_][]const u8{ "curl", "-f", "http://localhost:8080/health" };
+    try testing.expectEqual(@as(u8, 0), (try probe_once(rig, handle, &check, 1_000)).exited);
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "probe-web", .data = "unhealthy" });
+    try testing.expectEqual(@as(u8, 1), (try probe_once(rig, handle, &check, 1_000)).exited);
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "probe-web", .data = "probe_refused" });
+    const refused = try probe_once(rig, handle, &check, 1_000);
+    try testing.expectEqualStrings("ZC-E0502", refused.refused.code.slice());
+
+    try rig.fake.faults.writeFile(testing.io, .{ .sub_path = "probe-web", .data = "probe_timeout" });
+    var local: Diag = undefined;
+    local.reset();
+    const fake = rig.fake.interface();
+    try fake.probe_begin(handle, &check, 50, &local);
+    try testing.expect((try fake.probe_poll(handle, &local)) == .running);
+    try testing.io.sleep(.fromMilliseconds(60), .awake);
+    try testing.expect((try fake.probe_poll(handle, &local)) == .timed_out);
+    // A finished check is forgotten: polling again is refused, not a second result.
+    try testing.expect((try fake.probe_poll(handle, &local)) == .refused);
+}
+
+test "a health check of a stopped container is refused" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    const handle = try rig.begin("probe-gone", &.{ "sh", "-c", "exit 0" });
+    _ = try rig.wait_stopped(handle);
+    const check = [_][]const u8{"true"};
+    const result = try probe_once(rig, handle, &check, 1_000);
+    try testing.expect(result == .refused);
+}
+
+/// Begins a check and returns its first poll, which the fake settles at once unless the fault
+/// file says `probe_timeout`.
+fn probe_once(
+    rig: *Rig,
+    handle: runtime.Handle,
+    command: []const []const u8,
+    timeout_ms: u32,
+) !runtime.ProbeResult {
+    var local: Diag = undefined;
+    local.reset();
+    const fake = rig.fake.interface();
+    try fake.probe_begin(handle, command, timeout_ms, &local);
+    return fake.probe_poll(handle, &local);
+}
