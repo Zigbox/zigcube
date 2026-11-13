@@ -260,23 +260,62 @@ fn number_of(comptime T: type, args: []const []const u8, index: *usize, diag: *D
 // ---- The trust policy --------------------------------------------------------------------------
 
 /// Reads and parses the policy file of the `trust` entry, once, at start. Any problem is
-/// ZC-E0106 naming the file, and a policy Zigbox refuses names its line, column and kind.
+/// ZC-E0106 naming the file, and a policy Zigbox refuses names its line, column and kind. The
+/// file is judged and read through one descriptor, so it cannot be swapped between the two.
 fn read_policy(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!Trust {
     if (path.len == 0 or path.len > constants.config_path_bytes_max) {
         return bad(diag, "trust.policy must be a path of 1 to 1024 bytes", .{}, policy_fix);
     }
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch
+        return bad(diag, "can't read the trust policy {s}", .{path}, policy_fix);
+    defer file.close(io);
+    const owner = owner_of(file) orelse
+        return bad(diag, "can't read the trust policy {s}", .{path}, policy_fix);
+    if (owner_problem(owner, std.os.linux.geteuid())) |problem| {
+        return bad(diag, "the trust policy {s} {s} (owner uid {d}, mode {o:0>4})", .{
+            path, problem, owner.uid, owner.mode & 0o7777,
+        }, "chown it to root (or the server's user) and chmod go-w it: a policy that others" ++
+            " can rewrite gates nothing");
+    }
     // A file of exactly the bound is allowed: the limit refuses one that reaches it.
     const limit: std.Io.Limit = .limited(zigbox.trust.limits.policy_bytes_max + 1);
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch |err| {
+    var reader = file.reader(io, &.{});
+    const source = reader.interface.allocRemaining(arena, limit) catch |err| {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.StreamTooLong => bad(diag, "the trust policy {s} is larger than {d} bytes", .{
                 path, zigbox.trust.limits.policy_bytes_max,
             }, "trim it"),
-            else => bad(diag, "can't read the trust policy {s}", .{path}, policy_fix),
+            error.ReadFailed => bad(diag, "can't read the trust policy {s}", .{path}, policy_fix),
         };
     };
     return policy_of(arena, source, path, diag);
+}
+
+/// Who owns the policy file and its mode bits.
+const Owner = struct { uid: u32, mode: u32 };
+
+fn owner_of(file: std.Io.File) ?Owner {
+    const linux = std.os.linux;
+    var stat = std.mem.zeroes(linux.Statx);
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    const result = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, mask, &stat);
+    if (linux.errno(result) != .SUCCESS) return null;
+    if (!stat.mask.MODE or !stat.mask.UID) return null;
+    return .{ .uid = stat.uid, .mode = stat.mode };
+}
+
+/// Zigbox's rule for its system policy (`trust/gate.zig`, "the system policy binds users who
+/// cannot write it"), carried over to a server that need not run as root: the file is a regular
+/// file, owned by root or by the server's own user, and writable by neither group nor others.
+/// Null when it may be used; otherwise what is wrong, for the cause line.
+fn owner_problem(owner: Owner, euid: u32) ?[]const u8 {
+    if (owner.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return "is not a regular file";
+    if (owner.uid != 0 and owner.uid != euid) {
+        return "is owned by neither root nor the server's user";
+    }
+    if (owner.mode & 0o022 != 0) return "can be written by its group or by others";
+    return null;
 }
 
 fn policy_of(arena: Allocator, source: []const u8, path: []const u8, diag: *Diag) Error!Trust {
@@ -796,4 +835,54 @@ test "trust names a policy file; a bad entry or a policy zbx refuses is ZC-E0106
     try expect_bad(missing, &diag);
     diag.reset();
     try expect_bad(read_policy(arena, testing.io, "", &diag), &diag);
+}
+
+test "a trust policy others can rewrite is ZC-E0106; one only root or the server writes is read" {
+    // Goal: Zigbox's rule for its system policy, carried over (PR #241 review): a policy file
+    // that anyone but root or the server's user could rewrite gates nothing. Method: the rule on
+    // owners and modes, then a real file read at 0644 and refused at 0664, 0646 and as a
+    // directory, each naming the file and its mode.
+    const euid: u32 = 1000;
+    const regular: u32 = std.os.linux.S.IFREG;
+    try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o644 }, euid) == null);
+    try testing.expect(owner_problem(.{ .uid = euid, .mode = regular | 0o600 }, euid) == null);
+    try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o4755 }, euid) == null);
+    const refused = [_]Owner{
+        .{ .uid = 1001, .mode = regular | 0o644 },
+        .{ .uid = 0, .mode = regular | 0o664 },
+        .{ .uid = euid, .mode = regular | 0o646 },
+        .{ .uid = 0, .mode = std.os.linux.S.IFDIR | 0o755 },
+    };
+    for (refused) |owner| try testing.expect(owner_problem(owner, euid) != null);
+
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const public = zigbox.trust.key.public_text(zigbox.trust.key.public_of_seed(@splat(7)));
+    const good = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"botpike\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    try tmp.dir.writeFile(io, .{ .sub_path = "trust.zon", .data = good });
+    const path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/trust.zon", .{tmp.sub_path});
+    const file = try tmp.dir.openFile(io, "trust.zon", .{ .mode = .read_write });
+    defer file.close(io);
+    var diag: Diag = undefined;
+    diag.reset();
+    try file.setPermissions(io, .fromMode(0o644));
+    const trust = try read_policy(arena, io, path, &diag);
+    try testing.expect(trust.policy.checks());
+    for ([_]std.posix.mode_t{ 0o664, 0o646 }) |mode| {
+        try file.setPermissions(io, .fromMode(mode));
+        diag.reset();
+        try expect_bad(read_policy(arena, io, path, &diag), &diag);
+        const cause = diag.causes.slice()[0].slice();
+        try testing.expect(std.mem.indexOf(u8, cause, "written by its group or by others") != null);
+        try testing.expect(std.mem.indexOf(u8, cause, "trust.zon") != null);
+    }
+    try tmp.dir.createDir(io, "dir.zon", .default_dir);
+    const dir_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/dir.zon", .{tmp.sub_path});
+    diag.reset();
+    try expect_bad(read_policy(arena, io, dir_path, &diag), &diag);
 }

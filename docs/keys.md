@@ -494,6 +494,21 @@ printable ASCII (one line of `zbx trust export`), as submitted; absent when the 
 `job_labels_max` (6) labels, `job_command_words_max` (64) command words, `env` of at most
 `job_env_bytes_max` (8 KiB). Written with its `/job-input/` and `/job-admission` in one transaction.
 
+**Upgrade note (B5 `signatures`).** Every reader of `/jobs/` and `/job-runs/` decodes with unknown
+members ignored, so an older build reads these records, but it drops what it ignores:
+
+- A pre-B5 server serving `POST /v1/jobs/{name}/cancel` decodes the job, sets `cancel_requested` and
+  writes it back without `signatures`. After the next upgrade, resubmitting the same signed body
+  answers `409` ZC-E0131 for a job the client never changed.
+- A run made by a pre-B5 job controller has no `signatures`. Once the node's check of B5 slice 2
+  exists, an agent with a trust policy refuses such a run although its job was signed.
+- A pre-B5 server answers a body with `signatures` `400` ZC-E0104 (unknown member).
+- A pre-B5 agent ignores the run's `signatures` and runs the job unchecked, which is safe in slice 1.
+
+Order: upgrade every server first, and finish the rollout before submitting signed jobs; never serve
+cancels from a server rolled back past B5; agents may be upgraded in any order until slice 2, and
+after it, before any agent is given a trust policy.
+
 ### `/job-input/<name>`: the input (API)
 
 `{"v":1,"base64":"…"}`: at most `job_input_bytes_max` (64 KiB) of UTF-8 without NUL, held base64

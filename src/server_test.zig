@@ -1073,3 +1073,83 @@ test "POST /v1/jobs takes the worst-case input over the wire; every other body s
     try expect_diagnostic(small, 413, "ZC-E0108");
     try testing.expect(std.mem.indexOf(u8, small.body, "425984") == null);
 }
+
+// ---- B5: the trust policy from the configuration file to the refusal ------------------------
+
+const trust_fixture = @import("job_trust_fixture.zig");
+
+test "a server started from --config with a trust policy refuses an unsigned job with 403" {
+    // Goal: the production path of B5 slice 1, end to end (PR #241 review): `--config` names a
+    // policy, `server_config.load` reads it, `Server.start` gives the API its scratch, and
+    // POST /v1/jobs judges by it. Method: write a policy trusting key 7 and a configuration
+    // naming it, load them as zcube-server does, start a real server under the testing
+    // allocator (a leaked or twice-freed scratch fails the test), POST an unsigned job (403
+    // ZBX-E0905, and no job), then the same job signed by key 7 (201).
+    var test_io: TestIo = undefined;
+    const io = test_io.start();
+    defer test_io.stop();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const public = trust_fixture.public_text(7);
+    const policy = try std.fmt.allocPrint(arena, ".{{ .version = 1, .keys = .{{ .{{ " ++
+        ".name = \"key-7\", .public = \"{s}\" }} }}, .require_signature = true }}", .{&public});
+    try tmp.dir.writeFile(io, .{ .sub_path = "trust.zon", .data = policy });
+    const settings = try std.fmt.allocPrint(arena, ".{{ .listen = \"127.0.0.1:0\", " ++
+        ".store = \"memory\", .trust = .{{ .policy = \"{s}/trust.zon\" }} }}", .{directory});
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.zon", .data = settings });
+    const config_path = try std.fmt.allocPrint(arena, "{s}/server.zon", .{directory});
+
+    var diag: Diag = undefined;
+    diag.reset();
+    const command = config_mod.load(arena, io, &.{ "--config", config_path }, &diag) catch |err| {
+        std.debug.print("load: {s} {s}\n", .{ @errorName(err), diag.causes.slice()[0].slice() });
+        return err;
+    };
+    var config = command.run;
+    try testing.expect(config.trust != null);
+    config.quiet = true;
+    const server = try start_server(io, config);
+    defer server.stop();
+    const address = server.address();
+
+    var fixture = try trust_fixture.Fixture.init(testing.allocator);
+    defer fixture.deinit(testing.allocator);
+    const unsigned = try trust_body(arena, io, &.{});
+    const refused = try send(io, address, "POST", "/v1/jobs", unsigned);
+    defer refused.free();
+    try expect_diagnostic(refused, 403, "ZBX-E0905");
+    const absent = try get(io, address, "/v1/jobs/guarded");
+    defer absent.free();
+    try testing.expectEqual(@as(u16, 404), absent.status);
+
+    const line = try fixture.sign_manifest(arena, 7, 1, 9);
+    const signed = try trust_body(arena, io, &.{line});
+    const admitted = try send(io, address, "POST", "/v1/jobs", signed);
+    defer admitted.free();
+    if (admitted.status != 201) std.debug.print("{s}\n", .{admitted.raw});
+    try testing.expectEqual(@as(u16, 201), admitted.status);
+}
+
+/// The job `guarded` over `tree(1)`, pinned to the manifest of `source(9)`, with `signatures`.
+fn trust_body(arena: std.mem.Allocator, io: std.Io, signatures: []const []const u8) ![]const u8 {
+    var image_buffer: [67]u8 = undefined;
+    var source_buffer: [128]u8 = undefined;
+    const image = trust_fixture.image(&image_buffer, 1);
+    const source = trust_fixture.source(&source_buffer, 9);
+    var list: std.Io.Writer.Allocating = .init(arena);
+    for (signatures, 0..) |line, index| {
+        if (index > 0) try list.writer.writeAll(",");
+        try list.writer.print("{f}", .{std.json.fmt(line, .{})});
+    }
+    const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).toMilliseconds()));
+    return std.fmt.allocPrint(arena,
+        \\{{"name":"guarded","image":"{s}","source":"{s}","command":["true"],"deadline_ms":60000,
+    ++
+        \\"submit_by_ms":{d},"signatures":[{s}]}}
+    , .{ image, source, now + 30_000, list.written() });
+}

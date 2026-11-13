@@ -233,8 +233,11 @@ pub const registry = [_]Entry{
         \\it cannot use: a file that is not valid ZON, an unknown setting, a store
         \\that is not memory, sqlite:<path> or postgres:<settings>, a listen
         \\address that is not host:port, or a `trust` entry whose policy file
-        \\cannot be read or is not a policy zbx reads (the cause names its line,
-        \\column and what is wrong). The cause line names the setting.
+        \\cannot be read, is not a policy zbx reads (the cause names its line,
+        \\column and what is wrong), or could be rewritten by someone other than
+        \\root or the server's user (it must be a regular file owned by one of
+        \\them, writable by neither group nor others). The cause line names the
+        \\setting.
         \\
         \\Nothing was started. Correct the setting and start the server again.
         ,
