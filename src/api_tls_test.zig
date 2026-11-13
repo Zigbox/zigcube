@@ -200,6 +200,48 @@ test "the API over TLS: an admin, a jobs client and a node, each held to its sco
     try testing.expect(own != 403);
     const other = try rig.status(&node, "PUT", "/v1/agent/nodes/node2");
     try testing.expectEqual(@as(u16, 403), other);
+    // Teeth (B7 slice 3, `ca issue-node`): a node certificate for node1 cannot join as node2.
+    const join = try rig.status(&node, "POST", "/v1/agent/nodes/node2/credential");
+    try testing.expectEqual(@as(u16, 403), join);
+}
+
+test "the API over TLS: a server certificate for another name is refused, naming both (B7)" {
+    // Goal: a client checks the server's certificate against its --tls-name. Method: load the
+    // admin's credentials with the name `api.example.com`; the server's certificate names
+    // `zcube-server`; the handshake must fail with ZC-E0812 and say both names.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    const arena = rig.arena.allocator();
+    var credentials: api_tls_client.Credentials = undefined;
+    var diag: Diag = undefined;
+    diag.reset();
+    try credentials.load(rig.io, .{
+        .ca = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rig.dir(), try rig.ca_file() }),
+        .cert = try std.fmt.allocPrint(arena, "{s}/ops.crt", .{rig.dir()}),
+        .key = try std.fmt.allocPrint(arena, "{s}/ops.key", .{rig.dir()}),
+        .server_name = "api.example.com",
+    }, &diag);
+    defer credentials.deinit();
+    const stream = try rig.server.tls_address().connect(rig.io, .{ .mode = .stream });
+    defer stream.close(rig.io);
+    const head = "GET /v1/status HTTP/1.1\r\nHost: zcube-server\r\nContent-Length: 0\r\n\r\n";
+    const got = try api_tls_client.exchange(
+        &credentials,
+        rig.io,
+        stream.socket.handle,
+        arena,
+        &.{head},
+        1 << 20,
+        api_tls_client.reply_is_whole,
+        peer_stream.boot_ms(rig.io) + 10_000,
+        &diag,
+    );
+    try testing.expect(got.ending != .done);
+    try testing.expectEqual(@import("diag/codes.zig").Code.E0812, diag.code.?);
+    const cause = diag.last_cause().?;
+    try testing.expect(std.mem.indexOf(u8, cause, "api.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, cause, "zcube-server") != null);
 }
 
 test "the API over TLS: plain HTTP on the TLS port gets no answer, and the loopback one does" {
@@ -234,4 +276,24 @@ test "the API over TLS: plain HTTP on the TLS port gets no answer, and the loopb
         defer testing.allocator.free(raw);
         try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200"));
     }
+}
+
+test "an agent bootstraps with a node certificate for its own node only (B7 slice 3)" {
+    // Goal: no admin bootstrap, and no bootstrap as another node. Method: an admin certificate
+    // and node1's certificate are each checked as an agent's --cert for node1 and node2.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var admin: api_tls_client.Credentials = undefined;
+    try rig.load("ops", &admin);
+    defer admin.deinit();
+    var node: api_tls_client.Credentials = undefined;
+    try rig.load("node1", &node);
+    defer node.deinit();
+    var diag: Diag = undefined;
+    diag.reset();
+    try node.require_node("node1.crt", "node1", &diag);
+    try testing.expectError(error.Failed, node.require_node("node1.crt", "node2", &diag));
+    diag.reset();
+    try testing.expectError(error.Failed, admin.require_node("ops.crt", "node1", &diag));
 }

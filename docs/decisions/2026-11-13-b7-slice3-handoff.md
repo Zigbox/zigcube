@@ -14,6 +14,7 @@ Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
   `api_scope.refusal` first; a refusal is 403 ZC-E0822 (registered in 197949c; goldens, the
   errors site and the console mock's code list are generated).
 - `zcube`: `--ca --cert --key --tls-name`, or `ZCUBE_CA ZCUBE_CERT ZCUBE_KEY ZCUBE_TLS_NAME`.
+- `zcube-server ca issue-node NAME` (a node bootstrap certificate) beside `ca issue-client`.
 - `zcube-agent`: the same flags or ZON keys. It presents its own `node.crt` and `peer.key` once
   it has joined (and the new one after each renewal), else `--cert`/`--key`.
 - `api_tls_client.zig` is the client side shared by both (files, the pin, one exchange).
@@ -24,11 +25,9 @@ Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
 
 ## Open questions for the supervisor
 
-1. **Agent bootstrap.** The join endpoint (`POST /v1/agent/nodes/{node}/credential`) is under
-   the node's path, so over TLS a new agent needs a certificate before it has its `node.crt`.
-   Today that is `--cert`/`--key`, an admin client certificate (or a node certificate made some
-   other way). A join token or a `node` scope of `ca issue-client` would be narrower. Not
-   decided here.
+1. **Agent bootstrap** (decided by the supervisor, `2026-11-13-b7-supervisor-calls.md`):
+   `zcube-server ca issue-node NAME` writes a node certificate; the agent presents it until it
+   holds `node.crt`, and refuses an admin's or another node's certificate as `--cert`.
 2. **The CLI has no ZON config file**; environment variables stand in for "a ZON config with
    the same keys" on the `zcube` side. The agent has the ZON keys.
 3. **The default listener is now TLS.** `zcube-server` with no listen flag serves TLS on

@@ -34,14 +34,17 @@ pub const usage =
     \\                    [--verbose] [--quiet]
     \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--config FILE]
     \\                    [--store SPEC] [--state-dir DIR]
+    \\       zcube-server ca issue-node NAME [--out DIR] [--config FILE] [--store SPEC]
+    \\                    [--state-dir DIR]
     \\       zcube-server --version | --help
     \\
     \\  --config FILE     a ZON file with .listen, .insecure_listen, .tls_name, .store,
     \\                    .create_store and .relays (the upstreams a job's relay may name)
     \\  --listen ADDR     where to serve the API over TLS, an IP address and a port (default
     \\                    127.0.0.1:7070 unless --insecure-listen is given). Every client
-    \\                    presents a certificate of this server's CA: an agent its node's,
-    \\                    anyone else one from ca issue-client
+    \\                    presents a certificate of this server's CA: an agent its node's
+    \\                    (from ca issue-node until it has joined), anyone else one from
+    \\                    ca issue-client
     \\  --insecure-listen ADDR
     \\                    also serve plain HTTP, with no certificate and every request
     \\                    allowed, on a loopback address only (127.0.0.1:PORT or [::1]:PORT):
@@ -64,6 +67,9 @@ pub const usage =
     \\server need not run): NAME.key and NAME.crt, mode 0600, in --out (default: the working
     \\directory). --scope is what the client may do: jobs, or admin. A name in the revoked file
     \\is refused.
+    \\
+    \\ca issue-node signs a node certificate the same way, for a new agent's --cert and --key:
+    \\it may join and act as NAME only. Once joined, the agent presents its own node.crt.
     \\
     \\The insecure listener allows anything to anyone who can reach it: keep it on loopback.
     \\
@@ -105,12 +111,13 @@ pub const Config = struct {
 
 pub const Command = union(enum) { run: Config, ca_issue_client: IssueClient, version, help };
 
-/// `zcube-server ca issue-client NAME --scope jobs|admin`: the store settings find the CA key
-/// (`config`), and the files are written in `out_dir`.
+/// `zcube-server ca issue-client NAME --scope jobs|admin` or `ca issue-node NAME`: the store
+/// settings find the CA key (`config`), and the files are written in `out_dir`.
 pub const IssueClient = struct {
     config: Config,
     name: []const u8,
-    scope: Scope,
+    /// The client's scope; null for `ca issue-node`, a node's bootstrap certificate (B7 slice 3).
+    scope: ?Scope,
     out_dir: []const u8 = ".",
 };
 
@@ -178,24 +185,26 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     return .{ .run = try merge(flags, file, diag) };
 }
 
-/// `ca issue-client NAME --scope S [--out DIR]` and the store flags of a run.
+/// `ca issue-client NAME --scope S [--out DIR]` or `ca issue-node NAME [--out DIR]`, and the
+/// store flags of a run.
 fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     assert(std.mem.eql(u8, args[0], "ca"));
-    if (args.len < 2 or !std.mem.eql(u8, args[1], "issue-client")) {
-        const problem = "zcube-server ca has one command, issue-client";
+    const node = args.len >= 2 and std.mem.eql(u8, args[1], "issue-node");
+    if (args.len < 2 or !(node or std.mem.eql(u8, args[1], "issue-client"))) {
+        const problem = "zcube-server ca has two commands, issue-client and issue-node";
         return bad(diag, problem, .{}, "run it with --help");
     }
     if (args.len < 3 or std.mem.startsWith(u8, args[2], "-")) {
-        return bad(diag, "ca issue-client needs a client name", .{}, "run it with --help");
+        return bad(diag, "ca {s} needs a name", .{args[1]}, "run it with --help");
     }
-    var request: IssueClient = .{ .config = undefined, .name = args[2], .scope = undefined };
-    var scope: ?Scope = null;
+    var request: IssueClient = .{ .config = undefined, .name = args[2], .scope = null };
     var rest: std.ArrayList([]const u8) = .empty;
     var index: usize = 3;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--scope")) {
+            if (node) return bad(diag, "ca issue-node takes no --scope", .{}, "leave it out");
             const text = try value_of(args, &index, diag);
-            scope = std.meta.stringToEnum(Scope, text) orelse {
+            request.scope = std.meta.stringToEnum(Scope, text) orelse {
                 const problem = "--scope is jobs or admin, not {s}";
                 return bad(diag, problem, .{text}, "run it with --help");
             };
@@ -205,14 +214,14 @@ fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) 
             try rest.append(arena, args[index]);
         }
     }
-    request.scope = scope orelse {
+    if (!node and request.scope == null) {
         return bad(diag, "ca issue-client needs --scope jobs or --scope admin", .{}, "add one");
-    };
+    }
     const flags = try parse_flags(rest.items, diag);
     if (flags.version or flags.help) return if (flags.version) .version else .help;
     if (flags.new_ca or flags.create_store) {
-        const problem = "ca issue-client signs with the CA a server already made";
-        return bad(diag, problem, .{}, "leave out --new-ca and --create-store");
+        const problem = "ca {s} signs with the CA a server already made";
+        return bad(diag, problem, .{args[1]}, "leave out --new-ca and --create-store");
     }
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
@@ -834,6 +843,7 @@ test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
     diag.reset();
     _ = try parse_insecure_listen("127.0.0.1:7070", &diag);
     _ = try parse_insecure_listen("[::1]:7070", &diag);
+    _ = try parse_insecure_listen("127.0.0.2:7070", &diag); // All of 127.0.0.0/8.
     for ([_][]const u8{ "0.0.0.0:7070", "10.0.0.1:7070", "[::]:7070" }) |input| {
         diag.reset();
         try expect_bad(parse_insecure_listen(input, &diag), &diag);

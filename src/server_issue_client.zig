@@ -1,5 +1,6 @@
 //! `zcube-server ca issue-client NAME --scope jobs|admin` (B7 slice 2, docs/mtls.md): signs a
-//! client certificate with the store's CA, on the server host, and writes `NAME.key` (PKCS#8
+//! client certificate with the store's CA; `ca issue-node NAME` (B7 slice 3) a node's bootstrap
+//! certificate, the same way, on the server host, and writes `NAME.key` (PKCS#8
 //! PEM) and `NAME.crt` (PEM), both mode 0600. Shell code: it reads the state directory and writes
 //! the two files. The server need not run; nothing is recorded anywhere, because the scope is in
 //! the certificate (identity extension version 2) and revocation is by name (`revoked`).
@@ -51,14 +52,23 @@ pub fn issue(
     defer std.crypto.secureZero(u8, &seed);
     const key = try make_key(io, &seed, diag);
     var certificate: x509.Der = .{};
-    ca.issue_client_certificate(&certificate, &.{
-        .client = request.name,
-        .scope = request.scope,
-        .subject_key = key.public_key.toBytes(),
-        .ttl_ms = client_ttl_ms,
-    }) catch |err| return refused(diag, request.name, err);
+    const subject_key = key.public_key.toBytes();
+    if (request.scope) |scope| {
+        ca.issue_client_certificate(&certificate, &.{
+            .client = request.name,
+            .scope = scope,
+            .subject_key = subject_key,
+            .ttl_ms = client_ttl_ms,
+        }) catch |err| return refused(diag, request.name, err);
+    } else {
+        ca.issue_node_certificate(&certificate, &.{
+            .node = request.name,
+            .subject_key = subject_key,
+            .ttl_ms = client_ttl_ms,
+        }) catch |err| return refused(diag, request.name, err);
+    }
     const parsed = x509.verify(certificate.slice(), ca.public(), ca.wall.now_ms(), .{
-        .kind = .client,
+        .kind = if (request.scope == null) .node else .client,
         .name = null,
     }) catch unreachable; // The CA just issued it, valid from now for seven days.
     try write_files(io, request, &seed, certificate.slice(), diag);
@@ -281,4 +291,42 @@ test "ca issue-client writes a 0600 key and certificate the CA signed, and refus
     const request = &command.ca_issue_client;
     try testing.expectError(error.Failed, issue(testing.allocator, io, request, &diag));
     try testing.expectEqual(Code.E0106, diag.code.?);
+}
+
+test "ca issue-node writes a node certificate for NAME, and takes no --scope (B7 slice 3)" {
+    // Goal: the bootstrap certificate of a new agent. Method: make a CA, issue for node7, verify
+    // the certificate as a node's with node7's SPIFFE ID; --scope is refused.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    var real: RealClock = .{ .io = io };
+    var ca: peer_ca.Ca = undefined;
+    var diag: Diag = undefined;
+    diag.reset();
+    try server_ca.open(&ca, testing.allocator, io, dir, real.clock(), .{ .quiet = true }, &diag);
+    const args = [_][]const u8{
+        "ca",          "issue-node", "node7", "--store", "postgres:host=x",
+        "--state-dir", dir,          "--out", dir,
+    };
+    const command = try config_mod.load(arena, io, &args, &diag);
+    try testing.expect(command.ca_issue_client.scope == null);
+    _ = try issue(testing.allocator, io, &command.ca_issue_client, &diag);
+    var text: [pem_mod.bytes_max]u8 = undefined;
+    var der_buffer: [constants.x509_cert_bytes_max]u8 = undefined;
+    const crt_text = try tmp.dir.readFile(io, "node7.crt", &text);
+    const der = pem_mod.decode(crt_text, .certificate, &der_buffer).?;
+    var cluster_buffer: [peer_ca.cluster_bytes]u8 = undefined;
+    var uri_buffer: [constants.x509_spiffe_bytes_max]u8 = undefined;
+    const identity = @import("x509_identity.zig");
+    const uri = try identity.spiffe_write(&uri_buffer, .node, ca.cluster(&cluster_buffer), "node7");
+    _ = try x509.verify(der, ca.public(), real.clock().now_ms(), .{ .kind = .node, .name = uri });
+
+    diag.reset();
+    const scoped = [_][]const u8{ "ca", "issue-node", "node8", "--scope", "admin" };
+    try testing.expectError(error.BadConfig, config_mod.load(arena, io, &scoped, &diag));
 }

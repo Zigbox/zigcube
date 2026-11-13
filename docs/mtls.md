@@ -104,7 +104,9 @@ make is refused with **403 `ZC-E0822`** before anything is read or written.
 | `local` (`--insecure-listen`) | everything |
 
 The agent handlers keep every key they write under the node of the path, so an agent writes only
-under its own node's keys. `api_test.zig` calls every endpoint as each caller, allowed and
+under its own node's keys. That per-node rule holds on the TLS listener only: on
+`--insecure-listen` every request is `local` and may write any node's keys, which is why that
+listener binds nothing but a loopback address. `api_test.zig` calls every endpoint as each caller, allowed and
 refused; `api_tls_test.zig` does it end to end over TLS.
 
 ### Clients
@@ -122,11 +124,21 @@ Without `--ca` a client speaks plain HTTP (to `--insecure-listen`). `zcube` need
 files together. A file that cannot be used is `ZC-E0806` naming it; a certificate not issued by
 the CA of `--ca`, or a key that is not the certificate's, is refused before any connection.
 
-The agent with `--ca` presents its own `node.crt` and `peer.key` from its state directory when
-the CA of `--ca` issued them, and switches to the new `node.crt` after every join and renewal.
-An agent that has not joined yet has no `node.crt`: it presents `--cert` and `--key` instead,
-and without them it does not start (`ZC-E0806`). The join endpoint is under the node's own path,
-so that first certificate must be the node's or an admin's (see the handoff of slice 3).
+A client checks the server's certificate against `--tls-name`; a certificate for another name is
+refused at the handshake with `ZC-E0812`, which names both names.
+
+**Agent bootstrap.** A new agent has no `node.crt` yet, and the join endpoint
+(`POST /v1/agent/nodes/<name>/credential`) is under its node's path. On the server host,
+`zcube-server ca issue-node NAME [--out DIR]` (with the server's `--store` and `--state-dir`)
+writes `NAME.key` and `NAME.crt`, mode 0600: a node certificate for NAME, 7 days, signed by the
+store's CA. It refuses a name in `revoked`, never overwrites a file and never makes a CA; it is
+`ca issue-client`'s code path with the node kind. The agent presents those as `--cert` and
+`--key` until it holds a `node.crt` over its own peer key that the CA of `--ca` issued, then that
+`node.crt` (and the new one after every renewal). Its `--cert` must be a node certificate for its
+own `--node`: an admin's or another node's is refused before it connects (`ZC-E0806`). And the
+server holds a bootstrap certificate for NAME to NAME's paths, so it can join and act as NAME
+only (`api_tls_test.zig`: node1's certificate gets 403 joining as node2). Without `--cert` and
+without a `node.crt`, the agent does not start (`ZC-E0806`).
 
 ## Tests
 

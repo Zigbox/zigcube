@@ -681,6 +681,7 @@ fn open_tls(
     }
     const cert = tls.cert orelse return api_tls_client.refuse_no_identity(diag, peer.where);
     try credentials.load_identity(io, cert, tls.key.?, diag);
+    try credentials.require_node(cert, config.node, diag);
     return credentials;
 }
 

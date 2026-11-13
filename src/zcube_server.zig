@@ -86,15 +86,19 @@ fn issue_client(init: std.process.Init, request: *const config_mod.IssueClient) 
     };
     var until_buffer: [20]u8 = undefined;
     var buffer: [512]u8 = undefined;
+    var who_buffer: [128]u8 = undefined;
+    const who = if (request.scope) |scope|
+        std.fmt.bufPrint(&who_buffer, "client {s}, scope {s}", .{ request.name, scope.text() })
+    else
+        std.fmt.bufPrint(&who_buffer, "node {s}", .{request.name});
     const line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s}.key and {s}.crt in {s} " ++
-        "(client {s}, scope {s}, until {s})\n", .{
+        "({s}, until {s})\n", .{
         request.name,
         request.name,
         request.out_dir,
-        request.name,
-        request.scope.text(),
+        who catch "the certificate",
         x509.format_time(&until_buffer, issued.not_after_ms),
-    }) catch return say(init.io, "zcube-server: wrote the client's key and certificate\n");
+    }) catch return say(init.io, "zcube-server: wrote the key and certificate\n");
     return say(init.io, line);
 }
 

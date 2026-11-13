@@ -19,6 +19,7 @@ const peer_stream = @import("peer_stream.zig");
 const tls_client = @import("tls_client.zig");
 const tls_conn = @import("tls_conn.zig");
 const x509 = @import("x509.zig");
+const x509_identity = @import("x509_identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -99,6 +100,26 @@ pub const Credentials = struct {
         if (!std.mem.eql(u8, public, &c.key_pair.public_key.toBytes())) {
             std.crypto.secureZero(u8, std.mem.asBytes(&c.key_pair));
             return refuse(diag, key, "use", "it is not the key of the certificate");
+        }
+    }
+
+    /// The agent's bootstrap certificate (`--cert`, from `ca issue-node`) must be a node
+    /// certificate for `node` itself: never an admin's or another node's (B7 slice 3).
+    pub fn require_node(
+        c: *const Credentials,
+        cert: []const u8,
+        node: []const u8,
+        diag: *Diag,
+    ) LoadError!void {
+        const bytes = c.certificate.slice();
+        const parsed = x509.parse(bytes) catch unreachable; // `load_identity` parsed it.
+        const why = "it is not a node certificate for this agent's --node " ++
+            "(zcube-server ca issue-node NAME writes one)";
+        if (parsed.kind != .node) return refuse(diag, cert, "use", why);
+        const spiffe = x509_identity.spiffe_parse(parsed.name.of(bytes)) catch
+            return refuse(diag, cert, "use", why);
+        if (spiffe.path != .node or !std.mem.eql(u8, spiffe.name, node)) {
+            return refuse(diag, cert, "use", why);
         }
     }
 
