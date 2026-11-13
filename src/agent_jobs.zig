@@ -26,6 +26,7 @@ const c1_teeth = @import("c1_teeth.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
+const job_trust = @import("job_trust.zig");
 const records = @import("records.zig");
 const runtime = @import("runtime.zig");
 
@@ -773,6 +774,7 @@ const Work = struct {
         const run = &entry.rec;
         var record = claiming;
         if (past_bound(ctx, record)) return work.not_started(subject, record);
+        if (try work.refused_by_trust(subject, record, run)) return;
         const input = work.input_of(subject, run) catch |err| switch (err) {
             error.InputAbsent => return work.cannot_start(subject, record, .{ .input = .absent }),
             error.InputMismatch => {
@@ -814,6 +816,35 @@ const Work = struct {
         // slow ones) at its deadline (#202).
         work.agent.arm_run_deadline(ctx, record.deadline_mono_ms.?);
         try work.start(subject, record, run, input);
+    }
+
+    /// The node's own check (B5): with a trust policy, the run's signatures are judged before
+    /// anything of it is fetched or started, whatever the server admitted. A refused run is
+    /// reported `stopped`, exit `refused`, with ZBX-E0905 and its causes; nothing is started, so
+    /// no supervisor is spawned. The record stays `claiming` and goes once the run is unassigned,
+    /// as after any start failure. Returns whether the run was refused.
+    fn refused_by_trust(
+        work: *Work,
+        subject: Subject,
+        record: StartRecord,
+        run: *const records.JobRun,
+    ) Error!bool {
+        const trust = work.agent.config.trust orelse return false;
+        const ctx = work.ctx;
+        const judged = job_trust.judge_run(trust, ctx.arena, .{
+            .image = run.image,
+            .source = run.source,
+            .signatures = run.signatures orelse &.{},
+        }) catch return failures.no_memory(ctx.diag);
+        const refusal = judged orelse return false;
+        try work.report(.{
+            .run = subject.id,
+            .status = .stopped,
+            .epoch = record.epoch,
+            .exit = .{ .kind = .refused },
+            .diagnostic = try records.diagnostic_raw(ctx.arena, refusal, ctx.diag),
+        });
+        return true;
     }
 
     /// The retry bound of a `claiming` record has been reached on this boot: the pass is late (the

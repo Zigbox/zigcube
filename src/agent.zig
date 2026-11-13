@@ -35,6 +35,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
+const job_trust = @import("job_trust.zig");
 const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const failures = @import("store_failures.zig");
@@ -139,6 +140,9 @@ pub const Config = struct {
     /// `HOST:PORT` of the node's peer server, as other nodes' fetches reach it; borrowed.
     peer: []const u8 = "",
     agent_version: []const u8 = "0.0.0",
+    /// The node's own trust policy (`--trust-policy`, B5): every run is judged against it before
+    /// it starts, and a refused one never starts. Null checks nothing. Borrowed.
+    trust: ?*const job_trust.Trust = null,
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -748,6 +752,7 @@ pub const Agent = struct {
             .agent_version = agent.config.agent_version,
             .address = agent.config.address,
             .capacity = agent.config.capacity,
+            .trust_policy = if (agent.config.trust) |trust| trust.path else "",
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);

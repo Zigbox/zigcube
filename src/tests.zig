@@ -113,4 +113,5 @@ comptime {
 
 test {
     _ = @import("zigbox_limits_test.zig");
+    _ = @import("trust_file.zig");
 }

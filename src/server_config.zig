@@ -22,6 +22,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const zigbox = @import("zigbox");
+const trust_file = @import("trust_file.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -259,80 +260,26 @@ fn number_of(comptime T: type, args: []const []const u8, index: *usize, diag: *D
 
 // ---- The trust policy --------------------------------------------------------------------------
 
-/// Reads and parses the policy file of the `trust` entry, once, at start. Any problem is
-/// ZC-E0106 naming the file, and a policy Zigbox refuses names its line, column and kind. The
-/// file is judged and read through one descriptor, so it cannot be swapped between the two.
+/// Reads and parses the policy file of the `trust` entry, once, at start (`trust_file.zig`).
+/// Any problem is ZC-E0106 naming the file.
 fn read_policy(arena: Allocator, io: std.Io, path: []const u8, diag: *Diag) Error!Trust {
-    if (path.len == 0 or path.len > constants.config_path_bytes_max) {
-        return bad(diag, "trust.policy must be a path of 1 to 1024 bytes", .{}, policy_fix);
-    }
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch
-        return bad(diag, "can't read the trust policy {s}", .{path}, policy_fix);
-    defer file.close(io);
-    const owner = owner_of(file) orelse
-        return bad(diag, "can't read the trust policy {s}", .{path}, policy_fix);
-    if (owner_problem(owner, std.os.linux.geteuid())) |problem| {
-        return bad(diag, "the trust policy {s} {s} (owner uid {d}, mode {o:0>4})", .{
-            path, problem, owner.uid, owner.mode & 0o7777,
-        }, "chown it to root (or the server's user) and chmod go-w it: a policy that others" ++
-            " can rewrite gates nothing");
-    }
-    // A file of exactly the bound is allowed: the limit refuses one that reaches it.
-    const limit: std.Io.Limit = .limited(zigbox.trust.limits.policy_bytes_max + 1);
-    var reader = file.reader(io, &.{});
-    const source = reader.interface.allocRemaining(arena, limit) catch |err| {
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.StreamTooLong => bad(diag, "the trust policy {s} is larger than {d} bytes", .{
-                path, zigbox.trust.limits.policy_bytes_max,
-            }, "trim it"),
-            error.ReadFailed => bad(diag, "can't read the trust policy {s}", .{path}, policy_fix),
-        };
-    };
-    return policy_of(arena, source, path, diag);
-}
-
-/// Who owns the policy file and its mode bits.
-const Owner = struct { uid: u32, mode: u32 };
-
-fn owner_of(file: std.Io.File) ?Owner {
-    const linux = std.os.linux;
-    var stat = std.mem.zeroes(linux.Statx);
-    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
-    const result = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, mask, &stat);
-    if (linux.errno(result) != .SUCCESS) return null;
-    if (!stat.mask.MODE or !stat.mask.UID) return null;
-    return .{ .uid = stat.uid, .mode = stat.mode };
-}
-
-/// Zigbox's rule for its system policy (`trust/gate.zig`, "the system policy binds users who
-/// cannot write it"), carried over to a server that need not run as root: the file is a regular
-/// file, owned by root or by the server's own user, and writable by neither group nor others.
-/// Null when it may be used; otherwise what is wrong, for the cause line.
-fn owner_problem(owner: Owner, euid: u32) ?[]const u8 {
-    if (owner.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return "is not a regular file";
-    if (owner.uid != 0 and owner.uid != euid) {
-        return "is owned by neither root nor the server's user";
-    }
-    if (owner.mode & 0o022 != 0) return "can be written by its group or by others";
-    return null;
+    const loaded = try trust_file.read(arena, io, path, trust_options, diag);
+    return .{ .path = loaded.path, .policy = loaded.policy };
 }
 
 fn policy_of(arena: Allocator, source: []const u8, path: []const u8, diag: *Diag) Error!Trust {
-    const policy = try arena.create(Policy);
-    if (zigbox.trust.policy.parse(source, policy)) |problem| {
-        const detail = problem.detail_text();
-        return bad(diag, "the trust policy {s} is not a policy zbx reads: {t} at {d}:{d}{s}{s}", .{
-            path,
-            problem.kind,
-            problem.line,
-            problem.column,
-            if (detail.len > 0) " near " else "",
-            detail,
-        }, "check it with zbx trust policy check, or fix the line it names");
-    }
-    return .{ .path = path, .policy = policy };
+    const loaded = try trust_file.parse(arena, source, path, trust_options, diag);
+    return .{ .path = loaded.path, .policy = loaded.policy };
 }
+
+const trust_options: trust_file.Options = .{
+    .code = .E0106,
+    .setting = "trust.policy",
+    .user = "the server's user",
+    .fix = policy_fix,
+    .owner_fix = "chown it to root (or the server's user) and chmod go-w it: a policy that" ++
+        " others can rewrite gates nothing",
+};
 
 const policy_fix = "write it as .trust = .{ .policy = \"/etc/zcube/trust.zon\" }, naming a" ++
     " readable Zigbox policy file";
@@ -842,19 +789,6 @@ test "a trust policy others can rewrite is ZC-E0106; one only root or the server
     // that anyone but root or the server's user could rewrite gates nothing. Method: the rule on
     // owners and modes, then a real file read at 0644 and refused at 0664, 0646 and as a
     // directory, each naming the file and its mode.
-    const euid: u32 = 1000;
-    const regular: u32 = std.os.linux.S.IFREG;
-    try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o644 }, euid) == null);
-    try testing.expect(owner_problem(.{ .uid = euid, .mode = regular | 0o600 }, euid) == null);
-    try testing.expect(owner_problem(.{ .uid = 0, .mode = regular | 0o4755 }, euid) == null);
-    const refused = [_]Owner{
-        .{ .uid = 1001, .mode = regular | 0o644 },
-        .{ .uid = 0, .mode = regular | 0o664 },
-        .{ .uid = euid, .mode = regular | 0o646 },
-        .{ .uid = 0, .mode = std.os.linux.S.IFDIR | 0o755 },
-    };
-    for (refused) |owner| try testing.expect(owner_problem(owner, euid) != null);
-
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

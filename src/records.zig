@@ -371,6 +371,8 @@ pub const JobFailure = enum {
     @"unreachable",
     not_started,
     unknown,
+    /// B5: the node's trust policy refused the run before it started (ZBX-E0905).
+    refused,
 };
 
 /// How a job ended: `exited` carries exactly one of `code` and `signal`, `failed` a `cause`,
@@ -637,6 +639,9 @@ pub const Node = struct {
     address: []const u8 = "",
     capacity: Requests,
     labels: []const []const u8 = &.{},
+    /// The path of the trust policy the node's agent checks every job's signatures against
+    /// before it starts a run (`--trust-policy`, B5); empty: the agent checks nothing.
+    trust_policy: []const u8 = "",
 };
 
 /// One tree a node holds completely, as its summary advertises it (docs/swarm.md): the tree's
@@ -696,7 +701,8 @@ pub const Pull = struct {
 
 pub const ObservedStatus = enum { starting, running, stopped };
 
-pub const ExitKind = enum { exited, signaled, oom, pid_limit, start_failed, lost };
+/// `refused` (B5) is a job's only: the node's trust policy refused the run before it started.
+pub const ExitKind = enum { exited, signaled, oom, pid_limit, start_failed, lost, refused };
 
 pub const Exit = struct {
     kind: ExitKind,
@@ -1077,6 +1083,7 @@ pub fn exit_text(exit: Exit, buffer: []u8) []const u8 {
         .pid_limit => std.fmt.bufPrint(buffer, "hit its process limit", .{}),
         .start_failed => std.fmt.bufPrint(buffer, "failed to start", .{}),
         .lost => std.fmt.bufPrint(buffer, "was lost", .{}),
+        .refused => std.fmt.bufPrint(buffer, "was refused by the node's trust policy", .{}),
     };
     // Cannot fail: every text above is under 64 bytes, and the buffer has at least that.
     return text catch unreachable;

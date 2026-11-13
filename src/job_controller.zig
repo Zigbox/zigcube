@@ -534,6 +534,7 @@ pub fn map_ending(observed: *const records.JobObserved) ?Ending {
         .pid_limit => failed(.pid_limit, null),
         .start_failed => failed(.start_failed, null),
         .lost => failed(.unknown, null),
+        .refused => failed(.refused, null),
     };
 }
 

@@ -16,6 +16,8 @@ const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
 const store = @import("store.zig");
 const writers = @import("writers.zig");
+const job_trust = @import("job_trust.zig");
+const trust_fixture = @import("job_trust_fixture.zig");
 
 const image = "b3:51aa9c03";
 const run_id = "train-job";
@@ -38,7 +40,10 @@ const Rig = struct {
     world: *sim_world.World,
 
     fn start() !Rig {
-        const fixtures = &sim_runtime.default_fixtures;
+        return start_with(&sim_runtime.default_fixtures);
+    }
+
+    fn start_with(fixtures: []const []const u8) !Rig {
         const world = try sim_world.World.create(testing.allocator, 5, fixtures);
         errdefer world.destroy();
         world.advance(2_000);
@@ -1715,4 +1720,111 @@ test "an agent with no runs never cuts a call before its fence" {
     try testing.expectEqual(@as(u32, 0), world.switched.keepalive_cost.?.cut);
     try testing.expectEqual(@as(u32, 0), world.agent.fences);
     try testing.expectEqual(lease, world.agent.lease);
+}
+
+// ---- The node's trust policy (B5 slice 2) ------------------------------------------------------
+
+/// The node checks runs against a policy that trusts key 1 and asks for a signature; the run's
+/// image is a tree the simulated runtime has. The records are written straight into the store,
+/// around the server's admission check, so only the node's own check stands between them and a
+/// start.
+const TrustCase = struct {
+    fixture: trust_fixture.Fixture,
+    config: job_trust.Trust,
+    image_buffer: [67]u8,
+    images: [1][]const u8,
+    rig: Rig,
+
+    fn start(case: *TrustCase) !void {
+        case.fixture = try trust_fixture.Fixture.init(testing.allocator);
+        errdefer case.fixture.deinit(testing.allocator);
+        try case.fixture.trust_keys(&.{1}, true);
+        case.config = case.fixture.config();
+        case.images = .{trust_fixture.image(&case.image_buffer, 0x31)};
+        case.rig = try Rig.start_with(&case.images);
+        case.rig.world.agent.config.trust = &case.config;
+        starts_seen = 0;
+        case.rig.world.sim.on_start = count_start;
+    }
+
+    fn stop(case: *TrustCase) void {
+        case.rig.stop();
+        case.fixture.deinit(testing.allocator);
+    }
+
+    /// Assigns the run with `signatures`, straight into the store, and runs a few passes.
+    fn assign_and_pass(case: *TrustCase, signatures: ?[]const []const u8) !void {
+        var run = case.rig.run_record(null, 60_000);
+        run.image = case.images[0];
+        run.signatures = signatures;
+        _ = try case.rig.assign_run(run);
+        for (0..3) |_| case.rig.step();
+    }
+
+    /// A line signed by the key of `seed`; the caller frees it (the world's arena is reset by
+    /// every step).
+    fn sign(case: *TrustCase, seed: u8) ![]const u8 {
+        return case.fixture.sign_tree(testing.allocator, seed, 0x31);
+    }
+};
+
+fn expect_refused(case: *TrustCase) !void {
+    try testing.expectEqual(@as(u32, 0), starts_seen);
+    try testing.expect(!case.rig.running());
+    const seen = (try case.rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.stopped, seen.status);
+    try testing.expectEqual(records.ExitKind.refused, seen.exit.?.kind);
+    try testing.expect(!seen.started);
+    try expect_code(seen, "ZBX-E0905");
+}
+
+fn unsigned_run_refused() !void {
+    var case: TrustCase = undefined;
+    try case.start();
+    defer case.stop();
+    try case.assign_and_pass(null);
+    try expect_refused(&case);
+}
+
+test "a run written around the server with no signature is refused by the node, unstarted" {
+    // Goal: the node's own check (B5): an assignment that never met the server's check is judged
+    // before anything starts. Method: the run and its assignment go straight into the store with
+    // no signature; three passes start nothing and report `refused` with ZBX-E0905.
+    try unsigned_run_refused();
+}
+
+test "a run signed by a key the node does not trust is refused; one it trusts starts" {
+    var refused: TrustCase = undefined;
+    try refused.start();
+    defer refused.stop();
+    const stranger = try refused.sign(2);
+    defer testing.allocator.free(stranger);
+    try refused.assign_and_pass(&.{stranger});
+    try expect_refused(&refused);
+
+    var signed: TrustCase = undefined;
+    try signed.start();
+    defer signed.stop();
+    const line = try signed.sign(1);
+    defer testing.allocator.free(line);
+    try signed.assign_and_pass(&.{line});
+    try testing.expectEqual(@as(u32, 1), starts_seen);
+    try testing.expect(signed.rig.running());
+    const seen = (try signed.rig.observed()).?;
+    try testing.expectEqual(records.JobObservedStatus.running, seen.status);
+}
+
+test "an agent with no trust policy checks nothing" {
+    var case: TrustCase = undefined;
+    try case.start();
+    defer case.stop();
+    case.rig.world.agent.config.trust = null;
+    try case.assign_and_pass(null);
+    try testing.expectEqual(@as(u32, 1), starts_seen);
+}
+
+test "teeth: with the node's check skipped, an unsigned run written around the server starts" {
+    job_trust.set_test_fault(.skip_node_check, true);
+    defer job_trust.set_test_fault(.skip_node_check, false);
+    if (unsigned_run_refused()) |_| return error.TestToothMissed else |_| {}
 }

@@ -61,6 +61,8 @@ pub const TestFault = enum {
     subject_from_signature,
     /// `shape_problem` passes everything.
     skip_bounds,
+    /// The node's check before a run starts (`judge_run`) starts every run.
+    skip_node_check,
 };
 
 var faults: [std.enums.values(TestFault).len]bool = @splat(false);
@@ -137,9 +139,43 @@ pub fn admit(
         // At most `job_signatures_max` lines, under Zigbox's count (the comptime block above).
         _ = scratch.record.add(line) catch unreachable;
     }
-    const tree = tree_of(job.image) orelse {
-        return .{ .refused = try refusal(config, arena, job, .no_tree) };
-    };
+    const refused = try judge_lines(config, arena, job) orelse return .admitted;
+    return .{ .refused = refused };
+}
+
+/// The node's check before a run starts (B5 slice 2, the agent): `job` under the node's own
+/// policy. Null when the run may start; otherwise ZBX-E0905 (or E0906), in `arena`. Unlike
+/// `admit`, a line that is not an envelope is not an error of the request: it is judged as
+/// Zigbox's run gate judges it, a line that does not count. A run's lines passed the server's
+/// shape check, but a row written around the API is held to the same bounds here: over the
+/// bounds, nothing counts.
+pub fn judge_run(
+    config: *const Trust,
+    arena: std.mem.Allocator,
+    job: Job,
+) error{OutOfMemory}!?*const Diagnostic {
+    if (!config.policy.checks()) return null;
+    if (fault_on(.skip_node_check)) return null;
+    config.scratch.record.clear();
+    var problem: [problem_bytes_max]u8 = undefined;
+    if (shape_problem(&problem, job.signatures) == null) {
+        for (job.signatures) |line| {
+            // A line the record holds already is a duplicate, and counts once.
+            _ = config.scratch.record.add(line) catch unreachable; // Bounded by the shape.
+        }
+    }
+    return judge_lines(config, arena, job);
+}
+
+/// The verdict on the lines in `config.scratch.record`: null when they satisfy the policy,
+/// else the refusal.
+fn judge_lines(
+    config: *const Trust,
+    arena: std.mem.Allocator,
+    job: Job,
+) error{OutOfMemory}!?*const Diagnostic {
+    const scratch = config.scratch;
+    const tree = tree_of(job.image) orelse return try refusal(config, arena, job, .no_tree);
     var subject: trust.verdict.Subject = .{
         .tree = tree,
         .binding = binding_of(job.source),
@@ -150,12 +186,12 @@ pub fn admit(
     const report = &scratch.report;
     const work = &scratch.work;
     const signed = trust.verdict.judge(work, config.policy, &scratch.record, subject, report);
-    if (fault_on(.count_any_line) and report.count > 0) return .admitted;
-    if (!signed) return .{ .refused = try refusal(config, arena, job, .unsigned) };
+    if (fault_on(.count_any_line) and report.count > 0) return null;
+    if (!signed) return try refusal(config, arena, job, .unsigned);
     if (!trust.verdict.provenance_met(config.policy, report)) {
-        return .{ .refused = try refusal(config, arena, job, .no_provenance) };
+        return try refusal(config, arena, job, .no_provenance);
     }
-    return .admitted;
+    return null;
 }
 
 /// The tree of an image `b3:<64 lowercase hex>`, or null for anything else.
