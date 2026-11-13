@@ -48,6 +48,7 @@ const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const fencing = @import("fencing.zig");
 const sim_cluster = @import("sim_cluster.zig");
+const sim_coverage = @import("sim_coverage.zig");
 const sim_shape = @import("sim_shape.zig");
 const symptom_spec = @import("symptom.zig");
 
@@ -314,11 +315,18 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
     defer out.flush() catch {}; // Nowhere else to report it.
     var failures: u64 = 0;
     var matched = false;
+    // How many seeds of each profile reached each coverage name, printed before the summary
+    // (`sim_fleet coverage` adds the ranges up). On the heap: five tables are about 40 KiB.
+    const reach = init.gpa.create(sim_coverage.Reach) catch return constants.exit_environment;
+    defer init.gpa.destroy(reach);
+    reach.* = .{};
     var seed = parsed.first_seed;
     while (true) : (seed += 1) {
         const resolved = sim_cluster.plan(seed, parsed.operations, parsed.options);
         if (parsed.trace_steps) trace_plan(init.io, seed, resolved);
         sim_cluster.simulate(init.gpa, seed, resolved.operations, resolved.options, report);
+        // Before `report_failure`, whose shrink runs other worlds in `report`.
+        reach.note(resolved.options.profile, &report.coverage);
         if (report.failed) {
             failures += 1;
             report_failure(init, parsed, seed, resolved, report, out) catch
@@ -359,6 +367,7 @@ fn run_range(init: std.process.Init, parsed: *const Args, report: *sim_cluster.R
         }) catch return constants.exit_environment;
         return constants.exit_ok;
     }
+    reach.print(out) catch return constants.exit_environment;
     const total = parsed.last_seed - parsed.first_seed + 1;
     // `--c1` says so: the fleet must not take a plain run for sim-c1 (src/sim_fleet_issue.zig).
     const run_name: []const u8 = if (parsed.options.c1) "sim-cluster --c1" else "sim-cluster";

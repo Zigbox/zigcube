@@ -48,6 +48,7 @@ const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
 const why_acceptance = @import("why_acceptance.zig");
 const sim_checks = @import("sim_checks.zig");
+const sim_coverage = @import("sim_coverage.zig");
 const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
@@ -157,6 +158,9 @@ pub const Report = struct {
     dead_calls: u32 = 0,
     bytes: [report_bytes_max]u8 = undefined,
     len: u32 = 0,
+    /// What the run reached (`sim_coverage.zig`), filled at its end, passed or failed; printed
+    /// after `world hash` on a pass, so every other line is what it was without it.
+    coverage: sim_coverage.Table = .{},
 
     pub fn text(report: *const Report) []const u8 {
         assert(report.len <= report_bytes_max);
@@ -822,6 +826,11 @@ pub const Cluster = struct {
     second_ms: u64,
     check_ms: u64,
     stats: Stats,
+    /// Coverage counted as the run goes: the checks evaluated, the operations drawn, the most
+    /// decisions of each action one listing held. Read only by `record_coverage`.
+    check_ids: sim_coverage.CheckIds,
+    ops_drawn: [op_count]u64,
+    decision_actions: sim_coverage.Actions,
     /// The totals when the faults ended and the heal began.
     fault_totals: ?PhaseTotals,
     /// Where in the run a check is made: "faults", "healed", "convergence" or "end". A failure
@@ -930,6 +939,9 @@ pub const Cluster = struct {
         c.second_ms = 0;
         c.check_ms = 0;
         c.stats = .{};
+        c.check_ids = .{};
+        c.ops_drawn = @splat(0);
+        c.decision_actions = .{};
         c.fault_totals = null;
         c.step = "faults";
         c.on_step = null;
@@ -2074,6 +2086,8 @@ const Op = enum {
     job_end,
 };
 
+const op_count = @typeInfo(Op).@"enum".field_names.len;
+
 /// With `faults_on` false (after the heal) the fault operations get no weight.
 fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
     const f: u32 = @intFromBool(faults_on);
@@ -2098,7 +2112,9 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
 fn operation(c: *Cluster) void {
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
-    switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
+    const op = pick_op(&c.swarm, random, c.fault_totals == null);
+    c.ops_drawn[@intFromEnum(op)] += 1;
+    switch (op) {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
         },
@@ -2166,6 +2182,7 @@ fn operation(c: *Cluster) void {
 const Failure = error{StepFailed};
 
 fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
+    c.check_ids.note(what);
     if (ok) return;
     c.report.failed = true;
     c.report.print("FAILED: {s} (seed {d}, at {d} ms)\n", .{
@@ -2229,6 +2246,7 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
     var at: ?store.Revision = null;
     var nodes_lost: u32 = 0;
     var replicas_lost: u32 = 0;
+    var actions: sim_coverage.Table = .{};
     for (0..64) |_| {
         const page = ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_decisions,
@@ -2242,6 +2260,7 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
                 return check(c, false, "a decision cannot be read");
             try decision_has_cause(c, ctx, &decision);
             try verdict(c, sim_checks.count(ctx, &counts, &decision));
+            if (decision.action.len > 0) actions.add(decision.action, 1);
             if (std.mem.eql(u8, decision.action, "mark_lost")) nodes_lost += 1;
             // A `mark_replica_lost` caused by a decision is the grace's end (the others are
             // caused by an observed record).
@@ -2254,6 +2273,7 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
         if (after != null) continue;
         c.stats.nodes_marked_lost = @max(c.stats.nodes_marked_lost, nodes_lost);
         c.stats.replicas_marked_lost = @max(c.stats.replicas_marked_lost, replicas_lost);
+        c.decision_actions.merge(&actions);
         if (c.dropped_total() > 0) return;
         return verdict(c, sim_checks.summaries(ctx, &counts, at.?));
     }
@@ -3197,9 +3217,14 @@ pub fn simulate(
     run_steps(c, operations, heal_at) catch {
         assert(report.failed);
         if (c.fault_totals != null) print_phases(c);
+        record_coverage(c);
         return;
     };
     print_summary(c);
+    record_coverage(c);
+    var writer = std.Io.Writer.fixed(report.bytes[report.len..]);
+    report.coverage.print(&writer) catch {}; // What does not fit is dropped.
+    report.len += @intCast(writer.buffered().len);
 }
 
 fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
@@ -3382,17 +3407,7 @@ fn print_summary(c: *Cluster) void {
     report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
         s.nodes_marked_lost, s.replicas_marked_lost,
     });
-    var total: sim_net.Stats = .{};
-    for (c.nodes) |node| {
-        const link = c.net.stats(node.index);
-        total.delivered += link.delivered;
-        total.requests_dropped += link.requests_dropped;
-        total.replies_lost += link.replies_lost;
-        total.duplicated += link.duplicated;
-        total.parked += link.parked;
-        total.delivered_late += link.delivered_late;
-        total.partitioned += link.partitioned;
-    }
+    const total = net_total(c);
     report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} " ++
         "parked={d} delivered_late={d} partitioned={d}\n", .{
         total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
@@ -3468,6 +3483,88 @@ fn print_jobs(c: *Cluster) void {
             opened, closed, open_now, by[0], by[1], by[2], by[3],
         });
     }
+}
+
+fn net_total(c: *const Cluster) sim_net.Stats {
+    var total: sim_net.Stats = .{};
+    for (c.nodes) |node| {
+        const link = c.net.stats(node.index);
+        total.delivered += link.delivered;
+        total.requests_dropped += link.requests_dropped;
+        total.replies_lost += link.replies_lost;
+        total.duplicated += link.duplicated;
+        total.parked += link.parked;
+        total.delivered_late += link.delivered_late;
+        total.partitioned += link.partitioned;
+    }
+    return total;
+}
+
+/// The run's coverage into `report.coverage`: only counters the run already kept, read once at
+/// its end (no draw, no store call), so the world is the same with or without it.
+fn record_coverage(c: *Cluster) void {
+    const t = &c.report.coverage;
+    c.check_ids.add_to(t);
+    for (c.ops_drawn, 0..) |count, index| {
+        t.add_joined("op.", @tagName(@as(Op, @enumFromInt(index))), count);
+    }
+    c.decision_actions.add_to(t);
+    const s = c.stats;
+    const net = net_total(c);
+    t.add("fault.crash", s.crashes_injected);
+    t.add("fault.wipe", s.wipes);
+    t.add("fault.partition", s.partitions);
+    t.add("fault.outage", s.outages);
+    t.add("fault.suspend", s.suspends);
+    t.add("fault.runtime", s.runtime_faults);
+    t.add("fault.server_restart", s.server_restarts);
+    t.add("fault.ack_lost", c.ack_loss.lost_count);
+    t.add("fault.request_dropped", net.requests_dropped);
+    t.add("fault.reply_lost", net.replies_lost);
+    t.add("fault.duplicated", net.duplicated);
+    t.add("fault.parked", net.parked);
+    t.add("fault.delivered_late", net.delivered_late);
+    t.add("fault.partitioned", net.partitioned);
+    t.add("path.fence", total_fences(c));
+    t.add("path.dead_call", s.dead_calls);
+    t.add("path.server_failure", s.server_failures);
+    t.add("path.agent_failure", s.agent_failures);
+    t.add("path.node_lost", s.nodes_marked_lost);
+    t.add("path.replica_lost_after_grace", s.replicas_marked_lost);
+    t.add("path.duplicate_second", s.duplicate_seconds);
+    if (c.c1) record_coverage_c1(c, t);
+    if (c.jobs_on) record_coverage_jobs(c, t);
+}
+
+fn record_coverage_c1(c: *Cluster, t: *sim_coverage.Table) void {
+    t.add("check.revision", c.c1_revisions);
+    t.add("check.guarded_write", c.c1_tally.guarded_writes);
+    t.add("check.observation_judged", c.c1_tally.observations_judged);
+    t.add("check.placement_judged", c.c1_tally.placements_judged);
+    t.add("check.decision_recorded", c.recorder.counts.recorded);
+    t.add("check.decision_key_changed", c.recorder.counts.keys_changed);
+    t.add("check.decision_key_deleted", c.recorder.counts.keys_deleted);
+    t.add("path.overlap_worst_ms", c.overlap_worst_ms);
+    t.add("path.overlap_unwatched", c.overlaps_unwatched);
+}
+
+fn record_coverage_jobs(c: *Cluster, t: *sim_coverage.Table) void {
+    const j = &c.jobs;
+    t.add("check.job_start_judged", j.starts_judged);
+    t.add("check.job_status_judged", c.c1_tally.job_statuses_judged);
+    t.add("check.job_run_placed_judged", c.c1_tally.runs_placed_judged);
+    t.add("check.job_report_judged", c.c1_tally.job_reports_judged);
+    t.add("check.job_ending_handled", c.jobs_watch.handled_count);
+    t.add("path.job_created", j.created);
+    t.add("path.job_cancelled", j.cancelled);
+    t.add("path.job_ended", j.ended);
+    t.add("path.job_ledger_full", j.ledger_full);
+    t.add("path.job_report_refused", job_refusals(c));
+    t.add("path.job_watch_relist", c.jobs_watch.relists);
+    t.add("path.job_watch_restart", c.jobs_watch.restarts);
+    var opened: u64 = 0;
+    for (c.nodes) |node| opened += node.sim.containers.relays_opened;
+    t.add("path.relay_opened", opened);
 }
 
 fn print_phases(c: *Cluster) void {
