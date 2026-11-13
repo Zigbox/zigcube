@@ -390,10 +390,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
     remote.set_deadline(boot.clock(), std.math.maxInt(u64));
     var boot_id_buffer: [64]u8 = undefined;
-    var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
-    // An IP address and a port always fit.
-    const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
-    load_pair(gpa, &remote, backend.pair_state, config.state_dir, server, &diag) catch
+    load_pair(gpa, &remote, backend.pair_state, config.state_dir, config.server, &diag) catch
         return fail(io, &diag, config.verbose);
     var peer_identity = switch (open_peer(io, config, &diag)) {
         .opened => |opened| opened,
@@ -485,9 +482,12 @@ fn load_pair(
     remote: *remote_mod.RemoteStore,
     pair_state: *@import("fake_files.zig").DirState,
     state_dir: []const u8,
-    server: []const u8,
+    server_address: std.Io.net.IpAddress,
     diag: *Diag,
 ) error{BackendFailed}!void {
+    var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
+    // An IP address and a port always fit.
+    const server = std.fmt.bufPrint(&server_buffer, "{f}", .{server_address}) catch unreachable;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const state = pair_state.interface();

@@ -622,3 +622,19 @@ test "check and repair allocations, and --confirm for repair only" {
         try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, case.cause) != null);
     }
 }
+
+test "the TLS options are global, before or after the command (B7)" {
+    // Goal: --ca, --cert, --key and --tls-name reach the client wherever they stand.
+    const parsed = try parse_text(&.{
+        "--ca",       "ca.crt", "status", "--cert", "ops.crt", "--key", "ops.key",
+        "--tls-name", "api.x",
+    });
+    try testing.expectEqualStrings("ca.crt", parsed.options.ca.?);
+    try testing.expectEqualStrings("ops.crt", parsed.options.cert.?);
+    try testing.expectEqualStrings("ops.key", parsed.options.key.?);
+    try testing.expectEqualStrings("api.x", parsed.options.tls_name.?);
+    var diag: Diag = undefined;
+    diag.reset();
+    var refused: Parsed = undefined;
+    try testing.expectError(error.Failed, parse(&.{ "status", "--ca" }, &refused, &diag));
+}

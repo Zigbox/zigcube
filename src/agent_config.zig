@@ -885,3 +885,35 @@ test "peer_advertise from a configuration file is checked like the flag" {
     try testing.expect(is_unspecified(try IpAddress.parse("::ffff:0.0.0.0", 1)));
     try testing.expect(!is_unspecified(try IpAddress.parse("::ffff:10.0.0.1", 1)));
 }
+
+test "the TLS settings: --ca alone or with --cert and --key, from flags or the file (B7)" {
+    // Goal: docs/mtls.md, the agent's client settings. Method: none given is plain HTTP; --ca
+    // with the default name; the file's settings; then each refusal.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const empty: File = .{};
+    try testing.expect(try tls_of(try parse_flags(&.{}, &diag), empty, &diag) == null);
+    const ca_only = (try tls_of(try parse_flags(&.{ "--ca", "ca.crt" }, &diag), empty, &diag)).?;
+    try testing.expectEqualStrings("ca.crt", ca_only.ca);
+    try testing.expectEqualStrings("zcube-server", ca_only.server_name);
+    try testing.expect(ca_only.cert == null);
+    const zon = ".{ .ca = \"c\", .cert = \"n.crt\", .key = \"n.key\", .tls_name = \"api.x\" }";
+    const file = try parse_file(arena, zon, "agent.zon", &diag);
+    const from_file = (try tls_of(try parse_flags(&.{}, &diag), file, &diag)).?;
+    try testing.expectEqualStrings("n.key", from_file.key.?);
+    try testing.expectEqualStrings("api.x", from_file.server_name);
+    const refusals = [_][]const []const u8{
+        &.{ "--cert", "n.crt", "--key", "n.key" },
+        &.{ "--tls-name", "api.x" },
+        &.{ "--ca", "c", "--cert", "n.crt" },
+        &.{ "--ca", "c", "--key", "n.key" },
+        &.{ "--ca", "c", "--tls-name", "not a name" },
+    };
+    for (refusals) |args| {
+        diag.reset();
+        try expect_bad(tls_of(try parse_flags(args, &diag), empty, &diag), &diag);
+    }
+}

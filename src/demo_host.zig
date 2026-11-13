@@ -153,7 +153,7 @@ pub const Host = struct {
         const state_dir = try host.path_in_work("server-state");
         var args: std.ArrayList([]const u8) = .empty;
         try args.appendSlice(arena_allocator, &.{
-            "--listen",       listen,
+            "--insecure-listen", listen,
             "--store",        host.config.store,
             "--state-dir",    state_dir,
             "--create-store", "--quiet",

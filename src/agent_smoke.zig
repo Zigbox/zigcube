@@ -123,7 +123,7 @@ const Smoke = struct {
         });
         const args = [_][]const u8{
             "--config",       config,
-            "--listen",       listen,
+            "--insecure-listen", listen,
             "--store",        store,
             "--create-store", "--quiet",
         };

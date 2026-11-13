@@ -828,3 +828,20 @@ test "relays are a table of names and addresses; every malformed entry is ZC-E01
         try expect_bad(merge(.{}, parsed, &diag), &diag);
     }
 }
+
+test "--insecure-listen is loopback only, and --tls-name is a DNS name (B7)" {
+    var diag: Diag = undefined;
+    diag.reset();
+    _ = try parse_insecure_listen("127.0.0.1:7070", &diag);
+    _ = try parse_insecure_listen("[::1]:7070", &diag);
+    for ([_][]const u8{ "0.0.0.0:7070", "10.0.0.1:7070", "[::]:7070" }) |input| {
+        diag.reset();
+        try expect_bad(parse_insecure_listen(input, &diag), &diag);
+    }
+    diag.reset();
+    try testing.expectEqualStrings("api.example.com", try tls_name_of("api.example.com", &diag));
+    for ([_][]const u8{ "", "has space", "-lead.example" }) |input| {
+        diag.reset();
+        try expect_bad(tls_name_of(input, &diag), &diag);
+    }
+}

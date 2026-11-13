@@ -54,7 +54,8 @@ run. It lives `x509_leaf_ttl_ms_max` (7 days). It never makes a CA: a store with
 is `ZC-E0806`, as is an existing `NAME.key` or `NAME.crt`, which it does not replace. A name in
 the server's `revoked` file is `ZC-E0807`: the file holds node and client names alike
 (decisions/2026-11-13-revoked-names-shared.md), and a revoked name stops being issued at once.
-Refusing a certificate already issued at the handshake comes with the API over TLS (slice 3).
+A revoked name is also refused at the handshake of the API over TLS (`ZC-E0819`), so a
+certificate already issued stops working once its name is in `revoked`.
 
 ### Validity
 
@@ -70,6 +71,62 @@ A certificate is valid from `not_before - 60 s` (inclusive) to `not_after + 60 s
 A label key is at most 63 bytes and a value at most 256 bytes. There are at most 16 labels, and
 together they total at most 256 bytes (decisions/2026-11-04-identity-label-bytes-256.md). They
 are sorted by key, with no key twice.
+
+## The API over TLS (B7 slice 3)
+
+`zcube-server` has two listeners:
+
+- `--listen HOST:PORT` serves the API and the console over TLS 1.3 (`server_tls.zig` around
+  `tls_server.zig`). Every client must present a certificate this store's CA issued: a `client`
+  certificate (`ca issue-client`) or a node's `node.crt` (issued at join). The server's own
+  certificate is made from the CA at start, carries the DNS name `--tls-name` (default
+  `zcube-server`), and is made again when half its life is gone.
+- `--insecure-listen HOST:PORT` serves plain HTTP on a loopback address only (127.0.0.1 or ::1;
+  anything else is `ZC-E0106`). It is for the console on the same host, the local mode
+  (`zcube local up`) and the test harnesses. A request on it is the caller `local`, which may
+  call everything: whoever can reach loopback already runs on the server's host.
+
+With neither given, the server serves TLS on `127.0.0.1:7070`, the old default address. The server names the caller from the certificate the
+handshake verified, never from a header: a node's certificate is the caller `node <name>`, a
+client certificate is `client <name>` with its scope. A certificate whose name is in `revoked`,
+or whose SPIFFE ID is not of this cluster, is refused at the handshake (`ZC-E0819`).
+
+### Scopes
+
+`Api.handle` checks the caller before it routes (`api_scope.zig`); a request the caller may not
+make is refused with **403 `ZC-E0822`** before anything is read or written.
+
+| Caller | May call |
+|---|---|
+| `node <name>` (an agent) | `/v1/agent/nodes/<name>` and below, its own node's only |
+| `client`, scope `jobs` | `/v1/jobs` and below, and `GET /v1/why/job/<name>` |
+| `client`, scope `admin` | everything |
+| `local` (`--insecure-listen`) | everything |
+
+The agent handlers keep every key they write under the node of the path, so an agent writes only
+under its own node's keys. `api_test.zig` calls every endpoint as each caller, allowed and
+refused; `api_tls_test.zig` does it end to end over TLS.
+
+### Clients
+
+`zcube` and `zcube-agent` take the same four settings (`api_tls_client.zig`):
+
+| Flag | `zcube` environment | Agent ZON key | Meaning |
+|---|---|---|---|
+| `--ca FILE` | `ZCUBE_CA` | `.ca` | the CA certificate (`ca.crt` in the server's state directory); the client pins its key |
+| `--cert FILE` | `ZCUBE_CERT` | `.cert` | the certificate to present (PEM) |
+| `--key FILE` | `ZCUBE_KEY` | `.key` | its Ed25519 key (PKCS#8 PEM, mode 0600) |
+| `--tls-name NAME` | `ZCUBE_TLS_NAME` | `.tls_name` | the DNS name the server's certificate must carry (default `zcube-server`) |
+
+Without `--ca` a client speaks plain HTTP (to `--insecure-listen`). `zcube` needs all three
+files together. A file that cannot be used is `ZC-E0806` naming it; a certificate not issued by
+the CA of `--ca`, or a key that is not the certificate's, is refused before any connection.
+
+The agent with `--ca` presents its own `node.crt` and `peer.key` from its state directory when
+the CA of `--ca` issued them, and switches to the new `node.crt` after every join and renewal.
+An agent that has not joined yet has no `node.crt`: it presents `--cert` and `--key` instead,
+and without them it does not start (`ZC-E0806`). The join endpoint is under the node's own path,
+so that first certificate must be the node's or an admin's (see the handoff of slice 3).
 
 ## Tests
 

@@ -28,6 +28,13 @@ each is an **Ask first**. The owner approved this document as written (endpoints
 | Auth | Out of scope here. SPEC says tokens are scoped; the console needs a read-only scope. A missing or insufficient token must be a diagnostic like any other. |
 | Versioning | The path carries the major version. Additive fields are not a new version, so clients ignore unknown fields. |
 
+### Callers and scopes (B7 slice 3)
+
+Over `--listen` (TLS) the caller is named by its client certificate: a node's agent may call only
+`/v1/agent/nodes/<its node>` and below, a `jobs` client only the jobs API and `GET
+/v1/why/job/<name>`, an `admin` client everything. Any other request is **403 `ZC-E0822`**, before
+it is read. `--insecure-listen` (loopback) may call everything. [mtls.md](mtls.md), "Scopes".
+
 ### Errors
 
 A failed request has a non-2xx status and this body:

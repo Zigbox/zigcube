@@ -48,6 +48,9 @@ The images the fake runtime "has" are read from `fixtures/images.zon` (`--images
 digest is `start_failed` with the placeholder `ZBX-E0410` ([runtime-codes.md](runtime-codes.md)),
 unless `--registry` gives it a registry to fetch from (below).
 Capacity is declared, as HANDOFF's provisional answer says.
+With `--ca FILE` (and `--tls-name`) the agent speaks TLS to the server's `--listen`, presenting
+its own `node.crt` once it has joined, else `--cert` and `--key`
+([mtls.md](mtls.md), "The API over TLS"); without it, plain HTTP to `--insecure-listen`.
 
 Start-up failures are `ZC-E0505` (configuration) or `ZC-E0506` (state directory) on stderr with
 the exit code of their blame. While it runs, a server that cannot be reached is `ZC-E0503`, shown

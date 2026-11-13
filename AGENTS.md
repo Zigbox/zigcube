@@ -37,8 +37,12 @@ These arrive with the scaffold; keep this list current as they land.
 
 - `zig build` builds `zig-out/bin/zcube`, `zcube-server` and `zcube-agent`. `zcube-server` needs
   the SQLite and libpq development files, embeds `web/` and the console's WASM module, and runs
-  as `zcube-server [--config FILE] [--listen HOST:PORT] [--store memory|sqlite:<path>|postgres:<settings>]
-  [--create-store]`; `--help` says the rest. Its writes are unauthenticated: listen on a private address.
+  as `zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT] [--tls-name NAME]
+  [--store memory|sqlite:<path>|postgres:<settings>] [--create-store]`; `--help` says the rest.
+  `--listen` serves TLS 1.3 and every client presents a certificate of the store's CA;
+  `--insecure-listen` serves plain HTTP on loopback only, as the caller `local`, which may call
+  everything (B7 slice 3, docs/mtls.md "The API over TLS"; the harnesses and `zcube local` use it).
+  `zcube` and `zcube-agent` take `--ca`, `--cert`, `--key` and `--tls-name` for TLS.
   `zcube-server ca issue-client NAME --scope jobs|admin [--out DIR]` with the server's `--store`
   (and `--state-dir`) writes a client certificate and key (0600) signed by that store's CA
   (B7, docs/mtls.md); it never makes a CA.

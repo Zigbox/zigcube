@@ -1,0 +1,49 @@
+# B7 slice 3 handoff: the API over TLS
+
+Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
+
+## What was built
+
+- `zcube-server --listen` serves TLS 1.3 (`server_tls.zig`, around `tls_server.zig`);
+  `--insecure-listen` serves plain HTTP, loopback only (anything else is ZC-E0106). With neither,
+  TLS listens on `127.0.0.1:7070`. `--tls-name` (default `zcube-server`) is the DNS name of the
+  server's certificate.
+- The caller (`api_scope.Caller`: `local`, `node`, `client` with a scope) is named from the
+  verified certificate and travels in `api.Request.caller` (a required field: there is no default,
+  so a forgotten one fails to compile instead of allowing everything). `Api.route` asks
+  `api_scope.refusal` first; a refusal is 403 ZC-E0822 (registered in 197949c; goldens, the
+  errors site and the console mock's code list are generated).
+- `zcube`: `--ca --cert --key --tls-name`, or `ZCUBE_CA ZCUBE_CERT ZCUBE_KEY ZCUBE_TLS_NAME`.
+- `zcube-agent`: the same flags or ZON keys. It presents its own `node.crt` and `peer.key` once
+  it has joined (and the new one after each renewal), else `--cert`/`--key`.
+- `api_tls_client.zig` is the client side shared by both (files, the pin, one exchange).
+- Tests: `api_test.zig` "scopes: every endpoint ..." (every endpoint x node1, jobs, admin, plus
+  node2's paths), `api_tls_test.zig` (real server, real certificates), config and flag tests.
+- The harnesses (agent-smoke, local-smoke via `zcube local`, demo-c0/c1 via `demo_host`,
+  swarm-smoke, store-failover) start the server with `--insecure-listen`.
+
+## Open questions for the supervisor
+
+1. **Agent bootstrap.** The join endpoint (`POST /v1/agent/nodes/{node}/credential`) is under
+   the node's path, so over TLS a new agent needs a certificate before it has its `node.crt`.
+   Today that is `--cert`/`--key`, an admin client certificate (or a node certificate made some
+   other way). A join token or a `node` scope of `ca issue-client` would be narrower. Not
+   decided here.
+2. **The CLI has no ZON config file**; environment variables stand in for "a ZON config with
+   the same keys" on the `zcube` side. The agent has the ZON keys.
+3. **The default listener is now TLS.** `zcube-server` with no listen flag serves TLS on
+   127.0.0.1:7070, so `zcube` with no flags (plain HTTP to 127.0.0.1:7070) no longer reaches it.
+   This follows from "`--listen` serves TLS" but changes what a bare start does.
+4. **The console** works on `--insecure-listen` only: a browser presenting a client certificate
+   is not set up.
+
+## Traps
+
+- `pem.decode` wants the exact text with the trailing newline after END.
+- `x509_identity.dns_problem` returns `bool`, not a reason.
+- `api_tls_client.Credentials.present` refuses (returns false) a certificate the pinned CA did
+  not issue, so an agent whose state directory is from another CA falls back to `--cert`.
+
+## Next
+
+Slice 4 of docs/briefs/b7.md.

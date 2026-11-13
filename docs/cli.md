@@ -36,6 +36,8 @@ zcube help | version
 | `-v`, `--verbose` | the full cause chain and context of a failure; every request made, with its id |
 | `-o`, `--output text\|wide\|json` | `wide` adds columns to `get` and `stats pull`; `json` is for scripts (below) |
 | `--server HOST:PORT` | where `zcube-server` listens: this flag, else `$ZCUBE_SERVER`, else `127.0.0.1:7070`. An IP address (or `localhost`) and a port |
+| `--ca FILE`, `--cert FILE`, `--key FILE` | speak TLS to `--listen` with this CA pinned and this certificate and key (`$ZCUBE_CA`, `$ZCUBE_CERT`, `$ZCUBE_KEY`); all three or none. Without them `zcube` speaks plain HTTP, to `--insecure-listen` ([mtls.md](mtls.md), "The API over TLS") |
+| `--tls-name NAME` | the DNS name the server's certificate must carry (`$ZCUBE_TLS_NAME`, default `zcube-server`) |
 | `-y`, `--yes` | `apply`, `delete`: do not ask first |
 | `--dry-run` | `apply`: show the change and stop |
 | `--no-redact` | `bundle`: keep secrets in the bundle (prints a warning) |

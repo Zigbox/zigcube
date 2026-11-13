@@ -1258,3 +1258,99 @@ test "a job names a relay the server configures; any other name or an env overri
         try testing.expect(std.mem.indexOf(u8, response.body, case.field) != null);
     }
 }
+
+test "scopes: every endpoint as an agent, a jobs client and an admin client (B7)" {
+    var rig = try Rig.start(91);
+    defer rig.stop();
+    const Allowed = struct { node1: bool, jobs: bool };
+    const Row = struct { method: []const u8, path: []const u8, query: []const u8 = "", allowed: Allowed };
+    const none: Allowed = .{ .node1 = false, .jobs = false };
+    const jobs: Allowed = .{ .node1 = false, .jobs = true };
+    const own: Allowed = .{ .node1 = true, .jobs = false };
+    const rows = [_]Row{
+        .{ .method = "GET", .path = "/v1/status", .allowed = none },
+        .{ .method = "GET", .path = "/v1/list", .allowed = none },
+        .{ .method = "GET", .path = "/v1/watch", .query = "timeout=0", .allowed = none },
+        .{ .method = "GET", .path = "/v1/leases", .allowed = none },
+        .{ .method = "GET", .path = "/v1/why/service/hello", .allowed = none },
+        .{ .method = "GET", .path = "/v1/why/replica/hello-0", .allowed = none },
+        .{ .method = "GET", .path = "/v1/why/node/node1", .allowed = none },
+        .{ .method = "GET", .path = "/v1/why/job/build", .allowed = jobs },
+        .{ .method = "GET", .path = "/v1/stats/pull", .allowed = none },
+        .{ .method = "GET", .path = "/v1/codes", .allowed = none },
+        .{ .method = "GET", .path = "/v1/explain/ZC-E0822", .allowed = none },
+        .{ .method = "POST", .path = "/v1/apply", .query = "dry_run=1", .allowed = none },
+        .{ .method = "DELETE", .path = "/v1/services/hello", .allowed = none },
+        .{ .method = "GET", .path = "/v1/check/allocations", .allowed = none },
+        .{ .method = "POST", .path = "/v1/repair/allocations/node1", .allowed = none },
+        .{ .method = "POST", .path = "/v1/jobs", .allowed = jobs },
+        .{ .method = "GET", .path = "/v1/jobs", .allowed = jobs },
+        .{ .method = "GET", .path = "/v1/jobs/build", .allowed = jobs },
+        .{ .method = "GET", .path = "/v1/jobs/watch", .query = "timeout=0", .allowed = jobs },
+        .{ .method = "POST", .path = "/v1/jobs/build/cancel", .allowed = jobs },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease", .allowed = own },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/credential", .allowed = own },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease/1/keepalive", .allowed = own },
+        .{ .method = "PUT", .path = "/v1/agent/nodes/node1", .allowed = own },
+        .{ .method = "PUT", .path = "/v1/agent/nodes/node1/store", .allowed = own },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/pulls", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/replicas", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/assigned", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/observed", .allowed = own },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/observed", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs/build/input", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/job-observed", .allowed = own },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node1/job-observed", .allowed = own },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node1/watch", .query = "timeout=0", .allowed = own },
+        // Another node's keys: node1's agent may not write or read them.
+        .{ .method = "PUT", .path = "/v1/agent/nodes/node2", .allowed = none },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node2/lease", .allowed = none },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = none },
+        .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = none },
+        .{ .method = "GET", .path = "/v1/agent/nodes/node2/watch", .query = "timeout=0", .allowed = none },
+    };
+    const node1: api_mod.Caller = .{ .node = "node1" };
+    const app: api_mod.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
+    const ops: api_mod.Caller = .{ .client = .{ .name = "ops", .scope = .admin } };
+    for (rows) |row| {
+        const cases = [_]struct { caller: api_mod.Caller, allowed: bool }{
+            .{ .caller = node1, .allowed = row.allowed.node1 },
+            .{ .caller = app, .allowed = row.allowed.jobs },
+            .{ .caller = ops, .allowed = true },
+        };
+        for (cases) |case| {
+            const response = rig.call(.{
+                .caller = case.caller,
+                .method = row.method,
+                .path = row.path,
+                .query = row.query,
+                .body = "{}",
+            });
+            if (case.allowed) {
+                // The handler answered; what it said is its own business (400, 404, ...).
+                if (response.status == 403) std.debug.print("{s} {s}\n", .{ row.method, row.path });
+                try testing.expect(response.status != 403);
+            } else {
+                if (response.status != 403) std.debug.print("{s} {s}\n", .{ row.method, row.path });
+                try rig.refused(response, 403, "ZC-E0822");
+            }
+        }
+    }
+}
+
+test "scopes: a refused agent writes nothing under another node's keys (B7)" {
+    var rig = try Rig.start(92);
+    defer rig.stop();
+    const before = rig.world.revision().?;
+    const node1: api_mod.Caller = .{ .node = "node1" };
+    const body = "{\"capacity\":{\"cpu_millis\":1000,\"memory_bytes\":1073741824}}";
+    const response = rig.call(.{
+        .caller = node1,
+        .method = "PUT",
+        .path = "/v1/agent/nodes/node2",
+        .body = body,
+    });
+    try rig.refused(response, 403, "ZC-E0822");
+    try testing.expectEqual(before, rig.world.revision().?);
+}
