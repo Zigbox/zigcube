@@ -321,7 +321,7 @@ fn refused_at_agent(demo: *Demo, refused: []const Refused) !void {
             std.mem.eql(u8, ended.cause, "refused") and said;
         demo.expect(refused_here, "{s} ({s}) is refused at the agent: failed, cause refused, " ++
             "ZBX-E0905 saying \"{s}\" (got {s}, {s}, diagnostic {s})", .{
-            job.name, job.why, words, view.state, ended.cause,
+            job.name,                                                                       job.why, words, view.state, ended.cause,
             if (ended.diagnostic == null) "none" else if (said) "as wanted" else "another",
         });
     }
