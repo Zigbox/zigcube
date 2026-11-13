@@ -366,7 +366,7 @@ const Fixture = struct {
         fixture.manual = .{ .ms = 10_000 };
         fixture.memory.init(testing.allocator, fixture.manual.clock());
         fixture.arena = .init(testing.allocator);
-        fixture.diag = .{};
+        fixture.diag.reset();
     }
 
     fn deinit(fixture: *Fixture) void {
