@@ -382,6 +382,37 @@ test "why answers with the chain, and 404 for a subject that never existed" {
     try rig.refused(rig.get("/v1/why/service/broken", "decision=zzz"), 400, "ZC-E0104");
 }
 
+test "why grant answers the grant's verdict, its diagnostic and the destination's grants" {
+    // Goal: api.md, "GET /v1/why/grant": the C4 demo's step 2 (ZC-E0707 and the grant db has),
+    // the `connection` alias, and the refusals. Method: db allows web; ask for batch and web.
+    var rig = try Rig.start(6);
+    defer rig.stop();
+    var db = hello;
+    db.name = "db";
+    db.allow = &.{.{ .from = "web", .port = 5432 }};
+    _ = try rig.world.apply(db);
+    var web = hello;
+    web.name = "web";
+    _ = try rig.world.apply(web);
+    rig.world.advance(3000);
+    const refused = try rig.ok("/v1/why/grant/hello/db/5432", "");
+    try testing.expectEqualStrings("no_grant", field(refused, "verdict").string);
+    try testing.expectEqualStrings("ZC-E0707", field(field(refused, "diagnostic"), "code").string);
+    const allows = field(refused, "allows").array.items;
+    try testing.expectEqualStrings("web", field(allows[0], "from").string);
+    try testing.expectEqualStrings("alex@laptop", field(field(allows[0], "added"), "by").string);
+    const granted = try rig.ok("/v1/why/connection/web/db/5432", "");
+    try testing.expectEqualStrings("no_endpoint", field(granted, "verdict").string);
+    try testing.expectEqual(@as(usize, 2), field(granted, "excluded").array.items.len);
+
+    try rig.refused(rig.get("/v1/why/grant/web/nope/5432", ""), 404, "ZC-E0101");
+    try rig.refused(rig.get("/v1/why/grant/web/db", ""), 404, "ZC-E0101");
+    try rig.refused(rig.get("/v1/why/grant/web/db/0", ""), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/why/grant/web/db/65536", ""), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/why/grant/Web!/db/80", ""), 400, "ZC-E0104");
+    try rig.refused(rig.get("/v1/why/grant/web/db/80/x", ""), 404, "ZC-E0101");
+}
+
 test "request ids are assigned, echoed, and reported with failures" {
     // Goal: api.md, "Request ID": a new id on every request, success or failure; a valid client
     // id is used; an invalid one is refused and the refusal carries a new id.

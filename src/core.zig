@@ -27,6 +27,7 @@ pub const modules = .{
     @import("apply.zig"),
     @import("mesh_address.zig"),
     @import("mesh_plan.zig"),
+    @import("why_grant.zig"),
     @import("history.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),

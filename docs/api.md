@@ -196,6 +196,39 @@ terminal.
 - Unknown subject with no decisions: `404`, `ZC-E0101`. A deleted subject whose decisions
   survive (24 h, keys.md) answers `200` with `state.exists: false`.
 
+### `GET /v1/why/grant/{from}/{to}/{port}` (C4 slice 2)
+
+`zcube why grant` (alias `GET /v1/why/connection/...`): may service `from` connect to service
+`to` on `port`, and if so, to which replicas. Computed by `src/why_grant.zig` from one snapshot
+with the same compiler the agents' mesh plan uses (`src/mesh_plan.zig`), so the answer is the
+plan's, not a re-derivation.
+
+```json
+{ "v": 1, "revision": 41, "from": "batch", "to": "db", "port": 5432,
+  "verdict": "no_grant",
+  "text": "no grant batch → db:5432 (ZC-E0707); db allows: web → 5432 (added by alex@laptop at 2026-11-13 10:02:11Z)",
+  "diagnostic": { "code": "ZC-E0707", "…": "…" },
+  "allows": [ { "from": "web", "port": 5432,
+                "added": { "decision": "…-0007", "at_ms": 1763028131000, "by": "alex@laptop" } } ],
+  "endpoints": [],
+  "excluded": [] }
+```
+
+- `verdict` is `granted`, `no_grant` (ZC-E0707), `no_source` (the grant names a service that does
+  not exist, ZC-W0704), `destination_has_no_address` or `source_has_no_address` (apply it again) or
+  `no_endpoint` (granted, and no replica of `to` is ready with a mesh endpoint, ZC-E0709). `diagnostic` is present for the
+  three coded verdicts.
+- `allows` is `to`'s whole `allow` list; `added` names the newest `grant` decision that added it,
+  when one survives retention. `removed` (present only for `no_grant`) names the decision that
+  removed the asked-for grant, if one survives.
+- `endpoints` are the replicas the source would be sent to, in the order a source replica with no
+  local endpoint tries them; `excluded` are `to`'s other replicas, each with `exclusion`
+  (`not_ready`, `draining`, `no_endpoint`) and a `text`.
+- A replica is ready when the node it is assigned to reports it running at its generation and,
+  with a health check, last reported it healthy.
+- `text` is the sentence the CLI prints. Unknown `to`: `404` ZC-E0101. A bad name or a port
+  outside 1 to 65535: `400` ZC-E0104.
+
 ### `GET /v1/stats/pull[?node=<name>][&limit=<n>]` (C2 slice 7)
 
 What pulls moved, by source: the `/pulls/` records of keys.md, newest `finished_at_ms` first.

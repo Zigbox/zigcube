@@ -22,8 +22,8 @@
 //! grant, which is what `zcube why grant` shows.
 //!
 //! **Ready** is the C3 brief's readiness without its `min_ready_ms` timer, which C3's readiness
-//! slice adds (docs/decisions/2026-11-13-c4-mesh-plan.md): running at the replica's current
-//! assignment and, with a health check, last reported healthy.
+//! slice adds (docs/decisions/2026-11-13-c4-mesh-plan.md): reported running by the node it is
+//! assigned to, at its generation, and, with a health check, last reported healthy.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -44,7 +44,7 @@ pub const Readiness = enum {
     ready,
     /// No node holds its assignment.
     not_assigned,
-    /// Its node has not reported it at its current assignment.
+    /// The node it is assigned to has not reported it, at its generation.
     not_reported,
     starting,
     stopped,
@@ -551,8 +551,13 @@ fn replica_of_snapshot(
         .node = node,
         .readiness = .not_reported,
     };
+    // The record on the assigned node, for this generation. A replica's report names no epoch
+    // (only a job's does), so one that does must name this placement's.
     const entry = observed orelse return result;
-    if (entry.rec.assignment != assigned.kv.mod_revision) return result;
+    if (entry.rec.generation != replica.generation) return result;
+    if (entry.rec.assignment) |epoch| {
+        if (epoch != assigned.kv.mod_revision) return result;
+    }
     result.endpoint = entry.rec.endpoint;
     result.readiness = switch (entry.rec.status) {
         .starting => .starting,

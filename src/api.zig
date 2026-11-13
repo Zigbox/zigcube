@@ -47,6 +47,7 @@ const failures = @import("store_failures.zig");
 const store_verified = @import("store_verified.zig");
 const text_util = @import("text.zig");
 const why_mod = @import("why.zig");
+const why_grant_mod = @import("why_grant.zig");
 
 const Allocator = std.mem.Allocator;
 const Context = controller.Context;
@@ -1320,10 +1321,13 @@ const Call = struct {
         const ctx = call.ctx;
         try call.query.allow(ctx, &.{"decision"});
         const kind_text = call.parts.next() orelse return no_such(ctx, "/v1/why");
+        const is_grant = std.mem.eql(u8, kind_text, "grant") or
+            std.mem.eql(u8, kind_text, "connection");
+        if (is_grant) return why_grant(call);
         const name = call.parts.next() orelse return no_such(ctx, "/v1/why/<kind>");
         try call.no_more();
         const kind = std.meta.stringToEnum(records.SubjectKind, kind_text) orelse
-            return no_such(ctx, "/v1/why/<kind>: kind is service, replica, node or job");
+            return no_such(ctx, "/v1/why/<kind>: kind is service, replica, node, job or grant");
         if (records.name_problem(name, constants.node_name_bytes_max) != null) {
             return bad_request(ctx, "name", "is not a valid name");
         }
@@ -1334,6 +1338,32 @@ const Call = struct {
             }
         }
         const result = why_mod.why(ctx, .{ .kind = kind, .name = name }, decision) catch
+            return propagate(ctx);
+        const out = Out.create(ctx) catch return no_memory(ctx);
+        out.json.options.emit_null_optional_fields = false;
+        try out.value(result);
+        return out.finish();
+    }
+
+    /// GET /v1/why/grant/{from}/{to}/{port} (and /v1/why/connection/..., its alias): whether
+    /// `from` may connect to `to` on `port`, and why (docs/api.md).
+    fn why_grant(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.query.allow(ctx, &.{});
+        const usage = "/v1/why/grant/<from>/<to>/<port>";
+        const from = call.parts.next() orelse return no_such(ctx, usage);
+        const to = call.parts.next() orelse return no_such(ctx, usage);
+        const port_text = call.parts.next() orelse return no_such(ctx, usage);
+        try call.no_more();
+        if (records.name_problem(from, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "from", "is not a valid service name");
+        }
+        if (records.name_problem(to, constants.service_name_bytes_max) != null) {
+            return bad_request(ctx, "to", "is not a valid service name");
+        }
+        const port = std.fmt.parseInt(u16, port_text, 10) catch 0;
+        if (port == 0) return bad_request(ctx, "port", "is not a port from 1 to 65535");
+        const result = why_grant_mod.why_grant(ctx, .{ .from = from, .to = to, .port = port }) catch
             return propagate(ctx);
         const out = Out.create(ctx) catch return no_memory(ctx);
         out.json.options.emit_null_optional_fields = false;

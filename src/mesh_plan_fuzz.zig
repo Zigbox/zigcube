@@ -40,7 +40,7 @@ const World = struct {
     services: [service_names.len]mesh_plan.Service,
     allow: [service_names.len][grants_max * ports.len]records.Grant,
     replicas: [replicas_max]mesh_plan.Replica,
-    replica_count: usize,
+    replica_count: u32,
 
     fn input(world: *const World) mesh_plan.Input {
         return .{ .services = &world.services, .replicas = world.replicas[0..world.replica_count] };
