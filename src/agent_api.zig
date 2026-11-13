@@ -255,13 +255,17 @@ const Call = struct {
             error.Removed => return removed(ctx, call.node),
             error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),
         };
-        // The node certificate (B7) certifies the same key for the same life, so the two are
-        // renewed together. Its one check beyond `issue`'s: the key is not the CA's own.
+        // The node certificate (B7) certifies the same key for the same window, read from one
+        // clock reading, so the two are renewed together. Its one check beyond `issue`'s: the
+        // key is not the CA's own.
         var certificate: x509.Der = .{};
         ca.issue_node_certificate(&certificate, &.{
             .node = call.node,
             .subject_key = node_key,
-            .ttl_ms = issued.not_after_ms - issued.not_before_ms,
+            .lifetime = .{
+                .not_before_ms = issued.not_before_ms,
+                .not_after_ms = issued.not_after_ms,
+            },
         }) catch |err| switch (err) {
             error.Removed => return removed(ctx, call.node),
             error.BadKey => return bad_request(ctx, "node_key", "is not an Ed25519 public key"),

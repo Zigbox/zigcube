@@ -40,7 +40,7 @@ fn issue(
         .node => try ca.issue_node_certificate(&der, &.{
             .node = name,
             .subject_key = key.public_key.toBytes(),
-            .ttl_ms = ttl_ms,
+            .lifetime = try ca.window(ttl_ms),
         }),
         .jobs, .admin => try ca.issue_client_certificate(&der, &.{
             .client = name,

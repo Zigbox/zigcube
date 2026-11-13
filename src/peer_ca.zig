@@ -164,8 +164,9 @@ pub const Ca = struct {
         return cluster_of(ca.public(), buffer);
     }
 
-    /// A node's certificate (B7) for `request.node`, issued beside its peer credential at join
-    /// and on renewal, over the same peer key. A removed node is refused, as for `issue`.
+    /// A node's certificate (B7) for `request.node` over `request.lifetime`: at join and on
+    /// renewal the peer credential's own window, so the two are one grant (one clock reading);
+    /// from `zcube-server ca issue-node`, `window`'s. A removed node is refused, as for `issue`.
     pub fn issue_node_certificate(
         ca: *const Ca,
         out: *x509.Der,
@@ -173,15 +174,21 @@ pub const Ca = struct {
     ) IssueCertificateError!void {
         if (ca.revoked.contains(request.node)) return error.Removed;
         try ca.check_leaf_key(request.subject_key);
-        const lifetime = try lifetime_from(ca.wall.now_ms(), request.ttl_ms);
         var cluster_buffer: [cluster_bytes]u8 = undefined;
         try x509.issue_node(out, ca.key, &.{
             .cluster = ca.cluster(&cluster_buffer),
             .node = request.node,
             .subject_key = request.subject_key,
-            .lifetime = lifetime,
+            .lifetime = request.lifetime,
         });
         assert(out.slice().len <= constants.x509_cert_bytes_max);
+    }
+
+    /// The window from the CA's clock now for `ttl_ms`, for a certificate issued on its own.
+    pub fn window(ca: *const Ca, ttl_ms: u64) CertificateError!x509.Lifetime {
+        const lifetime = try lifetime_from(ca.wall.now_ms(), ttl_ms);
+        assert(lifetime.not_after_ms >= lifetime.not_before_ms);
+        return lifetime;
     }
 
     /// A client's certificate (B7) for `request.client` with `request.scope`. A name in the
@@ -264,7 +271,8 @@ pub const NodeArgs = struct {
     node: []const u8,
     /// The node's peer key: the agent holds the private half.
     subject_key: [32]u8,
-    ttl_ms: u64,
+    /// No longer than `x509_leaf_ttl_ms_max` (`IssueLifetime` otherwise).
+    lifetime: x509.Lifetime,
 };
 
 pub const ClientArgs = struct {
@@ -616,7 +624,7 @@ test "the CA issues node and client certificates in its own cluster and refuses 
     var node_args: NodeArgs = .{
         .node = "node-1",
         .subject_key = try test_key(9),
-        .ttl_ms = constants.peer_credential_ttl_ms,
+        .lifetime = try ca.window(constants.peer_credential_ttl_ms),
     };
     try ca.issue_node_certificate(&out, &node_args);
     const node_uri = try x509_identity.spiffe_write(&uri_buffer, .node, cluster, "node-1");
@@ -650,9 +658,10 @@ test "the CA issues node and client certificates in its own cluster and refuses 
     node_args.node = "Node 1";
     try std.testing.expectError(error.BadNodeName, ca.issue_node_certificate(&out, &node_args));
     node_args.node = "node-1";
-    node_args.ttl_ms = constants.x509_leaf_ttl_ms_max + 1000;
+    node_args.lifetime = try ca.window(constants.x509_leaf_ttl_ms_max + 1000);
     try std.testing.expectError(error.IssueLifetime, ca.issue_node_certificate(&out, &node_args));
-    node_args.ttl_ms = constants.peer_credential_ttl_ms;
+    try std.testing.expectError(error.IssueLifetime, ca.window(std.math.maxInt(u64)));
+    node_args.lifetime = try ca.window(constants.peer_credential_ttl_ms);
 
     try ca.revoked.parse("node-1\nops-1\n");
     try std.testing.expectError(error.Removed, ca.issue_node_certificate(&out, &node_args));

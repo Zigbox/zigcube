@@ -12,7 +12,7 @@ const c1_teeth = @import("c1_teeth.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const server_mod = @import("server.zig");
-const issue_client_mod = @import("server_issue_client.zig");
+const issue_mod = @import("server_issue.zig");
 const x509 = @import("x509.zig");
 
 const Diag = diag_mod.Diag;
@@ -69,34 +69,40 @@ pub fn main(init: std.process.Init) u8 {
         .version => return say(init.io, "zcube-server " ++ build_options.version ++ "\n"),
         .help => return say(init.io, config_mod.usage),
         .run => |config| return run(init, config),
-        .ca_issue_client => |request| return issue_client(init, &request),
+        .ca_issue => |request| return issue(init, &request),
     }
 }
 
-/// `zcube-server ca issue-client`: writes the files and says where, or prints the diagnostic.
-fn issue_client(init: std.process.Init, request: *const config_mod.IssueClient) u8 {
+/// `zcube-server ca issue-client` or `ca issue-node`: writes the files and says where, or prints
+/// the diagnostic.
+fn issue(init: std.process.Init, request: *const config_mod.Issue) u8 {
     var diag: Diag = undefined;
     diag.reset();
-    const issued = issue_client_mod.issue(init.gpa, init.io, request, &diag) catch |err| {
+    const issued = issue_mod.issue(init.gpa, init.io, request, &diag) catch |err| {
         return switch (err) {
             error.OutOfMemory => constants.exit_environment,
             error.Canceled => constants.exit_ok,
             error.Failed => fail(init.io, &diag, request.config.verbose),
         };
     };
+    assert(request.name.len > 0);
+    assert(issued.not_after_ms > 0);
+    var what_buffer: [constants.node_name_bytes_max + 32]u8 = undefined;
+    const what = switch (request.subject) {
+        .client => |scope| std.fmt.bufPrint(&what_buffer, "client {s}, scope {s}", .{
+            request.name, scope.text(),
+        }) catch unreachable, // A name is no longer than a node name.
+        .node => std.fmt.bufPrint(&what_buffer, "node {s}", .{request.name}) catch
+            unreachable, // As above.
+    };
     var until_buffer: [20]u8 = undefined;
     var buffer: [512]u8 = undefined;
-    var who_buffer: [128]u8 = undefined;
-    const who = if (request.scope) |scope|
-        std.fmt.bufPrint(&who_buffer, "client {s}, scope {s}", .{ request.name, scope.text() })
-    else
-        std.fmt.bufPrint(&who_buffer, "node {s}", .{request.name});
     const line = std.fmt.bufPrint(&buffer, "zcube-server: wrote {s}.key and {s}.crt in {s} " ++
         "({s}, until {s})\n", .{
         request.name,
         request.name,
         request.out_dir,
-        who catch "the certificate",
+        what,
         x509.format_time(&until_buffer, issued.not_after_ms),
     }) catch return say(init.io, "zcube-server: wrote the key and certificate\n");
     return say(init.io, line);

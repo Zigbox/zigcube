@@ -446,11 +446,28 @@ fn serve(shell: *Shell, diag: *Diag, stored_problem: bool) u8 {
         shell.show("\n", diag, "zcube-agent: ignoring it; the node joins the cluster CA again\n");
         diag.reset();
     }
+    if (shell.peer.node_certificate_missing) note_node_certificate_missing(shell);
     shell.notice_pair();
     install_signals();
     loop(shell);
     shell.save_pair(true);
     return constants.exit_ok;
+}
+
+/// Said once, at start: the stored credential is kept without its node certificate (an agent
+/// upgraded before its server, docs/agent.md). Not a failure: peer fetches go on.
+fn note_node_certificate_missing(shell: *Shell) void {
+    assert(shell.peer.credential != null);
+    assert(shell.peer.node_certificate == null);
+    var buffer: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "zcube-agent: {s}/{s} is missing beside a valid " ++
+        "{s}: the credential is kept, and the next renewal brings the node certificate " ++
+        "(a server older than this agent sends none: upgrade the server first)\n", .{
+        shell.peer.where,
+        agent_peer.node_certificate_file,
+        agent_peer.credential_file,
+    }) catch return; // A state directory path too long to quote: the renewal still runs.
+    std.Io.File.stderr().writeStreamingAll(shell.io, line) catch {}; // Nowhere else to say it.
 }
 
 fn loop(shell: *Shell) void {

@@ -27,6 +27,12 @@ Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
 - The harnesses (agent-smoke, local-smoke via `zcube local`, demo-c0/c1 via `demo_host`,
   swarm-smoke, store-failover) start the server with `--insecure-listen`.
 
+- Merged claude/b7-slice2's fix (f58f605): its `ca issue-node` and `--replace`
+  (`server_issue.zig`) replace this slice's `server_issue_client.zig`; the usage keeps both
+  slices' flags. The credential endpoint over `--listen` is the node's own or an admin's
+  (`api_scope`; the endpoint x caller table refuses node2 and a jobs client,
+  `2026-11-13-node-cert-bootstrap.md`); over `--insecure-listen` the old join path stays.
+
 ## Open questions for the supervisor
 
 1. **Agent bootstrap** (decided by the supervisor, `2026-11-13-b7-supervisor-calls.md`):
