@@ -391,11 +391,16 @@ fn node_judgement(ctx: *const Context, name: []const u8) Error!?records.NodeStat
     return try records.read(records.NodeStatus, ctx.arena, kv, ctx.diag);
 }
 
-/// What the node checks before it starts a job's run (B5): the policy the agent named at
-/// registration, or nothing.
+/// What the node checks before it starts a job's run (B5), as far as the store knows: the path
+/// the agent named when it registered, or none. The store has the path, not the policy, and not
+/// a later restart's flag (an agent restarted under a live lease does not register again), so
+/// the words say "registered with" and claim nothing about what the file asks.
 fn trust_phrase(ctx: *const Context, node: *const records.Node) Error![]const u8 {
-    if (node.trust_policy.len == 0) return "checks no job signatures (no --trust-policy)";
-    return controller.format(ctx, "checks job signatures against {s}", .{node.trust_policy});
+    if (node.trust_policy.len == 0) {
+        return "registered without --trust-policy: no job run is judged";
+    }
+    return controller.format(ctx, "registered with --trust-policy {s}: job runs (not " ++
+        "replicas) are judged under the policy the agent read at its start", .{node.trust_policy});
 }
 
 /// "ready (tenure 22)", "registered, not yet judged", or a judgement for an earlier tenure.
@@ -1041,7 +1046,7 @@ test "why node states its load and its judgement, and notes that nothing is reba
     try testing.expectEqualStrings(
         "node node1: ready (tenure 1), lease 1 with 0 replicas assigned, " ++
             "0m of 4000m CPU and 0B of 8.0Gi memory in use; " ++
-            "checks no job signatures (no --trust-policy)",
+            "registered without --trust-policy: no job run is judged",
         before.state.text,
     );
     const assigned = records.assigned_replica(
@@ -1068,6 +1073,31 @@ test "why node states its load and its judgement, and notes that nothing is reba
     const note = note_of(idle.steps).?;
     try expect_contains(note.text, "does not rebalance");
     try testing.expect(note.decision == null);
+}
+
+test "why node names the policy path the node registered with, and claims no more" {
+    // Goal: the state line says what the store knows of the node's check, the path of the
+    // registration, and does not claim signatures are checked (the policy may ask for nothing).
+    // Method: node3 registers with a trust_policy path and is judged ready.
+    const world = try new_world(8);
+    defer world.destroy();
+    world.advance(2000);
+    const node: records.Node = .{
+        .name = "node3",
+        .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 << 30 },
+        .trust_policy = "/etc/zcube/trust.zon",
+    };
+    try put_record(world, .{ .agent = "node3" }, records.node_key("node3").slice(), node);
+    var ctx = world.controller_context();
+    const got = try ctx.store.get(ctx.arena, "/nodes/node3", null, ctx.diag);
+    try put_status(world, "node3", .ready, got.kv.?.mod_revision);
+    ctx = world.controller_context();
+    const answer = try why(&ctx, .{ .kind = .node, .name = "node3" }, null);
+    try expect_contains(
+        answer.state.text,
+        "; registered with --trust-policy /etc/zcube/trust.zon: job runs (not replicas) are " ++
+            "judged under the policy the agent read at its start",
+    );
 }
 
 test "why node says a judgement for an older tenure, and a status with no registration" {

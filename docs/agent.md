@@ -325,14 +325,18 @@ The fake runtime's `faults/<name>` files (`oom`, `pid_limit`, `lost`) work for a
 reader the server uses too: a regular file, owned by root or by the agent's own user, writable by
 neither group nor others, and a policy Zigbox parses. Anything else is ZC-E0505 and the agent does
 not start. No API call names, changes or switches the node's policy off; the node record carries its
-path (`trust_policy`) so `zcube why node` can say which file it checks against. An agent without the
-flag checks nothing, and `zcube why node` says so ("checks no job signatures (no --trust-policy)").
-The path published is the one of the registration: an agent restarted while its remembered lease
-still lives renews that lease and does not register again, so a changed `--trust-policy` is checked
-at once but published only at the next registration (see "Known limits").
+path (`trust_policy`) so `zcube why node` can say which file the agent registered with. An agent
+without the flag checks nothing, and `zcube why node` says so ("registered without --trust-policy:
+no job run is judged"). Only job runs are judged; a service's replicas carry no signatures and are
+not. The file is read once, at the agent's start: an edit to it takes effect when the agent is
+restarted, not before. The path published is the one of the registration, and may be older than
+the flag the agent now runs with (see "Known limits").
 
-The check is the last thing before a start, after the deadline and before the input is fetched
-(`refused_by_trust` in `src/agent_jobs.zig`): `job_trust.judge_run` takes the run record's
+The check is the first thing `begin` does with a run, before the deadline and before the input is
+fetched (`trust_refusal` in `src/agent_jobs.zig`), and every path that would report a run
+`not_started` (its start bound passed, its claim ended unstarted) judges it first, so a run the
+policy refuses ends `refused`, never `failed` with cause `deadline`, even when the first report of
+the refusal was lost: `job_trust.judge_run` takes the run record's
 `signatures` and image (and `source`, when it has one) and calls Zigbox's `verdict.judge` with the
 node's policy. A run it refuses is never started: no supervisor, no container directory, no input
 fetched. The agent reports it as an exit of kind `refused` with the ZBX-E0905 or ZBX-E0906 diagnostic
@@ -342,11 +346,16 @@ own check (slice 1) refuses such a job at `POST`; the node's check catches what 
 without it, which `src/agent_jobs_test.zig` (over the simulated runtime) and
 `src/fake_runtime_test.zig` (over real processes) write straight into the store.
 
-With `--runtime zigbox` an admitted run's envelopes also go to the node's Zigbox store: the
-supervisor calls `zigbox.store.import_trust` with the run's lines and its tree before
-`start_with_image`, so Zigbox's own gate sees what Zigcube saw. Zigbox refuses a bundle whole; a
-refused import is ZBX-E0909 in the container's failure record and the run ends as a start failure.
-The fake and simulated runtimes ignore the envelopes.
+With `--runtime zigbox` an admitted run's envelopes may also go to the node's Zigbox store, for
+`zbx` on the node: the supervisor calls `zigbox.store.import_trust` with the run's lines and its tree
+before `start_with_image`, but only when the node's own `zbx` policy (`/etc/zbx/policy.zon`, then
+the user's `~/.config/zbx/policy.zon`, read through Zigbox's host) asks for signatures or
+provenance; a node without one gets nothing written. Lines the store already holds are kept once.
+Nothing about the import stops the start: Zigbox's library `start` runs no trust gate of its own
+(only `zbx run` does), the agent has already judged the run, and a store that will not take the
+bundle (full: 8 signatures per tree, 4,096 records; busy; unwritable) is one line on the
+supervisor's stderr with ZBX-E0909 and its cause, and the run starts. The fake and simulated
+runtimes ignore the envelopes.
 
 ## What survives what
 
@@ -463,8 +472,12 @@ adopts them (`list` is `zigbox.lifecycle.list` plus `adopt`). The agent never ho
 
 - **A restart under a live lease does not register again** (found in B5 slice 2). The agent renews
   its remembered lease and keeps its tenure, so `/nodes/<node>` keeps the first registration's
-  `agent_version`, `capacity` and `trust_policy` until the lease ends and the agent registers
-  afresh. A changed `--trust-policy` is enforced at once; only what `zcube why node` reports lags.
+  `agent_version`, `capacity` and `trust_policy` for as long as it keeps that lease, which it
+  renews on every pass: the record changes only when the lease is lost (the agent was down longer
+  than the ttl, the host rebooted, or the node fenced) and the agent registers afresh. A restart
+  with a changed `--trust-policy`, or after the file was edited, enforces the new policy from the
+  restart; what `zcube why node` reports can stay the old path indefinitely, and it never shows
+  what the file asks.
   Registering again would move the tenure (the node record's revision), which fencing and job
   claims compare, so the fix is a decision for the owner, not this slice.
 - **A whole call is bounded, connect included; Linux only.** The standard library's threaded `Io`

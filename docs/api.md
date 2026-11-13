@@ -174,8 +174,9 @@ terminal.
   each after the chain: `replace_replica (observed): 142 times since 2025-10-24 23:13:20Z`.
 - `why node`'s `state.text` names the judgement and the load:
   `node node3: ready (tenure 22), lease 9 with 0 replicas assigned, 0m of 4000m CPU and 0B of
-  8.0Gi memory in use; checks no job signatures (no --trust-policy)` (B5: or `checks job signatures
-  against <path>`); a node with no `/node-status` is `registered, not yet judged`, one whose
+  8.0Gi memory in use; registered without --trust-policy: no job run is judged` (B5: or
+  `registered with --trust-policy <path>: job runs (not replicas) are judged under the policy the
+  agent read at its start`); a node with no `/node-status` is `registered, not yet judged`, one whose
   status is for an earlier tenure says so, and one that is not registered says `not registered`
   and, if a status remains, `last judged <state> (tenure N)`. The `note` step is added when the
   node is `ready` for its current tenure and holds fewer replicas than another registered node:
@@ -504,10 +505,12 @@ covers ends with the new ending **`refused`**: the agent reports `exit {"kind":"
 `refused` and that diagnostic, and the run is never retried and never placed on another node. A job
 stored before a policy changed, or written to the store around the API, is refused here. The watch
 shows the ending like any other (`/job-status/<name>`); `zcube why job` says `failed, refused by
-<node>'s trust policy` and its chain carries the diagnostic. The node publishes the path it checks
-against in `/nodes/<node>`'s `trust_policy`; `zcube why node` ends its state line with `checks job
-signatures against <path>`, or `checks no job signatures (no --trust-policy)` for an agent without
-one, which checks nothing.
+<node>'s trust policy` and its chain carries the diagnostic. The node publishes the path it registered
+with in `/nodes/<node>`'s `trust_policy`; `zcube why node` ends its state line with `registered with
+--trust-policy <path>: job runs (not replicas) are judged under the policy the agent read at its
+start`, or `registered without --trust-policy: no job run is judged`. The record carries the path,
+not what the policy asks (a policy may ask for nothing), and it is the registration's: an agent
+restarted with another flag under a live lease keeps the old record (`docs/agent.md`).
 
 ### Relays (B3 slice 2)
 
