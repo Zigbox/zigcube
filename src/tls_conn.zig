@@ -57,6 +57,8 @@ pub const Options = struct {
     server_name: []const u8,
     /// The workload identity, if the server may ask for it. Its signer outlives the connection.
     client_auth: tls_client.ClientAuth = .none,
+    /// `.foreign` for a relay's upstream (B4): a server outside the cluster, with its own anchor.
+    server_profile: tls_client.ServerProfile = .cluster,
     handshake_timeout_ms: u32 = constants.tls_handshake_timeout_ms,
 };
 
@@ -119,6 +121,7 @@ pub const Conn = struct {
             .session_id = undefined,
             .secret = undefined,
             .client_auth = options.client_auth,
+            .server_profile = options.server_profile,
         };
         inline for (.{ &config.random, &config.session_id, &config.secret }) |field| {
             secure_random.fill(io, field, diag, "the TLS handshake secrets") catch |err| {
