@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0706]: the server refused a relayed run's certificate
+  cause  the server refused a certificate for job ingest-7: a stale epoch
+  reqid  r-0000001
+  fix    none needed if the run lost its claim
+  more   zcube explain E0706
+  docs   https://zigbox.github.io/zigcube/errors/E0706.html

@@ -110,6 +110,7 @@ pub const Code = enum(u8) {
     E0703,
     E0704,
     E0705,
+    E0706,
     W0701,
     W0702,
     E0801,
@@ -1526,6 +1527,27 @@ pub const registry = [_]Entry{
         \\
         \\A reset by the job or the upstream is ordinary and needs no action. If it
         \\repeats on every connection, check the node's network and the upstream.
+        ,
+    },
+    .{
+        .code = .E0706,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the server refused a relayed run's certificate",
+        .explanation =
+        \\A relayed job's supervisor made a key for the run, and the agent asked the
+        \\server to sign it. The server signs only for the node that holds the job's
+        \\current claim, at the claim's placement epoch, for an image that matches
+        \\the job's, while the run has not ended. It refused: the cause says which
+        \\check failed (not this node's claim, a stale epoch, the run has ended, a
+        \\different image).
+        \\
+        \\The relay stays closed: the job's connections to it are closed without
+        \\reaching the upstream, and the line is in the job's `relay.log`. This is
+        \\what a run that lost its claim (the node was cut off, the job was placed
+        \\elsewhere, or it was cancelled) should see, and needs no action. If it
+        \\repeats for a run that is still this node's, check `zcube job status` for
+        \\the claim and compare the agent's and the server's versions.
         ,
     },
     .{
