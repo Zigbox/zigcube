@@ -101,7 +101,18 @@ const Container = struct {
     /// The listener of the container's relay is open. Opened at start, closed by every ending
     /// (`end`) and gone with the container when its node's disk is wiped (the host died).
     relay_open: bool = false,
+    /// B4: the certificate the run's supervisor holds (sim_certs.zig), null until the server
+    /// issues one. It lives in the supervisor's memory, so it goes with the container.
+    cert: ?Cert = null,
+    /// The clock reading (simulation ms) before which the supervisor does not ask again.
+    cert_ask_ms: u64 = 0,
+    /// Relayed connections open now through the relay, each on the run's certificate. Every
+    /// ending closes them with the listener (`end`).
+    conns: u32 = 0,
 };
+
+/// A run's certificate as its supervisor keeps it: the placement epoch it names and its end.
+pub const Cert = struct { epoch: u64, not_after_ms: u64 };
 
 const Change = struct {
     handle: runtime.Handle,
@@ -132,6 +143,11 @@ pub const SimRuntime = struct {
     /// Set when a container was forgotten (evicted or replaced) with its listener still open: a
     /// listener nobody can close any more. Sticky, so that eviction cannot hide the leak.
     relay_forgotten: bool = false,
+    /// Relayed connections opened and closed so far (B4, the report's tally).
+    conns_opened: u32 = 0,
+    conns_closed: u32 = 0,
+    /// Set when a container was forgotten with relayed connections still open (R6; sticky).
+    conns_forgotten: bool = false,
 
     const vtable: runtime.Runtime.VTable = .{
         .start = start_impl,
@@ -234,6 +250,7 @@ pub const SimRuntime = struct {
         // The listeners die with the host.
         self.relays_closed += self.relay_open_count();
         self.relays_closed_by[3] += self.relay_open_count();
+        for (self.containers.items) |container| self.conns_closed += container.conns;
         for (self.containers.items) |container| self.free_container(container);
         self.containers.clearRetainingCapacity();
     }
@@ -337,7 +354,17 @@ pub const SimRuntime = struct {
             };
             self.relays_closed_by[kind] += 1;
         }
+        // B4: the relayed connections close with the relay, before the ending can be reported.
+        self.close_conns(container);
         self.record(.{ .handle = runtime.Handle.init(container.name), .ended = ended });
+    }
+
+    /// Closes a run's relayed connections (`relay_conn_leak` is the test-only fault that leaves
+    /// them open, R6's tooth).
+    fn close_conns(self: *SimRuntime, container: *Container) void {
+        if (c1_teeth.relay_conn_leak) return;
+        self.conns_closed += container.conns;
+        container.conns = 0;
     }
 
     /// Queues a status change for `events`, dropping the oldest when the queue is full: events
@@ -475,6 +502,7 @@ pub const SimRuntime = struct {
 
     fn remove(self: *SimRuntime, container: *Container) void {
         if (container.relay_open) self.relay_forgotten = true;
+        if (container.conns > 0) self.conns_forgotten = true;
         const index = container - self.containers.items.ptr;
         self.free_container(container.*);
         _ = self.containers.orderedRemove(index);
@@ -513,6 +541,9 @@ pub const SimRuntime = struct {
                 if (!container.ignores_stop) return self.end(container, .{ .signaled = 15 });
                 if (grace_ms == 0) return self.end(container, .{ .signaled = 9 });
                 container.phase = .{ .stopping = now + grace_ms };
+                // B4: a supervisor told to stop ends its relayed connections at once
+                // (`relay_cancel_ms_max`), before the container's grace runs out.
+                self.close_conns(container);
             },
             .stopping => |deadline| {
                 if (now + grace_ms < deadline) container.phase = .{ .stopping = now + grace_ms };

@@ -111,6 +111,19 @@ pub const relay_leak = declared("c1_teeth_relay_leak");
 /// carries the relay the job asked for; B3 slice 3). Needs the `strong` world's relayed jobs.
 pub const relay_dropped = declared("c1_teeth_relay_dropped");
 
+/// The issuance rule (`job_cert.decide`) does not compare the ask's placement epoch with the
+/// run's (must break R4: a certificate is issued only to the node that holds the run's claim, at
+/// its epoch; B4 slice 3). The simulator's forged asks name stale epochs. Needs relayed jobs.
+pub const job_cert_stale = declared("c1_teeth_job_cert_stale");
+
+/// The issuance rule counts `workload_cert_slack_ms` twice in a certificate's `not_after` (must
+/// break R5: no certificate outlives start + deadline + grace + slack; B4 slice 3).
+pub const job_cert_long = declared("c1_teeth_job_cert_long");
+
+/// The simulated runtime leaves a relayed run's connections open when the container ends (must
+/// break R6: no relayed connection is open after its run's ending is reported; B4 slice 3).
+pub const relay_conn_leak = declared("c1_teeth_relay_conn_leak");
+
 /// The job start ledger holds `job_ledger_small_max` runs, not 4096 (must break J8: a full ledger
 /// fails the run instead of leaving J2 and J8's second clause judging less than they claim).
 pub const job_ledger_small = declared("c1_teeth_job_ledger_small");
@@ -133,10 +146,12 @@ pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
-pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
+pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped or
+    job_cert_stale or job_cert_long or relay_conn_leak;
 
 pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_compare or
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
+    job_cert_stale or job_cert_long or relay_conn_leak;
