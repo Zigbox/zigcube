@@ -7,8 +7,10 @@
 
 - **The fuzzer judges change_cipher_spec faults by the records the server read.** The damage
   step can drop the bad record or move it behind the Finished, after which a connect is right.
-  The `ccs` and `ccs_byte` knobs therefore leave `good` set, and `flight_whole` alone decides.
-  Iteration seeds 2070481195666110524 and 8609624064817084225 are regressions.
+  A fault confined to those records sets `knobs_ccs`, and the server may connect when
+  `knobs_good or knobs_ccs` and `flight_whole` holds. This is the oracle of
+  `claude/b7-slice2` (cd197db), taken word for word so slice 2 merges cleanly on top. Iteration
+  seeds 2070481195666110524 and 8609624064817084225 are regressions.
 - **A fuzzer tooth first runs its seed range with the fault off** and fails if any seed connects
   falsely there, so a tooth cannot pass on an oracle that is wrong without the fault.
 - **The alert is plain whenever the client holds no keys.**
