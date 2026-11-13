@@ -204,7 +204,7 @@ pub const Reach = struct {
     tables: [profiles]Table = @splat(.{}),
 
     pub fn note(reach: *Reach, profile: sim_shape.ClusterProfile, run: *const Table) void {
-        const index = @intFromEnum(profile);
+        const index = @backingInt(profile);
         reach.seeds[index] += 1;
         const table = &reach.tables[index];
         for (run.names[0..run.len], run.counts[0..run.len]) |*name, count| {
@@ -218,7 +218,7 @@ pub const Reach = struct {
     pub fn print(reach: *const Reach, out: *std.Io.Writer) std.Io.Writer.Error!void {
         for (reach.seeds, &reach.tables, 0..) |seeds, *table, index| {
             if (seeds == 0) continue;
-            const profile: sim_shape.ClusterProfile = @enumFromInt(index);
+            const profile: sim_shape.ClusterProfile = @fromBackingInt(@intCast(index));
             try out.print("coverage: profile={s} seeds={d}", .{ profile.name(), seeds });
             for (table.names[0..table.len], table.counts[0..table.len]) |*name, count| {
                 try out.print(" {s}={d}", .{ name.slice(), count });

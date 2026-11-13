@@ -4,6 +4,8 @@
 //!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
 //!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
 //!                      < one run kind's output of a round
+//!     sim_fleet coverage|bias --kind sim-cluster|sim-c1 --commit SHA --file FILE
+//!                      (src/sim_fleet_coverage.zig)
 //!
 //! Reads what one kind of producer printed in one round on stdin: for `sim-cluster`, each
 //! `sim_cluster --seeds A..B <operations> --shrink`; for `sim-c1`, the same with `--c1`; for
@@ -35,6 +37,7 @@ const issue = @import("sim_fleet_issue.zig");
 const symptom_spec = @import("symptom.zig");
 const state_file = @import("sim_fleet_state.zig");
 const github_api = @import("sim_fleet_github.zig");
+const coverage = @import("sim_fleet_coverage.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
@@ -44,7 +47,11 @@ const usage_text =
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
     "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
     "--shrink` (sim-swarm), concatenated; with --canary, the fault-on RUNNER's run of that\n" ++
-    "kind over seeds A..B, filed as sim-canary\n";
+    "kind over seeds A..B, filed as sim-canary\n" ++
+    "       sim_fleet coverage --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
+    "adds the `coverage: profile=` lines of that kind's round on stdin to FILE\n" ++
+    "       sim_fleet bias --kind sim-cluster|sim-c1 --commit SHA --file FILE\n" ++
+    "prints the fault profile a biased round runs (src/sim_fleet_coverage.zig)\n";
 
 pub const Options = struct {
     kind: []const u8 = issue.kind_sim_cluster,
@@ -455,6 +462,7 @@ fn parse_args(args: []const []const u8) ?Args {
 pub fn main(init: std.process.Init) u8 {
     const arena = init.arena.allocator();
     const argv = init.minimal.args.toSlice(arena) catch return constants.exit_user;
+    if (coverage.parse_args(argv)) |args| return run_coverage(init, args);
     const args = parse_args(argv) orelse {
         std.Io.File.stderr().writeStreamingAll(init.io, usage_text) catch {}; // Nowhere else.
         return constants.exit_user;
@@ -470,6 +478,24 @@ pub fn main(init: std.process.Init) u8 {
             else => constants.exit_environment,
         };
     };
+}
+
+fn run_coverage(init: std.process.Init, args: coverage.Args) u8 {
+    var out_buffer: [1024]u8 = undefined;
+    var out_writer = std.Io.File.stdout().writerStreaming(init.io, &out_buffer);
+    defer out_writer.interface.flush() catch {}; // Nowhere else to report it.
+    var err_buffer: [1024]u8 = undefined;
+    var err_writer = std.Io.File.stderr().writerStreaming(init.io, &err_buffer);
+    const log = &err_writer.interface;
+    defer log.flush() catch {}; // Nowhere else to report it.
+    coverage.run(init, args, &out_writer.interface, log) catch |err| {
+        log.print("sim-fleet: {s}\n", .{coverage.explain(err)}) catch {}; // Nowhere else.
+        return switch (err) {
+            error.BadLine, error.BadBook => constants.exit_user,
+            else => constants.exit_environment,
+        };
+    };
+    return constants.exit_ok;
 }
 
 const RunError = issue.ParseError || state_file.ParseError || IngestError ||

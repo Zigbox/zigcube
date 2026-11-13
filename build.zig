@@ -1917,8 +1917,8 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     b.step("sim-fleet-exe", "Install the simulation fleet's reporter into zig-out/bin")
         .dependOn(&install.step);
     // `zig build test` also runs the fleet's own shell functions against this reporter:
-    // `run.sh`'s crash records and its canary, the latter over the manifest `sim-canary-exe`
-    // installs.
+    // `run.sh`'s crash records, its canary (over the manifest `sim-canary-exe` installs) and its
+    // coverage feedback.
     const test_step = &b.top_level_steps.get("test").?.step;
     const records = b.addSystemCommand(&.{"sh"});
     records.addFileArg(b.path("ops/sim-fleet/test-crash-record.sh"));
@@ -1933,6 +1933,13 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     canary.addFileInput(b.path("ops/sim-fleet/run.sh"));
     canary.expectExitCode(0);
     test_step.dependOn(&canary.step);
+    // Its coverage feedback: `bias_pick` and `coverage_add` against the real reporter.
+    const bias = b.addSystemCommand(&.{"sh"});
+    bias.addFileArg(b.path("ops/sim-fleet/test-bias.sh"));
+    bias.addArtifactArg(exe);
+    bias.addFileInput(b.path("ops/sim-fleet/run.sh"));
+    bias.expectExitCode(0);
+    test_step.dependOn(&bias.step);
     // demo-b3's guest script reads the relay logs of the Zigbox runtime's layout and fails on none.
     const guest = b.addSystemCommand(&.{"sh"});
     guest.addFileArg(b.path("ops/demo-b3/test-guest.sh"));

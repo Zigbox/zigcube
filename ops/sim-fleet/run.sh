@@ -4,8 +4,11 @@
 # --c1` and `sim_swarm`; the kinds `sim-cluster`, `sim-c1`, `sim-swarm`), and hand each round
 # (every batch, plus a record of each crashed seed) to `sim_fleet ingest`, once per kind. Every
 # SIM_FLEET_CANARY_ONE_IN rounds a fourth worker runs the teeth canary, a fault-on runner that
-# must fail. Settings come from the environment (the unit reads /etc/sim-fleet/fleet.env). The
-# token is a file; this script never prints it.
+# must fail. With SIM_FLEET_PROFILE=auto, one round in SIM_FLEET_BIAS_ONE_IN runs each cluster
+# kind under the one fault profile `sim_fleet bias` names: the one that best reaches what the
+# commit's seeds have reached least (coverage feedback, docs/core.md). Settings come from the
+# environment (the unit reads /etc/sim-fleet/fleet.env). The token is a file; this script never
+# prints it.
 set -eu
 
 main() {
@@ -29,6 +32,10 @@ main() {
     # from before the draw keeps the old fixed size.
     : "${SIM_FLEET_OPS:=auto}"
     : "${SIM_FLEET_PROFILE:=auto}"
+    # Coverage feedback: with SIM_FLEET_PROFILE=auto, 1 round in this many runs the cluster kinds
+    # under the profile `sim_fleet bias` picks from $STATE/coverage.txt (bias_pick); the other
+    # rounds draw the profile from the seed. 0 never biases, 1 biases every round.
+    : "${SIM_FLEET_BIAS_ONE_IN:=2}"
     : "${SIM_FLEET_BATCH:=100}"
     # Seeds per batch by kind; the cluster kinds fall back to SIM_FLEET_BATCH. The swarm's default
     # is 50000 and ignores SIM_FLEET_BATCH, because an installed fleet.env already sets that to
@@ -62,6 +69,12 @@ main() {
     case "$SIM_FLEET_CANARY_ONE_IN" in
     '' | *[!0-9]*)
         log "SIM_FLEET_CANARY_ONE_IN is '$SIM_FLEET_CANARY_ONE_IN': it must be a number (0: off)"
+        exit 2
+        ;;
+    esac
+    case "$SIM_FLEET_BIAS_ONE_IN" in
+    '' | *[!0-9]*)
+        log "SIM_FLEET_BIAS_ONE_IN is '$SIM_FLEET_BIAS_ONE_IN': it must be a number (0: off)"
         exit 2
         ;;
     esac
@@ -185,7 +198,11 @@ kind_exe() {
 
 kind_flags() {
     profile=$SIM_FLEET_PROFILE
-    if [ "$1" = sim-canary ]; then profile=auto; fi
+    case "$1" in
+    sim-canary) profile=auto ;;
+    sim-cluster) profile=${bias_cluster:-$profile} ;;
+    sim-c1) profile=${bias_c1:-$profile} ;;
+    esac
     if [ "$1" = sim-canary ] && [ -n "$canary_ops" ]; then
         # A fixed range runs the world its tooth was found in: the runner's default profile.
         echo "--c1"
@@ -260,6 +277,7 @@ run_round() {
     rm -rf "$round"
     mkdir -p "$round"
     canary_pick
+    bias_pick
     workers=0
     for kind in $KINDS; do
         n=$(kind_workers "$kind")
@@ -285,7 +303,10 @@ run_round() {
             fi
             w=$((w + 1))
         done
-        if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind" || true; fi
+        if [ -s "$round/all-$kind" ]; then
+            ingest "$kind" "$round/all-$kind" || true
+            coverage_add "$kind" "$round/all-$kind"
+        fi
     done
     if [ -n "$canary_runner" ]; then canary_report "$canary_worker"; fi
 }
@@ -598,6 +619,42 @@ crash_record() {
     fi
     printf '%s: seeds %s..%s, %s: 1 of 1 failed\n' "$(kind_prefix "$3")" "$1" "$1" \
         "$(ops_phrase "$3")"
+}
+
+# Coverage feedback (docs/core.md, "Coverage"): every SIM_FLEET_BIAS_ONE_IN-th round of an
+# `auto` fleet, each cluster kind runs under the one profile `sim_fleet bias` picks from the
+# commit's coverage so far, instead of the seed's own draw. Sets bias_cluster and bias_c1 (empty:
+# the seed draws), which kind_flags reads, so a crash's replay runs the same flags. The tracker
+# counts the round's seeds as any other's.
+bias_pick() {
+    bias_cluster=""
+    bias_c1=""
+    bias_round=$((${bias_round:-0} + 1))
+    one_in=${SIM_FLEET_BIAS_ONE_IN:-0}
+    if [ "$SIM_FLEET_PROFILE" != auto ] || [ "$one_in" -eq 0 ] ||
+        [ $((bias_round % one_in)) -ne 0 ]; then
+        return 0
+    fi
+    for kind in $KINDS; do
+        case "$kind" in sim-cluster | sim-c1) ;; *) continue ;; esac
+        picked=$("$bin/sim_fleet" bias --kind "$kind" --commit "$built" \
+            --file "$STATE/coverage.txt" 2>"$round/bias-$kind") || {
+            cat "$round/bias-$kind" >&2
+            log "sim_fleet bias failed for $kind; its seeds draw their profile this round"
+            continue
+        }
+        log "$(sed 's/^sim-fleet: //' "$round/bias-$kind")"
+        if [ "$kind" = sim-cluster ]; then bias_cluster=$picked; else bias_c1=$picked; fi
+    done
+}
+
+# Adds the `coverage:` lines of kind $1's round file $2 to the commit's coverage. A failure is
+# logged and costs only this round's coverage.
+coverage_add() {
+    case "$1" in sim-cluster | sim-c1) ;; *) return 0 ;; esac
+    "$bin/sim_fleet" coverage --kind "$1" --commit "$built" --file "$STATE/coverage.txt" \
+        <"$2" >"$round/coverage-$1" 2>&1 || log "sim_fleet coverage failed for $1:" \
+        "$(cat "$round/coverage-$1")"
 }
 
 # Hands kind $1's file $2 to the reporter; for the canary, $3 is the seeds it ran. What the
