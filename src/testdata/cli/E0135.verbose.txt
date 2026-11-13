@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0135]: a service's allow list has a bad entry
+  cause  allow: grant 1: port 0 is not a port from 1 to 65535
+  reqid  r-0000001
+  fix    fix the entry and apply again
+  more   zcube explain E0135
+  docs   https://zigbox.github.io/zigcube/errors/E0135.html

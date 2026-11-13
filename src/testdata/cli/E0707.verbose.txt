@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0707]: no grant allows this connection
+  cause  no grant lets batch reach db on port 5432; db allows web on 5432
+  reqid  r-0000001
+  fix    add { .from = "batch", .port = 5432 } to db's allow
+  more   zcube explain E0707
+  docs   https://zigbox.github.io/zigcube/errors/E0707.html

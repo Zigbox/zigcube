@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0711]: the mesh could not make a socket in the container
+  cause  the runtime refused a socket in the container of web-1:
+         PermissionDenied
+  reqid  r-0000001
+  fix    upgrade the runtime and the agent together
+  more   zcube explain E0711
+  docs   https://zigbox.github.io/zigcube/errors/E0711.html

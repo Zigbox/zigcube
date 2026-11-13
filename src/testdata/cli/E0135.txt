@@ -1,0 +1,5 @@
+error[ZC-E0135]: a service's allow list has a bad entry
+  cause  allow: grant 1: port 0 is not a port from 1 to 65535
+  fix    fix the entry and apply again
+  more   zcube explain E0135 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0135.html

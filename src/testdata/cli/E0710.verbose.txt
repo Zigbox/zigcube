@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  503
+error[ZC-E0710]: a mesh port could not be bound on this node
+  cause  every port from 30000 to 30999 on node1 is in use
+  reqid  r-0000001
+  fix    free ports in the range, or give the agent another range
+  more   zcube explain E0710
+  docs   https://zigbox.github.io/zigcube/errors/E0710.html

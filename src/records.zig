@@ -630,8 +630,35 @@ pub const RolloutPolicy = struct {
     }
 };
 
+/// One grant on a destination service (C4): replicas of `from` may connect to `port` of this
+/// service through the mesh (docs/keys.md, `/services`). `apply` refuses a bad one (ZC-E0135); a
+/// record that holds one anyway does not read.
+pub const Grant = struct {
+    from: []const u8,
+    port: u32,
+
+    pub fn equal(first: Grant, second: Grant) bool {
+        return first.port == second.port and std.mem.eql(u8, first.from, second.from);
+    }
+};
+
+pub fn grants_equal(first: []const Grant, second: []const Grant) bool {
+    if (first.len != second.len) return false;
+    for (first, second) |left, right| {
+        if (!left.equal(right)) return false;
+    }
+    return true;
+}
+
+pub fn grants_contain(grants: []const Grant, grant: Grant) bool {
+    for (grants) |held| {
+        if (held.equal(grant)) return true;
+    }
+    return false;
+}
+
 pub const Service = struct {
-    v: u32 = service_version_rollout,
+    v: u32 = service_version_mesh,
     name: []const u8,
     image: []const u8,
     replicas: u32,
@@ -652,8 +679,13 @@ pub const Service = struct {
     /// The rollout policy (version 4); absent: the default, `RolloutPolicy{}`. `apply` stores
     /// none when the policy is the default.
     rollout: ?RolloutPolicy = null,
-
-    /// The policy in force: the stored one, or the default.
+    /// Version 5 (C4): the mesh address, `127.77.<hi>.<lo>`, given by the API from
+    /// `/mesh-address-next` when the service is created and never changed while it exists
+    /// (docs/keys.md). Absent in a record written before C4 until its next apply.
+    mesh_address: ?[]const u8 = null,
+    /// Version 5: who may connect to this service through the mesh, at most `service_allow_max`
+    /// grants. Not part of what a replica runs: a change is never a new generation.
+    allow: []const Grant = &.{},
     pub fn rollout_policy(service: *const Service) RolloutPolicy {
         return service.rollout orelse .{};
     }
@@ -661,12 +693,16 @@ pub const Service = struct {
 
 /// Services and replicas are written at the oldest version that holds their members: version 4
 /// only with a `health` or a `rollout`, so that a release before C3 still reads every service that
-/// uses neither (docs/keys.md, "Versions"). `encode` sets it, so no writer can leave `v` at the
-/// default.
+/// uses neither, and version 5 only with a `mesh_address` or an `allow` (docs/keys.md,
+/// "Versions"). `encode` sets it, so no writer can leave `v` at the default. Replicas stop at 4:
+/// the mesh members are not copied into them.
 pub const service_version_plain: u32 = 3;
 pub const service_version_rollout: u32 = 4;
+pub const service_version_mesh: u32 = 5;
 
 pub fn service_version(service: *const Service) u32 {
+    if (service.mesh_address != null) return service_version_mesh;
+    if (service.allow.len > 0) return service_version_mesh;
     if (service.health != null) return service_version_rollout;
     if (service.rollout != null) return service_version_rollout;
     return service_version_plain;
@@ -675,6 +711,130 @@ pub fn service_version(service: *const Service) u32 {
 pub fn replica_version(replica: *const Replica) u32 {
     if (replica.health != null) return service_version_rollout;
     return service_version_plain;
+}
+
+// ---- Mesh addresses (C4) ------------------------------------------------------------------------
+
+/// `/mesh-address-next`: the number the next mesh address takes, from `mesh_address_min`. Past
+/// `mesh_address_max` it wraps, and the API then looks for an address no one holds
+/// (docs/keys.md, "Mesh addresses").
+pub const MeshAddressNext = struct {
+    v: u32 = 1,
+    next: u32,
+};
+
+/// `/mesh-addresses/<n>`: who holds address `n`. Written by the API with the service that takes
+/// it; marked released when that service is deleted, and replaced only by the allocation that
+/// reuses it, once the quarantine has passed and no replica of `service` remains.
+pub const MeshAddressHold = struct {
+    v: u32 = 1,
+    service: []const u8,
+    /// When the service was deleted; absent while it exists.
+    released_at_ms: ?u64 = null,
+};
+
+pub const key_mesh_address_next = "/mesh-address-next";
+pub const prefix_mesh_addresses = "/mesh-addresses/";
+
+/// `/mesh-addresses/<n>`, `n` in five digits, so a listing is in address order.
+pub fn mesh_address_key(number: u16) Key {
+    assert(number >= constants.mesh_address_min);
+    assert(number <= constants.mesh_address_max);
+    var digits: [5]u8 = undefined;
+    // Cannot fail: a u16 has at most five digits.
+    const text = std.fmt.bufPrint(&digits, "{d:0>5}", .{number}) catch unreachable;
+    return Key.build(&.{ prefix_mesh_addresses, text });
+}
+
+/// "127.77.<hi>.<lo>" for address number `number`.
+pub fn mesh_address_text(
+    buffer: *[constants.mesh_address_text_bytes_max]u8,
+    number: u16,
+) []const u8 {
+    assert(number >= constants.mesh_address_min);
+    assert(number <= constants.mesh_address_max);
+    const first = constants.mesh_block_first_octet;
+    const second = constants.mesh_block_second_octet;
+    // Cannot fail: four octets of at most three digits and three dots fill at most 15 bytes,
+    // and the first two are "127.77.", so the text is at most 13.
+    return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{
+        first, second, number >> 8, number & 0xff,
+    }) catch unreachable;
+}
+
+/// The number of a mesh address in its one canonical text, or null for anything else (another
+/// block, a leading zero, the block's first or last address).
+pub fn mesh_address_parse(text: []const u8) ?u16 {
+    if (text.len > constants.mesh_address_text_bytes_max) return null;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    var octets: [4]u8 = undefined;
+    for (&octets) |*octet| {
+        const part = parts.next() orelse return null;
+        if (part.len == 0 or part.len > 3) return null;
+        if (part.len > 1 and part[0] == '0') return null;
+        octet.* = std.fmt.parseInt(u8, part, 10) catch return null;
+    }
+    if (parts.next() != null) return null;
+    if (octets[0] != constants.mesh_block_first_octet) return null;
+    if (octets[1] != constants.mesh_block_second_octet) return null;
+    const number = @as(u16, octets[2]) << 8 | octets[3];
+    if (number < constants.mesh_address_min) return null;
+    if (number > constants.mesh_address_max) return null;
+    return number;
+}
+
+/// Why an `.allow` list cannot be stored, as a cause sentence (ZC-E0135), or null if it can: a
+/// port of 0 or above 65535, a source that is not a service name or is the service itself, the
+/// same grant twice, more than `service_allow_max` grants.
+pub fn allow_problem(
+    buffer: []u8,
+    service: []const u8,
+    allow: []const Grant,
+) ?[]const u8 {
+    assert(buffer.len >= 128);
+    if (allow.len > constants.service_allow_max) {
+        return bufprint_cut(buffer, "it holds {d} grants; a service holds at most {d}", .{
+            allow.len, constants.service_allow_max,
+        });
+    }
+    for (allow, 0..) |grant, index| {
+        const number = index + 1; // Counted from 1, as a person reads the list.
+        if (name_problem(grant.from, constants.service_name_bytes_max) != null) {
+            return bufprint_cut(buffer, "grant {d}: from is not a valid service name", .{number});
+        }
+        if (grant.port == 0 or grant.port > std.math.maxInt(u16)) {
+            return bufprint_cut(buffer, "grant {d}: port {d} is not a port from 1 to 65535", .{
+                number, grant.port,
+            });
+        }
+        if (std.mem.eql(u8, grant.from, service)) {
+            return bufprint_cut(buffer, "grant {d}: {s} names itself; a service does not " ++
+                "reach itself through the mesh", .{ number, service });
+        }
+        if (grants_contain(allow[0..index], grant)) {
+            return bufprint_cut(buffer, "grant {d}: {s} on port {d} is listed twice", .{
+                number, grant.from, grant.port,
+            });
+        }
+    }
+    return null;
+}
+
+fn bufprint_cut(buffer: []u8, comptime format: []const u8, args: anytype) []const u8 {
+    assert(buffer.len >= 128);
+    // Cannot fail: every sentence of `allow_problem` names at most one valid service name
+    // (`service_name_bytes_max`, 48 bytes) and two numbers, under the 128 bytes asserted.
+    return std.fmt.bufPrint(buffer, format, args) catch unreachable;
+}
+
+/// Whether a service record's version 5 members are ones `apply` could have written.
+fn service_mesh_valid(service: Service) bool {
+    if (service.mesh_address) |text| {
+        if (mesh_address_parse(text) == null) return false;
+    }
+    if (name_problem(service.name, constants.service_name_bytes_max) != null) return false;
+    var buffer: [256]u8 = undefined;
+    return allow_problem(&buffer, service.name, service.allow) == null;
 }
 
 /// The counter that keeps replica ids unique forever: the number the next replica takes.
@@ -906,7 +1066,7 @@ pub const Exit = struct {
 pub const HealthState = enum { unknown, healthy, unhealthy };
 
 pub const Observed = struct {
-    v: u32 = 3,
+    v: u32 = observed_version_mesh,
     replica: []const u8,
     node: []const u8,
     generation: u64,
@@ -927,6 +1087,10 @@ pub const Observed = struct {
     /// Version 3: the exit code of the last probe that ran to an exit, 0 to 255 like every exit
     /// code (`Exit`): a value outside it does not parse.
     last_probe_exit: ?u8 = null,
+    /// Version 4 (C4): where the replica's supervisor takes mesh connections,
+    /// `<node address>:<port>`, the node address being the one the agent advertises for C2's
+    /// chunk server. Absent for a replica with no mesh port.
+    endpoint: ?[]const u8 = null,
 };
 
 /// Observations are written at the oldest version that holds their members: version 3 only with
@@ -934,11 +1098,33 @@ pub const Observed = struct {
 /// a health check (docs/keys.md, `/observed`).
 pub const observed_version_plain: u32 = 2;
 pub const observed_version_health: u32 = 3;
+pub const observed_version_mesh: u32 = 4;
 
 pub fn observed_version(observed: *const Observed) u32 {
+    if (observed.endpoint != null) return observed_version_mesh;
     const health = observed.health != null or observed.health_failures != null or
         observed.last_probe_exit != null;
     return if (health) observed_version_health else observed_version_plain;
+}
+
+/// Whether an observation's endpoint is `<host>:<port>` within `mesh_endpoint_bytes_max`, the
+/// port from 1 to 65535. The host is the agent's to name; a reader does not resolve it.
+pub fn endpoint_valid(endpoint: ?[]const u8) bool {
+    const text = endpoint orelse return true;
+    if (text.len > constants.mesh_endpoint_bytes_max) return false;
+    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return false;
+    if (colon == 0) return false;
+    for (text[0..colon]) |byte| {
+        // A host name, IPv4, or bracketed IPv6 (whose colons are inside the brackets).
+        const host_byte = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or
+            byte == ':' or byte == '[' or byte == ']';
+        if (!host_byte) return false;
+    }
+    const digits = text[colon + 1 ..];
+    if (digits.len == 0 or digits.len > 5) return false;
+    for (digits) |byte| if (!std.ascii.isDigit(byte)) return false;
+    const port = std.fmt.parseInt(u32, digits, 10) catch unreachable; // At most five digits.
+    return port > 0 and port <= std.math.maxInt(u16);
 }
 
 /// The health verdict an observation carries: `unknown` for one without a check, and for every
@@ -1223,6 +1409,10 @@ pub fn read(comptime T: type, arena: Allocator, kv: store.KeyValue, diag: *Diag)
         if (!job_valid(record)) return malformed(diag, kv.key, @typeName(T));
     }
     if (T == Assigned and !assigned_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    if (T == Service and !service_mesh_valid(record)) return malformed(diag, kv.key, @typeName(T));
+    if (T == Observed and !endpoint_valid(record.endpoint)) {
+        return malformed(diag, kv.key, @typeName(T));
+    }
     if (T == JobStatus and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobObserved and !record.valid()) return malformed(diag, kv.key, @typeName(T));
     if (T == JobAdmission and !admission_valid(record)) {
@@ -2034,13 +2224,13 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
     const arena = arena_state.allocator();
     var diag: Diag = undefined;
     diag.reset();
-    const observed = "{\"v\":4,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
+    const observed = "{\"v\":5,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
         "\"status\":\"running\",\"reported_at_ms\":5}";
     const kv = kv_of("/observed/node1/hello-1", observed);
     try testing.expectError(error.Malformed, read(Observed, arena, kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
     try testing.expectEqualStrings(
-        "the value at /observed/node1/hello-1 is version 4; this release reads up to version 3",
+        "the value at /observed/node1/hello-1 is version 5; this release reads up to version 4",
         diag.last_cause().?,
     );
     // Version 1 of a record that C1 has not changed is the newest there is.
@@ -2051,9 +2241,9 @@ test "a newer version is refused with ZC-E0303, not as malformed" {
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
 }
 
-test "source round-trips at version 3 and a version 5 service is refused" {
+test "source round-trips at version 3 and a version 6 service is refused" {
     // Goal: `source` is stored and read back, absent means empty, and a newer service is named.
-    // Method: encode a service with and without it, read both back, then read a v5 value.
+    // Method: encode a service with and without it, read both back, then read a v6 value.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2089,14 +2279,61 @@ test "source round-trips at version 3 and a version 5 service is refused" {
     const replica_kv = kv_of("/replicas/hello/hello-1", replica_bytes);
     const replica_back = try read(Replica, arena, replica_kv, &diag);
     try testing.expectEqualStrings(reference, replica_back.source);
-    const newer = "{\"v\":5,\"name\":\"hello\"}";
+    const newer = "{\"v\":6,\"name\":\"hello\"}";
     const newer_kv = kv_of("/services/hello", newer);
     try testing.expectError(error.Malformed, read(Service, arena, newer_kv, &diag));
     try testing.expectEqual(codes.Code.E0303, diag.code.?);
     try testing.expectEqualStrings(
-        "the value at /services/hello is version 5; this release reads up to version 4",
+        "the value at /services/hello is version 6; this release reads up to version 5",
         diag.last_cause().?,
     );
+}
+
+test "services and observations written before C4 still read, with no mesh members" {
+    // Goal: the slice's test "old records still read". Method: a version 3 and a version 4
+    // service, and a version 3 observation, as C2 and C3 wrote them, read back without an
+    // address, grants or endpoint; a v5 service with a bad address or grant, or a v4 observation
+    // with a bad endpoint, is malformed (ZC-E0301), not taken in.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const service_tail = "\"name\":\"hello\",\"image\":\"b3:51aa9c03\",\"replicas\":1," ++
+        "\"command\":[\"run\"],\"generation\":2}";
+    inline for (.{ "{\"v\":3,", "{\"v\":4," }) |head| {
+        const old = try read(Service, arena, kv_of("/services/hello", head ++ service_tail), &diag);
+        try testing.expectEqual(@as(?[]const u8, null), old.mesh_address);
+        try testing.expectEqual(@as(usize, 0), old.allow.len);
+    }
+    const observed = "{\"v\":3,\"replica\":\"hello-1\",\"node\":\"node1\",\"generation\":1," ++
+        "\"status\":\"running\",\"reported_at_ms\":5,\"health\":\"healthy\"}";
+    const seen = try read(Observed, arena, kv_of("/observed/node1/hello-1", observed), &diag);
+    try testing.expectEqual(@as(?[]const u8, null), seen.endpoint);
+    const bad_services = [_][]const u8{
+        "{\"v\":5,\"mesh_address\":\"127.77.0.0\"," ++ service_tail,
+        "{\"v\":5,\"mesh_address\":\"10.0.0.1\"," ++ service_tail,
+        "{\"v\":5,\"allow\":[{\"from\":\"web\",\"port\":0}]," ++ service_tail,
+        "{\"v\":5,\"allow\":[{\"from\":\"hello\",\"port\":80}]," ++ service_tail,
+    };
+    for (bad_services) |bytes| {
+        diag.reset();
+        const kv = kv_of("/services/hello", bytes);
+        try testing.expectError(error.Malformed, read(Service, arena, kv, &diag));
+        try testing.expectEqual(codes.Code.E0301, diag.code.?);
+    }
+    const bad_endpoints = [_][]const u8{
+        "node1", "node1:0", "node1:65536", ":80", "a b:80", "node1:+80", "node1:",
+    };
+    for (bad_endpoints) |endpoint| {
+        diag.reset();
+        const bytes = try std.fmt.allocPrint(arena, "{{\"v\":4,\"replica\":\"hello-1\"," ++
+            "\"node\":\"node1\",\"generation\":1,\"status\":\"running\"," ++
+            "\"reported_at_ms\":5,\"endpoint\":\"{s}\"}}", .{endpoint});
+        const kv = kv_of("/observed/node1/hello-1", bytes);
+        try testing.expectError(error.Malformed, read(Observed, arena, kv, &diag));
+        try testing.expectEqual(codes.Code.E0301, diag.code.?);
+    }
 }
 
 test "a newer version is refused before the shape is parsed" {
@@ -2131,6 +2368,7 @@ test "the version a record is written in is the version the reader accepts" {
         NodeStore,     Pull,       JobInput,
         JobAdmission,  JobEndings, JobStatus,
         JobObserved,   History,    Rollout,
+        MeshAddressNext, MeshAddressHold,
     }) |T| {
         var value = std.mem.zeroes(T);
         value.v = version_current(T);
@@ -2138,7 +2376,11 @@ test "the version a record is written in is the version the reader accepts" {
         if (T == Assigned) value.service = "s";
         // A service or replica is written at version 4 only with a health check (`encode`).
         if (T == Service or T == Replica) value.health = test_health;
+        // A service is written at version 5 only with a mesh member, an observation at version 4
+        // only with an endpoint (C4).
+        if (T == Service) value.mesh_address = "127.77.0.1";
         if (T == Observed) value.health = .healthy;
+        if (T == Observed) value.endpoint = "node1:30000";
         const bytes = try encode(arena, value, &diag);
         const prefix = try std.fmt.allocPrint(arena, "{{\"v\":{d},", .{version_current(T)});
         try testing.expect(std.mem.startsWith(u8, bytes, prefix));

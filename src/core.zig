@@ -25,6 +25,7 @@ pub const modules = .{
     @import("auditor.zig"),
     @import("job_api.zig"),
     @import("apply.zig"),
+    @import("mesh_address.zig"),
     @import("history.zig"),
     @import("chunk_summary.zig"),
     @import("mtls_smoke.zig"),
@@ -171,6 +172,7 @@ test {
     _ = @import("tls_client_test.zig");
     _ = @import("tls_wire_test.zig");
     _ = @import("replica_controller_test.zig");
+    _ = @import("mesh_address_test.zig");
     _ = @import("scheduler_test.zig");
     _ = @import("job_controller_test.zig");
     _ = @import("api_test.zig");

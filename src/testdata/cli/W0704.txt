@@ -1,0 +1,5 @@
+warning[ZC-W0704]: a grant names a service that does not exist
+  cause  db allows btach, and no service is named btach
+  fix    correct the name if it is a typo
+  more   zcube explain W0704 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0704.html

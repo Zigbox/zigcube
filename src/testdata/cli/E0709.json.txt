@@ -1,0 +1,1 @@
+{"code":"ZC-E0709","severity":"error","blame":"user","summary":"a granted service has no ready replica","causes":["db has no ready replica with a mesh endpoint"],"while":[],"context":{"reqid":"r-0000001"},"fixes":[{"sentence":"zcube why service db","command":null}],"docs":"https://zigbox.github.io/zigcube/errors/E0709.html","omitted":{"causes":0,"while":0,"context":0,"fixes":0}}

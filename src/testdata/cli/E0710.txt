@@ -1,0 +1,5 @@
+error[ZC-E0710]: a mesh port could not be bound on this node
+  cause  every port from 30000 to 30999 on node1 is in use
+  fix    free ports in the range, or give the agent another range
+  more   zcube explain E0710 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0710.html

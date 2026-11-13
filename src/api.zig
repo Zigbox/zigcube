@@ -235,6 +235,8 @@ const ApplyBody = struct {
     limits: records.Limits = .{},
     source: []const u8 = "",
     applied_by: []const u8 = anonymous,
+    /// C4: who may connect through the mesh; `apply` checks it (ZC-E0135).
+    allow: []const records.Grant = &.{},
 };
 
 const CheckFinding = struct { decision: []const u8, revision: u64 };
@@ -355,6 +357,7 @@ fn apply_input(ctx: *const Context, body: []const u8, id: []const u8) Failure!ap
         .source = parsed.source,
         .applied_by = parsed.applied_by,
         .request_id = id,
+        .allow = parsed.allow,
     };
 }
 

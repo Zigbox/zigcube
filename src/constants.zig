@@ -121,6 +121,42 @@ pub const replicas_max: u32 = runtime_handles_max;
 pub const nodes_max: u32 = 64;
 /// Records one reconcile pass reads: a service holds at most this many replicas.
 pub const replicas_per_service_max: u32 = 128;
+// ---- The mesh (C4, docs/briefs/c4.md; bounds approved by the owner, O9) ----------------------
+
+/// Mesh addresses are `127.77.<hi>.<lo>`, `n = hi * 256 + lo` from 1 to 65,534: the block
+/// `127.77.0.0/16` without its first and last address. All of `127.0.0.0/8` is loopback on Linux,
+/// so binding one needs no configuration.
+pub const mesh_block_first_octet: u8 = 127;
+pub const mesh_block_second_octet: u8 = 77;
+pub const mesh_address_min: u16 = 1;
+pub const mesh_address_max: u16 = 65_534;
+/// "127.77.255.254": the longest address text.
+pub const mesh_address_text_bytes_max: u32 = 13;
+/// A deleted service's address is reused only after the decision-retention window for a gone
+/// subject (24 hours), and only once no replica of the old service remains.
+pub const mesh_address_quarantine_ms: u64 = decision_gone_age_ms_max;
+/// Addresses one allocation looks at once the counter has wrapped, before the apply is refused
+/// (ZC-E0207). Each is one read of the store in the apply.
+pub const mesh_address_probes_max: u32 = store_list_limit_max;
+/// Grants one service's `.allow` holds (ZC-E0135 past it). PROPOSED, awaiting the supervisor.
+pub const service_allow_max: u32 = 64;
+/// The default range of mesh ports an agent hands its replicas (`--mesh-ports`): one each.
+pub const mesh_ports_default_first: u16 = 30_000;
+pub const mesh_ports_default_last: u16 = 30_999;
+/// A replica's endpoint in `/observed`: `<node address>:<port>`.
+pub const mesh_endpoint_bytes_max: u32 = 256 + ":65535".len;
+
+comptime {
+    assert(mesh_address_min > 0);
+    assert(mesh_address_max == 256 * 256 - 2);
+    // Far above the cluster bound: addresses do not run out while services exist.
+    assert(mesh_address_max > services_max);
+    assert(mesh_address_probes_max > services_max);
+    assert(service_allow_max <= services_max);
+    // Every replica a node may hold gets a port of the default range (the brief, O9).
+    assert(mesh_ports_default_last - mesh_ports_default_first + 1 >= agent_node_replicas_max);
+}
+
 /// Generations of a service `/history` keeps (owner,
 /// docs/decisions/2026-11-05-c3-owner-answers.md): an apply that adds one past it deletes the
 /// oldest. Rolling back to a deleted one is ZC-E0128.

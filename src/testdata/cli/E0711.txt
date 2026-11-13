@@ -1,0 +1,6 @@
+error[ZC-E0711]: the mesh could not make a socket in the container
+  cause  the runtime refused a socket in the container of web-1:
+         PermissionDenied
+  fix    upgrade the runtime and the agent together
+  more   zcube explain E0711 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0711.html

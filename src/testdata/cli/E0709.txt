@@ -1,0 +1,5 @@
+error[ZC-E0709]: a granted service has no ready replica
+  cause  db has no ready replica with a mesh endpoint
+  fix    zcube why service db
+  more   zcube explain E0709 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0709.html

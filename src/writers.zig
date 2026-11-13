@@ -57,6 +57,8 @@ const Rule = struct { prefix: []const u8, owner: Owner, exact: bool = false };
 pub const rules = [_]Rule{
     .{ .prefix = records.prefix_services, .owner = .api },
     .{ .prefix = records.prefix_history, .owner = .api },
+    .{ .prefix = records.key_mesh_address_next, .owner = .api, .exact = true },
+    .{ .prefix = records.prefix_mesh_addresses, .owner = .api },
     .{ .prefix = records.prefix_rollouts, .owner = .rollout_controller },
     .{ .prefix = records.prefix_jobs, .owner = .api },
     .{ .prefix = records.prefix_job_input, .owner = .api },
@@ -337,6 +339,8 @@ fn request_of(ops: []const store.Op) store.TxnRequest {
 const samples = [_]struct { key: []const u8, role: Role }{
     .{ .key = "/services/hello", .role = .api },
     .{ .key = "/history/hello/7", .role = .api },
+    .{ .key = "/mesh-address-next", .role = .api },
+    .{ .key = "/mesh-addresses/00001", .role = .api },
     .{ .key = "/rollouts/hello", .role = .rollout_controller },
     .{ .key = "/jobs/j1", .role = .api },
     .{ .key = "/job-input/j1", .role = .api },

@@ -59,6 +59,7 @@ pub const Code = enum(u8) {
     E0132,
     E0133,
     E0134,
+    E0135,
     E0201,
     E0202,
     E0203,
@@ -124,6 +125,13 @@ pub const Code = enum(u8) {
     E0705,
     W0701,
     W0702,
+    E0707,
+    E0708,
+    E0709,
+    E0710,
+    E0711,
+    W0703,
+    W0704,
     E0801,
     E0802,
     E0803,
@@ -692,6 +700,22 @@ pub const registry = [_]Entry{
         \\
         \\Submit again with a new submit-by time. If the job was created by an
         \\earlier attempt, zcube job get NAME shows it; do not assume it did not run.
+        ,
+    },
+    .{
+        .code = .E0135,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a service's allow list has a bad entry",
+        .explanation =
+        \\A service's `allow` lists the services that may connect to it and the port
+        \\each may use. The server refused this one before storing anything: an entry
+        \\names a port of 0 or above 65535, names the service itself, repeats an
+        \\earlier entry, names a service that could not exist, or the list is longer
+        \\than 64 entries. The cause line names the entry.
+        \\
+        \\Fix the entry and apply again. A grant to a service that does not exist yet
+        \\is allowed: only its name must be valid.
         ,
     },
     .{
@@ -1761,6 +1785,112 @@ pub const registry = [_]Entry{
         \\
         \\Open a new connection to go on. A job that needs a connection quiet for
         \\longer than five minutes should send something now and then.
+        ,
+    },
+    .{
+        .code = .E0707,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "no grant allows this connection",
+        .explanation =
+        \\A replica connected to another service on the mesh, and the destination's
+        \\`allow` list has no entry for the source service and that port. The
+        \\connection was closed before any byte reached the destination. Grants are
+        \\checked at both ends; either one refuses on its own.
+        \\
+        \\If the connection should be allowed, add `{ .from = "SOURCE", .port = N }`
+        \\to the destination's `allow` and apply it. zcube why grant SOURCE DEST:PORT
+        \\shows what the destination allows now and who changed it last.
+        ,
+    },
+    .{
+        .code = .E0708,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a mesh peer's certificate was refused",
+        .explanation =
+        \\A mesh connection's peer showed a certificate this end did not accept: it is
+        \\not signed by this cluster's workload issuer, is not a service certificate,
+        \\names no service, has expired or is not valid yet. The cause line says
+        \\which. The connection was closed.
+        \\
+        \\A certificate that has expired or is not valid yet usually means a node's
+        \\clock is wrong: check time sync on both nodes. Any other reason means the
+        \\peer is not a replica of this cluster, which is a bug if both ends are.
+        ,
+    },
+    .{
+        .code = .E0709,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a granted service has no ready replica",
+        .explanation =
+        \\A replica connected to a service it is allowed to reach, and no replica of
+        \\that service is ready: none runs, none has passed its readiness check, or
+        \\none has published a mesh endpoint yet. The connection was closed.
+        \\
+        \\Check the destination with zcube why service NAME. The connection may be
+        \\opened again; it succeeds once a replica of the destination is ready.
+        ,
+    },
+    .{
+        .code = .E0710,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a mesh port could not be bound on this node",
+        .explanation =
+        \\The agent gives each replica a port from the node's mesh port range for the
+        \\connections other replicas make to it. No port of the range could be bound:
+        \\other programs on the node hold them. The replica runs but takes no mesh
+        \\connections until a port is free.
+        \\
+        \\Find what holds the ports (ss -ltn) and stop it, or give the agent another
+        \\range. The agent retries on its own.
+        ,
+    },
+    .{
+        .code = .E0711,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the mesh could not make a socket in the container",
+        .explanation =
+        \\To carry a replica's mesh connections the agent makes a listening socket in
+        \\the container's own network namespace. The runtime refused it, so the
+        \\replica has no mesh: connections it makes to other services, and theirs
+        \\to it, fail.
+        \\
+        \\The cause line names the runtime's error. Check that the node's runtime is
+        \\the release the agent expects; the agent and the runtime are upgraded
+        \\together.
+        ,
+    },
+    .{
+        .code = .W0703,
+        .severity = .warning,
+        .blame = .environment,
+        .summary = "a replica's mesh certificate could not be renewed",
+        .explanation =
+        \\The agent renews each replica's mesh certificate at half its lifetime, and
+        \\the server did not issue a new one: it was unreachable, or refused. The
+        \\replica keeps running. When its certificate expires it is taken off the
+        \\mesh until a renewal succeeds; the agent keeps trying.
+        \\
+        \\Check that the node reaches the server. A refusal names its own code in
+        \\the cause line.
+        ,
+    },
+    .{
+        .code = .W0704,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a grant names a service that does not exist",
+        .explanation =
+        \\A service's `allow` names a source service that is not stored. The grant
+        \\was kept, so services may be applied in any order; it takes effect when a
+        \\service of that name is created.
+        \\
+        \\If the name is a typo, correct it and apply again: a grant to a missing
+        \\service would let whoever creates that name connect.
         ,
     },
     .{

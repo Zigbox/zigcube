@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0709]: a granted service has no ready replica
+  cause  db has no ready replica with a mesh endpoint
+  reqid  r-0000001
+  fix    zcube why service db
+  more   zcube explain E0709
+  docs   https://zigbox.github.io/zigcube/errors/E0709.html

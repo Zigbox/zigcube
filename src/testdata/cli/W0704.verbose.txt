@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+warning[ZC-W0704]: a grant names a service that does not exist
+  cause  db allows btach, and no service is named btach
+  reqid  r-0000001
+  fix    correct the name if it is a typo
+  more   zcube explain W0704
+  docs   https://zigbox.github.io/zigcube/errors/W0704.html

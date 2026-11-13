@@ -21,6 +21,7 @@ and deletes is that role's; a refusal is a defect, never an error.
 | `/services/<name>` | API | C0 |
 | `/replicas/<service>/<id>` | replica controller | C0 |
 | `/history/<service>/<generation>` | API | C3 slice 5 |
+| `/mesh-address-next`, `/mesh-addresses/<n>` | API | C4 slice 1 |
 | `/rollouts/<service>` | rollout controller | C3 slice 7 (defined in slice 5) |
 | `/replica-numbers/<service>` | replica controller | C1 slice 3 |
 | `/assigned/<node>/<id>` | scheduler | C1 slice 3 |
@@ -58,14 +59,18 @@ records of an ended job: `/jobs/`, `/job-input/`, `/job-runs/`, `/job-status/` a
 C3 adds a ninth role, `rollout_controller`, which writes `/rollouts/<service>` and nothing else
 (below, "`/rollouts/<service>`"). `/history/` is the API's: it writes a generation's record in the
 apply's transaction and deletes a service's history before the service.
+C4 gives the API two more keys, `/mesh-address-next` and `/mesh-addresses/<n>` (below, "Mesh
+addresses"), written in the apply's or the delete's own transaction.
 
 ## Versions
 
 Every value has `"v"`. A reader accepts every version up to the one its release writes and
 ignores members it does not know. `Service` and `Replica` write `"v": 3` (C2 slice 2 added
 `source`), and `"v": 4` only when they carry a member of C3 (`health`, or a service's `rollout`);
-`Observed` writes `"v": 2` (it gained members in C1), and `"v": 3` only with a health verdict
-(C3); `Assigned` writes `"v": 2` for a run (B1: it gained `job`) and `"v": 1` for a replica; `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
+`Service` writes `"v": 5` when it carries a member of C4 (`mesh_address` or `allow`), which from C4
+is every service an apply writes (below, "Version 5");
+`Observed` writes `"v": 2` (it gained members in C1), `"v": 3` only with a health verdict
+(C3), and `"v": 4` only with an `endpoint` (C4); `Assigned` writes `"v": 2` for a run (B1: it gained `job`) and `"v": 1` for a replica; `Decision` writes `"v": 3` (C2 slice 5 added `locality_bytes` and `node_store_revision`); `Pull` writes `"v": 1` (C2 slice 7); every other record
 writes `"v": 1`. **A record is written at the oldest version that holds its members**
 (`records.encode`), so a release before C3 still reads every service, replica and observation
 that uses nothing of C3. Records C0, C1 and B3 wrote still read: the fixtures in
@@ -158,6 +163,58 @@ and the agent reads them, and bundles redact them (DIAGNOSTICS.md).
 - A version 3 record reads as "no health, the default rollout".
 
 Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and stores them.
+
+### Version 5: `mesh_address` and `allow` (C4 slice 1)
+
+```json
+{ "v": 5, "name": "db", "...": "...",
+  "mesh_address": "127.77.0.3",
+  "allow": [ {"from": "web", "port": 5432}, {"from": "batch", "port": 5432} ] }
+```
+
+- `mesh_address` is the service's address on the mesh, `127.77.<hi>.<lo>`, written in canonical
+  dotted form (no leading zeros), the number `256 × hi + lo` from 1 to 65,534. The API assigns it
+  on the apply that creates the service (below, "Mesh addresses") and copies it to every later
+  version: it never changes while the service exists. An apply does not take it from the body. A
+  service written before C4 has none and takes one on its next apply, even an apply that changes
+  nothing else (the summary says `mesh address assigned`).
+- `allow` (absent: empty) lists who may connect to the service through the mesh: each grant names
+  a source service `from` and a destination `port` (1 to 65535). At most 64 grants
+  (`service_allow_max`); no grant names the service itself; no grant appears twice. `from` must be
+  a valid service name but need not exist (ZC-W0704 is a warning, so services may be applied in
+  any order). Otherwise ZC-E0135, before anything is written. A change of `allow` does not bump
+  `generation` (it does not change what a replica runs): the summary says `grants changed`, and
+  the apply writes a `grant` decision (below, "Apply decisions").
+- A version 3 or 4 record reads as "no address, no grants". **Downgrade:** every service a C4
+  server writes is version 5, so a server before C4 refuses it (ZC-E0303). Going back to an
+  earlier release after C4 has applied a service is not supported.
+
+## Mesh addresses (C4 slice 1)
+
+```json
+/mesh-address-next   { "v": 1, "next": 4 }
+/mesh-addresses/00003 { "v": 1, "service": "db" }
+/mesh-addresses/00001 { "v": 1, "service": "old", "released_at_ms": 1761350000123 }
+```
+
+- `/mesh-address-next` is the counter: the number the next create tries first. Absent means 1.
+  `/mesh-addresses/<n>` (`n` the address number, five digits, zero-padded) is the hold: which
+  service has the address, and, once that service is deleted, when it was released.
+- **Assigned in the apply's transaction.** The apply that creates a service reads the counter,
+  takes the first number from it on that is free, and writes the counter (one past it) and the
+  hold with the service, each compared at the revision read. Two applies that race for a number
+  conflict; one is retried. Past 65,534 the counter starts again at 1.
+- **Free** means no hold, or a released hold that is at least a day old
+  (`mesh_address_quarantine_ms`, the decision-retention window) and whose service has no replica
+  left anywhere: no `/replicas/<service>/` record and no `/observed/<node>/<service>-<n>` (one
+  that does not read counts as left). A create probes at most 500 numbers
+  (`mesh_address_probes_max`); if none is free it is refused with ZC-E0207. With at most 256
+  services (`services_max`) that happens only if well over 500 services were deleted within a day
+  or still have replicas.
+- **Released by the delete**, in its own transaction: the hold keeps the service name and gains
+  `released_at_ms`. A hold is never deleted, so these keys number at most 65,534. A service
+  deleted and applied again takes a new address; its old one may come back to another service
+  only after the rules above.
 
 ## `/history/<service>/<generation>`: what a generation ran (C3 slice 5)
 
@@ -372,6 +429,12 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
   written as version 2, and a version 1 or 2 record reads as health `unknown`, whatever it holds.
   The server sets `v`: the agent endpoint stores a report at the version its members need,
   whatever `v` the agent sent, and refuses a member it does not know (`ZC-E0104`).
+- Version 4 (C4 slice 1, written from the mesh slices): `endpoint`, where the replica's supervisor
+  takes mesh connections, `<node address>:<port>`: the node address the agent advertises for C2's
+  chunk server and the replica's port from the agent's mesh range (`--mesh-ports`, default
+  `30000-30999`). A host name, an IPv4 address or a bracketed IPv6 address, at most 262 bytes, and
+  a port from 1 to 65535; otherwise the record is malformed (ZC-E0301). Absent for a replica with
+  no mesh port; an observation without it is written at version 3 or below.
 
 Lifetime: until the agent or the node controller removes it. One writer per key (the node's agent), written on every status change, not on a timer, so the
 store's revision tells when the node last learned something. Written with one compare, never
@@ -452,11 +515,19 @@ the cost is a couple of kilobytes per such decision.
   `"replicas 3 → 5, env changed"`; it never contains an `env` value). It exists because the
   previous generation's spec is gone once history is compacted, so neither the console nor
   `zcube apply` could say afterwards what an old apply changed. It is present only on `apply`
-  decisions.
+  and `grant` decisions.
 - This decision's `cause` has no `revision`: a transaction cannot know the revision it will take.
   A reader takes it from the decision key's own `mod_revision`, which is the revision of the
   apply (the decision and the service were written together). Decisions that react to the apply
   later write `{"kind": "desired", "key": "/services/hello", "revision": <that revision>}`.
+
+**Grant decisions (C4).** An apply that changes a service's `allow` also writes a `grant`
+decision, in the same transaction: `actor` `api`, subject the destination service, `reason`
+`"alex@laptop changed who may connect to db (request r-0001a4f)"`, `change` the grants that came
+and went, `"web → 5432 added, batch → 80 removed"`, and the same `cause` as the apply. Creating a
+service with grants writes one too; creating one without, or deleting a service, does not. The
+grants themselves are in the service record, so `zcube why grant` reads them there and finds when
+each came by these decisions.
 
 **Service-level decisions.** A decision's subject may be a service, not only a replica or a node.
 `zcube why service x` needs them or the chain for a service starts nowhere. The replica

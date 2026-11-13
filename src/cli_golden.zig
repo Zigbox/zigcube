@@ -396,6 +396,46 @@ fn job_late(diag: *diag_mod.Diag) void { // api.zig
     sample(diag, .E0134, &.{cause}, "submit again with a new submit-by time");
 }
 
+fn allow_bad(diag: *diag_mod.Diag) void { // apply.zig
+    const cause = "allow: grant 1: port 0 is not a port from 1 to 65535";
+    sample(diag, .E0135, &.{cause}, "fix the entry and apply again");
+}
+
+fn mesh_no_grant(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+    const cause = "no grant lets batch reach db on port 5432; db allows web on 5432";
+    sample(diag, .E0707, &.{cause}, "add { .from = \"batch\", .port = 5432 } to db's allow");
+}
+
+fn mesh_peer_refused(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+    const cause = "the peer's certificate expired at 2026-11-13T10:00:00Z";
+    sample(diag, .E0708, &.{cause}, "check time sync on both nodes");
+}
+
+fn mesh_no_endpoint(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+    const cause = "db has no ready replica with a mesh endpoint";
+    sample(diag, .E0709, &.{cause}, "zcube why service db");
+}
+
+fn mesh_port_busy(diag: *diag_mod.Diag) void { // mesh (C4 slice 3)
+    const cause = "every port from 30000 to 30999 on node1 is in use";
+    sample(diag, .E0710, &.{cause}, "free ports in the range, or give the agent another range");
+}
+
+fn mesh_no_socket(diag: *diag_mod.Diag) void { // mesh (C4 slice 4)
+    const cause = "the runtime refused a socket in the container of web-1: PermissionDenied";
+    sample(diag, .E0711, &.{cause}, "upgrade the runtime and the agent together");
+}
+
+fn mesh_not_renewed(diag: *diag_mod.Diag) void { // mesh (C4 slice 2)
+    const cause = "the certificate of web-1 was not renewed: the server did not answer";
+    sample(diag, .W0703, &.{cause}, "check that the node reaches the server");
+}
+
+fn grant_unknown(diag: *diag_mod.Diag) void { // apply.zig
+    const cause = "db allows btach, and no service is named btach";
+    sample(diag, .W0704, &.{cause}, "correct the name if it is a typo");
+}
+
 fn job_contradicts(diag: *diag_mod.Diag) void { // job_controller.zig
     const cause = "/job-status/train-7 has ended but /job-runs/train-7 does not exist";
     const fix = "restore the missing record, or delete all the job's keys in one transaction";
@@ -950,6 +990,7 @@ const cases = [_]Case{
     relayed_to(.E0132, &job_run, job_too_many),
     relayed_to(.E0133, &.{ "job", "get", "x" }, job_unknown),
     relayed_to(.E0134, &job_run, job_late),
+    relayed(.E0135, allow_bad),
     relayed(.E0201, store_down),
     relayed(.E0202, store_failed),
     relayed(.E0203, compacted),
@@ -1040,6 +1081,13 @@ const cases = [_]Case{
     relayed(.E0705, relay_broken),
     relayed(.W0701, relay_full),
     relayed(.W0702, relay_bound),
+    relayed(.E0707, mesh_no_grant),
+    relayed(.E0708, mesh_peer_refused),
+    relayed(.E0709, mesh_no_endpoint),
+    relayed(.E0710, mesh_port_busy),
+    relayed(.E0711, mesh_no_socket),
+    relayed(.W0703, mesh_not_renewed),
+    relayed(.W0704, grant_unknown),
 };
 
 const repair_node1: []const []const u8 = &.{ "repair", "allocations", "node1" };

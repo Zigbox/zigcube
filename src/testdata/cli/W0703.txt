@@ -1,0 +1,5 @@
+warning[ZC-W0703]: a replica's mesh certificate could not be renewed
+  cause  the certificate of web-1 was not renewed: the server did not answer
+  fix    check that the node reaches the server
+  more   zcube explain W0703 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/W0703.html

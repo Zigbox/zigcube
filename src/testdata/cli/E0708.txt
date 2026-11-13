@@ -1,0 +1,5 @@
+error[ZC-E0708]: a mesh peer's certificate was refused
+  cause  the peer's certificate expired at 2026-11-13T10:00:00Z
+  fix    check time sync on both nodes
+  more   zcube explain E0708 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0708.html

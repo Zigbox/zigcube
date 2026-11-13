@@ -12,6 +12,7 @@ const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const evidence = @import("evidence.zig");
 const history = @import("history.zig");
+const mesh_address = @import("mesh_address.zig");
 const records = @import("records.zig");
 const store = @import("store.zig");
 
@@ -37,6 +38,9 @@ pub const Input = struct {
     health: ?records.Health = null,
     /// How a new generation replaces the old (C3); null, or the default, is stored as null.
     rollout: ?records.RolloutPolicy = null,
+    /// Who may connect to the service through the mesh (C4, docs/keys.md); a change is not a new
+    /// generation, and writes a `grant` decision.
+    allow: []const records.Grant = &.{},
 };
 
 pub const Result = union(enum) {
@@ -115,46 +119,17 @@ fn legacy_counter(ctx: *const Context, existing: ?records.Service) Error!?u64 {
 pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Input) Error!Result {
     const planned = try plan(ctx, input);
     if (planned.unchanged) return .unchanged;
-    const service: records.Service = .{
-        .name = input.name,
-        .image = input.image,
-        .replicas = input.replicas,
-        .command = input.command,
-        .env = input.env,
-        .limits = input.limits,
-        .source = input.source,
-        .generation = planned.generation,
-        .next_replica = try legacy_counter(ctx, planned.existing),
-        .applied_by = input.applied_by,
-        .request_id = input.request_id,
-        .health = input.health,
-        .rollout = stored_rollout(input.rollout),
-    };
-    const key = records.service_key(input.name);
     var batch: controller.Batch = .{};
+    const service = try service_record(ctx, &batch, &planned, input);
+    const key = records.service_key(input.name);
     batch.expect(key.slice(), planned.mod_revision);
     const service_key_copy = try controller.key_copy(ctx, &key);
     batch.put(service_key_copy, try records.encode(ctx.arena, service, ctx.diag));
-    const new_generation = if (planned.existing) |old|
-        old.generation != planned.generation
-    else
-        true;
-    if (new_generation) {
-        const record = records.history_of(&service, ctx.clock.now_ms());
-        var seed: records.History = undefined;
-        var owner: ?history.Owner = null;
-        if (planned.existing) |*old| {
-            // When the old generation was applied is not stored: its seed says 0, unknown. A
-            // record no build writes, generation 0, has nothing to seed.
-            if (old.generation > 0) seed = records.history_of(old, 0);
-            owner = .{
-                .create_revision = planned.create_revision,
-                .generation = old.generation,
-                .seed = if (old.generation > 0) &seed else null,
-            };
-        }
-        try history.put(ctx, &batch, &record, owner);
+    // The grant decision before the history: `history.put` leaves room for one decision only.
+    if (grants_changed(planned.existing, input)) {
+        try put_grant_decision(ctx, source, &batch, planned.existing, input, service_key_copy);
     }
+    try put_history(ctx, &batch, &planned, &service);
     const reason = try controller.format(ctx, "{s} applied {s} (request {s})", .{
         input.applied_by, input.name, input.request_id,
     });
@@ -181,6 +156,115 @@ pub fn apply(ctx: *const Context, source: *controller.DecisionSource, input: Inp
     };
 }
 
+/// The service as `apply` stores it. A service that has no mesh address yet (a new one, or one
+/// written before C4) takes one here, in `batch` (`mesh_address.assign`); one that has it keeps it.
+fn service_record(
+    ctx: *const Context,
+    batch: *controller.Batch,
+    planned: *const Plan,
+    input: Input,
+) Error!records.Service {
+    assert(!planned.unchanged);
+    assert(batch.ops_count == 0);
+    const kept: ?[]const u8 = if (planned.existing) |old| old.mesh_address else null;
+    const address = kept orelse try mesh_address.assign(ctx, batch, input.name);
+    assert(records.mesh_address_parse(address) != null);
+    return .{
+        .name = input.name,
+        .image = input.image,
+        .replicas = input.replicas,
+        .command = input.command,
+        .env = input.env,
+        .limits = input.limits,
+        .source = input.source,
+        .generation = planned.generation,
+        .next_replica = try legacy_counter(ctx, planned.existing),
+        .applied_by = input.applied_by,
+        .request_id = input.request_id,
+        .health = input.health,
+        .rollout = stored_rollout(input.rollout),
+        .mesh_address = address,
+        .allow = input.allow,
+    };
+}
+
+/// The history record of a new generation, if this apply makes one.
+fn put_history(
+    ctx: *const Context,
+    batch: *controller.Batch,
+    planned: *const Plan,
+    service: *const records.Service,
+) Error!void {
+    assert(service.generation == planned.generation);
+    assert(batch.ops_count > 0);
+    const new_generation = if (planned.existing) |old|
+        old.generation != planned.generation
+    else
+        true;
+    if (new_generation) {
+        const record = records.history_of(service, ctx.clock.now_ms());
+        var seed: records.History = undefined;
+        var owner: ?history.Owner = null;
+        if (planned.existing) |*old| {
+            // When the old generation was applied is not stored: its seed says 0, unknown. A
+            // record no build writes, generation 0, has nothing to seed.
+            if (old.generation > 0) seed = records.history_of(old, 0);
+            owner = .{
+                .create_revision = planned.create_revision,
+                .generation = old.generation,
+                .seed = if (old.generation > 0) &seed else null,
+            };
+        }
+        try history.put(ctx, batch, &record, owner);
+    }
+}
+
+/// Whether an apply changes the service's grants: a new service with any, or a changed list.
+fn grants_changed(existing: ?records.Service, input: Input) bool {
+    const old = existing orelse return input.allow.len > 0;
+    return !records.grants_equal(old.allow, input.allow);
+}
+
+/// The `grant` decision (docs/keys.md): who changed the grants of a service and which came and
+/// went, as one line. The grants themselves are in the service record it causes.
+fn put_grant_decision(
+    ctx: *const Context,
+    source: *controller.DecisionSource,
+    batch: *controller.Batch,
+    existing: ?records.Service,
+    input: Input,
+    service_key: []const u8,
+) Error!void {
+    assert(batch.has_room(controller.decision_ops));
+    const old: []const records.Grant = if (existing) |service| service.allow else &.{};
+    var text: std.ArrayList(u8) = .empty;
+    for (input.allow) |grant| {
+        if (records.grants_contain(old, grant)) continue;
+        try append_part(ctx, &text, try grant_text(ctx, grant, "added"));
+    }
+    for (old) |grant| {
+        if (records.grants_contain(input.allow, grant)) continue;
+        try append_part(ctx, &text, try grant_text(ctx, grant, "removed"));
+    }
+    assert(text.items.len > 0);
+    const reason = try controller.format(ctx, "{s} changed who may connect to {s} (request {s})", .{
+        input.applied_by, input.name, input.request_id,
+    });
+    _ = try controller.put_decision(ctx, source, .{
+        .actor = actor,
+        .action = "grant",
+        .subject = .{ .kind = .service, .name = input.name },
+        .reason = reason,
+        .change = text.items,
+        .cause = .{ .kind = .desired, .key = service_key },
+    }, batch);
+}
+
+/// "web → 5432 added".
+fn grant_text(ctx: *const Context, grant: records.Grant, comptime how: []const u8) Error![]const u8 {
+    return controller.format(ctx, "{s} → {d} " ++ how, .{ grant.from, grant.port });
+}
+
 /// Deletes a service and records who did. Its replicas are stopped by the replica controller.
 pub fn delete_service(
     ctx: *const Context,
@@ -201,6 +285,11 @@ pub fn delete_service(
     var batch: controller.Batch = .{};
     batch.expect(key.slice(), kv.mod_revision);
     batch.delete(kv.key);
+    // The address stays held, released, until no replica is left and a day has passed. A record
+    // that does not read is still deleted; its address, if any, stays held.
+    if (try mesh_address.held_by(ctx, kv.value)) |address| {
+        try mesh_address.release(ctx, &batch, name, address);
+    }
     const reason = try controller.format(ctx, "{s} deleted {s} (request {s})", .{
         applied_by, name, request_id,
     });
@@ -288,6 +377,10 @@ fn change_summary(ctx: *const Context, existing: ?records.Service, input: Input)
     const old_rollout = old.rollout_policy();
     const new_rollout = input.rollout orelse records.RolloutPolicy{};
     if (!old_rollout.equal(new_rollout)) try append_part(ctx, &text, "rollout changed");
+    if (!records.grants_equal(old.allow, input.allow)) try append_part(ctx, &text, "grants changed");
+    // A service written before C4 takes its address on its next apply, a re-apply of the same
+    // file included (docs/keys.md, "Mesh addresses").
+    if (old.mesh_address == null) try append_part(ctx, &text, "mesh address assigned");
     if (text.items.len == 0) return no_change;
     return text.items;
 }
@@ -383,6 +476,10 @@ fn validate(ctx: *const Context, input: Input) Error!void {
     }
     if (input.health) |health| try validate_health(ctx, health);
     if (input.rollout) |rollout| try validate_rollout(ctx, rollout);
+    var buffer: [256]u8 = undefined;
+    if (records.allow_problem(&buffer, input.name, input.allow)) |problem| {
+        return refuse(ctx, .E0135, "allow: {s}", .{problem});
+    }
 }
 
 /// A command health check (C3): ZC-E0125 naming the field. The command is bounded as a
@@ -697,6 +794,8 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
         .generation = 1,
         .applied_by = old.applied_by,
         .request_id = old.request_id,
+        // With an address, so the re-apply below is unchanged rather than a C4 backfill.
+        .mesh_address = "127.77.0.2",
     };
     const value = try records.encode(ctx.arena, stored, &diag);
     const written = try ctx.store.txn(.{
@@ -960,7 +1059,8 @@ test "C3: apply writes history with a new generation only, capped, and delete re
     try testing.expectEqualSlices(u64, &.{1}, try history_generations(&ctx));
 }
 
-test "C3: a default rollout is stored as none, so the service stays version 3" {
+test "C3: a default rollout is stored as none, so the service carries no rollout" {
+    // (Before C4 the record stayed version 3; from C4 its mesh address makes it version 5.)
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var manual: ManualClock = .{ .ms = 1761350000123 };
@@ -981,7 +1081,8 @@ test "C3: a default rollout is stored as none, so the service stays version 3" {
     defaulted.rollout = .{};
     _ = try apply(&ctx, &source, defaulted);
     const got = try ctx.store.get(ctx.arena, records.service_key("hello").slice(), null, &diag);
-    try testing.expect(std.mem.startsWith(u8, got.kv.?.value, "{\"v\":3,"));
+    try testing.expect(std.mem.startsWith(u8, got.kv.?.value, "{\"v\":5,"));
+    try testing.expect(std.mem.indexOf(u8, got.kv.?.value, "rollout") == null);
     try testing.expect((try apply(&ctx, &source, hello)) == .unchanged);
 }
 
