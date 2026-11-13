@@ -9,5 +9,6 @@ test {
     _ = @import("tls_client_test.zig");
     _ = @import("tls_fuzz.zig");
     _ = @import("tls_fuzz_teeth.zig");
+    _ = @import("tls_server_test.zig");
     _ = @import("x509_fuzz.zig");
 }
