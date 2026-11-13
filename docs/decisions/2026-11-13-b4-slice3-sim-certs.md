@@ -41,7 +41,8 @@ Brief: docs/briefs/b4.md, "Slices", item 3. Code: `src/sim_certs.zig` and its wi
 - **Determinism.** The model has its own generator, seeded from the run's seed. Worlds without
   relayed jobs (anything not `strong`) draw exactly as before. Strong worlds differ only by the
   model's store reads and node-clock reads, which draw nothing from the world. The pinned seeds
-  (`sim-c1-worlds`, `sim-c1-burst`, `sim-c1-regressions`) were run on this commit: see the report.
+  (`sim-c1-worlds`, `sim-c1-burst`, `sim-c1-regressions`, `sim-c1-regress`, `sim-c1-reuse`) pass
+  with the model on: see the slice report.
 - **Teeth.** `job_cert_stale` (R4) and `job_cert_long` (R5) are switches inside `job_cert.zig`,
   the real rule, so a tooth weakens the code that slice 2 will serve. `relay_conn_leak` (R6) is
   inside `SimRuntime`. All three imply `strong`. The binaries assert `!c1_teeth.any`, so none of
@@ -51,6 +52,10 @@ Brief: docs/briefs/b4.md, "Slices", item 3. Code: `src/sim_certs.zig` and its wi
 
 - `**` (array repetition) and `@typeInfo(E).error_set.?` are gone in the pinned Zig. Use
   `.error_set.error_names.?`.
+- Draw `u32`, never `usize`, in the model: `usize` is 32 bits on `wasm32`, so
+  `uintLessThan(usize, n)` and `enumValue` draw differently there, and `sim-cluster`'s native and
+  WASM reports disagree (`check` caught it on seed 16525981159377107204). Use
+  `enumValueWithIndex(E, u32)`.
 - `Node.name` is now `pub`, because `sim_certs.supervise` takes the nodes as `anytype`.
 
 ## Next
