@@ -76,6 +76,8 @@ pub const Host = struct {
         return .{ .io = host.io, .arena = host.arena(), .state = host.state };
     }
 
+    /// Milliseconds since boot, for measuring durations. Never a time the server compares with
+    /// its own clock, which is Unix time (`server_store.RealClock`).
     pub fn now_ms(host: *const Host) u64 {
         return @intCast(std.Io.Clock.awake.now(host.io).toMilliseconds());
     }

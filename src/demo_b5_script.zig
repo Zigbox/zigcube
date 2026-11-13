@@ -6,9 +6,11 @@
 //!      a signature. The server starts on the host, the agent (`--runtime zigbox`) in the guest;
 //!   2. a job signed by `release` is submitted (`POST /v1/jobs`), runs and exits 0;
 //!   3. three jobs are refused at the server: unsigned, signed by `stranger`, and signed for v2
-//!      but naming v1. Each answer is 403 with ZBX-E0905 and no job exists after it;
+//!      but naming v1. Each answer is 403 with ZBX-E0905 and its own cause, and no job exists
+//!      after it;
 //!   4. the same three are written straight into the store (src/demo_b5_inject.zig), around the
-//!      server's check: each ends `failed`, cause `refused`, and no container is made for it.
+//!      server's check: each ends `failed`, cause `refused`, with ZBX-E0905 and its own cause, and
+//!      no container is made for it, while the signed job's is listed.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -37,21 +39,33 @@ const Signed = struct {
     elsewhere: []const u8,
 };
 
-/// A job each check refuses: the name it is submitted under and the lines it carries.
-const Refused = struct { name: []const u8, why: []const u8, signatures: []const []const u8 };
+/// A job each check refuses: the name it is submitted under, the lines it carries, and the case,
+/// whose words the refusal's cause must hold (`inject.Refused.words`).
+const Refused = struct {
+    name: []const u8,
+    why: []const u8,
+    signatures: []const []const u8,
+    case: inject.Refused,
+};
 
 pub fn run(demo: *Demo) !void {
     const signed = try sign(demo);
     try start(demo);
     try signed_runs(demo, signed);
     const refused = [_]Refused{
-        .{ .name = "unsigned", .why = "no signature", .signatures = &.{} },
-        .{ .name = "stranger", .why = "signed by a key no policy trusts", .signatures = &.{
-            signed.stranger,
-        } },
-        .{ .name = "elsewhere", .why = "a trusted signature of another tree", .signatures = &.{
-            signed.elsewhere,
-        } },
+        .{ .name = "unsigned", .why = "no signature", .signatures = &.{}, .case = .unsigned },
+        .{
+            .name = "stranger",
+            .why = "signed by a key no policy trusts",
+            .signatures = &.{signed.stranger},
+            .case = .stranger,
+        },
+        .{
+            .name = "elsewhere",
+            .why = "a trusted signature of another tree",
+            .signatures = &.{signed.elsewhere},
+            .case = .elsewhere,
+        },
     };
     try refused_at_server(demo, &refused);
     try refused_at_agent(demo, &refused);
@@ -175,16 +189,7 @@ fn node_joined(_: void, demo: *Demo) !bool {
 /// `POST /v1/jobs`: the CLI has no way to attach a signature (docs/demos/b5.md, "Cuts").
 fn post_job(demo: *Demo, name: []const u8, signatures: []const []const u8) !Reply {
     const host = demo.host;
-    const arena = demo.arena();
-    const now: u64 = host.now_ms();
-    const body = try std.json.Stringify.valueAlloc(arena, .{
-        .name = name,
-        .image = demo.v1_tree,
-        .deadline_ms = deadline_ms,
-        .submit_by_ms = now + 60 * 1000,
-        .signatures = signatures,
-        .command = &command,
-    }, .{});
+    const body = try job_body(demo.arena(), host.io, name, demo.v1_tree, signatures);
     const reply = try host.call("POST", "/v1/jobs", body);
     host.say("  POST /v1/jobs {s} ({d} signature(s)): {d} {s}", .{
         name, signatures.len, reply.status, reply.body,
@@ -194,19 +199,46 @@ fn post_job(demo: *Demo, name: []const u8, signatures: []const []const u8) !Repl
 
 const Reply = struct { status: u16, body: []const u8 };
 
+/// The window `submit_by_ms` leaves the server to take the job in.
+const submit_window_ms: u64 = 60 * 1000;
+
+/// The body of `POST /v1/jobs`. `submit_by_ms` is Unix time, as the server's clock is
+/// (`server_store.RealClock`): the time since boot made the server refuse every job, ZC-E0134.
+fn job_body(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    image: []const u8,
+    signatures: []const []const u8,
+) ![]const u8 {
+    const now: u64 = @intCast(std.Io.Clock.real.now(io).toMilliseconds());
+    return std.json.Stringify.valueAlloc(arena, .{
+        .name = name,
+        .image = image,
+        .deadline_ms = deadline_ms,
+        .submit_by_ms = now + submit_window_ms,
+        .signatures = signatures,
+        .command = &command,
+    }, .{});
+}
+
 fn has_ended(name: []const u8, demo: *Demo) !bool {
     const view = (try state.job_view(demo.host, name)) orelse return false;
     return view.end_kind != null;
 }
 
-/// `status.end.cause` of the job, which `state.job_view` does not carry; "" when it has none.
-fn end_cause(demo: *Demo, name: []const u8) ![]const u8 {
+/// What `state.job_view` does not carry of a job: `status.end.cause` ("" when it has none) and
+/// `status.diagnostic` (null when it has none).
+const Ending = struct { cause: []const u8, diagnostic: ?Json };
+
+fn ending(demo: *Demo, name: []const u8) !Ending {
     const path = try std.fmt.allocPrint(demo.arena(), "/v1/jobs/{s}", .{name});
     const value = try demo.host.json(path);
-    const status = object_of(value, "status") orelse return "";
-    const end = object_of(status, "end") orelse return "";
-    const cause = end.object.get("cause") orelse return "";
-    return if (cause == .string) cause.string else "";
+    const status = object_of(value, "status") orelse return .{ .cause = "", .diagnostic = null };
+    const diagnostic = status.object.get("diagnostic");
+    const end = object_of(status, "end") orelse return .{ .cause = "", .diagnostic = diagnostic };
+    const cause = end.object.get("cause") orelse return .{ .cause = "", .diagnostic = diagnostic };
+    return .{ .cause = if (cause == .string) cause.string else "", .diagnostic = diagnostic };
 }
 
 fn object_of(value: Json, key: ?[]const u8) ?Json {
@@ -240,9 +272,10 @@ fn refused_at_server(demo: *Demo, refused: []const Refused) !void {
     host.section("3. Refused at the server: unsigned, an untrusted key, another tree");
     for (refused) |job| {
         const reply = try post_job(demo, job.name, job.signatures);
-        demo.expect(reply.status == 403 and
-            std.mem.indexOf(u8, reply.body, "ZBX-E0905") != null, "{s} ({s}) is refused at " ++
-            "the server: 403 with ZBX-E0905 (got {d})", .{ job.name, job.why, reply.status });
+        const words = job.case.words();
+        const said = inject.body_refuses(demo.arena(), reply.body, words);
+        demo.expect(reply.status == 403 and said, "{s} ({s}) is refused at the server: 403 " ++
+            "with ZBX-E0905, cause \"{s}\" (got {d})", .{ job.name, job.why, words, reply.status });
         const path = try std.fmt.allocPrint(demo.arena(), "/v1/jobs/{s}", .{job.name});
         const after = try host.call("GET", path, "");
         demo.expect(after.status == 404, "no job {s} was created (GET answered {d})", .{
@@ -281,13 +314,23 @@ fn refused_at_agent(demo: *Demo, refused: []const Refused) !void {
         try demo.wait_hard(job.name, has_ended, "a refused job to end", job_wait_ms);
         _ = try host.zcube(&.{ "job", "get", job.name });
         const view = try state.need_job(host, job.name);
-        const cause = try end_cause(demo, job.name);
+        const ended = try ending(demo, job.name);
+        const words = job.case.words();
+        const said = if (ended.diagnostic) |value| inject.refusal_says(value, words) else false;
         const refused_here = std.mem.eql(u8, view.state, "failed") and
-            std.mem.eql(u8, cause, "refused");
-        demo.expect(refused_here, "{s} ({s}) is refused at the agent: failed, cause refused " ++
-            "(got {s}, {s})", .{ job.name, job.why, view.state, cause });
+            std.mem.eql(u8, ended.cause, "refused") and said;
+        demo.expect(refused_here, "{s} ({s}) is refused at the agent: failed, cause refused, " ++
+            "ZBX-E0905 saying \"{s}\" (got {s}, {s}, diagnostic {s})", .{
+            job.name, job.why, words, view.state, ended.cause,
+            if (ended.diagnostic == null) "none" else if (said) "as wanted" else "another",
+        });
     }
     const containers = try demo.guest(0, "containers", .{});
+    // The control: the same listing holds the signed job's container, so "none" is not a listing
+    // that could hold nothing.
+    const signed_line = "container signed" ++ records.job_run_suffix;
+    try host.check(std.mem.indexOf(u8, containers, signed_line) != null, "the listing holds " ++
+        "{s}, the signed job's", .{signed_line});
     for (refused) |job| {
         // The run's container is named by its run id, `<name>-job` (`records.job_run_id`).
         const line = try std.fmt.allocPrint(demo.arena(), "container {s}{s}", .{
@@ -310,10 +353,27 @@ comptime {
     assert(tree_length == 67);
 }
 
-test "a job body fits a request" {
-    // Two envelopes of a few hundred bytes each are far inside the API's body limit.
-    try std.testing.expect(command.len == 3);
-    try std.testing.expect(constants.job_deadline_ms_max >= deadline_ms);
+test "a job body fits a request and its submit_by_ms is Unix time" {
+    const testing = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The largest body the demo posts: one signature line about as long as zbx's (an envelope of
+    // a few hundred bytes, base64), which must fit the API's body limit many times over.
+    const line = try arena.alloc(u8, 1024);
+    @memset(line, 'x');
+    const tree = "b3:abababababababababababababababababababababababababababababababab";
+    const before: u64 = @intCast(std.Io.Clock.real.now(testing.io).toMilliseconds());
+    const body = try job_body(arena, testing.io, "signed", tree, &.{line});
+    try testing.expect(body.len > line.len);
+    try testing.expect(body.len * 4 <= constants.http_body_bytes_max);
+    const parsed = try std.json.parseFromSliceLeaky(Json, arena, body, .{});
+    const submit_by: u64 = @intCast(parsed.object.get("submit_by_ms").?.integer);
+    // Within a minute after now on the real clock, as the server reads it: the time since boot
+    // (the first version) is decades before it.
+    try testing.expect(submit_by >= before + submit_window_ms);
+    try testing.expect(submit_by <= before + submit_window_ms + 10 * 1000);
+    try testing.expect(constants.job_deadline_ms_max >= deadline_ms);
 }
 
 test {

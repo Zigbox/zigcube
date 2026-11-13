@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
         .sqlite = sqlite,
         .libpq = libpq_module,
     });
-    add_agent_smoke_step(b, built, zigbox_module);
+    add_agent_smoke_step(b, built, shared_options);
     add_swarm_smoke_steps(b, shared_options, built);
     add_mtls_interop_step(b, shared_options);
     add_mtls_teeth_step(b, shared_options);
@@ -283,14 +283,20 @@ fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built
 /// `zig build agent-smoke`: the server and the agent as real processes, with real containers
 /// (src/agent_smoke.zig). It runs the executables the build made, whatever `-Doptimize` says, and
 /// is not `demo-c0`. It never caches: it exists to be run.
-fn add_agent_smoke_step(b: *std.Build, built: Built, zigbox_module: *std.Build.Module) void {
+/// Step 9 writes jobs straight into the stopped server's SQLite store (src/demo_b5_inject.zig),
+/// so it links the store backends.
+fn add_agent_smoke_step(b: *std.Build, built: Built, options: ExecutablesOptions) void {
     const exe = b.addExecutable(.{
         .name = "agent_smoke",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/agent_smoke.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
-            .imports = &.{.{ .name = "zigbox", .module = zigbox_module }},
+            .imports = &.{
+                .{ .name = "zigbox", .module = options.zigbox },
+                .{ .name = "sqlite_c", .module = options.sqlite },
+                .{ .name = "libpq_c", .module = options.libpq },
+            },
         }),
     });
     const run = b.addRunArtifact(exe);
