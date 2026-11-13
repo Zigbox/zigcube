@@ -215,30 +215,39 @@ fn is_good_ccs(record: []const u8) bool {
         record[header_bytes] == 1;
 }
 
-/// The hello the server read is the client's: the same records, the same order, nothing after.
-fn hello_whole(original: []const u8, damaged: []const u8) bool {
+/// The hello the server read is the client's: the same records, the same order, then at most
+/// one well-formed change_cipher_spec (which a client may send before its flight) and nothing
+/// else. Returns how many change_cipher_spec records followed, or null when the hello is not whole.
+fn hello_whole(original: []const u8, damaged: []const u8) ?u32 {
     var original_starts: [records_max + 1]u32 = undefined;
     var damaged_starts: [records_max + 1]u32 = undefined;
     const count = record_starts(original, &original_starts);
-    if (record_starts(damaged, &damaged_starts) != count) return false;
-    if (damaged_starts[count] != damaged.len) return false;
+    const damaged_count = record_starts(damaged, &damaged_starts);
+    if (damaged_count < count) return null;
+    if (damaged_starts[damaged_count] != damaged.len) return null;
     for (0..count) |index| {
         const a = original[original_starts[index]..original_starts[index + 1]];
         const b = damaged[damaged_starts[index]..damaged_starts[index + 1]];
-        if (!same_record(a, b)) return false;
+        if (!same_record(a, b)) return null;
     }
-    return true;
+    const ccs = damaged_count - count;
+    if (ccs > constants.tls_change_cipher_spec_records_max) return null;
+    for (count..damaged_count) |index| {
+        if (!is_good_ccs(damaged[damaged_starts[index]..damaged_starts[index + 1]])) return null;
+    }
+    return ccs;
 }
 
 /// The records of `damaged` begin with the protected records of `original`, in order, with at
-/// most one well-formed change_cipher_spec among them and nothing else.
-fn flight_whole(original: []const u8, damaged: []const u8) bool {
+/// most one well-formed change_cipher_spec among them and the `ccs_before` the hello carried,
+/// and nothing else.
+fn flight_whole(original: []const u8, damaged: []const u8, ccs_before: u32) bool {
     var original_starts: [records_max + 1]u32 = undefined;
     var damaged_starts: [records_max + 1]u32 = undefined;
     const original_count = record_starts(original, &original_starts);
     const damaged_count = record_starts(damaged, &damaged_starts);
     var next: u32 = 0;
-    var ccs_seen: u32 = 0;
+    var ccs_seen: u32 = ccs_before;
     for (0..damaged_count) |index| {
         while (next < original_count and original[original_starts[next]] == content_ccs) {
             next += 1;
@@ -414,9 +423,9 @@ pub fn run_once(seed: u64, refusal: *bool) !bool {
     else
         .none;
     const hello_length = mutate(random, hello_kind, hello, &world.damaged);
-    const hello_ok = hello_whole(hello, world.damaged[0..hello_length]);
+    const hello_ccs = hello_whole(hello, world.damaged[0..hello_length]);
     if (hello_length > 0) try feed(world, random, world.damaged[0..hello_length]);
-    if (!world.refused) try flight_stage(world, random, hello_ok, hello_kind);
+    if (!world.refused) try flight_stage(world, random, hello_ccs, hello_kind);
     if (!world.refused and !world.server.is_connected()) {
         const before = world.sent_length;
         if (world.server.end_of_input(&world.diag)) |_| {
@@ -430,11 +439,11 @@ pub fn run_once(seed: u64, refusal: *bool) !bool {
     return world.false_connect;
 }
 
-fn flight_stage(world: *World, random: std.Random, hello_ok: bool, hello_kind: Mutation) !void {
+fn flight_stage(world: *World, random: std.Random, hello_ccs: ?u32, hello_kind: Mutation) !void {
     world.client.accept_flight(world.sent[0..world.sent_length]) catch {
         // The server read a hello the client did not send, or refused the hello in the client's
         // terms (the knobs): it must not have produced a flight the client takes.
-        try testing.expect(!hello_ok or !world.knobs_good);
+        try testing.expect(hello_ccs == null or !world.knobs_good);
         return;
     };
     world.sent_length = 0;
@@ -442,7 +451,8 @@ fn flight_stage(world: *World, random: std.Random, hello_ok: bool, hello_kind: M
     const kind: Mutation = if (random.boolean()) random.enumValue(Mutation) else .none;
     const length = mutate(random, kind, flight, &world.damaged);
     const damaged = world.damaged[0..length];
-    world.legit = hello_ok and world.knobs_good and flight_whole(flight, damaged);
+    world.legit = world.knobs_good and hello_ccs != null and
+        flight_whole(flight, damaged, hello_ccs orelse 0);
     if (length > 0) try feed(world, random, damaged);
     const whole = hello_kind == .none and kind == .none and world.knobs_good;
     if (whole) {
@@ -522,21 +532,41 @@ test "fuzz: the record oracle" {
     var length: usize = schedule.write_plain(&flight, .change_cipher_spec, 0x0303, &.{1}).len;
     length += schedule.write_plain(flight[length..], .application_data, 0x0303, "abc").len;
     const original = flight[0..length];
-    try testing.expect(flight_whole(original, original));
-    try testing.expect(flight_whole(original, original[header_bytes + 1 ..]));
+    try testing.expect(flight_whole(original, original, 0));
+    try testing.expect(flight_whole(original, original[header_bytes + 1 ..], 0));
     var copy: [64]u8 = undefined;
     @memcpy(copy[0..length], original);
     copy[length - 1] ^= 1;
-    try testing.expect(!flight_whole(original, copy[0..length]));
+    try testing.expect(!flight_whole(original, copy[0..length], 0));
     @memcpy(copy[0..length], original);
     copy[1] ^= 1; // A change_cipher_spec's version is not read.
-    try testing.expect(flight_whole(original, copy[0..length]));
+    try testing.expect(flight_whole(original, copy[0..length], 0));
     copy[header_bytes] = 2;
-    try testing.expect(!flight_whole(original, copy[0..length]));
+    try testing.expect(!flight_whole(original, copy[0..length], 0));
     var twice: [64]u8 = undefined;
     const ccs_bytes = header_bytes + 1;
     @memcpy(twice[0..ccs_bytes], original[0..ccs_bytes]);
     @memcpy(twice[ccs_bytes..][0..length], original);
-    try testing.expect(!flight_whole(original, twice[0 .. ccs_bytes + length]));
-    try testing.expect(!flight_whole(original, original[0 .. length - 1]));
+    try testing.expect(!flight_whole(original, twice[0 .. ccs_bytes + length], 0));
+    try testing.expect(!flight_whole(original, original[0 .. length - 1], 0));
+    // A change_cipher_spec the hello carried counts against the flight's.
+    try testing.expect(!flight_whole(original, original, 1));
+    try testing.expect(flight_whole(original, original[header_bytes + 1 ..], 1));
+}
+
+test "fuzz: the hello oracle" {
+    // Goal: a hello followed by one good change_cipher_spec is whole, as the server reads it.
+    // Method: a one-record hello against each tail it can carry.
+    var hello: [64]u8 = undefined;
+    var length: usize = schedule.write_plain(&hello, .handshake, 0x0301, "abc").len;
+    const original = hello[0..length];
+    try testing.expectEqual(@as(?u32, 0), hello_whole(original, original));
+    try testing.expectEqual(@as(?u32, null), hello_whole(original, original[0 .. length - 1]));
+    length += schedule.write_plain(hello[length..], .change_cipher_spec, 0x0303, &.{1}).len;
+    try testing.expectEqual(@as(?u32, 1), hello_whole(original, hello[0..length]));
+    const one = length;
+    length += schedule.write_plain(hello[length..], .change_cipher_spec, 0x0303, &.{1}).len;
+    try testing.expectEqual(@as(?u32, null), hello_whole(original, hello[0..length]));
+    hello[one - 1] = 2;
+    try testing.expectEqual(@as(?u32, null), hello_whole(original, hello[0..one]));
 }
