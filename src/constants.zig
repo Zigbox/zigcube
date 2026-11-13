@@ -138,7 +138,7 @@ pub const mesh_address_quarantine_ms: u64 = decision_gone_age_ms_max;
 /// Addresses one allocation looks at once the counter has wrapped, before the apply is refused
 /// (ZC-E0207). Each is one read of the store in the apply.
 pub const mesh_address_probes_max: u32 = store_list_limit_max;
-/// Grants one service's `.allow` holds (ZC-E0135 past it). PROPOSED, awaiting the supervisor.
+/// Grants one service's `.allow` holds (ZC-E0135 past it). Approved by the supervisor, 2026-11-13.
 pub const service_allow_max: u32 = 64;
 /// The default range of mesh ports an agent hands its replicas (`--mesh-ports`): one each.
 pub const mesh_ports_default_first: u16 = 30_000;

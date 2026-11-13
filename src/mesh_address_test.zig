@@ -298,3 +298,33 @@ test "a change of allow writes a grant decision and is not a new generation" {
     try testing.expectEqual(@as(usize, 0), stored.allow.len);
     try testing.expectEqual(@as(u32, 5), stored.v);
 }
+
+test "a create past the end of the block wraps, and is ZC-E0207 when every probe is held" {
+    // Goal: the supervisor's test of the wrap and the refusal. Method: hold the last
+    // `mesh_address_probes_max` numbers of the block and start the counter at the first of them:
+    // the create is refused and writes nothing. Free the first and start one later: the probe
+    // runs off the end of the block, wraps and takes 127.77.0.1.
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const first: u16 = constants.mesh_address_max - constants.mesh_address_probes_max + 1;
+    var number: u32 = first;
+    while (number <= constants.mesh_address_max) : (number += 1) {
+        const key = records.mesh_address_key(@intCast(number));
+        try fixture.put(key.slice(), records.MeshAddressHold{ .service = "held" });
+    }
+    try fixture.put(records.key_mesh_address_next, records.MeshAddressNext{ .next = first });
+    try testing.expectError(error.NoCapacity, fixture.apply(input("db")));
+    try testing.expectEqual(.E0207, fixture.diag.code.?);
+    const cause = fixture.diag.causes.slice()[0].slice();
+    try testing.expect(std.mem.startsWith(u8, cause, "127.77.0.0/16 has no free address"));
+    fixture.diag.reset();
+    const ctx = fixture.context();
+    const db = try ctx.store.get(ctx.arena, records.service_key("db").slice(), null, ctx.diag);
+    try testing.expectEqual(@as(?store.KeyValue, null), db.kv);
+
+    try fixture.remove(records.mesh_address_key(first).slice());
+    try fixture.put(records.key_mesh_address_next, records.MeshAddressNext{ .next = first + 1 });
+    _ = try fixture.apply(input("db"));
+    try testing.expectEqualStrings("127.77.0.1", try fixture.address("db"));
+}

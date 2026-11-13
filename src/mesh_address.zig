@@ -167,7 +167,7 @@ pub fn replica_of(replica: []const u8, service: []const u8) bool {
 fn exhausted(ctx: *const Context, next: u32) Error {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0207);
-    ctx.diag.cause("no mesh address is free: the {d} addresses from number {d} on are all " ++
+    ctx.diag.cause("127.77.0.0/16 has no free address: the {d} from number {d} on are all " ++
         "held by services, or by deleted ones whose replicas remain or that were deleted " ++
         "within 24 hours", .{ constants.mesh_address_probes_max, wrapped(next) });
     ctx.diag.fix(.{ .sentence = "delete services that are no longer used, or wait a day" });
