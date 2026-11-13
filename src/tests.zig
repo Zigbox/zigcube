@@ -86,6 +86,7 @@ comptime {
     _ = @import("relay_fuzz.zig");
     _ = @import("relay.zig");
     _ = @import("tls_fuzz.zig"); // The same.
+    _ = @import("tls_server_fuzz.zig"); // The same.
     _ = @import("tls_conn.zig"); // Sockets and the real clock: native only.
     _ = @import("tls_conn_test.zig");
     _ = @import("fuzz_seeds.zig");

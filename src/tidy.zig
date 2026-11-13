@@ -621,8 +621,11 @@ fn import_allowed(importing_path: []const u8, target: []const u8) bool {
             std.mem.eql(u8, importing_path, "src/zcube_agent.zig");
     }
     // The scripted TLS server is a test fixture (docs/briefs/mtls-client.md): only test roots
-    // may import it, so no shipped binary can link it.
+    // may import it, so no shipped binary can link it. The scripted client likewise.
     if (std.mem.endsWith(u8, target, "tls_testpeer.zig")) return testpeer_importer(importing_path);
+    if (std.mem.endsWith(u8, target, "tls_testclient.zig")) {
+        return testclient_importer(importing_path);
+    }
     for (module_allowlist) |name| {
         if (std.mem.eql(u8, name, target)) return true;
     }
@@ -649,6 +652,12 @@ fn testpeer_importer(path: []const u8) bool {
     if (std.mem.endsWith(u8, path, "_test.zig")) return true;
     if (std.mem.eql(u8, path, "src/cli_golden.zig")) return true; // A test root.
     return std.mem.eql(u8, path, "src/tls_fuzz.zig");
+}
+
+/// The files that may import `tls_testclient.zig`: test files and the server's fuzzer.
+fn testclient_importer(path: []const u8) bool {
+    if (std.mem.endsWith(u8, path, "_test.zig")) return true;
+    return std.mem.eql(u8, path, "src/tls_server_fuzz.zig");
 }
 
 pub fn check_source(report: *Report, path: []const u8, source: []const u8) void {
@@ -927,7 +936,7 @@ test "imports: std and in-repo files pass; escapes, absolute paths and packages 
     try testing.expectEqual(@as(u32, 4), report.total());
 }
 
-test "imports: the scripted TLS server is imported only from test roots" {
+test "imports: the scripted TLS server and client are imported only from test roots" {
     // Goal: no shipped module can link the test peer. Method: the same import from a test file,
     // the fuzzer and ordinary modules.
     const source = "const p = @import(\"tls_testpeer.zig\");\n";
@@ -941,6 +950,18 @@ test "imports: the scripted TLS server is imported only from test roots" {
     for (cases) |case| {
         var report: Report = .{};
         check_source(&report, case.path, source);
+        try testing.expectEqual(!case.allowed, report.contains(.import_not_allowed, 1));
+    }
+    const client_source = "const c = @import(\"tls_testclient.zig\");\n";
+    const client_cases = [_]struct { path: []const u8, allowed: bool }{
+        .{ .path = "src/tls_server_test.zig", .allowed = true },
+        .{ .path = "src/tls_server_fuzz.zig", .allowed = true },
+        .{ .path = "src/tls_server.zig", .allowed = false },
+        .{ .path = "src/zcube_server.zig", .allowed = false },
+    };
+    for (client_cases) |case| {
+        var report: Report = .{};
+        check_source(&report, case.path, client_source);
         try testing.expectEqual(!case.allowed, report.contains(.import_not_allowed, 1));
     }
 }

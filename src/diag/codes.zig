@@ -1815,6 +1815,11 @@ pub const registry = [_]Entry{
         \\a refused certificate is expired, issued by another CA, or for a
         \\different workload than the server allows. A signer that fails is a
         \\different error (ZC-E0820).
+        \\
+        \\On a zcube server, this is a client that came without a certificate: it
+        \\sent an empty Certificate, and the server answered certificate_required.
+        \\The server takes no connection without one. Give the client a
+        \\certificate from this cluster's CA.
         ,
     },
     .{
@@ -1924,6 +1929,9 @@ pub const registry = [_]Entry{
         \\process or in another. This is that signer failing, not the server or the
         \\certificate. Check that the process or device holding the key is running
         \\and reachable, then reconnect.
+        \\
+        \\On a zcube server, this is the server's own signer: it could not sign its
+        \\CertificateVerify, so it sent internal_error and no client was let in.
         ,
     },
     .{

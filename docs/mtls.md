@@ -175,6 +175,81 @@ and goes to `failed`, a sink of its own (ZC-E0813 to E0820 as the table below). 
 only through `close_notify`. In `connected`, `KeyUpdate` re-keys one direction, and a key limit is
 ZC-E0815.
 
+## The TLS 1.3 server (`tls_server.zig`)
+
+B7 slice 1 (`docs/briefs/b7.md`; the scope is `docs/decisions/2026-11-13-in-house-tls-server.md`).
+It is a pure state machine like the client, and its interface has the same shape: `wants`,
+`receive`, `output` and `drain`, `end_of_input`, `seal_application`, `send_key_update` and
+`close_notify`. It shares the client's key schedule, record layer and wire code (`tls_wire.zig`
+holds the parsers and writers for both sides). The shell passes in the server's random value,
+its x25519 secret, the time, and the `Identity`: the server's chain and a `Signer`. It has no
+socket shell yet; that comes in slice 3.
+
+What it speaks is what the client speaks: TLS 1.3, `TLS_AES_128_GCM_SHA256`, x25519 and ed25519.
+It has no HelloRetryRequest, no PSK, no tickets and no early data.
+
+**A client certificate is always required.** Every flight carries a CertificateRequest (empty
+context, `signature_algorithms` = ed25519). The chain the client sends (at most two certificates)
+is verified against the CA for `Config.client_kind` (`workload` until slice 2 adds `node` and
+`client`). A CA-signed certificate of another kind is ZC-E0819. An empty Certificate is ZC-E0814
+with the `certificate_required` alert. `peer()` returns the verified kind and name.
+
+**Its rules.** These are the client's, mirrored:
+
+- The ClientHello (reassembled across records, up to the message limit) has no bytes behind it
+  in its record, a non-low-order x25519 share, null compression, and no extension twice. A `pre_shared_key` must come last, and is refused, as is
+  `early_data`.
+- One compatibility `change_cipher_spec` (body `01`) is dropped between the server's flight and
+  the client's Finished, and only between whole messages. The server sends its own after the
+  ServerHello only when the client sent a session id.
+- Keys never change in the middle of a record: bytes behind the client's Finished or a KeyUpdate
+  are refused.
+- Application data before the client's Finished is refused, not passed on.
+- A KeyUpdate in either direction re-keys, and one that asks is answered. `seal_application`
+  puts the KeyUpdate in front of a record when the write keys reach their limit.
+- A failure queues one alert (sealed once the server's own write keys are live, after the
+  ServerHello), wipes every secret, and ends the connection.
+
+The handshake deadline and the record limits are the client's constants (table below). The shell
+enforces the deadline.
+
+```
+wait_client_hello --ClientHello / server flight--> wait_certificate
+     --Certificate--> wait_certificate_verify --CertificateVerify--> wait_finished
+     --client Finished--> connected
+connected --close_notify (either way)--> closed
+any state --refuse / fail_silently--> failed
+```
+
+**Diagnostics.** A refusal raises one of the client's codes, ZC-E0810 to ZC-E0820 (ZC-E0809 for
+a malformed certificate), with a cause and a fix written for the server's operator. The cause
+names the client's offence. ZC-E0820 is the server's own signer failing. No code was added.
+
+**Tests.**
+
+- `tls_server_test.zig`:
+  - the real `tls_client.Client`, with required client auth, against the server in the same
+    process, in pieces of every size, with data and KeyUpdates both ways;
+  - near-miss tables, a scripted client (`tls_testclient.zig`) one knob away from correct, for
+    the ClientHello and for the client's flight, each with its code and alert;
+  - ten teeth tests, one per security check: the chain (another CA, and a damaged
+    certificate), the kind, the required certificate, CertificateVerify, its context string,
+    Finished, the key-change boundary, early data, and a transcript that leaves out the client's
+    certificate.
+- `tls_server_fuzz.zig`:
+  - The scripted client is correct, or wrong in one of twenty-one knobs.
+  - In an eighth of the runs its hello is damaged, and in half of them its flight, in one of
+    eleven ways. The result is fed in random pieces.
+  - The server must connect exactly when the hello reached it whole, every knob was correct, and
+    the records it read were the client's in order (at most one good `change_cipher_spec` among
+    them). The check runs at every step.
+  - Every refusal must carry a code and a cause, write at most one alert, and leave the server
+    reading nothing.
+  - A connection then runs a script of data and KeyUpdates both ways.
+  - Its teeth (`tls_server_fuzz_teeth.zig`, in `mtls-teeth` only) switch off the CertificateVerify,
+    Finished and chain checks in turn. Each must produce a false connect.
+- Tidy allows only test files and the server's fuzzer to import `tls_testclient.zig`.
+
 ## The constants
 
 All are in `src/constants.zig` with their reasons; changing one is a change to that file.
@@ -198,7 +273,9 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   name and a time past the window are each refused, and the client writes a ClientHello.
   `wasm-test` runs every core module's unit tests, the TLS ones included.
 - `zig build mtls-teeth` (in `check`) runs the tests named `teeth:`: each switches one check off
-  (chain signature, name, window, CertificateVerify, Finished, transcript, client-auth rules) and
+  (chain signature, name, window, CertificateVerify, Finished, transcript, client-auth rules; on
+  the server, the client chain and kind, the required certificate, CertificateVerify and its
+  context, Finished, the key-change boundary, early data, and the fuzzer's three) and
   passes only if the matching test then fails. Each of these tests also runs its negative half
   (the check on, the scenario refused), because this step does not run the plain tests.
 - `zig build mtls-interop` (not in `check`; CI job of its own) runs the client against

@@ -10,7 +10,7 @@ const assert = std.debug.assert;
 
 /// The exact number of `teeth:` tests. Fewer means the filter or the test roots broke, more means
 /// this constant is stale; change it in the same commit that adds or removes a tooth.
-const teeth_tests = 23;
+const teeth_tests = 26;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var count: usize = 0;
