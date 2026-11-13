@@ -187,11 +187,6 @@ pub const Agent = struct {
     /// names it as the one it replaces, so that a late registration of an earlier attempt is
     /// refused (#237). 0 before the first registration of this process or its kept state.
     last_tenure: u64,
-    /// A lease granted for a registration that has not been acknowledged (its request failed or
-    /// its reply was lost): the retry registers on the same lease, which the server accepts
-    /// again, rather than on a new one the first attempt would have made it refuse (#237).
-    /// `lease_none` with none. Memory only: a restart grants a new one.
-    pending: struct { lease: store.LeaseId = store.lease_none, ttl_ms: u32 = 0, sent_ms: u64 = 0 },
     /// The revision of the node's registration: the agent's tenure. 0 with no lease.
     tenure: store.Revision,
     /// `s`: when the last acknowledged keepalive (or the grant) was sent, monotonic.
@@ -304,7 +299,6 @@ pub const Agent = struct {
         agent.lease_ttl_ms = 0;
         agent.tenure = 0;
         agent.last_tenure = 0;
-        agent.pending = .{};
         agent.sent_ms = 0;
         agent.renew_at_ms = 0;
         agent.fence = .{};
@@ -753,11 +747,7 @@ pub const Agent = struct {
                 return .fenced;
             }
         }
-        if (agent.pending.lease == store.lease_none) {
-            const granted = try ctx.store.lease_grant(constants.lease_ttl_ms, ctx.diag);
-            agent.pending = .{ .lease = granted.id, .ttl_ms = granted.ttl_ms, .sent_ms = sent };
-        }
-        const lease = agent.pending;
+        const lease = try ctx.store.lease_grant(constants.lease_ttl_ms, ctx.diag);
         const node: records.Node = .{
             .name = agent.config.node,
             .agent_version = agent.config.agent_version,
@@ -767,22 +757,16 @@ pub const Agent = struct {
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);
-        const put: store.Put = .{ .key = key.slice(), .value = value, .lease = lease.lease };
+        const put: store.Put = .{ .key = key.slice(), .value = value, .lease = lease.id };
         const request: store.TxnRequest = .{ .on_success = &.{.{ .put = put }} };
         const role: writers.Role = .{ .agent = agent.config.node };
-        const done = writers.txn(ctx.store, role, request, ctx.diag) catch |err| {
-            // Only a request that got no answer may have landed, and its retry names the same
-            // lease; any answer, a refusal included, ends the attempt with its lease.
-            if (err != error.Unreachable) agent.pending = .{};
-            return err;
-        };
+        const done = try writers.txn(ctx.store, role, request, ctx.diag);
         assert(done.succeeded);
         assert(done.revision > 0);
-        agent.pending = .{};
-        agent.lease = lease.lease;
+        agent.lease = lease.id;
         agent.tenure = done.revision;
         agent.last_tenure = done.revision;
-        try agent.acknowledged(ctx, lease.sent_ms, lease.ttl_ms);
+        try agent.acknowledged(ctx, sent, lease.ttl_ms);
         return .acted;
     }
 

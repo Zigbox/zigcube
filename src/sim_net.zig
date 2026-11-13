@@ -365,7 +365,7 @@ pub const SimNet = struct {
         };
         assert(net.lease_ttl_ms > late_registration_lead_ms);
         const due_ms = net.now_ms + net.lease_ttl_ms - late_registration_lead_ms;
-        _ = net.park_at(link, stale, due_ms, true);
+        _ = net.park_at(link, stale, .{ .at_ms = due_ms }, true);
     }
 
     /// The request reaches the server; its reply is in `scratch` until the next hand-over.
@@ -410,22 +410,26 @@ pub const SimNet = struct {
     /// are full or memory is.
     fn park(net: *SimNet, link: *Link, request: client.Request, faults: Faults) bool {
         assert(faults.reorder_delay_ms_min <= faults.reorder_delay_ms_max);
-        const random = net.prng.random();
-        const wait_ms = random.intRangeAtMost(
-            u32,
-            faults.reorder_delay_ms_min,
-            faults.reorder_delay_ms_max,
-        );
-        const due_ms = net.now_ms + request.hold_ms + wait_ms;
-        if (!net.park_at(link, request, due_ms, false)) return false;
-        return true;
+        return net.park_at(link, request, .{ .drawn = faults }, false);
     }
 
-    /// Keeps a copy to deliver at `due_ms`. False if all the slots are full or memory is.
-    fn park_at(net: *SimNet, link: *Link, request: client.Request, due_ms: u64, stale: bool) bool {
+    /// When a parked copy is delivered: at a time given, or after a delay drawn from the seed
+    /// once a slot and the copy are found (the draw order of every world before #237).
+    const ParkDue = union(enum) { at_ms: u64, drawn: Faults };
+
+    /// Keeps a copy to deliver at `due`. False if all the slots are full or memory is.
+    fn park_at(net: *SimNet, link: *Link, request: client.Request, due: ParkDue, stale: bool) bool {
         for (&link.parked) |*slot| {
             if (slot.* != null) continue;
             const copy = net.copy_request(request) catch return false;
+            const due_ms = switch (due) {
+                .at_ms => |at| at,
+                .drawn => |faults| net.now_ms + request.hold_ms + net.prng.random().intRangeAtMost(
+                    u32,
+                    faults.reorder_delay_ms_min,
+                    faults.reorder_delay_ms_max,
+                ),
+            };
             slot.* = .{
                 .method = copy.method,
                 .target = copy.target,

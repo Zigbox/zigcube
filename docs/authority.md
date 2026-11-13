@@ -222,10 +222,13 @@ This is real fencing, because the store is the shared resource and it checks the
 it carries the tenure it replaces (`replaces`: the `mod_revision` its agent last held, 0 for
 none) and the server writes `/nodes/<node>` in one transaction that compares the key at that
 revision (or absent). A registration that was delayed on the wire and arrives after a newer one
-finds another revision and is refused (ZC-E0510); without the compare it would move the key onto
+finds another revision, on a newer lease, and is refused (ZC-E0510); without the compare it would move the key onto
 its own lease, which nobody renews, and the node would be lost while its agent still ran its
-replicas (I1b). A key already on the registration's own lease is the same registration sent
-again, and is accepted. The lease keepalive requires that the node's key is on the lease it
+replicas (I1b). A key on the registration's own or an older lease was written by the agent's own
+earlier attempt (a lost reply, a crash before it recorded the tenure), and the retry is accepted:
+the compare refuses only a registration older than the key's lease. **Lease ids only grow** (a
+store requirement: SQLite `AUTOINCREMENT`, a Postgres identity column, the memory counter) and a
+registration's lease is granted before it is sent. The lease keepalive requires that the node's key is on the lease it
 renews, so an agent whose registration was overtaken stops renewing at once and fences (ZC-E0205).
 An older agent sends no `replaces` and is not compared; only the keepalive rule limits it.
 `docs/decisions/2026-11-13-register-tenure.md`.

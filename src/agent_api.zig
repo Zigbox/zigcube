@@ -280,11 +280,13 @@ const Call = struct {
     }
 
     /// The revision `/nodes/<node>` has now, which a registration that names the tenure it
-    /// replaces must still find: 0 if the key is absent. Refuses (ZC-E0510) a key at another
-    /// revision. 0 for an agent that names nothing: it is not compared. A key that is already on
-    /// the registration's own lease is the agent's earlier attempt, whose reply was lost: the
-    /// retry is accepted and replaces it (no other agent holds that lease, so nothing is
-    /// overtaken), where the tenure it names has moved only by that attempt.
+    /// replaces must still find: 0 if the key is absent. 0 for an agent that names nothing: it
+    /// is not compared. A key at another revision is refused (ZC-E0510) only when it is on a
+    /// NEWER lease than the registration's: that registration is an earlier attempt, delayed on
+    /// the wire, and accepting it would move the key onto a lease nobody renews (#237). A key on
+    /// the same or an older lease was written by this agent's own earlier attempt (a lost
+    /// reply, a crash before it recorded the tenure, a server restart), so its retry, which
+    /// always carries a newer lease (ids only grow: docs/authority.md), is accepted.
     fn registration_held(call: Call, replaces: ?u64, lease_id: store.LeaseId) Failure!u64 {
         const named = replaces orelse return 0;
         const ctx = call.ctx;
@@ -294,7 +296,7 @@ const Call = struct {
         };
         const kv = found.kv orelse return 0;
         if (kv.mod_revision == named) return kv.mod_revision;
-        if (kv.lease == lease_id) return kv.mod_revision;
+        if (kv.lease <= lease_id) return kv.mod_revision;
         // Test-only (#237): the compare is left out, as the server did before the rule.
         if (c1_teeth.register_unchecked) return kv.mod_revision;
         return tenure_moved(ctx, call.node, named);

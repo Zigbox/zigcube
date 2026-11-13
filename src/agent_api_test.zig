@@ -240,11 +240,11 @@ test "a registration overtaken by a newer one is ZC-E0510 and moves nothing (#23
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", plain);
 }
 
-test "a registration retried on the same lease after a lost reply is accepted (#237)" {
-    // Goal: an agent whose registration landed but whose reply was lost retries with the same
-    // lease and the tenure it named, and must not be refused for a tenure its own attempt moved.
-    // Method: register on L1 replacing T0, register again with the same body; the key stays on
-    // L1. A registration on another lease naming T0 is still refused.
+test "a registration retried after a lost reply is accepted, a delayed older one is not (#237)" {
+    // Goal: an agent whose registration landed but whose reply was lost retries on a newer lease
+    // naming the tenure it knew, and must not be refused for a tenure its own attempt moved.
+    // Method: register on L2 replacing T0, register again on L3 with T0 (accepted, same lease
+    // and same body too); a registration on L1, older than the key's lease, is refused.
     var rig = try Rig.start(6);
     defer rig.stop();
     var buffer: [512]u8 = undefined;
@@ -255,8 +255,11 @@ test "a registration retried on the same lease after a lost reply is accepted (#
     const body = try register_replacing(&buffer, second, tenure);
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
     _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", body);
+    const third = try rig.grant("node2");
+    const retry = try register_replacing(&buffer, third, tenure);
+    _ = try rig.ok("PUT", "/v1/agent/nodes/node2", "", retry);
     const listed = try rig.ok("GET", "/v1/list", "prefix=/nodes/node2", "");
-    try testing.expectEqual(second, field(field(listed, "kvs").array.items[0], "lease").integer);
+    try testing.expectEqual(third, field(field(listed, "kvs").array.items[0], "lease").integer);
     const stale = try register_replacing(&buffer, first, tenure);
     try rig.refused(rig.call("PUT", "/v1/agent/nodes/node2", "", stale), 503, "ZC-E0510");
 }
@@ -424,7 +427,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
     // Goal: an agent cannot write another node's keys, nor a key that is not its record's, nor a
     // transaction the store would assert on. Method: one bad report per rule; the revision
     // must not move.
-    var rig = try Rig.start(7);
+    var rig = try Rig.start(6);
     defer rig.stop();
     try rig.join("node2");
     const before = try rig.revision();
@@ -479,7 +482,7 @@ test "a report that is not this node's own, or not one transaction, is refused" 
 test "a report whose record does not name the request's tenure is refused" {
     // Goal: a record with no tenure would read as C0 and bypass the controller's admissibility
     // gate (authority.md section 3). Method: a record without one, and one with another tenure.
-    var rig = try Rig.start(7);
+    var rig = try Rig.start(6);
     defer rig.stop();
     try rig.join("node2");
     const before = try rig.revision();
