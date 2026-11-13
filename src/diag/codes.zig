@@ -49,6 +49,11 @@ pub const Code = enum(u8) {
     E0122,
     E0123,
     E0124,
+    E0125,
+    E0126,
+    E0127,
+    E0128,
+    E0129,
     E0130,
     E0131,
     E0132,
@@ -73,6 +78,11 @@ pub const Code = enum(u8) {
     E0301,
     E0302,
     E0303,
+    E0304,
+    E0305,
+    E0306,
+    W0304,
+    W0305,
     E0307,
     W0307,
     W0308,
@@ -95,10 +105,12 @@ pub const Code = enum(u8) {
     E0513,
     E0514,
     E0515,
+    E0516,
     E0521,
     E0522,
     E0523,
     W0501,
+    W0502,
     W0503,
     W0504,
     E0601,
@@ -511,6 +523,85 @@ pub const registry = [_]Entry{
         \\
         \\Wait for the other command to finish and run this one again. The lock is
         \\released when its holder ends, however it ends, so it is never stale.
+        ,
+    },
+    .{
+        .code = .E0125,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a service's health check is not valid",
+        .explanation =
+        \\The service file's `health` block describes a check that cannot run as
+        \\written. A health check is a command run inside each replica's container:
+        \\it needs 1 to 64 words with a non-empty first word, an `interval_ms` above
+        \\zero, a `timeout_ms` above zero and no longer than the interval, and
+        \\`failure_threshold` and `success_threshold` of at least 1. The cause line
+        \\names the field.
+        \\
+        \\Nothing was applied. Correct the service file and apply it again. C3
+        \\checks are commands only; a TCP or HTTP check waits for a network path
+        \\into the container.
+        ,
+    },
+    .{
+        .code = .E0126,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a service's rollout policy is not valid",
+        .explanation =
+        \\The service file's `rollout` block cannot be followed. A rolling update
+        \\must be able to move: `max_surge` and `max_unavailable` may not both be 0,
+        \\and neither may exceed the 128 replicas a service may have. The times must
+        \\nest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no
+        \\longer than `progress_deadline_ms`. The cause line names the field.
+        \\
+        \\Nothing was applied. Correct the service file and apply it again; a
+        \\service with no `rollout` block uses the default policy, which is valid.
+        ,
+    },
+    .{
+        .code = .E0127,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "there is nothing to roll back to",
+        .explanation =
+        \\A rollback asks for a generation of the service other than the one it
+        \\runs now, and the service's history holds none: it was created by one
+        \\apply and never changed what its replicas run, or its history was deleted
+        \\with an earlier service of the same name.
+        \\
+        \\Nothing was changed. To run something else, apply the service file you
+        \\want; `zcube history <service>` lists the generations there are.
+        ,
+    },
+    .{
+        .code = .E0128,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the generation to roll back to is no longer in the history",
+        .explanation =
+        \\A service keeps the 16 newest generations it was applied with; an apply
+        \\that adds a 17th deletes the oldest. The generation the rollback named is
+        \\older than that, or was never one of this service's (a service deleted
+        \\and applied again starts at generation 1 with no history).
+        \\
+        \\Nothing was changed. `zcube history <service>` lists the generations that
+        \\can be restored. To run an older one, apply its service file again.
+        ,
+    },
+    .{
+        .code = .E0129,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the service has no rollout to pause or resume",
+        .explanation =
+        \\Pause and resume act on a rollout in progress: pause stops it starting or
+        \\retiring replicas, resume lets it go on. This service has no rollout, or
+        \\its rollout has already ended (complete or failed), or it is already in
+        \\the state asked for.
+        \\
+        \\Nothing was changed. `zcube rollout status <service>` shows what is
+        \\running.
         ,
     },
     .{
@@ -930,6 +1021,87 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0304,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a rollout failed: a new replica did not become ready",
+        .explanation =
+        \\A rollout starts replicas of the new generation a few at a time and
+        \\retires old ones only once new ones are ready. A new replica did not
+        \\become ready within `ready_timeout_ms`: it exited, was held, or its
+        \\health check kept failing. The new version is at fault, not the cluster.
+        \\
+        \\The cause line names the replica and what it did. With `on_failure`
+        \\rollback (the default) the service is rolled back to the generation it
+        \\ran before; with `pause` the rollout stops where it is. Fix the release,
+        \\then apply it again; `zcube why replica <id>` shows its last failure.
+        ,
+    },
+    .{
+        .code = .E0305,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a rollout stalled: a new replica cannot be placed",
+        .explanation =
+        \\A rolling update starts each new replica before it retires an old one
+        \\(`max_surge`), so for a while the service needs room for more replicas
+        \\than it has. No ready node had room for the next new replica, so the
+        \\rollout cannot go on without breaking `max_unavailable`.
+        \\
+        \\The cause line names the replica and what it needs. Add a node or free
+        \\capacity, or allow the rollout to retire first (`max_unavailable` above
+        \\0); the rollout continues by itself once a replica can be placed.
+        ,
+    },
+    .{
+        .code = .E0306,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "a rollout passed its progress deadline",
+        .explanation =
+        \\A rollout must finish within `progress_deadline_ms` of its start. This
+        \\one did not: new replicas became ready too slowly, or not at all, though
+        \\none failed outright.
+        \\
+        \\With `on_failure` rollback (the default) the service is rolled back to
+        \\the generation it ran before; with `pause` the rollout stops where it is.
+        \\If the new version is right but slow to start, raise the deadline in the
+        \\service file and apply it again.
+        ,
+    },
+    .{
+        .code = .W0304,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a rollout paused itself after a failure",
+        .explanation =
+        \\The service's rollout policy says `on_failure: pause`, and the rollout
+        \\failed (ZC-E0304 or ZC-E0306). It stopped where it was: replicas of both
+        \\generations keep running, and nothing is started or retired until you
+        \\act.
+        \\
+        \\`zcube rollout status <service>` shows both generations. Resume with
+        \\`zcube rollout resume <service>`, roll back with `zcube rollback
+        \\<service>`, or apply a fixed release.
+        ,
+    },
+    .{
+        .code = .W0305,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a rollout was rolled back automatically",
+        .explanation =
+        \\The rollout of a new generation failed (ZC-E0304 or ZC-E0306) and the
+        \\service's rollout policy is `on_failure: rollback`, the default. The
+        \\service was applied again with the spec of the generation it ran before,
+        \\as a new generation, and that rollout replaces the failed replicas.
+        \\
+        \\The summary names the failing replica and the generation restored. Fix
+        \\the release and apply it again; a newer apply always wins over an
+        \\automatic rollback.
+        ,
+    },
+    .{
         .code = .E0307,
         .severity = .@"error",
         .blame = .external,
@@ -1275,6 +1447,23 @@ pub const registry = [_]Entry{
         ,
     },
     .{
+        .code = .E0516,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "a replica's health check could not run",
+        .explanation =
+        \\The agent runs a replica's health check as a command inside its
+        \\container. The command could not be started there at all: the runtime
+        \\refused it, and its code is the cause. This says nothing about whether
+        \\the replica is healthy, so it counts as neither a pass nor a failure.
+        \\
+        \\Read the runtime's code in the cause line: a container that has just
+        \\stopped, or a runtime that does not support running a command in a
+        \\container, are the usual reasons. If the cause is a broken contract of
+        \\the runtime itself, report it with the diagnostic bundle.
+        ,
+    },
+    .{
         .code = .E0521,
         .severity = .@"error",
         .blame = .environment,
@@ -1342,6 +1531,21 @@ pub const registry = [_]Entry{
         \\
         \\This happens when the agent was paused or cut off from the server for
         \\longer than the lease time to live less the fencing margin.
+        ,
+    },
+    .{
+        .code = .W0502,
+        .severity = .warning,
+        .blame = .user,
+        .summary = "a replica's health check timed out",
+        .explanation =
+        \\The health check command ran in the replica's container for longer than
+        \\the service's `timeout_ms` and was stopped. It counts as a failed check:
+        \\`failure_threshold` failures in a row make the replica unhealthy.
+        \\
+        \\The cause line names the replica and the timeout. Make the check
+        \\command faster, or raise `timeout_ms` (at most `interval_ms`) in the
+        \\service file and apply it again.
         ,
     },
     .{

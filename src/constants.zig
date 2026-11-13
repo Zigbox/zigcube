@@ -121,6 +121,12 @@ pub const replicas_max: u32 = runtime_handles_max;
 pub const nodes_max: u32 = 64;
 /// Records one reconcile pass reads: a service holds at most this many replicas.
 pub const replicas_per_service_max: u32 = 128;
+/// Generations of a service `/history` keeps (owner, docs/decisions/2026-11-05-c3-owner-answers.md):
+/// an apply that adds one past it deletes the oldest. Rolling back to a deleted one is ZC-E0128.
+pub const history_generations_max: u32 = 16;
+/// History keys one read of a service's history takes at most. Every writer keeps
+/// `history_generations_max`; the slack covers keys a crash between transactions could leave.
+pub const history_scan_max: u32 = 64;
 /// Writes one controller step makes at most (each is a transaction of at most
 /// `store_txn_ops_max` operations): the step stops, says so, and runs again for the rest.
 pub const controller_txns_per_step_max: u32 = 64;
@@ -811,6 +817,10 @@ comptime {
     assert(store_watch_hole_retries_max > 0);
     assert(store_postgres_schema_bytes_max + "zcube_".len < 63); // A NOTIFY channel is a name.
     assert(replicas_per_service_max <= replicas_max);
+    // An apply's transaction: service, history, a decision and the oldest generations it drops.
+    assert(history_generations_max >= 1);
+    assert(history_scan_max <= store_list_limit_max);
+    assert(history_scan_max >= history_generations_max);
     assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
     assert(retention_batch_pairs * 2 <= store_txn_ops_max);
     assert(why_steps_max <= retention_pinned_max);

@@ -1,0 +1,7 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0127]: there is nothing to roll back to
+  cause  service hello has run only generation 1
+  reqid  r-0000001
+  fix    apply the service file you want to run
+  more   zcube explain E0127
+  docs   https://zigbox.github.io/zigcube/errors/E0127.html
