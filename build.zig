@@ -1933,6 +1933,12 @@ fn add_sim_fleet_step(b: *std.Build, sim: SimStepOptions) void {
     canary.addFileInput(b.path("ops/sim-fleet/run.sh"));
     canary.expectExitCode(0);
     test_step.dependOn(&canary.step);
+    const store_faults = b.addSystemCommand(&.{"sh"});
+    store_faults.addFileArg(b.path("ops/sim-fleet/test-store-faults.sh"));
+    store_faults.addArtifactArg(exe);
+    store_faults.addFileInput(b.path("ops/sim-fleet/run.sh"));
+    store_faults.expectExitCode(0);
+    test_step.dependOn(&store_faults.step);
     // demo-b3's guest script reads the relay logs of the Zigbox runtime's layout and fails on none.
     const guest = b.addSystemCommand(&.{"sh"});
     guest.addFileArg(b.path("ops/demo-b3/test-guest.sh"));

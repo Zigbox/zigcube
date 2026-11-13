@@ -21,7 +21,13 @@ pub const kind_sim_swarm = "sim-swarm";
 /// runner's run over fresh seeds, read with its simulator kind's parser and judged by
 /// `canary_verdict`: a miss or a wrong symptom is a failure of this kind.
 pub const kind_sim_canary = "sim-canary";
-pub const kinds = [_][]const u8{ kind_sim_cluster, kind_sim_c1, kind_sim_swarm, kind_sim_canary };
+/// Not a simulator either: `zig build test-store-faults`, once a day (`run.sh`,
+/// `store_faults_day`).
+/// A "seed" is one run of the runner (a backend, or a failover mode); see `parse_store_faults`.
+pub const kind_store_faults = "store-faults";
+pub const kinds = [_][]const u8{
+    kind_sim_cluster, kind_sim_c1, kind_sim_swarm, kind_sim_canary, kind_store_faults,
+};
 
 comptime {
     // The state file refuses more kinds per day than this (sim_fleet_state.zig).
@@ -197,6 +203,7 @@ fn normalize_crash(arena: std.mem.Allocator, message: []const u8) error{OutOfMem
 /// and counting its seeds would be a guess, so the whole round is refused.
 pub fn parse(arena: std.mem.Allocator, kind: []const u8, text: []const u8) ParseError!Batch {
     assert(kind_known(kind));
+    if (std.mem.eql(u8, kind, kind_store_faults)) return parse_store_faults(arena, text);
     var failures: std.ArrayList(Failure) = .empty;
     var seeds: u64 = 0;
     var operations: ?u32 = null;
@@ -241,6 +248,167 @@ pub fn parse(arena: std.mem.Allocator, kind: []const u8, text: []const u8) Parse
     }
     if (failures.items.len > seeds) return error.BadLine;
     return .{ .seeds = seeds, .operations = operations, .failures = failures.items };
+}
+
+/// One run of `store_faults` being read: its header's seed and backend, the step it is filed
+/// under (`sqlite`, `postgres`, `failover-sync`, `failover-async`) and the first thing it said
+/// was wrong.
+const StoreRun = struct { seed: u64, backend: []const u8, step: []const u8, check: []const u8 };
+
+/// `backend=B seed=N (replay: ...)`, the first line of every run.
+fn parse_store_header(line: []const u8) ?struct { backend: []const u8, seed: u64 } {
+    const rest = after_prefix(line, "backend=") orelse return null;
+    const space = std.mem.indexOf(u8, rest, " seed=") orelse return null;
+    const tail = rest[space + " seed=".len ..];
+    const end = std.mem.indexOfScalar(u8, tail, ' ') orelse tail.len;
+    const seed = std.fmt.parseInt(u64, tail[0..end], 10) catch return null;
+    if (space == 0) return null;
+    return .{ .backend = rest[0..space], .seed = seed };
+}
+
+/// The name of the checker's verdict in `.{ .failed = .{ .kind = .lost_write, ... } }`.
+fn store_verdict_kind(text: []const u8) ?[]const u8 {
+    const marker = ".kind = .";
+    const at = std.mem.indexOf(u8, text, marker) orelse return null;
+    const from = at + marker.len;
+    var end = from;
+    while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) end += 1;
+    if (end == from) return null;
+    return text[from..end];
+}
+
+/// What a diagnostic line of a run says is wrong, or null if the line is not one: the checker's
+/// verdict by stage (`history: lost_write`), a runner's `FAILED: ...`, a failover's
+/// `failover sync: FAILED: ...`, with digits elided so one failure is one fingerprint.
+fn store_check(arena: std.mem.Allocator, line: []const u8) error{OutOfMemory}!?[]const u8 {
+    for ([_][]const u8{ "history: ", "compaction: " }) |stage| {
+        if (!std.mem.startsWith(u8, line, stage)) continue;
+        const name = store_verdict_kind(line) orelse return try normalize_crash(arena, line);
+        return try std.fmt.allocPrint(arena, "{s}{s}", .{ stage, name });
+    }
+    if (after_prefix(line, "FAILED: ")) |text| return try normalize_crash(arena, text);
+    if (after_prefix(line, "failover ")) |rest| {
+        const at = std.mem.indexOf(u8, rest, ": FAILED: ") orelse return null;
+        return try normalize_crash(arena, rest[at + ": FAILED: ".len ..]);
+    }
+    return null;
+}
+
+fn store_replay(arena: std.mem.Allocator, run: StoreRun) error{OutOfMemory}![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "zig build test-store-faults -Dbackend={s} -Dseed={d}",
+        .{ run.backend, run.seed },
+    );
+}
+
+/// Reads the output of `zig build test-store-faults` for one backend, or several concatenated
+/// (the Postgres run and its two failover runs, then the SQLite run). Each run prints
+/// `store-faults: backend=B seed=N ...` first and ends in `PASS`, `FAIL seed=N`, `ERROR name
+/// seed=N`, or for a failover `failover M: PASS`/`FAILED`. A run is one "seed" of the round,
+/// filed under the step `sqlite`, `postgres`, `failover-sync` or `failover-async`, with the
+/// verdict it earned as the check. A run that died (run.sh records it as `seed N: CRASHED:`
+/// with `step:` and `replay:` lines, as for a simulator, and `setup` when no run started) ends
+/// the run it follows; a run with no end is a round cut short, and is refused.
+fn parse_store_faults(arena: std.mem.Allocator, text: []const u8) ParseError!Batch {
+    var failures: std.ArrayList(Failure) = .empty;
+    var runs: u64 = 0;
+    var open: ?StoreRun = null;
+    var crashed = false; // The last failure is a crash record whose details may follow.
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \r");
+        line = after_prefix(line, "store-faults: ") orelse line;
+        if (parse_store_header(line)) |header| {
+            if (open != null) return error.BadLine;
+            runs += 1;
+            open = .{
+                .seed = header.seed,
+                .backend = header.backend,
+                .step = header.backend,
+                .check = "",
+            };
+            crashed = false;
+        } else if (parse_seed_line(line)) |found| {
+            if (failures.items.len == constants.fleet_round_failures_max) {
+                return error.TooManyFailures;
+            }
+            if (open == null) runs += 1;
+            const run: StoreRun = open orelse
+                .{ .seed = found.seed, .backend = "", .step = "", .check = "" };
+            try failures.append(arena, .{
+                .seed = found.seed,
+                .check = try normalize_crash(arena, found.check),
+                .crash = found.crash,
+                .step = run.step,
+                .replay = if (open != null) try store_replay(arena, run) else "",
+            });
+            open = null;
+            crashed = true; // Its detail lines follow, crash or not.
+        } else if (crashed) {
+            const last = &failures.items[failures.items.len - 1];
+            try parse_crash_detail(last, std.mem.trim(u8, line, " "));
+        } else if (open) |*run| {
+            if (try store_run_line(arena, &failures, run, line)) open = null;
+        } else if (std.mem.eql(u8, line, "PASS") or std.mem.startsWith(u8, line, "FAIL seed=")) {
+            return error.BadLine; // A verdict with no run before it.
+        }
+    }
+    if (open != null) return error.NoSummary;
+    if (runs == 0) return error.NoSummary;
+    for (failures.items) |failure| {
+        if (failure.step.len == 0 or failure.replay.len == 0) return error.BadLine;
+    }
+    return .{ .seeds = runs, .operations = null, .failures = failures.items };
+}
+
+/// A crash record's `step:` and `replay:` lines replace what the run's header gave.
+fn parse_crash_detail(failure: *Failure, line: []const u8) ParseError!void {
+    if (after_prefix(line, "step: ")) |step| {
+        if (step.len == 0) return error.BadLine;
+        failure.step = step;
+    } else if (after_prefix(line, "replay: ")) |replay| {
+        failure.replay = replay;
+    }
+}
+
+/// One line inside an open run. Returns true when the line ended it.
+fn store_run_line(
+    arena: std.mem.Allocator,
+    failures: *std.ArrayList(Failure),
+    run: *StoreRun,
+    line: []const u8,
+) ParseError!bool {
+    if (after_prefix(line, "failover run: ")) |mode| {
+        const word = mode[0 .. std.mem.indexOfScalar(u8, mode, ' ') orelse mode.len];
+        run.step = try std.fmt.allocPrint(arena, "failover-{s}", .{word});
+    } else if (try store_check(arena, line)) |check| {
+        if (run.check.len == 0) run.check = check;
+    } else if (std.mem.eql(u8, line, "PASS") or std.mem.startsWith(u8, line, "failover ") and
+        std.mem.indexOf(u8, line, ": PASS") != null)
+    {
+        return true;
+    } else if (std.mem.startsWith(u8, line, "FAIL seed=") or
+        std.mem.startsWith(u8, line, "ERROR "))
+    {
+        if (failures.items.len == constants.fleet_round_failures_max) return error.TooManyFailures;
+        if (run.check.len == 0) {
+            run.check = if (after_prefix(line, "ERROR ")) |rest|
+                try std.fmt.allocPrint(arena, "error: {s}", .{
+                    rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len],
+                })
+            else
+                "the run failed";
+        }
+        try failures.append(arena, .{
+            .seed = run.seed,
+            .check = run.check,
+            .step = run.step,
+            .replay = try store_replay(arena, run.*),
+        });
+        return true;
+    }
+    return false;
 }
 
 /// An indented line under a `seed N:` line: step, replay or the shrunk count.
@@ -395,6 +563,9 @@ pub fn replay_line(
     assert(commit.len > 0);
     const replay = failure.shrunk_replay orelse failure.replay;
     assert(replay.len > 0);
+    if (std.mem.eql(u8, kind, kind_store_faults)) {
+        return std.fmt.allocPrint(arena, "git checkout {s} && {s}", .{ commit, replay });
+    }
     return std.fmt.allocPrint(
         arena,
         "git checkout {s} && zig build -Doptimize=ReleaseSafe {s} && {s}",
@@ -452,7 +623,9 @@ fn write_failure(
     }
     if (failure.observed) |observed| try out.print("- failed instead with: {s}\n", .{observed});
     // A canary's whole run (`range_last`) has no operation count and nothing shrunk.
-    if (failure.range_last == null) try write_operations(out, failure);
+    if (failure.range_last == null and !std.mem.eql(u8, report.kind, kind_store_faults)) {
+        try write_operations(out, failure);
+    }
     try out.print("\nReplay:\n\n```\n{s}\n```\n", .{replay});
     if (report.more.len > 0) {
         try out.writeAll("\nAlso failing this way in the same round: seeds ");
@@ -956,4 +1129,116 @@ test "the replay line builds the kind's own runner and replays the shrunk run" {
             "zig-out/bin/sim_cluster 2 7 0 --c1 --heal-at=60",
         try replay_line(arena, kind_sim_c1, "abc123", c1.failures[1]),
     );
+}
+
+// Real output of `store_faults` (sqlite, `--mutate drop_ack` and `stale_history`), trimmed of its
+// count lines; the failover lines are as src/store_failover.zig prints them.
+const store_clean =
+    \\store-faults: backend=postgres seed=11 (replay: -Dseed=11)
+    \\store-faults: calls=1000 acked=990 failed=3 unknown=7 (applied=2 absent=5) log_events=9
+    \\store-faults: PASS
+    \\store-faults: backend=postgres seed=11 (replay: -Dseed=11)
+    \\store-faults: failover run: sync standby
+    \\store-faults: failover sync: held at revision 12; the server remembers 12
+    \\store-faults: failover sync: PASS: no acknowledged write lost
+    \\store-faults: backend=postgres seed=11 (replay: -Dseed=11)
+    \\store-faults: failover run: async standby
+    \\store-faults: failover async: PASS: the promoted store is at 40
+    \\store-faults: backend=sqlite seed=12 (replay: -Dseed=12)
+    \\store-faults: sqlite: no proxy applies; history checker only, no faults
+    \\store-faults: PASS
+    \\
+;
+const store_failing =
+    \\store-faults: backend=sqlite seed=587643522279407410 (replay: -Dseed=587643522279407410)
+    \\store-faults: sqlite: no proxy applies; history checker only, no faults
+    \\store-faults: history: .{ .failed = .{ .kind = .lost_write, .revision = 1099511627777,
+    \\ .key = 0, .entry = 8 } }
+    \\store-faults: FAIL seed=587643522279407410 (replay: -Dseed=587643522279407410)
+    \\store-faults: backend=postgres seed=7 (replay: -Dseed=7)
+    \\store-faults: failover run: async standby
+    \\store-faults: failover async: FAILED: the server did not halt, ZC-E0215 missing after 31 s
+    \\store-faults: failover async: the server's logs are in /tmp/x
+    \\store-faults: FAIL seed=7 (replay: -Dseed=7)
+    \\
+;
+
+test "store-faults output parses: clean runs count, failures are filed under their run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const clean = try parse(arena, kind_store_faults, store_clean);
+    try std.testing.expectEqual(@as(u64, 4), clean.seeds);
+    try std.testing.expectEqual(@as(usize, 0), clean.failures.len);
+    try std.testing.expectEqual(@as(?u32, null), clean.operations);
+    const bad = try parse(arena, kind_store_faults, store_failing);
+    try std.testing.expectEqual(@as(u64, 2), bad.seeds);
+    try std.testing.expectEqual(@as(usize, 2), bad.failures.len);
+    try std.testing.expectEqualStrings("history: lost_write", bad.failures[0].check);
+    try std.testing.expectEqualStrings("sqlite", bad.failures[0].step);
+    try std.testing.expectEqualStrings(
+        "the server did not halt, ZC-EN missing after N s",
+        bad.failures[1].check,
+    );
+    try std.testing.expectEqualStrings("failover-async", bad.failures[1].step);
+    try std.testing.expectEqualStrings(
+        "git checkout abc && zig build test-store-faults -Dbackend=postgres -Dseed=7",
+        try replay_line(arena, kind_store_faults, "abc", bad.failures[1]),
+    );
+    const t = try title(arena, kind_store_faults, bad.failures[0]);
+    try std.testing.expectEqualStrings("store-faults: history: lost_write (step: sqlite)", t);
+}
+
+test "store-faults: errors, crash records and cut-short output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const errored_text =
+        "store-faults: backend=sqlite seed=3 (replay: -Dseed=3)\n" ++
+        "store-faults: ERROR OutOfMemory seed=3\n";
+    const errored = try parse(arena, kind_store_faults, errored_text);
+    try std.testing.expectEqualStrings("error: OutOfMemory", errored.failures[0].check);
+    // A run that died after its header: the crash record ends it, once.
+    const died_text =
+        "store-faults: backend=postgres seed=3 (replay: -Dseed=3)\n" ++
+        "seed 3: CRASHED: killed by signal 9\n  step: postgres\n  replay: zig build t\n";
+    const died = try parse(arena, kind_store_faults, died_text);
+    try std.testing.expectEqual(@as(u64, 1), died.seeds);
+    try std.testing.expect(died.failures[0].crash);
+    // No run started (no database, no build): a record of its own, counted and never filed.
+    const none_text =
+        "seed 0: FAILED: no run started: exit 1\n  step: setup\n  replay: zig build t\n";
+    const none = try parse(arena, kind_store_faults, none_text);
+    try std.testing.expectEqual(@as(u64, 1), none.seeds);
+    try std.testing.expect(none.failures[0].infra());
+    // Cut short: a header with no end, two headers in a row, or no run at all is refused.
+    const header = "store-faults: backend=sqlite seed=3 (replay: -Dseed=3)\n";
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_store_faults, header));
+    try std.testing.expectError(error.BadLine, parse(arena, kind_store_faults, header ++ header));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_store_faults, ""));
+    try std.testing.expectError(error.BadLine, parse(arena, kind_store_faults, "PASS\n"));
+}
+
+test "store-faults fingerprints hash the kind and ignore the seed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bad = try parse(arena, kind_store_faults, store_failing);
+    var other = bad.failures[0];
+    other.seed += 1;
+    try std.testing.expectEqualSlices(
+        u8,
+        &fingerprint(kind_store_faults, bad.failures[0]),
+        &fingerprint(kind_store_faults, other),
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &fingerprint(kind_store_faults, bad.failures[0]),
+        &fingerprint(kind_sim_cluster, bad.failures[0]),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &fingerprint(kind_store_faults, bad.failures[0]),
+        &fingerprint(kind_store_faults, bad.failures[1]),
+    ));
 }

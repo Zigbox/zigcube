@@ -48,6 +48,8 @@ const shell_allowlist = [_][]const u8{
     // `test-canary.sh` runs its canary cycle against fake fault-on runners and the built
     // `sim_fleet`, and `test-crash-record.sh` feeds its crash records to `sim_fleet`.
     "ops/sim-fleet/test-canary.sh",
+    // Sources run.sh and runs `store_faults_day` against a fake `zig` and the built `sim_fleet`.
+    "ops/sim-fleet/test-store-faults.sh",
     "ops/sim-fleet/test-crash-record.sh",
     // Runs demo-b3's guest.sh (a shell script already, below) against fake state directories.
     "ops/demo-b3/test-guest.sh",

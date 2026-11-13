@@ -1,7 +1,8 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]
+//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|store-faults]
+//!                      [--dry-run]
 //!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
 //!                      < one run kind's output of a round
 //!
@@ -38,12 +39,13 @@ const github_api = @import("sim_fleet_github.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
-    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm] [--dry-run]\n" ++
-    "                        [--canary RUNNER --canary-seeds A..B\n" ++
+    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|store-faults]\n" ++
+    "                        [--dry-run] [--canary RUNNER --canary-seeds A..B\n" ++
     "                         [--expect-symptom TEXT[|TEXT]]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++
     "(--kind sim-cluster), the same with --c1 (sim-c1), or `sim_swarm --seeds A..B <ops>\n" ++
-    "--shrink` (sim-swarm), concatenated; with --canary, the fault-on RUNNER's run of that\n" ++
+    "--shrink` (sim-swarm), concatenated, or `zig build test-store-faults` (store-faults,\n" ++
+    "once a day); with --canary, the fault-on RUNNER's run of that\n" ++
     "kind over seeds A..B, filed as sim-canary\n";
 
 pub const Options = struct {

@@ -51,6 +51,13 @@ main() {
     # tries in a row at most (canary_retry).
     : "${SIM_FLEET_CANARY_TRIES_MAX:=5}"
     : "${SIM_FLEET_TRACKER:=}"
+    # `zig build test-store-faults` once per UTC day (docs/briefs/c3-sim-fleet.md, item 4): SQLite,
+    # then Postgres with its two failover runs. 0 turns it off. It needs the Postgres 16 programs
+    # (setup.sh installs them; SIM_FLEET_PG_BIN is their directory) and keeps its throwaway
+    # databases under $SIM_FLEET_HOME/pg.
+    : "${SIM_FLEET_STORE_FAULTS:=1}"
+    : "${SIM_FLEET_PG_BIN:=/usr/lib/postgresql/16/bin}"
+    : "${SIM_FLEET_STORE_FAULTS_TIMEOUT:=1800}"
     # Deadlines, in seconds: nothing the loop waits on may hang it.
     : "${SIM_FLEET_GIT_TIMEOUT:=300}"
     : "${SIM_FLEET_BUILD_TIMEOUT:=3600}"
@@ -62,6 +69,12 @@ main() {
     case "$SIM_FLEET_CANARY_ONE_IN" in
     '' | *[!0-9]*)
         log "SIM_FLEET_CANARY_ONE_IN is '$SIM_FLEET_CANARY_ONE_IN': it must be a number (0: off)"
+        exit 2
+        ;;
+    esac
+    case "$SIM_FLEET_STORE_FAULTS$SIM_FLEET_STORE_FAULTS_TIMEOUT" in
+    '' | *[!0-9]*)
+        log "SIM_FLEET_STORE_FAULTS and SIM_FLEET_STORE_FAULTS_TIMEOUT must be numbers"
         exit 2
         ;;
     esac
@@ -288,6 +301,98 @@ run_round() {
         if [ -s "$round/all-$kind" ]; then ingest "$kind" "$round/all-$kind" || true; fi
     done
     if [ -n "$canary_runner" ]; then canary_report "$canary_worker"; fi
+    store_faults_day
+}
+
+# `test-store-faults` (docs/briefs/c3-sim-fleet.md, item 4): the first round of each UTC day runs
+# it on the built commit, SQLite and then Postgres (which also makes its two failover runs), and
+# hands what it printed to `sim_fleet ingest --kind store-faults`, which files a failure like a
+# simulator's. It runs after the round's own work, one process at a time, and is counted once
+# the day's run is over whatever the reporter answered (a round GitHub refused is in
+# $STATE/last-failed-round-store-faults.txt, and the next day's run finds a real failure again).
+# A run that died, or never started, is recorded as the producers' crashes are (sf_record). The
+# host has no KVM and nothing here needs it.
+store_faults_day() {
+    if [ "$SIM_FLEET_STORE_FAULTS" -eq 0 ]; then return 0; fi
+    today=$(date -u +%Y-%m-%d)
+    if [ "$(cat "$STATE/store-faults-day" 2>/dev/null || true)" = "$today" ]; then return 0; fi
+    if ! git checkout --quiet --detach "$built"; then
+        log "store-faults: cannot check out $built; trying again next round"
+        return 0
+    fi
+    log "store-faults: running at $built"
+    : >"$round/all-store-faults"
+    sf_backend sqlite >>"$round/all-store-faults"
+    sf_backend postgres >>"$round/all-store-faults"
+    ingest store-faults "$round/all-store-faults" || true
+    echo "$today" >"$STATE/store-faults-day.new"
+    mv "$STATE/store-faults-day.new" "$STATE/store-faults-day"
+}
+
+# Runs `zig build test-store-faults -Dbackend=$1` and prints its output, then a record of how it
+# died if it did (sf_record). Postgres is a throwaway server of the host's Postgres 16 programs
+# (`zig build pg-up`), stopped, with the failover pair, afterwards.
+sf_backend() {
+    out="$round/sf-$1"
+    code=0
+    if [ "$1" = postgres ]; then
+        : "${ZCUBE_PG_DIR:=$SIM_FLEET_HOME/pg}" "${ZCUBE_PG_PAIR_DIR:=$SIM_FLEET_HOME/pg-pair}"
+        export ZCUBE_PG_DIR ZCUBE_PG_PAIR_DIR
+        export ZCUBE_PG_BIN="$SIM_FLEET_PG_BIN"
+        if [ ! -x "$SIM_FLEET_PG_BIN/initdb" ]; then
+            log "store-faults: no Postgres 16 programs in $SIM_FLEET_PG_BIN (setup.sh installs them)" >&2
+            sf_setup postgres "no Postgres 16 programs in $SIM_FLEET_PG_BIN"
+            return 0
+        fi
+        zig build pg-down >/dev/null 2>&1 || true
+        if ! timeout "$SIM_FLEET_BUILD_TIMEOUT" zig build pg-up >"$out.up" 2>&1; then
+            log "store-faults: zig build pg-up failed: $(head -n1 "$out.up")" >&2
+            sf_setup postgres "zig build pg-up failed"
+            return 0
+        fi
+    fi
+    timeout "$SIM_FLEET_STORE_FAULTS_TIMEOUT" zig build test-store-faults "-Dbackend=$1" \
+        >"$out" 2>&1 || code=$?
+    if [ "$1" = postgres ]; then
+        zig build pg-down >/dev/null 2>&1 || true
+        zig build pg-pair-down >/dev/null 2>&1 || true
+    fi
+    cat "$out"
+    sf_record "$1" "$code" "$out"
+}
+
+# What the reporter reads for a run that never started: counted, never filed (the host's trouble).
+sf_setup() {
+    printf 'seed 0: FAILED: %s\n  step: setup\n' "$2"
+    printf '  replay: zig build test-store-faults -Dbackend=%s\n' "$1"
+}
+
+# The record of a run of backend $1 that ended with exit code $2 and printed $3, if it ended
+# without a verdict: no result line after its last header (it died), or a non-zero exit with no
+# FAIL, ERROR or FAILED line at all (it never started: a build or a conformance test failed). The
+# message is the build's first `error:` line, else the exit code or signal.
+sf_record() {
+    if [ "$2" -eq 0 ]; then return 0; fi
+    last=$(grep -E '^store-faults: (backend=|PASS|FAIL seed=|ERROR |failover [a-z]+: PASS)' "$3" |
+        tail -n1)
+    case "$last" in
+    "store-faults: backend="*) open=1 ;;
+    *) open=0 ;;
+    esac
+    if [ "$open" -eq 0 ] && grep -qE '^store-faults: (FAIL seed=|ERROR )' "$3"; then return 0; fi
+    if [ "$open" -eq 0 ] && [ "$2" -eq 1 ] && [ -n "$last" ]; then return 0; fi
+    message=$(sed -n 's/^.*panic: //p; s/^error: //p' "$3" | head -n1)
+    case "$2" in
+    124) message="timed out after $SIM_FLEET_STORE_FAULTS_TIMEOUT s" ;;
+    137) message="killed (out of memory?)" ;;
+    *) if [ -z "$message" ]; then message="exit $2"; fi ;;
+    esac
+    seed=$(printf '%s\n' "$last" | sed -n 's/^store-faults: backend=[a-z]* seed=\([0-9]*\).*/\1/p')
+    printf 'seed %s: CRASHED: %s\n' "${seed:-0}" "$message"
+    if [ "$open" -eq 0 ]; then
+        printf '  step: before-run\n'
+        printf '  replay: zig build test-store-faults -Dbackend=%s\n' "$1"
+    fi
 }
 
 # The teeth canary (docs/briefs/c3-sim-fleet.md, item 3): the fleet's own proof that it still
