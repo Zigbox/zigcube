@@ -49,7 +49,7 @@ pub const Config = struct {
     /// The server's certificate (and optionally the CA's after it) and its signer.
     identity: Identity,
     /// The kind of certificate a client must present.
-    client_kind: x509.Kind = .workload,
+    client_kind: x509.Kind,
 };
 
 /// The client the handshake authenticated.
@@ -107,8 +107,20 @@ pub const TestFault = enum {
     transcript_client_auth,
     /// Application data before the client's Finished is passed on.
     early_application_data,
-    /// Bytes behind the client's Finished, in the same record, are read on.
+    /// Bytes behind a key change (the ClientHello, the client's Finished, a KeyUpdate), in the
+    /// same record, are read on.
     key_change_boundary,
+    /// Any number of change_cipher_spec records, of any one-byte body, are dropped.
+    change_cipher_spec,
+    /// An alert or application data between the pieces of a handshake message is read.
+    interleave,
+    /// A plaintext alert is read at any point, not only before the client's first protected
+    /// record.
+    plain_alert_window,
+    /// A ClientHello that offers early data is taken.
+    early_data,
+    /// The client's KeyUpdates are not counted against the limit.
+    key_update_limit,
 };
 var faults: [std.enums.values(TestFault).len]bool = @splat(false);
 
@@ -354,7 +366,8 @@ pub const Server = struct {
         assert(body.len == header.length);
         if (header.content_type == .change_cipher_spec) return self.on_change_cipher_spec(diag);
         if (!self.read_protected) return self.on_plain(diag, header.content_type);
-        if (header.content_type == .alert and self.plain_alert_allowed()) {
+        const plain_alert = self.plain_alert_allowed() or fault_on(.plain_alert_window);
+        if (header.content_type == .alert and plain_alert) {
             return self.on_alert(diag, body);
         }
         if (header.content_type != .application_data) {
@@ -378,7 +391,7 @@ pub const Server = struct {
         assert(self.state == .wait_client_hello);
         const body = self.record[header_bytes..self.record_total];
         if (body.len == 0) return self.record_failure(diag, error.UnexpectedMessage);
-        if (kind == .alert and self.flight_length != 0) {
+        if (kind == .alert and self.flight_length != 0 and !fault_on(.interleave)) {
             return self.record_failure(diag, error.UnexpectedMessage);
         }
         return switch (kind) {
@@ -394,11 +407,23 @@ pub const Server = struct {
         kind: schedule.ContentType,
         content: []const u8,
     ) Error!Event {
-        if (kind != .handshake) {
+        if (kind != .handshake and !fault_on(.interleave)) {
             if (self.flight_length != 0) return self.record_failure(diag, error.UnexpectedMessage);
         }
         switch (kind) {
-            .handshake => return self.on_handshake_bytes(diag, content),
+            .handshake => {
+                // No zero-length handshake fragments (RFC 8446 section 5.1).
+                if (content.len == 0) {
+                    return self.fail(
+                        diag,
+                        .E0815,
+                        .unexpected_message,
+                        "the client sent a protected handshake record with no content",
+                        .{},
+                    );
+                }
+                return self.on_handshake_bytes(diag, content);
+            },
             .alert => return self.on_alert(diag, content),
             .application_data => {
                 if (self.state != .connected and !fault_on(.early_application_data)) {
@@ -425,10 +450,11 @@ pub const Server = struct {
             else => return self.record_failure(diag, error.UnexpectedMessage),
         }
         if (self.flight_length != 0) return self.record_failure(diag, error.UnexpectedMessage);
+        if (body.len != 1) return self.record_failure(diag, error.UnexpectedMessage);
+        if (fault_on(.change_cipher_spec)) return .none;
         if (self.ccs_dropped >= constants.tls_change_cipher_spec_records_max) {
             return self.record_failure(diag, error.UnexpectedMessage);
         }
-        if (body.len != 1) return self.record_failure(diag, error.UnexpectedMessage);
         if (body[0] != 1) return self.record_failure(diag, error.UnexpectedMessage);
         self.ccs_dropped += 1;
         return .none;
@@ -491,12 +517,10 @@ pub const Server = struct {
             if (self.flight_length < total) break;
             const kind = self.flight[0];
             const keys_change = self.changes_keys(kind);
-            const message_event = try self.on_message(diag, kind, total);
-            if (message_event != .none) event = message_event;
-            std.mem.copyForwards(u8, &self.flight, self.flight[total..self.flight_length]);
-            self.flight_length -= total;
-            if (keys_change and self.flight_length != 0 and !fault_on(.key_change_boundary)) {
-                // The bytes behind a key change belong under the new keys, not this record.
+            if (keys_change and self.flight_length > total and !fault_on(.key_change_boundary)) {
+                // The bytes behind a key change belong under the new keys, not this record. The
+                // check comes before the message is acted on, so a refused ClientHello leaves no
+                // keys behind and its alert goes in the clear.
                 return self.fail(
                     diag,
                     .E0813,
@@ -505,6 +529,10 @@ pub const Server = struct {
                     .{},
                 );
             }
+            const message_event = try self.on_message(diag, kind, total);
+            if (message_event != .none) event = message_event;
+            std.mem.copyForwards(u8, &self.flight, self.flight[total..self.flight_length]);
+            self.flight_length -= total;
         }
         return event;
     }
@@ -547,7 +575,7 @@ pub const Server = struct {
         try self.expect_kind(diag, kind, wire.handshake_client_hello, "ClientHello");
         const hello = wire.parse_client_hello(message[4..]) catch |err|
             return self.wire_failure(diag, err, "ClientHello");
-        if (hello.early_data) {
+        if (hello.early_data and !fault_on(.early_data)) {
             return self.fail(
                 diag,
                 .E0818,
@@ -621,6 +649,9 @@ pub const Server = struct {
         const certificate_hash = self.transcript.hash();
         const verify_content = schedule.certificate_verify_content(.server, &certificate_hash);
         const signature = self.signer.sign(self.signer.context, &verify_content) orelse {
+            // The refusal drops the ServerHello queued above, so the client holds no keys: the
+            // alert goes in the clear, which it can read.
+            self.write.wipe();
             return self.fail(
                 diag,
                 .E0820,
@@ -783,6 +814,7 @@ pub const Server = struct {
         }
         const requested = wire.parse_key_update(body) catch |err|
             return self.wire_failure(diag, err, "KeyUpdate");
+        if (fault_on(.key_update_limit)) self.read.updates = 0; // The count is not kept.
         self.read.rekey() catch |err| return self.record_failure(diag, err);
         if (!requested) return;
         // Every request is answered with an update of our own write keys, so a peer that keeps
@@ -837,7 +869,8 @@ pub const Server = struct {
             }),
         }
         add_fix(diag, code);
-        return self.refuse(diag, server_wire_alert(err, message));
+        const hello = self.state == .wait_client_hello;
+        return self.refuse(diag, server_wire_alert(err, hello));
     }
 
     fn record_failure(self: *Server, diag: *Diag, err: schedule.Error) Error {
@@ -910,8 +943,10 @@ pub const Server = struct {
         self.flight_length = 0;
     }
 
-    /// An alert goes out under the write keys once there are any; before the ServerHello it is
-    /// plain. After a refusal of the ClientHello the client has no keys, so it is plain too.
+    /// An alert goes out under the write keys while there are any, else plain: before the
+    /// ServerHello, after a refused ClientHello, and when this server's own signer fails (the
+    /// refusal drops the ServerHello, so the client holds no keys and `send_flight` wipes the
+    /// write keys first).
     fn queue_alert(self: *Server, level: u8, alert: wire.Alert) void {
         const content = [2]u8{ level, @backingInt(alert) };
         self.out_length = 0;
@@ -926,10 +961,10 @@ pub const Server = struct {
     }
 };
 
-/// A refused ClientHello offers what this server does not take: a handshake failure, or a
-/// protocol version alert for a client that does not speak TLS 1.3 (RFC 8446 section 4.2.1).
-fn server_wire_alert(err: wire.Error, message: []const u8) wire.Alert {
-    if (std.mem.eql(u8, message, "ClientHello")) {
+/// A refused ClientHello (`hello`) offers what this server does not take: a handshake failure, or
+/// a protocol version alert for a client that does not speak TLS 1.3 (RFC 8446 section 4.2.1).
+fn server_wire_alert(err: wire.Error, hello: bool) wire.Alert {
+    if (hello) {
         switch (err) {
             error.CipherSuite, error.Group, error.SignatureScheme => return .handshake_failure,
             error.MissingExtension => return .missing_extension,

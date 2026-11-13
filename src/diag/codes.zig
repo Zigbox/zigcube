@@ -1918,7 +1918,7 @@ pub const registry = [_]Entry{
         .code = .E0820,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "the key behind the client certificate did not sign",
+        .summary = "the key behind a client's or this server's certificate did not sign",
         .explanation =
         \\The server asked for a client certificate and the client has one, but the
         \\signer that holds its private key returned no signature, so the proof of
@@ -1931,7 +1931,8 @@ pub const registry = [_]Entry{
         \\and reachable, then reconnect.
         \\
         \\On a zcube server, this is the server's own signer: it could not sign its
-        \\CertificateVerify, so it sent internal_error and no client was let in.
+        \\CertificateVerify, so it sent the client an internal_error alert in the
+        \\clear (the client held no keys yet) and let no client in.
         ,
     },
     .{

@@ -190,15 +190,19 @@ It has no HelloRetryRequest, no PSK, no tickets and no early data.
 
 **A client certificate is always required.** Every flight carries a CertificateRequest (empty
 context, `signature_algorithms` = ed25519). The chain the client sends (at most two certificates)
-is verified against the CA for `Config.client_kind` (`workload` until slice 2 adds `node` and
-`client`). A CA-signed certificate of another kind is ZC-E0819. An empty Certificate is ZC-E0814
+is verified against the CA for `Config.client_kind`, which has no default: each listener names
+the kind it takes. Slice 1 has no listener; the tests and the fuzzer use `workload`, the kind a
+job's relay listener takes. The API listener of slice 3 serves the agent (`node`, slice 2) and
+`zcube` (`client`, slice 2), so it needs two kinds where `Config` holds one; that is an open
+question for the supervisor before slice 3. A CA-signed certificate of another kind is ZC-E0819. An empty Certificate is ZC-E0814
 with the `certificate_required` alert. `peer()` returns the verified kind and name.
 
 **Its rules.** These are the client's, mirrored:
 
 - The ClientHello (reassembled across records, up to the message limit) has no bytes behind it
-  in its record, a non-low-order x25519 share, null compression, and no extension twice. A `pre_shared_key` must come last, and is refused, as is
-  `early_data`.
+  in its record, a non-low-order x25519 share, null compression, and no extension twice. A `pre_shared_key` must come last; it is then ignored (a full handshake,
+  which RFC 8446 allows a server that takes no PSK). `early_data` is refused (ZC-E0818).
+  `key_share` without `supported_groups` is refused with `missing_extension` (section 9.2).
 - One compatibility `change_cipher_spec` (body `01`) is dropped between the server's flight and
   the client's Finished, and only between whole messages. The server sends its own after the
   ServerHello only when the client sent a session id.

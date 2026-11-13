@@ -45,6 +45,11 @@ pub const Hello = struct {
     psk_not_last: bool = false,
     /// The key share lists x25519 twice.
     duplicate_group: bool = false,
+    /// supported_groups is sent (a key_share needs it, RFC 8446 section 9.2).
+    supported_groups: bool = true,
+    /// The start of a Certificate (its header, announcing 256 bytes) follows the ClientHello in
+    /// its record.
+    trailing: bool = false,
 };
 
 pub const Chain = enum { good, none, other_ca, expired, server_kind, three, tampered };
@@ -71,6 +76,9 @@ pub const Faults = struct {
     one_record: bool = true,
     /// Certificate and CertificateVerify swap places.
     swapped: bool = false,
+    /// Certificate and CertificateVerify stay out of the client's transcript: its signature and
+    /// its Finished do not cover them, as if they were swapped in after the client signed.
+    unbound_auth: bool = false,
 };
 
 pub const Config = struct {
@@ -142,10 +150,16 @@ pub const Client = struct {
     pub fn hello(self: *Client, out: []u8) []u8 {
         const message = self.hello_message(out[header_bytes..]);
         self.transcript.add(message);
+        var length = message.len;
+        if (self.config.faults.hello.trailing) {
+            const tail = [4]u8{ wire.handshake_certificate, 0, 1, 0 };
+            @memcpy(out[header_bytes + length ..][0..tail.len], &tail);
+            length += tail.len;
+        }
         out[0] = @backingInt(schedule.ContentType.handshake);
         std.mem.writeInt(u16, out[1..3], 0x0301, .big);
-        std.mem.writeInt(u16, out[3..5], @intCast(message.len), .big);
-        return out[0 .. header_bytes + message.len];
+        std.mem.writeInt(u16, out[3..5], @intCast(length), .big);
+        return out[0 .. header_bytes + length];
     }
 
     fn hello_message(self: *Client, out: []u8) []u8 {
@@ -180,7 +194,7 @@ pub const Client = struct {
         const knobs = self.config.faults.hello;
         // server_name, supported_groups: read past by the server.
         w.bytes(&.{ 0, 0, 0, 9, 0, 7, 0, 0, 4, 'z', 'c', '.', 'x' });
-        w.bytes(&.{ 0, 10, 0, 4, 0, 2, 0, 0x1d });
+        if (knobs.supported_groups) w.bytes(&.{ 0, 10, 0, 4, 0, 2, 0, 0x1d });
         switch (knobs.signature_algorithms) {
             .ed25519 => w.bytes(&.{ 0, 13, 0, 6, 0, 4, 0x04, 0x03, 0x08, 0x07 }),
             .other => w.bytes(&.{ 0, 13, 0, 4, 0, 2, 0x04, 0x03 }),
@@ -330,9 +344,11 @@ pub const Client = struct {
         var buffers: [3][constants.tls_handshake_message_bytes_max]u8 = undefined;
         var count: u32 = 0;
         const certificate = self.certificate_message(&buffers[0]);
-        self.transcript.add(certificate);
+        if (!faults.unbound_auth) self.transcript.add(certificate);
         const verify = self.verify_message(&buffers[1]);
-        if (verify) |message| self.transcript.add(message);
+        if (verify) |message| {
+            if (!faults.unbound_auth) self.transcript.add(message);
+        }
         if (faults.swapped) {
             if (verify) |message| append(&messages, &count, message);
             append(&messages, &count, certificate);

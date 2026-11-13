@@ -538,6 +538,8 @@ const ClientExtensions = struct {
     /// signature_algorithms lists Ed25519; null if the extension is absent.
     ed25519: ?bool = null,
     early_data: bool = false,
+    /// supported_groups was sent; a key_share needs it (section 9.2).
+    supported_groups: bool = false,
 };
 
 /// Reads a ClientHello body (after the four-byte handshake header) for a server that speaks only
@@ -569,6 +571,8 @@ pub fn parse_client_hello(body: []const u8) Error!ClientHello {
     if (compression.len != 1) return error.IllegalParameter;
     if (compression[0] != 0) return error.IllegalParameter;
     const key = parsed.key orelse return error.Group;
+    // A ClientHello with a key_share must carry supported_groups too (section 9.2).
+    if (!parsed.supported_groups) return error.MissingExtension;
     const ed25519 = parsed.ed25519 orelse return error.MissingExtension;
     if (!ed25519) return error.SignatureScheme;
     return .{ .session_id = session_id, .public_key = key, .early_data = parsed.early_data };
@@ -589,6 +593,7 @@ fn read_client_extensions(reader: *Reader, parsed: *ClientExtensions) Error!void
         switch (kind) {
             ext_supported_versions => parsed.tls13 = try lists_version(data),
             ext_key_share => try read_client_key_share(data, parsed),
+            ext_supported_groups => parsed.supported_groups = true,
             ext_signature_algorithms => parsed.ed25519 = try lists_ed25519(data),
             ext_early_data => {
                 if (data.len != 0) return error.Malformed;
@@ -735,7 +740,9 @@ pub fn write_certificate_verify(signature: *const [64]u8) [certificate_verify_by
 /// none to give (section 4.4.2). A malformed body is not empty; its parse refuses it.
 pub fn certificate_is_empty(body: []const u8) bool {
     var reader = Reader.init(body);
-    _ = reader.vector8() catch return false;
+    // A request context the server did not send is `parse_certificate`'s illegal_parameter.
+    const context = reader.vector8() catch return false;
+    if (context.len != 0) return false;
     const list = reader.vector24() catch return false;
     reader.finish() catch return false;
     return list.len == 0;

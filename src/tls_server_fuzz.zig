@@ -63,7 +63,9 @@ const World = struct {
     original: [buffer_bytes]u8,
     damaged: [buffer_bytes]u8,
     /// The client's knobs are all correct (or only those a server must take: no session id, no
-    /// change_cipher_spec, one record per message).
+    /// change_cipher_spec, one record per message). The change_cipher_spec knobs (how many, and
+    /// their byte) are not judged here: they make records, which `flight_whole` judges as the
+    /// server read them, since the damage step can drop or move a bad one.
     knobs_good: bool,
     /// What the server may connect to: set before the flight is fed.
     legit: bool,
@@ -292,6 +294,7 @@ fn setup(world: *World, random: std.Random) !void {
             .certificates = &world.chain,
             .signer = tls_server.key_pair_signer(&world.server_key),
         },
+        .client_kind = .workload,
     });
     var client_random: [32]u8 = undefined;
     var client_secret: [32]u8 = undefined;
@@ -338,11 +341,18 @@ fn random_faults(random: std.Random, good: *bool) testclient.Faults {
         9 => faults.hello.early_data = true,
         10 => faults.hello.psk_not_last = true,
         11 => faults.hello.duplicate_group = true,
-        12 => faults.ccs = random.intRangeAtMost(u32, 2, 3),
+        // The change_cipher_spec faults leave `good` set: whether the server may connect
+        // depends on the records it reads (`flight_whole`), not on the knob, since the damage
+        // step can drop the bad record or move it behind the Finished.
+        12 => {
+            faults.ccs = random.intRangeAtMost(u32, 2, 3);
+            good.* = true;
+        },
         13 => {
             // A wrong byte matters only in a change_cipher_spec that is sent.
             faults.ccs_byte = random.intRangeAtMost(u8, 2, 255);
             faults.ccs = 1;
+            good.* = true;
         },
         14 => {
             faults.chain = random.enumValue(testclient.Chain);
@@ -454,9 +464,10 @@ fn flight_stage(world: *World, random: std.Random, hello_ccs: ?u32, hello_kind: 
     world.legit = world.knobs_good and hello_ccs != null and
         flight_whole(flight, damaged, hello_ccs orelse 0);
     if (length > 0) try feed(world, random, damaged);
-    const whole = hello_kind == .none and kind == .none and world.knobs_good;
+    const whole = hello_kind == .none and kind == .none and world.legit;
     if (whole) {
-        // A correct client's flight left whole must connect.
+        // A correct client's flight left whole (its change_cipher_spec records included) must
+        // connect.
         try testing.expect(world.server.is_connected());
         try after_connect(world, random);
     }
@@ -523,6 +534,14 @@ test "fuzz: a damaged client flight never connects falsely and never crashes" {
     // knob; its hello (an eighth of the runs) or its flight (half) damaged in one of eleven ways
     // and fed in random pieces. A failure prints the seed.
     try seeds.run("tls server fuzz", iterations_default, fuzz_once);
+}
+
+test "fuzz: a change_cipher_spec fault the damage step undid connects" {
+    // Goal: the oracle judges a change_cipher_spec fault by the records the server read, not by
+    // the knob. Method: the two iterations that once reported a false connect: a bad
+    // change_cipher_spec dropped (byte 88), and one moved behind the Finished (byte 50).
+    try fuzz_once(2070481195666110524);
+    try fuzz_once(8609624064817084225);
 }
 
 test "fuzz: the record oracle" {
