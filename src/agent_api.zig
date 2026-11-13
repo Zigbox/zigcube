@@ -1200,7 +1200,7 @@ fn no_such(ctx: *const Context, path: []const u8) Failure {
 fn removed(ctx: *const Context, node: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0807);
-    ctx.diag.cause("node {s} is on the server's list of removed nodes", .{node});
+    ctx.diag.cause("node {s} is on the server's list of removed names (revoked)", .{node});
     ctx.diag.fix(.{ .sentence = "take the name out of the revoked file and restart zcube-server" });
     return error.Failed;
 }

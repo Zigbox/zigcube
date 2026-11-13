@@ -1645,39 +1645,51 @@ pub const registry = [_]Entry{
         .code = .E0806,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a peer key or trust file can't be used",
+        .summary = "a peer key, certificate or trust file can't be used",
         .explanation =
         \\The server's CA key (ca*.key in its state directory), the list of removed
-        \\nodes (revoked), or an agent's node key (peer.key), credential (peer.cred)
-        \\or trusted CA key (ca.pub) could not be read, created, written or parsed,
-        \\or its file or directory has permissions that let other users read a secret
-        \\or write a trust file. Key files must be owned by the process, mode 0600,
-        \\and hold one line of 64 hex digits; the state directory must not be
-        \\writable by group or others. A revoked line must be a node name.
+        \\names (revoked), an agent's node key (peer.key), credential (peer.cred),
+        \\node certificate (node.crt) or trusted CA key (ca.pub), or a file that
+        \\zcube-server ca issue-client or issue-node writes (NAME.key, NAME.crt)
+        \\could not be read, created, written or parsed, or its file or directory has
+        \\permissions that let other users read a secret or write a trust file. Key
+        \\files must be owned by the process, mode 0600; the state directory must not
+        \\be writable by group or others. A revoked line must be a node or client
+        \\name.
         \\
         \\The secret is never printed. If the file is damaged and there is a backup,
-        \\put it back. An agent's files are caches: it ignores a damaged peer.cred
-        \\or ca.pub and joins again by itself; delete peer.key to get a new node key.
-        \\A server whose CA key is missing although its store has run refuses to
-        \\start: put the key back, or start once with --new-ca to make a new CA on
-        \\purpose (every agent then joins again by itself).
+        \\put it back. An agent's files are caches: it ignores a damaged peer.cred,
+        \\node.crt or ca.pub and joins or renews again by itself; delete peer.key to
+        \\get a new node key. A server whose CA key is missing although its store has
+        \\run refuses to start: put the key back, or start once with --new-ca to make
+        \\a new CA on purpose (every agent then joins again by itself).
+        \\
+        \\ca issue-client and ca issue-node never make a CA: if the store has none,
+        \\give the --store and --state-dir the server runs with, or start the server
+        \\with this --store first. They never replace an existing NAME.key or NAME.crt
+        \\unless run with --replace, which is how a certificate is re-issued.
         ,
     },
     .{
         .code = .E0807,
         .severity = .@"error",
         .blame = .user,
-        .summary = "a node was refused a credential: it was removed",
+        .summary = "a name on the removed list was refused a certificate",
         .explanation =
-        \\The server will not issue or renew a peer credential for this node,
-        \\because its name is on the server's list of removed nodes (the revoked
-        \\file in its state directory). The node's current credential stays valid
-        \\until it expires, within a day, and then its peers refuse it.
+        \\The server will not issue or renew a credential or certificate for this
+        \\name, because it is on the server's list of removed names (the revoked file
+        \\in its state directory), which holds node and client names alike. A node's
+        \\current credential stays valid until it expires, within a day, and then its
+        \\peers refuse it; a certificate already issued stays valid until it expires.
         \\
-        \\If the node should be in the cluster, remove its name from the revoked
-        \\file and restart zcube-server; the agent asks again by itself. The API is
-        \\unauthenticated, so this binds an honest node only: until the API has auth,
-        \\anyone who can reach it can register a name and ask for a credential.
+        \\For a node that should be in the cluster: remove its name from the revoked
+        \\file and restart zcube-server; the agent asks again by itself.
+        \\For a client: remove its name from the revoked file and run
+        \\zcube-server ca issue-client again, or choose another name.
+        \\
+        \\Until the API asks for a client certificate (B7 slice 3), this binds an
+        \\honest node only: anyone who can reach the API can register a node name
+        \\and ask for a credential.
         ,
     },
     .{

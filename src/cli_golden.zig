@@ -552,7 +552,7 @@ fn peer_removed(diag: *diag_mod.Diag) void { // agent_api.zig
     sample(
         diag,
         .E0807,
-        &.{"node node3 is on the server's list of removed nodes"},
+        &.{"node node3 is on the server's list of removed names (revoked)"},
         "remove its name from the revoked file, then restart zcube-server",
     );
 }
