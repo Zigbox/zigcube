@@ -626,8 +626,8 @@ test "check and repair allocations, and --confirm for repair only" {
 test "the TLS options are global, before or after the command (B7)" {
     // Goal: --ca, --cert, --key and --tls-name reach the client wherever they stand.
     const parsed = try parse_text(&.{
-        "--ca",       "ca.crt", "status", "--cert", "ops.crt", "--key", "ops.key",
-        "--tls-name", "api.x",
+        "--ca",  "ca.crt",  "get",        "replicas", "--cert", "ops.crt",
+        "--key", "ops.key", "--tls-name", "api.x",
     });
     try testing.expectEqualStrings("ca.crt", parsed.options.ca.?);
     try testing.expectEqualStrings("ops.crt", parsed.options.cert.?);
@@ -636,5 +636,5 @@ test "the TLS options are global, before or after the command (B7)" {
     var diag: Diag = undefined;
     diag.reset();
     var refused: Parsed = undefined;
-    try testing.expectError(error.Failed, parse(&.{ "status", "--ca" }, &refused, &diag));
+    try testing.expectError(error.Failed, parse(&.{ "get", "replicas", "--ca" }, &refused, &diag));
 }

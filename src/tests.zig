@@ -51,7 +51,6 @@ test {
     _ = @import("server_static.zig");
     _ = @import("server.zig");
     _ = @import("server_test.zig");
-    _ = @import("api_tls_test.zig");
     _ = @import("pull_arena_test.zig");
     _ = @import("bundle.zig");
     _ = @import("bundle_collect.zig");
@@ -114,4 +113,5 @@ comptime {
 
 test {
     _ = @import("zigbox_limits_test.zig");
+    _ = @import("api_tls_test.zig");
 }

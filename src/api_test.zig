@@ -1259,61 +1259,78 @@ test "a job names a relay the server configures; any other name or an env overri
     }
 }
 
+const Allowed = struct { node1: bool, jobs: bool };
+const ScopeRow = struct {
+    method: []const u8,
+    path: []const u8,
+    query: []const u8 = "",
+    allowed: Allowed,
+};
+const scope_none: Allowed = .{ .node1 = false, .jobs = false };
+const scope_jobs: Allowed = .{ .node1 = false, .jobs = true };
+const scope_own: Allowed = .{ .node1 = true, .jobs = false };
+/// Every endpoint, and who besides an admin may call it (docs/mtls.md, "Scopes").
+const scope_rows = [_]ScopeRow{
+    .{ .method = "GET", .path = "/v1/status", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/list", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/watch", .query = "timeout=0", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/leases", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/service/hello", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/replica/hello-0", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/node/node1", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/why/job/build", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/stats/pull", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/codes", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/explain/ZC-E0822", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/apply", .query = "dry_run=1", .allowed = scope_none },
+    .{ .method = "DELETE", .path = "/v1/services/hello", .allowed = scope_none },
+    .{ .method = "GET", .path = "/v1/check/allocations", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/repair/allocations/node1", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/jobs", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/jobs", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/jobs/build", .allowed = scope_jobs },
+    .{ .method = "GET", .path = "/v1/jobs/watch", .query = "timeout=0", .allowed = scope_jobs },
+    .{ .method = "POST", .path = "/v1/jobs/build/cancel", .allowed = scope_jobs },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/credential", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease/1/keepalive", .allowed = scope_own },
+    .{ .method = "PUT", .path = "/v1/agent/nodes/node1", .allowed = scope_own },
+    .{ .method = "PUT", .path = "/v1/agent/nodes/node1/store", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/pulls", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/replicas", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/assigned", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/observed", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/observed", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs/build/input", .allowed = scope_own },
+    .{ .method = "GET", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node1/watch",
+        .query = "timeout=0",
+        .allowed = scope_own,
+    },
+    // Another node's keys: node1's agent may not write or read them.
+    .{ .method = "PUT", .path = "/v1/agent/nodes/node2", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/lease", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = scope_none },
+    .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = scope_none },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node2/watch",
+        .query = "timeout=0",
+        .allowed = scope_none,
+    },
+};
+
 test "scopes: every endpoint as an agent, a jobs client and an admin client (B7)" {
     var rig = try Rig.start(91);
     defer rig.stop();
-    const Allowed = struct { node1: bool, jobs: bool };
-    const Row = struct { method: []const u8, path: []const u8, query: []const u8 = "", allowed: Allowed };
-    const none: Allowed = .{ .node1 = false, .jobs = false };
-    const jobs: Allowed = .{ .node1 = false, .jobs = true };
-    const own: Allowed = .{ .node1 = true, .jobs = false };
-    const rows = [_]Row{
-        .{ .method = "GET", .path = "/v1/status", .allowed = none },
-        .{ .method = "GET", .path = "/v1/list", .allowed = none },
-        .{ .method = "GET", .path = "/v1/watch", .query = "timeout=0", .allowed = none },
-        .{ .method = "GET", .path = "/v1/leases", .allowed = none },
-        .{ .method = "GET", .path = "/v1/why/service/hello", .allowed = none },
-        .{ .method = "GET", .path = "/v1/why/replica/hello-0", .allowed = none },
-        .{ .method = "GET", .path = "/v1/why/node/node1", .allowed = none },
-        .{ .method = "GET", .path = "/v1/why/job/build", .allowed = jobs },
-        .{ .method = "GET", .path = "/v1/stats/pull", .allowed = none },
-        .{ .method = "GET", .path = "/v1/codes", .allowed = none },
-        .{ .method = "GET", .path = "/v1/explain/ZC-E0822", .allowed = none },
-        .{ .method = "POST", .path = "/v1/apply", .query = "dry_run=1", .allowed = none },
-        .{ .method = "DELETE", .path = "/v1/services/hello", .allowed = none },
-        .{ .method = "GET", .path = "/v1/check/allocations", .allowed = none },
-        .{ .method = "POST", .path = "/v1/repair/allocations/node1", .allowed = none },
-        .{ .method = "POST", .path = "/v1/jobs", .allowed = jobs },
-        .{ .method = "GET", .path = "/v1/jobs", .allowed = jobs },
-        .{ .method = "GET", .path = "/v1/jobs/build", .allowed = jobs },
-        .{ .method = "GET", .path = "/v1/jobs/watch", .query = "timeout=0", .allowed = jobs },
-        .{ .method = "POST", .path = "/v1/jobs/build/cancel", .allowed = jobs },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease", .allowed = own },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node1/credential", .allowed = own },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node1/lease/1/keepalive", .allowed = own },
-        .{ .method = "PUT", .path = "/v1/agent/nodes/node1", .allowed = own },
-        .{ .method = "PUT", .path = "/v1/agent/nodes/node1/store", .allowed = own },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node1/pulls", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/replicas", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/assigned", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/observed", .allowed = own },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node1/observed", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs/build/input", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/job-observed", .allowed = own },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node1/job-observed", .allowed = own },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node1/watch", .query = "timeout=0", .allowed = own },
-        // Another node's keys: node1's agent may not write or read them.
-        .{ .method = "PUT", .path = "/v1/agent/nodes/node2", .allowed = none },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node2/lease", .allowed = none },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = none },
-        .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = none },
-        .{ .method = "GET", .path = "/v1/agent/nodes/node2/watch", .query = "timeout=0", .allowed = none },
-    };
     const node1: api_mod.Caller = .{ .node = "node1" };
     const app: api_mod.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
     const ops: api_mod.Caller = .{ .client = .{ .name = "ops", .scope = .admin } };
-    for (rows) |row| {
+    for (scope_rows) |row| {
         const cases = [_]struct { caller: api_mod.Caller, allowed: bool }{
             .{ .caller = node1, .allowed = row.allowed.node1 },
             .{ .caller = app, .allowed = row.allowed.jobs },

@@ -154,9 +154,9 @@ pub const Host = struct {
         var args: std.ArrayList([]const u8) = .empty;
         try args.appendSlice(arena_allocator, &.{
             "--insecure-listen", listen,
-            "--store",        host.config.store,
-            "--state-dir",    state_dir,
-            "--create-store", "--quiet",
+            "--store",           host.config.store,
+            "--state-dir",       state_dir,
+            "--create-store",    "--quiet",
         });
         if (host.config.lost_grace_ms) |grace| {
             try args.appendSlice(arena_allocator, &.{ "--lost-grace-ms", grace });

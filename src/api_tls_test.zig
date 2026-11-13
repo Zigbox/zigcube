@@ -10,6 +10,8 @@ const diag_mod = @import("diag.zig");
 const peer_ca = @import("peer_ca.zig");
 const peer_stream = @import("peer_stream.zig");
 const pem = @import("pem.zig");
+const server_ca = @import("server_ca.zig");
+const secure_random = @import("secure_random.zig");
 const server_mod = @import("server.zig");
 const x509 = @import("x509.zig");
 
@@ -22,9 +24,15 @@ const Kind = enum { node, jobs, admin };
 
 /// Issues a certificate of `kind` for `name` with the server's CA and writes `<name>.crt` and
 /// `<name>.key` into `dir`.
-fn issue(io: std.Io, dir: std.Io.Dir, ca: *const peer_ca.Ca, kind: Kind, name: []const u8) !void {
-    var seed: [32]u8 = undefined;
-    io.random(&seed);
+fn issue(
+    io: std.Io,
+    dir: std.Io.Dir,
+    ca: *const peer_ca.Ca,
+    kind: Kind,
+    name: []const u8,
+) !void {
+    var seed = try secure_random.random_seed(io);
+    defer std.crypto.secureZero(u8, &seed);
     const key = try Ed25519.KeyPair.generateDeterministic(seed);
     var der: x509.Der = .{};
     const ttl_ms = constants.x509_leaf_ttl_ms_max;
@@ -44,7 +52,8 @@ fn issue(io: std.Io, dir: std.Io.Dir, ca: *const peer_ca.Ca, kind: Kind, name: [
     var text: [pem.bytes_max]u8 = undefined;
     var file_name: [64]u8 = undefined;
     const crt = try std.fmt.bufPrint(&file_name, "{s}.crt", .{name});
-    try dir.writeFile(io, .{ .sub_path = crt, .data = pem.encode(&text, .certificate, der.slice()) });
+    const certificate = pem.encode(&text, .certificate, der.slice());
+    try dir.writeFile(io, .{ .sub_path = crt, .data = certificate });
     const key_name = try std.fmt.bufPrint(&file_name, "{s}.key", .{name});
     const file = try dir.createFile(io, key_name, .{ .permissions = .fromMode(0o600) });
     defer file.close(io);
@@ -56,7 +65,7 @@ const Rig = struct {
     threaded: std.Io.Threaded,
     tmp: testing.TmpDir,
     path_buffer: [std.fs.max_path_bytes]u8,
-    path_length: usize,
+    path_length: u32,
     server: *server_mod.Server,
     arena: std.heap.ArenaAllocator,
 
@@ -65,7 +74,7 @@ const Rig = struct {
         rig.threaded = .init(testing.allocator, .{ .concurrent_limit = .limited(room) });
         rig.io = rig.threaded.io();
         rig.tmp = testing.tmpDir(.{});
-        rig.path_length = try rig.tmp.dir.realPath(rig.io, &rig.path_buffer);
+        rig.path_length = @intCast(try rig.tmp.dir.realPath(rig.io, &rig.path_buffer));
         rig.arena = std.heap.ArenaAllocator.init(testing.allocator);
         const arena = rig.arena.allocator();
         var diag: Diag = undefined;
@@ -100,6 +109,14 @@ const Rig = struct {
         rig.threaded.deinit();
     }
 
+    /// The CA certificate's name in the state directory: one per store (`server_ca`).
+    fn ca_file(rig: *Rig) ![]const u8 {
+        const server = rig.server;
+        var name: [server_ca.key_name_bytes_max]u8 = undefined;
+        const key = server.ca_name_buffer[0..server.ca_name_length];
+        return rig.arena.allocator().dupe(u8, server_ca.cert_name_for(key, &name));
+    }
+
     fn dir(rig: *const Rig) []const u8 {
         return rig.path_buffer[0..rig.path_length];
     }
@@ -109,7 +126,7 @@ const Rig = struct {
         var diag: Diag = undefined;
         diag.reset();
         credentials.load(rig.io, .{
-            .ca = try std.fmt.allocPrint(arena, "{s}/ca.crt", .{rig.dir()}),
+            .ca = try std.fmt.allocPrint(arena, "{s}/{s}", .{ rig.dir(), try rig.ca_file() }),
             .cert = try std.fmt.allocPrint(arena, "{s}/{s}.crt", .{ rig.dir(), name }),
             .key = try std.fmt.allocPrint(arena, "{s}/{s}.key", .{ rig.dir(), name }),
         }, &diag) catch |err| {
@@ -127,10 +144,11 @@ const Rig = struct {
     ) !u16 {
         const stream = try rig.server.tls_address().connect(rig.io, .{ .mode = .stream });
         defer stream.close(rig.io);
+        const body = if (std.mem.eql(u8, method, "GET")) "" else "{}";
         const head = try std.fmt.allocPrint(
             rig.arena.allocator(),
-            "{s} {s} HTTP/1.1\r\nHost: zcube-server\r\nContent-Length: 2\r\n\r\n{{}}",
-            .{ method, path },
+            "{s} {s} HTTP/1.1\r\nHost: zcube-server\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ method, path, body.len, body },
         );
         var diag: Diag = undefined;
         diag.reset();
@@ -150,7 +168,9 @@ const Rig = struct {
             std.debug.print("{s} {s}: {t} {?t}\n", .{ method, path, got.ending, diag.code });
             return error.TestUnexpectedResult;
         }
-        return std.fmt.parseInt(u16, got.reply[9..12], 10);
+        const code = try std.fmt.parseInt(u16, got.reply[9..12], 10);
+        if (code == 400) std.debug.print("{s} {s}: {s}\n", .{ method, path, got.reply });
+        return code;
     }
 };
 

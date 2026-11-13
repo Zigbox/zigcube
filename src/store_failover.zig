@@ -307,7 +307,7 @@ fn start_server(rig: *Rig) !void {
     const store_arg = try std.fmt.allocPrint(arena, "postgres:{s}", .{rig.through});
     const argv = [_][]const u8{
         rig.options.server, "--insecure-listen", listen, "--store",
-        store_arg,          "--state-dir", state,  "--create-store",
+        store_arg,          "--state-dir",       state,  "--create-store",
         "--quiet",
     };
     rig.server = try std.process.spawn(rig.io, .{
