@@ -68,6 +68,7 @@ const Rig = struct {
     ) api_mod.Response {
         const ctx = rig.world.controller_context();
         return rig.api.handle(&ctx, .{
+            .caller = .local,
             .method = method,
             .path = path,
             .query = query,
@@ -446,6 +447,7 @@ test "the watch says whether an assignment of the node changed, and holds when n
     // The shell asks again with `hold` false after a hold ended: no second hold.
     const ctx = rig.world.controller_context();
     const again = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = base,
         .query = hold_query,
@@ -688,6 +690,7 @@ const NoHashTransport = struct {
         const split = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
         const query = if (split < request.target.len) request.target[split + 1 ..] else "";
         const response = self.rig.api.handle(&ctx, .{
+            .caller = .local,
             .method = request.method,
             .path = request.target[0..split],
             .query = query,
@@ -715,6 +718,7 @@ test "a store with no hash at the agent's revision: no known_hash, and the agent
     var plain = rig.world.controller_context();
     plain.store = .{ .context = plain.store.context, .vtable = &no_hash_vtable };
     const response = rig.api.handle(&plain, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/agent/nodes/node1/replicas",
         .query = below,
@@ -1133,6 +1137,7 @@ test "a run's input is read at one revision" {
     vtable.get = GetSpy.get;
     ctx.store.vtable = &vtable;
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/agent/nodes/node2/runs/train/input",
         .query = "",

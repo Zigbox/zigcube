@@ -42,6 +42,7 @@ const node_store = @import("node_store.zig");
 const remote_mod = @import("agent_remote.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const agent_peer = @import("agent_peer.zig");
+const api_tls_client = @import("api_tls_client.zig");
 const dir_images = @import("dir_images.zig");
 const zigbox_fetch = @import("zigbox_fetch.zig");
 const peer_server_mod = @import("peer_server.zig");
@@ -91,6 +92,8 @@ const Shell = struct {
     /// The node's peer identity (docs/peer.md) and the transport its join calls use.
     peer: *agent_peer.Peer,
     peer_transport: remote_mod.client.Transport,
+    /// The API's TLS client when `--ca` is given; it presents the new `node.crt` after a join.
+    tls: ?*api_tls_client.Credentials = null,
 
     /// Joins the cluster CA or renews the credential when it is due. A failure never stops the
     /// agent: it is shown once per streak and tried again after `peer_join_retry_ms`.
@@ -122,6 +125,10 @@ const Shell = struct {
             shell.diag.reset();
             return;
         };
+        if (shell.tls) |credentials| {
+            // The CA of `--ca` issued it (the server is pinned to it), so it is presented.
+            _ = credentials.present(&shell.peer.node_certificate.?, shell.peer.key);
+        }
         const verb = if (had) "renewed" else "joined";
         var buffer: [128]u8 = undefined;
         const text = "zcube-agent: node {s} {s} the cluster CA\n";
@@ -383,7 +390,6 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
     var remote = remote_mod.RemoteStore.init(gpa, http_transport.transport(), config.node);
     remote.set_deadline(boot.clock(), std.math.maxInt(u64));
     var boot_id_buffer: [64]u8 = undefined;
-    const boot_id = read_boot_id(io, &boot_id_buffer);
     var server_buffer: [remote_mod.client.remembered_server_bytes_max]u8 = undefined;
     // An IP address and a port always fit.
     const server = std.fmt.bufPrint(&server_buffer, "{f}", .{config.server}) catch unreachable;
@@ -394,15 +400,18 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .exit => |code| return code,
     };
     defer peer_identity.close();
+    var credentials: api_tls_client.Credentials = undefined;
+    http_transport.client.tls = open_tls(io, config, &peer_identity, &credentials, &diag) catch
+        return fail(io, &diag, config.verbose);
+    defer if (config.tls != null) credentials.deinit();
     const agent = gpa.create(agent_mod.Agent) catch return constants.exit_environment;
     defer gpa.destroy(agent);
     var peer_buffer: [64]u8 = undefined;
-    const peer_text = peer_address(&peer_buffer, config.peer_advertise);
     agent.init(.{
         .node = config.node,
         .capacity = config.capacity,
         .address = config.address,
-        .peer = peer_text,
+        .peer = peer_address(&peer_buffer, config.peer_advertise),
         .agent_version = build_options.version,
     });
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
@@ -424,9 +433,10 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .diag = undefined,
         .verbose = config.verbose,
         .policy = loop_mod.Loop.init(),
-        .boot_id = boot_id,
+        .boot_id = read_boot_id(io, &boot_id_buffer),
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
+        .tls = http_transport.client.tls,
     };
     defer shell.arena.deinit();
     announce(io, config);
@@ -652,6 +662,26 @@ fn open_peer(io: std.Io, config: config_mod.Config, diag: *Diag) union(enum) {
             error.Failed => return .{ .exit = fail(io, diag, config.verbose) },
         };
     return .{ .opened = opened };
+}
+
+/// The API's TLS client (B7, docs/mtls.md): pins the CA of `--ca` and presents the node's own
+/// `node.crt` when that CA issued it, else `--cert` and `--key`.
+/// Null when `--ca` is not given (plain HTTP).
+fn open_tls(
+    io: std.Io,
+    config: config_mod.Config,
+    peer: *const agent_peer.Peer,
+    credentials: *api_tls_client.Credentials,
+    diag: *Diag,
+) api_tls_client.LoadError!?*api_tls_client.Credentials {
+    const tls = config.tls orelse return null;
+    try credentials.load_ca(io, tls.ca, tls.server_name, diag);
+    if (peer.node_certificate) |*certificate| {
+        if (credentials.present(certificate, peer.key)) return credentials;
+    }
+    const cert = tls.cert orelse return api_tls_client.refuse_no_identity(diag, peer.where);
+    try credentials.load_identity(io, cert, tls.key.?, diag);
+    return credentials;
 }
 
 /// Prints the diagnostic and returns the exit code its blame decides.

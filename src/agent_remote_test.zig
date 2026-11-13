@@ -138,7 +138,8 @@ fn start_server_on(io: std.Io, store_config: config_mod.Store, create: bool) !*s
     var diag: Diag = undefined;
     diag.reset();
     const config: config_mod.Config = .{
-        .listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable, // A literal.
+        // A literal.
+        .insecure_listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable,
         .store = store_config,
         .create_store = create,
         .verbose = false,

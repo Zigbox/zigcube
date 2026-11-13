@@ -72,7 +72,12 @@ pub fn run_with(env: *const Env, args: []const []const u8, executor: Executor) u
         return finish(&ending, &report);
     }
     var client: Client = undefined;
-    Client.init(&client, env, parsed.options.server, &report) catch {
+    Client.init(&client, env, parsed.options.server, .{
+        .ca = parsed.options.ca,
+        .cert = parsed.options.cert,
+        .key = parsed.options.key,
+        .tls_name = parsed.options.tls_name,
+    }, &report) catch {
         return finish(&ending, &report);
     };
     ending.client = &client;

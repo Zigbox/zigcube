@@ -125,10 +125,20 @@ fn run(init: std.process.Init, config: config_mod.Config) u8 {
 
 fn announce(io: std.Io, server: *server_mod.Server, config: config_mod.Config) void {
     var buffer: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "zcube-server {s} listening on {f} (store: {s})\n", .{
-        build_options.version, server.address(), config.store.backend(),
-    }) catch return;
-    _ = say(io, line);
+    if (config.listen != null) {
+        const line = std.fmt.bufPrint(&buffer, "zcube-server {s} listening on {f} (TLS, name " ++
+            "{s}; store: {s})\n", .{
+            build_options.version, server.tls_address(), config.tls_name, config.store.backend(),
+        }) catch return;
+        _ = say(io, line);
+    }
+    if (config.insecure_listen != null) {
+        const line = std.fmt.bufPrint(&buffer, "zcube-server {s} listening on {f} (insecure, " ++
+            "loopback; store: {s})\n", .{
+            build_options.version, server.address(), config.store.backend(),
+        }) catch return;
+        _ = say(io, line);
+    }
     if (config.store == .memory) {
         _ = say(io, "zcube-server: the memory store keeps nothing: stopping the server loses it\n");
     }

@@ -1,0 +1,6 @@
+error[ZC-E0822]: the caller's certificate does not allow this request
+  cause  client app (scope jobs) may not GET /v1/list: it needs a client of
+         scope admin
+  fix    ask an operator for a certificate that allows it:   zcube-server ca issue-client NAME --scope admin
+  more   zcube explain E0822 · rerun with --verbose for the full cause chain
+  docs   https://zigbox.github.io/zigcube/errors/E0822.html

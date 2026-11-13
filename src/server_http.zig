@@ -31,6 +31,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const BoundedArena = @import("server_arena.zig").BoundedArena;
 const static = @import("server_static.zig");
+const server_tls = @import("server_tls.zig");
 const store = @import("store.zig");
 
 const Allocator = std.mem.Allocator;
@@ -49,8 +50,8 @@ pub const Options = struct {
 /// bounded by the idle timeout, working and holding are not (the store has timeouts of its own,
 /// and a hold is bounded by its own deadline). `reading` is the body of a request: the whole
 /// body must arrive within the idle timeout, so a client that stalls half way cannot hold the
-/// slot.
-const State = enum { waiting, reading, working, holding, writing };
+/// slot. `handshake` is a TLS handshake, bounded by `tls_handshake_timeout_ms`.
+const State = enum { handshake, waiting, reading, working, holding, writing };
 
 const Slot = struct {
     mutex: std.Io.Mutex = .init,
@@ -149,7 +150,11 @@ pub const Shared = struct {
             const stream = slot.stream orelse continue;
             if (slot.state == .working) continue;
             if (slot.state == .holding) continue;
-            if (now -| slot.since_ms < constants.http_idle_timeout_ms) continue;
+            const limit_ms: u64 = if (slot.state == .handshake)
+                constants.tls_handshake_timeout_ms
+            else
+                constants.http_idle_timeout_ms;
+            if (now -| slot.since_ms < limit_ms) continue;
             stream.shutdown(shared.io, .both) catch {}; // Already closing is the goal.
         }
     }
@@ -170,7 +175,7 @@ pub const Shared = struct {
     }
 
     fn new_id(shared: *Shared, ctx: *const controller.Context) []const u8 {
-        return shared.api.assign_id(ctx, .{ .method = "", .path = "" });
+        return shared.api.assign_id(ctx, .{ .caller = .local, .method = "", .path = "" });
     }
 };
 
@@ -180,6 +185,7 @@ pub const Shared = struct {
 const Work = struct {
     shared: *Shared,
     slot: u32,
+    transport: *const Transport,
     arena: BoundedArena,
     diag: Diag,
 
@@ -195,31 +201,96 @@ const Work = struct {
     }
 };
 
+/// One connection's streams. Over TLS `reader` and `writer` are the plaintext side of `tls`;
+/// `raw` is the socket's own reader either way.
+const Transport = struct {
+    stream: net.Stream,
+    raw: *std.Io.Reader,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+    tls: ?*server_tls.Conn,
+    /// Who the connection's certificate names: every request of it is made as this caller.
+    caller: api_mod.Caller,
+};
+
 /// Serves one connection until the client leaves, asks to close, goes idle or breaks the
-/// protocol. Takes ownership of the slot: it is freed (and the stream closed) here.
-pub fn serve(shared: *Shared, slot: u32, stream: net.Stream) void {
+/// protocol. Takes ownership of the slot: it is freed (and the stream closed) here. With `tls`
+/// the connection is the TLS listener's: the handshake comes first, and the client's
+/// certificate names the caller; without, it is the loopback `--insecure-listen` listener's.
+pub fn serve(shared: *Shared, slot: u32, stream: net.Stream, tls: ?*server_tls.Setup) void {
     defer shared.release_slot(slot);
     var read_buffer: [constants.http_head_bytes_max]u8 = undefined;
     var write_buffer: [constants.http_write_buffer_bytes]u8 = undefined;
     var reader = stream.reader(shared.io, &read_buffer);
     var writer = stream.writer(shared.io, &write_buffer);
-    var connection = http.Server.init(&reader.interface, &writer.interface);
+    const setup = tls orelse return serve_requests(shared, slot, &.{
+        .stream = stream,
+        .raw = &reader.interface,
+        .reader = &reader.interface,
+        .writer = &writer.interface,
+        .tls = null,
+        .caller = .local,
+    });
+    serve_tls(shared, slot, stream, setup, &reader.interface, &writer.interface);
+}
+
+/// The plaintext side's buffers and the TLS state: large, so on the heap, not the task's stack.
+const TlsConnection = struct {
+    conn: server_tls.Conn,
+    head: [constants.http_head_bytes_max]u8,
+};
+
+fn serve_tls(
+    shared: *Shared,
+    slot: u32,
+    stream: net.Stream,
+    setup: *server_tls.Setup,
+    raw_reader: *std.Io.Reader,
+    raw_writer: *std.Io.Writer,
+) void {
+    shared.set_state(slot, .handshake);
+    const tls = shared.gpa.create(TlsConnection) catch return; // The client sees a close.
+    defer shared.gpa.destroy(tls);
+    var diag: Diag = undefined;
+    diag.reset();
+    tls.conn.open(setup, raw_reader, raw_writer, &tls.head, &diag) catch {
+        tls.conn.deinit();
+        return log_refusal(shared, &diag);
+    };
+    defer tls.conn.deinit();
+    const caller = setup.caller(&tls.conn, &diag) orelse {
+        tls.conn.close();
+        return log_refusal(shared, &diag);
+    };
+    serve_requests(shared, slot, &.{
+        .stream = stream,
+        .raw = raw_reader,
+        .reader = &tls.conn.reader,
+        .writer = &tls.conn.writer,
+        .tls = &tls.conn,
+        .caller = caller,
+    });
+}
+
+fn serve_requests(shared: *Shared, slot: u32, transport: *const Transport) void {
+    var connection = http.Server.init(transport.reader, transport.writer);
     var work: Work = .{
         .shared = shared,
         .slot = slot,
+        .transport = transport,
         .arena = .init(shared.gpa, constants.request_arena_bytes_max),
         .diag = undefined,
     };
     defer work.arena.deinit();
     for (0..constants.http_requests_per_connection_max) |_| {
         shared.set_state(slot, .waiting);
-        if (shared.stopping.load(.acquire)) return wait_for_client(shared, slot, &reader);
+        if (shared.stopping.load(.acquire)) return wait_for_client(shared, slot, transport);
         var request = connection.receiveHead() catch |err| {
-            refuse_head(&work, &writer, err);
-            return linger(shared, slot, stream, &reader);
+            refuse_head(&work, transport.writer, err);
+            return linger(shared, slot, transport);
         };
         const keep_alive = answer(&work, &request) catch return;
-        if (!keep_alive) return linger(shared, slot, stream, &reader);
+        if (!keep_alive) return linger(shared, slot, transport);
     }
 }
 
@@ -229,19 +300,21 @@ pub fn serve(shared: *Shared, slot: u32, stream: net.Stream) void {
 /// limit: reuse_address"). A client that reads its reply and closes, as the agent does, closes
 /// at once; any other is ended by the watchdog (the idle timeout) or by the stop itself after
 /// `server_stop_ms`.
-fn wait_for_client(shared: *Shared, slot: u32, reader: *net.Stream.Reader) void {
+fn wait_for_client(shared: *Shared, slot: u32, transport: *const Transport) void {
     shared.set_state(slot, .waiting);
-    _ = reader.interface.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
+    if (transport.tls) |conn| conn.close();
+    _ = transport.raw.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
 }
 
 /// Closing a socket that still has unread data makes the kernel send a reset, which can destroy
-/// the reply the client has not read yet. So after a reply that ends the connection, stop sending,
-/// read what the client still sends (at most `http_linger_bytes_max`; the watchdog ends a client
-/// that stalls) and only then close.
-fn linger(shared: *Shared, slot: u32, stream: net.Stream, reader: *net.Stream.Reader) void {
+/// the reply the client has not read yet. So after a reply that ends the connection, stop sending
+/// (over TLS, after close_notify), read what the client still sends (at most
+/// `http_linger_bytes_max`; the watchdog ends a client that stalls) and only then close.
+fn linger(shared: *Shared, slot: u32, transport: *const Transport) void {
     shared.set_state(slot, .waiting);
-    stream.shutdown(shared.io, .send) catch return;
-    _ = reader.interface.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
+    if (transport.tls) |conn| conn.close();
+    transport.stream.shutdown(shared.io, .send) catch return;
+    _ = transport.raw.discardShort(constants.http_linger_bytes_max) catch {}; // Gone is fine.
 }
 
 const Closed = error{Closed};
@@ -388,6 +461,7 @@ fn serve_api(
 ) api_mod.Response {
     const shared = work.shared;
     const request: api_mod.Request = .{
+        .caller = work.transport.caller,
         .method = parsed.method,
         .path = parsed.path,
         .query = parsed.query,
@@ -614,7 +688,7 @@ pub fn release(shared: *Shared, slot: u32) void {
 // ---- Refusals before there is a request ---------------------------------------------------------
 
 /// The head could not be read: answer the ones that deserve an answer, then close.
-fn refuse_head(work: *Work, writer: *net.Stream.Writer, err: http.Server.ReceiveHeadError) void {
+fn refuse_head(work: *Work, writer: *std.Io.Writer, err: http.Server.ReceiveHeadError) void {
     const status: u16 = switch (err) {
         error.HttpHeadersOversize => 431,
         error.HttpHeadersInvalid => 400,
@@ -627,7 +701,7 @@ fn refuse_head(work: *Work, writer: *net.Stream.Writer, err: http.Server.Receive
         refuse_response(work.shared, &ctx, status, .E0108, big)
     else
         refuse_response(work.shared, &ctx, status, .E0104, invalid);
-    write_raw(&writer.interface, response);
+    write_raw(writer, response);
 }
 
 /// Writes a complete reply without an `http.Server.Request`: for a connection that has none yet.
@@ -646,6 +720,19 @@ pub fn write_raw(out: *std.Io.Writer, response: api_mod.Response) void {
 }
 
 // ---- Logging ------------------------------------------------------------------------------------
+
+/// A TLS connection refused before its first request: its diagnostic, on one line, unless the
+/// server is silent. A client that just went away raised nothing and is not logged.
+fn log_refusal(shared: *Shared, diag: *const Diag) void {
+    if (shared.options.silent) return;
+    const code = diag.code orelse return;
+    var buffer: [768]u8 = undefined;
+    const stamp = std.Io.Clock.real.now(shared.io).toMilliseconds();
+    const line = std.fmt.bufPrint(&buffer, "[{d}] tls: ZC-{t}: {s}\n", .{
+        stamp, code, diag.last_cause() orelse "",
+    }) catch return;
+    std.Io.File.stderr().writeStreamingAll(shared.io, line) catch {}; // Nowhere else to report it.
+}
 
 /// One line per request that matters: failures and writes always, everything with `verbose`,
 /// failures only with `quiet`. The request id is the thread between a client's error and this log.

@@ -12,6 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const net = std.Io.net;
 const zigbox = @import("zigbox");
+const api_tls_client = @import("api_tls_client.zig");
 const cli_env = @import("cli_env.zig");
 const cli_report = @import("cli_report.zig");
 const constants = @import("constants.zig");
@@ -32,8 +33,18 @@ pub const Trace = struct { id: cli_report.RequestId, line: text_util.Bounded(160
 
 const traces_max = 64;
 
+/// `--ca`, `--cert`, `--key` and `--tls-name` as given; each null means its environment variable.
+pub const TlsFlags = struct {
+    ca: ?[]const u8 = null,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
+};
+
 pub const Client = struct {
     env: *const Env,
+    /// The API over TLS (docs/mtls.md); null: plain HTTP, for `--insecure-listen`.
+    tls: ?api_tls_client.Credentials,
     address: net.IpAddress,
     /// The address as the user gave it (or the default), for messages.
     server_text: []const u8,
@@ -45,7 +56,13 @@ pub const Client = struct {
 
     /// Initialises in place. The address comes from `--server`, then `ZCUBE_SERVER`, then the
     /// default; one that is not `HOST:PORT` is ZC-E0112.
-    pub fn init(client: *Client, env: *const Env, flag: ?[]const u8, report: *Report) Error!void {
+    pub fn init(
+        client: *Client,
+        env: *const Env,
+        flag: ?[]const u8,
+        tls: TlsFlags,
+        report: *Report,
+    ) Error!void {
         const text = flag orelse env.getenv("ZCUBE_SERVER") orelse constants.cli_server_default;
         const source = if (flag != null) "--server" else if (env.getenv("ZCUBE_SERVER") != null)
             "ZCUBE_SERVER"
@@ -54,6 +71,7 @@ pub const Client = struct {
         const address = parse_server(text) orelse return bad_server(report, text, source);
         client.* = .{
             .env = env,
+            .tls = null,
             .address = address,
             .server_text = text,
             .traces = undefined,
@@ -62,6 +80,30 @@ pub const Client = struct {
             .counter = 0,
         };
         assert(client.address.getPort() != 0);
+        try client.init_tls(tls, report);
+    }
+
+    /// Loads the TLS files when any of the three is named; all three must be.
+    fn init_tls(client: *Client, flags: TlsFlags, report: *Report) Error!void {
+        const env = client.env;
+        const ca = flags.ca orelse env.getenv("ZCUBE_CA");
+        const cert = flags.cert orelse env.getenv("ZCUBE_CERT");
+        const key = flags.key orelse env.getenv("ZCUBE_KEY");
+        if (ca == null and cert == null and key == null) return;
+        if (ca == null or cert == null or key == null) return tls_incomplete(report);
+        const name = flags.tls_name orelse env.getenv("ZCUBE_TLS_NAME") orelse
+            api_tls_client.server_name_default;
+        client.tls = undefined;
+        const paths: api_tls_client.Paths = .{
+            .ca = ca.?,
+            .cert = cert.?,
+            .key = key.?,
+            .server_name = name,
+        };
+        client.tls.?.load(env.io, paths, &report.diag) catch |err| {
+            client.tls = null;
+            return err;
+        };
     }
 
     pub fn get(client: *Client, path: []const u8, report: *Report) Error!Reply {
@@ -186,6 +228,10 @@ pub const Client = struct {
             .body_bytes = @intCast(body.len),
         };
         const request = request_head(&head, line) orelse return bad_path(report, path);
+        if (client.tls != null) {
+            const raw = try client.exchange_tls(stream.socket.handle, request, body, report);
+            return parse_reply(raw, report, id);
+        }
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(io, &write_buffer);
         writer.interface.writeAll(request) catch return lost(client, report, "sending the request");
@@ -194,7 +240,60 @@ pub const Client = struct {
         const raw = try read_reply(client, &stream, report);
         return parse_reply(raw, report, id);
     }
+
+    /// The request over TLS. The deadline is the reply timeout from the connect, for every read
+    /// together: the TLS connection reads records, not the pieces `read_reply` waits for.
+    fn exchange_tls(
+        client: *Client,
+        fd: std.posix.fd_t,
+        request: []const u8,
+        body: []const u8,
+        report: *Report,
+    ) Error![]const u8 {
+        const io = client.env.io;
+        const end_ms = boot_ms(io) + client.env.reply_timeout_ms;
+        const done = try api_tls_client.exchange(
+            &client.tls.?,
+            io,
+            fd,
+            client.env.arena,
+            &.{ request, body },
+            constants.cli_reply_bytes_max,
+            api_tls_client.reply_is_whole,
+            end_ms,
+            &report.diag,
+        );
+        switch (done.ending) {
+            .done => {},
+            .silent => return silent(client, report),
+            .failed => {
+                assert(report.diag.code != null);
+                report.diag.context("server", "{s}", .{client.server_text});
+                report.diag.context("reqid", "{s}", .{report.request_id.slice()});
+                return error.Failed;
+            },
+        }
+        if (done.reply.len > constants.cli_reply_bytes_max) return too_big(report);
+        return done.reply;
+    }
 };
+
+fn boot_ms(io: std.Io) u64 {
+    const ms = std.Io.Clock.boot.now(io).toMilliseconds();
+    assert(ms >= 0);
+    return @intCast(ms);
+}
+
+fn tls_incomplete(report: *Report) Error {
+    assert(report.diag.code == null);
+    report.diag.raise(.E0111);
+    report.diag.cause("--ca, --cert and --key go together: the API over TLS needs all three", .{});
+    report.diag.fix(.{
+        .sentence = "give all three (or ZCUBE_CA, ZCUBE_CERT, ZCUBE_KEY), or none for plain HTTP:",
+        .command = "zcube --ca ca.crt --cert me.crt --key me.key get service",
+    });
+    return error.Failed;
+}
 
 /// `HOST:PORT` with an IP address (or `localhost`) and a port that is not 0.
 pub fn parse_server(text: []const u8) ?net.IpAddress {
@@ -246,20 +345,7 @@ fn read_reply(client: *const Client, stream: *net.Stream, report: *Report) Error
     }
 }
 
-/// True once `raw` holds a head that promises a `Content-Length` and that many bytes after it.
-fn reply_is_whole(raw: []const u8) bool {
-    const split = std.mem.find(u8, raw, "\r\n\r\n") orelse return false;
-    var lines = std.mem.splitSequence(u8, raw[0..split], "\r\n");
-    _ = lines.next(); // The status line.
-    while (lines.next()) |line| {
-        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
-        if (!std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) continue;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const promised = std.fmt.parseInt(usize, value, 10) catch return false;
-        return raw.len - (split + 4) >= promised;
-    }
-    return false;
-}
+const reply_is_whole = api_tls_client.reply_is_whole;
 
 fn silent(client: *const Client, report: *Report) Error {
     assert(report.diag.code == null);

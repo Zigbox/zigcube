@@ -18,23 +18,36 @@ const fencing = @import("fencing.zig");
 const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const x509_identity = @import("x509_identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
 const IpAddress = std.Io.net.IpAddress;
 
 pub const listen_default = "127.0.0.1:7070";
+/// The DNS name in the TLS listener's certificate, which clients check (`--tls-name`).
+pub const tls_name_default = "zcube-server";
 
 pub const usage =
-    \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
-    \\                    [--new-ca] [--verbose] [--quiet]
+    \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT]
+    \\                    [--tls-name NAME] [--store SPEC] [--create-store] [--new-ca]
+    \\                    [--verbose] [--quiet]
     \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--config FILE]
     \\                    [--store SPEC] [--state-dir DIR]
     \\       zcube-server --version | --help
     \\
-    \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
-    \\                    (the upstreams a job's relay may name)
-    \\  --listen ADDR     where to listen, an IP address and a port (default 127.0.0.1:7070)
+    \\  --config FILE     a ZON file with .listen, .insecure_listen, .tls_name, .store,
+    \\                    .create_store and .relays (the upstreams a job's relay may name)
+    \\  --listen ADDR     where to serve the API over TLS, an IP address and a port (default
+    \\                    127.0.0.1:7070 unless --insecure-listen is given). Every client
+    \\                    presents a certificate of this server's CA: an agent its node's,
+    \\                    anyone else one from ca issue-client
+    \\  --insecure-listen ADDR
+    \\                    also serve plain HTTP, with no certificate and every request
+    \\                    allowed, on a loopback address only (127.0.0.1:PORT or [::1]:PORT):
+    \\                    for zcube local, the console in a browser, and tests
+    \\  --tls-name NAME   the DNS name in the server's certificate, which clients check
+    \\                    (default zcube-server)
     \\  --store SPEC      memory | sqlite:<path> | postgres:<libpq settings> (default memory)
     \\  --lease-ttl-ms N  the ttl of the agents' leases (default 10000); agents learn it
     \\  --lost-grace-ms N how long a lost node's replicas stay before they are replaced under
@@ -52,7 +65,7 @@ pub const usage =
     \\directory). --scope is what the client may do: jobs, or admin. A name in the revoked file
     \\is refused.
     \\
-    \\Writes to the API are unauthenticated: listen on a loopback or private address.
+    \\The insecure listener allows anything to anyone who can reach it: keep it on loopback.
     \\
 ;
 
@@ -67,7 +80,12 @@ pub const Store = union(enum) {
 };
 
 pub const Config = struct {
-    listen: IpAddress,
+    /// The TLS listener (`--listen`); at least one of the two listeners is set.
+    listen: ?IpAddress = null,
+    /// The plain-HTTP listener (`--insecure-listen`): a loopback address only.
+    insecure_listen: ?IpAddress = null,
+    /// The DNS name of the TLS listener's certificate.
+    tls_name: []const u8 = tls_name_default,
     store: Store,
     create_store: bool,
     /// Where the remembered revision is kept; null: beside the SQLite file. A Postgres store
@@ -105,6 +123,8 @@ pub const Relay = @import("records.zig").JobRelay;
 /// file's own and so are read from the syntax tree.
 const File = struct {
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
@@ -117,6 +137,8 @@ const File = struct {
 /// the names itself, because it parses these with the relays left out).
 const Fields = struct {
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: ?bool = null,
     lease_ttl_ms: ?u32 = null,
@@ -128,6 +150,8 @@ const Fields = struct {
 const Flags = struct {
     config: ?[]const u8 = null,
     listen: ?[]const u8 = null,
+    insecure_listen: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     store: ?[]const u8 = null,
     create_store: bool = false,
     lease_ttl_ms: ?u32 = null,
@@ -197,10 +221,18 @@ fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) 
 }
 
 fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
-    const listen_text = flags.listen orelse file.listen orelse listen_default;
+    const insecure_text = flags.insecure_listen orelse file.insecure_listen;
+    // With neither listener named, the TLS one listens on the default address.
+    const listen_text = flags.listen orelse file.listen orelse
+        if (insecure_text == null) @as([]const u8, listen_default) else null;
     const store_text = flags.store orelse file.store orelse "memory";
     return .{
-        .listen = try parse_listen(listen_text, diag),
+        .listen = if (listen_text) |text| try parse_listen(text, diag) else null,
+        .insecure_listen = if (insecure_text) |t| try parse_insecure_listen(t, diag) else null,
+        .tls_name = try tls_name_of(
+            flags.tls_name orelse file.tls_name orelse tls_name_default,
+            diag,
+        ),
         .store = try parse_store(store_text, diag),
         .create_store = if (flags.create_store) true else (file.create_store orelse false),
         .state_dir = flags.state_dir orelse file.state_dir,
@@ -264,6 +296,10 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.config = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--listen")) {
             flags.listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--insecure-listen")) {
+            flags.insecure_listen = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, arg, "--tls-name")) {
+            flags.tls_name = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--store")) {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
@@ -364,7 +400,8 @@ fn parse_tree(
 }
 
 const known_settings = [_][]const u8{
-    "listen", "store", "create_store", "lease_ttl_ms", "lost_grace_ms", "state_dir", "relays",
+    "listen",       "insecure_listen", "tls_name",  "store",  "create_store",
+    "lease_ttl_ms", "lost_grace_ms",   "state_dir", "relays",
 };
 
 /// The relays of the file's root struct, after its field names are checked. A relay is
@@ -509,6 +546,31 @@ fn relays_valid(relays: []const Relay, diag: *Diag) Error![]const Relay {
 
 /// "127.0.0.1:7070" or "[::1]:7070": an IP address and a port. A name is refused, because
 /// resolving one at start-up could quietly choose a different interface than the user meant.
+/// An address of this machine's loopback interface: 127.0.0.0/8 or ::1.
+pub fn is_loopback(address: IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| std.mem.eql(u8, &ip6.bytes, &(@as([15]u8, @splat(0)) ++ [1]u8{1})),
+    };
+}
+
+/// `--insecure-listen`: an address as for `--listen`, and on loopback (ZC-E0106 otherwise).
+pub fn parse_insecure_listen(text: []const u8, diag: *Diag) Error!IpAddress {
+    const address = try parse_listen(text, diag);
+    if (is_loopback(address)) return address;
+    return bad(diag, "--insecure-listen {s} is not a loopback address", .{text}, "serve plain " ++
+        "HTTP on 127.0.0.1 or [::1] only, and everything else with --listen (TLS)");
+}
+
+/// The TLS name: a DNS name the certificate can carry (ZC-E0106 otherwise).
+fn tls_name_of(name: []const u8, diag: *Diag) Error![]const u8 {
+    if (x509_identity.dns_problem(name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-name {s} is not a DNS name", .{name}, "use letters, digits, " ++
+            "hyphens and dots, as zcube-server or api.example.com");
+    }
+    return name;
+}
+
 pub fn parse_listen(text: []const u8, diag: *Diag) Error!IpAddress {
     const reason = "use an IP address and a port, like 127.0.0.1:7070";
     if (text.len == 0) return bad(diag, "the listen address is empty", .{}, reason);
@@ -628,7 +690,7 @@ test "flags win over the file, unknown flags and settings are refused" {
     const typed = [_][]const u8{ "--listen", "127.0.0.1:9", "--store", "memory", "-v" };
     const flags = try parse_flags(&typed, &diag);
     const config = try merge(flags, file, &diag);
-    try testing.expectEqual(@as(u16, 9), config.listen.getPort());
+    try testing.expectEqual(@as(u16, 9), config.listen.?.getPort());
     try testing.expect(config.store == .memory);
     try testing.expect(config.create_store);
     try testing.expect(config.verbose);

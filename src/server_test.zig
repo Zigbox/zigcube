@@ -41,7 +41,8 @@ fn config_for(store: config_mod.Store, create: bool) config_mod.Config {
     var diag: Diag = undefined;
     diag.reset();
     return .{
-        .listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable, // A literal.
+        // A literal.
+        .insecure_listen = config_mod.parse_listen("127.0.0.1:0", &diag) catch unreachable,
         .store = store,
         .create_store = create,
         .verbose = false,
@@ -487,7 +488,7 @@ test "a port in use, and a store that is not there, are coded start-up failures"
     const first = try start_server(io, config_for(.memory, false));
     defer first.stop();
     var taken = config_for(.memory, false);
-    taken.listen = first.address();
+    taken.insecure_listen = first.address();
     var diag: Diag = undefined;
     diag.reset();
     const options: server_mod.Options = .{ .version = "0.0.0-test" };
@@ -974,7 +975,7 @@ test "a server stopped while it answers a held watch leaves its port free to sta
     var text: [32]u8 = undefined;
     const listen = try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{address.getPort()});
     var config = config_for(.memory, false);
-    config.listen = try config_mod.parse_listen(listen, &diag);
+    config.insecure_listen = try config_mod.parse_listen(listen, &diag);
     const second = try start_server(io, config);
     second.stop();
 }
@@ -1001,7 +1002,7 @@ test "a server that closed a connection first can be restarted on its port at on
     var text: [32]u8 = undefined;
     const listen = try std.fmt.bufPrint(&text, "127.0.0.1:{d}", .{address.getPort()});
     var config = config_for(.memory, false);
-    config.listen = try config_mod.parse_listen(listen, &diag);
+    config.insecure_listen = try config_mod.parse_listen(listen, &diag);
     const second = try start_server(io, config);
     defer second.stop();
     const status = try get(io, second.address(), "/v1/status");

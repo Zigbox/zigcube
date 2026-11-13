@@ -1,0 +1,8 @@
+request  r-0000001  GET /v1/list?prefix=%2Fservices%2F&limit=500  400
+error[ZC-E0822]: the caller's certificate does not allow this request
+  cause  client app (scope jobs) may not GET /v1/list: it needs a client of
+         scope admin
+  reqid  r-0000001
+  fix    ask an operator for a certificate that allows it:   zcube-server ca issue-client NAME --scope admin
+  more   zcube explain E0822
+  docs   https://zigbox.github.io/zigcube/errors/E0822.html

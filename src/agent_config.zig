@@ -23,6 +23,7 @@ const assert = std.debug.assert;
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const records = @import("records.zig");
+const x509_identity = @import("x509_identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Diag = diag_mod.Diag;
@@ -35,11 +36,12 @@ pub const usage =
     \\                   [--cpu-millis N] [--memory-bytes N] [--images FILE] [--address TEXT]
     \\                   [--images-dir DIR] [--peer-listen HOST:PORT] [--peer-advertise HOST:PORT]
     \\                   [--registry HOST:PORT] [--runtime fake|zigbox] [--verbose]
+    \\                   [--ca FILE [--cert FILE --key FILE] [--tls-name NAME]]
     \\       zcube-agent --version | --help
     \\
     \\  --config FILE      a ZON file with .node, .server, .state_dir, .cpu_millis, .memory_bytes,
     \\                     .runtime, .images, .address, .images_dir, .peer_listen, .peer_advertise
-    \\                     and .registry
+    \\                     .registry, .ca, .cert, .key and .tls_name
     \\  --node NAME        this node's name (a lowercase hostname label)
     \\  --server ADDR      zcube-server's address, an IP address and a port
     \\  --state-dir DIR    where the agent keeps its containers (created if missing)
@@ -57,6 +59,11 @@ pub const usage =
     \\                     --peer-listen is 0.0.0.0 or :: (default: the --peer-listen address)
     \\  --registry ADDR    fake runtime: where an image the node lacks is fetched from when no
     \\                     peer has it (needs --images-dir)
+    \\  --ca FILE          the cluster CA's certificate (ca.crt): talk to the server over TLS
+    \\                     (docs/mtls.md); without it, plain HTTP (--insecure-listen)
+    \\  --cert FILE, --key FILE  the certificate and key to present until the node has its
+    \\                     own (node.crt in the state directory, issued at join)
+    \\  --tls-name NAME    the DNS name in the server's certificate (default zcube-server)
     \\  --verbose          show the internal message of a bug
     \\
     \\Containers run as plain host processes under supervisors of their own, so stopping the agent
@@ -92,6 +99,17 @@ pub const Config = struct {
     peer_advertise: ?IpAddress = null,
     /// The registry an image the node lacks is fetched from (`zcube-agent fetch`), as typed.
     registry: ?[]const u8 = null,
+    /// The API over TLS; null: plain HTTP.
+    tls: ?Tls = null,
+};
+
+/// `--ca`, `--cert`, `--key` and `--tls-name`. `cert` and `key` come together or not at all;
+/// without them the agent needs its own `node.crt` from an earlier join.
+pub const Tls = struct {
+    ca: []const u8,
+    cert: ?[]const u8,
+    key: ?[]const u8,
+    server_name: []const u8,
 };
 
 pub const Command = union(enum) {
@@ -122,6 +140,10 @@ const File = struct {
     peer_listen: ?[]const u8 = null,
     peer_advertise: ?[]const u8 = null,
     registry: ?[]const u8 = null,
+    ca: ?[]const u8 = null,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
 };
 
 /// The fixtures file: the digests the fake runtime has.
@@ -144,6 +166,10 @@ const Flags = struct {
     peer_listen: ?[]const u8 = null,
     peer_advertise: ?[]const u8 = null,
     registry: ?[]const u8 = null,
+    ca: ?[]const u8 = null,
+    cert: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    tls_name: ?[]const u8 = null,
     verbose: bool = false,
     version: bool = false,
     help: bool = false,
@@ -243,7 +269,27 @@ fn merge(arena: Allocator, io: std.Io, flags: Flags, file: File, diag: *Diag) Er
         .peer_listen = peer_listen,
         .peer_advertise = peer_advertise,
         .registry = registry,
+        .tls = try tls_of(flags, file, diag),
     };
+}
+
+fn tls_of(flags: Flags, file: File, diag: *Diag) Error!?Tls {
+    const ca = flags.ca orelse file.ca;
+    const cert = flags.cert orelse file.cert;
+    const key = flags.key orelse file.key;
+    const name = flags.tls_name orelse file.tls_name;
+    if (ca == null) {
+        if (cert == null and key == null and name == null) return null;
+        return bad(diag, "--cert, --key and --tls-name need --ca", .{}, "give --ca FILE");
+    }
+    if ((cert == null) != (key == null)) {
+        return bad(diag, "--cert and --key go together", .{}, "give both, or neither");
+    }
+    const server_name = name orelse "zcube-server";
+    if (x509_identity.dns_problem(server_name, constants.x509_dns_name_bytes_max)) {
+        return bad(diag, "--tls-name {s} is not a DNS name", .{server_name}, "give a DNS name");
+    }
+    return .{ .ca = ca.?, .cert = cert, .key = key, .server_name = server_name };
 }
 
 /// The address to publish for peers: the advertised one, else the listen address if it names a
@@ -326,6 +372,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             flags.peer_advertise = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--registry")) {
             flags.registry = try value_of(args, &index, diag);
+        } else if (tls_flag(&flags, arg)) |field| {
+            field.* = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--cpu-millis")) {
             flags.cpu_millis = try number_of(u32, args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--memory-bytes")) {
@@ -340,6 +388,14 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
         }
     }
     return flags;
+}
+
+fn tls_flag(flags: *Flags, arg: []const u8) ?*?[]const u8 {
+    if (std.mem.eql(u8, arg, "--ca")) return &flags.ca;
+    if (std.mem.eql(u8, arg, "--cert")) return &flags.cert;
+    if (std.mem.eql(u8, arg, "--key")) return &flags.key;
+    if (std.mem.eql(u8, arg, "--tls-name")) return &flags.tls_name;
+    return null;
 }
 
 fn is_flag(arg: []const u8, long: []const u8, short: []const u8) bool {

@@ -20,6 +20,7 @@ const assert = std.debug.assert;
 const zigbox = @import("zigbox");
 const agent_jobs = @import("agent_jobs.zig");
 const agent_records = @import("agent_records.zig");
+const api = @import("api.zig");
 const cli = @import("cli.zig");
 const cli_env = @import("cli_env.zig");
 const cli_local = @import("cli_local.zig");
@@ -658,6 +659,12 @@ fn entropy_failed(diag: *diag_mod.Diag) void { // secure_random.zig
     secure_random.raise(diag, "the TLS key share");
 }
 
+fn scope_refused(diag: *diag_mod.Diag) void { // api.zig
+    const caller: api.Caller = .{ .client = .{ .name = "app", .scope = .jobs } };
+    const path = "/v1/list";
+    api.raise_not_allowed(diag, caller, "GET", path, .admin);
+}
+
 fn tls_cut_off(diag: *diag_mod.Diag) void { // tls_client.zig
     var client: tls_client.Client = undefined;
     var hello: [1024]u8 = undefined;
@@ -949,6 +956,7 @@ const cases = [_]Case{
     relayed(.E0819, x509_wrong_use),
     relayed(.E0820, tls_signer_failed),
     relayed(.E0821, entropy_failed),
+    relayed(.E0822, scope_refused),
     relayed(.W0601, peer_bad_chunk),
     relayed(.E0601, tree_missing),
     relayed(.W0602, peer_bad_tree),

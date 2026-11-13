@@ -64,7 +64,7 @@ const Rig = struct {
     }
 
     fn get(rig: *Rig, path: []const u8, query: []const u8) api_mod.Response {
-        return rig.call(.{ .method = "GET", .path = path, .query = query });
+        return rig.call(.{ .caller = .local, .method = "GET", .path = path, .query = query });
     }
 
     /// The body parsed, copied out of the world's arena so a later call cannot disturb it.
@@ -227,6 +227,7 @@ test "watch answers what is ready with a bookmark and leaves the waiting to the 
     const waiting = rig.get("/v1/watch", waiting_query);
     try testing.expectEqual(@as(u32, 5000), waiting.hold_ms);
     const again = rig.call(.{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/watch",
         .query = waiting_query,
@@ -341,15 +342,22 @@ test "request ids are assigned, echoed, and reported with failures" {
     try testing.expectEqualStrings("r-0000001", first.request_id);
     try testing.expectEqualStrings("r-0000002", rig.get("/v1/status", "").request_id);
     const sent = rig.call(.{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/status",
         .request_id = "from-the-cli-0001",
     });
     try testing.expectEqualStrings("from-the-cli-0001", sent.request_id);
-    const short = rig.call(.{ .method = "GET", .path = "/v1/status", .request_id = "abc" });
+    const short = rig.call(.{
+        .caller = .local,
+        .method = "GET",
+        .path = "/v1/status",
+        .request_id = "abc",
+    });
     try rig.refused(short, 400, "ZC-E0104");
     try testing.expect(!std.mem.eql(u8, short.request_id, "abc"));
     const odd = rig.call(.{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/status",
         .request_id = "has spaces here",
@@ -364,7 +372,11 @@ test "requests the API cannot understand are ZC-E0104 and write nothing" {
     // a dangling continue, a bad escape.
     var rig = try Rig.start(7);
     defer rig.stop();
-    try rig.refused(rig.call(.{ .method = "POST", .path = "/v1/status" }), 400, "ZC-E0104");
+    try rig.refused(rig.call(.{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/status",
+    }), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/status", "x=1"), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/list", "limit=0"), 400, "ZC-E0104");
     try rig.refused(rig.get("/v1/list", "limit=501"), 400, "ZC-E0104");
@@ -435,7 +447,13 @@ const hello_json =
 ;
 
 fn post(rig: *Rig, query: []const u8, body: []const u8) api_mod.Response {
-    return rig.call(.{ .method = "POST", .path = "/v1/apply", .query = query, .body = body });
+    return rig.call(.{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/apply",
+        .query = query,
+        .body = body,
+    });
 }
 
 test "POST /v1/apply creates, scales, answers a dry run without writing, and reports no change" {
@@ -536,17 +554,30 @@ test "DELETE /v1/services/{name} deletes, and a missing service is ZC-E0101" {
     defer rig.stop();
     _ = try rig.json(post(&rig, "", hello_json));
     rig.world.advance(2000);
-    const deleted = rig.call(.{ .method = "DELETE", .path = "/v1/services/hello" });
+    const deleted = rig.call(.{
+        .caller = .local,
+        .method = "DELETE",
+        .path = "/v1/services/hello",
+    });
     const body = try rig.json(deleted);
     try testing.expectEqual(@as(u16, 200), deleted.status);
     try testing.expectEqualStrings("delete", field(body, "action").string);
     try testing.expect(field(body, "decision").string.len > 0);
     rig.world.advance(5000);
     try testing.expectEqual(@as(u32, 0), rig.world.replica_count("hello"));
-    const again = rig.call(.{ .method = "DELETE", .path = "/v1/services/hello" });
+    const again = rig.call(.{ .caller = .local, .method = "DELETE", .path = "/v1/services/hello" });
     try rig.refused(again, 404, "ZC-E0101");
-    try rig.refused(rig.call(.{ .method = "DELETE", .path = "/v1/list" }), 400, "ZC-E0104");
-    const odd = rig.call(.{ .method = "PUT", .path = "/v1/apply", .body = hello_json });
+    try rig.refused(rig.call(.{
+        .caller = .local,
+        .method = "DELETE",
+        .path = "/v1/list",
+    }), 400, "ZC-E0104");
+    const odd = rig.call(.{
+        .caller = .local,
+        .method = "PUT",
+        .path = "/v1/apply",
+        .body = hello_json,
+    });
     try rig.refused(odd, 400, "ZC-E0104");
 }
 
@@ -568,7 +599,7 @@ fn corrupt_node1(rig: *Rig) !void {
 
 fn repair(rig: *Rig, query: []const u8) api_mod.Response {
     const path = "/v1/repair/allocations/" ++ sim_world.node_name;
-    return rig.call(.{ .method = "POST", .path = path, .query = query });
+    return rig.call(.{ .caller = .local, .method = "POST", .path = path, .query = query });
 }
 
 test "status lists the auditor's finding; check shows it; repair asks, then writes and cites it" {
@@ -755,6 +786,7 @@ test "stats pull at its read cap with the largest records fits the request arena
     var ctx = rig.world.controller_context();
     ctx.arena = arena.allocator();
     const response = rig.api.handle(&ctx, .{
+        .caller = .local,
         .method = "GET",
         .path = "/v1/stats/pull",
         .query = "limit=500",
@@ -983,7 +1015,7 @@ fn job_json(rig: *Rig, name: []const u8, image: []const u8) ![]const u8 {
 }
 
 fn post_job(rig: *Rig, path: []const u8, body: []const u8) api_mod.Response {
-    return rig.call(.{ .method = "POST", .path = path, .body = body });
+    return rig.call(.{ .caller = .local, .method = "POST", .path = path, .body = body });
 }
 
 test "a job body that does not parse says why, under ZC-E0104" {
@@ -1129,7 +1161,12 @@ test "a relay array filling the whole body is refused by name, without building 
     defer arena.deinit();
     var ctx = rig.world.controller_context();
     ctx.arena = arena.allocator();
-    const response = rig.api.handle(&ctx, .{ .method = "POST", .path = "/v1/jobs", .body = body });
+    const response = rig.api.handle(&ctx, .{
+        .caller = .local,
+        .method = "POST",
+        .path = "/v1/jobs",
+        .body = body,
+    });
     try rig.refused(response, 400, "ZC-E0130");
     try testing.expect(std.mem.indexOf(u8, response.body, "relay") != null);
     try testing.expect(arena.queryCapacity() <= constants.request_arena_bytes_max);
@@ -1197,7 +1234,7 @@ test "a job names a relay the server configures; any other name or an env overri
     const good = try relay_body(&rig, "r1", ",\"relay\":\"botpike\"");
     try testing.expectEqual(@as(u16, 201), post_job(&rig, "/v1/jobs", good).status);
     try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", good).status);
-    const got = rig.call(.{ .method = "GET", .path = "/v1/jobs/r1" });
+    const got = rig.call(.{ .caller = .local, .method = "GET", .path = "/v1/jobs/r1" });
     try testing.expect(std.mem.indexOf(u8, got.body, "\"relay\":\"botpike\"") != null);
     try testing.expect(std.mem.indexOf(u8, got.body, "127.0.0.1") == null);
 
