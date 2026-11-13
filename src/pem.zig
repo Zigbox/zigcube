@@ -50,7 +50,9 @@ pub const pkcs8_bytes = pkcs8_prefix.len + 32;
 pub fn encode(out: *[bytes_max]u8, label: Label, bytes: []const u8) []const u8 {
     assert(bytes.len > 0);
     assert(bytes.len <= constants.x509_cert_bytes_max);
+    // The base64 of a key is the key: zeroed on the way out, as `encode_key`'s DER is.
     var base64: [base64_bytes_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &base64);
     const encoded = std.base64.standard.Encoder.encode(&base64, bytes);
     var writer: std.Io.Writer = .fixed(out);
     writer.writeAll(label.begin()) catch unreachable; // `bytes_max` holds it.
@@ -75,7 +77,9 @@ pub fn decode(
     if (!std.mem.endsWith(u8, text, label.end())) return null;
     if (text.len < label.begin().len + label.end().len) return null;
     const body = text[label.begin().len .. text.len - label.end().len];
+    // Both copies of the text below hold a key when the block is one: zeroed on the way out.
     var base64: [base64_bytes_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &base64);
     var length: usize = 0;
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line| {
@@ -91,6 +95,7 @@ pub fn decode(
     if (decoded_length > out.len) return null;
     std.base64.standard.Decoder.decode(out, base64[0..length]) catch return null;
     var again: [bytes_max]u8 = undefined;
+    defer std.crypto.secureZero(u8, &again);
     if (!std.mem.eql(u8, encode(&again, label, out[0..decoded_length]), text)) return null;
     return out[0..decoded_length];
 }

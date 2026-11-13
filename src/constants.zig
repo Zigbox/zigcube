@@ -652,6 +652,9 @@ comptime {
     assert(x509_labels_bytes_max < x509_cert_bytes_max / 2);
     assert(x509_leaf_ttl_ms_max < x509_ca_ttl_ms_max);
     assert(x509_leaf_ttl_ms_max % 1000 == 0);
+    // A node certificate (B7) lives exactly as long as the credential it is issued beside, so
+    // every credential life a verifier accepts is a life the x509 profile admits.
+    assert(peer_credential_ttl_ms_max <= x509_leaf_ttl_ms_max);
     assert(x509_ca_ttl_ms_max % 1000 == 0);
     assert(x509_cn_bytes_max >= node_name_bytes_max);
     assert(x509_cn_bytes_max >= 9 + 16);

@@ -48,8 +48,9 @@ pub const Config = struct {
     secret: [32]u8,
     /// The server's certificate (and optionally the CA's after it) and its signer.
     identity: Identity,
-    /// The kind of certificate a client must present.
-    client_kind: x509.Kind = .workload,
+    /// The kind of certificate a client must present. No default: a server that took any
+    /// kind by default would be open to the wrong callers (B7 slice 3 makes this a set).
+    client_kind: x509.Kind,
 };
 
 /// The client the handshake authenticated.

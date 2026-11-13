@@ -28,8 +28,10 @@ pub const listen_default = "127.0.0.1:7070";
 pub const usage =
     \\usage: zcube-server [--config FILE] [--listen HOST:PORT] [--store SPEC] [--create-store]
     \\                    [--new-ca] [--verbose] [--quiet]
-    \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--config FILE]
-    \\                    [--store SPEC] [--state-dir DIR]
+    \\       zcube-server ca issue-client NAME --scope jobs|admin [--out DIR] [--replace]
+    \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
+    \\       zcube-server ca issue-node NAME [--out DIR] [--replace]
+    \\                    [--config FILE] [--store SPEC] [--state-dir DIR]
     \\       zcube-server --version | --help
     \\
     \\  --config FILE     a ZON file with .listen, .store, .create_store and .relays
@@ -49,8 +51,11 @@ pub const usage =
     \\
     \\ca issue-client signs a client certificate with the store's CA (on the server host; the
     \\server need not run): NAME.key and NAME.crt, mode 0600, in --out (default: the working
-    \\directory). --scope is what the client may do: jobs, or admin. A name in the revoked file
-    \\is refused.
+    \\directory). --scope is what the client may do: jobs, or admin. ca issue-node does the
+    \\same for a node's first certificate, which the operator copies to the node. Either is
+    \\valid for 7 days: run it again with --replace (by hand or from cron) to re-issue; without
+    \\--replace an existing NAME.key or NAME.crt is refused. A name in the revoked file is
+    \\refused.
     \\
     \\Writes to the API are unauthenticated: listen on a loopback or private address.
     \\
@@ -85,15 +90,20 @@ pub const Config = struct {
     relays: []const Relay = &.{},
 };
 
-pub const Command = union(enum) { run: Config, ca_issue_client: IssueClient, version, help };
+pub const Command = union(enum) { run: Config, ca_issue: Issue, version, help };
 
-/// `zcube-server ca issue-client NAME --scope jobs|admin`: the store settings find the CA key
-/// (`config`), and the files are written in `out_dir`.
-pub const IssueClient = struct {
+/// `zcube-server ca issue-client NAME --scope jobs|admin` or `ca issue-node NAME`: the store
+/// settings find the CA key (`config`), and the files are written in `out_dir`.
+pub const Issue = struct {
     config: Config,
+    /// What the certificate is for: a client (with `scope`) or a node.
+    subject: Subject,
     name: []const u8,
-    scope: Scope,
     out_dir: []const u8 = ".",
+    /// Replace an existing `NAME.key` and `NAME.crt` (`--replace`); refused otherwise.
+    replace: bool = false,
+
+    pub const Subject = union(enum) { client: Scope, node };
 };
 
 pub const Scope = @import("x509.zig").Scope;
@@ -154,46 +164,83 @@ pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag)
     return .{ .run = try merge(flags, file, diag) };
 }
 
-/// `ca issue-client NAME --scope S [--out DIR]` and the store flags of a run.
+/// `ca issue-client NAME --scope S` or `ca issue-node NAME`, `[--out DIR] [--replace]`, and the
+/// store flags of a run. `--help` anywhere after `ca` is the help.
 fn load_ca(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     assert(std.mem.eql(u8, args[0], "ca"));
-    if (args.len < 2 or !std.mem.eql(u8, args[1], "issue-client")) {
-        const problem = "zcube-server ca has one command, issue-client";
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.eql(u8, arg, "-h")) return .help;
+    }
+    const node = args.len >= 2 and std.mem.eql(u8, args[1], "issue-node");
+    const client = args.len >= 2 and std.mem.eql(u8, args[1], "issue-client");
+    if (!node and !client) {
+        const problem = "zcube-server ca has two commands, issue-client and issue-node";
         return bad(diag, problem, .{}, "run it with --help");
     }
+    const what = if (node) "ca issue-node needs a node name" else "ca issue-client needs a name";
     if (args.len < 3 or std.mem.startsWith(u8, args[2], "-")) {
-        return bad(diag, "ca issue-client needs a client name", .{}, "run it with --help");
+        return bad(diag, "{s}", .{what}, "run it with --help");
     }
-    var request: IssueClient = .{ .config = undefined, .name = args[2], .scope = undefined };
+    var request: Issue = .{ .config = undefined, .subject = .node, .name = args[2] };
     var scope: ?Scope = null;
+    var out: ?[]const u8 = null;
     var rest: std.ArrayList([]const u8) = .empty;
     var index: usize = 3;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--scope")) {
-            const text = try value_of(args, &index, diag);
-            scope = std.meta.stringToEnum(Scope, text) orelse {
-                const problem = "--scope is jobs or admin, not {s}";
-                return bad(diag, problem, .{text}, "run it with --help");
-            };
+            if (scope != null) return bad(diag, "--scope is given twice", .{}, "give it once");
+            scope = try scope_of(args, &index, diag);
         } else if (std.mem.eql(u8, args[index], "--out")) {
-            request.out_dir = try value_of(args, &index, diag);
+            if (out != null) return bad(diag, "--out is given twice", .{}, "give it once");
+            out = try value_of(args, &index, diag);
+        } else if (std.mem.eql(u8, args[index], "--replace")) {
+            request.replace = true;
         } else {
             try rest.append(arena, args[index]);
         }
     }
-    request.scope = scope orelse {
+    if (out) |directory| request.out_dir = directory;
+    request.subject = try subject_of(node, scope, diag);
+    request.config = try issue_config(arena, io, rest.items, diag);
+    return .{ .ca_issue = request };
+}
+
+fn scope_of(args: []const []const u8, index: *usize, diag: *Diag) Error!Scope {
+    const text = try value_of(args, index, diag);
+    return Scope.parse(text) orelse
+        bad(diag, "--scope is jobs or admin, not {s}", .{text}, "run it with --help");
+}
+
+/// A client needs a scope; a node has none (it may call the agent API for itself only).
+fn subject_of(node: bool, scope: ?Scope, diag: *Diag) Error!Issue.Subject {
+    if (node) {
+        if (scope != null) {
+            const problem = "a node certificate has no --scope: a node may act for itself only";
+            return bad(diag, problem, .{}, "leave out --scope");
+        }
+        return .node;
+    }
+    const given = scope orelse {
         return bad(diag, "ca issue-client needs --scope jobs or --scope admin", .{}, "add one");
     };
-    const flags = try parse_flags(rest.items, diag);
-    if (flags.version or flags.help) return if (flags.version) .version else .help;
+    return .{ .client = given };
+}
+
+/// The store settings of a run, read as the server reads them, without the ones that make a CA.
+fn issue_config(arena: Allocator, io: std.Io, rest: []const []const u8, diag: *Diag) Error!Config {
+    const flags = try parse_flags(rest, diag);
+    if (flags.version) {
+        return bad(diag, "--version is not a setting of ca", .{}, "run zcube-server --version");
+    }
+    assert(!flags.help); // `load_ca` answered it.
     if (flags.new_ca or flags.create_store) {
-        const problem = "ca issue-client signs with the CA a server already made";
+        const problem = "ca signs with the CA a server already made";
         return bad(diag, problem, .{}, "leave out --new-ca and --create-store");
     }
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
-    request.config = try merge(flags, file, diag);
-    return .{ .ca_issue_client = request };
+    return merge(flags, file, diag);
 }
 
 fn merge(flags: Flags, file: File, diag: *Diag) Error!Config {
@@ -643,9 +690,10 @@ test "flags win over the file, unknown flags and settings are refused" {
     try expect_bad(parse_zon(arena, "this is not zon", "server.zon", &diag), &diag);
 }
 
-test "ca issue-client takes a name, a scope and an output directory, and refuses the rest" {
-    // Goal: the subcommand's parsing. Method: a full command and its defaults, then a missing
-    // name, a missing or unknown scope, an unknown subcommand and --new-ca, each ZC-E0106.
+test "ca issue-client and issue-node take a name, a scope (a client's), --out and --replace" {
+    // Goal: the subcommands' parsing. Method: full commands and their defaults, --help anywhere,
+    // then a missing name, a missing, repeated or unknown scope, a node given a scope, a repeated
+    // --out, an unknown subcommand and --new-ca, each ZC-E0106.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -655,15 +703,29 @@ test "ca issue-client takes a name, a scope and an output directory, and refuses
     const full = [_][]const u8{
         "ca", "issue-client", "ops-1", "--store", "sqlite:/a", "--scope", "jobs", "--out", "/o",
     };
-    const command = (try load(arena, io, &full, &diag)).ca_issue_client;
+    const command = (try load(arena, io, &full, &diag)).ca_issue;
     try testing.expectEqualStrings("ops-1", command.name);
-    try testing.expectEqual(Scope.jobs, command.scope);
+    try testing.expectEqual(Scope.jobs, command.subject.client);
     try testing.expectEqualStrings("/o", command.out_dir);
     try testing.expectEqualStrings("/a", command.config.store.sqlite);
-    const short = [_][]const u8{ "ca", "issue-client", "ops-1", "--scope", "admin" };
-    const plain = (try load(arena, io, &short, &diag)).ca_issue_client;
+    try testing.expect(!command.replace);
+    const short = [_][]const u8{ "ca", "issue-client", "ops-1", "--scope", "admin", "--replace" };
+    const plain = (try load(arena, io, &short, &diag)).ca_issue;
     try testing.expectEqualStrings(".", plain.out_dir);
-    try testing.expectEqual(Scope.admin, plain.scope);
+    try testing.expectEqual(Scope.admin, plain.subject.client);
+    try testing.expect(plain.replace);
+    const node = [_][]const u8{ "ca", "issue-node", "node-1", "--out", "/n" };
+    const for_node = (try load(arena, io, &node, &diag)).ca_issue;
+    try testing.expectEqual(Issue.Subject.node, for_node.subject);
+    try testing.expectEqualStrings("node-1", for_node.name);
+    try testing.expectEqualStrings("/n", for_node.out_dir);
+    // `--help` anywhere after `ca` is the help, not a refusal.
+    const helps = [_][]const []const u8{
+        &.{ "ca", "--help" },
+        &.{ "ca", "issue-client", "--help" },
+        &.{ "ca", "issue-node", "node-1", "-h" },
+    };
+    for (helps) |args| try testing.expectEqual(Command.help, try load(arena, io, args, &diag));
 
     const refusals = [_][]const []const u8{
         &.{ "ca", "issue-client" },
@@ -675,6 +737,13 @@ test "ca issue-client takes a name, a scope and an output directory, and refuses
         &.{"ca"},
         &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--new-ca" },
         &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--bogus" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--scope", "admin" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--out", "a", "--out", "b" },
+        &.{ "ca", "issue-client", "ops-1", "--scope", "jobs", "--version" },
+        &.{ "ca", "issue-node" },
+        &.{ "ca", "issue-node", "--out", "x" },
+        &.{ "ca", "issue-node", "node-1", "--scope", "jobs" },
+        &.{ "ca", "issue-node", "node-1", "--create-store" },
     };
     for (refusals) |args| {
         diag.reset();

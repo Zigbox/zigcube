@@ -296,6 +296,7 @@ fn setup(world: *World, random: std.Random) !void {
             .certificates = &world.chain,
             .signer = tls_server.key_pair_signer(&world.server_key),
         },
+        .client_kind = .workload,
     });
     var client_random: [32]u8 = undefined;
     var client_secret: [32]u8 = undefined;

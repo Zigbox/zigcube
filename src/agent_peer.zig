@@ -45,8 +45,12 @@ pub const Peer = struct {
     key: Ed25519.KeyPair,
     credential: ?peer.Credential = null,
     ca_public: ?[32]u8 = null,
-    /// Present exactly when `credential` is: the two are issued, stored and dropped together.
+    /// Issued, stored and dropped with `credential`, so present whenever it is, but one case:
+    /// a valid `peer.cred` stored with no `node.crt` beside it (written by an agent from before
+    /// B7, or the server is older than this agent) is kept, and the next renewal brings it.
     node_certificate: ?x509.Der = null,
+    /// `open` kept a valid credential with no `node.crt` beside it: the caller says so once.
+    node_certificate_missing: bool = false,
     /// Wall-clock time at which the credential is renewed; 0 when there is none to keep.
     renew_at_ms: u64 = 0,
     /// A failed join is not tried again before this wall-clock time.
@@ -179,10 +183,18 @@ pub const Peer = struct {
         if (!std.mem.eql(u8, &issued.credential.node_key, &public)) {
             return bad(diag, "the credential is for another key than the one sent");
         }
+        if (issued.node_certificate.slice().len == 0) {
+            // A server from before B7 answers without one. The stored credential, if valid, is
+            // kept until it expires; this is tried again every `peer_join_retry_ms`.
+            const problem = "the answer has no node_certificate: the server is older than the " ++
+                "agent; upgrade the server first";
+            return bad(diag, problem);
+        }
         if (self.node_certificate_problem(&issued)) |problem| return bad(diag, problem);
         self.credential = issued.credential;
         self.ca_public = issued.ca_public;
         self.node_certificate = issued.node_certificate;
+        self.node_certificate_missing = false;
         self.renew_at_ms = renew_time(&issued.credential);
         self.store(diag) catch |err| {
             // The pair is in memory and works; the failed write is retried at the agent's next
@@ -255,6 +267,8 @@ pub const Peer = struct {
     /// Writes `ca.pub`, `node.crt` and then `peer.cred`: the credential's presence means the
     /// set is whole.
     pub fn store(self: *Peer, diag: *Diag) Error!void {
+        assert(self.credential != null);
+        assert(self.node_certificate != null);
         var ca_text: [65]u8 = undefined;
         const ca_line = std.fmt.bufPrint(&ca_text, "{x}\n", .{&self.ca_public.?}) catch
             unreachable; // Sized.
@@ -271,8 +285,11 @@ pub const Peer = struct {
     }
 
     /// Reads `peer.cred`, `ca.pub` and `node.crt`. A set that does not belong to this key and
-    /// node, or has no node certificate (an agent from before B7), is not an error: it is
-    /// ignored, and the agent joins again at once.
+    /// node, or whose `node.crt` is another set's, is not an error: it is ignored, and the agent
+    /// joins again at once. A valid credential with no `node.crt` at all (an agent from before
+    /// B7, or a server older than this agent) is kept, with `node_certificate_missing` set: were
+    /// it dropped, an agent upgraded before its server could not join again until the server
+    /// is upgraded, and peer fetches on the node would stop.
     fn load_stored(self: *Peer, diag: *Diag) files.Error!void {
         var ca_buffer: [128]u8 = undefined;
         var credential_buffer: [512]u8 = undefined;
@@ -309,27 +326,39 @@ pub const Peer = struct {
         if (!std.mem.eql(u8, &credential.node_key, &public)) return;
         if (!std.mem.eql(u8, &credential.ca_key_id, &peer.ca_key_id(ca_public))) return;
         var issued: Issued = .{ .credential = credential, .ca_public = ca_public };
-        if (!try self.load_node_certificate(&issued, diag)) return;
+        switch (try self.load_node_certificate(&issued, diag)) {
+            .other => return,
+            .absent => {
+                self.node_certificate = null;
+                self.node_certificate_missing = true;
+            },
+            .valid => {
+                self.node_certificate = issued.node_certificate;
+                self.node_certificate_missing = false;
+            },
+        }
         self.credential = credential;
         self.ca_public = ca_public;
-        self.node_certificate = issued.node_certificate;
         self.renew_at_ms = renew_time(&credential);
     }
 
-    /// Reads `node.crt` into `issued`: false when it is absent or not this set's.
-    fn load_node_certificate(self: *const Peer, issued: *Issued, diag: *Diag) files.Error!bool {
+    const Stored = enum { valid, absent, other };
+
+    /// Reads `node.crt` into `issued`: `absent`, or `other` when it is not this set's.
+    fn load_node_certificate(self: *const Peer, issued: *Issued, diag: *Diag) files.Error!Stored {
         var text_buffer: [pem.bytes_max]u8 = undefined;
         const name = node_certificate_file;
         const io, const dir, const where = .{ self.io, self.dir, self.where };
         const text = try files.read(io, dir, where, name, .plain, &text_buffer, diag) orelse
-            return false;
+            return .absent;
         var der: [constants.x509_cert_bytes_max]u8 = undefined;
         const bytes = pem.decode(text, .certificate, &der) orelse
             return files.unusable(diag, where, name, "parse", "it is not one PEM certificate");
         const at = issued.node_certificate.bytes.len - bytes.len;
         @memcpy(issued.node_certificate.bytes[at..], bytes);
         issued.node_certificate.start = @intCast(at);
-        return self.node_certificate_problem(issued) == null;
+        if (self.node_certificate_problem(issued) != null) return .other;
+        return .valid;
     }
 };
 
@@ -387,7 +416,8 @@ const Issued = struct {
 
 const Answer = struct {
     credential: []const u8,
-    node_certificate: []const u8,
+    /// Absent in a server from before B7: `join` says so rather than "not what the server sends".
+    node_certificate: ?[]const u8 = null,
     ca_public: []const u8,
     not_before_ms: u64 = 0,
     not_after_ms: u64 = 0,
@@ -405,11 +435,11 @@ fn parse_reply(arena: Allocator, body: []const u8) ?Issued {
     const credential = peer.decode(&raw) catch return null;
     var issued: Issued = .{ .credential = credential, .ca_public = ca_public };
     const certificate = &issued.node_certificate;
-    if (answer.node_certificate.len > certificate.bytes.len * 2) return null;
-    const at = certificate.bytes.len - answer.node_certificate.len / 2;
+    const certificate_hex = answer.node_certificate orelse return issued; // Left empty.
+    if (certificate_hex.len > certificate.bytes.len * 2) return null;
+    const at = certificate.bytes.len - certificate_hex.len / 2;
     const tail = certificate.bytes[at..];
-    const decoded_certificate = std.fmt.hexToBytes(tail, answer.node_certificate) catch
-        return null;
+    const decoded_certificate = std.fmt.hexToBytes(tail, certificate_hex) catch return null;
     if (decoded_certificate.len == 0) return null;
     if (decoded_certificate.len != certificate.bytes.len - at) return null;
     certificate.start = @intCast(at);
@@ -558,8 +588,8 @@ test "a corrupt or loose cache file is ignored with one problem, never an error"
     try std.testing.expect(loose.stored_problem);
     try std.testing.expect(loose.ca_public == null);
 
-    // `node.crt`: damaged is a problem, absent (an agent from before B7) or for another node is
-    // a cache that does not fit. Each way the agent holds nothing and joins again.
+    // `node.crt`: damaged is a problem, and the agent holds nothing and joins again. Absent, the
+    // valid credential is kept (the next test).
     try store_pair(&state, "node1", 5);
     try state.tmp.dir.writeFile(io, .{
         .sub_path = node_certificate_file,
@@ -572,15 +602,54 @@ test "a corrupt or loose cache file is ignored with one problem, never an error"
     try std.testing.expect(damaged.stored_problem);
     try std.testing.expect(damaged.credential == null);
     try std.testing.expect(damaged.node_certificate == null);
+}
 
+test "a valid credential with no node.crt is kept, and an old server's answer says so" {
+    // Goal: review B of B7 slice 2, SHOULD 1 and 2. An agent upgraded before its server keeps
+    // the credential it holds (peer fetches go on), and a renewal against a server that sends
+    // no node certificate fails with a cause that names the upgrade order. Method: store a pair,
+    // delete node.crt, reopen (kept, flagged, not due); renew against an answer without
+    // node_certificate (E0504 with that cause, credential kept); then a whole answer stores
+    // node.crt and clears the flag.
+    const io = std.testing.io;
+    var state: TestState = undefined;
+    try state.make(io);
+    defer state.tmp.cleanup();
+    var diag: Diag = undefined;
     try store_pair(&state, "node1", 5);
     try state.tmp.dir.deleteFile(io, node_certificate_file);
     diag.reset();
-    var absent = try Peer.open(io, state.path(), "node1", &diag);
-    defer absent.close();
-    try std.testing.expect(!absent.stored_problem);
-    try std.testing.expect(absent.credential == null);
-    try std.testing.expect(absent.due(0));
+    var agent = try Peer.open(io, state.path(), "node1", &diag);
+    defer agent.close();
+    try std.testing.expect(diag.code == null);
+    try std.testing.expect(!agent.stored_problem);
+    try std.testing.expect(agent.node_certificate_missing);
+    try std.testing.expect(agent.node_certificate == null);
+    const held = agent.credential.?;
+    try std.testing.expect(!agent.due(2000));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ca = try Ed25519.KeyPair.generateDeterministic(@splat(5));
+    const mine = agent.key.public_key.toBytes();
+    var old: Canned = .{ .status = 200, .body = try certified(arena, ca, mine, .absent) };
+    const now_ms = agent.renew_at_ms;
+    try std.testing.expect(!try_step(&agent, &old, now_ms, &diag));
+    try std.testing.expectEqual(@as(?codes.Code, .E0504), diag.code);
+    const cause = diag.last_cause().?;
+    try std.testing.expect(std.mem.indexOf(u8, cause, "no node_certificate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cause, "upgrade the server first") != null);
+    try std.testing.expectEqualSlices(u8, &peer.encode(&held), &peer.encode(&agent.credential.?));
+    try std.testing.expect(agent.node_certificate_missing);
+    try std.testing.expectError(error.FileNotFound, state.tmp.dir.statFile(io, "node.crt", .{}));
+
+    const later_ms = now_ms + constants.peer_join_retry_ms;
+    var good: Canned = .{ .status = 200, .body = try issued_body(arena, ca, ca, "node1", mine) };
+    try std.testing.expect(try_step(&agent, &good, later_ms, &diag));
+    try std.testing.expect(!agent.node_certificate_missing);
+    try std.testing.expect(agent.node_certificate != null);
+    _ = try state.tmp.dir.statFile(io, node_certificate_file, .{});
 }
 
 /// A server that answers every call the same way and counts them.
