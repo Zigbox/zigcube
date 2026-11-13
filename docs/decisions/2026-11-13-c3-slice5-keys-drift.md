@@ -43,9 +43,12 @@ and `claude/b6-slice1`:
    held more (it cannot through the API), an apply deletes what fits in its transaction (16 ops,
    leaving room for its decision) and the next apply deletes more; the newest generations are
    never the ones dropped. Listing more than `history_scan_max` (64) history keys for one service
-   is ZC-E0302, as every other bounded listing. A stored generation above the one being written
-   is an earlier service's (a build before C3 deleted the service and left its history; a
-   generation only grows within one service) and is deleted first.
+   is ZC-E0302, as every other bounded listing. A stored record that is not the service's own is
+   deleted first: written before the service key was created (a build before C3 deleted the
+   service and left its history), or below a generation that has no record (a build before C3
+   applied it). `history.usable` never offers such a record for a rollback, even before it is
+   deleted. (Fix of review: the first version deleted only generations above the one written, so
+   an older build's delete and re-create left the old service's lower generations restorable.)
 6. **Deleting a service deletes its history first**, under the API role, in transactions that
    each expect the service at the revision the delete read. A conflict stops the delete with
    ZC-E0105 as before; history already deleted stays deleted (a rollback to it is ZC-E0128).

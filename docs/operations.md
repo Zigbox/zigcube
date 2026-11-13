@@ -29,11 +29,16 @@ oldest version that holds its members, so until a service carries `health` or a 
 2. **Apply no service with `health` or `rollout` until every server and agent is upgraded.**
    An older server or agent refuses a version 4 service or replica, and an older server a version
    3 observation, with `ZC-E0303`, naming the key and both versions.
-3. A downgrade is safe only while no record is at a new version. `/history/` and `/rollouts/`
-   records an older server does not know are left alone by it. An older server deleting a
-   service leaves that service's history behind; when a server of this release applies the name
-   again, it deletes every generation above the one it writes (they belong to the deleted
-   service), so the old history never mixes with the new.
+3. A downgrade is safe only while no record is at a new version. An older server leaves
+   `/history/` and `/rollouts/` alone and writes no history, so after an upgrade back:
+   - a service the older server **deleted** (and perhaps applied again) has the deleted service's
+     history left behind. None of it is offered for a rollback, and the next apply of the name by
+     this release deletes it.
+   - a service the older server **changed** has a gap: the generations it applied have no
+     record. Nothing from before the gap is offered for a rollback (it predates the downgrade),
+     and the next apply deletes it. Until that apply, `zcube rollback` has nothing to go back to.
+   Records that do not fit in that apply's transaction are deleted by the following ones and are
+   never offered meanwhile (docs/keys.md, `/history`).
 
 ## Postgres high availability: the supported setup
 

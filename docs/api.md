@@ -562,7 +562,9 @@ controller or API handler writes them yet.
    every status change, which is not the same thing.
 8. **[Approved]** **Environment values are secrets in `/services/<name>`.** The API must not send them to a
    read-only token; send names only. The console masks them anyway, but that is the second line
-   of defence, not the first.
+   of defence, not the first. As built, the server blanks the `env` values of every record it
+   sends a read-only token, whatever its prefix (`/services/`, `/replicas/`, `/jobs/`,
+   `/job-runs/` and, since C3 slice 5, `/history/`), on `/v1/list` and `/v1/watch` alike.
 9. **[Approved]** **Service-level decisions.** `zcube why service x` needs decisions whose subject is the
    service ("scale_up", "replace_replica", "hold_failed_replica"), not only per-replica ones,
    or the chain for a service starts nowhere. The mock records both, linked by `cause`.

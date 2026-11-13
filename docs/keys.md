@@ -176,10 +176,20 @@ never changed. Users address versions by generation (owner, 2026-11-05).
 here is ZC-E0128 (owner, 2026-11-05). Deleting a service deletes its history first, in
 transactions that each expect the service at the revision the delete read, so a service that is
 gone leaves no history and a service that changed meanwhile keeps the history of its new
-generation. A stored generation above the one an apply writes belongs to an earlier service of
-the same name (a build before C3 left it behind) and that apply deletes it. `env` values are
-secrets here as in the service (the API never sends them to a
-read-only token).
+generation.
+
+**Which records are the service's own** (`history.usable`): those written at or after the
+revision that created the service key (a record's `mod_revision` against the service's
+`create_revision`), forming an unbroken run of generations that ends at the service's own. A build
+before C3 writes no history: one that deleted the service leaves the old service's records
+behind, written before the new service existed, and one that applied generations leaves a gap
+below the service's own. A rollback is offered only the run; every other record is dropped by the
+next apply that writes history, as far as its transaction has room (the rest by later ones), and
+is never offered meanwhile. So a rollback cannot restore a deleted service's spec, nor one from
+before a downgrade.
+
+`env` values are secrets here as in the service: the API never sends them to a read-only token
+(docs/api.md item 8).
 
 ## `/rollouts/<service>`: a rollout in progress (C3 slice 7; defined in slice 5)
 
