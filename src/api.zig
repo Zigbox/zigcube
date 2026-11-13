@@ -669,6 +669,7 @@ pub fn status_for(code: codes.Code, blame: zigbox.codes.Blame) u16 {
         .user => {
             if (code == .E0101) return 404;
             if (code == .E0203) return 410;
+            if (code == .E0822) return 403;
             // The state the request rested on is not (or no longer) there.
             if (code == .E0105 or code == .E0402 or code == .E0403) return 409;
             if (code == .E0131) return 409;

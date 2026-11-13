@@ -133,6 +133,7 @@ pub const Code = enum(u8) {
     E0819,
     E0820,
     E0821,
+    E0822,
     B0001,
     B0002,
     B0003,
@@ -1949,6 +1950,26 @@ pub const registry = [_]Entry{
         \\
         \\Check that getrandom works where this runs: the kernel, the seccomp profile
         \\and the container sandbox must allow it. Then run the command again.
+        ,
+    },
+    .{
+        .code = .E0822,
+        .severity = .@"error",
+        .blame = .user,
+        .summary = "the caller's certificate does not allow this request",
+        .explanation =
+        \\The server refused a request because the client certificate it came with
+        \\does not give the scope the request needs. The diagnostic names the caller
+        \\and the scope it would need. The answer is HTTP 403, and nothing was read
+        \\or written.
+        \\
+        \\A node's certificate (an agent) may call only the agent API under its own
+        \\node's name: /v1/agent/nodes/<its name>/. A client certificate of scope
+        \\`jobs` may submit, list, watch and cancel jobs (/v1/jobs) and ask why about
+        \\a job. Everything else needs a client certificate of scope `admin`.
+        \\
+        \\Use a certificate with the scope the request needs: an operator issues one
+        \\with `zcube-server ca issue-client NAME --scope admin`.
         ,
     },
     .{
