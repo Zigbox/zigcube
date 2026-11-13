@@ -22,6 +22,9 @@ good.
   `running_reported` ring in `agent.zig` and `agent_jobs.zig`).
 - ZC-E0706's explanation names the two transient causes.
 
+Upgrade order: the server first. An agent from before these fixes reads the server's 409 for
+`not_started` as final. B4 is unreleased, so no deployed pair is affected.
+
 ## The certificate step is bounded, and per container
 
 - `relay_cert_asks_per_step_max` (8) caps the asks of one step.
