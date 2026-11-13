@@ -15,6 +15,6 @@
 # 2. In `def install`, after `bin.install "zbx"`:
     resource("zcube").stage { bin.install "zcube" }
 
-# 3. In `test do`; neither command reaches a server:
-    assert_match "zcube @VERSION@", shell_output("#{bin}/zcube --version")
+# 3. In `test do`; neither command reaches a server (zcube has no --version flag):
+    assert_match "the Zigcube command line", shell_output("#{bin}/zcube help")
     assert_match "only on Linux", shell_output("#{bin}/zcube explain E0122")

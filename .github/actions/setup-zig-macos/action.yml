@@ -1,0 +1,24 @@
+name: Set up Zig (macOS, Apple silicon)
+description: >
+  Installs the Zig toolchain pinned in build.zig.zon from ziglang.org for an Apple silicon runner
+  and verifies the tarball against its published SHA-256 before using it. Copied from Zigbox's
+  action of the same name: the system tools are called by absolute path, so a program planted in
+  a Homebrew directory is never run.
+runs:
+  using: composite
+  steps:
+    - name: Install Zig 0.17.0
+      shell: /bin/bash --noprofile --norc -euo pipefail {0}
+      env:
+        ZIG_VERSION: 0.17.0
+        # From https://ziglang.org/download/index.json, field 0.17.0 / aarch64-macos / shasum.
+        ZIG_SHA256: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+      run: |
+        archive="zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+        /usr/bin/curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+        echo "${ZIG_SHA256}  ${RUNNER_TEMP}/${archive}" | /usr/bin/shasum -a 256 -c -
+        /usr/bin/tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+        echo "${RUNNER_TEMP}/zig-aarch64-macos-${ZIG_VERSION}" >> "${GITHUB_PATH}"
+    - name: Show the toolchain
+      shell: /bin/bash --noprofile --norc -euo pipefail {0}
+      run: zig version
