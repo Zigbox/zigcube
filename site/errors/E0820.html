@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZC-E0820 · Zigcube</title>
-<meta name="description" content="the key behind the client certificate did not sign">
+<meta name="description" content="the key behind a client's or this server's certificate did not sign">
 <link rel="canonical" href="https://zigbox.github.io/zigcube/errors/E0820.html">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -73,12 +73,12 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <main class="wrap">
 <p class="eyebrow">Diagnostic code</p>
 <h1>ZC-E0820</h1>
-<p class="summary">the key behind the client certificate did not sign</p>
+<p class="summary">the key behind a client's or this server's certificate did not sign</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>environment</dd></div><div><dt>Exit code</dt><dd>2</dd></div></dl>
 <h2>What it means</h2>
 <p>The server asked for a client certificate and the client has one, but the signer that holds its private key returned no signature, so the proof of possession (CertificateVerify) could not be made. The connection is closed with an internal_error alert; nothing was accepted.</p>
 <p>The key never enters the TLS client: it sits behind a signer, in the same process or in another. This is that signer failing, not the server or the certificate. Check that the process or device holding the key is running and reachable, then reconnect.</p>
-<p>On a zcube server, this is the server's own signer: it could not sign its CertificateVerify, so it sent internal_error and no client was let in.</p>
+<p>On a zcube server, this is the server's own signer: it could not sign its CertificateVerify, so it sent the client an internal_error alert in the clear (the client held no keys yet) and let no client in.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>
 <pre class="term">zcube explain E0820</pre>

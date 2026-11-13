@@ -439,6 +439,18 @@ const hello_misses = [_]NearMiss{
         .alert = .illegal_parameter,
         .faults = .{ .hello = .{ .psk_not_last = true } },
     },
+    .{
+        .name = "bytes after the hello",
+        .code = .E0813,
+        .alert = .unexpected_message,
+        .faults = .{ .hello = .{ .trailing = true } },
+    },
+    .{
+        .name = "no supported_groups",
+        .code = .E0813,
+        .alert = .missing_extension,
+        .faults = .{ .hello = .{ .supported_groups = false } },
+    },
 };
 
 const flight_misses = [_]NearMiss{
@@ -537,6 +549,12 @@ const flight_misses = [_]NearMiss{
         .code = .E0813,
         .alert = .unexpected_message,
         .faults = .{ .trailing = true },
+    },
+    .{
+        .name = "a request context and no certificates",
+        .code = .E0813,
+        .alert = .illegal_parameter,
+        .faults = .{ .chain = .none, .verify = .omit, .context = "x" },
     },
     .{
         .name = "data before Finished",
@@ -652,6 +670,81 @@ test "a record that does not authenticate ends the connection and wipes it" {
     for (rig.server.record) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
+test "the client's KeyUpdates stop at the limit, and so do the server's answers" {
+    // Goal: tls_key_updates_per_connection_max bounds both directions (ZC-E0815). Method: the
+    // counters are set near the limit rather than driven there 65,536 times.
+    var rig: Rig = undefined;
+    var buffer: [64]u8 = undefined;
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    rig.server.read.updates = constants.tls_key_updates_per_connection_max - 1;
+    _ = try rig.feed(rig.client.key_update(&buffer, false), 4096); // The last one allowed.
+    _ = try rig.feed(rig.client.seal(&buffer, .application_data, "x"), 4096);
+    try std.testing.expectEqual(@as(u32, 1), rig.data_events);
+    try std.testing.expectError(error.Refused, rig.feed(rig.client.key_update(&buffer, false), 4096));
+    try rig.expect_code(.E0815);
+    const cause = rig.diag.last_cause().?;
+    try std.testing.expect(std.mem.indexOf(u8, cause, "updated its keys") != null);
+    // A requested update the server's write keys cannot answer.
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    rig.server.write.updates = constants.tls_key_updates_per_connection_max;
+    try std.testing.expectError(error.Refused, rig.feed(rig.client.key_update(&buffer, true), 4096));
+    try rig.expect_code(.E0815);
+    try std.testing.expect(std.mem.indexOf(u8, rig.diag.last_cause().?, "answering") != null);
+}
+
+test "one change_cipher_spec is dropped and a second is refused" {
+    comptime assert(constants.tls_change_cipher_spec_records_max == 1);
+    var rig: Rig = undefined;
+    try rig.setup(.{});
+    try rig.hello(4096);
+    const ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
+    try std.testing.expect(try rig.feed(&ccs, 4096) == .none);
+    try std.testing.expectEqual(@as(u32, 0), rig.sent_length);
+    try std.testing.expectError(error.Refused, rig.feed(&ccs, 4096));
+    try rig.expect_code(.E0815);
+}
+
+test "a plain alert is refused once the client has sent a protected record" {
+    // Goal: plain_alert_allowed holds only between the server's flight and the client's first
+    // protected record. Method: a plain alert after a protected record of the flight, and one
+    // after the handshake.
+    const alert = [_]u8{ 21, 3, 3, 0, 2, 2, 42 };
+    var rig: Rig = undefined;
+    var buffer: [64]u8 = undefined;
+    try rig.setup(.{});
+    try rig.hello(4096);
+    const certificate = [_]u8{ wire.handshake_certificate, 0, 0, 4 };
+    _ = try rig.feed(rig.client.seal(&buffer, .handshake, &certificate), 4096);
+    try std.testing.expectError(error.Refused, rig.feed(&alert, 4096));
+    try rig.expect_code(.E0815);
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    try std.testing.expectError(error.Refused, rig.feed(&alert, 4096));
+    try rig.expect_code(.E0815);
+}
+
+fn signer_fails(context: *const anyopaque, message: []const u8) ?[64]u8 {
+    _ = context;
+    _ = message;
+    return null;
+}
+
+test "a signer that fails sends internal_error in the clear and lets no client in" {
+    // Goal: the client reads the alert. It holds no keys before the ServerHello, which the
+    // server dropped. Method: a signer that returns nothing.
+    var rig: Rig = undefined;
+    try rig.setup(.{});
+    rig.server.signer = .{ .context = &rig.server_key, .sign = signer_fails };
+    try std.testing.expectError(error.Refused, rig.feed(rig.client.hello(&rig.input), 4096));
+    try rig.expect_code(.E0820);
+    try std.testing.expectEqual(@as(u32, 7), rig.sent_length);
+    try std.testing.expectEqual(@as(u8, 21), rig.sent[0]);
+    try std.testing.expectEqual(@backingInt(wire.Alert.internal_error), rig.sent[6]);
+    try std.testing.expect(!rig.server.is_connected());
+}
+
 // ---- Teeth: each security check, skipped, lets a refused client through ------------------------
 
 fn expect_tooth(fault: tls_server.TestFault, faults: testclient.Faults) !void {
@@ -697,17 +790,11 @@ test "teeth: without the key-change boundary bytes after Finished are read" {
     try expect_tooth(.key_change_boundary, .{ .trailing = true });
 }
 
-test "teeth: a transcript without the client's certificate is refused by a correct client" {
+test "teeth: without the client's certificate in the transcript an unbound one connects" {
     // Goal: the transcript binds the client's Certificate and CertificateVerify. Method: a
-    // server that leaves them out disagrees with a correct client's Finished.
-    var rig: Rig = undefined;
-    try rig.setup(.{});
-    try expect_connected(&rig, 4096);
-    tls_server.set_test_fault(.transcript_client_auth, true);
-    defer tls_server.set_test_fault(.transcript_client_auth, false);
-    try rig.setup(.{});
-    try std.testing.expectError(error.Refused, rig.handshake(4096));
-    try rig.expect_code(.E0813);
+    // client whose signature and Finished leave them out, as if they were swapped in after it
+    // signed, is refused; a server that leaves them out too takes it.
+    try expect_tooth(.transcript_client_auth, .{ .unbound_auth = true });
 }
 
 test "teeth: without the early-data check data before Finished is passed on" {
@@ -719,5 +806,89 @@ test "teeth: without the early-data check data before Finished is passed on" {
     defer tls_server.set_test_fault(.early_application_data, false);
     try rig.setup(.{ .early_application_data = true });
     try std.testing.expect(try rig.handshake(4096) == .connected);
+    try std.testing.expectEqual(@as(u32, 1), rig.data_events);
+}
+
+test "teeth: without the change_cipher_spec checks two, or one of 2, are dropped" {
+    try expect_tooth(.change_cipher_spec, .{ .ccs = 2 });
+    try expect_tooth(.change_cipher_spec, .{ .ccs_byte = 2 });
+}
+
+test "teeth: without the early-data refusal a hello that offers it is answered" {
+    try expect_tooth(.early_data, .{ .hello = .{ .early_data = true } });
+}
+
+test "teeth: without the key-change boundary bytes after the ClientHello are read" {
+    var rig: Rig = undefined;
+    const faults: testclient.Faults = .{ .hello = .{ .trailing = true } };
+    try rig.setup(faults);
+    try std.testing.expectError(error.Refused, rig.feed(rig.client.hello(&rig.input), 4096));
+    try rig.expect_code(.E0813);
+    try std.testing.expectEqual(@as(u32, 7), rig.sent_length); // The alert is plain.
+    tls_server.set_test_fault(.key_change_boundary, true);
+    defer tls_server.set_test_fault(.key_change_boundary, false);
+    try rig.setup(faults);
+    try std.testing.expect(try rig.feed(rig.client.hello(&rig.input), 4096) == .none);
+    try rig.client.accept_flight(rig.sent[0..rig.sent_length]); // The hello was answered.
+}
+
+/// A KeyUpdate in two protected records with application data between them.
+fn split_key_update(rig: *Rig) tls_server.Error!Event {
+    var buffer: [256]u8 = undefined;
+    const pieces = [_][]const u8{ &.{ schedule.key_update_type, 0, 0 }, &.{ 1, 0 } };
+    _ = try rig.feed(rig.client.seal(&buffer, .handshake, pieces[0]), 4096);
+    _ = try rig.feed(rig.client.seal(&buffer, .application_data, "between"), 4096);
+    const event = try rig.feed(rig.client.seal(&buffer, .handshake, pieces[1]), 4096);
+    rig.client.write.rekey() catch unreachable; // One update, far below the limit.
+    return event;
+}
+
+test "teeth: without the interleave check data between handshake pieces is read" {
+    var rig: Rig = undefined;
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    try std.testing.expectError(error.Refused, split_key_update(&rig));
+    try rig.expect_code(.E0815);
+    try std.testing.expectEqual(@as(u32, 0), rig.data_events);
+    tls_server.set_test_fault(.interleave, true);
+    defer tls_server.set_test_fault(.interleave, false);
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    _ = try split_key_update(&rig);
+    try std.testing.expectEqual(@as(u32, 1), rig.data_events);
+    var buffer: [64]u8 = undefined;
+    _ = try rig.feed(rig.client.seal(&buffer, .application_data, "after"), 4096);
+    try std.testing.expectEqual(@as(u32, 2), rig.data_events);
+}
+
+test "teeth: without the plaintext-alert window a plain close_notify ends a connection" {
+    const close_notify = [_]u8{ 21, 3, 3, 0, 2, 1, 0 };
+    var rig: Rig = undefined;
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    try std.testing.expectError(error.Refused, rig.feed(&close_notify, 4096));
+    try rig.expect_code(.E0815);
+    tls_server.set_test_fault(.plain_alert_window, true);
+    defer tls_server.set_test_fault(.plain_alert_window, false);
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    try std.testing.expect(try rig.feed(&close_notify, 4096) == .closed);
+}
+
+test "teeth: without the KeyUpdate limit an update past it is taken" {
+    var rig: Rig = undefined;
+    var buffer: [64]u8 = undefined;
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    rig.server.read.updates = constants.tls_key_updates_per_connection_max;
+    try std.testing.expectError(error.Refused, rig.feed(rig.client.key_update(&buffer, false), 4096));
+    try rig.expect_code(.E0815);
+    tls_server.set_test_fault(.key_update_limit, true);
+    defer tls_server.set_test_fault(.key_update_limit, false);
+    try rig.setup(.{});
+    try expect_connected(&rig, 4096);
+    rig.server.read.updates = constants.tls_key_updates_per_connection_max;
+    _ = try rig.feed(rig.client.key_update(&buffer, false), 4096);
+    _ = try rig.feed(rig.client.seal(&buffer, .application_data, "after"), 4096);
     try std.testing.expectEqual(@as(u32, 1), rig.data_events);
 }

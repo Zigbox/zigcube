@@ -55,6 +55,7 @@ check $PR x "" "ops/zigbox-smoke/guest.sh" TFFFFTFFF
 check $PR x "" "src/store_faults.zig src/store_failover.zig" TTFFFFFFF
 check $PR x "" "src/mtls_interop.zig" TFFFFFFTF
 check $PR x "" "ops/mtls-interop/InteropServer.java" TFFFFFFTF
+check $PR x "" "src/tls_server.zig src/tls_server_test.zig src/tls_testclient.zig" TFFFFFFTF
 check $PR x "" "src/demo_c0.zig src/demo_c1.zig" TFTTFFFFF
 # Everything: the build, CI itself, the shared demo driver, the server, the agent, the store
 # backends, the core, and any path no rule names (also a new directory).
