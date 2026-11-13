@@ -347,14 +347,21 @@ without it, which `src/agent_jobs_test.zig` (over the simulated runtime) and
 `src/fake_runtime_test.zig` (over real processes) write straight into the store.
 
 With `--runtime zigbox` an admitted run's envelopes may also go to the node's Zigbox store, for
-`zbx` on the node: the supervisor calls `zigbox.store.import_trust` with the run's lines and its tree
+`zbx` on the node. Only the lines that counted in the agent's verdict travel in the spec
+(`job_trust.counted_lines`: signed by a key the node's `--trust-policy` lists, about this tree and
+binding), none without a policy, so lines anyone can add to a job (the API's writes are
+unauthenticated) never reach the store, and Zigbox, which refuses a bundle whole, is never handed a
+line it would refuse. The supervisor calls `zigbox.store.import_trust` with those lines and the tree
 before `start_with_image`, but only when the node's own `zbx` policy (`/etc/zbx/policy.zon`, then
 the user's `~/.config/zbx/policy.zon`, read through Zigbox's host) asks for signatures or
 provenance; a node without one gets nothing written. Lines the store already holds are kept once.
 Nothing about the import stops the start: Zigbox's library `start` runs no trust gate of its own
 (only `zbx run` does), the agent has already judged the run, and a store that will not take the
 bundle (full: 8 signatures per tree, 4,096 records; busy; unwritable) is one line on the
-supervisor's stderr with ZBX-E0909 and its cause, and the run starts. The fake and simulated
+supervisor's stderr with ZBX-E0909 and its cause, and the run starts. What persists: each counted
+line, once (a line the store holds is not added again), in the tree's record, until `zbx trust
+prune --apply` removes the record of a tree that is gone; a trusted signer who signs one tree more
+than eight times fills that tree's record, which costs only `zbx`'s view, never a start. The fake and simulated
 runtimes ignore the envelopes.
 
 ## What survives what

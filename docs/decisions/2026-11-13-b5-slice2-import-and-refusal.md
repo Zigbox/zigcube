@@ -12,6 +12,10 @@
   Zigbox host's file system, as the gate would) and imports nothing unless it asks for a
   signature or provenance; a policy it cannot read or parse counts as asking. Zigbox's import
   keeps a line the store already holds once (`.present`), so a routine rerun adds nothing.
+- **Only the lines that counted.** The agent hands the runtime the lines that counted in its own
+  verdict (`job_trust.counted_lines`), none without `--trust-policy`. A stranger's lines (the
+  API's writes are unauthenticated) cannot fill a tree's record or the store, and a line Zigbox
+  would refuse (another tree, a bad signature) cannot make it refuse the good ones with it.
 - **A store that will not keep them never wedges a start.** Before, the ninth signature for one
   tree (`signatures_per_tree_max`), a full store (`trust_records_max`) or a missing store made every
   later signed run on that image fail ZBX-E0909 for good. Now any failure of the import is one

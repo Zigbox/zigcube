@@ -850,6 +850,17 @@ const Work = struct {
         return try records.diagnostic_raw(ctx.arena, refusal, ctx.diag);
     }
 
+    /// The run's lines that counted in the node's verdict, the only ones the runtime may keep
+    /// (`job_trust.counted_lines`); none without a trust policy.
+    fn kept_signatures(work: *Work, run: *const records.JobRun) Error![]const []const u8 {
+        const trust = work.agent.config.trust orelse return &.{};
+        return job_trust.counted_lines(trust, work.ctx.arena, .{
+            .image = run.image,
+            .source = run.source,
+            .signatures = run.signatures orelse &.{},
+        }) catch return failures.no_memory(work.ctx.diag);
+    }
+
     /// A refused run is reported `stopped`, exit `refused`; nothing is started, so no supervisor
     /// is spawned. The record stays `claiming` and goes once the run is unassigned, as after any
     /// start failure. A report that is lost is made again by a later pass (`not_started`).
@@ -957,7 +968,7 @@ const Work = struct {
             .image = run.image,
             .source = run.source,
             .relay = relay_address(run),
-            .signatures = run.signatures orelse &.{},
+            .signatures = try work.kept_signatures(run),
             .command = run.command,
             .env = env,
             .limits = .{

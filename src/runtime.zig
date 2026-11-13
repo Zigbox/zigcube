@@ -111,10 +111,11 @@ pub const Spec = struct {
     /// give a container a relay must not start it without one; every runtime serves relays since
     /// slice 4, so nothing refuses a spec that names one. (B3 slice 2.)
     relay: []const u8 = "",
-    /// A job's DSSE envelopes, one JSON line each, as submitted (B5). The Zigbox runtime imports
-    /// them into the node's Zigbox store before the start, so a node whose own Zigbox policy asks
-    /// for signatures finds them; the agent has already judged them (`job_trust.judge_run`). A
-    /// runtime with no store (the fake and the simulated one) ignores them.
+    /// The job's DSSE envelopes that counted under the node's `--trust-policy`, one JSON line
+    /// each (B5; `job_trust.counted_lines`), none without a policy. The Zigbox runtime keeps them
+    /// in the node's Zigbox store when the node's own `zbx` policy asks for signatures, for `zbx`
+    /// there; it never fails a start over them. A runtime with no store (the fake and the
+    /// simulated one) ignores them.
     signatures: []const []const u8 = &.{},
     /// Must include `label_replica`.
     labels: []const Label,

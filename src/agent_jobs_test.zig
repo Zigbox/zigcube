@@ -1826,6 +1826,44 @@ test "a run signed by a key the node does not trust is refused; one it trusts st
     try testing.expectEqual(records.JobObservedStatus.running, seen.status);
 }
 
+/// What the last start handed the runtime as the run's signatures: their count and a copy of
+/// the first (the spec lives in the step's arena).
+var kept_count: usize = 0;
+var kept_first: [4096]u8 = undefined;
+var kept_first_len: usize = 0;
+
+fn record_kept(context: *anyopaque, spec: *const @import("runtime.zig").Spec) void {
+    count_start(context, spec);
+    kept_count = spec.signatures.len;
+    kept_first_len = 0;
+    if (spec.signatures.len == 0) return;
+    const first = spec.signatures[0];
+    @memcpy(kept_first[0..first.len], first);
+    kept_first_len = first.len;
+}
+
+test "only the lines the node counted reach the runtime's spec" {
+    // Goal: the runtime (the Zigbox one keeps them in the node's store) gets the lines that
+    // counted under the node's policy and nothing else (B5 slice 2 review): a stranger's line
+    // and a line about another tree, both of which anyone can add, are dropped. Method: one
+    // run with three lines, one good; the start hook copies what the spec carried.
+    var case: TrustCase = undefined;
+    try case.start();
+    defer case.stop();
+    case.rig.world.sim.on_start = record_kept;
+    const stranger = try case.sign(2);
+    defer testing.allocator.free(stranger);
+    const other_tree = try case.fixture.sign_tree(testing.allocator, 1, 0x32);
+    defer testing.allocator.free(other_tree);
+    const good = try case.sign(1);
+    defer testing.allocator.free(good);
+    kept_count = 99;
+    try case.assign_and_pass(&.{ stranger, other_tree, good });
+    try testing.expectEqual(@as(u32, 1), starts_seen);
+    try testing.expectEqual(@as(usize, 1), kept_count);
+    try testing.expectEqualStrings(good, kept_first[0..kept_first_len]);
+}
+
 test "a refused run past its start bound is reported refused, not not_started" {
     // Goal: the refused ending wins (B5 slice 2 review): a pass that comes late must not turn a
     // run the node refuses into `not_started`, which the server ends `failed deadline`. Method:
