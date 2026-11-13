@@ -342,7 +342,8 @@ and the server says so once. `GET /v1/stats/pull` reads tolerantly (`skipped`) a
   `assignment` are current and `/node-status/<node>` is `ready`.
 - Version 3 (C3, written from slice 9): `health` (`unknown`, `healthy`, `unhealthy`; absent for a
   replica without a check), `health_failures` (consecutive failed probes) and `last_probe_exit`.
-  Still written on change only. An observation without them is written as version 2.
+  Still written on change only. An observation without them is written as version 2, and a
+  version 1 or 2 record reads as health `unknown`.
 
 Lifetime: until the agent or the node controller removes it. One writer per key (the node's agent), written on every status change, not on a timer, so the
 store's revision tells when the node last learned something. Written with one compare, never

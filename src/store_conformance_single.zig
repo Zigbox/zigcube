@@ -1564,6 +1564,56 @@ test "history: apply keeps the newest generations and delete removes them, on ev
     try testing.expectEqual(@as(usize, 0), (try history.stored(&ctx, "hello")).len);
 }
 
+/// A version 2 observation as a C2 agent wrote it, from `src/testdata/b3_store.txt`.
+const observed_v2_text =
+    \\{"v":2,"replica":"hello-5","node":"node1","generation":2,"status":"running",
+++
+    \\"started_at_ms":1794590952515,"reported_at_ms":1794590952515,"tenure":1}
+;
+
+test "observed: version 3 round-trips, version 2 reads as health unknown, on every backend" {
+    // Goal: docs/keys.md `/observed`: health lives in version 3 and is written only with a
+    // verdict; a C2 agent's version 2 record reads as health unknown. Method: put both through
+    // the store, read them back with `records.read`.
+    const harness = try Harness.start();
+    defer harness.stop();
+    errdefer harness.report_seed();
+    var diag: Diag = undefined;
+    diag.reset();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const s = (try harness.connect()).interface();
+
+    var judged: records.Observed = .{
+        .replica = "hello-1",
+        .node = "node1",
+        .generation = 1,
+        .status = .running,
+        .reported_at_ms = 1761350000000,
+        .health = .unhealthy,
+        .health_failures = 3,
+        .last_probe_exit = 1,
+    };
+    judged.v = 0; // `encode` must set it.
+    const bytes = try records.encode(arena, judged, &diag);
+    _ = try put_one(s, &diag, "/observed/node1/hello-1", bytes);
+    const got = try s.get(arena, "/observed/node1/hello-1", null, &diag);
+    const back = try records.read(records.Observed, arena, got.kv.?, &diag);
+    try testing.expectEqual(records.observed_version_health, back.v);
+    try testing.expectEqual(records.HealthState.unhealthy, records.observed_health(&back));
+    try testing.expectEqual(@as(u32, 3), back.health_failures.?);
+    try testing.expectEqual(@as(i32, 1), back.last_probe_exit.?);
+
+    _ = try put_one(s, &diag, "/observed/node1/hello-5", observed_v2_text);
+    const old = try s.get(arena, "/observed/node1/hello-5", null, &diag);
+    const plain = try records.read(records.Observed, arena, old.kv.?, &diag);
+    try testing.expectEqual(records.observed_version_plain, plain.v);
+    try testing.expectEqual(records.HealthState.unknown, records.observed_health(&plain));
+    try testing.expect(plain.health_failures == null);
+    try testing.expect(plain.last_probe_exit == null);
+}
+
 // ---- The chain hash ----------------------------------------------------------------------------
 
 /// `h(4)` of the history `chain_history` writes, the same on every backend: the encoding is one

@@ -1,8 +1,7 @@
 # C3 slice 5: the key layout as built, and where it departs from the brief
 
-*Decided 2026-11-13, by the slice (C3 slice 5). The `/observed` version is pending the
-supervisor's confirmation: the question was sent before the code was written, and no answer had
-arrived when the slice was reported.*
+*Decided 2026-11-13, by the slice (C3 slice 5). The `/observed` version (decision 1) was confirmed
+by the supervisor the same day.*
 
 ## Drift check (before any code)
 
@@ -20,8 +19,12 @@ and `claude/b6-slice1`:
 1. **`/observed` version 3 holds health** (`health` unknown|healthy|unhealthy, `health_failures`,
    `last_probe_exit`). This slice defines it and the reader accepts it; nothing writes it until
    slice 9. The alternative, leaving `/observed` alone until slice 9, was not taken: a server of
-   this release must read what a slice-9 agent reports, so the reader goes first. Pending the
-   supervisor's confirmation.
+   this release must read what a slice-9 agent reports, so the reader goes first. Confirmed by the
+   supervisor (2026-11-13): all three members optional; a version 1 or 2 record reads as health
+   `unknown` (`records.observed_health`); version 4 and above is refused with ZC-E0303 like every
+   other record; agents keep writing version 2 until slice 9 (decision 2). The conformance suite
+   checks on every backend that a version 3 record round-trips and that a version 2 record, as a
+   C2 agent wrote it, reads as health unknown.
 2. **A record is written at the oldest version that holds its members** (`records.encode`, which
    sets `v` for `Service`, `Replica` and `Observed`). A service with neither `health` nor a
    non-default `rollout` stays version 3, a replica without `health` stays version 3, an

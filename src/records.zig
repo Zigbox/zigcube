@@ -925,6 +925,12 @@ pub fn observed_version(observed: *const Observed) u32 {
     return if (health) observed_version_health else observed_version_plain;
 }
 
+/// The health verdict an observation carries: `unknown` for one without a check, and for every
+/// version 1 and 2 record, which predate health checks.
+pub fn observed_health(observed: *const Observed) HealthState {
+    return observed.health orelse .unknown;
+}
+
 /// The placement: the scheduler's decision to run a replica on a node.
 pub const Assigned = struct {
     v: u32 = 2,
