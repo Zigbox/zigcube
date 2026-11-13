@@ -18,6 +18,7 @@ const config_mod = @import("server_config.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const http = @import("agent_http.zig");
+const private_dir = @import("testing/private_dir.zig");
 const records = @import("records.zig");
 const remote_mod = @import("agent_remote.zig");
 const server_mod = @import("server.zig");
@@ -144,6 +145,7 @@ fn start_server_on(io: std.Io, store_config: config_mod.Store, create: bool) !*s
         .verbose = false,
         .quiet = true,
     };
+    try private_dir.state_dir(io, config);
     return server_mod.Server.start(testing.allocator, io, config, .{
         .version = "0.0.0-test",
         .report_failures = false,
@@ -636,7 +638,12 @@ test "a node joins the CA, keeps its pair, renews at half life, is refused once 
     // Removal: the file is read at start, and then the node is refused, not stopped.
     var dir = try std.Io.Dir.cwd().openDir(rig.io, base[0..base_length], .{});
     defer dir.close(rig.io);
-    try dir.writeFile(rig.io, .{ .sub_path = "revoked", .data = "# gone\nnode1\n" });
+    // 0600 whatever the umask: the server refuses a revoked file other users can write.
+    try dir.writeFile(rig.io, .{
+        .sub_path = "revoked",
+        .data = "# gone\nnode1\n",
+        .flags = .{ .permissions = .fromMode(0o600) },
+    });
     try rig.restart_server();
     const kept = again.credential.?;
     try testing.expectError(

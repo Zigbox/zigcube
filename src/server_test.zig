@@ -14,6 +14,7 @@ const agent_mod = @import("agent.zig");
 const config_mod = @import("server_config.zig");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
+const private_dir = @import("testing/private_dir.zig");
 const server_mod = @import("server.zig");
 const server_store = @import("server_store.zig");
 const sim_runtime = @import("sim_runtime.zig");
@@ -50,6 +51,7 @@ fn config_for(store: config_mod.Store, create: bool) config_mod.Config {
 }
 
 fn start_server(io: std.Io, config: config_mod.Config) !*server_mod.Server {
+    try private_dir.state_dir(io, config);
     var diag: Diag = undefined;
     diag.reset();
     return server_mod.Server.start(testing.allocator, io, config, .{
