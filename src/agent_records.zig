@@ -151,26 +151,28 @@ pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
     return false;
 }
 
+/// The files of an older container of the name that a start removes before it puts the spec.
+const stale_files = [_][]const u8{
+    file_run,
+    file_child,
+    file_supervisor,
+    file_forced,
+    file_fetch,
+    file_fetch_log,
+    file_relay_port,
+    file_relay_log,
+    file_relay_public,
+    file_relay_certificate,
+    file_relay_refused,
+    file_relay_fault,
+};
+
 /// Starts the container's record: clears what an older container of the name left (a stopped
 /// container's directory has no spec by now, see `remove_container`), then puts the spec.
 pub fn write_spec(state: AgentState, spec: *const SpecFile) agent_state.Error!void {
     assert(runtime.name_problem(spec.name) == null);
     var path_buffer: [agent_state.name_bytes_max]u8 = undefined;
-    const files = [_][]const u8{
-        file_run,
-        file_child,
-        file_supervisor,
-        file_forced,
-        file_fetch,
-        file_fetch_log,
-        file_relay_port,
-        file_relay_log,
-        file_relay_public,
-        file_relay_certificate,
-        file_relay_refused,
-        file_relay_fault,
-    };
-    for (files) |stale| {
+    for (stale_files) |stale| {
         state.remove(path(&path_buffer, spec.name, stale)) catch |err| switch (err) {
             error.Absent => {}, // The usual case.
             else => |other| return other,
@@ -624,7 +626,8 @@ test "a crash at every write point leaves records a restart reads" {
     // asserted so the loop cannot silently stop covering a case.
     var counts: Counts = .{};
     for ([_]agent_state.CrashKind{ .process, .host }) |kind| {
-        for (1..11) |point| {
+        // A start's write points are one per stale file, then the spec's: reach past them.
+        for (1..stale_files.len + 4) |point| {
             for (0..64) |seed| {
                 var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
                 defer arena_state.deinit();
