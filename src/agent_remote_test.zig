@@ -582,6 +582,15 @@ fn register_after_refusals(
     return lease;
 }
 
+/// Writes the server's `revoked` file in `state_dir`, 0600 whatever the umask: the server refuses
+/// a revoked file other users can write.
+fn write_revoked(io: std.Io, state_dir: []const u8, data: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, state_dir, .{});
+    defer dir.close(io);
+    const flags: std.Io.Dir.CreateFileOptions = .{ .permissions = .fromMode(0o600) };
+    try dir.writeFile(io, .{ .sub_path = "revoked", .data = data, .flags = flags });
+}
+
 test "a node joins the CA, keeps its pair, renews at half life, is refused once removed" {
     // Goal: docs/peer.md's issuance, persistence, renewal and removal through real HTTP and the
     // real files. Method: join; restart the server (the CA key is the same) and the peer (the
@@ -636,14 +645,7 @@ test "a node joins the CA, keeps its pair, renews at half life, is refused once 
     try testing.expectEqual(identity.ca_public.?, again.ca_public.?);
 
     // Removal: the file is read at start, and then the node is refused, not stopped.
-    var dir = try std.Io.Dir.cwd().openDir(rig.io, base[0..base_length], .{});
-    defer dir.close(rig.io);
-    // 0600 whatever the umask: the server refuses a revoked file other users can write.
-    try dir.writeFile(rig.io, .{
-        .sub_path = "revoked",
-        .data = "# gone\nnode1\n",
-        .flags = .{ .permissions = .fromMode(0o600) },
-    });
+    try write_revoked(rig.io, base[0..base_length], "# gone\nnode1\n");
     try rig.restart_server();
     const kept = again.credential.?;
     try testing.expectError(
