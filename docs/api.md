@@ -654,6 +654,27 @@ Registers the node: the server writes `/nodes/<node>` on the lease, in the recor
 `lease` and `capacity` are required, and both capacity numbers must be above 0. Answer
 `{"revision": 431}`. A lease that is not the store's is `ZC-E0205`.
 
+`replaces` (optional, #237) is the tenure the agent believes it holds: the `mod_revision` of
+`/nodes/<node>` its last registration answered, or 0 for none. When it is given, the write is
+compared against that revision, and a registration for a tenure that is no longer current (an
+earlier attempt landed late, after a newer one) is `ZC-E0510` and moves nothing. A key that is
+absent is filled, and a key on the registration's own or an older lease is the agent's own
+earlier attempt (its reply was lost), which is accepted: only a registration whose lease is older
+than the key's is refused. A keepalive of a lease the node's key is not
+on is `ZC-E0205` (the lease is an orphan: the agent grants again and registers again).
+
+**Upgrade, in this order: the server first, then the agents.**
+
+- A new agent against an old server: the agent always sends `replaces` (0 included), and an old
+  server rejects the unknown member with a 400 on every registration, so the node never
+  registers. That is why the server goes first.
+- An old agent against a new server: it sends no `replaces`, so nothing is compared, and a late
+  registration of its own can still move the key onto a lease nobody renews. Only the new
+  keepalive check limits it: the agent learns at its next renewal (`ZC-E0205`) and fences,
+  instead of renewing for ever. **#237 is closed only once every agent is upgraded.**
+- An agent's own retry always carries a newer lease than its earlier attempt, so it is never
+  refused. `docs/decisions/2026-11-13-register-tenure.md`.
+
 ### `PUT /v1/agent/nodes/{node}/store` (C2 slice 5)
 
 Writes the node's image summary, `/node-store/<node>` of keys.md, bound to the node's lease. The body

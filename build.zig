@@ -1357,6 +1357,16 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "R3",
     },
     .{
+        .name = "register_unchecked",
+        .root = "src/sim_c1_teeth_register_unchecked_main.zig",
+        // I1b: the stale registration's lease expires with the agent quiet or cut off, the node
+        // is marked lost and its replicas are replaced while the agent still runs them (22 of
+        // 40 seeds). The other seeds end in a liveness failure; the canary needs I1b itself.
+        .symptom = "I1b",
+        .canary_seeds = 40,
+        .any_symptom = true,
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world
@@ -1467,6 +1477,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     add_burst_step(b, sim);
     add_worlds_step(b, sim);
     add_reuse_step(b, sim);
+    add_late_step(b, sim);
     add_regress_step(b, sim);
     add_regressions_step(b, sim);
     add_fencing_teeth_step(b, sim);
@@ -1749,6 +1760,27 @@ fn add_reuse_step(b: *std.Build, sim: SimStepOptions) void {
     run.addArgs(&.{ "--seeds", b.fmt("1..{d}", .{reuse_seeds_max}), "300", "--c1" });
     run.expectExitCode(0);
     b.step("sim-c1-reuse", "Run sim-c1 in the job_reuse world with the agent right (J11 holds)")
+        .dependOn(&run.step);
+}
+
+/// `zig build sim-c1-late` (#237): the cluster simulation with the late registration of the
+/// `register_unchecked` tooth's world on and the fix in (the register compare, the keepalive's
+/// lease check): every check holds on seeds 1 to 40, and the report shows the stale registrations
+/// landing (refused).
+fn add_late_step(b: *std.Build, sim: SimStepOptions) void {
+    const exe = b.addExecutable(.{
+        .name = "sim_c1_late",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sim_cluster_main.zig"),
+            .target = sim.target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "zigbox", .module = sim.zigbox }},
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "--seeds", "1..40", "100", "--c1", "--late-registration" });
+    run.expectExitCode(0);
+    b.step("sim-c1-late", "Run sim-c1 with late registrations (#237) and the fix in")
         .dependOn(&run.step);
 }
 

@@ -212,6 +212,8 @@ test "a server that is not there is ZC-E0503, and the same store works when it r
     var diag: Diag = undefined;
     diag.reset();
     const lease = try remote.lease_grant(10_000, &diag);
+    // A keepalive renews the lease of the node's registration only (#237).
+    _ = try remote.txn(.{ .on_success = &.{register_op(lease.id)} }, &diag);
 
     rig.server.stop();
     try testing.expectError(error.BackendFailed, remote.lease_grant(10_000, &diag));
@@ -467,6 +469,38 @@ test "the agent core over HTTP: start, replace a killed replica, survive a serve
         try rig.io.sleep(.fromMilliseconds(20), .awake);
     }
     try testing.expectEqual(@as(u32, 2), sim.running_count());
+}
+
+test "an agent that lost the outcome of its registration registers again on a newer lease (#237)" {
+    // Goal: a registration whose outcome the agent never recorded (a lost reply, a crash before
+    // the state file) must not leave the node refused until the old lease ends: the retry is on a
+    // newer lease and names the tenure the agent knew. Method: join, then forget the lease and the
+    // tenure as the agent does after a crash, keeping only the tenure it had recorded before the
+    // key moved (the key is on the first lease, at a revision the agent has not recorded); the
+    // next step registers and is accepted, under a newer tenure.
+    var rig = try Rig.start();
+    defer rig.stop();
+    var sim: sim_runtime.SimRuntime = undefined;
+    sim.init(testing.allocator, rig.clock_source.clock(), 7, &sim_runtime.default_fixtures);
+    defer sim.deinit();
+    const agent = try testing.allocator.create(agent_mod.Agent);
+    defer testing.allocator.destroy(agent);
+    agent.init(.{
+        .node = "node1",
+        .capacity = .{ .cpu_millis = 4000, .memory_bytes = 8 * 1024 * 1024 * 1024 },
+    });
+    _ = try step(rig, agent, &sim);
+    const first_lease = agent.lease;
+    const first_tenure = agent.tenure;
+    try testing.expect(first_lease != 0 and first_tenure != 0);
+
+    agent.lease = 0;
+    agent.tenure = 0;
+    agent.last_tenure = first_tenure - 1; // what the agent knew before the key moved
+    _ = try step(rig, agent, &sim);
+    try testing.expect(agent.lease > first_lease);
+    try testing.expect(agent.tenure > first_tenure);
+    try testing.expectEqual(agent.tenure, agent.last_tenure);
 }
 
 const runtime_name = struct {

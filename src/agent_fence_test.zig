@@ -127,6 +127,34 @@ fn restart_cut_off(world: *sim_world.World) void {
     world.restart_agent();
 }
 
+test "a fence keeps the tenure, and a restart's first registration still names it (#237)" {
+    // Goal: after a fence the agent holds no lease but remembers the tenure it held, in memory
+    // and in its state file, so that the registration after a restart is not refused for want of
+    // a tenure to replace. Method: cut the store off until the fence is done, restart the agent,
+    // still cut off: it keeps the tenure, holds no lease and does not fence again; with the
+    // store back it registers under a newer tenure.
+    const world = try start(31);
+    defer world.destroy();
+    const held = world.agent.tenure;
+    try testing.expect(held != 0);
+    world.set_store_down(true);
+    advance_to(world, fencing.worst_case_dead_ms(world.agent.sent_ms, world.agent.lease_ttl_ms));
+    try testing.expectEqual(@as(u32, 1), world.agent.fences);
+    try testing.expectEqual(store.lease_none, world.agent.lease);
+    try testing.expectEqual(held, world.agent.last_tenure);
+
+    world.restart_agent();
+    world.advance(fence_steps_ms);
+    try testing.expectEqual(held, world.agent.last_tenure);
+    try testing.expectEqual(store.lease_none, world.agent.lease);
+    try testing.expectEqual(@as(u32, 0), world.agent.fences);
+
+    world.set_store_down(false);
+    world.advance(5_000);
+    try testing.expect(world.agent.tenure > held);
+    try testing.expectEqual(world.agent.tenure, world.agent.last_tenure);
+}
+
 test "a restarted agent whose kept lease has run out fences at once" {
     const world = try start(14);
     defer world.destroy();

@@ -218,6 +218,27 @@ identified by that key's `mod_revision` at registration (the *tenure revision*).
 
 This is real fencing, because the store is the shared resource and it checks the token.
 
+**A registration is compared too (#237).** Registering is the one write that creates a tenure, so
+it carries the tenure it replaces (`replaces`: the `mod_revision` its agent last held, 0 for
+none) and the server writes `/nodes/<node>` in one transaction that compares the key at that
+revision (or absent). A registration that was delayed on the wire and arrives after a newer one
+finds another revision, on a newer lease, and is refused (ZC-E0510); without the compare it would move the key onto
+its own lease, which nobody renews, and the node would be lost while its agent still ran its
+replicas (I1b). A key on the registration's own or an older lease was written by the agent's own
+earlier attempt (a lost reply, a crash before it recorded the tenure), and the retry is accepted:
+the compare refuses only a registration older than the key's lease. **Lease ids only grow
+within one store's history** (SQLite `AUTOINCREMENT`, a Postgres identity column, the memory
+counter; the conformance test checks one store process) and a registration's lease is granted
+before it is sent. That does not hold through an async failover that loses only lease grants
+(`VerifiedStore` sees no revision or chain-hash change, so ZC-E0215 does not halt it, and the
+promoted standby reissues those ids) nor after an operator accepts a rollback. It does not reach
+I1b: a registration in flight across such a failover is narrow, and if one lands on a reissued id
+it moves its node's key onto another node's lease, but the agent's next attempt grants a newer id
+and is accepted, which replaces the key. The bound is the agent's next step. The lease keepalive requires that the node's key is on the lease it
+renews, so an agent whose registration was overtaken stops renewing at once and fences (ZC-E0205).
+An older agent sends no `replaces` and is not compared; only the keepalive rule limits it.
+`docs/decisions/2026-11-13-register-tenure.md`.
+
 **Why not bind `/observed` keys to the lease.** In discussion I proposed attaching every observed
 key to the node's lease, so that expiry deletes them. The store forbids it at scale:
 `store_lease_keys_max` is 64, because a lease's keys are deleted in one revision and a watch batch

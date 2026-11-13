@@ -279,6 +279,29 @@ const Call = struct {
         if (kv.lease != lease_id) return not_registered(ctx, call.node, lease_id);
     }
 
+    /// The revision `/nodes/<node>` has now, which a registration that names the tenure it
+    /// replaces must still find: 0 if the key is absent. 0 for an agent that names nothing: it
+    /// is not compared. A key at another revision is refused (ZC-E0510) only when it is on a
+    /// NEWER lease than the registration's: that registration is an earlier attempt, delayed on
+    /// the wire, and accepting it would move the key onto a lease nobody renews (#237). A key on
+    /// the same or an older lease was written by this agent's own earlier attempt (a lost
+    /// reply, a crash before it recorded the tenure, a server restart), so its retry, which
+    /// always carries a newer lease (ids only grow: docs/authority.md), is accepted.
+    fn registration_held(call: Call, replaces: ?u64, lease_id: store.LeaseId) Failure!u64 {
+        const named = replaces orelse return 0;
+        const ctx = call.ctx;
+        const key = records.node_key(call.node);
+        const found = ctx.store.get(ctx.arena, key.slice(), null, ctx.diag) catch {
+            return propagate(ctx);
+        };
+        const kv = found.kv orelse return 0;
+        if (kv.mod_revision == named) return kv.mod_revision;
+        if (kv.lease <= lease_id) return kv.mod_revision;
+        // Test-only (#237): the compare is left out, as the server did before the rule.
+        if (c1_teeth.register_unchecked) return kv.mod_revision;
+        return tenure_moved(ctx, call.node, named);
+    }
+
     // ---- PUT /v1/agent/nodes/{node} ----
 
     fn register(call: Call) Failure!Reply {
@@ -305,10 +328,18 @@ const Call = struct {
         const value = records.encode(ctx.arena, node, ctx.diag) catch return propagate(ctx);
         const put: store.Put = .{ .key = key.slice(), .value = value, .lease = input.lease };
         const op: store.Op = .{ .put = put };
-        const request: store.TxnRequest = .{ .on_success = &.{op} };
+        // The registration replaces the tenure it names or fills an empty key; anything else
+        // is an overtaken registration (#237). The compare makes the check and the write one.
+        const held = try call.registration_held(input.replaces, input.lease);
+        const compares = [_]store.Compare{.{ .key = key.slice(), .mod_revision = held }};
+        const request: store.TxnRequest = .{
+            .compares = if (input.replaces != null) &compares else &.{},
+            .on_success = &.{op},
+        };
         const role: writers.Role = .{ .agent = call.node };
         const result = writers.txn(ctx.store, role, request, ctx.diag) catch
             return propagate(ctx);
+        if (!result.succeeded) return tenure_moved(ctx, call.node, input.replaces orelse 0);
         const pair = try call.chain_written(result);
         return reply(ctx, .{ .revision = result.revision, .chain = pair });
     }
@@ -326,6 +357,10 @@ const Call = struct {
         const id = std.fmt.parseInt(u64, id_text, 10) catch
             return bad_request(ctx, "lease", "is not a number");
         if (id == store.lease_none) return bad_request(ctx, "lease", "must not be 0");
+        // A lease that is not the node's registration is no longer the agent's: it must not
+        // keep pushing back its fence while the key sits on another (ZC-E0205, as for a lease
+        // that ended; #237).
+        if (!c1_teeth.register_unchecked) try call.registered_on(id);
         const granted = ctx.store.lease_keepalive(id, ctx.diag) catch return propagate(ctx);
         const lease_reply = .{ .id = granted.id, .ttl_ms = granted.ttl_ms };
         return reply(ctx, .{ .lease = lease_reply, .chain = try call.chain() });
@@ -922,6 +957,8 @@ const RegisterBody = struct {
     agent_version: []const u8 = "",
     address: []const u8 = "",
     labels: []const []const u8 = &.{},
+    /// The tenure the agent last held (`records.Node.replaces`); absent for an older agent.
+    replaces: ?u64 = null,
 };
 
 const CredentialBody = struct { node_key: []const u8, lease: u64 };
@@ -1123,6 +1160,18 @@ fn tenure_ended(ctx: *const Context, node: []const u8) Failure {
     ctx.diag.raise(.E0510);
     ctx.diag.cause("node {s} is not registered under the tenure this write names", .{node});
     ctx.diag.fix(.{ .sentence = "the agent stops its containers and registers the node again" });
+    return error.Failed;
+}
+
+/// A registration names a tenure the node has moved past: a newer registration took the key, so
+/// this one is late (#237). Nothing is written.
+fn tenure_moved(ctx: *const Context, node: []const u8, replaces: u64) Failure {
+    assert(ctx.diag.code == null);
+    ctx.diag.raise(.E0510);
+    ctx.diag.cause("this registration of node {s} replaces tenure {d}, not the current one", .{
+        node, replaces,
+    });
+    ctx.diag.fix(.{ .sentence = "the agent registers the node again by itself" });
     return error.Failed;
 }
 

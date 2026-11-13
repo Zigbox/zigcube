@@ -26,6 +26,12 @@ pub const wedge = declared("c1_teeth_wedge");
 /// if the controller did not compare the report's tenure (must break I3).
 pub const stale_observation = declared("c1_teeth_stale_observation");
 
+/// The server registers a node without comparing the tenure the registration replaces, and a
+/// keepalive does not check that the lease is the one the node's key is on (must break I1b: a
+/// registration overtaken by a newer one lands late and puts the key on a lease nobody renews,
+/// #237).
+pub const register_unchecked = declared("c1_teeth_register_unchecked");
+
 /// The scheduler ranks locality ahead of spread (C2 slice 5; must break the placement-order
 /// invariant of `sim-cluster`).
 pub const locality_before_spread = declared("c1_teeth_locality_before_spread");
@@ -139,4 +145,5 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
+    register_unchecked;

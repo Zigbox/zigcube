@@ -908,12 +908,7 @@ pub const Cluster = struct {
         };
         c.ack_loss = .init(c.tap.interface(), seed ^ 0xac4, c.swarm.ack_loss_per_mille);
         c.switched = .{ .inner = c.ack_loss.interface() };
-        c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
-        c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
-        if (options.lease_ttl_ms) |ttl_ms| {
-            assert(fencing.inequality_problem(ttl_ms) == null);
-            c.api.lease_ttl_ms = ttl_ms;
-        }
+        c.init_net(gpa, seed, options);
         c.api_source = .{ .instance = 0 };
         c.prng = .init(seed ^ 0xc15e_7e12);
         c.diag.reset();
@@ -949,6 +944,19 @@ pub const Cluster = struct {
         c.nodes = try gpa.alloc(*Node, c.swarm.nodes);
         for (c.nodes, 0..) |*slot, index| slot.* = try c.create_node(@intCast(index));
         return c;
+    }
+
+    /// The network and the server's API: the late registration is off unless asked for, so a run
+    /// is the world it was (old replay lines), and the network knows the lease ttl.
+    fn init_net(c: *Cluster, gpa: Allocator, seed: u64, options: Options) void {
+        c.net.init(gpa, .{ .context = c, .handle_fn = handle }, seed ^ 0x4e7);
+        c.net.late_registration = options.late_registration or c1_teeth.register_unchecked;
+        c.api = .{ .version = "0.0.0", .backend = "memory", .started_at_ms = epoch_ms };
+        if (options.lease_ttl_ms) |ttl_ms| {
+            assert(fencing.inequality_problem(ttl_ms) == null);
+            c.api.lease_ttl_ms = ttl_ms;
+            c.net.lease_ttl_ms = ttl_ms;
+        }
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -3091,6 +3099,9 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// The network delivers a stale registration late (`SimNet.late_registration`, #237). Off, a
+    /// run is the world it was before the fix; the `register_unchecked` tooth turns it on.
+    late_registration: bool = false,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3360,6 +3371,40 @@ fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
     try check(c, met, "too few requests reached the server while faults were on");
 }
 
+/// The report line of the network's counters, summed over the nodes.
+fn print_net(c: *Cluster) void {
+    const report = c.report;
+    var total: sim_net.Stats = .{};
+    for (c.nodes) |node| {
+        const link = c.net.stats(node.index);
+        total.delivered += link.delivered;
+        total.requests_dropped += link.requests_dropped;
+        total.replies_lost += link.replies_lost;
+        total.duplicated += link.duplicated;
+        total.parked += link.parked;
+        total.delivered_late += link.delivered_late;
+        total.partitioned += link.partitioned;
+        total.late_registrations += link.late_registrations;
+        total.late_registrations_landed += link.late_registrations_landed;
+    }
+    report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} ", .{
+        total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
+    });
+    report.print("parked={d} delivered_late={d} partitioned={d} ", .{
+        total.parked, total.delivered_late, total.partitioned,
+    });
+    report.print("late_registrations={d} landed={d}\n", .{
+        total.late_registrations, total.late_registrations_landed,
+    });
+    // A late-registration run that delivered none tests nothing (the parked body no longer
+    // parses, say): fail it here, at the cause, instead of passing vacuously.
+    if (c.net.late_registration and !report.failed and total.late_registrations == 0) {
+        report.failed = true;
+        report.print("FAILED: no late registration was delivered (seed {d})\n", .{c.seed});
+        report.print("step: late registration\n", .{});
+    }
+}
+
 fn print_summary(c: *Cluster) void {
     const report = c.report;
     const s = c.stats;
@@ -3382,22 +3427,7 @@ fn print_summary(c: *Cluster) void {
     report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
         s.nodes_marked_lost, s.replicas_marked_lost,
     });
-    var total: sim_net.Stats = .{};
-    for (c.nodes) |node| {
-        const link = c.net.stats(node.index);
-        total.delivered += link.delivered;
-        total.requests_dropped += link.requests_dropped;
-        total.replies_lost += link.replies_lost;
-        total.duplicated += link.duplicated;
-        total.parked += link.parked;
-        total.delivered_late += link.delivered_late;
-        total.partitioned += link.partitioned;
-    }
-    report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} " ++
-        "parked={d} delivered_late={d} partitioned={d}\n", .{
-        total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
-        total.parked,    total.delivered_late,   total.partitioned,
-    });
+    print_net(c);
     const fences = total_fences(c);
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
     report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
@@ -3562,9 +3592,10 @@ test "a crashed node's step makes no call to the server (#167)" {
     // load must not reach the server (`tapped_call` refuses; it asserts nothing got through).
     // Method: a run that crashes an agent mid-step; it counts the calls the gate refused and the
     // test fails if there were none, so a change of the draws cannot leave it passing without
-    // reaching the gate. Seed 57 at 100 operations under c1 did when this was written.
+    // reaching the gate. Seed 9 at 100 operations under c1 does (57 did until #237 changed the
+    // agent's registration, then 2 until the lost reply's retry reused its lease).
     var report: Report = undefined;
-    simulate(testing.allocator, 57, 100, .{ .c1 = true }, &report);
+    simulate(testing.allocator, 9, 100, .{ .c1 = true }, &report);
     if (report.failed) std.debug.print("{s}\n", .{report.text()});
     try testing.expect(!report.failed);
     try testing.expect(report.dead_calls > 0);

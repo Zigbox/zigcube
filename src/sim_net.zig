@@ -29,6 +29,16 @@
 //!   does. A liveness bound after a heal must therefore allow `reorder_delay_ms_max` for the
 //!   stragglers.
 //!
+//! **A late registration** (`late_registration`, off unless a run asks for it): the race of #237.
+//! When the agent asks for a lease the network first grants one of its own, an earlier attempt's
+//! (the agent restarted, or lost its connection, between its attempts): that lease is older than
+//! the agent's, so it expires first, and nobody renews it. When the agent's registration is
+//! accepted, the earlier attempt's registration (the same body, that lease, naming the same
+//! tenure it replaces) is parked and reaches the server `lease_ttl_ms - late_registration_lead_ms`
+//! later, once per lease the agent asked for, while that lease is still alive. A
+//! server that registers the node on it puts the key on a lease nobody renews (#237). It draws
+//! nothing from the seed, and a run that does not ask for it is the world it was before.
+//!
 //! Duplicate and reorder act on requests only: a duplicated or late reply is read once by a
 //! synchronous caller and can change nothing, so the model leaves it out.
 //!
@@ -90,7 +100,15 @@ pub const Stats = struct {
     parked: u32 = 0,
     delivered_late: u32 = 0,
     partitioned: u32 = 0,
+    /// Late registrations delivered (`late_registration`), and those the server accepted.
+    late_registrations: u32 = 0,
+    late_registrations_landed: u32 = 0,
 };
+
+/// How long before its lease ends the stale registration arrives, the latest it can: the node key
+/// then sits on a lease nobody renews for this long, which is all the time the agent has to find
+/// out before the server takes the node for lost.
+pub const late_registration_lead_ms: u32 = 1_000;
 
 const Parked = struct {
     method: []u8,
@@ -101,10 +119,15 @@ const Parked = struct {
     due_ms: u64,
     /// Order of parking: requests due at the same time arrive oldest first.
     sequence: u64,
+    /// A late registration (`late_registration`): its reply is counted, not dropped unseen.
+    stale: bool = false,
 };
 
 const Link = struct {
     faults: Faults = .{},
+    /// The lease granted just before the agent's last one (`late_registration`); 0 if none or
+    /// already used.
+    orphan_lease: u64 = 0,
     parked: [parked_max]?Parked = @splat(null),
     stats: Stats = .{},
 };
@@ -122,6 +145,10 @@ pub const SimNet = struct {
     now_ms: u64,
     /// Parked requests so far, to order those due together.
     parked_total: u64,
+    /// Deliver a late registration after each registration the server accepts (see above).
+    late_registration: bool,
+    /// The lease ttl the server grants, which fixes when a late registration arrives.
+    lease_ttl_ms: u32,
 
     const Port = struct { net: *SimNet, node: u32 };
 
@@ -137,6 +164,8 @@ pub const SimNet = struct {
             .last_call_ms = 0,
             .now_ms = 0,
             .parked_total = 0,
+            .late_registration = false,
+            .lease_ttl_ms = constants.lease_ttl_ms,
         };
         for (&net.ports, 0..) |*port, node| port.* = .{ .net = net, .node = @intCast(node) };
     }
@@ -180,12 +209,16 @@ pub const SimNet = struct {
             link.parked[next.slot] = null;
             defer net.free_parked(parked);
             link.stats.delivered_late += 1;
-            _ = net.hand_over(next.node, .{
+            const late = net.hand_over(next.node, .{
                 .method = parked.method,
                 .target = parked.target,
                 .body = parked.body,
                 .hold_ms = parked.hold_ms,
             });
+            if (parked.stale) {
+                link.stats.late_registrations += 1;
+                if (late.status == 200) link.stats.late_registrations_landed += 1;
+            }
         }
         assert(net.earliest_due() == null); // Every slot was visited at most once above.
     }
@@ -265,6 +298,7 @@ pub const SimNet = struct {
             }
         }
         var elapsed_ms = net.delay(faults.request.delay_ms_max);
+        if (net.late_registration and is_lease_grant(request)) net.grant_orphan(port.node, request);
         const first = net.hand_over(port.node, request);
         // The duplicate reuses `scratch`, so the first reply is copied out before it arrives.
         var kept: ?[]u8 = null;
@@ -274,6 +308,10 @@ pub const SimNet = struct {
             _ = net.hand_over(port.node, request);
         }
         defer if (kept) |bytes| net.gpa.free(bytes);
+        if (net.late_registration and first.status == 200 and is_registration(request)) {
+            if (kept == null) kept = net.gpa.dupe(u8, first.body) catch return error.OutOfMemory;
+            net.park_late_registration(port.node, request);
+        }
         const reply_body = kept orelse first.body;
         // The server has acted. Nothing below can undo it.
         elapsed_ms += net.delay(faults.reply.delay_ms_max);
@@ -286,6 +324,48 @@ pub const SimNet = struct {
         net.last_call_ms = elapsed_ms;
         const body = arena.dupe(u8, reply_body) catch return error.OutOfMemory;
         return .{ .status = first.status, .body = body };
+    }
+
+    /// Grants the lease of an earlier attempt, just before the agent's own grant (so it is the
+    /// older one). Remembered for the registration that follows.
+    fn grant_orphan(net: *SimNet, node: u32, request: client.Request) void {
+        net.links[node].orphan_lease = 0;
+        const granted = net.hand_over(node, request);
+        if (granted.status != 200) return;
+        var arena_state = std.heap.ArenaAllocator.init(net.gpa);
+        defer arena_state.deinit();
+        const Granted = struct { lease: struct { id: u64 } };
+        const arena = arena_state.allocator();
+        const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
+        const parsed = std.json.parseFromSliceLeaky(Granted, arena, granted.body, options) catch
+            return;
+        net.links[node].orphan_lease = parsed.lease.id;
+    }
+
+    /// The registration the agent sent, parked to arrive again later for the orphan lease: the
+    /// same body otherwise. At most once per orphan lease.
+    fn park_late_registration(net: *SimNet, node: u32, request: client.Request) void {
+        const link = &net.links[node];
+        const orphan = link.orphan_lease;
+        if (orphan == 0) return;
+        link.orphan_lease = 0;
+        const prefix = "{\"lease\":";
+        if (!std.mem.startsWith(u8, request.body, prefix)) return;
+        var end: usize = prefix.len;
+        while (end < request.body.len and std.ascii.isDigit(request.body[end])) end += 1;
+        var arena_state = std.heap.ArenaAllocator.init(net.gpa);
+        defer arena_state.deinit();
+        const body = std.fmt.allocPrint(arena_state.allocator(), "{s}{d}{s}", .{
+            prefix, orphan, request.body[end..],
+        }) catch return;
+        const stale: client.Request = .{
+            .method = request.method,
+            .target = request.target,
+            .body = body,
+        };
+        assert(net.lease_ttl_ms > late_registration_lead_ms);
+        const due_ms = net.now_ms + net.lease_ttl_ms - late_registration_lead_ms;
+        _ = net.park_at(link, stale, .{ .at_ms = due_ms }, true);
     }
 
     /// The request reaches the server; its reply is in `scratch` until the next hand-over.
@@ -330,30 +410,60 @@ pub const SimNet = struct {
     /// are full or memory is.
     fn park(net: *SimNet, link: *Link, request: client.Request, faults: Faults) bool {
         assert(faults.reorder_delay_ms_min <= faults.reorder_delay_ms_max);
+        return net.park_at(link, request, .{ .drawn = faults }, false);
+    }
+
+    /// When a parked copy is delivered: at a time given, or after a delay drawn from the seed
+    /// once a slot and the copy are found (the draw order of every world before #237).
+    const ParkDue = union(enum) { at_ms: u64, drawn: Faults };
+
+    /// Keeps a copy to deliver at `due`. False if all the slots are full or memory is.
+    fn park_at(net: *SimNet, link: *Link, request: client.Request, due: ParkDue, stale: bool) bool {
         for (&link.parked) |*slot| {
             if (slot.* != null) continue;
             const copy = net.copy_request(request) catch return false;
-            const random = net.prng.random();
-            const wait_ms = random.intRangeAtMost(
-                u32,
-                faults.reorder_delay_ms_min,
-                faults.reorder_delay_ms_max,
-            );
+            const due_ms = switch (due) {
+                .at_ms => |at| at,
+                .drawn => |faults| net.now_ms + request.hold_ms + net.prng.random().intRangeAtMost(
+                    u32,
+                    faults.reorder_delay_ms_min,
+                    faults.reorder_delay_ms_max,
+                ),
+            };
             slot.* = .{
                 .method = copy.method,
                 .target = copy.target,
                 .body = copy.body,
                 .hold_ms = request.hold_ms,
-                .due_ms = net.now_ms + request.hold_ms + wait_ms,
+                .due_ms = due_ms,
                 .sequence = net.parked_total,
+                .stale = stale,
             };
             net.parked_total += 1;
-            link.stats.parked += 1;
+            if (!stale) link.stats.parked += 1;
             return true;
         }
         return false;
     }
 };
+
+/// `POST /v1/agent/nodes/{node}/lease`: a lease grant (a keepalive has more path).
+fn is_lease_grant(request: client.Request) bool {
+    const base = "/v1/agent/nodes/";
+    if (!std.mem.eql(u8, request.method, "POST")) return false;
+    if (!std.mem.startsWith(u8, request.target, base)) return false;
+    const path_end = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
+    return std.mem.endsWith(u8, request.target[0..path_end], "/lease");
+}
+
+/// `PUT /v1/agent/nodes/{node}`: a node's registration (the summary and the lease have more path).
+fn is_registration(request: client.Request) bool {
+    const base = "/v1/agent/nodes/";
+    if (!std.mem.eql(u8, request.method, "PUT")) return false;
+    if (!std.mem.startsWith(u8, request.target, base)) return false;
+    const path_end = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
+    return std.mem.indexOfScalarPos(u8, request.target[0..path_end], base.len, '/') == null;
+}
 
 const testing = std.testing;
 
