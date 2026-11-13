@@ -755,11 +755,10 @@ pub fn mesh_address_text(
     assert(number <= constants.mesh_address_max);
     const first = constants.mesh_block_first_octet;
     const second = constants.mesh_block_second_octet;
-    // Cannot fail: four octets of at most three digits and three dots fill at most 15 bytes,
-    // and the first two are "127.77.", so the text is at most 13.
-    return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{
-        first, second, number >> 8, number & 0xff,
-    }) catch unreachable;
+    const octets = .{ first, second, number >> 8, number & 0xff };
+    // Cannot fail: the first two octets are "127.77." (7 bytes), and the last two at most three
+    // digits each and a dot, so the text is at most 14.
+    return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", octets) catch unreachable;
 }
 
 /// The number of a mesh address in its one canonical text, or null for anything else (another
@@ -2361,13 +2360,13 @@ test "the version a record is written in is the version the reader accepts" {
     var diag: Diag = undefined;
     diag.reset();
     inline for (.{
-        Service,       Replica,    Node,
-        Observed,      Assigned,   Allocation,
-        Audit,         NodeStatus, Summary,
-        ReplicaNumber, Decision,   IndexEntry,
-        NodeStore,     Pull,       JobInput,
-        JobAdmission,  JobEndings, JobStatus,
-        JobObserved,   History,    Rollout,
+        Service,         Replica,         Node,
+        Observed,        Assigned,        Allocation,
+        Audit,           NodeStatus,      Summary,
+        ReplicaNumber,   Decision,        IndexEntry,
+        NodeStore,       Pull,            JobInput,
+        JobAdmission,    JobEndings,      JobStatus,
+        JobObserved,     History,         Rollout,
         MeshAddressNext, MeshAddressHold,
     }) |T| {
         var value = std.mem.zeroes(T);
@@ -2379,6 +2378,8 @@ test "the version a record is written in is the version the reader accepts" {
         // A service is written at version 5 only with a mesh member, an observation at version 4
         // only with an endpoint (C4).
         if (T == Service) value.mesh_address = "127.77.0.1";
+        // `read` checks a v5 service's grants against its name, so it needs a valid one.
+        if (T == Service) value.name = "s";
         if (T == Observed) value.health = .healthy;
         if (T == Observed) value.endpoint = "node1:30000";
         const bytes = try encode(arena, value, &diag);

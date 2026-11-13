@@ -226,14 +226,25 @@ export class Engine {
     const key = `/services/${spec.name}`;
     const existing = this.getKv(key);
     const same = existing && ["image", "command", "env", "limits", "source"].every(k => JSON.stringify(existing.value[k]) === JSON.stringify(spec[k] ?? (k === "env" ? [] : k === "limits" ? {} : k === "source" ? "" : undefined)));
+    const ops = [];
+    // docs/keys.md "Mesh addresses" (C4): kept from the stored service, else the counter's next
+    // number, held under /mesh-addresses/<n>. The mock never wraps the counter, so never reuses.
+    let mesh_address = existing?.value.mesh_address;
+    if (!mesh_address) {
+      const n = this.get("/mesh-address-next")?.next ?? 1;
+      mesh_address = `127.77.${n >> 8}.${n & 255}`;
+      ops.push({ put: ["/mesh-address-next", { v: 1, next: n + 1 }] });
+      ops.push({ put: [`/mesh-addresses/${String(n).padStart(5, "0")}`, { v: 1, service: spec.name }] });
+    }
     const value = {
-      v: 3, name: spec.name, image: spec.image, replicas: spec.replicas, command: spec.command,
+      v: 5, name: spec.name, image: spec.image, replicas: spec.replicas, command: spec.command,
       env: spec.env || [], limits: spec.limits || {}, source: spec.source || "", // docs/keys.md: the OCI reference, "" if none
       // A change of the replica count alone does not bump the generation here; keys.md is silent on it.
       generation: existing ? existing.value.generation + (same ? 0 : 1) : 1,
       applied_by: actor, request_id: requestId, // proposed additions to /services/<name>, see docs/api.md
+      mesh_address, allow: spec.allow || [],
     };
-    const ops = [{ put: [key, value] }];
+    ops.unshift({ put: [key, value] });
     // docs/keys.md `/history/<service>/<generation>`: one record per new generation, written with
     // the service; at most 16 per service, the lowest generation dropped in the same commit.
     if (!existing || value.generation !== existing.value.generation) {

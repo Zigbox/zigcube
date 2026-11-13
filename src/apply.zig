@@ -261,7 +261,11 @@ fn put_grant_decision(
 }
 
 /// "web → 5432 added".
-fn grant_text(ctx: *const Context, grant: records.Grant, comptime how: []const u8) Error![]const u8 {
+fn grant_text(
+    ctx: *const Context,
+    grant: records.Grant,
+    comptime how: []const u8,
+) Error![]const u8 {
     return controller.format(ctx, "{s} → {d} " ++ how, .{ grant.from, grant.port });
 }
 
@@ -377,7 +381,9 @@ fn change_summary(ctx: *const Context, existing: ?records.Service, input: Input)
     const old_rollout = old.rollout_policy();
     const new_rollout = input.rollout orelse records.RolloutPolicy{};
     if (!old_rollout.equal(new_rollout)) try append_part(ctx, &text, "rollout changed");
-    if (!records.grants_equal(old.allow, input.allow)) try append_part(ctx, &text, "grants changed");
+    if (!records.grants_equal(old.allow, input.allow)) {
+        try append_part(ctx, &text, "grants changed");
+    }
     // A service written before C4 takes its address on its next apply, a re-apply of the same
     // file included (docs/keys.md, "Mesh addresses").
     if (old.mesh_address == null) try append_part(ctx, &text, "mesh address assigned");
@@ -772,7 +778,6 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
         diag.reset();
     }
     try testing.expectEqual(@as(store.Revision, 0), (try ctx.store.status(&diag)).revision);
-
     var edge = hello;
     edge.limits = .{
         .cpu_millis = constants.job_limit_cpu_millis_max,
@@ -794,8 +799,7 @@ test "apply refuses container limits outside the runtime's bounds; a stored one 
         .generation = 1,
         .applied_by = old.applied_by,
         .request_id = old.request_id,
-        // With an address, so the re-apply below is unchanged rather than a C4 backfill.
-        .mesh_address = "127.77.0.2",
+        .mesh_address = "127.77.0.2", // an address: the re-apply is unchanged, not a backfill
     };
     const value = try records.encode(ctx.arena, stored, &diag);
     const written = try ctx.store.txn(.{

@@ -66,7 +66,10 @@ applied service hello: replicas 3 → 5
   the OCI reference the image is pulled from when the node does not have it, pinned by digest, as
   `registry.example/hello@sha256:<64 hex digits>`; `zbx pull` prints the reference and the digest.
   `apply` refuses a tag, with `ZC-E0104`). Leave `.source` out and the tree must already be on the
-  node. `get service -o wide` and `get replicas -o wide` gain a `SOURCE` column, and `-o json`
+  node. `.allow` (C4) lists who may connect to the service through the mesh, as
+  `.allow = .{ .{ .from = "web", .port = 5432 } }`; left out or empty, nothing may. A bad grant is
+  refused by the server with `ZC-E0135` naming it ([api.md](api.md), "`POST /v1/apply`"). A change to
+  `.allow` alone keeps the generation and is shown as a grant change (`web → 5432 added`). `get service -o wide` and `get replicas -o wide` gain a `SOURCE` column, and `-o json`
   a `source` member, only for a service that has one. An unknown field is an
   error, so a typo is not silently ignored. Every problem is `ZC-E0110` with the file, line and
   column and the line itself (`--verbose`); a file that can't be read is `ZC-E0109` (any file a command names: the service file, the input file of `job run`). Nothing is

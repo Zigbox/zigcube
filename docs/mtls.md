@@ -208,6 +208,24 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
   fails the clean-close check.
 
+## Threats the service mesh adds (C4)
+
+C4 (docs/briefs/c4.md) puts a workload certificate's key in each service replica's supervisor and
+has supervisors serve the node's network for their replicas. Slice 1 records these threats; the
+slice named after each builds the defence, and its tests are the evidence.
+
+| # | Threat | Defence | Slice |
+| --- | --- | --- | --- |
+| T1 | A container connects to a service it has no grant for | The container is `--net none`; its only sockets to other workloads are the listeners its supervisor makes for current grants. The destination supervisor checks the grant again (ZC-E0707) | 2, 4, 7 |
+| T2 | A compromised or lying source node widens access (claims a grant, a service or a port) | The destination checks chain, `/service/<S>`, the grant `S → D:P` and the port in SNI against its own view; the source node is not trusted | 3, 6 |
+| T3 | A revoked grant keeps working | Both ends close the listeners and open connections of a grant within `mesh_revoke_ms` of seeing it go; either end alone refuses | 4, 6 |
+| T4 | A replica's key leaks to the workload or to disk | The supervisor makes the key in memory and never writes or passes it on; the workload sees only plaintext on loopback | 3 |
+| T5 | **A supervisor is a new trust edge (G10).** A compromised supervisor holds one replica's key and serves the node's network for it | It can act as that one replica, under its grants, until its certificate expires or its epoch moves on; no daemon holds more than one replica's key, and a node-wide ingress is ruled out for that reason | 3 |
+| T6 | A certificate is used after its replica is replaced or its node fenced | Issuance only for the node holding the current assignment at the current epoch (ZC-E0706); the destination refuses a stale epoch; certificates are short and renewed (ZC-W0703 when not) | 3 |
+| T7 | A deleted service's address is taken by a new service while old replicas still answer on it | An address is not reused while a replica of the old service remains, nor within 24 hours of the delete (docs/keys.md, "Mesh addresses") | 1 |
+| T8 | A grant names a service that does not exist yet, and a later service of that name inherits it | Accepted by design: a grant names a service, not an incarnation; `zcube why grant` shows it, and ZC-W0704 warns of a grant to a service that does not exist | 2 |
+| T9 | Plaintext crosses the node's network | Every workload connection goes through two supervisors over TLS 1.3, on one node too; there is no unencrypted same-node path | 6 |
+
 ## Diagnostics
 
 | Code | Refused because |

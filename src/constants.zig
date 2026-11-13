@@ -131,7 +131,7 @@ pub const mesh_block_second_octet: u8 = 77;
 pub const mesh_address_min: u16 = 1;
 pub const mesh_address_max: u16 = 65_534;
 /// "127.77.255.254": the longest address text.
-pub const mesh_address_text_bytes_max: u32 = 13;
+pub const mesh_address_text_bytes_max: u32 = 14;
 /// A deleted service's address is reused only after the decision-retention window for a gone
 /// subject (24 hours), and only once no replica of the old service remains.
 pub const mesh_address_quarantine_ms: u64 = decision_gone_age_ms_max;

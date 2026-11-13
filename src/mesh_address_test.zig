@@ -227,7 +227,7 @@ test "every number of the block becomes a canonical address and parses back" {
         try testing.expectEqual(@as(?u16, @intCast(number)), records.mesh_address_parse(text));
     }
     const refused = [_][]const u8{
-        "127.77.0.0",  "127.77.255.255", "127.77.0.01", "127.78.0.1",
+        "127.77.0.0",  "127.77.255.255", "127.77.0.01",  "127.78.0.1",
         "127.77.0",    "127.77.0.1.",    "127.77.256.1", "127.77.-1.1",
         " 127.77.0.1", "",
     };
@@ -263,6 +263,7 @@ test "a bad allow list is ZC-E0135 and writes nothing" {
         try testing.expectEqual(.E0135, fixture.diag.code.?);
         const cause = fixture.diag.causes.slice()[0].slice();
         try testing.expect(std.mem.indexOf(u8, cause, case.cause) != null);
+        fixture.diag.reset();
         const ctx = fixture.context();
         const held = try ctx.store.get(ctx.arena, "/mesh-addresses/00001", null, ctx.diag);
         try testing.expectEqual(@as(?store.KeyValue, null), held.kv);

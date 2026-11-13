@@ -284,6 +284,21 @@ The answer is the decision id and the one-line summary (api.md item 5), whether 
   `cpu_millis` 10 to 1,024,000 and `memory_bytes` 4 MiB to 2^40, and the cause names
   `limits.<member>`. Limits the stored service already has are not re-checked, so applying the same
   file again is `none`, not a refusal (docs/decisions/2026-11-08-service-apply-limits.md). A store that is down is `503` and `ZC-E0201`, as everywhere.
+- **`allow` (C4 slice 1)** says which services may connect to this one through the mesh, and on
+  which port: `"allow": [{"from": "web", "port": 5432}]`. It is optional and empty by default (no
+  grant: nothing may connect). At most `service_allow_max` (64) grants; each `from` is a service
+  name (it need not exist yet), never this service itself, and `port` is 1 to 65535; a pair listed
+  twice is refused. Anything else is `400` and **`ZC-E0135`**, its cause naming the grant by number
+  (`allow: grant 2: web on port 5432 is listed twice`). A change to `allow` alone does not bump
+  `generation`: it is recorded as a `grant` decision whose `change` says what was added and removed
+  (`web → 5432 added, batch → 80 removed`), next to the `apply` decision when the spec changed too.
+- **The mesh address.** Every service the API writes holds `mesh_address`, `127.77.<hi>.<lo>`,
+  given when the service is first written (or first re-applied, for a service written before C4)
+  and kept until it is deleted (`docs/keys.md`, "Mesh addresses"). The client never sends it (a
+  body with `mesh_address` is `ZC-E0104`, an unknown field). It appears with `allow` on
+  `/services/<name>` in the read endpoints. When every address is held (by services, or by deleted
+  ones whose replicas remain or that were deleted within a day), a create is `503` and
+  `ZC-E0207`.
 
 ### `DELETE /v1/services/{name}[?applied_by=<name>]`
 
