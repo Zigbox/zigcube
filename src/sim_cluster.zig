@@ -3361,6 +3361,33 @@ fn enough_work_under_faults(c: *Cluster, operations: u32) Failure!void {
     try check(c, met, "too few requests reached the server while faults were on");
 }
 
+/// The report line of the network's counters, summed over the nodes.
+fn print_net(c: *Cluster) void {
+    const report = c.report;
+    var total: sim_net.Stats = .{};
+    for (c.nodes) |node| {
+        const link = c.net.stats(node.index);
+        total.delivered += link.delivered;
+        total.requests_dropped += link.requests_dropped;
+        total.replies_lost += link.replies_lost;
+        total.duplicated += link.duplicated;
+        total.parked += link.parked;
+        total.delivered_late += link.delivered_late;
+        total.partitioned += link.partitioned;
+        total.late_registrations += link.late_registrations;
+        total.late_registrations_landed += link.late_registrations_landed;
+    }
+    report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} ", .{
+        total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
+    });
+    report.print("parked={d} delivered_late={d} partitioned={d} ", .{
+        total.parked, total.delivered_late, total.partitioned,
+    });
+    report.print("late_registrations={d} landed={d}\n", .{
+        total.late_registrations, total.late_registrations_landed,
+    });
+}
+
 fn print_summary(c: *Cluster) void {
     const report = c.report;
     const s = c.stats;
@@ -3383,25 +3410,7 @@ fn print_summary(c: *Cluster) void {
     report.print("lost nodes: mark_lost={d} replicas replaced after the grace={d}\n", .{
         s.nodes_marked_lost, s.replicas_marked_lost,
     });
-    var total: sim_net.Stats = .{};
-    for (c.nodes) |node| {
-        const link = c.net.stats(node.index);
-        total.delivered += link.delivered;
-        total.requests_dropped += link.requests_dropped;
-        total.replies_lost += link.replies_lost;
-        total.duplicated += link.duplicated;
-        total.parked += link.parked;
-        total.delivered_late += link.delivered_late;
-        total.partitioned += link.partitioned;
-        total.late_registrations += link.late_registrations;
-        total.late_registrations_landed += link.late_registrations_landed;
-    }
-    report.print("net: delivered={d} requests_dropped={d} replies_lost={d} duplicated={d} " ++
-        "parked={d} delivered_late={d} partitioned={d} late_registrations={d} landed={d}\n", .{
-        total.delivered, total.requests_dropped, total.replies_lost, total.duplicated,
-        total.parked,    total.delivered_late,   total.partitioned,
-        total.late_registrations, total.late_registrations_landed,
-    });
+    print_net(c);
     const fences = total_fences(c);
     report.print("fences: {d} (agents that stopped their containers for a lease)\n", .{fences});
     report.print("duplicates: {d} replica-seconds on two nodes (a failure under sim-c1, " ++
