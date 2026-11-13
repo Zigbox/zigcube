@@ -188,6 +188,10 @@ Until C3 slice 11 the API's apply body takes neither member: slice 5 defines and
 - A version 3 or 4 record reads as "no address, no grants". **Downgrade:** every service a C4
   server writes is version 5, so a server before C4 refuses it (ZC-E0303). Going back to an
   earlier release after C4 has applied a service is not supported.
+  **Upgrade:** only the server reads `/services/` (the agent sees replicas through the agent
+  endpoint, the command line the API's JSON), so upgrade every server before the first C4 apply: a
+  server before C4 left running beside a C4 one refuses the version 5 records it writes. Agents
+  and the command line may follow in any order.
 
 ## Mesh addresses (C4 slice 1)
 
