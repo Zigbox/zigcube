@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a rollout paused itself after a failure</p>
 <dl class="facts"><div><dt>Kind</dt><dd>warning</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>The service's rollout policy says `on_failure: pause`, and the rollout failed (ZC-E0304 or ZC-E0306). It stopped where it was: replicas of both generations keep running, and nothing is started or retired until you act.</p>
+<p>The service's rollout policy says `on_failure: pause`, and the rollout failed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was: replicas of both generations keep running, and nothing is started or retired until you act.</p>
 <p>`zcube rollout status &lt;service&gt;` shows both generations. Resume with `zcube rollout resume &lt;service&gt;`, roll back with `zcube rollback &lt;service&gt;`, or apply a fixed release.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

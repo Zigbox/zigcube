@@ -746,10 +746,13 @@ pub fn history_of(service: *const Service, applied_at_ms: u64) History {
 pub const RolloutPhase = enum { progressing, paused, rolling_back, complete, failed };
 
 /// What the replica controller may do now for a rollout: start this many new replicas, retire
-/// this many old ones.
+/// this many ready old ones (`retire`, the count R1 limits) and this many old ones that are not
+/// ready (`retire_unready`). A replica counted as unready that is ready when the controller acts
+/// is not retired on `retire_unready`.
 pub const RolloutBudget = struct {
     start: u32 = 0,
     retire: u32 = 0,
+    retire_unready: u32 = 0,
 };
 
 /// `/rollouts/<service>`: the one rollout of a service, written by the rollout controller (C3
@@ -1860,7 +1863,7 @@ test "C3: history and rollout records encode and read back" {
         .phase = .progressing,
         .started_at_ms = 10,
         .deadline_at_ms = 600_010,
-        .budget = .{ .start = 1, .retire = 0 },
+        .budget = .{ .start = 1, .retire = 0, .retire_unready = 2 },
         .cause_decision = "0000000000000001-0000",
     };
     const rollout_key_value = rollout_key("hello");
@@ -1869,6 +1872,7 @@ test "C3: history and rollout records encode and read back" {
     const rollout_back = try read(Rollout, arena, kv_of("/rollouts/hello", rollout_bytes), &diag);
     try testing.expectEqual(RolloutPhase.progressing, rollout_back.phase);
     try testing.expectEqual(@as(u32, 1), rollout_back.budget.start);
+    try testing.expectEqual(@as(u32, 2), rollout_back.budget.retire_unready);
     // A rollout belongs to one incarnation of its service: not to one created again, nor to none.
     try testing.expect(rollout_of(&rollout_back, 40));
     try testing.expect(!rollout_of(&rollout_back, 41));

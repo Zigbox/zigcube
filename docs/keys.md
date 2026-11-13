@@ -204,15 +204,18 @@ known). So after an upgrade the first new generation can always be rolled back t
 ```json
 { "v": 1, "service": "hello", "service_created": 40, "from": 6, "to": 7, "phase": "progressing",
   "started_at_ms": 1761350000123, "deadline_at_ms": 1761350600123, "next_at_ms": 1761350005123,
-  "ready_new": 1, "retired_old": 1, "budget": {"start": 1, "retire": 0},
+  "ready_new": 1, "retired_old": 1, "budget": {"start": 1, "retire": 0, "retire_unready": 0},
   "cause_decision": "1761350000123-api0-0001" }
 ```
 
 Written only by the rollout controller (role `rollout_controller`), one per service. `phase` is
 `progressing`, `paused`, `rolling_back`, `complete` or `failed`. `budget` is how many new
-replicas the replica controller may start now and how many old ones it may retire; the replica
-controller stays the only writer of `/replicas/`. `next_at_ms` is when the controller looks again
-without a store change (`min_ready_ms`). Deleted a retention period after `complete`.
+replicas the replica controller may start now, how many ready old ones it may retire (`retire`,
+the count that keeps `max_unavailable`) and how many old ones that are not ready it may retire
+(`retire_unready`, optional, 0 when absent; a replica that is ready when the controller acts is
+never retired on it); the replica controller stays the only writer of `/replicas/`. `next_at_ms`
+is when the controller looks again without a store change (`min_ready_ms`). Deleted a retention
+period after `complete`.
 
 **Whose rollout it is.** `service_created` is the `create_revision` of the `/services/<service>`
 key the rollout was started for. Deleting a service does not delete its rollout: the API is not

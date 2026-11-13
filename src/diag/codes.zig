@@ -597,10 +597,12 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "the service has no rollout to pause or resume",
         .explanation =
-        \\Pause and resume act on a rollout in progress: pause stops it starting or
-        \\retiring replicas, resume lets it go on. This service has no rollout, or
-        \\its rollout has already ended (complete or failed), or it is already in
-        \\the state asked for.
+        \\Pause stops a rollout starting or retiring replicas; resume lets a paused
+        \\rollout go on. This service has no rollout, its rollout is complete, or
+        \\(for resume) its rollout failed: a failed rollout can be paused, which
+        \\stops an automatic rollback it owes, and resumed once paused. Pausing a
+        \\paused rollout, or resuming one that is running, is not this error: it
+        \\succeeds and changes nothing.
         \\
         \\Nothing was changed. `zcube rollout status <service>` shows what is
         \\running.
@@ -1052,7 +1054,9 @@ pub const registry = [_]Entry{
         \\
         \\The cause line names the replica and what it needs. Add a node or free
         \\capacity, or allow the rollout to retire first (`max_unavailable` above
-        \\0); the rollout continues by itself once a replica can be placed.
+        \\0); the rollout continues by itself once a replica can be placed. If it
+        \\is still stalled when `progress_deadline_ms` passes, it fails with this
+        \\code, not ZC-E0306, and follows `on_failure` like any failed rollout.
         ,
     },
     .{
@@ -1063,7 +1067,8 @@ pub const registry = [_]Entry{
         .explanation =
         \\A rollout must finish within `progress_deadline_ms` of its start. This
         \\one did not: new replicas became ready too slowly, or not at all, though
-        \\none failed outright.
+        \\none failed outright. (A rollout stalled for room when its deadline
+        \\passed fails with ZC-E0305 instead.)
         \\
         \\With `on_failure` rollback (the default) the service is rolled back to
         \\the generation it ran before; with `pause` the rollout stops where it is.
@@ -1078,9 +1083,9 @@ pub const registry = [_]Entry{
         .summary = "a rollout paused itself after a failure",
         .explanation =
         \\The service's rollout policy says `on_failure: pause`, and the rollout
-        \\failed (ZC-E0304 or ZC-E0306). It stopped where it was: replicas of both
-        \\generations keep running, and nothing is started or retired until you
-        \\act.
+        \\failed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:
+        \\replicas of both generations keep running, and nothing is started or
+        \\retired until you act.
         \\
         \\`zcube rollout status <service>` shows both generations. Resume with
         \\`zcube rollout resume <service>`, roll back with `zcube rollback
@@ -1093,10 +1098,11 @@ pub const registry = [_]Entry{
         .blame = .user,
         .summary = "a rollout was rolled back automatically",
         .explanation =
-        \\The rollout of a new generation failed (ZC-E0304 or ZC-E0306) and the
-        \\service's rollout policy is `on_failure: rollback`, the default. The
-        \\service was applied again with the spec of the generation it ran before,
-        \\as a new generation, and that rollout replaces the failed replicas.
+        \\The rollout of a new generation failed (ZC-E0304, ZC-E0305 or
+        \\ZC-E0306) and the service's rollout policy is `on_failure: rollback`,
+        \\the default. The service was applied again with the spec of the
+        \\generation it ran before, as a new generation, and that rollout
+        \\replaces the failed replicas.
         \\
         \\The summary names the failing replica and the generation restored. Fix
         \\the release and apply it again; a newer apply always wins over an

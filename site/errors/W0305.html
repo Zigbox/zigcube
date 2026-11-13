@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">a rollout was rolled back automatically</p>
 <dl class="facts"><div><dt>Kind</dt><dd>warning</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>The rollout of a new generation failed (ZC-E0304 or ZC-E0306) and the service's rollout policy is `on_failure: rollback`, the default. The service was applied again with the spec of the generation it ran before, as a new generation, and that rollout replaces the failed replicas.</p>
+<p>The rollout of a new generation failed (ZC-E0304, ZC-E0305 or ZC-E0306) and the service's rollout policy is `on_failure: rollback`, the default. The service was applied again with the spec of the generation it ran before, as a new generation, and that rollout replaces the failed replicas.</p>
 <p>The summary names the failing replica and the generation restored. Fix the release and apply it again; a newer apply always wins over an automatic rollback.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

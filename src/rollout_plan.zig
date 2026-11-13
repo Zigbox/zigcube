@@ -22,17 +22,21 @@
 //! **The phases** (`pass`, `pause_rollout`, `resume_rollout`, `begin`):
 //!
 //!     begin(apply)    ──► progressing          begin(rollback) ──► rolling_back
-//!     progressing  ── done ──► complete        rolling_back ── done ──► complete
+//!     progressing, rolling_back ── done ──► complete
 //!     progressing  ── failure, on_failure rollback ──► failed   (a rollback is owed)
-//!     progressing  ── failure, on_failure pause    ──► paused
-//!     rolling_back ── failure ──► paused       (a failed rollback is never rolled back again)
-//!     failed       ── on_failure pause (a policy changed since) ──► paused
-//!     progressing, rolling_back ── pause ──► paused ── resume ──► progressing
+//!     rolling_back ── failure, on_failure rollback ──► failed   (nothing owed: not rolled back)
+//!     progressing, rolling_back ── failure, on_failure pause ──► paused (by the failure)
+//!     failed       ── on_failure pause (a policy changed since) ──► paused (by the failure)
+//!     progressing, rolling_back ── pause ──► paused (by the user)
+//!     failed       ── pause ──► paused (by the failure)
+//!     paused       ── resume ──► progressing or rolling_back, as the rollout's reason says
 //!
-//! A rollout leaves `failed` only by `begin`: the automatic rollback lands as a new generation
-//! (`begin(rollback)`), or a newer user apply does (`begin(apply)`). `begin` from any phase starts
-//! a rollout from the current mix of replicas. `paused` and `failed` start and retire nothing;
-//! replacing a replica that failed on its own is the replica controller's, outside the budget.
+//! A rollout leaves `failed` only by `begin` or a pause: the automatic rollback lands as a new
+//! generation (`begin(rollback)`), or a newer user apply does (`begin(apply)`). `begin` from any
+//! phase starts a rollout from the current mix of replicas. `paused` and `failed` start and retire
+//! nothing; replacing a replica that failed on its own is the replica controller's, outside the
+//! budget. A resumed rollout is judged only on failures seen after the resume
+//! (`State.evidence_from_ms`).
 //!
 //! Done means no old replica is live and `desired` new ones are ready. Done wins over a failure
 //! seen on the same pass: the work it guards is finished.
@@ -98,10 +102,15 @@ pub const Plan = struct {
         return plan.retire_unready == 0;
     }
 
-    /// The budget as `/rollouts` stores it: the unready old replicas are part of `retire`, and
-    /// the replica controller retires them before any ready one.
+    /// The budget as `/rollouts` stores it, the two retire counts apart: R1 limits `retire`
+    /// alone, so a replica that turns ready between the plan and the act is never retired on the
+    /// unready count.
     pub fn stored(plan: *const Plan) records.RolloutBudget {
-        return .{ .start = plan.start, .retire = plan.retire + plan.retire_unready };
+        return .{
+            .start = plan.start,
+            .retire = plan.retire,
+            .retire_unready = plan.retire_unready,
+        };
     }
 };
 
@@ -186,38 +195,63 @@ pub fn ready_at(since_ms: ?u64, min_ready_ms: u32) ?u64 {
     return at;
 }
 
-/// A rollout's state as the controller keeps it between passes.
-pub const State = struct {
-    phase: Phase,
-    started_at_ms: u64,
-    deadline_at_ms: u64,
-    /// When the current pause began: set exactly while `phase` is `paused`.
-    paused_at_ms: ?u64 = null,
+/// What a rollout is for: a new generation applied by the user (`apply`), or the automatic or
+/// user rollback that landed as one (`rollback`). It names the active phase (`active_phase`).
+pub const Reason = enum {
+    apply,
+    rollback,
 
-    pub fn assert_valid(state: *const State) void {
-        assert(state.deadline_at_ms >= state.started_at_ms);
-        if (state.phase == .paused) {
-            assert(state.paused_at_ms != null);
-        } else {
-            assert(state.paused_at_ms == null);
-        }
-        if (state.paused_at_ms) |paused_at| assert(paused_at >= state.started_at_ms);
+    pub fn active_phase(reason: Reason) Phase {
+        return switch (reason) {
+            .apply => .progressing,
+            .rollback => .rolling_back,
+        };
     }
 };
 
-pub const Reason = enum { apply, rollback };
+/// Why a rollout is paused: the user paused it (`pause_rollout`), or it stopped for a failure
+/// (`on_failure pause`, or a pause of a `failed` rollout). Resume treats them apart.
+pub const PauseCause = enum { user, failure };
 
-/// A rollout starting at `now_ms`: a new generation was applied (`apply`), or the automatic
-/// rollback landed (`rollback`). From any phase: a newer generation replaces the rollout's target.
+/// A rollout's state as the controller keeps it between passes.
+pub const State = struct {
+    phase: Phase,
+    reason: Reason,
+    started_at_ms: u64,
+    deadline_at_ms: u64,
+    /// Failures the controller saw before this moment do not count: the start, or the last
+    /// resume. A resumed rollout is judged on what happens after the resume only.
+    evidence_from_ms: u64,
+    /// When the current pause began: set exactly while `phase` is `paused`.
+    paused_at_ms: ?u64 = null,
+    /// Why: set exactly while `phase` is `paused`.
+    paused_by: ?PauseCause = null,
+
+    pub fn assert_valid(state: *const State) void {
+        assert(state.deadline_at_ms >= state.started_at_ms);
+        assert(state.evidence_from_ms >= state.started_at_ms);
+        if (state.phase == .paused) {
+            assert(state.paused_at_ms != null);
+            assert(state.paused_by != null);
+        } else {
+            assert(state.paused_at_ms == null);
+            assert(state.paused_by == null);
+        }
+        if (active(state.phase)) assert(state.phase == state.reason.active_phase());
+        if (state.paused_at_ms) |paused_at| assert(paused_at >= state.evidence_from_ms);
+    }
+};
+
+/// A rollout starting at `now_ms` for `reason`. From any phase: a newer generation replaces the
+/// rollout's target.
 pub fn begin(policy: *const Policy, reason: Reason, now_ms: u64) State {
     assert(policy_valid(policy));
     const state: State = .{
-        .phase = switch (reason) {
-            .apply => .progressing,
-            .rollback => .rolling_back,
-        },
+        .phase = reason.active_phase(),
+        .reason = reason,
         .started_at_ms = now_ms,
         .deadline_at_ms = now_ms + policy.progress_deadline_ms,
+        .evidence_from_ms = now_ms,
     };
     state.assert_valid();
     assert(active(state.phase));
@@ -232,27 +266,33 @@ pub const Failure = enum {
     restarts,
     /// A new replica was not ready within `ready_timeout_ms`.
     ready_timeout,
+    /// The rollout passed `progress_deadline_ms` while new replicas could not be placed: the
+    /// cluster is at fault, not the release (ZC-E0305, blame environment).
+    stalled,
     /// The rollout passed `progress_deadline_ms`.
     deadline,
 
     pub fn code(failure: Failure) Code {
         return switch (failure) {
             .held, .restarts, .ready_timeout => .E0304,
+            .stalled => .E0305,
             .deadline => .E0306,
         };
     }
 };
 
 /// What one pass of the controller sees besides the mix. Counting restarts against a bound and
-/// placing replicas are the controller's; the plan takes their verdicts.
+/// placing replicas are the controller's; the plan takes their verdicts, with the moment each
+/// was first seen so that a resumed rollout is not failed again on what it was paused for.
 pub const Facts = struct {
     desired: u32,
     mix: Mix,
     now_ms: u64,
-    /// A new replica is held.
-    new_held: bool = false,
-    /// A new replica restarted more often than the rollout allows.
-    new_restarts_exceeded: bool = false,
+    /// When the controller saw the most recently held new replica become held; null if none is.
+    new_held_at_ms: ?u64 = null,
+    /// When the controller saw the most recent new replica pass the restart bound (slice 7's
+    /// `rollout_restarts_max`); null if none has.
+    new_restarts_exceeded_at_ms: ?u64 = null,
     /// When the controller first saw the longest-waiting new replica that is live and not ready;
     /// null if every live new replica is ready.
     new_unready_since_ms: ?u64 = null,
@@ -273,12 +313,21 @@ pub const Pass = struct {
     /// on every pass until a new generation begins a rollout.
     rollback: bool = false,
     /// New replicas the budget allows cannot be placed (ZC-E0305). Not a failure: the rollout
-    /// goes on once one can be, and the progress deadline ends it if none ever can.
+    /// goes on once one can be, and the progress deadline ends it (`Failure.stalled`) if none
+    /// ever can.
     stalled: bool = false,
     /// When the controller should look again without a store change: the deadline, a ready
     /// timeout or a replica becoming ready. Null outside the active phases.
     next_at_ms: ?u64 = null,
 };
+
+/// Whether a rollout in `state` owes a rollback under `policy`: it failed, its policy says
+/// `rollback`, and it was not itself a rollback (a failed rollback is not rolled back again).
+pub fn rollback_owed(policy: *const Policy, state: *const State) bool {
+    if (state.phase != .failed) return false;
+    if (policy.on_failure != .rollback) return false;
+    return state.reason == .apply;
+}
 
 /// One pass: the phase that follows `state` on what `facts` shows, and the budget in it.
 pub fn pass(policy: *const Policy, state: *const State, facts: *const Facts) Pass {
@@ -289,13 +338,13 @@ pub fn pass(policy: *const Policy, state: *const State, facts: *const Facts) Pas
     switch (state.phase) {
         .complete, .paused => {},
         .failed => switch (policy.on_failure) {
-            .rollback => result.rollback = true,
-            .pause => result.state = paused(state, facts.now_ms),
+            .rollback => result.rollback = rollback_owed(policy, state),
+            .pause => result.state = paused(state, facts.now_ms, .failure),
         },
         .progressing, .rolling_back => pass_active(policy, state, facts, &result),
     }
     result.state.assert_valid();
-    if (result.rollback) assert(result.state.phase == .failed);
+    assert(result.rollback == rollback_owed(policy, &result.state));
     if (!active(result.state.phase)) assert(result.plan.zero());
     return result;
 }
@@ -307,32 +356,44 @@ fn pass_active(policy: *const Policy, state: *const State, facts: *const Facts, 
         out.state = finished(state, .complete);
         return;
     }
-    if (failure_of(policy, state, facts)) |failure| {
+    const plan = budget(policy, facts.desired, &facts.mix, state.phase);
+    const stalled = facts.unplaceable and plan.start > 0;
+    if (failure_of(policy, state, facts, stalled)) |failure| {
         out.failure = failure;
-        out.state = paused(state, facts.now_ms);
-        if (state.phase == .progressing) {
-            if (policy.on_failure == .rollback) {
+        switch (policy.on_failure) {
+            .pause => out.state = paused(state, facts.now_ms, .failure),
+            .rollback => {
                 out.state = finished(state, .failed);
-                out.rollback = true;
-            }
+                out.rollback = rollback_owed(policy, &out.state);
+            },
         }
         return;
     }
-    out.plan = budget(policy, facts.desired, &facts.mix, state.phase);
-    out.stalled = facts.unplaceable and out.plan.start > 0;
+    out.plan = plan;
+    out.stalled = stalled;
     out.next_at_ms = next_at(policy, state, facts);
     assert(out.state.phase == state.phase);
 }
 
-fn failure_of(policy: *const Policy, state: *const State, facts: *const Facts) ?Failure {
+fn failure_of(
+    policy: *const Policy,
+    state: *const State,
+    facts: *const Facts,
+    stalled: bool,
+) ?Failure {
     assert(active(state.phase));
-    if (facts.new_held) return .held;
-    if (facts.new_restarts_exceeded) return .restarts;
+    const from = state.evidence_from_ms;
+    if (facts.new_held_at_ms) |at| {
+        if (at >= from) return .held;
+    }
+    if (facts.new_restarts_exceeded_at_ms) |at| {
+        if (at >= from) return .restarts;
+    }
     if (facts.new_unready_since_ms) |since| {
         assert(facts.mix.new_ready < facts.mix.new_live);
-        if (facts.now_ms -| since >= policy.ready_timeout_ms) return .ready_timeout;
+        if (facts.now_ms -| @max(since, from) >= policy.ready_timeout_ms) return .ready_timeout;
     }
-    if (facts.now_ms >= state.deadline_at_ms) return .deadline;
+    if (facts.now_ms >= state.deadline_at_ms) return if (stalled) .stalled else .deadline;
     return null;
 }
 
@@ -342,7 +403,7 @@ fn next_at(policy: *const Policy, state: *const State, facts: *const Facts) u64 
     assert(facts.now_ms < state.deadline_at_ms);
     var at = state.deadline_at_ms;
     if (facts.new_unready_since_ms) |since| {
-        at = @min(at, since + policy.ready_timeout_ms);
+        at = @min(at, @max(since, state.evidence_from_ms) + policy.ready_timeout_ms);
     }
     if (facts.ready_pending_at_ms) |pending| {
         if (pending > facts.now_ms) at = @min(at, pending);
@@ -352,60 +413,81 @@ fn next_at(policy: *const Policy, state: *const State, facts: *const Facts) u64 
 }
 
 fn finished(state: *const State, phase: Phase) State {
+    assert(active(state.phase));
     assert(!active(phase));
     assert(phase != .paused);
-    assert(state.paused_at_ms == null);
     var next = state.*;
     next.phase = phase;
     return next;
 }
 
-fn paused(state: *const State, now_ms: u64) State {
+fn paused(state: *const State, now_ms: u64, cause: PauseCause) State {
     assert(state.phase != .paused);
     assert(state.phase != .complete);
     var next = state.*;
     next.phase = .paused;
-    next.paused_at_ms = @max(now_ms, state.started_at_ms);
+    next.paused_at_ms = @max(now_ms, state.evidence_from_ms);
+    next.paused_by = cause;
     return next;
 }
 
 pub const Refusal = error{
-    /// Nothing to pause or resume (ZC-E0129): the rollout is complete, failed, or (for resume)
-    /// not paused.
+    /// Nothing to pause or resume (ZC-E0129): the rollout is complete, or (for resume) failed.
     NoRollout,
 };
 
 /// A user's pause: the rollout starts and retires nothing until `resume_rollout`. Pausing a paused
-/// rollout changes nothing.
+/// rollout changes nothing. A `failed` rollout may be paused: that stops a rollback it owes, and
+/// is the one way to hold a failed rollout that has no generation to roll back to (a service's
+/// first). Its pause counts as a failure's.
 pub fn pause_rollout(state: *const State, now_ms: u64) Refusal!State {
     state.assert_valid();
     const next = switch (state.phase) {
         .paused => state.*,
-        .progressing, .rolling_back => paused(state, now_ms),
-        .complete, .failed => return error.NoRollout,
+        .progressing, .rolling_back => paused(state, now_ms, .user),
+        .failed => paused(state, now_ms, .failure),
+        .complete => return error.NoRollout,
     };
     next.assert_valid();
     assert(next.phase == .paused);
     return next;
 }
 
-/// A user's resume: the rollout goes on, its deadline moved by the time it was paused. Resuming
-/// a rollout that is not paused changes nothing. A resumed rollback is `progressing`: it is an
-/// ordinary rollout from then on, and its failure follows `on_failure`.
-pub fn resume_rollout(state: *const State, now_ms: u64) Refusal!State {
+/// A user's resume: the rollout goes on in the phase its reason names, so a paused rollback
+/// stays a rollback. Failures seen before the resume no longer count. After a user's pause the
+/// deadline moves by the time it was paused; after a failure's it starts again from the resume,
+/// so a rollout paused for passing its deadline is not failed again at once. Resuming a running
+/// rollout changes nothing.
+pub fn resume_rollout(policy: *const Policy, state: *const State, now_ms: u64) Refusal!State {
+    assert(policy_valid(policy));
     state.assert_valid();
     const next: State = switch (state.phase) {
         .progressing, .rolling_back => state.*,
-        .paused => .{
-            .phase = .progressing,
-            .started_at_ms = state.started_at_ms,
-            .deadline_at_ms = state.deadline_at_ms + (now_ms -| state.paused_at_ms.?),
-        },
+        .paused => resumed(policy, state, now_ms),
         .complete, .failed => return error.NoRollout,
     };
     next.assert_valid();
-    assert(next.deadline_at_ms >= state.deadline_at_ms);
+    assert(active(next.phase));
+    assert(next.reason == state.reason);
+    assert(next.evidence_from_ms >= state.evidence_from_ms);
     return next;
+}
+
+fn resumed(policy: *const Policy, state: *const State, now_ms: u64) State {
+    assert(state.phase == .paused);
+    const paused_at = state.paused_at_ms.?;
+    const at = @max(now_ms, paused_at);
+    const deadline_at_ms = switch (state.paused_by.?) {
+        .user => state.deadline_at_ms + (at - paused_at),
+        .failure => at + policy.progress_deadline_ms,
+    };
+    return .{
+        .phase = state.reason.active_phase(),
+        .reason = state.reason,
+        .started_at_ms = state.started_at_ms,
+        .deadline_at_ms = deadline_at_ms,
+        .evidence_from_ms = at,
+    };
 }
 
 comptime {
@@ -505,7 +587,8 @@ test "rollout plan: only progressing and rolling_back move replicas" {
     // Ready is 3 = desired, so no ready old replica may go (R1); the unready one may.
     const plan = budget(&policy, 3, &mix, .progressing);
     try testing.expectEqualDeep(Plan{ .retire_unready = 1 }, plan);
-    try testing.expectEqualDeep(records.RolloutBudget{ .start = 0, .retire = 1 }, plan.stored());
+    const stored: records.RolloutBudget = .{ .start = 0, .retire = 0, .retire_unready = 1 };
+    try testing.expectEqualDeep(stored, plan.stored());
 }
 
 test "rollout plan: policies the API refuses are not valid" {
@@ -539,17 +622,29 @@ const done_mix: Mix = .{ .new_live = 3, .new_ready = 3 };
 fn state_in(phase: Phase) State {
     return .{
         .phase = phase,
+        .reason = if (phase == .rolling_back) .rollback else .apply,
         .started_at_ms = t0,
         .deadline_at_ms = t0 + 600_000,
+        .evidence_from_ms = t0,
         .paused_at_ms = if (phase == .paused) t0 + 1_000 else null,
+        .paused_by = if (phase == .paused) .user else null,
     };
+}
+
+fn state_of(phase: Phase, reason: Reason) State {
+    var state = state_in(phase);
+    state.reason = reason;
+    state.assert_valid();
+    return state;
 }
 
 test "rollout plan: every edge of a pass" {
     // Goal: each phase moves where the module's header says on a pass, and nowhere else. Method:
-    // a table of (phase, on_failure, facts) with the phase, failure and rollback each must give.
+    // a table of (phase, reason, on_failure, facts) with the phase, failure and rollback each
+    // must give.
     const Case = struct {
         from: Phase,
+        reason: Reason = .apply,
         on_failure: records.RolloutOnFailure = .rollback,
         facts: Facts,
         to: Phase,
@@ -560,18 +655,21 @@ test "rollout plan: every edge of a pass" {
     const plain: Facts = .{ .desired = 3, .mix = rolling_mix, .now_ms = now };
     const finished_facts: Facts = .{ .desired = 3, .mix = done_mix, .now_ms = now };
     var held = plain;
-    held.new_held = true;
+    held.new_held_at_ms = now;
     const f: ?Failure = .held;
+    const back: Reason = .rollback;
     const cases = [_]Case{
         .{ .from = .progressing, .facts = plain, .to = .progressing },
         .{ .from = .progressing, .facts = finished_facts, .to = .complete },
         .{ .from = .progressing, .facts = held, .to = .failed, .failure = .held, .rollback = true },
         .{ .from = .progressing, .on_failure = .pause, .facts = held, .to = .paused, .failure = f },
-        .{ .from = .rolling_back, .facts = plain, .to = .rolling_back },
-        .{ .from = .rolling_back, .facts = finished_facts, .to = .complete },
-        .{ .from = .rolling_back, .facts = held, .to = .paused, .failure = .held },
+        .{ .from = .rolling_back, .reason = back, .facts = plain, .to = .rolling_back },
+        .{ .from = .rolling_back, .reason = back, .facts = finished_facts, .to = .complete },
+        // A failed rollback ends `failed`, owing nothing (R7): it is not rolled back again.
+        .{ .from = .rolling_back, .reason = back, .facts = held, .to = .failed, .failure = f },
         .{
             .from = .rolling_back,
+            .reason = back,
             .on_failure = .pause,
             .facts = held,
             .to = .paused,
@@ -584,21 +682,23 @@ test "rollout plan: every edge of a pass" {
         .{ .from = .complete, .facts = held, .to = .complete },
         .{ .from = .failed, .facts = plain, .to = .failed, .rollback = true },
         .{ .from = .failed, .facts = finished_facts, .to = .failed, .rollback = true },
+        .{ .from = .failed, .reason = back, .facts = plain, .to = .failed },
         .{ .from = .failed, .on_failure = .pause, .facts = plain, .to = .paused },
     };
     for (cases, 0..) |case, index| {
         const policy: Policy = .{ .on_failure = case.on_failure };
-        const state = state_in(case.from);
+        const state = state_of(case.from, case.reason);
         const result = pass(&policy, &state, &case.facts);
         errdefer std.debug.print("case {d}\n", .{index});
         try testing.expectEqual(case.to, result.state.phase);
         try testing.expectEqual(case.failure, result.failure);
         try testing.expectEqual(case.rollback, result.rollback);
+        try testing.expectEqual(state.reason, result.state.reason);
         try testing.expectEqual(state.started_at_ms, result.state.started_at_ms);
         try testing.expectEqual(state.deadline_at_ms, result.state.deadline_at_ms);
-        if (case.to == .paused) {
-            const paused_at = result.state.paused_at_ms;
-            if (case.from != .paused) try testing.expectEqual(@as(?u64, now), paused_at);
+        if (case.to == .paused and case.from != .paused) {
+            try testing.expectEqual(@as(?u64, now), result.state.paused_at_ms);
+            try testing.expectEqual(@as(?PauseCause, .failure), result.state.paused_by);
         }
         if (!active(case.to)) try testing.expect(result.plan.zero());
         if (!active(case.to)) try testing.expectEqual(@as(?u64, null), result.next_at_ms);
@@ -615,18 +715,19 @@ test "rollout plan: failures in order, and done before any" {
     try testing.expectEqual(@as(?Failure, .deadline), pass(&policy, &state, &facts).failure);
     facts.new_unready_since_ms = late - policy.ready_timeout_ms;
     try testing.expectEqual(@as(?Failure, .ready_timeout), pass(&policy, &state, &facts).failure);
-    facts.new_restarts_exceeded = true;
+    facts.new_restarts_exceeded_at_ms = late;
     try testing.expectEqual(@as(?Failure, .restarts), pass(&policy, &state, &facts).failure);
-    facts.new_held = true;
+    facts.new_held_at_ms = late;
     try testing.expectEqual(@as(?Failure, .held), pass(&policy, &state, &facts).failure);
     try testing.expectEqual(Code.E0304, Failure.held.code());
+    try testing.expectEqual(Code.E0305, Failure.stalled.code());
     try testing.expectEqual(Code.E0306, Failure.deadline.code());
 
     const finished_facts: Facts = .{
         .desired = 3,
         .mix = done_mix,
         .now_ms = late,
-        .new_held = true,
+        .new_held_at_ms = late,
     };
     const result = pass(&policy, &state, &finished_facts);
     try testing.expectEqual(Phase.complete, result.state.phase);
@@ -667,9 +768,10 @@ test "rollout plan: the next look is the earliest timer" {
     try testing.expectEqual(@as(?u64, t0 + 120_000), pass(&policy, &state, &facts).next_at_ms);
 }
 
-test "rollout plan: a stall is reported and is not a failure" {
+test "rollout plan: a stall is reported, and at the deadline it is the cluster's failure" {
     // Goal: new replicas that cannot be placed set `stalled` (ZC-E0305) while the budget allows
-    // a start, and leave the phase alone; with nothing to start there is no stall.
+    // a start, and leave the phase alone; with nothing to start there is no stall. A stall at the
+    // deadline fails as `stalled` (E0305, blame environment), not as the release's deadline.
     const policy: Policy = .{};
     const state = state_in(.progressing);
     var facts: Facts = .{
@@ -681,36 +783,94 @@ test "rollout plan: a stall is reported and is not a failure" {
     const stalled = pass(&policy, &state, &facts);
     try testing.expect(stalled.stalled);
     try testing.expectEqual(Phase.progressing, stalled.state.phase);
+    facts.now_ms = state.deadline_at_ms;
+    const failed = pass(&policy, &state, &facts);
+    try testing.expectEqual(@as(?Failure, .stalled), failed.failure);
+    try testing.expectEqual(Phase.failed, failed.state.phase);
+    facts.unplaceable = false;
+    try testing.expectEqual(@as(?Failure, .deadline), pass(&policy, &state, &facts).failure);
+    facts.now_ms = t0 + 10;
+    facts.unplaceable = true;
     facts.mix = rolling_mix;
     try testing.expect(!pass(&policy, &state, &facts).stalled);
 }
 
 test "rollout plan: every edge of pause, resume and begin" {
     // Goal: pause and resume move between the phases the header names and refuse the rest
-    // (ZC-E0129); resume moves the deadline by the paused time; begin starts from any phase.
+    // (ZC-E0129); resume returns to the rollout's own phase and moves a user pause's deadline by
+    // the paused time; begin starts from any phase.
+    const policy: Policy = .{};
     const now = t0 + 50_000;
     for ([_]Phase{ .progressing, .rolling_back }) |phase| {
         const state = state_in(phase);
         const held = try pause_rollout(&state, now);
         try testing.expectEqual(Phase.paused, held.phase);
         try testing.expectEqual(@as(?u64, now), held.paused_at_ms);
-        try testing.expectEqualDeep(state, try resume_rollout(&state, now));
+        try testing.expectEqual(@as(?PauseCause, .user), held.paused_by);
+        try testing.expectEqualDeep(state, try resume_rollout(&policy, &state, now));
+        // A paused rollback resumes as a rollback.
+        const later = now + 7_000;
+        const resumed_state = try resume_rollout(&policy, &held, later);
+        try testing.expectEqual(phase, resumed_state.phase);
+        try testing.expectEqual(state.deadline_at_ms + 7_000, resumed_state.deadline_at_ms);
+        try testing.expectEqual(later, resumed_state.evidence_from_ms);
     }
     const paused_state = state_in(.paused);
     try testing.expectEqualDeep(paused_state, try pause_rollout(&paused_state, now));
-    const resumed = try resume_rollout(&paused_state, now);
-    try testing.expectEqual(Phase.progressing, resumed.phase);
-    try testing.expectEqual(@as(?u64, null), resumed.paused_at_ms);
+    const resumed_state = try resume_rollout(&policy, &paused_state, now);
+    try testing.expectEqual(Phase.progressing, resumed_state.phase);
+    try testing.expectEqual(@as(?u64, null), resumed_state.paused_at_ms);
     const paused_ms = now - paused_state.paused_at_ms.?;
-    try testing.expectEqual(paused_state.deadline_at_ms + paused_ms, resumed.deadline_at_ms);
-    for ([_]Phase{ .complete, .failed }) |phase| {
-        const state = state_in(phase);
-        try testing.expectError(error.NoRollout, pause_rollout(&state, now));
-        try testing.expectError(error.NoRollout, resume_rollout(&state, now));
-    }
-    const policy: Policy = .{ .progress_deadline_ms = 300_000 };
-    const applied = begin(&policy, .apply, now);
+    try testing.expectEqual(paused_state.deadline_at_ms + paused_ms, resumed_state.deadline_at_ms);
+    // A failed rollout may be paused (its rollback, if owed, stops); it may not be resumed.
+    const failed_state = state_in(.failed);
+    const held_failed = try pause_rollout(&failed_state, now);
+    try testing.expectEqual(@as(?PauseCause, .failure), held_failed.paused_by);
+    try testing.expectError(error.NoRollout, resume_rollout(&policy, &failed_state, now));
+    const complete_state = state_in(.complete);
+    try testing.expectError(error.NoRollout, pause_rollout(&complete_state, now));
+    try testing.expectError(error.NoRollout, resume_rollout(&policy, &complete_state, now));
+    const short: Policy = .{ .progress_deadline_ms = 300_000 };
+    const applied = begin(&short, .apply, now);
     try testing.expectEqual(Phase.progressing, applied.phase);
     try testing.expectEqual(now + 300_000, applied.deadline_at_ms);
-    try testing.expectEqual(Phase.rolling_back, begin(&policy, .rollback, now).phase);
+    try testing.expectEqual(Phase.rolling_back, begin(&short, .rollback, now).phase);
+}
+
+test "rollout plan: a resumed failure is judged on new evidence only" {
+    // Goal: a rollout paused for a failure (on_failure pause) and resumed goes on, and is not
+    // failed again on the evidence it was paused for: a held replica, a passed restart bound, a
+    // ready timeout or the deadline. New evidence after the resume fails it again. Method: each
+    // failure pauses a rollout; resume; the same facts a moment later; then fresh ones.
+    const policy: Policy = .{ .on_failure = .pause };
+    const Kind = enum { held, restarts, ready_timeout, deadline };
+    for ([_]Reason{ .apply, .rollback }) |reason| {
+        for (std.enums.values(Kind)) |kind| {
+            const state = begin(&policy, reason, t0);
+            const at = state.deadline_at_ms;
+            var facts: Facts = .{ .desired = 3, .mix = rolling_mix, .now_ms = at };
+            switch (kind) {
+                .held => facts.new_held_at_ms = at - 1,
+                .restarts => facts.new_restarts_exceeded_at_ms = at - 1,
+                .ready_timeout => facts.new_unready_since_ms = at - policy.ready_timeout_ms,
+                .deadline => {},
+            }
+            const stopped = pass(&policy, &state, &facts);
+            try testing.expect(stopped.failure != null);
+            try testing.expectEqual(Phase.paused, stopped.state.phase);
+            const resume_at = at + 60_000;
+            const resumed_state = try resume_rollout(&policy, &stopped.state, resume_at);
+            try testing.expectEqual(reason.active_phase(), resumed_state.phase);
+            const fresh_deadline = resume_at + policy.progress_deadline_ms;
+            try testing.expectEqual(fresh_deadline, resumed_state.deadline_at_ms);
+            facts.now_ms = resume_at + 1;
+            const again = pass(&policy, &resumed_state, &facts);
+            try testing.expectEqual(@as(?Failure, null), again.failure);
+            try testing.expectEqual(reason.active_phase(), again.state.phase);
+            // Fresh evidence counts.
+            facts.new_held_at_ms = resume_at + 1;
+            const fresh = pass(&policy, &resumed_state, &facts);
+            try testing.expectEqual(@as(?Failure, .held), fresh.failure);
+        }
+    }
 }

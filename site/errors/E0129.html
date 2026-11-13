@@ -76,7 +76,7 @@ footer{border-top:1px solid var(--line);padding-block:24px;color:var(--muted);
 <p class="summary">the service has no rollout to pause or resume</p>
 <dl class="facts"><div><dt>Kind</dt><dd>error</dd></div><div><dt>Blame</dt><dd>user</dd></div><div><dt>Exit code</dt><dd>1</dd></div></dl>
 <h2>What it means</h2>
-<p>Pause and resume act on a rollout in progress: pause stops it starting or retiring replicas, resume lets it go on. This service has no rollout, or its rollout has already ended (complete or failed), or it is already in the state asked for.</p>
+<p>Pause stops a rollout starting or retiring replicas; resume lets a paused rollout go on. This service has no rollout, its rollout is complete, or (for resume) its rollout failed: a failed rollout can be paused, which stops an automatic rollback it owes, and resumed once paused. Pausing a paused rollout, or resuming one that is running, is not this error: it succeeds and changes nothing.</p>
 <p>Nothing was changed. `zcube rollout status &lt;service&gt;` shows what is running.</p>
 <h2>Offline</h2>
 <p>The same text, without a network:</p>

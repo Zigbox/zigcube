@@ -8,9 +8,11 @@
 //! - **A rollout to the end** in a small model world: the replica controller does all or part of
 //!   each budget, new replicas become ready and retired ones stop in a random order, and the
 //!   rollout must reach `complete` within a bound, with R1 and R2 at every step.
-//! - **The phases** on a random walk of passes, pauses, resumes and begins: every move is an edge
-//!   of the module's table, the state stays valid, and a rollout moves no replica outside the
-//!   active phases.
+//! - **The phases** on a random walk of passes, pauses, resumes, begins and policy changes, some
+//!   of them in the same millisecond: each operation is applied to the module and to `Model`, a
+//!   phase machine written here from the brief, and the two states, failures, rollbacks, budgets
+//!   and next looks must be equal. The model knows which operation it applied, so nothing it
+//!   checks is read back from the module.
 //!
 //! Seeds and replay are in `fuzz_seeds.zig`: a failure prints the master seed and the iteration
 //! seed, each with its replay.
@@ -228,53 +230,222 @@ fn apply(
     for (0..part(random, plan.start)) |_| world.add(fresh);
 }
 
-/// The edges the module's header allows, as (from, to) pairs; `begin` may go from anywhere to an
-/// active phase.
-fn edge_allowed(from: Phase, to: Phase) bool {
-    if (from == to) return true;
-    return switch (from) {
-        .progressing => to == .complete or to == .failed or to == .paused,
-        .rolling_back => to == .complete or to == .paused,
-        .failed => to == .paused,
-        .paused => to == .progressing,
-        .complete => false,
+/// The phase oracle: the rollout as the brief and the module's header describe it, kept apart
+/// from the module. Every operation is applied to both, and the states must be equal. The model
+/// knows which operation it applied, so a `begin` is recognised as one whatever the clock says.
+const Model = struct {
+    phase: Phase,
+    reason: plan_mod.Reason,
+    started_at_ms: u64,
+    deadline_at_ms: u64,
+    evidence_from_ms: u64,
+    paused_at_ms: ?u64 = null,
+    paused_by: ?plan_mod.PauseCause = null,
+
+    fn begun(policy: *const Policy, reason: plan_mod.Reason, now: u64) Model {
+        return .{
+            .phase = if (reason == .apply) .progressing else .rolling_back,
+            .reason = reason,
+            .started_at_ms = now,
+            .deadline_at_ms = now + policy.progress_deadline_ms,
+            .evidence_from_ms = now,
+        };
+    }
+
+    fn state(model: *const Model) State {
+        return .{
+            .phase = model.phase,
+            .reason = model.reason,
+            .started_at_ms = model.started_at_ms,
+            .deadline_at_ms = model.deadline_at_ms,
+            .evidence_from_ms = model.evidence_from_ms,
+            .paused_at_ms = model.paused_at_ms,
+            .paused_by = model.paused_by,
+        };
+    }
+
+    fn running(model: *const Model) bool {
+        return model.phase == .progressing or model.phase == .rolling_back;
+    }
+
+    fn hold(model: *Model, now: u64, cause: plan_mod.PauseCause) void {
+        model.phase = .paused;
+        model.paused_at_ms = @max(now, model.evidence_from_ms);
+        model.paused_by = cause;
+    }
+
+    /// Whether a pause is refused; else the model is paused.
+    fn pause(model: *Model, now: u64) bool {
+        switch (model.phase) {
+            .complete => return true,
+            .paused => {},
+            .failed => model.hold(now, .failure),
+            .progressing, .rolling_back => model.hold(now, .user),
+        }
+        return false;
+    }
+
+    /// Whether a resume is refused; else the model runs again.
+    fn @"resume"(model: *Model, policy: *const Policy, now: u64) bool {
+        if (model.phase == .complete or model.phase == .failed) return true;
+        if (model.phase != .paused) return false;
+        const at = @max(now, model.paused_at_ms.?);
+        if (model.paused_by.? == .user) {
+            model.deadline_at_ms += at - model.paused_at_ms.?;
+        } else {
+            model.deadline_at_ms = at + policy.progress_deadline_ms;
+        }
+        model.evidence_from_ms = at;
+        model.phase = if (model.reason == .apply) .progressing else .rolling_back;
+        model.paused_at_ms = null;
+        model.paused_by = null;
+        return false;
+    }
+};
+
+/// What the model expects of one pass.
+const Expected = struct { failure: ?plan_mod.Failure = null, rollback: bool = false };
+
+fn model_pass(model: *Model, policy: *const Policy, facts: *const plan_mod.Facts) Expected {
+    switch (model.phase) {
+        .complete, .paused => return .{},
+        .failed => {
+            if (policy.on_failure == .pause) {
+                model.hold(facts.now_ms, .failure);
+                return .{};
+            }
+            return .{ .rollback = model.reason == .apply };
+        },
+        .progressing, .rolling_back => {},
+    }
+    const mix = &facts.mix;
+    if (mix.old_live == 0 and mix.new_ready >= facts.desired) {
+        model.phase = .complete;
+        return .{};
+    }
+    const failure = model_failure(model, policy, facts) orelse return .{};
+    if (policy.on_failure == .pause) {
+        model.hold(facts.now_ms, .failure);
+        return .{ .failure = failure };
+    }
+    model.phase = .failed;
+    return .{ .failure = failure, .rollback = model.reason == .apply };
+}
+
+fn model_failure(
+    model: *const Model,
+    policy: *const Policy,
+    facts: *const plan_mod.Facts,
+) ?plan_mod.Failure {
+    const from = model.evidence_from_ms;
+    if (facts.new_held_at_ms != null and facts.new_held_at_ms.? >= from) return .held;
+    const restarts = facts.new_restarts_exceeded_at_ms;
+    if (restarts != null and restarts.? >= from) return .restarts;
+    if (facts.new_unready_since_ms) |since| {
+        const counted_from = @max(since, from);
+        if (facts.now_ms >= counted_from + policy.ready_timeout_ms) return .ready_timeout;
+    }
+    if (facts.now_ms < model.deadline_at_ms) return null;
+    const start = oracle(policy, facts.desired, &facts.mix).start;
+    return if (facts.unplaceable and start > 0) .stalled else .deadline;
+}
+
+/// The next look the model expects of a pass that leaves a rollout running.
+fn model_next_at(model: *const Model, policy: *const Policy, facts: *const plan_mod.Facts) u64 {
+    var at = model.deadline_at_ms;
+    if (facts.new_unready_since_ms) |since| {
+        at = @min(at, @max(since, model.evidence_from_ms) + policy.ready_timeout_ms);
+    }
+    if (facts.ready_pending_at_ms) |pending| {
+        if (pending > facts.now_ms) at = @min(at, pending);
+    }
+    return at;
+}
+
+const Op = enum { begin_apply, begin_rollback, pause, @"resume", policy, pass };
+
+fn random_op(random: std.Random) Op {
+    return switch (random.uintLessThan(u8, 12)) {
+        0 => .begin_apply,
+        1 => .begin_rollback,
+        2 => .pause,
+        3 => .@"resume",
+        4 => .policy,
+        else => .pass,
     };
+}
+
+/// One operation on both the module and the model, compared after it.
+fn step(
+    random: std.Random,
+    op: Op,
+    policy: *Policy,
+    state: *State,
+    model: *Model,
+    now: u64,
+) !void {
+    switch (op) {
+        .begin_apply, .begin_rollback => {
+            const reason: plan_mod.Reason = if (op == .begin_apply) .apply else .rollback;
+            state.* = plan_mod.begin(policy, reason, now);
+            model.* = Model.begun(policy, reason, now);
+        },
+        .pause => {
+            const refused = model.pause(now);
+            if (plan_mod.pause_rollout(state, now)) |next| {
+                try testing.expect(!refused);
+                state.* = next;
+            } else |_| try testing.expect(refused);
+        },
+        .@"resume" => {
+            const refused = model.@"resume"(policy, now);
+            if (plan_mod.resume_rollout(policy, state, now)) |next| {
+                try testing.expect(!refused);
+                state.* = next;
+            } else |_| try testing.expect(refused);
+        },
+        .policy => policy.on_failure = if (random.boolean()) .rollback else .pause,
+        .pass => state.* = try check_pass(random, policy, state, model, now),
+    }
+    state.assert_valid();
+    try testing.expectEqualDeep(model.state(), state.*);
 }
 
 fn check_phases(random: std.Random) !void {
     var policy = random_policy(random);
     var now: u64 = t0;
     var state = plan_mod.begin(&policy, .apply, now);
+    var model = Model.begun(&policy, .apply, now);
     for (0..64) |_| {
-        now += random.uintAtMost(u64, 200_000);
-        const before = state;
-        switch (random.uintLessThan(u8, 10)) {
-            0 => state = plan_mod.begin(&policy, if (random.boolean()) .apply else .rollback, now),
-            1 => state = plan_mod.pause_rollout(&state, now) catch state,
-            2 => state = plan_mod.resume_rollout(&state, now) catch state,
-            3 => policy.on_failure = if (random.boolean()) .rollback else .pause,
-            else => state = try check_pass(random, &policy, &state, now),
-        }
-        state.assert_valid();
-        if (state.started_at_ms == before.started_at_ms) {
-            try testing.expect(edge_allowed(before.phase, state.phase));
-            try testing.expect(state.deadline_at_ms >= before.deadline_at_ms);
-        } else {
-            try testing.expect(plan_mod.active(state.phase));
-        }
+        // One step in eight takes no time: a begin, pause or resume in the same millisecond as
+        // the step before must be told apart by what it did, not by the clock.
+        if (random.uintLessThan(u8, 8) != 0) now += 1 + random.uintAtMost(u64, 200_000);
+        try step(random, random_op(random), &policy, &state, &model, now);
     }
 }
 
-fn check_pass(random: std.Random, policy: *const Policy, state: *const State, now: u64) !State {
+/// A moment of evidence: none, or one up to 200 s before `now`.
+fn random_seen(random: std.Random, now: u64, odds: u8) ?u64 {
+    if (random.uintLessThan(u8, odds) != 0) return null;
+    return now -| random.uintAtMost(u64, 200_000);
+}
+
+fn check_pass(
+    random: std.Random,
+    policy: *const Policy,
+    state: *const State,
+    model: *Model,
+    now: u64,
+) !State {
     const mix = random_mix(random, world_replicas_max);
     const facts: plan_mod.Facts = .{
         .desired = random.uintAtMost(u32, world_replicas_max),
         .mix = mix,
         .now_ms = now,
-        .new_held = random.uintLessThan(u8, 8) == 0,
-        .new_restarts_exceeded = random.uintLessThan(u8, 8) == 0,
-        .new_unready_since_ms = if (mix.new_ready < mix.new_live and random.boolean())
-            now -| random.uintAtMost(u64, 200_000)
+        .new_held_at_ms = random_seen(random, now, 8),
+        .new_restarts_exceeded_at_ms = random_seen(random, now, 8),
+        .new_unready_since_ms = if (mix.new_ready < mix.new_live)
+            random_seen(random, now, 2)
         else
             null,
         .ready_pending_at_ms = if (random.boolean())
@@ -283,15 +454,23 @@ fn check_pass(random: std.Random, policy: *const Policy, state: *const State, no
             null,
         .unplaceable = random.boolean(),
     };
+    const running = model.running();
+    const expected = model_pass(model, policy, &facts);
     const result = plan_mod.pass(policy, state, &facts);
-    if (!plan_mod.active(result.state.phase)) {
+    try testing.expectEqual(expected.failure, result.failure);
+    try testing.expectEqual(expected.rollback, result.rollback);
+    if (model.running()) {
+        assert(running);
+        const plan = oracle(policy, facts.desired, &mix);
+        try testing.expectEqualDeep(plan, result.plan);
+        try testing.expectEqual(facts.unplaceable and plan.start > 0, result.stalled);
+        try testing.expectEqual(@as(?u64, model_next_at(model, policy, &facts)), result.next_at_ms);
+        try testing.expect(result.next_at_ms.? > now);
+    } else {
         try testing.expect(result.plan.zero());
         try testing.expect(result.next_at_ms == null);
+        try testing.expect(!result.stalled);
     }
-    if (result.rollback) try testing.expectEqual(Phase.failed, result.state.phase);
-    if (result.next_at_ms) |at| try testing.expect(at > now);
-    if (result.failure != null) try testing.expect(plan_mod.active(state.phase));
-    if (result.stalled) try testing.expect(result.plan.start > 0);
     return result.state;
 }
 
@@ -305,6 +484,36 @@ fn fuzz_once(seed: u64) !void {
 
 test "rollout plan fuzz: the budget, a rollout to the end, and the phases" {
     // Goal: the plan keeps R1 and R2, never deadlocks, finishes every rollout in a model world,
-    // and moves only along its edges. Method: `fuzz_once` per iteration seed (header).
+    // and moves as the phase model does. Method: `fuzz_once` per iteration seed (header).
     try seeds.run("rollout plan fuzz", iterations_default, fuzz_once);
+}
+
+test "rollout plan fuzz: iteration seeds that once failed" {
+    // Goal: the seeds review found pass. 15358748992189162208 drew a time step of 0, and
+    // 16187094404926879864 a begin in the same millisecond as the step before: the old phase
+    // oracle took a begin for a pass and failed. The draws have changed since, so the next test
+    // replays the shape of both by hand.
+    for ([_]u64{ 15358748992189162208, 16187094404926879864 }) |seed| try fuzz_once(seed);
+}
+
+test "rollout plan fuzz: a begin, pause and resume in the same millisecond" {
+    // Goal: operations that take no time are checked against the model like any other. Method:
+    // a rollout that fails (rollback owed), is begun again, paused, resumed and begun again, all
+    // at one moment, then a pass.
+    var prng = std.Random.DefaultPrng.init(1);
+    const random = prng.random();
+    var policy: Policy = .{};
+    const now = t0 + 700_000;
+    var state = plan_mod.begin(&policy, .apply, t0);
+    var model = Model.begun(&policy, .apply, t0);
+    const all_old: Mix = .{ .old_live = 3, .old_ready = 3 };
+    const facts: plan_mod.Facts = .{ .desired = 3, .mix = all_old, .now_ms = now };
+    const failed = plan_mod.pass(&policy, &state, &facts);
+    _ = model_pass(&model, &policy, &facts);
+    try testing.expectEqual(Phase.failed, failed.state.phase);
+    state = failed.state;
+    try testing.expectEqualDeep(model.state(), state);
+    const ops = [_]Op{ .begin_rollback, .pause, .@"resume", .begin_apply, .pause, .begin_apply };
+    for (ops) |op| try step(random, op, &policy, &state, &model, now);
+    try step(random, .pass, &policy, &state, &model, now);
 }

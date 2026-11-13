@@ -173,14 +173,14 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "a service's health check is not valid",
-    "explanation": "The service file's `health` block describes a check that cannot run as\nwritten. A health check is a command run inside each replica's container:\nit needs 1 to 64 words with a non-empty first word, an `interval_ms` above\nzero, a `timeout_ms` above zero and no longer than the interval, and\n`failure_threshold` and `success_threshold` of at least 1. The cause line\nnames the field.\n\nNothing was applied. Correct the service file and apply it again. C3\nchecks are commands only; a TCP or HTTP check waits for a network path\ninto the container."
+    "explanation": "The service file's `health` block describes a check that cannot run as\nwritten. A health check is a command run inside each replica's container:\nit needs 1 to 64 words with a non-empty first word, an `interval_ms` above\nzero and at most an hour, a `timeout_ms` above zero and no longer than the\ninterval, a `start_period_ms` of at most an hour, and `failure_threshold`\nand `success_threshold` of at least 1, each reaching its verdict within a\nday (threshold times interval). The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again. C3\nchecks are commands only; a TCP or HTTP check waits for a network path\ninto the container."
   },
   {
     "code": "ZC-E0126",
     "severity": "error",
     "blame": "user",
     "summary": "a service's rollout policy is not valid",
-    "explanation": "The service file's `rollout` block cannot be followed. A rolling update\nmust be able to move: `max_surge` and `max_unavailable` may not both be 0,\nand neither may exceed the 128 replicas a service may have. The times must\nnest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no\nlonger than `progress_deadline_ms`. The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again; a\nservice with no `rollout` block uses the default policy, which is valid."
+    "explanation": "The service file's `rollout` block cannot be followed. A rolling update\nmust be able to move: `max_surge` and `max_unavailable` may not both be 0,\nand neither may exceed the 128 replicas a service may have. The times must\nnest: `min_ready_ms` below `ready_timeout_ms`, and `ready_timeout_ms` no\nlonger than `progress_deadline_ms`, which is at most a day. `grace_ms` is\nat most a minute. The cause line names the field.\n\nNothing was applied. Correct the service file and apply it again; a\nservice with no `rollout` block uses the default policy, which is valid."
   },
   {
     "code": "ZC-E0127",
@@ -201,7 +201,7 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "user",
     "summary": "the service has no rollout to pause or resume",
-    "explanation": "Pause and resume act on a rollout in progress: pause stops it starting or\nretiring replicas, resume lets it go on. This service has no rollout, or\nits rollout has already ended (complete or failed), or it is already in\nthe state asked for.\n\nNothing was changed. `zcube rollout status <service>` shows what is\nrunning."
+    "explanation": "Pause stops a rollout starting or retiring replicas; resume lets a paused\nrollout go on. This service has no rollout, its rollout is complete, or\n(for resume) its rollout failed: a failed rollout can be paused, which\nstops an automatic rollback it owes, and resumed once paused. Pausing a\npaused rollout, or resuming one that is running, is not this error: it\nsucceeds and changes nothing.\n\nNothing was changed. `zcube rollout status <service>` shows what is\nrunning."
   },
   {
     "code": "ZC-E0130",
@@ -383,28 +383,28 @@ export const ZC_CODES = [
     "severity": "error",
     "blame": "environment",
     "summary": "a rollout stalled: a new replica cannot be placed",
-    "explanation": "A rolling update starts each new replica before it retires an old one\n(`max_surge`), so for a while the service needs room for more replicas\nthan it has. No ready node had room for the next new replica, so the\nrollout cannot go on without breaking `max_unavailable`.\n\nThe cause line names the replica and what it needs. Add a node or free\ncapacity, or allow the rollout to retire first (`max_unavailable` above\n0); the rollout continues by itself once a replica can be placed."
+    "explanation": "A rolling update starts each new replica before it retires an old one\n(`max_surge`), so for a while the service needs room for more replicas\nthan it has. No ready node had room for the next new replica, so the\nrollout cannot go on without breaking `max_unavailable`.\n\nThe cause line names the replica and what it needs. Add a node or free\ncapacity, or allow the rollout to retire first (`max_unavailable` above\n0); the rollout continues by itself once a replica can be placed. If it\nis still stalled when `progress_deadline_ms` passes, it fails with this\ncode, not ZC-E0306, and follows `on_failure` like any failed rollout."
   },
   {
     "code": "ZC-E0306",
     "severity": "error",
     "blame": "user",
     "summary": "a rollout passed its progress deadline",
-    "explanation": "A rollout must finish within `progress_deadline_ms` of its start. This\none did not: new replicas became ready too slowly, or not at all, though\nnone failed outright.\n\nWith `on_failure` rollback (the default) the service is rolled back to\nthe generation it ran before; with `pause` the rollout stops where it is.\nIf the new version is right but slow to start, raise the deadline in the\nservice file and apply it again."
+    "explanation": "A rollout must finish within `progress_deadline_ms` of its start. This\none did not: new replicas became ready too slowly, or not at all, though\nnone failed outright. (A rollout stalled for room when its deadline\npassed fails with ZC-E0305 instead.)\n\nWith `on_failure` rollback (the default) the service is rolled back to\nthe generation it ran before; with `pause` the rollout stops where it is.\nIf the new version is right but slow to start, raise the deadline in the\nservice file and apply it again."
   },
   {
     "code": "ZC-W0304",
     "severity": "warning",
     "blame": "user",
     "summary": "a rollout paused itself after a failure",
-    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304 or ZC-E0306). It stopped where it was: replicas of both\ngenerations keep running, and nothing is started or retired until you\nact.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>`, or apply a fixed release."
+    "explanation": "The service's rollout policy says `on_failure: pause`, and the rollout\nfailed (ZC-E0304, ZC-E0305 or ZC-E0306). It stopped where it was:\nreplicas of both generations keep running, and nothing is started or\nretired until you act.\n\n`zcube rollout status <service>` shows both generations. Resume with\n`zcube rollout resume <service>`, roll back with `zcube rollback\n<service>`, or apply a fixed release."
   },
   {
     "code": "ZC-W0305",
     "severity": "warning",
     "blame": "user",
     "summary": "a rollout was rolled back automatically",
-    "explanation": "The rollout of a new generation failed (ZC-E0304 or ZC-E0306) and the\nservice's rollout policy is `on_failure: rollback`, the default. The\nservice was applied again with the spec of the generation it ran before,\nas a new generation, and that rollout replaces the failed replicas.\n\nThe summary names the failing replica and the generation restored. Fix\nthe release and apply it again; a newer apply always wins over an\nautomatic rollback."
+    "explanation": "The rollout of a new generation failed (ZC-E0304, ZC-E0305 or\nZC-E0306) and the service's rollout policy is `on_failure: rollback`,\nthe default. The service was applied again with the spec of the\ngeneration it ran before, as a new generation, and that rollout\nreplaces the failed replicas.\n\nThe summary names the failing replica and the generation restored. Fix\nthe release and apply it again; a newer apply always wins over an\nautomatic rollback."
   },
   {
     "code": "ZC-E0307",

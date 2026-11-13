@@ -6,46 +6,73 @@
 in the core list, with no store and no clock of its own. Choices the brief left open or that
 differ from it:
 
-1. **A stall (ZC-E0305) is reported, not a failure.** The brief lists "surge cannot be placed"
-   among the failures; E0305's registered explanation says the rollout "continues by itself once a
-   replica can be placed", and its blame is the environment, not the new version. Rolling back a
-   good version because the cluster is full would be wrong, and `progress_deadline_ms` (E0306)
-   already bounds a stall that never clears. So `pass` sets `stalled` when the plan has a start
-   to make and the controller says nothing fits, and the phase stays where it is. Slice 7 records
-   the E0305 decision from it.
-2. **The restart bound is not a number here.** The brief names `rollout_restarts_max`, which
-   does not exist yet and would be a user-visible bound: adding it needs the supervisor's word
-   (AGENTS.md). `Facts.new_restarts_exceeded` takes the controller's verdict instead; slice 7
-   asks for the value.
-3. **A failed rollback is not rolled back.** A rollout that began as a rollback and fails goes
-   to `paused` whatever `on_failure` says, so a version pair that both fail cannot swap forever.
-   `failed` therefore always means "a rollback is owed" (`Pass.rollback`), and with
-   `on_failure pause` a failure goes straight to `paused`.
-4. **Pause and resume.** Pause is allowed from `progressing` and `rolling_back`; pausing a paused
-   rollout, or resuming a running one, changes nothing; pause or resume of a `complete` or `failed`
-   rollout is refused (`error.NoRollout`, ZC-E0129). A resumed rollback comes back as
-   `progressing`: from there on it is a rollout to the version it names. Resume extends
-   `deadline_at_ms` by the paused time.
-5. **`paused_at_ms` is state the `/rollouts` record does not have.** Resume needs it to extend the
-   deadline. Slice 7 adds it to the record as an optional member (an additive change to the
-   record); slice 6 changes no record and no key.
-6. **Unready old replicas are a separate count.** `Plan.retire_unready` holds them apart from
-   `retire` (ready old replicas, the ones R1 limits), and `Plan.stored()` adds them into the
-   record's single `retire`. The record's count is right only if the replica controller retires
-   unready replicas first. A replica that turns ready between the plan and the act would then be
-   retired outside R1. Slice 7 must either re-check readiness when it acts, or store the two counts
-   apart.
+1. **A stall (ZC-E0305) is reported, not a failure, until the deadline.** The brief lists
+   "surge cannot be placed" among the failures; E0305's registered explanation says the rollout
+   "continues by itself once a replica can be placed", and its blame is the environment, not the
+   new version. Rolling back a good version because the cluster is full would be wrong. So `pass`
+   sets `stalled` when the plan has a start to make and the controller says nothing fits, and the
+   phase stays where it is. If the rollout is still stalled on the pass that finds
+   `progress_deadline_ms` passed, it fails as `Failure.stalled`, whose code is **E0305**
+   (environment), not E0306: the decision slice 7 records, and the W0304 or W0305 that follows,
+   cite the stall, not the user's release. `on_failure` still applies, so R7 (complete, or failed
+   then rolled back) holds; the E0305, E0306, W0304 and W0305 explanations say so. This supersedes
+   the paragraph of `2026-11-13-c3-health-rollout-bounds.md` that kept such a stall as E0306.
+2. **The restart bound is not a number here.** `Facts.new_restarts_exceeded_at_ms` takes the
+   controller's verdict; the bound (`rollout_restarts_max`, 3) and the counting are slice 7's:
+   `2026-11-13-c3-rollout-restarts-max.md`.
+3. **A failed rollback is not rolled back, and ends `failed`.** A rollout begun as a rollback
+   (`State.reason = rollback`) that fails goes to `failed` under `on_failure rollback`, owing
+   nothing (`rollback_owed` is false), so a version pair that both fail cannot swap forever and the
+   rollout still ends (R7) instead of waiting in `paused` for an operator. Under `on_failure pause`
+   it pauses, as any rollout does. `Pass.rollback` is set exactly when `rollback_owed` holds: the
+   rollout failed, the policy says `rollback`, and its reason is `apply`.
+4. **Pause and resume.** Pause is allowed from `progressing`, `rolling_back` and `failed`;
+   pausing a paused rollout changes nothing; pausing a `complete` rollout is refused
+   (`error.NoRollout`, ZC-E0129). Pausing a `failed` rollout stops a rollback it owes; it is also
+   the way to hold a failed first generation, which has no generation to roll back to (slice 7's
+   rollback handler refuses it, so without the pause it would stay `failed` calling it). Resume is
+   allowed from `paused`, changes nothing on a running rollout, and is refused on `complete` and
+   `failed`. ZC-E0129's explanation now says exactly this: the idempotent cases succeed.
+   - **A resumed rollout returns to its own phase.** `State.reason` (apply or rollback) names it,
+     so a paused rollback resumes as `rolling_back`, never as `progressing`.
+   - **A resumed rollout is judged on new evidence only.** `State.evidence_from_ms` is the start,
+     then each resume. A held replica or a passed restart bound counts only if the controller saw
+     it at or after that moment (hence `Facts.new_held_at_ms` and `new_restarts_exceeded_at_ms`,
+     timestamps instead of booleans), and a ready timeout counts from the later of the replica's
+     first unready sighting and that moment.
+   - **The deadline.** `State.paused_by` says whether the user paused the rollout or a failure
+     did (`on_failure pause`, or a pause of a `failed` rollout). After a user's pause the deadline
+     moves by the paused time (the brief). After a failure's it starts again from the resume
+     (`now + progress_deadline_ms`): a rollout paused for passing its deadline would otherwise fail
+     again on the next pass.
+5. **State the `/rollouts` record does not have.** Slice 7 adds `paused_at_ms`, `paused_by`,
+   `reason` and `evidence_from_ms` to the record as optional members (an additive change), since
+   resume needs them. `reason` cannot be read from `phase` while the rollout is `paused` or
+   `failed`. Slice 6 changes no key.
+6. **Unready old replicas are a separate count, in the plan and in the record.** `Plan` holds
+   `retire` (ready old replicas, the ones R1 limits) apart from `retire_unready`, and
+   `Plan.stored()` keeps them apart: `records.RolloutBudget` gains `retire_unready` (optional,
+   default 0; no build writes `/rollouts` yet, so no older text lacks it in practice). A replica
+   that turns ready between the plan and the act is therefore never retired on the unready count;
+   slice 7's replica controller retires on `retire_unready` only replicas that are not ready when
+   it acts.
 7. **R1 does not hold for `recreate`,** which retires every old replica before it starts any new
    one. That is the strategy's point. The slice-7 simulation check of R1 exempts it.
 8. **Done wins.** If a pass sees the rollout done and a failure at once, it completes. Failures
-   are ranked: held, restarts, ready timeout, then deadline. The first three are E0304 and the
-   deadline is E0306.
+   are ranked: held, restarts, ready timeout, then the deadline (stalled or not). The first three
+   are E0304, a stalled deadline E0305, the deadline E0306.
 9. **A newer apply (`begin`) is allowed from any phase,** `paused` and `failed` included, and
-   starts a fresh `progressing` rollout with a new deadline.
+   starts a fresh rollout with a new deadline, in the phase its reason names.
 
 The fuzzer (`src/rollout_plan_fuzz.zig`, in `zig build test`) checks the budget against an
 oracle written separately from the module. It runs each rollout to `complete` in a model world
 where the controller carries out all or part of each budget, with R1 and R2 checked at every step.
-It also walks the phases and checks each move against the edge table.
+It also walks the phases (passes, pauses, resumes, begins and policy changes, one step in eight
+taking no time) against `Model`, a phase machine written in the fuzzer from this file and the
+brief: after every operation the states, failures, rollbacks, budgets, stalls and next looks must
+be equal. The model knows which operation it applied, so a `begin` in the same millisecond as the
+step before is recognised (review B's finding; the old oracle read `started_at_ms` back from the
+module). The iteration seeds review found, 15358748992189162208 and 16187094404926879864, are
+replayed by a test, and a hand-built test runs a begin, pause and resume in one millisecond.
 
 Where: `src/rollout_plan.zig` (header), `docs/briefs/c3.md` (slices 6 and 7).
