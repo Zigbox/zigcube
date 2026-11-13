@@ -44,6 +44,18 @@ Date: 2026-11-13. Branch `claude/b7-slice3`, from `claude/b7-slice2`.
 - `api_tls_client.Credentials.present` refuses (returns false) a certificate the pinned CA did
   not issue, so an agent whose state directory is from another CA falls back to `--cert`.
 
+- The CA certificate in the state directory is `ca-<hash>.crt` when the store is a file (one CA
+  per store, `server_ca.key_name_for`), not `ca.crt`; `api_tls_test.zig` asks the server for it.
+- A GET with a body is 400 before the scope check: send none.
+- `src/tests.zig`'s first `test {}` block is at the 70-line limit; new test files go in the second.
+
+## What ran
+
+`zig build test`, `tidy`, `errors-site-check`, `agent-smoke`, `local-smoke`,
+`demo-c0 -Dbackend=sqlite`, `demo-c1 -Dbackend=sqlite`, `zig build check`. Not run: the Postgres
+demos and suite (the store did not change), `mtls-interop`, `swarm-smoke`, `demo-b3`, and every
+harness over TLS (they use `--insecure-listen`).
+
 ## Next
 
 Slice 4 of docs/briefs/b7.md.
