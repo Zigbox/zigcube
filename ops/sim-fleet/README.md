@@ -34,6 +34,7 @@ One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_sw
    | `sim_c1_teeth_job_refused_loop` (with its symptom, J10) | 67 of 80 (drawn operations, `--profile=auto`, 2026-11-08) | 0.6 | 80 | 1.5e-32 |
    | `sim_c1_teeth_job_unclaimed` (with its symptom, J8) | 79 and 92 of 200 (100 operations, `--strong`, plain and `--c1`, seeds 1..200); 108 and 106 of 200 (drawn operations, `--profile=auto`, same; 2026-11-08) | 0.3 | 60 | 5.1e-10 |
    | `sim_c1_teeth_job_wipe` (with its symptom, J2 or J7: `--expect-symptom` takes `|`-separated alternatives and a bare "J" matches nothing) | 26 and 26 of 200 (100 operations, `--strong`, plain and `--c1`); 25 of 200 plain (drawn operations, `--profile=auto`); 4 of 60 `--c1` (same; a rate of about 0.07, wide error) | 0.065 | 300 | 1.9e-9 |
+   | `sim_c1_teeth_register_unchecked` (with its symptom, I1b or a node left lost) | 38 of 40 (100 operations, `--c1`, 2026-11-13) | 0.8 | 20 | 1.2e-14 |
    | `sim_c1_teeth_relay_leak` (with its symptom, R1) | 37 and 32 of 40 (100 operations, `--strong` implied, plain and `--c1`); 35 of 40 `--c1` (drawn operations, `--profile=auto`; 2026-11-10) | 0.8 | 20 | 1.2e-14 |
    | `sim_c1_teeth_relay_dropped` (with its symptom, R3) | not yet measured | not yet set | 20 | not yet computed |
    | `sim_c1_teeth_job_ledger_small` (with its symptom, J8: the start ledger is full (16 runs), 400 operations) | not measured (caught at seed 1) | not set | 10 | not measured |
