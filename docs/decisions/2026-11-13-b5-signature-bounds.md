@@ -1,7 +1,8 @@
 # B5 slice 1: signature bounds, the request bound, and what Zigbox does not export
 
-Date: 2026-11-13. Proposed by the B5 slice 1 implementer; the supervisor decides each point below
-in review (AGENTS.md: bounds and new codes are the supervisor's).
+Date: 2026-11-13. Proposed by the B5 slice 1 implementer. **Accepted by the supervisor,
+2026-11-13:** the request bound (point 2), the signature bounds (point 1), the mirrored refusal
+text for now (point 5) and the development pin on Zigbox `main` `aa4d64c`.
 
 ## Context
 
@@ -10,7 +11,7 @@ B5 slice 1 (`docs/briefs/b5.md`) puts `signatures` in the job body and judges th
 configuration. The pin moved to Zigbox `aa4d64c`, which carries `pub const trust`
 (`docs/decisions/2026-11-12-zigbox-exports-trust-surface.md`).
 
-## Decisions (proposed)
+## Decisions
 
 1. **The brief's bounds stay: 4 envelopes of at most 2048 bytes.** Zigbox's are wider:
    `signatures_per_tree_max` is 8 and `envelope_bytes_max` is the base64 of a 64 KiB statement
@@ -41,8 +42,8 @@ configuration. The pin moved to Zigbox `aa4d64c`, which carries `pub const trust
 5. **The refusal's text is mirrored, not shared.** Zigbox's run gate builds its E0905 diagnostic
    in `src/trust/diagnose.zig`, which imports the host and is not exported. Zigcube's
    `job_trust.refusal` writes the same cause lines (`reason_text` is copied from Zigbox) through
-   `zigbox.diag.Diag`. A gap to report to Zigbox: exporting the pure part of `diagnose.zig` would
-   let both share it.
+   `zigbox.diag.Diag`. Zigbox should export the pure part of `diagnose.zig` so both share it; the
+   supervisor files that gap with Zigbox.
 6. **What is judged.** Only a new job: a retry of a stored job (the `200` same-spec path) keeps the
    answer it had, and `signatures` is part of the spec compared. Under a checking policy the
    image must be a tree (`b3:` and 64 hex digits); otherwise the refusal is E0905 with "not a
