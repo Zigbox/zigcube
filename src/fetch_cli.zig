@@ -1968,6 +1968,34 @@ test "the fetch arguments need a node, directories, a digest and a registry" {
     try std.testing.expect(parse(&.{ "--node", "n", "--bogus", "x" }) == null);
 }
 
+test "the TLS flags go with --server and --ca, and --cert with --key" {
+    // Goal: the fetch reads the server over TLS only with a CA it can check the server by, and
+    // presents --cert only with its key; anything less is refused (usage), never plain HTTP.
+    const base = [_][]const u8{
+        "--node",       "node1",          "--state-dir", "/s",
+        "--images-dir", "/i",             "--digest",    "b3:00000000",
+        "--registry",   "127.0.0.1:9000", "--server",    "127.0.0.1:9100",
+    };
+    const tls = [_][]const u8{ "--ca", "/ca.crt", "--tls-name", "zc", "--cert", "/n.crt" } ++
+        [_][]const u8{ "--key", "/n.key" };
+    const full = parse(&(base ++ tls)).?;
+    try std.testing.expectEqualStrings("/ca.crt", full.ca);
+    try std.testing.expectEqualStrings("zc", full.tls_name);
+    try std.testing.expectEqualStrings("/n.crt", full.cert);
+    try std.testing.expectEqualStrings("/n.key", full.key);
+    try std.testing.expect(parse(&(base ++ tls[0..2].*)) != null);
+    // --cert without --key, --key without --cert, TLS without --ca, an empty value.
+    try std.testing.expect(parse(&(base ++ tls[0..6].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[0..2].* ++ tls[4..8].*)) != null);
+    try std.testing.expect(parse(&(base ++ tls[0..4].* ++ tls[6..8].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[0..2].* ++ tls[6..8].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[2..4].*)) == null);
+    try std.testing.expect(parse(&(base ++ tls[4..8].*)) == null);
+    try std.testing.expect(parse(&(base ++ [_][]const u8{ "--ca", "" })) == null);
+    // TLS without --server has nothing to read.
+    try std.testing.expect(parse(&(base[0..10].* ++ tls[0..2].*)) == null);
+}
+
 const test_filter = "00ff00ff00ff00ff";
 
 /// A `/v1/list` reply for the tests: one `/node-store/<name>` per `(name, peer, filter)`.
