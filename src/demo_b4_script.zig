@@ -93,37 +93,37 @@ const keys_search_python =
     \\
 ;
 
-/// `fence`: every count must be 0 and every route `failed`. The positive control: a child the
-/// job forks, which it may ptrace and whose memory it may open (same user, its own descendant),
-/// so `kid_mem` and `kid_ptrace` must be 1, and `others` (every process it sees but itself) at
-/// least 1. `/proc/<pid>/mem` is only opened: its permission check is at open, and a read at
-/// offset 0 fails on any process (nothing is mapped there).
+/// `fence`: every count must be 0 and every route `failed`. Its control is a child it forks
+/// (`kid`): it must count as one of `others`, and the same probes must reach it (`kid_mem`,
+/// `kid_ptrace` 1), so a probe that cannot succeed would fail the row instead of passing it. The
+/// mem probe opens `/proc/<pid>/mem`, which checks ptrace access; reading offset 0 would fail on
+/// any process (unmapped).
 const fence_python =
-    \\import ctypes,os,time,urllib.request as u
-    \\L=ctypes.CDLL(None,use_errno=True)
-    \\k=os.fork()
-    \\if k==0:time.sleep(600);os._exit(0)
-    \\V=[int(p)for p in os.listdir("/proc")if p.isdigit()]
-    \\O=[p for p in V if p!=os.getpid()]
-    \\N=[p for p in O if p!=k]
+    \\import ctypes, os, time, urllib.request as u
+    \\L = ctypes.CDLL(None, use_errno=True)
+    \\k = os.fork()
+    \\if k == 0: time.sleep(60); os._exit(0)
+    \\V = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    \\O = [p for p in V if p != os.getpid()]
+    \\N = [p for p in O if p != k]
     \\def rd(p):
-    \\ try:return open("/proc/%d/cmdline"%p,"rb").read()
-    \\ except OSError:return b""
-    \\see=sum(1 for p in N if b"zcube"in rd(p)or b"zbx"in rd(p))
+    \\ try: return open("/proc/%d/cmdline" % p, "rb").read()
+    \\ except OSError: return b""
+    \\see = sum(1 for p in N if b"zcube" in rd(p) or b"zbx" in rd(p))
     \\def alive(p):
-    \\ try:os.kill(p,0);return 1
-    \\ except ProcessLookupError:return 0
-    \\ except OSError:return 1
-    \\top=int(open("/proc/sys/kernel/pid_max").read())
-    \\out=sum(alive(p)for p in range(1,top)if p not in V)
+    \\ try: os.kill(p, 0); return 1
+    \\ except ProcessLookupError: return 0
+    \\ except OSError: return 1
+    \\top = int(open("/proc/sys/kernel/pid_max").read())
+    \\out = sum(alive(p) for p in range(1, top) if p not in V)
     \\def mem(p):
-    \\ try:open("/proc/%d/mem"%p,"rb").close();return 1
-    \\ except OSError:return 0
-    \\tr=lambda p:int(L.ptrace(16,p,0,0)==0)
-    \\c=(see,out,sum(map(tr,N)),sum(map(mem,N)),len(O),mem(k),tr(k))
-    \\os.kill(k,9)
-    \\q="see=%d&outside=%d&ptrace=%d&mem=%d&others=%d&kid_mem=%d&kid_ptrace=%d"%c
-    \\u.urlopen(os.environ["ZCUBE_RELAY"]+"/fence?"+q,timeout=15).read()
+    \\ try: open("/proc/%d/mem" % p, "rb").close(); return 1
+    \\ except OSError: return 0
+    \\tr = lambda p: int(L.ptrace(16, p, 0, 0) == 0)
+    \\q = "see=%d&outside=%d&mem=%d&ptrace=%d&others=%d&kid_mem=%d&kid_ptrace=%d" % (
+    \\ see, out, sum(map(mem, N)), sum(map(tr, N)), len(O), mem(k), tr(k))
+    \\os.kill(k, 9)
+    \\u.urlopen(os.environ["ZCUBE_RELAY"] + "/fence?" + q, timeout=15).read()
 ;
 
 /// `net`: IPv6 to the internet, UDP to the internet and UDP to the node; each must fail.
@@ -322,6 +322,8 @@ fn keys_row(demo: *Demo) !void {
 
 const fence_counts = [_][]const u8{ "see", "outside", "ptrace", "mem" };
 const fence_routes = [_][]const u8{ "ipv6", "udp_internet", "udp_node" };
+/// The control: the same probes against the job's own child must succeed.
+const fence_controls = [_][]const u8{ "kid_mem", "kid_ptrace" };
 
 fn fence_row(demo: *Demo) !void {
     const host = demo.host;
@@ -333,9 +335,15 @@ fn fence_row(demo: *Demo) !void {
     try run_job(demo, job_fence, &.{}, fence_python);
     try run_job(demo, job_net, &.{ "--env", node_env }, net_python);
     const fence_line = try report(demo, job_fence, "GET /fence?", spiffe(job_fence)) orelse return;
-    host.say("  the job tried {s} other visible process(es)", .{
-        query(fence_line, "others") orelse "?",
-    });
+    const others = std.fmt.parseInt(u32, query(fence_line, "others") orelse "", 10) catch 0;
+    host.say("  the job tried {d} other visible process(es), its own child among them", .{others});
+    demo.expect(others >= 1, "the job saw its own child, so the probes had a process to try " ++
+        "(others {d})", .{others});
+    for (fence_controls) |name| {
+        const value = query(fence_line, name) orelse "?";
+        demo.expect(std.mem.eql(u8, value, "1"), "control: the job's {s} reached its own child " ++
+            "(got {s})", .{ name["kid_".len..], value });
+    }
     for (fence_counts) |name| {
         const value = query(fence_line, name) orelse "?";
         demo.expect(std.mem.eql(u8, value, "0"), "{s}: 0 processes (got {s})", .{
