@@ -14,7 +14,18 @@
 //!     reported as ZC-E0814, named;
 //!   - refused by the client (a server chain from another CA, an expired or misnamed server
 //!     certificate, a server that does not ask for a certificate, a TLS 1.2 server, truncation);
-//!   - server-sent events delivered as they arrive, and a stream across a KeyUpdate.
+//!   - server-sent events delivered as they arrive, and a stream across a KeyUpdate;
+//!   - the workload-certificate row (B4 slice 4): the real relay (`relay.zig`), secured with the
+//!     run's key, its job certificate (`spiffe://<cluster>/job/<name>`, issued by
+//!     `peer_ca.Ca.issue_job_certificate`) written as `relay.crt` the way the agent writes it.
+//!     The harness connects to the relay's loopback port as the job would. Accepted: a line
+//!     crosses both ways, the server read the job's SPIFFE id and extension exactly, and the job's
+//!     end reaches the server as `close_notify`. The JDK server pins the job's id (allow-list),
+//!     and refuses another job's certificate; `openssl s_server` has no SPIFFE allow-list, so
+//!     there the case asserts that it sees the other job's id. An expired certificate and one
+//!     from another CA are refused by both: the relay's `relay.log` holds one ZC-E0814 line and
+//!     the job's connection is closed. Without `relay.crt` the relay never dials: ZC-E0705, the
+//!     job's connection closed, and the server's output unchanged (it saw no connection).
 //!
 //! The JDK and OpenSSL are test tools only: nothing here ships
 //! (docs/decisions/2026-11-05-interop-tools-are-test-only.md). It prints to stdout only (the
@@ -24,8 +35,12 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const agent_records = @import("agent_records.zig");
 const diag_mod = @import("diag.zig");
+const peer_ca = @import("peer_ca.zig");
 const peer_stream = @import("peer_stream.zig");
+const relay_module = @import("relay.zig");
+const relay_tls = @import("relay_tls.zig");
 const tls_client = @import("tls_client.zig");
 const tls_conn = @import("tls_conn.zig");
 const x509 = @import("x509.zig");
@@ -33,6 +48,7 @@ const x509_identity = @import("x509_identity.zig");
 
 const Allocator = std.mem.Allocator;
 const Code = @import("diag/codes.zig").Code;
+const ManualClock = @import("clock.zig").ManualClock;
 const Conn = tls_conn.Conn;
 const Diag = diag_mod.Diag;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -44,6 +60,11 @@ const server_name = "broker.botpike.com";
 const cluster = "prod.example";
 const job = "broker-1";
 const spiffe_id = "spiffe://prod.example/service/broker-1";
+/// The relayed run (B4): the job whose certificate the relay presents, and another job.
+const relay_job = "nightly-7";
+const relay_job_id = "spiffe://prod.example/job/nightly-7";
+const other_job = "nightly-8";
+const other_job_id = "spiffe://prod.example/job/nightly-8";
 const java_major = "21";
 const step_ms: u64 = 5000;
 const events_count = 20;
@@ -68,6 +89,8 @@ const identity: x509_identity.Identity = .{
 
 const ServerCert = enum { good, other_ca, expired, wrong_name };
 const ClientCert = enum { good, other_ca, expired, other_job, none };
+/// The relay's `relay.crt`: the run's job certificate, or one of the four bad cases.
+const JobCert = enum { good, other_job, expired, other_ca, none };
 
 /// Every key and certificate the cases need, issued by the code under test.
 const Pki = struct {
@@ -76,6 +99,9 @@ const Pki = struct {
     server_key: Ed25519.KeyPair,
     client_key: Ed25519.KeyPair,
     clients: [4]x509.Der,
+    /// The run's key, which the relay holds, and its job certificates (`JobCert` order).
+    relay_key: Ed25519.KeyPair,
+    jobs: [4]x509.Der,
     now: u64,
 
     fn init(pki: *Pki, now: u64) !void {
@@ -90,6 +116,41 @@ const Pki = struct {
         try pki.workload(&pki.clients[1], pki.other_ca, job, valid);
         try pki.workload(&pki.clients[2], pki.ca, job, stale);
         try pki.workload(&pki.clients[3], pki.ca, "intruder-9", valid);
+        pki.relay_key = try Ed25519.KeyPair.generateDeterministic(@splat(0x41));
+        try pki.issue_job(&pki.jobs[0], pki.ca, relay_job, valid);
+        try pki.issue_job(&pki.jobs[1], pki.ca, other_job, valid);
+        try pki.issue_job(&pki.jobs[2], pki.ca, relay_job, stale);
+        try pki.issue_job(&pki.jobs[3], pki.other_ca, relay_job, valid);
+    }
+
+    /// A relayed run's certificate for the relay's key, through the server's own issuance
+    /// (`peer_ca.Ca.issue_job_certificate`, which `POST .../runs/{name}/certificate` calls).
+    fn issue_job(
+        pki: *const Pki,
+        out: *x509.Der,
+        signer: Ed25519.KeyPair,
+        name: []const u8,
+        lifetime: x509.Lifetime,
+    ) !void {
+        var clock: ManualClock = .{ .ms = pki.now };
+        const ca: peer_ca.Ca = .{ .key = signer, .revoked = .{}, .wall = clock.clock() };
+        try ca.issue_job_certificate(out, &.{
+            .cluster = cluster,
+            .name = name,
+            .subject_key = pki.relay_key.public_key.toBytes(),
+            .identity = identity,
+            .lifetime = lifetime,
+        });
+    }
+
+    fn job_cert(pki: *const Pki, which: JobCert) ?*const x509.Der {
+        return switch (which) {
+            .good => &pki.jobs[0],
+            .other_job => &pki.jobs[1],
+            .expired => &pki.jobs[2],
+            .other_ca => &pki.jobs[3],
+            .none => null,
+        };
     }
 
     fn window(pki: *const Pki, expired: bool) x509.Lifetime {
@@ -590,7 +651,7 @@ fn run_case(h: *Harness, case: *const Case) !void {
     switch (case.expect) {
         .accepted => {
             try h.check(seen == .accepted, "refused: {s}", .{describe(h, &buffer)});
-            try check_identity(h, &server);
+            try check_identity(h, &server, spiffe_id);
             try close_clean(h, &server);
         },
         .refused => |want| {
@@ -617,14 +678,15 @@ fn check_java_says(h: *Harness, server: *Server, says: []const u8) !void {
     });
 }
 
-/// The identity the server read from our certificate, against what we put in it.
-fn check_identity(h: *Harness, server: *Server) !void {
+/// The identity the server read from our certificate, against what we put in it: the SPIFFE id
+/// `id` and the extension's fields.
+fn check_identity(h: *Harness, server: *Server, id: []const u8) !void {
     const scratch = h.scratch.allocator();
     const digest = std.fmt.bytesToHex(identity.image_digest, .lower);
     const expected = try std.fmt.allocPrint(
         scratch,
         "spiffe={s} version=1 digest={s} epoch={d} labels=app=broker;env=prod",
-        .{ spiffe_id, digest, identity.placement_epoch },
+        .{ id, digest, identity.placement_epoch },
     );
     switch (server.kind) {
         .java => {
@@ -633,13 +695,13 @@ fn check_identity(h: *Harness, server: *Server) !void {
             const read = line["CONN ".len..];
             try h.check(std.mem.eql(u8, read, expected), "the JVM read {s}", .{line});
         },
-        .openssl => try check_openssl_view(h, server, expected),
+        .openssl => try check_openssl_view(h, server, id, expected),
     }
 }
 
 /// OpenSSL prints the certificate it was given. `openssl x509` reads the SPIFFE id; the Java
 /// decoder reads the private extension (OpenSSL has no name for it).
-fn check_openssl_view(h: *Harness, server: *Server, expected: []const u8) !void {
+fn check_openssl_view(h: *Harness, server: *Server, id: []const u8, expected: []const u8) !void {
     const scratch = h.scratch.allocator();
     const log = h.log_text(server);
     const marker = std.mem.find(u8, log, "Client certificate") orelse
@@ -656,7 +718,7 @@ fn check_openssl_view(h: *Harness, server: *Server, expected: []const u8) !void 
     const text = try run_tool(h, &.{
         "openssl", "x509", "-in", h.path("seen.pem"), "-noout", "-text",
     });
-    const uri = try std.fmt.allocPrint(scratch, "URI:{s}", .{spiffe_id});
+    const uri = try std.fmt.allocPrint(scratch, "URI:{s}", .{id});
     try h.check(std.mem.find(u8, text, uri) != null, "openssl x509 shows no {s}", .{uri});
     const decoded = try run_tool(h, &.{
         h.java, "-cp", h.classes, "InteropServer", "--decode", h.path("seen.pem"),
@@ -856,6 +918,227 @@ fn bulk_java(h: *Harness) !void {
     try close_clean(h, &live.server);
 }
 
+// ---- The relay's job certificate (B4) --------------------------------------------------------
+
+/// The relay's connect and handshake bound in these cases: it also bounds the wait for a
+/// `relay.crt` that never comes.
+const relay_timeout_ms: u32 = 5000;
+
+const RelayExpect = union(enum) {
+    /// Bytes cross both ways through the relay, and the server read this SPIFFE id and the
+    /// extension exactly.
+    accepted: []const u8,
+    /// The server refused the handshake: `relay.log` has one line, ZC-E0814 holding `text`, the
+    /// job's connection is closed, and (Java) the JVM's `FAILED` line holds `says`.
+    refused: struct { text: []const u8, says: []const u8 = "" },
+    /// No `relay.crt`: the relay never dials (ZC-E0705), closes the job's connection, and the
+    /// server sees no connection at all.
+    no_dial,
+};
+
+const RelayCase = struct {
+    name: []const u8,
+    kind: ServerKind,
+    cert: JobCert,
+    expect: RelayExpect,
+};
+
+fn relay_both(comptime name: []const u8, cert: JobCert, expect: [2]RelayExpect) [2]RelayCase {
+    return .{
+        .{ .name = "openssl relay " ++ name, .kind = .openssl, .cert = cert, .expect = expect[0] },
+        .{ .name = "java relay " ++ name, .kind = .java, .cert = cert, .expect = expect[1] },
+    };
+}
+
+fn relay_refused(text: []const u8, says: []const u8) RelayExpect {
+    return .{ .refused = .{ .text = text, .says = says } };
+}
+
+const relay_cases =
+    relay_both("accepted: the job certificate", .good, .{
+        .{ .accepted = relay_job_id }, .{ .accepted = relay_job_id },
+    }) ++
+    [2]RelayCase{
+        .{
+            // s_server has no SPIFFE allow-list: what it can do is show whom it let in.
+            .name = "openssl relay another job's certificate is seen as that job",
+            .kind = .openssl,
+            .cert = .other_job,
+            .expect = .{ .accepted = other_job_id },
+        },
+        .{
+            .name = "java relay refuses another job's certificate (the allow-list)",
+            .kind = .java,
+            .cert = .other_job,
+            .expect = relay_refused("certificate_unknown", "is not on the allow-list"),
+        },
+    } ++
+    relay_both("refuses an expired job certificate", .expired, .{
+        relay_refused("certificate_expired", ""),
+        relay_refused("certificate_unknown", "validity check failed"),
+    }) ++
+    relay_both("refuses a job certificate from another CA", .other_ca, .{
+        relay_refused("unknown_ca", ""),
+        relay_refused("certificate_unknown", "unable to find valid certification path"),
+    }) ++
+    relay_both("without a job certificate never dials", .none, .{ .no_dial, .no_dial });
+
+/// The container's directory as the relay sees it: `relay.crt` (when the case has one) and
+/// `relay.log`.
+const RelayDir = struct {
+    dir: std.Io.Dir,
+    path: []const u8,
+    log: [:0]const u8,
+};
+
+fn run_relay_case(h: *Harness, case: *const RelayCase) !void {
+    const pin: ?[]const u8 = if (case.kind == .java) relay_job_id else null;
+    var server = try start_server(h, .{ .kind = case.kind, .allow = pin });
+    defer server.stop(h.io);
+    const before = h.log_text(&server);
+    var place = try relay_dir(h);
+    defer place.dir.close(h.io);
+    // The agent's part: the certificate the server issued, as `relay.crt` (DER).
+    if (h.pki.job_cert(case.cert)) |certificate| try place.dir.writeFile(h.io, .{
+        .sub_path = agent_records.file_relay_certificate,
+        .data = certificate.slice(),
+    });
+    const relay = try start_relay(h, &server, &place);
+    defer relay.stop();
+    // The job's part: a plain connection to the relay's loopback port.
+    const job_fd = try relay_module.dial(relay.port);
+    defer _ = std.os.linux.close(job_fd);
+    switch (case.expect) {
+        .accepted => |id| try relay_accepts(h, &server, &place, job_fd, id),
+        .refused => |want| try relay_refuses(h, &server, &place, job_fd, want.text, want.says),
+        .no_dial => try relay_never_dials(h, &server, &place, job_fd, before),
+    }
+}
+
+fn relay_dir(h: *Harness) !RelayDir {
+    const scratch = h.scratch.allocator();
+    const path = try std.fmt.allocPrint(scratch, "{s}/relay-{d}", .{ h.work, h.cases });
+    try std.Io.Dir.cwd().createDirPath(h.io, path);
+    return .{
+        .dir = try std.Io.Dir.cwd().openDir(h.io, path, .{}),
+        .path = path,
+        .log = try std.fmt.allocPrintSentinel(scratch, "{s}/relay.log", .{path}, 0),
+    };
+}
+
+/// The real relay, as the supervisor runs it: secured with the run's key, its upstream the
+/// stock server, which it checks against the CA that signed the server's certificate.
+fn start_relay(h: *Harness, server: *const Server, place: *const RelayDir) !*relay_module.Relay {
+    const upstream: relay_module.Upstream = .{ .host = "127.0.0.1", .port = server.port };
+    const relay = try relay_module.Relay.open(h.gpa, h.io, upstream, place.log);
+    errdefer relay.stop();
+    const tls: relay_tls.Tls = .{
+        .server_name = server_name,
+        .anchor = h.pki.ca.public_key.toBytes(),
+    };
+    try relay.secure(tls, h.pki.relay_key, place.dir.handle);
+    relay.limits.connect_timeout_ms = relay_timeout_ms;
+    try relay.run();
+    return relay;
+}
+
+fn relay_log(h: *Harness, place: *const RelayDir) []const u8 {
+    const limit: std.Io.Limit = .limited(64 << 10);
+    return std.Io.Dir.cwd().readFileAlloc(h.io, place.log, h.scratch.allocator(), limit) catch "";
+}
+
+/// Reads exactly `out.len` bytes from the job's side of the relay.
+fn job_read(h: *Harness, fd: std.posix.fd_t, out: []u8) !void {
+    var have: usize = 0;
+    while (have < out.len) {
+        const got = relay_module.receive(fd, out[have..], @intCast(step_ms)) orelse
+            return h.check(false, "the job read nothing in {d} ms", .{step_ms});
+        try h.check(got > 0, "the relay closed the job's connection after {d} bytes", .{have});
+        have += got;
+    }
+}
+
+fn relay_accepts(
+    h: *Harness,
+    server: *Server,
+    place: *const RelayDir,
+    job_fd: std.posix.fd_t,
+    id: []const u8,
+) !void {
+    const line = "hello\n";
+    const sent = std.os.linux.write(job_fd, line, line.len);
+    try h.check(sent == line.len, "the job could not write to the relay", .{});
+    const want: []const u8 = switch (server.kind) {
+        .java => "echo:hello\n",
+        .openssl => "world\n",
+    };
+    if (server.kind == .openssl) {
+        const read = h.wait_log(server, "hello", step_ms);
+        try h.check(read, "s_server never read the job's line", .{});
+        try h.send(server, "world\n");
+    }
+    var reply: [16]u8 = undefined;
+    const got = reply[0..want.len];
+    try job_read(h, job_fd, got);
+    try h.check(std.mem.eql(u8, got, want), "the job read {s}", .{got});
+    try check_identity(h, server, id);
+    // The job's end: the relay sends `close_notify`, and the server sees a clean end.
+    _ = std.os.linux.shutdown(job_fd, std.os.linux.SHUT.WR);
+    const marker = switch (server.kind) {
+        .java => "CLOSED clean",
+        .openssl => "DONE",
+    };
+    try h.check(h.wait_log(server, marker, step_ms), "the server never saw the relay's end", .{});
+    const log = relay_log(h, place);
+    try h.check(log.len == 0, "relay.log says {s}", .{log});
+}
+
+/// The job waits for the relay to end its connection, with nothing from upstream.
+fn job_closed(h: *Harness, job_fd: std.posix.fd_t, ms: u64) !void {
+    var buffer: [64]u8 = undefined;
+    const got = relay_module.receive(job_fd, &buffer, @intCast(ms)) orelse
+        return h.check(false, "the relay kept the job's connection open {d} ms", .{ms});
+    try h.check(got == 0, "the job read {d} bytes: {s}", .{ got, buffer[0..got] });
+}
+
+fn relay_refuses(
+    h: *Harness,
+    server: *Server,
+    place: *const RelayDir,
+    job_fd: std.posix.fd_t,
+    text: []const u8,
+    says: []const u8,
+) !void {
+    try job_closed(h, job_fd, step_ms);
+    const log = std.mem.trimEnd(u8, relay_log(h, place), "\n");
+    try h.check(std.mem.startsWith(u8, log, "ZC-E0814 "), "relay.log says {s}", .{log});
+    try h.check(std.mem.findScalar(u8, log, '\n') == null, "relay.log has more: {s}", .{log});
+    const named = std.mem.find(u8, log, text) != null;
+    try h.check(named, "relay.log lacks \"{s}\": {s}", .{ text, log });
+    if (server.kind == .java) try check_java_says(h, server, says);
+    h.say("      -> relay.log: {s}", .{log});
+}
+
+fn relay_never_dials(
+    h: *Harness,
+    server: *Server,
+    place: *const RelayDir,
+    job_fd: std.posix.fd_t,
+    before: []const u8,
+) !void {
+    try job_closed(h, job_fd, relay_timeout_ms + step_ms);
+    const log = std.mem.trimEnd(u8, relay_log(h, place), "\n");
+    const waited = std.mem.find(u8, log, "had not arrived") != null;
+    try h.check(std.mem.startsWith(u8, log, "ZC-E0705 ") and waited, "relay.log says {s}", .{log});
+    // A connection, even one that never finished a handshake, would put a line in the log.
+    h.sleep_ms(500);
+    const after = h.log_text(server);
+    try h.check(std.mem.eql(u8, before, after), "the server saw a connection: {s}", .{
+        after[@min(before.len, after.len)..],
+    });
+    h.say("      -> relay.log: {s}", .{log});
+}
+
 fn finish(h: *Harness, name: []const u8, result: anyerror!void) void {
     h.cases += 1;
     result catch |err| {
@@ -921,6 +1204,10 @@ fn run(init: std.process.Init, source: []const u8) !u8 {
         h.diag.reset();
         finish(&h, scenario.name, scenario.run(&h));
         conn.deinit();
+    }
+    for (&relay_cases) |*case| {
+        _ = h.scratch.reset(.retain_capacity);
+        finish(&h, case.name, run_relay_case(&h, case));
     }
     h.say("{d} cases, {d} failed", .{ h.cases, h.failures });
     return if (h.failures == 0) 0 else 1;

@@ -206,7 +206,13 @@ All are in `src/constants.zig` with their reasons; changing one is a change to t
   and fails, not skips, without them
   (decisions/2026-11-06-interop-needs-setpriv.md). The JVM runs with
   `-Dcom.sun.net.ssl.requireCloseNotify=true`, so a client that drops TCP without `close_notify`
-  fails the clean-close check.
+  fails the clean-close check. Its workload-certificate row (B4 slice 4) puts the real relay
+  between the harness (the job) and each server, with a job certificate the cluster CA issued
+  through the server's issuance code: both servers read the job's SPIFFE id and extension; the
+  JDK server pins the job's id and refuses another job's certificate, while `openssl s_server`,
+  which has no SPIFFE allow-list, is shown to see the other job's id; both refuse an expired
+  certificate and one from another CA (ZC-E0814 in `relay.log`, the job's connection closed);
+  without a certificate the relay never dials (ZC-E0705) and neither server sees a connection.
 
 ## Issuance (B4 slice 2)
 
