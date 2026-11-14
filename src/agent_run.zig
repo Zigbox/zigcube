@@ -890,7 +890,8 @@ test "the certificate step looks for relay files where each runtime keeps its co
     try std.testing.expectEqualStrings("node1", zigbox_asker.node);
     const fake_asker = relay_asker("node1", .fake);
     try std.testing.expectEqualStrings(agent_records.dir_containers, fake_asker.dir);
-    try std.testing.expect(!std.mem.eql(u8, agent_records.dir_zigbox, agent_records.dir_containers));
+    const dirs_differ = !std.mem.eql(u8, agent_records.dir_zigbox, agent_records.dir_containers);
+    try std.testing.expect(dirs_differ);
 }
 
 test "a cancelled task while the node key is made exits quietly, with no diagnostic" {

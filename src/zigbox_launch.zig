@@ -266,7 +266,7 @@ test "a relaunch clears the last run's relay files" {
     }
     try testing.expect(files.exists(io, dir, file_spec));
     const relay_tls = @import("relay_tls.zig");
-    const key = std.crypto.sign.Ed25519.KeyPair.generate(io);
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x41));
     var credential: relay_tls.Credential = .init(&key);
     credential.poll(dir.handle);
     try testing.expectEqual(relay_tls.State.waiting, credential.state.load(.acquire));

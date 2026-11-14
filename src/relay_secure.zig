@@ -85,7 +85,8 @@ const Rig = struct {
         }, 0);
         errdefer testing.allocator.free(log_path);
         const upstream: relay_module.Upstream = .{ .host = "127.0.0.1", .port = 9 };
-        const relay = try relay_module.Relay.open(testing.allocator, testing.io, upstream, log_path);
+        const gpa = testing.allocator;
+        const relay = try relay_module.Relay.open(gpa, testing.io, upstream, log_path);
         return .{ .tmp = tmp, .log_path = log_path, .relay = relay };
     }
 

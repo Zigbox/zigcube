@@ -1135,14 +1135,14 @@ test "a wait's error is read before its pid: interrupted again, any other over, 
 const RelayRig = struct {
     tmp: std.testing.TmpDir,
     path: [std.fs.max_path_bytes]u8,
-    path_length: usize,
+    path_length: u32,
     log_path: [std.fs.max_path_bytes:0]u8,
     relay: *relay_module.Relay,
 
     fn open(rig: *RelayRig) !void {
         rig.tmp = std.testing.tmpDir(.{});
         errdefer rig.tmp.cleanup();
-        rig.path_length = try rig.tmp.dir.realPath(std.testing.io, &rig.path);
+        rig.path_length = @intCast(try rig.tmp.dir.realPath(std.testing.io, &rig.path));
         const log = try std.fmt.bufPrintSentinel(&rig.log_path, "{s}/relay.log", .{
             rig.path[0..rig.path_length],
         }, 0);
