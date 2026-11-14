@@ -38,7 +38,8 @@ These arrive with the scaffold; keep this list current as they land.
 - `zig build` builds `zig-out/bin/zcube`, `zcube-server` and `zcube-agent`. `zcube-server` needs
   the SQLite and libpq development files, embeds `web/` and the console's WASM module, and runs
   as `zcube-server [--config FILE] [--listen HOST:PORT] [--insecure-listen HOST:PORT] [--tls-name NAME]
-  [--store memory|sqlite:<path>|postgres:<settings>] [--create-store]`; `--help` says the rest.
+  [--tls-san NAME_OR_IP]... [--store memory|sqlite:<path>|postgres:<settings>] [--create-store]`;
+  `--help` says the rest.
   `--listen` serves TLS 1.3 and every client presents a certificate of the store's CA;
   `--insecure-listen` serves plain HTTP on loopback only, as the caller `local`, which may call
   everything (B7 slice 3, docs/mtls.md "The API over TLS"; `zcube local`, `local-smoke`, `swarm-smoke`
@@ -49,6 +50,11 @@ These arrive with the scaffold; keep this list current as they land.
   CA (B7, docs/mtls.md); `ca issue-node NAME` writes a node certificate for a new agent's
   `--cert`/`--key` (it may join and act as NAME only). Each lives 7 days; re-issue with `--replace`
   (without it an existing file is refused). Neither makes a CA.
+  `ca issue-client NAME --scope S --p12 FILE [--password-file F]` writes a PKCS#12 file (0600, never
+  overwritten) from the store's P-256 browser CA for a browser; the password comes from the file
+  (0600) or stdin, never argv. Browsers get the P-256 server certificate (names `--tls-name` and
+  each `--tls-san`); `node tools/browser_check.mjs URL --mode server --tls --api http://LOOPBACK`
+  checks the console in real Chrome over mTLS (docs/mtls.md, "Browsers").
 - `zig build test` runs unit and snapshot tests (tidy's own tests included). `-Dtest-filter=NAME` runs only tests whose name contains NAME (the run is cached: to repeat one, run the binary under `.zig-cache/o/*/test` directly). It installs `zcube-agent` first: the `FakeRuntime` tests start real processes, each container under `zcube-agent supervise`, and skip if `zig-out/bin/zcube-agent` (or `ZCUBE_AGENT_EXE`) is not there. A test that dies can leave processes behind; `pkill -9 -f '[z]cube-agent supervise'` removes them.
 - `zig build tidy` checks formatting and the mechanical style rules: 100 columns, 70-line functions, banned patterns, `catch unreachable` comments, no `and`/`or` inside `assert(...)`. Run it before every commit; CI does.
 - `zig build test-store -Dbackend=memory|sqlite|postgres [-Dseed=N]` runs the store conformance suite. It always re-runs with a fresh seed (Zig's per-run test seed), prints nothing when it passes, and a failing test prints `seed=N`; replay with `-Dseed=N`. SQLite needs `libsqlite3-dev`, Postgres `libpq-dev` (the session-start hook installs it).

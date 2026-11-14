@@ -57,9 +57,9 @@ Requirements:
 - **Malleability.** ECDSA signatures are checked for low-S and encoding malleability as std
   does, with a test.
 
-**Status.** Part 1 is **not built in this session**. This session's context was spent on
-part 2 and on finding the evidence above. The supervisor allowed part 2 to be its own report,
-so part 1 is handed to a fresh session, from this decision.
+**Status.** Part 1 was built by a later session (branch `claude/b7-slice6-browser`); its
+choices are in docs/decisions/2026-11-14-b7-slice6-browser-choices.md and docs/mtls.md,
+"Browsers".
 
 ## Part 2, the harnesses over TLS
 

@@ -105,9 +105,8 @@ are sorted by key, with no key twice.
   certificate is made from the CA at start, carries the DNS name `--tls-name` (default
   `zcube-server`), and is made again when half its life is gone.
 - `--insecure-listen HOST:PORT` serves plain HTTP on a loopback address only (127.0.0.1 or ::1;
-  anything else is `ZC-E0106`). It is for the console on the same host (browsers offer no
-  Ed25519 and cannot handshake with `--listen` until the browser path of
-  docs/decisions/2026-11-14-b7-slice6-console-over-tls.md is built), the local mode (`zcube local up`) and
+  anything else is `ZC-E0106`). It is for the console on the same host (a browser can
+  also use `--listen`, on the P-256 path of "Browsers" below), the local mode (`zcube local up`) and
   the tests of this listener. The other harnesses talk to `--listen` with certificates from
   `ca issue-client` and `ca issue-node` (`src/harness_tls.zig`, B7 slice 6). A request on it is the caller `local`, which may
   call everything: whoever can reach loopback already runs on the server's host.
@@ -182,6 +181,56 @@ the agent falls back to `--cert` ([agent.md](agent.md), "Node certificates"). An
 server holds a bootstrap certificate for NAME to NAME's paths, so it can join and act as NAME
 only (`api_tls_test.zig`: node1's certificate gets 403 joining as node2). Without `--cert` and
 without a `node.crt`, the agent does not start (`ZC-E0806`).
+
+### Browsers (B7 slice 6)
+
+Browsers offer no Ed25519, so `--listen` has a second path for them, on ECDSA P-256
+(docs/decisions/2026-11-14-b7-slice6-console-over-tls.md, path A):
+
+- **The browser CA.** Each store has a second CA beside the cluster CA: `<stem>-browser.key` (the
+  P-256 scalar, 64 hex digits, mode 0600) and `<stem>-browser.crt` (PEM), next to `ca-<hash>.key`
+  in the state directory (`server_browser_ca.zig`). The server makes the key at start when it is
+  absent; `ca issue-client --p12` never does.
+- **The server's P-256 certificate**, signed by the browser CA, carries `--tls-name` and every
+  `--tls-san NAME_OR_IP` (repeatable, no default: a browser checks the name in the address bar,
+  so add `localhost`, the host's name or its IP). The server presents it only to a ClientHello
+  that does not list `ed25519` among its signature schemes; every client that offers Ed25519
+  (`zcube`, the agents, curl with OpenSSL) gets the Ed25519 certificate as before.
+- **Client certificates.** `zcube-server ca issue-client NAME --scope jobs|admin --p12 FILE
+  [--password-file F]` writes a PKCS#12 file (mode 0600, never overwritten: remove it first to
+  re-issue) with a P-256 key and a 7-day certificate from the browser CA (`server_issue_p12.zig`,
+  `pkcs12.zig`: PBES2 with PBKDF2-HMAC-SHA256 and AES-256-CBC, an HMAC-SHA256 MAC, 600,000
+  iterations). The password comes from `--password-file` (mode 0600, or `ZC-E0806`) or from
+  stdin, never from argv; a terminal on stdin is refused (`ZC-E0106`), and one trailing newline
+  is dropped. `--p12` takes no `--out` or `--replace` and is for clients only.
+- **The CAs never sign across paths.** The browser CA signs only P-256 keys and the cluster CA
+  only Ed25519 keys; each path's parser refuses the other's algorithm (`ZC-E0809`), so a P-256
+  certificate does not verify under the cluster CA nor an Ed25519 one under the browser CA, on
+  either side of the handshake (`x509_p256_test.zig`, near-miss rows and `teeth:`). The server
+  verifies a client chain from either CA; the caller and its scope are named as on the cluster
+  path.
+
+**Opening the console over TLS.** The browser's user imports two things: `<stem>-browser.crt` as
+a trusted root, and the `.p12` with its password. For Chrome on Linux that is the NSS database
+in `$HOME/.pki/nssdb`:
+
+```sh
+certutil -N -d sql:$HOME/.pki/nssdb --empty-password        # once
+certutil -A -d sql:$HOME/.pki/nssdb -n zcube-browser-ca -t "C,," -i STATE/ca-<hash>-browser.crt
+pk12util -d sql:$HOME/.pki/nssdb -i web-1.p12 -w PASSWORD_FILE -K ""
+```
+
+then opens `https://<a --tls-san name>:<port>/` and picks the certificate when asked.
+
+`tools/browser_check.mjs <url> --mode server --tls --api http://127.0.0.1:PORT` checks this in
+real Chrome (Playwright's `channel: "chromium"`): Playwright's default headless shell never sends
+a client certificate, so it cannot pass the handshake (`ZC-E0814`). The check was set up as above
+plus a managed policy that picks the certificate without a prompt,
+`/etc/opt/chrome_for_testing/policies/managed/zcube-check.json` holding
+`{"AutoSelectCertificateForUrls":["{\"pattern\":\"https://localhost:17443\",\"filter\":{}}"]}`
+(Chrome for Testing reads that directory, not `/etc/opt/chrome`). `--api` is where Node seeds
+the store, the loopback listener, since Node's fetch has no client certificate. It is a
+dev-time check, not in CI.
 
 ## Tests
 
