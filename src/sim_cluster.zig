@@ -43,6 +43,7 @@ const controller = @import("controller.zig");
 const diag_mod = @import("diag.zig");
 const node_store = @import("node_store.zig");
 const records = @import("records.zig");
+const rollout_controller = @import("rollout_controller.zig");
 const agent_jobs = @import("agent_jobs.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
@@ -2911,9 +2912,22 @@ fn converged(c: *Cluster) Failure!void {
             null,
             constants.replicas_max,
         ) catch return check(c, false, "the replicas cannot be read");
-        try check(c, replicas.items.len == service.rec.replicas, "a service lacks replicas");
-        const good = !std.mem.eql(u8, service.rec.image, broken_digest);
+        // A halted rollout (failed or paused; C3, until slice 8 rolls back) keeps the old
+        // replicas beside the new, up to its surge: each replica then runs if its own image is
+        // good.
+        const halted = rollout_controller.halted(&ctx, &service) catch
+            return check(c, false, "the rollouts cannot be read");
+        const count = replicas.items.len;
+        const wanted = service.rec.replicas;
+        if (halted) {
+            try check(c, count >= wanted, "a service lacks replicas");
+            try check(c, count <= wanted + service.rec.rollout_policy().max_surge, "a halted " ++
+                "rollout holds more than its surge");
+        } else {
+            try check(c, count == wanted, "a service lacks replicas");
+        }
         for (replicas.items) |replica| {
+            const good = !std.mem.eql(u8, replica.rec.image, broken_digest);
             try replica_converged(c, observed.items, &homes, &replica.rec, good);
         }
     }

@@ -27,6 +27,7 @@ const apply_mod = @import("apply.zig");
 const constants = @import("constants.zig");
 const controller = @import("controller.zig");
 const records = @import("records.zig");
+const rollout_controller = @import("rollout_controller.zig");
 const sim_checks = @import("sim_checks.zig");
 const sim_runtime = @import("sim_runtime.zig");
 const sim_world = @import("sim_world.zig");
@@ -615,7 +616,12 @@ fn desired_total(world: *World) ?u32 {
         constants.services_max,
     ) catch return null;
     var total: u32 = 0;
-    for (list.items) |service| total += service.rec.replicas;
+    for (list.items) |*service| {
+        total += service.rec.replicas;
+        // A halted rollout keeps its surge (C3): the old replicas run beside the new.
+        const stopped_short = rollout_controller.halted(&ctx, service) catch return null;
+        if (stopped_short) total += service.rec.rollout_policy().max_surge;
+    }
     return total;
 }
 
@@ -693,12 +699,18 @@ fn converged(run: *Run) Failure!void {
         constants.services_max,
     ) catch return run.check(.fuzz, false, "the services cannot be read");
     var running_total: u32 = 0;
-    for (list.items) |service| {
+    for (list.items) |*service| {
         const name = service.rec.name;
-        const wanted = service.rec.replicas;
-        const good = !std.mem.eql(u8, service.rec.image, broken_digest);
         const running = world.running_count(name);
         running_total += running;
+        const stopped_short = rollout_controller.halted(&ctx, service) catch
+            return run.check(.fuzz, false, "the rollouts cannot be read");
+        if (stopped_short) {
+            try halted_converged(run, service);
+            continue;
+        }
+        const wanted = service.rec.replicas;
+        const good = !std.mem.eql(u8, service.rec.image, broken_digest);
         if (world.replica_count(name) != wanted or (good and running != wanted)) {
             dump_service(run, name);
         }
@@ -707,6 +719,23 @@ fn converged(run: *Run) Failure!void {
         if (!good) try run.check(.fuzz, running == 0, "a broken service is running");
     }
     try run.check(.fuzz, world.sim.running_count() == running_total, "containers left behind");
+}
+
+/// A service whose rollout failed or was paused (C3, until slice 8 rolls back): it keeps at least
+/// what it asks for and at most `max_surge` more; replicas of the broken image do not run, and
+/// every other replica does.
+fn halted_converged(run: *Run, service: *const controller.Entry(records.Service)) Failure!void {
+    const world = run.world;
+    const name = service.rec.name;
+    const count = world.replica_count(name);
+    const wanted = service.rec.replicas;
+    const most = wanted + service.rec.rollout_policy().max_surge;
+    const held = world.image_count(name, broken_digest);
+    const running = world.running_count(name);
+    if (count < wanted or count > most or running + held != count) dump_service(run, name);
+    try run.check(.fuzz, count >= wanted, "a service lacks replicas");
+    try run.check(.fuzz, count <= most, "a halted rollout holds more than its surge");
+    try run.check(.fuzz, running + held == count, "a halted rollout's replica is not running");
 }
 
 // ---- Tests -----------------------------------------------------------------------------------

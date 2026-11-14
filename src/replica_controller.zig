@@ -244,8 +244,10 @@ const Run = struct {
         if (!try run.hold_pass(service, &plan)) return;
         const roll = try run.roll_of(service, &plan);
         if (plan.dead > 0) return run.replace(service, &plan, &roll);
-        if (plan.stale > 0) return run.roll_out(service, &plan, &roll);
-        const keep = plan.live + plan.held;
+        if (plan.stale > 0 and roll.starts) return run.roll_out(service, &plan, &roll);
+        // A halted rollout (failed or paused) keeps its stale replicas, which then count as
+        // any other toward what the service asks for.
+        const keep = plan.live + plan.held + plan.stale;
         if (keep < service.rec.replicas) return run.scale_up(service, keep, &roll);
         if (keep > service.rec.replicas) return run.scale_down(service, &plan);
     }
@@ -407,7 +409,6 @@ const Run = struct {
         var lost_nodes: [judged_nodes_batch_max][]const u8 = undefined;
         var lost_nodes_count: u32 = 0;
         const removals_max: u32 = if (plan.stale > 0) 1 else batch_replicas_max;
-        var replaceable: u32 = 0;
         for (plan.slice()) |*item| {
             if (item.class != .dead) continue;
             if (removed_count == removals_max) break;
@@ -416,14 +417,15 @@ const Run = struct {
             }
             removed[removed_count] = item;
             removed_count += 1;
-            const current = item.replica.rec.generation == service.rec.generation;
-            if (current or roll.starts) replaceable += 1;
         }
         const keep = plan.live + plan.held;
         const wanted = service.rec.replicas;
         const missing = if (wanted > keep) wanted - keep else 0;
         var creations = @min(batch_replicas_max - removed_count, missing);
-        if (plan.stale > 0) creations = @min(creations, replaceable);
+        // A replica that failed on its own is replaced, of either generation, without waiting
+        // for the rollout's budget (c3.md): only the surge bound applies. Stale replicas still
+        // missing are the rollout's to start.
+        if (plan.stale > 0) creations = @min(creations, removed_count);
         creations = @min(creations, roll.room);
         if (!run.budget()) return;
 
@@ -953,7 +955,7 @@ const Run = struct {
 
     fn scale_down(run: *Run, service: *const ServiceEntry, plan: *const ServicePlan) Error!void {
         const wanted = service.rec.replicas;
-        const keep = plan.live + plan.held;
+        const keep = plan.live + plan.held + plan.stale;
         assert(keep > wanted);
         var victims: [constants.replicas_per_service_max]Item = undefined;
         var count: u32 = 0;
@@ -1093,14 +1095,16 @@ fn classify_one(
     service: *const records.Service,
     observed: ?*const Entry(records.Observed),
 ) Class {
-    if (replica.generation < service.generation) return .stale;
     // A service deleted and applied again between two steps starts over at generation 1, so a
     // replica of the old one can be ahead of the new service or equal to it (docs/keys.md): only
     // what it runs says whether it is current.
-    if (!records.replica_runs_service(replica, service)) return .stale;
-    const found = observed orelse return .live;
-    if (found.rec.status != .stopped) return .live;
-    if (user_fault(&found.rec)) return .held;
+    const current = replica.generation >= service.generation and
+        records.replica_runs_service(replica, service);
+    const stopped = if (observed) |found| found.rec.status == .stopped else false;
+    // A stale replica that stopped on its own is dead: it is replaced at once, without waiting
+    // for the rollout's budget (c3.md). Only a current one is held for its user's fault.
+    if (!stopped) return if (current) .live else .stale;
+    if (current and user_fault(&observed.?.rec)) return .held;
     return .dead;
 }
 

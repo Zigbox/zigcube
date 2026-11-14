@@ -689,6 +689,16 @@ pub const World = struct {
         return count;
     }
 
+    /// How many of `service`'s replica keys run `image`.
+    pub fn image_count(world: *World, service: []const u8, image: []const u8) u32 {
+        var count: u32 = 0;
+        var iterator = ReplicaIterator.start(world, service);
+        while (iterator.next()) |entry| {
+            if (std.mem.eql(u8, entry.image, image)) count += 1;
+        }
+        return count;
+    }
+
     /// How many replica keys `service` has.
     pub fn replica_count(world: *World, service: []const u8) u32 {
         var count: u32 = 0;
@@ -717,7 +727,11 @@ const ReplicaIterator = struct {
     observed: []const controller.Entry(records.Observed),
     index: u32,
 
-    const Item = struct { id: []const u8, observed_status: ?records.ObservedStatus };
+    const Item = struct {
+        id: []const u8,
+        image: []const u8,
+        observed_status: ?records.ObservedStatus,
+    };
 
     fn start(world: *World, service: []const u8) ReplicaIterator {
         const ctx = world.controller_context();
@@ -759,7 +773,7 @@ const ReplicaIterator = struct {
             if (!std.mem.eql(u8, item.rec.replica, replica.id)) continue;
             status = item.rec.status;
         }
-        return .{ .id = replica.id, .observed_status = status };
+        return .{ .id = replica.id, .image = replica.image, .observed_status = status };
     }
 };
 

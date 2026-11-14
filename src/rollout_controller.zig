@@ -717,6 +717,16 @@ pub fn state_of(rollout: *const records.Rollout) ?plan_mod.State {
     return state;
 }
 
+/// Whether `service`'s rollout of its current generation stopped short, failed or paused: its
+/// replicas may then mix generations and number up to `max_surge` more than it asks for.
+pub fn halted(ctx: *const Context, service: *const Entry(records.Service)) Error!bool {
+    const key = records.rollout_key(service.rec.name);
+    const rollout = try get_entry(records.Rollout, ctx, key) orelse return false;
+    if (!records.rollout_of(&rollout.rec, service.kv.create_revision)) return false;
+    if (rollout.rec.to != service.rec.generation) return false;
+    return rollout.rec.phase == .failed or rollout.rec.phase == .paused;
+}
+
 // ---- Pause and resume (the API's handlers, C3 slice 11) --------------------------------------
 
 pub const Request = enum { pause, resume_rollout };
