@@ -78,6 +78,15 @@ pub const evict_world = declared("c1_evict_world") or job_evicted;
 /// `any`.
 pub const burst_world = declared("c1_burst_world") or evict_world;
 
+/// The runner a replay line names: a root may name its own installed runner (`sim_runner`),
+/// since a world or a tooth is a comptime flag of that runner and `sim_cluster` has neither.
+pub const runner: []const u8 = if (@hasDecl(root, "sim_runner"))
+    root.sim_runner
+else if (burst_world)
+    "sim_c1_burst"
+else
+    "sim_cluster";
+
 /// The jobs watch drops the events of some endings (must break J4: a client that follows the watch
 /// misses an ending it never hears of).
 pub const job_gap = declared("c1_teeth_job_gap");
@@ -131,6 +140,12 @@ pub const job_reuse = declared("c1_teeth_job_reuse");
 /// container of the earlier job meets the new one. Not in `any`.
 pub const reuse_world = declared("c1_reuse_world") or job_reuse;
 
+/// The agent's job pass ends at the first failure that is not the runtime's (a server call that
+/// failed, such as a committed write whose answer was lost), and a replica stage's such failure
+/// skips the job pass, as before #247: a stop committed for a run later in the pass waits for a
+/// pass with no such failure (must break J6 in the evict world, seed 225; #247, #248).
+pub const job_pass_break = declared("c1_teeth_job_pass_break");
+
 /// The teeth whose fault needs the `strong` world (state-directory wipes, unplaceable jobs, relayed
 /// jobs).
 pub const strong_world = job_unclaimed or job_wipe or evict_world or relay_leak or relay_dropped;
@@ -139,4 +154,5 @@ pub const any = old_renewal_rule or skip_allocation_compare or skip_readiness_co
     skew_beyond_bound or wedge or stale_observation or locality_before_spread or job_restart or
     job_claim or job_double or job_rewrite or job_cancel or job_deadline or job_deadline_late or
     job_deadline_offline or job_gap or job_stale or job_refused_loop or job_unclaimed or
-    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse;
+    job_wipe or job_evicted or job_ledger_small or relay_leak or relay_dropped or job_reuse or
+    job_pass_break;
