@@ -1011,6 +1011,9 @@ const SimStepOptions = struct {
     /// `-Dauto-shape`: sim-cluster, sim-c1 and sim-swarm draw their operations (and the cluster
     /// its nodes, lease ttl and replica counts) from the seed; `-Dops` and `-Dnodes` are ignored.
     auto_shape: bool = false,
+    /// `-Dtenants`: sim-c1 runs B6's tenant world (`--strong --tenants`: node labels, operator
+    /// relabels and P1), natively and as WASM.
+    tenants: bool = false,
 };
 
 /// The operations argument of a simulator: `auto` or the number.
@@ -1075,6 +1078,8 @@ fn add_sim_steps(b: *std.Build, options: SimStepOptions) void {
     sim.swarm_profile = b.option([]const u8, "swarm-profile", swarm_help) orelse "mixed";
     const shape_help = "Draw operations (and nodes, lease ttl, replicas) from the seed";
     sim.auto_shape = b.option(bool, "auto-shape", shape_help) orelse false;
+    const tenants_help = "sim-c1 runs the tenant world (--strong --tenants) and judges P1";
+    sim.tenants = b.option(bool, "tenants", tenants_help) orelse false;
     add_sim_step(b, sim);
     add_sim_cluster_step(b, sim);
     add_sim_swarm_step(b, sim);
@@ -1360,8 +1365,17 @@ const c1_teeth_roots = [_]struct {
         .name = "placement_exclusive",
         .root = "src/sim_c1_teeth_placement_exclusive_main.zig",
         // P1 (an assignment against a node's `exclusive` or a job's `require`); tenant labels
-        // exist only in the strong world, which the tooth switches on. Plain runs (no `--c1`)
+        // exist only in the tenant world, which the tooth switches on. Plain runs (no `--c1`)
         // do not judge P1: it needs the per-revision tap.
+        .symptom = "P1",
+        .canary_seeds = 20,
+    },
+    .{
+        .name = "relabel_kept",
+        .root = "src/sim_c1_teeth_relabel_kept_main.zig",
+        // P1b (a hold that a node's new labels refuse is never moved off): the replica and job
+        // controllers keep what a re-registered node holds. Tenant labels exist only in the
+        // tenant world, which the tooth switches on. Plain runs do not judge P1.
         .symptom = "P1",
         .canary_seeds = 20,
     },
@@ -1411,7 +1425,7 @@ const canary_symptom_swarm_teeth = "a chunk with wrong bytes was accepted";
 /// `zig build sim-c1 [-Dseed=N] [-Dops=N] [-Dnodes=N]`: the cluster simulation with the
 /// per-revision invariant checks (`Options.c1`), natively and as WebAssembly, the reports
 /// compared byte for byte. `sim-c1-exe` installs the native runner (`sim_cluster --c1`);
-/// `sim-c1-teeth` runs the 24 negative tests, each of which passes only if its check fires.
+/// `sim-c1-teeth` runs the 25 negative tests, each of which passes only if its check fires.
 fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const exe = b.addExecutable(.{
         .name = "sim_cluster",
@@ -1432,6 +1446,7 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
     const run = b.addRunArtifact(exe);
     run.addArgs(&.{ seed_text, ops_text, nodes_text, "--c1" });
     run.addArg(b.fmt("--profile={s}", .{sim.profile}));
+    if (sim.tenants) run.addArgs(&.{ "--strong", "--tenants" });
     const native_report = run.captureStdOut(.{});
     const step = b.step("sim-c1", "Run sim-c1 natively and as WASM, and compare (-Dseed=N)");
     for (v8_modes) |mode| {
@@ -1441,10 +1456,11 @@ fn add_sim_c1_steps(b: *std.Build, sim: SimStepOptions) void {
         node.addFileArg(sim.library.getEmittedBin());
         node.addArgs(&.{ seed_text, ops_text, nodes_text, "true", sim.profile });
         node.addFileArg(native_report);
+        if (sim.tenants) node.addArg("strong,tenants");
         step.dependOn(&node.step);
     }
     const teeth = b.step("sim-c1-teeth", "Run the sim-c1 negative tests; each must fire its check");
-    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 24 fault-on sim-c1 runners");
+    const teeth_exes = b.step("sim-c1-teeth-exe", "Install the 25 fault-on sim-c1 runners");
     for (c1_teeth_roots) |entry| {
         const teeth_exe = b.addExecutable(.{
             .name = b.fmt("sim_c1_teeth_{s}", .{entry.name}),

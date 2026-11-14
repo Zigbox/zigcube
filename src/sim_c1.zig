@@ -163,8 +163,6 @@ pub const Tally = struct {
     runs_placed_judged: u64 = 0,
     /// Stored `running` and `stopped` reports of runs checked for J9.
     job_reports_judged: u64 = 0,
-    /// New assignments checked against their node's labels and the job's `require` (P1).
-    tenancy_judged: u64 = 0,
 };
 
 /// Checks one transaction about to commit against the head it will commit over (I2 and I3). The
@@ -172,87 +170,9 @@ pub const Tally = struct {
 /// compare fails writes nothing, which is the store doing its job.
 pub fn before_commit(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
     if (scheduler.placement_problem(ctx, request, &tally.placements_judged)) |found| return found;
-    if (tenancy_problem(ctx, request, tally)) |found| return found;
     if (superseded(ctx, request, tally)) |found| return found;
     if (job_problem(ctx, request, tally)) |found| return found;
     return admissible_observations(ctx, request, tally);
-}
-
-/// P1 (B6, docs/briefs/b6.md): a new assignment lands only on a node that carries every pair of
-/// its job's `require`, and a node with an `exclusive = K` label takes only a run whose `require`
-/// names `K` with the node's own value (a replica has no `require`, so it never lands there). It
-/// reads `/nodes/<node>` at the head the transaction commits over, so a relabel that raced the
-/// placement is the compare's to refuse, not a violation; an assignment already held when its node
-/// is registered again with other labels is not judged again (a placement is judged when made).
-fn tenancy_problem(ctx: *const Context, request: store.TxnRequest, tally: *Tally) Found {
-    for (request.on_success) |op| {
-        const put = switch (op) {
-            .put => |put| put,
-            .delete => continue,
-        };
-        if (!std.mem.startsWith(u8, put.key, records.prefix_assigned)) continue;
-        const rest = put.key[records.prefix_assigned.len..];
-        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
-        const existing = ctx.store.get(ctx.arena, put.key, null, ctx.diag) catch {
-            ctx.diag.reset();
-            return "P1: an assignment cannot be read";
-        };
-        if (existing.kv != null) continue;
-        const assigned = std.json.parseFromSliceLeaky(records.Assigned, ctx.arena, put.value, .{
-            .ignore_unknown_fields = true,
-        }) catch return "P1: an assignment cannot be decoded";
-        const node_at = records.node_key(rest[0..slash]);
-        const node_got = ctx.store.get(ctx.arena, node_at.slice(), null, ctx.diag) catch {
-            ctx.diag.reset();
-            return "P1: a node cannot be read";
-        };
-        const node_kv = node_got.kv orelse continue; // I7's to say.
-        const node = records.read(records.Node, ctx.arena, node_kv, ctx.diag) catch {
-            ctx.diag.reset();
-            return "P1: a node cannot be decoded";
-        };
-        var require: []const records.Pair = &.{};
-        if (assigned.job) |name| {
-            const run_at = records.job_run_key(name);
-            const run_got = ctx.store.get(ctx.arena, run_at.slice(), null, ctx.diag) catch {
-                ctx.diag.reset();
-                return "P1: a run cannot be read";
-            };
-            const run_kv = run_got.kv orelse continue; // J5's to say.
-            const run = records.read(records.JobRun, ctx.arena, run_kv, ctx.diag) catch {
-                ctx.diag.reset();
-                return "P1: a run cannot be decoded";
-            };
-            if (run.placement) |placement| require = placement.require;
-        }
-        tally.tenancy_judged += 1;
-        if (tenancy_refused(node.labels, require)) |found| return found;
-    }
-    return null;
-}
-
-/// The sentence for why a node with `labels` may not take a placement that requires `require`.
-fn tenancy_refused(labels: []const []const u8, require: []const records.Pair) Found {
-    for (require) |pair| {
-        const own = records.node_label_value(labels, pair[0]) orelse
-            return "P1: a placement onto a node that lacks a label the job requires";
-        if (!std.mem.eql(u8, own, pair[1])) {
-            return "P1: a placement onto a node whose label differs from the job's require";
-        }
-    }
-    for (labels) |label| {
-        const at = std.mem.indexOfScalar(u8, label, '=') orelse continue;
-        if (!std.mem.eql(u8, label[0..at], records.exclusive_label)) continue;
-        const key = label[at + 1 ..];
-        const own = records.node_label_value(labels, key) orelse
-            return "P1: a placement onto a node exclusive to a key it does not carry";
-        var named = false;
-        for (require) |pair| {
-            if (std.mem.eql(u8, pair[0], key) and std.mem.eql(u8, pair[1], own)) named = true;
-        }
-        if (!named) return "P1: a placement onto a node exclusive to a tenant the job is not of";
-    }
-    return null;
 }
 
 /// The key whose compare guards a write: an agent's put under `/observed/<node>/` rests on the

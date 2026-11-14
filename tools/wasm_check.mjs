@@ -83,7 +83,9 @@ if (simSwarm) {
 
 if (simCluster) {
   // Same contract as --sim: the native report arrives as a file; the two must be equal byte for byte.
-  const [wasmPath, seedText, operationsText, nodesText, livenessText, profileText, nativePath] = process.argv.slice(3);
+  // An optional last argument names the worlds: `strong`, `tenants` or `strong,tenants`.
+  const [wasmPath, seedText, operationsText, nodesText, livenessText, profileText, nativePath, worldsText = ""] = process.argv.slice(3);
+  const worlds = worldsText.split(",");
   const exports = await instantiate(readFileSync(wasmPath));
   const started = Date.now();
   const failed = exports.zcube_sim_cluster_shaped(
@@ -95,6 +97,7 @@ if (simCluster) {
     profileIndex(CLUSTER_PROFILES, profileText),
     0,
     0,
+    (worlds.includes("strong") ? 1 : 0) | (worlds.includes("tenants") ? 2 : 0),
   );
   const label = simC1 ? "sim-c1" : "sim-cluster";
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
@@ -107,7 +110,7 @@ if (simCluster) {
     console.error(wasmText);
     process.exit(1);
   }
-  console.log(`${label}: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}; wasm ${seconds} s)`);
+  console.log(`${label}: seed ${seedText}: native and wasm agree byte for byte (${wasmText.length} bytes; ${operationsText} operations, nodes ${nodesText === "0" ? "by seed" : nodesText}, liveness ${livenessText}${worldsText === "" ? "" : ", " + worldsText}; wasm ${seconds} s)`);
   process.exit(0);
 }
 

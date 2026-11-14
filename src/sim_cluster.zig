@@ -52,6 +52,7 @@ const sim_clock = @import("sim_clock.zig");
 const sim_net = @import("sim_net.zig");
 const sim_node = @import("sim_node.zig");
 const sim_store = @import("sim_store.zig");
+const sim_tenancy = @import("sim_tenancy.zig");
 const sim_tap = @import("sim_tap.zig");
 const sim_world = @import("sim_world.zig");
 const job_api = @import("job_api.zig");
@@ -413,6 +414,8 @@ const Node = struct {
     /// configured with. A restart may change it; the node registers it again when its lease
     /// ends, which is a new tenure.
     label_set: u8 = 0,
+    /// B6: the agent was stopped by `relabel_node`, and comes back with another label set.
+    relabel_pending: bool = false,
     /// The agent does nothing before this true time (a call in progress, a back-off).
     resume_ms: u64,
     /// How long the calls of the step in progress took.
@@ -476,6 +479,20 @@ const Node = struct {
         return if (node.index % 2 == 0) draw % 2 else draw;
     }
 
+    /// A label set other than the node's own (`relabel_node`): even-index nodes have one other
+    /// to take, the others three. Drawn from the label generator only.
+    fn relabel_other(node: *Node) void {
+        const before = node.label_set;
+        for (0..tenant_sets.len * 4) |_| {
+            node.label_set = node.draw_label_set();
+            if (node.label_set != before) break;
+        } else {
+            node.label_set = before ^ 1; // Another set of the same exclusiveness.
+        }
+        assert(node.label_set != before);
+        node.cluster.relabels += 1;
+    }
+
     /// The network as the agent sees it, with the time its calls take added up.
     fn transport(node: *Node) agent_client.Transport {
         return .{ .context = node, .call_fn = tapped_call };
@@ -520,13 +537,18 @@ const Node = struct {
             node.sim.containers.wipe();
             node.cluster.stats.wipes += 1;
         }
-        // B6: half the restarts of the strong world come back configured with other labels (its
-        // own generator: no other draw moves). The registration, and with it the labels, changes
-        // only when the lease ends (a host crash fences, a long cut expires it); until then
-        // the server holds the old ones, which P1 reads at each placement.
-        if (node.cluster.tenants and node.cluster.label_prng.random().boolean()) {
+        // B6: half the restarts of the tenant world draw the node's labels again (its own
+        // generator: no other draw moves), and some of those draws differ. The registration, and
+        // with it the labels, changes only when the lease ends (a host crash fences, a long cut
+        // expires it); then the replica and job controllers move off what the new labels refuse
+        // (P1, `sim_tenancy`).
+        if (node.relabel_pending) {
+            node.relabel_pending = false;
+            node.relabel_other();
+        } else if (node.cluster.tenants and node.cluster.label_prng.random().boolean()) {
+            const before = node.label_set;
             node.label_set = node.draw_label_set();
-            node.cluster.relabels += 1;
+            if (node.label_set != before) node.cluster.relabels += 1;
         }
         node.sim.restart();
         node.agent.init(node.config());
@@ -749,6 +771,8 @@ pub const Stats = struct {
     agent_failures: u32 = 0,
     transactions: u32 = 0,
     crashes_injected: u32 = 0,
+    /// B6: agents an operator restarted with other labels (`relabel_node`).
+    relabel_restarts: u32 = 0,
     /// Host crashes that also lost the disk (`Options.strong` only; no draw).
     wipes: u32 = 0,
     /// Calls refused because the agent that made them had crashed.
@@ -886,8 +910,10 @@ pub const Cluster = struct {
     /// B6: draws the nodes' tenant labels (`Options.tenants` only), apart from `prng` so that no
     /// other draw of a run moves.
     label_prng: std.Random.DefaultPrng,
-    /// Restarts that came back with other labels.
+    /// Restarts that came back with other labels (a draw of the same set is not counted).
     relabels: u32,
+    /// B6's P1 judge (`sim_tenancy`): registrations, refused holds, its verdict.
+    tenancy: sim_tenancy.Tenancy,
     job_next: u32,
     /// The reuse world (B2.1 slice 4): retention run by a jump of time, so that a name is reused
     /// while a container of its earlier incarnation still stands. Its counters: jumps made,
@@ -985,6 +1011,7 @@ pub const Cluster = struct {
         c.tenants = requested or c1_teeth.tenant_world;
         c.label_prng = .init(seed ^ 0xb6b6_7e1a_9d03);
         c.relabels = 0;
+        c.tenancy = .{};
     }
 
     /// The reuse world's cursor and counters start empty.
@@ -1122,6 +1149,15 @@ pub const Cluster = struct {
         return instance;
     }
 
+    fn node_names(c: *const Cluster) NodeNames {
+        var names: NodeNames = .{ .count = @intCast(c.nodes.len) };
+        for (c.nodes, 0..) |node, i| {
+            names.names[i] = node.name();
+            names.sets[i] = node.label_set;
+        }
+        return names;
+    }
+
     pub fn store_handle(c: *Cluster) store.Store {
         return c.switched.interface();
     }
@@ -1248,6 +1284,7 @@ pub const Cluster = struct {
             c.check_ms += slice;
             if (c.check_ms >= check_interval_ms) {
                 c.check_ms = 0;
+                track_tenancy(c) catch return;
                 safety(c) catch return; // The report says what failed.
             }
         }
@@ -1545,6 +1582,23 @@ pub const Cluster = struct {
         }
     }
 
+    /// B6, the tenant world under faults only: before one operation in eight (the label
+    /// generator draws it), an operator configures one node's agent with other labels and
+    /// restarts it. Its containers keep running and it registers again within its lease, so
+    /// what it holds may now be refused by its own labels: the replica and job controllers must
+    /// move that off (P1, `sim_tenancy`). Runs without tenants draw nothing here.
+    fn relabel_node(c: *Cluster) void {
+        assert(c.tenants);
+        const random = c.label_prng.random();
+        if (random.uintLessThan(u32, 8) != 0) return;
+        const node = c.nodes[random.uintLessThan(usize, c.nodes.len)];
+        if (node.down or node.sim.crashed) return;
+        c.stats.relabel_restarts += 1;
+        node.relabel_pending = true;
+        node.sim.crash_now(.process);
+        node.check_crashed();
+    }
+
     fn create_job(c: *Cluster) void {
         _ = c.create_job_as(c.job_next);
     }
@@ -1641,7 +1695,7 @@ pub const Cluster = struct {
         var require_buffer: [1]records.Pair = undefined;
         var placement: ?job_api.PlacementInput = null;
         if (c.tenants) {
-            if (job_tenant(number)) |tenant| {
+            if (sim_tenancy.job_tenant(number)) |tenant| {
                 require_buffer[0] = .{ "tenant", tenant };
                 placement = .{ .require = &require_buffer };
             }
@@ -1772,37 +1826,14 @@ pub const Cluster = struct {
     }
 };
 
-/// The label sets a node of the strong world may carry (B6): tenant `a` or `b`, each exclusive to
-/// its tenant or not. Two of the four are exclusive.
-const tenant_sets = [_][]const []const u8{
-    &.{"tenant=a"},
-    &.{"tenant=b"},
-    &.{ "tenant=a", "exclusive=tenant" },
-    &.{ "tenant=b", "exclusive=tenant" },
-};
-
-/// The tenant job number `n` of the strong world requires (no draw): every fourth names none (it
-/// may use only a node that is not exclusive), most name `a` or `b`, and every eleventh names a
-/// tenant no node carries (it stays pending and ends `not_started`).
-fn job_tenant(n: u32) ?[]const u8 {
-    if (n % 11 == 4) return "c";
-    return switch (n % 4) {
-        0 => null,
-        1, 3 => "a",
-        else => "b",
-    };
-}
+const tenant_sets = sim_tenancy.tenant_sets;
 
 /// Whether the `strong` world's job number `n` names the relay (every third; no draw).
 fn job_relayed(n: u32) bool {
     return n % 3 == 1;
 }
 
-/// The job number of a name made by `create_job` ("jb-N"); null for any other name.
-fn job_number(name: []const u8) ?u32 {
-    if (!std.mem.startsWith(u8, name, "jb-")) return null;
-    return std.fmt.parseInt(u32, name["jb-".len..], 10) catch null;
-}
+const job_number = sim_tenancy.job_number;
 
 /// The job a container belongs to, from its label; null for a replica's container.
 fn job_of(container: anytype) ?[]const u8 {
@@ -1871,6 +1902,7 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
             sim_jobs_watch.note_commit(&c.jobs_watch, txn, revision, c.tap_arena.allocator());
         }
     }
+    note_tenancy(c, &ctx, request);
     if (c.c1_violation != null) return;
     if (request != null) {
         if (c.c1_pending) |found| {
@@ -1905,6 +1937,64 @@ fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
         .diag = &c.tap_diag,
     };
     c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally);
+    if (c.tenants and c.c1_pending == null) {
+        const names = c.node_names();
+        c.c1_pending = sim_tenancy.placed_problem(&c.tenancy, &ctx, names.slice(), request);
+    }
+}
+
+/// The names of the simulated nodes, and the label set each one's agent runs with (B6).
+const NodeNames = struct {
+    names: [nodes_max][]const u8 = undefined,
+    sets: [nodes_max]u8 = undefined,
+    count: u32 = 0,
+
+    fn slice(n: *const NodeNames) []const []const u8 {
+        return n.names[0..n.count];
+    }
+};
+
+/// P1 (B6): a revision that touched `/nodes/` (or a lease expiry) may be a registration; the judge
+/// records which set each tenure registered with and checks the stored labels against it.
+fn note_tenancy(c: *Cluster, ctx: *const controller.Context, request: ?store.TxnRequest) void {
+    if (!c.tenants) return;
+    if (request) |txn| {
+        var touched = false;
+        for (txn.on_success) |op| {
+            const key = switch (op) {
+                .put => |put| put.key,
+                .delete => |key| key,
+            };
+            if (std.mem.startsWith(u8, key, records.prefix_nodes)) touched = true;
+        }
+        if (!touched) return;
+    }
+    const names = c.node_names();
+    sim_tenancy.note_registrations(&c.tenancy, ctx, names.slice(), names.sets[0..names.count]);
+}
+
+/// P1b (B6), once a second while the store is healthy: refused holds are acted on in time.
+fn track_tenancy(c: *Cluster) Failure!void {
+    if (!c.tenants or !c.c1) return;
+    try check(c, c.tenancy.violation == null, c.tenancy.violation orelse "");
+    if (store_faulty(c)) {
+        c.store_healthy_since_ms = c.manual.ms; // As `track_jobs` keeps it.
+        return;
+    }
+    var scratch = std.heap.ArenaAllocator.init(c.gpa);
+    defer scratch.deinit();
+    c.diag.reset();
+    const ctx: controller.Context = .{
+        .store = c.tap.inner,
+        .clock = c.manual.clock(),
+        .arena = scratch.allocator(),
+        .diag = &c.diag,
+    };
+    const names = c.node_names();
+    const now = c.manual.ms;
+    const healthy = c.store_healthy_since_ms;
+    const found = sim_tenancy.scan(&c.tenancy, &ctx, names.slice(), now, healthy, false);
+    try check(c, found == null, found orelse "");
 }
 
 /// The injection of the two negative tests (compare skipped): just ahead of the scheduler's
@@ -2167,6 +2257,7 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
 }
 
 fn operation(c: *Cluster) void {
+    if (c.tenants and c.fault_totals == null) c.relabel_node();
     const random = c.prng.random();
     const name = service_names[random.uintLessThan(u32, service_names.len)];
     switch (pick_op(&c.swarm, random, c.fault_totals == null)) {
@@ -2991,6 +3082,16 @@ fn converged(c: *Cluster) Failure!void {
     try no_strays(c, &ctx, &homes);
     if (c.jobs_on) try jobs_converged(c, &ctx);
     if (c.jobs_on) try start_records_retired(c, &ctx);
+    if (c.tenants and c.c1) try tenancy_at_rest(c, &ctx);
+}
+
+/// P1 at rest (B6): no node holds an assignment its registered labels refuse.
+fn tenancy_at_rest(c: *Cluster, ctx: *const controller.Context) Failure!void {
+    try check(c, c.tenancy.violation == null, c.tenancy.violation orelse "");
+    const names = c.node_names();
+    const now = c.manual.ms;
+    const found = sim_tenancy.scan(&c.tenancy, ctx, names.slice(), now, now, true);
+    try check(c, found == null, found orelse "");
 }
 
 /// Every container alive on any node is the container of a replica placed on that node.
@@ -3529,8 +3630,11 @@ fn print_jobs(c: *Cluster) void {
         });
     }
     if (c.tenants) {
-        c.report.print("jobs: tenants relabels={d} placements judged={d}\n", .{
-            c.relabels, c.c1_tally.tenancy_judged,
+        c.report.print("jobs: tenants relabels={d} (operator restarts {d}) P1 placements " ++
+            "judged={d} refused holds={d} acted worst={d} ms\n", .{
+            c.relabels,                  c.stats.relabel_restarts,
+            c.tenancy.placements_judged, c.tenancy.refused_seen,
+            c.tenancy.acted_worst_ms,
         });
     }
     if (c.strong) {

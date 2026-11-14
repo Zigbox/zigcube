@@ -118,8 +118,9 @@ export fn zcube_sim_c1(seed: u64, operations: u32, nodes: u32) u32 {
 
 /// The cluster simulation with the knobs of the command line: `operations` 0 draws the whole shape
 /// from the seed (`sim_cluster.plan`), `profile` is a `sim_shape.ClusterProfile` index or
-/// `profile_auto`, and 0 for `nodes`, `lease_ttl_ms` or `replicas_pct` leaves it unset. The report
-/// is what the native runner prints for the same arguments.
+/// `profile_auto`, and 0 for `nodes`, `lease_ttl_ms` or `replicas_pct` leaves it unset. `worlds`
+/// is `--strong` (bit 0) and `--tenants` (bit 1). The report is what the native runner prints for
+/// the same arguments.
 export fn zcube_sim_cluster_shaped(
     seed: u64,
     operations: u32,
@@ -129,11 +130,14 @@ export fn zcube_sim_cluster_shaped(
     profile: u32,
     lease_ttl_ms: u32,
     replicas_pct: u32,
+    worlds: u32,
 ) u32 {
     const requested: sim_cluster.Options = .{
         .nodes = if (nodes == 0) null else nodes,
         .liveness = liveness != 0,
         .c1 = c1 != 0,
+        .strong = worlds & 1 != 0,
+        .tenants = worlds & 2 != 0,
         .profile_auto = profile == profile_auto,
         .profile = if (profile == profile_auto)
             .mixed
