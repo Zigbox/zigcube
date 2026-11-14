@@ -925,6 +925,20 @@ test "browser path: each near miss is refused, the cluster CA's certificates inc
     try std.testing.expectEqual(@as(u32, 0), failures);
 }
 
+test "browser path: a browser with no certificate is told of the browser CA, not the cluster's" {
+    // Goal: ZC-E0814 names the CA of the path the client is on. Method: the same empty
+    // Certificate on each path; only the browser path's cause names the browser CA.
+    var rig: Rig = undefined;
+    try rig.setup_browser(.{ .chain = .none, .verify = .omit });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0814);
+    try std.testing.expect(std.mem.indexOf(u8, rig.diag.last_cause().?, "browser CA") != null);
+    try rig.setup(.{ .chain = .none, .verify = .omit });
+    try std.testing.expectError(error.Refused, rig.handshake(4096));
+    try rig.expect_code(.E0814);
+    try std.testing.expect(std.mem.indexOf(u8, rig.diag.last_cause().?, "browser") == null);
+}
+
 test "cross path: a browser client certificate is refused on the Ed25519 path" {
     var rig: Rig = undefined;
     try rig.setup_server_kinds(.initMany(&.{ .node, .client }));

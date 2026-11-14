@@ -5,7 +5,8 @@
 //! the cluster CA never signs a P-256 key: the two profiles' parsers refuse each other's
 //! algorithm, so a certificate cannot cross paths (`x509_p256.zig`).
 //!
-//! Shell code. `<stem>-browser.key` (the P-256 secret scalar as 64 hex digits, mode 0600) sits
+//! Shell code. `<stem>-browser.key` (a 32-byte seed as 64 hex digits, mode 0600; the P-256
+//! scalar is derived from it by `generateDeterministic`, an HMAC-DRBG over the seed) sits
 //! beside the cluster key `<stem>.key`, and `<stem>-browser.crt` (PEM) is its certificate, which a
 //! browser's user imports as a trusted root. A missing key is made when the server starts: no
 //! browser certificate can exist without it, so a new one locks nobody out who was not already
@@ -66,6 +67,7 @@ pub fn open(
     state_dir: ?[]const u8,
     key_name: []const u8,
     absent: Absent,
+    quiet: bool,
     diag: *Diag,
 ) Error!KeyPair {
     assert(diag.code == null);
@@ -84,7 +86,7 @@ pub fn open(
     const key = try load_or_make(io, dir, path, name, absent, diag);
     var cert_buffer: [name_bytes_max]u8 = undefined;
     const cert_name = cert_name_for(key_name, &cert_buffer);
-    try ensure_certificate(io, ca, key, dir, path, cert_name, diag);
+    try ensure_certificate(io, ca, key, dir, path, cert_name, quiet, diag);
     return key;
 }
 
@@ -115,19 +117,28 @@ fn load_or_make(
     return key;
 }
 
-/// A fresh key; its seed is left in `seed` for the caller to write.
+/// A fresh key; its seed is left in `seed` for the caller to write. `generateDeterministic`
+/// derives the scalar from the seed by HMAC-DRBG, retrying inside until it is below n, and fails
+/// only on a zero scalar (about 2^-256); a seed that does so is replaced by a new draw, at most
+/// `x509_p256_key_attempts_max` times, and then the random source is reported broken (ZC-E0821).
 pub fn make_key(io: std.Io, seed: *[32]u8, diag: *Diag) Error!KeyPair {
-    // A seed outside the scalar field (about 2^-32) or zero is refused; draw another.
-    while (true) {
+    comptime assert(constants.x509_p256_key_attempts_max > 1);
+    var attempt: u32 = 0;
+    while (attempt < constants.x509_p256_key_attempts_max) : (attempt += 1) {
         secure_random.fill(io, seed, diag, "the browser CA key") catch |err| return switch (err) {
             error.Unavailable => error.Failed,
             error.Canceled => error.Canceled,
         };
         return Ecdsa.KeyPair.generateDeterministic(seed.*) catch continue;
     }
+    assert(attempt == constants.x509_p256_key_attempts_max);
+    secure_random.raise(diag, "a P-256 key: every seed it gave derived a zero scalar");
+    return error.Failed;
 }
 
-/// Writes the CA certificate unless the file already holds this key's, valid a month ahead.
+/// Writes the CA certificate unless the file already holds this key's, valid a month ahead. A
+/// file that is replaced (near its end, or another key's) is said on stderr unless `quiet`:
+/// every browser that trusts the old one must import the new one as a root.
 fn ensure_certificate(
     io: std.Io,
     ca: *const peer_ca.Ca,
@@ -135,6 +146,7 @@ fn ensure_certificate(
     dir: std.Io.Dir,
     path: []const u8,
     name: []const u8,
+    quiet: bool,
     diag: *Diag,
 ) Error!void {
     var text: [pem_mod.bytes_max]u8 = undefined;
@@ -158,7 +170,20 @@ fn ensure_certificate(
     };
     p256.issue_ca(&certificate, key, lifetime) catch unreachable; // A CA's own fixed fields.
     const pem = pem_mod.encode(&text, .certificate, certificate.slice());
-    return files.write(io, dir, path, name, pem, 0o600, diag);
+    try files.write(io, dir, path, name, pem, 0o600, diag);
+    if (found == .bytes and !quiet) say_remade(io, path, name);
+}
+
+/// One line on stderr: the browser CA certificate was made again, so browsers re-import it.
+fn say_remade(io: std.Io, path: []const u8, name: []const u8) void {
+    assert(path.len > 0);
+    assert(name.len > 0);
+    var line: [constants.state_path_bytes_max + 256]u8 = undefined;
+    const text = std.fmt.bufPrint(&line, "zcube-server: made the browser CA certificate {s} " ++
+        "in {s} again (it ended within 30 days or named another key); import it again as a " ++
+        "trusted root in every browser that opens the console\n", .{ name, path }) catch
+        return; // A path this long is printed by nothing else either.
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {}; // Nowhere else.
 }
 
 /// What a server certificate on the browser path names: `--tls-name`, then each `--tls-san`.

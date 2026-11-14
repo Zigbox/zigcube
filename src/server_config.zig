@@ -148,7 +148,8 @@ pub const Issue = struct {
 };
 
 pub const Scope = @import("x509.zig").Scope;
-pub const San = @import("x509_p256.zig").San;
+const p256 = @import("x509_p256.zig");
+pub const San = p256.San;
 
 /// One relay: the name a job gives and the `host:port` the node agent connects to for it.
 pub const Relay = @import("records.zig").JobRelay;
@@ -186,6 +187,8 @@ const Flags = struct {
     listen: ?[]const u8 = null,
     insecure_listen: ?[]const u8 = null,
     tls_name: ?[]const u8 = null,
+    /// Every `--tls-san`, parsed, in order (a flag only, not a key of the file).
+    tls_sans: []const San = &.{},
     store: ?[]const u8 = null,
     create_store: bool = false,
     lease_ttl_ms: ?u32 = null,
@@ -204,28 +207,34 @@ pub const Error = error{ BadConfig, OutOfMemory };
 /// Strings in the result live in `arena`.
 pub fn load(arena: Allocator, io: std.Io, args: []const []const u8, diag: *Diag) Error!Command {
     if (args.len > 0 and std.mem.eql(u8, args[0], "ca")) return load_ca(arena, io, args, diag);
-    const flags = try parse_flags(args, diag);
+    const flags = try parse_flags(arena, args, diag);
     if (flags.version) return .version;
     if (flags.help) return .help;
     var file: File = .{};
     if (flags.config) |path| file = try read_file(arena, io, path, diag);
     var config = try merge(flags, file, diag);
-    config.tls_sans = try sans_of(arena, args, diag);
+    config.tls_sans = try sans_valid(&config, flags.tls_sans, diag);
     return .{ .run = config };
 }
 
-/// Every `--tls-san` value in `args`, in order (`parse_flags` has checked each has one): an IP
-/// address (its 4 or 16 bytes) or a DNS name (ZC-E0106 otherwise). The list is in `arena`.
-fn sans_of(arena: Allocator, args: []const []const u8, diag: *Diag) Error![]const San {
-    var sans: std.ArrayList(San) = .empty;
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        if (!std.mem.eql(u8, args[index], "--tls-san")) continue;
-        index += 1;
-        assert(index < args.len);
-        try sans.append(arena, try san_of(arena, args[index], diag));
+/// `sans` when the TLS listener serves them and they fit the browser path's certificate beside
+/// `--tls-name`, whatever key signs it (`x509_p256.server_names_bytes_max`, derived from
+/// `x509_cert_bytes_max`); ZC-E0106 otherwise, so the server never starts to fail at issuing.
+fn sans_valid(config: *const Config, sans: []const San, diag: *Diag) Error![]const San {
+    if (sans.len == 0) return sans;
+    if (config.listen == null) {
+        return bad(diag, "--tls-san names the browser certificate of the TLS listener, and " ++
+            "there is no --listen", .{}, "add --listen, or leave out --tls-san");
     }
-    return sans.items;
+    const used = p256.server_names_bytes(config.tls_name, sans);
+    const fit = p256.server_names_bytes_max(config.tls_name);
+    assert(fit < constants.x509_cert_bytes_max);
+    if (used > fit) {
+        return bad(diag, "--tls-name and the {d} --tls-san names take {d} bytes of the browser " ++
+            "certificate; at most {d} bytes of names fit", .{ sans.len, used, fit }, "drop " ++
+            "some --tls-san names (each takes its length plus 2 bytes)");
+    }
+    return sans;
 }
 
 fn san_of(arena: Allocator, text: []const u8, diag: *Diag) Error!San {
@@ -335,7 +344,7 @@ fn subject_of(node: bool, scope: ?Scope, diag: *Diag) Error!Issue.Subject {
 
 /// The store settings of a run, read as the server reads them, without the ones that make a CA.
 fn issue_config(arena: Allocator, io: std.Io, rest: []const []const u8, diag: *Diag) Error!Config {
-    const flags = try parse_flags(rest, diag);
+    const flags = try parse_flags(arena, rest, diag);
     if (flags.version) {
         return bad(diag, "--version is not a setting of ca", .{}, "run zcube-server --version");
     }
@@ -400,8 +409,11 @@ fn lease_ttl_of(given: ?u32, diag: *Diag) Error!u32 {
 
 // ---- Flags -------------------------------------------------------------------------------------
 
-pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
+/// The flags as typed; `--tls-san` values are parsed (ZC-E0106 for one that is neither a DNS name
+/// nor an IP address) into a list in `arena`.
+pub fn parse_flags(arena: Allocator, args: []const []const u8, diag: *Diag) Error!Flags {
     var flags: Flags = .{};
+    var sans: std.ArrayList(San) = .empty;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -430,7 +442,7 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
         } else if (std.mem.eql(u8, arg, "--tls-name")) {
             flags.tls_name = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--tls-san")) {
-            _ = try value_of(args, &index, diag); // Read again, in order, by `sans_of`.
+            try sans.append(arena, try san_of(arena, try value_of(args, &index, diag), diag));
         } else if (std.mem.eql(u8, arg, "--store")) {
             flags.store = try value_of(args, &index, diag);
         } else if (std.mem.eql(u8, arg, "--lease-ttl-ms")) {
@@ -444,6 +456,8 @@ pub fn parse_flags(args: []const []const u8, diag: *Diag) Error!Flags {
             return bad(diag, problem, .{arg}, "run it with --help");
         }
     }
+    flags.tls_sans = sans.items;
+    assert(flags.tls_sans.len <= args.len / 2);
     return flags;
 }
 
@@ -820,7 +834,7 @@ test "flags win over the file, unknown flags and settings are refused" {
     const source = ".{ .listen = \"10.0.0.1:1\", .store = \"sqlite:/a\", .create_store = true }";
     const file = try parse_zon(arena, source, "server.zon", &diag);
     const typed = [_][]const u8{ "--listen", "127.0.0.1:9", "--store", "memory", "-v" };
-    const flags = try parse_flags(&typed, &diag);
+    const flags = try parse_flags(arena, &typed, &diag);
     const config = try merge(flags, file, &diag);
     try testing.expectEqual(@as(u16, 9), config.listen.?.getPort());
     try testing.expect(config.store == .memory);
@@ -828,9 +842,9 @@ test "flags win over the file, unknown flags and settings are refused" {
     try testing.expect(config.verbose);
 
     diag.reset();
-    try expect_bad(parse_flags(&.{"--bogus"}, &diag), &diag);
+    try expect_bad(parse_flags(arena, &.{"--bogus"}, &diag), &diag);
     diag.reset();
-    try expect_bad(parse_flags(&.{"--listen"}, &diag), &diag);
+    try expect_bad(parse_flags(arena, &.{"--listen"}, &diag), &diag);
     diag.reset();
     try expect_bad(parse_zon(arena, ".{ .listn = \"x\" }", "server.zon", &diag), &diag);
     diag.reset();
@@ -960,7 +974,7 @@ test "the lost grace is a flag, a file setting, and refused over an hour" {
     var diag: Diag = undefined;
     diag.reset();
     try testing.expectEqual(constants.lost_grace_ms, (try merge(.{}, .{}, &diag)).lost_grace_ms);
-    const flags = try parse_flags(&.{ "--lost-grace-ms", "30000" }, &diag);
+    const flags = try parse_flags(testing.allocator, &.{ "--lost-grace-ms", "30000" }, &diag);
     const both = try merge(flags, .{ .lost_grace_ms = 5 }, &diag);
     try testing.expectEqual(@as(u32, 30000), both.lost_grace_ms);
     const at_limit = try merge(.{ .lost_grace_ms = constants.lost_grace_ms_max }, .{}, &diag);
@@ -1062,4 +1076,40 @@ test "--tls-san is repeatable, in order, a DNS name or an IP address (B7 slice 6
     }
     diag.reset();
     try expect_bad(load(arena, testing.io, &.{"--tls-san"}, &diag), &diag);
+}
+
+test "--tls-san is refused without --listen, and past what the certificate holds (B7 slice 6)" {
+    // Goal: names the browser certificate cannot carry, or that no listener serves, are refused
+    // at config time with ZC-E0106 and say why. Method: --insecure-listen alone; then 64-byte
+    // names added one at a time until they no longer fit, which must happen, with the count of
+    // bytes that fit in the cause.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diag = undefined;
+    diag.reset();
+    const alone = [_][]const u8{ "--insecure-listen", "127.0.0.1:9", "--tls-san", "localhost" };
+    try expect_bad(load(arena, testing.io, &alone, &diag), &diag);
+    try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, "no --listen") != null);
+    var long: [constants.x509_dns_name_bytes_max]u8 = @splat('a'); // The longest a name may be.
+    long[long.len - 2] = '.';
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(arena, &.{ "--listen", "127.0.0.1:9" });
+    const fit = p256.server_names_bytes_max(tls_name_default);
+    var count: u32 = 0;
+    while (count < constants.x509_cert_bytes_max / long.len) : (count += 1) {
+        try args.appendSlice(arena, &.{ "--tls-san", &long });
+        diag.reset();
+        const used = 2 + tls_name_default.len + (count + 1) * (2 + long.len);
+        if (used <= fit) {
+            const command = try load(arena, testing.io, args.items, &diag);
+            try testing.expectEqual(@as(usize, count + 1), command.run.tls_sans.len);
+            continue;
+        }
+        try expect_bad(load(arena, testing.io, args.items, &diag), &diag);
+        var text: [32]u8 = undefined;
+        const at_most = try std.fmt.bufPrint(&text, "at most {d} bytes", .{fit});
+        try testing.expect(std.mem.indexOf(u8, diag.last_cause().?, at_most) != null);
+        break;
+    } else return error.TestUnexpectedResult; // The names never stopped fitting.
 }

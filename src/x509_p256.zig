@@ -470,6 +470,67 @@ pub fn issue_server(out: *Der, ca: KeyPair, request: *const ServerRequest) Error
     try write_certificate(out, &tbs, .{ .key = ca });
 }
 
+/// The bytes the names of a server certificate take (each GeneralName's tag, length and
+/// content: `dns_name`, then each of `sans`), as `server_names_bytes_max` counts them. Each name
+/// is at most `x509_dns_name_bytes_max` or 16 bytes, so its length is one byte.
+pub fn server_names_bytes(dns_name: []const u8, sans: []const San) u32 {
+    comptime assert(constants.x509_dns_name_bytes_max < 128);
+    assert(dns_name.len <= constants.x509_dns_name_bytes_max);
+    var total: u32 = 2 + @as(u32, @intCast(dns_name.len));
+    for (sans) |san| {
+        const content = switch (san) {
+            .dns => |name| name,
+            .ip => |address| address,
+        };
+        assert(content.len <= constants.x509_dns_name_bytes_max);
+        total += 2 + @as(u32, @intCast(content.len));
+    }
+    return total;
+}
+
+/// The most bytes of names (`server_names_bytes`) a server certificate for `dns_name` holds
+/// within `x509_cert_bytes_max`, whichever key signs it: measured with the longest DER
+/// signature, the longest times and filler names, by bisection. Pure; for refusing `--tls-san`
+/// names at config time rather than at the server's start.
+pub fn server_names_bytes_max(dns_name: []const u8) u32 {
+    assert(dns_name.len > 0);
+    assert(dns_name.len <= constants.x509_dns_name_bytes_max);
+    var fits: u32 = 2 + @as(u32, @intCast(dns_name.len)); // Always fits: `--tls-name` alone.
+    assert(server_names_fit(dns_name, fits));
+    var too_many: u32 = constants.x509_cert_bytes_max; // Never fits: the rest takes some bytes.
+    assert(!server_names_fit(dns_name, too_many));
+    while (too_many - fits > 1) {
+        const middle = fits + (too_many - fits) / 2;
+        if (server_names_fit(dns_name, middle)) fits = middle else too_many = middle;
+    }
+    return fits;
+}
+
+/// Whether a worst-case server certificate for `dns_name` with `names_bytes` of names fits.
+fn server_names_fit(dns_name: []const u8, names_bytes: u32) bool {
+    assert(names_bytes > 0);
+    assert(names_bytes <= constants.x509_cert_bytes_max);
+    const filler: [constants.x509_cert_bytes_max]u8 = @splat(0x5a);
+    const longest_signature: [signature_der_bytes_max]u8 = @splat(0x5a);
+    const serial: [constants.x509_serial_bytes_max]u8 = @splat(0x5a);
+    const issuer: [ca_cn_bytes]u8 = @splat('a');
+    const year_2100_s: u64 = 4_102_444_800; // GeneralizedTime: the longer encoding.
+    const tbs: Tbs = .{
+        .kind = .server,
+        .serial = &serial,
+        .issuer_cn = &issuer,
+        .subject_cn = dns_name,
+        .not_before_s = year_2100_s,
+        .not_after_s = year_2100_s,
+        .public_key = @splat(0x5a),
+        .names = filler[0..names_bytes],
+        .identity = "",
+    };
+    var out: Der = .{};
+    write_certificate(&out, &tbs, .{ .bytes = &longest_signature }) catch return false;
+    return true;
+}
+
 pub const ClientRequest = struct {
     cluster: []const u8,
     client: []const u8,
@@ -830,4 +891,39 @@ pub fn cluster_kind(kind: Kind) x509.Kind {
         .server => .server,
         .client => .client,
     };
+}
+
+test "server names: the most that fit is exact, and a real certificate at it is issued" {
+    // Goal: `server_names_bytes_max` is the bound `--tls-san` is refused against (B7 slice 6):
+    // one byte more never fits, and names that take exactly that many bytes are issued with a
+    // real key. Method: bisection checked at its edge, then names sized to the bound.
+    const testing = std.testing;
+    const dns_name = "zcube-server";
+    const fit = server_names_bytes_max(dns_name);
+    try testing.expect(server_names_fit(dns_name, fit));
+    try testing.expect(!server_names_fit(dns_name, fit + 1));
+    const letters: [constants.x509_dns_name_bytes_max]u8 = @splat('a');
+    var sans: [constants.x509_cert_bytes_max / 3]San = undefined;
+    var count: u32 = 0;
+    var remaining = fit - server_names_bytes(dns_name, &.{});
+    while (remaining > 2 * (2 + letters.len)) : (count += 1) {
+        sans[count] = .{ .dns = &letters };
+        remaining -= 2 + letters.len;
+    }
+    // Two names share what is left, each at least a byte long.
+    const half = remaining / 2;
+    sans[count] = .{ .dns = letters[0 .. half - 2] };
+    sans[count + 1] = .{ .dns = letters[0 .. remaining - half - 2] };
+    count += 2;
+    try testing.expectEqual(fit, server_names_bytes(dns_name, sans[0..count]));
+    const ca = try Ecdsa.KeyPair.generateDeterministic(@splat(0xB0));
+    const subject = try Ecdsa.KeyPair.generateDeterministic(@splat(0xB1));
+    var out: Der = .{};
+    try issue_server(&out, ca, &.{
+        .dns_name = dns_name,
+        .sans = sans[0..count],
+        .subject_key = point_of(subject),
+        .lifetime = .{ .not_before_ms = 1_800_000_000_000, .not_after_ms = 1_800_003_600_000 },
+    });
+    try testing.expect(out.slice().len <= constants.x509_cert_bytes_max);
 }

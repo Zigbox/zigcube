@@ -247,6 +247,7 @@ pub const Server = struct {
             directory,
             server.ca_name_buffer[0..server.ca_name_length],
             .make,
+            config.quiet,
             diag,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,

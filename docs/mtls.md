@@ -192,8 +192,8 @@ without a `node.crt`, the agent does not start (`ZC-E0806`).
 Browsers offer no Ed25519, so `--listen` has a second path for them, on ECDSA P-256
 (docs/decisions/2026-11-14-b7-slice6-console-over-tls.md, path A):
 
-- **The browser CA.** Each store has a second CA beside the cluster CA: `<stem>-browser.key` (the
-  P-256 scalar, 64 hex digits, mode 0600) and `<stem>-browser.crt` (PEM), next to `ca-<hash>.key`
+- **The browser CA.** Each store has a second CA beside the cluster CA: `<stem>-browser.key` (a
+  32-byte seed, 64 hex digits, mode 0600, from which the P-256 scalar is derived) and `<stem>-browser.crt` (PEM), next to `ca-<hash>.key`
   in the state directory (`server_browser_ca.zig`). The server makes the key at start when it is
   absent; `ca issue-client --p12` never does.
 - **The server's P-256 certificate**, signed by the browser CA, carries `--tls-name` and every

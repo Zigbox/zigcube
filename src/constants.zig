@@ -646,6 +646,9 @@ pub const x509_foreign_key_purposes_max: u32 = 8;
 pub const x509_foreign_ttl_ms_max: u64 = x509_ca_ttl_ms_max;
 /// The cluster part of a SPIFFE ID: a sequence of DNS labels.
 pub const x509_cluster_bytes_max: u32 = 63;
+/// Seeds drawn for one P-256 key before giving up. A seed fails only when the derived scalar is
+/// zero (about 2^-256), so a second failure means the random source is broken.
+pub const x509_p256_key_attempts_max: u32 = 4;
 /// A server leaf's `dNSName`, exact match (no wildcard); it is also the subject CN.
 pub const x509_dns_name_bytes_max: u32 = x509_cn_bytes_max;
 /// `spiffe://<cluster>/service/<name>`.

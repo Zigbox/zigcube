@@ -894,13 +894,27 @@ pub const Server = struct {
         return first_kind(self.client_kinds);
     }
 
+    /// ZC-E0814, naming the CA of the handshake's path: a browser (no Ed25519 offered) needs a
+    /// certificate of the browser CA, which only `ca issue-client --p12` makes.
     fn fail_no_certificate(self: *Server, diag: *Diag) Error {
         diag.raise(.E0814);
-        diag.cause(
-            "the client sent no certificate; this server requires one from the cluster CA",
-            .{},
-        );
-        add_fix(diag, .E0814);
+        switch (self.scheme) {
+            .ed25519 => {
+                diag.cause(
+                    "the client sent no certificate; this server requires one from the cluster CA",
+                    .{},
+                );
+                add_fix(diag, .E0814);
+            },
+            .ecdsa_p256 => {
+                assert(self.browser_enabled);
+                diag.cause("the client (a browser: it offered no Ed25519) sent no certificate; " ++
+                    "this server requires one from the cluster's browser CA", .{});
+                diag.fix(.{ .sentence = "Import a .p12 the browser CA signed into the " ++
+                    "browser: zcube-server ca issue-client NAME --scope admin --p12 FILE " ++
+                    "(docs/mtls.md, \"Browsers\")." });
+            },
+        }
         return self.refuse(diag, .certificate_required);
     }
 

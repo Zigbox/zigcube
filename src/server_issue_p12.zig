@@ -110,7 +110,9 @@ fn open_browser(
     const directory = @import("server.zig").Server.state_path(config.*, diag).?;
     var name_buffer: [server_ca.key_name_bytes_max]u8 = undefined;
     const key_name = try issue_mod.key_name_of(gpa, io, config.store, &name_buffer, diag);
-    return browser_ca.open(io, ca, directory, key_name, .refuse, diag) catch |err| switch (err) {
+    const quiet = false; // `ca issue-client` says on stderr that the root was made again.
+    const opened = browser_ca.open(io, ca, directory, key_name, .refuse, quiet, diag);
+    return opened catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Canceled,
         error.Failed => error.Failed,
@@ -241,7 +243,8 @@ test "ca issue-client --p12 writes a 0600 file once, and refuses a missing CA or
     try testing.expectEqual(Code.E0806, diag.code.?);
     var name_buffer: [server_ca.key_name_bytes_max]u8 = undefined;
     diag.reset();
-    _ = try browser_ca.open(io, &ca, dir, server_ca.key_name_for(null, &name_buffer), .make, &diag);
+    const key_name = server_ca.key_name_for(null, &name_buffer);
+    _ = try browser_ca.open(io, &ca, dir, key_name, .make, true, &diag);
 
     try (try tmp.dir.openFile(io, "pw", .{})).setPermissions(io, .fromMode(0o644));
     try testing.expectError(error.Failed, issue_test(arena, dir, &extra, &diag));
@@ -262,7 +265,9 @@ test "ca issue-client --p12 writes a 0600 file once, and refuses a missing CA or
     try testing.expectEqual(stat.size, (try tmp.dir.statFile(io, "web-1.p12", .{})).size);
 
     try tmp.dir.writeFile(io, .{ .sub_path = server_ca.revoked_file, .data = "web-2\n" });
-    const revoked = [_][]const u8{ "--p12", "web-2.p12", "--password-file", pw };
+    // Under the test's directory, so the check that nothing was written there can fail.
+    const p12_revoked = try std.fs.path.join(arena, &.{ dir, "web-2.p12" });
+    const revoked = [_][]const u8{ "--p12", p12_revoked, "--password-file", pw };
     diag.reset();
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(arena, &.{ "ca", "issue-client", "web-2", "--scope", "admin" });
