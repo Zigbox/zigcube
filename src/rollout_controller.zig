@@ -435,7 +435,10 @@ const Run = struct {
         found: ?*const RolloutEntry,
     ) Error!void {
         const reason = try run.reason_of(service);
-        const state = plan_mod.begin(policy, reason, run.now);
+        // The service ran an earlier generation if a rollback started this, or if old replicas
+        // name one (`from`, 0 for none): a failed first generation owes no rollback.
+        const ran_before = reason == .rollback or seen.old_generation != 0;
+        const state = plan_mod.begin(policy, reason, ran_before, run.now);
         const facts = run.facts_of(service, seen, &state);
         const result = plan_mod.pass(policy, &state, &facts);
         var batch: Batch = .{};
@@ -704,6 +707,7 @@ pub fn state_of(rollout: *const records.Rollout) ?plan_mod.State {
     const state: plan_mod.State = .{
         .phase = rollout.phase,
         .reason = reason,
+        .earlier = reason == .rollback or rollout.from != 0,
         .started_at_ms = rollout.started_at_ms,
         .deadline_at_ms = rollout.deadline_at_ms,
         .evidence_from_ms = evidence_from,
