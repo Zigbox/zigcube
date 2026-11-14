@@ -1,7 +1,7 @@
 //! `sim_fleet`: the simulation fleet's reporter (docs/briefs/c1-9.md, ops/sim-fleet/README.md).
 //!
 //!     sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]
-//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|store-faults]
+//!                      [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]
 //!                      [--dry-run]
 //!                      [--canary RUNNER --canary-seeds A..B [--expect-symptom TEXT[|TEXT...]]]
 //!                      < one run kind's output of a round
@@ -42,7 +42,8 @@ const coverage = @import("sim_fleet_coverage.zig");
 
 const usage_text =
     "usage: sim_fleet ingest --repo OWNER/NAME --commit SHA --state FILE [--token-file FILE]\n" ++
-    "                        [--tracker N] [--kind sim-cluster|sim-c1|sim-swarm|store-faults]\n" ++
+    "                        [--tracker N]\n" ++
+    "                        [--kind sim-cluster|sim-c1|sim-swarm|sim-soak|store-faults]\n" ++
     "                        [--dry-run] [--canary RUNNER --canary-seeds A..B\n" ++
     "                         [--expect-symptom TEXT[|TEXT]]]\n" ++
     "reads one kind's output of a round on stdin: `sim_cluster --seeds A..B <ops> --shrink`\n" ++

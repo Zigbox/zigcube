@@ -161,6 +161,9 @@ pub const Report = struct {
     /// What the run reached (`sim_coverage.zig`), filled at its end, passed or failed; printed
     /// after `world hash` on a pass, so every other line is what it was without it.
     coverage: sim_coverage.Table = .{},
+    /// Operations the run drew, the failing one included: a soak that stopped or failed after
+    /// it replays as a run of exactly this many (`Options.on_epoch`).
+    operations_run: u32 = 0,
 
     pub fn text(report: *const Report) []const u8 {
         assert(report.len <= report_bytes_max);
@@ -889,6 +892,24 @@ pub const Cluster = struct {
     strong: bool,
     /// The host crashes injected so far (the wipe takes every other one, from the first).
     host_crashes: u32,
+    /// The last operations, printed after a failure (`OpTrace`).
+    trace: OpTrace = .{},
+    /// Operations drawn so far, the one running included; the soak's stop point
+    /// (`Options.on_epoch`) and the length of a run that replays this one.
+    operations_done: u32 = 0,
+    on_epoch: ?*const fn (epoch: *const Epoch) bool = null,
+    epoch_operations: u32 = 1000,
+    /// Decisions the last decisions check listed (the soak's history size).
+    decisions_listed: u32 = 0,
+
+    /// The trace and the soak's fields (`OpTrace`, `Options.on_epoch`), as a run starts.
+    fn init_soak(c: *Cluster) void {
+        c.trace = .{};
+        c.operations_done = 0;
+        c.on_epoch = null;
+        c.epoch_operations = 1000;
+        c.decisions_listed = 0;
+    }
 
     pub fn create(
         gpa: Allocator,
@@ -951,6 +972,7 @@ pub const Cluster = struct {
         c.init_reuse();
         c.strong = options.strong or c1_teeth.strong_world;
         c.host_crashes = 0;
+        c.init_soak();
         c.init_c1(gpa);
         c.server = control_plane.ControlPlane.init(c.take_instance());
         c.server.check_i6 = true;
@@ -2093,6 +2115,47 @@ const Op = enum {
 
 const op_count = @typeInfo(Op).@"enum".field_names.len;
 
+/// The last `trace_ops_max` operations of a run, oldest first when printed: what a failure's
+/// report (and the fleet's issue, `src/sim_fleet_issue.zig`) shows of how the world got there
+/// (C3 fleet 7). It draws nothing and is not hashed, so it changes no world.
+pub const trace_ops_max: u32 = 24;
+
+const OpTrace = struct {
+    entries: [trace_ops_max]Entry = undefined,
+    /// Operations added, of which the last `@min(count, trace_ops_max)` are kept.
+    count: u32 = 0,
+
+    const Entry = struct { index: u32, at_ms: u64, op: Op, service: u8 };
+
+    fn add(trace: *OpTrace, index: u32, at_ms: u64, op: Op, service: u32) void {
+        assert(service < service_names.len);
+        trace.entries[trace.count % trace_ops_max] = .{
+            .index = index,
+            .at_ms = at_ms,
+            .op = op,
+            .service = @intCast(service),
+        };
+        trace.count +|= 1;
+    }
+
+    /// `trace: op <index> at <ms> ms: <op> [<service>]`, one line per operation kept. A service
+    /// is named only for the operations that act on one.
+    fn print(trace: *const OpTrace, report: *Report) void {
+        const kept = @min(trace.count, trace_ops_max);
+        for (trace.count - kept..trace.count) |n| {
+            const entry = trace.entries[n % trace_ops_max];
+            const service = switch (entry.op) {
+                .apply, .scale, .delete, .broken => service_names[entry.service],
+                else => "",
+            };
+            const gap: []const u8 = if (service.len > 0) " " else "";
+            report.print("trace: op {d} at {d} ms: {s}{s}{s}\n", .{
+                entry.index, entry.at_ms, @tagName(entry.op), gap, service,
+            });
+        }
+    }
+};
+
 /// With `faults_on` false (after the heal) the fault operations get no weight.
 fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
     const f: u32 = @intFromBool(faults_on);
@@ -2116,9 +2179,11 @@ fn pick_op(swarm: *const Swarm, random: std.Random, faults_on: bool) Op {
 
 fn operation(c: *Cluster) void {
     const random = c.prng.random();
-    const name = service_names[random.uintLessThan(u32, service_names.len)];
+    const service = random.uintLessThan(u32, service_names.len);
+    const name = service_names[service];
     const op = pick_op(&c.swarm, random, c.fault_totals == null);
     c.ops_drawn[@backingInt(op)] += 1;
+    c.trace.add(c.operations_done - 1, c.manual.ms - epoch_ms, op, service);
     switch (op) {
         .advance => {
             c.advance(100 + random.uintLessThan(u32, 6000));
@@ -2194,6 +2259,7 @@ fn check(c: *Cluster, ok: bool, what: []const u8) Failure!void {
         what, c.seed, c.manual.ms - epoch_ms,
     });
     c.report.print("step: {s}\n", .{c.step});
+    c.trace.print(c.report);
     return error.StepFailed;
 }
 
@@ -2241,6 +2307,13 @@ fn why_terminates(
     try check(c, last.type != .decision, "a why chain ends in a decision, not a cause");
 }
 
+/// Pages of decisions the decisions check reads, and so the decisions a world may hold before
+/// it fails with "there are more decisions than the check reads". A soak (src/sim_soak.zig) holds
+/// about three per operation and retention keeps a week, so the bound is a soak's, not a
+/// fleet run's (800 operations at most): 64 pages lasted about 10,000 operations.
+pub const decision_pages_max: u32 = 1024;
+pub const decisions_read_max: u32 = decision_pages_max * constants.store_list_limit_max;
+
 /// Every decision has a reason and a cause that exists; a replica of a lost node is replaced no
 /// earlier than the grace after its node's `mark_lost`; and, while retention has dropped nothing,
 /// every summary's `count` is the number of decisions written for its subject, action and kind
@@ -2252,7 +2325,8 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
     var nodes_lost: u32 = 0;
     var replicas_lost: u32 = 0;
     var actions: sim_coverage.Table = .{};
-    for (0..64) |_| {
+    var decisions: u32 = 0;
+    for (0..decision_pages_max) |_| {
         const page = ctx.store.list(ctx.arena, .{
             .prefix = records.prefix_decisions,
             .at_revision = at,
@@ -2263,6 +2337,7 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
         for (page.kvs) |kv| {
             const decision = records.read(records.Decision, ctx.arena, kv, ctx.diag) catch
                 return check(c, false, "a decision cannot be read");
+            decisions += 1;
             try decision_has_cause(c, ctx, &decision);
             try verdict(c, sim_checks.count(ctx, &counts, &decision));
             if (decision.action.len > 0) actions.add(decision.action, 1);
@@ -2279,6 +2354,7 @@ fn decisions_have_causes(c: *Cluster, ctx: *const controller.Context) Failure!vo
         c.stats.nodes_marked_lost = @max(c.stats.nodes_marked_lost, nodes_lost);
         c.stats.replicas_marked_lost = @max(c.stats.replicas_marked_lost, replicas_lost);
         c.decision_actions.merge(&actions);
+        c.decisions_listed = decisions;
         if (c.dropped_total() > 0) return;
         return verdict(c, sim_checks.summaries(ctx, &counts, at.?));
     }
@@ -3116,6 +3192,34 @@ pub const Options = struct {
     /// world it was before those faults existed, bit for bit (a replay line of an older failure
     /// has no `--strong`). `plan` turns it on for drawn operations (`auto`).
     strong: bool = false,
+    /// The long soak (C3 fleet 6, `sim_cluster --soak`): called after every `epoch_operations`
+    /// operations with what the run has grown to; false ends the run there, and the end checks
+    /// run as for a run of that many operations, so `sim_cluster <seed> <operations>
+    /// --liveness=false` replays it. Liveness off only (a heal point needs the run's length).
+    /// It must not touch the run.
+    on_epoch: ?*const fn (epoch: *const Epoch) bool = null,
+    epoch_operations: u32 = 1000,
+};
+
+/// What a soak's run has grown to after an epoch (`Options.on_epoch`): the history and the
+/// fixed-width counters a long run could leak, overflow or drift on.
+pub const Epoch = struct {
+    operations: u32,
+    virtual_ms: u64,
+    revision: u64,
+    transactions: u32,
+    agent_steps: u32,
+    server_steps: u32,
+    /// Decisions the last decisions check listed, and those retention has dropped so far.
+    decisions: u32,
+    decisions_dropped: u64,
+    /// The memory store's live keys, history entries not yet compacted, and leases.
+    store_keys: u64,
+    store_log: u64,
+    store_leases: u64,
+    /// Jobs created so far, and the start ledger's runs.
+    jobs_created: u32,
+    job_ledger: u32,
 };
 
 /// What a command line asked for, resolved: the operations and the options every unset knob of
@@ -3182,7 +3286,11 @@ pub fn simulate(
     };
     defer c.destroy();
     defer report.dead_calls = c.stats.dead_calls;
+    defer report.operations_run = c.operations_done;
     c.on_step = options.on_step;
+    if (options.on_epoch != null) assert(!options.liveness);
+    c.on_epoch = options.on_epoch;
+    c.epoch_operations = options.epoch_operations;
     c.enter("faults");
     report.print("sim-cluster seed={d} operations={d}\n", .{ seed, operations });
     c.swarm.print(report);
@@ -3238,9 +3346,11 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
             heal(c);
             c.enter("healed");
         }
+        c.operations_done = @intCast(index + 1);
         operation(c);
         if (c.report.failed) return error.StepFailed;
         try safety(c);
+        if (!soak_goes_on(c)) break;
     }
     if (c.liveness) {
         if (c.fault_totals == null) heal(c);
@@ -3255,9 +3365,32 @@ fn run_steps(c: *Cluster, operations: u32, heal_at: u32) Failure!void {
     }
     c.enter("end");
     try safety(c);
-    try enough_work_under_faults(c, @min(heal_at, operations));
+    try enough_work_under_faults(c, @min(heal_at, c.operations_done));
     try work_under_ceiling(c);
     try acceptance(c);
+}
+
+/// The soak's hook after each epoch (`Options.on_epoch`); true without one.
+fn soak_goes_on(c: *Cluster) bool {
+    const hook = c.on_epoch orelse return true;
+    assert(c.epoch_operations > 0);
+    if (c.operations_done % c.epoch_operations != 0) return true;
+    const epoch: Epoch = .{
+        .operations = c.operations_done,
+        .virtual_ms = c.manual.ms - epoch_ms,
+        .revision = c.memory.revision,
+        .transactions = c.stats.transactions,
+        .agent_steps = c.stats.agent_steps,
+        .server_steps = c.stats.server_steps,
+        .decisions = c.decisions_listed,
+        .decisions_dropped = c.dropped_total(),
+        .store_keys = c.memory.live.items.len,
+        .store_log = c.memory.log.items.len,
+        .store_leases = c.memory.leases.items.len,
+        .jobs_created = c.job_next - 1,
+        .job_ledger = c.jobs.ledger_count,
+    };
+    return hook(&epoch);
 }
 
 /// sim-c1, docs/authority.md §5: every cited key is changed or deleted and the history compacted

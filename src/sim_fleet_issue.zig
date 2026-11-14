@@ -17,6 +17,10 @@ test {
 pub const kind_sim_cluster = "sim-cluster";
 pub const kind_sim_c1 = "sim-c1";
 pub const kind_sim_swarm = "sim-swarm";
+/// The long soak, `sim_cluster <seed> soak` (src/sim_soak.zig): one seed for hours, its summary
+/// `sim-cluster --soak: seeds N..N, K operations: F of 1 failed`. Not part of a round: run.sh
+/// does not run it (ops/sim-fleet/soak.sh does).
+pub const kind_sim_soak = "sim-soak";
 /// Not a simulator: the teeth canary (`run.sh`, `canary_pick`). A batch of it is one fault-on
 /// runner's run over fresh seeds, read with its simulator kind's parser and judged by
 /// `canary_verdict`: a miss or a wrong symptom is a failure of this kind.
@@ -27,6 +31,7 @@ pub const kind_sim_canary = "sim-canary";
 pub const kind_store_faults = "store-faults";
 pub const kinds = [_][]const u8{
     kind_sim_cluster, kind_sim_c1, kind_sim_swarm, kind_sim_canary, kind_store_faults,
+    kind_sim_soak,
 };
 
 comptime {
@@ -56,6 +61,7 @@ fn summary_prefix(kind: []const u8) []const u8 {
     if (std.mem.eql(u8, kind, kind_sim_swarm)) return "sim-swarm: seeds ";
     if (std.mem.eql(u8, kind, kind_sim_canary)) return "sim-canary: seeds ";
     if (std.mem.eql(u8, kind, kind_sim_c1)) return "sim-cluster --c1: seeds ";
+    if (std.mem.eql(u8, kind, kind_sim_soak)) return "sim-cluster --soak: seeds ";
     return "sim-cluster: seeds ";
 }
 
@@ -88,6 +94,10 @@ pub const Failure = struct {
     range_last: ?u64 = null,
     /// A canary that failed with the wrong symptom: the check the first failing seed broke.
     observed: ?[]const u8 = null,
+    /// The run's last operations before the failure (`  trace: op N at T ms: ...`, of the shrunk
+    /// run when it shrank) and a soak check's numbers (`  soak: ...`): the lines as printed, one
+    /// span of the input. Empty when the runner printed none (a crash, a swarm run, a canary).
+    trace: []const u8 = "",
 
     /// A run that never started is the host's trouble (see `step_setup`). A crash is never: it
     /// is a bug wherever it happened, and run.sh records a crash that traced no step in `setup`.
@@ -442,11 +452,21 @@ fn parse_detail(failure: *Failure, line: []const u8) ParseError!void {
         } else {
             failure.shrunk_replay = replay;
         }
+    } else if (std.mem.startsWith(u8, line, "trace: ") or std.mem.startsWith(u8, line, "soak: ")) {
+        failure.trace = if (failure.trace.len == 0) line else span(failure.trace, line);
     } else if (after_prefix(line, "shrunk to ")) |rest| {
         const space = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.BadLine;
         failure.shrunk_operations = std.fmt.parseInt(u32, rest[0..space], 10) catch
             return error.BadLine;
     }
+}
+
+/// From the start of `first` to the end of `last`, two lines of the same input text.
+fn span(first: []const u8, last: []const u8) []const u8 {
+    const start = @intFromPtr(first.ptr);
+    const end = @intFromPtr(last.ptr) + last.len;
+    assert(end >= start + first.len);
+    return first.ptr[0 .. end - start];
 }
 
 /// A teeth canary's run (`sim_fleet ingest --canary`): the fault-on runner, the simulator kind
@@ -647,12 +667,37 @@ fn write_failure(
         try write_operations(out, failure);
     }
     try out.print("\nReplay:\n\n```\n{s}\n```\n", .{replay});
+    try write_trace(out, failure.trace);
     if (report.more.len > 0) {
         try out.writeAll("\nAlso failing this way in the same round: seeds ");
         try write_seeds(out, report.more);
         try out.writeAll(".\n");
     }
 }
+
+/// The trace under the replay, folded: its lines unindented, at most `trace_lines_max` of them
+/// (the runner prints 24 operations and a soak line).
+fn write_trace(out: *std.Io.Writer, trace: []const u8) std.Io.Writer.Error!void {
+    if (trace.len == 0) return;
+    try out.writeAll("\n<details><summary>Trace: the last operations before the failure" ++
+        "</summary>\n\n```\n");
+    var lines = std.mem.splitScalar(u8, trace, '\n');
+    var written: u32 = 0;
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r");
+        if (line.len == 0) continue;
+        if (written == trace_lines_max) {
+            try out.writeAll("(cut)\n");
+            break;
+        }
+        try out.print("{s}\n", .{line[0..@min(line.len, trace_line_bytes_max)]});
+        written += 1;
+    }
+    try out.writeAll("```\n\n</details>\n");
+}
+
+const trace_lines_max: u32 = 32;
+const trace_line_bytes_max: usize = 200;
 
 fn write_operations(out: *std.Io.Writer, failure: Failure) std.Io.Writer.Error!void {
     assert(failure.range_last == null);
@@ -1356,4 +1401,84 @@ test "store-faults: the watch checker and a client thread fail under fingerprint
             try std.testing.expect(!std.mem.eql(u8, &left, &right));
         }
     }
+}
+
+// C3 fleet 7: the shape `sim_cluster --seeds A..B <ops> --shrink` prints since the trace (the
+// shrunk run's last operations), and a soak's failure (`sim_cluster <seed> soak`).
+const traced_failing =
+    \\seed 4: FAILED: J8: a run was never started (seed 4, at 61000 ms)
+    \\  step: end
+    \\  profile: mixed
+    \\  shape: operations=300 nodes=3 lease_ttl_ms=15000 replicas_pct=100
+    \\  replay: zig-out/bin/sim_cluster 4 300 3 --heal-at=200
+    \\  shrunk to 41 operations
+    \\  replay: zig-out/bin/sim_cluster 4 41 3 --heal-at=200
+    \\  trace: op 39 at 58100 ms: job_create
+    \\  trace: op 40 at 60900 ms: apply web
+    \\coverage: profile=mixed seeds=1 op.advance=1
+    \\sim-cluster: seeds 4..4, 300 operations: 1 of 1 failed
+;
+
+const soak_failing =
+    \\soak: epoch 1 operations=500 wall_ms=4000 live_bytes=1000
+    \\soak: epoch 2 operations=1000 wall_ms=9000 live_bytes=9000
+    \\seed 7: FAILED: soak: memory grew faster than the history it holds
+    \\  step: soak
+    \\  profile: mixed
+    \\  shape: operations=1000 nodes=0 lease_ttl_ms=15000 replicas_pct=100
+    \\  replay: zig-out/bin/sim_cluster 7 soak 0 --soak-operations=1000 --soak-epoch=500
+    \\  soak: 90 live bytes per history item, 20 after the warm-up, limit 4 times
+    \\sim-cluster --soak: seeds 7..7, 1000 operations: 1 of 1 failed
+;
+
+test "an issue carries the shrunk replay and the trace of the shrunk run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const batch = try parse(arena, kind_sim_cluster, traced_failing);
+    try std.testing.expectEqual(@as(usize, 1), batch.failures.len);
+    const failure = batch.failures[0];
+    try std.testing.expectEqual(@as(?u32, 41), failure.shrunk_operations);
+    try std.testing.expectEqualStrings(
+        "trace: op 39 at 58100 ms: job_create\n  trace: op 40 at 60900 ms: apply web",
+        failure.trace,
+    );
+    const report: Report = .{
+        .kind = kind_sim_cluster,
+        .commit = "abc",
+        .failure = failure,
+        .more = &.{},
+    };
+    const body = try issue_body(arena, &report);
+    const replay = "zig-out/bin/sim_cluster 4 41 3 --heal-at=200\n```";
+    try std.testing.expect(std.mem.indexOf(u8, body, replay) != null);
+    const trace = "```\ntrace: op 39 at 58100 ms: job_create\n" ++
+        "trace: op 40 at 60900 ms: apply web\n```";
+    try std.testing.expect(std.mem.indexOf(u8, body, trace) != null);
+    try std.testing.expect(std.mem.indexOf(u8, try comment_body(arena, &report), trace) != null);
+    // The trace is evidence, not identity: the same check at the same step is the same issue.
+    var untraced = failure;
+    untraced.trace = "";
+    try std.testing.expectEqualStrings(
+        &fingerprint(kind_sim_cluster, untraced),
+        &fingerprint(kind_sim_cluster, failure),
+    );
+}
+
+test "a soak's failure is read under its own kind, its numbers in the trace" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const batch = try parse(arena, kind_sim_soak, soak_failing);
+    try std.testing.expectEqual(@as(u64, 1), batch.seeds);
+    try std.testing.expectEqual(@as(?u32, 1000), batch.operations);
+    const failure = batch.failures[0];
+    try std.testing.expectEqualStrings("soak", failure.step);
+    try std.testing.expect(std.mem.startsWith(u8, failure.trace, "soak: 90 live bytes"));
+    // A plain round's parser does not take a soak's summary, nor the other way round.
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_cluster, soak_failing));
+    try std.testing.expectError(error.NoSummary, parse(arena, kind_sim_soak, traced_failing));
+    const line = try replay_line(arena, kind_sim_soak, "abc", failure);
+    const runs = "sim-cluster-exe && zig-out/bin/sim_cluster 7 soak";
+    try std.testing.expect(std.mem.indexOf(u8, line, runs) != null);
 }
