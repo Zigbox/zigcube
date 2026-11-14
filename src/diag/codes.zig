@@ -1684,7 +1684,8 @@ pub const registry = [_]Entry{
         \\peers refuse it; a certificate already issued stays valid until it expires.
         \\
         \\For a node that should be in the cluster: remove its name from the revoked
-        \\file and restart zcube-server; the agent asks again by itself.
+        \\file; the server rereads it within a second and the agent asks again by
+        \\itself.
         \\For a client: remove its name from the revoked file and run
         \\zcube-server ca issue-client again, or choose another name.
         \\
@@ -1768,6 +1769,10 @@ pub const registry = [_]Entry{
         \\outside its validity window, allowing peer_clock_skew_ms of clock difference
         \\on each side. The signature was checked first, so the certificate is
         \\genuine. The cause shows notBefore, notAfter and this machine's time.
+        \\
+        \\The API server checks the client's certificate again before each request,
+        \\so a connection outlives its certificate by at most one request; the agent
+        \\checks its own node.crt before each connection.
         \\
         \\Check the clocks on both machines. A workload certificate lives for the
         \\service's deadline, at most x509_leaf_ttl_ms_max: ask for a new one.
@@ -1925,8 +1930,13 @@ pub const registry = [_]Entry{
         \\under a foreign anchor, a certificate whose extended key usage lacks
         \\serverAuth or whose basic constraints say CA.
         \\
-        \\The cause names the kind found and the kind needed. Give the peer a
-        \\certificate issued for its role: a server certificate for a server.
+        \\The server also refuses, with this code, a node or client certificate whose
+        \\name is in its revoked file: at the handshake, and before each request on
+        \\a connection opened before the name was revoked, which is then closed.
+        \\
+        \\The cause names the kind found and the kind needed, or the revoked name.
+        \\Give the peer a certificate issued for its role: a server certificate for
+        \\a server.
         ,
     },
     .{

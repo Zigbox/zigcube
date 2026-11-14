@@ -210,8 +210,8 @@ pub const Peer = struct {
             diag.raise(.E0807);
             diag.cause("zcube-server will not issue node {s} a peer credential", .{self.node});
             diag.cause("the name is on the server's list of removed names (revoked)", .{});
-            const sentence = "if the node belongs here, take it off the server's revoked file, " ++
-                "then restart the server";
+            const sentence = "if the node belongs here, take it off the server's revoked file " ++
+                "(the server rereads it within a second)";
             diag.fix(.{ .sentence = sentence });
             return error.Failed;
         }

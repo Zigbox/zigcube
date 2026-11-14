@@ -1447,9 +1447,15 @@ fn check_after_shape(
 /// Valid from `not_before - skew` (inclusive) to `not_after + skew` (exclusive): decision file
 /// 2026-11-04-x509-validity-boundaries.md.
 fn check_window(parsed: *const Parsed, now_ms: u64) Error!void {
+    return window(parsed.not_before_ms, parsed.not_after_ms, now_ms);
+}
+
+/// The validity rule of `check_window` on bare times, for a certificate checked again after its
+/// handshake (B7 slice 5: the server before each request, the agent before each connection).
+pub fn window(not_before_ms: u64, not_after_ms: u64, now_ms: u64) Error!void {
     const skew = constants.peer_clock_skew_ms;
-    if (parsed.not_before_ms > now_ms +| skew) return error.NotYetValid;
-    if (now_ms >= parsed.not_after_ms +| skew) return error.Expired;
+    if (not_before_ms > now_ms +| skew) return error.NotYetValid;
+    if (now_ms >= not_after_ms +| skew) return error.Expired;
 }
 
 // ---- Diagnostics -----------------------------------------------------------------------------

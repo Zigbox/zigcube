@@ -1225,7 +1225,7 @@ fn removed(ctx: *const Context, node: []const u8) Failure {
     assert(ctx.diag.code == null);
     ctx.diag.raise(.E0807);
     ctx.diag.cause("node {s} is on the server's list of removed names (revoked)", .{node});
-    ctx.diag.fix(.{ .sentence = "take the name out of the revoked file and restart zcube-server" });
+    ctx.diag.fix(.{ .sentence = "take the name out of the revoked file (the server rereads it)" });
     return error.Failed;
 }
 

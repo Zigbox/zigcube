@@ -105,6 +105,8 @@ comptime {
     _ = @import("fetch_cli.zig");
     _ = @import("fetch_worker.zig");
     _ = @import("server_ca.zig");
+    _ = @import("server_revoked.zig");
+    _ = @import("server_tls_test.zig");
     _ = @import("server_issue.zig");
     _ = @import("agent_run.zig");
     _ = @import("demo_c2_check.zig");

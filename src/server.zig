@@ -25,6 +25,7 @@ const Remembered = @import("server_remember.zig").Remembered;
 const peer_ca = @import("peer_ca.zig");
 const server_ca = @import("server_ca.zig");
 const server_tls = @import("server_tls.zig");
+const server_revoked = @import("server_revoked.zig");
 const RealClock = @import("server_store.zig").RealClock;
 const store_verified = @import("store_verified.zig");
 
@@ -66,6 +67,10 @@ pub const Server = struct {
     insecure_listener: ?net.Server,
     /// The TLS listener's certificate and key; set up when there is a TLS listener.
     tls: server_tls.Setup,
+    /// The watch of `<state dir>/revoked` (B7 slice 5); the watchdog ticks it when
+    /// `shared.tick` is set, which it is when there is a state directory.
+    revoked_source: server_revoked.FileSource = undefined,
+    revoked_watch: server_revoked.Watch = undefined,
     group: std.Io.Group,
     accept_future: ?std.Io.Future(void),
     insecure_accept_future: ?std.Io.Future(void),
@@ -216,6 +221,21 @@ pub const Server = struct {
     fn open_ca(server: *Server, config: config_mod.Config, diag: *Diag) Error!void {
         const directory = state_path(config, diag);
         if (diag.code != null) return error.StartFailed;
+        if (directory) |path| {
+            // Looked at before it is read, so an edit made in between is seen by the watch.
+            server.revoked_source.init(server.gpa, server.io, path);
+            server.revoked_watch.init(
+                server.io,
+                server.revoked_source.interface(),
+                &server.ca,
+                &server.shared.api_mutex,
+                server.shared.options.silent,
+            );
+            server.shared.tick = .{
+                .context = &server.revoked_watch,
+                .run = server_revoked.Watch.tick_any,
+            };
+        }
         server_ca.open(
             &server.ca,
             server.gpa,
@@ -306,6 +326,7 @@ pub const Server = struct {
         if (config.listen) |where| {
             server.tls.init(server.io, &server.ca, config.tls_name, diag) catch
                 return error.StartFailed;
+            if (server.shared.tick != null) server.revoked_watch.tls_mutex = &server.tls.mutex;
             server.listener = listen(server.io, where, diag) catch |err| {
                 server.tls.deinit();
                 return err;

@@ -23,6 +23,8 @@ const secure_random = @import("secure_random.zig");
 const tls_server = @import("tls_server.zig");
 const x509 = @import("x509.zig");
 const x509_identity = @import("x509_identity.zig");
+const builtin = @import("builtin");
+const Clock = @import("clock.zig").Clock;
 
 const Diag = diag_mod.Diag;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -36,13 +38,36 @@ pub const Error = error{ Refused, Closed };
 
 const Phase = enum { handshake, open, peer_closed, broken };
 
+/// Test-only faults for the teeth tests (B7 slice 5): each skips one check `Setup.recheck` makes
+/// before a request. Compiled out of every build but a test.
+pub const TestFault = enum {
+    /// A certificate that expired after the handshake is still served.
+    recheck_expiry,
+    /// A name revoked after the handshake is still served.
+    recheck_revoked,
+};
+var faults: [std.enums.values(TestFault).len]bool = @splat(false);
+
+pub fn set_test_fault(fault: TestFault, on: bool) void {
+    if (builtin.is_test) faults[@backingInt(fault)] = on;
+}
+
+fn fault_on(fault: TestFault) bool {
+    return builtin.is_test and faults[@backingInt(fault)];
+}
+
 /// What every connection of the TLS listener shares: the CA, and the server's certificate and key,
 /// made at start and made again when half the certificate's life is gone. Each connection copies
 /// the certificate and the key it starts with, so a renewal never changes a handshake under way.
 pub const Setup = struct {
     io: std.Io,
+    /// Guards the certificate and key, `wall`, and the CA's `revoked` set, which the server's
+    /// watch of the `revoked` file replaces under it (`server_revoked.zig`).
     mutex: std.Io.Mutex = .init,
     ca: *const peer_ca.Ca,
+    /// The clock `recheck` judges a peer's certificate by: the CA's wall clock, which a test
+    /// replaces (under `mutex`) to move time past a certificate's expiry.
+    wall: Clock,
     dns_name: []const u8,
     key_pair: Ed25519.KeyPair,
     certificate: x509.Der,
@@ -62,6 +87,7 @@ pub const Setup = struct {
         setup.* = .{
             .io = io,
             .ca = ca,
+            .wall = ca.wall,
             .dns_name = dns_name,
             .key_pair = undefined,
             .certificate = undefined,
@@ -137,17 +163,12 @@ pub const Setup = struct {
     /// The caller the handshake authenticated, or null (with ZC-E0819 raised) when its name is in
     /// the CA's `revoked` file or its SPIFFE ID is not of this cluster. The names point into
     /// `conn`.
-    pub fn caller(setup: *const Setup, conn: *const Conn, diag: *Diag) ?api_scope.Caller {
+    pub fn caller(setup: *Setup, conn: *const Conn, diag: *Diag) ?api_scope.Caller {
         const peer = conn.peer();
         const spiffe = x509_identity.spiffe_parse(peer.name) catch return refuse(diag, peer);
         const cluster = setup.cluster_buffer[0..setup.cluster_length];
         if (!std.mem.eql(u8, spiffe.cluster, cluster)) return refuse(diag, peer);
-        const revoked_kind: peer_ca.Revoked.Kind = switch (peer.kind) {
-            .node => .node,
-            .client => .client,
-            else => unreachable, // The server takes these two kinds only.
-        };
-        if (setup.ca.revoked.contains(revoked_kind, spiffe.name)) return refuse(diag, peer);
+        if (setup.is_revoked(peer.kind, spiffe.name)) return refuse(diag, peer);
         switch (peer.kind) {
             .node => {
                 if (spiffe.path != .node) return refuse(diag, peer);
@@ -160,6 +181,55 @@ pub const Setup = struct {
             },
             else => unreachable, // The server takes these two kinds only.
         }
+    }
+
+    /// Whether the CA's current `revoked` set names `name` for `kind`.
+    fn is_revoked(setup: *Setup, kind: x509.Kind, name: []const u8) bool {
+        const revoked_kind: peer_ca.Revoked.Kind = switch (kind) {
+            .node => .node,
+            .client => .client,
+            else => unreachable, // The server takes these two kinds only.
+        };
+        setup.mutex.lockUncancelable(setup.io);
+        defer setup.mutex.unlock(setup.io);
+        return setup.ca.revoked.contains(revoked_kind, name);
+    }
+
+    /// Checks `conn`'s peer again before a request on it (B7 slice 5): false, with the
+    /// diagnostic raised, when its certificate has expired since the handshake (ZC-E0811, the
+    /// window rule of `x509.window`) or its name is now in `revoked` (ZC-E0819). `caller` has
+    /// accepted the peer.
+    pub fn recheck(setup: *Setup, conn: *const Conn, diag: *Diag) bool {
+        return setup.recheck_peer(conn.peer(), diag);
+    }
+
+    /// `recheck` for the peer a handshake authenticated: the unit the tests drive.
+    pub fn recheck_peer(setup: *Setup, peer: tls_server.Peer, diag: *Diag) bool {
+        setup.mutex.lockUncancelable(setup.io);
+        const now_ms = setup.wall.now_ms();
+        setup.mutex.unlock(setup.io);
+        if (!fault_on(.recheck_expiry)) {
+            x509.window(peer.not_before_ms, peer.not_after_ms, now_ms) catch |err| {
+                const detail: x509.Detail = .{
+                    .not_before_ms = peer.not_before_ms,
+                    .not_after_ms = peer.not_after_ms,
+                    .now_ms = now_ms,
+                };
+                x509.raise(diag, err, "the client", &detail);
+                diag.cause("checked before each request: the connection is closed", .{});
+                return false;
+            };
+        }
+        const spiffe = x509_identity.spiffe_parse(peer.name) catch unreachable; // `caller`
+        // parsed this name already, at the handshake, and refuses the connection otherwise.
+        if (!fault_on(.recheck_revoked)) {
+            if (setup.is_revoked(peer.kind, spiffe.name)) {
+                _ = refuse(diag, peer);
+                diag.cause("revoked after the connection opened: it is closed", .{});
+                return false;
+            }
+        }
+        return true;
     }
 
     /// ZC-E0819, with the fix for the certificate's kind: a node's comes from `issue-node`, a

@@ -14,12 +14,14 @@ const server_ca = @import("server_ca.zig");
 const secure_random = @import("secure_random.zig");
 const server_mod = @import("server.zig");
 const server_static = @import("server_static.zig");
+const tls_conn = @import("tls_conn.zig");
 const x509 = @import("x509.zig");
 
 const testing = std.testing;
 const net = std.Io.net;
 const Diag = diag_mod.Diag;
 const Ed25519 = std.crypto.sign.Ed25519;
+const ManualClock = @import("clock.zig").ManualClock;
 
 const Kind = enum { node, jobs, admin };
 
@@ -523,4 +525,126 @@ test "TLS clients fill at most their slots, and the loopback listener is still s
     const raw = try plain.interface.allocRemaining(testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(raw);
     try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200"));
+}
+
+/// One kept-alive TLS connection to the API, for the checks between its requests (B7 slice 5).
+const Kept = struct {
+    stream: net.Stream,
+    conn: *tls_conn.Conn,
+    end_ms: u64,
+
+    fn open(kept: *Kept, rig: *Rig, credentials: *api_tls_client.Credentials) !void {
+        kept.stream = try rig.server.tls_address().connect(rig.io, .{ .mode = .stream });
+        kept.conn = try rig.arena.allocator().create(tls_conn.Conn);
+        kept.end_ms = peer_stream.boot_ms(rig.io) + 10_000;
+        var diag: Diag = undefined;
+        diag.reset();
+        const options = credentials.options(rig.io, kept.stream.socket.handle);
+        try kept.conn.open(&options, &diag);
+    }
+
+    fn close(kept: *Kept, rig: *Rig) void {
+        kept.conn.deinit();
+        kept.stream.close(rig.io);
+    }
+
+    /// `GET /v1/jobs` (a jobs client may read it) on the connection, and the whole reply.
+    fn get(kept: *Kept, rig: *Rig) ![]const u8 {
+        var diag: Diag = undefined;
+        diag.reset();
+        const head = "GET /v1/jobs HTTP/1.1\r\nHost: zcube-server\r\n\r\n";
+        try kept.conn.write(head, kept.end_ms, &diag);
+        try kept.conn.flush(kept.end_ms, &diag);
+        var out: std.ArrayList(u8) = .empty;
+        var chunk: [4096]u8 = undefined;
+        while (!api_tls_client.reply_is_whole(out.items)) {
+            const length = try kept.conn.read(&chunk, kept.end_ms, &diag);
+            if (length == 0) return error.TestUnexpectedResult;
+            try out.appendSlice(rig.arena.allocator(), chunk[0..length]);
+        }
+        return out.items;
+    }
+
+    /// True once the server has ended the connection: a clean close or a closed transport.
+    fn ended(kept: *Kept) bool {
+        var diag: Diag = undefined;
+        diag.reset();
+        var chunk: [256]u8 = undefined;
+        const length = kept.conn.read(&chunk, kept.end_ms, &diag) catch |err| {
+            return err != error.Timeout;
+        };
+        return length == 0;
+    }
+};
+
+fn expect_refused(reply: []const u8, code: []const u8) !void {
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 403"));
+    try testing.expect(std.mem.indexOf(u8, reply, code) != null);
+    try testing.expect(std.ascii.findIgnoreCase(reply, "connection: close") != null);
+}
+
+test "a client revoked mid-connection is refused its next request, and closed (B7 slice 5)" {
+    // Goal: parts B and C end to end. Method: a jobs client keeps one connection open and is
+    // served; then its name is written to the revoked file in the state directory. The server's
+    // watchdog rereads the file (no restart); the next request on the same connection gets 403
+    // ZC-E0819 and the connection is closed. A new connection is refused at the handshake.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var app: api_tls_client.Credentials = undefined;
+    try rig.load("app", &app);
+    defer app.deinit();
+    var kept: Kept = undefined;
+    try kept.open(&rig, &app);
+    defer kept.close(&rig);
+    try testing.expect(std.mem.startsWith(u8, try kept.get(&rig), "HTTP/1.1 200"));
+    var state = try std.Io.Dir.cwd().openDir(rig.io, rig.dir(), .{});
+    defer state.close(rig.io);
+    try state.writeFile(rig.io, .{ .sub_path = server_ca.revoked_file, .data = "client/app\n" });
+    try wait_revoked(&rig, .client, "app");
+    try expect_refused(try kept.get(&rig), "ZC-E0819");
+    try testing.expect(kept.ended());
+}
+
+/// Waits, a few watchdog ticks at most, for the server to have reloaded `name` as revoked.
+fn wait_revoked(rig: *Rig, kind: peer_ca.Revoked.Kind, name: []const u8) !void {
+    const tls = &rig.server.tls;
+    for (0..100) |_| {
+        tls.mutex.lockUncancelable(rig.io);
+        const done = rig.server.ca.revoked.contains(kind, name);
+        tls.mutex.unlock(rig.io);
+        if (done) return;
+        try rig.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a client whose certificate expires mid-connection is refused, and closed (B7 slice 5)" {
+    // Goal: part B's expiry check end to end. Method: a jobs client keeps one connection open
+    // and is served; then the server's clock for the check (`Setup.wall`) is moved past the
+    // certificate's not_after plus the skew. The next request gets 403 ZC-E0811 and the
+    // connection is closed.
+    var rig: Rig = undefined;
+    try rig.start();
+    defer rig.stop();
+    var app: api_tls_client.Credentials = undefined;
+    try rig.load("app", &app);
+    defer app.deinit();
+    var kept: Kept = undefined;
+    try kept.open(&rig, &app);
+    defer kept.close(&rig);
+    try testing.expect(std.mem.startsWith(u8, try kept.get(&rig), "HTTP/1.1 200"));
+    var later: ManualClock = .{ .ms = wall_ms(rig.io) + 2 * constants.x509_leaf_ttl_ms_max };
+    const tls = &rig.server.tls;
+    tls.mutex.lockUncancelable(rig.io);
+    const before = tls.wall;
+    tls.wall = later.clock();
+    tls.mutex.unlock(rig.io);
+    defer {
+        tls.mutex.lockUncancelable(rig.io);
+        tls.wall = before;
+        tls.mutex.unlock(rig.io);
+    }
+    try expect_refused(try kept.get(&rig), "ZC-E0811");
+    try testing.expect(kept.ended());
 }
