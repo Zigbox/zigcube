@@ -8,7 +8,7 @@
 # Commands:  guest.sh setup-root | learn <reference> | images <tree> <reference>
 #            guest.sh agent <node> <server host:port> | restart | node-addr
 #            guest.sh put <file> <base64 chunk> | upstream <cluster> <job,job,...>
-#            guest.sh upstream-log | listeners | relay-logs | logs
+#            guest.sh upstream-log | listeners | relay-logs [<job>] | logs
 #            guest.sh key-candidates <marker> | stop-relay <marker>
 #
 # Every command prints `ok: ...` for what it did, or `FAIL: ...` and exits 1.
@@ -232,14 +232,38 @@ PY
 # The root-only tools of demo-b4, in Python. `key-candidates <marker>`: the run's key, read from
 # its supervisor's memory (as root, from outside), for the job to search for. The supervisor
 # keeps the Ed25519 secret key as seed || public key, so every 32 bytes just before a copy of the
-# public key (relay.pub's first field) are a candidate seed; they go to /root/candidates.hex,
-# which the upstream serves. `stop-relay <marker>`: the planned fault "the relay stopped mid-run":
+# public key (relay.pub's first field) may be the seed; only those whose Ed25519 public key is
+# relay.pub's are kept (at least one must be), and they go to /root/candidates.hex, which the
+# upstream serves. `stop-relay <marker>`: the planned fault "the relay stopped mid-run":
 # a duplicate of the supervisor's listener (pidfd_getfd) is shut down, so its accept fails and
 # the relay must kill the run. The job is found by its last argument, `<marker>`.
 write_tools() {
     cat >/root/tools.py <<'PY'
-import ctypes, os, re, socket, sys
+import ctypes, hashlib, os, socket, sys
 STATE = os.environ.get("STATE", "/root/state")
+# Ed25519's public key of a seed (RFC 8032, 5.1.5), in extended coordinates: slow and not
+# constant time, which is fine for a test tool reading a key it already holds.
+P = 2 ** 255 - 19
+D = -121665 * pow(121666, P - 2, P) % P
+GX = 15112221349535400772501151409588531511454012693041857206046113283949847762202
+GY = 46316835694926478169428394003475163141307993866256225615783033603165251855960
+def add(a, b):
+    (x1, y1, z1, t1), (x2, y2, z2, t2) = a, b
+    m, n = (y1 - x1) * (y2 - x2), (y1 + x1) * (y2 + x2)
+    c, d = 2 * t1 * t2 * D, 2 * z1 * z2
+    e, f, g, h = n - m, d - c, d + c, n + m
+    return (e * f % P, g * h % P, f * g % P, e * h % P)
+def public_of(seed):
+    s = int.from_bytes(hashlib.sha512(seed).digest()[:32], "little")
+    s = s & (1 << 254) - 8 | 1 << 254
+    q, b = (0, 1, 1, 0), (GX, GY, 1, GX * GY % P)
+    while s:
+        if s & 1:
+            q = add(q, b)
+        b, s = add(b, b), s >> 1
+    zi = pow(q[2], P - 2, P)
+    x, y = q[0] * zi % P, q[1] * zi % P
+    return (y | (x & 1) << 255).to_bytes(32, "little")
 def argv(pid):
     try:
         return open("/proc/%s/cmdline" % pid, "rb").read().split(b"\0")[:-1]
@@ -289,13 +313,17 @@ def candidates(marker):
             if at >= 32:
                 found.add(data[at - 32 : at])
             at = data.find(public, at + 1)
-    # A seed is random: fill patterns (zeros, Zig's 0xaa) and other low-entropy runs are not.
-    found = [c for c in found if c != public and len(set(c)) >= 16]
+    # Only the run's own seed derives relay.pub's public key: anything else beside a copy of it
+    # (a certificate's bytes, a fill pattern) is not a key and would make the search vacuous.
+    looked = len(found)
+    found = [c for c in found if public_of(c) == public]
     if not found:
-        sys.exit("FAIL: the run's key is not in supervisor %s's memory" % pid)
+        sys.exit("FAIL: none of %d candidate(s) in supervisor %s's memory derives the public "
+                 "key %s" % (looked, pid, public.hex()))
     with open("/root/candidates.hex", "w") as out:
         out.write(" ".join(c.hex() for c in sorted(found)))
-    print("ok: %d candidate(s) from supervisor %s, public key %s" % (len(found), pid, public.hex()))
+    print("ok: %d seed(s) of public key %s in supervisor %s (of %d candidate(s))"
+          % (len(found), public.hex(), pid, looked))
 def stop_relay(marker):
     pid, fd, directory = supervisor_of(listener_inode(job_pid(marker)))
     libc = ctypes.CDLL(None, use_errno=True)
@@ -330,9 +358,18 @@ cmd_node_addr() {
 cmd_listeners() { ss -ltnH; }
 
 # Every job's relay.log, under the layout `--runtime zigbox` uses (<state>/zigbox/<name>/; the
-# fake runtime's `containers/` does not exist there). With none at all it fails, so a wrong path
-# cannot read as "nothing logged".
+# fake runtime's `containers/` does not exist there), or with a name only that job's. With none at
+# all it fails, so a wrong path cannot read as "nothing logged".
 cmd_relay_logs() {
+    if [ $# -eq 1 ]; then
+        log="$STATE/zigbox/$1/relay.log"
+        [ -f "$log" ] || fail "no $log: job $1's relay left none"
+        echo "---- $log ----"
+        cat "$log"
+        echo "ok: job $1's relay.log"
+        return
+    fi
+    [ $# -eq 0 ] || fail "usage: guest.sh relay-logs [<job>]"
     found=0
     for log in "$STATE"/zigbox/*/relay.log; do
         [ -f "$log" ] || continue
@@ -369,7 +406,7 @@ main() {
         upstream-log) cmd_upstream_log ;;
         node-addr) cmd_node_addr ;;
         listeners) cmd_listeners ;;
-        relay-logs) cmd_relay_logs ;;
+        relay-logs) cmd_relay_logs "$@" ;;
         logs) cmd_logs ;;
         *) fail "unknown command $command" ;;
     esac
