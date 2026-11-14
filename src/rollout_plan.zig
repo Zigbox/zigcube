@@ -491,9 +491,10 @@ fn resumed(policy: *const Policy, state: *const State, now_ms: u64) State {
     assert(state.phase == .paused);
     const paused_at = state.paused_at_ms.?;
     const at = @max(now_ms, paused_at);
+    // Saturating: a stored deadline is read from the store, and a far one must not overflow.
     const deadline_at_ms = switch (state.paused_by.?) {
-        .user => state.deadline_at_ms + (at - paused_at),
-        .failure => at + policy.progress_deadline_ms,
+        .user => state.deadline_at_ms +| (at - paused_at),
+        .failure => at +| policy.progress_deadline_ms,
     };
     return .{
         .phase = state.reason.active_phase(),

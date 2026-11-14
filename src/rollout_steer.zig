@@ -195,6 +195,9 @@ pub fn state_of(rollout: *const records.Rollout) rollout_plan.State {
     var state: rollout_plan.State = .{
         .phase = rollout.phase,
         .reason = reason,
+        // A rollback always has a generation to go back to; an apply has one unless it is the
+        // service's first (slice 6, docs/decisions/2026-11-14-c3-first-generation-failure.md).
+        .earlier = rollout.from != 0 or reason == .rollback,
         .started_at_ms = started,
         .deadline_at_ms = @max(rollout.deadline_at_ms, started),
         .evidence_from_ms = evidence_from,
