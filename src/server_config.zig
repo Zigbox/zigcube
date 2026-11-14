@@ -983,7 +983,8 @@ test "--tls-san is repeatable, in order, a DNS name or an IP address (B7 slice 6
     try testing.expectEqualStrings("console.example.com", sans[0].dns);
     try testing.expectEqualSlices(u8, &.{ 192, 0, 2, 7 }, sans[1].ip);
     try testing.expectEqual(@as(usize, 16), sans[2].ip.len);
-    try testing.expectEqual(@as(usize, 0), (try load(arena, testing.io, &.{}, &diag)).run.tls_sans.len);
+    const none = try load(arena, testing.io, &.{}, &diag);
+    try testing.expectEqual(@as(usize, 0), none.run.tls_sans.len);
     for ([_][]const u8{ "has space", "-lead.example", "" }) |input| {
         diag.reset();
         try expect_bad(load(arena, testing.io, &.{ "--tls-san", input }, &diag), &diag);
