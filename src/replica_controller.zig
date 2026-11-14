@@ -102,6 +102,9 @@ comptime {
     assert(fixed + (batch_replicas_max + 1) * per_replica +
         judged_nodes_batch_max * per_judged_node > constants.store_txn_compares_max);
     assert(judged_nodes_batch_max <= batch_replicas_max);
+    // A rollout step: the fixed compares and the rollout's; per replica created or retired its
+    // key, its assignment or its report, and its decision's summary.
+    assert(fixed + 1 + batch_replicas_max * per_replica <= constants.store_txn_compares_max);
     const per_hold = controller.decision_compares + 2 + per_judged_node;
     assert(hold_batch_max * per_hold <= constants.store_txn_compares_max);
 }
@@ -781,6 +784,14 @@ const Run = struct {
                 replica.rec.id, replica.rec.generation, service.rec.name, service.rec.generation,
             });
         try run.stop_replica(batch, replica, reason, because);
+        // The retirement was chosen by whether the replica was running (`choose_retired`): its
+        // report is in the read set, so one that came up meanwhile is not retired unready (R1).
+        if (item.observed) |observed| {
+            batch.expect(observed.kv.key, observed.kv.mod_revision);
+        } else if (run.snap.node_of(replica.rec.id)) |node| {
+            const key = records.observed_key(node, replica.rec.id);
+            batch.expect(try controller.key_copy(run.ctx, &key), 0);
+        }
     }
 
     fn stop_replica(

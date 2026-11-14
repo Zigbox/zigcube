@@ -47,6 +47,7 @@ const rollout_controller = @import("rollout_controller.zig");
 const agent_jobs = @import("agent_jobs.zig");
 const control_plane = @import("control_plane.zig");
 const sim_c1 = @import("sim_c1.zig");
+const sim_c3 = @import("sim_c3.zig");
 const why_acceptance = @import("why_acceptance.zig");
 const sim_checks = @import("sim_checks.zig");
 const sim_clock = @import("sim_clock.zig");
@@ -843,6 +844,8 @@ pub const Cluster = struct {
     /// Replaced replicas whose overlap was not watched because the table was full.
     overlaps_unwatched: u32,
     c1_tally: sim_c1.Tally,
+    /// What C3's rollout checks judged (`sim_c3`).
+    c3_tally: sim_c3.Tally,
     c1_violation_revision: store.Revision,
     c1_revisions: u64,
     /// Scratch for the per-revision checks, which run inside a store call.
@@ -983,6 +986,7 @@ pub const Cluster = struct {
         c.c1_pending = null;
         c.overlaps_unwatched = 0;
         c.c1_tally = .{};
+        c.c3_tally = .{};
         c.c1_violation_revision = 0;
         c.c1_revisions = 0;
         c.tap_arena = .init(gpa);
@@ -1809,8 +1813,10 @@ fn tapped(context: *anyopaque, request: ?store.TxnRequest, revision: store.Revis
             return;
         }
     }
-    if (sim_c1.at_revision(&ctx, request, c.retention_running)) |found| {
-        c.c1_violation = found;
+    const found = sim_c1.at_revision(&ctx, request, c.retention_running) orelse
+        sim_c3.at_revision(&ctx, request, &c.c3_tally);
+    if (found) |problem| {
+        c.c1_violation = problem;
         c.c1_violation_revision = revision;
     }
 }
@@ -1834,7 +1840,8 @@ fn before_commit(context: *anyopaque, request: store.TxnRequest) void {
         .arena = c.tap_arena.allocator(),
         .diag = &c.tap_diag,
     };
-    c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally);
+    c.c1_pending = sim_c1.before_commit(&ctx, request, &c.c1_tally) orelse
+        sim_c3.before_commit(&ctx, request, &c.c3_tally);
 }
 
 /// The injection of the two negative tests (compare skipped): just ahead of the scheduler's
@@ -3432,6 +3439,12 @@ fn print_summary(c: *Cluster) void {
             c.c1_tally.facts_other,
         });
         report.print("sim-c1 L1: placements judged={d}\n", .{c.c1_tally.placements_judged});
+        report.print("sim-c3 R1 retirements={d} R2 surges={d} R3 versions={d} R4 paused={d} " ++
+            "R6 history={d}\n", .{
+            c.c3_tally.retirements_judged, c.c3_tally.surges_judged,
+            c.c3_tally.versions_judged,    c.c3_tally.paused_judged,
+            c.c3_tally.history_judged,
+        });
         const n = c.recorder.counts;
         report.print("sim-c1 acceptance: decisions={d} complete={d} truncated={d} dropped={d} " ++
             "keys deleted={d} changed={d}\n", .{
