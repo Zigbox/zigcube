@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
     add_zigbox_smoke_step(b, built);
     add_tidy_step(b);
     add_packages_steps(b);
+    add_release_assets_step(b);
     add_errors_site_steps(b);
     const library = add_wasm_steps(b, optimize);
     add_sim_steps(b, .{
@@ -1011,6 +1012,55 @@ fn add_redate_step(b: *std.Build, tool: *std.Build.Step.Compile, signed_at: ?[]c
         step.dependOn(&b.addFail("packages-redate needs -Dsigned-at=SECONDS").step);
     }
     step.dependOn(&run.step);
+}
+
+/// `zig build release-assets -Dbin=DIR` writes one tarball of the executables per architecture,
+/// the SBOM and `SHA256SUMS` under `zig-out/release-assets/`. `-Dbin` is the directory
+/// `packages` reads (default `zig-out/release-bin`); `-Dpackage-arch=x86_64|aarch64` limits the
+/// run to one architecture (default both). With `-Dpackages-dir=DIR` (the signed tree of the
+/// release script) it adds the debs and rpms of those architectures, and `-Drepos-archive=FILE`
+/// adds the repository archive; without `-Dpackages-dir` the step needs `-Dno-packages`.
+fn add_release_assets_step(b: *std.Build) void {
+    // `-Dbin` is declared by `add_packages_steps`, which shares it with this step; `b.option`
+    // panics on a second declaration, so read the value as the user gave it.
+    var bin: ?[]const u8 = null;
+    if (b.user_input_options.get("bin")) |given| {
+        if (given == .scalar) bin = given.scalar;
+    }
+    const arch_help = "Write the release assets of this architecture only (x86_64 or aarch64)";
+    const arch = b.option([]const u8, "package-arch", arch_help);
+    const packages_help = "Signed package tree to take the debs and rpms from";
+    const packages = b.option([]const u8, "packages-dir", packages_help);
+    const no_packages_help = "Write release assets without debs and rpms";
+    const no_packages = b.option(bool, "no-packages", no_packages_help) orelse false;
+    const archive_help = "zigcube-repos.tar.gz to add to the assets";
+    const archive = b.option([]const u8, "repos-archive", archive_help);
+    const epoch = b.option([]const u8, "source-date-epoch", "Timestamp of tar entries and SBOM");
+    const tool = b.addExecutable(.{
+        .name = "release_assets_main",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/release_assets_main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    // A refused run prints one line naming the file; `zig build` must show it.
+    run.stdio = .inherit;
+    run.addArgs(&.{ "assets", "--version", @import("build.zig.zon").version });
+    run.addArgs(&.{ "--bin", bin orelse "zig-out/release-bin" });
+    if (arch) |name| run.addArgs(&.{ "--arch", name });
+    run.addArgs(&.{ "--license", "LICENSE", "--license-id", "Apache-2.0" });
+    run.addArgs(&.{ "--zig-version", @import("builtin").zig_version_string });
+    run.addArgs(&.{ "--out", "zig-out/release-assets" });
+    if (epoch) |seconds| run.addArgs(&.{ "--source-date-epoch", seconds });
+    if (packages) |directory| run.addArgs(&.{ "--packages", directory });
+    if (no_packages) run.addArg("--no-packages");
+    if (archive) |file| run.addArgs(&.{ "--extra", file });
+    run.has_side_effects = true;
+    const help = "Write the release tarballs, the SBOM and SHA256SUMS (-Dbin, -Dpackage-arch)";
+    b.step("release-assets", help).dependOn(&run.step);
 }
 
 fn package_tool(b: *std.Build) *std.Build.Step.Compile {

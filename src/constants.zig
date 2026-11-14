@@ -1150,6 +1150,16 @@ pub const package_maintainer = "Zigbox project <packages@zigbox.org>";
 /// The user id of the fixed test key (the package writer's own signer; vouches for nothing).
 pub const package_test_key_user_id =
     "Zigbox package test key (vouches for nothing) <test@zigbox.invalid>";
+/// The most files a release's asset directory holds: a tarball and, per architecture, five
+/// packages of two kinds; the SBOM, `SHA256SUMS` and the repository archive.
+pub const release_assets_max: u32 = 64;
+/// The largest release asset `SHA256SUMS` hashes: a tarball, a package or the repository archive.
+pub const release_asset_bytes_max: u32 = 128 * 1024 * 1024;
+/// The licence file a release tarball holds (the Apache 2.0 text is about 11 KiB).
+pub const release_license_bytes_max: u32 = 64 * 1024;
+/// A release's source date (tar times, SBOM timestamp) outside 1980-01-01 (the package default)
+/// to 2100-01-01 (UTC) is a mistaken argument.
+pub const release_source_date_max: u64 = 4_102_444_800;
 
 comptime {
     assert(package_path_bytes_max < 100); // A ustar name field is 100 bytes with its terminator.
@@ -1161,4 +1171,6 @@ comptime {
     assert(package_files_max <= rpm_header_entries_max);
     assert(package_recommends_max + 4 * package_relations_max < rpm_header_entries_max);
     assert(repo_packages_max * 2 <= repo_files_max);
+    assert(package_source_date_epoch < release_source_date_max);
+    assert(release_asset_bytes_max >= package_file_bytes_max);
 }
