@@ -37,6 +37,12 @@ pub const Error = controller.Error || error{Refused};
 
 pub const actor = "api";
 
+/// `placement` as a request gave it: its pairs, and what was wrong with its shape, if anything.
+pub const PlacementInput = struct {
+    require: []const records.Pair = &.{},
+    problem: ?[]const u8 = null,
+};
+
 /// A job as a client submits it. `input` is decoded.
 pub const Input = struct {
     name: []const u8,
@@ -61,8 +67,9 @@ pub const Input = struct {
     signatures: []const []const u8 = &.{},
     /// The server's trust policy, from its configuration: null checks nothing (`job_trust.zig`).
     trust: ?*const job_trust.Trust = null,
-    /// The request named a `placement`: refused, it is not built yet.
-    placement: bool = false,
+    /// The job's `placement` (B6) as the request gave it, absent when it gave none. A `problem`
+    /// is a sentence about its shape that `validate_placement` refuses.
+    placement: ?PlacementInput = null,
     applied_by: []const u8,
     request_id: []const u8,
 };
@@ -158,6 +165,42 @@ fn validate_relay(ctx: *const Context, input: Input) Error!void {
     if (name.len == 0) return refuse(ctx, "relay", "must be the name of a relay, a string", .{});
     if (resolve_relay(input) == null) {
         return refuse(ctx, "relay", "'{s}' is not a relay this server configures", .{name});
+    }
+}
+
+/// The one place that says what `placement` may hold: an object of at most `job_require_max`
+/// label keys to values, under the label bounds, each key once.
+fn validate_placement(ctx: *const Context, input: Input) Error!void {
+    const placement = input.placement orelse return;
+    if (placement.problem) |problem| return refuse(ctx, "placement", "{s}", .{problem});
+    if (placement.require.len > constants.job_require_max) {
+        return refuse(ctx, "placement", "require has {d} entries, at most {d}", .{
+            placement.require.len, constants.job_require_max,
+        });
+    }
+    for (placement.require, 0..) |pair, at| {
+        if (pair[0].len == 0) return refuse(ctx, "placement", "a require key is empty", .{});
+        if (has_nul(pair[0]) or has_nul(pair[1])) {
+            return refuse(ctx, "placement", "{s} holds a NUL byte", .{pair[0]});
+        }
+        if (pair[0].len > constants.label_key_bytes_max) {
+            return refuse(ctx, "placement", "a require key is over {d} bytes", .{
+                constants.label_key_bytes_max,
+            });
+        }
+        if (pair[1].len > constants.label_value_bytes_max) {
+            return refuse(ctx, "placement", "the value of {s} is over {d} bytes", .{
+                pair[0], constants.label_value_bytes_max,
+            });
+        }
+        if (std.mem.indexOfScalar(u8, pair[0], '=') != null) {
+            return refuse(ctx, "placement", "the key {s} holds '='", .{pair[0]});
+        }
+        for (placement.require[0..at]) |earlier| {
+            if (std.mem.eql(u8, earlier[0], pair[0])) {
+                return refuse(ctx, "placement", "require names {s} twice", .{pair[0]});
+            }
+        }
     }
 }
 
@@ -422,7 +465,7 @@ fn validate_shape(ctx: *const Context, input: Input, now_ms: u64) Error!void {
     if (job_trust.shape_problem(&problem_buffer, input.signatures)) |problem| {
         return refuse(ctx, "signatures", "{s}", .{problem});
     }
-    if (input.placement) return not_built(ctx, "placement");
+    try validate_placement(ctx, input);
     try validate_times(ctx, input, now_ms);
     try validate_input(ctx, input);
 }
@@ -468,6 +511,7 @@ pub fn run_of(job: *const records.Job, id: []const u8) records.JobRun {
         .input_bytes = job.input_bytes,
         .relay = job.relay,
         .signatures = job.signatures,
+        .placement = job.placement,
         .start_by_ms = job.created_at_ms + job.deadline_ms,
         .created_at_ms = job.created_at_ms,
         .stop = .{ .cause = .not_started, .at_ms = std.math.maxInt(u64) },
@@ -486,6 +530,7 @@ fn check_run_size(ctx: *const Context, job: *const records.Job) Error!void {
         .{ .name = "command", .bytes = try json_bytes(ctx, job.command) },
         .{ .name = "env", .bytes = try json_bytes(ctx, job.env) },
         .{ .name = "labels", .bytes = try json_bytes(ctx, job.labels) },
+        .{ .name = "placement", .bytes = try json_bytes(ctx, job.placement) },
         .{ .name = "source", .bytes = try json_bytes(ctx, job.source) },
         .{ .name = "image", .bytes = try json_bytes(ctx, job.image) },
         .{ .name = "signatures", .bytes = try json_bytes(ctx, job.signatures) },
@@ -523,7 +568,22 @@ fn spec_equal(old: *const records.Job, new: *const records.Job) bool {
     const new_relay: ?[]const u8 = if (new.relay) |r| r.name else null;
     if (!optional_equal(old_relay, new_relay)) return false;
     if (!strings_equal(old.signatures orelse &.{}, new.signatures orelse &.{})) return false;
+    if (!placement_equal(old.placement, new.placement)) return false;
     return optional_equal(old.input_digest, new.input_digest);
+}
+
+/// The placement to store: none when the request gave none or an empty `require`, so that
+/// `{}` and no `placement` are the same spec.
+fn placement_of(input: Input) ?records.Placement {
+    const given = input.placement orelse return null;
+    if (given.require.len == 0) return null;
+    return .{ .require = given.require };
+}
+
+fn placement_equal(old: ?records.Placement, new: ?records.Placement) bool {
+    const left = if (old) |placement| placement.require else &.{};
+    const right = if (new) |placement| placement.require else &.{};
+    return pairs_equal(left, right);
 }
 
 fn optional_equal(a: ?[]const u8, b: ?[]const u8) bool {
@@ -653,6 +713,7 @@ pub fn create(
         .relay = resolve_relay(input),
         // Absent when there are none, so a job without them encodes as before B5.
         .signatures = if (input.signatures.len > 0) input.signatures else null,
+        .placement = placement_of(input),
         .submit_by_ms = input.submit_by_ms,
         .created_at_ms = now_ms,
         .applied_by = input.applied_by,

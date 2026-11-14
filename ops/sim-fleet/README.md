@@ -42,6 +42,8 @@ One host that runs the simulators (`sim_cluster`, `sim_cluster --c1` and `sim_sw
    | `sim_c1_teeth_relay_conn_leak` (with its symptom, R6) | 223 of 240 (same; one seed fails R7 first) | 0.7 | 20 | 3.5e-11 |
    | `sim_c1_teeth_relay_stop_leak` (with its symptom, R7) | 95 of 240 (same) | 0.25 | 80 | 1.0e-10 |
    | `sim_c1_teeth_job_untrusted` (with its symptom, J12) | 23 of 30 `--c1` (drawn operations, `--profile=auto`; 2026-11-13) | 0.6 | 30 | 1.2e-12 |
+   | `sim_c1_teeth_placement_exclusive` (with its symptom, P1) | 15 of 20 (100 operations, `--c1`, `--tenants` implied; 2026-11-14) | 0.5 | 35 | 2.9e-11 |
+   | `sim_c1_teeth_relabel_kept` (with its symptom, P1) | 25 of 40 (100 operations, `--c1`, `--tenants` implied; 6 of 10 in 1..10; 2026-11-14) | 0.4 | 50 | 8.1e-12 |
    | `sim_c1_teeth_job_ledger_small` (with its symptom, J8: the start ledger is full (16 runs)) | 8 of 10 (seeds 1..10, 400 operations, `--c1`, 2026-11-13); drawn operations (52 to 329) start too few runs to fill 16, so its canary is the fixed range `1+15@400` (#236, docs/decisions/2026-11-13-ledger-canary-fixed-ops.md) | 0.8 | 15 | 3e-11 |
    | `sim_c1_teeth_job_evicted` (with its symptom, J8: a run that no node started) | sparse: about 1 seed in 100, and the only known hit is seed 241 at 300 (186 until #225's fix, 2026-11-13) operations, `--c1`, default profile (2026-11-11). Its canary is the fixed range `241+1@300` (manifest `FIRST+COUNT@OPS`; `run.sh` passes `--c1` only), about 55 s, so it re-proves that one seed, not a hit rate | n/a | 1 | n/a (a seed-specific check: it says whether the clause still fires at 241, not that the clause is caught in general) |
    | `sim_swarm_teeth` | 192 of 400 (reviewer: 51 of 101) | 0.4 | 200 | 4e-45 |

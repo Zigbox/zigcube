@@ -106,6 +106,13 @@ capacity fits the replica's resolved requests (its limits, else 250m CPU and 128
 placing decision says), the fewest replicas of the service first. A replica no node fits waits,
 unplaced, with no decision; `why` says "waiting for a node".
 
+B6 puts a filter ahead of fit: among the ready nodes, one is a candidate only if it carries every
+`placement.require` pair of the run as a `key=value` label and, for each `exclusive=K` label it
+has, the run's `require` names `K` with the node's value. The order is readiness, then that filter,
+then fit, spread, locality, least allocated, name. A run no node passes waits with the hold reason
+"no ready node has tenant=acme" (or "<node> is exclusive to tenant=acme"); a replica carries no
+`require`, so it never passes an exclusive node. Only the run's hold reason names the filter.
+
 ## What the simulation proves
 
 `zig build sim-c0 [-Dseed=N] [-Dops=N]` runs `sim_c0.zig` natively and as WebAssembly, for one
@@ -516,7 +523,7 @@ an agent restart keeps it with the container. Three checks, judged on every tick
 or replaced; sticky), so a relay is closed before its ending can be reported; **R2** (a restatement of J2 and R1 for listeners keyed by run id; no tooth of its own) no two listeners
 are open for one run (across nodes); **R3** (also: a started job's spec carries the relay the job asked for, judged against the job's name, not the spec's own field; `relay_dropped` blanks it and must fail R3) a running relayed container has its listener open. Only
 the `strong` world makes relayed jobs, so a run without `--strong` makes no relayed jobs and draws as before.
-`sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `strong`) leaves the listener open at
+`sim-c1-teeth-relay_leak` (`c1_teeth.relay_leak`, which implies `--strong`) leaves the listener open at
 the ending and must fail R1, with or without `--c1`. The fleet's canary list gains `sim_c1_teeth_relay_leak`.
 
 **Certificates (B4 slice 3, `src/sim_certs.zig`).** In the `strong` world each running relayed
@@ -585,5 +592,30 @@ and profiles (CI's `sim-worlds` job). The tooth, `sim-c1-teeth-job_untrusted`
 fail J12, with or without `--c1`. The fleet's sim-c1 workers pass `--signed`; the canaries do not
 (the tooth's runner opens the world itself, and every other canary keeps the world it was measured
 in). `docs/decisions/2026-11-13-b5-slice3-handoff.md`.
+
+**P1** (B6 slice 2, docs/briefs/b6.md, as the supervisor ruled it on 2026-11-13: no exclusive node holds
+a job of another tenant or a service, across node loss, re-registration with other labels and partitions;
+`src/sim_tenancy.zig`, `docs/decisions/2026-11-13-b6-slice2-p1.md`). Only the tenant world (`--tenants`,
+which drawn `auto` operations switch on) has tenants, and draws none from the cluster's generator
+(`label_prng`, apart from `prng`): a run without `--tenants` is the world it was before, `--strong`
+included. Nodes carry `tenant=a` or `tenant=b`, and the nodes of odd index (the second, the fourth, ...)
+may also be `exclusive=tenant`; the nodes of even index never are, and `replicas_for` counts only those, so
+the services always fit. A restart of an agent, half the time, comes back configured with other labels, and
+before one operation in eight (until the heal) an operator reinstalls one node with a different set (a host
+crash that loses its disk; an odd node half the time, toggled between its shared and exclusive set;
+`relabels=` and `operator restarts` in the report). An agent sends new labels only with a new tenure (after a
+fence or a lost disk), which starts empty, so what a relabel leaves refused is the stale assignments of the
+old tenure, until the controllers act. Jobs name `tenant=a` or `b` (`job_tenant`, no draw), every fourth
+none (and only a non-exclusive node may run it), every eleventh `tenant=c`, which no node carries (it stays
+pending and ends `not_started`). The judge is independent: it records the labels each agent registered
+with (each new `/nodes/<n>` revision), each job's tenant from the simulation's own `job_tenant`, and decides
+with its own rule. **P1a** (`--c1`, in `before_commit`): no new assignment lands on a node whose registered
+labels refuse it, and a stored run's `require` is the job's. **P1b** (every simulated second the store is
+healthy): a hold its node's registration refuses is acted on (the replica removed, the run stopped, ended or
+replaced) within 5 s (`acted_ms_max`) of when it is first seen or the store last failed; at rest none remains. A node with
+no registration is I7's. `sim-c1-teeth-placement_exclusive` (`c1_teeth.placement_exclusive`, which implies
+`--tenants`) skips the scheduler's `exclusive` rule and must fail P1; `sim-c1-teeth-relabel_kept`
+(`c1_teeth.relabel_kept`, which implies `--tenants`) turns off the controllers' relabel eviction and must
+fail P1.
 
 `zig build check` runs `sim-c1` on a fresh seed (`sim-c1: seed N`) and `sim-c1-teeth`.

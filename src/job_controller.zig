@@ -48,6 +48,7 @@ const evidence = @import("evidence.zig");
 const failures = @import("store_failures.zig");
 const job_retention = @import("job_retention.zig");
 const records = @import("records.zig");
+const scheduler = @import("scheduler.zig");
 const store = @import("store.zig");
 const zigbox = @import("zigbox");
 
@@ -624,6 +625,7 @@ const Pass = struct {
             .input_bytes = spec.input_bytes,
             .relay = spec.relay,
             .signatures = spec.signatures,
+            .placement = spec.placement,
             .start_by_ms = spec.created_at_ms +| spec.deadline_ms,
             .created_at_ms = now,
         };
@@ -737,8 +739,25 @@ const Pass = struct {
                 });
             }
         }
+        if (run.rec.stop == null and job.rec.cancel_requested == null and pass.refused(run)) {
+            return pass.write_stop(job, run, status, .@"unreachable");
+        }
         if (status.rec.state == .running) return pass.judge_running(job, run, status);
         try pass.judge_unclaimed(job, run, status, claim_seen);
+    }
+
+    /// B6 (P1): the run's node was registered again with labels that refuse the job's `require`
+    /// (another tenant, or exclusive to one the job is not of). Registration is the agent's write
+    /// and cannot end the run itself (writers.zig), so the run is stopped here, at the first
+    /// revision that can: the node of its placement, as it was when the run was placed, is gone.
+    /// The stop compares the node's `/nodes` record it read (`expect_placement`).
+    fn refused(pass: *Pass, run: *const Entry(records.JobRun)) bool {
+        // Test-only fault (sim-c1-teeth-relabel_kept): a relabelled node keeps its runs.
+        if (c1_teeth.relabel_kept) return false;
+        const placed = pass.world.assignment(run.rec.id) orelse return false;
+        const node = pass.world.node_entry(assigned_node(placed.kv.key)) orelse return false;
+        const require = if (run.rec.placement) |placement| placement.require else &.{};
+        return scheduler.refuses(node.rec.labels, require);
     }
 
     /// What the node the run is assigned to reported of it, if anything.
@@ -1066,7 +1085,10 @@ const Pass = struct {
             .reason = switch (cause) {
                 .cancel => "the job was cancelled; its run is to stop",
                 .not_started => "the run did not start within its deadline",
-                .@"unreachable" => "the node of the run was lost before it claimed the run",
+                .@"unreachable" => if (pass.refused(run))
+                    "the node of the run was registered again with labels that refuse the job"
+                else
+                    "the node of the run was lost before it claimed the run",
             },
             .cause = .{ .kind = .desired, .key = job.kv.key, .revision = job.kv.mod_revision },
             .read_revision = pass.world.revision,

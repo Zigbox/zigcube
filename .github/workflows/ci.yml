@@ -403,6 +403,11 @@ jobs:
         run: |
           echo "seed ${{ github.run_id }}"
           zig build sim-c1 -Dseed=${{ github.run_id }} -Dops=200 -Doptimize=ReleaseSafe --summary all
+      # B6's tenant world (P1: node labels, relabels, eviction), native against WASM.
+      - name: sim-c1 tenant world, native and WASM, seed of this run
+        run: |
+          echo "seed ${{ github.run_id }}"
+          zig build sim-c1 -Dtenants -Dseed=${{ github.run_id }} -Dops=150 -Doptimize=ReleaseSafe --summary all
       # Replays of sim-c1 runs that once failed (build.zig, `c1_regressions`).
       - name: sim-c1 regressions
         run: zig build sim-c1-regressions --summary all

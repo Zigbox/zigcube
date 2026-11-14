@@ -143,6 +143,8 @@ pub const Config = struct {
     /// The node's own trust policy (`--trust-policy`, B5): every run is judged against it before
     /// it starts, and a refused one never starts. Null checks nothing. Borrowed.
     trust: ?*const job_trust.Trust = null,
+    /// The node's labels, `key=value` words, sent at registration (B6; at most 8; borrowed).
+    labels: []const []const u8 = &.{},
 };
 
 /// The state file that holds the lease, in the agent's state directory.
@@ -781,6 +783,7 @@ pub const Agent = struct {
             .address = agent.config.address,
             .capacity = agent.config.capacity,
             .trust_policy = published_policy(agent.config.trust),
+            .labels = agent.config.labels,
         };
         const key = records.node_key(agent.config.node);
         const value = try records.encode(ctx.arena, node, ctx.diag);

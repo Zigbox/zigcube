@@ -994,6 +994,9 @@ pub const job_command_words_max: u32 = runtime_command_words_max;
 pub const job_input_env_bytes_max: u32 = 64;
 /// Labels of a job: `runtime_labels_max` less `zcube.replica` and `zcube.job`.
 pub const job_labels_max: u32 = runtime_labels_max - 2;
+/// Entries of a job's `placement.require` (B6). Four is what a job can say about where it runs:
+/// a tenant, and three more labels a pool may carry.
+pub const job_require_max: u32 = 4;
 /// The bounds of a job's `limits`, those of Zigbox's runtime (`zigbox` `constants.zig`): a value
 /// outside them would be refused when the run starts, long after the job was accepted.
 /// Mirrors Zigbox's `limit_cpu_millis_min`.
@@ -1065,6 +1068,9 @@ comptime {
     // The body, its parse and the decoded input must sit in the request arena well within it.
     assert(job_request_bytes_max * 8 <= request_arena_bytes_max);
     assert(job_labels_max == 6);
+    // `require` and `labels` are both in the run record the agents read: `job_run_bytes_max` bounds
+    // it, and `check_run_size` counts `require` with the rest.
+    assert(job_require_max == 4);
     assert(job_command_words_max == runtime_command_words_max);
     // The run id is a container name (a hostname label), and `<service>-<n>` never equals it.
     assert(job_run_id_bytes_max <= 63);

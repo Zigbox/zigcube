@@ -385,8 +385,8 @@ fn check_applied_by(ctx: *const Context, text: []const u8) Failure!void {
     }
 }
 
-/// The `relay` of a job body: a string, or anything else, which is skipped (never built, like
-/// `Present`) and refused by name in `job_api` as an empty relay name.
+/// The `relay` of a job body: a string, or anything else, which is skipped (never built) and
+/// refused by name in `job_api` as an empty relay name.
 const RelayField = struct {
     name: ?[]const u8 = null,
 
@@ -403,24 +403,94 @@ const RelayField = struct {
     }
 };
 
-/// A JSON value that is skipped, not built: only its presence is kept. A `std.json.Value` of a
-/// 425,984-byte array of zeros takes about 37 times that in the arena.
-const Present = struct {
+/// The `placement` of a job body: `{"require": {"key": "value"}}`. What does not fit that shape is
+/// not an error of the parser but a `problem`, a sentence that `job_api` refuses (ZC-E0130,
+/// naming `placement`): a member other than `require`, a `require` that is not an object, a value
+/// that is not a string, a key given twice.
+const PlacementField = struct {
+    require: []const records.Pair = &.{},
+    problem: ?[]const u8 = null,
+    seen_require: bool = false,
+
     pub fn jsonParse(
         allocator: std.mem.Allocator,
         source: anytype,
         options: std.json.ParseOptions,
-    ) !Present {
-        _ = allocator;
-        _ = options;
-        try source.skipValue();
-        return .{};
+    ) !PlacementField {
+        var field: PlacementField = .{};
+        if (try source.peekNextTokenType() != .object_begin) {
+            try source.skipValue();
+            field.problem = "must be an object: {\"require\": {\"key\": \"value\"}}";
+            return field;
+        }
+        _ = try source.next();
+        while (true) {
+            const max = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, max);
+            switch (name) {
+                .object_end => return field,
+                .string, .allocated_string => |text| {
+                    if (std.mem.eql(u8, text, "require")) {
+                        if (field.seen_require) {
+                            field.problem = field.problem orelse "names require twice";
+                        }
+                        field.seen_require = true;
+                        try field.read_require(allocator, source, options);
+                    } else {
+                        try source.skipValue();
+                        field.problem = field.problem orelse
+                            "has a member the API does not know; it takes only require";
+                    }
+                },
+                else => return error.UnexpectedToken,
+            }
+        }
+    }
+
+    fn read_require(
+        field: *PlacementField,
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !void {
+        if (try source.peekNextTokenType() != .object_begin) {
+            try source.skipValue();
+            field.problem = field.problem orelse "require must be an object of strings";
+            return;
+        }
+        _ = try source.next();
+        var pairs: std.ArrayList(records.Pair) = .empty;
+        field.require = &.{};
+        while (true) {
+            const max = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, max);
+            const key = switch (name) {
+                .object_end => {
+                    field.require = pairs.items;
+                    return;
+                },
+                .string, .allocated_string => |text| text,
+                else => return error.UnexpectedToken,
+            };
+            if (try source.peekNextTokenType() != .string) {
+                try source.skipValue();
+                field.problem = field.problem orelse "every value in require must be a string";
+                continue;
+            }
+            const value = try std.json.innerParse([]const u8, allocator, source, options);
+            for (pairs.items) |pair| {
+                if (std.mem.eql(u8, pair[0], key)) {
+                    field.problem = field.problem orelse "require names a key twice";
+                }
+            }
+            try pairs.append(allocator, .{ key, value });
+        }
     }
 };
 
 /// The body of `POST /v1/jobs`: a job as JSON. `relay` is the name of a relay of the server's
-/// configuration (B3); `placement` is parsed so that it can be refused by name (not built yet),
-/// not as an unknown field.
+/// configuration (B3); `placement` (B6) is parsed by `PlacementField`, whose problems are refused
+/// by name, not as an unknown field.
 const JobBody = struct {
     name: []const u8,
     image: []const u8,
@@ -437,7 +507,7 @@ const JobBody = struct {
     submit_by_ms: u64,
     relay: ?RelayField = null,
     signatures: []const []const u8 = &.{},
-    placement: ?Present = null,
+    placement: ?PlacementField = null,
     applied_by: []const u8 = anonymous,
 };
 
@@ -463,6 +533,8 @@ const JobSpec = struct {
     relay: ?[]const u8,
     /// The job's signatures (B5), as submitted; empty when it has none.
     signatures: []const []const u8,
+    /// B6: what the job requires of a node; absent when it asked for nothing.
+    placement: ?records.Placement,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8,
@@ -485,6 +557,7 @@ const JobSpec = struct {
             .input_bytes = job.input_bytes,
             .relay = if (job.relay) |relay| relay.name else null,
             .signatures = job.signatures orelse &.{},
+            .placement = job.placement,
             .submit_by_ms = job.submit_by_ms,
             .created_at_ms = job.created_at_ms,
             .applied_by = job.applied_by,
@@ -576,7 +649,10 @@ fn job_input(
         .relays = api.relays,
         .signatures = parsed.signatures,
         .trust = api.trust,
-        .placement = parsed.placement != null,
+        .placement = if (parsed.placement) |field| .{
+            .require = field.require,
+            .problem = field.problem,
+        } else null,
         .applied_by = parsed.applied_by,
         .request_id = id,
     };

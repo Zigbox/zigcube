@@ -278,6 +278,72 @@ pub const JobRelay = struct {
     plain: bool = false,
 };
 
+/// Where a job may run (B6): the node labels it requires, as key and value pairs with unique
+/// keys. A node is a candidate only if it carries every pair (docs/keys.md, "Placement").
+pub const Placement = struct {
+    require: []const Pair = &.{},
+
+    /// `{"require":{"key":"value"}}`: the shape the API takes and shows, and the record's.
+    pub fn jsonStringify(placement: Placement, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("require");
+        try jw.beginObject();
+        for (placement.require) |pair| {
+            try jw.objectField(pair[0]);
+            try jw.write(pair[1]);
+        }
+        try jw.endObject();
+        try jw.endObject();
+    }
+
+    /// Reads what `jsonStringify` writes. A member other than `require`, a value that is not a
+    /// string or a key twice is an error: what the API accepts is checked before it is stored.
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Placement {
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        var require: []const Pair = &.{};
+        while (true) {
+            const limit = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, limit);
+            switch (name) {
+                .object_end => return .{ .require = require },
+                .string, .allocated_string => |text| {
+                    if (!std.mem.eql(u8, text, "require")) return error.UnknownField;
+                    if (require.len > 0) return error.DuplicateField;
+                    require = try parse_require(allocator, source, options);
+                },
+                else => return error.UnexpectedToken,
+            }
+        }
+    }
+
+    fn parse_require(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) ![]const Pair {
+        if (.object_begin != try source.next()) return error.UnexpectedToken;
+        var pairs: std.ArrayList(Pair) = .empty;
+        while (true) {
+            const limit = options.max_value_len.?;
+            const name = try source.nextAllocMax(allocator, .alloc_if_needed, limit);
+            const key = switch (name) {
+                .object_end => return pairs.items,
+                .string, .allocated_string => |text| text,
+                else => return error.UnexpectedToken,
+            };
+            for (pairs.items) |pair| {
+                if (std.mem.eql(u8, pair[0], key)) return error.DuplicateField;
+            }
+            const value = try std.json.innerParse([]const u8, allocator, source, options);
+            try pairs.append(allocator, .{ key, value });
+        }
+    }
+};
+
 /// The desired state of a job: the immutable spec, and the one mutable member, `cancel_requested`.
 /// The input is never here, only its digest and size (`/job-input/<name>` holds it).
 pub const Job = struct {
@@ -301,6 +367,9 @@ pub const Job = struct {
     /// B5: the job's DSSE envelopes, each one line of `zbx trust export`; absent when it has none
     /// and on every job stored before it (additive, same version).
     signatures: ?[]const []const u8 = null,
+    /// B6: absent on every job stored before it and on a job that asks for none (additive, same
+    /// version).
+    placement: ?Placement = null,
     submit_by_ms: u64,
     created_at_ms: u64,
     applied_by: []const u8 = "",
@@ -358,6 +427,8 @@ pub const JobRun = struct {
     relay: ?JobRelay = null,
     /// B5: the job's signatures, for the node's own check; absent when it has none.
     signatures: ?[]const []const u8 = null,
+    /// B6: the job's `placement`, which the scheduler reads when it places the run.
+    placement: ?Placement = null,
     start_by_ms: u64,
     created_at_ms: u64,
     stop: ?RunStop = null,
@@ -655,6 +726,39 @@ pub const Node = struct {
     /// signature or a provenance; empty: the agent checks nothing (as of its registration).
     trust_policy: []const u8 = "",
 };
+
+/// The value of the label `key` among a node's labels, which are `key=value` words (B6): the first
+/// word with that key. A word with no `=` is a key with no value and is never matched.
+pub fn node_label_value(labels: []const []const u8, key: []const u8) ?[]const u8 {
+    for (labels) |label| {
+        const at = std.mem.indexOfScalar(u8, label, '=') orelse continue;
+        if (std.mem.eql(u8, label[0..at], key)) return label[at + 1 ..];
+    }
+    return null;
+}
+
+/// The node label whose value names the key a node is reserved by: `exclusive=tenant`.
+pub const exclusive_label = "exclusive";
+
+/// Null if a node's labels may be registered, else the sentence that says why not (B6): each
+/// `exclusive=K` must name a key `K` that the node carries, once.
+pub fn node_labels_problem(labels: []const []const u8) ?[]const u8 {
+    for (labels) |label| {
+        const at = std.mem.indexOfScalar(u8, label, '=') orelse continue;
+        if (!std.mem.eql(u8, label[0..at], exclusive_label)) continue;
+        const key = label[at + 1 ..];
+        if (node_label_value(labels, key) == null) {
+            return "an exclusive label names a key the node does not carry";
+        }
+        var carried: u32 = 0;
+        for (labels) |other| {
+            const eq = std.mem.indexOfScalar(u8, other, '=') orelse continue;
+            if (std.mem.eql(u8, other[0..eq], key)) carried += 1;
+        }
+        if (carried > 1) return "an exclusive label names a key the node carries twice";
+    }
+    return null;
+}
 
 /// One tree a node holds completely, as its summary advertises it (docs/swarm.md): the tree's
 /// digest, its size, and the bottom-K sketch of its chunks as hex (24 digits an entry: the key,
