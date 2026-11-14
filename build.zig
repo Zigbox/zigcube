@@ -1520,6 +1520,23 @@ const c1_teeth_roots = [_]struct {
         .plain_symptom = "M6: a key was certified for two",
     },
     .{
+        .name = "mesh_issue_any_node",
+        .root = "src/sim_c1_teeth_mesh_issue_any_node_main.zig",
+        // M3's node clause (C4 slice 3 fixes): the issuer looks the assignment up on any node,
+        // and a forged ask in another node's name gets a certificate.
+        .symptom = "M3: a certificate was issued for a replica not assigned to the node",
+        .canary_seeds = 20,
+        .plain_symptom = "M3: a certificate was issued for a replica not assigned to the node",
+    },
+    .{
+        .name = "mesh_renew_late",
+        .root = "src/sim_c1_teeth_mesh_renew_late_main.zig",
+        // M3r (C4 slice 3 fixes): supervisors renew only at expiry, not at half-life.
+        .symptom = "M3r",
+        .canary_seeds = 20,
+        .plain_symptom = "M3r",
+    },
+    .{
         .name = "job_reuse",
         .root = "src/sim_c1_teeth_job_reuse_main.zig",
         // J11 (a run that exited without a node starting it); the reuse world

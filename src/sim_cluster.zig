@@ -1248,7 +1248,7 @@ pub const Cluster = struct {
     fn supervise_mesh(c: *Cluster) void {
         if (store_faulty(c)) return;
         const ctx = c.certs_context();
-        sim_mesh_certs.supervise(&c.mesh, &ctx, c.nodes, &c.net);
+        sim_mesh_certs.supervise(&c.mesh, &ctx, c.nodes, &c.net, c.manual.ms);
     }
 
     /// The context the certificate model reads the store through: the tap's memory store, the
@@ -2361,7 +2361,6 @@ fn replica_has_decisions(
     if (assigned) try check(c, placed, "a placed replica has no place decision");
 }
 
-/// The store is down, or about to be: reads would fail and would use up the countdown.
 /// The full digest a strong world's service runs in place of a short one (`next_full_digest`).
 fn full_digest(image: []const u8) []const u8 {
     if (std.mem.eql(u8, image, hello_digest)) return relay_digest;
@@ -2369,6 +2368,7 @@ fn full_digest(image: []const u8) []const u8 {
     return image;
 }
 
+/// The store is down, or about to be: reads would fail and would use up the countdown.
 fn store_faulty(c: *const Cluster) bool {
     if (c.switched.fail_after != null) return true;
     return c.switched.down;
@@ -2935,6 +2935,7 @@ fn jobs_converged(c: *Cluster, ctx: *const controller.Context) Failure!void {
 /// Every fault off; the agents come back up as time passes. Ends the fault phase.
 fn heal(c: *Cluster) void {
     c.fault_totals = c.phase_totals();
+    c.mesh.healed_at_ms = c.manual.ms;
     c.set_store_down(false);
     c.ack_loss.loss_per_mille = 0;
     c.swarm.net = .{};
@@ -3534,6 +3535,9 @@ fn print_mesh(c: *Cluster) void {
         c.report.print(" {s}={d}", .{ sim_mesh_certs.reason_name(index), count });
     }
     c.report.print("\n", .{});
+    c.report.print("mesh: longest wait for a certificate after the heal {d} ms (M3r bound {d})\n", .{
+        mesh.due_max_ms, sim_mesh_certs.ask_interval_ms + sim_mesh_certs.renew_cut_ms,
+    });
 }
 
 fn print_jobs(c: *Cluster) void {

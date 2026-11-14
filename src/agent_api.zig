@@ -522,7 +522,7 @@ const Call = struct {
     /// Signs a relayed run's key: `spiffe://<cluster>/job/<name>`, the image digest, placement
     /// epoch and labels, valid until the run's last legitimate moment. `job_cert.decide` says
     /// whether this node may have it; a refusal is ZC-E0706. Not authenticated beyond that claim
-    /// check until B7 (docs/mtls.md, threat list).
+    /// check until B7 (docs/mtls.md, "Issuance").
     fn run_certificate(call: Call, name: []const u8) Failure!Reply {
         const ctx = call.ctx;
         try call.certificate_path("a run's certificate");
@@ -547,11 +547,12 @@ const Call = struct {
     /// Signs a service replica's key (C4 slice 3): `spiffe://<cluster>/service/<service>`, the
     /// replica's digest and placement epoch, valid `workload_cert_ttl_ms`. `service_cert.decide`
     /// says whether this node may have it; a refusal is ZC-E0706 with a cause that names the
-    /// service. Not authenticated beyond the assignment check until B7 (docs/mtls.md, T5).
+    /// service. Not authenticated beyond that claim check until B7 (docs/mtls.md, "Issuance"):
+    /// anyone who reaches the agent API can have a replica's certificate for a key of their own.
     fn replica_certificate(call: Call, id: []const u8) Failure!Reply {
         const ctx = call.ctx;
         try call.certificate_path("a replica's certificate");
-        if (records.name_problem(id, constants.service_name_bytes_max) != null) {
+        if (records.name_problem(id, constants.replica_id_bytes_max) != null) {
             return bad_request(ctx, "id", "is not a valid replica id");
         }
         const ca = call.ca.?;
@@ -628,9 +629,9 @@ const Call = struct {
         });
     }
 
-    /// The replica's assignment on this node, then its `/replicas` record, both at one revision,
-    /// and `service_cert.decide` over them. The assignment names the service, so a replica that
-    /// is not assigned here is refused without reading `/replicas`.
+    /// `service_cert.look_up` (this node's assignment of the replica, then the replica it names)
+    /// at one revision, and `service_cert.decide` over it. The lookup is the node gate: it reads
+    /// only this node's key.
     fn replica_subject(
         call: Call,
         id: []const u8,
@@ -638,32 +639,18 @@ const Call = struct {
     ) Failure!service_cert.Subject {
         const ctx = call.ctx;
         const head = ctx.store.status(ctx.diag) catch return propagate(ctx);
-        const assigned_key = records.assigned_key(call.node, id);
-        const found = ctx.store.get(ctx.arena, assigned_key.slice(), head.revision, ctx.diag) catch
-            return propagate(ctx);
-        const kv = found.kv orelse
-            return refused_replica_certificate(ctx, id, "", error.wrong_node);
-        const placed = records.read(records.Assigned, ctx.arena, kv, ctx.diag) catch
-            return propagate(ctx);
-        if (placed.job != null or placed.service.len == 0) {
-            return refused_replica_certificate(ctx, id, "", error.wrong_node);
-        }
-        const replica_key = records.replica_key(placed.service, id);
-        const held = ctx.store.get(ctx.arena, replica_key.slice(), head.revision, ctx.diag) catch
-            return propagate(ctx);
-        const replica: ?records.Replica = if (held.kv) |replica_kv|
-            records.read(records.Replica, ctx.arena, replica_kv, ctx.diag) catch
-                return propagate(ctx)
-        else
-            null;
-        const assignment: service_cert.Assignment = .{
-            .node = call.node,
-            .service = placed.service,
-            .epoch = kv.mod_revision,
-        };
+        const found = service_cert.look_up(
+            ctx.store,
+            ctx.arena,
+            call.node,
+            id,
+            head.revision,
+            ctx.diag,
+        ) catch return propagate(ctx);
+        const service = if (found.assignment) |assignment| assignment.service else "";
         const ttl_ms = constants.workload_cert_ttl_ms;
-        return service_cert.decide(replica, assignment, ask, ttl_ms) catch |refusal|
-            refused_replica_certificate(ctx, id, placed.service, refusal);
+        return service_cert.decide(found, ask, ttl_ms) catch |refusal|
+            refused_replica_certificate(ctx, id, service, refusal);
     }
 
     /// The job, its status, this node's claim and the run's assignment, read at one revision,
@@ -1032,7 +1019,7 @@ const Call = struct {
     fn check_put(call: Call, put: *const ObservedPut, tenure: u64) Failure!void {
         const ctx = call.ctx;
         const rec = &put.value;
-        if (records.name_problem(rec.replica, constants.node_name_bytes_max) != null) {
+        if (records.name_problem(rec.replica, constants.replica_id_bytes_max) != null) {
             return bad_request(ctx, "puts", "a record names a replica that is not a valid name");
         }
         if (!std.mem.eql(u8, rec.node, call.node)) {
@@ -1054,7 +1041,7 @@ const Call = struct {
             return bad_request(ctx, "deletes", "a key is not under this node's observed");
         }
         const rest = key[prefix.len..];
-        if (records.name_problem(rest, constants.node_name_bytes_max) != null) {
+        if (records.name_problem(rest, constants.replica_id_bytes_max) != null) {
             return bad_request(ctx, "deletes", "a key does not end in a replica id");
         }
     }
@@ -1436,7 +1423,11 @@ fn refused_replica_certificate(
             id, service_cert.reason(refusal),
         });
     }
-    ctx.diag.fix(.{ .sentence = "none needed if the replica moved or was replaced" });
+    if (refusal == error.short_pin) {
+        ctx.diag.fix(.{ .sentence = "pin the full 64-hex digest" });
+    } else {
+        ctx.diag.fix(.{ .sentence = "none needed if the replica moved or was replaced" });
+    }
     return error.Failed;
 }
 

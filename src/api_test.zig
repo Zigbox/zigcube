@@ -1316,6 +1316,7 @@ test "a job names a relay the server configures; any other name or an env overri
 
 const peer_ca = @import("peer_ca.zig");
 const x509 = @import("x509.zig");
+const x509_identity = @import("x509_identity.zig");
 
 /// Writes `r1`'s assignment to node1, its claim and status as running under that epoch, as the
 /// scheduler and the agent would; returns the epoch.
@@ -1441,29 +1442,52 @@ test "a relayed run's certificate: issued to its claim, refused (ZC-E0706) to an
 /// Writes replica `web-1` of service web (image `relay_image`) and its assignment to `node`;
 /// returns the assignment's revision, the placement epoch.
 fn place_replica(rig: *Rig, node: []const u8) !u64 {
+    return place_service_replica(rig, node, "web", "web-1", relay_image);
+}
+
+/// Writes replica `id` of `service` (running `image`) and its assignment to `node`; returns the
+/// assignment's revision, the placement epoch.
+fn place_service_replica(
+    rig: *Rig,
+    node: []const u8,
+    service: []const u8,
+    id: []const u8,
+    image: []const u8,
+) !u64 {
     const arena = rig.parsed.allocator();
     const replica = try std.json.Stringify.valueAlloc(arena, records.Replica{
-        .id = "web-1",
-        .service = "web",
+        .id = id,
+        .service = service,
         .generation = 1,
-        .image = relay_image,
+        .image = image,
         .command = &.{"serve"},
     }, .{});
-    const assigned = try std.json.Stringify.valueAlloc(arena, records.assigned_replica(
-        "web-1",
-        "web",
-        .{ .cpu_millis = 100, .memory_bytes = 1 << 20 },
-        "test",
-    ), .{});
-    const replica_key = records.replica_key("web", "web-1");
-    const assigned_key = records.assigned_key(node, "web-1");
+    const placed = records.assigned_replica(id, service, test_requests, "test");
+    const replica_key = records.replica_key(service, id);
+    return put_two(rig, replica_key.slice(), replica, node, id, placed);
+}
+
+const test_requests: records.Requests = .{ .cpu_millis = 100, .memory_bytes = 1 << 20 };
+
+/// Writes `value` at `key` and `placed` at `id`'s assignment on `node` in one transaction;
+/// returns its revision.
+fn put_two(
+    rig: *Rig,
+    key: []const u8,
+    value: []const u8,
+    node: []const u8,
+    id: []const u8,
+    placed: records.Assigned,
+) !u64 {
+    const assigned = try std.json.Stringify.valueAlloc(rig.parsed.allocator(), placed, .{});
+    const assigned_key = records.assigned_key(node, id);
     const writes = [_]store.Op{
-        .{ .put = .{ .key = replica_key.slice(), .value = replica } },
+        .{ .put = .{ .key = key, .value = value } },
         .{ .put = .{ .key = assigned_key.slice(), .value = assigned } },
     };
     rig.world.diag.reset();
-    const placed = try rig.world.store_handle().txn(.{ .on_success = &writes }, &rig.world.diag);
-    return @intCast(placed.revision);
+    const done = try rig.world.store_handle().txn(.{ .on_success = &writes }, &rig.world.diag);
+    return @intCast(done.revision);
 }
 
 fn refused_replica(rig: *Rig, path: []const u8, body: []const u8) !void {
@@ -1528,4 +1552,111 @@ test "a service replica's certificate: issued to its assignment, refused (ZC-E07
     _ = try rig.world.store_handle().txn(.{ .on_success = &gone }, &rig.world.diag);
     try refused_replica(&rig, path, try certificate_body(&rig, moved, digest, key));
     try rig.refused(post_job(&rig, path, "{\"epoch\":1}"), 400, "ZC-E0104");
+}
+
+/// A rig whose agent API signs workload certificates with a test CA.
+fn rig_with_ca(rig: *Rig, ca: *const peer_ca.Ca) void {
+    rig.api.ca = ca;
+    rig.api.cluster = "test.cluster";
+}
+
+fn test_ca(rig: *Rig) !peer_ca.Ca {
+    return .{
+        .key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7)),
+        .revoked = .{},
+        .wall = rig.world.manual.clock(),
+    };
+}
+
+fn test_key() ![32]u8 {
+    return (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9)))
+        .public_key.toBytes();
+}
+
+test "a service replica's certificate: the epoch is the assignment's, not the head's" {
+    // Goal: the review's S1. Method: place web-1, then write something unrelated so the head
+    // moves past the placement; an ask under the placement epoch is 200 and the certificate's
+    // identity extension carries that epoch and the replica's digest; an ask under the head's
+    // revision is 409 ZC-E0706. A server that compared or signed the head's revision fails.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const ca = try test_ca(&rig);
+    rig_with_ca(&rig, &ca);
+    const key = try test_key();
+    const digest = relay_image["b3:".len..];
+    const epoch = try place_replica(&rig, "node1");
+    const other = try place_service_replica(&rig, "node2", "api", "api-1", relay_image);
+    try testing.expect(other > epoch);
+    const path = "/v1/agent/nodes/node1/replicas/web-1/certificate";
+    const ok = post_job(&rig, path, try certificate_body(&rig, epoch, digest, key));
+    if (ok.status != 200) std.debug.print("{s}\n", .{ok.body});
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    var der: [constants.x509_cert_bytes_max]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&der, field(try rig.json(ok), "certificate").string);
+    var detail: x509.Detail = .{};
+    const cert = try x509.parse_profile(bytes, .cluster, &detail);
+    const identity = try x509_identity.decode(cert.identity.of(bytes));
+    try testing.expectEqual(epoch, identity.placement_epoch);
+    var pinned: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pinned, digest);
+    try testing.expectEqualSlices(u8, &pinned, &identity.image_digest);
+    try refused_replica(&rig, path, try certificate_body(&rig, other, digest, key));
+}
+
+test "a service replica's certificate: replica ids up to their own bound, past a long service" {
+    // Goal: the review's MUST. Method: a service of service_name_bytes_max bytes has replica ids
+    // longer than any service name; its replica is issued (200), an unassigned id of
+    // replica_id_bytes_max bytes is refused for good (409 ZC-E0706), and one byte past it is a
+    // bad request (400 ZC-E0104). A bound of the service's length gives the first two a 400.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const ca = try test_ca(&rig);
+    rig_with_ca(&rig, &ca);
+    const key = try test_key();
+    const digest = relay_image["b3:".len..];
+    const service: [constants.service_name_bytes_max]u8 = @splat('s');
+    const id = service ++ "-10";
+    try testing.expect(id.len > constants.service_name_bytes_max);
+    const epoch = try place_service_replica(&rig, "node1", &service, id, relay_image);
+    const prefix = "/v1/agent/nodes/node1/replicas/";
+    const path = prefix ++ id ++ "/certificate";
+    const ok = post_job(&rig, path, try certificate_body(&rig, epoch, digest, key));
+    if (ok.status != 200) std.debug.print("{s}\n", .{ok.body});
+    try testing.expectEqual(@as(u16, 200), ok.status);
+    const id_max: [constants.replica_id_bytes_max]u8 = @splat('r');
+    const longest = prefix ++ id_max ++ "/certificate";
+    const body = try certificate_body(&rig, epoch, digest, key);
+    try rig.refused(post_job(&rig, longest, body), 409, "ZC-E0706");
+    const past = prefix ++ id_max ++ "r/certificate";
+    try rig.refused(post_job(&rig, past, body), 400, "ZC-E0104");
+}
+
+test "a service replica's certificate: a short pin, a job's run, a record of another service" {
+    // Goal: the review's S4 and N3 and ruling 8. Method: a replica pinned by a short digest is
+    // refused with the fix to pin the full digest; a job run's assignment asked for as a replica
+    // is refused; an assignment whose service is not the id's (a corrupt record) is refused, not
+    // a crash. Each is 409 ZC-E0706 and nothing is signed.
+    var rig = try Rig.start(1);
+    defer rig.stop();
+    const ca = try test_ca(&rig);
+    rig_with_ca(&rig, &ca);
+    const key = try test_key();
+    const digest = relay_image["b3:".len..];
+    const short_epoch = try place_service_replica(&rig, "node1", "web", "web-1", "b3:51aa9c03");
+    const path = "/v1/agent/nodes/node1/replicas/web-1/certificate";
+    const short = post_job(&rig, path, try certificate_body(&rig, short_epoch, digest, key));
+    try rig.refused(short, 409, "ZC-E0706");
+    try testing.expect(std.mem.indexOf(u8, short.body, "full 64-hex digest") != null);
+
+    const run = records.assigned_run("r1-job", "r1", test_requests, "test");
+    const run_epoch = try put_two(&rig, "/unrelated", "{}", "node1", "r1-job", run);
+    const run_path = "/v1/agent/nodes/node1/replicas/r1-job/certificate";
+    const as_replica = try certificate_body(&rig, run_epoch, digest, key);
+    try rig.refused(post_job(&rig, run_path, as_replica), 409, "ZC-E0706");
+
+    const api = records.assigned_replica("web-2", "api", test_requests, "test");
+    const corrupt = try put_two(&rig, "/unrelated", "{}", "node1", "web-2", api);
+    const corrupt_path = "/v1/agent/nodes/node1/replicas/web-2/certificate";
+    const asked = try certificate_body(&rig, corrupt, digest, key);
+    try rig.refused(post_job(&rig, corrupt_path, asked), 409, "ZC-E0706");
 }

@@ -222,6 +222,13 @@ Threats this does not answer yet:
 - **Issuance is unauthenticated until B7.** Anyone who can reach the server's agent API and names
   a node, a running relayed job, its epoch and digest gets a certificate for a key of their own.
   The server checks the claim (`job_cert.decide`), not who asks. Listen on a private address.
+  The same holds for a service replica's certificate (C4 slice 3,
+  `POST /v1/agent/nodes/{node}/replicas/{id}/certificate`, `service_cert.decide`): naming a node,
+  a replica assigned to it, the placement epoch and the digest is enough. So until B7
+  authenticates issuance, no mesh peer may trust a `/service/` certificate as proof that its
+  holder is the replica it names: the mesh slices that accept them (C4 slices 4 and 5) are
+  blocked on B7 for anything beyond a test cluster on a private network
+  (docs/decisions/2026-11-14-c4-service-cert-rulings.md, ruling 6).
 - The Zigbox runtime's relay still dials plain TCP (B4 slice 4).
 
 ## Threats the service mesh adds (C4)

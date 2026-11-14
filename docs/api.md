@@ -932,11 +932,18 @@ valid for `workload_cert_ttl_ms` (1 hour) from the server's clock, and answers a
 certificate does. The supervisor asks again at half-life with a new key; a certificate that
 expires unrenewed takes the replica off the mesh (ZC-W0703), not out of service.
 
-Refusals: `404` and `400` as for a run's certificate (`id` is checked as a name); **`409`
-ZC-E0706** for every other refusal, final for that ask: the cause names the replica, its service
-when the assignment names one, and the check that failed (not assigned here, a stale epoch, a
-deleted replica, another digest). A newer assignment or digest is a new ask. The call writes no
-store key, and is unauthenticated until B7 (docs/mtls.md, T5).
+Refusals: `404` and `400` as for a run's certificate (`id` is checked as a name of up to 63
+bytes, `replica_id_bytes_max`: a replica id is its service's name and `-<n>`, so it is longer than
+any service name); **`409` ZC-E0706** for every other refusal, final for that ask: the cause names
+the replica, its service when the assignment names one, and the check that failed (not assigned
+here, which includes a job run's assignment and a record whose service the id does not belong to;
+a stale epoch; a deleted replica; another digest; or a service that pins its image by a short
+`b3:` digest, whose fix is to pin the full 64-hex digest: admission accepts a short pin, the mesh
+refuses it, docs/decisions/2026-11-14-c4-service-cert-rulings.md). Unlike a run's certificate, no
+cause is a 503: the paragraph above on causes that are not final is about runs only, and a replica
+the server has not yet assigned to `{node}` is refused like one assigned elsewhere (a supervisor asks
+only for a replica its node runs). A newer assignment or digest is a new ask. The call writes no
+store key, and is unauthenticated until B7 (docs/mtls.md, "Issuance").
 
 ### `GET /v1/agent/nodes/{node}/watch?from=&timeout=`
 

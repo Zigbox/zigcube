@@ -177,9 +177,11 @@ pub fn replicas_prefix(service: []const u8) Key {
     return Key.build(&.{ prefix_replicas, service, "/" });
 }
 
+/// `id` must be one of `service`'s (`replica_id_valid`): a caller with an id or a service from
+/// the store or a request checks first, and refuses rather than asserts.
 pub fn replica_key(service: []const u8, id: []const u8) Key {
     assert(std.mem.startsWith(u8, id, service));
-    assert(name_problem(id, constants.node_name_bytes_max) == null);
+    assert(name_problem(id, constants.replica_id_bytes_max) == null);
     return Key.build(&.{ prefix_replicas, service, "/", id });
 }
 
@@ -189,7 +191,7 @@ pub fn observed_prefix(node: []const u8) Key {
 }
 
 pub fn observed_key(node: []const u8, replica: []const u8) Key {
-    assert(name_problem(replica, constants.node_name_bytes_max) == null);
+    assert(name_problem(replica, constants.replica_id_bytes_max) == null);
     return Key.build(&.{ prefix_observed, node, "/", replica });
 }
 
@@ -237,7 +239,7 @@ pub fn assigned_prefix(node: []const u8) Key {
 }
 
 pub fn assigned_key(node: []const u8, replica: []const u8) Key {
-    assert(name_problem(replica, constants.node_name_bytes_max) == null);
+    assert(name_problem(replica, constants.replica_id_bytes_max) == null);
     return Key.build(&.{ prefix_assigned, node, "/", replica });
 }
 
@@ -542,6 +544,14 @@ pub fn name_problem(name: []const u8, bytes_max: u32) ?NameProblem {
     }
     if (name[0] == '-' or name[name.len - 1] == '-') return .hyphen_at_edge;
     return null;
+}
+
+/// Whether `id` may name a replica of `service` in a key: a name of at most
+/// `replica_id_bytes_max` that starts with the service's (a valid service name).
+pub fn replica_id_valid(service: []const u8, id: []const u8) bool {
+    if (name_problem(service, constants.service_name_bytes_max) != null) return false;
+    if (name_problem(id, constants.replica_id_bytes_max) != null) return false;
+    return std.mem.startsWith(u8, id, service);
 }
 
 /// `<service>-<n>`: the replica number, or null if `id` is not of that form for `service`.

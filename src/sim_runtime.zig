@@ -114,6 +114,9 @@ const Container = struct {
     mesh_ask_ms: u64 = 0,
     /// The certificate expired unrenewed: the replica is off the mesh (ZC-W0703) until a renewal.
     mesh_down: bool = false,
+    /// M3r (sim_mesh_certs.zig): the simulation time since which this replica, connected and
+    /// certifiable after the heal, has held no certificate before half-life; null otherwise.
+    mesh_due_ms: ?u64 = null,
     /// Relayed connections open now through the relay, each on the run's certificate. Every
     /// ending closes them with the listener (`end`).
     conns: u32 = 0,

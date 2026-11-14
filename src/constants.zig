@@ -116,6 +116,10 @@ pub const node_name_bytes_max: u32 = 63;
 /// Replica ids are `<service>-<n>` with `n` under a billion, so an id is at most 58 bytes and fits
 /// the container-name rule of 63.
 pub const replica_number_max: u32 = 999_999_999;
+/// The longest replica id a key or a request may name: the container-name rule of 63, the bound
+/// `records.replica_key` has always checked (a name, like a node's). It is the id's own bound, not
+/// the service's: `<service>-<n>` is longer than its service.
+pub const replica_id_bytes_max: u32 = 63;
 pub const services_max: u32 = 256;
 pub const replicas_max: u32 = runtime_handles_max;
 pub const nodes_max: u32 = 64;
@@ -889,6 +893,7 @@ comptime {
     assert(rollout_grace_ms_max <= rollout_deadline_ms_max);
     assert(rollout_deadline_ms_max == job_deadline_ms_max);
     assert(service_name_bytes_max + 1 + 9 <= 63); // "<service>-<n>" fits a container name.
+    assert(service_name_bytes_max + 1 + 9 <= replica_id_bytes_max);
     assert(retention_batch_pairs * 2 <= store_txn_ops_max);
     assert(why_steps_max <= retention_pinned_max);
     assert(retention_scratch_bytes <= request_arena_bytes_max / 4);
