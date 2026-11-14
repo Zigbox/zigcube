@@ -127,8 +127,9 @@ pub const Credential = struct {
     certificate: x509.Der = .{},
     chain: [1][]const u8 = undefined,
 
-    pub fn init(key: Ed25519.KeyPair) Credential {
-        return .{ .key = key };
+    /// `key` by pointer: the one copy is the credential's own (`Relay.stop` zeroes it).
+    pub fn init(key: *const Ed25519.KeyPair) Credential {
+        return .{ .key = key.* };
     }
 
     pub fn identity(credential: *const Credential) tls_client.Identity {

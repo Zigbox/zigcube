@@ -166,6 +166,19 @@ pub fn has_image(fixtures: []const []const u8, image: []const u8) bool {
     return false;
 }
 
+/// The relay's files of an earlier run, which a new launch removes under either runtime
+/// (`zigbox_launch.write_spec` too): a stale `relay.crt` is another key's certificate, which the
+/// relay never takes, so its run would wait for one to ZC-E0705; a stale `relay.refused` would
+/// end it with ZC-E0706.
+pub const relay_files = [_][]const u8{
+    file_relay_port,
+    file_relay_log,
+    file_relay_public,
+    file_relay_certificate,
+    file_relay_refused,
+    file_relay_fault,
+};
+
 /// The files of an older container of the name that a start removes before it puts the spec.
 const stale_files = [_][]const u8{
     file_run,
@@ -174,13 +187,7 @@ const stale_files = [_][]const u8{
     file_forced,
     file_fetch,
     file_fetch_log,
-    file_relay_port,
-    file_relay_log,
-    file_relay_public,
-    file_relay_certificate,
-    file_relay_refused,
-    file_relay_fault,
-};
+} ++ relay_files;
 
 /// Starts the container's record: clears what an older container of the name left (a stopped
 /// container's directory has no spec by now, see `remove_container`), then puts the spec.

@@ -1036,7 +1036,7 @@ fn start_relay(h: *Harness, server: *const Server, place: *const RelayDir) !*rel
         .server_name = server_name,
         .anchor = h.pki.ca.public_key.toBytes(),
     };
-    try relay.secure(tls, h.pki.relay_key, place.dir.handle);
+    try relay.secure(tls, &h.pki.relay_key, place.dir.handle);
     relay.limits.connect_timeout_ms = relay_timeout_ms;
     try relay.run();
     return relay;

@@ -233,7 +233,7 @@ const ExecutablesOptions = struct {
     sqlite: *std.Build.Module,
     libpq: *std.Build.Module,
     web_files: *std.Build.Module,
-    /// Whether `zig build` installs them; the Debug set demo-b3 runs is built only for it.
+    /// Whether `zig build` installs them.
     install: bool = true,
 };
 
@@ -247,9 +247,8 @@ const Built = struct {
     agent_install: *std.Build.Step.InstallArtifact,
 };
 
-/// demo-b3's server and agent, Debug whatever `-Doptimize` says, never installed: until B4 slice 4
-/// the zigbox runtime speaks no TLS to a relay's upstream, so the demo relays to a plain test
-/// upstream, which only a Debug build serves (docs/decisions/2026-11-13-b4-slice2-fixes.md).
+/// The server, the agent and the CLI, in the mode `-Doptimize` names (the demos run CI's
+/// ReleaseSafe ones since B4 slice 4), installed unless `install` says otherwise.
 fn add_executables(b: *std.Build, executables_options: ExecutablesOptions) Built {
     const build_options = executables_options.options.createModule();
     var built: Built = undefined;
@@ -838,8 +837,11 @@ fn add_demo_script_tests(
         build_step.dependOn(&b.addRunArtifact(script_tests).step);
     }
     // The tests named `relay plain:` prove, in the mode Zigcube ships, that the server refuses
-    // `.plain` and the zigbox supervisor refuses to serve it.
-    for ([_][]const u8{ "src/server_config.zig", "src/zigbox_supervisor.zig" }) |root| {
+    // `.plain`, the zigbox supervisor refuses to serve it, and a relay refuses to run without TLS.
+    const release_roots = [_][]const u8{
+        "src/server_config.zig", "src/zigbox_supervisor.zig", "src/relay.zig",
+    };
+    for (release_roots) |root| {
         const release_tests = b.addTest(.{
             .filters = &.{"relay plain:"},
             .root_module = b.createModule(.{

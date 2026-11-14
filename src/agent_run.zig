@@ -417,8 +417,15 @@ fn peer_address(buffer: *[64]u8, advertise: ?std.Io.net.IpAddress) []const u8 {
 }
 
 /// Where the certificate step finds the runtime's relay files.
-fn relay_dir(kind: @TypeOf(@as(config_mod.Config, undefined).runtime)) []const u8 {
+fn relay_dir(kind: RuntimeKind) []const u8 {
     return if (kind == .zigbox) agent_records.dir_zigbox else agent_records.dir_containers;
+}
+
+const RuntimeKind = @TypeOf(@as(config_mod.Config, undefined).runtime);
+
+/// The certificate step for node `node`'s runs under runtime `kind`.
+fn relay_asker(node: []const u8, kind: RuntimeKind) agent_relay_certs.Asker {
+    return .{ .node = node, .dir = relay_dir(kind) };
 }
 
 /// Runs the agent until it is told to stop. Returns the process's exit code.
@@ -486,7 +493,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .boot_id = boot_id,
         .peer = &peer_identity,
         .peer_transport = http_transport.transport(),
-        .relay_certs = .{ .node = config.node, .dir = relay_dir(config.runtime) },
+        .relay_certs = relay_asker(config.node, config.runtime),
     };
     defer shell.arena.deinit();
     announce(io, config);
@@ -873,6 +880,18 @@ const Backend = struct {
 };
 
 // ---- Tests ------------------------------------------------------------------------------------
+
+test "the certificate step looks for relay files where each runtime keeps its containers" {
+    // Goal: a `--runtime zigbox` agent asks for its runs' certificates (B4): its supervisors
+    // write relay.pub under `zigbox/`, and an asker looking under `containers/` never finds one.
+    // The end-to-end proof is demo-b4, which this cloud container cannot run.
+    const zigbox_asker = relay_asker("node1", .zigbox);
+    try std.testing.expectEqualStrings(agent_records.dir_zigbox, zigbox_asker.dir);
+    try std.testing.expectEqualStrings("node1", zigbox_asker.node);
+    const fake_asker = relay_asker("node1", .fake);
+    try std.testing.expectEqualStrings(agent_records.dir_containers, fake_asker.dir);
+    try std.testing.expect(!std.mem.eql(u8, agent_records.dir_zigbox, agent_records.dir_containers));
+}
 
 test "a cancelled task while the node key is made exits quietly, with no diagnostic" {
     // Goal: the agent's first start draws the node key; a cancel there is no failure and must not

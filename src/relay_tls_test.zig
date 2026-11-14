@@ -211,7 +211,7 @@ fn open_relay(up: *const Upstream, dir: std.Io.Dir, log: [:0]const u8) !*relay_m
     const relay = try relay_module.Relay.open(testing.allocator, testing.io, target, log);
     errdefer relay.stop();
     const key = try Ed25519.KeyPair.generateDeterministic(@splat(0x41));
-    try relay.secure(up.tls(), key, dir.handle);
+    try relay.secure(up.tls(), &key, dir.handle);
     relay.limits.connect_timeout_ms = 2000;
     return relay;
 }
@@ -332,7 +332,7 @@ test "a certificate for another key is not taken" {
     const now = peer_stream.wall_ms(testing.io);
     var certificate: x509.Der = .{};
     try issue(&certificate, other, now, .none);
-    var credential: relay_tls.Credential = .init(key);
+    var credential: relay_tls.Credential = .init(&key);
     try testing.expectError(error.NotTheRunKey, credential.take(certificate.slice()));
     try testing.expectEqual(relay_tls.State.waiting, credential.state.load(.acquire));
     try issue(&certificate, key, now, .none);

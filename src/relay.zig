@@ -7,7 +7,8 @@
 //! A connection thread connects to the upstream (ZC-E0701 refused, ZC-E0704 no answer in
 //! `relay_connect_timeout_ms`), then copies both ways through two `Pipe`s (`relay_pump.zig`)
 //! until both ends are done, a bound is reached (ZC-W0702: bytes, or idle), or a read or write
-//! fails (ZC-E0705). The upstream is plain TCP; B4 replaces `connect_upstream` with mTLS.
+//! fails (ZC-E0705). The upstream speaks TLS with the run's certificate (B4); plain TCP only in
+//! a Debug build's tests (`run` refuses it elsewhere).
 //!
 //! `stop` is the only way the relay ends: it closes the listener and every connection, in every
 //! thread's own hands, and returns when none is left. The supervisor calls it before it reports
@@ -149,7 +150,8 @@ pub const Relay = struct {
     credential: ?*relay_tls.Credential = null,
     dir_fd: fd_t = -1,
     /// The command this relay serves, set before `run`; 0 for none. A run never outlives its
-    /// relay (Zigcube #228): if the acceptor ends before `stop`, it kills this process.
+    /// relay (Zigcube #228): if the acceptor ends before `stop`, it kills this process. The
+    /// supervisor clears it (atomically) once it has reaped the command.
     command_pid: i32 = 0,
 
     pub const OpenError = error{ SocketFailed, BindFailed, ListenFailed, OutOfMemory };
@@ -218,11 +220,12 @@ pub const Relay = struct {
 
     /// Makes the relay's upstream TLS (B4), before `run`: `key` is the run's, made by the caller
     /// and kept only in this process; `dir_fd` is the container's directory, where the agent
-    /// puts the certificate. The relay owns the credential from here.
+    /// puts the certificate. The relay owns the credential from here; `key` is taken by pointer
+    /// so that no copy is left in this frame (the caller zeroes its own).
     pub fn secure(
         relay: *Relay,
         tls: relay_tls.Tls,
-        key: std.crypto.sign.Ed25519.KeyPair,
+        key: *const std.crypto.sign.Ed25519.KeyPair,
         dir_fd: fd_t,
     ) error{OutOfMemory}!void {
         assert(relay.acceptor == null);
@@ -235,13 +238,21 @@ pub const Relay = struct {
         relay.dir_fd = dir_fd;
     }
 
-    /// Starts accepting.
-    pub fn run(relay: *Relay) !void {
+    pub const RunError = error{PlainRefused} || std.Thread.SpawnError;
+
+    /// Starts accepting. A relay without TLS (`secure` not called) is refused in any build but
+    /// Debug, whoever the caller is (#228): `relay_plan` refuses it first, and this is the last
+    /// place that can, so a caller that skips the plan still never relays in plaintext.
+    pub fn run(relay: *Relay) RunError!void {
         assert(relay.acceptor == null);
         assert(relay.limits.valid());
         assert((relay.tls == null) == (relay.credential == null));
         if (relay.tls != null) assert(relay.dir_fd >= 0);
+        if (relay.tls == null) {
+            if (!relay_tls.plain_allowed) return error.PlainRefused;
+        }
         relay.acceptor = try std.Thread.spawn(.{}, accept_loop, .{relay});
+        assert(relay.acceptor != null);
     }
 
     /// Closes the listener and every connection and waits for the threads. Safe to call without
@@ -307,7 +318,9 @@ pub const Relay = struct {
         relay.note(.E0702, "the relay's listener stopped while the job ran ({s}): " ++
             "the job's command was killed", .{cause});
         if (fault_outlive) return;
-        if (relay.command_pid > 1) _ = linux.kill(relay.command_pid, .KILL);
+        // Cleared by the supervisor once it has reaped the command: a reaped pid may be reused.
+        const pid = @atomicLoad(i32, &relay.command_pid, .acquire);
+        if (pid > 1) _ = linux.kill(pid, .KILL);
     }
 
     fn look_for_credential(relay: *Relay) void {
@@ -971,6 +984,33 @@ test "an end from the job is passed on and the upstream's reply still arrives" {
     const log = try rig.finish();
     defer testing.allocator.free(log);
     try testing.expectEqual(@as(usize, 0), log.len);
+}
+
+test "relay plain: a relay without TLS runs only in a Debug build" {
+    // #228. `demo-b3-build` also runs this test in ReleaseSafe. Goal: whatever its caller
+    // checked, a relay never connects in plaintext in the mode Zigcube ships. Method: open a
+    // relay, call `run` without `secure`: refused outside Debug (the listener still closes on
+    // `stop`), served in Debug.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try tmp.dir.realPath(testing.io, &path);
+    const log_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/relay.log", .{
+        path[0..length],
+    }, 0);
+    defer testing.allocator.free(log_path);
+    const upstream: Upstream = .{ .host = "127.0.0.1", .port = 9 };
+    const relay = try Relay.open(testing.allocator, testing.io, upstream, log_path);
+    const port = relay.port;
+    if (relay_tls.plain_allowed) {
+        try relay.run();
+        try testing.expect(relay.acceptor != null);
+    } else {
+        try testing.expectError(error.PlainRefused, relay.run());
+        try testing.expect(relay.acceptor == null);
+    }
+    relay.stop();
+    try testing.expectError(error.ConnectFailed, dial(port));
 }
 
 test "an upstream address is HOST:PORT" {

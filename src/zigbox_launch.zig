@@ -19,6 +19,7 @@ const zigbox = @import("zigbox");
 const constants = @import("constants.zig");
 const diag_mod = @import("diag.zig");
 const files = @import("fake_files.zig");
+const agent_records = @import("agent_records.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -108,6 +109,9 @@ pub fn write_spec(io: std.Io, root: Dir, spec: *const Spec) files.WriteError!voi
     dir.deleteFile(io, file_spec) catch {}; // Absent is fine; a new one follows.
     dir.deleteFile(io, file_failed) catch {};
     dir.deleteFile(io, file_supervisor) catch {}; // The last launch's; this one writes its own.
+    for (agent_records.relay_files) |stale| {
+        dir.deleteFile(io, stale) catch {}; // The last run's relay files, if it had a relay.
+    }
     const lock = dir.createFile(io, file_lock, .{ .truncate = false }) catch
         return error.WriteFailed;
     lock.close(io);
@@ -233,6 +237,39 @@ test "a launch directory goes from absent to working to failed or gone" {
     const holder = try dir.createFile(io, file_lock, .{ .truncate = false, .lock = .exclusive });
     defer holder.close(io);
     try testing.expectEqual(Phase.working, phase(io, dir, arena));
+}
+
+test "a relaunch clears the last run's relay files" {
+    // Goal: a new launch of a name never inherits the last run's relay files. A stale
+    // `relay.crt` is for another key: the new run's relay would not take it and would wait to
+    // ZC-E0705; a stale `relay.refused` would end the run with ZC-E0706 for nothing. Method: a
+    // launch directory holding every relay file, then a relaunch: none is left, the spec is
+    // there, and a new run's credential polling the directory is still waiting.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    const root = try open_root(io, tmp.dir);
+    defer root.close(io);
+    try write_spec(io, root, &sample("job-1"));
+    const dir = container_dir(io, root, "job-1").?;
+    defer dir.close(io);
+    // Named here, not taken from `relay_files`: a file dropped from that list must fail this.
+    const written = [_][]const u8{
+        "relay.port", "relay.log", "relay.pub", "relay.crt", "relay.refused", "relay.fault",
+    };
+    for (written) |stale| {
+        try dir.writeFile(io, .{ .sub_path = stale, .data = "an earlier run's\n" });
+    }
+    try write_spec(io, root, &sample("job-1"));
+    for (written) |stale| {
+        try testing.expect(!files.exists(io, dir, stale));
+    }
+    try testing.expect(files.exists(io, dir, file_spec));
+    const relay_tls = @import("relay_tls.zig");
+    const key = std.crypto.sign.Ed25519.KeyPair.generate(io);
+    var credential: relay_tls.Credential = .init(&key);
+    credential.poll(dir.handle);
+    try testing.expectEqual(relay_tls.State.waiting, credential.state.load(.acquire));
 }
 
 test "a spec survives the round trip" {
