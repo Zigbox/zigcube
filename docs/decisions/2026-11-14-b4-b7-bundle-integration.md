@@ -141,8 +141,17 @@ No bound, limit or default was changed by the integration itself.
 
 ## The Zigbox pin
 
-The brief asked for Zigbox v0.5.1. That tag does not exist: Zigbox has only v0.5.0. So the pin stays
-at aa4d64c, which is the pin every merged branch already used.
+The brief asked for Zigbox v0.5.1. When the bundle was cut that tag did not exist (Zigbox had only
+v0.5.0), so the pin stayed at aa4d64c, the pin every merged branch already used.
+
+Zigbox v0.5.1 was published on 2026-11-14. The supervisor named its commit as 30ede01, but the tag
+`v0.5.1` points to 7901666 (the merge of Zigbox's release PR #150). 30ede01 is Zigbox `main` at the
+time, which also carries ZB-5 to ZB-8 (5d1b0ba), and those are for 0.5.2. The bundle is never pinned
+to an untagged commit, so the pin moved to the tag's commit, 7901666:
+- hash `zigbox-0.5.1-RBMWED7DrgBK6jM9dQMKtgaotNmlSJOtf-gc-t-cHL3S`, computed with `zig fetch` on a
+  `git archive` of 7901666;
+- aa4d64c is an ancestor of 7901666 (37 commits), so B5's `zigbox.trust` surface is in the tag;
+- 5d1b0ba is not in the tag.
 
 ## For the supervisor
 
