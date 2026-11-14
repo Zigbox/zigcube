@@ -404,6 +404,17 @@ test "the API over TLS: replies larger than the server's write buffer arrive who
     }
     try testing.expect(server_static.find("/mock/codes.js").?.bytes.len >= 64 * 1024);
     try testing.expect(server_static.find("/css/console.css").?.bytes.len >= 25_000);
+
+    // An API reply larger than one TLS record (16 KiB), the case the slice 4 review hit: GET
+    // /v1/codes as admin sent its head and then spun with no body.
+    const reply = try rig.call(&admin, "GET", "/v1/codes");
+    try testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200"));
+    const split = std.mem.indexOf(u8, reply, "\r\n\r\n").?;
+    const body = reply[split + 4 ..];
+    try testing.expect(body.len > 16 * 1024);
+    var length_text: [24]u8 = undefined;
+    const length_line = try std.fmt.bufPrint(&length_text, "Content-Length: {d}\r\n", .{body.len});
+    try testing.expect(std.ascii.findIgnoreCase(reply[0 .. split + 2], length_line) != null);
 }
 
 test "TLS clients fill at most their slots, and the loopback listener is still served (B7)" {
