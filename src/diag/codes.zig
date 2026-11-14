@@ -110,6 +110,7 @@ pub const Code = enum(u8) {
     E0703,
     E0704,
     E0705,
+    E0706,
     W0701,
     W0702,
     E0801,
@@ -1466,21 +1467,29 @@ pub const registry = [_]Entry{
         .code = .E0702,
         .severity = .@"error",
         .blame = .environment,
-        .summary = "a job's relay could not listen",
+        .summary = "a job's relay could not be served",
         .explanation =
-        \\The supervisor of a job could not set up the relay the job asked for, so the
+        \\A job asked for a relay, and the job's supervisor could not serve it, so the
         \\job does not run without the route it was promised. The cause line says
-        \\which step failed (the socket, the bind, the listen, the relay's address).
+        \\which of three things happened:
         \\
-        \\On the fake runtime the job is not started and ends as a start failure. On
-        \\the real runtime the container has already started, so the supervisor kills
-        \\it: it ends as killed by signal 9 and the cause is the line `ZC-E0702` in
-        \\the job's `relay.log`.
+        \\- The relay could not be set up: the socket, the bind, the listen or the
+        \\  relay's address failed. If the cause is a socket or file descriptor error,
+        \\  the host may be out of descriptors: check `ulimit -n` and the node's load.
+        \\  If it names the relay's address, correct it in the server's `relays`
+        \\  setting.
+        \\- The relay stopped while the job ran, and the job's command was killed with
+        \\  it. Look in the node agent's log for why, around the time of the ending.
+        \\- The relay cannot be served as the job names it: a job submitted before B4
+        \\  carries no upstream server name and CA, a release build serves no plain
+        \\  relay, and the zigbox runtime does not speak TLS to an upstream until B4
+        \\  slice 4. Run the job on the fake runtime, or wait for that release.
         \\
-        \\If the cause is a socket or file descriptor error, the host may be out of
-        \\descriptors: check `ulimit -n` and the node's load. If it names the relay's
-        \\address, correct the relay's address in the server's `relays` setting. Then
-        \\submit the job again.
+        \\On the fake runtime a relay that cannot be set up stops the job before it
+        \\starts, and it ends as a start failure. Otherwise the container has already
+        \\started, so the supervisor kills it: it ends as killed by signal 9 and the
+        \\cause is the line `ZC-E0702` in the job's `relay.log`. In each case, fix
+        \\what the cause names, then submit the job again.
         ,
     },
     .{
@@ -1526,6 +1535,31 @@ pub const registry = [_]Entry{
         \\
         \\A reset by the job or the upstream is ordinary and needs no action. If it
         \\repeats on every connection, check the node's network and the upstream.
+        ,
+    },
+    .{
+        .code = .E0706,
+        .severity = .@"error",
+        .blame = .environment,
+        .summary = "the server refused a relayed run's certificate",
+        .explanation =
+        \\A relayed job's supervisor made a key for the run, and the agent asked the
+        \\server to sign it. The server signs only for the node that holds the job's
+        \\current claim, at the claim's placement epoch, for an image that matches
+        \\the job's, while the run has not ended. It refused: the cause says which
+        \\check failed (not this node's claim, a stale epoch, the run has ended, a
+        \\different image).
+        \\
+        \\The relay stays closed: the job's connections to it are closed without
+        \\reaching the upstream, and the line is in the job's `relay.log`. This is
+        \\what a run that lost its claim (the node was cut off, the job was placed
+        \\elsewhere, or it was cancelled) should see, and needs no action. If it
+        \\repeats for a run that is still this node's, check `zcube job status` for
+        \\the claim and compare the agent's and the server's versions.
+        \\
+        \\Two causes are not final: no node has claimed the run yet, or the claim has
+        \\not started it. The server then answers 503, not 409, and the agent asks
+        \\again by itself; it marks the run refused only on a 409.
         ,
     },
     .{

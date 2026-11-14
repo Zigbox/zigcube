@@ -26,12 +26,36 @@ const files = @import("fake_files.zig");
 const backoff = @import("fetch_backoff.zig");
 const relay_module = @import("relay.zig");
 const Relay = relay_module.Relay;
+const relay_tls = @import("relay_tls.zig");
+const secure_random = @import("secure_random.zig");
+const runtime = @import("runtime.zig");
+const job_cert = @import("job_cert.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 
 /// The command's pid, for the signal handler, which has nowhere else to look.
 var child_pid: std.atomic.Value(i32) = .init(0);
+
+/// The relay's listener, for the `relay_stop` test fault's handler (`SIGUSR1`); -1 for none.
+var relay_listener: std.atomic.Value(i32) = .init(-1);
+
+/// The `relay_stop` fault (sent by `FakeRuntime` as `SIGUSR1`): the listener is shut down, so
+/// the relay's acceptor ends as if the relay had died, and must take the command with it.
+fn on_relay_fault(_: std.posix.SIG) callconv(.c) void {
+    const fd = relay_listener.load(.seq_cst);
+    if (fd >= 0) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+}
+
+const root = @import("root");
+
+/// The tooth of the "no relay, no workload" test (B4 slice 2): the command runs although its
+/// relay could not be opened. A constant only a root file can switch on
+/// (`zcube_agent_relay_teeth_unrelayed.zig`), which only `zig build relay-teeth` compiles.
+const fault_run_unrelayed: bool = if (@hasDecl(root, "relay_teeth_run_unrelayed"))
+    root.relay_teeth_run_unrelayed
+else
+    false;
 
 /// Set once this supervisor itself got `SIGTERM`: a fetch that ends by a signal after that was
 /// stopped; before it, the fetch crashed.
@@ -111,6 +135,12 @@ pub fn run(init: std.process.Init, dir_path: []const u8) u8 {
         .flags = 0,
     };
     std.posix.sigaction(.TERM, &action, null);
+    const relay_fault: std.posix.Sigaction = .{
+        .handler = .{ .handler = on_relay_fault },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.USR1, &relay_fault, null);
     const own_pid: i32 = @intCast(std.os.linux.getpid());
     files.write_pid(io, dir, files.file_supervisor, own_pid) catch
         return constants.exit_environment;
@@ -269,12 +299,14 @@ fn supervise(
     // when no thread of the relay is left.
     var relay: ?*Relay = null;
     if (spec.relay) |upstream| {
-        switch (open_relay(init, dir, dir_path, upstream, &environ)) {
+        switch (open_relay(init, dir, dir_path, upstream, spec, &environ)) {
             .opened => |opened| relay = opened,
-            .failed => |over| return record(io, dir, over),
+            .failed => |over| if (!fault_run_unrelayed) return record(io, dir, over),
         }
     }
     const ending = run_command(init, dir, spec, &environ, relay);
+    // Cleared first: after `stop` the number may name another file.
+    relay_listener.store(-1, .seq_cst);
     if (relay) |open| open.stop();
     const over = ending orelse return constants.exit_environment;
     return record(io, dir, over);
@@ -290,11 +322,20 @@ fn open_relay(
     dir: Dir,
     dir_path: []const u8,
     upstream: []const u8,
+    spec: *const files.SpecFile,
     environ: *std.process.Environ.Map,
 ) RelayOpening {
+    if (files.exists(init.io, dir, files.file_relay_fault)) {
+        return relay_failed("the relay could not be opened (the test fault relay_open)");
+    }
     const target = relay_module.Upstream.parse(upstream) orelse {
         return relay_failed("the relay's address is not HOST:PORT");
     };
+    const tls = relay_tls.tls_of(spec.relay_server_name, spec.relay_server_anchor);
+    if (tls == null and !(spec.relay_plain and relay_tls.plain_allowed)) {
+        return relay_failed("the relay names no upstream server name and CA " ++
+            "(a job submitted before B4: submit it again)");
+    }
     const log_path = std.fmt.allocPrintSentinel(init.gpa, "{s}/{s}", .{
         dir_path, files.file_relay_log,
     }, 0) catch return relay_failed("there was no memory for the relay's log path");
@@ -307,6 +348,12 @@ fn open_relay(
             error.OutOfMemory => "there was no memory for the relay",
         });
     };
+    if (tls) |upstream_tls| {
+        if (secure_relay(init, dir, relay, upstream_tls, spec)) |cause| {
+            relay.stop();
+            return relay_failed(cause);
+        }
+    }
     var text: [64]u8 = undefined;
     const address = std.fmt.bufPrint(&text, "http://127.0.0.1:{d}", .{relay.port}) catch
         unreachable; // 64 bytes hold a port.
@@ -321,6 +368,53 @@ fn open_relay(
         return relay_failed("relay.port could not be written");
     };
     return .{ .opened = relay };
+}
+
+/// Makes the run's key, gives it to the relay and writes its public half to `relay.pub` for the
+/// agent, which asks the server for the certificate. The key itself never leaves this process.
+fn secure_relay(
+    init: std.process.Init,
+    dir: Dir,
+    relay: *Relay,
+    tls: relay_tls.Tls,
+    spec: *const files.SpecFile,
+) ?[]const u8 {
+    const job = label_of(spec, runtime.label_job) orelse return "the run has no job label";
+    const created = label_of(spec, runtime.label_created) orelse
+        return "the run has no placement epoch label";
+    const epoch = std.fmt.parseInt(u64, created, 10) catch
+        return "the run's placement epoch label is not a number";
+    if (epoch == 0) return "the run's placement epoch label is 0";
+    if (job.len == 0 or job.len > constants.service_name_bytes_max) {
+        return "the run's job label is not a job name";
+    }
+    const digest = job_cert.image_digest(spec.image) orelse
+        return "the run's image is not pinned by digest (b3:<64 hex digits>)";
+    var seed = secure_random.random_seed(init.io) catch
+        return "no randomness for the run's key";
+    defer std.crypto.secureZero(u8, &seed);
+    var key = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch
+        return "the run's key could not be made";
+    // `secure` keeps its own copy; this one is not left on the stack.
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key.secret_key));
+    relay.secure(tls, key, dir.handle) catch return "there was no memory for the run's key";
+    const request: relay_tls.Request = .{
+        .key = key.public_key.toBytes(),
+        .epoch = epoch,
+        .image_digest = digest,
+        .job = job,
+    };
+    var text: [relay_tls.Request.bytes_max]u8 = undefined;
+    files.write_atomic(init.io, dir, files.file_relay_public, request.format(&text)) catch
+        return "relay.pub could not be written";
+    return null;
+}
+
+fn label_of(spec: *const files.SpecFile, key: []const u8) ?[]const u8 {
+    for (spec.labels) |pair| {
+        if (std.mem.eql(u8, pair[0], key)) return pair[1];
+    }
+    return null;
 }
 
 fn relay_failed(cause: []const u8) RelayOpening {
@@ -346,6 +440,10 @@ fn run_command(
     }) catch |err| return spawn_failure(err);
     const pid: i32 = child.id.?;
     publish_child(pid);
+    if (relay) |open| {
+        open.command_pid = pid;
+        relay_listener.store(open.listener, .seq_cst);
+    }
     if (relay) |open| open.run() catch {
         // Without a relay thread the command has a listener nobody serves: end it.
         _ = std.os.linux.kill(pid, .KILL);

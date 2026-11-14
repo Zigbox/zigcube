@@ -50,7 +50,12 @@ pub const Config = struct {
     /// The ephemeral x25519 secret.
     secret: [32]u8,
     client_auth: ClientAuth = .none,
+    /// Which rules the server's leaf is held to: a cluster server's, or (a relay's upstream, B4)
+    /// a foreign server's, signed by an anchor of its own (`x509.verify_foreign_server`).
+    server_profile: ServerProfile = .cluster,
 };
+
+pub const ServerProfile = enum { cluster, foreign };
 
 /// Whether and how the client authenticates. A required authentication always has an identity, so
 /// the state "required, with nothing to present" cannot be written.
@@ -145,6 +150,7 @@ fn fault_on(fault: TestFault) bool {
 pub const Client = struct {
     state: State,
     anchor: [32]u8,
+    server_profile: ServerProfile,
     now_ms: u64,
     name: [constants.tls_server_name_bytes_max]u8,
     name_length: u32,
@@ -188,6 +194,7 @@ pub const Client = struct {
         assert(config.server_name.len <= constants.tls_server_name_bytes_max);
         self.state = .idle;
         self.anchor = config.anchor;
+        self.server_profile = config.server_profile;
         self.now_ms = config.now_ms;
         self.name_length = @intCast(config.server_name.len);
         @memcpy(self.name[0..config.server_name.len], config.server_name);
@@ -674,10 +681,20 @@ pub const Client = struct {
         };
         const name = self.name[0..self.name_length];
         var detail: x509.Detail = .{};
-        const parsed = x509.verify_detailed(chain.leaf, self.anchor, self.now_ms, .{
-            .kind = .server,
-            .name = name,
-        }, &detail) catch |err| {
+        const verified = switch (self.server_profile) {
+            .cluster => x509.verify_detailed(chain.leaf, self.anchor, self.now_ms, .{
+                .kind = .server,
+                .name = name,
+            }, &detail),
+            .foreign => x509.verify_foreign_server(
+                chain.leaf,
+                self.anchor,
+                self.now_ms,
+                name,
+                &detail,
+            ),
+        };
+        const parsed = verified catch |err| {
             x509.raise(diag, err, name, &detail);
             return self.refuse(diag, certificate_alert(err));
         };

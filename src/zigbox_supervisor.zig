@@ -26,6 +26,7 @@ const launch = @import("zigbox_launch.zig");
 const pull_report = @import("pull_report.zig");
 const records = @import("records.zig");
 const relay_module = @import("relay.zig");
+const relay_tls = @import("relay_tls.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -603,6 +604,10 @@ fn open_relay(
     const taken = handle.session.take_listener() orelse
         return kill_unrelayed(ctx, handle, "the container gave no listener");
     const listener: std.os.linux.fd_t = @intCast(taken);
+    if (relay_refused(spec)) |cause| {
+        _ = std.os.linux.close(listener);
+        return kill_unrelayed(ctx, handle, cause);
+    }
     const upstream = relay_module.Upstream.parse(spec.relay) orelse {
         _ = std.os.linux.close(listener);
         return kill_unrelayed(ctx, handle, "the relay's address is not HOST:PORT");
@@ -625,6 +630,21 @@ fn open_relay(
         return kill_unrelayed(ctx, handle, "the relay's thread could not start");
     };
     return relay;
+}
+
+/// Why this supervisor will not serve the relay, or null. It speaks only B3's plain TCP to an
+/// upstream until B4 slice 4 brings TLS here, and a release build serves no plain upstream: a
+/// relay that names a TLS server, or that is not a Debug build's plain one, is refused rather
+/// than connected in plaintext without the run's identity (fail closed, #228).
+fn relay_refused(spec: *const launch.Spec) ?[]const u8 {
+    assert(spec.relay.len > 0);
+    if (spec.relay_server_name.len > 0) {
+        return "the zigbox runtime does not speak TLS to a relay's upstream yet (B4 slice 4)";
+    }
+    if (!spec.relay_plain) return "the relay names no upstream server name and CA " ++
+        "(a job submitted before B4: submit it again)";
+    if (!relay_tls.plain_allowed) return "a release build serves no plain-TCP relay upstream";
+    return null;
 }
 
 fn relay_log_path(buffer: *[std.fs.max_path_bytes:0]u8, ctx: RelayContext) ?[:0]const u8 {
@@ -651,9 +671,9 @@ fn kill_unrelayed(
 /// existing log is kept). Nowhere else to say it: a failure to write is dropped.
 fn append_relay_failure(path: [:0]const u8, cause: []const u8) void {
     var line: [constants.relay_address_bytes_max]u8 = undefined;
-    const text = std.fmt.bufPrint(&line, "ZC-E0702 a job's relay could not listen: {s}\n", .{
-        cause,
-    }) catch "ZC-E0702 a job's relay could not listen\n";
+    const format = "ZC-E0702 a job's relay could not be served: {s}\n";
+    const text = std.fmt.bufPrint(&line, format, .{cause}) catch
+        "ZC-E0702 a job's relay could not be served\n";
     const flags: std.os.linux.O = .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
@@ -756,6 +776,30 @@ test "a job with a relay gets no network, one listener on the relay port and ZCU
     try std.testing.expectEqualStrings(constants.relay_env_name, relayed.env_names[1]);
 }
 
+test "relay plain: the zigbox supervisor refuses a TLS relay and a release build's plain one" {
+    // #228. `demo-b3-build` also runs this test in ReleaseSafe, where the plain one is refused.
+    // Goal: fail closed until B4 slice 4 brings TLS here. Method: a relay naming a server name is
+    // refused (never connected in plaintext), so is one that is neither TLS nor plain, and a
+    // plain one only in a build that admits plain upstreams.
+    var spec: launch.Spec = .{
+        .name = "job-1",
+        .tree = "b3:aa",
+        .reference = "ghcr.io/o/r@sha256:00",
+        .command = &.{"true"},
+        .env = &.{},
+        .labels = &.{},
+        .relay = "botpike:443",
+        .launched = 1,
+    };
+    try std.testing.expect(relay_refused(&spec) != null);
+    spec.relay_server_name = "broker.botpike.test";
+    spec.relay_plain = true;
+    const tls = relay_refused(&spec).?;
+    try std.testing.expect(std.mem.indexOf(u8, tls, "TLS") != null);
+    spec.relay_server_name = "";
+    try std.testing.expectEqual(relay_tls.plain_allowed, relay_refused(&spec) == null);
+}
+
 test "a relay that cannot be served is written to relay.log after what is there (ZC-E0702)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -770,7 +814,7 @@ test "a relay that cannot be served is written to relay.log after what is there 
     const text = try tmp.dir.readFileAlloc(io, "relay.log", std.testing.allocator, limit);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("earlier line\n" ++
-        "ZC-E0702 a job's relay could not listen: the container gave no listener\n", text);
+        "ZC-E0702 a job's relay could not be served: the container gave no listener\n", text);
 }
 
 test "the fetch is told where to put its pull record, and the registry and server only if known" {

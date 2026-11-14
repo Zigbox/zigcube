@@ -78,7 +78,7 @@ classify() {
       src/console_*.zig | src/web_embed.zig | src/sim_*.zig | src/tests.zig | src/tidy.zig | \
       src/errors_site.zig | src/testdata/* | src/testing/check.zig | src/wasm_core.zig | \
       src/*_test.zig | src/agent_smoke.zig | src/local_smoke.zig | src/swarm_smoke.zig | \
-      src/bench_watch.zig | src/zcube_agent_teeth.zig) return ;;
+      src/bench_watch.zig | src/zcube_agent_teeth.zig | src/zcube_agent_relay_teeth_*.zig) return ;;
   esac
   want_all
 }

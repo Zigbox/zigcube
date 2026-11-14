@@ -74,6 +74,8 @@ pub const ClientAuth = struct {
     authorities: bool = false,
     /// The `signature_algorithms_cert` extension, when set, lists these.
     cert_schemes: ?[]const u16 = null,
+    /// The SPIFFE URI the client's certificate must carry, when set (B4: the run's job).
+    name: ?[]const u8 = null,
 };
 
 /// What the peer made of the client's last flight.
@@ -115,6 +117,9 @@ pub const Peer = struct {
     finished_hash: schedule.Hash,
     /// The public key of the client certificate that verified, when one did.
     client_key: ?[32]u8,
+    /// That certificate, so a test can read what it says (`client_leaf()`).
+    client_leaf_bytes: [constants.x509_cert_bytes_max]u8,
+    client_leaf_length: u32,
 
     pub fn init(config: Config) Peer {
         var peer: Peer = undefined;
@@ -122,7 +127,13 @@ pub const Peer = struct {
         peer.transcript = schedule.Transcript.init();
         peer.secrets = schedule.Schedule.init();
         peer.client_key = null;
+        peer.client_leaf_length = 0;
         return peer;
+    }
+
+    /// The client certificate that verified, or empty.
+    pub fn client_leaf(self: *const Peer) []const u8 {
+        return self.client_leaf_bytes[0..self.client_leaf_length];
     }
 
     /// Answers the ClientHello `record` with the server's whole first flight, ready to send.
@@ -404,8 +415,9 @@ pub const Peer = struct {
         var detail: x509.Detail = .{};
         const parsed = x509.verify_detailed(leaf, auth.anchor, auth.now_ms, .{
             .kind = .workload,
-            .name = null,
+            .name = auth.name,
         }, &detail) catch return .bad_certificate;
+        if (leaf.len > self.client_leaf_bytes.len) return .bad_certificate;
         self.transcript.add(body);
         const hash = self.transcript.hash();
         const verify = self.next_message(rest) orelse return .malformed;
@@ -419,6 +431,8 @@ pub const Peer = struct {
         signature.verify(&content, public) catch return .bad_verify;
         self.transcript.add(verify);
         self.client_key = key;
+        @memcpy(self.client_leaf_bytes[0..leaf.len], leaf);
+        self.client_leaf_length = @intCast(leaf.len);
         return .ok;
     }
 

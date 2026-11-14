@@ -195,6 +195,12 @@ pub const Agent = struct {
     /// Job reports the store refused (B2): only a race with a new assignment or the tenure's end,
     /// so the cluster simulation checks they stop once the world has settled (J10).
     job_reports_refused: u64,
+    /// Runs (the Wyhash of the run id) whose `running` report the server is known to hold, as a
+    /// ring of the latest. The shell asks a relayed run's certificate only for these (B4 slice
+    /// 2): the server signs only a claim with a start. An entry that outlives its run only lets
+    /// an ask through, which the server refuses or defers, so nothing else removes one.
+    running_reported: [constants.agent_node_runs_max]u64,
+    running_reported_next: u32,
     restored: bool,
     stops: [constants.agent_stops_max]PendingStop,
     stops_count: u32,
@@ -299,6 +305,8 @@ pub const Agent = struct {
         agent.fence = .{};
         agent.fences = 0;
         agent.job_reports_refused = 0;
+        agent.running_reported = @splat(0);
+        agent.running_reported_next = 0;
         agent.store_refusals = 0;
         agent.store_refused = false;
         agent.store_refusal_len = 0;
@@ -319,6 +327,26 @@ pub const Agent = struct {
         agent.steps = 0;
         agent.input_failure_run = 0;
         agent.input_failure_len = 0;
+    }
+
+    /// Notes that the server holds `run`'s `running` report (`running_reported`).
+    pub fn note_running_reported(agent: *Agent, run: []const u8) void {
+        assert(run.len > 0);
+        if (agent.running_reported_known(run)) return;
+        const index = agent.running_reported_next % constants.agent_node_runs_max;
+        agent.running_reported[index] = std.hash.Wyhash.hash(0, run);
+        agent.running_reported_next = (index + 1) % constants.agent_node_runs_max;
+        assert(agent.running_reported_known(run));
+    }
+
+    /// Whether the server is known to hold `run`'s `running` report.
+    pub fn running_reported_known(agent: *const Agent, run: []const u8) bool {
+        assert(run.len > 0);
+        const hash = std.hash.Wyhash.hash(0, run);
+        for (agent.running_reported) |held| {
+            if (held == hash) return true;
+        }
+        return false;
     }
 
     /// Keeps what the last failed input fetch of `run` said.

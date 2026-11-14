@@ -1095,6 +1095,7 @@ test "a spec the runtime refuses is rendered with its field and its limit" {
         .{ .too_many_labels, "labels:", "more than 8 labels" },
         .{ .bad_label, "labels:", "key over 32 bytes" },
         .{ .missing_replica_label, "labels:", "replica label" },
+        .{ .relay_network_open, "network:", "loopback only" },
     };
     for (expected) |case| {
         var collector: diag_mod.Diag = undefined;

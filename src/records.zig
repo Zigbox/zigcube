@@ -265,7 +265,18 @@ pub const JobCancel = struct { at_ms: u64, by: []const u8 = "" };
 /// The relay a job asked for, resolved at admission from the server's configuration (B3): the
 /// name the job wrote and the upstream address the configuration gave it then. A job never
 /// carries an address of its own choosing.
-pub const JobRelay = struct { name: []const u8, address: []const u8 };
+pub const JobRelay = struct {
+    name: []const u8,
+    address: []const u8,
+    /// B4: the DNS name the upstream's certificate must carry, and the 64 hex digits of the
+    /// Ed25519 key that signs it (read from the configuration's `server_ca`). Empty on a job
+    /// stored before B4: such a relay has no upstream to check and stays closed (fail closed).
+    server_name: []const u8 = "",
+    server_anchor: []const u8 = "",
+    /// Test-only: the upstream is plain TCP, as in B3. The server accepts it only from a Debug
+    /// build's configuration (`server_config.relay_plain_allowed`), never from a release one.
+    plain: bool = false,
+};
 
 /// The desired state of a job: the immutable spec, and the one mutable member, `cancel_requested`.
 /// The input is never here, only its digest and size (`/job-input/<name>` holds it).
