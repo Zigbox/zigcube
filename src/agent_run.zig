@@ -404,6 +404,7 @@ pub fn run(init: std.process.Init, config: config_mod.Config) u8 {
         .address = config.address,
         .peer = peer_text,
         .agent_version = build_options.version,
+        .labels = config.labels,
     });
     var fake_images: node_store.FakeImages = .{ .digests = config.images };
     var swarm: Swarm = .{};

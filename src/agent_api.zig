@@ -292,8 +292,12 @@ const Call = struct {
         if (capacity.memory_bytes == 0) return bad_request(ctx, "capacity", "needs memory_bytes");
         try check_text(ctx, "agent_version", input.agent_version, node_text_bytes_max);
         try check_text(ctx, "address", input.address, node_text_bytes_max);
-        if (input.labels.len > node_labels_max) return bad_request(ctx, "labels", "has too many");
-        for (input.labels) |label| try check_text(ctx, "labels", label, node_text_bytes_max);
+        if (input.labels.len > constants.node_labels_max) {
+            return bad_request(ctx, "labels", "has too many");
+        }
+        for (input.labels) |label| {
+            try check_text(ctx, "labels", label, constants.node_label_bytes_max);
+        }
         if (records.node_labels_problem(input.labels)) |problem| {
             return bad_request(ctx, "labels", problem);
         }
@@ -915,7 +919,6 @@ fn scan_watch(
 /// events, and a store that has this many unread batches has changed.
 const watch_batches_max: u32 = 64;
 const node_text_bytes_max: u32 = 128;
-const node_labels_max: u32 = 8;
 
 // ---- Bodies and replies ------------------------------------------------------------------------
 

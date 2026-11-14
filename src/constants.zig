@@ -103,6 +103,10 @@ pub const runtime_handles_max: u32 = 512;
 pub const runtime_events_batch_max: u32 = 64;
 pub const label_key_bytes_max: u32 = 32;
 pub const label_value_bytes_max: u32 = 128;
+/// A node's labels (`/nodes/<n>.labels`, B6): at most this many `key=value` words, each at most
+/// `node_label_bytes_max` bytes, as the agent API admits at registration.
+pub const node_labels_max: u32 = 8;
+pub const node_label_bytes_max: u32 = 128;
 /// "b3:" and 64 hex digits; shorter forms are fixture names in the fake runtime.
 pub const image_digest_bytes_max: u32 = 67;
 /// The longest OCI reference a service's `source` may hold: Zigbox's `reference_bytes_max`
