@@ -244,7 +244,9 @@ pub const Table = struct {
         var wake: u64 = maxInt(u64);
         for (table.entries[0..table.count]) |*entry| {
             if (entry.began_ms) |began_at| {
-                wake = @min(wake, poll_at(began_at, entry.timeout_ms, now));
+                // `now` may be the start of the agent's step, and the check began later in it.
+                const at = @max(now, began_at);
+                wake = @min(wake, poll_at(began_at, entry.timeout_ms, at));
             } else if (!full and entry.due_ms > now) {
                 wake = @min(wake, entry.due_ms);
             }
@@ -441,6 +443,8 @@ test "probe_scheduler: the next check is due an interval after the last began" {
     try testing.expect(table.next_to_begin(100) == null);
     // In flight: polled after the minimum, not first at the timeout (600).
     try testing.expectEqual(100 + constants.probe_poll_ms_min, table.wake_ms(100));
+    // The agent asks with the time its step began, and the check began later in that step.
+    try testing.expectEqual(100 + constants.probe_poll_ms_min, table.wake_ms(40));
     entry.finished(.{ .exited = 0 }, 300);
     try testing.expectEqual(@as(u64, 1_100), entry.due_ms);
     try testing.expectEqual(@as(u64, 1_100), table.wake_ms(300));

@@ -21,6 +21,13 @@
   (Docker's rule) was not taken: one lucky pass would arm the failure count early.
 - **The first check runs when the agent first sees the container running**, then every
   `interval_ms` from when the last one began (at once if it ran longer).
+- **A check in flight is polled soon, then less often** (review fix, 2026-11-14):
+  `probe_poll_ms_min` (100 ms, the fence's poll) after it began, then each time it has run twice
+  as long, and at its timeout, and on the same doubling past it until the runtime reports it
+  (`probe_scheduler.poll_at`). Polling only at the timeout saw a check that ended early late, and
+  a check not reported by its timeout waited for the resync. An internal constant.
+- **The cap of 8 stays provisional** until the supervisor confirms it (it is commented as such in
+  `constants.zig`).
 
 Where: docs/agent.md, "Health checks"; docs/keys.md, `/observed` version 3;
 `src/probe_scheduler.zig`, `src/agent_health.zig`.

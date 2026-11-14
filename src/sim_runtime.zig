@@ -91,6 +91,8 @@ pub const HealthScript = enum {
     hangs,
     /// The check cannot run (as Zigbox refusing the exec would): `refused`.
     refuses,
+    /// The runtime refuses to begin the check: `probe_begin` fails with ZC-E0502.
+    refuses_to_begin,
 };
 
 /// How long a simulated health check runs before it exits, unless its timeout is shorter.
@@ -148,6 +150,9 @@ pub const SimRuntime = struct {
     /// simulation sets it to keep a ledger of starts (sim-c1's J2 and J7).
     on_start: ?*const fn (context: *anyopaque, spec: *const runtime.Spec) void = null,
     on_start_context: *anyopaque = undefined,
+    /// Health checks begun and refused at begin so far (the report's tally of the probe seam).
+    probes_begun: u32 = 0,
+    probes_refused: u32 = 0,
     /// Listeners opened and closed so far (the report's tally of the relay model).
     relays_opened: u32 = 0,
     relays_closed: u32 = 0,
@@ -230,6 +235,28 @@ pub const SimRuntime = struct {
     ) error{NotFound}!void {
         const container = self.find(name) orelse return error.NotFound;
         container.health = script;
+    }
+
+    /// Scripts the health checks of the running container `index` places, counted round the
+    /// running containers in creation order, and returns its name; null if none runs. Draws
+    /// nothing from the seed.
+    pub fn script_health(self: *SimRuntime, index: u32, script: HealthScript) ?[]const u8 {
+        var running: u32 = 0;
+        for (self.containers.items) |container| {
+            if (container.phase != .stopped) running += 1;
+        }
+        if (running == 0) return null;
+        var pick = index % running;
+        for (self.containers.items) |*container| {
+            if (container.phase == .stopped) continue;
+            if (pick > 0) {
+                pick -= 1;
+                continue;
+            }
+            container.health = script;
+            return container.name;
+        }
+        unreachable; // `pick` is below the number of running containers.
     }
 
     /// A fault on a random running container, or null if none runs. The seed decides which.
@@ -665,6 +692,14 @@ pub const SimRuntime = struct {
         const self = from(context);
         self.tick();
         const container = self.find(handle.name()) orelse return not_found(diag, handle);
+        if (container.health == .refuses_to_begin) {
+            self.probes_refused += 1;
+            diag.raise(.E0502);
+            diag.cause("the simulated runtime refused to begin the check", .{});
+            diag.fix(.{ .sentence = "see why the container cannot run the command" });
+            return error.RuntimeFailed;
+        }
+        self.probes_begun += 1;
         container.probe = .{ .began_ms = self.clock.now_ms(), .timeout_ms = timeout_ms };
     }
 

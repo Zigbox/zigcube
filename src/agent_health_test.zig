@@ -163,6 +163,40 @@ test "agent health: a check that hangs times out (ZC-W0502), one refused is ZC-E
     try testing.expect(seen.code == null);
 }
 
+test "agent health: a check the runtime will not begin is ZC-E0516, the runtime's code its cause" {
+    const rig = try Rig.start(check(1, 1, 0));
+    defer rig.stop();
+    try testing.expectEqual(records.HealthState.healthy, (try rig.seen()).health.?);
+    try rig.script(.refuses_to_begin);
+    rig.world.advance(3_000);
+    var seen = try rig.seen();
+    // Neither a pass nor a failure: the verdict stands, and the step goes on.
+    try testing.expectEqual(records.HealthState.healthy, seen.health.?);
+    try testing.expectEqual(@as(?u32, 0), seen.health_failures);
+    try testing.expectEqualStrings(codes.full_name(.E0516), seen.code.?);
+    try testing.expectEqual(records.ObservedStatus.running, seen.status);
+    const arena = rig.world.fresh_arena();
+    const text = try diagnostic_text(rig, arena);
+    const refusal = "the simulated runtime refused to begin the check";
+    const cause = try std.fmt.allocPrint(arena, "{s}: {s}", .{ codes.full_name(.E0502), refusal });
+    try testing.expect(std.mem.indexOf(u8, text, cause) != null);
+
+    // The check runs again in turn, and the code goes when it passes.
+    try rig.script(.healthy);
+    rig.world.advance(2_000);
+    seen = try rig.seen();
+    try testing.expectEqual(records.HealthState.healthy, seen.health.?);
+    try testing.expect(seen.code == null);
+}
+
+fn diagnostic_text(rig: *Rig, arena: std.mem.Allocator) ![]const u8 {
+    const world = rig.world;
+    const key = records.observed_key(sim_world.node_name, rig.replica);
+    const got = try world.store_handle().get(arena, key.slice(), null, &world.diag);
+    const value = try records.read(records.Observed, arena, got.kv.?, &world.diag);
+    return value.diagnostic.?.text;
+}
+
 test "agent health: failures in the start period are not counted" {
     // The container started about 2 s ago, and its first check passed; the start period is 6 s.
     const rig = try Rig.start(check(1, 1, 6_000));
