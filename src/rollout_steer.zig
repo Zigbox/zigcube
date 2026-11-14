@@ -55,6 +55,8 @@ pub const Result = union(enum) {
     /// Written at `revision`; `decision` is the id of the decision, in the context's arena.
     written: struct {
         revision: store.Revision,
+        /// The phase before and after.
+        previous: records.RolloutPhase,
         phase: records.RolloutPhase,
         to: u64,
         decision: []const u8,
@@ -86,13 +88,15 @@ pub fn steer_once(
 ) Error!Result {
     var batch: controller.Batch = .{};
     const prepared = try prepare(ctx, source, input, &batch);
-    const written = switch (prepared) {
+    const ready = switch (prepared) {
         .unchanged => |unchanged| return .{ .unchanged = unchanged },
         .ready => |ready| ready,
     };
+    const written = ready.record;
     return switch (try controller.commit(ctx, .rollout_controller, &batch)) {
         .applied => |revision| .{ .written = .{
             .revision = revision,
+            .previous = ready.previous,
             .phase = written.phase,
             .to = written.to,
             .decision = written.cause_decision,
@@ -103,8 +107,8 @@ pub fn steer_once(
 
 const Prepared = union(enum) {
     unchanged: Unchanged,
-    /// The record `batch` writes.
-    ready: records.Rollout,
+    /// The record `batch` writes, and the phase it had.
+    ready: struct { record: records.Rollout, previous: records.RolloutPhase },
 };
 
 /// Reads the service and its rollout and fills `batch` with the write and its compares.
@@ -144,7 +148,7 @@ fn prepare(
     var written = record_of(&rollout, &next);
     written.cause_decision = try controller.format(ctx, "{s}", .{id.slice()});
     batch.put(kv.key, try records.encode(ctx.arena, written, ctx.diag));
-    return .{ .ready = written };
+    return .{ .ready = .{ .record = written, .previous = rollout.phase } };
 }
 
 fn put_decision(

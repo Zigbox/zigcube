@@ -1069,7 +1069,7 @@ test "the job routes: 201, 200, 409, GET without secrets, list, cancel 202, why"
     const created = post_job(&rig, "/v1/jobs", body);
     try testing.expectEqual(@as(u16, 201), created.status);
     try testing.expectEqual(@as(u16, 200), post_job(&rig, "/v1/jobs", body).status);
-    const other = try job_json(&rig, "nightly", "b3:7c02aaaaaaaa");
+    const other = try job_json(&rig, "nightly", "b3:51aa9c04");
     try rig.refused(post_job(&rig, "/v1/jobs", other), 409, "ZC-E0131");
     const late = try std.fmt.allocPrint(rig.parsed.allocator(),
         \\{{"name":"late","image":"b3:51aa9c03","command":["true"],"deadline_ms":1,
@@ -1270,4 +1270,116 @@ test "a job names a relay the server configures; any other name or an env overri
         try rig.refused(response, 400, "ZC-E0130");
         try testing.expect(std.mem.indexOf(u8, response.body, case.field) != null);
     }
+}
+
+// ---- Rollouts and history (C3 slice 11) --------------------------------------------------------
+
+/// Puts a rollout of `hello` as the rollout controller would (slice 7 is not in this build: the
+/// tests hold the record contract of slices 5 and 6, docs/keys.md).
+fn put_rollout(rig: *Rig, phase: records.RolloutPhase, created: ?u64) !void {
+    const ctx = rig.world.controller_context();
+    const service = try ctx.store.get(ctx.arena, "/services/hello", null, ctx.diag);
+    const rollout: records.Rollout = .{
+        .service = "hello",
+        .service_created = created orelse service.kv.?.create_revision,
+        .from = 1,
+        .to = 2,
+        .phase = phase,
+        .started_at_ms = sim_world.epoch_ms,
+        .deadline_at_ms = sim_world.epoch_ms + 600_000,
+        .budget = .{ .start = 1, .retire = 1 },
+    };
+    const bytes = try records.encode(ctx.arena, rollout, ctx.diag);
+    const op: store.Op = .{ .put = .{ .key = "/rollouts/hello", .value = bytes } };
+    _ = try writers.txn(ctx.store, .rollout_controller, .{ .on_success = &.{op} }, ctx.diag);
+}
+
+fn rollout_post(rig: *Rig, verb: []const u8, body: []const u8) !api_mod.Response {
+    const arena = rig.parsed.allocator();
+    const path = try std.fmt.allocPrint(arena, "/v1/services/hello/rollout/{s}", .{verb});
+    return rig.call(.{ .method = "POST", .path = path, .body = body });
+}
+
+test "GET /v1/services/{name}/history lists the generations newest first, env redacted" {
+    var rig = try Rig.start(31);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    const changed = try std.mem.replaceOwned(u8, rig.parsed.allocator(), hello_json, "9c03", "9c04");
+    _ = try rig.json(post(&rig, "", changed));
+    const body = try rig.ok("/v1/services/hello/history", "");
+    try testing.expectEqual(@as(i64, 2), field(body, "generation").integer);
+    const generations = field(body, "generations").array.items;
+    try testing.expectEqual(@as(usize, 2), generations.len);
+    try testing.expectEqual(@as(i64, 2), field(generations[0], "generation").integer);
+    try testing.expectEqual(@as(i64, 1), field(generations[1], "generation").integer);
+    const value = field(generations[0], "value");
+    try testing.expectEqualStrings("b3:51aa9c04", field(value, "image").string);
+    const env = field(value, "env").array.items;
+    try testing.expectEqualStrings("API_TOKEN", env[0].array.items[0].string);
+    try testing.expect(env[0].array.items[1] == .null);
+    try rig.refused(rig.get("/v1/services/nope/history", ""), 404, "ZC-E0101");
+    try rig.refused(rig.get("/v1/services/hello/other", ""), 404, "ZC-E0101");
+}
+
+test "GET .../rollout answers null, then the record; pause and resume write it, ZC-E0129 else" {
+    // Goal: docs/api.md, "Rollouts and history": status is a read, pause and resume are writes
+    // to the rollout record by the rollout controller's role (rollout_steer.zig).
+    var rig = try Rig.start(32);
+    defer rig.stop();
+    _ = try rig.json(post(&rig, "", hello_json));
+    const none = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expect(field(none, "rollout") == .null);
+    try testing.expectEqual(@as(i64, 2), field(none, "replicas").integer);
+    try rig.refused(try rollout_post(&rig, "pause", ""), 409, "ZC-E0129");
+
+    try put_rollout(&rig, .progressing, null);
+    const running = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqualStrings("progressing", field(field(running, "rollout"), "phase").string);
+
+    const paused = try rollout_post(&rig, "pause", "{\"applied_by\":\"alex@laptop\"}");
+    const paused_body = try rig.json(paused);
+    try testing.expectEqual(@as(u16, 200), paused.status);
+    try testing.expectEqualStrings("pause", field(paused_body, "action").string);
+    try testing.expectEqualStrings("paused", field(paused_body, "phase").string);
+    try testing.expectEqualStrings("progressing → paused", field(paused_body, "change").string);
+    try testing.expect(field(paused_body, "decision").string.len > 0);
+    const record = field(try rig.ok("/v1/services/hello/rollout", ""), "rollout");
+    try testing.expectEqualStrings("user", field(record, "paused_by").string);
+    try testing.expectEqual(@as(i64, 0), field(field(record, "budget"), "start").integer);
+
+    const again = try rig.json(try rollout_post(&rig, "pause", ""));
+    try testing.expectEqualStrings("none", field(again, "action").string);
+    const resumed = try rig.json(try rollout_post(&rig, "resume", ""));
+    try testing.expectEqualStrings("progressing", field(resumed, "phase").string);
+
+    try put_rollout(&rig, .complete, null);
+    try rig.refused(try rollout_post(&rig, "resume", ""), 409, "ZC-E0129");
+    try put_rollout(&rig, .progressing, 999_999);
+    const stale = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expect(field(stale, "rollout") == .null);
+    try rig.refused(try rollout_post(&rig, "pause", ""), 409, "ZC-E0129");
+    try rig.refused(try rollout_post(&rig, "stop", ""), 404, "ZC-E0101");
+    try rig.refused(try rollout_post(&rig, "pause", "[1]"), 400, "ZC-E0104");
+    const missing = rig.call(.{ .method = "POST", .path = "/v1/services/nope/rollout/pause" });
+    try rig.refused(missing, 404, "ZC-E0101");
+}
+
+test "POST /v1/apply takes health and rollout, and refuses invalid ones" {
+    var rig = try Rig.start(33);
+    defer rig.stop();
+    const with_policy =
+        \\{"name":"hello","image":"b3:51aa9c03","replicas":2,"command":["sh"],
+        \\ "health":{"command":["true"],"interval_ms":1000,"timeout_ms":500,
+        \\  "failure_threshold":3,"success_threshold":1},"rollout":{"max_surge":2}}
+    ;
+    const applied = post(&rig, "", with_policy);
+    if (applied.status != 200) std.debug.print("{s}\n", .{applied.body});
+    try testing.expectEqual(@as(u16, 200), applied.status);
+    const status = try rig.ok("/v1/services/hello/rollout", "");
+    try testing.expectEqual(@as(i64, 2), field(field(status, "policy"), "max_surge").integer);
+    const bad =
+        \\{"name":"hello","image":"b3:51aa9c03","replicas":2,"command":["sh"],
+        \\ "rollout":{"max_surge":0,"max_unavailable":0}}
+    ;
+    try rig.refused(post(&rig, "", bad), 400, "ZC-E0126");
 }
