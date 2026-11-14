@@ -469,10 +469,12 @@ fn wait_registered(smoke: *Smoke, want: u32) !void {
     try smoke.expect(false, "timed out waiting for {d} nodes to register", .{want});
 }
 
-/// Waits for the node's replica to run and its fetch to end: the agent reports a replica running
-/// once its supervisor started, which with `FakeRuntime` is before the fetch child (and its
-/// summary line, ` chunks N ... registry N `) is done. Over TLS the fetch is slower, so waiting
-/// for the status alone lets the registry counts race the fetch.
+/// Waits for the node's replica to run and its fetch to end. Both are needed: `FakeRuntime.start`
+/// answers `.started` once `fetch.json` and `supervisor.pid` exist, so the agent reports the
+/// replica running while the fetch child may still be fetching (its summary line, ` chunks N ...
+/// registry N `, not yet written), and the registry counts would race the fetch. docs/agent.md
+/// says such a replica is `starting`: the product gap is recorded in
+/// decisions/2026-11-14-b7-slice7-o5-over-tls.md, to be fixed after the b3 tag, not here.
 fn wait_running(smoke: *Smoke, at: usize) !void {
     var waited: u32 = 0;
     while (waited < wait_ms) : (waited += 100) {
@@ -517,12 +519,8 @@ fn step_first_from_registry(smoke: *Smoke) !void {
 
 /// node1 has node2 as its only peer: the registry is not asked again.
 fn step_second_from_peer(smoke: *Smoke) !void {
-    // node1 starts once node2's chunk summary is in the store, so its plan sees node2.
-    var waited: u32 = 0;
-    while (waited < wait_ms and try smoke.summaries() < 1) : (waited += 100) {
-        try smoke.io.sleep(.fromMilliseconds(100), .awake);
-    }
-    try smoke.expect(try smoke.summaries() >= 1, "node2 never published its chunks", .{});
+    // No wait for node2's summary: O5 makes node1, which is not elected for the tree, wait for
+    // a peer to hold it (over TLS too, B7 slice 7).
     try smoke.start_agent(0);
     try wait_registered(smoke, 2);
     try smoke.apply(2);

@@ -17,6 +17,7 @@
 //!   PUT  /v1/agent/nodes/{node}/store                  the node's image summary (advisory)
 //!   GET  /v1/agent/nodes/{node}/watch?from=&timeout=   "something changed", a long poll
 //!   POST /v1/agent/nodes/{node}/credential             a peer credential for the node's key
+//!   GET  /v1/agent/nodes/{node}/fetchers/{digest}      the nodes that fetch an image (O5)
 //!
 //! **Every answer but the credential's carries `chain`**: `{"revision": R, "hash": "<hex>"}`,
 //! the store's `status`
@@ -44,6 +45,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const builtin = @import("builtin");
 const constants = @import("constants.zig");
 const c1_teeth = @import("c1_teeth.zig");
 const compare_sets = @import("compare_sets.zig");
@@ -141,6 +143,7 @@ pub fn route(
     if (std.mem.eql(u8, what, "pulls")) return call.pull();
     if (std.mem.eql(u8, what, "watch")) return call.watch();
     if (std.mem.eql(u8, what, "credential")) return call.credential();
+    if (std.mem.eql(u8, what, "fetchers")) return call.fetchers();
     return no_such(ctx, "/v1/agent/nodes/<node>/<that>");
 }
 
@@ -422,6 +425,56 @@ const Call = struct {
         }
         const pair = try call.chain();
         return reply(ctx, .{ .revision = all.revision, .kvs = mine.items, .chain = pair });
+    }
+
+    // ---- GET /v1/agent/nodes/{node}/fetchers/{digest} ----
+
+    /// The names of the nodes assigned a replica whose image is `digest`, each once, in key
+    /// order: what the swarm fetch's O5 wait needs (docs/briefs/c2.md), computed here so that a
+    /// node's certificate learns the names and nothing of the records (no spec, no env; B7 slice
+    /// 7, decisions/2026-11-14-b7-slice7-o5-over-tls.md). Any node may ask, about any digest.
+    fn fetchers(call: Call) Failure!Reply {
+        const ctx = call.ctx;
+        try call.require_method("GET");
+        try call.only_known();
+        const digest = call.parts.next() orelse return no_such(ctx, "that path");
+        try call.no_more();
+        if (!image_digest_valid(digest)) {
+            return bad_request(ctx, "digest", "is not b3: and 8 to 64 lower-case hex digits");
+        }
+        const all = controller.list_all(
+            records.Replica,
+            ctx,
+            records.prefix_replicas,
+            null,
+            constants.replicas_max,
+        ) catch return propagate(ctx);
+        const given = controller.list_all(
+            records.Assigned,
+            ctx,
+            records.prefix_assigned,
+            all.revision,
+            constants.assigned_max,
+        ) catch return propagate(ctx);
+        var ids: std.StringHashMapUnmanaged(void) = .empty;
+        for (all.items) |entry| {
+            const match = std.mem.eql(u8, entry.rec.image, digest);
+            if (!match and !fault_on(.fetchers_digest)) continue;
+            ids.put(ctx.arena, entry.rec.id, {}) catch return no_memory(ctx);
+        }
+        var nodes: std.ArrayList([]const u8) = .empty;
+        for (given.items) |entry| {
+            if (!ids.contains(entry.rec.replica)) continue;
+            const rest = entry.kv.key[records.prefix_assigned.len..];
+            const node = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse continue];
+            const last = if (nodes.items.len == 0) "" else nodes.items[nodes.items.len - 1];
+            // Keys ascend, so one node's assignments are adjacent.
+            if (std.mem.eql(u8, last, node)) continue;
+            nodes.append(ctx.arena, node) catch return no_memory(ctx);
+        }
+        assert(nodes.items.len <= given.items.len);
+        const pair = try call.chain();
+        return reply(ctx, .{ .revision = all.revision, .nodes = nodes.items, .chain = pair });
     }
 
     // ---- GET /v1/agent/nodes/{node}/assigned ----
@@ -1123,6 +1176,34 @@ const Numbers = struct {
     /// The revision the first page was read at, with `after`: the pages are one read.
     at: ?u64 = null,
 };
+
+/// `b3:` and 8 to 64 lower-case hex digits, as the fetch child takes it (`fetch_cli.zig`).
+fn image_digest_valid(digest: []const u8) bool {
+    if (!std.mem.startsWith(u8, digest, "b3:")) return false;
+    const digits = digest[3..];
+    if (digits.len < 8 or digits.len > 64) return false;
+    for (digits) |byte| {
+        const ok = switch (byte) {
+            '0'...'9', 'a'...'f' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Test-only fault for the teeth test: `fetchers` names every assigned node, not only those
+/// assigned the digest's replicas.
+pub const TestFault = enum { fetchers_digest };
+var faults: [std.enums.values(TestFault).len]bool = @splat(false);
+
+pub fn set_test_fault(fault: TestFault, on: bool) void {
+    if (builtin.is_test) faults[@backingInt(fault)] = on;
+}
+
+fn fault_on(fault: TestFault) bool {
+    return builtin.is_test and faults[@backingInt(fault)];
+}
 
 fn no_parameter(ctx: *const Context, name: []const u8) Failure {
     return bad_request(ctx, name, "this endpoint takes no such parameter");

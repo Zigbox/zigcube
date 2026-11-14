@@ -5,6 +5,7 @@
 const std = @import("std");
 const testing = std.testing;
 const api_mod = @import("api.zig");
+const agent_api = @import("agent_api.zig");
 const agent_state = @import("agent_state.zig");
 const apply_mod = @import("apply.zig");
 const codes = @import("diag/codes.zig");
@@ -1308,6 +1309,11 @@ const scope_rows = [_]ScopeRow{
     .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs", .allowed = scope_own },
     .{ .method = "GET", .path = "/v1/agent/nodes/node1/runs/build/input", .allowed = scope_own },
     .{ .method = "GET", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node1/fetchers/b3:51aa9c03",
+        .allowed = scope_own,
+    },
     .{ .method = "POST", .path = "/v1/agent/nodes/node1/job-observed", .allowed = scope_own },
     .{
         .method = "GET",
@@ -1325,6 +1331,11 @@ const scope_rows = [_]ScopeRow{
     },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/observed", .allowed = scope_none },
     .{ .method = "POST", .path = "/v1/agent/nodes/node2/job-observed", .allowed = scope_none },
+    .{
+        .method = "GET",
+        .path = "/v1/agent/nodes/node2/fetchers/b3:51aa9c03",
+        .allowed = scope_none,
+    },
     .{
         .method = "GET",
         .path = "/v1/agent/nodes/node2/watch",
@@ -1389,4 +1400,79 @@ test "scopes: a refused agent writes nothing under another node's keys (B7)" {
     });
     try rig.refused(response, 403, "ZC-E0822");
     try testing.expectEqual(before, rig.world.revision().?);
+}
+
+/// `hello` (2 replicas) and `other` (1 replica, another image) applied and placed on node1.
+fn fetchers_rig(seed: u64) !Rig {
+    var rig = try Rig.start(seed);
+    errdefer rig.stop();
+    _ = try rig.world.apply(hello);
+    var other = hello;
+    other.name = "other";
+    other.image = "b3:0123abcd";
+    other.replicas = 1;
+    _ = try rig.world.apply(other);
+    rig.world.advance(3000);
+    return rig;
+}
+
+/// The `nodes` a node's certificate is told fetch `digest`, checking the reply holds nothing else.
+fn fetchers_of(rig: *Rig, digest: []const u8) ![]const Json {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "/v1/agent/nodes/node1/fetchers/{s}", .{
+        digest,
+    });
+    const response = rig.call(.{ .caller = .{ .node = "node1" }, .method = "GET", .path = path });
+    if (response.status != 200) std.debug.print("{s}\n", .{response.body});
+    try testing.expectEqual(@as(u16, 200), response.status);
+    const body = try rig.json(response);
+    // Names, the revision and the chain pair: no record, no env.
+    try testing.expectEqual(@as(usize, 3), body.object.count());
+    try testing.expect(body.object.get("revision") != null);
+    try testing.expect(body.object.get("chain") != null);
+    try testing.expect(std.mem.indexOf(u8, response.body, "s3cr3t") == null);
+    const nodes = field(body, "nodes").array.items;
+    for (nodes) |node| try testing.expect(node == .string);
+    return nodes;
+}
+
+test "fetchers names the nodes assigned a digest's replicas, once each, and nothing more (B7)" {
+    // Goal: the O5 wait over TLS (decisions/2026-11-14-b7-slice7-o5-over-tls.md): a node's
+    // certificate learns which nodes fetch a tree from names alone, never the replica records.
+    var rig = try fetchers_rig(93);
+    defer rig.stop();
+    const hello_nodes = try fetchers_of(&rig, hello.image);
+    try testing.expectEqual(@as(usize, 1), hello_nodes.len); // Two replicas, one node.
+    try testing.expectEqualStrings("node1", hello_nodes[0].string);
+    try testing.expectEqual(@as(usize, 1), (try fetchers_of(&rig, "b3:0123abcd")).len);
+    try testing.expectEqual(@as(usize, 0), (try fetchers_of(&rig, "b3:99999999")).len);
+    const node1: api_mod.Caller = .{ .node = "node1" };
+    const bad = [_][]const u8{
+        "/v1/agent/nodes/node1/fetchers",
+        "/v1/agent/nodes/node1/fetchers/sha256:51aa9c03",
+        "/v1/agent/nodes/node1/fetchers/b3:51AA9C03",
+        "/v1/agent/nodes/node1/fetchers/b3:51aa",
+        "/v1/agent/nodes/node1/fetchers/b3:51aa9c03/x",
+    };
+    for (bad) |path| {
+        const response = rig.call(.{ .caller = node1, .method = "GET", .path = path });
+        try testing.expect(response.status == 400 or response.status == 404);
+    }
+    const posted = rig.call(.{
+        .caller = node1,
+        .method = "POST",
+        .path = "/v1/agent/nodes/node1/fetchers/b3:51aa9c03",
+    });
+    try rig.refused(posted, 400, "ZC-E0104");
+}
+
+test "teeth: without the digest filter fetchers names nodes that fetch another image" {
+    // Goal: the digest is what keeps `fetchers` to the tree's own fetchers. The negative half
+    // runs here too: `mtls-teeth` does not run the plain tests.
+    var rig = try fetchers_rig(94);
+    defer rig.stop();
+    try testing.expectEqual(@as(usize, 0), (try fetchers_of(&rig, "b3:99999999")).len);
+    agent_api.set_test_fault(.fetchers_digest, true);
+    defer agent_api.set_test_fault(.fetchers_digest, false);
+    try testing.expectEqual(@as(usize, 1), (try fetchers_of(&rig, "b3:99999999")).len);
 }

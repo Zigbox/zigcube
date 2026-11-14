@@ -1479,10 +1479,6 @@ const node_store_listing: Listing = .{
     .limit = discover_page_nodes,
     .pages_max = discover_pages_max,
 };
-/// The assignments and replicas, read once per fetch to know which nodes fetch the tree (O5).
-/// Their records are well under a kilobyte, so a page of this many fits `discover_page_bytes_max`.
-const assigned_listing: Listing = .{ .prefix = "/assigned/", .limit = 128, .pages_max = 8 };
-const replicas_listing: Listing = .{ .prefix = "/replicas/", .limit = 128, .pages_max = 8 };
 
 /// Reads the server's `/node-store/` list, a page at a time (`discover_page_nodes` each, at most
 /// `discover_pages_max`); what was read when a later page fails is kept, and null if none was.
@@ -1703,10 +1699,11 @@ const Begun = struct {
     waited_ms: u64,
 };
 
-/// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, reads which nodes fetch
-/// the tree (not over TLS) and, unless a peer holds it or this node ranks lowest among them,
-/// re-reads `/node-store/` every `fetch_peer_poll_ms` for up to `fetch_peer_wait_ms` until a peer
-/// holds it. `arena` holds the fetchers; `poll` is reset before each read and holds the last.
+/// O5 (docs/briefs/c2.md, owner 2026-11-03): before the peers are chosen, asks the server which
+/// nodes fetch the tree (over plain HTTP and TLS alike) and, unless a peer holds it or this node
+/// ranks lowest among them, re-reads `/node-store/` every `fetch_peer_poll_ms` for up to
+/// `fetch_peer_wait_ms` until a peer holds it. `arena` holds the fetchers; `poll` is reset before
+/// each read and holds the last.
 fn begin(
     arena: std.mem.Allocator,
     poll: *std.heap.ArenaAllocator,
@@ -1716,12 +1713,7 @@ fn begin(
 ) Begun {
     const scratch = arena.alloc(u8, discover_page_bytes_max) catch
         return .{ .stores = null, .start = .peers, .fetchers = 0, .waited_ms = 0 };
-    // Over TLS a node may read `/node-store/` only (api_scope.zig): no fetchers, so no wait,
-    // as before O5 (decisions/2026-11-14-b7-slice7-node-store-read.md).
-    const fetchers = if (net.server_tls != null)
-        &.{}
-    else
-        fetching_nodes(arena, getter, scratch, parsed.digest);
+    const fetchers = fetching_nodes(arena, getter, scratch, parsed.node, parsed.digest);
     const started = net.clock_ms();
     while (true) {
         _ = poll.reset(.retain_capacity);
@@ -1748,45 +1740,40 @@ fn begin(
     }
 }
 
-/// The nodes with an assignment of a replica whose image is `digest` (`/assigned/<node>/<id>`
-/// joined to `/replicas/<service>/<id>`), each once. Empty if either list cannot be read: the
-/// fetch then ranks itself alone and does not wait, as before O5.
+/// The nodes the server names as fetching `digest`, each once: those assigned a replica of it,
+/// `GET /v1/agent/nodes/<self>/fetchers/<digest>` (`agent_api.zig`), which a node's certificate
+/// may call (decisions/2026-11-14-b7-slice7-o5-over-tls.md). Copied into `arena`, since
+/// `scratch` serves the next request. Empty if it cannot be read: the fetch then ranks itself
+/// alone and does not wait, as before O5. A name that is not a node name is left out.
 fn fetching_nodes(
     arena: std.mem.Allocator,
     getter: anytype,
     scratch: []u8,
+    self: []const u8,
     digest: []const u8,
 ) []const []const u8 {
-    const replicas = collect_list(arena, getter, scratch, replicas_listing) orelse return &.{};
-    var ids: std.ArrayList([]const u8) = .empty;
-    for (replicas) |kv| {
-        const image = string_field(kv.value, "image") orelse continue;
-        if (!std.mem.eql(u8, image, digest)) continue;
-        const id = string_field(kv.value, "id") orelse continue;
-        ids.append(arena, id) catch return &.{};
-    }
-    if (ids.items.len == 0) return &.{};
-    const assigned = collect_list(arena, getter, scratch, assigned_listing) orelse return &.{};
-    return assigned_nodes(arena, assigned, ids.items);
-}
-
-/// The nodes of `/assigned/<node>/<id>` keys whose `id` is in `ids`, each once.
-fn assigned_nodes(
-    arena: std.mem.Allocator,
-    assigned: []const Kv,
-    ids: []const []const u8,
-) []const []const u8 {
+    assert(digest_valid(digest));
+    var target: [fetchers_path_bytes_max]u8 = undefined;
+    const form = "/v1/agent/nodes/{s}/fetchers/{s}";
+    const path = std.fmt.bufPrint(&target, form, .{ self, digest }) catch return &.{};
+    const body = getter.get(path, scratch) orelse return &.{};
+    const Reply = struct { nodes: []const []const u8 };
+    const parsed = std.json.parseFromSliceLeaky(Reply, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return &.{};
     var nodes: std.ArrayList([]const u8) = .empty;
-    for (assigned) |kv| {
-        const rest = strip_prefix(kv.key, "/assigned/") orelse continue;
-        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse continue;
-        const node = rest[0..slash];
-        const id = rest[slash + 1 ..];
-        if (!contains(ids, id) or contains(nodes.items, node)) continue;
+    for (parsed.nodes) |node| {
+        if (nodes.items.len == constants.nodes_max) break;
+        if (records.name_problem(node, constants.node_name_bytes_max) != null) continue;
+        if (contains(nodes.items, node)) continue;
         nodes.append(arena, node) catch return nodes.items;
     }
     return nodes.items;
 }
+
+const fetchers_path_bytes_max = "/v1/agent/nodes//fetchers/".len +
+    constants.node_name_bytes_max + "b3:".len + 64;
 
 fn strip_prefix(text: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, text, prefix)) return null;
@@ -2344,37 +2331,43 @@ test "without a registry the sources a failed fetch names are the peers alone" {
     );
 }
 
-test "the nodes fetching a tree are those assigned a replica of it, each once" {
-    // Goal: O5's set of fetchers from `/assigned/` and `/replicas/`. Method: two replicas of the
-    // tree on node1 and one on node3, one of another image on node2.
+test "the nodes fetching a tree are those the server names, each once, node names only" {
+    // Goal: O5's set of fetchers from the server's `fetchers` endpoint, asked under this node's
+    // own path with the digest. Method: a reply that names node1 twice, a name that is not a
+    // node name and node3; then the path the request named.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const assigned = parse_kvs(arena,
-        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{"replica":"app-1"}},
-        \\{"key":"/assigned/node1/app-2","value":{}},{"key":"/assigned/node2/web-1","value":{}},
-        \\{"key":"/assigned/node3/app-3","value":{}},{"key":"/assigned/bad","value":{}}]}
-    ).?;
-    const ids = [_][]const u8{ "app-1", "app-2", "app-3" };
-    const nodes = assigned_nodes(arena, assigned, &ids);
+    const pages = [_][]const u8{
+        \\{"revision":7,"nodes":["node1","node1","Bad Name","node3"],"chain":{}}
+        ,
+    };
+    var calls: u32 = 0;
+    var last_path: [160]u8 = undefined;
+    const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last_path };
+    const scratch = try arena.alloc(u8, 4096);
+    const nodes = fetching_nodes(arena, getter, scratch, "node2", "b3:aaaaaaaa");
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("node1", nodes[0]);
     try std.testing.expectEqualStrings("node3", nodes[1]);
+    try std.testing.expectEqual(@as(u32, 1), calls);
+    // A reply that is not the endpoint's: no fetchers, so no wait.
+    calls = 0;
+    const wrong = [_][]const u8{"{\"kvs\":[]}"};
+    const other: PagedGetter = .{ .pages = &wrong, .calls = &calls, .last_path = &last_path };
+    const none = fetching_nodes(arena, other, scratch, "node2", "b3:aaaaaaaa");
+    try std.testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "the fetching nodes stay as read when the same buffer serves the next request" {
     // Goal: the demo-c2 run 41965968058 bug: the names pointed into the reply buffer, so the next
     // `/node-store/` read changed them and no node ranked lowest. Method: read the fetchers, then
-    // a node-store page through the same buffer; the names and the ids they came from hold.
+    // a node-store page through the same buffer; the names hold.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const pages = [_][]const u8{
-        \\{"kvs":[{"key":"/replicas/app/app-1","value":{"id":"app-1","image":"b3:aa"}},
-        \\{"key":"/replicas/app/app-2","value":{"id":"app-2","image":"b3:aa"}}]}
-        ,
-        \\{"kvs":[{"key":"/assigned/node1/app-1","value":{}},
-        \\{"key":"/assigned/node3/app-2","value":{}}]}
+        \\{"revision":3,"nodes":["node1","node3"]}
         ,
         \\{"kvs":[{"key":"/node-store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz","value":{
         \\"peer":"10.0.0.9:7700","trees":[]}}]}
@@ -2385,24 +2378,24 @@ test "the fetching nodes stay as read when the same buffer serves the next reque
     const getter: PagedGetter = .{ .pages = &pages, .calls = &calls, .last_path = &last_path };
     const scratch = try arena.alloc(u8, 4096);
     @memset(scratch, 'x');
-    const nodes = fetching_nodes(arena, getter, scratch, "b3:aa");
+    const nodes = fetching_nodes(arena, getter, scratch, "node2", "b3:aaaaaaaa");
     _ = collect_pages(arena, getter, scratch).?;
     try std.testing.expectEqual(@as(usize, 2), nodes.len);
     try std.testing.expectEqualStrings("node1", nodes[0]);
     try std.testing.expectEqualStrings("node3", nodes[1]);
 }
 
-/// A server that has two fetchers of "b3:aa" and no node-store entry, whatever the path.
+/// A server that names two fetchers of the tree and has no node-store entry. It answers the
+/// fetchers path of `digest` only, so a request that names another path or digest finds none.
 const FetchersGetter = struct {
-    fn get(_: FetchersGetter, path: []const u8, out: []u8) ?[]const u8 {
-        const body: []const u8 = if (std.mem.indexOf(u8, path, "/replicas/") != null)
-            \\{"kvs":[{"key":"/replicas/app/a1","value":{"id":"a1","image":"b3:aa"}},
-            \\{"key":"/replicas/app/a2","value":{"id":"a2","image":"b3:aa"}}]}
-        else if (std.mem.indexOf(u8, path, "/assigned/") != null)
-            \\{"kvs":[{"key":"/assigned/node1/a1","value":{}},
-            \\{"key":"/assigned/node2/a2","value":{}}]}
-        else
-            return null;
+    digest: []const u8,
+
+    fn get(getter: FetchersGetter, path: []const u8, out: []u8) ?[]const u8 {
+        const tail = "/fetchers/";
+        const at = std.mem.indexOf(u8, path, tail) orelse return null;
+        if (!std.mem.startsWith(u8, path, "/v1/agent/nodes/")) return null;
+        if (!std.mem.eql(u8, path[at + tail.len ..], getter.digest)) return null;
+        const body = "{\"revision\":1,\"nodes\":[\"node1\",\"node2\"]}";
         @memcpy(out[0..body.len], body);
         return out[0..body.len];
     }
@@ -2419,7 +2412,8 @@ test "the O5 wait says where it is: begin writes progress lines while no peer ho
     var poll: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer poll.deinit();
     const fetchers = [_][]const u8{ "node1", "node2" };
-    const self: []const u8 = if (fetch_plan.registry_first("node1", "b3:aa", &fetchers))
+    const tree = "b3:aaaaaaaa";
+    const self: []const u8 = if (fetch_plan.registry_first("node1", tree, &fetchers))
         "node2"
     else
         "node1";
@@ -2433,13 +2427,53 @@ test "the O5 wait says where it is: begin writes progress lines while no peer ho
         .reply = &scratch,
         .test_clock_ms = &fake,
     };
-    const parsed: Args = .{ .node = self, .digest = "b3:aa" };
-    const begun = begin(arena, &poll, &net, FetchersGetter{}, &parsed);
+    const parsed: Args = .{ .node = self, .digest = tree };
+    const begun = begin(arena, &poll, &net, FetchersGetter{ .digest = tree }, &parsed);
     try std.testing.expect(begun.start == .waited);
     try std.testing.expect(begun.waited_ms >= constants.fetch_peer_wait_ms);
     const lines: u32 = constants.fetch_peer_wait_ms / constants.fetch_progress_ms;
     try std.testing.expect(net.progress_lines >= lines - 1 and net.progress_lines <= lines + 1);
     try std.testing.expect(net.progress_lines > 0);
+}
+
+test "over TLS too, a node that another fetcher outranks waits for a peer (O5)" {
+    // Goal: B7 slice 7's MUST: with the server read over TLS, O5 holds, so only the elected node
+    // reads the registry first (demo-c2's registry_once). Method: as above, with `server_tls`
+    // set (the getter answers in its place); then the elected node, which does not wait.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var poll: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer poll.deinit();
+    const fetchers = [_][]const u8{ "node1", "node2" };
+    const tree = "b3:aaaaaaaa";
+    const elected: []const u8 = if (fetch_plan.registry_first("node1", tree, &fetchers))
+        "node1"
+    else
+        "node2";
+    const other: []const u8 = if (elected[4] == '1') "node2" else "node1";
+    var fake: u64 = 5_000;
+    var scratch: [8]u8 = undefined;
+    var server_tls: ServerTls = undefined; // Never read: the getter answers.
+    var net: Net = .{
+        .io = std.testing.io,
+        .registry = null,
+        .peers = &.{},
+        .identity = null,
+        .reply = &scratch,
+        .test_clock_ms = &fake,
+        .server_tls = &server_tls,
+    };
+    const getter: FetchersGetter = .{ .digest = tree };
+    const waiting: Args = .{ .node = other, .digest = tree };
+    const begun = begin(arena, &poll, &net, getter, &waiting);
+    try std.testing.expect(begun.start == .waited);
+    try std.testing.expectEqual(@as(u32, 2), begun.fetchers);
+    try std.testing.expect(begun.waited_ms >= constants.fetch_peer_wait_ms);
+    const first: Args = .{ .node = elected, .digest = tree };
+    const chosen = begin(arena, &poll, &net, getter, &first);
+    try std.testing.expect(chosen.start == .registry_first);
+    try std.testing.expectEqual(@as(u64, 0), chosen.waited_ms);
 }
 
 test "a peer holds a tree when its summary lists it and it can be reached" {

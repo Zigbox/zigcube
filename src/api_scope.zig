@@ -17,6 +17,9 @@
 //!   `GET /v1/list` with `prefix` exactly `/node-store/` and no parameter but `limit`, `at` and
 //!   `continue` (B7 slice 7, decisions/2026-11-14-b7-slice7-node-store-read.md). Nothing else
 //!   under `/v1/list`, so a node never reads another service's spec (its env).
+//!   Which nodes fetch a tree (O5) a node learns under its own path instead,
+//!   `GET /v1/agent/nodes/<its name>/fetchers/<digest>`: node names only, computed by the
+//!   server (decisions/2026-11-14-b7-slice7-o5-over-tls.md).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -196,6 +199,11 @@ test "need_of: the agent API by node, the jobs API, and everything else is admin
         .{ .method = "POST", .path = "/v1/agent/nodes/node1/credentials", .need = .{
             .node = "node1",
         } },
+        .{
+            .method = "GET",
+            .path = "/v1/agent/nodes/node1/fetchers/b3:51aa9c03",
+            .need = .{ .node = "node1" },
+        },
         .{ .method = "GET", .path = "/v1/agent/nodes/", .need = .admin },
         .{ .method = "GET", .path = "/v1/agent/nodes", .need = .admin },
         .{ .method = "GET", .path = "/v1/agent/", .need = .admin },
@@ -230,6 +238,11 @@ test "refusal: a node only under its own name, jobs only jobs, admin and local e
     try testing.expect(refusal(node1, "PUT", "/v1/agent/nodes/node2", "") != null);
     // A prefix of another name is not the name.
     try testing.expect(refusal(node1, "PUT", "/v1/agent/nodes/node12/lease", "") != null);
+    // Which nodes fetch a tree (O5, B7 slice 7): asked under the node's own name only.
+    const fetchers = "/fetchers/b3:51aa9c03";
+    try testing.expect(refusal(node1, "GET", "/v1/agent/nodes/node1" ++ fetchers, "") == null);
+    try testing.expect(refusal(node1, "GET", "/v1/agent/nodes/node2" ++ fetchers, "") != null);
+    try testing.expect(refusal(jobs, "GET", "/v1/agent/nodes/node1" ++ fetchers, "") != null);
     try testing.expect(refusal(node1, "GET", "/v1/jobs", "") != null);
     try testing.expect(refusal(node1, "GET", "/v1/status", "") != null);
     try testing.expect(refusal(jobs, "POST", "/v1/jobs", "") == null);
@@ -298,6 +311,10 @@ test "a node may list /node-store/ with limit, at and continue, and nothing else
         "prefix=/node-store/&watch=true",
         "prefix=/node-store/&limit",
         "pre%66ix=/node-store/",
+        "pre=/node-store/",
+        "prefix=/node-store/&lim=5",
+        "prefix=/node-store/&a=1",
+        "prefix=/node-store/&continu=/node-store/x",
         "prefix=/node-store/%00",
     };
     for (refused) |query| {
@@ -311,11 +328,16 @@ test "teeth: without the prefix check a node reads the services' specs" {
     // Goal: the prefix check is what keeps a node's list to `/node-store/` (a service's spec holds
     // its env). The negative half runs here too: `mtls-teeth` does not run the plain tests.
     const node1: Caller = .{ .node = "node1" };
-    const services = "prefix=/services/&limit=500";
-    try testing.expect(refusal(node1, "GET", "/v1/list", services) != null);
+    const reads = [_][]const u8{
+        "prefix=/services/&limit=500",
+        "prefix=/replicas/",
+        "prefix=/env/",
+        "prefix=%2Fjob-inputs%2F",
+    };
+    for (reads) |query| try testing.expect(refusal(node1, "GET", "/v1/list", query) != null);
     set_test_fault(.prefix_check, true);
     defer set_test_fault(.prefix_check, false);
-    try testing.expect(refusal(node1, "GET", "/v1/list", services) == null);
+    for (reads) |query| try testing.expect(refusal(node1, "GET", "/v1/list", query) == null);
 }
 
 comptime {
